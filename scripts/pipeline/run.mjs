@@ -3784,7 +3784,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
         const { values } = parseArgs({
           args: rest,
           options: {
-            'env-files': { type: 'string', default: '' },
+            'env-files': { type: 'string' },
             env: { type: 'string', default: '' },
             'keychain-service': { type: 'string', default: 'happier/pipeline' },
             'keychain-account': { type: 'string', default: '' },
@@ -3797,6 +3797,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           allowPositionals: false,
         });
 
+        const hasExplicitEnvFiles = values['env-files'] !== undefined;
         const envFilesRaw = String(values['env-files'] ?? '').trim();
         const envRaw = String(values.env ?? '').trim();
         const keychainService = String(values['keychain-service'] ?? '').trim() || 'happier/pipeline';
@@ -3817,14 +3818,13 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
             }
             envTargets.push(env);
           }
-        } else if (!envFilesRaw) {
+        } else if (!hasExplicitEnvFiles) {
           // Default behavior: when importing from standard repo env files, import all env overlays.
           envTargets = ['preview', 'production'];
         }
 
-        const wantsEnvBundles = envTargets.length > 0;
-
         const envFilesList = envFilesRaw ? parseCsvList(envFilesRaw) : [];
+        /** @returns {'production'|'preview'|''} */
         const envFileMatch = (filePath) => {
           const base = path.basename(String(filePath ?? '').trim());
           if (base === '.env.pipeline.production.local') return 'production';
@@ -3832,15 +3832,28 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           return '';
         };
 
-        const baseEnvFiles = envFilesList.filter((f) => !envFileMatch(f));
-        const baseFiles = baseEnvFiles.length > 0 ? baseEnvFiles : envFilesRaw ? ['.env.pipeline.local'] : ['.env.pipeline.local'];
+        if (hasExplicitEnvFiles) {
+          if (envFilesList.length === 0) fail('--env-files must name at least one file.');
+          /** @type {('production'|'preview')[]} */
+          const suppliedEnvironments = [];
+          for (const file of envFilesList) {
+            const environment = envFileMatch(file);
+            if (environment && !suppliedEnvironments.includes(environment)) suppliedEnvironments.push(environment);
+          }
+          if (envRaw) {
+            if (suppliedEnvironments.some((env) => !envTargets.includes(env)) || envTargets.some((env) => !suppliedEnvironments.includes(env))) {
+              fail('--env must match the environments of the explicitly selected overlay files.');
+            }
+          } else {
+            envTargets = suppliedEnvironments;
+          }
+        }
+        const wantsEnvBundles = envTargets.length > 0;
+        const baseFiles = hasExplicitEnvFiles ? envFilesList.filter((f) => !envFileMatch(f)) : ['.env.pipeline.local'];
         /** @type {string[]} */
         const cleanupFileInputs = [...baseFiles];
 
         const { baseAccount } = resolveKeychainBundleAccounts({ accountPrefix: keychainAccount || undefined });
-        console.log(
-          `[pipeline] keychain import: service=${keychainService} account=${baseAccount} (base bundle)`,
-        );
 
         /**
          * @param {ReturnType<typeof importDotenvIntoKeychainBundle>} result
@@ -3866,16 +3879,19 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           }
         };
 
-        const baseResult = importDotenvIntoKeychainBundle({
-          repoRoot,
-          envFiles: baseFiles,
-          keychainService,
-          keychainAccount: baseAccount,
-          onlyMissing,
-          ignoreMissing,
-          dryRun,
-        });
-        logResult(baseResult, 'base');
+        if (baseFiles.length > 0) {
+          console.log(`[pipeline] keychain import: service=${keychainService} account=${baseAccount} (base bundle)`);
+          const baseResult = importDotenvIntoKeychainBundle({
+            repoRoot,
+            envFiles: baseFiles,
+            keychainService,
+            keychainAccount: baseAccount,
+            onlyMissing,
+            ignoreMissing,
+            dryRun,
+          });
+          logResult(baseResult, 'base');
+        }
 
         if (wantsEnvBundles) {
           for (const deployEnvironment of envTargets) {
@@ -3884,7 +3900,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
               deployEnvironment,
             });
             const envFilesFromList = envFilesList.filter((f) => envFileMatch(f) === deployEnvironment);
-            const envFiles = envFilesFromList.length > 0 ? envFilesFromList : [`.env.pipeline.${deployEnvironment}.local`];
+            const envFiles = hasExplicitEnvFiles ? envFilesFromList : [`.env.pipeline.${deployEnvironment}.local`];
             cleanupFileInputs.push(...envFiles);
 
             console.log(

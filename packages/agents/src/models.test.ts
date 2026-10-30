@@ -34,8 +34,8 @@ describe('agent model config', () => {
     const geminiModels = getAgentStaticModels('gemini');
 
     expect(claude.staticModels?.slice(0, 2)).toMatchObject([
-      { id: 'claude-fable-5-1', name: 'Fable 5.1', contextWindowTokens: 1_000_000 },
       { id: 'claude-opus-5-5', name: 'Opus 5.5', contextWindowTokens: 1_000_000 },
+      { id: 'claude-fable-5-1', name: 'Fable 5.1', contextWindowTokens: 1_000_000 },
     ]);
 
     expect(claude.staticModels?.find((model) => model.id === 'claude-sonnet-5-5')).toMatchObject({
