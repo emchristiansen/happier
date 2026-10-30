@@ -3378,16 +3378,19 @@ export function createCodexAppServerRuntime(params: Readonly<{
             ? `${typeof value}:${String(value)}`
             : null
     );
-    const associatePendingProviderRequest = (requestKey: string | null | undefined, callId: string): void => {
-        if (!requestKey) return;
-        if (externallyResolvedProviderRequests.delete(requestKey)) {
-            params.permissionHandler?.cancelPendingRequest?.(
-                callId,
-                'Resolved in another Codex client',
-            );
-            return;
-        }
-        pendingProviderRequestCallIds.set(requestKey, callId);
+    const handlePendingProviderToolCall = async (
+        requestKey: string | null | undefined,
+        callId: string,
+        toolName: string,
+        input: unknown,
+        unavailableDecision: 'denied' | 'abort' = 'denied',
+    ): Promise<PermissionResult> => {
+        // Preparation may be queued behind a projection after another client resolves this request.
+        if (requestKey && externallyResolvedProviderRequests.delete(requestKey)) return { decision: 'abort' };
+        if (requestKey) pendingProviderRequestCallIds.set(requestKey, callId);
+        return params.permissionHandler
+            ? await params.permissionHandler.handleToolCall(callId, toolName, input)
+            : { decision: unavailableDecision };
     };
 
     type CodexAppServerMcpElicitationAction = 'accept' | 'decline' | 'cancel';
@@ -3426,11 +3429,10 @@ export function createCodexAppServerRuntime(params: Readonly<{
 
         markActiveTurnMeaningfulContextWindowRecoveryActivity();
         const requestKey = providerRequestKey(message?.id);
-        associatePendingProviderRequest(requestKey, invocation.toolCallId);
         return async () => {
-            const result = params.permissionHandler
-                ? await params.permissionHandler.handleToolCall(invocation.toolCallId, invocation.toolName, invocation.input)
-                : { decision: 'denied' as const };
+            const result = await handlePendingProviderToolCall(
+                requestKey, invocation.toolCallId, invocation.toolName, invocation.input,
+            );
             return mapMcpElicitationResponse(result);
         };
     };
@@ -3466,21 +3468,19 @@ export function createCodexAppServerRuntime(params: Readonly<{
             }
 
             if (update.type === 'approval-request') {
-                associatePendingProviderRequest(options?.providerRequestKey, update.callId);
                 return async () => {
-                    const result = params.permissionHandler
-                        ? await params.permissionHandler.handleToolCall(update.callId, update.toolName, update.input)
-                        : { decision: 'denied' as const };
+                    const result = await handlePendingProviderToolCall(
+                        options?.providerRequestKey, update.callId, update.toolName, update.input,
+                    );
                     return mapApprovalDecision(update.requestKind, result);
                 };
             }
 
             if (update.type === 'permissions-request') {
-                associatePendingProviderRequest(options?.providerRequestKey, update.callId);
                 return async () => {
-                    const result = params.permissionHandler
-                        ? await params.permissionHandler.handleToolCall(update.callId, update.toolName, update.input)
-                        : { decision: 'denied' as const };
+                    const result = await handlePendingProviderToolCall(
+                        options?.providerRequestKey, update.callId, update.toolName, update.input,
+                    );
                     return mapPermissionsDecision(update, result);
                 };
             }
@@ -3525,11 +3525,10 @@ export function createCodexAppServerRuntime(params: Readonly<{
                         },
                     }
                     : normalizeCodexRequestUserInputQuestionsToAskUserQuestionInput(update.questions);
-            associatePendingProviderRequest(options?.providerRequestKey, update.callId);
             return async () => {
-                const result = params.permissionHandler
-                        ? await params.permissionHandler.handleToolCall(update.callId, toolName, toolInput)
-                        : { decision: 'abort' as const };
+                const result = await handlePendingProviderToolCall(
+                    options?.providerRequestKey, update.callId, toolName, toolInput, 'abort',
+                );
                 logger.debug('[codex-app-server] requestUserInput resolved', {
                     callId: update.callId,
                     toolName,

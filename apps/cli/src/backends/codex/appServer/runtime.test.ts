@@ -21,7 +21,7 @@ import {
 
 import type { ApiSessionClient } from '@/api/session/sessionClient';
 import type { ACPMessageData } from '@/api/session/sessionMessageTypes';
-import type { Metadata, PermissionMode } from '@/api/types';
+import type { AgentState, Metadata, PermissionMode } from '@/api/types';
 import type { AgentMessage } from '@/agent';
 import type { SessionTurnLifecycle } from '@/agent/runtime/session/turn/types';
 import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
@@ -51,6 +51,8 @@ import {
 } from './runtime';
 import { CodexAppServerSteerUnavailableError, isCodexAppServerSteerRejectedBeforeEffectError } from './appServerCompatibility';
 import { createCodexAppServerProcessEnv, createCodexAppServerTestEnvScope } from './testkit/fakeCodexAppServer';
+import { createCodexPermissionHandler } from '../utils/createCodexPermissionHandler';
+import type { DisposableCodexAppServerClient } from './client/createCodexAppServerClient';
 
 // These partial session fixtures model create/load; existing-ID admission uses real API/RPC tests.
 const creationScopeInputAdmission = createMutableApiSessionClientFixture().waitForProviderInputAdmission;
@@ -7397,6 +7399,113 @@ describe('createCodexAppServerRuntime', () => {
             'Resolved in another Codex client',
         );
     });
+
+    it.each(['before-preparation', 'after-publication', 'unrelated-request', 'different-thread'] as const)(
+        'does not leave a real approval pending when external resolution arrives %s',
+        async (resolutionTiming) => {
+            const { root } = await createRuntimeFixture('happier-codex-external-approval-order-');
+            const requests = new Map<string, Parameters<DisposableCodexAppServerClient['registerRequestHandler']>[1]>();
+            const notifications = new Map<string, Parameters<DisposableCodexAppServerClient['registerNotificationHandler']>[1]>();
+            let state: AgentState = { requests: {}, completedRequests: {} };
+            const published: string[] = [];
+            let signalToolCall!: () => void;
+            const toolCallSeen = new Promise<void>((resolve) => { signalToolCall = resolve; });
+            const session = {
+                ...createApiSessionClientFixture(),
+                sendCodexMessage: (message: unknown) => {
+                    if (message && typeof message === 'object'
+                        && (message as Record<string, unknown>).type === 'tool-call'
+                        && (message as Record<string, unknown>).callId === 'cmd_external') signalToolCall();
+                },
+                getAgentStateSnapshot: () => state,
+                updateAgentState: (update: (current: AgentState) => AgentState) => {
+                    state = update(state);
+                    published.push(...Object.keys(state.requests ?? {}));
+                },
+                updateAgentStateRequestSettlement: async (update: (current: AgentState) => AgentState) => {
+                    state = update(state);
+                },
+            };
+            const permissionHandler = createCodexPermissionHandler({ session });
+            // Only the native RPC transport and session persistence are controlled; approval creation is real.
+            const client: DisposableCodexAppServerClient = {
+                request: async (method) => {
+                    if (method === 'thread/start') return { thread: { id: 'thread-external' } };
+                    if (method === 'turn/start') return { turn: { id: 'turn-external' } };
+                    if (method === 'model/list') return { data: [] };
+                    return {};
+                },
+                notify: async () => {},
+                registerRequestHandler: (method, handler) => {
+                    requests.set(method, handler);
+                    return () => { requests.delete(method); };
+                },
+                registerNotificationHandler: (method, handler) => {
+                    notifications.set(method, handler);
+                    return () => { notifications.delete(method); };
+                },
+                onExit: () => () => {},
+                dispose: async () => {},
+            };
+            const runtime = createCodexAppServerRuntime({
+                directory: root,
+                session,
+                permissionHandler,
+                onThinkingChange: vi.fn(),
+                createClient: async () => client,
+            });
+            await runtime.startOrLoad({});
+            const prompt = runtime.sendPrompt('external approval ordering');
+            let response: unknown;
+            let responded = false;
+            let pendingRequest: Promise<void> | null = null;
+            try {
+                await waitForCondition(() => runtime.canSteerPrompt(), { timeoutMs: 500, intervalMs: 5, label: 'native turn accepted' });
+                await notifications.get('item/started')!({
+                    threadId: 'thread-external', turnId: 'turn-external',
+                    item: { id: 'cmd_external', type: 'commandExecution', command: 'git fetch origin', cwd: '/repo' },
+                });
+                await toolCallSeen;
+                const handleRequest = requests.get('item/commandExecution/requestApproval');
+                const resolveRequest = notifications.get('serverRequest/resolved');
+                expect(handleRequest).toBeDefined();
+                expect(resolveRequest).toBeDefined();
+                const pending = Promise.resolve(handleRequest!({
+                    threadId: 'thread-external', turnId: 'turn-external',
+                    itemId: 'cmd_external', command: 'git fetch origin', cwd: '/repo',
+                }, { id: 'approval-external' })).then((result) => {
+                    response = result;
+                    responded = true;
+                }, (error: unknown) => {
+                    response = error;
+                    responded = true;
+                });
+                pendingRequest = pending;
+                if (resolutionTiming === 'unrelated-request' || resolutionTiming === 'different-thread') {
+                    await resolveRequest!({
+                        threadId: resolutionTiming === 'different-thread' ? 'other-thread' : 'thread-external',
+                        requestId: resolutionTiming === 'unrelated-request' ? 'other-request' : 'approval-external',
+                    });
+                }
+                if (resolutionTiming !== 'before-preparation') {
+                    await waitForCondition(() => published.includes('cmd_external'), { timeoutMs: 500, intervalMs: 5, label: 'ordinary approval published' });
+                }
+                await resolveRequest!({ threadId: 'thread-external', requestId: 'approval-external' });
+                await waitForCondition(() => responded || (resolutionTiming === 'before-preparation' && Object.hasOwn(state.requests ?? {}, 'cmd_external')), {
+                    timeoutMs: 500, intervalMs: 5, label: 'resolved approval settles or exposes stale publication',
+                });
+                expect(state.requests).not.toHaveProperty('cmd_external');
+                if (resolutionTiming === 'before-preparation') expect(published).not.toContain('cmd_external');
+                await pending;
+                expect(response).toEqual({ decision: 'cancel' });
+            } finally {
+                permissionHandler.reset();
+                await pendingRequest;
+                await runtime.reset();
+                await prompt.catch(() => {});
+            }
+        },
+    );
 
     it('bridges permission escalation server requests through the generic permission handler', async () => {
         const { root, requestLogPath } = await createRuntimeFixture('happier-codex-app-server-runtime-bridge-request-permissions-');
