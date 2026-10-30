@@ -1749,7 +1749,9 @@ test('macos wsrepl lima matrix wrapper fails closed when Playwright does not pro
   assert.equal(summary.sessionId, null);
 });
 
-test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit when playwright summary ok is true', async () => {
+for (const runnerExit of [0, 2]) {
+for (const outcome of ['qualified-cleanup', 'missing-meta', 'mismatched-session', 'fatal-with-green', 'reused-stale-green', 'missing-summary', 'false-summary', 'wrong-ordered-steps']) {
+  test(`wsrepl current result association: exit ${runnerExit}, ${outcome}`, async () => {
   const root = await mkdtemp(join(tmpdir(), 'hstack-macos-lima-wsrepl-matrix-nonzero-runner-ok-summary-'));
   const binDir = join(root, 'bin');
   const homeDir = join(root, 'home');
@@ -1761,6 +1763,28 @@ test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit
   await mkdir(homeDir, { recursive: true });
   await mkdir(reportDir, { recursive: true });
   await mkdir(logDir, { recursive: true });
+
+  // Keep runtime/account settings out of the fixture, while resolving only host
+  // shell/data tools from the maintained environment (including Nix store bins).
+  const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir; command -v awk; command -v grep; command -v sed; command -v find'], {
+    env: { PATH: process.env.PATH }, encoding: 'utf8',
+  });
+  assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+  const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+  assert.equal(tools.length, 7);
+  const fixtureToolPath = [...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter);
+  const fixturePath = `${binDir}:${fixtureToolPath}:${testEnv.PATH}`;
+  const pythonBoundary = join(root, 'python-boundary');
+  await mkdir(pythonBoundary);
+  await writeFile(join(pythonBoundary, 'sitecustomize.py'), [
+    'import socket',
+    'def fixture_connection_refused(*args, **kwargs):',
+    '    raise ConnectionRefusedError("fake fixture port is not listening")',
+    'socket.create_connection = fixture_connection_refused',
+    'socket.socket.connect = fixture_connection_refused',
+    'socket.socket.connect_ex = fixture_connection_refused',
+  ].join('\n') + '\n');
+  await writeScript(join(binDir, 'curl'), "#!/usr/bin/env bash\nprintf \"%s\\n\" '{}'\n");
 
   const unamePath = join(binDir, 'uname');
   await writeFile(unamePath, ['#!/usr/bin/env bash', 'echo Darwin'].join('\n') + '\n', 'utf8');
@@ -1858,6 +1882,10 @@ test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit
       'shift || true',
       'if [[ "$script" == *playwright-session-handoff-wsrepl-matrix.mjs ]]; then',
       '  out="${HAPPIER_QA_OUTDIR:-}"',
+      "  if [[ \"${WSREPL_QA_RESULT_TEST_SCENARIO}\" == \"reused-stale-green\" ]]; then",
+      "    printf \"%s\\n\" '{\"ok\":false,\"reason\":\"current_failure\"}' > \"$out/fatal.json\"",
+      "    exit \"${WSREPL_QA_RESULT_TEST_EXIT}\"",
+      "  fi",
       '  mkdir -p "$out/steps/step-01"',
       '  printf "%s\\n" "{\\"ok\\":true}" > "$out/steps/step-01/result.json"',
       '  python3 - "$out" "${HAPPIER_QA_SESSION_PATH:-}" <<\'PY\'',
@@ -1871,6 +1899,7 @@ test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit
       '  \"outDir\": out_dir,',
       '  \"sessionId\": \"sess_created_1\",',
       '  \"sessionPath\": session_path,',
+      "  \"stepsJson\": __import__(\"os\").environ.get(\"HAPPIER_QA_STEPS_JSON\", \"\"),",
       '}, indent=2) + \"\\n\", encoding=\"utf-8\")',
       'Path(out_dir, \"summary.json\").write_text(json.dumps({',
       '  \"kind\": \"wsrepl_handoff_matrix_summary\",',
@@ -1878,8 +1907,26 @@ test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit
       '  \"sessionId\": \"sess_created_1\",',
       '}, indent=2) + \"\\n\", encoding=\"utf-8\")',
       'PY',
+      "  case \"${WSREPL_QA_RESULT_TEST_SCENARIO}\" in",
+      "    missing-meta) rm -f \"$out/meta.json\" ;;",
+      "    mismatched-session) printf \"%s\\n\" '{\"sessionId\":\"different-session\",\"stepsJson\":\"[]\"}' > \"$out/meta.json\" ;;",
+      "    fatal-with-green) printf \"%s\\n\" '{\"ok\":false,\"reason\":\"current_failure\"}' > \"$out/fatal.json\" ;;",
+      "    missing-summary) rm -f \"$out/summary.json\" ;;",
+      "    false-summary) printf \"%s\\n\" '{\"kind\":\"wsrepl_handoff_matrix_summary\",\"ok\":false,\"sessionId\":\"sess_created_1\"}' > \"$out/summary.json\" ;;",
+      "    wrong-ordered-steps) python3 - \"$out/meta.json\" <<'PY'",
+      "import json, sys",
+      "from pathlib import Path",
+      "path = Path(sys.argv[1])",
+      "meta = json.loads(path.read_text())",
+      "steps = json.loads(meta[\"stepsJson\"])",
+      "assert len(steps) == 2 and steps[0] != steps[1]",
+      "meta[\"stepsJson\"] = json.dumps(list(reversed(steps)))",
+      "path.write_text(json.dumps(meta))",
+      "PY",
+      "      ;;",
+      "  esac",
       '  # Simulate an unexpected nonzero process exit even though the harness wrote a green summary.',
-      '  exit 2',
+      "  exit \"${WSREPL_QA_RESULT_TEST_EXIT}\"",
       'fi',
       'exit 0',
     ].join('\n') + '\n',
@@ -1920,8 +1967,8 @@ test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      '    export PATH=/usr/bin:/bin',
-      limaGuestExec,
+      "    export PATH=" + JSON.stringify(fixturePath),
+      limaGuestExec.replace('exec /bin/bash --noprofile --norc', `exec ${JSON.stringify(tools[0])} --noprofile --norc`),
       '    ;;',
       '  *)',
       '    exit 0',
@@ -1944,13 +1991,20 @@ test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit
   const scriptPath = resolve(join(__dirname, 'wsrepl-lima-matrix.sh'));
   const env = {
     ...testEnv,
+    WSREPL_QA_RESULT_TEST_SCENARIO: outcome,
+    WSREPL_QA_RESULT_TEST_EXIT: String(runnerExit),
+    HAPPIER_QA_SESSION_ID: 'sess_created_1',
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${testEnv.PATH}`,
+    PATH: fixturePath,
+    PYTHONPATH: pythonBoundary,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_STACK_NAME: 'stack-test',
-    HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
+    HAPPIER_QA_STEPS_JSON: JSON.stringify([
+      { targetMachineId: 'machine_target_1', strategy: 'transfer_snapshot' },
+      { targetMachineId: 'machine_target_2', strategy: 'sync_changes' },
+    ]),
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'stack_runtime',
     WSREPL_QA_HOST_MACHINE_ID: 'machine_host_1',
     WSREPL_QA_VM_MACHINE_ID: 'machine_vm_1',
@@ -1959,25 +2013,44 @@ test('macos wsrepl lima matrix wrapper normalizes nonzero Playwright runner exit
     WSREPL_QA_VM_HAPPIER_MODE: 'skip',
   };
 
+  const prior = join(reportDir, 'playwright', 'attempt-01');
+  const priorSummary = JSON.stringify({ kind: 'wsrepl_handoff_matrix_summary', ok: true, sessionId: 'old-session' });
+  const priorMeta = JSON.stringify({ sessionId: 'old-session', stepsJson: '[]' });
+  if (outcome === 'reused-stale-green') {
+    await mkdir(prior, { recursive: true });
+    await writeFile(join(prior, 'summary.json'), priorSummary);
+    await writeFile(join(prior, 'meta.json'), priorMeta);
+  }
   const res = spawnSync('bash', [scriptPath, 'happy-wsrepl'], {
     cwd: root,
     env,
     encoding: 'utf8',
   });
 
-  assert.equal(
-    res.status,
-    0,
-    `expected exit 0 when playwright summary is ok, even if the runner exits nonzero\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`,
-  );
-
+  await writeFile(join(reportDir, 'fixture.stdout'), res.stdout ?? '');
+  await writeFile(join(reportDir, 'fixture.stderr'), res.stderr ?? '');
+  assert.equal(res.error, undefined, `fixture spawn failed: ${res.error}\n${res.stdout}\n${res.stderr}`);
+  assert.equal(await fileExists(join(reportDir, 'summary.json')), true, `missing wrapper result\n${res.stdout}\n${res.stderr}`);
   const summary = JSON.parse(await readFile(join(reportDir, 'summary.json'), 'utf8'));
   assert.equal(summary.kind, 'wsrepl_lima_matrix_wrapper');
-  assert.equal(summary.status, 0);
-  assert.equal(summary.failureStage, null);
-  assert.equal(summary.failureReason, null);
-  assert.equal(summary.sessionId, 'sess_created_1');
-});
+  if (outcome === 'qualified-cleanup') {
+    assert.equal(res.status, 0, `qualified cleanup failed\n${res.stdout}\n${res.stderr}`);
+    assert.equal(summary.status, 0);
+    assert.equal(summary.sessionId, 'sess_created_1');
+    assert.equal(summary.failureStage, null);
+    assert.equal(summary.failureReason, null);
+  } else {
+    assert.notEqual(res.status, 0, `unqualified result accepted: ${outcome}\n${res.stdout}\n${res.stderr}`);
+    assert.notEqual(summary.status, 0);
+  }
+  if (outcome === 'reused-stale-green') {
+    assert.equal(await readFile(join(prior, 'summary.json'), 'utf8'), priorSummary);
+    assert.equal(await readFile(join(prior, 'meta.json'), 'utf8'), priorMeta);
+    assert.notEqual(await realpath(summary.playwrightOutDir), await realpath(prior));
+  }
+  });
+}
+}
 
 test('macos wsrepl lima matrix wrapper defaults host happier source to stack runtime when available', async () => {
   const root = await mkdtemp(join(tmpdir(), 'hstack-macos-lima-wsrepl-matrix-host-default-stack-runtime-'));
@@ -11384,4 +11457,52 @@ test('macos wsrepl lima matrix wrapper defaults host happier source to PATH when
   assert.equal(await fileExists(runtimeLog), false, 'expected stack runtime happier not to be invoked');
   const pathInvocations = await readFile(happierLog, 'utf8');
   assert.ok(pathInvocations.includes('path-happier daemon start'), `expected PATH happier to be invoked (got ${pathInvocations})`);
+});
+
+test('wsrepl real driver resolves repository paths and propagates external runner failure', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'wsrepl-real-driver-layout-'));
+  const repoRoot = resolve(__dirname, '../../..');
+  const copied = [
+    'scripts/qa/playwright-session-handoff-wsrepl-matrix.mjs',
+    'scripts/workspaces/execYarnCommand.mjs',
+    'packages/cli-common/windowsCommandInvocation.mjs',
+    'packages/tests/scripts/run-playwright-with-heartbeat.mjs',
+    'packages/tests/scripts/runPlaywrightWithHeartbeat.shared.mjs',
+    'packages/tests/scripts/managedChildLifecycle.mjs',
+    'packages/tests/scripts/processTree.mjs',
+    'packages/tests/scripts/heartbeatDiagnostic.mjs',
+    'packages/tests/playwright.ui.config.mjs',
+    'packages/tests/suites/ui-e2e/session.handoff.fromHeaderAction.feat.sessions.handoff.spec.ts',
+  ];
+  for (const path of copied) {
+    const target = join(root, path);
+    await mkdir(resolve(target, '..'), { recursive: true });
+    await writeFile(target, await readFile(join(repoRoot, path)));
+  }
+  const binDir = join(root, 'bin');
+  await mkdir(binDir);
+  const capture = join(root, 'captured.json');
+  const fakeYarn = join(binDir, 'yarn');
+  await writeScript(fakeYarn, [
+    `#!${process.execPath}`,
+    "const fs = require('node:fs');",
+    'const args = process.argv.slice(2);',
+    "if (args.length !== 6 || args[0] !== '-s' || args[1] !== 'playwright' || args[2] !== 'test' || args[3] !== '-c') throw new Error('Unexpected external invocation');",
+    'fs.writeFileSync(process.env.WSREPL_DRIVER_CAPTURE_PATH, JSON.stringify({ args, cwd: process.cwd() }));',
+    'process.exit(23);',
+  ].join('\n') + '\n');
+  const outdir = join(root, 'output');
+  const res = spawnSync(process.execPath, [join(root, copied[0])], {
+    cwd: root,
+    env: { ...testEnv, PATH: `${binDir}:${testEnv.PATH}`, npm_execpath: '', HAPPIER_QA_OUTDIR: outdir,
+      HAPPIER_CI_DIAGNOSTIC_PATH: join(root, 'heartbeat.ndjson'), WSREPL_DRIVER_CAPTURE_PATH: capture },
+    encoding: 'utf8',
+  });
+  assert.equal(res.status, 23, `wrong driver boundary: ${res.stdout}\n${res.stderr}`);
+  const actual = JSON.parse(await readFile(capture, 'utf8'));
+  assert.equal(actual.cwd, root);
+  assert.equal(actual.args[4], join(root, 'packages/tests/playwright.ui.config.mjs'));
+  assert.equal(actual.args[5], join(root, 'packages/tests/suites/ui-e2e/session.handoff.fromHeaderAction.feat.sessions.handoff.spec.ts'));
+  assert.equal(JSON.parse(await readFile(join(outdir, 'fatal.json'), 'utf8')).code, 23);
+  assert.equal(await fileExists(join(outdir, 'summary.json')), false);
 });
