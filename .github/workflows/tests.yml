@@ -359,23 +359,28 @@ jobs:
       - name: Fail closed for unclassified executable source
         id: unmatched
         if: ${{ !inputs.select_jobs_explicitly }}
-        env:
-          CHANGED_PATHS_JSON: ${{ steps.changes.outputs.changed_files }}
-          DOCUMENTATION_PATHS_JSON: ${{ steps.changes.outputs.documentation_files }}
-          CLASSIFIED_PATHS_ALL: ${{ steps.changes.outputs.all_files }}
-          CLASSIFIED_PATHS_UI: ${{ steps.changes.outputs.ui_files }}
-          CLASSIFIED_PATHS_SERVER: ${{ steps.changes.outputs.server_files }}
-          CLASSIFIED_PATHS_CLI: ${{ steps.changes.outputs.cli_files }}
-          CLASSIFIED_PATHS_STACK: ${{ steps.changes.outputs.stack_files }}
-          CLASSIFIED_PATHS_UI_E2E: ${{ steps.changes.outputs.ui_e2e_files }}
-          CLASSIFIED_PATHS_SERVER_DB_CONTRACT: ${{ steps.changes.outputs.server_db_contract_files }}
-          CLASSIFIED_PATHS_RELEASE_CONTRACTS: ${{ steps.changes.outputs.release_contracts_files }}
-          CLASSIFIED_PATHS_INSTALLERS_SMOKE: ${{ steps.changes.outputs.installers_smoke_files }}
-          CLASSIFIED_PATHS_BINARY_SMOKE: ${{ steps.changes.outputs.binary_smoke_files }}
-          CLASSIFIED_PATHS_CLI_DAEMON_E2E: ${{ steps.changes.outputs.cli_daemon_e2e_files }}
-          CLASSIFIED_PATHS_E2E_CORE: ${{ steps.changes.outputs.e2e_core_files }}
-          CLASSIFIED_PATHS_TYPECHECK: ${{ steps.changes.outputs.typecheck_files }}
-        run: node scripts/ci/classify-source-ci-paths.mjs --github-output "$GITHUB_OUTPUT"
+        run: |
+          # Keep complete path lists in a file, outside the process environment.
+          cat > "$RUNNER_TEMP/source-ci-paths.json" <<'SOURCE_CI_PATHS_JSON'
+          {
+            "CHANGED_PATHS_JSON": ${{ toJSON(steps.changes.outputs.changed_files) }},
+            "DOCUMENTATION_PATHS_JSON": ${{ toJSON(steps.changes.outputs.documentation_files) }},
+            "CLASSIFIED_PATHS_ALL": ${{ toJSON(steps.changes.outputs.all_files) }},
+            "CLASSIFIED_PATHS_UI": ${{ toJSON(steps.changes.outputs.ui_files) }},
+            "CLASSIFIED_PATHS_SERVER": ${{ toJSON(steps.changes.outputs.server_files) }},
+            "CLASSIFIED_PATHS_CLI": ${{ toJSON(steps.changes.outputs.cli_files) }},
+            "CLASSIFIED_PATHS_STACK": ${{ toJSON(steps.changes.outputs.stack_files) }},
+            "CLASSIFIED_PATHS_UI_E2E": ${{ toJSON(steps.changes.outputs.ui_e2e_files) }},
+            "CLASSIFIED_PATHS_SERVER_DB_CONTRACT": ${{ toJSON(steps.changes.outputs.server_db_contract_files) }},
+            "CLASSIFIED_PATHS_RELEASE_CONTRACTS": ${{ toJSON(steps.changes.outputs.release_contracts_files) }},
+            "CLASSIFIED_PATHS_INSTALLERS_SMOKE": ${{ toJSON(steps.changes.outputs.installers_smoke_files) }},
+            "CLASSIFIED_PATHS_BINARY_SMOKE": ${{ toJSON(steps.changes.outputs.binary_smoke_files) }},
+            "CLASSIFIED_PATHS_CLI_DAEMON_E2E": ${{ toJSON(steps.changes.outputs.cli_daemon_e2e_files) }},
+            "CLASSIFIED_PATHS_E2E_CORE": ${{ toJSON(steps.changes.outputs.e2e_core_files) }},
+            "CLASSIFIED_PATHS_TYPECHECK": ${{ toJSON(steps.changes.outputs.typecheck_files) }}
+          }
+          SOURCE_CI_PATHS_JSON
+          node scripts/ci/classify-source-ci-paths.mjs --inputs-file "$RUNNER_TEMP/source-ci-paths.json" --github-output "$GITHUB_OUTPUT"
 
       - name: Validate editorial-only source against its exact checked baseline
         id: notes

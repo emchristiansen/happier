@@ -162,7 +162,7 @@ function parsePathList(raw, label) {
 export async function main(argv = process.argv.slice(2), env = process.env) {
   const { values } = parseArgs({
     args: argv,
-    options: { 'github-output': { type: 'string', default: '' }, 'notes-only': { type: 'boolean', default: false } },
+    options: { 'github-output': { type: 'string', default: '' }, 'inputs-file': { type: 'string', default: '' }, 'notes-only': { type: 'boolean', default: false } },
     allowPositionals: false,
   });
   if (values['notes-only']) {
@@ -172,9 +172,16 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     else process.stdout.write(output);
     return result;
   }
-  const changedPaths = parsePathList(env.CHANGED_PATHS_JSON, 'CHANGED_PATHS_JSON');
-  const documentationPaths = parsePathList(env.DOCUMENTATION_PATHS_JSON, 'DOCUMENTATION_PATHS_JSON');
-  const classifiedPaths = Object.entries(env)
+  // File-carried lists avoid process-launch limits on integration-sized changes.
+  const pathInputs = values['inputs-file']
+    ? JSON.parse(await readFile(resolve(String(values['inputs-file'])), 'utf8'))
+    : env;
+  if (!pathInputs || typeof pathInputs !== 'object' || Array.isArray(pathInputs)) {
+    throw new Error('Source-CI path inputs must be a JSON object');
+  }
+  const changedPaths = parsePathList(pathInputs.CHANGED_PATHS_JSON, 'CHANGED_PATHS_JSON');
+  const documentationPaths = parsePathList(pathInputs.DOCUMENTATION_PATHS_JSON, 'DOCUMENTATION_PATHS_JSON');
+  const classifiedPaths = Object.entries(pathInputs)
     .filter(([key]) => key.startsWith('CLASSIFIED_PATHS_'))
     .flatMap(([key, raw]) => parsePathList(raw, key));
   const unmatchedPaths = findUnmatchedSourcePaths({ changedPaths, classifiedPaths, documentationPaths });

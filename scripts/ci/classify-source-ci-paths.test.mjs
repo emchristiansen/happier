@@ -156,3 +156,33 @@ test('workspace dependency closure fails closed for a new unmapped package direc
     unknownWorkspacePaths: ['packages/new-runtime/src/index.ts'],
   });
 });
+
+
+test('file-carried classifier input preserves fail-closed selection and rejects malformed lists', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'happier-ci-path-file-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const workspaces = ['apps/ui', 'apps/server', 'apps/cli', 'apps/stack'];
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ workspaces }));
+  for (const directory of workspaces) {
+    mkdirSync(join(root, directory), { recursive: true });
+    writeFileSync(join(root, directory, 'package.json'), JSON.stringify({ name: `@happier-dev/${directory === 'apps/ui' ? 'app' : directory.slice(5)}` }));
+  }
+  const inputPath = join(root, 'path inputs.json');
+  const invoke = () => spawnSync(process.execPath, [fileURLToPath(new URL('./classify-source-ci-paths.mjs', import.meta.url)), '--inputs-file', inputPath], {
+    cwd: root, encoding: 'utf8',
+  });
+  writeFileSync(inputPath, JSON.stringify({
+    CHANGED_PATHS_JSON: JSON.stringify(['apps/ui/src/render.ts', 'scripts/unclassified.ts']),
+    DOCUMENTATION_PATHS_JSON: '[]',
+    CLASSIFIED_PATHS_UI: JSON.stringify(['apps/ui/src/render.ts']),
+  }));
+  const result = invoke();
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^all=true$/mu);
+  assert.match(result.stdout, /^ui=true$/mu);
+  assert.match(result.stdout, /^unmatched_paths=\["scripts\/unclassified\.ts"\]$/mu);
+  writeFileSync(inputPath, JSON.stringify({ CHANGED_PATHS_JSON: '{"not":"a path list"}', DOCUMENTATION_PATHS_JSON: '[]' }));
+  const invalid = invoke();
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /CHANGED_PATHS_JSON must be a JSON array of paths/u);
+});

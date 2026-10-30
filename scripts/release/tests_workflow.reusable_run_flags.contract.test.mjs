@@ -342,8 +342,7 @@ test('the source-CI classifier fail-closes shared tooling and reaches direct roo
   const unmatchedStep = workflow.jobs.ci_plan.steps.find((step) => step.id === 'unmatched');
   assert.equal(unmatchedStep.if, '${{ !inputs.select_jobs_explicitly }}');
   assert.match(unmatchedStep.run, /classify-source-ci-paths\.mjs/);
-  assert.equal(unmatchedStep.env.CHANGED_PATHS_JSON, '${{ steps.changes.outputs.changed_files }}');
-  assert.equal(unmatchedStep.env.DOCUMENTATION_PATHS_JSON, '${{ steps.changes.outputs.documentation_files }}');
+  assert.equal(unmatchedStep.env, undefined, 'integration-sized path lists must not enter the process environment');
   for (const [name, output] of Object.entries(workflow.jobs.ci_plan.outputs)) {
     if (!name.startsWith('run_')) continue;
     assert.match(output, /steps\.unmatched\.outputs\.all == 'true'/);
@@ -383,4 +382,39 @@ test('protected pushes cover the complete source except planner-validated notes-
       `${outputName} should remain path-selected rather than expanding ordinary source CI into release/deep certification`,
     );
   }
+});
+
+
+test('source-CI path transfer accepts the complete integration range without environment overflow', async (t) => {
+  const workflow = YAML.parse(await readFile(join(repoRoot, '.github/workflows/tests.yml'), 'utf8'));
+  const step = workflow.jobs.ci_plan.steps.find((candidate) => candidate.id === 'unmatched');
+  const scratch = mkdtempSync(join(tmpdir(), 'ci-path-transfer-'));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const paths = Array.from({ length: 5701 }, (_, index) => `apps/ui/sources/ci path fixtures/session-${index}.tsx`);
+  const unmatched = `scripts/not-yet-classified/quotes-'"-$()-backtick-\`-\\-line\nSOURCE_CI_PATHS_JSON.ts`;
+  const allPaths = [...paths, unmatched];
+  const outputs = Object.fromEntries(Object.keys(YAML.parse(workflow.jobs.ci_plan.steps.find((candidate) => candidate.id === 'changes').with.filters))
+    .map((name) => [`${name}_files`, '[]']));
+  outputs.changed_files = JSON.stringify(allPaths);
+  outputs.ui_files = JSON.stringify(paths);
+  outputs.typecheck_files = JSON.stringify(paths);
+  const expand = (source) => source.replace(/\$\{\{\s*(toJSON\()?steps\.changes\.outputs\.(\w+)\)?\s*\}\}/gu,
+    (_match, encoded, key) => encoded ? JSON.stringify(outputs[key]) : outputs[key]);
+  const scriptPath = join(scratch, 'classify.sh');
+  writeFileSync(scriptPath, expand(step.run));
+  const result = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', scriptPath], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...Object.fromEntries(Object.entries(step.env ?? {}).map(([key, value]) => [key, expand(value)])),
+      RUNNER_TEMP: scratch,
+      GITHUB_OUTPUT: join(scratch, 'outputs'),
+    },
+  });
+  assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+  const selection = await readFile(join(scratch, 'outputs'), 'utf8');
+  assert.match(selection, /^all=true$/mu);
+  assert.match(selection, /^ui=true$/mu);
+  assert.deepEqual(JSON.parse(selection.split('\n').find((line) => line.startsWith('unmatched_paths=')).slice('unmatched_paths='.length)), [unmatched]);
 });
