@@ -95,7 +95,7 @@ export function resolveReleaseValidationPlan(input) {
     run_artifact_verify: String(automatic.has('artifact-verify')),
     run_binary_smoke: String(automatic.has('binary-smoke')),
     run_cli_update_continuity: String(automatic.has('cli-update')),
-    run_daemon_continuity: 'false',
+    run_daemon_continuity: String(automatic.has('daemon-continuity')),
     run_session_continuity: String(automatic.has('session-continuity')),
     run_release_assets_docker: String(automatic.has('docker-release-assets')),
     run_self_host_systemd: 'false',

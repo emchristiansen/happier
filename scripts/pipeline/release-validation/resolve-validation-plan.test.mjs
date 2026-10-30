@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveReleaseValidationPlan, resolveReleaseValidationSuiteGate } from './resolve-validation-plan.mjs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { main, resolveReleaseValidationPlan, resolveReleaseValidationSuiteGate } from './resolve-validation-plan.mjs';
 
 test('validation plan keeps fast evidence and selects heavy suites only from changed seams', () => {
   assert.deepEqual(resolveReleaseValidationPlan({
@@ -107,3 +111,26 @@ test('validation plan supports explicit reasoned refinements without a legacy fl
     waiveSuiteIds: ['artifact-verify'],
   }), /cannot be waived/);
 });
+
+for (const [name, refinements, expected] of [
+  ['default omission', [], 'false'],
+  ['explicit inclusion', ['--include-suites', 'daemon-continuity'], 'true'],
+  ['explicit inclusion then waiver', ['--include-suites', 'daemon-continuity', '--waive-suites', 'daemon-continuity'], 'false'],
+]) {
+  test(`the release verification command preserves daemon-continuity ${name} in GitHub outputs`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'happier-validation-plan-'));
+    try {
+      const output = join(directory, 'github-output');
+      const result = await main([
+        '--profile', 'integrated', '--has-cli-candidate', 'true',
+        '--has-server-candidate', 'true', '--github-output', output,
+        ...refinements,
+      ]);
+      assert.equal(result.run_daemon_continuity, expected);
+      assert.match(readFileSync(output, 'utf8'), new RegExp(`^run_daemon_continuity=${expected}$`, 'm'));
+      assert.deepEqual(result.waivedSuiteIds, name.endsWith('waiver') ? ['daemon-continuity'] : []);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
