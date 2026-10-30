@@ -181,7 +181,8 @@ function stringifyExecFailure(error) {
  * EAS local builds can occasionally finish successfully, write the requested artifact,
  * and then fail during best-effort temporary `.git` cleanup in the local build plugin.
  * We still validate the artifact immediately after this hook, so only demote the specific
- * staged-repo cleanup signature when the output file already exists.
+ * staged-repo cleanup signature when this attempt produced a regular output file.
+ * The caller reserves a new output directory per attempt, so a previous artifact cannot qualify.
  *
  * @param {{ error: unknown; artifactPath: string }} input
  */
@@ -189,7 +190,9 @@ function isIgnorableEasLocalCleanupFailure({ error, artifactPath }) {
   const details = stringifyExecFailure(error);
   return (
     /ENOTEMPTY: directory not empty, rmdir ['"].*\/\.git['"]/.test(details) &&
-    String(artifactPath ?? '').trim().length > 0
+    String(artifactPath ?? '').trim().length > 0 &&
+    fs.existsSync(artifactPath) &&
+    fs.statSync(artifactPath).isFile()
   );
 }
 
@@ -920,6 +923,9 @@ async function main() {
     const staged = stageForEas ? stageRepoForDagger({ repoRoot }) : null;
     const effectiveRepoDir = staged?.stagedRepoDir ?? repoRoot;
     const effectiveUiDir = path.join(effectiveRepoDir, 'apps', 'ui');
+    // Keep an earlier requested output untouched until this attempt passes artifact validation.
+    const attemptDir = dryRun ? null : fs.mkdtempSync(path.join(path.dirname(absOut), '.happier-eas-local-'));
+    const attemptArtifactOut = attemptDir ? path.join(attemptDir, path.basename(absOut)) : absOut;
 
     try {
       // Do not symlink the real repo's node_modules into the staged context.
@@ -937,7 +943,7 @@ async function main() {
         profile,
         '--local',
         '--output',
-        absOut,
+        attemptArtifactOut,
         ...(nonInteractive ? ['--non-interactive'] : []),
       ];
       try {
@@ -952,7 +958,7 @@ async function main() {
           },
         );
       } catch (error) {
-        if (!isIgnorableEasLocalCleanupFailure({ error, artifactPath: absOut })) {
+        if (!isIgnorableEasLocalCleanupFailure({ error, artifactPath: attemptArtifactOut })) {
           throw error;
         }
         console.warn('[pipeline] ignoring EAS local cleanup failure after successful artifact write');
@@ -962,13 +968,19 @@ async function main() {
     }
 
     if (!dryRun) {
-      if (!fs.existsSync(absOut)) {
-        fail(`Missing EAS local build output at: ${absOut}`);
+      if (!fs.existsSync(attemptArtifactOut)) {
+        fail(`Missing EAS local build output at: ${attemptArtifactOut}`);
       }
-      if (platform === 'android' && absOut.endsWith('.aab')) verifyAndroidPageSize({ aabPath: absOut });
-      const size = fs.statSync(absOut).size;
+      if (platform === 'android' && attemptArtifactOut.endsWith('.aab')) verifyAndroidPageSize({ aabPath: attemptArtifactOut });
+      const size = fs.statSync(attemptArtifactOut).size;
       if (size < 1_000_000) {
-        fail(`EAS local build output is unexpectedly small (${size} bytes): ${absOut}`);
+        fail(`EAS local build output is unexpectedly small (${size} bytes): ${attemptArtifactOut}`);
+      }
+      fs.renameSync(attemptArtifactOut, absOut);
+      try {
+        if (attemptDir) fs.rmdirSync(attemptDir);
+      } catch (error) {
+        console.warn(`[pipeline] retained build attempt directory ${attemptDir}: ${String(error)}`);
       }
     }
 
