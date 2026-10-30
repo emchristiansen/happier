@@ -1,3 +1,4 @@
+import { removeConnectedServiceCredentialFiles } from '@/daemon/connectedServices/credentials/removeConnectedServiceCredentialFiles';
 import { AGENTS_CORE } from '@happier-dev/agents';
 
 import { checklists } from './cli/checklists';
@@ -13,6 +14,11 @@ import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/con
 
 const geminiConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCredentialLifecycleDescriptor = {
   providerId: 'gemini',
+  credentialStorageCleanup: {
+    async deleteCredentialStorageForHomeRoot({ rootDir }) {
+      await removeConnectedServiceCredentialFiles(rootDir, geminiConnectedServiceStateSharingDescriptor.authIsolation.secretEntries.map((entry) => `home/${entry}`));
+    },
+  },
   serviceIds: AGENTS_CORE.gemini.connectedServices.supportedServiceIds,
   spawnPreflightOauthRefresh: { mode: 'expiry_window' },
   refreshedCredentialApplication: { mode: 'restart_required' },

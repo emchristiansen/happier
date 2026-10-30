@@ -1,8 +1,9 @@
+import { moveConnectedServiceHomeEntryAside } from '@/daemon/connectedServices/stateSharing/connectedServiceHomeEntrySync';
 import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { readConnectedServiceStateSharingManifest } from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingManifest';
 
@@ -124,7 +125,7 @@ describe('syncClaudeConnectedServiceHome self-source sharing-policy reconciliati
 });
 
 describe('syncClaudeConnectedServiceHome candidate session import reconciliation', () => {
-  it('keeps the newest canonical jsonl and removes stale conflict copies instead of leaving divergent imports', async () => {
+  it('keeps the newest canonical jsonl and retains distinct older conflict history', async () => {
     const { homeDir, targetDir, ambientDir } = await makeSelfSourceHome();
     const ambientProjectDir = join(ambientDir, 'projects', PROJECT_DIR_NAME);
     await mkdir(ambientProjectDir, { recursive: true });
@@ -151,10 +152,9 @@ describe('syncClaudeConnectedServiceHome candidate session import reconciliation
       candidatePersistedSessionFile: candidatePath,
     });
 
-    // Canonical newest content wins; no conflict copy remains for the resume id.
+    // Resume still selects the newest canonical file without destroying other history.
     await expect(readFile(canonicalPath, 'utf8')).resolves.toContain('canonical newest content');
-    const entries = await readdir(ambientProjectDir);
-    expect(entries.filter((entry) => entry.includes('.happier-import-'))).toEqual([]);
+    await expect(readFile(staleConflictPath, 'utf8')).resolves.toBe('{"type":"assistant","text":"frozen import"}\n');
 
     const manifest = await readConnectedServiceStateSharingManifest(targetDir);
     const mapping = manifest.sessionFileMappings.find((item) => item.vendorResumeId === VENDOR_RESUME_ID);
@@ -188,14 +188,14 @@ describe('syncClaudeConnectedServiceHome candidate session import reconciliation
 
     await expect(readFile(canonicalPath, 'utf8')).resolves.toContain('newer real session');
     const entries = await readdir(ambientProjectDir);
-    expect(entries.filter((entry) => entry.includes('.happier-import-'))).toEqual([]);
+    const retainedContents = await Promise.all(entries.map((entry) => readFile(join(ambientProjectDir, entry), 'utf8')));
+    expect(retainedContents).toContain('{"type":"assistant","text":"stale canonical"}\n');
 
     const manifest = await readConnectedServiceStateSharingManifest(targetDir);
     const mapping = manifest.sessionFileMappings.find((item) => item.vendorResumeId === VENDOR_RESUME_ID);
     expect(mapping?.destinationPath).toBe(canonicalPath);
   });
 });
-
 
 describe('Claude global guidance identity', () => {
   it.each(['linked', 'copied'] as const)('links global guidance under %s config policy', async (configMode) => {
@@ -219,5 +219,39 @@ describe('Claude global guidance identity', () => {
       sharingPolicyOverride: { configMode: 'isolated', stateMode: 'isolated' },
     });
     await expect(lstat(join(targetDir, 'CLAUDE.md'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+describe('retained home-entry collision', () => {
+  it('keeps a previous same-timestamp transcript when moving another file aside', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-retained-collision-'));
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1234);
+    try {
+      const path = join(root, 'session.jsonl');
+      await writeFile(path, 'new distinct history\n');
+      await writeFile(`${path}.local-1234`, 'previous distinct history\n');
+      await moveConnectedServiceHomeEntryAside(path);
+      expect(await readFile(`${path}.local-1234`, 'utf8')).toBe('previous distinct history\n');
+      expect(await readFile(`${path}.local-1234-1`, 'utf8')).toBe('new distinct history\n');
+    } finally { clock.mockRestore(); await rm(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('Claude credential directory preservation', () => {
+  it('refuses unqualified credential directories during home synchronization without removing their history', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-claude-auth-directory-'));
+    try {
+      const source = join(root, 'source');
+      const target = join(root, 'target');
+      await mkdir(source, { recursive: true });
+      await mkdir(join(target, 'accounts'), { recursive: true });
+      await writeFile(join(target, 'accounts', 'history.jsonl'), 'distinct legacy directory history\n');
+      const outcome = await syncClaudeConnectedServiceHome({
+        sourceEnv: { HOME: root, CLAUDE_CONFIG_DIR: source }, targetDir: target,
+        sharingPolicyOverride: { configMode: 'isolated', stateMode: 'isolated' },
+      }).then(() => null, (error: unknown) => error);
+      expect(await readFile(join(target, 'accounts', 'history.jsonl'), 'utf8')).toBe('distinct legacy directory history\n');
+      expect(outcome).toBeInstanceOf(Error);
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

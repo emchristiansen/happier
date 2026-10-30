@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -18,13 +18,14 @@ describe('materializeConnectedServicesForSpawn atomicity', () => {
     const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-atomicity-'));
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-atomicity-server-'));
     const activeRoot = join(baseDir, normalizeMaterializationKeyForPath('session-live'), 'codex');
-    await mkdir(activeRoot, { recursive: true });
-    await writeFile(join(activeRoot, 'auth.json'), '{"access_token":"live"}\n');
+    await mkdir(join(activeRoot, 'codex-home'), { recursive: true });
+    await writeFile(join(activeRoot, 'codex-home', 'auth.json'), '{"access_token":"live"}\n');
 
-    vi.doMock('@/backends/catalog', () => ({
+    vi.doMock('@/backends/catalog', async (importOriginal) => ({
+      ...await importOriginal<typeof import('@/backends/catalog')>(),
       getConnectedServiceMaterializer: async () => async (params: { rootDir: string; cleanupRoot: () => void }) => {
-        await mkdir(params.rootDir, { recursive: true });
-        await writeFile(join(params.rootDir, 'auth.json'), '{"access_token":"attempt"}\n');
+        await mkdir(join(params.rootDir, 'codex-home'), { recursive: true });
+        await writeFile(join(params.rootDir, 'codex-home', 'auth.json'), '{"access_token":"attempt"}\n');
         params.cleanupRoot();
         throw new Error('materialization failed');
       },
@@ -47,7 +48,7 @@ describe('materializeConnectedServicesForSpawn atomicity', () => {
       recordsByServiceId: new Map([['openai-codex', record]]),
     })).rejects.toThrow('materialization failed');
 
-    await expect(readFile(join(activeRoot, 'auth.json'), 'utf8')).resolves.toContain('live');
+    await expect(readFile(join(activeRoot, 'codex-home', 'auth.json'), 'utf8')).resolves.toContain('live');
   });
 
   it('serializes full materialization work for the same final target root', async () => {
@@ -61,7 +62,8 @@ describe('materializeConnectedServicesForSpawn atomicity', () => {
       releaseFirst = resolve;
     });
     firstEntered = new Promise<void>((resolve) => {
-      vi.doMock('@/backends/catalog', () => ({
+      vi.doMock('@/backends/catalog', async (importOriginal) => ({
+        ...await importOriginal<typeof import('@/backends/catalog')>(),
         getConnectedServiceMaterializer: async () => async (params: {
           rootDir: string;
           processEnv?: NodeJS.ProcessEnv;
@@ -72,11 +74,12 @@ describe('materializeConnectedServicesForSpawn atomicity', () => {
             resolve();
             await firstRelease;
           }
-          await mkdir(params.rootDir, { recursive: true });
-          await writeFile(join(params.rootDir, 'auth.json'), `{"access_token":"${label}"}\n`);
+          await mkdir(join(params.rootDir, 'codex-home'), { recursive: true });
+          await writeFile(join(params.rootDir, 'history.jsonl'), `history:${label}\n`);
+          await writeFile(join(params.rootDir, 'codex-home', 'auth.json'), `{"access_token":"${label}"}\n`);
           return {
             env: {
-              HAPPIER_TEST_AUTH_FILE: join(params.rootDir, 'auth.json'),
+              HAPPIER_TEST_AUTH_FILE: join(params.rootDir, 'codex-home', 'auth.json'),
             },
             cleanupOnFailure: params.cleanupRoot,
             cleanupOnExit: null,
@@ -118,17 +121,25 @@ describe('materializeConnectedServicesForSpawn atomicity', () => {
     expect(observedBeforeRelease).toBe('pending');
 
     releaseFirst();
-    await expect(first).resolves.toMatchObject({
+    const firstResult = await first;
+    expect(firstResult).toMatchObject({
       env: expect.objectContaining({
-        HAPPIER_TEST_AUTH_FILE: join(activeRoot, 'auth.json'),
+        HAPPIER_TEST_AUTH_FILE: join(activeRoot, 'codex-home', 'auth.json'),
       }),
     });
     await expect(second).resolves.toMatchObject({
       env: expect.objectContaining({
-        HAPPIER_TEST_AUTH_FILE: join(activeRoot, 'auth.json'),
+        HAPPIER_TEST_AUTH_FILE: join(activeRoot, 'codex-home', 'auth.json'),
       }),
     });
-    await expect(readFile(join(activeRoot, 'auth.json'), 'utf8')).resolves.toContain('B');
+    await expect(readFile(join(activeRoot, 'codex-home', 'auth.json'), 'utf8')).resolves.toContain('B');
+    const retired = (await readdir(dirname(activeRoot))).find((entry) => entry.startsWith('codex.previous-'));
+    expect(retired).toBeDefined();
+    expect(await readFile(join(dirname(activeRoot), retired!, 'history.jsonl'), 'utf8')).toBe('history:A\n');
+    await expect(readFile(join(dirname(activeRoot), retired!, 'codex-home', 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await firstResult!.cleanupMaterializationRoot();
+    // A late old-run callback must not revoke a successor's current credentials.
+    await expect(readFile(join(activeRoot, 'codex-home', 'auth.json'), 'utf8')).resolves.toContain('B');
   });
 
   it('serializes env-only promotion attempts for the same final target root', async () => {
@@ -159,14 +170,15 @@ describe('materializeConnectedServicesForSpawn atomicity', () => {
         },
       }));
     });
-    vi.doMock('@/backends/catalog', () => ({
+    vi.doMock('@/backends/catalog', async (importOriginal) => ({
+      ...await importOriginal<typeof import('@/backends/catalog')>(),
       getConnectedServiceMaterializer: async () => async (params: {
         rootDir: string;
         processEnv?: NodeJS.ProcessEnv;
       }) => {
         const label = String(params.processEnv?.HAPPIER_TEST_MATERIALIZATION_LABEL ?? '');
         attemptRootByLabel.set(label, params.rootDir);
-        await mkdir(params.rootDir, { recursive: true });
+        await mkdir(join(params.rootDir, 'codex-home'), { recursive: true });
         return {
           env: {
             HAPPIER_TEST_ENV_ONLY_LABEL: label,

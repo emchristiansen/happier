@@ -1051,7 +1051,7 @@ existing state-sharing descriptor; isolated state stays local to that binding.
 Antigravity's isolated-state policy still refuses continuation across different
 accounts, including a pool rotation; the storage change does not relax it.
 Configuration inheritance remains a separate policy. Discovery probes and other
-temporary materializers retain disposable roots.
+temporary materializers use private roots whose histories survive retirement.
 
 Direct linking recovers a connected-service runtime snapshot only from a marker
 for the same Agent and native conversation. A matching working directory does
@@ -1073,13 +1073,34 @@ existing preservation owner. Legacy per-session roots may contribute their
 declared private state; moving an isolated Codex conversation between durable
 account homes imports only that resumed conversation, not the other account's
 history or memories. Adoption alone does not authorize deletion. Legacy
-Run cleanup requires explicit ephemeral retention; resumable and unidentified
-hashed roots are kept. The cleanup scheduler checks actual runtime registrations
-before deleting live Run homes, including pending cleanup after release. Session
-reference lookup remains current-server scoped; retaining an unidentified root
-does not establish that its original Run can resume. Both ordinary and archived
-Session references protect retained history; an unreadable or incomplete listing
-defers deletion rather than supplying partial deletion authority.
+Run cleanup requires explicit ephemeral retention to revoke private credentials;
+it never deletes transcripts. Expired materialized homes and attempts retain
+history, and deleted group homes retain their quarantine directories indefinitely.
+The cleanup scheduler checks actual runtime registrations before revoking home
+credentials, including pending cleanup after release. Both ordinary and archived
+Session references protect retained homes; an unreadable or incomplete listing
+defers cleanup. Retaining an unidentified root does not establish that its original
+Run can resume.
+
+Atomic connected-service replacement retains both the previous home and a
+rejected promoted home on rollback, with their credentials retired separately.
+Claude conflict reconciliation keeps every distinct older transcript while
+selecting the newest canonical resume filename. File credentials are revoked by
+the provider's declared cleanup hook; Claude's path-derived Keychain cleanup runs
+before group quarantine changes the original path. Existing renamed quarantines
+supply no authority to remove a recreated group's current Keychain item.
+Credential filenames are unlinked without recursive removal. An unexpected
+directory, including a legacy `accounts` directory with no established contents
+contract, remains intact and makes cleanup fail explicitly. Previously replaced
+or renamed homes do not provide their original path-derived Keychain identity;
+their file retirement does not certify Keychain revocation. The existing legacy
+Keychain sweep remains a separate owner, with no execution result implied here.
+
+These are Happier storage guarantees, not a vendor retention setting. No supported
+Claude no-expiry contract has been established; no zero, finite substitute or
+invalid cleanup period is emitted. Codex prompt-history limits do not establish
+rollout retention. Source and disposable-fixture checks do not prove that a running
+daemon has adopted this implementation.
 
 Managed Codex app-server startup records the account whose access token was
 actually applied. Connected-account reset-credit reads use the daemon's current

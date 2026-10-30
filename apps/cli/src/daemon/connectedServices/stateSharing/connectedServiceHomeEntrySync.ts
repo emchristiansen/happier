@@ -1,4 +1,4 @@
-import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises';
+import { copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { createAbsolutePathSymlink } from '@/utils/fs/createAbsolutePathSymlink';
@@ -44,15 +44,23 @@ export async function removeLinkedConnectedServiceHomeEntries(
   }
 }
 
-export async function moveConnectedServiceHomeEntryAside(path: string): Promise<void> {
+export async function moveConnectedServiceHomeEntryAside(path: string): Promise<string | null> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const suffix = `.local-${Date.now()}${attempt === 0 ? '' : `-${attempt}`}`;
     try {
-      await rename(path, `${path}${suffix}`);
-      return;
+      const destination = `${path}${suffix}`;
+      const info = await lstat(path);
+      if (!info.isDirectory()) {
+        // rename replaces an existing file on POSIX. An exclusive link retains every collision.
+        await link(path, destination);
+        await unlink(path);
+      } else {
+        await rename(path, destination);
+      }
+      return destination;
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
-      if (err?.code === 'ENOENT') return;
+      if (err?.code === 'ENOENT') return null;
       // A same-timestamp sibling collision can report EEXIST, ENOTEMPTY, or EISDIR
       // depending on whether the existing backup is a file or directory and the host OS.
       if (err?.code === 'EEXIST' || err?.code === 'ENOTEMPTY' || err?.code === 'EISDIR') continue;
