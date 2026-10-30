@@ -39,6 +39,7 @@ import { createTestAuth, type TestAuth } from './auth';
 import { seedCliAuthForServer } from './cliAuth';
 import { daemonControlPostJson } from './daemon/controlServerClient';
 import { fetchJson } from './http';
+import { countFakeClaudeEventsAfterCurrentRunSentinel } from './fakeClaude';
 import { writeTestManifestForServer } from './manifestForServer';
 import { createTempPathBin } from './fs/tempPathBin';
 import { ensureCliSharedDepsBuilt } from './process/cliDist';
@@ -840,37 +841,16 @@ export function isRuntimeAuthRecoveryAwaitingProviderOutcomeProof(intent: unknow
 export async function countFakeClaudeUserTextOccurrences(params: Readonly<{
   logPath: string;
   text: string;
-  sinceMs?: number;
+  sinceMs: number;
 }>): Promise<number> {
-  let raw = '';
-  try {
-    raw = await readFile(params.logPath, 'utf8');
-  } catch {
-    return 0;
-  }
-  let count = 0;
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event: UnknownRecord | null = null;
-    try {
-      event = asRecord(JSON.parse(trimmed) as unknown);
-    } catch {
-      continue;
-    }
-    if (!event) continue;
-    if (typeof params.sinceMs === 'number') {
-      if (typeof event.ts !== 'number' || event.ts < params.sinceMs) continue;
-    }
-    const userTextPreview = typeof event.userTextPreview === 'string' ? event.userTextPreview : null;
-    if (!userTextPreview?.includes(params.text)) continue;
-    if (event.type === 'sdk_stdin' && event.hasUserText === true) {
-      count += 1;
-      continue;
-    }
-    if (event.type === 'local_stdin_turn_completed') {
-      count += 1;
-    }
-  }
-  return count;
+  return await countFakeClaudeEventsAfterCurrentRunSentinel({
+    logPath: params.logPath,
+    sinceMs: params.sinceMs,
+    predicate: (event) => {
+      const userTextPreview = typeof event.userTextPreview === 'string' ? event.userTextPreview : null;
+      return Boolean(userTextPreview?.includes(params.text))
+        && ((event.type === 'sdk_stdin' && event.hasUserText === true)
+          || event.type === 'local_stdin_turn_completed');
+    },
+  });
 }
