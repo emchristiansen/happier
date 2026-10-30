@@ -170,7 +170,7 @@ describe('getProviderSettingsPlugin', () => {
         expect(visibleFieldKeys.has('cursorApiEndpoint')).toBe(true);
     });
 
-    it('exposes Kimi ACP Python selector in provider settings UI sections', () => {
+    it('omits the Kimi ACP Python selector from provider settings UI sections', () => {
         const kimiPlugin = getProviderSettingsPlugin('kimi');
         const visibleFieldKeys = new Set(
             kimiPlugin?.uiSections.flatMap((section) => section.fields.map((field) => field.key)) ?? [],
