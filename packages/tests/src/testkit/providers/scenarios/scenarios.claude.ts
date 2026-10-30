@@ -7,7 +7,7 @@ import { hasStringSubstring } from '../assertions';
 import { fetchSessionV2 } from '../../sessions';
 import { decryptLegacyBase64 } from '../../messageCrypto';
 import { sleep } from '../../timing';
-import { cleanupOutsideWorkspacePath, makeOutsideWorkspacePath } from '../harness/outsideWorkspacePath';
+import { cleanupOutsideWorkspacePath, makeOutsideWorkspacePath, requireOwnedOutsideWorkspacePath, type OwnedOutsideWorkspacePath } from '../harness/outsideWorkspacePath';
 
 const agentSdkRemoteMetaBase = {
   claudeRemoteAgentSdkEnabled: true,
@@ -92,7 +92,7 @@ const readKnownFileScenario: ProviderScenario = {
   },
 };
 
-let permissionSurfaceOutsideWorkspacePath: string | null = null;
+let permissionSurfaceOutsideWorkspacePath: OwnedOutsideWorkspacePath | null = null;
 
 const permissionSurfaceOutsideWorkspaceScenario: ProviderScenario = {
   id: 'permission_surface_outside_workspace',
@@ -129,25 +129,25 @@ const permissionSurfaceOutsideWorkspaceScenario: ProviderScenario = {
     ['claude/claude/tool-call/Write', 'claude/claude/tool-call/Edit'],
   ],
   verify: async ({ fixtures }) => {
-    const reqs =
-      ((fixtures?.examples?.['claude/claude/permission-request/Write'] ?? []) as any[])
-        .concat((fixtures?.examples?.['claude/claude/permission-request/Edit'] ?? []) as any[]);
-    if (!Array.isArray(reqs) || reqs.length === 0) throw new Error('Missing permission-request/Write fixtures');
-    const filepath = reqs[0]?.payload?.input?.file_path;
-    if (typeof filepath !== 'string' || filepath.length === 0) throw new Error('permission-request/Write missing input.file_path');
+    const ownedPath = permissionSurfaceOutsideWorkspacePath;
     try {
+      const reqs =
+        ((fixtures?.examples?.['claude/claude/permission-request/Write'] ?? []) as any[])
+          .concat((fixtures?.examples?.['claude/claude/permission-request/Edit'] ?? []) as any[]);
+      if (!Array.isArray(reqs) || reqs.length === 0) throw new Error('Missing permission-request/Write fixtures');
+      const filepath = requireOwnedOutsideWorkspacePath(ownedPath, reqs[0]?.payload?.input?.file_path);
       const content = await readFile(filepath, 'utf8').catch(() => '');
       if (!content.includes('OUTSIDE_CLAUDE_E2E')) {
         throw new Error(`Approved permission but expected content was not written: ${filepath}`);
       }
     } finally {
-      await cleanupOutsideWorkspacePath(filepath);
+      await cleanupOutsideWorkspacePath(ownedPath);
       permissionSurfaceOutsideWorkspacePath = null;
     }
   },
 };
 
-let permissionDenyOutsideWorkspacePath: string | null = null;
+let permissionDenyOutsideWorkspacePath: OwnedOutsideWorkspacePath | null = null;
 
 const permissionDenyOutsideWorkspaceScenario: ProviderScenario = {
   id: 'permission_deny_outside_workspace',
@@ -185,18 +185,18 @@ const permissionDenyOutsideWorkspaceScenario: ProviderScenario = {
     ['claude/claude/tool-call/Write', 'claude/claude/tool-call/Edit'],
   ],
   verify: async ({ fixtures }) => {
-    const reqs =
-      ((fixtures?.examples?.['claude/claude/permission-request/Write'] ?? []) as any[])
-        .concat((fixtures?.examples?.['claude/claude/permission-request/Edit'] ?? []) as any[]);
-    if (!Array.isArray(reqs) || reqs.length === 0) throw new Error('Missing permission-request/Write fixtures');
-    const filepath = reqs[0]?.payload?.input?.file_path;
-    if (typeof filepath !== 'string' || filepath.length === 0) throw new Error('permission-request/Write missing input.file_path');
+    const ownedPath = permissionDenyOutsideWorkspacePath;
     try {
+      const reqs =
+        ((fixtures?.examples?.['claude/claude/permission-request/Write'] ?? []) as any[])
+          .concat((fixtures?.examples?.['claude/claude/permission-request/Edit'] ?? []) as any[]);
+      if (!Array.isArray(reqs) || reqs.length === 0) throw new Error('Missing permission-request/Write fixtures');
+      const filepath = requireOwnedOutsideWorkspacePath(ownedPath, reqs[0]?.payload?.input?.file_path);
       if (existsSync(filepath)) {
         throw new Error(`Denied permission but file exists on disk: ${filepath}`);
       }
     } finally {
-      await cleanupOutsideWorkspacePath(filepath);
+      await cleanupOutsideWorkspacePath(ownedPath);
       permissionDenyOutsideWorkspacePath = null;
     }
   },
