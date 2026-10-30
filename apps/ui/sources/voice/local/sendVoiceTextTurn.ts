@@ -62,6 +62,7 @@ export async function sendVoiceTextTurn(params: {
     handoffMode: 'interrupt_and_send';
   }>;
 }): Promise<void> {
+  if (params.signal?.aborted) return;
   const { sessionId, settings, userText } = params;
   const { adapterId, config } = resolveLocalVoiceAdapterSettings(settings);
   const networkTimeoutMs = resolveVoiceNetworkTimeoutMs(config?.networkTimeoutMs, 15_000);
@@ -269,9 +270,11 @@ export async function sendVoiceTextTurn(params: {
       callerSurface: 'voice_turn',
       forceImmediate: true,
     });
+    if (params.signal?.aborted) return;
     submittedUserLocalId = submission?.localId;
     voiceActivityController.appendActionExecuted(sessionId, adapterId, 'unknown', `Sent to session: ${userText.slice(0, 200)}`);
   } catch (error) {
+    if (params.signal?.aborted) return;
     voiceActivityController.appendError(sessionId, adapterId, 'send_failed', error instanceof Error ? error.message : 'send_failed');
     patchLocalVoiceState({ status: 'idle', sessionId, ...resolveLocalVoiceError(error, 'send_failed') });
     throw error;
