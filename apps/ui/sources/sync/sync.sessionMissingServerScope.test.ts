@@ -2822,4 +2822,112 @@ describe('sync.fetchMessages server-scoped known-session checks', () => {
         }
     });
 
+
+    describe('automation mutation completion scope', () => {
+        const operations = ['create', 'update', 'assignments', 'pause', 'resume', 'delete', 'run-now'] as const;
+
+        for (const switchBeforeBody of [false, true]) {
+            it.each(operations)(
+                `${switchBeforeBody ? 'refuses stale' : 'applies current'} %s completion after response body consumption`,
+                async (operation) => {
+                    // Refuse ambient analytics configuration before importing the real Sync owner.
+                    expect((await import('@/config')).config.postHogKey).toBeFalsy();
+                    const { sync } = await import('./sync');
+                    const internals = sync as unknown as {
+                        credentials: { token: string; secret: string } | null;
+                        resetServerScopedRuntimeState: () => void;
+                    };
+                    const originalCredentials = internals.credentials;
+                    const serverA = upsertServerProfile({ serverUrl: 'https://automation-a.example', name: 'Automation A' });
+                    const serverB = upsertServerProfile({ serverUrl: 'https://automation-b.example', name: 'Automation B' });
+                    setActiveServerId(serverA.id, { scope: 'device' });
+                    internals.credentials = { token: 'automation-a-token', secret: 'automation-a-secret' };
+                    const automation: import('./api/automations/apiAutomationTypes').ApiAutomation = {
+                        id: 'automation-shared-id', name: 'A completed', description: null, enabled: true,
+                        schedule: { kind: 'manual', scheduleExpr: null, everyMs: null, timezone: null },
+                        targetType: 'new_session', templateCiphertext: 'fixture-template', templateVersion: 1,
+                        nextRunAt: null, lastRunAt: null, createdAt: 1, updatedAt: 2, assignments: [],
+                    };
+                    const run: import('./api/automations/apiAutomationTypes').ApiAutomationRun = {
+                        id: 'run-a', automationId: automation.id, state: 'queued', scheduledAt: 2, dueAt: 2,
+                        claimedAt: null, startedAt: null, finishedAt: null, claimedByMachineId: null,
+                        leaseExpiresAt: null, attempt: 0, summaryCiphertext: null, errorCode: null,
+                        errorMessage: null, producedSessionId: null, createdAt: 2, updatedAt: 2,
+                    };
+                    const bodyStarted = createDeferred<void>();
+                    const body = createDeferred<unknown>();
+                    const response = new Response('', { status: 200, headers: { 'Content-Type': 'application/json' } });
+                    // HTTP response-body timing is the mocked transport boundary. API parsing and Sync/store stay real.
+                    vi.spyOn(response, 'json').mockImplementation(async () => {
+                        bodyStarted.resolve();
+                        return await body.promise;
+                    });
+                    runtimeFetchMock.mockImplementation(createServerFetchWithReachabilityProbe((input) => {
+                        const url = getServerFetchUrl(input);
+                        if (url.origin !== 'https://automation-a.example' || !url.pathname.startsWith('/v2/automations')) {
+                            throw new Error(`Unexpected automation transport: ${url}`);
+                        }
+                        return response;
+                    }));
+                    const invoke = (): Promise<unknown> => {
+                        switch (operation) {
+                            case 'create': return sync.createAutomation({
+                                name: 'A completed', enabled: true, schedule: { kind: 'manual' },
+                                targetType: 'new_session', templateCiphertext: 'fixture-template',
+                            });
+                            case 'update': return sync.updateAutomation(automation.id, { name: 'A completed' });
+                            case 'assignments': return sync.replaceAutomationAssignments(automation.id, []);
+                            case 'pause': return sync.pauseAutomation(automation.id);
+                            case 'resume': return sync.resumeAutomation(automation.id);
+                            case 'delete': return sync.deleteAutomation(automation.id);
+                            case 'run-now': return sync.runAutomationNow(automation.id);
+                        }
+                    };
+                    const completed = invoke().then(
+                        (value) => ({ kind: 'fulfilled' as const, value }),
+                        (error: unknown) => ({ kind: 'rejected' as const, error }),
+                    );
+                    try {
+                        await Promise.race([
+                            bodyStarted.promise,
+                            completed.then(() => { throw new Error('Mutation settled before held response body was entered'); }),
+                        ]);
+                        if (switchBeforeBody) {
+                            setActiveServerId(serverB.id, { scope: 'device' });
+                            internals.resetServerScopedRuntimeState();
+                            internals.credentials = { token: 'automation-b-token', secret: 'automation-b-secret' };
+                        }
+                        storage.getState().upsertAutomation({ ...automation, name: 'Current server row' });
+                        storage.getState().setAutomationRuns(automation.id, [{ ...run, id: 'current-run' }]);
+                        const beforeAutomations = storage.getState().automations;
+                        const beforeRuns = storage.getState().automationRunsByAutomationId;
+                        body.resolve(operation === 'run-now' ? { run } : operation === 'delete' ? {} : automation);
+                        const outcome = await completed;
+                        if (switchBeforeBody) {
+                            expect(outcome.kind).toBe('rejected');
+                            if (outcome.kind !== 'rejected') throw new Error('Expected stale mutation refusal');
+                            expect(outcome.error).toMatchObject({ name: 'StaleServerGenerationError' });
+                            expect(storage.getState().automations).toBe(beforeAutomations);
+                            expect(storage.getState().automationRunsByAutomationId).toBe(beforeRuns);
+                        } else {
+                            expect(outcome.kind).toBe('fulfilled');
+                            if (operation === 'delete') {
+                                expect(storage.getState().automations[automation.id]).toBeUndefined();
+                                expect(storage.getState().automationRunsByAutomationId[automation.id]).toBeUndefined();
+                            } else if (operation === 'run-now') {
+                                expect(storage.getState().automationRunsByAutomationId[automation.id]?.some((entry) => entry.id === run.id)).toBe(true);
+                            } else {
+                                expect(storage.getState().automations[automation.id]).toEqual(automation);
+                            }
+                        }
+                    } finally {
+                        body.resolve(operation === 'run-now' ? { run } : operation === 'delete' ? {} : automation);
+                        await completed;
+                        internals.credentials = originalCredentials;
+                    }
+                },
+            );
+        }
+    });
+
 });

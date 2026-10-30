@@ -1,6 +1,7 @@
 import Constants from 'expo-constants';
 import { parsePermissionIntentAlias, resolvePermissionIntentFromSessionMetadata } from '@happier-dev/agents';
 import { apiSocket } from '@/sync/api/session/apiSocket';
+import { StaleServerGenerationError } from '@/sync/http/client';
 import { ensureSessionRuntimeForPendingInput } from '@/sync/ops';
 import { shouldDelegatePendingActivationToDaemon } from '@/sync/domains/session/input/pendingActivationWakeDecision';
 import { isMachineOnline } from '@/utils/sessions/machineUtils';
@@ -4988,7 +4989,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const created = await createAutomationApi(this.credentials, input);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(created);
         return created;
     }
@@ -4997,7 +5000,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const updated = await updateAutomationApi(this.credentials, automationId, input);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(updated);
         return updated;
     }
@@ -5009,7 +5014,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const updated = await replaceAutomationAssignmentsApi(this.credentials, automationId, assignments);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(updated);
         return updated;
     }
@@ -5018,7 +5025,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const updated = await pauseAutomationApi(this.credentials, automationId);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(updated);
         return updated;
     }
@@ -5027,7 +5036,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const updated = await resumeAutomationApi(this.credentials, automationId);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(updated);
         return updated;
     }
@@ -5036,7 +5047,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         await deleteAutomationApi(this.credentials, automationId);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().removeAutomation(automationId);
     }
 
@@ -5044,7 +5057,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const run = await runAutomationNowApi(this.credentials, automationId);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomationRun(run);
         return run;
     }
