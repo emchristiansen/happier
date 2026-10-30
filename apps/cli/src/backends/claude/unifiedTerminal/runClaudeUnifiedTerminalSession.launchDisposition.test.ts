@@ -112,6 +112,7 @@ describe('runClaudeUnifiedTerminalSession launch disposition', () => {
       cwd: directory, env: { PATH: process.env.PATH ?? '' } });
     const ledger = createClaudeProviderActivityLedger();
     ledger.apply({ type: 'started', sessionId: 'claude-resume-id', taskId: 'native-child' });
+    const observedProviderExit = vi.fn();
     const states: string[] = [];
     const runtimeActivityAdapter = createClaudeProviderRuntimeActivityAdapter({ providerActivityLedger: ledger,
       contributionHandle: { report: async snapshot => { states.push(snapshot.state); },
@@ -127,7 +128,7 @@ describe('runClaudeUnifiedTerminalSession launch disposition', () => {
     const session = runClaudeUnifiedTerminalSession({
       ...baseOptions(createAdapter(), abortController), path: directory, createController: undefined,
       currentTerminalHost: { handle: existingHandle, lifecycle: 'borrowed' },
-      providerActivityLedger: ledger, runtimeActivityAdapter,
+      providerActivityLedger: ledger, runtimeActivityAdapter, onProviderProcessExit: observedProviderExit,
       launchCurrentTerminalProcess: async () => launchOwnedTerminalProcess({ spawn: prepared, cwd: directory, spawnProcess,
         ...(outcome === 'termination-unproven' ? { terminateProcess: async (child) => { process.kill(child.pid!, 'SIGKILL'); } } : {}),
       }),
@@ -144,6 +145,7 @@ describe('runClaudeUnifiedTerminalSession launch disposition', () => {
       expect(nativePid, String(error)).toBeDefined();
       expect(isPidAlive(nativePid!)).toBe(true);
       expect(ledger.getActiveProviderTaskCount()).toBe(1);
+      expect(observedProviderExit).not.toHaveBeenCalled();
       expect(states.at(-1)).toBe('unknown');
       expect(resolveClaudeRemoteLaunchErrorDisposition({ error, exitReason: null, runtimeTerminationStarted: false })).toBe('preserve-resume-and-exit');
     } finally {
@@ -161,6 +163,7 @@ describe('runClaudeUnifiedTerminalSession launch disposition', () => {
       args: ['-e', 'setInterval(() => {}, 1000)'], cwd: directory, env: { PATH: process.env.PATH ?? '' } });
     const ledger = createClaudeProviderActivityLedger();
     ledger.apply({ type: 'started', sessionId: 'claude-resume-id', taskId: 'background-child' });
+    const observedProviderExit = vi.fn();
     const sessionRuntimeActivity = createSessionRuntimeActivity('supported');
     await sessionRuntimeActivity.bindPublisher({ publish: async () => {}, close: async () => {} });
     const contributionHandle = sessionRuntimeActivity.agentRuntimeContributionHandle;
@@ -183,7 +186,7 @@ describe('runClaudeUnifiedTerminalSession launch disposition', () => {
       await runClaudeUnifiedTerminalSession({
         ...baseOptions(createAdapter(), abortController), path: directory, createController: undefined,
         currentTerminalHost: { handle: existingHandle, lifecycle: 'borrowed' },
-        runtimeActivityAdapter, providerActivityLedger: ledger,
+        runtimeActivityAdapter, providerActivityLedger: ledger, onProviderProcessExit: observedProviderExit,
         launchCurrentTerminalProcess: async () => {
           ownedProcess = await launchOwnedTerminalProcess({ spawn: prepared, cwd: directory,
             // Hold the actual OS termination boundary until the test releases this child.
@@ -218,6 +221,7 @@ describe('runClaudeUnifiedTerminalSession launch disposition', () => {
             await stopped;
           }
           expect(ledger.getActiveProviderTaskCount()).toBe(0);
+          expect(observedProviderExit).toHaveBeenCalledTimes(1);
           abortController.abort();
         },
       });

@@ -371,15 +371,6 @@ export async function claudeUnifiedTerminalLauncher(
     },
   });
   const transcriptProjector = createClaudeSessionTranscriptProjector({ session, logPrefix: '[unified]', workflowActivitySource });
-  /**
-   * Did THIS launcher destroy the terminal host for an explicit user stop?
-   *
-   * The teardown below is reached by every exit — a provider crash, a runtime issue, a plain return,
-   * a CLI signal — and on this runtime the terminal host is DETACHED, so most of those leave Claude
-   * and its background shells running. Only the explicit-stop disposal is the kill we performed and
-   * watched, which is the sole condition under which a background-task record may be resolved.
-   */
-  let providerProcessTreeDestroyedForExplicitStop = false;
   let lastSurfacedRuntimeAuthFailureAtMs: number | null = null;
   let recentPrimaryProviderUnavailableForPromptDelivery: ClaudeUnifiedProviderUnavailablePromptDeliveryWindow | null = null;
   let usageLimitDialogVisible = false;
@@ -959,6 +950,9 @@ export async function claudeUnifiedTerminalLauncher(
       logPrefix: '[unified]',
       logDebug: (message, error) => logger.debug(message, error),
     });
+    // Evidence belongs to this attempt; a later relaunch must not inherit a prior provider death.
+    let providerExitObserved = false;
+    let ownedHostDestroyed = false;
     let launchAttemptSettled = false;
     let returnedExactInFlightMessage = false;
     const settleReturnedExactInFlightMessage = (): void => {
@@ -1004,6 +998,7 @@ export async function claudeUnifiedTerminalLauncher(
         if (binding.shouldSuppressTranscriptMessage(message)) return;
         await transcriptProjector.observeCommitted(message);
       },
+      onProviderProcessExit: () => { providerExitObserved = true; },
       onProviderLaunchStarting: () => startupLifecycle.onProviderLaunchStarting(),
       onProviderSessionStarted: () => {
         startupLifecycle.onProviderSessionStarted();
@@ -1275,7 +1270,7 @@ export async function claudeUnifiedTerminalLauncher(
           // disposal resolves: a failed destroy leaves the host, and its shells, alive.
           stopTerminalHostForExplicitStop: async () => {
             await stopTerminalHostForExplicitStop();
-            providerProcessTreeDestroyedForExplicitStop = true;
+            if (lifecycle === 'owned') ownedHostDestroyed = true;
           },
         });
       },
@@ -1294,6 +1289,20 @@ export async function claudeUnifiedTerminalLauncher(
         settleReturnedExactInFlightMessage();
       }
       throw error;
+    }).finally(() => {
+      // Runtime cleanup has drained its observers. Wrapper exit preserves a detached host and
+      // supplies no death proof; only a native-process observation or owned-host destruction does.
+      if (providerExitObserved || ownedHostDestroyed) {
+        transcriptProjector.finalizeInterruptedWorkOnShutdown();
+      }
+      // Borrowed-host release may stop our provider but leaves other host children untouched.
+      if (ownedHostDestroyed) {
+        try {
+          workflowActivitySource?.finalizeBackgroundTaskRecordsOnOrderlyStop();
+        } catch (error) {
+          logger.debug('[unified]: failed to resolve background task records on explicit stop (non-fatal)', error);
+        }
+      }
     });
     launchAttemptSettled = true;
     settleReturnedExactInFlightMessage();
@@ -1434,22 +1443,6 @@ export async function claudeUnifiedTerminalLauncher(
     // An accepted prompt may end the terminal session before its metadata write resolves. Do not
     // let the next launcher instance observe the seed as still live.
     await replaySeedRetirement.drain();
-    // This teardown is the OBSERVATION that the provider process is gone: resolve every
-    // shutdown-sensitive source the projector owns before the sources are drained and disposed.
-    // G-6 marks an active-but-unmet goal interrupted; RULING-14 resolves live workflow runs and
-    // their agents so they stop reading as "Working" forever.
-    transcriptProjector.finalizeInterruptedWorkOnShutdown();
-    // Background shells are the one kind that can OUTLIVE the provider, so they are resolved on a
-    // narrower fact than the rest: not "we are tearing down" but "we destroyed the host they lived
-    // in". After a crash the shell may genuinely still be writing, and nothing would ever correct a
-    // `cancelled` record — no startup reconcile reads this namespace.
-    if (providerProcessTreeDestroyedForExplicitStop) {
-      try {
-        workflowActivitySource?.finalizeBackgroundTaskRecordsOnOrderlyStop();
-      } catch (error) {
-        logger.debug('[unified]: failed to resolve background task records on explicit stop (non-fatal)', error);
-      }
-    }
     // Drain any pending workflow-activity writes, then stop scheduling (dispose via reset()).
     await transcriptProjector.flushWorkflowActivity();
     transcriptProjector.reset();

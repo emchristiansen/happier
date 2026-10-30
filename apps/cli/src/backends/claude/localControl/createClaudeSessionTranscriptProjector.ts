@@ -127,8 +127,8 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
   /** Drain pending workflow-activity writes immediately (turn end / stream close / finalize). No-op without a source. */
   flushWorkflowActivity(): Promise<void>;
   /**
-   * The ONE teardown observation for every shutdown-sensitive source this projector owns. Call it
-   * from an OBSERVED death (a launcher's graceful teardown) immediately BEFORE
+   * The ONE termination observation for every shutdown-sensitive source this projector owns.
+   * Call only after verified provider termination; wrapper teardown alone is insufficient. Call BEFORE
    * `flushWorkflowActivity()`, so the resolved state is what gets drained.
    *
    * - G-6 goal: an active/unmet Claude goal is republished with `statusReason:'interrupted'`

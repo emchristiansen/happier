@@ -308,6 +308,8 @@ export type ClaudeUnifiedTerminalSessionOptions<Mode extends EnhancedMode = Enha
   onProviderPromptStarted?: (() => void | Promise<void>) | undefined;
   /** Fires only when this runner is about to create a new provider host with spawn argv. */
   onProviderLaunchStarting?: (() => void | Promise<void>) | undefined;
+  /** Fires only after owned-process exit supplies native exit or process-tree termination proof. */
+  onProviderProcessExit?: (() => void) | undefined;
   onProviderSessionStarted?: (() => void) | undefined;
   /** Fires when the single startup-readiness owner proves the provider is at an idle input boundary. */
   onStartupReady?: (() => void | Promise<void>) | undefined;
@@ -972,6 +974,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
   const allowEmptyStartupInputBeforeSessionStart = first === null && Boolean(opts.initialMode);
   let lifecycleBridge: ReturnType<typeof createClaudeUnifiedHookLifecycleBridge> | undefined;
   const observeProviderProcessExit = (): void => {
+    opts.onProviderProcessExit?.();
     if (lifecycleBridge) {
       lifecycleBridge.observeProcessExit();
     } else {

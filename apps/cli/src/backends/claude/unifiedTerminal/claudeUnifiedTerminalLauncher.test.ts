@@ -1,4 +1,9 @@
 import { readFileSync } from 'node:fs';
+import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { SessionWorkflowRunSnapshotV1 } from '@happier-dev/protocol';
+import { completedNativeChildTranscript } from '../workflows/claudeWorkflowActivitySource.testkit';
 import { resolve } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,6 +16,7 @@ import type { AccountSettings } from '@happier-dev/protocol';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 
 import type { Session } from '../session';
+import type { SessionHookData } from '../utils/startHookServer';
 import type { EnhancedMode } from '../loop';
 
 const mocks = vi.hoisted(() => ({
@@ -151,13 +157,14 @@ function abortLauncherOnEmptyQueueWait(session: Session, waitNumber = 1): AbortS
 }
 
 function createSession(overrides: Readonly<{
+  path?: string;
   terminalRuntime?: Session['terminalRuntime'];
   metadata?: unknown;
   startedBy?: Session['startedBy'];
 }> = {}): Session {
   let metadata: unknown = overrides.metadata ?? {};
   return {
-    path: '/workspace/project',
+    path: overrides.path ?? '/workspace/project',
     client: {
       waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
       sessionId: 'happy-session-id',
@@ -4771,10 +4778,95 @@ describe('claudeUnifiedTerminalLauncher', () => {
     }
   });
 
-  // RULING-14. This launcher's teardown IS the observation that the Claude process is gone, so a
-  // workflow run and its agents that were still live at that moment must be resolved — otherwise the
-  // roster paints them "Working" forever. The remote launcher already did this; this one only
-  // drained, which is why the fix was live on one launcher out of three.
+  it('preserves active workflow records when wrapper shutdown preserves the detached provider', async () => {
+    setProcessTty(false);
+    const directory = await mkdtemp(join(tmpdir(), 'claude-preserved-workflow-'));
+    const transcriptPath = join(directory, 'claude-current.jsonl');
+    await writeFile(transcriptPath, JSON.stringify({ type: 'user', uuid: 'prior-prompt', sessionId: 'claude-current',
+      message: { role: 'user', content: 'prior prompt' } }) + '\n');
+    const session = createSession({ path: directory, metadata: { claudeSessionId: 'claude-current' } });
+    session.sessionId = 'claude-current';
+    session.transcriptPath = transcriptPath;
+    const hookCallbacks = new Set<(data: SessionHookData) => void>();
+    vi.mocked(session.addClaudeSessionHookCallback).mockImplementation(callback => { hookCallbacks.add(callback); });
+    vi.mocked(session.removeClaudeSessionHookCallback).mockImplementation(callback => { hookCallbacks.delete(callback); });
+    const snapshots: SessionWorkflowRunSnapshotV1[] = [];
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async (record: { content: { t: string; v?: SessionWorkflowRunSnapshotV1 } }) => {
+        if (record.content.t === 'plain' && record.content.v?.agents) snapshots.push(record.content.v);
+      },
+    });
+    const factory = await vi.importActual<typeof import('../workflows/createClaudeWorkflowActivitySourceForSession')>(
+      '../workflows/createClaudeWorkflowActivitySourceForSession');
+    mocks.createClaudeWorkflowActivitySourceForSession.mockImplementationOnce(async params => {
+      const source = await factory.createClaudeWorkflowActivitySourceForSession(params as Parameters<typeof factory.createClaudeWorkflowActivitySourceForSession>[0]);
+      expect(source).not.toBeNull();
+      return source;
+    });
+    const runtime = await vi.importActual<typeof import('./runClaudeUnifiedTerminalSession')>('./runClaudeUnifiedTerminalSession');
+    let observerReady = false;
+    let rawValues = 0;
+    const abort = new AbortController();
+    const disposeHost = vi.fn(async () => {});
+    const adapter = {
+      kind: 'tmux' as const,
+      createOrAttachHost: async () => ({ kind: 'tmux' as const, sessionName: 'workflow-fixture', paneId: '%1',
+        attachMetadata: { attachStrategy: 'terminal_host' as const, topology: 'shared' as const,
+          locality: 'same_machine' as const, liveProbe: 'required' as const } }),
+      injectUserPrompt: async () => ({ status: 'injected' as const, at: Date.now(), bytesWritten: 0 }),
+      interruptTurn: async () => {},
+      evaluateLiveness: async () => ({ paneAlive: true, observedAt: Date.now() }),
+      dispose: disposeHost,
+    };
+    // Execute the real runtime/controller and workflow projection. Replace only the native host,
+    // vendor launch argv and attachment-file boundary; no provider or terminal is started.
+    mocks.runClaudeUnifiedTerminalSession.mockImplementationOnce(async (opts: Parameters<typeof runtime.runClaudeUnifiedTerminalSession>[0]) => {
+      await runtime.runClaudeUnifiedTerminalSession({ ...opts,
+        processSignals: null,
+        resolveHostAdapter: async () => ({ status: 'resolved', adapter, reason: 'fixture' }),
+        buildSpawn: async () => ({ spawnArgv: ['/fixture/claude'], spawnEnv: {} }),
+        readTerminalHostAttachmentInfo: async () => null,
+        persistTerminalHostAttachmentInfo: async () => {},
+        clearSessionMarkerTerminalHostHealth: async () => true,
+        onTerminalHostReady: async params => {
+          await opts.onTerminalHostReady?.(params);
+          for (const callback of hookCallbacks) callback({ hook_event_name: 'SessionStart',
+            session_id: 'claude-current', transcript_path: transcriptPath });
+        },
+        onRawTranscriptValue: (value, observation) => { rawValues += 1; opts.onRawTranscriptValue?.(value, observation); },
+        onWorkflowActivityObserverReady: () => {
+          observerReady = true;
+          opts.onWorkflowActivityObserverReady?.();
+
+        },
+      });
+    });
+    const launched = claudeUnifiedTerminalLauncher(session, {
+      initialMode: { permissionMode: 'default', claudeUnifiedTerminalHost: 'tmux' }, signal: abort.signal,
+    });
+    try {
+      await vi.waitFor(() => expect(observerReady && rawValues > 0).toBe(true));
+      await appendFile(transcriptPath, completedNativeChildTranscript('claude-current').filter((_, index) => index % 3 < 2)
+        .map((row, index) => JSON.stringify({ ...(row as object), sessionId: 'claude-current',
+          timestamp: new Date().toISOString(), uuid: `live-task-${index}` })).join('\n') + '\n');
+      await vi.waitFor(() => expect(snapshots.at(-1)?.agents.some(agent => agent.status === 'active'), JSON.stringify({ observerReady, rawValues, snapshots, events: vi.mocked(session.client.sendSessionEvent).mock.calls })).toBe(true),
+        { timeout: 5000 });
+      abort.abort();
+      await launched;
+      expect(disposeHost).not.toHaveBeenCalled();
+      expect((await adapter.evaluateLiveness()).paneAlive).toBe(true);
+      expect(snapshots.at(-1)?.status).toBe('active');
+      expect(snapshots.at(-1)?.agents.some(agent => agent.status === 'active')).toBe(true);
+    } finally {
+      abort.abort();
+      await launched;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  // Finalization requires the runtime's positive native-exit observation; wrapper return alone
+  // leaves a detached provider alive. Resolve before draining the durable workflow records.
   it('resolves live workflow runs and agents when the provider dies (RULING-14)', async () => {
     setProcessTty(false);
     const lifecycle: string[] = [];
@@ -4789,7 +4881,9 @@ describe('claudeUnifiedTerminalLauncher', () => {
       armStartupReconciliation: vi.fn(),
       dispose: vi.fn(() => { lifecycle.push('dispose'); }),
     });
-    mocks.runClaudeUnifiedTerminalSession.mockImplementationOnce(async () => {});
+    mocks.runClaudeUnifiedTerminalSession.mockImplementationOnce(async (opts: { onProviderProcessExit?: () => void }) => {
+      opts.onProviderProcessExit?.();
+    });
 
     await claudeUnifiedTerminalLauncher(createSession(), {
       initialMode: { permissionMode: 'default', claudeUnifiedTerminalHost: 'tmux' },
@@ -4822,7 +4916,7 @@ describe('claudeUnifiedTerminalLauncher', () => {
       },
     };
 
-    const runLauncher = async (explicitStop: boolean): Promise<string[]> => {
+    const runLauncher = async (explicitStop: boolean, hostLifecycle: 'owned' | 'borrowed' = 'owned'): Promise<string[]> => {
       const lifecycle: string[] = [];
       // The wrapper the launcher hands UP to its caller — the one `requestClaudeExplicitRunnerStop`
       // actually invokes on a user stop.
@@ -4832,7 +4926,7 @@ describe('claudeUnifiedTerminalLauncher', () => {
         getWorkflowOwnedAgentToolUseIds: vi.fn(() => new Set<string>()),
         isWorkflowOwnedProviderTaskId: vi.fn(() => false),
         isWorkflowOwnedTaskReference: vi.fn(() => false),
-        finalizeInterruptedActivityOnShutdown: vi.fn(),
+        finalizeInterruptedActivityOnShutdown: vi.fn(() => { lifecycle.push('finalize-workflow'); }),
         finalizeBackgroundTaskRecordsOnOrderlyStop: vi.fn(() => { lifecycle.push('finalize-background'); }),
         flush: vi.fn(async () => { lifecycle.push('flush'); }),
         reconcileStartupInterruptedRuns: vi.fn(async () => {}),
@@ -4842,16 +4936,16 @@ describe('claudeUnifiedTerminalLauncher', () => {
       mocks.runClaudeUnifiedTerminalSession.mockImplementationOnce(async (opts: {
         onTerminalHostReady?: (params: Readonly<{
           handle: TerminalHostHandle;
-          lifecycle: 'owned';
+          lifecycle: 'owned' | 'borrowed';
           terminal: NonNullable<TerminalAttachmentInfo['terminal']>;
           stopTerminalHostForExplicitStop: () => Promise<void>;
         }>) => void | Promise<void>;
       }) => {
         await opts.onTerminalHostReady?.({
           handle,
-          lifecycle: 'owned',
+          lifecycle: hostLifecycle,
           terminal,
-          stopTerminalHostForExplicitStop: async () => { lifecycle.push('destroy-host'); },
+          stopTerminalHostForExplicitStop: async () => { lifecycle.push(hostLifecycle === 'owned' ? 'destroy-host' : 'release-host'); },
         });
         if (explicitStop) await forwardedDestroyOwnedHost?.();
       });
@@ -4867,9 +4961,11 @@ describe('claudeUnifiedTerminalLauncher', () => {
 
     // Explicit stop: we destroyed the host, so the shells inside it died with it — a recorded
     // observation, and the resolution must land BEFORE the drain that writes it.
-    expect(await runLauncher(true)).toEqual(['destroy-host', 'finalize-background', 'flush']);
+    expect(await runLauncher(true)).toEqual(['destroy-host', 'finalize-workflow', 'finalize-background', 'flush']);
     // Same teardown, no explicit stop: the detached host may still be running the shell. Silence.
     expect(await runLauncher(false)).toEqual(['flush']);
+    // Releasing a borrowed host leaves its other processes alive and supplies no host-death fact.
+    expect(await runLauncher(true, 'borrowed')).toEqual(['release-host', 'flush']);
   });
 
   // INV-R C-1. Workflow-agent transcript import was built in wave 23 and wired on exactly ONE
