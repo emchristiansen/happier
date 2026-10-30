@@ -1430,7 +1430,7 @@ describe('runCodex CodexACP resume behavior', () => {
     expect(outcome).toMatchObject({ ok: false });
   });
 
-  it.each(['fresh', 'resumed', 'accepted-failed', 'before-acceptance-failed'] as const)('sends configured instructions only when owed after shared local attachment (%s)', async (lifecycle) => {
+  it.each(['fresh', 'resumed', 'accepted-failed', 'deferred-accepted-failed', 'before-acceptance-failed'] as const)('sends configured instructions only when owed after shared local attachment (%s)', async (lifecycle) => {
     if (lifecycle === 'resumed') mockAttachedSessionMetadata({ codexSessionId: 'shared-fresh', codexBackendMode: 'appServer' });
     resolveCodexSharedControlSupportSpy.mockResolvedValueOnce({ ok: true, version: '0.153.4' });
     resolveRunnerMcpServersSpy.mockResolvedValueOnce({
@@ -1464,13 +1464,20 @@ describe('runCodex CodexACP resume behavior', () => {
         if (turnCount === 1 && lifecycle === 'before-acceptance-failed') {
           throw new Error('synthetic refusal before turn acceptance');
         }
-        const failed = turnCount === 1 && lifecycle === 'accepted-failed';
-        setImmediate(() => { void notifications.get('turn/completed')?.({
+        const failed = turnCount === 1 && (lifecycle === 'accepted-failed' || lifecycle === 'deferred-accepted-failed');
+        const completion = {
           threadId: 'shared-fresh', turn: {
             id, status: failed ? 'failed' : 'completed',
             ...(failed ? { error: { message: 'synthetic failure after turn acceptance' } } : {}),
           },
-        }); });
+        };
+        if (turnCount === 1 && lifecycle === 'deferred-accepted-failed') {
+          const notify = notifications.get('turn/completed');
+          if (!notify) throw new Error('Native terminal handler missing before turn/start response');
+          await notify(completion);
+        } else {
+          setImmediate(() => { void notifications.get('turn/completed')?.(completion); });
+        }
         return { turn: { id } };
       }
       throw new Error(`Unconfigured synthetic provider request: ${method}`);

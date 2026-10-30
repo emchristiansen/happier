@@ -5678,6 +5678,12 @@ export function createCodexAppServerRuntime(params: Readonly<{
                     if (startedTurnId) {
                         pendingTurn = { ...activeTurn, turnId: startedTurnId };
                         latestPendingTurnId = startedTurnId;
+                    }
+                    // The response proves acceptance before deferred terminal cleanup can retire the prompt.
+                    markPendingProviderPromptAccepted(pendingProviderPrompt, startedTurnId, {
+                        retainUntilProviderUserMessageProjection: true,
+                    });
+                    if (startedTurnId) {
                         notifyActiveTurnLifecycleChanged();
                         recordInProgressBestEffort(startedTurnId);
                         await turnBoundaryTracker.updateActiveTurnId(startedTurnId);
@@ -5692,9 +5698,6 @@ export function createCodexAppServerRuntime(params: Readonly<{
                     } else {
                         markActiveTurnSteerable();
                     }
-                    markPendingProviderPromptAccepted(pendingProviderPrompt, startedTurnId, {
-                        retainUntilProviderUserMessageProjection: true,
-                    });
                     // A native goal successor is a distinct provider turn, not an extension of
                     // this explicit prompt. The session loop preserves that successor through
                     // hasActiveProviderTurn(), which includes the atomic handoff barrier.
