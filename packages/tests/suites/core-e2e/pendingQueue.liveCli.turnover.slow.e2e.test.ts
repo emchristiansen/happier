@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, it } from 'vitest';
 
 import { repoRootDir } from '../../src/testkit/paths';
 import { runLoggedCommand } from '../../src/testkit/process/spawnProcess';
+import { sanitizeCliTestEnv } from '../../src/testkit/process/cliTestEnv';
 import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
 import { resolveTsxImportHookSpecifier } from '../../src/testkit/process/tsxImportHook';
 import { createRunDirs } from '../../src/testkit/runDir';
@@ -30,8 +31,11 @@ describe('core e2e: live CLI custody across real publisher turnover', () => {
         server.baseUrl, scenario, testDir, server.dataDir],
       cwd: root,
       env: {
-        ...process.env,
+        ...sanitizeCliTestEnv(process.env),
+        HAPPIER_HOME_DIR: resolve(testDir, 'cli-home'),
         HAPPIER_SERVER_URL: server.baseUrl,
+        HAPPIER_PUBLIC_SERVER_URL: server.baseUrl,
+        HAPPIER_LOCAL_SERVER_URL: server.baseUrl,
         HAPPIER_PENDING_CUSTODY_OUTCOME_TIMEOUT_MS: '987654321',
         TSX_TSCONFIG_PATH: resolve(root, 'apps/cli/tsconfig.json'),
       },
