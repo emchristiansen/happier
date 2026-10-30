@@ -444,6 +444,10 @@ async function main() {
     }
   }
 
+  if (!tagEnsured && !dryRun) {
+    fail(`Cannot publish release ${tag}: tag ref could not be ensured at ${sha}.`);
+  }
+
   const prereleaseFlag = prerelease ? ['--prerelease'] : [];
   const approvedReleaseBody = releaseMessage.trim();
 
