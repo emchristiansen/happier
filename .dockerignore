@@ -3,6 +3,16 @@
 node_modules
 **/node_modules
 **/dist
+# Local relay builds consume one exact server archive/envelope from this directory.
+# Other matching server outputs can enter the context but are never selected implicitly.
+!dist/
+dist/*
+!dist/release-assets/
+dist/release-assets/*
+!dist/release-assets/server/
+dist/release-assets/server/*
+!dist/release-assets/server/happier-server-*.tar.gz
+!dist/release-assets/server/checksums-happier-server-*.txt
 **/.turbo
 **/.next
 
