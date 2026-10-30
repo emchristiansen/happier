@@ -1082,15 +1082,16 @@ export async function machinePreviewEnv(
 
 export async function machineCollectBugReportDiagnostics(
     machineId: string,
-    options?: { timeoutMs?: number },
+    options?: { timeoutMs?: number; serverId?: string },
 ): Promise<BugReportCollectDiagnosticsResult | null> {
     try {
-        return await apiSocket.machineRPC<BugReportCollectDiagnosticsResult, {}>(
+        return await machineRpcWithServerScope<BugReportCollectDiagnosticsResult, {}>({
             machineId,
-            RPC_METHODS.BUGREPORT_COLLECT_DIAGNOSTICS,
-            {},
-            options,
-        );
+            serverId: options?.serverId,
+            timeoutMs: options?.timeoutMs,
+            method: RPC_METHODS.BUGREPORT_COLLECT_DIAGNOSTICS,
+            payload: {},
+        });
     } catch {
         return null;
     }

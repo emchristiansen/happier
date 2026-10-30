@@ -140,7 +140,7 @@ export const SystemStatusView = React.memo(function SystemStatusView() {
       [params.machineId]: { status: 'loading' },
     }));
 
-    const diagnostics = await machineCollectBugReportDiagnostics(params.machineId, { timeoutMs: params.timeoutMs });
+    const diagnostics = await machineCollectBugReportDiagnostics(params.machineId, { serverId: params.serverId, timeoutMs: params.timeoutMs });
     const fetchedAt = Date.now();
 
     const rawDoctorSnapshot = (diagnostics as { doctorSnapshot?: unknown } | null)?.doctorSnapshot;
