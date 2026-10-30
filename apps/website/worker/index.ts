@@ -51,7 +51,9 @@ async function proxyToPostHog(request: Request, url: URL): Promise<Response> {
     // posthog-js fetches its lazily-loaded chunks from /static/*, which lives on
     // the assets host, not the API host.
     const origin = path.startsWith('/static/') ? ASSETS_ORIGIN : API_ORIGIN;
-    const target = new URL(path + url.search, origin);
+    const target = new URL(origin);
+    target.pathname = path;
+    target.search = url.search;
 
     const outbound = new Request(target, request);
     // PostHog derives the cookieless identity hash from the request; the
