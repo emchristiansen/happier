@@ -33,8 +33,7 @@ export const DMG_TEXT_SIZE = 12;
 export const HIDDEN_VOLUME_ITEMS = Object.freeze(['.background', '.VolumeIcon.icns', '.fseventsd', '.Trashes']);
 
 function fail(message) {
-  console.error(message);
-  process.exit(1);
+  throw new Error(message);
 }
 
 /**
@@ -281,5 +280,10 @@ function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main();
+  try {
+    main();
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  }
 }
