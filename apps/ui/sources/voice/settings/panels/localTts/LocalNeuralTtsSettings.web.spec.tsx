@@ -210,4 +210,60 @@ describe('LocalNeuralTtsSettings (web)', () => {
     expect(warmupArg?.timeoutMs).toBe(120_000);
   });
 
+  it('allows cache clearing and retry after cancelling real web preparation', async () => {
+    const realTts = await vi.importActual<typeof import('@/voice/kokoro/runtime/synthesizeKokoroWav.web')>(
+      '@/voice/kokoro/runtime/synthesizeKokoroWav.web',
+    );
+    prepareKokoroTtsSpy.mockImplementation(realTts.prepareKokoroTts);
+    synthesizeKokoroWavSpy.mockImplementation(realTts.synthesizeKokoroWav);
+    const requests: Array<{ id: string; type: string }> = [];
+    class PreparationWorker {
+      onmessage: ((event: { data: unknown }) => void) | null = null;
+      postMessage(message: { id: string; type: string }) {
+        requests.push(message);
+        if (message.type === 'generate' || (message.type === 'prepare' && requests.filter((r) => r.type === 'prepare').length > 1)) {
+          this.onmessage?.({ data: { id: message.id, type: 'result', wavBytes: new ArrayBuffer(0) } });
+        }
+      }
+      terminate() {}
+    }
+    vi.stubGlobal('Worker', PreparationWorker);
+    try {
+      const { LocalNeuralTtsSettings } = await import('./LocalNeuralTtsSettings.web');
+      const { Modal } = await import('@/modal');
+      const { clearKokoroBrowserCaches } = await import('@/voice/kokoro/assets/kokoroBrowserCache');
+      const tree = (await renderScreen(React.createElement(LocalNeuralTtsSettings, {
+        cfgKokoro: { model: 'kokoro', assetId: null, voiceId: null, speed: null },
+        setKokoro: vi.fn(),
+        networkTimeoutMs: 1000,
+        popoverBoundaryRef: null,
+      }))).tree;
+      await act(async () => {});
+      const modelItem = () => tree.root.findAll((n) => n.props?.title === 'settingsVoice.local.kokoro.model.title')
+        .find((n) => typeof n.props?.onPress === 'function')!;
+      await act(async () => { await pressTestInstanceAsync(modelItem()); });
+      expect(requests.filter((r) => r.type === 'prepare')).toHaveLength(1);
+      expect(modelItem().props.rightElement).toBeTruthy();
+      await act(async () => { modelItem().props.rightElement.props.onPress({ stopPropagation() {} }); });
+      expect(requests.some((r) => r.type === 'cancel')).toBe(true);
+      expect(modelItem().props.detail).toBe('settingsVoice.local.kokoro.modelStatus.notDownloaded');
+      expect(modelItem().props.rightElement).toBeUndefined();
+      expect(modalAlertSpy).not.toHaveBeenCalled();
+
+      vi.mocked(Modal.confirm).mockResolvedValueOnce(true);
+      const cacheItem = tree.root.findAll((n) => n.props?.title === 'settingsVoice.local.kokoro.web.cache.title')
+        .find((n) => typeof n.props?.onPress === 'function')!;
+      await act(async () => { await pressTestInstanceAsync(cacheItem); });
+      expect(clearKokoroBrowserCaches).toHaveBeenCalled();
+      await act(async () => { await pressTestInstanceAsync(modelItem()); });
+      expect(requests.filter((r) => r.type === 'prepare')).toHaveLength(2);
+      expect(requests.some((r) => r.type === 'generate')).toBe(true);
+      expect(modelItem().props.detail).toBe('settingsVoice.local.kokoro.modelStatus.ready');
+    } finally {
+      prepareKokoroTtsSpy.mockReset();
+      synthesizeKokoroWavSpy.mockReset();
+      vi.unstubAllGlobals();
+    }
+  });
+
 });
