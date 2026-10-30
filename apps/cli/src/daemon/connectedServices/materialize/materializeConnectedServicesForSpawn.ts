@@ -490,10 +490,10 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
             diagnostics: materialized.diagnostics,
           });
           assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
+          // Backup retirement can fail after a valid promotion. Bind the new root before
+          // that retirement so failure and cancellation still revoke its credentials.
+          cleanupFinalRoot = retireMaterializedHome(rootDir, params.agentId, 'materialized_home', await lstat(rootDir));
         },
-      }).then(async () => {
-        cleanupFinalRoot = retireMaterializedHome(rootDir, params.agentId, 'materialized_home', await lstat(rootDir));
-        assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
       });
       await promotion;
     });
@@ -510,12 +510,15 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
       env: buildPromotedEnv(),
     };
   } catch (error) {
-    try {
-      materialized.cleanupOnFailure?.();
-    } catch {
-      // Preserve the validation or promotion failure as the actionable error.
+    const releases = await Promise.allSettled([
+      Promise.resolve().then(() => materialized.cleanupOnFailure?.()),
+      Promise.resolve().then(() => cleanupFinalRoot?.()),
+      cleanupRoot(),
+    ]);
+    const failures = releases.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+    if (failures.length > 0) {
+      throw new AggregateError([error, ...failures], 'Materialization failed and credential retirement failed; history was retained');
     }
-    cleanupRoot();
     throw error;
   } finally {
     forgetActiveAttemptIfCurrent(rootDir, attemptId);

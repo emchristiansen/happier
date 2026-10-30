@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { readFile, writeFile } from 'node:fs/promises';
 import fsPromises from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
-import { dirname, join, sep } from 'node:path';
+import { basename, dirname, join, sep } from 'node:path';
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { buildConnectedServiceCredentialRecord } from '@happier-dev/protocol';
 
@@ -99,6 +99,7 @@ describe('capabilities.invoke pre-session catalogs', () => {
         const location = String(path);
         if (armed && !held && boundary === 'mkdir' && location.includes(`${join('materialized', '.attempts')}${sep}`)) {
           acquiredAttempt = location;
+          await fsPromises.writeFile(join(acquiredAttempt, 'probe-artifact.txt'), `synthetic ${boundary} artifact`);
           held = true;
           await heldFilesystem;
         }
@@ -110,6 +111,7 @@ describe('capabilities.invoke pre-session catalogs', () => {
         const location = String(path);
         if (armed && !held && boundary === 'write' && location.includes(`${join('materialized', '.attempts')}${sep}`) && String(data).includes('fixture-access')) {
           acquiredAttempt = dirname(dirname(location));
+          await originalWriteFile(join(acquiredAttempt, 'probe-artifact.txt'), `synthetic ${boundary} artifact`);
           held = true;
           await heldFilesystem;
         }
@@ -120,6 +122,7 @@ describe('capabilities.invoke pre-session catalogs', () => {
         if (armed && !held && boundary === 'promote' && String(source).includes(`${join('materialized', '.attempts')}${sep}`)
           && !String(target).includes(`${join('materialized', '.attempts')}${sep}`)) {
           acquiredAttempt = String(target);
+          await originalWriteFile(join(acquiredAttempt, 'probe-artifact.txt'), `synthetic ${boundary} artifact`);
           held = true;
           await heldFilesystem;
         }
@@ -158,8 +161,15 @@ describe('capabilities.invoke pre-session catalogs', () => {
         releaseFilesystem();
         await expect(pending).resolves.toMatchObject({ ok: false, error: { code: 'preflight-catalog-unavailable' } });
         if (acquiredAttempt) {
-          expect(existsSync(acquiredAttempt)).toBe(false);
-          expect(await fsPromises.readdir(dirname(acquiredAttempt))).toEqual([]);
+          if (boundary === 'promote') {
+            // Cancellation rolls the promoted directory aside while retaining its distinct bytes.
+            const rejected = (await fsPromises.readdir(dirname(acquiredAttempt)))
+              .filter((entry) => entry.startsWith(`${basename(acquiredAttempt!)}.rejected-`));
+            expect(rejected).toHaveLength(1);
+            acquiredAttempt = join(dirname(acquiredAttempt), rejected[0]);
+          }
+          expect(await readFile(join(acquiredAttempt, 'probe-artifact.txt'), 'utf8')).toBe(`synthetic ${boundary} artifact`);
+          expect(existsSync(join(acquiredAttempt, 'codex-home', 'auth.json'))).toBe(false);
         }
         expect(existsSync(startupPath)).toBe(false);
         armed = false;
@@ -173,12 +183,10 @@ describe('capabilities.invoke pre-session catalogs', () => {
         } })).resolves.toMatchObject({ ok: true });
         const pid = Number((await readFile(startupPath, 'utf8')).trim());
         expect(() => process.kill(pid, 0)).toThrow();
-        if (acquiredAttempt) expect(await fsPromises.readdir(dirname(acquiredAttempt))).toEqual([]);
+        if (acquiredAttempt) expect(await readFile(join(acquiredAttempt, 'probe-artifact.txt'), 'utf8')).toBe(`synthetic ${boundary} artifact`);
       } finally {
         releaseFilesystem();
         await pending;
-        // The unfixed owner can return early; let its already-started OS work finish before teardown.
-        if (acquiredAttempt) await vi.waitFor(() => expect(existsSync(acquiredAttempt!)).toBe(false), { timeout: 5_000 });
         mkdir.mockRestore();
         write.mockRestore();
         rename.mockRestore();

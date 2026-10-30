@@ -1444,10 +1444,12 @@ describe('Codex home materialization preserves runtime custody', () => {
     await writeFile(join(home, 'AGENTS.md'), 'stale config omitted by stage');
     await mkdir(join(home, 'accounts'), { recursive: true });
     await writeFile(join(home, 'accounts', 'stale.json'), 'synthetic stale owned data');
+    await writeFile(join(home, 'probe-history.jsonl'), 'synthetic promoted history\n');
     if (purpose === 'probe') {
       // Directory contents have no qualified credential schema. Refuse retirement, retain both
       // homes, and keep the newly promoted runtime lock; never recursively erase the old tree.
       await expect(materializeConnectedServicesForSpawn(params)).rejects.toThrow();
+      await expect(lstat(join(home, 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
       const previous = (await readdir(dirname(dirname(home)))).find((entry) => entry.startsWith('codex.previous-'));
       expect(previous).toBeDefined();
       expect(await readFile(join(dirname(dirname(home)), previous!, 'codex-home', 'accounts', 'stale.json'), 'utf8')).toBe('synthetic stale owned data');
@@ -1455,6 +1457,7 @@ describe('Codex home materialization preserves runtime custody', () => {
       await materializeConnectedServicesForSpawn(params);
     }
     expect((await stat(lockPath)).ino).toBe(before.ino);
+    expect(await readFile(join(home, 'probe-history.jsonl'), 'utf8')).toBe('synthetic promoted history\n');
     if (purpose === 'probe') {
       await expect(lstat(join(home, 'AGENTS.md'))).rejects.toMatchObject({ code: 'ENOENT' });
       await expect(lstat(join(home, 'accounts', 'stale.json'))).rejects.toMatchObject({ code: 'ENOENT' });

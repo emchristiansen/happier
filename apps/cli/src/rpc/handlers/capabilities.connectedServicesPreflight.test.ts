@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
+import fsPromises from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import axios from 'axios';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
@@ -16,6 +18,7 @@ import {
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
+import { writeExecutableShim } from '@/testkit/fs/executableShim';
 import type { Credentials } from '@/persistence';
 
 const envKeys = [
@@ -35,6 +38,7 @@ let tempDir: string | null = null;
 
 afterEach(() => {
   vi.restoreAllMocks();
+  syncBuiltinESMExports();
   vi.doUnmock('@/api/api');
   vi.doUnmock('@/persistence');
   vi.doUnmock('@/settings/accountSettings/bootstrapAccountSettingsContext');
@@ -170,13 +174,21 @@ describe('capabilities.invoke connected-service preflight', () => {
     });
   }, 90_000);
 
-  it('materializes a selected Codex auth group through the canonical spawn resolver without a legacy stable home', async () => {
+  it.each([false, true])('retains selected-account probe history and reports credential retirement failure: %s', async (retirementFails) => {
     vi.resetModules();
     tempDir = mkdtempSync(join(tmpdir(), 'happier-capability-connected-preflight-'));
     process.env.HAPPIER_HOME_DIR = tempDir;
-    process.env.HAPPIER_CODEX_APP_SERVER_BIN = fileURLToPath(
-      new URL('../../backends/codex/preflight/__fixtures__/fakeCodexAppServer.mjs', import.meta.url),
-    );
+    const fixtureUrl = new URL('../../backends/codex/preflight/__fixtures__/fakeCodexAppServer.mjs', import.meta.url);
+    process.env.HAPPIER_CODEX_APP_SERVER_BIN = await writeExecutableShim({
+      dir: tempDir, fileName: 'history-writing-codex.mjs', contents: `#!${process.execPath}\n
+        import { mkdirSync, writeFileSync } from 'node:fs';
+        import { join } from 'node:path';
+        const sessions = join(process.env.CODEX_HOME, 'sessions');
+        mkdirSync(sessions, { recursive: true });
+        writeFileSync(join(sessions, 'probe.jsonl'), 'synthetic probe history\\n');
+        await import(${JSON.stringify(fixtureUrl.href)});
+      `,
+    });
     process.env.HAPPIER_FAKE_CODEX_APP_SERVER_DELAY_MS = '1';
     const captureFile = join(tempDir, 'captured-env.json');
     process.env.HAPPIER_FAKE_CODEX_APP_SERVER_ENV_CAPTURE_FILE = captureFile;
@@ -242,6 +254,14 @@ describe('capabilities.invoke connected-service preflight', () => {
     reloadConfiguration();
     await writeFile(configuration.privateKeyFile, JSON.stringify({ token: credentials.token,
       secret: Buffer.from(credentials.encryption.secret).toString('base64') }));
+    const unlink = fsPromises.unlink;
+    vi.spyOn(fsPromises, 'unlink').mockImplementation(async (path) => {
+      if (retirementFails && existsSync(captureFile) && String(path).endsWith(join('codex-home', 'auth.json'))) {
+        throw Object.assign(new Error('Synthetic credential retirement denied'), { code: 'EACCES' });
+      }
+      await unlink(path);
+    });
+    syncBuiltinESMExports();
     const legacyGroupHome = join(
       configuration.activeServerDir,
       'daemon',
@@ -286,7 +306,9 @@ describe('capabilities.invoke connected-service preflight', () => {
       },
     });
 
-    expect(response, JSON.stringify(response)).toMatchObject({ ok: true, result: { source: 'dynamic' } });
+    expect(response, JSON.stringify(response)).toMatchObject(retirementFails
+      ? { ok: false, error: { code: 'preflight-catalog-unavailable' } }
+      : { ok: true, result: { source: 'dynamic' } });
     expect(requests).toEqual(expect.arrayContaining([
       '/v3/connect/openai-codex/groups/happier',
       '/v3/connect/openai-codex/profiles/leeroy/credential',
@@ -300,7 +322,8 @@ describe('capabilities.invoke connected-service preflight', () => {
     // Codex's SQLite/session state rooted in the configured native home.
     expect(relative(materializedBase, String(captured.CODEX_SQLITE_HOME))).toMatch(/^\.\.(?:[\\/]|$)/u);
     expect(String(captured.CODEX_HOME)).not.toBe(legacyGroupHome);
-    expect(existsSync(String(captured.CODEX_HOME))).toBe(false);
+    expect(readFileSync(join(String(captured.CODEX_HOME), 'sessions', 'probe.jsonl'), 'utf8')).toBe('synthetic probe history\n');
+    expect(existsSync(join(String(captured.CODEX_HOME), 'auth.json'))).toBe(retirementFails);
   }, 90_000);
 
   it('fails closed instead of probing ambient auth when selected connected-service credentials are unavailable', async () => {
