@@ -369,6 +369,7 @@ function buildPlaywrightHarnessNodeScript(options = {}) {
     lines.push('  "stepsJson": steps,');
     lines.push('}');
     lines.push('Path(out_dir, "meta.json").write_text(json.dumps(payload), encoding="utf-8")');
+    lines.push('Path(out_dir, "summary.json").write_text(json.dumps({"kind": "wsrepl_handoff_matrix_summary", "ok": True, "sessionId": sid_value}), encoding="utf-8")');
     lines.push('PY');
     lines.push('  echo "stub ok"');
   }
@@ -384,6 +385,39 @@ function buildPlaywrightHarnessNodeScript(options = {}) {
 async function writeScript(filePath, content) {
   await writeFile(filePath, content, 'utf8');
   await chmod(filePath, 0o755);
+}
+
+for (const omitSession of [false, true]) {
+  test(`wsrepl fake result producer: ${omitSession ? 'preserves missing session' : 'writes current summary'}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'wsrepl-fake-producer-'));
+    const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir'], {
+      env: { PATH: process.env.PATH }, encoding: 'utf8',
+    });
+    assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+    const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+    assert.equal(tools.length, 3);
+    const toolPath = [...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter);
+    const script = join(root, 'fake-node');
+    await writeScript(script, buildPlaywrightHarnessNodeScript({ includeDaemonControl: false, sessionId: 'sess_local_producer' }));
+    const steps = JSON.stringify([{ targetMachineId: 'machine-a', strategy: 'sync_changes' }, { targetMachineId: 'machine-b', strategy: 'direct_peer' }]);
+    const result = spawnSync(tools[0], [script, '/fixture/playwright-session-handoff-wsrepl-matrix.mjs'], {
+      env: { ...testEnv, HOME: root, PATH: `${toolPath}:${testEnv.PATH}`, HAPPIER_QA_OUTDIR: root,
+        HAPPIER_QA_STEPS_JSON: steps, HAPPIER_QA_TEST_STUB_OMIT_SESSION_ID: omitSession ? '1' : '0' },
+      encoding: 'utf8',
+    });
+    await writeFile(join(root, 'fixture.stdout'), result.stdout ?? '');
+    await writeFile(join(root, 'fixture.stderr'), result.stderr ?? '');
+    assert.equal(result.status, 0, result.stderr);
+    const meta = JSON.parse(await readFile(join(root, 'meta.json'), 'utf8'));
+    assert.equal(meta.sessionId, omitSession ? null : 'sess_local_producer');
+    assert.equal(meta.stepsJson, steps);
+    if (!omitSession) {
+      const summary = JSON.parse(await readFile(join(root, 'summary.json'), 'utf8'));
+      assert.equal(summary.kind, 'wsrepl_handoff_matrix_summary');
+      assert.equal(summary.ok, true);
+      assert.equal(summary.sessionId, meta.sessionId);
+    }
+  });
 }
 
 test('macos wsrepl lima matrix wrapper defaults Playwright to headless (supports --headed override)', async () => {
