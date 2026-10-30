@@ -174,13 +174,14 @@ function resolveRuntimeStatusFreshnessRefreshDelayMs(
 }
 
 function useRuntimeStatusFreshnessRefresh(input: RuntimeStatusFreshnessRefreshInput): void {
-    const [, refresh] = React.useReducer((value: number) => value + 1, 0);
+    const [freshnessRevision, refresh] = React.useReducer((value: number) => value + 1, 0);
     React.useEffect(() => {
         const delayMs = resolveRuntimeStatusFreshnessRefreshDelayMs(input, Date.now());
         if (delayMs === null) return undefined;
         const timeoutId = setTimeout(refresh, delayMs);
         return () => clearTimeout(timeoutId);
     }, [
+        freshnessRevision,
         input.session.active,
         input.session.activeAt,
         input.session.presence,

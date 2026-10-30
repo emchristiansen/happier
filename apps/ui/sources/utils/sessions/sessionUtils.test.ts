@@ -1599,6 +1599,35 @@ describe('getSessionStatus', () => {
 });
 
 describe('useSessionStatus', () => {
+    it('refreshes across successive runtime freshness deadlines without a storage update', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        try {
+            const { useSessionStatus, shouldShowAbortButtonForSessionState, SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS } = await import('./sessionUtils');
+            const session = createBaseSession({
+                thinking: false,
+                latestTurnStatus: 'in_progress',
+                latestTurnStatusObservedAt: Date.now() - SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS + 5,
+                activeAt: Date.now() - SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS + 10,
+            });
+            const hook = await renderHook(() => useSessionStatus(session, {
+                subscribeToSession: false,
+                subscribeToTranscript: false,
+            }));
+
+            expect(hook.getCurrent().state).toBe('thinking');
+            await flushHookEffects({ cycles: 1, turns: 0, advanceTimersMs: 5 });
+            expect(hook.getCurrent().state).toBe('thinking');
+            expect(shouldShowAbortButtonForSessionState(hook.getCurrent().state)).toBe(true);
+
+            await flushHookEffects({ cycles: 1, turns: 0, advanceTimersMs: 5 });
+            expect(hook.getCurrent().state).toBe('waiting');
+            expect(shouldShowAbortButtonForSessionState(hook.getCurrent().state)).toBe(false);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it('refreshes when fresh thinking expires without a storage update', async () => {
         vi.useFakeTimers();
         vi.setSystemTime(1_000_000);
