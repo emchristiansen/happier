@@ -7410,8 +7410,7 @@ describe('createCodexAppServerRuntime', () => {
             const published: string[] = [];
             let signalToolCall!: () => void;
             const toolCallSeen = new Promise<void>((resolve) => { signalToolCall = resolve; });
-            const session = {
-                ...createApiSessionClientFixture(),
+            const session = Object.assign(createApiSessionClientFixture(), {
                 sendCodexMessage: (message: unknown) => {
                     if (message && typeof message === 'object'
                         && (message as Record<string, unknown>).type === 'tool-call'
@@ -7425,7 +7424,7 @@ describe('createCodexAppServerRuntime', () => {
                 updateAgentStateRequestSettlement: async (update: (current: AgentState) => AgentState) => {
                     state = update(state);
                 },
-            };
+            });
             const permissionHandler = createCodexPermissionHandler({ session });
             // Only the native RPC transport and session persistence are controlled; approval creation is real.
             const client: DisposableCodexAppServerClient = {
