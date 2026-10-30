@@ -174,18 +174,27 @@ describe('capabilities.invoke connected-service preflight', () => {
     });
   }, 90_000);
 
-  it.each([false, true])('retains selected-account probe history and reports credential retirement failure: %s', async (retirementFails) => {
+  it.each([
+    { stateMode: 'isolated', retirementFails: false },
+    { stateMode: 'shared', retirementFails: false },
+    { stateMode: 'isolated', retirementFails: true },
+  ] as const)('retains $stateMode probe history and reports retirement failure $retirementFails', async ({ stateMode, retirementFails }) => {
     vi.resetModules();
     tempDir = mkdtempSync(join(tmpdir(), 'happier-capability-connected-preflight-'));
     process.env.HAPPIER_HOME_DIR = tempDir;
     const fixtureUrl = new URL('../../backends/codex/preflight/__fixtures__/fakeCodexAppServer.mjs', import.meta.url);
     process.env.HAPPIER_CODEX_APP_SERVER_BIN = await writeExecutableShim({
       dir: tempDir, fileName: 'history-writing-codex.mjs', contents: `#!${process.execPath}\n
-        import { mkdirSync, writeFileSync } from 'node:fs';
+        import { lstatSync, mkdirSync, writeFileSync } from 'node:fs';
         import { join } from 'node:path';
         const sessions = join(process.env.CODEX_HOME, 'sessions');
         mkdirSync(sessions, { recursive: true });
         writeFileSync(join(sessions, 'probe.jsonl'), 'synthetic probe history\\n');
+        writeFileSync(${JSON.stringify(join(tempDir, 'history-ownership.json'))}, JSON.stringify({
+          homeIsSymlink: lstatSync(process.env.CODEX_HOME).isSymbolicLink(),
+          sessionsIsSymlink: lstatSync(sessions).isSymbolicLink(),
+          transcriptIsFile: lstatSync(join(sessions, 'probe.jsonl')).isFile(),
+        }));
         await import(${JSON.stringify(fixtureUrl.href)});
       `,
     });
@@ -237,7 +246,12 @@ describe('capabilities.invoke connected-service preflight', () => {
       requests.push(path);
       expect(options?.headers).toMatchObject({ Authorization: 'Bearer test-happier-token' });
       const data = path === '/v2/account/settings'
-        ? { content: { t: 'plain', v: { schemaVersion: 6, codexBackendMode: 'appServer' } }, version: 1 }
+        ? { content: { t: 'plain', v: { schemaVersion: 6, codexBackendMode: 'appServer',
+          connectedServicesProviderStateSharingSettingsV1: {
+            v: 1, defaults: { configMode: 'isolated', stateMode },
+            byAgentId: {}, acknowledgedRisksByAgentId: {},
+          },
+        } }, version: 1 }
         : path === '/v1/account/encryption' ? { mode: 'plain', updatedAt: 0 }
         : path === '/v3/connect/openai-codex/groups/happier' ? { group }
         : path === '/v3/connect/openai-codex/profiles/leeroy/credential'
@@ -318,10 +332,18 @@ describe('capabilities.invoke connected-service preflight', () => {
     expect(captured.CODEX_AUTH_FILE_PRESENT).toBe(true);
     const materializedBase = join(tempDir, 'daemon', 'connected-services', 'materialized');
     expect(relative(materializedBase, String(captured.CODEX_HOME))).not.toMatch(/^\.\.(?:[\\/]|$)/u);
-    // Connected auth stays isolated while the default state-sharing policy keeps
-    // Codex's SQLite/session state rooted in the configured native home.
-    expect(relative(materializedBase, String(captured.CODEX_SQLITE_HOME))).toMatch(/^\.\.(?:[\\/]|$)/u);
+    const sqliteRelative = relative(materializedBase, String(captured.CODEX_SQLITE_HOME));
+    if (stateMode === 'shared') {
+      expect(sqliteRelative).toMatch(/^\.\.(?:[\\/]|$)/u);
+      // Shared native history must survive independently of its materialized link.
+      expect(readFileSync(join(tempDir, 'native-codex-home', 'sessions', 'probe.jsonl'), 'utf8')).toBe('synthetic probe history\n');
+    } else {
+      expect(sqliteRelative).not.toMatch(/^\.\.(?:[\\/]|$)/u);
+    }
     expect(String(captured.CODEX_HOME)).not.toBe(legacyGroupHome);
+    expect(JSON.parse(readFileSync(join(tempDir, 'history-ownership.json'), 'utf8'))).toEqual({
+      homeIsSymlink: false, sessionsIsSymlink: stateMode === 'shared', transcriptIsFile: true,
+    });
     expect(readFileSync(join(String(captured.CODEX_HOME), 'sessions', 'probe.jsonl'), 'utf8')).toBe('synthetic probe history\n');
     expect(existsSync(join(String(captured.CODEX_HOME), 'auth.json'))).toBe(retirementFails);
   }, 90_000);
