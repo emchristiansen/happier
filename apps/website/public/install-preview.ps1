@@ -1518,12 +1518,14 @@ function Get-InstallerAssetVersionSortKey {
   $prereleaseRank = '0|'
   foreach ($part in ($prerelease -split '\.')) {
     if ($part -match '^\d+$') {
-      $prereleaseRank += '0|{0:D9}|' -f [int]$part
+      $prereleaseRank += '1|0|{0:D9}|' -f [int]$part
     }
     else {
-      $prereleaseRank += "1|$part|"
+      $prereleaseRank += "1|1|$part|"
     }
   }
+  # End the component sequence before the filename tie-break; a continuation sorts later.
+  $prereleaseRank += '0|'
   return "$sortKey$prereleaseRank$Name"
 }
 
