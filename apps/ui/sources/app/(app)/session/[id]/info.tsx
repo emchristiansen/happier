@@ -212,66 +212,28 @@ function shallowEqualRecord(
 
 function areSessionInfoStaticFieldsEqual(previous: Session, next: Session): boolean {
     if (previous === next) return true;
+    // Only status-independent counters are excluded; runtime observations must reach useSessionStatus.
     const {
         updatedAt: _previousUpdatedAt,
         seq: _previousSeq,
         lastViewedSessionSeq: _previousLastViewedSessionSeq,
-        activeAt: _previousActiveAt,
         latestReadyEventSeq: _previousLatestReadyEventSeq,
-        latestReadyEventAt: _previousLatestReadyEventAt,
         pendingVersion: _previousPendingVersion,
         metadataVersion: _previousMetadataVersion,
         agentStateVersion: _previousAgentStateVersion,
-        thinkingAt: _previousThinkingAt,
         ...previousStaticFields
     } = previous;
     const {
         updatedAt: _nextUpdatedAt,
         seq: _nextSeq,
         lastViewedSessionSeq: _nextLastViewedSessionSeq,
-        activeAt: _nextActiveAt,
         latestReadyEventSeq: _nextLatestReadyEventSeq,
-        latestReadyEventAt: _nextLatestReadyEventAt,
         pendingVersion: _nextPendingVersion,
         metadataVersion: _nextMetadataVersion,
         agentStateVersion: _nextAgentStateVersion,
-        thinkingAt: _nextThinkingAt,
         ...nextStaticFields
     } = next;
     return shallowEqualRecord(previousStaticFields, nextStaticFields);
-}
-
-function useStableSessionInfoContentSession(session: Session | null): Session | null {
-    return React.useMemo(() => session, [
-        session?.id,
-        session?.serverId,
-        session?.encryptionMode,
-        session?.createdAt,
-        session?.active,
-        session?.archivedAt,
-        session?.pendingCount,
-        session?.pendingPermissionRequestCount,
-        session?.pendingUserActionRequestCount,
-        session?.pendingRequestObservedAt,
-        session?.latestTurnStatus,
-        session?.latestTurnStatusObservedAt,
-        session?.lastRuntimeIssue,
-        session?.metadata,
-        session?.agentState,
-        session?.thinking,
-        session?.presence,
-        session?.optimisticThinkingAt,
-        session?.thinkingGraceUntil,
-        session?.todos,
-        session?.permissionMode,
-        session?.permissionModeUpdatedAt,
-        session?.modelMode,
-        session?.modelModeUpdatedAt,
-        session?.owner,
-        session?.ownerProfile,
-        session?.accessLevel,
-        session?.canApprovePermissions,
-    ]);
 }
 
 function areSessionInfoContentPropsEqual(
@@ -1495,7 +1457,6 @@ export default () => {
     // Handle three states: loading, deleted, and exists.
     // If the session record is already present, fail open and render it even if global hydration
     // is still in progress; otherwise deep links can get stuck in a permanent spinner state.
-    const contentSession = useStableSessionInfoContentSession(session);
 
     if (!session && (!isDataReady || !sessionHydrated) && !sessionMissingAfterHydration) {
         // Still loading data
@@ -1521,7 +1482,7 @@ export default () => {
     return (
         <View testID="session-info-screen" style={{ flex: 1 }}>
             <MemoizedSessionInfoContent
-                session={contentSession ?? session}
+                session={session}
                 sessionServerId={sessionServerId}
                 sourceMachineIdForHandoff={sourceMachineIdForHandoff}
                 runtimeAvailability={runtimeAvailability}

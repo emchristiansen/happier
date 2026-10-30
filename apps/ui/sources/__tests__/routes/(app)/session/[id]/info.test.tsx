@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react-test-renderer';
 
 import { flushHookEffects, renderScreen, standardCleanup } from '@/dev/testkit';
+import { createSessionFixture } from '@/dev/testkit/fixtures/sessionFixtures';
 import { createExpoRouterMock } from '@/dev/testkit/mocks/router';
 import { createStorageModuleStub, createStorageStoreProxy } from '@/dev/testkit/mocks/storage';
 import { setActiveServerId, upsertServerProfile } from '@/sync/domains/server/serverProfiles';
@@ -21,6 +22,7 @@ let mockSession: any = null;
 let isDataReady = true;
 let sessionHydrated = true;
 let sessionIsConnected = true;
+let useRealSessionStatus = false;
 let localDevModeEnabled = false;
 const routerPushSpy = vi.fn();
 const routerNavigateSpy = vi.fn();
@@ -142,6 +144,14 @@ const routerMock = createExpoRouterMock({
 
 installSessionRouteCommonModuleMocks({
     router: async () => routerMock.module,
+    text: async () => {
+        const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
+        return createTextModuleMock({
+            translate: (key: string, params?: Record<string, unknown>) => (
+                useRealSessionStatus && params ? `${key}:${JSON.stringify(params)}` : key
+            ),
+        });
+    },
     reactNative: async () => {
         const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
         return createReactNativeWebMock({
@@ -183,6 +193,7 @@ installSessionRouteCommonModuleMocks({
                     return null as unknown as LocalSettings[K];
                 },
                 useSetting: (key: string) => {
+                    if (key === 'sessionListWorkingStatusAnimatedTextEnabled') return false;
                     if (key === 'hideInactiveSessions') {
                         return hideInactiveSessions;
                     }
@@ -384,22 +395,26 @@ vi.mock('@happier-dev/agents', async (importOriginal) => {
         },
     };
 });
-vi.mock('@/utils/sessions/sessionUtils', () => ({
-    getSessionName: () => 'name',
-    useSessionStatus: (...args: unknown[]) => {
-        useSessionStatusSpy(...args);
-        return {
-            isConnected: sessionIsConnected,
-            statusText: 'Connected',
-            statusColor: 'green',
-            statusDotColor: 'green',
-            isPulsing: false,
-        };
-    },
-    formatOSPlatform: () => 'macOS',
-    formatPathRelativeToHome: (p: string) => p,
-    getSessionAvatarId: () => 'id',
-}));
+vi.mock('@/utils/sessions/sessionUtils', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/utils/sessions/sessionUtils')>();
+    return {
+        getSessionName: () => 'name',
+        useSessionStatus: (...args: Parameters<typeof actual.useSessionStatus>) => {
+            useSessionStatusSpy(...args);
+            if (useRealSessionStatus) return actual.useSessionStatus(...args);
+            return {
+                isConnected: sessionIsConnected,
+                statusText: 'Connected',
+                statusColor: 'green',
+                statusDotColor: 'green',
+                isPulsing: false,
+            };
+        },
+        formatOSPlatform: () => 'macOS',
+        formatPathRelativeToHome: (p: string) => p,
+        getSessionAvatarId: () => 'id',
+    };
+});
 vi.mock('expo-clipboard', () => ({ setStringAsync: vi.fn() }));
 vi.mock('@/utils/system/versionUtils', () => ({ isVersionSupported: () => true, MINIMUM_CLI_VERSION: '0.0.0' }));
 vi.mock('@/utils/sessions/terminalSessionDetails', () => ({ getAttachCommandForSession: () => null, getTmuxFallbackReason: () => null, getTmuxTargetForSession: () => null }));
@@ -427,6 +442,8 @@ describe('/session/[id]/info', () => {
         isDataReady = true;
         sessionHydrated = true;
         sessionIsConnected = true;
+        useRealSessionStatus = false;
+        useSessionSpy.mockImplementation((id) => id ? mockSession : null);
         localDevModeEnabled = false;
         routerPushSpy.mockReset();
         routerNavigateSpy.mockReset();
@@ -522,6 +539,7 @@ describe('/session/[id]/info', () => {
     afterEach(() => {
         clearTempData();
         standardCleanup();
+        vi.useRealTimers();
     });
 
     async function renderInfoScreen() {
@@ -719,6 +737,82 @@ describe('/session/[id]/info', () => {
         await screen.update(<Screen />);
 
         expect(itemListRenderSpy).not.toHaveBeenCalled();
+    });
+
+    it('keeps real info status working on a refreshed heartbeat and expires the genuinely stale record', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        useRealSessionStatus = true;
+        const session = createSessionFixture({
+            id: mockSessionId,
+            active: true,
+            presence: 'online',
+            activeAt: Date.now(),
+            thinking: false,
+            thinkingAt: Date.now(),
+            latestTurnStatus: 'in_progress',
+            latestTurnStatusObservedAt: Date.now(),
+        });
+        storage.setState({ sessions: { [session.id]: session } });
+        useSessionSpy.mockImplementation((id) => storage((state) => state.sessions[id] ?? null));
+        const screen = await renderInfoScreen();
+        const statusDetail = () => screen.findAllByType('Item' as any)
+            .find((node) => node.props.title === 'sessionInfo.sessionStatus')?.props.detail;
+        expect(statusDetail()).toBe('status.working');
+
+        await act(async () => {
+            await vi.advanceTimersByTimeAsync(90_000);
+            storage.setState({ sessions: {
+                [session.id]: { ...session, activeAt: Date.now(), thinkingAt: Date.now() },
+            } });
+        });
+        await act(async () => { await vi.advanceTimersByTimeAsync(30_001); });
+        expect(statusDetail()).toBe('status.working');
+
+        // A stopped heartbeat must still expire against the actual latest observation.
+        await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
+        expect(statusDetail()).toBe('status.online');
+    });
+
+    it('updates real info background activity projections while isolating unrelated counters', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000_000);
+        useRealSessionStatus = true;
+        const session = createSessionFixture({
+            id: mockSessionId,
+            active: true,
+            presence: 'online',
+            activeAt: Date.now(),
+            latestTurnStatus: 'completed',
+            latestTurnStatusObservedAt: Date.now(),
+            runtimeActivityState: 'idle',
+            runtimeActivityActiveCount: 0,
+            runtimeActivityObservedAt: Date.now(),
+            runtimeActivityRevision: 1,
+        });
+        storage.setState({ sessions: { [session.id]: session } });
+        useSessionSpy.mockImplementation((id) => storage((state) => state.sessions[id] ?? null));
+        const screen = await renderInfoScreen();
+        const statusDetail = () => screen.findAllByType('Item' as any)
+            .find((node) => node.props.title === 'sessionInfo.sessionStatus')?.props.detail;
+        expect(statusDetail()).toBe('status.online');
+        itemListRenderSpy.mockClear();
+        await act(async () => {
+            storage.setState({ sessions: {
+                [session.id]: { ...session, updatedAt: Date.now() + 1, seq: session.seq + 1 },
+            } });
+        });
+        expect(itemListRenderSpy).not.toHaveBeenCalled();
+
+        const background = { ...session, runtimeActivityState: 'active' as const, runtimeActivityActiveCount: 2, runtimeActivityRevision: 2 };
+        await act(async () => { storage.setState({ sessions: { [session.id]: background } }); });
+        expect(statusDetail()).toBe('status.backgroundActive:{"count":2}');
+        await act(async () => {
+            storage.setState({ sessions: { [session.id]: { ...background, runtimeActivityActiveCount: 3, runtimeActivityRevision: 3 } } });
+        });
+        expect(statusDetail()).toBe('status.backgroundActive:{"count":3}');
+        await act(async () => { storage.setState({ sessions: { [session.id]: session } }); });
+        expect(statusDetail()).toBe('status.online');
     });
 
     it('does not subscribe to execution-run session signals while the runs feature is disabled', async () => {
