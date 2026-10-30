@@ -109,7 +109,7 @@ const UpdatesGroupSection = React.memo(function UpdatesGroupSection(props: Reado
     const { model, group, presentation } = props;
     const compact = presentation === 'popover';
     const visibleItems = compact ? group.items.filter(needsAttention) : group.items;
-    const hiddenCount = group.items.length - visibleItems.length;
+    const hiddenUpToDateCount = compact ? group.items.filter((item) => item.state === 'upToDate').length : 0;
     const waitingOffline = !group.online ? group.items.filter((item) => item.latestVersion != null && item.currentVersion !== item.latestVersion).length : 0;
     const appGroup = group.kind === 'app';
     // Stable while an app update moves through its states, so the popover does not shrink mid-update.
@@ -166,8 +166,8 @@ const UpdatesGroupSection = React.memo(function UpdatesGroupSection(props: Reado
                     testID="updates.whatsNew"
                 />
             ) : null}
-            {compact && group.online && hiddenCount > 0 && visibleItems.length > 0 ? (
-                <Text style={styles.collapsedLine}>{t('updates.row.othersUpToDate', { count: hiddenCount })}</Text>
+            {compact && group.online && hiddenUpToDateCount > 0 && visibleItems.length > 0 ? (
+                <Text style={styles.collapsedLine}>{t('updates.row.othersUpToDate', { count: hiddenUpToDateCount })}</Text>
             ) : null}
         </ListSection>
     );

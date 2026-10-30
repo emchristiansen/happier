@@ -3,8 +3,10 @@ import { act } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { renderScreen } from '@/dev/testkit';
+import { installAgentAssetLoader } from '@/dev/testkit/mocks/agentAssets';
 import type { Machine } from '@/sync/domains/state/storageTypes';
-import type { UpdatesSummary } from '@/updates/items/buildUpdatesSummary';
+import { buildUpdatesSummary, type UpdatesSummary } from '@/updates/items/buildUpdatesSummary';
+import { buildAgentCliUpdateItem, buildProbeFailedItem } from '@/updates/items/buildMachineUpdateItems';
 import { storage } from '@/sync/domains/state/storageStore';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
 import { UpdatesPopoverButton } from './UpdatesPopoverButton';
@@ -70,7 +72,9 @@ vi.mock('@/modal', async (importOriginal) => {
 
 vi.mock('@/text', async () => {
     const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
-    return createTextModuleMock({ translate: (key: string) => key });
+    return createTextModuleMock({ translate: (key: string, params?: Record<string, unknown>) => (
+        key === 'updates.row.othersUpToDate' ? `${key}:${params?.count}` : key
+    ) });
 });
 
 const NONE: UpdatesSummary = { actionableCount: 0, failedCount: 0, runningCount: 0, phase: 'none', status: 'upToDate', visible: false };
@@ -185,6 +189,48 @@ describe('UpdatesPopoverButton', () => {
         );
         const labels = screen.findAll((node) => typeof node.props?.accessibilityLabel === 'string').map((node) => String(node.props.accessibilityLabel));
         expect(labels.some((label) => label.includes('updates.row.restartsService'))).toBe(true);
+    });
+
+    it.each(['unknown', 'unchecked', 'checking'] as const)('counts only confirmed up-to-date rows when another check is %s', async (state) => {
+        await installAgentAssetLoader();
+        const task = { running: false, step: null, errorMessage: null } as const;
+        const available = buildAgentCliUpdateItem({
+            machineId: 'studio', agentId: 'claude', title: 'Claude', online: true, task,
+            data: { available: true, version: '1.0.0', latestVersion: '2.0.0', updateSupported: true },
+        });
+        const current = buildAgentCliUpdateItem({
+            machineId: 'studio', agentId: 'gemini', title: 'Gemini', online: true, task,
+            data: { available: true, version: '1.0.0', latestVersion: '1.0.0', updateSupported: true },
+        });
+        const failedCheck = buildProbeFailedItem({
+            machineId: 'studio', subject: { kind: 'agent-cli', agentId: 'codex' }, title: 'Codex', online: true,
+        });
+        if (!available || !current) throw new Error('Expected installed agent update rows');
+        expect(failedCheck.state).toBe('unknown');
+        expect(failedCheck.failure).toEqual({ kind: 'latestUnknown' });
+        const items = [available, { ...failedCheck, state }];
+        const model: UpdatesContentModel = {
+            summary: buildUpdatesSummary(items),
+            groups: [{ id: 'studio', kind: 'machine', machineName: 'studio', machineId: 'studio', online: true, items }],
+            checkedAt: null, uncheckedMachineCount: 0, sessionsRunningOn: new Set(),
+            runItem: async () => {}, updateAll: async () => {}, stopAfterCurrent: () => {}, batch: null,
+            checkNow: () => {}, skipAppVersion: null, openWhatsNew: () => {}, whatsNewUnread: false,
+        };
+        expect(model.summary.status).toBe('available');
+        const screen = await renderScreen(<UpdatesContent model={model} presentation="popover" />);
+        const upToDateCounts = () => [...new Set(screen.findAll((node) => (
+            typeof node.type === 'string' && typeof node.props.children === 'string'
+            && node.props.children.startsWith('updates.row.othersUpToDate:')
+        )).map((node) => node.props.children))];
+        expect(upToDateCounts()).toEqual([]);
+
+        const withCurrent = { ...model, groups: [{ ...model.groups[0], items: [...items, current] }] };
+        await screen.update(<UpdatesContent model={withCurrent} presentation="popover" />);
+        expect(upToDateCounts()).toEqual(['updates.row.othersUpToDate:1']);
+        await screen.update(<UpdatesContent model={withCurrent} presentation="screen" />);
+        expect(screen.findAllHostsByTestId(`updates.row.${failedCheck.id}`).length).toBeGreaterThan(0);
+        expect(screen.findAllHostsByTestId(`updates.row.${current.id}`).length).toBeGreaterThan(0);
+        expect(upToDateCounts()).toEqual([]);
     });
 
     it('shows session impact by item machine identity, including this computer', async () => {
