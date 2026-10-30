@@ -313,9 +313,8 @@ export class TmuxUtilities {
           } catch {
             killRequested = false;
           } finally {
-            const operationIndex = args[1] === '-S' ? 3 : 1;
             logger.warn('[TMUX] Command timed out', {
-              operation: args[operationIndex] ?? 'unknown',
+              operation: TmuxUtilities.operationName(args),
               timeoutMs: commandTimeoutMs,
               pid: child.pid ?? null,
               killRequested,
