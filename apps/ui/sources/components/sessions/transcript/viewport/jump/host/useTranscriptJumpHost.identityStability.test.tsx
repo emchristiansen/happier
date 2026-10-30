@@ -241,51 +241,67 @@ describe('useTranscriptJumpHost identity stability', () => {
         await hook.unmount();
     });
 
-    it('preempts the active explicit jump and discards its pending durable promotion on user takeover', async () => {
-        const members = createStableMembers();
-        const load = createDeferred<null>();
-        loadTargetWindowMessagesMock.mockReturnValue(load.promise);
-        const hook = await renderHook(
-            (deps: JumpHostDeps) => useTranscriptJumpHost(deps),
-            {
-                initialProps: {
-                    ...buildDeps(members),
-                    jumpToSeq: 50,
-                } as JumpHostDeps,
-            },
-        );
-        expect(loadTargetWindowMessagesMock).toHaveBeenCalledTimes(1);
-        members.pendingJumpSeqViewportPromotionRef.current = {
-            emitViewportChange: vi.fn(),
-            seq: 50,
-            sessionId: 's1',
-        };
-        members.promotedJumpSeqViewportProtectionRef.current = {
-            promotedAtMs: Date.now(),
-            seq: 50,
-            sessionId: 's1',
-        };
+    it.each(['user-takeover', 'jump-to-bottom', 'native-bottom-already-pinned'] as const)(
+        'preempts a pending route jump and discards durable promotion on %s', async (takeover) => {
+            const members = createStableMembers();
+            const load = createDeferred<null>();
+            loadTargetWindowMessagesMock.mockReturnValue(load.promise);
+            const nativeBottom = takeover === 'native-bottom-already-pinned';
+            if (nativeBottom) members.readCurrentNativeDistanceFromBottom.mockReturnValue(0);
+            const initialDeps: JumpHostDeps = {
+                ...buildDeps(members),
+                jumpToSeq: 50,
+                platformOS: nativeBottom ? 'ios' : 'web',
+                usesNativeFlashListBottomMaintenance: nativeBottom,
+            };
+            const hook = await renderHook(
+                (deps: JumpHostDeps) => useTranscriptJumpHost(deps),
+                {
+                    initialProps: initialDeps,
+                },
+            );
+            expect(loadTargetWindowMessagesMock).toHaveBeenCalledTimes(1);
+            members.pendingJumpSeqViewportPromotionRef.current = {
+                emitViewportChange: vi.fn(),
+                seq: 50,
+                sessionId: 's1',
+            };
+            members.promotedJumpSeqViewportProtectionRef.current = {
+                promotedAtMs: Date.now(),
+                seq: 50,
+                sessionId: 's1',
+            };
 
-        hook.getCurrent().preemptExplicitJumpForUserTakeover();
-        expect(members.pendingJumpSeqViewportPromotionRef.current).toBeNull();
-        expect(members.promotedJumpSeqViewportProtectionRef.current).toBeNull();
-        expect(members.onRouteJumpSettled).toHaveBeenCalledTimes(1);
+            if (takeover === 'user-takeover') hook.getCurrent().preemptExplicitJumpForUserTakeover();
+            else hook.getCurrent().jumpToBottom();
+            expect(members.pendingJumpSeqViewportPromotionRef.current).toBeNull();
+            expect(members.promotedJumpSeqViewportProtectionRef.current).toBeNull();
+            expect(members.onRouteJumpSettled).toHaveBeenCalledTimes(1);
 
-        load.resolve(null);
-        await flushHookEffects();
-        expect(members.executeViewportCommandWithAnimation).not.toHaveBeenCalled();
-        expect(members.onRouteJumpSettled).toHaveBeenCalledTimes(1);
+            load.resolve(null);
+            await flushHookEffects();
+            if (takeover === 'jump-to-bottom') {
+                expect(members.executeViewportCommandWithAnimation).toHaveBeenCalledTimes(1);
+                expect(members.executeViewportCommandWithAnimation).toHaveBeenCalledWith(
+                    expect.objectContaining({ type: 'jump-to-bottom' }), expect.any(Boolean),
+                );
+            } else {
+                expect(members.executeViewportCommandWithAnimation).not.toHaveBeenCalled();
+            }
+            expect(members.endExplicitJumpWriteBarrier).toHaveBeenCalledTimes(1);
+            expect(members.onRouteJumpSettled).toHaveBeenCalledTimes(1);
 
-        await hook.rerender({
-            ...buildDeps(members),
-            committedMessagesCount: 2,
-            jumpToSeq: 50,
-            listContentHeight: 1_100,
-        } as JumpHostDeps);
-        await flushHookEffects();
-        expect(loadTargetWindowMessagesMock).toHaveBeenCalledTimes(1);
-        await hook.unmount();
-    });
+            await hook.rerender({
+                ...initialDeps,
+                committedMessagesCount: 2,
+                jumpToSeq: 50,
+                listContentHeight: 1_100,
+            } as JumpHostDeps);
+            await flushHookEffects();
+            expect(loadTargetWindowMessagesMock).toHaveBeenCalledTimes(1);
+            await hook.unmount();
+        },
+    );
 
     it('keeps jump and navigation callbacks stable across fresh deps object identities', async () => {
         const members = createStableMembers();

@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react-test-renderer';
 
-import { flushHookEffects, renderHook } from '@/dev/testkit';
+import { createDeferred, flushHookEffects, renderHook } from '@/dev/testkit';
 import type { Message } from '@/sync/domains/messages/messageTypes';
 import type { TranscriptNavigationEntry } from '@/components/sessions/transcript/navigation/transcriptNavigationTypes';
 
@@ -18,6 +18,7 @@ import {
     getTranscriptNavigationVisibilityStore,
 } from '../../visibility/transcriptNavigationVisibilityStore';
 import { useTranscriptJumpHost } from './useTranscriptJumpHost';
+import type { TranscriptJumpResult } from '../transcriptJumpTargetTypes';
 
 vi.mock('@/sync/sync', () => ({
     sync: {
@@ -257,6 +258,78 @@ describe('transcript jump landing owns the navigation anchor', () => {
             await hook.unmount();
         }
     });
+
+    it.each(['legendList', 'flashList'] as const)(
+        'keeps return to the live tail authoritative while an older %s web landing awaits a frame',
+        async (rendererKind) => {
+            const { listRef } = createHostMembers({ startIndex: 3, endIndex: 8 });
+            const releaseTakeover = vi.fn();
+            listRef.current = {
+                ...listRef.current,
+                beginExplicitJumpTakeover: vi.fn(() => releaseTakeover),
+            } as ScrollableChatListRef;
+            const frame = createDeferred<void>();
+            const waitingForFrame = createDeferred<void>();
+            const targetElement = { getBoundingClientRect: () => ({ top: 0, height: 40 }) };
+            const deps: JumpHostDeps = {
+                ...buildDeps({ listRef }),
+                platformOS: 'web',
+                rendererKind,
+                resolveWebScrollMetrics: () => ({
+                    clientHeight: 600,
+                    element: {
+                        getBoundingClientRect: () => ({ top: 0, height: 600 }),
+                        querySelector: (selector: string) => selector.includes('row-u2') ? targetElement : null,
+                        querySelectorAll: () => [],
+                    } as unknown as HTMLElement,
+                    scrollHeight: 4_000,
+                    scrollTop: 1_000,
+                }),
+                waitForNextVisualUpdate: vi.fn()
+                    .mockImplementationOnce(() => {
+                        waitingForFrame.resolve();
+                        return frame.promise;
+                    })
+                    .mockResolvedValue(undefined),
+            };
+            const hook = await renderHook(
+                (props: JumpHostDeps) => useTranscriptJumpHost(props),
+                { initialProps: deps },
+            );
+            // Hold the real landing loop at its renderer-frame boundary, without
+            // allowing the production rAF-starvation fallback to end the hold.
+            vi.useFakeTimers();
+            let oldJump: Promise<TranscriptJumpResult> | undefined;
+            try {
+                await act(async () => {
+                    oldJump = hook.getCurrent().jumpToTranscriptTarget({ kind: 'seq', seq: 12 });
+                    await waitingForFrame.promise;
+                });
+                const writes = vi.mocked(deps.executeViewportCommandWithAnimation);
+                expect(writes).toHaveBeenCalledWith(expect.objectContaining({ type: 'jump-to-seq', seq: 12 }), true);
+
+                await act(async () => hook.getCurrent().jumpToBottom());
+                expect(writes).toHaveBeenLastCalledWith(expect.objectContaining({ type: 'jump-to-bottom' }), expect.any(Boolean));
+                const writesAtBottom = writes.mock.calls.length;
+                const settled = oldJump!.then((result) => result);
+                await act(async () => {
+                    frame.resolve();
+                    await settled;
+                });
+
+                expect(writes).toHaveBeenCalledTimes(writesAtBottom);
+                await expect(settled).resolves.toEqual({ status: 'aborted' });
+                expect(deps.pendingJumpSeqViewportPromotionRef.current).toBeNull();
+                expect(deps.promotedJumpSeqViewportProtectionRef.current).toBeNull();
+                expect(releaseTakeover).toHaveBeenCalledTimes(1);
+                expect(deps.endExplicitJumpWriteBarrier).toHaveBeenCalledTimes(1);
+            } finally {
+                frame.resolve();
+                await hook.unmount();
+                vi.useRealTimers();
+            }
+        },
+    );
 
     it('lets an explicit return to the live tail replace the landing claim', async () => {
         const store = getTranscriptNavigationVisibilityStore(SESSION_ID);
