@@ -4,6 +4,9 @@ import type { SessionListRenderableSession } from '@/sync/domains/session/listin
 import type { SessionMessages } from '@/sync/store/domains/messages';
 import type { StorageState } from '@/sync/store/types';
 import { createReducer } from '@/sync/reducer/reducer';
+import { buildPendingChangedSessionPatch } from '@/sync/engine/socket/pendingChangedSessionPatch';
+import { planSessionListRenderablePatches, planSessionListRenderableReplacement } from '@/sync/store/domains/sessionListRenderableStoreUpdate';
+import { buildNextSessionListRenderableDelta } from '@/sync/store/domains/sessionListRenderableCommit';
 
 import { createLocalActivityBadgeSnapshotSelector } from './createLocalActivityBadgeSnapshotSelector';
 
@@ -90,6 +93,40 @@ function createState(params: Readonly<{
 describe('createLocalActivityBadgeSnapshotSelector derivation scope', () => {
     afterEach(() => {
         vi.restoreAllMocks();
+    });
+
+    it.each([[0, 0], [1, 1], [0, 1], [1, 0]])('reconciles a pending delta with a full refresh (%s -> %s)', (initialCount, finalCount) => {
+        vi.spyOn(Date, 'now').mockReturnValue(10_000_000);
+        const selector = createLocalActivityBadgeSnapshotSelector(SELECTOR_PARAMS);
+        const row = { ...createTrackedRenderable('row-a', false, () => {}),
+            pendingCount: initialCount, pendingVersion: 0 };
+        const initial = createState({ sessionListRenderables: { 'row-a': row },
+            delta: { revision: 1, changedSessionIds: ['row-a'], removedSessionIds: [], rebuiltSessionListViewData: true } });
+        expect(selector(initial).count).toBe(initialCount);
+
+        const changed = planSessionListRenderablePatches({
+            previousRenderables: initial.sessionListRenderables,
+            patches: [{ sessionId: 'row-a', patch: buildPendingChangedSessionPatch({
+                pendingCount: 1 - initialCount, pendingVersion: 1,
+            }) }],
+            isSessionListViewDataUninitialized: false,
+            rebuildOnAttentionPromotionFieldsChange: false,
+        });
+        expect(changed.needsSessionListViewDataRebuild).toBe(false);
+        const delta = buildNextSessionListRenderableDelta({ previous: initial.sessionListRenderableDelta,
+            changedSessionIds: changed.changedSessionIds, removedSessionIds: changed.removedSessionIds,
+            rebuiltSessionListViewData: changed.needsSessionListViewDataRebuild });
+        expect(selector(createState({ sessionListRenderables: changed.nextRenderables, delta })).count).toBe(1 - initialCount);
+
+        const refreshed = planSessionListRenderableReplacement({ previousRenderables: changed.nextRenderables,
+            incomingRenderables: [{ ...row, pendingCount: finalCount, pendingVersion: 2 }, createTrackedRenderable('row-b', false, () => {})],
+            isSessionListViewDataUninitialized: false, rebuildOnAttentionPromotionFieldsChange: false });
+        expect(refreshed.needsSessionListViewDataRebuild).toBe(true);
+        const finalState = createState({ sessionListRenderables: refreshed.nextRenderables,
+            delta: buildNextSessionListRenderableDelta({ previous: delta, changedSessionIds: refreshed.changedSessionIds,
+                removedSessionIds: refreshed.removedSessionIds, rebuiltSessionListViewData: refreshed.needsSessionListViewDataRebuild }) });
+        expect(createLocalActivityBadgeSnapshotSelector(SELECTOR_PARAMS)(finalState).count).toBe(finalCount);
+        expect(selector(finalState).count).toBe(finalCount);
     });
 
     it('does not re-derive every renderable when only one session transcript advances', () => {
