@@ -4,6 +4,8 @@ import { renderHook, standardCleanup } from '@/dev/testkit';
 import { scopedSessionLocalStateKey } from '@/sync/domains/state/sessionLocalStateKeys';
 import type { ManagedEndpointSupervisor } from '@happier-dev/connection-supervisor';
 import { createSocketIoAckTimeoutError } from '@/sync/runtime/socketIoAckTimeout';
+import { SOCKET_RPC_EVENTS } from '@happier-dev/protocol/socketRpc';
+import { forwardedRpcTargetResponse } from '../../../server/sources/app/api/socket/forwardedRpcTargetResponse';
 
 type EndpointSupervisorLookup = typeof import('@/sync/runtime/connectivity/endpointSupervisorPool').getEndpointSupervisorForServer;
 type EndpointSupervisorAcquire = typeof import('@/sync/runtime/connectivity/endpointSupervisorPool').acquireEndpointSupervisor;
@@ -819,6 +821,108 @@ describe('sync.sendMessage optimistic thinking', () => {
         expect(storage.getState().sessions[sessionId].optimisticThinkingAt ?? null).not.toBeNull();
 
         sessionRpcSpy.mockRestore();
+    });
+
+    describe('runtime application admission', () => {
+        const priorApiEncryption = { value: Reflect.get(apiSocket, 'encryption') };
+        beforeEach(() => { priorApiEncryption.value = Reflect.get(apiSocket, 'encryption'); });
+        afterEach(() => { Reflect.set(apiSocket, 'encryption', priorApiEncryption.value); });
+
+        async function prepareRuntimeResponse(encryptionMode: 'plain' | 'e2ee', response: unknown) {
+            const sessionId = `s_runtime_application_${encryptionMode}`;
+            storage.getState().applySessions([{
+                ...createSession({ sessionId }), encryptionMode,
+                metadata: { path: '/repo', host: 'host', permissionMode: 'default', permissionModeUpdatedAt: 1 },
+            }]);
+            storage.getState().applySettingsLocal({
+                sessionMessageSendMode: 'agent_queue',
+                sessionPermissionModeApplyTiming: 'next_prompt',
+            });
+            storage.getState().updateSessionPermissionMode(sessionId, 'yolo');
+            const encryption = await Encryption.create(new Uint8Array(32).fill(9));
+            await encryption.initializeSessions(new Map([[sessionId, null]]));
+            const cipher = encryption.getSessionEncryption(sessionId)!;
+            const { sync } = await import('./sync');
+            sync.encryption = encryption;
+            // Configure the real RPC cipher without opening a socket during this boundary fixture.
+            Reflect.set(apiSocket, 'encryption', encryption);
+            const fallbackCommit = vi.fn();
+            sync.setMessageTransport({ emitWithAck: fallbackCommit, send: vi.fn() });
+            const transport = vi.spyOn(apiSocket, 'emitWithAck').mockImplementation(async <T>(event: string, data: unknown) => {
+                if (event === SOCKET_RPC_EVENTS.CALL) {
+                    const call = data as { method: string; params: string | Record<string, unknown> };
+                    const request = encryptionMode === 'plain' ? call.params : await cipher.decryptRaw(call.params as string);
+                    expect(request).toMatchObject({ text: 'runtime application input', localId: expect.any(String) });
+                    // This is the real server envelope owner. The remote handler result is the network fixture.
+                    const targetResponse = encryptionMode === 'plain' ? response : await cipher.encryptRaw(response);
+                    return forwardedRpcTargetResponse({ method: call.method, targetResponse }) as T;
+                }
+                if (event === 'update-metadata') {
+                    return { result: 'success', version: 1, metadata: (data as { metadata: string }).metadata } as T;
+                }
+                throw new Error(`Unexpected boundary event: ${event}`);
+            });
+            return { sync, sessionId, transport, fallbackCommit };
+        }
+
+        it.each([
+            ['plain', 'runtime_recovery_waiting', 'runtime_recovery_waiting'],
+            ['e2ee', 'session_user_message_id_payload_conflict', 'session_user_message_id_payload_conflict'],
+            ['plain', 'session_user_message_unhandled', 'connect_error: runtime refused this request'],
+        ] as const)('rejects the %s runtime application refusal %s through direct submission', async (encryptionMode, errorCode, error) => {
+            const { sync, sessionId, transport, fallbackCommit } = await prepareRuntimeResponse(encryptionMode, { ok: false, errorCode, error });
+            const observedAccepted: string[] = [];
+            const unsubscribe = storage.subscribe((state) => {
+                for (const message of state.sessionPending[sessionId]?.messages ?? []) {
+                    if (message.deliveryStatus === 'accepted') observedAccepted.push(message.id);
+                }
+            });
+            try {
+                await expect(sync.submitMessage(sessionId, 'runtime application input')).rejects.toMatchObject({ code: errorCode, message: error });
+                expect(observedAccepted).toEqual([]);
+                expect(storage.getState().sessionPending[sessionId]?.messages ?? []).toEqual([]);
+                expect(storage.getState().sessions[sessionId].optimisticThinkingAt ?? null).toBeNull();
+                expect(storage.getState().sessions[sessionId].permissionMode).toBe('yolo');
+                expect(storage.getState().sessions[sessionId].metadata?.permissionMode).toBe('default');
+                expect(transport.mock.calls.filter(([event]) => event === 'update-metadata')).toHaveLength(0);
+                expect(fallbackCommit).not.toHaveBeenCalled();
+                expect(ensureSessionRuntimeForPendingInputMock).not.toHaveBeenCalled();
+                expect(runtimeFetchWithServerReachabilityMock.mock.calls.filter(([request]) => request.url?.includes('/pending'))).toHaveLength(0);
+            } finally {
+                unsubscribe();
+            }
+        });
+
+        it('rejects a malformed runtime application response without publishing admission', async () => {
+            const { sync, sessionId, transport, fallbackCommit } = await prepareRuntimeResponse('plain', null);
+            const observedAccepted: string[] = [];
+            const unsubscribe = storage.subscribe((state) => {
+                for (const message of state.sessionPending[sessionId]?.messages ?? []) {
+                    if (message.deliveryStatus === 'accepted') observedAccepted.push(message.id);
+                }
+            });
+            try {
+                await expect(sync.submitMessage(sessionId, 'runtime application input')).rejects.toThrow();
+                expect(observedAccepted).toEqual([]);
+                expect(transport.mock.calls.filter(([event]) => event === 'update-metadata')).toHaveLength(0);
+                expect(fallbackCommit).not.toHaveBeenCalled();
+            } finally {
+                unsubscribe();
+            }
+        });
+
+        it.each([['plain', false], ['e2ee', true]] as const)(
+            'preserves %s runtime application success and provider acceptance pending=%s',
+            async (encryptionMode, providerAcceptancePending) => {
+                const { sync, sessionId, fallbackCommit } = await prepareRuntimeResponse(encryptionMode, { ok: true, providerAcceptancePending });
+                const result = await sync.submitMessage(sessionId, 'runtime application input');
+                expect(result).toMatchObject({ type: 'success', persistence: 'provider_direct' });
+                expect(result.providerAcceptancePending === true).toBe(providerAcceptancePending);
+                expect(storage.getState().sessionPending[sessionId]?.messages.map((message) => message.deliveryStatus)).toEqual(['accepted']);
+                expect(storage.getState().sessions[sessionId].metadata?.permissionMode).toBe('yolo');
+                expect(fallbackCommit).not.toHaveBeenCalled();
+            },
+        );
     });
 
     it('wakes an apparently active session with fresh user-request provenance when runtime RPC falls back to a durable commit', async () => {

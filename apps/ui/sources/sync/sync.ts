@@ -16,6 +16,7 @@ import {
     type DirectTranscriptTruncationReason,
     resolveDirectTranscriptContinuation,
     type PendingDeliveryBlockedReason,
+    SessionUserMessageSendResponseSchema,
     type SessionUserMessageSendResponse,
 } from '@happier-dev/protocol';
 import { readCurrentUiClientCompatibilityDeclaration } from '@/sync/runtime/clientCompatibility/uiClientCompatibility';
@@ -2666,8 +2667,9 @@ class Sync {
 
             let runtimeRpcFallbackRequiresWake = false;
             if (session.active === true && canUseSessionUserMessageRuntimeRpc(session)) {
+                let rpcAck: SessionUserMessageSendResponse | null = null;
                 try {
-                    const rpcAck = await apiSocket.sessionRPC<SessionUserMessageSendResponse, {
+                    rpcAck = SessionUserMessageSendResponseSchema.parse(await apiSocket.sessionRPC<unknown, {
                         text: string;
                         localId: string;
                         meta: Record<string, unknown>;
@@ -2683,26 +2685,7 @@ class Sync {
                                     : {},
                         },
                         { timeoutMs: this.syncTuning.sessionRpcTimeoutMs },
-                    );
-                    storage.getState().upsertPendingMessage(sessionId, {
-                        id: localId,
-                        localId,
-                        createdAt,
-                        updatedAt: nowServerMs(),
-                        source: 'local_outbound',
-                        deliveryStatus: 'accepted',
-                        text,
-                        displayText,
-                        rawRecord: content,
-                    });
-                    await publishNextPromptPermissionModeIfNeeded();
-                    return {
-                        localId,
-                        persistence: 'provider_direct' as const,
-                        ...(rpcAck.ok === true && rpcAck.providerAcceptancePending === true
-                            ? { providerAcceptancePending: true }
-                            : {}),
-                    };
+                    ));
                 } catch (error) {
                     if (isSocketIoAckTimeoutError(error)) {
                         storage.getState().upsertPendingMessage(sessionId, {
@@ -2739,6 +2722,37 @@ class Sync {
                         return { localId: queued.localId, persistence: 'pending' as const };
                     }
                     runtimeRpcFallbackRequiresWake = true;
+                }
+                if (rpcAck !== null) {
+                    // Transport success does not admit a refused application request. Keep this
+                    // outside transport fallback handling even when refusal text resembles a socket error.
+                    if (rpcAck.ok !== true) {
+                        removePendingMessageCreatedForSend();
+                        throw createSessionMessageSubmitFailureError(
+                            rpcAck.errorCode,
+                            rpcAck.error,
+                            'Message send rejected',
+                        );
+                    }
+                    storage.getState().upsertPendingMessage(sessionId, {
+                        id: localId,
+                        localId,
+                        createdAt,
+                        updatedAt: nowServerMs(),
+                        source: 'local_outbound',
+                        deliveryStatus: 'accepted',
+                        text,
+                        displayText,
+                        rawRecord: content,
+                    });
+                    await publishNextPromptPermissionModeIfNeeded();
+                    return {
+                        localId,
+                        persistence: 'provider_direct' as const,
+                        ...(rpcAck.providerAcceptancePending === true
+                            ? { providerAcceptancePending: true }
+                            : {}),
+                    };
                 }
             }
 
