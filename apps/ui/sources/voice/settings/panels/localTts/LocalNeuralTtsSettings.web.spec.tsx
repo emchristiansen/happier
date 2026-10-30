@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 
 import { act, ReactTestRenderer } from 'react-test-renderer';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { pressTestInstanceAsync, renderScreen } from '@/dev/testkit';
+import { createDeferred, pressTestInstanceAsync, renderScreen } from '@/dev/testkit';
 import { installLocalTtsCommonModuleMocks } from './localTtsTestHelpers';
 
 
@@ -259,6 +259,35 @@ describe('LocalNeuralTtsSettings (web)', () => {
       expect(requests.filter((r) => r.type === 'prepare')).toHaveLength(2);
       expect(requests.some((r) => r.type === 'generate')).toBe(true);
       expect(modelItem().props.detail).toBe('settingsVoice.local.kokoro.modelStatus.ready');
+
+      const realCache = await vi.importActual<typeof import('@/voice/kokoro/assets/kokoroBrowserCache')>(
+        '@/voice/kokoro/assets/kokoroBrowserCache',
+      );
+      const { getKokoroBrowserCacheSummary } = await import('@/voice/kokoro/assets/kokoroBrowserCache');
+      vi.mocked(getKokoroBrowserCacheSummary).mockImplementation(realCache.getKokoroBrowserCacheSummary);
+      const pendingKeys = createDeferred<Request[]>();
+      let keyReads = 0;
+      vi.stubGlobal('caches', {
+        open: async () => ({ keys: () => { keyReads += 1; return pendingKeys.promise; } }),
+        delete: async () => true,
+      });
+      try {
+        await act(async () => { await pressTestInstanceAsync(modelItem()); });
+        // Preparation and warmup have finished; only the real final CacheStorage read is pending.
+        expect(keyReads).toBe(2);
+        expect(modelItem().props.rightElement).toBeTruthy();
+        await act(async () => { modelItem().props.rightElement.props.onPress({ stopPropagation() {} }); });
+        expect(modelItem().props.detail).toBe('settingsVoice.local.kokoro.modelStatus.notDownloaded');
+        expect(modelItem().props.rightElement).toBeUndefined();
+        await act(async () => { pendingKeys.resolve([]); });
+        expect(modelItem().props.detail).toBe('settingsVoice.local.kokoro.modelStatus.notDownloaded');
+        await act(async () => { await pressTestInstanceAsync(modelItem()); });
+        expect(modelItem().props.detail).toBe('settingsVoice.local.kokoro.modelStatus.ready');
+        expect(modalAlertSpy).not.toHaveBeenCalled();
+      } finally {
+        await act(async () => { pendingKeys.resolve([]); });
+        vi.mocked(getKokoroBrowserCacheSummary).mockResolvedValue({ transformersCacheCount: 0, kokoroVoicesCacheCount: 0 });
+      }
     } finally {
       prepareKokoroTtsSpy.mockReset();
       synthesizeKokoroWavSpy.mockReset();

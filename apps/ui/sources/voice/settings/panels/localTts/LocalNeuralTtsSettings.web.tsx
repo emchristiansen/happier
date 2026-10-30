@@ -170,6 +170,10 @@ export function LocalNeuralTtsSettings(props: {
   const cancelPrepare = React.useCallback(() => {
     const controller = prepareAbortRef.current;
     if (!controller) return;
+    // The cache-summary read is not abortable; cancellation releases the panel immediately.
+    prepareAbortRef.current = null;
+    setModelStatus('idle');
+    setDownloadProgress(null);
     try {
       controller.abort();
     } catch {
