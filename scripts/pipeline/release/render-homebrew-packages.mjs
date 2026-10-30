@@ -116,11 +116,18 @@ function resolvePinnedAsset({ release, checksums, checksumsName, assetName }) {
   return { url: asset.browser_download_url, sha256 };
 }
 
+/** @param {string} product @param {string} version */
+function checksumsAssetName(product, version) {
+  return `checksums-${product}-v${version}.txt`;
+}
+
 /** @param {Release} release @param {string} checksumsName */
 function requireChecksumsAsset(release, checksumsName) {
-  if (!release.assets.some((asset) => asset.name === checksumsName)) {
+  const asset = release.assets.find((candidate) => candidate.name === checksumsName);
+  if (!asset) {
     throw new Error(`[homebrew] ${release.tag_name} has no ${checksumsName}`);
   }
+  return asset;
 }
 
 /**
@@ -137,7 +144,7 @@ export function renderHappierFormulaFromRelease({
   if (compareStableVersions(version, minimumVersion) < 0) {
     throw new Error(`[homebrew] ${release.tag_name} predates the first Homebrew-aware CLI (${minimumVersion}); render the formula from ${minimumVersion} or later`);
   }
-  const checksumsName = `checksums-happier-v${version}.txt`;
+  const checksumsName = checksumsAssetName('happier', version);
   requireChecksumsAsset(release, checksumsName);
   const checksums = parseChecksums(checksumsText);
 
@@ -213,7 +220,7 @@ export function renderHappierFormulaFromRelease({
  */
 export function renderHappierCaskFromRelease({ release, checksumsText, repo = DEFAULT_REPO }) {
   const version = readStableReleaseVersion(release, 'ui-desktop-v');
-  const checksumsName = `checksums-happier-ui-desktop-v${version}.txt`;
+  const checksumsName = checksumsAssetName('happier-ui-desktop', version);
   requireChecksumsAsset(release, checksumsName);
   const checksums = parseChecksums(checksumsText);
 
@@ -275,10 +282,10 @@ export function renderHappierCaskFromRelease({ release, checksumsText, repo = DE
 }
 
 /**
- * @param {{ repo: string; tag: string; token: string }} params
+ * @param {{ repo: string; tag: string; token: string; checksumsName: string }} params
  * @returns {Promise<{ release: Release; checksumsText: string }>}
  */
-async function fetchReleaseWithChecksums({ repo, tag, token }) {
+async function fetchReleaseWithChecksums({ repo, tag, token, checksumsName }) {
   const headers = {
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
@@ -291,10 +298,7 @@ async function fetchReleaseWithChecksums({ repo, tag, token }) {
   }
   /** @type {Release} */
   const release = await response.json();
-  const checksumsAsset = release.assets.find((asset) => /^checksums-.+\.txt$/.test(asset.name));
-  if (!checksumsAsset) {
-    throw new Error(`[homebrew] ${repo} release ${tag} has no checksums asset`);
-  }
+  const checksumsAsset = requireChecksumsAsset(release, checksumsName);
   const checksumsResponse = await fetch(checksumsAsset.browser_download_url, { headers: { 'User-Agent': headers['User-Agent'] } });
   if (!checksumsResponse.ok) {
     throw new Error(`[homebrew] downloading ${checksumsAsset.name} failed: HTTP ${checksumsResponse.status}`);
@@ -324,14 +328,14 @@ async function main() {
 
   const written = [];
   if (cliVersion) {
-    const source = await fetchReleaseWithChecksums({ repo, tag: `cli-v${cliVersion}`, token });
+    const source = await fetchReleaseWithChecksums({ repo, tag: `cli-v${cliVersion}`, token, checksumsName: checksumsAssetName('happier', cliVersion) });
     const path = join(outDir, 'Formula', 'happier.rb');
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, renderHappierFormulaFromRelease({ ...source, repo }), 'utf8');
     written.push(path);
   }
   if (desktopVersion) {
-    const source = await fetchReleaseWithChecksums({ repo, tag: `ui-desktop-v${desktopVersion}`, token });
+    const source = await fetchReleaseWithChecksums({ repo, tag: `ui-desktop-v${desktopVersion}`, token, checksumsName: checksumsAssetName('happier-ui-desktop', desktopVersion) });
     const path = join(outDir, 'Casks', 'happier.rb');
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, renderHappierCaskFromRelease({ ...source, repo }), 'utf8');

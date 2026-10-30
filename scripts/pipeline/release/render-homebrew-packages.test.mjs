@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -118,3 +121,66 @@ test('the formula requires the macOS release the CLI binary is built for, on mac
   assert.match(formula, /  on_macos do\n    depends_on macos: :ventura\n\n    on_arm do/);
   assert.doesNotMatch(formula.split('  on_linux do')[1], /depends_on/);
 });
+
+
+for (const [kind, versionFlag, outputPath, render] of [
+  ['cli', '--cli-version', 'Formula/happier.rb', (text) => assert.match(text, /class Happier < Formula/)],
+  ['desktop', '--desktop-version', 'Casks/happier.rb', (text) => assert.match(text, /cask "happier"/)],
+]) {
+  for (const primaryPresent of [true, false]) {
+    test(`the ${kind} command selects its exact checksum envelope with component assets first (primary present: ${primaryPresent})`, () => {
+      const directory = mkdtempSync(join(tmpdir(), 'happier-homebrew-fetch-'));
+      try {
+        const source = JSON.parse(JSON.stringify(fixture[kind]).replaceAll('0.2.12', '0.2.17'));
+        const primary = source.release.assets.find((asset) => asset.name.startsWith('checksums-'));
+        assert.ok(primary);
+        const component = {
+          name: 'checksums-happier-memory-runtime-v0.2.17.txt',
+          browser_download_url: 'https://release.example/component-checksums.txt',
+        };
+        source.release.assets.unshift(component);
+        if (!primaryPresent) source.release.assets = source.release.assets.filter((asset) => asset !== primary);
+        const requestsPath = join(directory, 'requests.jsonl');
+        const preloadPath = join(directory, 'http-fixture.mjs');
+        // Only HTTP is replaced; execute the real command, selection, renderer and file writes.
+        writeFileSync(preloadPath, `
+          import { appendFileSync } from 'node:fs';
+          const source = ${JSON.stringify(source)};
+          const requestsPath = ${JSON.stringify(requestsPath)};
+          globalThis.fetch = async (url, options) => {
+            appendFileSync(requestsPath, JSON.stringify({ url, headers: options.headers }) + '\\n');
+            if (url === ${JSON.stringify(`https://api.github.com/repos/happier-dev/happier/releases/tags/${source.release.tag_name}`)}) {
+              return new Response(JSON.stringify(source.release), { status: 200 });
+            }
+            if (url === ${JSON.stringify(primary.browser_download_url)}) return new Response(source.checksums);
+            if (url === ${JSON.stringify(component.browser_download_url)}) return new Response('0'.repeat(64) + '  component.tar.gz\\n');
+            throw new Error('Unexpected fixture HTTP request: ' + url);
+          };
+        `);
+        const result = spawnSync(process.execPath, [
+          '--import', preloadPath,
+          fileURLToPath(new URL('./render-homebrew-packages.mjs', import.meta.url)),
+          versionFlag, '0.2.17', '--out-dir', join(directory, 'output'),
+        ], { encoding: 'utf8', env: { ...process.env, GITHUB_TOKEN: 'fixture-token', GH_TOKEN: '' } });
+        assert.ifError(result.error);
+        const requests = readFileSync(requestsPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+        assert.equal(requests[0].headers.Authorization, 'Bearer fixture-token');
+        if (primaryPresent) {
+          assert.equal(result.status, 0, result.stderr);
+          render(readFileSync(join(directory, 'output', outputPath), 'utf8'));
+          assert.deepEqual(requests.map(({ url }) => url), [
+            `https://api.github.com/repos/happier-dev/happier/releases/tags/${source.release.tag_name}`,
+            primary.browser_download_url,
+          ]);
+          assert.equal(requests[1].headers.Authorization, undefined);
+        } else {
+          assert.equal(result.status, 1);
+          assert.ok(result.stderr.includes(primary.name), result.stderr);
+          assert.equal(requests.length, 1, 'refuse missing primary before downloading an unrelated envelope');
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+}
