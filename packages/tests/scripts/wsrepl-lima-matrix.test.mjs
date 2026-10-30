@@ -10921,9 +10921,17 @@ test('macos wsrepl lima matrix wrapper records early-abort failure metadata befo
   await mkdir(homeDir, { recursive: true });
   await mkdir(reportDir, { recursive: true });
 
+  const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir'], {
+    env: { PATH: process.env.PATH }, encoding: 'utf8',
+  });
+  assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+  const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+  assert.equal(tools.length, 3);
+  const fixturePath = `${binDir}:${[...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter)}:${testEnv.PATH}`;
+
   // Reach the injected date failure without depending on host installations.
   for (const command of ['limactl', 'node']) {
-    await writeScript(join(binDir, command), '#!/bin/bash\nexit 0\n');
+    await writeScript(join(binDir, command), `#!${tools[0]}\nexit 0\n`);
   }
 
   const datePath = join(binDir, 'date');
@@ -10955,7 +10963,7 @@ test('macos wsrepl lima matrix wrapper records early-abort failure metadata befo
     ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${testEnv.PATH}`,
+    PATH: fixturePath,
     WSREPL_QA_OUTPUT_DIR: reportDir,
   };
 
@@ -10965,6 +10973,9 @@ test('macos wsrepl lima matrix wrapper records early-abort failure metadata befo
     encoding: 'utf8',
   });
 
+  await writeFile(join(reportDir, 'fixture.stdout'), res.stdout ?? '');
+  await writeFile(join(reportDir, 'fixture.stderr'), res.stderr ?? '');
+  assert.equal(res.error, undefined, `fixture spawn failed: ${res.error}`);
   assert.equal(res.status, 127, `expected early abort exit 127\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
 
   const summary = JSON.parse(await readFile(join(reportDir, 'summary.json'), 'utf8'));
