@@ -69,8 +69,9 @@ function fingerprintKind(value) {
   if (typeof value !== 'string') return null;
   if (/^linux-proc:(?:0|[1-9]\d*)$/.test(value)) return 'linux-proc';
   if (/^win32-cim:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value)) return 'win32-cim';
-  const ps = /^(aix|darwin|freebsd|linux|openbsd|sunos)-ps:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}$/.exec(value);
-  return ps ? `${ps[1]}-ps` : null;
+  // ps lstart carries neither timezone nor probe provenance in the retained fingerprint.
+  // Even equal-format strings from the same platform cannot establish replacement here.
+  return null;
 }
 
 function shouldReclaimLockSnapshot(snapshot, options = {}) {

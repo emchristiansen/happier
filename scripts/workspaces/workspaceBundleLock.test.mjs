@@ -575,3 +575,17 @@ for (const mode of ['async', 'sync']) {
     } finally { console.warn = savedWarn; rmSync(root, { recursive: true, force: true }); }
   });
 }
+
+test('J079 same ps prefix is not comparable without timezone provenance', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'happier-lock-ps-zone-'));
+  const lockPath = join(root, 'lock');
+  const raw = JSON.stringify({ pid: process.pid, createdAtMs: 1, token: 'ps-owner', processInstanceFingerprint: 'darwin-ps:Fri Oct 30 08:00:00 2026' });
+  writeFileSync(lockPath, raw);
+  try {
+    await assert.rejects(withWorkspaceBundleLock(() => assert.fail('timezone-ambiguous owner entered'), {
+      lockPath, timeoutMs: 15, pollIntervalMs: 1, isRunningPidImpl: () => true,
+      readProcessInstanceFingerprintImpl: () => 'darwin-ps:Fri Oct 30 00:00:00 2026',
+    }), { code: 'EWORKSPACEBUNDLELOCKTIMEOUT' });
+    assert.equal(readFileSync(lockPath, 'utf8'), raw);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
