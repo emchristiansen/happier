@@ -718,24 +718,23 @@ run_relay_upgrade_smoke() {
   short_sha="${sha:0:12}"
   to_image="happierdev/relay-server:local-upgrade-${short_sha}"
 
-  if ! docker image inspect "$to_image" >/dev/null 2>&1; then
-    echo "[npm-e2e-smoke] building relay-server upgrade image: $to_image ($upgrade_target)" >&2
-    build_args=(
-      --tag "$to_image"
-      --build-arg "HAPPIER_EMBEDDED_POLICY_ENV=preview"
+  # The checkout tag can outlive a target selection; let Docker's cache evaluate current build inputs.
+  echo "[npm-e2e-smoke] building relay-server upgrade image: $to_image ($upgrade_target)" >&2
+  build_args=(
+    --tag "$to_image"
+    --build-arg "HAPPIER_EMBEDDED_POLICY_ENV=preview"
+  )
+  if [[ -n "$relay_upgrade_to_server_tag" ]]; then
+    build_args+=(
+      --target relay-server
+      --build-arg "HAPPIER_RELAY_SERVER_RELEASE_TAG=$relay_upgrade_to_server_tag"
+      --build-arg "HAPPIER_RELAY_SERVER_VERSION=$relay_upgrade_to_server_version"
+      --build-arg "SENTRY_RELEASE=$sha"
     )
-    if [[ -n "$relay_upgrade_to_server_tag" ]]; then
-      build_args+=(
-        --target relay-server
-        --build-arg "HAPPIER_RELAY_SERVER_RELEASE_TAG=$relay_upgrade_to_server_tag"
-        --build-arg "HAPPIER_RELAY_SERVER_VERSION=$relay_upgrade_to_server_version"
-        --build-arg "SENTRY_RELEASE=$sha"
-      )
-    else
-      build_args+=(--target relay-server-local-source)
-    fi
-    docker build "${build_args[@]}" "$repo_root" >/dev/null
+  else
+    build_args+=(--target relay-server-local-source)
   fi
+  docker build "${build_args[@]}" "$repo_root" >/dev/null
 
   db_cases=()
   if [[ "$relay_upgrade_db" == "both" ]]; then
