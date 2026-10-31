@@ -44,7 +44,7 @@ import type {
 import type { TranscriptLifecycleHost } from '@/components/sessions/transcript/viewport/lifecycle/lifecycleHost';
 import type { ScrollableChatListRef } from '@/components/sessions/transcript/viewport/transcriptScrollableListTypes';
 import type { LastNativeRestoreIndexCommand } from '@/components/sessions/transcript/viewport/transcriptScrollableListTypes';
-import type { TranscriptPrependOlderLoadSyncOptions } from '@/components/sessions/transcript/viewport/prepend/host/runTranscriptPrependOlderLoad';
+import type { TranscriptPrependOlderLoadResult, TranscriptPrependOlderLoadSyncOptions } from '@/components/sessions/transcript/viewport/prepend/host/runTranscriptPrependOlderLoad';
 import {
     executeTranscriptTargetWindowJump,
     isTranscriptTargetObservedAtAlignment,
@@ -254,6 +254,7 @@ export type TranscriptJumpHostDeps = Readonly<{
     executeViewportCommandWithAnimation(command: TranscriptViewportCommand, animated: boolean): boolean;
     forkedTranscriptEnabled: boolean;
     hasMoreOlderRef: MutableRef<boolean | null>;
+    observeOlderLoadResult(result: TranscriptPrependOlderLoadResult): void;
     invalidateViewportAnchorCapture(): void;
     isLoaded: boolean;
     isPinnedRef: MutableRef<boolean>;
@@ -374,6 +375,7 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
         executeViewportCommandWithAnimation,
         forkedTranscriptEnabled,
         hasMoreOlderRef,
+        observeOlderLoadResult,
         invalidateViewportAnchorCapture,
         isLoaded,
         isPinnedRef,
@@ -993,10 +995,32 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
         });
     }, [resolveWebTranscriptTargetObservation]);
 
+    const completeRouteJumpOperation = React.useCallback((operation: RouteJumpOperation): void => {
+        if (inFlightRouteJumpRef.current !== operation) return;
+        inFlightRouteJumpRef.current = null;
+        consumedRouteJumpRef.current = operation;
+        onRouteJumpSettled(operation.sessionId);
+    }, [onRouteJumpSettled]);
+
+    const preemptExplicitJumpForUserTakeover = React.useCallback((): void => {
+        const activeOperation = currentExplicitJumpOperationRef.current;
+        const routeJumpOperation = inFlightRouteJumpRef.current;
+        currentExplicitJumpOperationRef.current = null;
+        pendingJumpSeqViewportPromotionRef.current = null;
+        promotedJumpSeqViewportProtectionRef.current = null;
+        activeOperation?.releaseTakeover();
+        if (routeJumpOperation) completeRouteJumpOperation(routeJumpOperation);
+    }, [
+        completeRouteJumpOperation,
+        pendingJumpSeqViewportPromotionRef,
+        promotedJumpSeqViewportProtectionRef,
+    ]);
+
     const jumpToBottom = React.useCallback(() => {
         // Returning to the live tail is its own explicit destination: it replaces
         // whatever a previous landing claimed, and its own scroll frames are
         // programmatic, so nothing else would release the claim.
+        preemptExplicitJumpForUserTakeover();
         landedNavigationAnchorRef.current = null;
         const plan = lifecycleHost.planExplicitJumpTakeover({
             reason: 'jump-to-bottom',
@@ -1039,6 +1063,7 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
         listContentHeightRef,
         pinThresholdPxRef,
         pinToBottom,
+        preemptExplicitJumpForUserTakeover,
         readCurrentNativeDistanceFromBottom,
         resolveViewportCommand,
         sessionId,
@@ -1187,6 +1212,7 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
                             ? await sync.loadOlderMessages(sessionId, syncLoadOlderOptions)
                             : await sync.loadOlderMessages(sessionId));
                     if (!isCurrentOperation()) return { status: 'aborted' };
+                    observeOlderLoadResult(loadOlderResult);
                     if (loadOlderResult.status === 'no_more') {
                         return { status: 'not-found', reason: 'exhausted' };
                     }
@@ -1276,6 +1302,7 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
         executeViewportCommandWithAnimation,
         forkedTranscriptEnabled,
         handleJumpLanded,
+        observeOlderLoadResult,
         invalidateViewportAnchorCapture,
         isPinnedRef,
         isTranscriptJumpTargetInRenderedWindow,
@@ -1302,27 +1329,6 @@ export function useTranscriptJumpHost(deps: TranscriptJumpHostDeps): TranscriptJ
         sessionId,
         waitForNextVisualUpdate,
         wantsPinnedRef,
-    ]);
-
-    const completeRouteJumpOperation = React.useCallback((operation: RouteJumpOperation): void => {
-        if (inFlightRouteJumpRef.current !== operation) return;
-        inFlightRouteJumpRef.current = null;
-        consumedRouteJumpRef.current = operation;
-        onRouteJumpSettled(operation.sessionId);
-    }, [onRouteJumpSettled]);
-
-    const preemptExplicitJumpForUserTakeover = React.useCallback((): void => {
-        const activeOperation = currentExplicitJumpOperationRef.current;
-        const routeJumpOperation = inFlightRouteJumpRef.current;
-        currentExplicitJumpOperationRef.current = null;
-        pendingJumpSeqViewportPromotionRef.current = null;
-        promotedJumpSeqViewportProtectionRef.current = null;
-        activeOperation?.releaseTakeover();
-        if (routeJumpOperation) completeRouteJumpOperation(routeJumpOperation);
-    }, [
-        completeRouteJumpOperation,
-        pendingJumpSeqViewportPromotionRef,
-        promotedJumpSeqViewportProtectionRef,
     ]);
 
     const isTranscriptNavigationTargetInRenderedWindow = React.useCallback((target: TranscriptJumpTarget): boolean => {

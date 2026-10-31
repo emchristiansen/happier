@@ -84,5 +84,13 @@ export async function resolveRunnerMcpServers(params: Readonly<{
   }
 
   const merged = mergeWithBuiltInHappierMcpServer({ builtIn: builtIn.mcpServers, extra: materialized.mcpServers });
-  return { happierMcpServer: builtIn.happierMcpServer, mcpServers: merged };
+  return {
+    happierMcpServer: {
+      ...builtIn.happierMcpServer,
+      stop: () => {
+        try { builtIn.happierMcpServer.stop(); } finally { materialized.cleanup(); }
+      },
+    },
+    mcpServers: merged,
+  };
 }

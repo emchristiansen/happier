@@ -27,7 +27,7 @@ Use **attach** when the session is still running and you want to reconnect to th
 happier attach <session-id>
 ```
 
-Use **resume** when the session is inactive but vendor-resumable:
+Use **resume** to continue a session without checking its state first:
 
 ```bash
 happier resume <session-id>
@@ -36,7 +36,7 @@ happier resume <session-id>
 Short version:
 
 - **attach** = reconnect to a running session
-- **resume** = reopen an inactive session through the provider/backend
+- **resume** = attach if running and attachable; otherwise reopen an inactive vendor-resumable session
 
 For the full workflows, see [Attach to a running session](/sessions/attach-to-session) and [Resume inactive sessions](/sessions/session-resume).
 
@@ -45,6 +45,17 @@ For the full workflows, see [Attach to a running session](/sessions/attach-to-se
 ```bash
 happier session create --title "My session" --message "Hello"
 ```
+
+For a scripted OpenCode session, choose the model and permission intent at creation:
+
+```bash
+happier session create --backend agent:opencode --model opencode/big-pickle \
+  --title "Demo" --prompt "Explain this repository" --permission-mode auto --json
+```
+
+`--title` sets the initial title. The agent can rename it later. Use
+`happier session set-title <session-id> "Demo"` to change the current title after
+the agent's initial rename; this does not lock the title against future agent updates.
 
 Target a different directory:
 
@@ -60,6 +71,9 @@ happier session create --path /path/to/repo --title "Repo session"
 happier session create --backend "agent:<agent-id>"
 happier session create --backend "acpBackend:<backend-id>"
 ```
+
+Built-in agent names are also accepted as shorthand: `--backend opencode`
+normalizes to `--backend agent:opencode`.
 
 When in doubt, inspect the canonical schema and available options via the action catalog:
 
@@ -126,6 +140,18 @@ Notes:
 - `--model` lets you target a specific model for that message when the backend supports it.
 - `--json` + explicit timeouts are recommended for scripts.
 
+### Choosing one message identity (`--local-id`)
+
+Development builds let CLI coordinators choose the message's `localId` before sending:
+
+```bash
+happier session send <session-id-or-prefix> "ping" --local-id 'board-wake-42' --json
+```
+
+Keep that exact ID when correlating the send result with session history or retrying a send.
+IDs must be nonblank and cannot begin with `-`. The relay rejects the reserved `agent-transition:` prefix.
+This override belongs to the CLI; MCP and voice tools continue using host-generated IDs.
+
 ## History
 
 Get recent transcript rows:
@@ -144,6 +170,17 @@ happier session history <session-id-or-prefix> --format raw --include-meta --inc
 
 Use `compact` when you want a simpler text-focused view.
 Use `raw` when you need provider payloads, metadata, or structured tool/message records.
+
+For readable structured progress, use the transcript action instead of parsing raw history:
+
+```bash
+happier session actions execute <session-id> session.transcript.get \
+  --input-json '{"includeTools":true,"limit":100}' --json
+```
+
+This returns semantic transcript items, including tool calls and results. Add
+`"includeRaw":true` when you also need their underlying records. Follow the returned
+pagination cursor to read more items. Compact history remains a text-focused view.
 
 ## Session control
 
@@ -188,21 +225,26 @@ happier session set-permission-mode <session-id-or-prefix> <mode>
 
 ### Permission intent (`set-permission-mode` and `--permission-mode`)
 
-Happier stores a provider-agnostic **permission intent** string for each session.
+Happier stores a provider-agnostic **permission intent** for each session.
 
-Common intents and aliases:
+Preferred inputs:
 
+- `read_only`
 - `default`
-- `read_only` (also accepts `read-only`, `readonly`, `ro`)
-- `safe-yolo` (also accepts legacy `acceptEdits`)
-- `yolo` (also accepts legacy `bypassPermissions`)
-- `plan`
+- `auto`
+- `yolo`
+
+Older spellings such as `read-only`, `safe-yolo`, `workspace_write`,
+`acceptEdits`, and `bypassPermissions` remain accepted. They normalize into
+compatible session metadata, so JSON output can retain an older wire spelling.
+Legacy `plan` permission input remains available for providers that map it to a
+session mode.
 
 Use it in either place:
 
 ```bash
 happier session set-permission-mode <session-id-or-prefix> read_only
-happier session send <session-id-or-prefix> "ping" --permission-mode safe-yolo
+happier session send <session-id-or-prefix> "ping" --permission-mode auto
 ```
 
 Notes:
@@ -247,6 +289,19 @@ Approve/deny in the app Inbox:
 
 ### Decide approvals from the CLI (advanced)
 
+Agent tool permission requests use `session.permission.respond`:
+
+```bash
+happier session actions execute <session-id> session.permission.respond \
+  --input-json '{"decision":"allow"}' --json
+```
+
+Omitting `requestId` selects the request only when exactly one tool permission
+request is pending. If several are pending, supply the specific `requestId` from
+the request shown in Happier. Inspect supported decisions and fields with
+`happier session actions describe session.permission.respond --json`.
+This differs from approving a Happier action in the Inbox.
+
 For automation-heavy workflows, the same approval flow is also available through the generic action executor.
 
 Example:
@@ -289,13 +344,18 @@ Current JSON envelopes:
 Execution runs are the structured “run” layer for multi-step flows (review / plan / delegate / voice agent):
 
 ```bash
-happier session run start <session-id> --intent <intent> --backend <backend-target-key> --json
+happier session run start <session-id> --intent <intent> --backend <backend-target-key> --permission-mode auto --json
 happier session run list <session-id> --json
 happier session run get <session-id> <run-id> --json
 happier session run send <session-id> <run-id> "message" --json
 happier session run stop <session-id> <run-id> --json
 happier session run wait <session-id> <run-id> --timeout 300 --json
 ```
+
+Execution-run inputs use the same preferred `read_only`, `default`, `auto`, and
+`yolo` vocabulary. Older `workspace_write`, `safe-yolo`, `acceptEdits`, and
+`bypassPermissions` inputs remain accepted; returned run state retains the
+compatible `read_only` / `workspace_write` wire projection.
 
 Advanced run control:
 

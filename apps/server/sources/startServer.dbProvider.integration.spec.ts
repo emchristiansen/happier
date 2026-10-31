@@ -99,19 +99,19 @@ describe("startServer DB provider selection", () => {
         );
     });
 
-    it("preserves sqlite filesystem paths containing spaces in DATABASE_URL", async () => {
+    it("preserves the native SQLite path when data dir contains spaces and hashes", async () => {
         const homeDir = join(tmpdir(), `happier-server-light-home-${Date.now()}-${Math.random().toString(36).slice(2)}`);
         await startServerHarness.start("light", {
             SERVER_ROLE: "api",
             HOME: homeDir,
             USERPROFILE: homeDir,
             HAPPY_DB_PROVIDER: "sqlite",
-            HAPPY_SERVER_LIGHT_DATA_DIR: "~/happy server light",
+            HAPPY_SERVER_LIGHT_DATA_DIR: "~/happy server #light",
             DATABASE_URL: undefined,
         });
 
         expect(process.env.DATABASE_URL).toBe(
-            `file:${join(homeDir, "happy server light", "happier-server-light.sqlite")}?socket_timeout=30&connection_limit=1`,
+            `file:${join(homeDir, "happy server #light", "happier-server-light.sqlite")}?socket_timeout=30&connection_limit=1`,
         );
     });
 });

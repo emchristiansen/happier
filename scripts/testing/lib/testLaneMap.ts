@@ -30,9 +30,9 @@ export interface TestLaneDefinition {
 export const TEST_LANE_DEFINITIONS: readonly TestLaneDefinition[] = Object.freeze([
   { id: 'test', category: 'unit', rootScriptName: 'test', rootCommand: 'yarn test', packageLocalOnly: false },
   { id: 'test:integration', category: 'integration', rootScriptName: 'test:integration', rootCommand: 'yarn test:integration', packageLocalOnly: false },
-  { id: 'cli:test:slow', category: 'integration', rootScriptName: null, rootCommand: null, packageLocalOnly: true },
-  { id: 'website:test', category: 'website', rootScriptName: null, rootCommand: null, packageLocalOnly: true },
-  { id: 'release-runtime:test', category: 'unit', rootScriptName: null, rootCommand: null, packageLocalOnly: true },
+  { id: 'cli:test:slow', category: 'integration', rootScriptName: 'test:cli:slow', rootCommand: 'yarn test:cli:slow', packageLocalOnly: false },
+  { id: 'website:test', category: 'website', rootScriptName: 'test', rootCommand: 'yarn test', packageLocalOnly: false },
+  { id: 'release-runtime:test', category: 'unit', rootScriptName: 'test', rootCommand: 'yarn test', packageLocalOnly: false },
   {
     id: 'test:db-contract:docker',
     category: 'db-contract',

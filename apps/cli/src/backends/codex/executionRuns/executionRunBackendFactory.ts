@@ -21,9 +21,12 @@ const CODEX_EXECUTION_RUN_PROCESS_ENV_KEYS = [
   'HAPPIER_CODEX_EXECUTION_RUN_TRANSPORT',
   'HAPPIER_CODEX_APP_SERVER_RPC_TIMEOUT_MS',
   'HAPPIER_CODEX_APP_SERVER_STARTUP_RPC_TIMEOUT_MS',
+  'HAPPIER_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS',
 ] as const;
 
 function buildCodexExecutionRunBaseEnv(isolationEnv: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv | undefined {
+  if (isolationEnv === undefined) return { ...process.env };
+
   const inherited: NodeJS.ProcessEnv = {};
   for (const key of CODEX_EXECUTION_RUN_PROCESS_ENV_KEYS) {
     const value = process.env[key];

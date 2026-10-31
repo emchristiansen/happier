@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { db, resolveSqliteRuntimePragmasFromEnv, resolveSqliteStartupDiagnosticsFromEnv } from "@/storage/db";
 import { createLightSqliteHarness, type LightSqliteHarness } from "@/testkit/lightSqliteHarness";
+import { resolveSqliteDatabaseFilePath } from "@/flavors/light/sqliteMigrations";
 
 describe("storage/prisma sqlite pragmas", () => {
     let harness: LightSqliteHarness | null = null;
@@ -63,43 +64,46 @@ describe("storage/prisma sqlite pragmas", () => {
         }).journalSizeLimitBytes).toBe(0);
     });
 
-    it("opens sqlite databases whose filesystem path contains spaces", async () => {
-        const parentDir = await mkdtemp(join(tmpdir(), "happier-sqlite-pragmas-"));
-        const baseDir = join(parentDir, "single connection");
-        await mkdir(baseDir);
+    it.each(["space here", "hash#here", "percent%20here"])("opens the same native database path for migration and Prisma (%s)", async (segment) => {
+        const baseDir = await mkdtemp(join(tmpdir(), `happier-${segment}-single-connection-`));
         const originalDatabaseUrl = process.env.DATABASE_URL;
-        const databaseUrl = renderPrismaCompatibleSqliteDatabaseUrl({
-            dbPath: join(baseDir, "test.sqlite"),
-            platform: process.platform,
-            sqlite: { connectionLimit: 1 },
-        });
-
-        process.env.DATABASE_URL = databaseUrl;
-        const { PrismaClient } = await import("../../generated/sqlite-client/index.js");
-        const client = new PrismaClient();
         try {
-            await client.$queryRawUnsafe("PRAGMA synchronous=NORMAL;");
-            const synchronousRows = await Promise.all(
-                Array.from({ length: 16 }, () =>
-                    client.$queryRawUnsafe<Array<{ synchronous: number | bigint }>>("SELECT synchronous FROM pragma_synchronous;"),
-                ),
-            );
+            const databaseUrl = renderPrismaCompatibleSqliteDatabaseUrl({
+                dbPath: join(baseDir, "test.sqlite"),
+                platform: process.platform,
+                sqlite: { connectionLimit: 1 },
+            });
+            process.env.DATABASE_URL = databaseUrl;
+            const { PrismaClient } = await import("../../generated/sqlite-client/index.js");
+            const client = new PrismaClient();
+            try {
+                expect(resolveSqliteDatabaseFilePath(databaseUrl)).toBe(join(baseDir, "test.sqlite"));
+                expect(resolveSqliteStartupDiagnosticsFromEnv({ DATABASE_URL: databaseUrl }).databaseUrlConnectionLimit).toBe(1);
+                await client.$queryRawUnsafe("PRAGMA synchronous=NORMAL;");
+                const synchronousRows = await Promise.all(
+                    Array.from({ length: 16 }, () =>
+                        client.$queryRawUnsafe<Array<{ synchronous: number | bigint }>>("SELECT synchronous FROM pragma_synchronous;"),
+                    ),
+                );
 
-            expect(synchronousRows.flat().map((row) => Number(row.synchronous))).toEqual(Array.from({ length: 16 }, () => 1));
+                expect(synchronousRows.flat().map((row) => Number(row.synchronous))).toEqual(Array.from({ length: 16 }, () => 1));
+                expect((await stat(join(baseDir, "test.sqlite"))).isFile()).toBe(true);
+            } finally {
+                await client.$disconnect();
+            }
         } finally {
-            await client.$disconnect();
             if (typeof originalDatabaseUrl === "string") {
                 process.env.DATABASE_URL = originalDatabaseUrl;
             } else {
                 delete process.env.DATABASE_URL;
             }
-            await rm(parentDir, { recursive: true, force: true });
+            await rm(baseDir, { recursive: true, force: true });
         }
     });
 
     it("reports sanitized sqlite startup diagnostics", () => {
         const diagnostics = resolveSqliteStartupDiagnosticsFromEnv({
-            DATABASE_URL: "file:/tmp/happier-secret-path/test.sqlite?socket_timeout=45&connection_limit=1",
+            DATABASE_URL: "file:/tmp/happier-secret-path/test.sqlite?socket_timeout=45&connection_limit=1&pool_timeout=60",
             HAPPIER_SQLITE_BUSY_TIMEOUT_MS: "45000",
             HAPPIER_SQLITE_JOURNAL_MODE: "DELETE",
             HAPPIER_SQLITE_SYNCHRONOUS: "FULL",
@@ -115,6 +119,8 @@ describe("storage/prisma sqlite pragmas", () => {
             databaseUrlConnectionLimit: 1,
             databaseUrlConnectionLimitStatus: "configured",
             readPoolConnectionLimit: null,
+            databaseUrlPoolAcquisitionTimeoutStatus: "unbounded",
+            ignoredDatabaseUrlQueryParameters: ["pool_timeout"],
         });
         expect(JSON.stringify(diagnostics)).not.toContain("happier-secret-path");
     });

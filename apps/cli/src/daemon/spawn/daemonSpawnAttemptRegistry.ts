@@ -13,7 +13,7 @@ type SpawnAttemptRecord = Readonly<{
   expiresAtMs: number;
 }>;
 
-function normalizeSpawnNonce(value: unknown): string {
+export function normalizeSpawnNonce(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
@@ -76,8 +76,8 @@ export function createDaemonSpawnAttemptRegistry(params: Readonly<{
       if (current?.terminal) return;
       records.set(normalizedSpawnNonce, {
         result,
-        terminal: isTerminalResult(result),
-        expiresAtMs: nowMs + ttlMs,
+        terminal: false,
+        expiresAtMs: current?.expiresAtMs ?? nowMs + ttlMs,
       });
     },
     settle: (spawnNonce, result) => {
@@ -110,6 +110,7 @@ export function createDaemonSpawnAttemptRegistry(params: Readonly<{
     resolve: (spawnNonce) => {
       const record = read(spawnNonce);
       if (!record) return { status: 'not_found' };
+      if (!record.terminal) return { status: 'pending' };
       if (record.result.type === 'error') {
         return {
           status: 'error',

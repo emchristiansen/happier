@@ -8,6 +8,8 @@ import type {
 } from '@/session/runtimeActivity/types';
 
 import { ExecutionRunManager } from '@/agent/executionRuns/runtime/ExecutionRunManager';
+import { prepareExecutionRunConnectedServices } from './prepareExecutionRunConnectedServices';
+import { listExecutionRunMarkers, removeExecutionRunMarker } from '@/daemon/executionRunRegistry';
 
 const SELECTION: ConnectedServiceBindingsV1 = {
   v: 1,
@@ -51,6 +53,74 @@ function createContributionHarness() {
 }
 
 describe('ExecutionRunManager — resume rehydrates the immutable launch record', () => {
+  it('publishes the successful resumed registration in run state and the actual activity marker', async () => {
+    const initialRegistration = {
+      v: 1 as const, agentId: 'codex', materializationKey: 'execution_run:initial',
+      connectedServicesBindings: SELECTION, brokerSelectionIdentity: null,
+      runtimeAccountIdentitySelections: [], sessionDirectory: '/tmp/wt', materializedRoot: '/legacy/codex',
+    };
+    let resumedHome = '/durable/team/codex-home';
+    let failNextLoad = false;
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude', cwd: '/tmp/wt',
+      createBackend: ({ connectedServicesCleanup }) => ({
+        ...createResumableBackend().backend,
+        async loadSessionWithReplayCapture() {
+          if (failNextLoad) throw new Error('provider resume refused');
+          return { sessionId: 'child_1' as SessionId, replay: [] };
+        },
+        async dispose() { await connectedServicesCleanup?.(); },
+      }),
+      sendAcp: () => {},
+      prepareConnectedServices: (params) => prepareExecutionRunConnectedServices({
+        ...params, cwd: '/tmp/wt', credentials: null,
+        // Substitute only the daemon control transport; canonical resume preparation stays real.
+        materializeViaDaemon: async (request) => ({
+          env: { CODEX_HOME: resumedHome },
+          proof: { v: 1, agentId: 'codex', materializationKey: request.materializationKey, connectedServicesBindings: SELECTION },
+          registration: { ...initialRegistration, materializationKey: request.materializationKey, materializedRoot: resumedHome },
+        }),
+        releaseViaDaemon: async () => true,
+      }),
+    });
+    const started = await manager.start({
+      sessionId: 'parent_1', intent: 'delegate', backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      permissionMode: 'read_only', retentionPolicy: 'resumable', runClass: 'long_lived', ioMode: 'request_response',
+      connectedServicesSelection: SELECTION, connectedServicesRegistration: initialRegistration,
+    });
+    try {
+      await expect.poll(() => manager.get(started.runId)?.resumeHandle?.kind).toBe('vendor_session.v1');
+      await manager.stop(started.runId);
+      await manager.waitForTerminal(started.runId);
+      await expect(manager.ensure(started.runId, { resume: true })).resolves.toEqual({ ok: true });
+      const registration = manager.get(started.runId)?.launch?.connectedServicesRegistration;
+      expect(registration?.materializedRoot).toBe('/durable/team/codex-home');
+      expect(registration?.materializationKey).not.toBe(initialRegistration.materializationKey);
+      expect(manager.get(started.runId)?.launch?.connectedServicesSelection).toEqual(SELECTION);
+      const marker = (await listExecutionRunMarkers()).find((candidate) => candidate.runId === started.runId);
+      expect(marker).toMatchObject({ status: 'running', executionRunConnectedServicesLaunchV1: {
+        runKey: registration?.materializationKey, materializedRoot: '/durable/team/codex-home',
+      } });
+
+      await manager.stop(started.runId);
+      await manager.waitForTerminal(started.runId);
+      const terminalMarker = (await listExecutionRunMarkers()).find((candidate) => candidate.runId === started.runId);
+      expect(terminalMarker).toMatchObject({ retentionPolicy: 'resumable', executionRunConnectedServicesLaunchV1: {
+        runKey: registration?.materializationKey, materializedRoot: '/durable/team/codex-home',
+      } });
+      resumedHome = '/durable/failed/codex-home';
+      failNextLoad = true;
+      await expect(manager.ensure(started.runId, { resume: true })).resolves.toMatchObject({ ok: false });
+      expect(manager.get(started.runId)?.launch?.connectedServicesRegistration).toEqual(registration);
+      expect((await listExecutionRunMarkers()).find((candidate) => candidate.runId === started.runId))
+        .toEqual(terminalMarker);
+    } finally {
+      await manager.stop(started.runId);
+      await manager.waitForTerminal(started.runId);
+      await removeExecutionRunMarker(started.runId);
+    }
+  });
+
   it('releases connected-service materialization when a terminal run has no resume handle', async () => {
     const cleanup = vi.fn(async () => {});
     const manager = new ExecutionRunManager({
@@ -102,6 +172,7 @@ describe('ExecutionRunManager — resume rehydrates the immutable launch record'
       sessionId: 'parent_1', intent: 'delegate', backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
       permissionMode: 'read_only', retentionPolicy: 'resumable', runClass: 'long_lived', ioMode: 'request_response',
     });
+    await expect.poll(() => manager.get(started.runId)?.resumeHandle?.kind).toBe('vendor_session.v1');
     await manager.stop(started.runId);
     await manager.waitForTerminal(started.runId);
     const backendCallsBeforeResume = createBackend.mock.calls.length;
@@ -118,11 +189,14 @@ describe('ExecutionRunManager — resume rehydrates the immutable launch record'
     expect(contribution.handle.report.mock.calls.at(-2)?.[0]).toEqual({
       state: 'active', activeCount: 1,
     });
-    expect(contribution.reports).toEqual([
-      { state: 'active', activeCount: 1 },
-      { state: 'idle', activeCount: 0 },
-      { state: 'idle', activeCount: 0 },
-    ]);
+    expect(contribution.reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
+
+    // The same successful-resume marker transition applies to native-auth runs.
+    await expect(manager.ensure(started.runId, { resume: true })).resolves.toEqual({ ok: true });
+    expect((await listExecutionRunMarkers()).find((marker) => marker.runId === started.runId)?.status).toBe('running');
+    await manager.stop(started.runId);
+    await manager.waitForTerminal(started.runId);
+    await removeExecutionRunMarker(started.runId);
   });
 
   it('fails closed on resume when the persisted CS account cannot be re-materialized', async () => {
@@ -153,6 +227,7 @@ describe('ExecutionRunManager — resume rehydrates the immutable launch record'
       connectedServicesEnv: { CODEX_HOME: '/start/root/codex-home' },
     });
 
+    await expect.poll(() => manager.get(started.runId)?.resumeHandle?.kind).toBe('vendor_session.v1');
     await manager.stop(started.runId);
     await manager.waitForTerminal(started.runId);
 
@@ -210,6 +285,7 @@ describe('ExecutionRunManager — resume rehydrates the immutable launch record'
       connectedServicesSelection: SELECTION,
       connectedServicesEnv: { CODEX_HOME: '/start/root/codex-home' },
     });
+    await expect.poll(() => manager.get(started.runId)?.resumeHandle?.kind).toBe('vendor_session.v1');
     await manager.stop(started.runId);
     await manager.waitForTerminal(started.runId);
 

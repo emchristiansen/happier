@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 type CodexJsonlStateFile = Readonly<{
@@ -10,6 +10,10 @@ const CODEX_JSONL_STATE_FILES = Object.freeze([
   { name: 'history.jsonl', kind: 'history' },
   { name: 'session_index.jsonl', kind: 'session_index' },
 ] satisfies readonly CodexJsonlStateFile[]);
+
+export function isCodexFixedJsonlStateFile(path: string): boolean {
+  return CODEX_JSONL_STATE_FILES.some(file => file.name === path);
+}
 
 type SessionIndexRecord = Readonly<{
   id: string;
@@ -84,10 +88,28 @@ async function appendJsonlLines(path: string, current: string | null, lines: rea
 export async function reconcileCodexSharedJsonlState(params: Readonly<{
   previousCodexHome?: string | null;
   sourceCodexHome: string;
+  localStateOnly?: boolean;
 }>): Promise<void> {
   if (!params.previousCodexHome) return;
+  if (params.localStateOnly) {
+    try {
+      if (!(await lstat(params.previousCodexHome)).isDirectory()) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+  }
   for (const file of CODEX_JSONL_STATE_FILES) {
-    const incoming = await readOptionalFile(join(params.previousCodexHome, file.name));
+    const incomingPath = join(params.previousCodexHome, file.name);
+    if (params.localStateOnly) {
+      try {
+        if ((await lstat(incomingPath)).isSymbolicLink()) continue;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+    }
+    const incoming = await readOptionalFile(incomingPath);
     if (incoming === null) continue;
     const destinationPath = join(params.sourceCodexHome, file.name);
     const current = await readOptionalFile(destinationPath);

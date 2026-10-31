@@ -1,4 +1,4 @@
-import type { ManagedConnectionState, ManagedConnectionTimingPolicy, ReadinessProbeResult } from './managedConnectionTypes.js';
+import type { ManagedConnectionState, ManagedConnectionTimingPolicy, ManagedProbeReportScope, ReadinessProbeResult } from './managedConnectionTypes.js';
 
 export type ManagedEndpointSupervisorState = ManagedConnectionState &
   Readonly<{
@@ -19,7 +19,11 @@ export interface ManagedEndpointSupervisor {
   stop(): Promise<void>;
   invalidate(): void;
   reportFailure(report: ManagedEndpointFailureReport): void;
-  reportProbeResult?(probe: Exclude<ReadinessProbeResult, Readonly<{ status: 'ready' }>>): void;
+  captureProbeReportScope?(): ManagedProbeReportScope;
+  reportProbeResult?(
+    probe: Exclude<ReadinessProbeResult, Readonly<{ status: 'ready' }>>,
+    scope?: ManagedProbeReportScope,
+  ): void;
   waitUntilOnline(params?: Readonly<{ timeoutMs?: number }>): Promise<void>;
   getState(): ManagedEndpointSupervisorState;
   subscribe(listener: (state: ManagedEndpointSupervisorState) => void): () => void;

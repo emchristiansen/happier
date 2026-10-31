@@ -1,10 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import type { ConnectedServiceBindingsV1 } from '@happier-dev/protocol';
+import { buildConnectedServiceCredentialRecord, type ConnectedServiceBindingsV1 } from '@happier-dev/protocol';
 
 import type { ExecutionRunState } from '@/agent/executionRuns/runtime/executionRunTypes';
-import { ExecutionRunConnectedServicesUnavailableError } from '@/agent/executionRuns/runtime/prepareExecutionRunConnectedServices';
+import { ExecutionRunConnectedServicesUnavailableError, prepareExecutionRunConnectedServices } from '@/agent/executionRuns/runtime/prepareExecutionRunConnectedServices';
 import { resolveExecutionRunResumeBackendOptions } from '@/agent/executionRuns/runtime/rehydrateExecutionRunBackendLaunch';
+import { materializeConnectedServicesForSpawn } from '@/daemon/connectedServices/materialize/materializeConnectedServicesForSpawn';
+import { createExecutionRunConnectedServicesBridge } from '@/daemon/connectedServices/runsBridge/materializeConnectedServicesForRun';
+import { ExecutionRunConnectedServiceMaterializeRequestSchema } from '@/daemon/connectedServices/runsBridge/contract';
+import { resolveConnectedServiceMaterializedRootDir } from '@/daemon/connectedServices/materialize/resolveConnectedServiceMaterializedRootDir';
 
 const CONNECTED_SELECTION: ConnectedServiceBindingsV1 = {
   v: 1,
@@ -35,6 +42,63 @@ function baseRun(launch: ExecutionRunState['launch']): ExecutionRunState {
 }
 
 describe('resolveExecutionRunResumeBackendOptions', () => {
+  it('imports a legacy run home through real resume preparation before releasing the new durable home', async () => {
+    const sandbox = await mkdtemp(join(tmpdir(), 'happier-resume-run-home-'));
+    try {
+      const previousRoot = resolveConnectedServiceMaterializedRootDir({
+        baseDir: join(sandbox, 'materialized'), agentId: 'codex', materializationKey: 'execution_run:old',
+      });
+      const rollout = join('sessions', 'rollout-2026-10-11T00-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl');
+      const history = '{"type":"session_meta","payload":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}\n';
+      await mkdir(join(previousRoot, 'codex-home', 'sessions'), { recursive: true });
+      await writeFile(join(previousRoot, 'codex-home', rollout), history);
+      const record = buildConnectedServiceCredentialRecord({
+        now: 10, serviceId: 'openai-codex', profileId: 'team', kind: 'oauth', expiresAt: null,
+        oauth: { accessToken: 'access-team', refreshToken: 'refresh-team', idToken: 'id-team',
+          scope: null, tokenType: null, providerAccountId: 'acct-team', providerEmail: null },
+      });
+      const bridge = createExecutionRunConnectedServicesBridge({
+        runtimeRegistry: null,
+        resolveAuthForSpawn: async (params) => {
+          const materialized = await materializeConnectedServicesForSpawn({
+            agentId: 'codex', materializationKey: params.materializationKey,
+            activeServerDir: join(sandbox, 'server'), baseDir: join(sandbox, 'materialized'),
+            previousMaterializedRoot: params.previousMaterializedRoot,
+            recordsByServiceId: new Map([['openai-codex', record]]),
+            selectionsByServiceId: new Map([['openai-codex', { kind: 'profile', serviceId: 'openai-codex', profileId: 'team', record }]]),
+            processEnv: { HOME: sandbox, CODEX_HOME: join(sandbox, 'native') },
+          });
+          return materialized ? { ...materialized,
+            cleanupOnFailure: materialized.cleanupOnFailure ?? null,
+            cleanupOnExit: materialized.cleanupOnExit ?? null,
+            connectedServicesBindings: CONNECTED_SELECTION, runtimeAccountIdentitySelections: [] } : null;
+        },
+      });
+      const options = await resolveExecutionRunResumeBackendOptions({
+        run: baseRun({ connectedServicesSelection: CONNECTED_SELECTION, connectedServicesRegistration: {
+          v: 1, agentId: 'codex', materializationKey: 'execution_run:old', connectedServicesBindings: CONNECTED_SELECTION,
+          brokerSelectionIdentity: null, runtimeAccountIdentitySelections: [], sessionDirectory: sandbox,
+          materializedRoot: previousRoot,
+        } }),
+        prepareConnectedServices: (params) => prepareExecutionRunConnectedServices({
+          ...params, credentials: null, cwd: sandbox,
+          materializeViaDaemon: async (request) => bridge.materialize({
+            ...ExecutionRunConnectedServiceMaterializeRequestSchema.parse(request), agentId: 'codex',
+          }),
+          releaseViaDaemon: async (request) => (await bridge.release(request)).released,
+        }),
+      });
+      const resumedHome = options.connectedServicesEnv?.CODEX_HOME;
+      expect(resumedHome).toBeTruthy();
+      await expect(readFile(join(resumedHome!, rollout), 'utf8')).resolves.toBe(history);
+      await options.connectedServicesCleanup?.();
+      await expect(readFile(join(resumedHome!, rollout), 'utf8')).resolves.toBe(history);
+      await expect(readFile(join(previousRoot, 'codex-home', rollout), 'utf8')).resolves.toBe(history);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
   it('re-resolves account settings + re-materializes the SAME persisted CS selection and threads model/effort', async () => {
     const cleanup = vi.fn(async () => undefined);
     const prepareConnectedServices = vi.fn(

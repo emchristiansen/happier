@@ -7,6 +7,7 @@ import { createConnectedServiceApiError } from './connectedServiceApiError';
 import {
     CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER,
     CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
+    appendConnectedServiceAuthGroupReaderCapabilities,
     ConnectedServiceAuthGroupListResponseV1Schema,
     type ConnectedServiceAuthGroupMemberCreateRequestV1,
     type ConnectedServiceAuthGroupMemberPatchRequestV1,
@@ -39,7 +40,7 @@ async function fetchAuthGroupEnvelope(
 ): Promise<ConnectedServiceAuthGroupV1> {
     return await backoff(async () => {
         const response = await serverFetch(
-            path,
+            appendConnectedServiceAuthGroupReaderCapabilities(path),
             {
                 method: init.method,
                 headers: {
@@ -103,7 +104,7 @@ export async function listConnectedServiceAuthGroupsV3(
 ): Promise<ReadonlyArray<ConnectedServiceAuthGroupV1>> {
     return await backoff(async () => {
         const response = await serverFetch(
-            `/v3/connect/${encodeURIComponent(params.serviceId)}/groups`,
+            appendConnectedServiceAuthGroupReaderCapabilities(`/v3/connect/${encodeURIComponent(params.serviceId)}/groups`),
             {
                 method: 'GET',
                 headers: {

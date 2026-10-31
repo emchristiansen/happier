@@ -13,9 +13,12 @@ const CONNECTED_SERVICE_MEMBER_RUNTIME_BLOCKER_CLEAR_KEYS = [
     'capacityLimitedUntilMs',
     'authInvalidUntilMs',
     'planUnavailableUntilMs',
+    'modelUnavailableUntilMsByModelId',
     'validationBlockedUntilMs',
     'credentialHealthStatus',
+    'autoDisabledReason',
     'lastFailureKind',
+    'lastFailureCode',
     'lastObservedAtMs',
 ] as const satisfies ReadonlyArray<keyof ConnectedServiceAuthGroupMemberStateV1>;
 

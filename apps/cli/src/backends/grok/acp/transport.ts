@@ -46,6 +46,12 @@ export class GrokTransport extends DefaultTransport {
     super('grok');
   }
 
+  getPermissionRequestScope(): 'session' {
+    // Grok children share the root permission actor and gateway; their answers settle the
+    // requesting native tool. Root sessionId alone does not identify the foreground prompt.
+    return 'session';
+  }
+
   override shouldProcessToolUpdate<T extends GrokToolUpdate>(
     update: T,
     context: Readonly<{ source: 'tool_call' | 'tool_call_update' }>,

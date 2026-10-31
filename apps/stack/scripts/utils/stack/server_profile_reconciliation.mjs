@@ -28,6 +28,19 @@ export function deriveEnvServerIdFromUrl(url) {
   return `env_${(h >>> 0).toString(16)}`;
 }
 
+function readCliSettings(homeDir) {
+  const baseDir = String(homeDir ?? '').trim();
+  if (!baseDir) return null;
+  const settingsPath = join(baseDir, 'settings.json');
+  if (!existsSync(settingsPath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function coerceServerProfileFromSettings(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = typeof raw.id === 'string' ? raw.id.trim() : '';
@@ -46,22 +59,72 @@ function coerceServerProfileFromSettings(raw) {
 }
 
 export function readActiveServerUrlsFromCliSettings(homeDir) {
-  const baseDir = String(homeDir ?? '').trim();
-  if (!baseDir) return null;
-  const settingsPath = join(baseDir, 'settings.json');
-  if (!existsSync(settingsPath)) return null;
+  const parsed = readCliSettings(homeDir);
+  if (!parsed) return null;
+  const schemaVersion = Number(parsed.schemaVersion ?? 0);
+  if (!Number.isFinite(schemaVersion) || schemaVersion < 5) return null;
+  const activeServerId = typeof parsed.activeServerId === 'string' ? parsed.activeServerId.trim() : '';
+  const servers = parsed.servers && typeof parsed.servers === 'object' ? parsed.servers : null;
+  if (!activeServerId || !servers) return null;
+  return coerceServerProfileFromSettings(servers[activeServerId]);
+}
+
+export function shouldVerifyStackServerProfileReconciliation(homeDir) {
+  const settings = readCliSettings(homeDir);
+  const schemaVersion = Number(settings?.schemaVersion ?? 0);
+  return Boolean(
+    Number.isFinite(schemaVersion)
+      && schemaVersion >= 5
+      && settings?.servers
+      && typeof settings.servers === 'object',
+  );
+}
+
+function profileEndpointMatches(actual, expected) {
+  // Match the CLI's normalizeUrlOrThrow serialization before it persists endpoints.
+  // Server identity keys are broader than endpoint equality; keep paths and queries distinct.
+  const serialize = (value) => new URL(value).toString().replace(/\/+$/, '');
   try {
-    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    if (!parsed || typeof parsed !== 'object') return null;
-    const schemaVersion = Number(parsed.schemaVersion ?? 0);
-    if (!Number.isFinite(schemaVersion) || schemaVersion < 5) return null;
-    const activeServerId = typeof parsed.activeServerId === 'string' ? parsed.activeServerId.trim() : '';
-    const servers = parsed.servers && typeof parsed.servers === 'object' ? parsed.servers : null;
-    if (!activeServerId || !servers) return null;
-    return coerceServerProfileFromSettings(servers[activeServerId]);
+    return serialize(actual) === serialize(expected);
   } catch {
-    return null;
+    return false;
   }
+}
+
+export function assertStackServerProfileReconciled({
+  homeDir,
+  serverId,
+  internalServerUrl,
+  publicServerUrl,
+}) {
+  const expectedId = String(serverId ?? '').trim();
+  const expectedInternalUrl = normalizeServerUrl(internalServerUrl);
+  const expectedPublicUrl = normalizeServerUrl(publicServerUrl);
+  const settings = readCliSettings(homeDir);
+  const activeServerId = typeof settings?.activeServerId === 'string' ? settings.activeServerId.trim() : '';
+  const servers = settings?.servers && typeof settings.servers === 'object' ? settings.servers : null;
+  const rawProfile = servers && expectedId ? servers[expectedId] : null;
+  // Read the persisted profile the way the CLI resolves it. The CLI profile writer does not persist a
+  // `localServerUrl` equal to `serverUrl`, so the local relay URL is only split when present.
+  const profile = coerceServerProfileFromSettings(rawProfile);
+
+  let reason = null;
+  if (!settings) reason = 'settings could not be read after the CLI exited';
+  else if (activeServerId !== expectedId) reason = `active profile remained ${activeServerId || 'unset'}`;
+  else if (!rawProfile || typeof rawProfile !== 'object') reason = `profile ${expectedId} was not written`;
+  else if (!profile) reason = `profile ${expectedId} is incomplete`;
+  else if (profile.id !== expectedId) reason = `profile ${expectedId} has a different identity`;
+  else if (!profileEndpointMatches(profile.serverUrl, expectedInternalUrl)) reason = 'relay URL was not updated';
+  else if (!profileEndpointMatches(profile.localServerUrl ?? profile.serverUrl, expectedInternalUrl)) reason = 'local relay URL was not updated';
+  else if (!profileEndpointMatches(profile.webappUrl, expectedPublicUrl)) reason = 'web app URL was not updated';
+
+  if (!reason) return;
+  const error = new Error(
+    `[hstack] the selected Happier CLI exited successfully but did not apply the requested stack relay profile (${reason}). `
+      + 'Upgrade or rebuild the Happier CLI before launching this stack.',
+  );
+  error.code = 'ESTACKCLIPROFILERECONCILIATION';
+  throw error;
 }
 
 /**

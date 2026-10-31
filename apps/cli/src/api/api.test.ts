@@ -8,11 +8,18 @@ import { logger } from '@/ui/logger';
 import tweetnacl from 'tweetnacl';
 
 // Use vi.hoisted to ensure mock functions are available when vi.mock factory runs
-const { mockGet, mockPost, mockIsAxiosError, consumeMachineReplacementCandidateAfterRegistrationMock } = vi.hoisted(() => ({
+const {
+    mockGet,
+    mockPost,
+    mockIsAxiosError,
+    consumeMachineReplacementCandidateAfterRegistrationMock,
+    fetchServerFeaturesSnapshotMock,
+} = vi.hoisted(() => ({
     mockGet: vi.fn(),
     mockPost: vi.fn(),
     mockIsAxiosError: vi.fn(() => true),
     consumeMachineReplacementCandidateAfterRegistrationMock: vi.fn(async () => undefined),
+    fetchServerFeaturesSnapshotMock: vi.fn(async () => ({ status: 'unsupported', reason: 'endpoint_missing' })),
 }));
 
 vi.mock('axios', () => ({
@@ -31,7 +38,7 @@ vi.mock('@/ui/logger', () => ({
 }));
 
 vi.mock('@/features/serverFeaturesClient', () => ({
-    fetchServerFeaturesSnapshot: async () => ({ status: 'unsupported', reason: 'endpoint_missing' }),
+    fetchServerFeaturesSnapshot: fetchServerFeaturesSnapshotMock,
 }));
 
 vi.mock('@/daemon/machineIdentity/machineReplacementCandidates', () => ({
@@ -50,7 +57,8 @@ vi.mock('./encryption', () => ({
 // Mock configuration
 vi.mock('@/configuration', () => ({
     configuration: {
-        apiServerUrl: 'https://api.example.com'
+        apiServerUrl: 'https://api.example.com',
+        sessionControlHttpTimeoutMs: 60_000,
     }
 }));
 
@@ -127,6 +135,24 @@ describe('Api server error handling', () => {
     });
 
     describe('getOrCreateSession', () => {
+        it('uses the canonical session-control timeout for the fail-closed feature decision', async () => {
+            mockPost.mockResolvedValue({
+                status: 201,
+                data: { session: { id: 's1' }, resolution: 'created' },
+            });
+
+            await api.getOrCreateSession({
+                tag: 'test-tag',
+                metadata: testMetadata as any,
+                state: null,
+            });
+
+            expect(fetchServerFeaturesSnapshotMock).toHaveBeenCalledWith({
+                serverUrl: 'https://api.example.com',
+                timeoutMs: 60_000,
+            });
+        });
+
         it('declares the current session-sync protocol on the canonical create/load request', async () => {
             mockPost.mockResolvedValue({
                 status: 201,

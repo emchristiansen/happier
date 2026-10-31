@@ -9,10 +9,13 @@ import { Icon } from '@/components/ui/icons/Icon';
 export const ConnectedServiceDetailActionsGroup = React.memo(function ConnectedServiceDetailActionsGroup(props: Readonly<{
   supportsOauth: boolean;
   oauthAddActionModes?: ReadonlyArray<'device' | 'paste' | 'browser'>;
+  oauthAddActionTitle?: string;
+  oauthPasteSubtitle?: string;
   supportsToken: boolean;
   tokenKind: 'access-token' | 'api-key' | 'setup-token' | null;
   tokenSetupUrl?: string | null;
   onAddOauthProfile: (method: 'device' | 'paste' | 'browser' | null) => void;
+  onImportNativeLogin?: () => void;
   onConnectToken: () => void;
   onOpenTokenSetupUrl: (url: string) => void;
 }>) {
@@ -24,6 +27,13 @@ export const ConnectedServiceDetailActionsGroup = React.memo(function ConnectedS
 
   return (
     <ItemGroup title={t('connectedServices.detail.actionsGroupTitle')}>
+      {props.onImportNativeLogin ? <Item
+        testID="connected-services-action:import-native-login"
+        title={t('connectedServices.importAccounts.title')}
+        subtitle={t('connectedServices.importAccounts.actionDescription')}
+        icon={<Icon name="download" size={20} color={theme.colors.accent.blue} />}
+        onPress={props.onImportNativeLogin}
+      /> : null}
       {props.supportsToken ? (
         <Item
           testID="connected-services-action:connect-token"
@@ -68,13 +78,13 @@ export const ConnectedServiceDetailActionsGroup = React.memo(function ConnectedS
                 mode === 'device'
                   ? t('connectedServices.detail.addOauthProfileDeviceSubtitle')
                   : mode === 'paste'
-                    ? t('connectedServices.detail.addOauthProfilePasteSubtitle')
+                    ? props.oauthPasteSubtitle ?? t('connectedServices.detail.addOauthProfilePasteSubtitle')
                     : t('connectedServices.detail.addOauthProfileBrowserSubtitle');
               return (
                 <Item
                   key={`add-oauth:${mode}`}
                   testID={`connected-services-action:add-oauth-profile-${mode}`}
-                  title={titleKey}
+                  title={props.oauthAddActionTitle ?? titleKey}
                   subtitle={subtitleKey}
                   icon={<Icon name="plus-circle" size={20} color={theme.colors.accent.blue} />}
                   onPress={() => props.onAddOauthProfile(mode)}
@@ -84,7 +94,7 @@ export const ConnectedServiceDetailActionsGroup = React.memo(function ConnectedS
           ) : (
             <Item
               testID="connected-services-action:add-oauth-profile"
-              title={t('connectedServices.detail.addOauthProfileTitle')}
+              title={props.oauthAddActionTitle ?? t('connectedServices.detail.addOauthProfileTitle')}
               subtitle={t('connectedServices.detail.addOauthProfileSubtitle')}
               icon={<Icon name="plus-circle" size={20} color={theme.colors.accent.blue} />}
               onPress={() => props.onAddOauthProfile(singleOauthMode)}

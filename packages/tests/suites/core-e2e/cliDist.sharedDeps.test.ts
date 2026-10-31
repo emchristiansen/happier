@@ -1,3 +1,4 @@
+import { afterAll as j078AfterAll, beforeEach as j078BeforeEach } from 'vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, writeFile, mkdir, access } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -116,7 +117,7 @@ describe('core e2e: cli dist build', () => {
     expect(await exists(resolve(repoRoot, 'packages', 'release-runtime', 'dist', 'index.js'))).toBe(true);
   });
 
-  it('creates a stable CLI dist snapshot for spawned processes', async () => {
+  it('J078 creates retained CLI dist generations for spawned processes', async () => {
     dir = await mkdtemp(join(tmpdir(), 'happier-cli-dist-snapshot-'));
     const repoRoot = dir;
 
@@ -142,7 +143,7 @@ describe('core e2e: cli dist build', () => {
       },
     );
 
-    expect(entrypoint).toBe(resolve(snapshotDir, 'dist', 'index.mjs'));
+    expect(entrypoint).not.toBe(resolve(snapshotDir, 'dist', 'index.mjs'));
     expect(await exists(entrypoint)).toBe(true);
 
     const entrypoint2 = await ensureCliDistSnapshotEntrypoint(
@@ -155,7 +156,8 @@ describe('core e2e: cli dist build', () => {
       },
     );
 
-    expect(entrypoint2).toBe(entrypoint);
+    expect(entrypoint2).not.toBe(entrypoint);
+    expect(await exists(entrypoint)).toBe(true);
   });
 
   it('launches the CLI dist snapshot from an arbitrary cwd with bundled workspace packages available', async () => {
@@ -299,7 +301,7 @@ describe('core e2e: cli dist build', () => {
     expect(execution.stdout.trim()).toBe('protocol-ok:axios-ok');
   });
 
-  it('launches the CLI source entrypoint from the snapshot root when source mode is enabled', async () => {
+  it('J078 resolves source mode from its returned generation', async () => {
     dir = await mkdtemp(join(tmpdir(), 'happier-cli-source-snapshot-launch-'));
     const repoRoot = dir;
 
@@ -352,17 +354,17 @@ describe('core e2e: cli dist build', () => {
       },
     );
 
-    expect(launchSpec.cwd).toBe(snapshotDir);
+    expect(launchSpec.cwd).not.toBe(snapshotDir);
     expect(launchSpec.args).toEqual(
       expect.arrayContaining([
         '--import',
         expect.stringContaining('tsx/dist/esm/index.mjs'),
-        expect.stringContaining(resolve(snapshotDir, 'src', 'index.ts')),
+        expect.stringContaining(resolve(launchSpec.cwd!, 'src', 'index.ts')),
       ]),
     );
   });
 
-  it('retries CLI dist snapshot copy when dist files change during the first copy attempt', async () => {
+  it('J078 retries private snapshot copy when dist files change during the first copy attempt', async () => {
     dir = await mkdtemp(join(tmpdir(), 'happier-cli-dist-snapshot-retry-'));
     const repoRoot = dir;
 
@@ -409,12 +411,72 @@ describe('core e2e: cli dist build', () => {
         },
       );
 
-      expect(entrypoint).toBe(resolve(snapshotDir, 'dist', 'index.mjs'));
+      expect(entrypoint).not.toBe(resolve(snapshotDir, 'dist', 'index.mjs'));
       expect(await exists(entrypoint)).toBe(true);
-      expect(await exists(resolve(snapshotDir, 'dist', 'copilotCliAuthSpec-hash.mjs'))).toBe(true);
+      expect(await exists(resolve(entrypoint, '..', 'copilotCliAuthSpec-hash.mjs'))).toBe(true);
     } finally {
       vi.doUnmock('node:fs/promises');
       vi.resetModules();
     }
   });
+});
+
+
+// J078: install genuine system boundaries before the real owners load. Fixture cp remains real.
+const j078Boundary = await vi.hoisted(async () => {
+  const { createRequire, syncBuiltinESMExports } = await import('node:module');
+  const req = createRequire(`${process.cwd()}/package.json`);
+  const fs = req('node:fs');
+  const promises = req('node:fs/promises');
+  const cp = req('node:child_process');
+  const http = req('node:http');
+  const https = req('node:https');
+  const net = req('node:net');
+  const original = { read: fs.readFileSync, cpSync: fs.cpSync, cp: promises.cp, kill: process.kill, fetch: globalThis.fetch,
+    child: Object.fromEntries(['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'].map((key) => [key, cp[key]])),
+    httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
+  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
+  const refuse = (name: string) => (..._args: unknown[]) => { state.attempts.push(name); throw new Error(`J078 forbidden external boundary: ${name}`); };
+  for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => state.active ? refuse(key)(...args) : original.child[key](...args);
+  http.request = (...args: unknown[]) => state.active ? refuse('http')(...args) : original.httpRequest(...args);
+  https.request = (...args: unknown[]) => state.active ? refuse('https')(...args) : original.httpsRequest(...args);
+  http.createServer = (...args: unknown[]) => state.active ? refuse('server')(...args) : original.httpServer(...args);
+  net.createServer = (...args: unknown[]) => state.active ? refuse('net')(...args) : original.netServer(...args);
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => state.active ? refuse('fetch')(...args) : original.fetch(...args)) as typeof fetch;
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (!state.active) return original.kill(pid, signal);
+    if (signal !== 0) return refuse('signal')(pid, signal);
+    return true; // Fixture liveness only; never send signal 0.
+  }) as typeof process.kill;
+  fs.readFileSync = (...args: unknown[]) => state.active && typeof args[0] === 'string' && /^\/proc\/\d+\/stat$/.test(args[0])
+    ? `1 (fixture) S ${Array(18).fill('0').join(' ')} 100` : original.read(...args);
+  const allowed = (path: unknown) => {
+    const root = process.env.TMPDIR;
+    if (!root || typeof path !== 'string' || !(path === root || path.startsWith(`${root}/`))) {
+      throw new Error(`J078 fixture copy outside owned TMPDIR: ${String(path)}`);
+    }
+  };
+  fs.cpSync = (...args: unknown[]) => { if (state.active) { allowed(args[0]); allowed(args[1]); } return original.cpSync(...args); };
+  promises.cp = async (src: string, dest: string, ...args: unknown[]) => {
+    if (state.active) { allowed(src); allowed(dest); }
+    const run = () => original.cp(src, dest, ...args) as Promise<void>;
+    return state.active && state.onCopy ? state.onCopy(src, dest, run) : run();
+  };
+  syncBuiltinESMExports();
+  if ((await import('node:child_process')).spawnSync !== cp.spawnSync
+    || (await import('node:fs')).readFileSync !== fs.readFileSync
+    || (await import('node:fs/promises')).cp !== promises.cp) throw new Error('J078 actual builtin binding mismatch');
+  return { state, restore: () => {
+    fs.readFileSync = original.read; fs.cpSync = original.cpSync; promises.cp = original.cp;
+    for (const key of Object.keys(original.child)) cp[key] = original.child[key];
+    http.request = original.httpRequest; https.request = original.httpsRequest;
+    http.createServer = original.httpServer; net.createServer = original.netServer;
+    process.kill = original.kill; globalThis.fetch = original.fetch; syncBuiltinESMExports();
+  } };
+});
+// Unselected legacy cases retain their own existing boundaries and assertions.
+j078BeforeEach(() => { j078Boundary.state.active = Boolean(expect.getState().currentTestName?.includes('J078')); });
+j078AfterAll(() => {
+  try { expect(j078Boundary.state.attempts).toEqual([]); }
+  finally { j078Boundary.restore(); }
 });

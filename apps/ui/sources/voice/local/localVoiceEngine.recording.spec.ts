@@ -97,6 +97,22 @@ describe('local voice engine recording lifecycle', () => {
         await expect(stopPromise).resolves.toBeUndefined();
 
         expect(getLocalVoiceState().status).toBe('idle');
-        expect(getLocalVoiceState().error).toBe('stt_failed');
+        expect(getLocalVoiceState().error).toBe('stt_timeout');
+    });
+
+    it.each([
+        [401, 'stt_auth_failed'],
+        [403, 'stt_auth_failed'],
+        [429, 'stt_rate_limited'],
+        [500, 'stt_failed'],
+    ])('reports HTTP %i from the STT service as %s instead of silently dropping the turn', async (status, code) => {
+        (globalThis.fetch as any).mockResolvedValueOnce(new Response('{}', { status }));
+
+        const { toggleLocalVoiceTurn, getLocalVoiceState } = await import('./localVoiceEngine');
+        await toggleLocalVoiceTurn('s1');
+        await expect(toggleLocalVoiceTurn('s1')).resolves.toBeUndefined();
+
+        expect(getLocalVoiceState().status).toBe('idle');
+        expect(getLocalVoiceState().error).toBe(code);
     });
 });

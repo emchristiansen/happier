@@ -41,9 +41,6 @@ test.describe('ui e2e: transcript small reconnect catch-up', () => {
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -77,8 +74,8 @@ test.describe('ui e2e: transcript small reconnect catch-up', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('uses incremental afterSeq catch-up on reconnect when gap is small', async ({ page }) => {
-    test.setTimeout(540_000);
+  test('uses incremental afterSeq catch-up on reconnect when gap is small', { tag: "@smoke" }, async ({ page }) => {
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     await page.setViewportSize({ width: 1440, height: 900 });

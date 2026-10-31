@@ -39,6 +39,7 @@ happier attach <session-id>
 What happens depends on how that session was started:
 
 - **tmux-backed session**: Happier reattaches you to the live tmux session
+- **zellij- or Herdr-hosted session**: Happier opens the existing pane that owns the session
 - **Windows Terminal session**: Happier focuses the existing Windows Terminal host for that session
 - **Windows Console session**: Happier brings the existing console host to the foreground
 - **provider-native attach session**: Happier uses the provider’s own attach flow for that session
@@ -57,18 +58,26 @@ Stopped sessions are not shown in this picker. Use [`happier resume`](/sessions/
 
 Attach support depends on the session type.
 
-### tmux-backed sessions
+### Terminal-hosted sessions
 
-This is the classic attach flow for providers such as **Claude** and **Codex** on machines where `tmux` is available.
+<Callout type="info">
+  Herdr hosting and automatic terminal presentation for supported server-backed sessions are available in Happier CLI 0.2.16 and later, including stable releases.
+</Callout>
+
+Older released Happier apps can still read and manage the session's core metadata.
+Herdr-specific selection and attachment controls require an updated app; they are
+not added to an older app by upgrading only its machine's CLI.
+
+Happier can host supported sessions in `tmux`, zellij, or Herdr on macOS and Linux.
 
 Requirements:
 
 - the session must run on a machine where Happier CLI/daemon is available,
-- `tmux` integration must be enabled before the session starts,
+- the terminal host must be selected before the session starts,
 - you must attach from the same machine that owns the running session,
 - you must be using the same Happier account/server profile that started the session.
 
-`tmux` keeps the provider process alive after the app starts it, so Happier can reconnect to it later.
+The host keeps the interactive process available so Happier can reconnect later. Herdr requires a stable release, version `0.9.2` or newer.
 
 ### Windows interactive-host sessions
 
@@ -84,21 +93,26 @@ If the session was started in **Windows Terminal** or **Console** mode, `happier
 
 Some providers can attach through their own native session model.
 
-For example, **OpenCode** can reopen a supported existing provider session without relying on tmux. In practice, this still means attaching from a terminal context that can reach the same underlying OpenCode machine/session.
+For example, **Codex App Server** sessions on macOS and Linux can open the Codex TUI against the same running thread, and **OpenCode** can reopen a supported existing provider session. Neither flow requires a terminal host. If a host is selected for new sessions, Happier can open that TUI there immediately instead of waiting for a manual attach. You still attach from the machine that owns the running session.
 
 ## Choose how app-started sessions should launch
 
-### Enable tmux-backed starts
+### Choose a terminal host
 
-Use this when you want tmux-backed attachable sessions on machines where tmux is available.
+Use this when you want supported sessions to appear immediately in tmux, zellij, or Herdr and remain attachable there.
 
 In the app:
 
 1. Open **Settings**
 2. Open **Session**
-3. Enable the **tmux integration** option
+3. Choose **Terminal host for new sessions**: **None**, **tmux**, **zellij**, or **Herdr**
 
-Once enabled, new supported sessions started from the app are launched inside `tmux` so Happier can reattach them later.
+New sessions with a real terminal surface start in the selected host. Server-backed Codex and OpenCode sessions open their local TUI against the same provider session. ACP and other headless runtimes stay headless. Machine details can override the account-wide choice.
+
+For Happier CLI 0.2.16 and later, a server-backed Codex or OpenCode terminal is an optional
+local client. Closing that managed terminal leaves the session available in Happier;
+it does not stop the shared controller or automatically reopen the terminal. Use
+**Detach terminal** to release it from the app, or **Stop** to end the session.
 
 ### Choose the default Windows mode
 
@@ -129,13 +143,13 @@ The most common flow looks like this:
 1. Start the session in the Happier app
 2. Use it normally in **remote** mode
 3. Run `happier attach <session-id>` on the owning machine
-4. Switch to **local** mode when you want direct provider-TUI control
+4. Open the provider TUI for the same session
 5. Continue working in the terminal
-6. Switch back to **remote** mode later to continue from the app
+6. Keep using the app at the same time on shared-control paths, or switch back later on exclusive-control paths
 
 Starting local control is terminal-driven. To take local control, attach from the terminal on the owning machine with `happier attach <session-id>`.
 
-If you send a message from the app while a Claude or Codex session is in local mode, Happier queues it first instead of typing it into your terminal. If the local turn is still running, Happier waits for that turn to finish, abort, or otherwise reach a safe boundary before switching the session back to remote processing and delivering the queued message.
+Shared-control sessions keep Happier connected while the provider TUI is open. On exclusive-control sessions, Happier queues app messages and waits for the local turn to finish, abort, or otherwise reach a safe boundary before switching back to remote processing.
 
 ## Remote control vs local control
 
@@ -146,7 +160,23 @@ The same session can move between two control styles:
 
 This is a control switch inside the same session, not a new session. The transcript, session id, and session settings stay the same.
 
-Remote-to-local control starts from the terminal with `happier attach`. Local-to-remote control can be requested from the app when the session is currently locally controlled. Happier may wait until the current local turn is done before it takes remote control, because forcing a prompt into a busy terminal TUI could interrupt or abort the provider’s current work.
+Remote-to-local control starts from the terminal with `happier attach`. Local-to-remote control can be requested from the app when the session is currently locally controlled. On exclusive-control paths, Happier may wait until the current local turn is done before it takes remote control. Shared-control paths keep the app connected while the TUI is attached.
+
+For Happier CLI 0.2.16 and later, shared-control sessions offer **Detach terminal**
+only for a TUI managed by the session runner. Detaching that TUI keeps the session
+and app writable. A separate native `happier attach` client is independent: close
+it in its terminal, rather than expecting the app to close it.
+If the session has a terminal host, `happier attach` restores its managed TUI there
+before opening or focusing the host. An already-attached TUI is reused.
+
+After a Herdr restart, Happier CLI 0.2.16 and later can also admit a native client started
+inside the session's restored pane while its shared controller remains running.
+Happier verifies the same conversation and current client before showing managed
+attachment and **Detach terminal**. Detaching closes that client, not the restored
+shell or pane, and leaves the session writable in the app. A restored pane alone
+does not grant this managed association; failed admission leaves it unbound.
+The saved Happier resume command must be available in the restored shell. If it
+is not, invoke the matching Happier CLI's `attach <session-id>` there yourself.
 
 ## Supported providers
 
@@ -155,7 +185,7 @@ Remote-to-local control starts from the terminal with `happier attach`. Local-to
 - Claude supports local and remote control in Happier.
 - In local mode, you use the normal Claude terminal UI directly.
 - App messages sent while Claude is locally controlled are queued and delivered after the current local turn reaches a safe stopping point.
-- On machines with `tmux`, this usually uses tmux-backed attach.
+- On macOS and Linux, this can use tmux, zellij, or Herdr.
 - On Windows, use Happier’s Windows remote session modes instead of expecting tmux.
 - If **local permission bridge** is enabled, some permission prompts can still appear in Happier while the session is locally attached.
 
@@ -164,18 +194,17 @@ See also: [Claude](/agents/claude)
 ### Codex
 
 - Codex supports app-started sessions plus later terminal attachment.
-- After attaching, you can switch into local control and continue from the Codex TUI directly.
-- App messages sent while Codex is locally controlled are queued and delivered after Codex finishes, aborts, or exits the current local turn.
-- On machines with `tmux`, this usually uses tmux-backed attach.
-- On Windows, use Happier’s Windows remote session modes instead of expecting tmux.
-- Switching back to remote lets Happier take over again without losing the session.
+- App Server sessions use shared local control with Codex CLI 0.131.0 or newer on macOS and Linux: the TUI and Happier remain connected to the same App Server thread.
+- App messages and approvals remain available while the TUI is attached; the normal Happier input flow waits when a turn is already active.
+- The shared path uses Codex’s native local socket and does not require a terminal host. A selected host controls where its TUI opens.
+- Windows, ACP sessions, and older App Server installations retain the existing exclusive attach behavior.
 
 See also: [Codex](/agents/codex)
 
 ### OpenCode
 
 - OpenCode supports app-started sessions plus later terminal attachment.
-- For supported sessions, Happier can use OpenCode’s native attach flow instead of tmux.
+- For supported sessions, Happier can use OpenCode’s native attach flow without requiring a terminal host. A selected host controls where its TUI opens.
 - OpenCode uses shared local control, so the app can remain writable while the OpenCode TUI is attached.
 - The session remains the same Happier session while you move between remote and local/shared control.
 
@@ -192,7 +221,7 @@ Happier keeps one canonical session state. During switching:
 
 This is expected. It prevents messages from being lost during mode switches or reconnects.
 
-For Claude and Codex local control, the pending queue also protects the current terminal turn. Happier does not send a queued app message into the provider TUI while that TUI is busy. It waits for the local turn to complete or stop, then resumes remote control and processes the queued message from the same session.
+For Claude and Codex’s exclusive compatibility paths, the pending queue also protects the current terminal turn. Happier waits for the local turn to complete or stop, then resumes remote control and processes the queued message from the same session. Shared Codex App Server sessions remain writable while attached.
 
 ## Troubleshooting
 
@@ -202,14 +231,15 @@ Check that:
 
 - the session was started with an attachable mode before it began running,
 - the session was started on this same machine,
-- you are authenticated against the same Happier server/account.
+- you are authenticated against the same Happier server/account,
+- for shared Codex attachment, the session uses App Server with Codex CLI 0.131.0 or newer on macOS or Linux.
 
 ### The session starts in the app but cannot be attached later
 
 This usually means one of the following:
 
 - the session was started in a non-attachable mode such as **Hidden** on Windows,
-- the session was not launched inside `tmux` on a tmux-based machine,
+- the session was not launched in the configured terminal host,
 - the Windows interactive host is no longer running,
 - the local machine/session ownership does not match the attach attempt.
 

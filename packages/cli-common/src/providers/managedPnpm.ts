@@ -6,8 +6,9 @@ import { delimiter, dirname, join } from 'node:path';
 import { fetchGitHubLatestRelease } from '@happier-dev/release-runtime';
 import { extractArchivePayloadToDirectory } from '@happier-dev/release-runtime/archiveExtraction';
 
-import { resolveWindowsCommandOnPath } from '../process/index.js';
+import { resolveWindowsCommandOnPath, runCommandCapture } from '../process/index.js';
 import { createManagedToolScratchDir } from './createManagedToolScratchDir.js';
+import { resolveProviderInstallCommandTimeoutMs } from './installCommandTimeout.js';
 import { downloadGitHubReleaseAsset } from './downloadGitHubReleaseAsset.js';
 import { resolvePnpmReleaseAsset, PNPM_GITHUB_REPO } from './pnpmRelease.js';
 import { resolveHappyHomeDirFromEnvironment } from './resolveHappyHomeDir.js';
@@ -264,21 +265,27 @@ async function installManagedPnpm(
   }
 }
 
+/**
+ * The pnpm the managed installer uses, without bootstrapping: an override, the existing
+ * managed pnpm, or (bootstrap disabled) pnpm on PATH. `bootstrap` means the next install
+ * would first download a managed pnpm.
+ */
+function selectManagedPnpmCommand(
+  processEnv: NodeJS.ProcessEnv,
+): Readonly<{ kind: 'command'; command: string | null }> | Readonly<{ kind: 'bootstrap' }> {
+  if (readRawPnpmOverride(processEnv)) return { kind: 'command', command: readPnpmOverride(processEnv) };
+  const existing = resolveExistingManagedOrOverridePnpmCommand(processEnv);
+  if (existing) return { kind: 'command', command: existing };
+  if (!shouldBootstrapManagedPnpm(processEnv)) return { kind: 'command', command: resolveCommandOnPath('pnpm', processEnv) };
+  return { kind: 'bootstrap' };
+}
+
 export async function ensureManagedPnpmCommand(
   processEnv: NodeJS.ProcessEnv = process.env,
   deps: EnsureManagedPnpmDeps = {},
 ): Promise<string | null> {
-  const rawOverride = readRawPnpmOverride(processEnv);
-  if (rawOverride) {
-    return readPnpmOverride(processEnv);
-  }
-
-  const existing = resolveExistingManagedOrOverridePnpmCommand(processEnv);
-  if (existing) return existing;
-
-  if (!shouldBootstrapManagedPnpm(processEnv)) {
-    return resolveCommandOnPath('pnpm', processEnv);
-  }
+  const selected = selectManagedPnpmCommand(processEnv);
+  if (selected.kind === 'command') return selected.command;
 
   try {
     return await installManagedPnpm(processEnv, deps);
@@ -295,4 +302,39 @@ export function buildManagedPnpmEnvironment(processEnv: NodeJS.ProcessEnv = proc
     PNPM_STORE_DIR: join(homeDir, 'tools', 'pnpm', 'store'),
     XDG_CACHE_HOME: processEnv.XDG_CACHE_HOME || join(homeDir, 'cache'),
   };
+}
+
+/** pnpm's built-in `minimumReleaseAge` default (minutes) from pnpm 11 on; earlier majors default to 0. */
+const PNPM_11_DEFAULT_MINIMUM_RELEASE_AGE_MINUTES = 24 * 60;
+
+/**
+ * The release-age rule the managed installer applies to `pnpm add`, in ms: the value the
+ * managed pnpm is configured with (`pnpm config get minimumReleaseAge`, which reports rc/env
+ * settings), else that pnpm version's built-in default. `null` when there is no existing pnpm
+ * to ask (a latest-version check never bootstraps one).
+ */
+export async function readManagedPnpmMinimumReleaseAgeMs(
+  processEnv: NodeJS.ProcessEnv = process.env,
+  deps: Readonly<{ runCommand?: typeof runCommandCapture }> = {},
+): Promise<number | null> {
+  const selected = selectManagedPnpmCommand(processEnv);
+  const pnpm = selected.kind === 'command' ? selected.command : null;
+  if (!pnpm) return null;
+  const runCommand = deps.runCommand ?? runCommandCapture;
+  const env = buildManagedPnpmEnvironment(processEnv);
+  const timeoutMs = resolveProviderInstallCommandTimeoutMs(processEnv);
+  const ask = async (args: ReadonlyArray<string>): Promise<string | null> => {
+    const result = await runCommand({ cmd: pnpm, args, env, cwd: managedPnpmInstallDir(processEnv), timeoutMs });
+    return result.kind === 'exited' && result.status === 0 ? result.stdout.trim() : null;
+  };
+
+  const configuredValue = await ask(['config', 'get', 'minimumReleaseAge']);
+  if (configuredValue !== null && configuredValue !== '') {
+    const configured = Number(configuredValue);
+    if (Number.isFinite(configured) && configured >= 0) return configured * 60_000;
+  }
+
+  const major = Number.parseInt(String(await ask(['--version']) ?? ''), 10);
+  if (!Number.isFinite(major)) return null;
+  return major >= 11 ? PNPM_11_DEFAULT_MINIMUM_RELEASE_AGE_MINUTES * 60_000 : 0;
 }

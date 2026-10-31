@@ -18,6 +18,7 @@ import { isKokoroRuntimeSupported } from '@/voice/kokoro/runtime/kokoroSupport';
 import { speakKokoroText } from '@/voice/output/KokoroTtsController';
 import { primeWebAudioPlayback } from '@/voice/output/webAudioContext';
 import { createVoicePlaybackController } from '@/voice/runtime/VoicePlaybackController';
+import { KOKORO_WEB_DEFAULT_VOICE_ID, resolveKokoroWebVoiceId } from '@/voice/kokoro/voices/resolveKokoroVoice';
 import { fireAndForget } from '@/utils/system/fireAndForget';
 import { Icon } from '@/components/ui/icons/Icon';
 
@@ -102,7 +103,9 @@ export function LocalNeuralTtsSettings(props: {
     stopPreview();
   }, [openMenu, previewingVoiceId, stopPreview]);
 
-  const effectiveVoiceId = props.cfgKokoro.voiceId ?? 'af_heart';
+  // Show the voice kokoro-js will actually use: the synced id may come from a native model pack.
+  const effectiveVoiceId =
+    voices.length > 0 ? resolveKokoroWebVoiceId(props.cfgKokoro.voiceId, voices.map((v) => v.id)) : (props.cfgKokoro.voiceId ?? KOKORO_WEB_DEFAULT_VOICE_ID);
   const effectiveSpeed = props.cfgKokoro.speed ?? 1;
   const effectiveAssetSetId = props.cfgKokoro.assetId ?? null;
   const assetSets = React.useMemo(() => getKokoroAssetSetOptions(), []);
@@ -111,20 +114,23 @@ export function LocalNeuralTtsSettings(props: {
   const prepareModel = React.useCallback(async () => {
     if (modelStatus === 'downloading') return;
 
+    const abortController = new AbortController();
+    prepareAbortRef.current = abortController;
+    const isCurrentPreparation = () => prepareAbortRef.current === abortController && !abortController.signal.aborted;
     try {
       setModelStatus('downloading');
       setDownloadProgress(null);
-      const abortController = new AbortController();
-      prepareAbortRef.current = abortController;
 
       await prepareKokoroTts({
         assetSetId: effectiveAssetSetId,
         timeoutMs: resolveKokoroOperationTimeoutMs(props.networkTimeoutMs),
         signal: abortController.signal,
         onProgress: (progress) => {
-          setDownloadProgress(progress);
+          if (isCurrentPreparation()) setDownloadProgress(progress);
         },
       });
+
+      if (!isCurrentPreparation()) return;
 
       // Warm up the runtime so "Ready" means "inference works", not just "runtime import succeeded".
       // This also ensures the first user-visible preview isn't the first time we compile WASM and load model assets.
@@ -138,10 +144,18 @@ export function LocalNeuralTtsSettings(props: {
         signal: abortController.signal,
       });
 
+      if (!isCurrentPreparation()) return;
+      const summary = await getKokoroBrowserCacheSummary();
+      if (!isCurrentPreparation()) return;
       setModelStatus('ready');
-      setCacheSummary(await getKokoroBrowserCacheSummary());
+      setCacheSummary(summary);
     } catch (error) {
-      if (prepareAbortRef.current?.signal?.aborted) return;
+      if (prepareAbortRef.current !== abortController) return;
+      if (abortController.signal.aborted) {
+        setModelStatus('idle');
+        setDownloadProgress(null);
+        return;
+      }
       setModelStatus('error');
       fireAndForget((async () => {
         await Modal.alert(t('common.error'), error instanceof Error ? error.message : String(error));
@@ -149,13 +163,17 @@ export function LocalNeuralTtsSettings(props: {
         tag: 'LocalNeuralTtsSettings.alert.prepareModelFailed',
       });
     } finally {
-      prepareAbortRef.current = null;
+      if (prepareAbortRef.current === abortController) prepareAbortRef.current = null;
     }
-  }, [effectiveAssetSetId, modelStatus, props.networkTimeoutMs]);
+  }, [effectiveAssetSetId, effectiveSpeed, effectiveVoiceId, modelStatus, props.networkTimeoutMs]);
 
   const cancelPrepare = React.useCallback(() => {
     const controller = prepareAbortRef.current;
     if (!controller) return;
+    // The cache-summary read is not abortable; cancellation releases the panel immediately.
+    prepareAbortRef.current = null;
+    setModelStatus('idle');
+    setDownloadProgress(null);
     try {
       controller.abort();
     } catch {

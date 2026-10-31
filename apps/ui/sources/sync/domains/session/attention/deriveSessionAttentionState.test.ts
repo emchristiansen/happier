@@ -65,11 +65,11 @@ describe('deriveSessionAttentionState', () => {
         })).toBe('running');
     });
 
-    it('lets shared fresh runtime evidence override terminal failure attention', () => {
+    it('keeps a failed primary turn visible while background work is running', () => {
         expect(deriveSessionAttentionState({
             latestTurnStatus: 'failed',
             lastRuntimeIssue: runtimeIssue,
             isRunning: true,
-        })).toBe('running');
+        })).toBe('failed');
     });
 });

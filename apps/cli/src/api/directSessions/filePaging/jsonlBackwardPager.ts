@@ -1,9 +1,7 @@
 import { open, stat } from 'node:fs/promises';
 
 import { tryParseJsonlLine } from './jsonlParse';
-
-const DEFAULT_CHUNK_BYTES = 64 * 1024;
-const DEFAULT_MAX_OVERSIZE_LINE_BYTES = 8 * 1024 * 1024;
+import { assertJsonlReadProgress, resolveJsonlReadBudget } from './jsonlReadBudget';
 
 export type JsonlParsedLine = Readonly<{
   value: unknown;
@@ -18,21 +16,22 @@ export async function readJsonlFileBackwardPage(params: Readonly<{
   maxItems: number;
   chunkBytes?: number;
   maxOversizeLineBytes?: number;
-}>): Promise<Readonly<{ items: readonly JsonlParsedLine[]; nextEndOffsetBytes: number; reachedStart: boolean }>> {
-  const maxBytes = Math.max(1, Math.trunc(params.maxBytes));
-  const maxItems = Math.max(1, Math.trunc(params.maxItems));
-  const chunkBytes = Math.max(1024, Math.trunc(params.chunkBytes ?? DEFAULT_CHUNK_BYTES));
-  const maxOversizeLineBytes = Math.max(
-    maxBytes,
-    Math.trunc(params.maxOversizeLineBytes ?? DEFAULT_MAX_OVERSIZE_LINE_BYTES),
-  );
+}>): Promise<Readonly<{
+  items: readonly JsonlParsedLine[];
+  nextEndOffsetBytes: number;
+  reachedStart: boolean;
+  // The consumed boundary at this page's end, excluding any incomplete terminal line.
+  // Null means the existing read budget could not locate that line's start.
+  tailOffsetBytes: number | null;
+}>> {
+  const { maxBytes, maxItems, chunkBytes, maxOversizeLineBytes } = resolveJsonlReadBudget(params);
 
   let fileSize = 0;
   try {
     const s = await stat(params.filePath);
     fileSize = s.size;
   } catch {
-    return { items: [], nextEndOffsetBytes: 0, reachedStart: true };
+    return { items: [], nextEndOffsetBytes: 0, reachedStart: true, tailOffsetBytes: 0 };
   }
 
   const initialEnd = (() => {
@@ -41,13 +40,15 @@ export async function readJsonlFileBackwardPage(params: Readonly<{
   })();
 
   if (initialEnd <= 0) {
-    return { items: [], nextEndOffsetBytes: 0, reachedStart: true };
+    return { items: [], nextEndOffsetBytes: 0, reachedStart: true, tailOffsetBytes: 0 };
   }
 
   const collectedNewestFirst: JsonlParsedLine[] = [];
   let bytesReadTotal = 0;
   let end = initialEnd;
   let carry = Buffer.alloc(0);
+  let tailOffsetBytes: number | null = null;
+  let oldestConsumedStartOffsetBytes: number | null = null;
 
   const fh = await open(params.filePath, 'r');
   try {
@@ -83,13 +84,19 @@ export async function readJsonlFileBackwardPage(params: Readonly<{
         const segment = combined.slice(segmentStartIndex, segmentEndIndexExclusive);
         segmentEndIndex = i;
 
-        const parsed = tryParseJsonlLine(segment);
-        if (parsed === null) continue;
-
         const startOffsetAbs =
           segmentStartIndex < chunk.length
             ? combinedStartOffset + segmentStartIndex
             : carryStartOffset + (segmentStartIndex - chunk.length);
+        const parsed = tryParseJsonlLine(segment);
+        oldestConsumedStartOffsetBytes = oldestConsumedStartOffsetBytes === null
+          ? startOffsetAbs
+          : Math.min(oldestConsumedStartOffsetBytes, startOffsetAbs);
+        if (tailOffsetBytes === null) {
+          tailOffsetBytes = segment.length === 0 || parsed !== null ? initialEnd : startOffsetAbs;
+        }
+        if (parsed === null) continue;
+
         const endOffsetAbs =
           segmentEndIndexExclusive < chunk.length
             ? combinedStartOffset + segmentEndIndexExclusive
@@ -103,6 +110,8 @@ export async function readJsonlFileBackwardPage(params: Readonly<{
 
       if (end === 0 && carry.length > 0 && collectedNewestFirst.length < maxItems) {
         const parsed = tryParseJsonlLine(carry);
+        oldestConsumedStartOffsetBytes = 0;
+        if (tailOffsetBytes === null) tailOffsetBytes = parsed !== null ? initialEnd : 0;
         if (parsed !== null) {
           collectedNewestFirst.push({ value: parsed, startOffsetBytes: 0, endOffsetBytes: carry.length });
           carry = Buffer.alloc(0);
@@ -114,7 +123,11 @@ export async function readJsonlFileBackwardPage(params: Readonly<{
   }
 
   const items = collectedNewestFirst.reverse();
-  const nextEndOffsetBytes = items.length > 0 ? items[0].startOffsetBytes : initialEnd;
+  const nextEndOffsetBytes = items.length > 0
+    ? items[0].startOffsetBytes
+    : (oldestConsumedStartOffsetBytes ?? initialEnd);
+  assertJsonlReadProgress({ consumedBytes: initialEnd - nextEndOffsetBytes, remainingSourceBytes: end,
+    pendingLineBytes: carry.length, maxLineBytes: maxOversizeLineBytes, direction: 'backward', offsetBytes: initialEnd });
   const reachedStart = nextEndOffsetBytes <= 0;
-  return { items, nextEndOffsetBytes, reachedStart };
+  return { items, nextEndOffsetBytes, reachedStart, tailOffsetBytes };
 }

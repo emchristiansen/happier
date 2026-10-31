@@ -42,6 +42,14 @@
       "types": "./dist/testing/accountScopedCipherFixtures.d.ts",
       "default": "./dist/testing/accountScopedCipherFixtures.js"
     },
+    "./testing/releasedV0215AccountProfile": {
+      "types": "./dist/connect/fixtures/releasedV0215AccountProfile.d.ts",
+      "default": "./dist/connect/fixtures/releasedV0215AccountProfile.js"
+    },
+    "./testing/releasedV0215RuntimeIssue": {
+      "types": "./dist/connect/fixtures/releasedV0215RuntimeIssue.d.ts",
+      "default": "./dist/connect/fixtures/releasedV0215RuntimeIssue.js"
+    },
     "./capabilities": {
       "types": "./dist/capabilities.d.ts",
       "default": "./dist/capabilities.js"
@@ -85,7 +93,7 @@
     "@noble/hashes": "^1.8.0",
     "base64-js": "^1.5.1",
     "tweetnacl": "^1.0.3",
-    "zod": "4.3.6",
+    "zod": "4.6.7",
     "zod-to-json-schema": "3.25.1"
   },
   "devDependencies": {

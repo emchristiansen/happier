@@ -3,6 +3,10 @@ export type HappierBuiltInToolDefinition = Readonly<{
   title: string;
   description: string;
   inputSchema: unknown;
+  annotations?: Readonly<{
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+  }>;
 }>;
 
 export type HappierBuiltInToolDispatchResult =

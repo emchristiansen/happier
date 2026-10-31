@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, posix } from 'node:path';
 
 import type { TrackedSession } from '@/daemon/types';
+import type { DaemonStartupSource } from '@/daemon/ownership/daemonOwnershipMetadata';
 import {
   resolveDaemonLegacySessionScopeSubtreeRelativePath,
   resolveDaemonSessionScopeBaseRelativePath,
@@ -170,6 +171,7 @@ export async function moveProcessOutOfDaemonServiceCgroup(params: Readonly<{
 export async function migrateTrackedSessionProcessesOutOfDaemonServiceCgroup(params: Readonly<{
   trackedSessions: Iterable<TrackedSession>;
   daemonPid?: number;
+  startupSource?: DaemonStartupSource;
   procfsRootDir?: string;
   cgroupRootDir?: string;
 }>): Promise<readonly ProcessCgroupMigration[]> {

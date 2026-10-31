@@ -5,6 +5,8 @@ import {
   V2SessionByIdNotFoundSchema,
   V2SessionByIdResponseSchema,
   V2SessionListResponseSchema,
+  CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY,
+  readConnectedServiceReaderSupport,
 } from "@happier-dev/protocol";
 import { resolveApiHotEndpointRateLimit } from "@/app/api/utils/apiRateLimitCatalog";
 import { PROFILE_SELECT, toShareUserProfile } from "@/app/share/types";
@@ -17,6 +19,7 @@ import {
     omitSessionListProjectionFallbackColumns,
     parseStoredSessionLatestTurnStatus,
     parseStoredSessionRuntimeIssue,
+    projectSessionRowsForReader,
 } from "./v2SessionListRows";
 import { mapPendingActivationAuthorization } from "@/app/session/pending/pendingActivationAuthorization";
 import {
@@ -35,8 +38,13 @@ import {
 } from "./v2SessionListPage";
 import { createV2SessionListInitialPage } from "./v2SessionListInitialPage";
 import { createV2SessionListServerTiming } from "./v2SessionListServerTiming";
+import {
+    createSessionRollbackEligibleTurnsSelect,
+    readSessionTurnRollbackEligibleStarts,
+} from "@/app/session/turns/sessionRollbackEligibilityProjection";
 
 const V2_ACTIVE_SESSION_LIST_QUERYSTRING_SCHEMA = z.object({
+    [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional(),
     limit: z.coerce.number().int().min(1)
         .max(V2_ACTIVE_SESSION_LIST_ROW_LIMIT)
         .default(V2_ACTIVE_SESSION_LIST_ROW_LIMIT),
@@ -49,6 +57,7 @@ const OPTIONAL_BOOLEAN_QUERY_PARAM_SCHEMA = z.preprocess((value) => {
 }, z.boolean()).optional();
 
 const V2_PAGED_SESSION_LIST_QUERYSTRING_SCHEMA = z.object({
+    [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional(),
     cursor: z.string().optional(),
     limit: z.coerce.number().int().min(1).max(200).default(50),
     includeAttention: OPTIONAL_BOOLEAN_QUERY_PARAM_SCHEMA,
@@ -103,6 +112,7 @@ const V1_SESSION_LIST_ROW_SELECT = {
     pendingActivationRequestedAt: true,
     pendingActivationStatus: true,
     pendingActivationFailureCode: true,
+    turns: createSessionRollbackEligibleTurnsSelect(),
     active: true,
     lastActiveAt: true,
 } as const satisfies Prisma.SessionSelect;
@@ -165,6 +175,9 @@ async function findV1SessionListRowsWithSelect(params: Readonly<{
 export function registerSessionListingRoutes(app: Fastify) {
     app.get('/v1/sessions', {
         preHandler: app.authenticate,
+        schema: {
+            querystring: z.object({ [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional() }).optional(),
+        },
         config: {
             rateLimit: resolveApiHotEndpointRateLimit(process.env, "sessions.list"),
         },
@@ -201,6 +214,7 @@ export function registerSessionListingRoutes(app: Fastify) {
                 pendingBlockedCount: v.pendingBlockedCount,
                 pendingVersion: v.pendingVersion,
                 pendingActivationAuthorization: mapPendingActivationAuthorization(v),
+                rollbackEligibleTurnStarts: readSessionTurnRollbackEligibleStarts(v),
                 dataEncryptionKey: encodeSessionDataEncryptionKey(v.dataEncryptionKey),
                 lastMessage: null,
             })),
@@ -233,6 +247,7 @@ export function registerSessionListingRoutes(app: Fastify) {
                     pendingBlockedCount: v.pendingBlockedCount,
                     pendingVersion: v.pendingVersion,
                     pendingActivationAuthorization: mapPendingActivationAuthorization(v),
+                    rollbackEligibleTurnStarts: readSessionTurnRollbackEligibleStarts(v),
                     dataEncryptionKey:
                         v.encryptionMode === "plain"
                             ? null
@@ -248,7 +263,8 @@ export function registerSessionListingRoutes(app: Fastify) {
             .sort((a, b) => b.updatedAt - a.updatedAt)
             .slice(0, 150);
 
-        return reply.send({ sessions });
+        return reply.send({ sessions: projectSessionRowsForReader(sessions,
+            readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY])) });
     });
 
     app.get('/v2/sessions/active', {
@@ -272,7 +288,8 @@ export function registerSessionListingRoutes(app: Fastify) {
         }));
 
         const payload = timing.measure("page", () => ({
-            sessions: mapV2SessionListRows({ rows: sessions, userId }),
+            sessions: projectSessionRowsForReader(mapV2SessionListRows({ rows: sessions, userId }),
+                readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY])),
         }));
         timing.apply(reply);
         return reply.send(payload);
@@ -348,10 +365,12 @@ export function registerSessionListingRoutes(app: Fastify) {
                 timing: timing.initialPageTiming(),
             });
         } else {
-            payload = timing.measure("page", () => createV2SessionListPage({ rows: sessions, userId, limit }));
+            payload = timing.measure("page", () => createV2SessionListPage({ rows: sessions, userId, limit,
+                supportedConnectedServiceIds: readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]) }));
         }
         timing.apply(reply);
-        return reply.send(payload);
+        return reply.send({ ...payload, sessions: projectSessionRowsForReader(payload.sessions,
+            readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY])) });
     });
 
     app.get('/v2/sessions/archived', {
@@ -393,9 +412,11 @@ export function registerSessionListingRoutes(app: Fastify) {
             take: limit + 1,
         }));
 
-        const payload = timing.measure("page", () => createV2SessionListPage({ rows: sessions, userId, limit }));
+        const payload = timing.measure("page", () => createV2SessionListPage({ rows: sessions, userId, limit,
+            supportedConnectedServiceIds: readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]) }));
         timing.apply(reply);
-        return reply.send(payload);
+        return reply.send({ ...payload, sessions: projectSessionRowsForReader(payload.sessions,
+            readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY])) });
     });
 
     app.get('/v2/sessions/:sessionId', {
@@ -404,6 +425,7 @@ export function registerSessionListingRoutes(app: Fastify) {
             rateLimit: resolveApiHotEndpointRateLimit(process.env, "session.detail"),
         },
         schema: {
+            querystring: z.object({ [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional() }).optional(),
             params: z.object({
                 sessionId: z.string(),
             }),
@@ -423,7 +445,8 @@ export function registerSessionListingRoutes(app: Fastify) {
         }
 
         return reply.send({
-            session: mapV2SessionListRows({ rows: [session], userId })[0],
+            session: projectSessionRowsForReader(mapV2SessionListRows({ rows: [session], userId }),
+                readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]))[0],
         });
     });
 }

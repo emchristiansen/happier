@@ -11,7 +11,7 @@ import { Text } from '@/components/ui/text/Text';
 import { FloatingTabBarSurface } from '@/components/ui/navigation/FloatingTabBarSurface';
 import { TabBadge } from '@/components/ui/navigation/tabBadge/TabBadge';
 import { resolveTabBarMetrics } from '@/components/ui/navigation/tabBarMetrics';
-import { useFriendRequests, useSetting } from '@/sync/domains/state/storage';
+import { useFriendRequestCount, useSetting } from '@/sync/domains/state/storage';
 import type { TabType } from './tabTypes';
 import { resolveTabBarTabs } from './resolveTabBarTabs';
 import { Icon, type IconName } from '@/components/ui/icons/Icon';
@@ -75,7 +75,7 @@ export const TabBar = React.memo(({ activeTab, onTabPress, trailingAccessory }: 
     const { theme } = useUnistyles();
     const insets = useSafeAreaInsets();
     const friendsEnabled = useFriendsEnabled();
-    const friendRequests = useFriendRequests();
+    const friendRequestCount = useFriendRequestCount();
     const inboxEnabled = useInboxAvailable();
     const inboxHasContent = useInboxHasContent();
     const friendsBadgeEnabled = useSetting('tabBarFriendsBadgeEnabled');
@@ -115,7 +115,7 @@ export const TabBar = React.memo(({ activeTab, onTabPress, trailingAccessory }: 
                                 paddingHorizontal: metrics.tabPaddingHorizontal,
                             }]}
                             onPress={() => onTabPress(tab.key)}
-                            hitSlop={8}
+                            hitSlop={{ top: 8, bottom: 8 }}
                         >
                             {isActive ? <View pointerEvents="none" style={[styles.activePill, { borderRadius: metrics.activePillRadius }]} /> : null}
                             <View style={styles.tabContent}>
@@ -124,8 +124,8 @@ export const TabBar = React.memo(({ activeTab, onTabPress, trailingAccessory }: 
                                     metrics.iconSize,
                                     isActive ? theme.colors.text.primary : theme.colors.text.secondary,
                                 )}
-                                {tab.key === 'friends' && friendsBadgeEnabled && friendRequests.length > 0 && (
-                                    <TabBadge variant="count" value={friendRequests.length} />
+                                {tab.key === 'friends' && friendsBadgeEnabled && friendRequestCount > 0 && (
+                                    <TabBadge variant="count" value={friendRequestCount} />
                                 )}
                                 {tab.key === 'inbox' && inboxBadgeEnabled && inboxHasContent ? (
                                     <TabBadge variant="dot" />

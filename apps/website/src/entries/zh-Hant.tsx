@@ -6,7 +6,6 @@ import ns_faq from '../i18n/generated/slices/zh-Hant/faq.json';
 import ns_features from '../i18n/generated/slices/zh-Hant/features.json';
 import ns_navigation from '../i18n/generated/slices/zh-Hant/navigation.json';
 import ns_pageProse from '../i18n/generated/slices/zh-Hant/pageProse.json';
-import ns_providers from '../i18n/generated/slices/zh-Hant/providers.json';
 
 
 // Registered here, not discovered by a glob: this entry is the only place
@@ -15,7 +14,7 @@ import ns_providers from '../i18n/generated/slices/zh-Hant/providers.json';
 // was measured to read — scripts/i18n-slice-overlays.mjs renders the page to
 // find them and proves the set reproduces its HTML byte for byte. Rollup
 // shares each namespace chunk between the routes that import it.
-registerOverlay('zh-Hant', Object.assign({}, ns_comparison, ns_faq, ns_features, ns_navigation, ns_pageProse, ns_providers));
+registerOverlay('zh-Hant', Object.assign({}, ns_comparison, ns_faq, ns_features, ns_navigation, ns_pageProse));
 
 /**
  * `/` — the client entry for the homepage, and the template for all of them.

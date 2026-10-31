@@ -26,9 +26,11 @@ import { join, resolve } from 'node:path';
 import type { Duplex } from 'node:stream';
 
 import {
+  buildConnectedServiceCredentialMetadata,
   buildConnectedServiceCredentialRecord,
   sealAccountScopedBlobCiphertext,
   type ConnectedServiceId,
+  type ConnectedServiceOauthCredentialRawMetadata,
   type ConnectedServiceQuotaSnapshotV1,
 } from '@happier-dev/protocol';
 
@@ -37,6 +39,7 @@ import { createTestAuth, type TestAuth } from './auth';
 import { seedCliAuthForServer } from './cliAuth';
 import { daemonControlPostJson } from './daemon/controlServerClient';
 import { fetchJson } from './http';
+import { countFakeClaudeEventsAfterCurrentRunSentinel } from './fakeClaude';
 import { writeTestManifestForServer } from './manifestForServer';
 import { createTempPathBin } from './fs/tempPathBin';
 import { ensureCliSharedDepsBuilt } from './process/cliDist';
@@ -309,8 +312,10 @@ export async function createConnectedServiceProfile(params: Readonly<{
   scope?: string | null;
   tokenType?: string | null;
   providerAccountId?: string;
+  oauthRaw?: ConnectedServiceOauthCredentialRawMetadata;
   expiresAt?: number;
-}>): Promise<void> {
+  allowProviderIdentityChange?: boolean;
+}>): Promise<string> {
   const now = Date.now();
   const providerAccountId = params.providerAccountId ?? `acct-${params.profileId}`;
   const expiresAt = params.expiresAt ?? now + 60 * 60_000;
@@ -328,6 +333,7 @@ export async function createConnectedServiceProfile(params: Readonly<{
       tokenType: params.tokenType ?? null,
       providerAccountId,
       providerEmail: params.providerEmail,
+      raw: params.oauthRaw,
     },
   });
   const machineKey = params.fixture.machineKey;
@@ -340,7 +346,7 @@ export async function createConnectedServiceProfile(params: Readonly<{
     randomBytes: (length) => randomBytes(length),
   });
 
-  const response = await fetchJson<{ success?: boolean }>(
+  const response = await fetchJson<{ success?: boolean; credentialRevision?: string }>(
     `${params.fixture.serverBaseUrl}/v2/connect/${params.serviceId}/profiles/${params.profileId}/credential`,
     {
       method: 'POST',
@@ -350,19 +356,16 @@ export async function createConnectedServiceProfile(params: Readonly<{
       },
       body: JSON.stringify({
         sealed: { format: 'account_scoped_v1', ciphertext },
-        metadata: {
-          kind: 'oauth',
-          providerEmail: params.providerEmail,
-          providerAccountId,
-          expiresAt: record.expiresAt,
-        },
+        ...(params.allowProviderIdentityChange ? { reconnect: { allowProviderIdentityChange: true } } : {}),
+        metadata: buildConnectedServiceCredentialMetadata(record),
       }),
       timeoutMs: 20_000,
     },
   );
-  if (response.status !== 200 || response.data?.success !== true) {
+  if (response.status !== 200 || response.data?.success !== true || typeof response.data.credentialRevision !== 'string') {
     throw new Error(`Failed to seed connected service profile ${params.profileId} (status=${response.status})`);
   }
+  return response.data.credentialRevision;
 }
 
 export async function createConnectedServiceAuthGroup(params: Readonly<{
@@ -490,7 +493,7 @@ export async function patchConnectedServiceAuthGroupMemberExhaustion(params: Rea
   return group;
 }
 
-function recoveryIntentPath(fixture: Pick<StartedConnectedServicesCodexDaemonFixture, 'daemonHomeDir' | 'serverId'>): string {
+export function recoveryIntentPath(fixture: Pick<StartedConnectedServicesCodexDaemonFixture, 'daemonHomeDir' | 'serverId'>): string {
   return resolve(
     join(
       fixture.daemonHomeDir,
@@ -553,6 +556,7 @@ export type StartedConnectedServicesClaudeDaemonFixture = Readonly<{
   daemonHomeDir: string;
   workspaceDir: string;
   serverId: string;
+  machineId: string;
   daemonPort: number;
   controlToken: string | undefined;
   fakeClaudeLogPath: string;
@@ -566,6 +570,7 @@ export async function startConnectedServicesClaudeDaemon(params: Readonly<{
   fakeClaudePath: string;
   fakeClaudeLogPath: string;
   fakeClaudeScenario?: string;
+  accountSettings?: Readonly<Record<string, unknown>>;
   serverExtraEnv?: Record<string, string>;
   extraEnv?: Record<string, string>;
 }>): Promise<StartedConnectedServicesClaudeDaemonFixture> {
@@ -590,7 +595,7 @@ export async function startConnectedServicesClaudeDaemon(params: Readonly<{
   await writeFile(join(sourceClaudeConfigDir, 'settings.json'), '{"theme":"e2e"}\n', 'utf8');
 
   const secret = Uint8Array.from(randomBytes(32));
-  const { serverId } = await seedCliAuthForServer({
+  const { serverId, machineId } = await seedCliAuthForServer({
     cliHome: daemonHomeDir,
     serverUrl: server.baseUrl,
     token: auth.token,
@@ -606,6 +611,7 @@ export async function startConnectedServicesClaudeDaemon(params: Readonly<{
       claudeUnifiedTerminalHost: 'auto',
       claudeRemoteAgentSdkEnabled: true,
       claudeRemoteSettingSourcesV2: ['user', 'project', 'local'],
+      ...(params.accountSettings ?? {}),
     },
   });
 
@@ -642,6 +648,7 @@ export async function startConnectedServicesClaudeDaemon(params: Readonly<{
     HAPPIER_HOME_DIR: daemonHomeDir,
     HAPPIER_SERVER_URL: server.baseUrl,
     HAPPIER_WEBAPP_URL: server.baseUrl,
+    HAPPIER_ACTIVE_SERVER_ID: serverId,
     CLAUDE_CONFIG_DIR: sourceClaudeConfigDir,
     HAPPIER_CLAUDE_PATH: params.fakeClaudePath,
     HAPPIER_E2E_FAKE_CLAUDE_LOG: params.fakeClaudeLogPath,
@@ -677,6 +684,7 @@ export async function startConnectedServicesClaudeDaemon(params: Readonly<{
     daemonHomeDir,
     workspaceDir,
     serverId,
+    machineId,
     daemonPort: daemon.state.httpPort,
     controlToken: daemon.state.controlToken,
     fakeClaudeLogPath: params.fakeClaudeLogPath,
@@ -710,6 +718,16 @@ export async function spawnConnectedClaudeGroupSession(params: Readonly<{
   profileId: string;
   initialPrompt?: string;
 }>): Promise<string> {
+  return spawnConnectedClaudeSession(params);
+}
+
+export async function spawnConnectedClaudeSession(params: Readonly<{
+  fixture: StartedConnectedServicesClaudeDaemonFixture;
+  sessionId: string;
+  groupId?: string;
+  profileId: string;
+  initialPrompt?: string;
+}>): Promise<string> {
   const response = await daemonControlPostJson<{ success?: boolean; sessionId?: unknown; error?: string }>({
     port: params.fixture.daemonPort,
     path: '/spawn-session',
@@ -739,8 +757,7 @@ export async function spawnConnectedClaudeGroupSession(params: Readonly<{
         bindingsByServiceId: {
           [CLAUDE_SUBSCRIPTION_SERVICE_ID]: {
             source: 'connected',
-            selection: 'group',
-            groupId: params.groupId,
+            ...(params.groupId ? { selection: 'group', groupId: params.groupId } : {}),
             profileId: params.profileId,
           },
         },
@@ -824,37 +841,16 @@ export function isRuntimeAuthRecoveryAwaitingProviderOutcomeProof(intent: unknow
 export async function countFakeClaudeUserTextOccurrences(params: Readonly<{
   logPath: string;
   text: string;
-  sinceMs?: number;
+  sinceMs: number;
 }>): Promise<number> {
-  let raw = '';
-  try {
-    raw = await readFile(params.logPath, 'utf8');
-  } catch {
-    return 0;
-  }
-  let count = 0;
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event: UnknownRecord | null = null;
-    try {
-      event = asRecord(JSON.parse(trimmed) as unknown);
-    } catch {
-      continue;
-    }
-    if (!event) continue;
-    if (typeof params.sinceMs === 'number') {
-      if (typeof event.ts !== 'number' || event.ts < params.sinceMs) continue;
-    }
-    const userTextPreview = typeof event.userTextPreview === 'string' ? event.userTextPreview : null;
-    if (!userTextPreview?.includes(params.text)) continue;
-    if (event.type === 'sdk_stdin' && event.hasUserText === true) {
-      count += 1;
-      continue;
-    }
-    if (event.type === 'local_stdin_turn_completed') {
-      count += 1;
-    }
-  }
-  return count;
+  return await countFakeClaudeEventsAfterCurrentRunSentinel({
+    logPath: params.logPath,
+    sinceMs: params.sinceMs,
+    predicate: (event) => {
+      const userTextPreview = typeof event.userTextPreview === 'string' ? event.userTextPreview : null;
+      return Boolean(userTextPreview?.includes(params.text))
+        && ((event.type === 'sdk_stdin' && event.hasUserText === true)
+          || event.type === 'local_stdin_turn_completed');
+    },
+  });
 }

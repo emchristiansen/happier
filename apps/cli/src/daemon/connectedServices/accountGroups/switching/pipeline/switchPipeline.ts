@@ -23,6 +23,8 @@ export type ConnectedServiceAuthGroupSwitchState = Readonly<{
   serviceId: string;
   groupId: string;
   activeProfileId: string | null;
+  lastSwitchReason?: string | null;
+  lastSwitchAt?: number | null;
   generation: number;
   runtimeStateRevision: number;
   /** Exact credential epoch for the active profile when the projection can resolve it. */
@@ -84,7 +86,7 @@ export type LeaseAcquireResult =
     }>
   | Readonly<{
       kind: 'loser';
-      waitForOwner(options?: Readonly<{ timeoutMs?: number }>): Promise<LeaseCompletion>;
+      waitForOwner(options?: Readonly<{ timeoutMs?: number; requireOwnerFinished?: boolean }>): Promise<LeaseCompletion>;
     }>;
 
 const DEFAULT_SWITCH_LEASE_TIMEOUT_MS = 30_000;
@@ -104,6 +106,8 @@ export class InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry {
   private readonly pendingByKey = new Map<string, {
     promise: Promise<LeaseOutcome>;
     resolve: (outcome: LeaseOutcome) => void;
+    finished: Promise<void>;
+    resolveFinished: () => void;
     settled: boolean;
   }>();
 
@@ -119,7 +123,9 @@ export class InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry {
           const timeoutMs = waitOptions?.timeoutMs ?? this.options.leaseTimeoutMs ?? DEFAULT_SWITCH_LEASE_TIMEOUT_MS;
           let timeout: ReturnType<typeof setTimeout> | null = null;
           const outcome = await Promise.race([
-            pending.promise,
+            waitOptions?.requireOwnerFinished
+              ? Promise.all([pending.promise, pending.finished]).then(([result]) => result)
+              : pending.promise,
             new Promise<LeaseOutcome>((_resolve, reject) => {
               timeout = setTimeout(() => reject(new ConnectedServiceAuthGroupSwitchLeaseExpiredError()), timeoutMs);
             }),
@@ -136,7 +142,9 @@ export class InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry {
     const promise = new Promise<LeaseOutcome>((resolve) => {
       resolveCompletion = resolve;
     });
-    const entry = { promise, resolve: resolveCompletion, settled: false };
+    let resolveFinished: () => void = () => {};
+    const finished = new Promise<void>((resolve) => { resolveFinished = resolve; });
+    const entry = { promise, resolve: resolveCompletion, finished, resolveFinished, settled: false };
     this.pendingByKey.set(key, entry);
     return {
       kind: 'owner',
@@ -149,11 +157,13 @@ export class InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry {
       finish: () => {
         if (this.pendingByKey.get(key) !== entry) return;
         this.pendingByKey.delete(key);
+        entry.resolveFinished();
       },
       fail: (error) => {
         const current = this.pendingByKey.get(key);
         if (current !== entry) return;
         this.pendingByKey.delete(key);
+        entry.resolveFinished();
         if (!entry.settled) {
           entry.settled = true;
           current.resolve({ status: 'failed', error });
@@ -272,6 +282,7 @@ export function isReasonEnabled(policy: ConnectedServiceAuthGroupPolicyV1, reaso
       return policy.switchOn.usageLimit;
     case 'auth_expired':
     case 'permission_denied':
+    case 'plan':
       return policy.switchOn.authExpired;
     case 'refresh_failed':
       return policy.switchOn.refreshFailure || policy.switchOn.authExpired;
@@ -605,10 +616,11 @@ export type ConnectedServiceAuthGroupSwitchPipelineRequest = Readonly<{
   switchesThisTurn?: number;
   sessionSwitchesThisHour?: number;
   deadlineAtMs?: number;
+  /** A durable post-reset retry may re-adopt the active member, but only with fresh positive quota proof. */
+  allowCurrentProfileRetry?: boolean;
 }>;
 
 export type ConnectedServiceAuthGroupSwitchPipelinePhase =
-  | 'lease_loser_non_apply'
   | 'lease_loser_apply'
   | 'record_observed_generation'
   | 'policy'

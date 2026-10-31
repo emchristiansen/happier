@@ -10,6 +10,7 @@ import type { StreamingTextRevealPreset } from '../streaming/streamingTextReveal
 import type { MarkdownRenderingProfile } from './MarkdownRenderingProfile';
 import type { MarkdownRenderSegment } from './markdownRenderSegmentTypes';
 import { SpecialMarkdownBlockView } from './SpecialMarkdownBlockView';
+import { MarkdownContainerView } from './MarkdownContainerView';
 
 type MarkdownSegmentViewProps = Readonly<{
     segment: MarkdownRenderSegment;
@@ -58,7 +59,19 @@ export const MarkdownSegmentView = React.memo((props: MarkdownSegmentViewProps) 
                 agentTexMath={props.agentTexMath}
             />
         )
-        : (
+        : props.segment.type === 'container-block' ? (
+            <MarkdownContainerView
+                block={props.segment.container}
+                sourceStart={props.segment.sourceStart}
+                selectable={props.selectable}
+                profile={props.profile}
+                onLinkPress={props.onLinkPress}
+                textStyle={props.textStyle}
+                streamingReveal={props.streamingReveal}
+                streamingRevealPreset={props.streamingRevealPreset}
+                agentTexMath={props.agentTexMath}
+            />
+        ) : (
             <SpecialMarkdownBlockView
             blocks={props.segment.blocks}
             first={props.segment.first}

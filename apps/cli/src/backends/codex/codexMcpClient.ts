@@ -4,6 +4,7 @@
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { DEFAULT_REQUEST_TIMEOUT_MSEC } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import { z } from 'zod/v4';
 
 import { logger } from '@/ui/logger';
@@ -13,6 +14,7 @@ import type { CodexSessionConfig, CodexToolResponse } from './types';
 import { createCodexTransport, type CodexMcpClientSpawnMode } from './mcp/client';
 import { registerCodexPermissionHandlers, type CodexMcpPermissionHandler } from './mcp/elicitationHandler';
 import { getCodexElicitationToolCallId, getCodexEventToolCallId } from './mcp/elicitationTypes';
+import { withCodexNativeStartupLock } from './utils/withCodexNativeStartupLock';
 
 const DEFAULT_TIMEOUT = 14 * 24 * 60 * 60 * 1000; // 14 days
 const CodexEventNotificationSchema = z.object({
@@ -95,7 +97,9 @@ export class CodexMcpClient {
             pendingAmendments: this.pendingAmendments,
         });
 
-        await this.client.connect(this.transport);
+        await withCodexNativeStartupLock(DEFAULT_REQUEST_TIMEOUT_MSEC, async () => {
+            await this.client.connect(transport);
+        });
         this.connected = true;
 
         logger.debug('[CodexMCP] Connected to Codex');

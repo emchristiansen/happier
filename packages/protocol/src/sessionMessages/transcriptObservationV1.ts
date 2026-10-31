@@ -23,6 +23,7 @@ export type SessionTranscriptObservationProvenanceV1 = z.infer<typeof SessionTra
 export function isRecoveredHistoryTranscriptObservationProvenance(
   value: unknown,
 ): value is SessionTranscriptObservationProvenanceV1 & { source: 'history' } {
+  if (value === undefined || value === null) return false;
   const provenance = SessionTranscriptObservationProvenanceV1Schema.safeParse(value);
   return provenance.success && provenance.data.source === 'history';
 }

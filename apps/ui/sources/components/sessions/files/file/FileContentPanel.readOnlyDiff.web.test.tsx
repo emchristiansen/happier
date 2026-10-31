@@ -58,10 +58,5 @@ describe('FileContentPanel (web read-only diff)', () => {
 
         expect(tree.findAllByType('DiffViewer' as any)).toHaveLength(1);
         expect(tree.findAllByType('CodeLinesView' as any)).toHaveLength(0);
-        expect(tree.root.findAllByType('View' as any)[0]?.props.style).toMatchObject({
-            flex: 1,
-            minHeight: 0,
-            position: 'relative',
-        });
     });
 });

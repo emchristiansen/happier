@@ -233,7 +233,7 @@ describe('buildDoctorRepairReport — --server <id> scoping', async () => {
       hasCredentials: true,
       isExpired: false,
       machineRegistered: true,
-      credentialEvidence: 'active-store',
+      credentialEvidence: 'inspected-store',
       isActive: true,
       reachability: 'verified',
     };

@@ -83,6 +83,7 @@ describe('materializeClaudeCodeNativeAuth', () => {
           claudeAiOauth: {
             subscriptionType: 'max',
             rateLimitTier: 'max_20x',
+            organizationUuid: 'organization-a',
           },
         },
       },
@@ -133,6 +134,26 @@ describe('materializeClaudeCodeNativeAuth', () => {
       rateLimitTier: 'max_20x',
     });
     expect(groupCredential.claudeAiOauth).not.toHaveProperty('refreshToken');
+    const readRoot = async () => JSON.parse(await readFile(join(groupClaudeConfigDir, '.claude.json'), 'utf8'));
+    expect((await readRoot()).oauthAccount.organizationUuid).toBe('organization-a');
+    await writeFile(join(groupClaudeConfigDir, '.claude.json'), JSON.stringify({
+      ...await readRoot(), modelAccessCache: ['organization-a-model'],
+    }));
+    const rematerialize = async (nextRecord: typeof record) => await materializeClaudeSubscriptionNativeAuthHome({
+      record: nextRecord,
+      targetClaudeConfigDir: groupClaudeConfigDir,
+      sourceEnv: { HOME: homeDir, CLAUDE_CONFIG_DIR: sourceClaudeConfigDir },
+      selectionDescriptor: { kind: 'group', serviceId: 'claude-subscription', groupId: 'claude-team',
+        activeProfileId: 'work-profile', fallbackProfileId: 'fallback-profile', generation: 7 },
+    });
+    await rematerialize(record);
+    expect((await readRoot()).modelAccessCache).toEqual(['organization-a-model']);
+    if (record.kind !== 'oauth') throw new Error('Expected OAuth fixture');
+    await rematerialize({ ...record, oauth: { ...record.oauth,
+      raw: { claudeAiOauth: { subscriptionType: 'max', rateLimitTier: 'max_20x', organizationUuid: 'organization-b' } },
+    } });
+    expect((await readRoot()).oauthAccount.organizationUuid).toBe('organization-b');
+    expect(await readRoot()).not.toHaveProperty('modelAccessCache');
     await expect(readFile(join(profileClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
     await expect(readFile(join(groupClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
 
@@ -341,18 +362,29 @@ describe('materializeClaudeCodeNativeAuth', () => {
     });
   });
 
-  it('updates an already-provenanced managed Claude home in place instead of replacing the live root', async () => {
+  it('refreshes a managed Claude home in place while retaining private state and isolated config', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-home-in-place-'));
     const sourceClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-source-in-place-'));
     const targetClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-target-in-place-'));
     await writeFile(join(sourceClaudeConfigDir, 'settings.json'), '{"theme":"source"}\n');
     await writeFile(join(targetClaudeConfigDir, 'live-runner-marker.txt'), 'must survive\n');
+    await writeFile(join(targetClaudeConfigDir, 'settings.json'), '{"theme":"private"}\n');
+    await writeFile(join(targetClaudeConfigDir, 'history.jsonl'), '{"display":"private history"}\n');
+    await mkdir(join(targetClaudeConfigDir, 'commands'), { recursive: true });
+    await writeFile(join(targetClaudeConfigDir, 'commands', 'private.md'), '# Private command\n');
+    await mkdir(join(targetClaudeConfigDir, 'projects', 'private-project', 'memory'), { recursive: true });
+    await writeFile(join(targetClaudeConfigDir, 'projects', 'private-project', 'session.jsonl'), '{"type":"assistant","message":"private session"}\n');
+    await writeFile(join(targetClaudeConfigDir, 'projects', 'private-project', 'memory', 'MEMORY.md'), '# Private memory\n');
+    await writeFile(join(targetClaudeConfigDir, '.claude.json'), JSON.stringify({
+      oauthAccount: { emailAddress: 'oauth-profile@example.test' },
+      projects: { 'private-project': { history: ['private root history'] } },
+    }));
     const previousRecord = buildHealthyClaudeSubscriptionRecord('oauth-profile', 'previous-access', 'previous-refresh');
     const nextRecord = buildHealthyClaudeSubscriptionRecord('oauth-profile', 'next-access', 'next-refresh');
     await writeClaudeConnectedServiceHomeProvenance({
       claudeConfigDir: targetClaudeConfigDir,
       provenance: buildClaudeConnectedServiceHomeProvenance({
-        record: nextRecord,
+        record: previousRecord,
         selectionDescriptor: {
           kind: 'profile',
           serviceId: 'claude-subscription',
@@ -370,7 +402,12 @@ describe('materializeClaudeCodeNativeAuth', () => {
       record: nextRecord,
       targetClaudeConfigDir,
       sourceEnv: { HOME: homeDir, CLAUDE_CONFIG_DIR: sourceClaudeConfigDir },
-      accountSettings: null,
+      accountSettings: {
+        connectedServicesProviderStateSharingSettingsV1: {
+          v: 1, defaults: { configMode: 'isolated', stateMode: 'isolated' },
+          byAgentId: {}, acknowledgedRisksByAgentId: {},
+        },
+      },
       sessionDirectory: null,
       selectionDescriptor: {
         kind: 'profile',
@@ -383,6 +420,13 @@ describe('materializeClaudeCodeNativeAuth', () => {
     const credential = JSON.parse(await readFile(join(targetClaudeConfigDir, '.credentials.json'), 'utf8'));
     expect(credential.claudeAiOauth.accessToken).toBe('next-access');
     await expect(readFile(join(targetClaudeConfigDir, 'live-runner-marker.txt'), 'utf8')).resolves.toBe('must survive\n');
+    await expect(readFile(join(targetClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"private"}\n');
+    await expect(readFile(join(targetClaudeConfigDir, 'commands', 'private.md'), 'utf8')).resolves.toBe('# Private command\n');
+    await expect(readFile(join(targetClaudeConfigDir, 'history.jsonl'), 'utf8')).resolves.toBe('{"display":"private history"}\n');
+    await expect(readFile(join(targetClaudeConfigDir, 'projects', 'private-project', 'memory', 'MEMORY.md'), 'utf8')).resolves.toBe('# Private memory\n');
+    await expect(readFile(join(targetClaudeConfigDir, 'projects', 'private-project', 'session.jsonl'), 'utf8')).resolves.toContain('private session');
+    expect(JSON.parse(await readFile(join(targetClaudeConfigDir, '.claude.json'), 'utf8')).projects)
+      .toEqual({ 'private-project': { history: ['private root history'] } });
   });
 
   it('strips legacy refresh-token fields from an already-provenanced materialized home before returning diagnostics', async () => {
@@ -574,7 +618,7 @@ describe('materializeClaudeCodeNativeAuth', () => {
     expect(manifest.sessionFileMappings).toEqual([]);
   });
 
-  it('preserves sibling session files of a replaced isolated home across a staged rebuild', async () => {
+  it.each(['missing', 'malformed'] as const)('preserves private Claude state and isolated config with %s provenance', async (provenanceKind) => {
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-home-'));
     const sourceClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-source-'));
     const targetClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-target-'));
@@ -586,6 +630,15 @@ describe('materializeClaudeCodeNativeAuth', () => {
     );
     await mkdir(dirname(siblingSessionPath), { recursive: true });
     await writeFile(siblingSessionPath, '{"type":"assistant","message":"sibling isolated session"}\n');
+    await writeFile(join(targetClaudeConfigDir, 'settings.json'), '{"theme":"private"}\n');
+    await writeFile(join(targetClaudeConfigDir, 'history.jsonl'), '{"display":"private history"}\n');
+    await mkdir(join(targetClaudeConfigDir, 'commands'), { recursive: true });
+    await writeFile(join(targetClaudeConfigDir, 'commands', 'private.md'), '# Private command\n');
+    await mkdir(join(targetClaudeConfigDir, 'projects', 'private', 'memory'), { recursive: true });
+    await writeFile(join(targetClaudeConfigDir, 'projects', 'private', 'memory', 'MEMORY.md'), '# Private memory\n');
+    if (provenanceKind === 'malformed') {
+      await writeFile(join(targetClaudeConfigDir, '.happier-claude-connected-service-home.json'), '{malformed');
+    }
     const record = buildHealthyClaudeSubscriptionRecord('oauth', 'access-placeholder', 'refresh-placeholder');
 
     const result = await materializeClaudeSubscriptionNativeAuthHome({
@@ -597,7 +650,7 @@ describe('materializeClaudeCodeNativeAuth', () => {
           v: 1,
           defaults: { configMode: 'linked', stateMode: 'shared' },
           byAgentId: {
-            claude: { configMode: 'copied', stateMode: 'isolated' },
+            claude: { configMode: 'isolated', stateMode: 'isolated' },
           },
           acknowledgedRisksByAgentId: {},
         },
@@ -611,13 +664,16 @@ describe('materializeClaudeCodeNativeAuth', () => {
     });
 
     expect(result.status).toBe('materialized');
-    // The staged replacement must not destroy the only copy of sessions resting in the old home.
+    await expect(readFile(join(targetClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"private"}\n');
+    await expect(readFile(join(targetClaudeConfigDir, 'history.jsonl'), 'utf8')).resolves.toBe('{"display":"private history"}\n');
+    await expect(readFile(join(targetClaudeConfigDir, 'commands', 'private.md'), 'utf8')).resolves.toBe('# Private command\n');
+    await expect(readFile(join(targetClaudeConfigDir, 'projects', 'private', 'memory', 'MEMORY.md'), 'utf8')).resolves.toBe('# Private memory\n');
     await expect(readFile(siblingSessionPath, 'utf8')).resolves.toContain('sibling isolated session');
     const manifest = await readConnectedServiceStateSharingManifest(targetClaudeConfigDir);
     expect(manifest.requestedStateMode).toBe('isolated');
   });
 
-  it('backfills sibling session files of a replaced home into the shared store on a shared staged rebuild', async () => {
+  it('adopts existing private sibling session files into the shared store before linking', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-home-'));
     const ambientClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-ambient-'));
     const targetClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-target-'));

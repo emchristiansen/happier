@@ -67,6 +67,7 @@ export type ClaudeUnifiedTerminalSessionBinding<Mode extends EnhancedMode = Enha
   recordPromptTurnStarted(): Promise<void>;
   recordProviderResumeStarted(input: ClaudeUnifiedNativeContinuationIntent): Promise<void>;
   recordProviderResumeSessionStarted(): void;
+  recordProviderStartupBlocked(): Promise<boolean>;
   recordProviderStartupReady(): Promise<void>;
   recordPromptTurnProgress(): Promise<void>;
   recordPromptTurnCompleted(): Promise<void>;
@@ -221,6 +222,17 @@ export function bindClaudeUnifiedTerminalSession<Mode extends EnhancedMode = Enh
     if (providerResumeBarrier !== 'provisional') return;
     providerResumeSessionStarted = true;
     scheduleProviderResumeIdleRelease();
+  }
+
+  async function recordProviderStartupBlocked(): Promise<boolean> {
+    await canonicalTurnStartPromise;
+    if (
+      providerResumeBarrier !== 'provisional'
+      || providerResumeSessionStarted
+      || !canonicalTurnOpen
+    ) return false;
+    await recordPromptTurnCancelled();
+    return true;
   }
 
   async function recordProviderStartupReady(): Promise<void> {
@@ -402,6 +414,7 @@ export function bindClaudeUnifiedTerminalSession<Mode extends EnhancedMode = Enh
     recordPromptTurnStarted,
     recordProviderResumeStarted,
     recordProviderResumeSessionStarted,
+    recordProviderStartupBlocked,
     recordProviderStartupReady,
     recordPromptTurnProgress,
     recordPromptTurnCompleted,

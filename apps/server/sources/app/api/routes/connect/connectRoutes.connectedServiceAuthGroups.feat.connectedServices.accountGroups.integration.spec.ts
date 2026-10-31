@@ -54,14 +54,14 @@ async function createAccount(publicKey: string) {
     return db.account.create({ data: { publicKey }, select: { id: true } });
 }
 
-async function createConnectedProfile(accountId: string, serviceId: string, profileId: string) {
+async function createConnectedProfile(accountId: string, serviceId: string, profileId: string, kind: "oauth" | "token" = "oauth") {
     await db.serviceAccountToken.create({
         data: {
             accountId,
             vendor: serviceId,
             profileId,
             token: Buffer.from(`sealed:${serviceId}:${profileId}`, "utf8"),
-            metadata: { kind: "oauth" },
+            metadata: { kind },
         },
     });
 }
@@ -207,41 +207,83 @@ describe("connectRoutes connected service auth groups (integration)", () => {
         await db.account.deleteMany().catch(() => {});
     });
 
-    it("negotiates quota-reset policy reads while preserving the opt-in across older-client edits", async () => {
-        const user = await createAccount("pk-groups-auto-reset");
+    it("negotiates expiry-first reads without changing stored strategy on unrelated older-client edits", async () => {
+        const user = await createAccount("pk-groups-expiry-first");
         await createConnectedProfile(user.id, "openai-codex", "work");
         const app = await createReadyApp();
-        const headers = { ...authHeaders(user.id), accept: "application/json; happier-connected-service-auto-quota-reset=1" };
-        const url = "/v3/connect/openai-codex/groups/reset-pool";
-        const create = await app.inject({ method: "POST", url: "/v3/connect/openai-codex/groups", headers,
-            payload: { groupId: "reset-pool", displayName: null, activeProfileId: "work", members: [{ profileId: "work", priority: 10 }], policy: { autoUseQuotaResetsWhenExhausted: true } },
+        const headers = authHeaders(user.id);
+        const url = "/v3/connect/openai-codex/groups/expiry-pool";
+        const create = await app.inject({ method: "POST", url: "/v3/connect/openai-codex/groups?happierPoolExpiryFirst=1", headers,
+            payload: { groupId: "expiry-pool", members: [{ profileId: "work", priority: 10 }] },
+        });
+        expect(create.statusCode).toBe(200);
+        expect(create.json().group.policy.strategy).toBe("expiry_first");
+        const oldRead = await app.inject({ method: "GET", url, headers });
+        expect(oldRead.json().group.policy.strategy).toBe("least_limited");
+        const edit = await app.inject({ method: "PATCH", url, headers,
+            payload: { expectedGeneration: create.json().group.generation, policy: { cooldownMs: 1234 } },
+        });
+        expect(edit.statusCode).toBe(200);
+        const read = await app.inject({ method: "GET", url: `${url}?happierPoolExpiryFirst=1`, headers });
+        expect(read.json().group.policy).toMatchObject({ strategy: "expiry_first", cooldownMs: 1234 });
+        const explicit = await app.inject({ method: "PATCH", url: `${url}?happierPoolExpiryFirst=1`, headers,
+            payload: { expectedGeneration: read.json().group.generation, policy: { strategy: "least_limited" } },
+        });
+        expect(explicit.statusCode).toBe(200);
+        expect(explicit.json().group.policy.strategy).toBe("least_limited");
+    });
+
+    it.each(["openai-codex", "claude-subscription"])("negotiates quota-reset policy reads while preserving the opt-in across older-client edits (%s)", async (serviceId) => {
+        const user = await createAccount(`pk-groups-auto-reset-${serviceId}`);
+        await createConnectedProfile(user.id, serviceId, "work");
+        const app = await createReadyApp();
+        const quotaResetHeaders = { ...authHeaders(user.id), accept: "application/json; happier-connected-service-auto-quota-reset=1" };
+        const headers = quotaResetHeaders;
+        const readerQuery = "happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1";
+        const url = `/v3/connect/${serviceId}/groups/reset-pool`;
+        const create = await app.inject({ method: "POST", url: `/v3/connect/${serviceId}/groups?${readerQuery}`, headers,
+            payload: { groupId: "reset-pool", displayName: null, activeProfileId: "work", members: [{ profileId: "work", priority: 10 }], policy: { autoUseQuotaResetsWhenExhausted: true, autoDisablePlanInvalidAccounts: true, quotaLimitSelection: { mode: "selected", providerLimitIds: ["standard"] } } },
         });
         expect(create.statusCode).toBe(200);
         expect(create.json().group.policy.autoUseQuotaResetsWhenExhausted).toBe(true);
         const oldRead = await app.inject({ method: "GET", url, headers: authHeaders(user.id) });
         expect(oldRead.json().group.policy).not.toHaveProperty("autoUseQuotaResetsWhenExhausted");
-        const oldList = await app.inject({ method: "GET", url: "/v3/connect/openai-codex/groups", headers: authHeaders(user.id) });
+        expect(oldRead.json().group.policy).not.toHaveProperty("autoDisablePlanInvalidAccounts");
+        expect(oldRead.json().group.policy).not.toHaveProperty("quotaLimitSelection");
+        const quotaResetOnlyRead = await app.inject({ method: "GET", url, headers: quotaResetHeaders });
+        expect(quotaResetOnlyRead.json().group.policy.autoUseQuotaResetsWhenExhausted).toBe(true);
+        expect(quotaResetOnlyRead.json().group.policy).not.toHaveProperty("autoDisablePlanInvalidAccounts");
+        expect(quotaResetOnlyRead.json().group.policy).not.toHaveProperty("quotaLimitSelection");
+        const oldList = await app.inject({ method: "GET", url: `/v3/connect/${serviceId}/groups`, headers: authHeaders(user.id) });
         expect(oldList.json().groups[0].policy).not.toHaveProperty("autoUseQuotaResetsWhenExhausted");
         const oldEdit = await app.inject({ method: "PATCH", url, headers: authHeaders(user.id), payload: {
             expectedGeneration: create.json().group.generation, policy: { ...oldRead.json().group.policy, cooldownMs: 1234 },
         } });
         expect(oldEdit.statusCode).toBe(200);
         expect(oldEdit.json().group.policy).not.toHaveProperty("autoUseQuotaResetsWhenExhausted");
-        const newRead = await app.inject({ method: "GET", url, headers });
-        expect(newRead.json().group.policy).toMatchObject({ autoUseQuotaResetsWhenExhausted: true, cooldownMs: 1234 });
+        const newRead = await app.inject({ method: "GET", url: `${url}?${readerQuery}`, headers });
+        expect(newRead.json().group.policy).toMatchObject({ autoUseQuotaResetsWhenExhausted: true, autoDisablePlanInvalidAccounts: true, quotaLimitSelection: { mode: "selected", providerLimitIds: ["standard"] }, cooldownMs: 1234 });
         process.env.HAPPIER_FEATURE_CONNECTED_SERVICES_QUOTAS__ENABLED = "0";
-        const disabledRead = await app.inject({ method: "GET", url, headers });
+        const disabledRead = await app.inject({ method: "GET", url: `${url}?${readerQuery}`, headers });
         expect(disabledRead.json().group.policy).not.toHaveProperty("autoUseQuotaResetsWhenExhausted");
         process.env.HAPPIER_FEATURE_CONNECTED_SERVICES_QUOTAS__ENABLED = "1";
-        const restoredRead = await app.inject({ method: "GET", url, headers });
+        const restoredRead = await app.inject({ method: "GET", url: `${url}?${readerQuery}`, headers });
         expect(restoredRead.json().group.policy.autoUseQuotaResetsWhenExhausted).toBe(true);
+
+        const createDefault = await app.inject({ method: "POST", url: `/v3/connect/${serviceId}/groups?${readerQuery}`, headers,
+            payload: { groupId: "default-limits-pool", displayName: null, activeProfileId: "work", members: [{ profileId: "work", priority: 10 }] },
+        });
+        expect(createDefault.statusCode).toBe(200);
+        expect(createDefault.json().group.policy.quotaLimitSelection).toEqual({ mode: "all", providerLimitIds: [] });
+        const oldDefaultRead = await app.inject({ method: "GET", url: `/v3/connect/${serviceId}/groups/default-limits-pool`, headers: authHeaders(user.id) });
+        expect(oldDefaultRead.json().group.policy).not.toHaveProperty("quotaLimitSelection");
     });
 
-    it.each(["claude-subscription", "openai-codex"])("rejects quota-reset opt-in when the service or quota feature cannot support it (%s)", async (serviceId) => {
+    it.each(["anthropic", "claude-subscription", "openai-codex"])("rejects quota-reset opt-in when the service or quota feature cannot support it (%s)", async (serviceId) => {
         const user = await createAccount(`pk-auto-reset-disabled-${serviceId}`);
-        await createConnectedProfile(user.id, serviceId, "work");
+        await createConnectedProfile(user.id, serviceId, "work", serviceId === "anthropic" ? "token" : "oauth");
         const app = await createReadyApp();
-        if (serviceId === "openai-codex") process.env.HAPPIER_FEATURE_CONNECTED_SERVICES_QUOTAS__ENABLED = "0";
+        if (serviceId !== "anthropic") process.env.HAPPIER_FEATURE_CONNECTED_SERVICES_QUOTAS__ENABLED = "0";
         const response = await app.inject({ method: "POST", url: `/v3/connect/${serviceId}/groups`, headers: authHeaders(user.id), payload: {
             groupId: "disabled-reset", displayName: null, activeProfileId: "work", members: [{ profileId: "work", priority: 10 }],
             policy: { autoUseQuotaResetsWhenExhausted: true },
@@ -325,7 +367,7 @@ describe("connectRoutes connected service auth groups (integration)", () => {
         expect(res.json()).toEqual({ error: "not_found" });
     });
 
-    it("allows gemini group configuration while rejecting same-group runtime fallback controls", async () => {
+    it("allows gemini same-group fallback policy and active profile changes", async () => {
         const user = await createAccount("pk-gemini-groups");
         await createConnectedProfile(user.id, "gemini", "work");
         await createConnectedProfile(user.id, "gemini", "backup");
@@ -339,15 +381,16 @@ describe("connectRoutes connected service auth groups (integration)", () => {
                 groupId: "gemini-main",
                 members: [{ profileId: "work" }, { profileId: "backup" }],
                 activeProfileId: "work",
+                policy: { autoSwitch: false },
             },
         });
         expect(created.statusCode).toBe(200);
-        expect(created.json()).toEqual({
-            group: expect.objectContaining({
-                serviceId: "gemini",
-                groupId: "gemini-main",
-                activeProfileId: "work",
-            }),
+        const createdGroup = ConnectedServiceAuthGroupResponseV1Schema.parse(created.json()).group;
+        expect(createdGroup).toMatchObject({
+            serviceId: "gemini",
+            groupId: "gemini-main",
+            activeProfileId: "work",
+            policy: { autoSwitch: false },
         });
 
         const autoSwitchPatch = await app.inject({
@@ -356,20 +399,42 @@ describe("connectRoutes connected service auth groups (integration)", () => {
             headers: authHeaders(user.id),
             payload: {
                 policy: { autoSwitch: true },
-                expectedGeneration: 0,
+                expectedGeneration: createdGroup.generation,
             },
         });
-        expect(autoSwitchPatch.statusCode).toBe(400);
-        expect(autoSwitchPatch.json()).toEqual({ error: "connect_group_runtime_fallback_unsupported" });
+        expect(autoSwitchPatch.statusCode).toBe(200);
+        const patchedGroup = ConnectedServiceAuthGroupResponseV1Schema.parse(autoSwitchPatch.json()).group;
+        expect(patchedGroup).toMatchObject({
+            activeProfileId: "work",
+            generation: createdGroup.generation + 1,
+            policy: { autoSwitch: true },
+        });
 
         const switchActiveProfile = await app.inject({
             method: "POST",
             url: "/v3/connect/gemini/groups/gemini-main/active-profile",
             headers: authHeaders(user.id),
-            payload: { profileId: "backup", expectedGeneration: 0 },
+            payload: { profileId: "backup", expectedGeneration: patchedGroup.generation },
         });
-        expect(switchActiveProfile.statusCode).toBe(400);
-        expect(switchActiveProfile.json()).toEqual({ error: "connect_group_runtime_fallback_unsupported" });
+        expect(switchActiveProfile.statusCode).toBe(200);
+        const switchedGroup = ConnectedServiceAuthGroupResponseV1Schema.parse(switchActiveProfile.json()).group;
+        expect(switchedGroup).toMatchObject({
+            activeProfileId: "backup",
+            generation: patchedGroup.generation + 1,
+            policy: { autoSwitch: true },
+        });
+
+        const read = await app.inject({
+            method: "GET",
+            url: "/v3/connect/gemini/groups/gemini-main",
+            headers: authHeaders(user.id),
+        });
+        expect(read.statusCode).toBe(200);
+        expect(ConnectedServiceAuthGroupResponseV1Schema.parse(read.json()).group).toMatchObject({
+            activeProfileId: "backup",
+            generation: switchedGroup.generation,
+            policy: { autoSwitch: true },
+        });
     });
 
     it("enforces account ownership and member profile existence", async () => {
@@ -480,6 +545,51 @@ describe("connectRoutes connected service auth groups (integration)", () => {
             serviceId: "openai-codex",
             groupId: "codex-main",
         })).resolves.toEqual({ activeProfileId: "backup", generation: 1 });
+    });
+
+    it.each(["active-profile", "patch", "patch-legacy", "delete", "disable"])("records automatic fallback provenance and clears it for an old-client manual %s", async (action) => {
+        const user = await createAccount("pk-groups-switch-provenance");
+        await createConnectedProfile(user.id, "openai-codex", "primary");
+        await createConnectedProfile(user.id, "openai-codex", "backup");
+        await seedAuthGroup({ accountId: user.id, serviceId: "openai-codex", groupId: "pool",
+            memberProfileIds: ["primary", "backup"], activeProfileId: "primary" });
+        const app = await createReadyApp();
+        const switched = await app.inject({
+            method: "POST", url: "/v3/connect/openai-codex/groups/pool/active-profile",
+            headers: { ...authHeaders(user.id), "x-happier-connected-service-switch-reason": "usage_limit" },
+            payload: { profileId: "backup", expectedGeneration: 0, overrideRuntimeCooldown: true },
+        });
+        expect(switched.statusCode).toBe(200);
+        expect(switched.json().group.state).toMatchObject({ lastSwitchReason: "usage_limit", lastSwitchAt: expect.any(Number) });
+        const refreshed = await app.inject({
+            method: "PATCH", url: "/v3/connect/openai-codex/groups/pool/runtime-state",
+            headers: authHeaders(user.id),
+            payload: { expectedGeneration: switched.json().group.generation,
+                expectedRuntimeStateRevision: switched.json().group.runtimeStateRevision,
+                state: { status: "ready" } },
+        });
+        expect(refreshed.statusCode).toBe(200);
+        expect(refreshed.json().group.state.lastSwitchReason).toBe("usage_limit");
+        if (action === "patch-legacy") {
+            await db.connectedServiceAuthGroup.updateMany({
+                where: { accountId: user.id, groupId: "pool" }, data: { stateJson: "{}" },
+            });
+        }
+        const manual = await app.inject({
+            method: action === "active-profile" ? "POST" : action === "delete" ? "DELETE" : "PATCH",
+            url: action === "active-profile" ? "/v3/connect/openai-codex/groups/pool/active-profile"
+                : action.startsWith("patch") ? "/v3/connect/openai-codex/groups/pool"
+                : "/v3/connect/openai-codex/groups/pool/members/backup"
+                    + (action === "delete" ? "?expectedGeneration=" + switched.json().group.generation : ""),
+            headers: action === "delete" ? { "x-test-user-id": user.id } : authHeaders(user.id),
+            ...(action === "delete" ? {} : { payload: {
+                ...(action === "active-profile" ? { profileId: "backup" }
+                    : action.startsWith("patch") ? { activeProfileId: action === "patch-legacy" ? "backup" : "primary" } : { enabled: false }),
+                expectedGeneration: switched.json().group.generation,
+            } }),
+        });
+        expect(manual.statusCode, manual.body).toBe(200);
+        expect(manual.json().group.state.lastSwitchReason).toBe("manual");
     });
 
     it("rejects unauthenticated active-profile CAS without mutating server truth", async () => {
@@ -1439,6 +1549,61 @@ describe("connectRoutes connected service auth groups (integration)", () => {
         expect(rejected.json()).toEqual({ error: "connect_group_active_profile_not_member" });
     });
 
+    it.each([
+        { label: "changed priority", initiallyEnabled: true, patch: { priority: 42 }, changed: true },
+        { label: "unchanged priority", initiallyEnabled: true, patch: { priority: 10 }, changed: false },
+        { label: "disable", initiallyEnabled: true, patch: { enabled: false }, changed: true },
+        { label: "already enabled", initiallyEnabled: true, patch: { enabled: true }, changed: false },
+        { label: "already disabled", initiallyEnabled: false, patch: { enabled: false }, changed: false },
+        { label: "re-enable unrelated quota state", initiallyEnabled: false, patch: { enabled: true }, changed: true },
+        { label: "empty patch", initiallyEnabled: true, patch: {}, changed: false },
+    ])("preserves member runtime state during metadata-only $label", async ({ label, initiallyEnabled, patch, changed }) => {
+        const user = await createAccount(`pk-groups-runtime-preserved-${label}`);
+        await createConnectedProfile(user.id, "openai-codex", "work");
+        const app = await createReadyApp();
+        const created = await app.inject({
+            method: "POST",
+            url: "/v3/connect/openai-codex/groups",
+            headers: authHeaders(user.id),
+            payload: { groupId: "codex-main", members: [{ profileId: "work", priority: 10, enabled: initiallyEnabled }] },
+        });
+        expect(created.statusCode).toBe(200);
+        const state = { quotaExhaustedUntilMs: Date.now() + 3_600_000, lastFailureKind: "usage_limit" };
+        const stateJson = JSON.stringify(state);
+        const memberKey = { accountId: user.id, vendor: "openai-codex", groupId: "codex-main", profileId: "work" };
+        await db.connectedServiceAuthGroupMember.update({
+            where: { accountId_vendor_groupId_profileId: memberKey },
+            data: { stateJson },
+        });
+        await db.connectedServiceAuthGroup.update({
+            where: { accountId_vendor_groupId: { accountId: user.id, vendor: "openai-codex", groupId: "codex-main" } },
+            data: { runtimeStateRevision: 4 },
+        });
+        const cursorBefore = await readAccountChangeCursor(user.id);
+        emitUpdate.mockClear();
+
+        const updated = await app.inject({
+            method: "PATCH",
+            url: "/v3/connect/openai-codex/groups/codex-main/members/work",
+            headers: authHeaders(user.id),
+            payload: { expectedGeneration: 0, ...patch },
+        });
+        expect(updated.statusCode).toBe(200);
+        expect(updated.json().group).toMatchObject({
+            generation: changed ? 1 : 0,
+            runtimeStateRevision: 4,
+            members: [expect.objectContaining({ profileId: "work", state, ...patch })],
+        });
+        expect(await db.connectedServiceAuthGroupMember.findUnique({
+            where: { accountId_vendor_groupId_profileId: memberKey },
+            select: { stateJson: true },
+        })).toEqual({ stateJson });
+        if (!changed) {
+            expect(await readAccountChangeCursor(user.id)).toBe(cursorBefore);
+            expect(emitUpdate).not.toHaveBeenCalled();
+        }
+    });
+
     it("bumps generation for member additions, updates, and non-active removals", async () => {
         const user = await createAccount("pk-groups-members");
         await createConnectedProfile(user.id, "openai-codex", "work");
@@ -1480,28 +1645,60 @@ describe("connectRoutes connected service auth groups (integration)", () => {
             method: "PATCH",
             url: "/v3/connect/openai-codex/groups/codex-main/members/backup",
             headers: authHeaders(user.id),
-            payload: { enabled: false, priority: 50, expectedGeneration: 1 },
+            payload: {
+                enabled: false,
+                priority: 50,
+                expectedGeneration: 1,
+                expectedRuntimeStateRevision: 0,
+                state: {
+                    autoDisabledReason: "model_not_entitled",
+                    lastFailureKind: "plan",
+                    lastFailureCode: "model_not_entitled",
+                    modelUnavailableUntilMsByModelId: { "gpt-5.6-sol": 86_401_000 },
+                    lastObservedAtMs: 1_000,
+                },
+            },
         });
         expect(disabled.statusCode).toBe(200);
         expect(disabled.json()).toEqual({
             group: expect.objectContaining({
                 generation: 2,
+                runtimeStateRevision: 1,
                 members: expect.arrayContaining([
-                    expect.objectContaining({ profileId: "backup", enabled: false, priority: 50 }),
+                    expect.objectContaining({
+                        profileId: "backup",
+                        enabled: false,
+                        priority: 50,
+                        state: expect.objectContaining({ autoDisabledReason: "model_not_entitled" }),
+                    }),
                 ]),
             }),
+        });
+        const reenabled = await app.inject({
+            method: "PATCH",
+            url: "/v3/connect/openai-codex/groups/codex-main/members/backup",
+            headers: authHeaders(user.id),
+            payload: { enabled: true, expectedGeneration: 2 },
+        });
+        expect(reenabled.statusCode).toBe(200);
+        expect(reenabled.json().group).toMatchObject({
+            generation: 3,
+            runtimeStateRevision: 2,
+            members: expect.arrayContaining([
+                expect.objectContaining({ profileId: "backup", enabled: true, state: {} }),
+            ]),
         });
 
         const removed = await app.inject({
             method: "DELETE",
-            url: "/v3/connect/openai-codex/groups/codex-main/members/backup?expectedGeneration=2",
+            url: "/v3/connect/openai-codex/groups/codex-main/members/backup?expectedGeneration=3",
             headers: { "x-test-user-id": user.id },
         });
         expect(removed.statusCode).toBe(200);
         expect(removed.json()).toEqual({
             group: expect.objectContaining({
                 activeProfileId: "work",
-                generation: 3,
+                generation: 4,
                 members: [
                     expect.objectContaining({ profileId: "work" }),
                 ],
@@ -3014,7 +3211,7 @@ describe("connectRoutes connected service auth groups (integration)", () => {
             headers: { "x-test-user-id": user.id },
         });
         expect(fetched.statusCode).toBe(200);
-        expect(fetched.json().group.state).toEqual({});
+        expect(fetched.json().group.state).toMatchObject({ lastSwitchReason: "manual", lastSwitchAt: expect.any(Number) });
         expect(fetched.json().group.members).toEqual(expect.arrayContaining([
             expect.objectContaining({ profileId: "work", state: {} }),
         ]));

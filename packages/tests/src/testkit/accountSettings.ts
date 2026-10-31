@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import {
   AccountSettingsV2UpdateResponseSchema,
   sealAccountScopedBlobCiphertext,
+  type AccountSettingsV2UpdateResponse,
 } from '@happier-dev/protocol';
 
 import { fetchJson } from './http';
@@ -12,12 +13,12 @@ type AccountSettingsV2GetResponse = Readonly<{
   version?: unknown;
 }>;
 
-async function writePlainAccountSettingsV2(params: Readonly<{
+async function tryWritePlainAccountSettingsV2(params: Readonly<{
   baseUrl: string;
   token: string;
   settings: unknown;
   expectedVersion: number;
-}>): Promise<number> {
+}>): Promise<AccountSettingsV2UpdateResponse> {
   const postRes = await fetchJson<unknown>(`${params.baseUrl}/v2/account/settings`, {
     method: 'POST',
     headers: {
@@ -38,12 +39,22 @@ async function writePlainAccountSettingsV2(params: Readonly<{
   if (!parsed.success) {
     throw new Error('Failed to parse plain account settings update response');
   }
-  if (!parsed.data.success) {
+  return parsed.data;
+}
+
+async function writePlainAccountSettingsV2(params: Readonly<{
+  baseUrl: string;
+  token: string;
+  settings: unknown;
+  expectedVersion: number;
+}>): Promise<number> {
+  const result = await tryWritePlainAccountSettingsV2(params);
+  if (!result.success) {
     throw new Error(
-      `Failed to update plain account settings due to version mismatch (expected=${params.expectedVersion}, current=${parsed.data.currentVersion})`,
+      `Failed to update plain account settings due to version mismatch (expected=${params.expectedVersion}, current=${result.currentVersion})`,
     );
   }
-  return parsed.data.version;
+  return result.version;
 }
 
 export async function upsertPlainAccountSettingsV2(params: Readonly<{
@@ -84,25 +95,34 @@ export async function patchPlainAccountSettingsV2(params: Readonly<{
   if (getRes.status !== 200 || typeof getRes.data?.version !== 'number') {
     throw new Error(`Failed to fetch current account settings version (status=${getRes.status})`);
   }
-  if (getRes.data.content?.t === 'encrypted') {
-    throw new Error('Cannot patch plain account settings over encrypted account settings');
+  let currentContent = getRes.data.content ?? null;
+  let currentVersion = getRes.data.version;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (currentContent?.t === 'encrypted') {
+      throw new Error('Cannot patch plain account settings over encrypted account settings');
+    }
+    const currentSettings = currentContent?.t === 'plain'
+      && typeof currentContent.v === 'object'
+      && currentContent.v !== null
+      && !Array.isArray(currentContent.v)
+      ? currentContent.v as Record<string, unknown>
+      : {};
+    const result = await tryWritePlainAccountSettingsV2({
+      baseUrl: params.baseUrl,
+      token: params.token,
+      expectedVersion: currentVersion,
+      settings: {
+        ...currentSettings,
+        ...params.settingsPatch,
+      },
+    });
+    if (result.success) return result.version;
+    currentContent = result.currentContent;
+    currentVersion = result.currentVersion;
   }
 
-  const currentSettings = getRes.data.content?.t === 'plain'
-    && typeof getRes.data.content.v === 'object'
-    && getRes.data.content.v !== null
-    && !Array.isArray(getRes.data.content.v)
-    ? getRes.data.content.v as Record<string, unknown>
-    : {};
-  return writePlainAccountSettingsV2({
-    baseUrl: params.baseUrl,
-    token: params.token,
-    expectedVersion: getRes.data.version,
-    settings: {
-      ...currentSettings,
-      ...params.settingsPatch,
-    },
-  });
+  throw new Error(`Failed to patch plain account settings after repeated version conflicts (current=${currentVersion})`);
 }
 
 export async function upsertEncryptedAccountSettingsV2(params: Readonly<{

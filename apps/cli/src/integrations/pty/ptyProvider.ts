@@ -8,6 +8,7 @@ import {
 } from '@/runtime/resolveRuntimeEntrypointArgv';
 import { isEmbeddedBunBundlePath } from '@/runtime/js/isEmbeddedBunBundlePath';
 import { logger } from '@/ui/logger';
+import { isBun } from '@/utils/runtime';
 import { createNodePtyRelayProvider } from './nodePtyRelayProvider';
 import { createPythonPtyRelayProvider } from './pythonPtyRelayProvider';
 
@@ -324,8 +325,13 @@ export function createNodePtyProvider(params?: Readonly<{
     return null;
   };
 
-  const nodePty = tryResolveModule('node-pty');
-  const homebridgePty = tryResolveModule('@homebridge/node-pty-prebuilt-multiarch');
+  // Both POSIX backends use tty.ReadStream for the nonblocking PTY master.
+  // Bun can return a successful spawn while silently losing input/output
+  // (oven-sh/bun#25822). Use the existing external relay until the bundled
+  // Bun runtime passes interactive PTY input/output and cleanup validation.
+  const useNativePty = platform === 'win32' || !isBun();
+  const nodePty = useNativePty ? tryResolveModule('node-pty') : null;
+  const homebridgePty = useNativePty ? tryResolveModule('@homebridge/node-pty-prebuilt-multiarch') : null;
   const nativeCandidates = [nodePty, homebridgePty];
   const preferred = nativeCandidates.find((candidate) => candidate !== null) ?? null;
   const fallback = nativeCandidates.find((candidate) => candidate !== null && candidate !== preferred) ?? null;

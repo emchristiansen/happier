@@ -101,8 +101,8 @@ function readNullableString(value: unknown): string | null | undefined {
     return typeof value === 'string' ? value : undefined;
 }
 
-function readRollbackEligibleTurnStarts(value: unknown): readonly number[] | null | undefined {
-    if (value === null) return null;
+function readRollbackEligibleTurnStarts(value: unknown): number[] | undefined {
+    if (value === null) return undefined;
     if (!Array.isArray(value)) return undefined;
 
     const starts: number[] = [];
@@ -229,7 +229,7 @@ function coerceLegacySessionRecord(raw: unknown): V2SessionRecord | null {
             || (raw.lastRuntimeIssue && typeof raw.lastRuntimeIssue === 'object')
                 ? raw.lastRuntimeIssue as V2SessionRecord['lastRuntimeIssue']
                 : undefined,
-        ...(rollbackEligibleTurnStarts !== undefined ? { rollbackEligibleTurnStarts } : {}),
+        rollbackEligibleTurnStarts,
         pendingCount: readNumber(raw.pendingCount) ?? undefined,
         pendingBlockedCount: readNumber(raw.pendingBlockedCount) ?? undefined,
         pendingVersion: readNumber(raw.pendingVersion) ?? undefined,
@@ -277,7 +277,7 @@ function parseCompatSessionListResponseValue(raw: unknown): V2SessionListRespons
     return {
         sessions: sessions as V2SessionRecord[],
         nextCursor: typeof raw.nextCursor === 'string' ? raw.nextCursor : null,
-        hasNext: raw.hasNext === true,
+        hasNext: typeof raw.hasNext === 'boolean' ? raw.hasNext : undefined,
     };
 }
 
@@ -376,7 +376,7 @@ export async function fetchSessionListPageCompat(params: Readonly<{
 }>): Promise<{
     sessions: V2SessionListResponse['sessions'];
     nextCursor: string | null;
-    hasNext: boolean;
+    hasNext: boolean | undefined;
     source: 'v2' | 'v1';
     includedActiveRows: boolean;
 }> {
@@ -416,7 +416,7 @@ export async function fetchSessionListPageCompat(params: Readonly<{
             return {
                 sessions: parsed.sessions,
                 nextCursor: typeof parsed.nextCursor === 'string' ? parsed.nextCursor : null,
-                hasNext: parsed.hasNext === true,
+                hasNext: parsed.hasNext,
                 source: 'v2',
                 includedActiveRows: parsed.includedActive === true,
             };

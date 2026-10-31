@@ -48,7 +48,7 @@ describe('agentActivityToneStyle', () => {
     });
 
     it('gives every status a distinct translated word so colour is never the only carrier', () => {
-        const words = AGENT_ACTIVITY_STATUSES_V1.map(resolveAgentActivityStatusWord);
+        const words = AGENT_ACTIVITY_STATUSES_V1.map((status) => resolveAgentActivityStatusWord(status));
 
         for (const word of words) {
             expect(word.trim().length).toBeGreaterThan(0);

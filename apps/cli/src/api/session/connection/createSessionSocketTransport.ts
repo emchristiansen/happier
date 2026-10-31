@@ -1,4 +1,5 @@
 import { io, type Socket } from 'socket.io-client';
+import { ConnectedServiceIdSchema, CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD } from '@happier-dev/protocol';
 
 import type { ManagedConnectionTransport } from '@happier-dev/connection-supervisor';
 
@@ -31,6 +32,7 @@ export function createSessionSocketTransport(params: Readonly<{
     const socket = io(serverUrl, {
         ...(transports ? { transports } : null),
         auth: {
+            [CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD]: ConnectedServiceIdSchema.options,
             token: params.token,
             clientType: 'session-scoped' as const,
             sessionId: params.sessionId,

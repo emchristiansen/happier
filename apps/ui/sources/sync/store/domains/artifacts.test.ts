@@ -30,6 +30,14 @@ function artifact(index: number): DecryptedArtifact {
 }
 
 describe('createArtifactsDomain', () => {
+  it('marks artifacts loaded only after a snapshot is applied', () => {
+    const harness = createHarness();
+    expect(harness.get().artifactsLoaded).toBe(false);
+
+    harness.get().applyArtifacts([]);
+    expect(harness.get().artifactsLoaded).toBe(true);
+  });
+
   it('retains only the newest configured artifact heads', () => {
     const cap = (loadSyncTuning() as { artifactHeadsRetentionMaxCount?: number }).artifactHeadsRetentionMaxCount ?? 1000;
     const harness = createHarness();

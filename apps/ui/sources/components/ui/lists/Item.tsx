@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { View, Pressable, StyleProp, ViewStyle, TextStyle, Platform, type AccessibilityRole, type AccessibilityState, type TextProps } from 'react-native';
+import { View, Pressable, StyleProp, ViewStyle, TextStyle, Platform, type AccessibilityRole, type AccessibilityState, type PressableProps, type TextProps } from 'react-native';
 import { Typography } from '@/constants/Typography';
 import { Modal } from '@/modal';
 import { t } from '@/text';
@@ -115,6 +115,8 @@ export interface ItemProps {
      * derive it from `accessibilityState`. All optional and back-compat.
      */
     accessibilityState?: AccessibilityState;
+    accessibilityActions?: PressableProps['accessibilityActions'];
+    onAccessibilityAction?: PressableProps['onAccessibilityAction'];
     accessibilityLabel?: string;
     accessibilityHint?: string;
     disabled?: boolean;
@@ -141,6 +143,12 @@ export interface ItemProps {
      * reuse-or-create step), so the further-step affordance stays visible.
      */
     keepChevronWithRightElement?: boolean;
+    /**
+     * Render `rightElement` beside, rather than inside, the row Pressable.
+     * Use this when the accessory owns an independent action so web never
+     * receives nested buttons and activating the accessory cannot open the row.
+     */
+    rightElementOutsidePressable?: boolean;
     showDivider?: boolean;
     dividerInset?: number;
     pressableStyle?: StyleProp<ViewStyle>;
@@ -204,7 +212,7 @@ const stylesheet = StyleSheet.create((theme, runtime) => ({
         paddingVertical: Platform.select({ ios: 8, default: 2 }),
     },
     iconContainer: {
-        marginRight: 12,
+        marginRight: ITEM_ICON_MARGIN_RIGHT.comfortable,
         width: ITEM_ICON_BOX_SIZE.comfortable,
         height: ITEM_ICON_BOX_SIZE.comfortable,
         alignItems: 'center',
@@ -213,17 +221,17 @@ const stylesheet = StyleSheet.create((theme, runtime) => ({
         ...ICON_LABEL_OPTICAL_NUDGE_STYLE,
     },
     iconContainerCompact: {
-        marginRight: 10,
+        marginRight: ITEM_ICON_MARGIN_RIGHT.compact,
         width: ITEM_ICON_BOX_SIZE.compact,
         height: ITEM_ICON_BOX_SIZE.compact,
     },
     iconContainerCozy: {
-        marginRight: 14,
+        marginRight: ITEM_ICON_MARGIN_RIGHT.cozy,
         width: ITEM_ICON_BOX_SIZE.cozy,
         height: ITEM_ICON_BOX_SIZE.cozy,
     },
     iconContainerTight: {
-        marginRight: 8,
+        marginRight: ITEM_ICON_MARGIN_RIGHT.tight,
         width: ITEM_ICON_BOX_SIZE.tight,
         height: ITEM_ICON_BOX_SIZE.tight,
     },
@@ -273,7 +281,18 @@ const stylesheet = StyleSheet.create((theme, runtime) => ({
     rightSection: {
         flexDirection: 'row',
         alignItems: 'center',
+        maxWidth: '50%',
         marginLeft: 8,
+    },
+    splitPressable: {
+        flex: 1,
+        alignSelf: 'stretch',
+        justifyContent: 'center',
+    },
+    splitPressableInner: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        flex: 1,
     },
     detail: {
         ...Typography.default('regular'),
@@ -339,6 +358,8 @@ export const Item = React.memo<ItemProps>((props) => {
         onFocus,
         onKeyDown,
         accessibilityState,
+        accessibilityActions,
+        onAccessibilityAction,
         accessibilityLabel,
         accessibilityHint,
         disabled,
@@ -355,6 +376,7 @@ export const Item = React.memo<ItemProps>((props) => {
         detailStyle,
         showChevron = true,
         keepChevronWithRightElement = false,
+        rightElementOutsidePressable = false,
         showDivider = true,
         dividerInset = isIOS ? 15 : 16,
         pressableStyle,
@@ -391,10 +413,15 @@ export const Item = React.memo<ItemProps>((props) => {
     }, [copy, copyFeedback, detail, subtitle, titleLabel]);
     
     const longPressConsumedRef = React.useRef(false);
+    const [isSplitPrimaryPressed, setIsSplitPrimaryPressed] = React.useState(false);
 
     // Handle long press for copy functionality
     const handlePressIn = React.useCallback(() => {
         longPressConsumedRef.current = false;
+        if (rightElementOutsidePressable && rightElement) setIsSplitPrimaryPressed(true);
+    }, [rightElement, rightElementOutsidePressable]);
+    const handlePressOut = React.useCallback(() => {
+        setIsSplitPrimaryPressed(false);
     }, []);
     
     const webDoublePressHandledAtMsRef = React.useRef<number>(0);
@@ -629,7 +656,7 @@ export const Item = React.memo<ItemProps>((props) => {
         );
     }, [isWeb]);
 
-    const renderRowContent = React.useCallback(() => (
+    const renderRowContent = React.useCallback((options?: Readonly<{ includeRightAccessory?: boolean }>) => (
         <>
             {/* Left Section */}
             {leftAccessory ? (
@@ -732,7 +759,7 @@ export const Item = React.memo<ItemProps>((props) => {
                         style={{ marginRight: showAccessory ? 6 : 0 }}
                     />
                 )}
-                {rightAccessory}
+                {options?.includeRightAccessory === false ? null : rightAccessory}
                 {chevronAccessory}
             </View>
         </>
@@ -783,9 +810,19 @@ export const Item = React.memo<ItemProps>((props) => {
         style,
     ]);
 
+    const splitRightElementOutsidePressable = Boolean(
+        isInteractive && rightElementOutsidePressable && rightAccessory,
+    );
+
     const resolveInteractiveRowStyle = React.useCallback((pressed: boolean) => {
         // `isHovered` is only ever set on web (the hover handlers are wired there only).
-        const backgroundColor = pressFeedback.resolveBackgroundColor({ pressed, hovered: isHovered })
+        const backgroundColor = pressFeedback.resolveBackgroundColor({
+            pressed,
+            // Web/Android normally let their Pressable paint its own ripple. A split row's
+            // primary Pressable cannot paint beneath its sibling action, so the shared parent
+            // receives the same token while the press is held.
+            hovered: isHovered || (pressed && splitRightElementOutsidePressable),
+        })
             ?? 'transparent';
 
         const roundedCornersStyle = getItemGroupRowCornerRadii({
@@ -814,7 +851,80 @@ export const Item = React.memo<ItemProps>((props) => {
         pressFeedback,
         pressableStyle,
         rowPosition,
+        splitRightElementOutsidePressable,
     ]);
+
+    if (splitRightElementOutsidePressable) {
+        return (
+            <>
+                <View style={[containerCore, style, resolveInteractiveRowStyle(isSplitPrimaryPressed)]}>
+                    <Pressable
+                        ref={focusRef}
+                        testID={testID}
+                        {...webTestIdProps}
+                        onPress={handlePress}
+                        onLongPress={handleLongPress}
+                        // @ts-expect-error - react-native types do not model web-only double click props; RN Web supports onDoubleClick.
+                        onDoubleClick={isWeb && onDoublePress ? (event: any) => {
+                            if (Date.now() - webDoublePressHandledAtMsRef.current < 600) return;
+                            webDoublePressHandledAtMsRef.current = Date.now();
+                            webLastPressAtMsRef.current = null;
+                            event?.preventDefault?.();
+                            event?.stopPropagation?.();
+                            onDoublePress();
+                        } : undefined}
+                        onPressIn={handlePressIn}
+                        onPressOut={handlePressOut}
+                        onFocus={handleFocus}
+                        onBlur={handleBlur}
+                        onHoverIn={isWeb && !disabled && !loading ? () => setIsHovered(true) : undefined}
+                        onHoverOut={isWeb ? () => setIsHovered(false) : undefined}
+                        onMouseDownCapture={isWeb ? (onMouseDownCapture as any) : undefined}
+                        onContextMenu={isWeb ? (onContextMenu as any) : undefined}
+                        {...(isWeb && webRole ? { role: webRole } : undefined)}
+                        {...(isWeb ? { tabIndex: webTabIndex, 'aria-level': accessibilityLevel, 'aria-keyshortcuts': webKeyShortcuts, onKeyDown } : undefined)}
+                        accessibilityRole={accessibilityRole ?? 'button'}
+                        accessibilityState={resolvedAccessibilityState}
+                        accessibilityActions={accessibilityActions}
+                        onAccessibilityAction={onAccessibilityAction}
+                        accessibilityLabel={accessibilityLabel}
+                        accessibilityHint={accessibilityHint}
+                        {...(isWeb && accessibilityState != null && accessibilityState.expanded != null
+                            ? ({ 'aria-expanded': accessibilityState.expanded } as Record<string, unknown>)
+                            : undefined)}
+                        disabled={disabled || loading}
+                        style={[styles.splitPressable, isWeb ? WEB_FOCUS_OUTLINE_RESET : null]}
+                        android_ripple={(isAndroid || isWeb) ? {
+                            color: theme.colors.surface.ripple,
+                            borderless: false,
+                            foreground: true,
+                        } : undefined}
+                    >
+                        <View style={[styles.splitPressableInner, containerPadding]}>
+                            {renderRowContent({ includeRightAccessory: false })}
+                        </View>
+                        {isFocusRingMounted ? (
+                            <FocusRing
+                                testID={testID === undefined ? undefined : `${testID}-focus-ring`}
+                                visible={isFocused && isKeyboardModality && !disabled && !loading}
+                                placement="inside"
+                                cornerRadii={focusRingCornerRadii}
+                            />
+                        ) : null}
+                    </Pressable>
+                    <View
+                        style={styles.rightSection}
+                        pointerEvents={disabled || loading ? 'none' : 'auto'}
+                        accessibilityElementsHidden={disabled || loading}
+                        importantForAccessibility={disabled || loading ? 'no-hide-descendants' : 'auto'}
+                    >
+                        {rightAccessory}
+                    </View>
+                </View>
+                {dividerNode}
+            </>
+        );
+    }
 
     if (isInteractive) {
         return (
@@ -846,6 +956,8 @@ export const Item = React.memo<ItemProps>((props) => {
                 {...(isWeb ? { tabIndex: webTabIndex, 'aria-level': accessibilityLevel, 'aria-keyshortcuts': webKeyShortcuts, onKeyDown } : undefined)}
                 accessibilityRole={accessibilityRole ?? 'button'}
                 accessibilityState={resolvedAccessibilityState}
+                accessibilityActions={accessibilityActions}
+                onAccessibilityAction={onAccessibilityAction}
                 accessibilityLabel={accessibilityLabel}
                 accessibilityHint={accessibilityHint}
                 {...(isWeb && accessibilityState != null && accessibilityState.expanded != null

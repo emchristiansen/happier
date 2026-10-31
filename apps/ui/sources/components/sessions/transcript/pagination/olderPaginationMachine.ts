@@ -85,7 +85,11 @@ export type OlderPaginationEvent =
     | (Readonly<{ type: 'scrollObserved' }> & OlderPaginationScrollObservation)
     | Readonly<{ type: 'loadStarted' }>
     | Readonly<{ type: 'loadFinished'; loaded: number; hasMore: boolean; error?: boolean }>
+    /** Initial-fill and navigation reads use the same source without arming this pager. */
+    | Readonly<{ type: 'sourceExhausted' }>
     | Readonly<{ type: 'cooldownElapsed' }>
+    /** A reader can request a retained page even when short content cannot scroll. */
+    | Readonly<{ type: 'continuationRequested' }>
     | Readonly<{ type: 'suspend'; reason: OlderPaginationSuspendReason }>
     | Readonly<{ type: 'resume'; reason: OlderPaginationSuspendReason }>
     | Readonly<{ type: 'reset' }>;
@@ -294,6 +298,16 @@ export function reduceOlderPagination(state: OlderPaginationState, event: OlderP
                 hasMore,
             };
         }
+        case 'sourceExhausted': {
+            if (!state.hasMore) return state;
+            return {
+                ...state,
+                phase: state.phase === 'loading' ? 'loading' : 'idle',
+                hasMore: false,
+                committedExactEdgeDuringLoad: false,
+                successfulLoadAwaitingCommittedLayout: false,
+            };
+        }
         case 'cooldownElapsed': {
             if (state.phase !== 'cooldown') return state;
             const rearm =
@@ -308,6 +322,19 @@ export function reduceOlderPagination(state: OlderPaginationState, event: OlderP
                     : false,
                 successfulLoadAwaitingCommittedLayout:
                     state.successfulLoadAwaitingCommittedLayout && !rearm,
+            };
+        }
+        case 'continuationRequested': {
+            if (!state.hasMore || state.phase === 'loading') return state;
+            return {
+                ...state,
+                phase: 'armed',
+                committedExactEdgeDuringLoad: false,
+                successfulLoadAwaitingCommittedLayout: false,
+                rearmEligible: false,
+                // Position gates automatic observations, not explicit reader intent.
+                // Fill and viewport-transaction suspensions remain authoritative.
+                suspendedReasons: withSuspendedReason(state.suspendedReasons, 'negative-offset', false),
             };
         }
         case 'suspend': {

@@ -34,6 +34,7 @@ export const SessionOrganizationSnapshotRequestSchema = z
     tagIds: z.array(SessionOrganizationScopedIdSchema).max(SESSION_ORGANIZATION_MAX_SCOPED_SNAPSHOT_IDS).default([]),
     orderScopes: z.array(SessionOrganizationOrderScopeRequestSchema).max(SESSION_ORGANIZATION_MAX_SCOPED_SNAPSHOT_IDS).default([]),
     includeAttentionStandings: z.boolean().default(false),
+    includeAttentionReminderTimes: z.boolean().default(false),
   })
   .strict();
 export type SessionOrganizationSnapshotRequest = z.infer<typeof SessionOrganizationSnapshotRequestSchema>;

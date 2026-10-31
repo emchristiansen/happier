@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { CommandContext } from '@/cli/commandRegistry';
+import { captureStdout } from '@/testkit/logger/captureOutput';
 
 import { runInstallCliCommand } from './install';
 
@@ -106,13 +107,18 @@ describe('runInstallCliCommand', () => {
       },
     });
 
-    await runInstallCliCommand(makeContext(['install', 'provider', 'gemini', '--force']), {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn() as never,
-      runDoctorCommand: vi.fn(),
-      invokeProviderCliInstall,
-    });
+    const stdout = captureStdout();
+    try {
+      await runInstallCliCommand(makeContext(['install', 'provider', 'gemini', '--force']), {
+        log: vi.fn(),
+        error: vi.fn(),
+        exit: vi.fn() as never,
+        runDoctorCommand: vi.fn(),
+        invokeProviderCliInstall,
+      });
+    } finally {
+      stdout.restore();
+    }
 
     expect(invokeProviderCliInstall).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -120,6 +126,8 @@ describe('runInstallCliCommand', () => {
         params: { dryRun: false, skipIfInstalled: false },
       }),
     );
+    // Non-TTY output: the install is a visible step that completes with its outcome.
+    expect(stdout.chunks.join('')).toContain('- [..] Installing Google Gemini CLI\n- [✓] Installed Google Gemini CLI via a managed package\n');
   });
 
   it('defaults vendor recipe execution for explicit provider installs', async () => {
@@ -168,10 +176,7 @@ describe('runInstallCliCommand', () => {
       invokeProviderCliInstall: vi.fn(),
     });
 
-    expect(error).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.stringContaining('Unknown provider id: not-a-provider'),
-    );
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('Unknown provider id: not-a-provider'));
     expect(exit).toHaveBeenCalledWith(1);
   });
 
@@ -187,7 +192,7 @@ describe('runInstallCliCommand', () => {
       invokeProviderCliInstall: vi.fn().mockRejectedValue(new Error('network stalled')),
     });
 
-    expect(error).toHaveBeenCalledWith(expect.any(String), 'network stalled');
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('network stalled'));
     expect(exit).toHaveBeenCalledWith(1);
   });
 });

@@ -11,6 +11,7 @@ import Animated, {
 import { motionTokens } from '@/components/ui/motion/motionTokens';
 import { reanimatedMotionTokens } from '@/components/ui/motion/reanimatedMotionTokens';
 import { OverlayScrim } from '@/components/ui/overlays/OverlayScrim';
+import { resolveFloatingTabBarBottomPadding } from '@/components/ui/navigation/floatingTabBarBottomInset';
 import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreference';
 import { isNewSessionFloatingComposerPresentation } from '@/components/sessions/new/navigation/newSessionPresentation';
 import {
@@ -24,7 +25,7 @@ import { AgentInput } from '@/components/sessions/agentInput';
 import { AttachmentFilePicker } from '@/components/sessions/attachments/AttachmentFilePicker';
 import { PopoverBoundaryProvider } from '@/components/ui/popover';
 import { t } from '@/text';
-import type { AcpConfigOptionOverridesV1 } from '@happier-dev/protocol';
+import { resolveRequestedSessionModeId, type AcpConfigOptionOverridesV1 } from '@happier-dev/protocol';
 import type { HandleCreateSessionOptions } from '../hooks/useCreateNewSession';
 import { useNewSessionAttachmentsController } from '@/components/sessions/new/attachments/useNewSessionAttachmentsController';
 import { isMobileLayoutWidth } from '@/components/sessions/layout/isMobileLayoutWidth';
@@ -69,6 +70,17 @@ const SIMPLE_NEW_SESSION_ENTER_FROM_SCALE = motionTokens.overlay.modal.fromScale
 
 /** A shorter drop on the way out — exits are quieter than entrances. */
 const SIMPLE_NEW_SESSION_EXIT_TRAVEL_PX = 12;
+
+/** Total gap between the floating card and the screen bottom while the keyboard is down. */
+function resolveFloatingComposerRestingGap(
+    props: Pick<NewSessionSimplePanelProps, 'newSessionSidePadding' | 'safeAreaBottom'>,
+): number {
+    if (Platform.OS === 'ios') return props.newSessionSidePadding;
+    return Math.max(
+        props.newSessionSidePadding,
+        resolveFloatingTabBarBottomPadding(props.safeAreaBottom, false),
+    );
+}
 
 /** How long the disarmed state may persist before it is assumed the pop never happened. */
 const SIMPLE_NEW_SESSION_DISMISS_SAFETY_MS = 1000;
@@ -341,17 +353,19 @@ export const NewSessionSimplePanel = React.memo(function NewSessionSimplePanel(p
             headerHeight={isFloatingComposer ? 0 : props.headerHeight}
             safeAreaTop={props.safeAreaTop}
             // The scaffold resolves the composer's resting offset as max(keyboardHeight,
-            // safeAreaBottom). A floating card is not seated against the screen edge, so the
+            // safeAreaBottom). A floating card is not seated against the screen edge, so on iOS the
             // home-indicator inset is the wrong resting gap — it leaves the card sitting visibly
-            // higher than its own side margin.
+            // higher than its own side margin. Android edge-to-edge is different: its inset is a
+            // solid navigation region (3-button bar / gesture area) the card must clear, so there
+            // the card floats above the whole inset exactly like the floating tab bar it replaces.
             //
-            // The target is a TOTAL resting gap equal to the side margin, and the composer wrapper
-            // already contributes `newSessionBottomPadding` below the card. Only the remainder
-            // belongs here, or the two stack and the card floats too high again. The wrapper's
-            // share is also what holds the card off the keyboard once it is up, so it stays put:
-            // the keyboard is always taller than this remainder, and max() then ignores it.
+            // The composer wrapper already contributes `newSessionBottomPadding` below the card.
+            // Only the remainder of the total resting gap belongs here, or the two stack and the
+            // card floats too high again. The wrapper's share is also what holds the card off the
+            // keyboard once it is up, so it stays put: the keyboard is always taller than this
+            // remainder, and max() then ignores it.
             safeAreaBottom={isFloatingComposer
-                ? Math.max(0, props.newSessionSidePadding - props.newSessionBottomPadding)
+                ? Math.max(0, resolveFloatingComposerRestingGap(props) - props.newSessionBottomPadding)
                 : props.safeAreaBottom}
             style={[
                 props.containerStyle,
@@ -527,7 +541,7 @@ function NewSessionSimplePanelComposer({
                         acpSessionModeOptionsOverrideProbe={props.acpSessionModeProbe}
                         onAcpSessionModeChange={
                             (props.acpSessionModeOptions?.length ?? 0) > 0 && props.setAcpSessionModeId
-                                ? (modeId) => props.setAcpSessionModeId?.(modeId === 'default' ? null : modeId)
+                                ? (modeId) => props.setAcpSessionModeId?.(resolveRequestedSessionModeId(modeId, props.acpSessionModeOptions) || null)
                                 : undefined
                         }
                         acpConfigOptionsOverride={props.acpConfigOptions}

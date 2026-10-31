@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { View, Platform } from 'react-native';
+import { View, Platform, type StyleProp, type ViewStyle } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
 
 import { Text } from '@/components/ui/text/Text';
@@ -29,6 +29,8 @@ import type { SelectionListAccessory } from './_types';
 export type SelectionListSectionHeaderProps = Readonly<{
     /** Section title (rendered as uppercase eyebrow text). May be undefined. */
     title?: string;
+    /** Keep the title's case — for titles that are names, such as hostnames, whose case is meaningful. */
+    preserveCase?: boolean;
     /**
      * Optional count rendered to the right of the title with tabular-nums so
      * width stays stable as numbers tick.
@@ -38,6 +40,8 @@ export type SelectionListSectionHeaderProps = Readonly<{
     rightAccessory?: SelectionListAccessory;
     /** Stable testID anchor (e.g. `<sectionTestId>:header`). */
     testID?: string;
+    /** Optional host-owned layout override; typography and accessory behavior remain canonical here. */
+    containerStyle?: StyleProp<ViewStyle>;
 }>;
 
 const stylesheet = StyleSheet.create((theme) => ({
@@ -91,10 +95,10 @@ export function SelectionListSectionHeader(
 ): React.ReactElement | null {
     const styles = stylesheet;
     if (props.title === undefined || props.title.length === 0) return null;
-    const title = props.title.toLocaleUpperCase();
+    const title = props.preserveCase ? props.title : props.title.toLocaleUpperCase();
     const rightAccessory = renderSelectionListAccessory(props.rightAccessory);
     return (
-        <View testID={props.testID} style={styles.container}>
+        <View testID={props.testID} style={[styles.container, props.containerStyle]}>
             <Text style={styles.label}>{title}</Text>
             {typeof props.count === 'number' ? (
                 <Text style={[styles.count, Typography.tabular()]}>{String(props.count)}</Text>

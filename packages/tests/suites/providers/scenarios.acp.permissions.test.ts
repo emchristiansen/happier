@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
@@ -115,9 +115,10 @@ describe('providers: ACP scenario builders (permissions)', () => {
   });
 
   it('accepts Kimi unknown permission-request payloads and extracts path from toolCall content', async () => {
-    const workspaceDir = await mkdtemp(join(tmpdir(), 'happier-acp-outside-kimi-'));
-    const outsidePath = join(tmpdir(), `happier-kimi-outside-${Date.now()}.txt`);
+    const fixtureRoot = await mkdtemp(join(tmpdir(), 'happier-acp-outside-kimi-'));
+    const workspaceDir = join(fixtureRoot, 'workspace');
     try {
+      await mkdir(workspaceDir);
       const scenario = makeAcpPermissionOutsideWorkspaceScenario({
         providerId: 'kimi',
         content: 'KIMI_OUTSIDE_OK',
@@ -126,6 +127,9 @@ describe('providers: ACP scenario builders (permissions)', () => {
         expectWriteCompletion: false,
       });
 
+      await scenario.setup?.({ workspaceDir, cliHome: workspaceDir });
+      const outsidePath = scenario.prompt?.({ workspaceDir }).match(/^- Absolute path: (.+)$/m)?.[1]?.trim() ?? null;
+      if (!outsidePath || dirname(outsidePath) !== fixtureRoot) throw new Error('Expected target inside owned fixture root');
       await writeFile(outsidePath, 'KIMI_OUTSIDE_OK\n', 'utf8');
 
       await scenario.verify?.(
@@ -147,8 +151,7 @@ describe('providers: ACP scenario builders (permissions)', () => {
         }),
       );
     } finally {
-      await rm(outsidePath, { force: true });
-      await rm(workspaceDir, { recursive: true, force: true });
+      await rm(fixtureRoot, { recursive: true, force: true });
     }
   });
 

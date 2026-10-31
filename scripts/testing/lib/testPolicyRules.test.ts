@@ -41,6 +41,35 @@ test('collectPolicyFindings keeps hidden skip aliases report-only for provider r
   );
 });
 
+test('exclusive parameterized tests cannot silently reduce the selected suite', () => {
+  for (const declaration of [
+    "it.only.each([1])('case', () => {});",
+    "it.concurrent.only('case', () => {});",
+    "test.concurrent.only.each([1])('case', () => {});",
+    "describe.only.each`value\n${1}`('case', () => {});",
+  ]) {
+    const report = collectPolicyFindings([{ filePath: 'example.test.ts', content: declaration }]);
+    assert.ok(report.findings.some((finding) => finding.ruleId === 'no-exclusive-tests' && finding.mode === 'enforce'));
+  }
+});
+
+test('test-policy fixture strings and comments are not executed exclusive tests', () => {
+  const report = collectPolicyFindings([{
+    filePath: 'policy.test.ts',
+    content: `
+      const fixture = "https://example.test/ it.only('fixture', () => {})";
+      // it.only('comment', () => {});
+      const other = { only: () => undefined };
+      other.only();
+      it('ordinary', () => {});
+      it.each([1])('ordinary parameterized', () => {});
+      test.concurrent.each([1])('ordinary concurrent', () => {});
+      describe.each\`value\n${1}\`('ordinary tagged', () => {});
+    `,
+  }]);
+  assert.equal(report.findings.filter((finding) => finding.ruleId === 'no-exclusive-tests').length, 0);
+});
+
 test('collectPolicyFindings bans @happier-dev/tests internals from non-test source', () => {
   const report = collectPolicyFindings([
     {

@@ -9,6 +9,36 @@ export const OPENCODE_PROVIDER_SETTINGS_PLUGIN: ProviderSettingsPlugin = {
     settings: OPENCODE_PROVIDER_FIELDS,
     uiSections: [
         {
+            id: 'opencodeCliGeneration',
+            title: { key: 'settingsProviders.plugins.opencode.sections.cliGeneration.title' },
+            footer: { key: 'settingsProviders.plugins.opencode.sections.cliGeneration.footer' },
+            fields: [
+                {
+                    key: 'opencodeCliGeneration',
+                    kind: 'enum',
+                    title: { key: 'settingsProviders.plugins.opencode.fields.opencodeCliGeneration.title' },
+                    subtitle: { key: 'settingsProviders.plugins.opencode.fields.opencodeCliGeneration.subtitle' },
+                    enumOptions: [
+                        {
+                            id: 'auto',
+                            title: { key: 'settingsProviders.plugins.opencode.fields.opencodeCliGeneration.options.auto.title' },
+                            subtitle: { key: 'settingsProviders.plugins.opencode.fields.opencodeCliGeneration.options.auto.subtitle' },
+                        },
+                        {
+                            id: 'stable',
+                            title: { key: 'settingsProviders.plugins.opencode.fields.opencodeCliGeneration.options.stable.title' },
+                            subtitle: { key: 'settingsProviders.plugins.opencode.fields.opencodeCliGeneration.options.stable.subtitle' },
+                        },
+                        {
+                            id: 'v2',
+                            title: { key: 'settingsProviders.plugins.opencode.fields.opencodeCliGeneration.options.v2.title' },
+                            subtitle: { key: 'settingsProviders.plugins.opencode.fields.opencodeCliGeneration.options.v2.subtitle' },
+                        },
+                    ],
+                },
+            ],
+        },
+        {
             id: 'opencodeBackendMode',
             title: { key: 'settingsProviders.plugins.opencode.sections.backendMode.title' },
             footer: { key: 'settingsProviders.plugins.opencode.sections.backendMode.footer' },

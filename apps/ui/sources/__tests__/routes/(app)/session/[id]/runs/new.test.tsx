@@ -122,6 +122,9 @@ function translateText(key: string, params?: Record<string, unknown>) {
     if (key === 'executionRuns.newRun.intents.review') return 'review';
     if (key === 'executionRuns.newRun.intents.plan') return 'plan';
     if (key === 'executionRuns.newRun.intents.delegate') return 'delegate';
+    if (key === 'agentInput.agent.claude') return 'Claude';
+    if (key === 'agentInput.agent.codex') return 'Codex';
+    if (key === 'agentInput.agent.pi') return 'Pi';
     if (key === 'agentInput.permissionMode.default') return 'default';
     if (key === 'agentInput.permissionMode.readOnly') return 'read-only';
     if (key === 'agentInput.permissionMode.safeYolo') return 'safe-yolo';
@@ -158,7 +161,6 @@ installSessionRouteCommonModuleMocks({
             theme: {
                 colors: {
                     surface: '#111',
-                    text: '#eee',
                     textSecondary: '#aaa',
                     divider: '#333',
                 },
@@ -940,7 +942,7 @@ describe('Session New Run Screen', () => {
             screen.changeTextByTestId('execution-run-new-instructions-input', 'review with default permissions');
         });
 
-        const selectClaude = screen.findByProps({ accessibilityLabel: 'Toggle backend claude' });
+        const selectClaude = screen.findByProps({ accessibilityLabel: 'Toggle backend Claude' });
         expect(selectClaude).toBeDefined();
         await pressTestInstanceAsync(selectClaude, 'backend claude');
 
@@ -977,7 +979,7 @@ describe('Session New Run Screen', () => {
         localSearchParamsMock = { id: 'session-1', intent: 'delegate' };
 
         const screen = await renderNewRunScreen();
-        const toggleClaude = screen.findByProps({ accessibilityLabel: 'Toggle backend claude' });
+        const toggleClaude = screen.findByProps({ accessibilityLabel: 'Toggle backend Claude' });
         expect(toggleClaude).toBeDefined();
 
         await pressTestInstanceAsync(toggleClaude, 'backend claude');
@@ -1008,7 +1010,7 @@ describe('Session New Run Screen', () => {
         };
 
         const screen = await renderNewRunScreen();
-        const togglePi = screen.findByProps({ accessibilityLabel: 'Toggle backend pi' });
+        const togglePi = screen.findByProps({ accessibilityLabel: 'Toggle backend Pi' });
         expect(togglePi).toBeDefined();
         expect(togglePi!.props.disabled).toBe(true);
     });

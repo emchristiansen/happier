@@ -39,7 +39,6 @@ services:
     volumes:
       - ${SSH_PUBLIC_KEY_PATH}:/ssh/authorized_keys:ro
       - ${PACKS_DIR:-./_packs}:/packs:ro
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
     tmpfs:
       - /run
       - /run/lock

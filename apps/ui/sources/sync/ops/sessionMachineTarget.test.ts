@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { RPC_ERROR_CODES } from '@happier-dev/protocol/rpc';
+import { createRpcCallError } from '@/sync/runtime/rpcErrors';
 
 const getStateSpy = vi.fn();
 
@@ -1122,6 +1123,16 @@ describe('sessionMachineTarget', () => {
             machineId: 'm-new',
             basePath: '/Volumes/target/workspace/live',
         });
+    });
+
+    it('recovers missing active Machine context without retrying a genuine decryption failure', async () => {
+        const { shouldFallbackFromMachineRpc } = await import('./sessionMachineTarget');
+        expect(shouldFallbackFromMachineRpc(createRpcCallError({
+            error: 'Machine context unavailable', errorCode: 'machine_rpc_context_unavailable',
+        }))).toBe(true);
+        expect(shouldFallbackFromMachineRpc(createRpcCallError({
+            error: 'Machine response could not be decrypted', errorCode: 'machine_rpc_decryption_failed',
+        }))).toBe(false);
     });
 
     it('disallows session-rpc fallback when session is inactive', async () => {

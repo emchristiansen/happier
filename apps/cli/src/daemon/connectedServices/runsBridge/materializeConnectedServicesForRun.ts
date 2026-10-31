@@ -1,4 +1,5 @@
 import type { CatalogAgentId } from '@/backends/types';
+import type { ExecutionRunRetentionPolicy } from '@happier-dev/protocol';
 import {
   HAPPIER_SESSION_CONNECTED_SERVICE_BROKER_SELECTION_IDENTITY_ENV_KEY,
   readSessionConnectedServiceBrokerSelectionIdentity,
@@ -41,11 +42,12 @@ export type ExecutionRunConnectedServiceMaterializeRequest = Readonly<{
   agentId: CatalogAgentId;
   /** The PID whose liveness anchors the registered runtime target (the runner hosting the run). */
   pid: number;
-  /** Run-scoped materialization key (e.g. `execution_run:<id>`); keeps run homes distinct from sessions. */
+  /** Run-scoped runtime identity (e.g. `execution_run:<id>`), independent of durable provider-home ownership. */
   materializationKey: string;
   /** The run's connected-service selection, defaulted upstream exactly like session spawn defaulting. */
   connectedServicesBindingsRaw: unknown;
   sessionDirectory?: string | null;
+  previousMaterializedRoot?: string;
   sessionId?: string | null;
 }>;
 
@@ -72,6 +74,7 @@ export type ResolveConnectedServiceAuthForRun = (
     materializationKey: string;
     connectedServicesBindingsRaw: unknown;
     sessionDirectory?: string | null;
+    previousMaterializedRoot?: string;
     sessionId?: string;
   }>,
 ) => ReturnType<typeof resolveConnectedServiceAuthForSpawn>;
@@ -104,6 +107,7 @@ export type ExecutionRunConnectedServicesBridge = Readonly<{
     pid: number;
     agentId: CatalogAgentId;
     materializedRoot: string;
+    retentionPolicy?: ExecutionRunRetentionPolicy | null;
   }>) => boolean;
 }>;
 
@@ -127,11 +131,12 @@ export function createExecutionRunConnectedServicesBridge(deps: Readonly<{
     materializedRoot: string;
     materializationKey: string;
     agentId: CatalogAgentId;
+    retentionPolicy?: ExecutionRunRetentionPolicy | null;
   }>) => (() => void | Promise<void>) | null;
 }>): ExecutionRunConnectedServicesBridge {
   const logger = deps.logger ?? defaultLogger;
-  // In-memory release state keyed by the run-scoped materialization key. A daemon restart drops it;
-  // the run's ephemeral root is then reclaimed by the run-root's own retention (best-effort residual).
+  // In-memory release state keyed by the run-scoped materialization key. Passive adoption restores
+  // it after a daemon restart; only disposable roots have a filesystem cleanup to run on release.
   const releaseEntriesByKey = new Map<string, RunReleaseEntry>();
   // A1: in-flight materializations by run key. A release racing an in-flight materialize (the runner
   // abandoned the call on a transport timeout, then fired the reclaim release) must serialize BEHIND
@@ -146,8 +151,10 @@ export function createExecutionRunConnectedServicesBridge(deps: Readonly<{
         materializedRoot: input.materializedRoot,
         materializationKey: input.runKey,
         agentId: input.agentId,
+        retentionPolicy: input.retentionPolicy,
       }) ?? null;
-      if (!cleanup) return false;
+      // A provider-owned durable home has no disposable root cleanup. Adoption still restores the
+      // run's release lifecycle; the cleanup factory alone decides whether a root may be deleted.
       releaseEntriesByKey.set(input.runKey, { pid: input.pid, cleanupOnExit: cleanup, cleanupPromise: null });
       return true;
     },
@@ -160,6 +167,7 @@ export function createExecutionRunConnectedServicesBridge(deps: Readonly<{
           materializationKey: request.materializationKey,
           connectedServicesBindingsRaw: request.connectedServicesBindingsRaw,
           sessionDirectory: request.sessionDirectory ?? null,
+          ...(request.previousMaterializedRoot ? { previousMaterializedRoot: request.previousMaterializedRoot } : {}),
           ...(request.sessionId ? { sessionId: request.sessionId } : {}),
         });
       } catch (error) {

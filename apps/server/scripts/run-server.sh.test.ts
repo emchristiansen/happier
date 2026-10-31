@@ -4,6 +4,8 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
+import { createEnvPatcher } from '../sources/testkit/env';
+
 function getScriptPath(): string {
   return resolve(__dirname, 'run-server.sh');
 }
@@ -60,11 +62,13 @@ async function readLogLines(path: string): Promise<string[]> {
 }
 
 describe('run-server.sh', () => {
+  const env = createEnvPatcher(['DATABASE_URL']);
   let tmpDir = '';
   let binDir = '';
   let logPath = '';
 
   beforeEach(async () => {
+    env.set('DATABASE_URL', undefined);
     tmpDir = await mkdtemp(join(tmpdir(), 'happier-run-server-'));
     binDir = join(tmpDir, 'bin');
     logPath = join(tmpDir, 'yarn.log');
@@ -75,6 +79,7 @@ describe('run-server.sh', () => {
   });
 
   afterEach(async () => {
+    env.restore();
     await rm(tmpDir, { recursive: true, force: true });
   });
 

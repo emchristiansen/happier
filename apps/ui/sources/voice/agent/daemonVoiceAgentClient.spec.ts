@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { RPC_ERROR_CODES } from '@happier-dev/protocol/rpc';
+import { RPC_ERROR_CODES, SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
+import { createSocketIoAckTimeoutError } from '@/sync/runtime/socketIoAckTimeout';
 import { installVoiceAgentCommonModuleMocks } from './voiceAgentTestHelpers';
 
 vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedSessionRpc', () => ({
@@ -190,7 +191,7 @@ describe('DaemonVoiceAgentClient', () => {
     );
   });
 
-  it('uses a startup RPC timeout aligned with the voice bootstrap timeout for ensureOrStart', async () => {
+  it('uses an unbounded acknowledgement lifetime for ensureOrStart', async () => {
     const { sessionRpcWithServerScope } = await import('@/sync/runtime/orchestration/serverScopedRpc/serverScopedSessionRpc');
     vi.mocked(sessionRpcWithServerScope).mockResolvedValueOnce({ ok: true, runId: 'run_1', created: true } as any);
 
@@ -211,12 +212,12 @@ describe('DaemonVoiceAgentClient', () => {
 
     expect(vi.mocked(sessionRpcWithServerScope)).toHaveBeenCalledWith(
       expect.objectContaining({
-        timeoutMs: 60_000,
+        timeoutMs: null,
       }),
     );
   });
 
-  it('honors an explicit bootstrap timeout when it exceeds the network timeout', async () => {
+  it('keeps an explicit provider bootstrap budget separate from the acknowledgement lifetime', async () => {
     const { sessionRpcWithServerScope } = await import('@/sync/runtime/orchestration/serverScopedRpc/serverScopedSessionRpc');
     vi.mocked(sessionRpcWithServerScope).mockResolvedValueOnce({ ok: true, runId: 'run_1', created: true } as any);
 
@@ -238,9 +239,51 @@ describe('DaemonVoiceAgentClient', () => {
 
     expect(vi.mocked(sessionRpcWithServerScope)).toHaveBeenCalledWith(
       expect.objectContaining({
-        timeoutMs: 90_000,
+        timeoutMs: null,
+        payload: expect.objectContaining({
+          start: expect.objectContaining({ bootstrapTimeoutMs: 90_000 }),
+        }),
       }),
     );
+  });
+
+  it('uses an unbounded acknowledgement lifetime for Voice action and stream lifecycle RPCs', async () => {
+    const { sessionRpcWithServerScope } = await import('@/sync/runtime/orchestration/serverScopedRpc/serverScopedSessionRpc');
+    vi.mocked(sessionRpcWithServerScope).mockImplementation(async ({ method, payload }: any) => {
+      if (method === SESSION_RPC_METHODS.EXECUTION_RUN_ACTION) {
+        return payload.actionId === 'voice_agent.welcome'
+          ? { ok: true, result: { assistantText: 'welcome' } }
+          : { ok: true, result: { commitText: 'commit' } };
+      }
+      if (method === SESSION_RPC_METHODS.EXECUTION_RUN_STREAM_START) return { streamId: 'stream-v1' };
+      if (method === SESSION_RPC_METHODS.EXECUTION_RUN_STREAM_START_V2) return { streamId: 'stream-v2' };
+      if (method === SESSION_RPC_METHODS.EXECUTION_RUN_STREAM_CANCEL) return { ok: true };
+      throw new Error(`unexpected method: ${String(method)}`);
+    });
+
+    const { DaemonVoiceAgentClient } = await import('./daemonVoiceAgentClient');
+    const client = new DaemonVoiceAgentClient();
+    await client.welcome({ sessionId: 's1', voiceAgentId: 'run-1' });
+    await client.commit({ sessionId: 's1', voiceAgentId: 'run-1', kind: 'session_instruction' });
+    await client.startTurnStream({ sessionId: 's1', voiceAgentId: 'run-1', userText: 'v1' });
+    await client.startTurnStream({
+      sessionId: 's1',
+      voiceAgentId: 'run-1',
+      userText: 'v2',
+      userTranscript: { mode: 'persist', localId: 'local-1' },
+    });
+    await client.cancelTurnStream({ sessionId: 's1', voiceAgentId: 'run-1', streamId: 'stream-v2' });
+
+    expect(vi.mocked(sessionRpcWithServerScope).mock.calls.map(([call]) => ({
+      method: call.method,
+      timeoutMs: call.timeoutMs,
+    }))).toEqual([
+      { method: SESSION_RPC_METHODS.EXECUTION_RUN_ACTION, timeoutMs: null },
+      { method: SESSION_RPC_METHODS.EXECUTION_RUN_ACTION, timeoutMs: null },
+      { method: SESSION_RPC_METHODS.EXECUTION_RUN_STREAM_START, timeoutMs: null },
+      { method: SESSION_RPC_METHODS.EXECUTION_RUN_STREAM_START_V2, timeoutMs: null },
+      { method: SESSION_RPC_METHODS.EXECUTION_RUN_STREAM_CANCEL, timeoutMs: null },
+    ]);
   });
 
   it('omits default sentinel model ids from the ensureOrStart start payload', async () => {
@@ -274,30 +317,33 @@ describe('DaemonVoiceAgentClient', () => {
     );
   });
 
-  it('retries execution.run.ensureOrStart once when the initial RPC times out', async () => {
+  it('surfaces an acknowledgement timeout as outcome-unknown without retrying ensureOrStart', async () => {
     const { sessionRpcWithServerScope } = await import('@/sync/runtime/orchestration/serverScopedRpc/serverScopedSessionRpc');
     vi.mocked(sessionRpcWithServerScope)
-      .mockRejectedValueOnce(new Error('operation has timed out'))
+      .mockRejectedValueOnce(createSocketIoAckTimeoutError())
       .mockResolvedValueOnce({ ok: true, runId: 'run_retry', created: true } as any);
 
-    const { DaemonVoiceAgentClient } = await import('./daemonVoiceAgentClient');
+    const { DaemonVoiceAgentClient, VoiceAgentStartOutcomeUnknownError } = await import('./daemonVoiceAgentClient');
     const client = new DaemonVoiceAgentClient();
 
-    await expect(
-      client.start({
-        sessionId: 's1',
-        agentSource: 'agent',
-        agentId: 'codex',
-        verbosity: 'short',
-        chatModelId: 'fast',
-        commitModelId: 'fast',
-        permissionPolicy: 'read_only',
-        idleTtlSeconds: 300,
-        initialContext: 'ctx',
-      }),
-    ).resolves.toEqual({ voiceAgentId: 'run_retry' });
+    const error = await client.start({
+      sessionId: 's1',
+      agentSource: 'agent',
+      agentId: 'codex',
+      verbosity: 'short',
+      chatModelId: 'fast',
+      commitModelId: 'fast',
+      permissionPolicy: 'read_only',
+      idleTtlSeconds: 300,
+      initialContext: 'ctx',
+    }).catch((caught: unknown) => caught);
 
-    expect(vi.mocked(sessionRpcWithServerScope)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(sessionRpcWithServerScope)).toHaveBeenCalledTimes(1);
+    expect(error).toBeInstanceOf(VoiceAgentStartOutcomeUnknownError);
+    expect(error).toMatchObject({
+      code: 'VOICE_AGENT_START_OUTCOME_UNKNOWN',
+      message: 'Voice agent start acknowledgement was not received; outcome is unknown',
+    });
   });
 
   it('forwards displayUserText separately from the execution payload when starting a turn stream', async () => {
@@ -353,6 +399,7 @@ describe('DaemonVoiceAgentClient', () => {
     expect(vi.mocked(sessionRpcWithServerScope)).toHaveBeenCalledWith({
       sessionId: 'session-1',
       method: SESSION_RPC_METHODS.EXECUTION_RUN_STREAM_START_V2,
+      timeoutMs: null,
       payload: {
         runId: 'run-1',
         message: 'Create the file.',

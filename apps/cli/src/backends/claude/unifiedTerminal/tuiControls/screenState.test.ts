@@ -137,6 +137,57 @@ const CLAUDE_2_1_170 = {
 } as const;
 
 describe('parseClaudeScreenState — usage-limit chooser', () => {
+  it('recognizes an active usage-limit wait footer without treating historical notices as current', () => {
+    const footer = [
+      '  ⚠ Usage limit reached · limit resets 5:10pm · clau.de/wrap-up',
+      '    Continuing automatically at 5:10pm · esc to cancel',
+      '  Opus 5.5',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ];
+    const composer = ['────────────────────', '❯ sounds good, proceed and contniue', '────────────────────'];
+    const active = parseClaudeScreenState([...composer, ...footer].join('\n'));
+
+    expect(active.usageLimitWaitVisible).toBe(true);
+    expect(active.usageLimitDialogVisible).toBe(false);
+    expect(active.generating).toBe(false);
+    expect(isSafeWindowForSlashControl(active)).toBe(false);
+    expect(resolveClaudeScreenInFlightSteerVeto(active)).toBe('usage_limit_wait');
+
+    const empty = parseClaudeScreenState(['────────────────────', '❯ ', '────────────────────', ...footer].join('\n'));
+    expect(empty.usageLimitWaitVisible).toBe(true);
+    expect(empty.inputBoxInteractive).toBe(true);
+    expect(isClaudeScreenReadyForInput(empty)).toBe(true);
+    expect(resolveClaudeScreenInFlightSteerVeto(empty)).toBeNull();
+
+    const historical = parseClaudeScreenState([...footer, ...composer].join('\n'));
+    expect(historical.usageLimitWaitVisible).toBe(false);
+    expect(historical.inputBoxInteractive).toBe(true);
+  });
+
+  it('treats the sparse Rewind message selector as terminal input ownership, never a composer', () => {
+    const state = parseClaudeScreenState([
+      '   Rewind',
+      '',
+      '   Restore the code and/or conversation to the point before…',
+      '',
+      '     ↑ 4 more above',
+      '     previous user message',
+      '     2 files changed +53 -4',
+      '',
+      '   ❯ (current)',
+      '',
+      '',
+      '   Enter to continue · Esc to cancel',
+    ].join('\n'));
+
+    expect(state.selectionListVisible).toBe(true);
+    expect(state.composerContent).toBeNull();
+    expect(state.userDraftPresent).toBe(false);
+    expect(isClaudeScreenReadyForInput(state)).toBe(false);
+    expect(isSafeWindowForSlashControl(state)).toBe(false);
+    expect(resolveClaudeScreenInFlightSteerVeto(state)).toBe('selection_list');
+  });
+
   it('recognizes the current chooser without pinning its paid alternatives', () => {
     const state = parseClaudeScreenState(CLAUDE_2_1_228_USAGE_LIMIT_DIALOG);
 
@@ -191,8 +242,23 @@ describe('parseClaudeScreenState — usage-limit chooser', () => {
   });
 });
 
-describe('parseClaudeScreenState — mode markers (default by absence)', () => {
-  it('detects default mode by the absence of any cycle marker', () => {
+describe('parseClaudeScreenState — mode markers (visible footer evidence)', () => {
+  it('keeps a clipped permission footer unknown rather than inferring default or a historical mode', () => {
+    const screen = ['⏵⏵ auto mode on', '────────────────────', '❯ ', '────────────────────', '  Opus 5.5'].join('\n');
+    expect(parseClaudeScreenState(screen).modeMarker).toBeNull();
+  });
+
+  it.each([
+    ['⏸ manual', 'default'],
+    ['⏸ plan', 'plan'],
+    ['⏵⏵ accept edits', 'acceptEdits'],
+    ['⏵⏵ auto', 'auto'],
+    ['⏵⏵ bypass permissions', 'bypassPermissions'],
+  ] as const)('recognizes the compact Claude footer %s', (footer, mode) => {
+    const screen = ['────────────────────', '❯ ', '────────────────────', `  ${footer} · 1 background`].join('\n');
+    expect(parseClaudeScreenState(screen).modeMarker).toBe(mode);
+  });
+  it('detects default mode from the visible shortcuts footer', () => {
     const state = parseClaudeScreenState(CLAUDE_2_1_170.idleDefault);
     expect(state.modeMarker).toBe('default');
     expect(state.inputBoxInteractive).toBe(true);
@@ -720,6 +786,93 @@ const CLAUDE_2_1_205_SAFEGUARD_PAUSE = readFileSync(
   new URL('./__fixtures__/claude-2.1.205-safeguard-pause.ansi', import.meta.url),
   'utf8',
 );
+
+const CLAUDE_2_1_274_EFFORT_DEFAULT_NUDGE = readFileSync(
+  new URL('./__fixtures__/claude-2.1.274-effort-default-nudge.ansi', import.meta.url),
+  'utf8',
+);
+
+describe('parseClaudeScreenState — effort default nudge (Claude Code 2.1.274, footer-less chooser)', () => {
+  // Live capture (session cmu5bmmtf01lxtmqa2v77al95): Claude's startup "Use <model> at <to>
+  // effort by default?" nudge renders an unindexed ❯ chooser with NO "Enter to confirm · Esc to
+  // cancel" footer. Reading the focused row as a composer draft left startup readiness waiting
+  // forever while no dialog was ever published to the user.
+  it('recognizes the nudge as the effort-change dialog with a focused selection and no composer draft', () => {
+    const state = parseClaudeScreenState(CLAUDE_2_1_274_EFFORT_DEFAULT_NUDGE, { cursor: { x: 3, y: 21 } });
+    expect(state.effortChangeDialogVisible).toBe(true);
+    expect(state.effortChangeDialogTarget).toBe('high');
+    expect(state.visibleDialogSelection).toEqual({
+      kind: 'focused',
+      options: [
+        { label: 'Keep xhigh', focused: true },
+        { label: 'Switch Fable 5.1 to high effort', focused: false },
+      ],
+    });
+    expect(state.unrecognizedConfirmationDialogVisible).toBe(false);
+    expect(state.composerContent).toBeNull();
+    expect(state.userDraftPresent).toBe(false);
+    expect(state.inputBoxInteractive).toBe(false);
+    expect(isClaudeScreenReadyForInput(state)).toBe(false);
+    expect(resolveClaudeScreenInFlightSteerVeto(state)).toBe('effort_change_dialog');
+  });
+
+  it('captures a footer-less unindexed chooser with unknown wording as a generic dialog', () => {
+    const state = parseClaudeScreenState([
+      '────────────────────────────────────────',
+      ' Share anonymous usage data?',
+      '',
+      '   Helps improve Claude Code. You can change this any time with /config.',
+      '',
+      '   ❯ Not now',
+      '     Yes, share usage data',
+      '',
+    ].join('\n'));
+    expect(state.unrecognizedConfirmationDialogVisible).toBe(true);
+    expect(state.unrecognizedConfirmationDialog).toMatchObject({
+      context: ['Share anonymous usage data?', 'Helps improve Claude Code. You can change this any time with /config.'],
+      options: [
+        { choice: 'option_1', label: 'Not now' },
+        { choice: 'option_2', label: 'Yes, share usage data' },
+      ],
+    });
+    expect(state.userDraftPresent).toBe(false);
+    expect(isClaudeScreenReadyForInput(state)).toBe(false);
+  });
+
+  it('still reads a rule-boxed multi-line draft as the composer, not a chooser', () => {
+    const state = parseClaudeScreenState([
+      '⏺ Done.',
+      '',
+      '────────────────────────────────────────',
+      '❯ first line of my draft',
+      '  second line of my draft',
+      '────────────────────────────────────────',
+      '  ⏵⏵ accept edits on (shift+tab to cycle)',
+    ].join('\n'), { cursor: { x: 25, y: 4 } });
+    expect(state.visibleDialogSelection).toBeNull();
+    expect(state.unrecognizedConfirmationDialogVisible).toBe(false);
+    expect(state.userDraftPresent).toBe(true);
+    expect(state.composerContent).toBe('first line of my draft\nsecond line of my draft');
+  });
+
+  it('does not mistake an echoed multi-line prompt above an empty composer for a chooser', () => {
+    const state = parseClaudeScreenState([
+      '❯ please summarize the change',
+      '  and list the touched files',
+      '',
+      '⏺ Summary: two files changed.',
+      '',
+      '────────────────────────────────────────',
+      '❯',
+      '────────────────────────────────────────',
+      '  ⏵⏵ accept edits on (shift+tab to cycle)',
+    ].join('\n'), { cursor: { x: 2, y: 6 } });
+    expect(state.visibleDialogSelection).toBeNull();
+    expect(state.unrecognizedConfirmationDialogVisible).toBe(false);
+    expect(state.composerContent).toBe('');
+    expect(isClaudeScreenReadyForInput(state)).toBe(true);
+  });
+});
 
 describe('parseClaudeScreenState — heavy-session resume choice dialog', () => {
   it('recognizes the resume-choice interstitial and maps its selectable options', () => {
@@ -1334,5 +1487,77 @@ describe('parseClaudeScreenState — agents selection panel (live 11:36 incident
     ].join('\n'));
     expect(state.selectionListVisible).toBe(false);
     expect(state.userDraftPresent).toBe(true);
+  });
+});
+
+// Live capture (Claude Code 2.1.301, tmux 120x40, `claude --bare`): a `!` as the first character of
+// the prompt switches to bash mode. The mode switch consumes the `!` (a bracketed paste of
+// `! echo hi` renders as `!  echo hi`), the prompt line starts with `!` instead of `❯`, and the
+// footer hint reads `! for shell mode`. The footer is also a `!` line, so the `!` marker only counts
+// when that footer follows — otherwise the last `!` match is the footer itself.
+//
+// Text typed at that prompt runs as a SHELL command, so it is not a message composer: it is exposed
+// as `shellComposerContent` only, and every readiness / steering / control check keeps failing closed.
+describe('parseClaudeScreenState — bash mode prompt (2.1.301)', () => {
+  const RULE = '────────────────────────────────────────────────';
+  const FOOTER = '  ! for shell mode';
+  const STAGED = ['', RULE, '!  echo hi', RULE, FOOTER].join('\n');
+  const EMPTY = ['', RULE, '! Try "fix typecheck errors"', RULE, FOOTER].join('\n');
+
+  it('exposes the command staged after a pasted "! cmd" as shellComposerContent', () => {
+    expect(parseClaudeScreenState(STAGED).shellComposerContent).toBe('echo hi');
+  });
+
+  it('never reads the "! for shell mode" footer hint as the prompt line', () => {
+    const state = parseClaudeScreenState(EMPTY);
+    expect(state.shellComposerContent).toBe('Try "fix typecheck errors"');
+    expect(state.shellComposerContent).not.toBe('for shell mode');
+  });
+
+  it('reads the bottom bash-mode prompt line, not an earlier "!" line', () => {
+    const state = parseClaudeScreenState([
+      '! earlier line in the scrollback',
+      RULE,
+      '!  git status',
+      RULE,
+      FOOTER,
+    ].join('\n'));
+    expect(state.shellComposerContent).toBe('git status');
+  });
+
+  it('is not a message composer: no readiness, control window or steering on a bash-mode prompt', () => {
+    for (const screen of [STAGED, EMPTY]) {
+      for (const context of [undefined, { cursor: { x: 2, y: 2 } }]) {
+        const state = parseClaudeScreenState(screen, context);
+        expect(state.composerContent).toBeNull();
+        expect(isClaudeScreenReadyForInput(state)).toBe(false);
+        expect(isSafeWindowForSlashControl(state)).toBe(false);
+        expect(isSafeWindowForModeCycle(state)).toBe(false);
+        expect(resolveClaudeScreenInFlightSteerVeto(state)).toBe('no_interactive_composer');
+      }
+    }
+  });
+
+  it('leaves normal mode untouched: a "!" line without the bash-mode footer is not a prompt', () => {
+    const normal = parseClaudeScreenState([
+      '! warning: not a prompt',
+      RULE,
+      '❯ a real draft',
+      RULE,
+      '  ⏵⏵ bypass permissions on',
+    ].join('\n'));
+    expect(normal.composerContent).toBe('a real draft');
+    expect(normal.shellComposerContent).toBeNull();
+    expect(parseClaudeScreenState('! warning: not a prompt').shellComposerContent).toBeNull();
+  });
+
+  it('selects one active input instead of retaining an older empty message composer', () => {
+    const state = parseClaudeScreenState(['❯ ', RULE, STAGED].join('\n'));
+    expect(state.composerContent).toBeNull();
+    expect(state.shellComposerContent).toBe('echo hi');
+    expect(isClaudeScreenReadyForInput(state)).toBe(false);
+    expect(isSafeWindowForSlashControl(state)).toBe(false);
+    expect(isSafeWindowForModeCycle(state)).toBe(false);
+    expect(resolveClaudeScreenInFlightSteerVeto(state)).toBe('no_interactive_composer');
   });
 });

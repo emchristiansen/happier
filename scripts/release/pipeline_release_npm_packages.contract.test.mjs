@@ -24,7 +24,10 @@ test('pipeline npm release script supports dry-run for CLI tarball publish', asy
     ],
     {
       cwd: repoRoot,
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        HAPPIER_RELEASE_PUBLISHED_VERSIONS_JSON: JSON.stringify({ github: {}, npm: {} }),
+      },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30_000,
@@ -34,4 +37,3 @@ test('pipeline npm release script supports dry-run for CLI tarball publish', asy
   assert.match(out, /apps\/cli/);
   assert.match(out, /scripts\/pipeline\/npm\/publish-tarball\.mjs/);
 });
-

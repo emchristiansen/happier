@@ -67,3 +67,37 @@ test('set-preview-versions supports --write=false (compute-only, no filesystem c
   assert.equal(readJson(dir, 'apps/stack/package.json').version, '9.9.9');
   assert.equal(readJson(dir, 'packages/relay-server/package.json').version, '3.4.5');
 });
+
+test('set-preview-versions can publish npm after the exact GitHub binary version already exists', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'happier-preview-versions-retry-'));
+  writeJson(dir, 'apps/cli/package.json', { name: '@happier-dev/cli', version: '1.2.3' });
+
+  const out = execFileSync(
+    process.execPath,
+    [
+      resolve(repoRoot, 'scripts', 'pipeline', 'npm', 'set-preview-versions.mjs'),
+      '--repo-root', dir,
+      '--publish-cli', 'true',
+      '--publish-stack', 'false',
+      '--publish-server', 'false',
+      '--cli-version', '1.2.3-preview.1',
+      '--write', 'false',
+    ],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        HAPPIER_RELEASE_PUBLISHED_VERSIONS_JSON: JSON.stringify({
+          github: { cli: ['1.2.3-preview.1'] },
+          npm: {},
+        }),
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30_000,
+    },
+  ).trim();
+
+  assert.equal(JSON.parse(out).cli, '1.2.3-preview.1');
+  assert.equal(readJson(dir, 'apps/cli/package.json').version, '1.2.3');
+});

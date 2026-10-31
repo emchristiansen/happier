@@ -145,5 +145,12 @@
     "ogTitle": "Hostuj relay Happier u siebie: SSO, mTLS i twoja własna baza danych",
     "ogDescription": "Relay, który hostujesz sam, zamknięty dla twojej organizacji GitHub albo grup OIDC, z certyfikatami klienta, ponownym sprawdzaniem przy offboardingu i polityką przechowywania, którą wybierasz. Wszystko na licencji MIT.",
     "ogImageAlt": "Logotyp Happier nad słowami: Jeden klient do każdego agenta kodującego."
+  },
+  "/download": {
+    "title": "Pobierz Happier na desktop, telefon i jako CLI",
+    "description": "Pobierz Happier dla macOS, Windows, Linux, iOS lub Androida albo zainstaluj CLI na komputerze, na którym działają twoi agenci.",
+    "ogTitle": "Pobierz Happier na wszystkie swoje urządzenia",
+    "ogDescription": "Aplikacje desktopowe i mobilne, bezpośredni APK oraz CLI uruchamiające agentów na twoim komputerze. Wszystkie wersje na jednej stronie.",
+    "ogImageAlt": "Logotyp Happier nad słowami: Jeden klient do każdego agenta kodującego."
   }
 }

@@ -83,10 +83,11 @@ describe("pending delivery reoffer tiers (real SQLite)", () => {
         };
         const updates: UpdatePayload[] = [];
         // Socket.IO transport is the system boundary; persistence, publication and routing stay real.
-        const socket = { id: randomUUID(), emit: (event: string, payload: UpdatePayload) => {
+        const socket = createFakeSocket({ id: randomUUID() });
+        socket.emit.mockImplementation((event: string, payload: UpdatePayload) => {
             if (event === "update") updates.push(payload);
-        } } as unknown as Socket;
-        const connection: ClientConnection = { connectionType: "user-scoped", userId: account.id, socket };
+        });
+        const connection: ClientConnection = { connectionType: "user-scoped", userId: account.id, socket: socket as unknown as Socket };
         connections.push({ userId: account.id, connection });
         eventRouter.addConnection(account.id, connection);
         const token = await auth.createToken(account.id);

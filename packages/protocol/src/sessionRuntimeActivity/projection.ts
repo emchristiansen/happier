@@ -72,6 +72,15 @@ export type SessionRuntimeActivityState = z.infer<typeof SessionRuntimeActivityS
 export type SessionRuntimeActivitySnapshot = z.infer<typeof SessionRuntimeActivitySnapshotSchema>;
 export type SessionRuntimeActivityProjection = z.infer<typeof SessionRuntimeActivityProjectionSchema>;
 
+/** Active work can require interruption consent even when its observation is stale. */
+export function hasActiveSessionRuntimeActivity(
+  snapshot: Readonly<{ state?: unknown; activeCount?: unknown }> | null | undefined,
+): boolean {
+  return snapshot?.state === 'active'
+    && typeof snapshot.activeCount === 'number'
+    && snapshot.activeCount > 0;
+}
+
 export const SESSION_RUNTIME_ACTIVITY_PROJECTION_FIELD_NAMES = [
   'runtimeActivityState',
   'runtimeActivityActiveCount',

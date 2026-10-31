@@ -83,8 +83,10 @@ const DAEMON_DIST_CLOSURE_FINGERPRINT_ENV = 'HAPPIER_CLI_SUBPROCESS_DAEMON_DIST_
 const RUNTIME_BACKED_SUBPROCESS_ENV = 'HAPPIER_CLI_SUBPROCESS_RUNTIME_BACKED';
 const CLI_DIST_BUILD_MANIFEST = '.build-manifest.json';
 const PINNED_RUNNER_DIST_DIR = '.runner-snapshots';
-const PINNED_RUNNER_REQUIRED_ASSET_RELATIVE_PATHS = [
+export const PINNED_RUNNER_REQUIRED_ASSET_RELATIVE_PATHS = [
   ['scripts', 'terminal_launch_spec_runner.cjs'],
+  ['scripts', 'process_tree.cjs'],
+  ['scripts', 'native_process_exit.cjs'],
   ['scripts', 'claude_local_launcher.cjs'],
   ['scripts', 'claude_remote_launcher.cjs'],
   ['scripts', 'claude_launcher_runtime.cjs'],
@@ -919,5 +921,5 @@ export function spawnHappyCLI(
   const spawnOptions: SpawnOptions = launchSpec.env
     ? { ...options, env: { ...(options.env ?? process.env), ...launchSpec.env } }
     : options;
-  return spawn(launchSpec.filePath, launchSpec.args, spawnOptions);
+  return spawn(launchSpec.filePath, launchSpec.args, { ...spawnOptions, windowsHide: spawnOptions.windowsHide !== false });
 }

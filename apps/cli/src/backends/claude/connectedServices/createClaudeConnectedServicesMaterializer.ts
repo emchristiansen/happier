@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import type { ConnectedServicesProviderMaterializer } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import { materializeClaudeConnectedServiceSelection } from './materializeClaudeConnectedServiceSelection';
 
@@ -10,6 +11,7 @@ export function createClaudeConnectedServicesMaterializer(): ConnectedServicesPr
       const selection = params.selectionsByServiceId?.get('claude-subscription');
       const materialized = await materializeClaudeConnectedServiceSelection({
         activeServerDir: params.activeServerDir,
+        probeConfigDir: params.materializationPurpose === 'probe' ? join(params.rootDir, 'claude-config') : undefined,
         serviceId: 'claude-subscription',
         record: claudeSubscription,
         fallbackProfileId: claudeSubscription.profileId,
@@ -19,6 +21,7 @@ export function createClaudeConnectedServicesMaterializer(): ConnectedServicesPr
         sessionDirectory: params.sessionDirectory ?? null,
         vendorResumeId: params.vendorResumeId ?? null,
         candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
+        sessionStateMode: params.sessionStateMode,
         validateGroupMutationCurrentness: params.validateGroupMutationCurrentness,
       });
       if (!materialized) return null;
@@ -35,6 +38,7 @@ export function createClaudeConnectedServicesMaterializer(): ConnectedServicesPr
     const selection = params.selectionsByServiceId?.get('anthropic');
     const materialized = await materializeClaudeConnectedServiceSelection({
       activeServerDir: params.activeServerDir,
+      probeConfigDir: params.materializationPurpose === 'probe' ? join(params.rootDir, 'claude-config') : undefined,
       serviceId: 'anthropic',
       record: anthropic,
       fallbackProfileId: anthropic.profileId,
@@ -44,6 +48,7 @@ export function createClaudeConnectedServicesMaterializer(): ConnectedServicesPr
       sessionDirectory: params.sessionDirectory ?? null,
       vendorResumeId: params.vendorResumeId ?? null,
       candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
+      sessionStateMode: params.sessionStateMode,
       validateGroupMutationCurrentness: params.validateGroupMutationCurrentness,
     });
     if (!materialized) return null;

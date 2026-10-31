@@ -17,7 +17,6 @@ import { t } from '@/text';
 import { trackFriendsProfileView, trackFriendsSearch } from '@/track';
 import { ItemGroup } from '@/components/ui/lists/ItemGroup';
 import { Item } from '@/components/ui/lists/Item';
-import { UpdateBanner } from '@/components/ui/feedback/UpdateBanner';
 import { RecoveryKeyReminderBanner } from '@/components/account/RecoveryKeyReminderBanner';
 import { Typography } from '@/constants/Typography';
 import { useRouter } from 'expo-router';
@@ -174,7 +173,6 @@ export const FriendsView = React.memo(({}: FriendsViewProps) => {
                     </View>
                 )}
                 <RecoveryKeyReminderBanner />
-                <UpdateBanner />
                 <View style={styles.emptyContainer}>
                     <ActivitySpinner size="large" color={theme.colors.text.secondary} />
                 </View>
@@ -197,7 +195,6 @@ export const FriendsView = React.memo(({}: FriendsViewProps) => {
                     </View>
                 )}
                 <RecoveryKeyReminderBanner />
-                <UpdateBanner />
                 <View style={styles.emptyContainer}>
                     <Image
                         source={require('@/assets/images/brutalist/Brutalism 10.png')}
@@ -231,7 +228,6 @@ export const FriendsView = React.memo(({}: FriendsViewProps) => {
                 width: '100%'
             }}>
                 <RecoveryKeyReminderBanner />
-                <UpdateBanner />
 
                 {friendRequests.length > 0 && (
                     <ItemGroup title={t('friends.pendingRequests')}>

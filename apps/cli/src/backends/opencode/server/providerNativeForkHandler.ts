@@ -1,4 +1,4 @@
-import type { ProviderNativeForkHandler } from '@/backends/forking/providerNativeForkHandler';
+import { ProviderNativeForkFailedBeforeDispatchError, isProviderNativeForkFailedBeforeDispatchError, type ProviderNativeForkHandler } from '@/backends/forking/providerNativeForkHandler';
 import { isAuthenticationError } from '@/api/client/httpStatusError';
 
 import {
@@ -8,12 +8,17 @@ import {
 } from '@/backends/opencode/utils/opencodeSessionAffinity';
 
 import { forkOpenCodeSessionNative } from './nativeFork';
+import { resolveOpenCodeProviderAttachTargetWithManagedServerFallback } from '../attach/evaluateOpenCodeProviderAttachEligibility';
 
 export const openCodeProviderNativeForkHandler: ProviderNativeForkHandler = async (params) => {
   const runtimeHandle = readOpenCodeSessionRuntimeHandleFromMetadata(params.parentMetadata);
   const backendMode = runtimeHandle.backendMode ?? '';
   const vendorSessionIdRaw = runtimeHandle.vendorSessionId ?? '';
   if (backendMode !== 'server' || !vendorSessionIdRaw) return null;
+  const hasRecordedTarget = runtimeHandle.serverBaseUrl !== null || runtimeHandle.managedServerLaunchFingerprint !== null;
+  const target = hasRecordedTarget
+    ? await resolveOpenCodeProviderAttachTargetWithManagedServerFallback({ metadata: params.parentMetadata }) : null;
+  if (target && !target.eligible) throw new ProviderNativeForkFailedBeforeDispatchError(new Error(target.reason));
 
   const forked = await forkOpenCodeSessionNative({
     credentials: params.credentials,
@@ -21,11 +26,12 @@ export const openCodeProviderNativeForkHandler: ProviderNativeForkHandler = asyn
     parentRawSession: params.parentRawSession,
     directory: params.directory,
     parentOpenCodeSessionId: vendorSessionIdRaw,
+    ...(target?.eligible ? { baseUrlOverride: target.baseUrl, managedServerLaunchFingerprint: target.managedServerLaunchFingerprint } : {}),
     forkPoint: params.forkPoint.type === 'seq'
       ? { type: 'seq', upToSeqInclusive: params.targetSeqInclusive }
       : { type: 'latest' },
   }).catch((error) => {
-    if (isAuthenticationError(error)) throw error;
+    if (isAuthenticationError(error) || isProviderNativeForkFailedBeforeDispatchError(error)) throw error;
     return null;
   });
   const vendorSessionId = typeof forked?.vendorSessionId === 'string' ? forked.vendorSessionId.trim() : '';
@@ -46,6 +52,7 @@ export const openCodeProviderNativeForkHandler: ProviderNativeForkHandler = asyn
       vendorSessionId,
       serverBaseUrl: runtimeHandle.serverBaseUrl ?? null,
       serverBaseUrlExplicit: runtimeHandle.serverBaseUrlExplicit,
+      managedServerLaunchFingerprint: runtimeHandle.managedServerLaunchFingerprint,
     }),
     providerHint: {
       providerId: params.agentId,

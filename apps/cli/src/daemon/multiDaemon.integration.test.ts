@@ -17,8 +17,9 @@ import {
 import { listDaemonStatusesForAllKnownServers, stopAllDaemonsBestEffort } from './multiDaemon';
 import { resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServicePaths } from './service/cli';
 
-function writeValidInstalledDaemonServiceForCurrentRuntime(homeDir: string, serverId: string): void {
-  const runtime = resolveDaemonServiceCliRuntimeFromEnv({ processEnv: process.env });
+/** The pinned background service that serves `serverId` (its own service, not the default-following one). */
+function writeValidPinnedDaemonServiceForCurrentRuntime(homeDir: string, serverId: string): void {
+  const runtime = resolveDaemonServiceCliRuntimeFromEnv({ processEnv: process.env, targetMode: 'pinned', instanceId: serverId });
   const paths = resolveDaemonServicePaths(runtime);
 
   mkdirSync(dirname(paths.installedPath), { recursive: true });
@@ -30,6 +31,7 @@ function writeValidInstalledDaemonServiceForCurrentRuntime(homeDir: string, serv
         label: paths.label,
         programArgs: ['/usr/local/bin/happier', 'daemon', 'start-sync'],
         env: {
+          HAPPIER_HOME_DIR: homeDir,
           HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
           HAPPIER_ACTIVE_SERVER_ID: serverId,
           HAPPIER_PUBLIC_RELEASE_CHANNEL: 'stable',
@@ -50,8 +52,9 @@ function writeValidInstalledDaemonServiceForCurrentRuntime(homeDir: string, serv
         description: 'Happier Daemon',
         execStart: ['/usr/local/bin/happier', 'daemon', 'start-sync'],
         env: {
+          HAPPIER_HOME_DIR: homeDir,
           HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
-          HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
+          HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'pinned',
           HAPPIER_ACTIVE_SERVER_ID: serverId,
           HAPPIER_PUBLIC_RELEASE_CHANNEL: 'stable',
         },
@@ -71,7 +74,7 @@ function writeValidInstalledDaemonServiceForCurrentRuntime(homeDir: string, serv
         HAPPIER_HOME_DIR: homeDir,
         HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: homeDir,
         HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
-        HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
+        HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'pinned',
         HAPPIER_ACTIVE_SERVER_ID: serverId,
         HAPPIER_PUBLIC_RELEASE_CHANNEL: 'stable',
       },
@@ -83,6 +86,101 @@ function writeValidInstalledDaemonServiceForCurrentRuntime(homeDir: string, serv
 }
 
 describe('multi-daemon helpers', () => {
+  it('reports no running daemons for an empty publication inventory', async () => {
+    await withConfiguredDaemonTestHome({ prefix: 'multi-stop-empty-' }, async () => {
+      await expect(stopAllDaemonsBestEffort()).resolves.toEqual({ status: 'not_running' });
+    });
+  });
+
+  it('fails closed on a removed profile startup lock without a state publication', async () => {
+    await withConfiguredDaemonTestHome({ prefix: 'multi-stop-removed-starting-' }, async ({ homeDir }) => {
+      const child = spawnSleepyDetachedProcess(['/repo/dist/index.mjs', 'daemon', 'start-sync']);
+      const lockPath = join(homeDir, 'servers', 'removed', 'daemon.preview.state.json.lock');
+      try {
+        mkdirSync(dirname(lockPath), { recursive: true });
+        writeFileSync(lockPath, String(child.pid));
+        await expect(stopAllDaemonsBestEffort()).rejects.toMatchObject({ code: 'daemon_stop_incomplete', reason: 'startup_in_progress', pid: child.pid });
+        expect(process.kill(child.pid, 0)).toBe(true);
+        expect(existsSync(lockPath)).toBe(true);
+      } finally {
+        await child.kill();
+      }
+    });
+  });
+
+  it('rechecks startup-only successors after stopping the original daemon', async () => {
+    await withConfiguredDaemonTestHome({ prefix: 'multi-stop-starting-successor-' }, async ({ homeDir }) => {
+      const predecessor = spawnSleepyDetachedProcess();
+      const successor = spawnSleepyDetachedProcess(['/repo/dist/index.mjs', 'daemon', 'start-sync']);
+      const statePath = await writeDaemonStateFixture(homeDir, 'removed', { pid: predecessor.pid, httpPort: 47891 });
+      const lockPath = join(homeDir, 'servers', 'successor', 'daemon.state.json.lock');
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+        process.kill(predecessor.pid, 'SIGTERM');
+        mkdirSync(dirname(lockPath), { recursive: true });
+        writeFileSync(lockPath, String(successor.pid));
+        return new Response('{}', { status: 200 });
+      });
+      try {
+        await expect(stopAllDaemonsBestEffort()).rejects.toMatchObject({ code: 'daemon_stop_incomplete', reason: 'startup_in_progress', pid: successor.pid });
+        expect(existsSync(statePath)).toBe(false);
+        expect(existsSync(lockPath)).toBe(true);
+        expect(process.kill(successor.pid, 0)).toBe(true);
+      } finally {
+        fetchSpy.mockRestore();
+        await predecessor.kill();
+        await successor.kill();
+      }
+    });
+  });
+
+  it.each([false, true])('attempts siblings after an incomplete stop (accepted=%s)', async (accepted) => {
+    await withConfiguredDaemonTestHome({ prefix: 'multi-stop-sibling-rings-' }, async ({ homeDir }) => {
+      const first = spawnSleepyDetachedProcess();
+      const second = spawnSleepyDetachedProcess();
+      await writeDaemonStateFixture(homeDir, 'removed', { pid: first.pid, httpPort: 47891 });
+      const secondPath = join(homeDir, 'servers', 'removed', 'daemon.preview.state.json');
+      writeFileSync(secondPath, JSON.stringify({ pid: second.pid, httpPort: 47892, startedAt: Date.now(), startedWithCliVersion: 'test' }));
+      let failFirst = true;
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+        const pid = String(url).includes(':47891/') ? first.pid : second.pid;
+        if (pid === first.pid && failFirst) return new Response('{}', { status: accepted ? 200 : 500 });
+        process.kill(pid, 'SIGTERM');
+        return new Response('{}', { status: 200 });
+      });
+      try {
+        await expect(stopAllDaemonsBestEffort()).rejects.toMatchObject({ code: 'daemon_stop_incomplete', reason: accepted ? 'graceful_stop_unconfirmed' : 'control_client_failure', pid: first.pid });
+        expect(await waitForProcessExit(second.pid, { timeoutMs: 3_000 })).toBe(true);
+        expect(process.kill(first.pid, 0)).toBe(true);
+        failFirst = false;
+        await expect(stopAllDaemonsBestEffort()).resolves.toEqual({ status: 'stopped', stoppedCount: 1 });
+      } finally {
+        fetchSpy.mockRestore();
+        await first.kill();
+        await second.kill();
+      }
+    });
+  });
+
+  it('stops two live release rings in the same removed profile', async () => {
+    await withConfiguredDaemonTestHome({ prefix: 'multi-stop-two-rings-' }, async ({ homeDir }) => {
+      const first = spawnSleepyDetachedProcess();
+      const second = spawnSleepyDetachedProcess();
+      await writeDaemonStateFixture(homeDir, 'removed', { pid: first.pid, httpPort: 47891 });
+      writeFileSync(join(homeDir, 'servers', 'removed', 'daemon.preview.state.json'), JSON.stringify({ pid: second.pid, httpPort: 47892, startedAt: Date.now(), startedWithCliVersion: 'test' }));
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+        process.kill(String(url).includes(':47891/') ? first.pid : second.pid, 'SIGTERM');
+        return new Response('{}', { status: 200 });
+      });
+      try {
+        await expect(stopAllDaemonsBestEffort()).resolves.toEqual({ status: 'stopped', stoppedCount: 2 });
+      } finally {
+        fetchSpy.mockRestore();
+        await first.kill();
+        await second.kill();
+      }
+    });
+  });
+
   it('lists daemon status per saved server profile', async () => {
     await withConfiguredDaemonTestHome({ prefix: 'happier-multi-daemon-' }, async ({ homeDir }) => {
       const accountId = 'acct_123';
@@ -103,7 +201,7 @@ describe('multi-daemon helpers', () => {
           pid: sleepy.pid,
           httpPort: 12345,
         });
-        writeValidInstalledDaemonServiceForCurrentRuntime(homeDir, 'company');
+        writeValidPinnedDaemonServiceForCurrentRuntime(homeDir, 'company');
 
         const serverDir = join(homeDir, 'servers', 'company');
         mkdirSync(serverDir, { recursive: true });
@@ -224,7 +322,7 @@ describe('multi-daemon helpers', () => {
     );
   });
 
-  it('stops all running daemons best-effort via /stop without taking over publication cleanup', async () => {
+  it('stops all running daemons best-effort via /stop and reclaims their exact departed publication', async () => {
     await withConfiguredDaemonTestHome({ prefix: 'happier-multi-daemon-stop-' }, async ({ homeDir }) => {
       await writeDaemonSettingsFixture(homeDir);
 
@@ -242,7 +340,7 @@ describe('multi-daemon helpers', () => {
         await stopAllDaemonsBestEffort();
 
         expect(await waitForProcessExit(daemon.pid, { timeoutMs: 3_000 })).toBe(true);
-        expect(existsSync(statePath)).toBe(true);
+        expect(existsSync(statePath)).toBe(false);
       } finally {
         await daemon.kill();
       }
@@ -267,7 +365,8 @@ describe('multi-daemon helpers', () => {
         startedWithCliVersion: '0.0.0-successor',
         controlToken: 'successor-token',
       }) + '\n';
-      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+        if (String(url).endsWith('/ping')) throw Object.assign(new Error('Control closed'), { cause: { code: 'ECONNREFUSED' } });
         try {
           process.kill(predecessor.pid, 'SIGTERM');
         } catch {
@@ -278,9 +377,8 @@ describe('multi-daemon helpers', () => {
       });
 
       try {
-        await stopAllDaemonsBestEffort();
+        await expect(stopAllDaemonsBestEffort()).rejects.toMatchObject({ code: 'daemon_stop_incomplete', reason: 'graceful_stop_unconfirmed', pid: process.pid });
 
-        expect(fetchSpy).toHaveBeenCalledTimes(1);
         expect(await waitForProcessExit(predecessor.pid, { timeoutMs: 3_000 })).toBe(true);
         expect(readFileSync(statePath, 'utf-8')).toBe(successorRaw);
       } finally {
@@ -290,18 +388,19 @@ describe('multi-daemon helpers', () => {
     });
   });
 
-  it('leaves stale daemon publication cleanup to the lifecycle lock owner', async () => {
+  it('reclaims an exact stale daemon publication through the lifecycle owner', async () => {
     await withConfiguredDaemonTestHome({ prefix: 'happier-multi-daemon-stale-state-' }, async ({ homeDir }) => {
       await writeDaemonSettingsFixture(homeDir);
+      const exited = spawnSleepyDetachedProcess();
+      expect(await exited.kill()).toBe(true);
       const statePath = await writeDaemonStateFixture(homeDir, 'company', {
-        pid: Number.MAX_SAFE_INTEGER,
+        pid: exited.pid,
         httpPort: 47892,
       });
-      const stateRaw = readFileSync(statePath, 'utf-8');
 
       await stopAllDaemonsBestEffort();
 
-      expect(readFileSync(statePath, 'utf-8')).toBe(stateRaw);
+      expect(existsSync(statePath)).toBe(false);
     });
   });
 
@@ -319,6 +418,7 @@ describe('multi-daemon helpers', () => {
 
       const observed: Array<{ url: string; body: unknown; headers: unknown }> = [];
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
+        if (String(url).endsWith('/ping')) throw Object.assign(new Error('Control closed'), { cause: { code: 'ECONNREFUSED' } });
         observed.push({ url: String(url), body: init?.body, headers: init?.headers });
         try {
           process.kill(sleepy.pid, 'SIGTERM');
@@ -331,11 +431,10 @@ describe('multi-daemon helpers', () => {
       try {
         await stopAllDaemonsBestEffort({ stopSessions: true });
 
-        expect(fetchSpy).toHaveBeenCalledTimes(1);
         expect(JSON.parse(String(observed[0]?.body ?? ''))).toEqual({ stopSessions: true });
         expect(String((observed[0]?.headers ?? ({} as any))['x-happier-daemon-token'] ?? '')).toBe('test-token');
         expect(await waitForProcessExit(sleepy.pid, { timeoutMs: 3_000 })).toBe(true);
-        expect(existsSync(statePath)).toBe(true);
+        expect(existsSync(statePath)).toBe(false);
       } finally {
         fetchSpy.mockRestore();
         await sleepy.kill();
@@ -373,9 +472,8 @@ describe('multi-daemon helpers', () => {
         try {
           await stopAllDaemonsBestEffort();
 
-          expect(fetchSpy).toHaveBeenCalledTimes(1);
-          expect(await waitForProcessExit(sleepy.pid, { timeoutMs: 3_000 })).toBe(true);
-          expect(existsSync(statePath)).toBe(true);
+            expect(await waitForProcessExit(sleepy.pid, { timeoutMs: 3_000 })).toBe(true);
+            expect(existsSync(statePath)).toBe(false);
         } finally {
           fetchSpy.mockRestore();
           await sleepy.kill();

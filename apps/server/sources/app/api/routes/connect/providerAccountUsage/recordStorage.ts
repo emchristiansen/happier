@@ -7,7 +7,8 @@ import {
     ProviderAccountUsageSnapshotV1Schema,
     SealedProviderAccountUsageSnapshotV1Schema,
     ProviderAccountSubscriptionV1Schema,
-    splitProviderAccountUsageSubscription,
+    ConnectedServiceQuotaRecoveryCreditDetailsByIdV1Schema,
+    splitProviderAccountUsageSupplementalFacets,
 } from "@happier-dev/protocol";
 import { validateProviderAccountUsageRecordWrite } from "./schemas";
 import type {
@@ -78,9 +79,13 @@ function parseStoredProviderAccountUsageRecord(row: Readonly<{
     const metadata = row.metadata === null || row.metadata === undefined
         ? undefined
         : zodProviderAccountUsageMetadata(row.metadata);
-    const snapshot = baseSnapshot && metadata?.subscription
-        ? { ...baseSnapshot, subscription: metadata.subscription }
-        : baseSnapshot;
+    const snapshot = baseSnapshot
+        ? {
+            ...baseSnapshot,
+            ...(metadata?.subscription ? { subscription: metadata.subscription } : {}),
+            ...(metadata?.recoveryCreditDetails ? { recoveryCreditDetails: metadata.recoveryCreditDetails } : {}),
+        }
+        : undefined;
     const sealedPayload = isJsonFieldAbsent(row.sealedPayload)
         ? undefined
         : SealedProviderAccountUsageSnapshotV1Schema.parse(row.sealedPayload);
@@ -114,9 +119,11 @@ function zodProviderAccountUsageMetadata(raw: unknown) {
         throw new ProviderAccountUsagePayloadInvariantError("Stored provider account usage materialFingerprint must be a string");
     }
     const subscription = (raw as { subscription?: unknown }).subscription;
+    const recoveryCreditDetails = (raw as { recoveryCreditDetails?: unknown }).recoveryCreditDetails;
     return {
         ...(materialFingerprint ? { materialFingerprint } : {}),
         ...(subscription !== undefined ? { subscription: ProviderAccountSubscriptionV1Schema.parse(subscription) } : {}),
+        ...(recoveryCreditDetails !== undefined ? { recoveryCreditDetails: ConnectedServiceQuotaRecoveryCreditDetailsByIdV1Schema.parse(recoveryCreditDetails) } : {}),
     };
 }
 
@@ -131,7 +138,7 @@ function parseProviderAccountUsageRecordWrite(raw: UpsertProviderAccountUsageRec
 }
 
 function buildProviderAccountUsageRecordCreateData(parsed: ParsedProviderAccountUsageRecordWrite) {
-    const plain = parsed.snapshot ? splitProviderAccountUsageSubscription(parsed.snapshot) : undefined;
+    const plain = parsed.snapshot ? splitProviderAccountUsageSupplementalFacets(parsed.snapshot) : undefined;
     return {
         accountId: parsed.accountId,
         providerId: parsed.recordKey.providerId,
@@ -149,12 +156,18 @@ function buildProviderAccountUsageRecordCreateData(parsed: ParsedProviderAccount
         ...(parsed.fetchedAt !== undefined ? { fetchedAt: new Date(parsed.fetchedAt) } : {}),
         ...(parsed.staleAfterMs !== undefined ? { staleAfterMs: parsed.staleAfterMs } : {}),
         ...(parsed.refreshRequestedAt !== undefined ? { refreshRequestedAt: new Date(parsed.refreshRequestedAt) } : {}),
-        ...(parsed.metadata || plain?.subscription ? { metadata: { ...parsed.metadata, ...(plain?.subscription ? { subscription: plain.subscription } : {}) } as Prisma.InputJsonValue } : {}),
+        ...(parsed.metadata || plain?.subscription || plain?.recoveryCreditDetails ? {
+            metadata: {
+                ...parsed.metadata,
+                ...(plain?.subscription ? { subscription: plain.subscription } : {}),
+                ...(plain?.recoveryCreditDetails ? { recoveryCreditDetails: plain.recoveryCreditDetails } : {}),
+            } as Prisma.InputJsonValue,
+        } : {}),
     };
 }
 
 function buildProviderAccountUsageRecordUpdateData(parsed: ParsedProviderAccountUsageRecordWrite) {
-    const plain = parsed.snapshot ? splitProviderAccountUsageSubscription(parsed.snapshot) : undefined;
+    const plain = parsed.snapshot ? splitProviderAccountUsageSupplementalFacets(parsed.snapshot) : undefined;
     return {
         providerId: parsed.recordKey.providerId,
         accountSubjectId: parsed.recordKey.accountSubjectId,
@@ -170,8 +183,12 @@ function buildProviderAccountUsageRecordUpdateData(parsed: ParsedProviderAccount
         fetchedAt: parsed.fetchedAt !== undefined ? new Date(parsed.fetchedAt) : null,
         staleAfterMs: parsed.staleAfterMs ?? null,
         refreshRequestedAt: parsed.refreshRequestedAt !== undefined ? new Date(parsed.refreshRequestedAt) : null,
-        metadata: parsed.metadata || plain?.subscription
-            ? { ...parsed.metadata, ...(plain?.subscription ? { subscription: plain.subscription } : {}) } as Prisma.InputJsonValue
+        metadata: parsed.metadata || plain?.subscription || plain?.recoveryCreditDetails
+            ? {
+                ...parsed.metadata,
+                ...(plain?.subscription ? { subscription: plain.subscription } : {}),
+                ...(plain?.recoveryCreditDetails ? { recoveryCreditDetails: plain.recoveryCreditDetails } : {}),
+            } as Prisma.InputJsonValue
             : prismaRuntime.DbNull,
     };
 }

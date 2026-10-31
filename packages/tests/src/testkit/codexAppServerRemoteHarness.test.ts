@@ -124,7 +124,7 @@ describe('startCodexAppServerRemoteHarness', () => {
     fetchCount = 0;
   });
 
-  it('captures the pre-spawn session baseline before launching the CLI', async () => {
+  it('captures the session baseline after launching the CLI', async () => {
     const { startCodexAppServerRemoteHarness } = await import('./codexAppServerRemoteHarness');
     const testDir = await mkdtemp(join(tmpdir(), 'happier-codex-app-server-harness-'));
 

@@ -22,6 +22,7 @@ function extractErrorCode(json: unknown): string | null {
 const ProviderAccountUsageV3ResponseSchema = z.object({
   content: StoredJsonContentEnvelopeSchema,
   subscription: z.unknown().optional(),
+  recoveryCreditDetails: z.unknown().optional(),
   metadata: z.object({
     fetchedAt: z.number().int().nonnegative(),
     staleAfterMs: z.number().int().nonnegative(),
@@ -76,8 +77,12 @@ export async function getProviderAccountUsageSnapshotPlain(
     if (parsed.data.content.t !== 'plain') return null;
 
     const baseSnapshot = ProviderAccountUsageSnapshotV1Schema.safeParse(parsed.data.content.v);
-    const snapshot = baseSnapshot.success && parsed.data.subscription !== undefined
-      ? ProviderAccountUsageSnapshotV1Schema.safeParse({ ...baseSnapshot.data, subscription: parsed.data.subscription })
+    const snapshot = baseSnapshot.success && (parsed.data.subscription !== undefined || parsed.data.recoveryCreditDetails !== undefined)
+      ? ProviderAccountUsageSnapshotV1Schema.safeParse({
+        ...baseSnapshot.data,
+        ...(parsed.data.subscription !== undefined ? { subscription: parsed.data.subscription } : {}),
+        ...(parsed.data.recoveryCreditDetails !== undefined ? { recoveryCreditDetails: parsed.data.recoveryCreditDetails } : {}),
+      })
       : baseSnapshot;
     if (!snapshot.success || snapshot.data.recordId !== recordId) {
       throw new Error('Invalid provider account usage response');

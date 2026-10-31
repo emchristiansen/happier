@@ -129,7 +129,9 @@ describe('terminal auth wait bound', () => {
       await expect(doAuth()).resolves.toBeNull();
       const text = output.text();
       expect(text).toContain('Scan this QR code');
-      expect(text).toContain('- [|] Waiting for authentication');
+      // One compact spinner line, never the multi-row planet that would push the code away.
+      expect(text).toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Waiting for authentication/u);
+      expect(text).not.toContain('⣿');
       expect(clear).not.toHaveBeenCalled();
     } finally {
       clear.mockRestore();

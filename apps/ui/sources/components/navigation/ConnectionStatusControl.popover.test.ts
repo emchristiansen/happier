@@ -278,6 +278,19 @@ function findAction(id: string): ActionLike | undefined {
     return getActions().find((action) => action.id === id);
 }
 
+/**
+ * Chooses a relay target the way the user does, through whichever presentation the popover picked
+ * for the current target count — the inline action list, or the dropdown.
+ */
+async function selectConnectionTarget(id: string): Promise<void> {
+    const action = findAction(id);
+    if (action?.onPress) {
+        action.onPress();
+        return;
+    }
+    latestDropdown()?.onSelect?.(id);
+}
+
 async function importConnectionStatusControl() {
     const module = await import('./ConnectionStatusControl');
     return module.ConnectionStatusControl;
@@ -1081,6 +1094,61 @@ describe('ConnectionStatusControl (native popover config)', () => {
             expect(actionIds.has('connection-popover-manage-relay')).toBe(false);
 
             (Platform as any).OS = previousPlatform;
+
+            await act(async () => {
+                tree?.unmount();
+            });
+        } finally {
+            if (previousScope === undefined) {
+                delete process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+            } else {
+                process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = previousScope;
+            }
+        }
+    });
+
+    it('records the direct Relay/Home selection intent, and records nothing for a group (R8/INV7)', async () => {
+        const previousScope = process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE;
+        const scope = `test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        process.env.EXPO_PUBLIC_HAPPY_STORAGE_SCOPE = scope;
+
+        try {
+            vi.resetModules();
+            const profiles = await import('@/sync/domains/server/serverProfiles');
+            const local = profiles.upsertServerProfile({ serverUrl: 'https://local.example.test', name: 'Local' });
+            const company = profiles.upsertServerProfile({ serverUrl: 'https://company.example.test', name: 'Company' });
+            profiles.setActiveServerId(local.id, { scope: 'device' });
+            settingsState.serverSelectionGroups = [
+                { id: 'grp-dev', name: 'Dev Group', serverIds: [local.id, company.id], presentation: 'grouped' },
+            ];
+
+            const ConnectionStatusControl = await importConnectionStatusControl();
+            const intent = await import('@/setup/directRelaySelectionIntent');
+
+            let tree: renderer.ReactTestRenderer | undefined;
+            const screen = await renderScreen(React.createElement(ConnectionStatusControl, { variant: 'sidebar' }));
+            tree = screen.tree;
+
+            const trigger = screen.findByProps({ accessibilityRole: 'button' });
+            await act(async () => {
+                await pressTestInstanceAsync(trigger);
+            });
+
+            // A group names several relays and cannot name one daemon target (B2), so choosing one
+            // must leave the setup gate with nothing to consume.
+            await act(async () => {
+                await selectConnectionTarget('target-use-group-grp-dev');
+            });
+            expect(intent.consumeDirectRelaySelectionIntent(company.id)).toBe(false);
+            expect(intent.consumeDirectRelaySelectionIntent(local.id)).toBe(false);
+
+            // The direct Relay/Home action is the one place the user chooses a single relay, and
+            // it is the only thing allowed to authorise repointing this computer's daemon.
+            await act(async () => {
+                await selectConnectionTarget(`target-use-server-${company.id}`);
+            });
+            expect(intent.consumeDirectRelaySelectionIntent(company.id)).toBe(true);
+            expect(intent.consumeDirectRelaySelectionIntent(company.id)).toBe(false);
 
             await act(async () => {
                 tree?.unmount();

@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act } from 'react-test-renderer';
+import { renderHook, standardCleanup } from '@/dev/testkit';
 import { scopedSessionLocalStateKey } from '@/sync/domains/state/sessionLocalStateKeys';
 import type { ManagedEndpointSupervisor } from '@happier-dev/connection-supervisor';
 import { createSocketIoAckTimeoutError } from '@/sync/runtime/socketIoAckTimeout';
+import { SOCKET_RPC_EVENTS } from '@happier-dev/protocol/socketRpc';
+import { forwardedRpcTargetResponse } from '../../../server/sources/app/api/socket/forwardedRpcTargetResponse';
 
 type EndpointSupervisorLookup = typeof import('@/sync/runtime/connectivity/endpointSupervisorPool').getEndpointSupervisorForServer;
 type EndpointSupervisorAcquire = typeof import('@/sync/runtime/connectivity/endpointSupervisorPool').acquireEndpointSupervisor;
@@ -74,6 +78,7 @@ vi.mock('@/voice/context/voiceHooks', () => ({
 
 import { Encryption } from '@/sync/encryption/encryption';
 import { storage } from './domains/state/storage';
+import { useSessionPendingMessages } from './domains/state/storage';
 import type { Session } from './domains/state/storageTypes';
 import { apiSocket } from '@/sync/api/session/apiSocket';
 import { HappyError } from '@/utils/errors/errors';
@@ -355,6 +360,7 @@ describe('sync.sendMessage optimistic thinking', () => {
     });
 
     afterEach(() => {
+        standardCleanup();
         vi.restoreAllMocks();
     });
 
@@ -531,6 +537,36 @@ describe('sync.sendMessage optimistic thinking', () => {
             { path: `/v2/sessions/${sessionId}/pending/${localId}/action`, method: 'PATCH' },
             { path: `/v2/sessions/${sessionId}/pending?includeDiscarded=1`, method: 'GET' },
         ]);
+    });
+
+    it.each([
+        { status: 404, code: 'not-found' },
+        { status: 409, code: 'action-conflict' },
+    ])('reconciles stale pending rows for every requested-action caller on $code', async ({ status, code }) => {
+        const sessionId = 's_pending_stale_action';
+        const localId = 'stale-pending-local';
+        storage.getState().applySessions([{
+            ...createSession({ sessionId }),
+            encryptionMode: 'plain',
+        }]);
+        storage.getState().upsertPendingMessage(sessionId, {
+            id: localId, localId, createdAt: 1, updatedAt: 1,
+            source: 'server_pending', deliveryStatus: 'accepted', pendingDeliveryStatus: 'server_queued',
+            text: 'already materialized',
+            rawRecord: { role: 'user', content: { type: 'text', text: 'already materialized' } },
+        });
+        const { sync } = await import('./sync');
+        sync.encryption = await Encryption.create(new Uint8Array(32).fill(7));
+        vi.spyOn(apiSocket, 'request').mockImplementation(async (_path, init) => {
+            if (init?.method === 'PATCH') return Response.json({ error: code }, { status });
+            return Response.json({ pending: [] });
+        });
+
+        await expect(sync.updatePendingRequestedAction(
+            sessionId, localId, { v: 1, kind: 'enqueue' }, { resumeWhenAvailable: true },
+        )).rejects.toMatchObject({ code });
+
+        expect(storage.getState().sessionPending[sessionId]?.messages).toEqual([]);
     });
 
     it('hydrates a missing active session before sending the user message', async () => {
@@ -787,6 +823,108 @@ describe('sync.sendMessage optimistic thinking', () => {
         sessionRpcSpy.mockRestore();
     });
 
+    describe('runtime application admission', () => {
+        const priorApiEncryption = { value: Reflect.get(apiSocket, 'encryption') };
+        beforeEach(() => { priorApiEncryption.value = Reflect.get(apiSocket, 'encryption'); });
+        afterEach(() => { Reflect.set(apiSocket, 'encryption', priorApiEncryption.value); });
+
+        async function prepareRuntimeResponse(encryptionMode: 'plain' | 'e2ee', response: unknown) {
+            const sessionId = `s_runtime_application_${encryptionMode}`;
+            storage.getState().applySessions([{
+                ...createSession({ sessionId }), encryptionMode,
+                metadata: { path: '/repo', host: 'host', permissionMode: 'default', permissionModeUpdatedAt: 1 },
+            }]);
+            storage.getState().applySettingsLocal({
+                sessionMessageSendMode: 'agent_queue',
+                sessionPermissionModeApplyTiming: 'next_prompt',
+            });
+            storage.getState().updateSessionPermissionMode(sessionId, 'yolo');
+            const encryption = await Encryption.create(new Uint8Array(32).fill(9));
+            await encryption.initializeSessions(new Map([[sessionId, null]]));
+            const cipher = encryption.getSessionEncryption(sessionId)!;
+            const { sync } = await import('./sync');
+            sync.encryption = encryption;
+            // Configure the real RPC cipher without opening a socket during this boundary fixture.
+            Reflect.set(apiSocket, 'encryption', encryption);
+            const fallbackCommit = vi.fn();
+            sync.setMessageTransport({ emitWithAck: fallbackCommit, send: vi.fn() });
+            const transport = vi.spyOn(apiSocket, 'emitWithAck').mockImplementation(async <T>(event: string, data: unknown) => {
+                if (event === SOCKET_RPC_EVENTS.CALL) {
+                    const call = data as { method: string; params: string | Record<string, unknown> };
+                    const request = encryptionMode === 'plain' ? call.params : await cipher.decryptRaw(call.params as string);
+                    expect(request).toMatchObject({ text: 'runtime application input', localId: expect.any(String) });
+                    // This is the real server envelope owner. The remote handler result is the network fixture.
+                    const targetResponse = encryptionMode === 'plain' ? response : await cipher.encryptRaw(response);
+                    return forwardedRpcTargetResponse({ method: call.method, targetResponse }) as T;
+                }
+                if (event === 'update-metadata') {
+                    return { result: 'success', version: 1, metadata: (data as { metadata: string }).metadata } as T;
+                }
+                throw new Error(`Unexpected boundary event: ${event}`);
+            });
+            return { sync, sessionId, transport, fallbackCommit };
+        }
+
+        it.each([
+            ['plain', 'runtime_recovery_waiting', 'runtime_recovery_waiting'],
+            ['e2ee', 'session_user_message_id_payload_conflict', 'session_user_message_id_payload_conflict'],
+            ['plain', 'session_user_message_unhandled', 'connect_error: runtime refused this request'],
+        ] as const)('rejects the %s runtime application refusal %s through direct submission', async (encryptionMode, errorCode, error) => {
+            const { sync, sessionId, transport, fallbackCommit } = await prepareRuntimeResponse(encryptionMode, { ok: false, errorCode, error });
+            const observedAccepted: string[] = [];
+            const unsubscribe = storage.subscribe((state) => {
+                for (const message of state.sessionPending[sessionId]?.messages ?? []) {
+                    if (message.deliveryStatus === 'accepted') observedAccepted.push(message.id);
+                }
+            });
+            try {
+                await expect(sync.submitMessage(sessionId, 'runtime application input')).rejects.toMatchObject({ code: errorCode, message: error });
+                expect(observedAccepted).toEqual([]);
+                expect(storage.getState().sessionPending[sessionId]?.messages ?? []).toEqual([]);
+                expect(storage.getState().sessions[sessionId].optimisticThinkingAt ?? null).toBeNull();
+                expect(storage.getState().sessions[sessionId].permissionMode).toBe('yolo');
+                expect(storage.getState().sessions[sessionId].metadata?.permissionMode).toBe('default');
+                expect(transport.mock.calls.filter(([event]) => event === 'update-metadata')).toHaveLength(0);
+                expect(fallbackCommit).not.toHaveBeenCalled();
+                expect(ensureSessionRuntimeForPendingInputMock).not.toHaveBeenCalled();
+                expect(runtimeFetchWithServerReachabilityMock.mock.calls.filter(([request]) => request.url?.includes('/pending'))).toHaveLength(0);
+            } finally {
+                unsubscribe();
+            }
+        });
+
+        it('rejects a malformed runtime application response without publishing admission', async () => {
+            const { sync, sessionId, transport, fallbackCommit } = await prepareRuntimeResponse('plain', null);
+            const observedAccepted: string[] = [];
+            const unsubscribe = storage.subscribe((state) => {
+                for (const message of state.sessionPending[sessionId]?.messages ?? []) {
+                    if (message.deliveryStatus === 'accepted') observedAccepted.push(message.id);
+                }
+            });
+            try {
+                await expect(sync.submitMessage(sessionId, 'runtime application input')).rejects.toThrow();
+                expect(observedAccepted).toEqual([]);
+                expect(transport.mock.calls.filter(([event]) => event === 'update-metadata')).toHaveLength(0);
+                expect(fallbackCommit).not.toHaveBeenCalled();
+            } finally {
+                unsubscribe();
+            }
+        });
+
+        it.each([['plain', false], ['e2ee', true]] as const)(
+            'preserves %s runtime application success and provider acceptance pending=%s',
+            async (encryptionMode, providerAcceptancePending) => {
+                const { sync, sessionId, fallbackCommit } = await prepareRuntimeResponse(encryptionMode, { ok: true, providerAcceptancePending });
+                const result = await sync.submitMessage(sessionId, 'runtime application input');
+                expect(result).toMatchObject({ type: 'success', persistence: 'provider_direct' });
+                expect(result.providerAcceptancePending === true).toBe(providerAcceptancePending);
+                expect(storage.getState().sessionPending[sessionId]?.messages.map((message) => message.deliveryStatus)).toEqual(['accepted']);
+                expect(storage.getState().sessions[sessionId].metadata?.permissionMode).toBe('yolo');
+                expect(fallbackCommit).not.toHaveBeenCalled();
+            },
+        );
+    });
+
     it('wakes an apparently active session with fresh user-request provenance when runtime RPC falls back to a durable commit', async () => {
         const sessionId = 's_active_runtime_rpc_post_boot_fallback';
         storage.getState().applySessions([createSession({
@@ -889,7 +1027,7 @@ describe('sync.sendMessage optimistic thinking', () => {
 
         expect(requestSpy).toHaveBeenCalledWith(
             `/v2/sessions/${sessionId}/pending?includeDiscarded=1`,
-            { method: 'GET' },
+            { method: 'GET', cache: 'no-store' },
         );
         expect(storage.getState().sessionPending[sessionId]?.messages).toEqual([
             expect.objectContaining({
@@ -944,10 +1082,64 @@ describe('sync.sendMessage optimistic thinking', () => {
         await vi.waitFor(() => {
             expect(requestSpy).toHaveBeenCalledWith(
                 `/v2/sessions/${sessionId}/pending?includeDiscarded=1`,
-                { method: 'GET' },
+                { method: 'GET', cache: 'no-store' },
             );
             expect(storage.getState().sessionPending[sessionId]?.messages).toEqual([]);
         });
+    });
+
+    it('reconciles a mounted server-delivering row when the settlement repeats an unchanged committed twin', async () => {
+        const sessionId = 's_server_pending_repeated_commit_without_receipt';
+        const localId = 'repeated-delivered-local-id';
+        const committed = {
+            id: 'already-committed-message-id',
+            seq: 1,
+            localId,
+            createdAt: 1_200,
+            isSidechain: false,
+            role: 'user',
+            content: { type: 'text', text: 'already delivered' },
+        } as const;
+        storage.getState().applySessions([{
+            ...createSession({ sessionId }),
+            encryptionMode: 'plain',
+        }]);
+        storage.getState().applyMessages(sessionId, [committed]);
+        storage.getState().upsertPendingMessage(sessionId, {
+            id: localId,
+            localId,
+            createdAt: 1_000,
+            updatedAt: 1_100,
+            source: 'server_pending',
+            deliveryStatus: 'accepted',
+            pendingDeliveryStatus: 'server_delivering',
+            text: 'already delivered',
+            rawRecord: {
+                role: 'user',
+                content: { type: 'text', text: 'already delivered' },
+                meta: {},
+            },
+        });
+        const mounted = await renderHook(() => useSessionPendingMessages(sessionId));
+        expect(mounted.getCurrent().messages.map((message) => message.localId)).toEqual([localId]);
+
+        const requestSpy = vi.spyOn(apiSocket, 'request').mockResolvedValue(
+            Response.json({ pending: [] }),
+        );
+        const { sync } = await import('./sync');
+
+        await act(async () => {
+            (sync as any).applyMessages(sessionId, [committed]);
+            await vi.waitFor(() => {
+                expect(requestSpy).toHaveBeenCalledWith(
+                    `/v2/sessions/${sessionId}/pending?includeDiscarded=1`,
+                    { method: 'GET', cache: 'no-store' },
+                );
+            });
+        });
+
+        expect(mounted.getCurrent().messages).toEqual([]);
+        await mounted.unmount();
     });
 
     it('replays identical scoped enqueue identities independently through the real Sync scheduler', async () => {
@@ -1773,12 +1965,37 @@ describe('sync.sendMessage optimistic thinking', () => {
         expect(storage.getState().sessions[sessionId].latestTurnStatus).toBe('completed');
     });
 
+    it('leaves a newer permission choice pending when an earlier prompt is admitted', async () => {
+        const sessionId = 's_perm_next_prompt_frozen';
+        storage.getState().applySessions([{
+            ...createSession({ sessionId }), encryptionMode: 'plain',
+            metadata: { path: '/repo', host: 'host', permissionMode: 'default', permissionModeUpdatedAt: 1 },
+        }]);
+        storage.getState().applySettingsLocal({ sessionPermissionModeApplyTiming: 'next_prompt' });
+        storage.getState().updateSessionPermissionMode(sessionId, 'yolo');
+        const { sync } = await import('./sync');
+        vi.spyOn(apiSocket, 'sessionRPC').mockRejectedValue(createRpcMethodNotAvailableError());
+        const emitMetadata = vi.spyOn(apiSocket, 'emitWithAck').mockResolvedValue({ result: 'success' });
+        sync.setMessageTransport({
+            // The transport's generic response is supplied by this JSON boundary fixture.
+            emitWithAck: async <T>() => {
+                storage.getState().updateSessionPermissionMode(sessionId, 'read-only');
+                return { ok: true, id: 'm1', seq: 1, localId: null, didWrite: true } as T;
+            },
+            send: vi.fn(),
+        });
+        await sync.sendMessage(sessionId, 'hello');
+        expect(emitMetadata.mock.calls.filter(([event]) => event === 'update-metadata')).toHaveLength(0);
+        expect(storage.getState().sessions[sessionId].permissionMode).toBe('read-only');
+        expect(storage.getState().sessions[sessionId].metadata?.permissionMode).toBe('default');
+    });
+
     it('publishes session metadata after send when apply timing is next_prompt and local permission selection is newer', async () => {
         const sessionId = 's_perm_next_prompt';
         storage.getState().applySessions([
             {
-                ...createSession({ sessionId }),
-                metadata: { permissionMode: 'default', permissionModeUpdatedAt: 1 } as any,
+                ...createSession({ sessionId }), encryptionMode: 'plain',
+                metadata: { path: '/repo', host: 'host', permissionMode: 'default', permissionModeUpdatedAt: 1 },
             },
         ]);
 
@@ -1805,25 +2022,79 @@ describe('sync.sendMessage optimistic thinking', () => {
             send: vi.fn(),
         });
 
-        const publish = vi.fn(async () => {});
-        (sync as any).publishSessionPermissionModeToMetadata = publish;
+        const publish = vi.spyOn(apiSocket, 'emitWithAck').mockImplementation(async <T>(_event: string, data: unknown) => ({
+            result: 'success', version: 1, metadata: (data as { metadata: string }).metadata,
+        }) as T);
 
         await sync.sendMessage(sessionId, 'hello');
 
-        expect(publish).toHaveBeenCalledTimes(1);
-        expect(publish).toHaveBeenCalledWith({
-            sessionId,
-            permissionMode: 'yolo',
-            permissionModeUpdatedAt: localUpdatedAt,
+        const writes = publish.mock.calls.filter(([event]) => event === 'update-metadata');
+        expect(writes).toHaveLength(1);
+        expect(JSON.parse((writes[0][1] as { metadata: string }).metadata)).toMatchObject({
+            permissionMode: 'yolo', permissionModeUpdatedAt: localUpdatedAt,
         });
+        expect(storage.getState().sessions[sessionId].metadata?.permissionMode).toBe('yolo');
+    });
+
+    it('does not publish an admitted prompt into a different account scope', async () => {
+        const sessionId = 's_perm_next_prompt_scope';
+        const session = {
+            ...createSession({ sessionId }), encryptionMode: 'plain' as const,
+            metadata: { path: '/repo', host: 'host', permissionMode: 'default', permissionModeUpdatedAt: 1 },
+        } satisfies Session;
+        storage.getState().applySessions([session]);
+        storage.getState().applySettingsLocal({ sessionPermissionModeApplyTiming: 'next_prompt' });
+        storage.getState().updateSessionPermissionMode(sessionId, 'yolo');
+        const { sync } = await import('./sync');
+        vi.spyOn(apiSocket, 'sessionRPC').mockRejectedValue(createRpcMethodNotAvailableError());
+        const emitMetadata = vi.spyOn(apiSocket, 'emitWithAck').mockResolvedValue({ result: 'success' });
+        sync.setMessageTransport({
+            // The transport's generic response is supplied by this JSON boundary fixture.
+            emitWithAck: async <T>() => {
+                storage.getState().activateProfileScope({ serverId: getActiveServerSnapshot().serverId, accountId: 'other-account' });
+                storage.getState().applySessions([session]);
+                storage.getState().applySettingsLocal({ sessionPermissionModeApplyTiming: 'next_prompt' });
+                storage.getState().updateSessionPermissionMode(sessionId, 'yolo');
+                return { ok: true, id: 'm1', seq: 1, localId: null, didWrite: true } as T;
+            },
+            send: vi.fn(),
+        });
+        await sync.sendMessage(sessionId, 'hello');
+        expect(emitMetadata.mock.calls.filter(([event]) => event === 'update-metadata')).toHaveLength(0);
+        expect(storage.getState().sessions[sessionId].permissionMode).toBe('yolo');
+        expect(storage.getState().sessions[sessionId].metadata?.permissionMode).toBe('default');
+    });
+
+    it('returns unpublished when the admitted permission write retires before acknowledgement', async () => {
+        const sessionId = 's_perm_next_prompt_retired';
+        const session = {
+            ...createSession({ sessionId }), encryptionMode: 'plain' as const,
+            metadata: { path: '/repo', host: 'host', permissionMode: 'default', permissionModeUpdatedAt: 1 },
+        } satisfies Session;
+        storage.getState().applySessions([session]);
+        storage.getState().applySettingsLocal({ sessionPermissionModeApplyTiming: 'next_prompt' });
+        storage.getState().updateSessionPermissionMode(sessionId, 'yolo');
+        const expectedAccountScope = storage.getState().profileScope;
+        const { sync } = await import('./sync');
+        vi.spyOn(apiSocket, 'emitWithAck').mockImplementation(async <T>(_event: string, data: unknown) => {
+            storage.getState().activateProfileScope({ serverId: getActiveServerSnapshot().serverId, accountId: 'other-account' });
+            storage.getState().applySessions([session]);
+            storage.getState().updateSessionPermissionMode(sessionId, 'read-only');
+            return { result: 'success', version: 1, metadata: (data as { metadata: string }).metadata } as T;
+        });
+        expect(await sync.publishNextPromptPermissionModeAfterAdmission({
+            sessionId, admittedPermissionMode: 'yolo', expectedAccountScope,
+        })).toBe(false);
+        expect(storage.getState().sessions[sessionId].permissionMode).toBe('read-only');
+        expect(storage.getState().sessions[sessionId].metadata?.permissionMode).toBe('default');
     });
 
     it('does not publish session metadata after send when apply timing is next_prompt but metadata is already up to date', async () => {
         const sessionId = 's_perm_next_prompt_noop';
         storage.getState().applySessions([
             {
-                ...createSession({ sessionId }),
-                metadata: { permissionMode: 'safe-yolo', permissionModeUpdatedAt: Date.now() } as any,
+                ...createSession({ sessionId }), encryptionMode: 'plain',
+                metadata: { path: '/repo', host: 'host', permissionMode: 'safe-yolo', permissionModeUpdatedAt: Date.now() },
             },
         ]);
 
@@ -1846,11 +2117,10 @@ describe('sync.sendMessage optimistic thinking', () => {
             send: vi.fn(),
         });
 
-        const publish = vi.fn(async () => {});
-        (sync as any).publishSessionPermissionModeToMetadata = publish;
+        const publish = vi.spyOn(apiSocket, 'emitWithAck').mockResolvedValue({ result: 'success' });
 
         await sync.sendMessage(sessionId, 'hello');
 
-        expect(publish).not.toHaveBeenCalled();
+        expect(publish.mock.calls.filter(([event]) => event === 'update-metadata')).toHaveLength(0);
     });
 });

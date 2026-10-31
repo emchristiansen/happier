@@ -1,9 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FeaturesResponseSchema } from '@happier-dev/protocol';
 
 import { resolveConnectedServicesQuotasDaemonEnabled } from './resolveConnectedServicesQuotasDaemonEnabled';
+import { resetServerFeaturesClientForTests } from '@/features/serverFeaturesClient';
 
 describe('resolveConnectedServicesQuotasDaemonEnabled', () => {
+  afterEach(() => {
+    resetServerFeaturesClientForTests();
+    vi.unstubAllGlobals();
+  });
+
   it('returns false when the server reports quotas disabled', async () => {
     vi.stubGlobal(
       'fetch',
@@ -85,4 +91,3 @@ describe('resolveConnectedServicesQuotasDaemonEnabled', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
-

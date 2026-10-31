@@ -1,4 +1,5 @@
 import type { Metadata, Session } from '@/sync/domains/state/storageTypes';
+import { resolveAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { computeHasUnreadActivity } from '@/sync/domains/messages/unread';
 import type {
     PrimaryTurnStatusV1,
@@ -20,7 +21,10 @@ import {
 } from '@/sync/domains/messages/transcriptRenderableAggregate';
 import { resolveLastViewedSessionSeq } from '@/sync/domains/session/readCursor/resolveLastViewedSessionSeq';
 import { resolveSessionReadableSeq } from '@/sync/domains/session/readCursor/resolveSessionReadableSeq';
-import { countSessionAgentActivityFromMetadata } from '@/sync/domains/session/agentActivity/countSessionAgentActivityFromMetadata';
+import { deriveAgentActivityCounts } from '@/sync/domains/session/agentActivity/deriveAgentActivityCounts';
+import { toAgentActivityCountable } from '@/sync/domains/session/agentActivity/deriveAgentActivityEntries';
+import type { AgentActivityEntry } from '@/sync/domains/session/agentActivity/types';
+import { readSessionAgentActivityEntriesFromMetadata } from '@/sync/domains/session/agentActivity/countSessionAgentActivityFromMetadata';
 import type { AgentActivityCounts } from '@/sync/domains/session/agentActivity/deriveAgentActivityCounts';
 import { resolveSessionProjectGroupingKeyParts } from './sessionListProjectGroupingKeys';
 import { deriveSessionListMeaningfulActivityAt } from './deriveSessionListActivity';
@@ -31,6 +35,7 @@ import {
     resolveSessionListUnreadEntryActivityAt,
 } from './placement/sessionListPlacementProjection';
 import { didSessionListWorkingRetentionInputsChange } from './placement/sessionListWorkingRetention';
+import { reconcileSessionLifecycleProjection, reconcileSessionRequestProjection } from '../sessionLifecycleProjection';
 import {
     deriveSessionRuntimePresentationState,
     resolveSessionRuntimePresenceFields,
@@ -45,6 +50,7 @@ export interface SessionListRenderableMetadata {
     homeDir?: string | null;
     host?: string | null;
     machineId?: string | null;
+    /** Canonical Agent identity resolved before discarding full metadata evidence. */
     flavor?: string | null;
     directSessionV1?: {
         v: 1;
@@ -71,6 +77,8 @@ export interface SessionListRenderableMetadata {
      * while the chip named the workflow.
      */
     agentActivityCounts?: AgentActivityCounts;
+    /** Bounded headline evidence, retained so runtime loss can reconcile counts without transcript reads. */
+    agentActivityEntries?: readonly AgentActivityEntry[];
     hiddenSystemSession?: boolean;
     terminalControlServiceabilityV1?: {
         v: 1;
@@ -132,6 +140,11 @@ export interface SessionListRenderableSession {
      */
     unreadSince?: number | null;
     keepVisibleWhenInactive?: boolean;
+    /**
+     * Derived local presentation of the canonical server-scoped archive operation.
+     * Never persisted or server-materialized.
+     */
+    archiving?: boolean;
     metadataUnavailable?: boolean;
 }
 
@@ -170,19 +183,57 @@ export function deriveSessionListRenderableHasUnreadMessagesFromReadableSeq(
     });
 }
 
-/**
- * Work still open in this session — the same tally the session header's glyph, the composer chip
- * and the Agents tab badge read. One counter, one grouping rule, one description (R-8).
- *
- * An agent stopped on a permission prompt is open work and is already inside `live`, so there is no
- * second tally to add here and no way for the two to drift.
- */
-function readAgentActivityCounts(metadata: Metadata): AgentActivityCounts {
-    return countSessionAgentActivityFromMetadata(metadata);
+export function deriveSessionListRenderableHasUnreadMessagesFromPatch(params: Readonly<{
+    renderable: SessionListRenderableSession;
+    patch: SessionListRenderablePatchFields;
+    explicitReadableSeq?: number | null;
+    recomputeUnread?: boolean;
+}>): boolean {
+    const { renderable, patch } = params;
+    if (
+        params.recomputeUnread !== true
+        && patch.metadata === undefined
+        && patch.lastViewedSessionSeq === undefined
+    ) {
+        return renderable.hasUnreadMessages === true;
+    }
+
+    const nextMetadata = patch.metadata === undefined ? renderable.metadata : patch.metadata;
+    const nextLastViewedSessionSeq = patch.lastViewedSessionSeq === undefined
+        ? renderable.lastViewedSessionSeq
+        : patch.lastViewedSessionSeq;
+    const projectedReadableSeq = resolveSessionReadableSeq({
+        messages: null,
+        sessionSeq: patch.seq ?? renderable.seq,
+        latestReadyEventSeq: patch.latestReadyEventSeq === undefined
+            ? renderable.latestReadyEventSeq
+            : patch.latestReadyEventSeq,
+        latestTurnStatus: patch.latestTurnStatus === undefined
+            ? renderable.latestTurnStatus
+            : patch.latestTurnStatus,
+        includeTerminalSessionSeq: true,
+    }) ?? 0;
+    const explicitReadableSeq = typeof params.explicitReadableSeq === 'number'
+        && Number.isFinite(params.explicitReadableSeq)
+        ? Math.max(0, Math.trunc(params.explicitReadableSeq))
+        : null;
+
+    return computeHasUnreadActivity({
+        sessionSeq: explicitReadableSeq === null
+            ? projectedReadableSeq
+            : Math.max(projectedReadableSeq, explicitReadableSeq),
+        pendingActivityAt: 0,
+        lastViewedSessionSeq: resolveLastViewedSessionSeq({
+            metadata: nextMetadata,
+            lastViewedSessionSeq: nextLastViewedSessionSeq,
+        }),
+        lastViewedPendingActivityAt: nextMetadata?.readStateV1?.pendingActivityAt,
+    });
 }
 
 export function buildSessionListRenderableMetadata(metadata: Metadata | null | undefined): SessionListRenderableMetadata | null {
     if (!metadata) return null;
+    const agentActivityEntries = readSessionAgentActivityEntriesFromMetadata(metadata);
     const directSessionV1 = (() : DirectSessionRenderableMetadata | null => {
         const candidate = metadata.directSessionV1;
         if (!candidate || typeof candidate !== 'object') return null;
@@ -223,10 +274,11 @@ export function buildSessionListRenderableMetadata(metadata: Metadata | null | u
         homeDir: typeof metadata.homeDir === 'string' ? metadata.homeDir : null,
         host: typeof metadata.host === 'string' ? metadata.host : null,
         machineId: typeof metadata.machineId === 'string' ? metadata.machineId : null,
-        flavor: typeof metadata.flavor === 'string' ? metadata.flavor : null,
+        flavor: resolveAgentIdFromSessionMetadata(metadata),
         directSessionV1,
         readStateV1,
-        agentActivityCounts: readAgentActivityCounts(metadata),
+        agentActivityCounts: deriveAgentActivityCounts(agentActivityEntries.map(toAgentActivityCountable)),
+        agentActivityEntries,
         hiddenSystemSession: metadata.systemSessionV1?.hidden === true,
         terminalControlServiceabilityV1: metadata.terminal?.controlServiceabilityV1 ?? null,
     };
@@ -387,10 +439,28 @@ function shouldPreserveSessionListRenderablePendingFlags(
     );
 }
 
+function preserveSessionListRenderableMissingPendingFlags(
+    previous: SessionListRenderableSession | undefined,
+    next: SessionListRenderableSession,
+): SessionListRenderableSession {
+    if (!shouldPreserveSessionListRenderablePendingFlags(next, previous)) return next;
+    return {
+        ...next,
+        agentStateVersion: previous.agentStateVersion,
+        hasPendingPermissionRequests: previous.hasPendingPermissionRequests,
+        hasPendingUserActionRequests: previous.hasPendingUserActionRequests,
+        pendingRequestObservedAt: previous.pendingRequestObservedAt ?? null,
+    };
+}
+
 export function preserveSessionListRenderableStaleFields(
     previous: SessionListRenderableSession | undefined,
     next: SessionListRenderableSession,
 ): SessionListRenderableSession {
+    next = preserveSessionListRenderableMissingPendingFlags(previous, reconcileSessionLifecycleProjection(
+        previous,
+        reconcileSessionRequestProjection(previous, next),
+    ));
     // A projection pass re-derives every renderable, so an unchanged session still arrives as a
     // fresh object. Handing that object on defeats identity all the way up the session list: the
     // row is rebuilt around it, then the array, then the whole list re-renders. Returning the
@@ -406,7 +476,6 @@ export function preserveSessionListRenderableStaleFields(
         && next.metadata == null
         && previous?.metadata == null
         && previous?.metadataUnavailable === true;
-    const preservePendingFlags = shouldPreserveSessionListRenderablePendingFlags(next, previous);
     const preserveDirectSessionClassification =
         previous?.metadata?.directSessionV1 != null
         && next.metadata != null
@@ -415,7 +484,7 @@ export function preserveSessionListRenderableStaleFields(
 
     if (
         previous == null
-        || (!preserveMetadata && !preserveMetadataUnavailable && !preservePendingFlags && !preserveDirectSessionClassification)
+        || (!preserveMetadata && !preserveMetadataUnavailable && !preserveDirectSessionClassification)
     ) {
         return next;
     }
@@ -432,22 +501,12 @@ export function preserveSessionListRenderableStaleFields(
     return {
         ...next,
         metadataVersion: preserveMetadata ? previous.metadataVersion : next.metadataVersion,
-        agentStateVersion: preservePendingFlags ? previous.agentStateVersion : next.agentStateVersion,
         metadata: nextMetadata,
         metadataUnavailable: preserveMetadata
             ? false
             : preserveMetadataUnavailable
                 ? true
                 : next.metadataUnavailable,
-        hasPendingPermissionRequests: preservePendingFlags
-            ? previous.hasPendingPermissionRequests
-            : next.hasPendingPermissionRequests,
-        hasPendingUserActionRequests: preservePendingFlags
-            ? previous.hasPendingUserActionRequests
-            : next.hasPendingUserActionRequests,
-        pendingRequestObservedAt: preservePendingFlags
-            ? previous.pendingRequestObservedAt ?? null
-            : next.pendingRequestObservedAt ?? null,
     };
 }
 
@@ -537,7 +596,10 @@ export function applySessionListRenderablePatch(
     // entry fact is re-stamped from the latest activity; keep the row's
     // existing entry time so an unread row does not move on every message.
     patched.unreadSince = resolveSessionListRenderableUnreadSince(renderable, patched);
-    return patched;
+    return preserveSessionListRenderableMissingPendingFlags(renderable, reconcileSessionLifecycleProjection(
+        renderable,
+        reconcileSessionRequestProjection(renderable, patched),
+    ));
 }
 
 export function isSessionListRenderablePatchNoop(
@@ -620,7 +682,7 @@ function isSessionRuntimeIssueV1(value: unknown): value is SessionRuntimeIssueV1
         && typeof issue.occurredAt === 'number';
 }
 
-function areSessionRuntimeIssuesEqual(
+export function areSessionRuntimeIssuesEqual(
     previous: SessionRuntimeIssueV1 | null,
     next: SessionRuntimeIssueV1 | null,
 ): boolean {
@@ -684,9 +746,30 @@ export function didSessionListRenderableEmbeddedListRowFieldsChange(
     // row-store overlays. Keep embedded list data structural/identity-focused
     // so live streaming does not republish the whole list array.
     if ((previous.metadataUnavailable === true) !== (next.metadataUnavailable === true)) return true;
-    if (!areSessionListRenderableMetadataEqual(previous.metadata, next.metadata)) return true;
+    if (!areSessionListRenderableEmbeddedRowMetadataEqual(previous.metadata, next.metadata)) return true;
 
     return false;
+}
+
+function areSessionListRenderableEmbeddedRowMetadataEqual(
+    previous: SessionListRenderableMetadata | null | undefined,
+    next: SessionListRenderableMetadata | null | undefined,
+): boolean {
+    if (previous === next) return true;
+    if (!previous || !next) return previous === next;
+    return (previous.name ?? null) === (next.name ?? null)
+        && (previous.summaryText ?? null) === (next.summaryText ?? null)
+        && previous.path === next.path
+        && (previous.homeDir ?? null) === (next.homeDir ?? null)
+        && (previous.host ?? null) === (next.host ?? null)
+        && (previous.machineId ?? null) === (next.machineId ?? null)
+        && (previous.flavor ?? null) === (next.flavor ?? null)
+        && (previous.directSessionV1?.v ?? null) === (next.directSessionV1?.v ?? null)
+        && (previous.directSessionV1?.providerId ?? null) === (next.directSessionV1?.providerId ?? null)
+        && (previous.readStateV1?.v ?? null) === (next.readStateV1?.v ?? null)
+        && (previous.readStateV1?.sessionSeq ?? null) === (next.readStateV1?.sessionSeq ?? null)
+        && (previous.readStateV1?.pendingActivityAt ?? null) === (next.readStateV1?.pendingActivityAt ?? null)
+        && (previous.hiddenSystemSession === true) === (next.hiddenSystemSession === true);
 }
 
 export function didSessionListRenderableAttentionPromotionFieldsChange(

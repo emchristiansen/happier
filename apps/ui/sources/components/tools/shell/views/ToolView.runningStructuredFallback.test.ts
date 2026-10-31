@@ -134,7 +134,10 @@ describe('ToolView (running tools)', () => {
         expect(flattened).toContain('stdout');
         expect(flattened).not.toContain('toolView.output');
 
-        const spinner = screen.findByType('ActivityIndicator' as any);
+        // The tool owns which color its running spinner gets; how the spinner draws it depends on
+        // the user's loading indicator style.
+        const { ActivitySpinner } = await import('@/components/ui/feedback/ActivitySpinner');
+        const spinner = screen.findByType(ActivitySpinner);
         expect(spinner?.props?.color).toBe('#555555');
     });
 });

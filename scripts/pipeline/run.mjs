@@ -31,6 +31,8 @@ import {
   supportsMobileNativeSubmit,
 } from './expo/mobile-release-environments.mjs';
 import { resolveTestflightDistributionConfig } from './expo/testflight-distribution-config.mjs';
+import { readBoundStoreNotes } from './release/release-notes/project-release-notes.mjs';
+import { requireGooglePlayCredential } from './expo/google-play-publish.mjs';
 import {
   formatPublicReleaseChannel,
   formatPublicReleaseChannelChoices,
@@ -416,6 +418,11 @@ function repoRootFromHere() {
   return path.resolve(here, '..', '..');
 }
 
+function resolvePipelineRepoRoot() {
+  const requestedRoot = String(process.env.HAPPIER_PIPELINE_REPO_ROOT ?? '').trim();
+  return requestedRoot ? path.resolve(requestedRoot) : repoRootFromHere();
+}
+
 /**
  * @param {{ repoRoot: string; env: Record<string, string>; args: string[]; dryRun: boolean }} opts
  */
@@ -549,7 +556,7 @@ function runChecksPlan({ repoRoot, env, args, dryRun }) {
  */
 function runChecks({ repoRoot, env, args, dryRun }) {
   const scriptPath = path.join(repoRoot, 'scripts', 'pipeline', 'checks', 'run-checks.mjs');
-  const fullArgs = [scriptPath, ...args];
+  const fullArgs = ['--experimental-strip-types', scriptPath, ...args];
   if (dryRun) {
     console.log(`[pipeline] exec: node ${fullArgs.map((a) => JSON.stringify(a)).join(' ')}`);
   }
@@ -679,7 +686,7 @@ function runExpoNativeBuild({ repoRoot, env, args, dryRun }) {
  * @param {{ repoRoot: string; env: Record<string, string>; args: string[]; dryRun: boolean }} opts
  */
 function runExpoSubmit({ repoRoot, env, args, dryRun }) {
-  const scriptPath = path.join(repoRoot, 'scripts', 'pipeline', 'expo', 'submit.mjs');
+  const scriptPath = fileURLToPath(new URL('./expo/submit.mjs', import.meta.url));
   const fullArgs = [scriptPath, ...args];
   if (dryRun) {
     console.log(`[pipeline] exec: node ${fullArgs.map((a) => JSON.stringify(a)).join(' ')}`);
@@ -695,7 +702,7 @@ function runExpoSubmit({ repoRoot, env, args, dryRun }) {
  * @param {{ repoRoot: string; env: Record<string, string>; args: string[]; dryRun: boolean }} opts
  */
 function runExpoTestflightDistribute({ repoRoot, env, args, dryRun }) {
-  const scriptPath = path.join(repoRoot, 'scripts', 'pipeline', 'expo', 'testflight-distribute.mjs');
+  const scriptPath = fileURLToPath(new URL('./expo/testflight-distribute.mjs', import.meta.url));
   const fullArgs = [scriptPath, ...args];
   if (dryRun) {
     console.log(`[pipeline] exec: node ${fullArgs.map((a) => JSON.stringify(a)).join(' ')}`);
@@ -705,6 +712,16 @@ function runExpoTestflightDistribute({ repoRoot, env, args, dryRun }) {
     env,
     stdio: 'inherit',
   });
+}
+
+/**
+ * @param {{ repoRoot: string; env: Record<string, string>; args: string[]; dryRun: boolean }} opts
+ */
+function runExpoStorePublish({ repoRoot, env, args, dryRun }) {
+  const scriptPath = fileURLToPath(new URL('./expo/store-publish.mjs', import.meta.url));
+  const fullArgs = [scriptPath, ...args];
+  if (dryRun) console.log(`[pipeline] exec: node ${fullArgs.map((a) => JSON.stringify(a)).join(' ')}`);
+  execFileSync(process.execPath, fullArgs, { cwd: repoRoot, env, stdio: 'inherit' });
 }
 
 /**
@@ -1037,7 +1054,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
 }
 
   async function main() {
-  const repoRoot = repoRootFromHere();
+  const repoRoot = resolvePipelineRepoRoot();
 
   const { argv, style } = parseGlobalCliFlags(process.argv.slice(2));
   const [subcommandRaw, ...rest] = argv;
@@ -1880,6 +1897,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
         'bump-cli-override': { type: 'string', default: 'preset' },
         'bump-stack-override': { type: 'string', default: 'preset' },
         'deploy-targets': { type: 'string', default: '' },
+        'force-deploy': { type: 'string', default: 'false' },
         'changed-ui': { type: 'string' },
         'changed-cli': { type: 'string' },
         'changed-stack': { type: 'string' },
@@ -1916,6 +1934,8 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
         String(values['bump-stack-override'] ?? 'preset'),
         '--deploy-targets',
         String(values['deploy-targets'] ?? ''),
+        '--force-deploy',
+        String(values['force-deploy'] ?? 'false'),
         '--changed-ui',
         String(values['changed-ui'] ?? ''),
         '--changed-cli',
@@ -2344,7 +2364,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
     return;
   }
 
-    if (subcommand === 'expo-submit') {
+  if (subcommand === 'expo-submit') {
       const { values } = parseArgs({
         args: rest,
         options: {
@@ -2356,6 +2376,11 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           interactive: { type: 'string', default: 'auto' },
           'eas-cli-version': { type: 'string', default: '' },
           'android-release-status': { type: 'string', default: 'draft' },
+          'release-notes-json': { type: 'string', default: '' },
+          'source-sha': { type: 'string', default: '' },
+          'release-id': { type: 'string', default: '' },
+          'app-version': { type: 'string', default: '' },
+          'android-version-code': { type: 'string', default: '' },
           wait: { type: 'string', default: 'true' },
           'dry-run': { type: 'boolean', default: false },
           'secrets-source': { type: 'string', default: 'auto' },
@@ -2430,6 +2455,10 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           ...(easCliVersion ? ['--eas-cli-version', easCliVersion] : []),
           '--android-release-status',
           androidReleaseStatus,
+          ...['release-notes-json', 'source-sha', 'release-id', 'app-version', 'android-version-code'].flatMap((flag) => {
+            const value = String(values[flag] ?? '').trim();
+            return value ? [`--${flag}`, value] : [];
+          }),
           ...(wait ? ['--wait', wait] : []),
           ...(dryRun ? ['--dry-run'] : []),
         ],
@@ -2771,6 +2800,11 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
         'dump-view': { type: 'string', default: 'true' },
         'fingerprint-mode': { type: 'string', default: 'always' },
         'preflight-only': { type: 'boolean', default: false },
+        'testflight-distribution-mode': { type: 'string', default: 'inline' },
+        'release-notes-json': { type: 'string', default: '' },
+        'source-sha': { type: 'string', default: '' },
+        'release-id': { type: 'string', default: '' },
+        'app-version': { type: 'string', default: '' },
         'release-message': { type: 'string', default: '' },
         'runtime-version': { type: 'string', default: '' },
         'ui-version-bump': { type: 'string', default: '' },
@@ -2835,6 +2869,10 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
     }
     /** @type {'always' | 'if-changed'} */
     const fingerprintMode = fingerprintModeRaw;
+    const testflightDistributionMode = String(values['testflight-distribution-mode'] ?? '').trim().toLowerCase() || 'inline';
+    if (testflightDistributionMode !== 'inline' && testflightDistributionMode !== 'deferred') {
+      fail(`--testflight-distribution-mode must be 'inline' or 'deferred' (got: ${values['testflight-distribution-mode']})`);
+    }
     const releaseMessage = String(values['release-message'] ?? '').trim();
     const runtimeVersion = String(values['runtime-version'] ?? '').trim();
 
@@ -2854,6 +2892,20 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
     if (runtimeVersion && action !== 'ota') {
       fail('--runtime-version is supported only for --action ota.');
     }
+    const productionStoreSubmit = environment === 'production' && action === 'native_submit';
+    if (productionStoreSubmit && (uiVersionBump || uiVersion)) {
+      fail('Production native submission uses the UI version bound to --release-notes-json; prepare version changes before projecting release notes.');
+    }
+    const releaseNotesJson = String(values['release-notes-json'] ?? '').trim();
+    const storeSourceSha = String(values['source-sha'] ?? '').trim();
+    const storeReleaseId = String(values['release-id'] ?? '').trim();
+    const storeAppVersion = String(values['app-version'] ?? '').trim();
+    const storeBindingArgs = productionStoreSubmit ? [
+      '--release-notes-json', releaseNotesJson,
+      '--source-sha', storeSourceSha,
+      '--release-id', storeReleaseId,
+      '--app-version', storeAppVersion,
+    ] : [];
 
     const nativeBuildModeRaw = String(values['native-build-mode'] ?? '').trim().toLowerCase() || 'cloud';
     if (nativeBuildModeRaw !== 'cloud' && nativeBuildModeRaw !== 'local') {
@@ -2918,7 +2970,31 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
       console.log(`[pipeline] loaded secrets from Keychain service '${keychainService}'`);
     }
 
+    if (productionStoreSubmit) {
+      if (!releaseNotesJson) fail('--release-notes-json is required for production native submission.');
+      const checkedOutSourceSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      const checkedOutAppVersion = String(JSON.parse(fs.readFileSync(path.join(repoRoot, 'apps/ui/package.json'), 'utf8')).version ?? '').trim();
+      if (storeSourceSha !== checkedOutSourceSha || storeAppVersion !== checkedOutAppVersion) {
+        fail('--source-sha and --app-version must match the exact native build checkout.');
+      }
+      for (const storePlatform of platform === 'all' ? ['android', 'ios'] : [platform]) {
+        readBoundStoreNotes({
+          bundlePath: path.resolve(repoRoot, releaseNotesJson), sourceSha: storeSourceSha,
+          releaseId: storeReleaseId, appVersion: storeAppVersion, platform: storePlatform,
+        });
+      }
+      if (platform === 'android' || platform === 'all') {
+        requireGooglePlayCredential(mergedEnv.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON);
+      }
+    }
+
       if (preflightOnly) {
+        if (productionStoreSubmit) {
+          console.log('[pipeline] ui-mobile release: production store notes and publishing prerequisites validated.');
+          return;
+        }
         const shouldHandleIos = platform === 'ios' || platform === 'all';
         if (!shouldHandleIos) {
           console.log('[pipeline] ui-mobile release: no iOS TestFlight configuration to validate.');
@@ -3061,7 +3137,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           });
         }
       } else {
-        const waitForCloudBuild = action !== 'native_submit';
+        const waitForCloudBuild = action !== 'native_submit' || (productionStoreSubmit && shouldHandleAndroid);
         runExpoNativeBuild({
           repoRoot,
           env: mergedEnv,
@@ -3211,9 +3287,10 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
                 '--path',
                 rel,
                 '--wait',
-                'false',
+                productionStoreSubmit && p === 'android' ? 'true' : 'false',
                 '--android-release-status',
                 androidReleaseStatus,
+                ...storeBindingArgs,
                 ...(easCliVersion ? ['--eas-cli-version', easCliVersion] : []),
                 ...(dryRun ? ['--dry-run'] : []),
               ],
@@ -3274,9 +3351,10 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
                 p,
                 ...(explicitId ? ['--id', explicitId] : []),
                 '--wait',
-                'false',
+                productionStoreSubmit && p === 'android' ? 'true' : 'false',
                 '--android-release-status',
                 androidReleaseStatus,
+                ...storeBindingArgs,
                 ...(easCliVersion ? ['--eas-cli-version', easCliVersion] : []),
                 ...(dryRun ? ['--dry-run'] : []),
               ],
@@ -3286,11 +3364,28 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
 
         const shouldHandleIos = platform === 'ios' || platform === 'all';
         if (shouldHandleIos) {
+          if (productionStoreSubmit) {
+            if (testflightDistributionMode === 'deferred') {
+              console.log('[pipeline] ui-mobile release: App Store publication deferred to the recovery workflow.');
+            } else if (dryRun || nativeBuildMode === 'local' || cloudBuildPresence.ios) {
+              runExpoStorePublish({
+                repoRoot, env: mergedEnv, dryRun,
+                args: [
+                  '--platform', 'ios', '--environment', 'production', '--profile', 'production',
+                  '--build-json', buildJsonForPlatform('ios'), ...storeBindingArgs,
+                  ...(easCliVersion ? ['--eas-cli-version', easCliVersion] : []),
+                  ...(dryRun ? ['--dry-run'] : []),
+                ],
+              });
+            }
+          }
           const testflightDistribution = resolveTestflightDistributionConfig({
             environment,
             env: mergedEnv,
           });
-          if (testflightDistribution.enabled) {
+          if (testflightDistribution.enabled && testflightDistributionMode === 'deferred') {
+            console.log('[pipeline] ui-mobile release: TestFlight external distribution deferred to the recovery workflow.');
+          } else if (testflightDistribution.enabled) {
             if (!dryRun && nativeBuildMode === 'cloud' && !cloudBuildPresence.ios) {
               console.log('[pipeline] ui-mobile release: skipping TestFlight external distribution (no iOS build was scheduled).');
             } else {
@@ -3689,7 +3784,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
         const { values } = parseArgs({
           args: rest,
           options: {
-            'env-files': { type: 'string', default: '' },
+            'env-files': { type: 'string' },
             env: { type: 'string', default: '' },
             'keychain-service': { type: 'string', default: 'happier/pipeline' },
             'keychain-account': { type: 'string', default: '' },
@@ -3702,6 +3797,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           allowPositionals: false,
         });
 
+        const hasExplicitEnvFiles = values['env-files'] !== undefined;
         const envFilesRaw = String(values['env-files'] ?? '').trim();
         const envRaw = String(values.env ?? '').trim();
         const keychainService = String(values['keychain-service'] ?? '').trim() || 'happier/pipeline';
@@ -3722,14 +3818,13 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
             }
             envTargets.push(env);
           }
-        } else if (!envFilesRaw) {
+        } else if (!hasExplicitEnvFiles) {
           // Default behavior: when importing from standard repo env files, import all env overlays.
           envTargets = ['preview', 'production'];
         }
 
-        const wantsEnvBundles = envTargets.length > 0;
-
         const envFilesList = envFilesRaw ? parseCsvList(envFilesRaw) : [];
+        /** @returns {'production'|'preview'|''} */
         const envFileMatch = (filePath) => {
           const base = path.basename(String(filePath ?? '').trim());
           if (base === '.env.pipeline.production.local') return 'production';
@@ -3737,15 +3832,28 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           return '';
         };
 
-        const baseEnvFiles = envFilesList.filter((f) => !envFileMatch(f));
-        const baseFiles = baseEnvFiles.length > 0 ? baseEnvFiles : envFilesRaw ? ['.env.pipeline.local'] : ['.env.pipeline.local'];
+        if (hasExplicitEnvFiles) {
+          if (envFilesList.length === 0) fail('--env-files must name at least one file.');
+          /** @type {('production'|'preview')[]} */
+          const suppliedEnvironments = [];
+          for (const file of envFilesList) {
+            const environment = envFileMatch(file);
+            if (environment && !suppliedEnvironments.includes(environment)) suppliedEnvironments.push(environment);
+          }
+          if (envRaw) {
+            if (suppliedEnvironments.some((env) => !envTargets.includes(env)) || envTargets.some((env) => !suppliedEnvironments.includes(env))) {
+              fail('--env must match the environments of the explicitly selected overlay files.');
+            }
+          } else {
+            envTargets = suppliedEnvironments;
+          }
+        }
+        const wantsEnvBundles = envTargets.length > 0;
+        const baseFiles = hasExplicitEnvFiles ? envFilesList.filter((f) => !envFileMatch(f)) : ['.env.pipeline.local'];
         /** @type {string[]} */
         const cleanupFileInputs = [...baseFiles];
 
         const { baseAccount } = resolveKeychainBundleAccounts({ accountPrefix: keychainAccount || undefined });
-        console.log(
-          `[pipeline] keychain import: service=${keychainService} account=${baseAccount} (base bundle)`,
-        );
 
         /**
          * @param {ReturnType<typeof importDotenvIntoKeychainBundle>} result
@@ -3771,16 +3879,19 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           }
         };
 
-        const baseResult = importDotenvIntoKeychainBundle({
-          repoRoot,
-          envFiles: baseFiles,
-          keychainService,
-          keychainAccount: baseAccount,
-          onlyMissing,
-          ignoreMissing,
-          dryRun,
-        });
-        logResult(baseResult, 'base');
+        if (baseFiles.length > 0) {
+          console.log(`[pipeline] keychain import: service=${keychainService} account=${baseAccount} (base bundle)`);
+          const baseResult = importDotenvIntoKeychainBundle({
+            repoRoot,
+            envFiles: baseFiles,
+            keychainService,
+            keychainAccount: baseAccount,
+            onlyMissing,
+            ignoreMissing,
+            dryRun,
+          });
+          logResult(baseResult, 'base');
+        }
 
         if (wantsEnvBundles) {
           for (const deployEnvironment of envTargets) {
@@ -3789,7 +3900,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
               deployEnvironment,
             });
             const envFilesFromList = envFilesList.filter((f) => envFileMatch(f) === deployEnvironment);
-            const envFiles = envFilesFromList.length > 0 ? envFilesFromList : [`.env.pipeline.${deployEnvironment}.local`];
+            const envFiles = hasExplicitEnvFiles ? envFilesFromList : [`.env.pipeline.${deployEnvironment}.local`];
             cleanupFileInputs.push(...envFiles);
 
             console.log(
@@ -4155,6 +4266,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
           mode: { type: 'string' },
           confirm: { type: 'string', default: '' },
           'allow-reset': { type: 'string', default: 'false' },
+          'preserve-target-descendant': { type: 'boolean', default: false },
           'summary-file': { type: 'string', default: '' },
           'allow-dirty': { type: 'string', default: 'false' },
           'dry-run': { type: 'boolean', default: false },
@@ -4224,6 +4336,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
         mode,
         '--allow-reset',
         allowReset || 'false',
+        ...(values['preserve-target-descendant'] === true ? ['--preserve-target-descendant'] : []),
         '--confirm',
         confirm,
         ...(summaryFile ? ['--summary-file', summaryFile] : []),
@@ -4503,6 +4616,7 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
                 ? authorizedPromotionSourceSha
                 : `refs/heads/${promotionSourceBranch}`,
               authorizedSha: authorizedPromotionSourceSha,
+              allowSourceAncestor: true,
             });
 
           if (jsonOutput) {
@@ -4692,6 +4806,8 @@ function runJsonScript({ repoRoot, env, scriptRel, args }) {
               'preset',
               '--deploy-targets',
               deployTargets.join(','),
+              '--force-deploy',
+              forceDeploy ? 'true' : 'false',
               '--changed-ui',
               changed.changed_ui ? 'true' : 'false',
               '--changed-cli',

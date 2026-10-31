@@ -1,3 +1,6 @@
+import { readToolCallObservedAtMs } from '@/sync/domains/session/subagents/toolCallActivityTimestamps';
+import { readSessionRuntimeLostSinceMs, resolveNextSessionRuntimePresentationFreshnessAtMs } from '@/sync/domains/session/attention/deriveSessionRuntimePresentationState';
+import { useSessionListRuntimeNowMs, useSessionListRuntimeWake } from './sessionListRuntimeClock';
 import * as React from 'react';
 
 import type { Message } from '@/sync/domains/messages/messageTypes';
@@ -37,6 +40,7 @@ function buildSessionSubagentToolMessageSignature(message: Message): string {
         toolCreatedAt: tool?.createdAt ?? null,
         toolStartedAt: tool?.startedAt ?? null,
         toolCompletedAt: tool?.completedAt ?? null,
+        childObservedAt: message.kind === 'tool-call' ? readToolCallObservedAtMs(message) : null,
         input: tool?.input ?? null,
         result: tool?.result ?? null,
     }) ?? 'null';
@@ -119,7 +123,7 @@ function useStableMessagesBySignature(
 
 function buildExecutionRunStateSignature(runs: readonly SessionSubagentActiveExecutionRunState[]): string {
     if (runs.length === 0) return '';
-    return runs.map((run) => `${run.runId}\u0000${run.status ?? ''}`).join('\u0001');
+    return runs.map((run) => `${run.runId}\u0000${run.status ?? ''}\u0000${run.runClass ?? ''}\u0000${run.turnInFlight ?? ''}`).join('\u0001');
 }
 
 function readSubagentKey(subagent: SessionSubagent): string {
@@ -137,9 +141,13 @@ export function useSessionSubagents(params: Readonly<{
     directSessionRuntime?: UseDirectSessionRuntimeResult;
 }>): Readonly<{
     subagents: readonly SessionSubagent[];
+    runtimeLostSinceMs: number | null;
     participantTargets: ReturnType<typeof deriveSessionSubagentRecipients>;
     sidechainIds: readonly string[];
 }> {
+    const runtimeNowMs = useSessionListRuntimeNowMs();
+    const runtimeLostSinceMs = params.session ? readSessionRuntimeLostSinceMs(params.session, Math.max(runtimeNowMs, Date.now())) : null;
+    useSessionListRuntimeWake(params.session ? resolveNextSessionRuntimePresentationFreshnessAtMs(params.session, Math.max(runtimeNowMs, Date.now())) : null);
     const executionRunsEnabled = useFeatureEnabled('execution.runs');
     const sessionFlavor = typeof (params.session as any)?.metadata?.flavor === 'string'
         ? String((params.session as any).metadata.flavor)
@@ -190,6 +198,7 @@ export function useSessionSubagents(params: Readonly<{
                 metadata: sessionFlavor ? { flavor: sessionFlavor } : {},
             },
             messages: subagentMessages,
+            runtimeLostSinceMs,
             activeExecutionRuns: stableRunningExecutionRuns,
         });
         return applyExecutionRunControlCapabilities(derivedSubagents, {
@@ -204,6 +213,7 @@ export function useSessionSubagents(params: Readonly<{
         stableRunningExecutionRuns,
         subagentMessages,
         sessionFlavor,
+        runtimeLostSinceMs,
     ]);
     const subagents = useReconciledStableRows(derivedSubagents, readSubagentKey);
 
@@ -218,5 +228,5 @@ export function useSessionSubagents(params: Readonly<{
     const sidechainIdsSignature = derivedSidechainIds.join('\0');
     const sidechainIds = useStableValueBySignature(derivedSidechainIds, sidechainIdsSignature);
 
-    return { subagents, participantTargets, sidechainIds };
+    return { subagents, runtimeLostSinceMs, participantTargets, sidechainIds };
 }

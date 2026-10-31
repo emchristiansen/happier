@@ -193,7 +193,8 @@ describe('opencode session handoff bundle', () => {
           runtimeHandle: {
             backendMode: 'server',
             vendorSessionId: 'op_sess_1',
-            serverBaseUrl: 'http://127.0.0.1:4096',
+            // The consumed provider-extra builder uses the canonical equivalent origin URL.
+            serverBaseUrl: 'http://127.0.0.1:4096/',
             serverBaseUrlExplicit: true,
           },
         },

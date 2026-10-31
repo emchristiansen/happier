@@ -37,6 +37,7 @@ export type OptionPickerOption = Readonly<{
 
 export type OptionPickerProbeState = Readonly<{
     phase: 'idle' | 'loading' | 'refreshing';
+    error?: boolean;
     onRefresh?: () => void;
     refreshAccessibilityLabel?: string;
     loadingAccessibilityLabel?: string;

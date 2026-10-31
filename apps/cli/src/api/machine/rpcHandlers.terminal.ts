@@ -7,6 +7,7 @@ import {
   DaemonTerminalRestartRequestSchema,
   DaemonTerminalStreamReadRequestSchema,
   type DaemonTerminalErrorCode,
+  type DaemonTerminalLaunchIntent,
 } from '@happier-dev/protocol';
 import { expandHomeDirPath } from '@/utils/path/expandHomeDirPath';
 
@@ -69,7 +70,7 @@ export function registerMachineTerminalRpcHandlers(params: Readonly<{
 
   const resolveLaunch = (input: Readonly<{
     terminalKey?: string;
-    launch?: Readonly<{ kind: 'session_attach'; sessionId: string }>;
+    launch?: DaemonTerminalLaunchIntent;
   }>): Readonly<{
     terminalKey: string;
     launch?: Readonly<{ file: string; args: readonly string[]; env?: Readonly<Record<string, string>> }>;
@@ -80,6 +81,21 @@ export function registerMachineTerminalRpcHandlers(params: Readonly<{
         const launchSpec = buildHappyCliSubprocessLaunchSpecFn(['attach', sessionId]);
         return {
           terminalKey: `session-attach:${sessionId}`,
+          launch: {
+            file: launchSpec.filePath,
+            args: launchSpec.args,
+            ...(launchSpec.env ? { env: launchSpec.env } : {}),
+          },
+        };
+      } catch {
+        return null;
+      }
+    }
+    if (input.launch?.kind === 'happier_cli') {
+      try {
+        const launchSpec = buildHappyCliSubprocessLaunchSpecFn(input.launch.args);
+        return {
+          terminalKey: input.terminalKey ?? `happier-cli:${JSON.stringify(input.launch.args)}`,
           launch: {
             file: launchSpec.filePath,
             args: launchSpec.args,

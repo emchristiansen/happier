@@ -29,6 +29,7 @@ test('binary publish product specs expose the canonical per-product release meta
     versionNotesSubject: 'CLI',
     notarizationEvidenceSuffix: 'cli',
     artifactTargets: BINARY_PUBLISH_TARGETS,
+    optionalComponentProducts: ['happier-memory-runtime', 'happier-difftastic'],
   });
 
   assert.deepEqual(getBinaryPublishProductSpec('hstack'), {

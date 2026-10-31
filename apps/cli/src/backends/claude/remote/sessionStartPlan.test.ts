@@ -1,8 +1,40 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { resolveClaudeRemoteSessionStartPlan } from './sessionStartPlan';
+import { getProjectPath } from '../utils/path';
 
 describe('resolveClaudeRemoteSessionStartPlan', () => {
+  it('resumes a copied transcript whose recorded cwd differs from the launch directory', () => {
+    const root = mkdtempSync(join(tmpdir(), 'claude-moved-resume-'));
+    const path = join(root, 'new-workspace');
+    const claudeConfigDir = join(root, 'claude');
+    const sessionId = '12345678-1234-1234-1234-123456789abc';
+    mkdirSync(path);
+    const projectDir = getProjectPath(path, claudeConfigDir);
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, `${sessionId}.jsonl`), `${JSON.stringify({
+      type: 'user',
+      uuid: 'message-1',
+      sessionId,
+      cwd: join(root, 'old-workspace'),
+      message: { role: 'user', content: 'previous conversation' },
+    })}\n`);
+
+    try {
+      expect(resolveClaudeRemoteSessionStartPlan({
+        sessionId,
+        transcriptPath: null,
+        path,
+        claudeConfigDir,
+      })).toEqual({ startFrom: sessionId, shouldContinue: false });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('keeps explicit session id and does not infer continue', () => {
     const result = resolveClaudeRemoteSessionStartPlan(
       {

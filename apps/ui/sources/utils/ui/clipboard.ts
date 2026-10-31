@@ -10,9 +10,11 @@ export async function getClipboardStringTrimmedSafe(): Promise<string> {
 
 export async function setClipboardStringSafe(value: string): Promise<boolean> {
     try {
-        await Clipboard.setStringAsync(value);
-        return true;
+        const copied = await Clipboard.setStringAsync(value);
+        if (!copied) console.warn('Clipboard write was refused by the platform.');
+        return copied;
     } catch {
+        console.warn('Clipboard write failed.');
         return false;
     }
 }

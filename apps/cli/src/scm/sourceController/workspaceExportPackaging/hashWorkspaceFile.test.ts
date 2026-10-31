@@ -29,8 +29,7 @@ describe('hashWorkspaceFile', () => {
 
     it('aborts hashing when assertCanContinue throws', async () => {
         const root = await makeTempDir('workspace-hash-abort-');
-        const filePath = join(root, 'README.md');
-        await writeFile(filePath, 'hello manifest\n');
+        const filePath = join(root, 'missing.md');
 
         let calls = 0;
         await expect(hashWorkspaceFile({

@@ -4,6 +4,40 @@ import { THEME_PROFILE_MAX_OVERRIDES_PER_MODE } from '@/theme/profiles/themeProf
 import { applyLocalSettings, localSettingsDefaults, localSettingsParse } from './localSettings';
 
 describe('localSettingsParse', () => {
+    it('defaults haptics on and keeps its opt-out device-local without coupling visual preferences', () => {
+        expect(localSettingsParse({})).toMatchObject({ hapticsEnabled: true });
+        const parsed = localSettingsParse({ hapticsEnabled: false, uiBackdropBlurEnabled: false, themePreference: 'dark' });
+        expect(parsed).toMatchObject({ hapticsEnabled: false, uiBackdropBlurEnabled: false, themePreference: 'dark' });
+        expect(applyLocalSettings(parsed, { hapticsEnabled: true })).toMatchObject({
+            hapticsEnabled: true,
+            uiBackdropBlurEnabled: false,
+            themePreference: 'dark',
+        });
+    });
+
+    it('defaults malformed haptics values without resetting other local preferences', () => {
+        expect(localSettingsParse({ hapticsEnabled: 'disabled', uiItemDensity: 'compact', themePreference: 'dark' })).toMatchObject({
+            hapticsEnabled: true,
+            uiItemDensity: 'compact',
+            themePreference: 'dark',
+        });
+    });
+
+    it('defaults the loading indicator to Normal speed with a Short pause, and degrades unknown values without resetting other local settings', () => {
+        const defaults = localSettingsParse(null);
+        expect(defaults.loadingIndicatorSpeed).toBe('normal');
+        expect(defaults.loadingIndicatorPause).toBe('short');
+        expect(localSettingsParse({ loadingIndicatorSpeed: 'fast', loadingIndicatorPause: 'none' })).toMatchObject({
+            loadingIndicatorSpeed: 'fast',
+            loadingIndicatorPause: 'none',
+        });
+
+        const parsed = localSettingsParse({ loadingIndicatorSpeed: 'warp', loadingIndicatorPause: 3, uiItemDensity: 'compact' });
+        expect(parsed.loadingIndicatorSpeed).toBe('normal');
+        expect(parsed.loadingIndicatorPause).toBe('short');
+        expect(parsed.uiItemDensity).toBe('compact');
+    });
+
     it('defaults the mobile brand hero dismissal timestamp to null', () => {
         expect(localSettingsParse(null).brandHeroSeenAt).toBeNull();
     });

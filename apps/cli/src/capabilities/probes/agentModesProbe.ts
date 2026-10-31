@@ -163,6 +163,9 @@ export async function probeAgentModesBestEffort(params: {
   connectedServices?: ConnectedServiceBindingsV1 | null;
   processEnv?: NodeJS.ProcessEnv;
   connectedServiceSelectionCacheKey?: string | null;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  onNativeCleanup?: import('./catalogProbeLifecycle').RegisterNativeCatalogCleanup;
 }): Promise<ProbedAgentModesResult> {
   const nowMs = Date.now();
   const cwd = typeof params.cwd === 'string' && params.cwd.trim().length > 0 ? params.cwd.trim() : process.cwd();
@@ -189,7 +192,8 @@ export async function probeAgentModesBestEffort(params: {
   const cached = agentModesProbeCache.get(cacheKey);
   if (cached?.kind === 'success' && agentModesProbeCache.isFresh(cached, nowMs)) return cached.value;
 
-  return await agentModesProbeCache.runDedupe(cacheKey, async () => {
+  const runProbe = async () => {
+    params.signal?.throwIfAborted();
     const cached2 = agentModesProbeCache.get(cacheKey);
     const nowMs2 = Date.now();
     if (cached2?.kind === 'success' && agentModesProbeCache.isFresh(cached2, nowMs2)) return cached2.value;
@@ -208,6 +212,9 @@ export async function probeAgentModesBestEffort(params: {
           backendTarget: params.backendTarget,
           cwd,
           timeoutMs,
+          deadlineAt: params.deadlineAt,
+          signal: params.signal,
+          onNativeCleanup: params.onNativeCleanup,
           profileId,
           accountSettings: params.accountSettings ?? null,
           credentials: params.credentials ?? null,
@@ -254,6 +261,9 @@ export async function probeAgentModesBestEffort(params: {
         processEnv: params.processEnv,
       });
       if (configuredBackend) {
+        const ownedBackend = configuredBackend;
+        params.onNativeCleanup?.(() => ownedBackend.dispose());
+        params.signal?.throwIfAborted();
         const modes = await probeModesFromAcpBackend({ backend: configuredBackend, timeoutMs }).catch(() => null);
         if (modes) {
           const res: ProbedAgentModesResult = { ...fallback, availableModes: modes, source: 'dynamic' };
@@ -272,7 +282,7 @@ export async function probeAgentModesBestEffort(params: {
       }
     }
 
-    const spawnValidation = await validateCatalogAcpProbeSpawn(params.agentId);
+    const spawnValidation = await validateCatalogAcpProbeSpawn(params.agentId, { processEnv: params.processEnv, cwd });
     if (!spawnValidation.ok) {
       agentModesProbeCache.setSuccess(cacheKey, fallback, { nowMs: nowMs2, ttlMs: PROBE_MODES_FAILURE_TTL_MS });
       return fallback;
@@ -290,8 +300,12 @@ export async function probeAgentModesBestEffort(params: {
         mcpServers: {},
         permissionHandler,
         permissionMode: 'default',
+        readinessOnly: true,
       });
       backend = created.backend;
+      const ownedBackend = backend;
+      params.onNativeCleanup?.(() => ownedBackend.dispose());
+      params.signal?.throwIfAborted();
 
       const modes = await probeModesFromAcpBackend({ backend, timeoutMs }).catch(() => null);
       if (!modes) {
@@ -310,5 +324,6 @@ export async function probeAgentModesBestEffort(params: {
         await backend.dispose().catch(() => {});
       }
     }
-  });
+  };
+  return params.signal ? await runProbe() : await agentModesProbeCache.runDedupe(cacheKey, runProbe);
 }

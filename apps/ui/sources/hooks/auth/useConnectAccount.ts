@@ -32,7 +32,7 @@ export function useConnectAccount(options?: UseConnectAccountOptions) {
         try {
             const publicKey = decodeBase64(parsed.publicKeyB64Url, 'base64url');
             const creds = auth.credentials!;
-            const response = buildAccountLinkResponse(creds, publicKey);
+            const response = await buildAccountLinkResponse(creds, publicKey, { supportsCredentialVariants: parsed.supportsCredentialVariants === true });
             await authAccountApprove(creds.token, publicKey, response);
             
             await Modal.alertAsync(t('common.success'), t('modals.deviceLinkedSuccessfully'), [

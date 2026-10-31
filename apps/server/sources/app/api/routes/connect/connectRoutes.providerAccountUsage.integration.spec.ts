@@ -133,6 +133,70 @@ describe("connectRoutes (provider account usage canonical routes)", () => {
         expect(await read()).toMatchObject({ subscription: none, content: { v: { fetchedAtMs: 5000 } } });
     });
 
+    it("returns recovery details alongside the ordinary plaintext quota envelope", async () => {
+        harness.resetEnv({
+            HAPPIER_FEATURE_CONNECTED_SERVICES_QUOTAS__ENABLED: "true",
+            HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: "optional",
+            HAPPIER_FEATURE_ENCRYPTION__DEFAULT_ACCOUNT_MODE: "plain",
+        });
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        const recoveryCredits = {
+            kind: "usage_limit_resets", availableCount: 2,
+            credits: [{ providerCreditId: "reset_one", kind: "rate_limit_reset", status: "available" }],
+        };
+        const base = createUsageSnapshot({ fetchedAt: 1000, recoveryCredits });
+        const recoveryCreditDetails = { reset_one: { remainingCount: 2, appliesToProviderLimitIds: ["weekly"] } };
+        const app = createProviderAccountUsageTestApp();
+        connectRoutes(app as Parameters<typeof connectRoutes>[0]);
+        await app.ready();
+        const payload = createV3ProviderAccountUsagePayload({ snapshot: base });
+        const write = await app.inject({
+            method: "POST", url: `/v3/connect/provider-account-usage/${base.recordId}`,
+            headers: { "content-type": "application/json", "x-test-user-id": user.id },
+            payload: { ...payload, metadata: { ...payload.metadata, recoveryCreditDetails } },
+        });
+        expect(write.statusCode).toBe(200);
+        const response = await app.inject({
+            method: "GET", url: `/v3/connect/provider-account-usage/${base.recordId}`,
+            headers: { "x-test-user-id": user.id },
+        });
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toMatchObject({
+            recoveryCreditDetails,
+            content: { t: "plain", v: { meters: base.meters, recoveryCredits: base.recoveryCredits } },
+        });
+        expect(response.json().content.v).not.toHaveProperty("recoveryCreditDetails");
+    });
+
+    it("rejects recovery detail authoring when disabled while accepting ordinary plaintext quota writes", async () => {
+        harness.resetEnv({
+            HAPPIER_FEATURE_CONNECTED_SERVICES_QUOTAS__ENABLED: "true",
+            HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: "optional",
+            HAPPIER_FEATURE_ENCRYPTION__DEFAULT_ACCOUNT_MODE: "plain",
+            HAPPIER_BUILD_FEATURES_DENY: "connectedServices.quotaRecoveryCreditDetails",
+        });
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        const base = createUsageSnapshot({ fetchedAt: 1000 });
+        const payload = createV3ProviderAccountUsagePayload({ snapshot: base });
+        const app = createProviderAccountUsageTestApp();
+        connectRoutes(app as Parameters<typeof connectRoutes>[0]);
+        await app.ready();
+        const write = (body: typeof payload | { content: typeof payload.content; metadata: typeof payload.metadata & { recoveryCreditDetails: object } }) => app.inject({
+            method: "POST", url: `/v3/connect/provider-account-usage/${base.recordId}`,
+            headers: { "content-type": "application/json", "x-test-user-id": user.id }, payload: body,
+        });
+        const rejected = await write({ ...payload, metadata: { ...payload.metadata, recoveryCreditDetails: { reset_one: { remainingCount: 2 } } } });
+        expect(rejected.statusCode).toBe(400);
+        expect(rejected.json()).toMatchObject({ error: "invalid-params", reason: "provider_account_usage_payload_invalid" });
+        const inlineRejected = await write({
+            ...payload,
+            content: { t: "plain", v: { ...base, recoveryCreditDetails: { reset_one: { remainingCount: 2, appliesToProviderLimitIds: [] } } } },
+        });
+        expect(inlineRejected.statusCode).toBe(400);
+        expect(inlineRejected.json()).toMatchObject({ error: "invalid-params", reason: "provider_account_usage_payload_invalid" });
+        expect((await write(payload)).statusCode).toBe(200);
+    });
+
     it("does not create plaintext provider-account usage rows from refresh requests for missing records", async () => {
         harness.resetEnv({
             HAPPIER_FEATURE_CONNECTED_SERVICES_QUOTAS__ENABLED: "true",
@@ -302,6 +366,19 @@ describe("connectRoutes (provider account usage canonical routes)", () => {
         connectRoutes(app as any);
         await app.ready();
 
+        const recoveryCreditDetails = { ciphertext: "opaque-recovery-details" };
+        const updatedSealed = { format: "account_scoped_v1", ciphertext: "sealed-provider-account-usage", recoveryCreditDetails };
+        const write = await app.inject({
+            method: "POST",
+            url: `/v2/connect/provider-account-usage/${snapshot.recordId}`,
+            headers: { "content-type": "application/json", "x-test-user-id": user.id },
+            payload: {
+                sealed: updatedSealed,
+                metadata: { fetchedAt: snapshot.fetchedAtMs + 1, staleAfterMs: snapshot.staleAfterMs, status: "ok" },
+            },
+        });
+        expect(write.statusCode).toBe(200);
+
         const read = await app.inject({
             method: "GET",
             url: `/v2/connect/provider-account-usage/${snapshot.recordId}`,
@@ -309,14 +386,20 @@ describe("connectRoutes (provider account usage canonical routes)", () => {
         });
         expect(read.statusCode).toBe(200);
         expect(read.json()).toEqual({
-            sealed: { format: "account_scoped_v1", ciphertext: "sealed-provider-account-usage" },
+            sealed: updatedSealed,
             metadata: {
-                fetchedAt: snapshot.fetchedAtMs,
+                fetchedAt: snapshot.fetchedAtMs + 1,
                 staleAfterMs: snapshot.staleAfterMs,
                 status: "ok",
             },
             sources: [],
         });
+        const persisted = await db.providerAccountUsageRecord.findUniqueOrThrow({
+            where: { accountId_recordId: { accountId: user.id, recordId: snapshot.recordId } },
+        });
+        expect(persisted.snapshot ?? {}).toEqual({});
+        expect(persisted.metadata).not.toHaveProperty("recoveryCreditDetails");
+        expect(persisted.sealedPayload).toEqual(updatedSealed);
 
         const refresh = await app.inject({
             method: "POST",

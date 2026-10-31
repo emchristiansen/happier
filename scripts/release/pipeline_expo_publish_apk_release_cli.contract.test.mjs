@@ -220,7 +220,7 @@ test('trusted publication binds a built APK to its explicit candidate version in
   assert.match(out, /--source-tag\s+ui-mobile-v9\.8\.7\b/);
 });
 
-test('preview APK publication retains the build filename and the website compatibility alias', async () => {
+test('preview APK publication retains the canonical channel filename', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'happier-apk-preview-alias-'));
   const apkPath = join(dir, 'happier-preview-android.apk');
   writeFileSync(apkPath, 'fake-apk');
@@ -237,7 +237,6 @@ test('preview APK publication retains the build filename and the website compati
   );
 
   assert.match(out, /happier-preview-android\.apk/);
-  assert.match(out, /happier-preview\.apk/);
 });
 
 test('APK publication accepts release notes from a file without multiline GitHub outputs', async () => {

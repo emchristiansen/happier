@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ConnectedServiceIdSchema } from '@happier-dev/protocol';
 
 const ioMock = vi.hoisted(() => vi.fn((_url: string, _options: { auth?: Record<string, unknown> }) => ({
   on: vi.fn(),
@@ -36,6 +37,7 @@ describe('createMachineSocketTransport', () => {
 
     expect(ioMock).toHaveBeenCalledWith('https://api.example.com', expect.objectContaining({
       auth: expect.objectContaining({
+        connectedServiceIds: ConnectedServiceIdSchema.options,
         clientType: 'machine-scoped',
         machineId: 'machine-1',
         installationId: 'installation-1',

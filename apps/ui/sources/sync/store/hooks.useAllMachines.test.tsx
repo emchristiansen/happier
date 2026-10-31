@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { act } from 'react-test-renderer';
 
-import { renderHook, standardCleanup } from '@/dev/testkit';
+import { createSessionFixture, renderHook, standardCleanup } from '@/dev/testkit';
 
-import { useAllMachines, useLaunchSelectionMachines, useMachineCliDetectionTarget, useMachineDisplayById, useMachineListByServerId, useSessionChatFooterState, useSessionForkSupportSource } from '@/sync/domains/state/storage';
+import { useAllMachines, useFirstVisibleMachineId, useLaunchSelectionMachines, useMachineCliDetectionTarget, useMachineDisplayById, useMachineListByServerId, useSessionChatFooterState, useSessionForkSupportSource } from '@/sync/domains/state/storage';
 import { storage } from '@/sync/domains/state/storageStore';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
 
@@ -12,6 +12,104 @@ afterEach(() => {
 });
 
 describe('useAllMachines', () => {
+    it('tracks the first visible machine id only while demanded', async () => {
+        const previousState = storage.getState();
+        const activeServerId = String(getActiveServerSnapshot().serverId ?? '').trim();
+        const firstMachine = {
+            id: 'm-first',
+            seq: 1,
+            createdAt: 1,
+            updatedAt: 1,
+            active: true,
+            activeAt: 1,
+            metadata: { host: 'first', platform: 'darwin', happyCliVersion: '1', happyHomeDir: '.happy', homeDir: '/home' },
+            metadataVersion: 1,
+            daemonState: null,
+            daemonStateVersion: 0,
+        };
+        const secondMachine = {
+            ...firstMachine,
+            id: 'm-second',
+            createdAt: 2,
+            updatedAt: 2,
+            activeAt: 2,
+            metadata: { ...firstMachine.metadata, host: 'second' },
+        };
+
+        try {
+            storage.setState((state) => ({
+                ...state,
+                isDataReady: true,
+                machines: {
+                    [firstMachine.id]: firstMachine,
+                    [secondMachine.id]: secondMachine,
+                },
+                machineListByServerId: activeServerId
+                    ? { [activeServerId]: [firstMachine, secondMachine] }
+                    : {},
+            }));
+
+            let renderCount = 0;
+            const hook = await renderHook(
+                (enabled: boolean) => {
+                    renderCount += 1;
+                    return useFirstVisibleMachineId(enabled);
+                },
+                {
+                    initialProps: true,
+                    flushOptions: { cycles: 1, turns: 4 },
+                },
+            );
+            expect(hook.getCurrent()).toBe('m-second');
+            const settledRenderCount = renderCount;
+
+            await act(async () => {
+                const refreshedSecondMachine = {
+                    ...secondMachine,
+                    updatedAt: 3,
+                    activeAt: 3,
+                };
+                storage.setState((state) => ({
+                    ...state,
+                    machines: {
+                        [firstMachine.id]: firstMachine,
+                        [refreshedSecondMachine.id]: refreshedSecondMachine,
+                    },
+                    machineListByServerId: activeServerId
+                        ? { [activeServerId]: [firstMachine, refreshedSecondMachine] }
+                        : {},
+                }));
+            });
+            expect(renderCount).toBe(settledRenderCount);
+
+            await act(async () => {
+                const promotedMachine = {
+                    ...firstMachine,
+                    createdAt: 4,
+                    updatedAt: 4,
+                    activeAt: 4,
+                };
+                storage.setState((state) => ({
+                    ...state,
+                    machines: {
+                        [promotedMachine.id]: promotedMachine,
+                        [secondMachine.id]: secondMachine,
+                    },
+                    machineListByServerId: activeServerId
+                        ? { [activeServerId]: [promotedMachine, secondMachine] }
+                        : {},
+                }));
+            });
+            expect(hook.getCurrent()).toBe('m-first');
+
+            await hook.rerender(false);
+            expect(hook.getCurrent()).toBeNull();
+            await hook.unmount();
+        } finally {
+            storage.setState(previousState);
+        }
+    });
+
     it('returns cached machines even when bootstrap is not fully ready (avoids empty flicker)', async () => {
         const previousState = storage.getState();
         try {
@@ -491,6 +589,48 @@ describe('useAllMachines', () => {
                 permissionsInUiWhileLocal: true,
             });
 
+            await hook.unmount();
+        } finally {
+            storage.setState(previousState);
+        }
+    });
+
+    it.each(['shared', 'exclusive'] as const)('retires and restores %s footer control through the real store', async (topology) => {
+        const previousState = storage.getState();
+        const session = createSessionFixture({
+            id: 's-control-lifecycle', active: true,
+            agentState: { controlledByUser: topology === 'exclusive', ...(topology === 'shared' ? {
+                localControl: { attached: true, topology, remoteWritable: true, canDetach: true },
+            } : {}) },
+        });
+        try {
+            storage.setState((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
+            const hook = await renderHook(() => useSessionChatFooterState(session.id), {
+                flushOptions: { cycles: 1, turns: 4 },
+            });
+            const attached = hook.getCurrent();
+            expect(attached?.localControl?.attached).toBe(true);
+            expect(attached?.controlledByUser).toBe(topology === 'exclusive');
+
+            await act(async () => {
+                storage.setState((state) => ({ sessions: { ...state.sessions, [session.id]: { ...session, active: false } } }));
+            });
+            expect(hook.getCurrent()).toMatchObject({ controlledByUser: false, localControl: null });
+
+            await act(async () => {
+                storage.setState((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
+            });
+            expect(hook.getCurrent()).toEqual(attached);
+
+            await act(async () => {
+                storage.setState((state) => ({ sessions: { ...state.sessions, [session.id]: {
+                    ...session, metadata: { ...session.metadata!, terminal: { mode: 'herdr',
+                        controlServiceabilityV1: { v: 1, attachmentId: 'retired-host', observedAt: 20,
+                            state: 'unknown', retired: true },
+                    } },
+                } } }));
+            });
+            expect(hook.getCurrent()).toMatchObject({ controlledByUser: false, localControl: null });
             await hook.unmount();
         } finally {
             storage.setState(previousState);

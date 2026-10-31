@@ -8,7 +8,6 @@ import { startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
 import { type StartedDaemon } from '../../src/testkit/daemon/daemon';
 import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
 import { gotoDomContentLoadedWithPathFallback, gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
-import { clickScopedButtonByTestIdOrRole } from '../../src/testkit/uiE2e/clickScopedButtonByTestIdOrRole';
 import { createGitRepoForPartialStagingFixture } from '../../src/testkit/uiE2e/gitRepoFixtures';
 import { spawnSessionFromDaemon } from '../../src/testkit/uiE2e/spawnSessionFromDaemon';
 import { toTestIdSafeValue } from '../../src/testkit/uiE2e/testIdSafeValue';
@@ -64,9 +63,6 @@ test.describe('ui e2e: SCM partial staging + commit + discard', () => {
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -92,7 +88,7 @@ test.describe('ui e2e: SCM partial staging + commit + discard', () => {
   });
 
   test('stages selected lines, commits, keeps remaining changes, and supports discard/revert UI', async ({ page }) => {
-    test.setTimeout(1_200_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     const browserDiagnostics = collectBrowserDiagnostics({ page });
@@ -145,12 +141,7 @@ test.describe('ui e2e: SCM partial staging + commit + discard', () => {
       await expect(rightPaneLocator(page)).toHaveCount(1, { timeout: 60_000 });
 
       const rightPane = rightPaneLocator(page);
-      await clickScopedButtonByTestIdOrRole({
-        scope: rightPane,
-        testId: 'session-rightpanel-tab:git',
-        roleName: 'Source control',
-        timeoutMs: 180_000,
-      });
+      await expect(rightPane.getByTestId('session-rightpanel-surface-git')).toBeVisible({ timeout: 180_000 });
 
       const twoHunksPath = 'src/two-hunks.txt';
       const wholeFilePath = 'src/whole-file.txt';

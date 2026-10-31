@@ -1,9 +1,10 @@
 import * as React from 'react';
-import { ActivityIndicator, View } from 'react-native';
+import { View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { Modal } from '@/modal';
 import { Text } from '@/components/ui/text/Text';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { t } from '@/text';
 import { resolveSessionGoalFailurePresentation } from '@/sync/ops/sessionGoalOperationFailure';
 
@@ -190,6 +191,25 @@ export function useSessionWorkStateGoalController(params: Readonly<{
         }
     }, [onClearGoal, onRequestClose]);
 
+    const resumeGoal = React.useCallback(async () => {
+        if (goal?.statusReason !== 'budgetLimited') {
+            await runGoalMutation({ status: 'active' });
+            return;
+        }
+
+        const confirmed = await Modal.confirm(
+            t('session.workState.goal.statusBudgetLimited'),
+            t('session.workState.goal.budgetReachedBody'),
+            {
+                cancelText: t('common.cancel'),
+                confirmText: t('session.workState.goal.removeBudgetAndResume'),
+            },
+        );
+        if (!confirmed) return;
+
+        await runGoalMutation({ status: 'active', tokenBudget: null });
+    }, [goal?.statusReason, runGoalMutation]);
+
     // U-7: goal / workflow / tasks stack with a hairline divider between present sections instead of
     // one uniform gap, so a busy popover reads as distinct landmarks rather than "soup".
     const taskGroups = groupSessionWorkStateItems(taskListSnapshot);
@@ -226,7 +246,7 @@ export function useSessionWorkStateGoalController(params: Readonly<{
                         void runGoalMutation(request);
                     }}
                     onPause={() => { void runGoalMutation({ status: 'paused' }); }}
-                    onResume={() => { void runGoalMutation({ status: 'active' }); }}
+                    onResume={() => { void resumeGoal(); }}
                     onComplete={() => { void runGoalMutation({ status: 'complete' }); }}
                     onClear={clearGoal}
                     onCancel={() => { void guardedRequestClose(); }}
@@ -264,7 +284,7 @@ export function useSessionWorkStateGoalController(params: Readonly<{
         >
             {pending ? (
                 <View testID="session-goal-pending" style={styles.statusRow}>
-                    <ActivityIndicator size="small" color={theme.colors.text.secondary} />
+                    <ActivitySpinner size="small" color={theme.colors.text.secondary} />
                     <Text style={[styles.pendingText, { color: theme.colors.text.secondary }]}>
                         {t('session.workState.goal.pending')}
                     </Text>

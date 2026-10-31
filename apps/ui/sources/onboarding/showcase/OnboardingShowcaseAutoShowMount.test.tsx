@@ -26,7 +26,7 @@ const authState = vi.hoisted(() => ({
 }));
 
 const setupIntentState = vi.hoisted(() => ({
-    pending: null as null | { phase: 'awaiting_auth' | 'post_auth' | 'dismissed' },
+    pending: null as null | { phase: 'awaiting_auth' | 'post_auth' },
 }));
 
 const modalState = vi.hoisted(() => ({

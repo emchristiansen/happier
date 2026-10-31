@@ -21,6 +21,22 @@ describe('parseMarkdownBlock (tables)', () => {
     });
   });
 
+  it('treats an escaped pipe as cell content rather than a column delimiter', () => {
+    const markdown = [
+      '| Pattern | Meaning |',
+      '| --- | --- |',
+      '| a \\| b | either |',
+      '',
+    ].join('\n');
+
+    const blocks = parseMarkdownBlock(markdown);
+    expect(blocks.find((b) => b.type === 'table')).toMatchObject({
+      type: 'table',
+      headers: ['Pattern', 'Meaning'],
+      rows: [['a | b', 'either']],
+    });
+  });
+
   it('pads short rows to match the header column count', () => {
     const markdown = [
       '| A | B | C |',

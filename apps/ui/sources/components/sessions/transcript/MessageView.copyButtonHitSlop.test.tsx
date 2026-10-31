@@ -1,9 +1,10 @@
 import React from 'react';
-import { act } from 'react-test-renderer';
+import { act, type ReactTestInstance } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { renderScreen, standardCleanup } from '@/dev/testkit';
 import { installMessageViewCommonModuleMocks } from './messageViewTestHelpers';
+import type { Message } from '@/sync/domains/messages/messageTypes';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -24,62 +25,20 @@ installMessageViewCommonModuleMocks({
             },
         });
     },
-    storage: async (importOriginal) => {
-        const { createStorageModuleMock } = await import('@/dev/testkit/mocks/storage');
-        return createStorageModuleMock({
-            importOriginal,
-            overrides: {
-                useSetting: (key: string) => key === 'transcriptMessageSelectionEnabled' ? true : null,
-                useSession: () => null,
-            },
-        });
+    storage: async (importOriginal) => importOriginal(),
+    text: async () => {
+        const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
+        return createTextModuleMock({ translate: (key: string) => key });
     },
 });
 
-vi.mock('@/components/markdown/MarkdownView', () => ({
-    MarkdownView: (props: any) => React.createElement('MarkdownView', props),
-}));
-
-vi.mock('@/components/tools/shell/views/ToolView', () => ({
-    ToolView: (props: any) => React.createElement('ToolView', props),
-}));
-
-vi.mock('@/components/tools/shell/views/ToolTimelineRow', () => ({
-    ToolTimelineRow: (props: any) => React.createElement('ToolTimelineRow', props),
-}));
-
-vi.mock('@/components/ui/text/Text', () => ({
-    Text: (props: any) => React.createElement('Text', props, props.children),
-    TextInput: (props: any) => React.createElement('TextInput', props, props.children),
-}));
-
-vi.mock('@/components/sessions/linkedFiles/extractWorkspaceFileMentions', () => ({
-    extractWorkspaceFileMentions: () => [],
-}));
-
-vi.mock('@/components/sessions/transcript/references/StructuredReferencesRow', () => ({
-    StructuredReferencesRow: () => null,
-}));
-
-vi.mock('@/components/ui/forms/dropdown/DropdownMenu', () => ({
-    DropdownMenu: (props: any) => React.createElement('DropdownMenu', props),
-}));
-
-vi.mock('@/utils/sessions/discardedCommittedMessages', () => ({
-    isCommittedMessageDiscarded: () => false,
-}));
-
 vi.mock('expo-clipboard', () => ({
-    setStringAsync: vi.fn(),
+    setStringAsync: vi.fn(async () => true),
 }));
 
 vi.mock('@expo/vector-icons', () => ({
     Ionicons: 'Ionicons',
     Octicons: 'Octicons',
-}));
-
-vi.mock('@/sync/sync', () => ({
-    sync: { submitMessage: vi.fn(), sendMessage: vi.fn() },
 }));
 
 function flattenStyle(style: unknown): Record<string, unknown> {
@@ -109,6 +68,8 @@ describe('MessageView (copy button hitSlop)', () => {
         async (platformOS) => {
             platformState.os = platformOS;
             vi.resetModules();
+            const { storage } = await import('@/sync/domains/state/storage');
+            storage.setState((state) => ({ settings: { ...state.settings, transcriptMessageSelectionEnabled: true } }));
             const { MessageView } = await import('./MessageView');
             const { TranscriptMessageSelectionProvider } = await import('./messageSelection/TranscriptMessageSelectionContext');
 
@@ -165,6 +126,8 @@ describe('MessageView (copy button hitSlop)', () => {
         async (platformOS, expectedSelectable) => {
             platformState.os = platformOS;
             vi.resetModules();
+            const { storage } = await import('@/sync/domains/state/storage');
+            storage.setState((state) => ({ settings: { ...state.settings, transcriptMessageSelectionEnabled: true } }));
             const { MessageView } = await import('./MessageView');
             const { TranscriptMessageSelectionProvider } = await import('./messageSelection/TranscriptMessageSelectionContext');
 
@@ -181,21 +144,16 @@ describe('MessageView (copy button hitSlop)', () => {
                 </TranscriptMessageSelectionProvider>,
             );
 
-            const markdownView = screen.findByType('MarkdownView' as any);
-            expect(markdownView.props.selectable).toBe(expectedSelectable);
-            expect(markdownView.props.profile).toBe('transcript');
-            expect(markdownView.props.textStyle).toMatchObject({
-                fontSize: 16,
-                lineHeight: 24,
-            });
+            const text = screen.findByType('EnrichedMarkdownText');
+            expect(text.children.join('')).toBe('hello');
+            expect(text.props.selectable).toBe(expectedSelectable);
         },
     );
 
-    it('copies a markdown option on long press without submitting the option as a message', async () => {
+    it('copies a markdown option through its rendered long-press action', async () => {
         platformState.os = 'ios';
         vi.resetModules();
         const Clipboard = await import('expo-clipboard');
-        const { sync } = await import('@/sync/sync');
         const { MessageView } = await import('./MessageView');
         const { TranscriptMessageSelectionProvider } = await import('./messageSelection/TranscriptMessageSelectionContext');
 
@@ -216,16 +174,89 @@ describe('MessageView (copy button hitSlop)', () => {
             </TranscriptMessageSelectionProvider>,
         );
 
-        const markdownView = screen.findByType('MarkdownView' as any);
-        expect(typeof markdownView.props.onOptionLongPress).toBe('function');
-
-        let copied = false;
-        await act(async () => {
-            copied = await markdownView.props.onOptionLongPress({ title: 'Run command' });
-        });
-
-        expect(copied).toBe(true);
+        const [option] = screen.findAll((node) => typeof node.type === 'string'
+            && String(node.type) === 'Pressable' && typeof node.props.onLongPress === 'function');
+        expect(option).toBeDefined();
+        await act(async () => { option.props.onLongPress(); });
         expect(Clipboard.setStringAsync).toHaveBeenCalledWith('Run command');
-        expect(sync.submitMessage).not.toHaveBeenCalled();
     });
+
+    it.each(['user', 'structured-user', 'agent', 'web'] as const)(
+        'keeps the %s hover wrapper from capturing native gestures while child copy remains usable',
+        async (branch) => {
+            platformState.os = branch === 'web' ? 'web' : 'android';
+            vi.resetModules();
+            const { MessageView } = await import('./MessageView');
+            const Clipboard = await import('expo-clipboard');
+            const message = {
+                kind: branch === 'agent' ? 'agent-text' : 'user-text',
+                id: 'gesture-message', localId: 'gesture-local', createdAt: 1,
+                text: '```ts\nconst value = 1;\n```',
+                ...(branch === 'structured-user' ? {
+                    meta: { happier: { kind: 'review_comments.v1', payload: {
+                        sessionId: 's1', comments: [{
+                            id: 'comment', filePath: 'src/file.ts', source: 'file',
+                            body: 'Review this line', createdAt: 1,
+                            anchor: { kind: 'fileLine', startLine: 1 },
+                            snapshot: { selectedLines: ['const value = 1;'], beforeContext: [], afterContext: [] },
+                        }],
+                    } } },
+                } : {}),
+            } satisfies Message;
+            const screen = await renderScreen(<MessageView message={message} metadata={null} sessionId="s1" />);
+            const copyButton = screen.findByTestId('transcript-message-copy:gesture-message');
+            if (!copyButton) throw new Error('Missing child copy action');
+            const ancestors: ReactTestInstance[] = [];
+            for (let node = copyButton.parent; node; node = node.parent) {
+                if (typeof node.type === 'string') ancestors.push(node);
+            }
+            // A hover-only message host must neither acquire the RN JS responder nor
+            // publish the available message and its actions as a disabled accessibility node.
+            expect(ancestors.some((node) => String(node.type) === 'Pressable')).toBe(false);
+            expect(ancestors.some((node) => node.props.disabled === true
+                || node.props.accessibilityState?.disabled === true)).toBe(false);
+            if (branch === 'web') {
+                const wrapper = ancestors.find((node) => typeof node.props.onPointerEnter === 'function');
+                if (!wrapper) throw new Error('Missing passive hover host');
+                const actions = () => screen.findAllHostsByTestId('transcript-message-actions:gesture-message')[0];
+                expect(flattenStyle(actions().props.style).pointerEvents).toBe('none');
+                await act(async () => { wrapper.props.onPointerEnter(); });
+                expect(flattenStyle(actions().props.style).pointerEvents).toBe('auto');
+                await act(async () => { wrapper.props.onPointerLeave(); });
+                expect(flattenStyle(actions().props.style).pointerEvents).toBe('none');
+            }
+            expect(copyButton.props.disabled).not.toBe(true);
+            const writes = vi.mocked(Clipboard.setStringAsync);
+            writes.mockClear();
+            await act(async () => { await copyButton.props.onPress(); });
+            expect(writes).toHaveBeenCalledWith(message.text);
+        },
+    );
+
+    it('clears the copied glyph and reports a refused retry after a successful message copy', async () => {
+        platformState.os = 'android';
+        vi.resetModules();
+        const { MessageView } = await import('./MessageView');
+        const Clipboard = await import('expo-clipboard');
+        const { Modal } = await import('@/modal');
+        const writes = vi.mocked(Clipboard.setStringAsync);
+        writes.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+        const alert = vi.mocked(Modal.alert);
+        alert.mockClear();
+        const message = {
+            kind: 'agent-text', id: 'copy-retry-message', localId: null, createdAt: 1, text: 'Copy this message',
+        } satisfies Message;
+        const screen = await renderScreen(<MessageView message={message} metadata={null} sessionId="s1" />);
+        const button = screen.findByTestId('transcript-message-copy:copy-retry-message');
+        if (!button) throw new Error('Missing message copy action');
+        const glyph = () => button.findAll((node) => typeof node.type === 'string'
+            && String(node.type) === 'Icon')[0]?.props.name;
+        await act(async () => { await button.props.onPress(); });
+        expect(glyph()).toBe('check');
+        expect(alert).not.toHaveBeenCalled();
+        await act(async () => { await button.props.onPress(); });
+        expect(glyph()).toBe('copy');
+        expect(alert).toHaveBeenCalledWith('common.error', 'items.failedToCopyToClipboard');
+    });
+
 });

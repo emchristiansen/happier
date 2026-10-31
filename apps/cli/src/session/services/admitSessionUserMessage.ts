@@ -8,6 +8,7 @@ import {
   type SessionEncryptionContext,
   type SessionStoredContentEncryptionMode,
 } from '@/session/transport/encryption/sessionEncryptionContext';
+import { resolveSessionUserMessageRequestedAction } from './resolveSessionUserMessageRequestedAction';
 
 /**
  * The single owner of "seal one user message and put it into durable Pending
@@ -128,7 +129,9 @@ export async function admitSessionUserMessageToPendingQueue(params: Readonly<{
           }),
         } as const);
 
-  const requestedAction = params.requestedAction ?? { v: 1, kind: 'steer_if_active' as const };
+  const requestedAction = resolveSessionUserMessageRequestedAction({
+    ...(params.requestedAction ? { requestedAction: params.requestedAction } : {}),
+  });
 
   const candidate: SessionUserMessageAdmissionBody = content.t === 'encrypted'
     ? { localId: params.localId, ciphertext: content.c, messageRole: 'user', requestedAction,

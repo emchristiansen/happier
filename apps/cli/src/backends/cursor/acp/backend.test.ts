@@ -41,29 +41,11 @@ describe('buildCursorAcpBackendOptions', () => {
     expect(options.authentication).toEqual({ kind: 'static', methodId: 'cursor_login' });
   });
 
-  it('does not negotiate the Cursor parameterized model picker for normal runtime sessions', () => {
+  it('negotiates Cursor model parameters for every ACP session', () => {
     process.env.PATH = '';
     process.env.HAPPIER_CURSOR_PATH = createFakeCursorAgent();
 
     const options = buildCursorAcpBackendOptions({ cwd: '/tmp', env: {} });
-    const request = buildInitializeRequest({
-      clientName: 'happier',
-      clientVersion: '0.0.0',
-      initializeClientCapabilitiesMeta: options.initializeClientCapabilitiesMeta,
-    });
-
-    expect(request.clientCapabilities?._meta).toBeUndefined();
-  });
-
-  it('can opt into the Cursor parameterized model picker for discovery probes', () => {
-    process.env.PATH = '';
-    process.env.HAPPIER_CURSOR_PATH = createFakeCursorAgent();
-
-    const options = buildCursorAcpBackendOptions({
-      cwd: '/tmp',
-      env: {},
-      parameterizedModelPicker: true,
-    });
     const request = buildInitializeRequest({
       clientName: 'happier',
       clientVersion: '0.0.0',

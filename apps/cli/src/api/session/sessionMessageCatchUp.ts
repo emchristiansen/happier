@@ -34,7 +34,8 @@ export async function catchUpSessionMessagesAfterSeq(params: {
 }): Promise<void> {
     let cursor = Number.isFinite(params.afterSeq) && params.afterSeq >= 0 ? Math.floor(params.afterSeq) : 0;
     const serverUrl = resolveServerHttpBaseUrl();
-    for (let page = 0; page < 10; page++) {
+    while (true) {
+        const pageAfterSeq = cursor;
         let response;
         try {
             response = await axios.get(`${serverUrl}/v1/sessions/${params.sessionId}/messages`, {
@@ -116,8 +117,8 @@ export async function catchUpSessionMessagesAfterSeq(params: {
             cursor = Math.max(cursor, seq);
         }
 
-        if (typeof nextAfterSeq === 'number' && Number.isFinite(nextAfterSeq) && nextAfterSeq > cursor) {
-            cursor = nextAfterSeq;
+        if (typeof nextAfterSeq === 'number' && Number.isFinite(nextAfterSeq) && nextAfterSeq > pageAfterSeq) {
+            cursor = Math.max(cursor, nextAfterSeq);
             continue;
         }
         return;

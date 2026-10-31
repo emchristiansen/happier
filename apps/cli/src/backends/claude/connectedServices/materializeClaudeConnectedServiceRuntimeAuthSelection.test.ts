@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -1024,7 +1024,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
     })).resolves.toMatchObject({ ok: true });
   });
 
-  it('isolates runtime rematerialization from stale target temp-file collisions by staging before replacement', async () => {
+  it('isolates native credential writes from stale target temp-file collisions without replacing the home', async () => {
     const fixedUuid = 'runtime-write-failure';
     vi.resetModules();
     vi.doMock('node:crypto', async (importOriginal) => {
@@ -1068,6 +1068,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
         })}\n`,
       );
       await mkdir(join(targetClaudeConfigDir, `.credentials.${fixedUuid}.tmp`), { recursive: true });
+      await writeFile(join(targetClaudeConfigDir, 'private-state'), 'preserve through runtime refresh');
       const record = buildConnectedServiceCredentialRecord({
         now: 1_000,
         serviceId: 'claude-subscription',
@@ -1176,6 +1177,8 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
       const replacedCredential = JSON.parse(await readFile(join(targetClaudeConfigDir, '.credentials.json'), 'utf8'));
       expect(replacedCredential.claudeAiOauth.accessToken).toBe('replacement-access-placeholder');
       expect(replacedCredential.claudeAiOauth).not.toHaveProperty('refreshToken');
+      await expect(readFile(join(targetClaudeConfigDir, 'private-state'), 'utf8')).resolves.toBe('preserve through runtime refresh');
+      expect((await lstat(join(targetClaudeConfigDir, `.credentials.${fixedUuid}.tmp`))).isDirectory()).toBe(true);
     } finally {
       vi.doUnmock('node:crypto');
       vi.resetModules();

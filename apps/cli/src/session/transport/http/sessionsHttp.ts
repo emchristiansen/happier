@@ -1,5 +1,7 @@
 import axios, { type AxiosResponse } from 'axios';
 import {
+  projectSessionMetadataForWire,
+  withConnectedServiceReaderSupport,
   type SessionStoredMessageContent,
   type SessionMessageRole,
   type SessionMessageAttentionImpact,
@@ -8,14 +10,18 @@ import {
   V2SessionByIdResponseSchema,
   V2SessionListResponseSchema,
   V2SessionMessageResponseSchema,
+  SessionTurnsProjectionV1Schema,
+  type SessionTurnsProjectionV1,
 } from '@happier-dev/protocol';
 
 import type { Credentials } from '@/persistence';
 import { resolveSessionEncryptionContext } from '@/api/client/encryptionKey';
+import { resolveSessionStoredContentEncryptionMode } from '@/session/transport/encryption/sessionEncryptionContext';
 import { createHttpStatusError, isAuthenticationStatus } from '@/api/client/httpStatusError';
 import { classifyServerEndpointError } from '@/api/client/classifyServerEndpointError';
 import { encodeBase64, encrypt } from '@/api/encryption';
 import { resolveSessionCreateEncryptionMode } from '@/api/session/resolveSessionCreateEncryptionMode';
+import { assertSessionEncryptionModeAllowedByEffectiveClientRequirement } from '@/settings/accountSettings/resolveEffectiveClientEncryptionRequirement';
 import { configuration } from '@/configuration';
 import { resolveServerHttpBaseUrl } from './serverHttpBaseUrl';
 import {
@@ -26,6 +32,28 @@ import { throwIfCliClientUpgradeRequired } from '@/api/clientCompatibility/cliCl
 
 export type RawSessionRecord = V2SessionByIdResponse['session'];
 export type RawSessionListRow = V2SessionListResponse['sessions'][number];
+
+export async function fetchSessionTurnsProjection(params: Readonly<{
+  token: string;
+  sessionId: string;
+}>): Promise<SessionTurnsProjectionV1 | null> {
+  const path = `/v1/sessions/${encodeSessionIdPathSegment(params.sessionId)}/turns`;
+  const response = await axios.get(withConnectedServiceReaderSupport(`${resolveServerHttpBaseUrl()}${path}`), {
+    headers: {
+      Authorization: `Bearer ${params.token}`,
+      'Content-Type': 'application/json',
+    },
+    timeout: configuration.sessionControlHttpTimeoutMs,
+    validateStatus: () => true,
+  });
+  if (response.status === 404) return null;
+  if (isAuthenticationStatus(response.status)) throwAuthenticationStatusError(response.status);
+  if (response.status < 200 || response.status >= 300) {
+    throwUnexpectedHttpStatusError(response.status, `Unexpected status from ${path}: ${response.status}`);
+  }
+  const parsed = SessionTurnsProjectionV1Schema.safeParse(response.data);
+  return parsed.success && parsed.data.sessionId === params.sessionId ? parsed.data : null;
+}
 
 function parseOrThrow<T>(schema: { safeParse: (value: unknown) => { success: boolean; data?: T } }, payload: unknown, message: string): T {
   const parsed = schema.safeParse(payload);
@@ -74,7 +102,7 @@ async function getSessionByIdResponse(params: Readonly<{
   const serverUrl = resolveServerHttpBaseUrl();
   const encodedSessionId = encodeSessionIdPathSegment(params.sessionId);
   const requestPurpose = buildSessionDetailRequestPurpose(params.reason ?? 'legacy-compat-proof');
-  const request = () => axios.get(`${serverUrl}/v2/sessions/${encodedSessionId}`, {
+  const request = () => axios.get(withConnectedServiceReaderSupport(`${serverUrl}/v2/sessions/${encodedSessionId}`), {
     headers: {
       Authorization: `Bearer ${params.token}`,
       'Content-Type': 'application/json',
@@ -258,7 +286,7 @@ export async function fetchSessionsPage(params: Readonly<{
   }
 
   const path = params.activeOnly ? '/v2/sessions/active' : params.archivedOnly ? '/v2/sessions/archived' : '/v2/sessions';
-  const response = await axios.get(`${serverUrl}${path}`, {
+  const response = await axios.get(withConnectedServiceReaderSupport(`${serverUrl}${path}`), {
     headers: {
       Authorization: `Bearer ${params.token}`,
       'Content-Type': 'application/json',
@@ -373,25 +401,29 @@ export async function getOrCreateSessionByTag(params: Readonly<{
     serverBaseUrl: serverUrl,
   });
 
-  const { encryptionKey, encryptionVariant, dataEncryptionKey } = resolveSessionEncryptionContext(params.credentials);
+  const encryptionContext = desiredSessionEncryptionMode === 'e2ee' ? resolveSessionEncryptionContext(params.credentials) : null;
+  const encryptSessionPayload = (value: unknown): string => {
+    if (!encryptionContext) throw new Error('Session encryption material is unavailable');
+    return encodeBase64(encrypt(encryptionContext.encryptionKey, encryptionContext.encryptionVariant, value));
+  };
 
   const metadataPayload =
     desiredSessionEncryptionMode === 'plain'
-      ? JSON.stringify(params.metadata)
-      : encodeBase64(encrypt(encryptionKey, encryptionVariant, params.metadata));
+      ? JSON.stringify(projectSessionMetadataForWire(params.metadata))
+      : encryptSessionPayload(projectSessionMetadataForWire(params.metadata));
   const agentStatePayload =
     desiredSessionEncryptionMode === 'plain'
       ? (params.agentState ? JSON.stringify(params.agentState) : null)
-      : (params.agentState ? encodeBase64(encrypt(encryptionKey, encryptionVariant, params.agentState)) : null);
+      : (params.agentState ? encryptSessionPayload(params.agentState) : null);
 
   const dataEncryptionKeyPayload =
     desiredSessionEncryptionMode === 'plain'
       ? null
-      : dataEncryptionKey
-        ? encodeBase64(dataEncryptionKey)
+      : encryptionContext?.dataEncryptionKey
+        ? encodeBase64(encryptionContext.dataEncryptionKey)
         : null;
 
-  const response = await axios.post(`${serverUrl}/v1/sessions`, {
+  const response = await axios.post(withConnectedServiceReaderSupport(`${serverUrl}/v1/sessions`), {
     tag: params.tag,
     metadata: metadataPayload,
     agentState: agentStatePayload,
@@ -421,6 +453,9 @@ export async function getOrCreateSessionByTag(params: Readonly<{
   if (!parsed || !parsed.session || typeof parsed.session !== 'object') {
     throw new Error('Unexpected /v1/sessions response shape');
   }
+  assertSessionEncryptionModeAllowedByEffectiveClientRequirement(
+    resolveSessionStoredContentEncryptionMode(parsed.session),
+  );
   // The current server marks whether this atomic create-or-load call created
   // the row. Older responses omit the additive field; treat that as unknown
   // rather than claiming ownership of a row that might predate this attempt.

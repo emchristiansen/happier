@@ -4,6 +4,8 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { withTempDir } from '@/testkit/fs/tempDir';
+
 import { readJsonlFileBackwardPage } from './jsonlBackwardPager';
 
 function buildJsonl(lines: unknown[], opts?: { trailingNewline?: boolean }): string {
@@ -13,6 +15,16 @@ function buildJsonl(lines: unknown[], opts?: { trailingNewline?: boolean }): str
 }
 
 describe('readJsonlFileBackwardPage', () => {
+  it('reads an intact record whose framing exactly fits the caller allowance', async () => withTempDir('happier-jsonl-boundary-', async (dir) => {
+    const filePath = join(dir, 't.jsonl');
+    const value = { text: 'é'.repeat(1024) };
+    const content = JSON.stringify(value) + '\n';
+    await writeFile(filePath, content);
+    const page = await readJsonlFileBackwardPage({ filePath, endOffsetBytes: null, maxBytes: 1024,
+      maxOversizeLineBytes: Buffer.byteLength(content), maxItems: 1 });
+    expect(page.items.map(line => line.value)).toEqual([value]);
+  }));
+
   it('pages backward from the end in stable order', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-jsonl-backward-'));
     const filePath = join(dir, 't.jsonl');
@@ -37,6 +49,45 @@ describe('readJsonlFileBackwardPage', () => {
 
     const page = await readJsonlFileBackwardPage({ filePath, endOffsetBytes: null, maxBytes: 1024, maxItems: 10 });
     expect(page.items.map((x) => (x.value as any).i)).toEqual([1, 2]);
+    expect(page.tailOffsetBytes).toBe(Buffer.byteLength(buildJsonl([{ i: 1 }, { i: 2 }], { trailingNewline: false })));
+  });
+
+  it('keeps an incomplete terminal line outside the consumed tail boundary', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-jsonl-backward-'));
+    const filePath = join(dir, 't.jsonl');
+    const complete = buildJsonl([{ i: 1 }]);
+    await writeFile(filePath, complete + JSON.stringify({ i: 2 }).slice(0, -1), 'utf8');
+
+    const page = await readJsonlFileBackwardPage({ filePath, endOffsetBytes: null, maxBytes: 1024, maxItems: 1 });
+    expect(page.items.map((line) => line.value)).toEqual([{ i: 1 }]);
+    expect(page.tailOffsetBytes).toBe(Buffer.byteLength(complete));
+  });
+
+  it('fails explicitly when the existing read allowance cannot locate a record boundary', async () => withTempDir('happier-jsonl-backward-', async (dir) => {
+    const filePath = join(dir, 't.jsonl');
+    await writeFile(filePath, JSON.stringify({ text: 'x'.repeat(4096) }).slice(0, -1), 'utf8');
+
+    await expect(readJsonlFileBackwardPage({
+      filePath, endOffsetBytes: null, maxBytes: 1024, maxItems: 1, maxOversizeLineBytes: 1024,
+    })).rejects.toMatchObject({ code: 'JSONL_RECORD_TOO_LARGE', maxLineBytes: 1024 });
+  }));
+
+  it('advances past complete malformed rows without stalling', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-jsonl-backward-'));
+    const filePath = join(dir, 't.jsonl');
+    const malformed = `not-json-${'x'.repeat(700)}\n`;
+    await writeFile(filePath, malformed + malformed, 'utf8');
+
+    const malformedPage = await readJsonlFileBackwardPage({
+      filePath,
+      endOffsetBytes: null,
+      maxBytes: 1024,
+      maxItems: 1,
+      maxOversizeLineBytes: 1024,
+    });
+    expect(malformedPage.items).toEqual([]);
+    expect(malformedPage.nextEndOffsetBytes).toBe(0);
+    expect(malformedPage.reachedStart).toBe(true);
   });
 
   it('keeps scanning backward until it can parse an oversized newest unread line', async () => {

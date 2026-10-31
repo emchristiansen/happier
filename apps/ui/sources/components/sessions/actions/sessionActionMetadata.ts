@@ -1,4 +1,5 @@
 import type * as React from 'react';
+import { isActionEnabledByActionsSettings, isApprovalRequiredByActionsSettings, type ActionsSettingsV1 } from '@happier-dev/protocol';
 
 import type { TranslationKeyNoParams } from '@/text';
 
@@ -63,8 +64,7 @@ const METADATA_BY_ACTION_ID: Readonly<Record<string, SessionActionMetadata>> = {
         titleKey: 'sessionInfo.archiveSession',
         subtitleKey: 'sessionInfo.archiveSessionSubtitle',
         icon: 'archive',
-        destructive: true,
-        requiresConfirmation: true,
+        destructive: false,
     },
     [SESSION_ACTION_UNARCHIVE_ID]: {
         titleKey: 'sessionInfo.unarchiveSession',
@@ -120,4 +120,19 @@ const METADATA_BY_ACTION_ID: Readonly<Record<string, SessionActionMetadata>> = {
 
 export function getSessionActionMetadata(actionId: string): SessionActionMetadata | null {
     return METADATA_BY_ACTION_ID[actionId] ?? null;
+}
+
+/** Single and bulk archive controls consume the same persisted UI Action policy. */
+export function resolveSessionArchiveActionPolicy(params: Readonly<{
+    actionId: typeof SESSION_ACTION_ARCHIVE_ID | typeof SESSION_ACTION_UNARCHIVE_ID;
+    settings: ActionsSettingsV1;
+    requiresStop?: boolean;
+}>): Readonly<{ enabled: boolean; requiresConfirmation: boolean; destructive: false }> {
+    const actionId = params.actionId === SESSION_ACTION_ARCHIVE_ID ? 'session.archive' : 'session.unarchive';
+    const context = { surface: 'ui_button' } as const;
+    return {
+        enabled: isActionEnabledByActionsSettings(actionId, params.settings, context),
+        requiresConfirmation: params.requiresStop === true || isApprovalRequiredByActionsSettings(actionId, params.settings, context),
+        destructive: false,
+    };
 }

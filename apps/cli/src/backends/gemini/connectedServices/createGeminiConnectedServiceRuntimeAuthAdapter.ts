@@ -1,8 +1,6 @@
 import {
-  ConnectedServiceQuotaSnapshotV1Schema,
   ConnectedServiceCredentialRevisionV1Schema,
   type ConnectedServiceCredentialRecordV1,
-  type ConnectedServiceQuotaMeterV1,
   type ConnectedServiceQuotaSnapshotV1,
 } from '@happier-dev/protocol';
 
@@ -11,15 +9,14 @@ import type {
   ConnectedServiceRuntimeFailureClassification,
   ConnectedServiceRuntimeAuthTargetInput,
 } from '@/daemon/connectedServices/runtimeAuth/types';
+import { createGeminiQuotaFetcher } from './quotaFetcher';
+import { ConnectedServiceQuotaFetchError } from '@/daemon/connectedServices/quotas/types';
 import { mapProviderLimitCategoryToRuntimeAuthFailureKind } from '@/daemon/connectedServices/runtimeAuth/mapProviderLimitCategoryToRuntimeAuthFailureKind';
 import {
   classifyProviderLimitEvidence,
   parseProviderResetAt,
 } from '@/daemon/connectedServices/quotas/normalization';
 
-const GEMINI_CODE_ASSIST_ENDPOINT = 'https://cloudcode-pa.googleapis.com';
-const GEMINI_CODE_ASSIST_API_VERSION = 'v1internal';
-const GEMINI_QUOTA_SNAPSHOT_STALE_AFTER_MS = 5 * 60 * 1000;
 
 type FetchRuntime = (url: string, init: RequestInit) => Promise<Response>;
 
@@ -84,98 +81,6 @@ function readRuntimeQuotaSnapshotStore(value: unknown): RuntimeQuotaSnapshotStor
         recordSnapshot: (record.recordSnapshot as RuntimeQuotaSnapshotStore['recordSnapshot']).bind(record),
       }
     : null;
-}
-
-function readResetAtMs(value: unknown): number | null {
-  const text = readString(value);
-  if (!text) return null;
-  const parsed = Date.parse(text);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
-}
-
-function clampPercent(value: number): number {
-  return Math.max(0, Math.min(100, value));
-}
-
-function buildCodeAssistUrl(method: string): string {
-  return `${GEMINI_CODE_ASSIST_ENDPOINT}/${GEMINI_CODE_ASSIST_API_VERSION}:${method}`;
-}
-
-async function requestGeminiCodeAssist(params: Readonly<{
-  fetchRuntime: FetchRuntime;
-  accessToken: string;
-  method: 'loadCodeAssist' | 'retrieveUserQuota';
-  body: unknown;
-}>): Promise<unknown> {
-  const response = await params.fetchRuntime(buildCodeAssistUrl(params.method), {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${params.accessToken}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify(params.body),
-  });
-  if (!response.ok) {
-    throw new Error(`gemini_code_assist_${params.method}_failed:${response.status}`);
-  }
-  return await response.json() as unknown;
-}
-
-function resolveQuotaProject(loadCodeAssistResponse: unknown): string | null {
-  return readString(readRecord(loadCodeAssistResponse)?.cloudaicompanionProject);
-}
-
-function buildMeter(bucket: unknown): ConnectedServiceQuotaMeterV1 | null {
-  const record = readRecord(bucket);
-  if (!record) return null;
-  const modelId = readString(record.modelId);
-  const remainingFraction = readFiniteNumber(record.remainingFraction);
-  if (!modelId || remainingFraction === null) return null;
-
-  const remainingAmount = readFiniteNumber(record.remainingAmount);
-  const normalizedLimit = 100;
-  const limit = remainingAmount !== null && remainingFraction > 0
-    ? Math.round(remainingAmount / remainingFraction)
-    : normalizedLimit;
-  const remaining = remainingAmount !== null
-    ? Math.max(0, Math.min(limit, remainingAmount))
-    : Math.round(clampPercent(remainingFraction * normalizedLimit));
-  const used = Math.max(0, limit - remaining);
-  const utilizationPct = clampPercent((1 - remainingFraction) * 100);
-
-  return {
-    meterId: modelId,
-    label: modelId,
-    used,
-    limit,
-    unit: remainingAmount !== null ? 'count' : 'unknown',
-    utilizationPct,
-    resetsAt: readResetAtMs(record.resetTime),
-    status: 'ok',
-    details: {},
-  };
-}
-
-function mapGeminiQuotaResponseToSnapshot(params: Readonly<{
-  profileId: string;
-  fetchedAt: number;
-  quotaResponse: unknown;
-}>): ConnectedServiceQuotaSnapshotV1 {
-  const buckets = readRecord(params.quotaResponse)?.buckets;
-  const meters = Array.isArray(buckets)
-    ? buckets.map(buildMeter).filter((meter): meter is ConnectedServiceQuotaMeterV1 => meter !== null)
-    : [];
-
-  return ConnectedServiceQuotaSnapshotV1Schema.parse({
-    v: 1,
-    serviceId: 'gemini',
-    profileId: params.profileId,
-    fetchedAt: Math.max(0, Math.trunc(params.fetchedAt)),
-    staleAfterMs: GEMINI_QUOTA_SNAPSHOT_STALE_AFTER_MS,
-    planLabel: null,
-    accountLabel: null,
-    meters,
-  });
 }
 
 function classifyGeminiRuntimeQuotaFailure(
@@ -263,30 +168,10 @@ export function createGeminiConnectedServiceRuntimeAuthAdapter(
 
       let quotaSnapshot: ConnectedServiceQuotaSnapshotV1;
       try {
-        const loadCodeAssistResponse = await requestGeminiCodeAssist({
-          fetchRuntime,
-          accessToken: record.oauth.accessToken,
-          method: 'loadCodeAssist',
-          body: { metadata: {} },
-        });
-        const project = resolveQuotaProject(loadCodeAssistResponse);
-        if (!project) {
-          return { status: 'unsupported', reason: 'gemini_code_assist_project_unavailable' };
-        }
-
-        const quotaResponse = await requestGeminiCodeAssist({
-          fetchRuntime,
-          accessToken: record.oauth.accessToken,
-          method: 'retrieveUserQuota',
-          body: { project },
-        });
-        quotaSnapshot = mapGeminiQuotaResponseToSnapshot({
-          profileId: record.profileId,
-          fetchedAt: now(),
-          quotaResponse,
-        });
-      } catch {
-        return { status: 'unsupported', reason: 'gemini_code_assist_request_failed' };
+        quotaSnapshot = (await createGeminiQuotaFetcher({ fetchRuntime }).fetch({ record, now: now(), signal: new AbortController().signal }))!;
+      } catch (error) {
+        return { status: 'unsupported', reason: error instanceof ConnectedServiceQuotaFetchError && error.message === 'gemini_code_assist_project_unavailable'
+          ? 'gemini_code_assist_project_unavailable' : 'gemini_code_assist_request_failed' };
       }
       const selection = readRecord(input.selection);
       const groupId = readString(selection?.groupId);

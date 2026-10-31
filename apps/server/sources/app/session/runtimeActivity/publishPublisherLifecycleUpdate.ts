@@ -60,9 +60,10 @@ export async function publishSessionPublisherLifecycleUpdate(params: Readonly<{
                 : {}),
         });
     }));
-    if (typeof params.badgeAttentionChanged === "boolean") {
+    // Reachability changes badge eligibility independently of turn or Runtime Activity updates.
+    if (params.badgeAttentionChanged === true || typeof params.active === "boolean") {
         await refreshSessionParticipantBadgePushes({
-            badgeAttentionChanged: params.badgeAttentionChanged,
+            badgeAttentionChanged: true,
             participantCursors: params.participantCursors,
         });
     }

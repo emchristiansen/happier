@@ -1,8 +1,4 @@
 import type { UiWebMode } from './uiWebTypes';
-import { applyExpoNodeHeapEnv } from '../../../../../scripts/expo/expoNodeHeapEnv.mjs';
-
-const UI_WEB_EXPO_HEAP_ENV_KEY = 'HAPPIER_E2E_UI_WEB_MAX_OLD_SPACE_SIZE_MB';
-const UI_WEB_EXPO_DEFAULT_MAX_OLD_SPACE_SIZE_MB = 8192;
 
 export function readPositiveEnvInt(raw: unknown, fallback: number): number {
   const parsed = Number.parseInt((raw ?? '').toString().trim(), 10);
@@ -21,11 +17,4 @@ export function resolveUiWebEntryProbeTimeoutMs(env: NodeJS.ProcessEnv): number 
 export function resolveUiWebExportFallbackToMetro(env: NodeJS.ProcessEnv): boolean {
   const raw = String(env.HAPPIER_E2E_UI_WEB_EXPORT_FALLBACK_TO_METRO ?? '1').trim().toLowerCase();
   return !(raw === '0' || raw === 'false' || raw === 'no' || raw === 'off');
-}
-
-export function applyUiWebExpoNodeHeapEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return applyExpoNodeHeapEnv(env, {
-    envKey: UI_WEB_EXPO_HEAP_ENV_KEY,
-    defaultSizeMb: UI_WEB_EXPO_DEFAULT_MAX_OLD_SPACE_SIZE_MB,
-  });
 }

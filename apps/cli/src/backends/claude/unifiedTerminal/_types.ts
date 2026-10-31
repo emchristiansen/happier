@@ -9,7 +9,7 @@ import type {
 import type { ClaudeScreenState } from './tuiControls/screenState';
 
 export type ClaudeUnifiedPromptOrigin = Readonly<{
-  kind: 'ui_pending' | 'ui_immediate' | 'rpc';
+  kind: 'ui_pending' | 'ui_immediate' | 'goal_control';
   clientId?: string | undefined;
   nonce?: string | undefined;
 }>;
@@ -30,6 +30,7 @@ export type ClaudeUnifiedPromptBatch<Mode = unknown> = Readonly<{
    */
   userMessageLocalIds?: readonly string[];
   pendingProviderAction?: import('@/agent/runtime/modeMessageQueue').PendingProviderAction;
+  pendingRequestedAction?: import('@happier-dev/protocol').PendingRequestedActionV1;
   providerAcceptancePending?: boolean;
 }>;
 
@@ -73,6 +74,7 @@ export type ClaudeUnifiedPromptInjectionFailureHandler<Mode = unknown> = (
 ) => ClaudeUnifiedPromptInjectionFailureHandling | Promise<ClaudeUnifiedPromptInjectionFailureHandling>;
 
 export type ClaudeUnifiedPromptInjectionOptions = Readonly<{
+  resolveDeliveryState?: TerminalPromptInput['resolveDeliveryState'];
   /**
    * The prompt is being steered into a RUNNING turn (Claude's TUI queues it natively and submits it
    * at turn end). The injector must skip quiet-screen deferral: a generating screen is never quiet,
@@ -131,7 +133,10 @@ export type ClaudeUnifiedInputArbiter<Mode = unknown> = Readonly<{
    */
   claimPendingInputInterruptAndRun(localId: string): boolean;
   confirmPromptAcceptedByProvider(): Promise<boolean>;
-  confirmPromptAcceptedByProviderIf(matcher: (batch: ClaudeUnifiedPromptBatch<Mode>) => boolean): Promise<boolean>;
+  confirmPromptAcceptedByProviderIf(
+    matcher: (batch: ClaudeUnifiedPromptBatch<Mode>) => boolean,
+    evidence?: 'prompt_submit' | 'transcript',
+  ): Promise<boolean>;
   observePendingProviderAcceptanceTerminalFailure(): Promise<boolean>;
   drainWhenSafe(): Promise<void>;
   waitForPendingQueuePumpStateChange(options: Readonly<{

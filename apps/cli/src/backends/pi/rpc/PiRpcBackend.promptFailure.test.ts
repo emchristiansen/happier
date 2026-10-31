@@ -7,15 +7,32 @@ import { join } from 'node:path';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import { logger } from '@/ui/logger';
 import type { AgentMessage } from '@/agent/core';
-import { CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS } from '@/daemon/connectedServices/runtimeAuth/reportConnectedServiceRuntimeAuthFailureToDaemon';
+import { buildUsageLimitIssueFingerprint } from '@happier-dev/protocol';
+import type { SessionTurnMutationV1 } from '@/api/session/mutations/sessionMutationTypes';
+import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
+import { createTestAcpRuntime } from '@/testkit/backends/acpRuntime';
+import { createApprovedPermissionHandler } from '@/testkit/backends/permissionHandler';
+import { createBasicSessionClientWithOverrides } from '@/testkit/backends/sessionFixtures';
+import { MessageBuffer } from '@/ui/ink/messageBuffer';
+import { agent } from '../index';
 
 import { PiRpcBackend } from './PiRpcBackend';
 
-const mockNotifyDaemonConnectedServiceRuntimeAuthFailure = vi.hoisted(() => vi.fn(async () => ({})));
+const daemonBoundary = vi.hoisted(() => ({ outboxRoot: '' }));
+const mockNotifyDaemonConnectedServiceRuntimeAuthFailure = vi.hoisted(() => vi.fn(async (_body: unknown, _options?: unknown) => ({
+  ok: true, result: { status: 'recovery_superseded' },
+})));
 
 vi.mock('@/daemon/controlClient', () => ({
   notifyDaemonConnectedServiceRuntimeAuthFailure: mockNotifyDaemonConnectedServiceRuntimeAuthFailure,
 }));
+// The daemon transport and its durable outbox are external boundaries; use disposable custody.
+vi.mock('@/configuration', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/configuration')>();
+  return { ...actual, configuration: Object.create(actual.configuration, {
+    activeServerDir: { get: () => daemonBoundary.outboxRoot || actual.configuration.activeServerDir },
+  }) };
+});
 
 function makeTempDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -38,6 +55,7 @@ function makeFakePiRpcProcessScript(dir: string): string {
 const readline = require('node:readline');
 const rl = readline.createInterface({ input: process.stdin });
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
+let catalogPublished = false;
 
 rl.on('line', (line) => {
   let command;
@@ -52,6 +70,13 @@ rl.on('line', (line) => {
       out({ id: command.id, type: 'response', command: 'new_session', success: true, data: { cancelled: false } });
       break;
     case 'get_state':
+      if (!catalogPublished) {
+        catalogPublished = true;
+        process.stderr.write(JSON.stringify({ type: 'happier-pi-model-catalog', models: [
+          { id: 'gpt-4o-mini', provider: 'openai', name: 'GPT-4o mini' },
+          { id: 'unnamed-model', provider: 'local' }
+        ] }) + '\\n');
+      }
       out({
         id: command.id,
         type: 'response',
@@ -213,6 +238,9 @@ rl.on('line', (line) => {
         type: 'response',
         command: 'prompt',
         success: false,
+        retryable: true,
+        attempt: 2,
+        maxAttempts: 3,
         error: 'Provider session failed'
       });
       break;
@@ -655,7 +683,7 @@ rl.on('line', (line) => {
   return scriptPath;
 }
 
-function makeFakePiRpcStructuredTurnFailedScript(dir: string): string {
+function makeFakePiRpcStructuredTurnFailedScript(dir: string, input: Readonly<{ usageLimit?: boolean }> = {}): string {
   const scriptPath = join(dir, 'fake-pi-rpc-structured-turn-failed.js');
   const script = `
 const readline = require('node:readline');
@@ -705,9 +733,9 @@ rl.on('line', (line) => {
       setTimeout(() => {
         out({
           type: 'turn_failed',
-          code: 'provider_auth_failed',
-          errorMessage: 'OpenAI Codex token sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa was rejected',
-          data: { status: 401 }
+          code: ${JSON.stringify(input.usageLimit ? 'usage_limit_reached' : 'provider_auth_failed')},
+          errorMessage: ${JSON.stringify(input.usageLimit ? 'OpenAI Codex usage limit reached' : 'OpenAI Codex token sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa was rejected')},
+          data: { status: ${input.usageLimit ? 429 : 401} }
         });
         out({ type: 'agent_end' });
       }, 10);
@@ -779,7 +807,7 @@ rl.on('line', (line) => {
             provider: 'openai-codex',
             model: 'gpt-5.6-luna',
             stopReason: 'error',
-            errorMessage: '401: {"error":{"code":"provider_auth_failed","message":"Credential sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa was rejected"},"request_body":"secret prompt payload"}'
+            errorMessage: '401: {"error":{"code":"provider_auth_failed","message":"Credential sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa was rejected; echoed request marker PI_PROVIDER_PROMPT_ECHO_7f9a"},"request_body":"secret prompt payload"}'
           }
         });
         out({ type: 'agent_end', willRetry: false });
@@ -1601,6 +1629,7 @@ describe('PiRpcBackend prompt error handling', () => {
 
   afterEach(async () => {
     mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mockClear();
+    daemonBoundary.outboxRoot = '';
     while (tempDirs.length > 0) {
       const dir = tempDirs.pop();
       if (dir) rmSync(dir, { recursive: true, force: true });
@@ -1710,10 +1739,22 @@ describe('PiRpcBackend prompt error handling', () => {
           expect.objectContaining({
             classification: 'pi_provider_failure',
             providerCode: 'pi_provider_session_error',
-            sanitizedPreview: 'Pi provider rejected the prompt before acceptance without details',
+            runtimeProvider: 'openai-codex',
+            runtimeModelId: 'openai-codex/gpt-5.5',
+            failureRecord: expect.objectContaining({
+              type: 'response',
+              command: 'prompt',
+              success: false,
+              retryable: true,
+              attempt: 2,
+              maxAttempts: 3,
+              keys: ['id', 'type', 'command', 'success', 'retryable', 'attempt', 'maxAttempts', 'error'],
+            }),
           }),
         ],
       ]);
+      expect(warnSpy.mock.calls.filter(([message]) => message === '[pi] Provider turn failed')[0]?.[1])
+        .not.toHaveProperty('sanitizedPreview');
     } finally {
       warnSpy.mockRestore();
       await backend.dispose();
@@ -2048,12 +2089,13 @@ describe('PiRpcBackend prompt error handling', () => {
       const status = messages.find((message) => message?.type === 'status' && message.status === 'error');
       expect(status?.detail).toContain('code=provider_auth_failed');
       expect(status?.detail).toContain('message=Credential [REDACTED] was rejected');
+      expect(status?.detail).toContain('PI_PROVIDER_PROMPT_ECHO_7f9a');
 
       expect(readProviderFailureToolResults(messages)).toEqual([
         expect.objectContaining({
           type: 'tool-result',
           toolName: 'terminal-output',
-          result: 'Pi provider reported provider failure after prompt acceptance: code=provider_auth_failed, status=401, message=Credential [REDACTED] was rejected',
+          result: expect.stringContaining('PI_PROVIDER_PROMPT_ECHO_7f9a'),
           isError: true,
           callId: expect.any(String),
         }),
@@ -2064,19 +2106,92 @@ describe('PiRpcBackend prompt error handling', () => {
       expect(logCalls[0]?.[1]).toMatchObject({
         classification: 'pi_provider_failure',
         providerCode: 'provider_auth_failed',
-        sanitizedPreview: expect.stringContaining('Credential [REDACTED] was rejected'),
+        runtimeProvider: 'openai-codex',
+        runtimeModelId: 'openai-codex/gpt-5.6-luna',
+        failureRecord: expect.objectContaining({
+          type: 'message_end',
+          messageShape: expect.objectContaining({
+            provider: 'openai-codex',
+            model: 'gpt-5.6-luna',
+            stopReason: 'error',
+          }),
+        }),
       });
+      expect(logCalls[0]?.[1]).not.toHaveProperty('sanitizedPreview');
 
-      const serialized = JSON.stringify({ messages, logCalls });
-      expect(serialized).not.toContain('sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-      expect(serialized).not.toContain('secret prompt payload');
+      const serializedLogs = JSON.stringify(logCalls);
+      expect(serializedLogs).not.toContain('PI_PROVIDER_PROMPT_ECHO_7f9a');
+      expect(serializedLogs).not.toContain('sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+      expect(serializedLogs).not.toContain('secret prompt payload');
     } finally {
       warnSpy.mockRestore();
       await backend.dispose();
     }
   });
 
-  it('reports classified Pi assistant provider failures to the daemon', async () => {
+  it.each([
+    { kind: 'usage_limit', serviceId: 'claude-subscription', profileId: 'claude-primary', groupId: 'claude-main', script: makeFakePiRpcUsageLimitScript },
+    { kind: 'dependency_failure', serviceId: 'openai-codex', profileId: 'codex-primary', groupId: 'codex-main', script: makeFakePiRpcCompactionDependencyFailureScript },
+    { kind: 'rate_limit', serviceId: 'openai-codex', profileId: 'codex-primary', groupId: 'codex-main', script: (dir: string) => makeFakePiRpcStructuredTurnFailedScript(dir, { usageLimit: true }) },
+  ] as const)('reports accepted Pi $kind with the exact canonical failed-turn issue fingerprint', async (input) => {
+    const workDir = makeTempDir('happier-pi-rpc-canonical-limit-');
+    tempDirs.push(workDir);
+    daemonBoundary.outboxRoot = workDir;
+    const fakeScript = input.script(workDir);
+    const happierSessionId = `happy-pi-canonical-${input.kind}-${input.serviceId}`;
+    const mutations: SessionTurnMutationV1[] = [];
+    let turnCount = 0;
+    const sessionTurnLifecycle = createSessionTurnLifecycle({
+      sessionId: happierSessionId, createId: () => `canonical-pi-turn-${++turnCount}`,
+      enqueueSessionTurn: async (mutation) => { mutations.push(mutation); },
+    });
+    const env = { HAPPIER_PI_RPC_COMPACTION_RESUME_GRACE_MS: '10', [HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY]: JSON.stringify([
+      { kind: 'group', serviceId: input.serviceId, groupId: input.groupId, activeProfileId: input.profileId, fallbackProfileId: 'fallback', generation: 4 },
+      { kind: 'profile', serviceId: input.serviceId === 'openai-codex' ? 'claude-subscription' : 'openai-codex', profileId: 'other-provider' },
+    ]) };
+    const backend = new PiRpcBackend({ cwd: workDir, command: process.execPath, args: [fakeScript],
+      happierSessionId, env });
+    const runtime = createTestAcpRuntime({ provider: 'pi', directory: workDir,
+      happierSessionId, processEnv: env,
+      session: { ...createBasicSessionClientWithOverrides({
+        sendAgentMessage: (provider, body) => {
+          void sessionTurnLifecycle.observeAcpLifecycleMarker({ provider, body }).pendingWrite;
+        },
+      }), sessionTurnLifecycle },
+      messageBuffer: new MessageBuffer(), mcpServers: {}, permissionHandler: createApprovedPermissionHandler(),
+      onThinkingChange: () => {}, ensureBackend: async () => backend,
+      hooks: await agent.getAcpRuntimeTurnHooks(),
+    });
+    try {
+      await runtime.startOrLoad({ resumeId: null });
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        runtime.beginTurn();
+        const error = await runtime.sendPrompt('continue').then(() => null, (error: unknown) => error);
+        await runtime.failTurn(error);
+        await runtime.flushTurn();
+      }
+      const issues = mutations.flatMap((mutation) => mutation.action === 'fail' && mutation.issue ? [mutation.issue] : []);
+      expect(issues).toHaveLength(2);
+      const fingerprints = issues.map((issue) => buildUsageLimitIssueFingerprint(issue));
+      expect(new Set(fingerprints).size).toBe(2);
+      await vi.waitFor(() => {
+        const reports = mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.map(([body]) => body)
+          .filter((body) => body && typeof body === 'object' && Reflect.get(body, 'sessionId') === happierSessionId);
+        expect(reports).toHaveLength(fingerprints.length);
+        expect(reports).toEqual(expect.arrayContaining(fingerprints.map((runtimeIssueFingerprint) => expect.objectContaining({
+          sessionId: happierSessionId, classification: expect.objectContaining({
+            kind: input.kind, serviceId: input.serviceId, profileId: input.profileId, groupId: input.groupId,
+            runtimeIssueFingerprint,
+          }),
+        }))));
+      });
+    } finally {
+      await runtime.reset();
+      await backend.dispose();
+    }
+  });
+
+  it('preserves classified Pi assistant failures for the canonical turn owner', async () => {
     const workDir = makeTempDir('happier-pi-rpc-usage-limit-');
     tempDirs.push(workDir);
     const fakeScript = makeFakePiRpcUsageLimitScript(workDir);
@@ -2113,32 +2228,13 @@ describe('PiRpcBackend prompt error handling', () => {
         },
       });
 
-      // Fail-closed escalation: a genuinely-unfinished usage-limit turn MUST report the
-      // classified runtime-auth failure to the daemon. We assert the escalation body's
-      // stable contract via objectContaining (kind/service/profile/group + reset hints)
-      // and the canonical delivery-timeout policy, without pinning every diagnostic field.
-      await vi.waitFor(() => {
-        expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).toHaveBeenCalledWith(
-          expect.objectContaining({
-            sessionId: 'happy-session-usage-limit',
-            switchesThisTurn: 0,
-            classification: expect.objectContaining({
-              kind: 'usage_limit',
-              serviceId: 'claude-subscription',
-              profileId: 'claude-primary',
-              groupId: 'claude-main',
-              retryAfterMs: 150_000,
-            }),
-          }),
-          expect.objectContaining({ timeoutMs: CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS }),
-        );
-      });
+      expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).not.toHaveBeenCalled();
     } finally {
       await backend.dispose();
     }
   });
 
-  it('reports classified terminal compaction dependency failures to the daemon', async () => {
+  it('preserves classified terminal compaction failures for the canonical turn owner', async () => {
     const workDir = makeTempDir('happier-pi-rpc-compaction-dependency-');
     tempDirs.push(workDir);
     const fakeScript = makeFakePiRpcCompactionDependencyFailureScript(workDir);
@@ -2175,24 +2271,7 @@ describe('PiRpcBackend prompt error handling', () => {
         },
       });
 
-      // Fail-closed escalation: a terminal compaction dependency failure that interrupted
-      // genuinely-unfinished work MUST still escalate to the daemon (this is what guards the
-      // Pi post-final-compaction reorder from silently swallowing real interruptions).
-      await vi.waitFor(() => {
-        expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).toHaveBeenCalledWith(
-          expect.objectContaining({
-            sessionId: 'happy-session-compaction-dependency',
-            switchesThisTurn: 0,
-            classification: expect.objectContaining({
-              kind: 'dependency_failure',
-              serviceId: 'openai-codex',
-              profileId: 'codex-primary',
-              groupId: 'codex-main',
-            }),
-          }),
-          expect.objectContaining({ timeoutMs: CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS }),
-        );
-      });
+      expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure).not.toHaveBeenCalled();
     } finally {
       await backend.dispose();
     }
@@ -2254,7 +2333,7 @@ describe('PiRpcBackend prompt error handling', () => {
     }
   });
 
-  it('exposes session model state after startSession (for model probing)', async () => {
+  it('publishes the complete session model state asynchronously after startSession', async () => {
     const workDir = makeTempDir('happier-pi-rpc-models-');
     tempDirs.push(workDir);
     const fakeScript = makeFakePiRpcProcessScript(workDir);
@@ -2266,9 +2345,23 @@ describe('PiRpcBackend prompt error handling', () => {
       env: {},
     });
 
+    const completeModelState = new Promise<Record<string, unknown>>((resolve) => {
+      backend.onMessage((message) => {
+        if (
+          message.type === 'event'
+          && message.name === 'session_models_state'
+          && Array.isArray((message.payload as { availableModels?: unknown })?.availableModels)
+          && (message.payload as { availableModels: unknown[] }).availableModels.length > 0
+        ) {
+          resolve(message.payload as Record<string, unknown>);
+        }
+      });
+    });
+
     try {
       await backend.startSession();
-      const state = (backend as any).getSessionModelState?.() ?? null;
+      await completeModelState;
+      const state = backend.getSessionModelState();
       expect(state).toEqual({
         currentModelId: 'openai/gpt-4o-mini',
         availableModels: [

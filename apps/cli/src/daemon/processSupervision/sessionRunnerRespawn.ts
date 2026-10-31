@@ -114,7 +114,8 @@ function buildRespawnOptions(params: Readonly<{
   const resumeFromOptions = normalizeOptionalString(params.spawnOptions.resume);
   const resumeFromTracked = normalizeOptionalString(params.vendorResumeId);
   const effectiveResume = resumeFromOptions || resumeFromTracked;
-  const { resume: _resume, ...spawnOptionsWithoutResume } = params.spawnOptions;
+  // Recovery is a new launch, not a retry of the caller's already accepted request.
+  const { resume: _resume, spawnNonce: _spawnNonce, ...spawnOptionsWithoutResume } = params.spawnOptions;
   return {
     ...spawnOptionsWithoutResume,
     ...(effectiveResume ? { resume: effectiveResume } : {}),
@@ -401,8 +402,7 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
       const forceRestart = options?.forceRestart === true;
       if (forceRestart) {
         // A connected-service-initiated forced restart explicitly supersedes any prior stop request
-        // (e.g. a stale flag left by an earlier manual stop that the resume path never cleared --
-        // `clearStopRequested` has no production caller). Without this, the forced kill's respawn is
+        // (e.g. a stop request before an explicit connected-service restart). Without this, the forced kill's respawn is
         // silently vetoed and the session dies, surfaced to the user as an exit-143 crash. Clearing
         // here makes the manager map, a freshly-created controller, and the scheduled-spawn re-check
         // all treat this as the intentional restart it is.

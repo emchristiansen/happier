@@ -72,6 +72,17 @@ describe('shouldAutoStartDaemonAfterAuth', () => {
       }),
     ).toBe(false);
   });
+
+  it('does not auto-start when guided setup owns the post-auth service reconciliation', () => {
+    expect(
+      shouldAutoStartDaemonAfterAuth({
+        env: { HAPPIER_SESSION_AUTOSTART_DAEMON: '1' },
+        isDaemonProcess: false,
+        startedBy: 'terminal',
+        callerIntent: 'setup-managed',
+      }),
+    ).toBe(false);
+  });
 });
 
 describe('applyDaemonAutostartEnvForInvocation', () => {

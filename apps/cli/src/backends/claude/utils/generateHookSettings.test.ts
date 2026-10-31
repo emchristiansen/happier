@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, w
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { writeExecutableShimSync } from '@/testkit/fs/executableShim';
@@ -116,12 +116,22 @@ describe('generateHookPluginDir', () => {
   const createdPluginDirs: string[] = [];
   const envKeys = [
     'CLAUDE_CONFIG_DIR',
+    'HAPPIER_JS_RUNTIME_PATH',
     'HAPPIER_MANAGED_NODE_BIN',
+    'HAPPIER_NODE_PATH',
     'HAPPIER_HOME_DIR',
     'HAPPIER_CLAUDE_HOOKS_DISABLED',
     'HAPPIER_CLAUDE_PERMISSION_HOOK_TIMEOUT_SECONDS',
   ] as const;
   let envScope = createEnvKeyScope(envKeys);
+
+  beforeEach(() => {
+    envScope.patch({
+      HAPPIER_JS_RUNTIME_PATH: undefined,
+      HAPPIER_MANAGED_NODE_BIN: undefined,
+      HAPPIER_NODE_PATH: undefined,
+    });
+  });
 
   afterEach(() => {
     for (const filePath of createdFiles.splice(0, createdFiles.length)) {
@@ -312,6 +322,7 @@ describe('generateHookPluginDir', () => {
 
     const hooksPath = join(pluginDir!, 'hooks', 'hooks.json');
     const parsed = JSON.parse(readFileSync(hooksPath, 'utf8')) as any;
+    expect(parsed.hooks?.PermissionRequest?.[0]?.matcher).toBe('*');
     const permissionCommand = parsed.hooks?.PermissionRequest?.[0]?.hooks?.[0]?.command as string;
     expect(permissionCommand).toContain('permission_hook_forwarder.cjs');
     expect(permissionCommand).toContain(pluginDir!);

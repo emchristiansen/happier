@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ConnectedServiceIdSchema } from "@happier-dev/protocol";
 
 import { resolveConnectedServicesFeature } from "./connectedServicesFeature";
 
@@ -9,13 +10,19 @@ describe("resolveConnectedServicesFeature", () => {
         expect(feature.features?.connectedServices).toEqual({
             enabled: true,
             quotas: { enabled: true },
+            quotaRecoveryCreditDetails: { enabled: true },
             subscription: { enabled: true },
             accountGroups: { enabled: true },
             accountFallback: { enabled: true },
             autoQuotaReset: { enabled: true },
+            autoDisablePlanInvalid: { enabled: true },
+            poolQuotaLimitSelection: { enabled: true },
+            poolExpiryFirst: { enabled: true },
         });
         expect(feature.capabilities?.connectedServices).toEqual({
+            supportedServiceIds: ConnectedServiceIdSchema.options,
             credentialDelete: { revisionGuard: true },
+            credentialWrite: { revisionGuard: true },
         });
     });
 
@@ -30,10 +37,14 @@ describe("resolveConnectedServicesFeature", () => {
         expect(feature.features?.connectedServices).toEqual({
             enabled: false,
             quotas: { enabled: true },
+            quotaRecoveryCreditDetails: { enabled: true },
             subscription: { enabled: true },
             accountGroups: { enabled: true },
             accountFallback: { enabled: true },
             autoQuotaReset: { enabled: true },
+            autoDisablePlanInvalid: { enabled: true },
+            poolQuotaLimitSelection: { enabled: true },
+            poolExpiryFirst: { enabled: true },
         });
     });
 
@@ -46,10 +57,14 @@ describe("resolveConnectedServicesFeature", () => {
         expect(feature.features?.connectedServices).toEqual({
             enabled: true,
             quotas: { enabled: true },
+            quotaRecoveryCreditDetails: { enabled: true },
             subscription: { enabled: true },
             accountGroups: { enabled: false },
             accountFallback: { enabled: false },
             autoQuotaReset: { enabled: true },
+            autoDisablePlanInvalid: { enabled: true },
+            poolQuotaLimitSelection: { enabled: true },
+            poolExpiryFirst: { enabled: true },
         });
     });
 });

@@ -1,4 +1,3 @@
-import chalk from 'chalk';
 
 import type { CommandContext } from '@/cli/commandRegistry';
 import { wantsJson, printJsonEnvelope } from '@/cli/output/jsonEnvelope';
@@ -6,6 +5,7 @@ import { mapUnknownErrorToControlError } from '@/cli/control/controlErrorMapping
 
 import { showServerHelp } from './server/help';
 import { runServerSubcommand } from './server/subcommands';
+import { fail } from '@happier-dev/cli-common/output';
 
 export async function handleServerCommand(args: string[]): Promise<void> {
   const json = wantsJson(args);
@@ -80,7 +80,7 @@ export async function handleServerCliCommand(context: CommandContext): Promise<v
       );
       return;
     }
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     showServerHelp();
     if (process.env.DEBUG) console.error(error);
     process.exitCode = typeof process.exitCode === 'number' && process.exitCode > 1 ? process.exitCode : 1;

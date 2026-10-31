@@ -60,6 +60,9 @@ export const UI_FEATURE_REGISTRY = {
     'encryption.plaintextStorage': {
         settingsToggle: undefined,
     },
+    'encryption.plaintextMachine': {
+        settingsToggle: undefined,
+    },
     'encryption.accountOptOut': {
         settingsToggle: undefined,
     },
@@ -110,7 +113,11 @@ export const UI_FEATURE_REGISTRY = {
         settingsToggle: undefined,
     },
     'connectedServices.subscription': { settingsToggle: undefined },
+    'connectedServices.quotaRecoveryCreditDetails': { settingsToggle: undefined },
     'connectedServices.autoQuotaReset': { settingsToggle: undefined },
+    'connectedServices.autoDisablePlanInvalid': { settingsToggle: undefined },
+    'connectedServices.poolQuotaLimitSelection': { settingsToggle: undefined },
+    'connectedServices.poolExpiryFirst': { settingsToggle: undefined },
     'connectedServices.accountFallback': {
         settingsToggle: undefined,
     },

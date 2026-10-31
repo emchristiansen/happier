@@ -6,6 +6,7 @@ import {
     type SessionListAttentionPromotionMode,
 } from '@/sync/domains/session/listing/attentionPromotion/sessionListAttentionPromotion';
 import type { SessionAttentionStandingPolicy } from '@/sync/domains/session/organization/attentionStanding';
+import type { SessionAttentionStanding } from '@happier-dev/protocol';
 
 export type SessionAttentionStandingInputs = Readonly<{
     /** Where the attention band puts a promoted session, or `off` when there is no band at all. */
@@ -24,7 +25,7 @@ export type SessionAttentionStandingInputs = Readonly<{
  * session organization view state so this adds no extra projection subscription.
  */
 export function useSessionAttentionStandingInputs(
-    overridesBySessionKey: Readonly<Record<string, boolean>>,
+    overridesBySessionKey: Readonly<Record<string, SessionAttentionStanding>>,
 ): SessionAttentionStandingInputs {
     const promotionMode = normalizeSessionListAttentionPromotionMode(useSetting('sessionListAttentionPromotionModeV1'));
     const defaultStanding = useSetting('sessionListAttentionStandingDefaultV1') === true;

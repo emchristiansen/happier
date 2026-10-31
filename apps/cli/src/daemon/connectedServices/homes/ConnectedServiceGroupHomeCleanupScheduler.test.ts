@@ -1,4 +1,4 @@
-import { mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
@@ -7,8 +7,45 @@ import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import { buildDefaultConnectedServiceCredentialLifecycleDescriptor } from '../credentials/lifecycleTypes';
 import { ConnectedServiceGroupHomeCleanupScheduler } from './ConnectedServiceGroupHomeCleanupScheduler';
 import { resolveConnectedServiceGroupHomeDir } from './resolveConnectedServiceHomeDir';
+import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
 
 describe('ConnectedServiceGroupHomeCleanupScheduler', () => {
+  it('keeps a live execution Run pool home until its canonical runtime registration releases', async () => {
+    const root = await createTempDir('happier-group-home-live-run-');
+    try {
+      const home = resolveConnectedServiceGroupHomeDir({
+        activeServerDir: root, serviceId: 'openai-codex', groupId: 'main', agentId: 'codex',
+      });
+      await mkdir(home, { recursive: true });
+      await writeFile(join(home, 'run-history.jsonl'), 'private live Run history\n');
+      const registry = new ConnectedServiceRuntimeRegistry();
+      registry.registerRunTarget({
+        runKey: 'execution_run:live', pid: 4321, agentId: 'codex', materializationKey: 'execution_run:live',
+        connectedServicesBindingsRaw: { v: 1, bindingsByServiceId: {
+          'openai-codex': { source: 'connected', selection: 'group', groupId: 'main', profileId: 'work' },
+        } },
+      });
+      const scheduler = new ConnectedServiceGroupHomeCleanupScheduler({
+        activeServerDir: root, runtimeRegistry: registry, hasLiveTarget: () => false,
+        resolveGroupDeletionAuthority: async () => ({ status: 'deleted' }),
+      });
+
+      await expect(scheduler.scheduleDeletedGroupCleanup({
+        serviceId: 'openai-codex', groupId: 'main', agentId: 'codex',
+      })).resolves.toMatchObject({ cleaned: false, pending: true });
+      await expect(scheduler.cleanupPendingDeletedGroupHomes()).resolves.toEqual([]);
+      expect(await readFile(join(home, 'run-history.jsonl'), 'utf8')).toBe('private live Run history\n');
+
+      registry.unregisterRunKey('execution_run:live');
+      await expect(scheduler.cleanupPendingDeletedGroupHomes()).resolves.toEqual([
+        expect.objectContaining({ cleaned: true, path: home }),
+      ]);
+      await expect(stat(home)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await removeTempDir(root);
+    }
+  });
+
   it('quarantines a deleted group home only after no live target references it', async () => {
     const root = await createTempDir('happier-connected-service-group-home-cleanup-');
     try {

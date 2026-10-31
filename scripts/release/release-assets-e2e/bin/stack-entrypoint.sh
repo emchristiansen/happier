@@ -122,6 +122,10 @@ if [[ -n "$HSTACK_HAPPIER_REPO" ]]; then
   # Its numeric owner intentionally differs from root inside the container, so
   # modern Git rejects the local clone unless this exact mounted path is admitted.
   git config --global --add safe.directory "$HSTACK_HAPPIER_REPO"
+  if [[ -d "$HSTACK_HAPPIER_REPO/.git" ]]; then
+    # hstack clones from the mounted .git directory, which Git checks separately.
+    git config --global --add safe.directory "$HSTACK_HAPPIER_REPO/.git"
+  fi
   setup_args+=( "--happier-repo=$HSTACK_HAPPIER_REPO" )
 fi
 

@@ -40,7 +40,8 @@ function readSessionId(props: Record<string, unknown>): string {
 
 function readCompactionId(props: Record<string, unknown>): string {
   return (
-    normalizeString(props.compactionID)
+    normalizeString(props.messageID)
+    || normalizeString(props.compactionID)
     || normalizeString(props.compactionId)
     || normalizeString(props.compaction_id)
     || normalizeString(props.id)

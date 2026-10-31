@@ -51,13 +51,6 @@ export type NativeCryptoWorkerQueueWaitFields = Readonly<{
     waitMs: number;
 }>;
 
-export type NativeCryptoWorkerQueueBackpressureFields = Readonly<{
-    operation: NativeCryptoWorkerOperation;
-    queueDepth: number;
-    inFlightCount: number;
-    capacity: number;
-}>;
-
 export type NativeCryptoWorkerAppStateQuiescentFields = Readonly<{
     queueDepth: number;
     inFlightCount: number;
@@ -190,18 +183,6 @@ export function recordNativeCryptoWorkerQueueWait(
         operation: encodeOperation(fields.operation),
         items: fields.items,
         queueDepth: fields.queueDepth,
-    });
-}
-
-export function recordNativeCryptoWorkerQueueBackpressure(
-    telemetry: SyncPerformanceTelemetry,
-    fields: NativeCryptoWorkerQueueBackpressureFields,
-): void {
-    telemetry.count('sync.crypto.worker.queueBackpressure', {
-        operation: encodeOperation(fields.operation),
-        queueDepth: fields.queueDepth,
-        inFlightCount: fields.inFlightCount,
-        capacity: fields.capacity,
     });
 }
 

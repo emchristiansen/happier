@@ -1,7 +1,10 @@
 import type {
+  ConnectedServiceAuthGroupQuotaLimitSelectionV1,
   ConnectedServiceId,
   ConnectedServiceQuotaSnapshotV1,
+  ProviderAccountUsageOrganizationContext,
 } from '@happier-dev/protocol';
+import { compareConnectedServiceQuotaObservationRecency, isProviderAccountUsageOrganizationContextMatch } from '@happier-dev/protocol';
 
 import type { ConnectedServiceAuthGroupMemberRuntimeState } from '../selection/selectConnectedServiceAuthGroupCandidate';
 import { buildConnectedServiceAuthGroupRuntimeStateFromMeters } from './projection';
@@ -31,21 +34,55 @@ function readFetchedAt(snapshot: ConnectedServiceQuotaSnapshotV1 | null | undefi
   return Number.isFinite(fetchedAt) && fetchedAt >= 0 ? fetchedAt : 0;
 }
 
-function selectFreshestSnapshot(
-  first: ConnectedServiceQuotaSnapshotV1 | null | undefined,
-  second: ConnectedServiceQuotaSnapshotV1 | null | undefined,
-): ConnectedServiceQuotaSnapshotV1 | null {
+export type ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry = Readonly<{
+  snapshot: ConnectedServiceQuotaSnapshotV1;
+  verifiedCredentialFingerprint?: string | null;
+}>;
+
+type SnapshotCurrentContext = Readonly<{
+  context: ProviderAccountUsageOrganizationContext | null;
+  verifiedCredentialFingerprint?: string | null;
+}>;
+
+function selectFreshestSnapshotEntry(
+  first: ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry | null | undefined,
+  second: ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry | null | undefined,
+  nowMs: number,
+): ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry | null {
   if (!first) return second ?? null;
   if (!second) return first;
-  return readFetchedAt(second) > readFetchedAt(first) ? second : first;
+  return compareConnectedServiceQuotaObservationRecency({
+    existingObservedAtMs: readFetchedAt(first.snapshot),
+    incomingObservedAtMs: readFetchedAt(second.snapshot),
+    nowMs,
+  }) === 'incoming_newer' ? second : first;
+}
+
+function isSnapshotEntryCurrent(
+  entry: ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry,
+  current: SnapshotCurrentContext,
+): boolean {
+  if (entry.snapshot.providerOrganizationId) {
+    return isProviderAccountUsageOrganizationContextMatch(entry.snapshot, current.context);
+  }
+  return Boolean(current.context?.providerAccountId
+    && entry.snapshot.activeAccountId === current.context.providerAccountId
+    && current.verifiedCredentialFingerprint
+    && entry.verifiedCredentialFingerprint === current.verifiedCredentialFingerprint);
 }
 
 function shouldRecordSnapshot(
   existing: ConnectedServiceQuotaSnapshotV1 | null | undefined,
   incoming: ConnectedServiceQuotaSnapshotV1,
+  nowMs: number,
 ): boolean {
   if (!existing) return true;
-  return readFetchedAt(incoming) >= readFetchedAt(existing);
+  const recency = compareConnectedServiceQuotaObservationRecency({
+    existingObservedAtMs: readFetchedAt(existing),
+    incomingObservedAtMs: readFetchedAt(incoming),
+    nowMs,
+  });
+  return recency === 'incoming_newer' || recency === 'same';
 }
 
 type BurnObservation = Readonly<{
@@ -98,15 +135,31 @@ function isSameBurnContext(left: BurnObservation, right: BurnObservation): boole
 }
 
 export class ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore {
-  private readonly snapshotsByKey = new Map<string, ConnectedServiceQuotaSnapshotV1>();
-  private readonly snapshotsByProfileKey = new Map<string, ConnectedServiceQuotaSnapshotV1>();
+  private readonly snapshotsByKey = new Map<string, ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry>();
+  private readonly snapshotsByProfileKey = new Map<string, ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry>();
   private readonly burnHistoryByKey = new Map<string, BurnHistory>();
 
-  recordSnapshot(input: SnapshotKeyInput & Readonly<{ snapshot: ConnectedServiceQuotaSnapshotV1 }>): void {
+  recordSnapshot(input: SnapshotKeyInput & ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry): void {
     const key = snapshotKey(input);
-    if (shouldRecordSnapshot(this.snapshotsByKey.get(key), input.snapshot)) {
-      this.snapshotsByKey.set(key, input.snapshot);
-      this.recordBurnObservation(key, input.snapshot, input.groupGeneration);
+    const nowMs = Date.now();
+    const existing = this.snapshotsByKey.get(key);
+    if (shouldRecordSnapshot(existing?.snapshot, input.snapshot, nowMs)) {
+      if (existing && (existing.snapshot.providerOrganizationId || input.snapshot.providerOrganizationId
+        || existing.verifiedCredentialFingerprint || input.verifiedCredentialFingerprint)
+        && !isSnapshotEntryCurrent(existing, {
+          context: {
+            providerAccountId: input.snapshot.activeAccountId ?? null,
+            providerOrganizationId: input.snapshot.providerOrganizationId ?? null,
+          },
+          verifiedCredentialFingerprint: input.verifiedCredentialFingerprint,
+        })) {
+        this.burnHistoryByKey.delete(key);
+      }
+      this.snapshotsByKey.set(key, {
+        snapshot: input.snapshot,
+        verifiedCredentialFingerprint: input.verifiedCredentialFingerprint,
+      });
+      this.recordBurnObservation(key, input.snapshot, input.groupGeneration, nowMs);
     }
     this.recordProfileSnapshot(input);
   }
@@ -115,13 +168,18 @@ export class ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore {
     key: string,
     snapshot: ConnectedServiceQuotaSnapshotV1,
     groupGeneration: number | null | undefined,
+    nowMs: number,
   ): void {
     const observation = readBurnObservation(snapshot, groupGeneration);
     if (!observation) return;
     const existing = this.burnHistoryByKey.get(key);
     // Only advance the history when this observation is strictly newer than the latest one; a
     // duplicate/stale fetchedAt would otherwise poison the delta with a zero time window.
-    if (existing && observation.atMs <= existing.latest.atMs) return;
+    if (existing && compareConnectedServiceQuotaObservationRecency({
+      existingObservedAtMs: existing.latest.atMs,
+      incomingObservedAtMs: observation.atMs,
+      nowMs,
+    }) !== 'incoming_newer') return;
     this.burnHistoryByKey.set(key, {
       prev: existing && isSameBurnContext(existing.latest, observation) ? existing.latest : null,
       latest: observation,
@@ -184,48 +242,89 @@ export class ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore {
     };
   }
 
-  recordProfileSnapshot(input: ProfileSnapshotKeyInput & Readonly<{ snapshot: ConnectedServiceQuotaSnapshotV1 }>): void {
+  recordProfileSnapshot(input: ProfileSnapshotKeyInput & ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry): void {
     const key = profileSnapshotKey(input);
-    if (shouldRecordSnapshot(this.snapshotsByProfileKey.get(key), input.snapshot)) {
-      this.snapshotsByProfileKey.set(key, input.snapshot);
+    if (shouldRecordSnapshot(this.snapshotsByProfileKey.get(key)?.snapshot, input.snapshot, Date.now())) {
+      this.snapshotsByProfileKey.set(key, {
+        snapshot: input.snapshot,
+        verifiedCredentialFingerprint: input.verifiedCredentialFingerprint,
+      });
     }
   }
 
-  getSnapshot(input: SnapshotKeyInput): ConnectedServiceQuotaSnapshotV1 | null {
-    return selectFreshestSnapshot(
-      this.snapshotsByKey.get(snapshotKey(input)),
+  retainProfileSnapshots(input: ProfileSnapshotKeyInput & SnapshotCurrentContext): void {
+    const shouldRetainEntry = (entry: ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry): boolean => {
+      if (!entry.snapshot.providerOrganizationId && input.verifiedCredentialFingerprint === undefined) {
+        // An unavailable credential read preserves verified bytes; reuse still requires current user/token proof.
+        return Boolean(entry.verifiedCredentialFingerprint
+          && (!input.context?.providerAccountId || entry.snapshot.activeAccountId === input.context.providerAccountId));
+      }
+      return isSnapshotEntryCurrent(entry, input);
+    };
+    const profileKey = profileSnapshotKey(input);
+    const profileEntry = this.snapshotsByProfileKey.get(profileKey);
+    if (profileEntry && !shouldRetainEntry(profileEntry)) {
+      this.snapshotsByProfileKey.delete(profileKey);
+    }
+    const servicePrefix = `${input.serviceId}\0`;
+    const profileSuffix = `\0${input.profileId}`;
+    for (const [key, entry] of this.snapshotsByKey) {
+      if (!key.startsWith(servicePrefix) || !key.endsWith(profileSuffix)) continue;
+      if (shouldRetainEntry(entry)) continue;
+      this.snapshotsByKey.delete(key);
+      this.burnHistoryByKey.delete(key);
+    }
+  }
+
+  getSnapshotEntry(input: ProfileSnapshotKeyInput & Readonly<{ groupId?: string }>): ConnectedServiceAuthGroupRuntimeQuotaSnapshotEntry | null {
+    return selectFreshestSnapshotEntry(
+      input.groupId === undefined ? null : this.snapshotsByKey.get(snapshotKey({ ...input, groupId: input.groupId })),
       this.snapshotsByProfileKey.get(profileSnapshotKey(input)),
+      Date.now(),
     );
+  }
+
+  getSnapshot(input: SnapshotKeyInput): ConnectedServiceQuotaSnapshotV1 | null {
+    return this.getSnapshotEntry(input)?.snapshot ?? null;
   }
 
   buildMemberStates(input: Readonly<{
     serviceId: ConnectedServiceId;
     groupId: string;
     capturedAtMs: number;
+    quotaLimitSelection?: ConnectedServiceAuthGroupQuotaLimitSelectionV1;
   }>): Map<string, ConnectedServiceAuthGroupMemberRuntimeState> {
     void input.capturedAtMs;
     const states = new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>();
     const prefix = `${input.serviceId}\0${input.groupId}\0`;
-    for (const [key, snapshot] of this.snapshotsByKey.entries()) {
+    for (const [key, entry] of this.snapshotsByKey.entries()) {
       if (!key.startsWith(prefix)) continue;
       const profileId = key.slice(prefix.length);
       const profileSnapshot = this.snapshotsByProfileKey.get(profileSnapshotKey({ serviceId: input.serviceId, profileId }));
-      states.set(profileId, buildMemberState(selectFreshestSnapshot(snapshot, profileSnapshot) ?? snapshot));
+      states.set(profileId, buildMemberState(
+        (selectFreshestSnapshotEntry(entry, profileSnapshot, input.capturedAtMs) ?? entry).snapshot,
+        input.quotaLimitSelection,
+      ));
     }
     const profilePrefix = `${input.serviceId}\0`;
-    for (const [key, snapshot] of this.snapshotsByProfileKey.entries()) {
+    for (const [key, { snapshot }] of this.snapshotsByProfileKey.entries()) {
       if (!key.startsWith(profilePrefix)) continue;
       const profileId = key.slice(profilePrefix.length);
       if (states.has(profileId)) continue;
-      states.set(profileId, buildMemberState(snapshot));
+      states.set(profileId, buildMemberState(snapshot, input.quotaLimitSelection));
     }
     return states;
   }
 }
 
-function buildMemberState(snapshot: ConnectedServiceQuotaSnapshotV1): ConnectedServiceAuthGroupMemberRuntimeState {
+function buildMemberState(
+  snapshot: ConnectedServiceQuotaSnapshotV1,
+  quotaLimitSelection?: ConnectedServiceAuthGroupQuotaLimitSelectionV1,
+): ConnectedServiceAuthGroupMemberRuntimeState {
   return buildConnectedServiceAuthGroupRuntimeStateFromMeters({
     capturedAtMs: snapshot.fetchedAt,
     meters: snapshot.meters,
+    subscription: snapshot.subscription,
+    selection: quotaLimitSelection,
   });
 }

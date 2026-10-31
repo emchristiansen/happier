@@ -1,4 +1,5 @@
 import { logger } from "@/ui/logger";
+import { delayUnrefAbortable } from '@/utils/time';
 import { claudeLocal, ExitCodeError } from "./claudeLocal";
 import { Session, type SessionFoundInfo } from "./session";
 import type { EnhancedMode } from './loop';
@@ -15,7 +16,7 @@ import { resolvePermissionIntentFromMetadataSnapshot, resolveSessionModeOverride
 import { ensureSessionInfoBeforeSwitch } from '@/backends/claude/utils/ensureSessionInfoBeforeSwitch';
 import { configuration } from '@/configuration';
 import { resolveClaudeConfigDirOverride } from './utils/resolveClaudeConfigDirOverride';
-import { resolveClaudeCodeExperimentalEnvOverlay } from './spawn/resolveClaudeCodeExperimentalEnvOverlay';
+import { resolveClaudeSessionEnvOverlay } from './spawn/resolveClaudeSessionEnvOverlay';
 import {
     createDeferredRemoteSwitchController,
     createLocalTurnLifecycleController,
@@ -40,6 +41,7 @@ import { createClaudeWorkflowActivitySourceForSession } from './workflows/create
 import { createWorkflowAgentTranscriptRegistrar } from './remote/sidechains/createWorkflowAgentTranscriptRegistrar';
 import type { ClaudeRemoteSubagentFileCollector } from './remote/sidechains/claudeRemoteSubagentFileCollector';
 import { loadClaudeJsonlReplayBaseline } from './utils/loadClaudeJsonlReplayBaseline';
+import { ClaudeNativeProviderExitUnverifiedError, hasUnverifiedProviderTermination } from './sdk/types';
 
 function upsertClaudePermissionModeArgs(
     args: string[] | undefined,
@@ -98,6 +100,12 @@ export async function claudeLocalLauncher(
          * UI input through terminal-host injection and must not enter legacy remote mode.
          */
         remoteSwitchingEnabled?: boolean;
+        /**
+         * Runner termination. Aborting stops the local Claude child through the launcher's own
+         * process abort and returns `exit` (never a remote switch), so the launcher teardown runs
+         * before the caller closes the session transport.
+         */
+        signal?: AbortSignal;
     },
 ): Promise<LauncherResult> {
 
@@ -239,6 +247,7 @@ export async function claudeLocalLauncher(
     };
     session.addSessionFoundCallback(scannerSessionCallback);
     const lifecycleHookCallback = (data: SessionHookData) => {
+        transcriptProjector.observeRaw(data, { historicalReplay: false, authenticatedHook: true });
         lifecycleTracker.observeHook(data);
     };
     session.addClaudeSessionHookCallback(lifecycleHookCallback);
@@ -246,16 +255,29 @@ export async function claudeLocalLauncher(
     // Handle abort
     let exitReason: LauncherResult | null = null;
     let abortingForModeSwitch = false;
+    let terminationRequested = false;
     const processAbortController = new AbortController();
+    const terminationSignal = opts?.signal;
+    const onTermination = () => {
+        logger.debug('[local]: runner termination requested');
+        terminationRequested = true;
+        abortingForModeSwitch = false;
+        exitReason = { type: 'exit', code: 0 };
+        if (!processAbortController.signal.aborted) {
+            processAbortController.abort(terminationSignal?.reason ?? 'claude-runner-termination');
+        }
+    };
+    if (terminationSignal?.aborted) {
+        onTermination();
+    } else {
+        terminationSignal?.addEventListener('abort', onTermination, { once: true });
+    }
     let exitFuture = new Future<void>();
     let syncLastPermissionModeFromMetadata: (() => void) | null = null;
     let deferredRemoteSwitch: { dispose: () => void } | null = null;
     let pendingQueueWatcher: { stop: () => void } | null = null;
     try {
         workflowActivitySource?.armStartupReconciliation();
-        await session.getProviderTaskRuntimeActivityAdapter()?.activateObservation(
-            'claude-local-provider-observer-installed',
-        );
         const clientEmitter = session.client as unknown as {
             getMetadataSnapshot?: () => Metadata | null | undefined;
             on?: (event: string, listener: () => void) => void;
@@ -366,6 +388,7 @@ export async function claudeLocalLauncher(
                 process.env.HAPPIER_E2E_PROVIDERS === '1' || process.env.HAPPY_E2E_PROVIDERS === '1';
             const pendingGateStartMs = configuration.startupTimingEnabled ? Date.now() : null;
             const discardResult = await discardQueuedAndPendingForLocalSwitch({
+                signal: processAbortController.signal,
                 queue: session.queue,
                 getServerPendingCount: () => session.client.peekActionablePendingMessageQueueV2Count({ reconcileWhenEmpty: 'force', reason: 'manual-check' }),
                 discardServerPending: () =>
@@ -391,7 +414,7 @@ export async function claudeLocalLauncher(
             }
 
             if (discardResult !== 'proceed') {
-                return { type: 'switch' };
+                return exitReason ?? { type: 'switch' };
             }
         }
 
@@ -425,6 +448,12 @@ export async function claudeLocalLauncher(
             const resumeFromSessionId = session.sessionId;
             const resumeFromTranscriptPath = session.transcriptPath;
             const expectsFork = resumeFromSessionId !== null;
+            const restoreUnconfirmedFork = () => {
+                if (expectsFork && session.sessionId === null) {
+                    session.sessionId = resumeFromSessionId;
+                    session.transcriptPath = resumeFromTranscriptPath;
+                }
+            };
             if (expectsFork) {
                 // Starting local mode from an existing session uses `--resume`, which forks
                 // to a new Claude session ID and transcript file. Clear the current
@@ -435,6 +464,8 @@ export async function claudeLocalLauncher(
 
             // Launch
             logger.debug('[local]: launch');
+            // No callback means creation failed; an observed wrapper exit can still be unqualified.
+            let providerStopped: boolean | undefined;
             try {
                 syncLastPermissionModeFromMetadata?.();
 
@@ -457,10 +488,16 @@ export async function claudeLocalLauncher(
                     if (!await session.client.waitForProviderInputAdmission(processAbortController.signal)) {
                         return { type: 'exit', code: 1 };
                     }
+                    // Every local attempt owns a fresh process. Reconcile its prelaunch inventory
+                    // through the same owner as Remote before reactivating the installed scanner.
+                    const runtimeActivity = session.getProviderTaskRuntimeActivityAdapter();
+                    await runtimeActivity?.publishBeforeRuntimeStart('claude-local-provider-not-started');
+                    await runtimeActivity?.activateObservation('claude-local-provider-observer-installed');
                     await claudeLocal({
                         path: session.path,
                         sessionId: resumeFromSessionId,
                         onSessionFound: handleSessionStart,
+                        onProcessExit: result => { providerStopped = result.providerStopped; },
                         onThinkingChange: applyFd3ThinkingFallback,
                         onLifecycleGapDetected: (event) => emitClaudeUnifiedLifecycleGapDetected(unifiedTelemetry, event),
                         abort: processAbortController.signal,
@@ -468,8 +505,9 @@ export async function claudeLocalLauncher(
                         happierSessionId: session.client.sessionId,
                         systemPromptText: session.defaultSystemPromptText,
                         envOverlay: {
-                            ...resolveClaudeCodeExperimentalEnvOverlay({
+                            ...resolveClaudeSessionEnvOverlay({
                                 claudeCodeExperimentalAgentTeamsEnabled: session.claudeCodeExperimentalAgentTeamsEnabled,
+                                claudeCodeIncludeInNativeHistory: session.claudeCodeIncludeInNativeHistory,
                             }),
                         },
                         happierMcpConfigJson: baseMcpConfigJson,
@@ -477,8 +515,17 @@ export async function claudeLocalLauncher(
                         hookPluginDir: session.hookPluginDir,
                     });
                 } finally {
-                    lifecycleTracker.observeProcessExit();
+                    lifecycleTracker.observeProcessExit({ providerStopped: providerStopped === true });
                     await Promise.resolve();
+                }
+                // A cancelled pre-spawn attempt has no child exit and cannot have forked the
+                // native session. Keep the prior resume identity and unconsumed launch flags.
+                if (processAbortController.signal.aborted && providerStopped === undefined) {
+                    restoreUnconfirmedFork();
+                    break;
+                }
+                if (providerStopped === false && abortingForModeSwitch) {
+                    throw new ClaudeNativeProviderExitUnverifiedError();
                 }
 
                 // Consume one-time Claude flags after spawn
@@ -493,6 +540,17 @@ export async function claudeLocalLauncher(
                 }
             } catch (e) {
                 logger.debug('[local]: launch error', e);
+                const replacingInvocation = abortingForModeSwitch || (!exitReason && !(e instanceof ExitCodeError));
+                const launchError = providerStopped === false && replacingInvocation && !hasUnverifiedProviderTermination(e)
+                    ? new AggregateError([e, new ClaudeNativeProviderExitUnverifiedError()],
+                        'Claude local replacement refused with unverified provider termination', { cause: e })
+                    : e;
+                if (hasUnverifiedProviderTermination(launchError)) {
+                    restoreUnconfirmedFork();
+                    session.client.sendSessionEvent({ type: 'message', message: formatErrorForUi(launchError) });
+                    exitReason = { type: 'exit', code: 1 };
+                    break;
+                }
                 // If Claude exited with non-zero exit code, propagate it
                 if (e instanceof ExitCodeError) {
                     // When switching modes, we abort the local Claude process (SIGTERM → exit code 143).
@@ -501,15 +559,15 @@ export async function claudeLocalLauncher(
                         logger.debug('[local]: Claude exited due to mode switch abort', { exitCode: e.exitCode });
                         break;
                     }
+                    if (terminationRequested) {
+                        logger.debug('[local]: Claude exited due to runner termination', { exitCode: e.exitCode });
+                        break;
+                    }
                     exitReason = { type: 'exit', code: e.exitCode };
                     break;
                 }
-                if (expectsFork && session.sessionId === null) {
-                    // If the local spawn failed before Claude reported the forked session,
-                    // restore the previous session info so remote mode can still resume it.
-                    session.sessionId = resumeFromSessionId;
-                    session.transcriptPath = resumeFromTranscriptPath;
-                }
+                // A launch that never proved its fork must preserve the previous resume identity.
+                restoreUnconfirmedFork();
                 if (!exitReason) {
                     transcriptProjector.reset();
                     errorCount += 1;
@@ -529,8 +587,9 @@ export async function claudeLocalLauncher(
                         break;
                     }
 
-                    // Backoff to avoid tight retry loops and log spam.
-                    await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * errorCount, 5000)));
+                    // Backoff to avoid tight retry loops and log spam. Ends early when the process
+                    // abort fires (runner termination or mode switch); the loop head then returns.
+                    await delayUnrefAbortable(Math.min(1000 * errorCount, 5000), processAbortController.signal);
                     continue;
                 } else {
                     break;
@@ -539,6 +598,7 @@ export async function claudeLocalLauncher(
             logger.debug('[local]: launch done');
 	        }
 	    } finally {
+        terminationSignal?.removeEventListener('abort', onTermination);
 	        const clientEmitter = session.client as unknown as {
 	            off?: (event: string, listener: () => void) => void;
 	        };

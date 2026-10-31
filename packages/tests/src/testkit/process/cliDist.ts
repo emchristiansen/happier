@@ -19,7 +19,7 @@ import {
 
 import { repoRootDir } from '../paths';
 import { sleep } from '../timing';
-import { ensureCliDistSnapshotNodeModules } from './cliDistSnapshotNodeModules';
+import { createRetainedCliSnapshot, ensureCliDistSnapshotNodeModules } from './cliDistSnapshotNodeModules';
 import { yarnCommand } from './commands';
 import { runLoggedCommand } from './spawnProcess';
 
@@ -637,26 +637,31 @@ export async function withCliDistBuildLock<T>(
   });
 }
 
+function skipsCliTestBuild(env: NodeJS.ProcessEnv): boolean {
+  return ['1', 'true', 'yes'].includes(String(env.HAPPIER_CLI_TEST_SKIP_BUILD ?? '').trim().toLowerCase());
+}
+
 export async function ensureCliDistBuilt(
   params: { testDir: string; env: NodeJS.ProcessEnv },
   options: EnsureCliDistBuiltOptions = {},
 ): Promise<string> {
   const rootDir = options.repoRoot ?? repoRootDir();
+  const skipBuild = skipsCliTestBuild(params.env);
   // Daemon processes execute `apps/cli/dist/*` which imports from workspace deps.
   // Ensure those deps are compiled first so we don't start with a stale/partial protocol build.
   await ensureCliSharedDepsBuilt(params, {
     repoRoot: rootDir,
     runCommand: options.runCommand,
-    skipSourceFreshnessCheck: options.skipSourceFreshnessCheck,
+    skipSourceFreshnessCheck: options.skipSourceFreshnessCheck ?? skipBuild,
     timeoutMs: options.timeoutMs,
     pollIntervalMs: options.pollIntervalMs,
     staleAfterMs: options.staleAfterMs,
   });
   const distDir = resolveCliDistDir(rootDir);
   const entrypoint = resolveCliDistEntrypoint(distDir);
-  const allowRebuild = options.allowRebuild ?? true;
+  const allowRebuild = options.allowRebuild ?? !skipBuild;
   const skipDistIntegrityCheck = options.skipDistIntegrityCheck ?? false;
-  const skipSourceFreshnessCheck = options.skipSourceFreshnessCheck ?? false;
+  const skipSourceFreshnessCheck = options.skipSourceFreshnessCheck ?? skipBuild;
   const resolveReusableEntrypoint = (): string | null => {
     const reusableDir = resolveExistingCliDistDir({
       rootDir,
@@ -811,167 +816,63 @@ function ensureSnapshotProjectLink(snapshotDir: string, rootDir: string, relPath
   }
 }
 
-function isSnapshotFreshForDist(params: {
-  snapshotEntrypoint: string;
-  canonicalEntrypoint: string;
-}): boolean {
-  try {
-    const snapshotStat = statSync(params.snapshotEntrypoint);
-    const canonicalStat = statSync(params.canonicalEntrypoint);
-    return snapshotStat.mtimeMs >= canonicalStat.mtimeMs;
-  } catch {
-    return false;
-  }
-}
-
 export async function ensureCliDistSnapshotEntrypoint(
   params: { testDir: string; env: NodeJS.ProcessEnv },
   options: EnsureCliDistSnapshotOptions,
 ): Promise<string> {
   const rootDir = options.repoRoot ?? repoRootDir();
+  const skipSourceFreshnessCheck = options.skipSourceFreshnessCheck ?? skipsCliTestBuild(params.env);
   const distLockPath = options.lockPath ?? resolve(rootDir, '.project', 'tmp', 'cli-dist-build.lock');
-  const snapshotDistDir = resolve(options.snapshotDir, 'dist');
-  const snapshotEntrypoint = resolve(snapshotDistDir, 'index.mjs');
-  const snapshotReadyMarkerPath = resolve(options.snapshotDir, '.cli-dist-snapshot.ready.json');
   const maxAttempts = 3;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    // Ensure dist is available first. We intentionally do this outside the snapshot lock to avoid
-    // re-entering the same lock from ensureCliDistBuilt.
-    const canonicalEntrypoint = await ensureCliDistBuilt(params, { ...options, repoRoot: rootDir, lockPath: distLockPath });
-
+    // Avoid re-entering the preparation lock from the canonical build owner.
+    await ensureCliDistBuilt(params, { ...options, repoRoot: rootDir, lockPath: distLockPath });
     try {
-      return await withCliDistBuildLock(
-        async () => {
-          const snapshotHasReadyMarker = (): boolean => {
-            return (
-              existsSync(snapshotReadyMarkerPath) && existsSync(resolve(options.snapshotDir, 'node_modules'))
-            );
-          };
-
-          const ensureSnapshotScaffolding = (): void => {
-            ensureSnapshotProjectFile(options.snapshotDir, rootDir, 'package.json');
-            ensureSnapshotProjectLink(options.snapshotDir, rootDir, 'scripts');
-            ensureSnapshotProjectLink(options.snapshotDir, rootDir, 'tools');
-            ensureSnapshotProjectLink(options.snapshotDir, rootDir, 'bin');
-            ensureSnapshotProjectFile(options.snapshotDir, rootDir, 'tsconfig.json');
-          };
-
-          const ensureSnapshotNodeModules = (): void => {
+      return await withCliDistBuildLock(async () => {
+        const distDir = resolveExistingCliDistDir({
+          rootDir,
+          skipDistIntegrityCheck: options.skipDistIntegrityCheck ?? false,
+          skipSourceFreshnessCheck,
+        });
+        if (!distDir) {
+          throw new Error(`Refusing to snapshot an incomplete CLI dist: ${resolveCliDistEntrypoint(resolveCliDistDir(rootDir))}`);
+        }
+        const generation = await createRetainedCliSnapshot({
+          snapshotDir: options.snapshotDir,
+          prepare: async (snapshotDir) => {
+            const snapshotDistDir = resolve(snapshotDir, 'dist');
+            await cp(distDir, snapshotDistDir, { recursive: true });
             const mode = (params.env.HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE ?? '').toString().trim().toLowerCase();
             if (mode === 'symlink') {
-              const snapshotNodeModulesDir = resolve(options.snapshotDir, 'node_modules');
-              if (existsSync(snapshotNodeModulesDir)) return;
-
-              const cliNodeModulesDir = resolve(rootDir, 'apps', 'cli', 'node_modules');
-              const rootNodeModulesDir = resolve(rootDir, 'node_modules');
-              const source = existsSync(cliNodeModulesDir) ? cliNodeModulesDir : rootNodeModulesDir;
-              if (!existsSync(source)) return;
-
-              mkdirSync(dirname(snapshotNodeModulesDir), { recursive: true });
-              try {
-                symlinkSync(source, snapshotNodeModulesDir, process.platform === 'win32' ? 'junction' : 'dir');
-              } catch {
-                // Best-effort only.
-              }
-              return;
+              const cliNodeModules = resolve(rootDir, 'apps', 'cli', 'node_modules');
+              const source = existsSync(cliNodeModules) ? cliNodeModules : resolve(rootDir, 'node_modules');
+              if (existsSync(source)) symlinkSync(source, resolve(snapshotDir, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+            } else {
+              ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
             }
-
-            ensureCliDistSnapshotNodeModules({
-              snapshotDir: options.snapshotDir,
-              snapshotDistDir,
-              rootDir,
-            });
-          };
-
-          const markSnapshotReady = (): void => {
-            if (snapshotHasReadyMarker()) return;
-            try {
-              writeFileSync(
-                snapshotReadyMarkerPath,
-                JSON.stringify({ v: 1, createdAt: new Date().toISOString() }),
-                'utf8',
-              );
-            } catch {
-              // Best-effort only.
+            ensureSnapshotProjectFile(snapshotDir, rootDir, 'package.json');
+            ensureSnapshotProjectFile(snapshotDir, rootDir, 'tsconfig.json');
+            for (const path of ['scripts', 'tools', 'bin']) ensureSnapshotProjectLink(snapshotDir, rootDir, path);
+            if (!(options.skipDistIntegrityCheck ?? false) && !isHealthyCliDist(snapshotDistDir)) {
+              const missing = findMissingDistChunkImports(snapshotDistDir);
+              throw new Error(`CLI dist snapshot incomplete: ${missing.length ? missing.join(', ') : resolve(snapshotDistDir, 'index.mjs')}`);
             }
-          };
-
-          const snapshotFreshForCurrentDist = (): boolean => isSnapshotFreshForDist({
-            snapshotEntrypoint,
-            canonicalEntrypoint,
-          });
-
-          if (isHealthyCliDist(snapshotDistDir) && snapshotHasReadyMarker() && snapshotFreshForCurrentDist()) {
-            // Fast path: keep daemon startups cheap during slow E2E lanes.
-            // Still reconcile runtime deps so stale snapshots self-heal when bundled dependency shapes change.
-            ensureSnapshotNodeModules();
-            ensureSnapshotScaffolding();
-            return snapshotEntrypoint;
-          }
-
-          // If a previous run left a partial or stale snapshot behind, self-heal instead of
-          // launching daemon code from an older dist than the provider process uses.
-          if (existsSync(options.snapshotDir) && (!isHealthyCliDist(snapshotDistDir) || !snapshotFreshForCurrentDist())) {
-            rmSync(options.snapshotDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-          }
-
-          if (isHealthyCliDist(snapshotDistDir) && snapshotFreshForCurrentDist()) {
-            ensureSnapshotNodeModules();
-            ensureSnapshotScaffolding();
-            markSnapshotReady();
-            return snapshotEntrypoint;
-          }
-
-          const distDir = resolveExistingCliDistDir({
-            rootDir,
-            skipDistIntegrityCheck: options.skipDistIntegrityCheck ?? false,
-            skipSourceFreshnessCheck: options.skipSourceFreshnessCheck ?? false,
-          });
-          if (!distDir) {
-            const canonicalDistDir = resolveCliDistDir(rootDir);
-            const missing = findMissingDistChunkImports(canonicalDistDir);
-            throw new Error(
-              missing.length > 0
-                ? `Refusing to snapshot an incomplete CLI dist (missing chunk imports): ${missing.join(', ')}`
-                : `Refusing to snapshot an incomplete CLI dist (missing index.mjs): ${resolveCliDistEntrypoint(canonicalDistDir)}`,
-            );
-          }
-
-          mkdirSync(dirname(options.snapshotDir), { recursive: true });
-          // Ensure we never mutate an existing snapshot (which could be in-use by a running daemon).
-          rmSync(options.snapshotDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-          mkdirSync(options.snapshotDir, { recursive: true });
-          await cp(distDir, snapshotDistDir, { recursive: true });
-          ensureSnapshotNodeModules();
-          ensureSnapshotScaffolding();
-
-          if (!(options.skipDistIntegrityCheck ?? false) && !isHealthyCliDist(snapshotDistDir)) {
-            const missing = findMissingDistChunkImports(snapshotDistDir);
-            throw new Error(
-              missing.length > 0
-                ? `CLI dist snapshot missing chunk imports: ${missing.join(', ')}`
-                : `CLI dist snapshot missing entrypoint: ${snapshotEntrypoint}`,
-            );
-          }
-
-          markSnapshotReady();
-          return snapshotEntrypoint;
-        },
-        {
-          lockPath: distLockPath,
-          timeoutMs: options.timeoutMs,
-          pollIntervalMs: options.pollIntervalMs,
-          staleAfterMs: options.staleAfterMs,
-        },
-      );
-    } catch (error: any) {
-      if (error?.code !== 'ENOENT' || attempt === maxAttempts) {
-        throw error;
-      }
-      rmSync(options.snapshotDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+            if (!existsSync(resolve(snapshotDir, 'node_modules'))) {
+              throw new Error(`CLI dist snapshot node_modules missing: ${snapshotDir}`);
+            }
+            writeFileSync(resolve(snapshotDir, '.cli-dist-snapshot.ready.json'), JSON.stringify({ v: 1, createdAt: new Date().toISOString() }), 'utf8');
+          },
+        });
+        return resolve(generation, 'dist', 'index.mjs');
+      }, {
+        lockPath: distLockPath, timeoutMs: options.timeoutMs, pollIntervalMs: options.pollIntervalMs,
+        staleAfterMs: options.staleAfterMs,
+      });
+    } catch (error) {
+      // The materialization owner has cleanup custody only of this attempt's unpublished data.
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT' || attempt === maxAttempts) throw error;
     }
   }
-
-  throw new Error(`Failed to create CLI dist snapshot after ${maxAttempts} attempts: ${snapshotEntrypoint}`);
+  throw new Error(`Failed to create CLI dist snapshot after ${maxAttempts} attempts: ${options.snapshotDir}`);
 }

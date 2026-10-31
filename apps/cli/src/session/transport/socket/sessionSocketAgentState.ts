@@ -1,9 +1,9 @@
+import { decryptSessionPayload } from '@/session/transport/encryption/sessionEncryptionContext';
 import type { Socket } from 'socket.io-client';
 
 import { createSessionScopedSocket } from '@/api/session/sockets';
 import { SessionMessageContentSchema } from '@/api/types';
 import { UpdateContainerSchema, type UpdateContainer } from '@happier-dev/protocol/updates';
-import { decodeBase64, decrypt } from '@/api/encryption';
 import { fetchSessionById } from '@/session/transport/http/sessionsHttp';
 import {
   detectSessionTurnActivityFromProjection,
@@ -90,11 +90,7 @@ function summarizeAgentStateCiphertext(params: Readonly<{
     const decrypted =
       params.sessionEncryptionMode === 'plain'
         ? JSON.parse(params.ciphertextBase64)
-        : decrypt(
-            params.ctx.encryptionKey,
-            params.ctx.encryptionVariant,
-            decodeBase64(params.ciphertextBase64, 'base64'),
-          );
+        : decryptSessionPayload({ ctx: params.ctx, ciphertextBase64: params.ciphertextBase64 });
     return summarizeAgentState(decrypted);
   } catch {
     return null;
@@ -110,11 +106,7 @@ function tryDecryptMessageEnvelope(params: Readonly<{
   if (!parsed.success) return null;
   if (parsed.data.t === 'plain') return parsed.data.v;
   try {
-    return decrypt(
-      params.ctx.encryptionKey,
-      params.ctx.encryptionVariant,
-      decodeBase64(parsed.data.c, 'base64'),
-    );
+    return decryptSessionPayload({ ctx: params.ctx, ciphertextBase64: parsed.data.c });
   } catch {
     return null;
   }
@@ -582,11 +574,7 @@ export async function readLatestAgentStateSummaryViaSocket(params: Readonly<{
         const decrypted =
           params.sessionEncryptionMode === 'plain'
             ? JSON.parse(agentStateCiphertext)
-            : decrypt(
-                params.ctx.encryptionKey,
-                params.ctx.encryptionVariant,
-                decodeBase64(agentStateCiphertext, 'base64'),
-              );
+            : decryptSessionPayload({ ctx: params.ctx, ciphertextBase64: agentStateCiphertext });
         const summary = summarizeAgentState(decrypted);
         clearTimeout(timer);
         cleanup();

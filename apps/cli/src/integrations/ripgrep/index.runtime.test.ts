@@ -61,6 +61,35 @@ describe('ripgrep runtime resolution', () => {
     );
   });
 
+  it('reports signal termination as an unsuccessful exit code', async () => {
+    const stdout = new EventEmitter();
+    const stderr = new EventEmitter();
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+    };
+    child.stdout = stdout;
+    child.stderr = stderr;
+
+    spawnMock.mockReturnValue(child);
+
+    const { run } = await import('./index');
+    const promise = run(['describe', 'needle']);
+    await vi.waitFor(() => {
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+    });
+
+    stdout.emit('data', Buffer.from('partial stdout'));
+    stderr.emit('data', Buffer.from('partial stderr'));
+    child.emit('close', null, 'SIGTERM');
+
+    await expect(promise).resolves.toEqual({
+      exitCode: -1,
+      stdout: 'partial stdout',
+      stderr: 'partial stderr',
+    });
+  });
+
   it('fails closed when no JavaScript runtime is available', async () => {
     requireJavaScriptRuntimeExecutableMock.mockRejectedValue(new ReferenceError('Set HAPPIER_JS_RUNTIME_PATH'));
 

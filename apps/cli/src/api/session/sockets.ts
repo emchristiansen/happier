@@ -1,4 +1,5 @@
 import { configuration } from '@/configuration';
+import { ConnectedServiceIdSchema, CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD } from '@happier-dev/protocol';
 import type { ClientToServerEvents, ServerToClientEvents } from '../types';
 import { io, Socket } from 'socket.io-client'
 import { getSocketIoProxyOptions } from '@/utils/proxy/socketIoProxy';
@@ -9,6 +10,7 @@ export function createSessionScopedSocket(opts: { token: string; sessionId: stri
     const transports = configuration.socketIoTransports;
     return io(serverUrl, {
         auth: {
+            [CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD]: ConnectedServiceIdSchema.options,
             token: opts.token,
             clientType: 'session-scoped' as const,
             sessionId: opts.sessionId,
@@ -28,6 +30,7 @@ export function createUserScopedSocket(opts: { token: string }): Socket<ServerTo
     const transports = configuration.socketIoTransports;
     return io(serverUrl, {
         auth: {
+            [CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD]: ConnectedServiceIdSchema.options,
             token: opts.token,
             clientType: 'user-scoped' as const,
         },

@@ -91,7 +91,16 @@ test('publish-server-runtime isolates unprivileged candidate bytes from trusted 
   assert.match(finalize, /--phase\s+finalize-candidate/);
   assert.match(finalize, /--authorized-sha/);
   assert.match(finalize, /MINISIGN_SECRET_KEY/);
-  assert.doesNotMatch(finalize, /install-yarn-dependencies|setup-bun|tar\s+-x|unzip/);
+  assert.doesNotMatch(finalize, /setup-bun|tar\s+-x|unzip/);
+
+  const finalizerSteps = workflow.jobs.finalize_publish.steps;
+  const installIndex = finalizerSteps.findIndex((step) => step.uses === './.github/actions/install-yarn-dependencies');
+  const tokenIndex = finalizerSteps.findIndex((step) => step.uses?.startsWith('actions/create-github-app-token@'));
+  const publishIndex = finalizerSteps.findIndex((step) => step.run?.includes('publish-server-runtime.mjs'));
+  assert.ok(installIndex >= 0, 'trusted finalizer dependencies must be installed for artifact verification');
+  assert.ok(tokenIndex > installIndex, 'trusted dependencies must install before the publish token exists');
+  assert.ok(publishIndex > tokenIndex, 'publication must consume the scoped publish token');
+  assert.match(finalizerSteps[installIndex].with.args, /--frozen-lockfile/);
 });
 
 test('workflow guards trusted control identity before every secret or environment job', async () => {

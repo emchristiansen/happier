@@ -57,6 +57,7 @@ import {
     hasCompletedLegacySessionOrganizationImport,
     markLegacySessionOrganizationImportComplete,
 } from './legacySessionOrganizationImport';
+import { assertUiAccountEncryptionModeAllowed } from '@/sync/domains/settings/clientEncryptionRequirement';
 
 export type SyncSettingsParams = {
     credentials: AuthCredentials;
@@ -295,7 +296,15 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
         options?: { requireReadable?: boolean },
     ): Promise<Record<string, unknown> | null> {
         if (!content) return null;
-        if (content.t === 'plain') return content.v as Record<string, unknown>;
+        if (content.t === 'plain') {
+            const raw = content.v as Record<string, unknown>;
+            assertUiAccountEncryptionModeAllowed({
+                mode: 'plain',
+                syncedSettings: raw,
+                localSettings: loadSettingsForCapturedScope().settings,
+            });
+            return raw;
+        }
         const decrypted = await decryptSettingsCiphertext(String(content.c ?? ''));
         if (!decrypted && options?.requireReadable) {
             throw new Error('Failed to open encrypted account settings');
@@ -413,6 +422,11 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
         v1Settings: string | null;
     } {
         if (accountMode === 'plain') {
+            assertUiAccountEncryptionModeAllowed({
+                mode: 'plain',
+                syncedSettings: raw,
+                localSettings: loadSettingsForCapturedScope().settings,
+            });
             return { content: { t: 'plain', v: raw }, v1Settings: null };
         }
         const ciphertext = sealAccountScopedBlobCiphertext({
@@ -656,11 +670,10 @@ export async function syncSettings(params: SyncSettingsParams): Promise<void> {
     // rewrite them so other clients can decrypt them reliably.
     if (decryptedSettings && fetched.api === 'v2') {
         const ciphertext = fetched.content?.t === 'encrypted' ? String(fetched.content.c ?? '') : '';
-        const machineKey = encryption.getContentPrivateKey();
         const opened = accountMode === 'e2ee' && fetched.content?.t === 'encrypted' && ciphertext
             ? openAccountScopedBlobCiphertext({
                   kind: 'account_settings',
-                  material: { type: 'dataKey', machineKey },
+                  material: { type: 'dataKey', machineKey: encryption.getContentPrivateKey() },
                   ciphertext,
               })
             : null;

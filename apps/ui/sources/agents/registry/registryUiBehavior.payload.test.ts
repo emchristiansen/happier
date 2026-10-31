@@ -391,6 +391,7 @@ describe('buildSpawnEnvironmentVariablesFromUiState', () => {
             agentId: 'opencode',
             settings: makeSettings({
                 opencodeBackendMode: 'acp' as any,
+                opencodeCliGeneration: 'v2' as any,
                 opencodeServerBaseUrl: ' http://127.0.0.1:4999/ ',
                 opencodeServerBaseUrlByServerIdV1: {
                     'server-1': 'http://127.0.0.1:4096/',
@@ -402,6 +403,7 @@ describe('buildSpawnEnvironmentVariablesFromUiState', () => {
         })).toEqual({
             FOO: '1',
             HAPPIER_OPENCODE_BACKEND_MODE: 'acp',
+            HAPPIER_OPENCODE_CLI_GENERATION: 'v2',
             HAPPIER_OPENCODE_SERVER_URL: 'http://127.0.0.1:4097/',
             HAPPIER_OPENCODE_SERVER_URL_EXPLICIT: '1',
         });

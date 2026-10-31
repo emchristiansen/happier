@@ -1,3 +1,8 @@
+#[path = "../build_support.rs"]
+#[allow(dead_code)]
+mod build_support;
+
+use build_support::{app_command_permission, APP_TAURI_COMMANDS};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +27,35 @@ fn read_default_capability() -> Value {
     read_json_file(manifest_dir().join("capabilities").join("default.json"))
 }
 
+/// Every string permission granted by any capability, across every window.
+fn granted_capability_permissions() -> Vec<String> {
+    let capabilities_dir = manifest_dir().join("capabilities");
+    let entries = fs::read_dir(&capabilities_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", capabilities_dir.display()));
+
+    let mut granted = Vec::new();
+    for entry in entries {
+        let path = entry
+            .expect("failed to read a capability directory entry")
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+
+        let capability = read_json_file(&path);
+        let permissions = capability["permissions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{} should declare a permissions array", path.display()));
+        granted.extend(
+            permissions
+                .iter()
+                .filter_map(|permission| permission.as_str())
+                .map(str::to_string),
+        );
+    }
+    granted
+}
+
 #[test]
 fn default_capability_allows_main_window_chrome_commands_without_losing_pet_overlay_scope() {
     let default_capability = read_default_capability();
@@ -41,6 +75,7 @@ fn default_capability_allows_main_window_chrome_commands_without_losing_pet_over
         "allow-desktop-close-window",
         "allow-desktop-show-main-window",
         "allow-desktop-start-window-dragging",
+        "allow-desktop-finish-shutdown",
     ] {
         assert!(
             permissions.contains(&Value::String(required_permission.to_string())),
@@ -96,6 +131,22 @@ fn stable_and_publicdev_configs_preserve_pet_overlay_capability() {
         assert!(
             capabilities.contains(&Value::String("pet_overlay".to_string())),
             "{config_name} should keep the pet_overlay capability",
+        );
+    }
+}
+
+/// A command the app registers but no capability grants still builds; it is only rejected when the
+/// webview invokes it, with nothing on the Rust side to notice. The opposite mistake — granting a
+/// permission for a command that does not exist — already fails the build with `UnknownPermission`.
+#[test]
+fn every_registered_app_command_is_granted_by_a_capability() {
+    let granted = granted_capability_permissions();
+
+    for command in APP_TAURI_COMMANDS {
+        let permission = app_command_permission(command);
+        assert!(
+            granted.contains(&permission),
+            "no capability grants {permission}; {command} would be rejected at invoke time",
         );
     }
 }

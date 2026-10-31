@@ -7,6 +7,7 @@ import type {
     MachineUpdateMetadataResponse,
     SpawnSessionResult,
 } from '@happier-dev/protocol';
+import { MACHINE_RPC_POLL_INTERVAL_MS } from './machineRpcPollInterval';
 import {
     SPAWN_SESSION_ERROR_CODES,
     isSpawnSessionErrorDetail,
@@ -56,6 +57,7 @@ import {
 import { prepareAccountSettingsForDaemonSpawnIfNeeded } from './accountSettingsDaemonSpawnPreparation';
 import { isAccountSettingsScopeChangedDuringSpawnPreparationError } from '@/sync/engine/settings/accountSettingsSpawnPreparationError';
 import { delay } from '@/utils/timing/time';
+import { ConnectedServiceAuthSelectionUnsupportedError, machineRpcWithConnectedServiceAuthAdmission, requireMachineConnectedServiceAuthSelection } from './connectedServiceAuthSupport';
 
 export type { SpawnHappySessionRpcParams, SpawnSessionOptions } from '../domains/session/spawn/spawnSessionPayload';
 export { buildSpawnHappySessionRpcParams } from '../domains/session/spawn/spawnSessionPayload';
@@ -102,7 +104,7 @@ export type MachineSpawnNewSessionUntilResolvedResult =
 
 export type MachineSpawnNewSessionResult = MachineSpawnNewSessionUntilResolvedResult;
 
-const DEFAULT_MACHINE_SPAWN_NONCE_RESOLUTION_POLL_INTERVAL_MS = 1_000;
+const DEFAULT_MACHINE_SPAWN_NONCE_RESOLUTION_POLL_INTERVAL_MS = MACHINE_RPC_POLL_INTERVAL_MS;
 
 function readAuthoritativeMachineHomeDir(params: Readonly<{
     machineId: string;
@@ -214,15 +216,8 @@ export async function machineSpawnNewSession(options: SpawnSessionOptions): Prom
         custody = null;
     };
     try {
-        const accountSettingsPreparation = typeof options.accountSettingsVersionHint === 'number'
-            ? {}
-            : await prepareAccountSettingsForDaemonSpawnIfNeeded(options.accountSettingsVersionHint);
-        const preparedOptions = {
-            ...options,
-            ...accountSettingsPreparation,
-        };
-        const { machineId } = preparedOptions;
-        const serverId = typeof preparedOptions.serverId === 'string' ? preparedOptions.serverId.trim() : null;
+        const { machineId } = options;
+        const serverId = typeof options.serverId === 'string' ? options.serverId.trim() : null;
         const profileScope = storage.getState().profileScope;
         if (!profileScope) {
             return {
@@ -232,6 +227,20 @@ export async function machineSpawnNewSession(options: SpawnSessionOptions): Prom
             };
         }
         const effectiveServerId = serverId || profileScope.serverId;
+        await requireMachineConnectedServiceAuthSelection({
+            machineId,
+            serverId: effectiveServerId,
+            accountId: profileScope.accountId,
+            backendTarget: options.backendTarget,
+            connectedServices: options.connectedServices,
+        });
+        const accountSettingsPreparation = typeof options.accountSettingsVersionHint === 'number'
+            ? {}
+            : await prepareAccountSettingsForDaemonSpawnIfNeeded(options.accountSettingsVersionHint);
+        const preparedOptions = {
+            ...options,
+            ...accountSettingsPreparation,
+        };
         const daemonCliVersion = readMachineDaemonCliVersion({
             machineId,
             effectiveServerId,
@@ -384,12 +393,16 @@ export async function machineSpawnNewSession(options: SpawnSessionOptions): Prom
         });
         spawnSubmitted = true;
         const callSpawnRpc = async (method: string) => (
-            await machineRpcWithServerScope<unknown, CompatibleSpawnHappySessionRpcParams>({
+            await machineRpcWithConnectedServiceAuthAdmission<CompatibleSpawnHappySessionRpcParams>({
                 machineId,
                 method,
                 payload: params,
                 serverId,
+                accountId: profileScope.accountId,
                 timeoutMs: readSpawnSessionRpcTimeoutMsFromEnv(),
+            }, {
+                backendTarget: preparedOptions.backendTarget,
+                connectedServices: preparedOptions.connectedServices,
             })
         );
         const result = await (async () => {
@@ -487,6 +500,10 @@ export async function machineSpawnNewSession(options: SpawnSessionOptions): Prom
         }
         return normalized;
     } catch (error) {
+        if (error instanceof ConnectedServiceAuthSelectionUnsupportedError) {
+            await clearCustody();
+            return { type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST, errorMessage: error.message };
+        }
         if (isAccountSettingsScopeChangedDuringSpawnPreparationError(error)) {
             if (!spawnSubmitted) await clearCustody();
             return {
@@ -1065,15 +1082,16 @@ export async function machinePreviewEnv(
 
 export async function machineCollectBugReportDiagnostics(
     machineId: string,
-    options?: { timeoutMs?: number },
+    options?: { timeoutMs?: number; serverId?: string },
 ): Promise<BugReportCollectDiagnosticsResult | null> {
     try {
-        return await apiSocket.machineRPC<BugReportCollectDiagnosticsResult, {}>(
+        return await machineRpcWithServerScope<BugReportCollectDiagnosticsResult, {}>({
             machineId,
-            RPC_METHODS.BUGREPORT_COLLECT_DIAGNOSTICS,
-            {},
-            options,
-        );
+            serverId: options?.serverId,
+            timeoutMs: options?.timeoutMs,
+            method: RPC_METHODS.BUGREPORT_COLLECT_DIAGNOSTICS,
+            payload: {},
+        });
     } catch {
         return null;
     }

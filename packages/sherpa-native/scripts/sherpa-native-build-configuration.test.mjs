@@ -12,6 +12,15 @@ function extractPodspecAssignment(podspec, property) {
   return match[1];
 }
 
+test("Android JNI library requests 16 KB LOAD and RELRO page alignment", () => {
+  const cmake = readFileSync(path.join(packageRoot, "android", "src", "main", "cpp", "CMakeLists.txt"), "utf8");
+  const linkOptions = cmake.match(/target_link_options\(happier_sherpa_jni\s+PRIVATE([\s\S]*?)\)/);
+
+  assert.ok(linkOptions, "sherpa JNI target must configure Android linker page alignment");
+  assert.match(linkOptions[1], /"-Wl,-z,max-page-size=16384"/);
+  assert.match(linkOptions[1], /"-Wl,-z,common-page-size=16384"/);
+});
+
 test("Android JNI source includes the standard containers it instantiates", () => {
   const jniSource = readFileSync(
     path.join(packageRoot, "android", "src", "main", "cpp", "HappierSherpaNativeJni.cpp"),
@@ -19,6 +28,16 @@ test("Android JNI source includes the standard containers it instantiates", () =
   );
 
   assert.match(jniSource, /^#include <vector>$/m);
+  assert.match(jniSource, /^#include <limits>$/m);
+});
+
+test("Android online ASR ends turns only on trailing-silence endpoint rules", () => {
+  const jniSource = readFileSync(
+    path.join(packageRoot, "android", "src", "main", "cpp", "HappierSherpaNativeJni.cpp"),
+    "utf8",
+  );
+
+  assert.match(jniSource, /config\.rule3_min_utterance_length = std::numeric_limits<float>::max\(\);/);
 });
 
 test("iOS Objective-C++ sources include the standard library headers they instantiate", () => {
@@ -28,6 +47,7 @@ test("iOS Objective-C++ sources include the standard library headers they instan
   assert.match(offlineSource, /^#include <cstring>$/m);
   assert.match(offlineSource, /^#include <memory>$/m);
   assert.match(onlineSource, /^#include <cstring>$/m);
+  assert.match(onlineSource, /^#include <limits>$/m);
 });
 
 test("iOS online ASR wrapper matches the vendored sherpa-onnx C API shape", () => {
@@ -40,9 +60,10 @@ test("iOS online ASR wrapper matches the vendored sherpa-onnx C API shape", () =
   assert.match(onlineSource, /config\.enable_endpoint = 1;/);
   assert.match(onlineSource, /config\.rule1_min_trailing_silence = 1\.2f;/);
   assert.match(onlineSource, /config\.rule2_min_trailing_silence = 0\.6f;/);
-  assert.match(onlineSource, /config\.rule3_min_utterance_length = 15\.0f;/);
+  // Rule 3 ends an utterance on length alone, mid-speech; only trailing-silence rules may end a turn.
+  assert.match(onlineSource, /config\.rule3_min_utterance_length = std::numeric_limits<float>::max\(\);/);
   assert.match(onlineSource, /const SherpaOnnxOnlineStream \*_stream;/);
-  assert.match(onlineSource, /initWithRecognizer:_recognizer stream:stream/);
+  assert.match(onlineSource, /initWithEngine:self recognizer:_recognizer stream:stream/);
   assert.doesNotMatch(onlineSource, /wrapper->_/);
 });
 

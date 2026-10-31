@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const repoDir = resolve(join(__dirname, '..'));
+const repoDir = resolve(join(__dirname, '..', '..'));
 
 function requireOutdir() {
   const outdir = String(process.env.HAPPIER_QA_OUTDIR ?? '').trim();

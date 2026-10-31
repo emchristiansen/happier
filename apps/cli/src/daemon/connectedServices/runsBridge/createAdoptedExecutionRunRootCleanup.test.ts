@@ -70,6 +70,7 @@ describe('createAdoptedExecutionRunRootCleanup', () => {
         materializedRoot: expectedRoot,
         agentId: 'codex',
         materializationKey: 'execution_run:one',
+        retentionPolicy: 'ephemeral',
         removeRoot,
       });
 

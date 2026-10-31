@@ -1,6 +1,12 @@
 import { db } from "@/storage/db";
 import { getPublicUrl } from "@/storage/blob/files";
 import { fetchLinkedProvidersForAccount } from "@/app/auth/providers/linkedProviders";
+import { z } from "zod";
+import {
+    CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY,
+    projectConnectedServiceProfileForReader,
+    readConnectedServiceReaderSupport,
+} from "@happier-dev/protocol";
 import { type Fastify } from "../../types";
 import { resolveApiHotEndpointRateLimit } from "@/app/api/utils/apiRateLimitCatalog";
 import {
@@ -11,6 +17,9 @@ import {
 export function registerAccountProfileRoute(app: Fastify): void {
     app.get('/v1/account/profile', {
         preHandler: app.authenticate,
+        schema: {
+            querystring: z.object({ [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional() }).optional(),
+        },
         config: {
             rateLimit: resolveApiHotEndpointRateLimit(process.env, "account.profile"),
         },
@@ -26,10 +35,10 @@ export function registerAccountProfileRoute(app: Fastify): void {
             }
         });
 
-        const connectedServicesProjection = await buildAccountConnectedServicesProjection({
+        const connectedServicesProjection = projectConnectedServiceProfileForReader(await buildAccountConnectedServicesProjection({
             tx: db as unknown as ConnectedServicesProjectionClient,
             accountId: userId,
-        });
+        }), readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]));
         const linkedProviders = await fetchLinkedProvidersForAccount({ tx: db as any, accountId: userId });
         return reply.send({
             id: userId,

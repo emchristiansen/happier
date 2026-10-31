@@ -1,7 +1,10 @@
-import { atomicReplaceDirSync, bundleWorkspacePackage, copyDirSafeSync } from './index';
+import { atomicReplaceDirSync, bundleInstalledPackageWithRuntimeDependencies, bundleWorkspacePackage, copyDirSafeSync, vendorBundledPackageRuntimeDependencies } from './index';
+import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 describe('bundleWorkspacePackage', () => {
@@ -11,6 +14,35 @@ describe('bundleWorkspacePackage', () => {
       rmSync(rootDir, { recursive: true, force: true });
       rootDir = undefined;
     }
+  });
+
+  it('preserves conditional package imports and their package-root runtime targets', () => {
+    rootDir = mkdtempSync(join(tmpdir(), 'workspace-package-imports-'));
+    const sourceDir = resolve(rootDir, 'packages', 'fixture');
+    const destinationDir = resolve(rootDir, 'apps', 'cli', 'node_modules', '@happier-dev', 'fixture');
+    const imports = {
+      '#http': { node: './runtime/node.js', default: './dist/fetch.js' },
+      '#fs': 'fs',
+      '#disabled': null,
+    };
+    mkdirSync(resolve(sourceDir, 'dist'), { recursive: true });
+    mkdirSync(resolve(sourceDir, 'runtime'), { recursive: true });
+    writeFileSync(resolve(sourceDir, 'package.json'), JSON.stringify({
+      name: '@happier-dev/fixture', version: '0.0.0', type: 'module',
+      exports: { '.': './dist/connect.js' }, imports,
+    }));
+    writeFileSync(resolve(sourceDir, 'dist/connect.js'), 'import { transport } from "#http"; import { existsSync } from "#fs"; export const selected = transport + ":" + typeof existsSync;\n');
+    writeFileSync(resolve(sourceDir, 'dist/fetch.js'), 'export const transport = "fetch";\n');
+    writeFileSync(resolve(sourceDir, 'runtime/node.js'), 'export const transport = "node";\n');
+    bundleWorkspacePackage({ packageName: '@happier-dev/fixture', srcDir: sourceDir, destDir: destinationDir });
+    // Real Node resolution observes the bundled manifest, not Vitest's resolver.
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `const module = await import(${JSON.stringify(pathToFileURL(resolve(destinationDir, 'dist/connect.js')).href)}); console.log(module.selected);`,
+    ], { encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim()).toBe('node:function');
+    expect(JSON.parse(readFileSync(resolve(destinationDir, 'package.json'), 'utf8')).imports).toEqual(imports);
+    expect(readFileSync(resolve(destinationDir, 'dist/fetch.js'), 'utf8')).toContain('fetch');
   });
 
   it('removes legacy dist staging dirs when rebundling into an existing destination', () => {
@@ -161,6 +193,81 @@ describe('bundleWorkspacePackage', () => {
       './workspaceLockLease.mjs',
     );
     expect(readFileSync(resolve(destPackageDir, 'workspaceLockLease.mjs'), 'utf8')).toContain('canonical');
+  });
+});
+
+describe('Transformers runtime dependency closure', () => {
+  let rootDir: string | undefined;
+
+  afterEach(() => {
+    if (rootDir) rmSync(rootDir, { recursive: true, force: true });
+    rootDir = undefined;
+  });
+
+  it.each(['host', 'installed'] as const)('keeps the isolated Node import and distinct Web runtime loadable through %s vendoring', (kind) => {
+    rootDir = mkdtempSync(join(tmpdir(), 'happier-transformers-closure-'));
+    const sourceDir = join(rootDir, 'source');
+    const payloadDir = join(rootDir, 'payload');
+    const writePackage = (packageDir: string, name: string, version: string, code: string, dependencies: Record<string, string> = {}) => {
+      mkdirSync(packageDir, { recursive: true });
+      writeFileSync(join(packageDir, 'package.json'), JSON.stringify({ name, version, type: 'module', exports: './index.js', dependencies }));
+      writeFileSync(join(packageDir, 'index.js'), code);
+    };
+
+    writePackage(sourceDir, 'host', '1.0.0', '', { '@huggingface/transformers': '3.8.1' });
+    const transformersDir = join(sourceDir, 'node_modules', '@huggingface', 'transformers');
+    // Mirrors 3.8.1's distributed Node import and manifest: Common is imported directly,
+    // but is only declared by the Node/Web runtimes, which require different versions.
+    writePackage(transformersDir, '@huggingface/transformers', '3.8.1',
+      'import { version as direct } from "onnxruntime-common"; import { version as node } from "onnxruntime-node"; import { version as web } from "onnxruntime-web"; export const versions = { direct, node, web };',
+      { 'onnxruntime-node': '1.21.0', 'onnxruntime-web': '1.22.0-dev.20250409-89f8206ba4' });
+    for (const [runtime, version] of [['node', '1.21.0'], ['web', '1.22.0-dev.20250409-89f8206ba4']]) {
+      const runtimeDir = join(sourceDir, 'node_modules', `onnxruntime-${runtime}`);
+      writePackage(runtimeDir, `onnxruntime-${runtime}`, version, 'export { version } from "onnxruntime-common";', { 'onnxruntime-common': version });
+      writePackage(join(runtimeDir, 'node_modules', 'onnxruntime-common'), 'onnxruntime-common', version, `export const version = ${JSON.stringify(version)};`);
+    }
+
+    if (kind === 'host') {
+      vendorBundledPackageRuntimeDependencies({ srcPackageJsonPath: join(sourceDir, 'package.json'), destPackageDir: payloadDir });
+    } else {
+      bundleInstalledPackageWithRuntimeDependencies({ packageName: '@huggingface/transformers', resolveFromPackageJsonPath: join(sourceDir, 'package.json'), destNodeModulesDir: join(payloadDir, 'node_modules') });
+    }
+    const moduleUrl = pathToFileURL(join(payloadDir, 'node_modules', '@huggingface', 'transformers', 'index.js')).href;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', 'console.log(JSON.stringify((await import(process.argv[1])).versions))', moduleUrl], { encoding: 'utf8', cwd: payloadDir });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ direct: '1.21.0', node: '1.21.0', web: '1.22.0-dev.20250409-89f8206ba4' });
+  });
+});
+
+describe('explicitly supplied root runtime dependencies', () => {
+  it('omits only the host dependency while preserving transitive consumers and default vendoring', () => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'happier-runtime-root-omission-'));
+    try {
+      const sourceDir = join(rootDir, 'source');
+      const writePackage = (directory: string, name: string, code: string, dependencies: Record<string, string>) => {
+        mkdirSync(directory, { recursive: true });
+        writeFileSync(join(directory, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.cjs', dependencies }));
+        writeFileSync(join(directory, 'index.cjs'), code);
+      };
+      writePackage(sourceDir, 'host', '', { 'optional-runtime': '1.0.0', consumer: '1.0.0' });
+      writePackage(join(sourceDir, 'node_modules/optional-runtime'), 'optional-runtime', 'module.exports = "runtime-loaded";', {});
+      writePackage(join(sourceDir, 'node_modules/consumer'), 'consumer', 'module.exports = require("optional-runtime");', { 'optional-runtime': '1.0.0' });
+
+      const payloadDir = join(rootDir, 'payload');
+      vendorBundledPackageRuntimeDependencies({
+        srcPackageJsonPath: join(sourceDir, 'package.json'),
+        destPackageDir: payloadDir,
+        excludeRootDependencies: ['optional-runtime'],
+      });
+      expect(existsSync(join(payloadDir, 'node_modules/optional-runtime'))).toBe(false);
+      expect(createRequire(join(payloadDir, 'package.json'))('consumer')).toBe('runtime-loaded');
+
+      const defaultPayloadDir = join(rootDir, 'default-payload');
+      vendorBundledPackageRuntimeDependencies({ srcPackageJsonPath: join(sourceDir, 'package.json'), destPackageDir: defaultPayloadDir });
+      expect(createRequire(join(defaultPayloadDir, 'package.json'))('optional-runtime')).toBe('runtime-loaded');
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
   });
 });
 

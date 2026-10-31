@@ -148,7 +148,7 @@ function isNpmNotFoundError(err) {
 function queryPublishedIntegrity(opts) {
   try {
     const output = String(
-      runNpm(opts.npmVersion, ['view', opts.packageSpec, 'dist.integrity', '--json'], {
+      runNpm(opts.npmVersion, ['view', opts.packageSpec, 'dist.integrity', '--json', '--prefer-online'], {
         env: opts.env,
         stdio: 'pipe',
       }) ?? '',
@@ -200,20 +200,54 @@ function sleepSync(milliseconds) {
 }
 
 /**
- * @param {{ npmVersion: string; env: Record<string, string>; packageName: string; version: string; distTag: string }} opts
+ * @param {{ npmVersion: string; env: Record<string, string>; packageName: string; version: string; integrity: string; distTag: string; publishedNow: boolean; canRepair: boolean }} opts
  */
-function ensureDistTag(opts) {
+function ensurePublication(opts) {
+  const verificationDelaysMs = [250, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+  if (opts.publishedNow) {
+    // npm scans accepted uploads before exposing them; its processing times are not an SLA.
+    // Reconcile reads only, under the containing job/process lifetime (or native operator
+    // cancellation for standalone use). Never republish or repair a tag while processing.
+    for (let attempt = 0; ; attempt += 1) {
+      const integrity = queryPublishedIntegrity({
+        npmVersion: opts.npmVersion,
+        env: opts.env,
+        packageSpec: `${opts.packageName}@${opts.version}`,
+      });
+      if (integrity && integrity !== opts.integrity) {
+        throw new Error(`Refusing to accept ${opts.packageName}@${opts.version}: npm has a different integrity (${integrity})`);
+      }
+      let tagVisible = false;
+      if (integrity) {
+        try {
+          tagVisible = queryDistTags(opts)[opts.distTag] === opts.version;
+        } catch (error) {
+          if (!isNpmNotFoundError(error)) throw error;
+        }
+      }
+      if (integrity && tagVisible) {
+        console.log(`[pipeline] npm publication verified with matching integrity: ${opts.packageName}@${opts.version}; ${opts.distTag} -> ${opts.version}`);
+        return;
+      }
+      const delayMs = verificationDelaysMs[Math.min(attempt, verificationDelaysMs.length - 1)];
+      console.log(`[pipeline] npm publication accepted; registry ${integrity ? 'dist-tag' : 'integrity'} visibility pending for ${opts.packageName}@${opts.version}; retrying reads in ${delayMs}ms (no further mutation)`);
+      sleepSync(delayMs);
+    }
+  }
+
   const current = queryDistTags(opts);
   if (current[opts.distTag] === opts.version) {
     console.log(`[pipeline] npm dist-tag verified: ${opts.distTag} -> ${opts.version}`);
     return;
   }
 
+  if (!opts.canRepair) {
+    throw new Error(`npm dist-tag ${opts.distTag} does not point to ${opts.version}; cannot repair without a token for a separate dist-tag repair`);
+  }
   console.log(`[pipeline] repairing npm dist-tag: ${opts.distTag} -> ${opts.version}`);
   runNpm(opts.npmVersion, ['dist-tag', 'add', `${opts.packageName}@${opts.version}`, opts.distTag], {
     env: opts.env,
   });
-  const verificationDelaysMs = [250, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
   for (let attempt = 0; attempt <= verificationDelaysMs.length; attempt += 1) {
     const verified = queryDistTags(opts);
     if (verified[opts.distTag] === opts.version) {
@@ -362,6 +396,7 @@ function main() {
     env: publishEnv,
     packageSpec,
   });
+  let publishedNow = false;
 
   if (existingIntegrity) {
     if (existingIntegrity !== metadata.integrity) {
@@ -373,6 +408,7 @@ function main() {
   } else {
     try {
       runNpm(npmVersion, publishArgs, { env: publishEnv });
+      publishedNow = true;
     } catch (publishError) {
       console.warn('[pipeline] npm publish outcome ambiguous; re-querying published integrity');
       let recoveredIntegrity;
@@ -387,15 +423,19 @@ function main() {
       }
       if (recoveredIntegrity !== metadata.integrity) throw publishError;
       console.log(`[pipeline] recovered npm publication with matching integrity: ${packageSpec}`);
+      publishedNow = true;
     }
   }
 
-  ensureDistTag({
+  ensurePublication({
     npmVersion,
     env: publishEnv,
     packageName: metadata.name,
     version: metadata.version,
+    integrity: metadata.integrity,
     distTag,
+    publishedNow,
+    canRepair: npmToken !== '',
   });
 }
 

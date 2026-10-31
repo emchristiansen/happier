@@ -11,6 +11,7 @@ import {
   OPEN_CODE_BROKER_SELECTIONS_ENV,
   buildOpenCodeBrokerMarker,
   buildOpenCodeBrokerPluginSource,
+  buildOpenCodeBrokerV2PluginSource,
   serializeOpenCodeBrokerSelections,
 } from './index';
 import { deriveConnectedServiceBrokerRefreshToken } from '@/daemon/connectedServices/broker/brokerRefreshCapabilityToken';
@@ -38,6 +39,24 @@ async function loadBrokerPlugin(provider: 'openai' | 'anthropic'): Promise<Broke
     provider: hooks.auth.provider,
     raw: hooks as unknown as Record<string, unknown>,
   };
+}
+
+type V2HookEvent = { baseURL?: string; request?: Request; response?: Response };
+type V2Hook = (event: V2HookEvent) => Promise<void> | void;
+
+async function loadV2BrokerPlugin(provider: 'openai' | 'anthropic'): Promise<{
+  id: string;
+  setup: (context: {
+    session: {
+      hook: (name: string, callback: V2Hook, options?: { providerID?: string }) => Promise<void>;
+    };
+  }) => Promise<void>;
+}> {
+  const dir = await mkdtemp(join(tmpdir(), 'happier-broker-plugin-v2-'));
+  const file = join(dir, `broker-${provider}-${Math.random().toString(36).slice(2)}.mjs`);
+  await writeFile(file, buildOpenCodeBrokerV2PluginSource(provider), 'utf8');
+  const mod = await import(pathToFileURL(file).href);
+  return mod.default;
 }
 
 async function writeBrokerStateFile(token: string): Promise<string> {
@@ -85,6 +104,75 @@ describe('openCodeBrokerPluginSource (generated artifact, exercised live)', () =
     const brokered = await loader(async () => ({ type: 'api', key: marker }));
     expect(typeof brokered.fetch).toBe('function');
     expect(brokered.apiKey).toBe(marker);
+  });
+
+  it('V2 exports the released definition ABI and applies broker auth through provider-scoped request hooks', async () => {
+    process.env[OPEN_CODE_BROKER_STATE_PATH_ENV] = await writeBrokerStateFile('daemon-control');
+    process.env[OPEN_CODE_BROKER_SELECTIONS_ENV] = serializeOpenCodeBrokerSelections({
+      openai: { serviceId: 'openai-codex', profileId: 'codex-pro', accountId: null, planType: 'pro' },
+    });
+
+    const bridgeBodies: Array<Record<string, unknown>> = [];
+    const providerRequests: Request[] = [];
+    globalThis.fetch = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes('/chatgpt-auth-tokens/refresh')) {
+        bridgeBodies.push(JSON.parse(String(init?.body ?? '{}')));
+        return new Response(JSON.stringify({
+          ok: true,
+          result: { accessToken: `broker-access-${bridgeBodies.length}`, chatgptAccountId: 'acct_v2' },
+        }), { status: 200 });
+      }
+      if (url.includes('/connected-service-auth/broker/loaded')) {
+        return new Response('{}', { status: 200 });
+      }
+      const request = input instanceof Request ? input : new Request(input, init);
+      providerRequests.push(request);
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+
+    const plugin = await loadV2BrokerPlugin('openai');
+    expect(plugin.id).toBe('happier-broker-openai');
+    expect(typeof plugin.setup).toBe('function');
+
+    const hooks = new Map<string, V2Hook>();
+    await plugin.setup({
+      session: {
+        hook: async (name, callback, options) => {
+          expect(options).toEqual({ providerID: 'openai' });
+          hooks.set(name, callback);
+        },
+      },
+    });
+
+    const modelEvent: V2HookEvent = { baseURL: 'https://api.openai.com/v1' };
+    await hooks.get('model.request')?.(modelEvent);
+    expect(modelEvent.baseURL).toBe('https://chatgpt.com/backend-api');
+
+    const requestEvent: V2HookEvent = {
+      request: new Request('https://chatgpt.com/backend-api/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': 'native-key-MUST-NOT-LEAK' },
+        body: JSON.stringify({ model: 'gpt-5-codex', input: [] }),
+      }),
+    };
+    await hooks.get('http.request')?.(requestEvent);
+    expect(requestEvent.request?.url).toBe('https://chatgpt.com/backend-api/codex/responses');
+    expect(requestEvent.request?.headers.get('authorization')).toBe('Bearer broker-access-1');
+    expect(requestEvent.request?.headers.get('x-api-key')).toBeNull();
+
+    const responseEvent: V2HookEvent = {
+      request: requestEvent.request,
+      response: new Response('unauthorized', { status: 401 }),
+    };
+    await hooks.get('http.response')?.(responseEvent);
+    expect(responseEvent.response?.status).toBe(200);
+    expect(bridgeBodies).toHaveLength(2);
+    expect(bridgeBodies[0]).toMatchObject({ forceRefresh: false });
+    expect(bridgeBodies[1]).toMatchObject({ forceRefresh: true });
+    expect(providerRequests).toHaveLength(1);
+    expect(providerRequests[0]?.headers.get('authorization')).toBe('Bearer broker-access-2');
+    expect(await providerRequests[0]?.clone().text()).not.toContain('native-key-MUST-NOT-LEAK');
   });
 
   it('Codex: fetches the access token from the daemon bridge and shapes the request (no refresh token anywhere)', async () => {

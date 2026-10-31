@@ -21,10 +21,11 @@ export const FeatureGatesSchema = z.object({
   encryption: z
     .object({
       plaintextStorage: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
+      plaintextMachine: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
       accountOptOut: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
     })
     .optional()
-    .default({ plaintextStorage: DEFAULT_GATE_DISABLED, accountOptOut: DEFAULT_GATE_DISABLED }),
+    .default({ plaintextStorage: DEFAULT_GATE_DISABLED, plaintextMachine: DEFAULT_GATE_DISABLED, accountOptOut: DEFAULT_GATE_DISABLED }),
   attachments: z
     .object({
       uploads: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
@@ -60,18 +61,26 @@ export const FeatureGatesSchema = z.object({
       enabled: z.boolean(),
       quotas: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
       subscription: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
+      quotaRecoveryCreditDetails: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
       accountGroups: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
       accountFallback: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
       autoQuotaReset: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
+      autoDisablePlanInvalid: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
+      poolQuotaLimitSelection: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
+      poolExpiryFirst: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
     })
     .optional()
     .default({
       enabled: false,
       quotas: DEFAULT_GATE_DISABLED,
       subscription: DEFAULT_GATE_DISABLED,
+      quotaRecoveryCreditDetails: DEFAULT_GATE_DISABLED,
       accountGroups: DEFAULT_GATE_DISABLED,
       accountFallback: DEFAULT_GATE_DISABLED,
       autoQuotaReset: DEFAULT_GATE_DISABLED,
+      autoDisablePlanInvalid: DEFAULT_GATE_DISABLED,
+      poolQuotaLimitSelection: DEFAULT_GATE_DISABLED,
+      poolExpiryFirst: DEFAULT_GATE_DISABLED,
     }),
   channelBridges: z
     .object({

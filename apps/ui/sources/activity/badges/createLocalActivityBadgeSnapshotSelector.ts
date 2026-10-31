@@ -21,6 +21,7 @@ export type ActivityBadgeSessionOptions = Readonly<{
     showUnread: boolean;
     showPendingPermissionRequests: boolean;
     showPendingUserActionRequests: boolean;
+    showQueuedUserInput: boolean;
 }>;
 
 export type LocalActivityBadgeSnapshot = Readonly<{
@@ -80,6 +81,7 @@ function buildParamsSignature(params: LocalActivityBadgeSnapshotSelectorParams):
         params.sessionOptions.showUnread === false ? 0 : 1,
         params.sessionOptions.showPendingPermissionRequests === false ? 0 : 1,
         params.sessionOptions.showPendingUserActionRequests === false ? 0 : 1,
+        params.sessionOptions.showQueuedUserInput === false ? 0 : 1,
     ].join('\u001f');
 }
 
@@ -104,6 +106,7 @@ function buildSessionActivitySignature(session: Session): string {
         readNumber(readState?.sessionSeq) ?? '',
         readNumber(readState?.pendingActivityAt) ?? '',
         metadata?.systemSessionV1?.hidden === true ? 1 : 0,
+        readNumber(session.pendingCount) ?? '',
         readNumber(session.pendingBlockedCount) ?? '',
         readNumber(session.pendingPermissionRequestCount) ?? '',
         readNumber(session.pendingUserActionRequestCount) ?? '',
@@ -135,6 +138,7 @@ function buildRenderableActivitySignature(renderable: SessionListRenderableSessi
         renderable.hasPendingPermissionRequests === true ? 1 : 0,
         renderable.hasPendingUserActionRequests === true ? 1 : 0,
         readNumber(renderable.pendingRequestObservedAt) ?? '',
+        readNumber(renderable.pendingCount) ?? '',
         readNumber(renderable.pendingBlockedCount) ?? '',
     ].join('\u001f');
 }
@@ -184,6 +188,9 @@ export function createLocalActivityBadgeSnapshotSelector(
     const sessionFreshnessLedger = createSessionRuntimeFreshnessLedger();
     const renderableFreshnessLedger = createRenderableRuntimeFreshnessLedger();
     const attentionBySessionId = new Map<string, boolean>();
+    // A delta advances the attention cache without advancing the full-refresh ledgers. Keep their
+    // touched members until the next sync, including changes that return to the ledger's old value.
+    const deltaUpdatedLedgerIds = new Set<string>();
     // Whether `attentionBySessionId` holds every session. Only a full derivation
     // establishes that; until it has run once, an incremental update would be
     // applied to an empty cache and undercount.
@@ -201,7 +208,7 @@ export function createLocalActivityBadgeSnapshotSelector(
     // ledger, so the union of their change sets is the complete set of sessions
     // whose contribution can have moved this wave.
     const collectLedgerChangedSessionIds = (): readonly string[] => {
-        const ids = new Set<string>();
+        const ids = new Set(deltaUpdatedLedgerIds);
         for (const id of sessionLedger.readChangedIds()) ids.add(id);
         for (const id of renderableLedger.readChangedIds()) ids.add(id);
         for (const id of sessionMessagesLedger.readChangedIds()) ids.add(id);
@@ -333,6 +340,15 @@ export function createLocalActivityBadgeSnapshotSelector(
             && delta.revision !== previousDeltaRevision
             && delta.rebuiltSessionListViewData !== true;
         if (canApplyDelta) {
+            for (const ids of [delta.changedSessionIds, delta.removedSessionIds]) {
+                for (const id of ids) {
+                    // New ids will be discovered by the next ledger sync anyway. Keeping only
+                    // baseline members bounds this set even during repeated add/remove deltas.
+                    if (sessionLedger.readSignature(id) || renderableLedger.readSignature(id)) {
+                        deltaUpdatedLedgerIds.add(id);
+                    }
+                }
+            }
             const nextSessionAttentionCount = applyAttentionDelta(
                 state,
                 delta.changedSessionIds,
@@ -382,7 +398,7 @@ export function createLocalActivityBadgeSnapshotSelector(
                 hasLocalBadgeSource === true ? 1 : 0,
             ].join('\u001c');
 
-        if (previousSignature === snapshotSignature && previousSnapshot) {
+        if (previousSignature === snapshotSignature && previousSnapshot && deltaUpdatedLedgerIds.size === 0) {
             return previousSnapshot;
         }
 
@@ -401,6 +417,7 @@ export function createLocalActivityBadgeSnapshotSelector(
         const sessionAttentionCountForWave = hasSeededAttentionCache
             ? applyAttentionDelta(state, collectLedgerChangedSessionIds(), [], nowMs)
             : rebuildAttentionCache(state, nowMs);
+        deltaUpdatedLedgerIds.clear();
         const count = Math.max(
             0,
             sessionAttentionCountForWave + Math.max(0, Math.trunc(params.friendRequestCount)),

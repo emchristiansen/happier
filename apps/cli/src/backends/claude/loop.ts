@@ -78,6 +78,7 @@ export interface EnhancedMode {
     claudeUnifiedTerminalResumeChoice?: ClaudeUnifiedTerminalResumeChoice;
     claudeRemoteSettingSourcesV2?: ReadonlyArray<'user' | 'project' | 'local'>;
     claudeRemoteSettingSources?: 'project' | 'user_project' | 'none';
+    claudeCodeIncludeInNativeHistory?: boolean;
     claudeCodeExperimentalAgentTeamsEnabled?: boolean;
     claudeRemoteEnableFileCheckpointing?: boolean;
     claudeRemoteMaxThinkingTokens?: number | null;
@@ -97,6 +98,7 @@ interface LoopOptions {
     claudeUnifiedTerminalEnabled?: boolean
         /** Force-enable Claude Code experimental Agent Teams across local + remote starts (off = inherit). */
         claudeCodeExperimentalAgentTeamsEnabled?: boolean
+    claudeCodeIncludeInNativeHistory?: boolean
     onModeChange: (mode: 'local' | 'remote') => void
     session: SessionClientPort
     pushSender?: PushNotificationClient | null
@@ -140,8 +142,9 @@ interface LoopOptions {
     expectedExistingTerminalHostAttachmentId?: string
     onTerminalHostReady?: ((params: Readonly<{
         handle: import('@/integrations/terminalHost/_types').TerminalHostHandle;
+        lifecycle: 'owned' | 'borrowed';
         terminal: NonNullable<import('@/api/types').Metadata['terminal']>;
-        destroyOwnedHostForExplicitStop: () => Promise<void>;
+        stopTerminalHostForExplicitStop: () => Promise<void>;
     }>) => void | Promise<void>)
     signal?: AbortSignal
 }
@@ -180,6 +183,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         runtimeActivityContributions,
     });
     session.claudeCodeExperimentalAgentTeamsEnabled = opts.claudeCodeExperimentalAgentTeamsEnabled === true;
+    session.claudeCodeIncludeInNativeHistory = opts.claudeCodeIncludeInNativeHistory === true;
 
     // Seed permission mode without blocking on transcript fetches.
     // The session's metadata snapshot is already available locally, and for fresh sessions
@@ -212,6 +216,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
                 model: opts.model,
                 claudeUnifiedTerminalEnabled: true,
                 claudeCodeExperimentalAgentTeamsEnabled: opts.claudeCodeExperimentalAgentTeamsEnabled,
+                claudeCodeIncludeInNativeHistory: opts.claudeCodeIncludeInNativeHistory,
             },
             expectedExistingTerminalHostAttachmentId: opts.expectedExistingTerminalHostAttachmentId,
             onTerminalHostReady: opts.onTerminalHostReady,
@@ -231,6 +236,10 @@ export async function loop(opts: LoopOptions): Promise<number> {
     let mode: 'local' | 'remote' = opts.startingMode ?? 'local';
     let localEntry: 'initial' | 'switch' = mode === 'local' ? 'initial' : 'switch';
     while (true) {
+        // Runner termination may land while one launcher hands off to the other; never start the next.
+        if (opts.signal?.aborted) {
+            return 0;
+        }
         logger.debug(`[loop] Iteration with mode: ${mode}`);
         switch (mode) {
             case 'local': {
@@ -238,6 +247,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
                 const result = await claudeLocalLauncher(session, {
                     entry: localEntry,
                     remoteSwitchingEnabled: true,
+                    signal: opts.signal,
                 });
                 localEntry = 'switch';
                 switch (result.type) {
@@ -257,6 +267,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
                 logger.infoFile('[CLAUDE_STARTUP] stage=provider_launcher_entered', { runtime: 'agent-sdk' });
                 const reason = await claudeRemoteLauncher(session, {
                     initialMode: opts.initialClaudeUnifiedTerminalMode,
+                    signal: opts.signal,
                 });
                 switch (reason) {
                     case 'exit':

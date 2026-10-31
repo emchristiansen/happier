@@ -25,7 +25,7 @@ export type ActionOperationStore = Readonly<{
         listedOperationIds: ReadonlySet<string>,
     ) => Readonly<{ missingActive: boolean }>;
     markSeen: (operationId: string, seenAt?: number) => boolean;
-    markAllTerminalSeen: (seenAt?: number) => boolean;
+    markAccountTerminalSeen: (accountId: string, seenAt?: number) => boolean;
     dismissRecent: (
         accountId: string,
         options?: Readonly<{ preserveOperationIds?: ReadonlySet<string> }>,
@@ -200,10 +200,16 @@ export function createActionOperationStore(): ActionOperationStore {
             publish({ ...state, terminalSeenAtById });
             return true;
         },
-        markAllTerminalSeen: (seenAt = Date.now()) => {
+        markAccountTerminalSeen: (accountId, seenAt = Date.now()) => {
             let terminalSeenAtById: Map<string, number> | null = null;
             for (const operation of state.operationsById.values()) {
-                if (!terminalStates.has(operation.state) || state.terminalSeenAtById.has(operation.operationId)) continue;
+                if (
+                    operation.scope.accountId !== accountId
+                    || !terminalStates.has(operation.state)
+                    || state.terminalSeenAtById.has(operation.operationId)
+                ) {
+                    continue;
+                }
                 terminalSeenAtById ??= new Map(state.terminalSeenAtById);
                 terminalSeenAtById.set(operation.operationId, seenAt);
             }

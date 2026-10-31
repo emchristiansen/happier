@@ -8,6 +8,7 @@ type JsonOwnerFileLockOptions = Readonly<{
   staleAfterMs: number;
   errorCode: string;
   pollIntervalMs?: number;
+  signal?: AbortSignal;
   readQuarantinedRaw?: (path: string) => Promise<string>;
 }>;
 
@@ -543,6 +544,7 @@ export async function withJsonOwnerFileLock<TResult>(
   options: JsonOwnerFileLockOptions,
   effect: () => Promise<TResult>,
 ): Promise<TResult> {
+  options.signal?.throwIfAborted();
   const startedAtMs = Date.now();
   const pollIntervalMs = Math.max(1, Math.trunc(options.pollIntervalMs ?? 10));
   const readQuarantinedRaw = options.readQuarantinedRaw ?? (async (path) => await readFile(path, 'utf8'));
@@ -550,6 +552,7 @@ export async function withJsonOwnerFileLock<TResult>(
 
   let ownRaw: string | null = null;
   for (;;) {
+    options.signal?.throwIfAborted();
     if (Date.now() - startedAtMs >= options.timeoutMs) throw new Error(options.errorCode);
     if (await inspectAndScavengeLockArtifacts(options.lockPath, options.staleAfterMs)) {
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
@@ -618,6 +621,7 @@ export async function withJsonOwnerFileLock<TResult>(
   }
 
   try {
+    options.signal?.throwIfAborted();
     return await effect();
   } finally {
     if (ownRaw !== null) {

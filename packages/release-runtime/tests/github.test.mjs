@@ -83,6 +83,18 @@ test('fetchGitHubReleaseByTag tolerates the bounded rolling-release replacement 
   assert.equal(release.tag_name, 'server-preview');
 });
 
+test('fetchGitHubReleaseByTag preserves the network failure cause for acquisition diagnostics', async () => {
+  const networkError = Object.assign(new Error('Connection refused'), { code: 'ECONNREFUSED' });
+  await assert.rejects(fetchGitHubReleaseByTag({
+    githubRepo: 'happier-dev/happier',
+    tag: 'cli-stable',
+    fetchImpl: async () => { throw networkError; },
+  }), (error) => {
+    assert.equal(error.cause, networkError);
+    return true;
+  });
+});
+
 test('fetchFirstGitHubReleaseByTags returns first non-404 release', async () => {
   const u1 = 'https://api.github.com/repos/happier-dev/happier/releases/tags/ui-web-preview';
   const u2 = 'https://api.github.com/repos/happier-dev/happier/releases/tags/ui-web-stable';

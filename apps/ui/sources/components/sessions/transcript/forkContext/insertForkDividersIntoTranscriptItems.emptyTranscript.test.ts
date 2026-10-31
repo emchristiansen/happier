@@ -62,7 +62,7 @@ describe('insertForkDividersIntoTranscriptItems — nothing hydrated yet', () =>
         expect(result.map((item) => item.kind)).toEqual([]);
     });
 
-    it('still emits the boundary as soon as one content row exists', () => {
+    it('emits the reached child-start boundary before its first committed message', () => {
         const items: ChatListItem[] = [
             { kind: 'message', id: 'msg:c1', messageId: 'c1', createdAt: 1, seq: 1 },
         ];
@@ -70,9 +70,12 @@ describe('insertForkDividersIntoTranscriptItems — nothing hydrated yet', () =>
             ...fork,
             segments: [
                 { sessionId: 'parent', isReadOnlyContext: true, cutoffSeqInclusive: 2, messageIdsOldestFirst: [] },
-                { sessionId: 'child', isReadOnlyContext: false, cutoffSeqInclusive: null, messageIdsOldestFirst: ['c1'] },
+                { sessionId: 'child', isReadOnlyContext: false, cutoffSeqInclusive: null, isHistoryStartLoaded: true, messageIdsOldestFirst: ['c1'] },
             ],
             combinedMessageIdsOldestFirst: ['c1'],
+            combinedMessagesById: {
+                c1: { kind: 'agent-text', id: 'c1', localId: null, createdAt: 1, seq: 1, text: 'child' },
+            },
             messageOriginById: { c1: { sessionId: 'child', isReadOnlyContext: false } },
             isLoaded: true,
         };

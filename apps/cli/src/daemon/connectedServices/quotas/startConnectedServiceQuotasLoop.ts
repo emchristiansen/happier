@@ -1,7 +1,10 @@
+import type { ConnectedServiceUsageSourceV1 } from '@happier-dev/protocol';
+
 export type ConnectedServiceQuotasLoopHandle = Readonly<{
   stop: () => Promise<void>;
   pause: () => void;
   resume: () => void;
+  wake: (sources?: readonly ConnectedServiceUsageSourceV1[]) => void;
 }>;
 
 export function startConnectedServiceQuotasLoop(params: Readonly<{
@@ -9,7 +12,10 @@ export function startConnectedServiceQuotasLoop(params: Readonly<{
   tickMs: number;
   tickJitterMs?: number;
   random?: () => number;
-  coordinator: Readonly<{ tickOnce: () => Promise<void> }>;
+  coordinator: Readonly<{
+    tickOnce: () => Promise<void>;
+    scheduleCurrentSourceRefresh?: (sources: readonly ConnectedServiceUsageSourceV1[]) => unknown;
+  }>;
   onTickError: (error: unknown) => void;
   setIntervalFn?: (fn: () => void, ms: number) => unknown;
   clearIntervalFn?: (handle: unknown) => void;
@@ -40,38 +46,51 @@ export function startConnectedServiceQuotasLoop(params: Readonly<{
   let stopped = false;
   let inFlight: Promise<void> | null = null;
   let paused = false;
+  let wakeRequested = false;
+  let timeoutHandle: unknown = null;
+  const usesTimeout = tickJitterMs > 0 || Boolean(params.setTimeoutFn || params.clearTimeoutFn);
+  const scheduleNext = (): void => {
+    if (stopped || !usesTimeout) return;
+    timeoutHandle = setTimeoutImpl(() => {
+      timeoutHandle = null;
+      runTick();
+    }, computeDelayMs());
+    (timeoutHandle as unknown as { unref?: () => void })?.unref?.();
+  };
+  const runTick = (): void => {
+    if (stopped) return;
+    if (inFlight || paused) {
+      if (timeoutHandle === null && !inFlight) scheduleNext();
+      return;
+    }
+    wakeRequested = false;
+    if (timeoutHandle !== null) {
+      clearTimeoutImpl(timeoutHandle);
+      timeoutHandle = null;
+    }
+    inFlight = (async () => {
+      try {
+        await params.coordinator.tickOnce();
+      } catch (error) {
+        params.onTickError(error);
+      } finally {
+        inFlight = null;
+        if (wakeRequested && !paused) runTick();
+        else scheduleNext();
+      }
+    })();
+  };
+  const wake = (sources: readonly ConnectedServiceUsageSourceV1[] = []): void => {
+    if (stopped) return;
+    if (sources.length > 0) params.coordinator.scheduleCurrentSourceRefresh?.(sources);
+    wakeRequested = true;
+    runTick();
+  };
   const waitForInFlight = async (): Promise<void> => {
     const pending = inFlight;
     if (pending) await pending;
   };
-  if (tickJitterMs > 0 || params.setTimeoutFn || params.clearTimeoutFn) {
-    let timeoutHandle: unknown = null;
-    const scheduleNext = (): void => {
-      if (stopped) return;
-      timeoutHandle = setTimeoutImpl(runTick, computeDelayMs());
-      (timeoutHandle as unknown as { unref?: () => void })?.unref?.();
-    };
-    const finishTick = (): void => {
-      scheduleNext();
-    };
-    const runTick = (): void => {
-      timeoutHandle = null;
-      if (stopped) return;
-      if (inFlight || paused) {
-        scheduleNext();
-        return;
-      }
-      inFlight = (async () => {
-        try {
-          await params.coordinator.tickOnce();
-        } catch (error) {
-          params.onTickError(error);
-        } finally {
-          inFlight = null;
-          finishTick();
-        }
-      })();
-    };
+  if (usesTimeout) {
     scheduleNext();
 
     return {
@@ -92,23 +111,13 @@ export function startConnectedServiceQuotasLoop(params: Readonly<{
       },
       resume: () => {
         paused = false;
+        if (wakeRequested) runTick();
       },
+      wake,
     };
   }
 
-  const intervalHandle = setIntervalImpl(() => {
-    if (stopped || inFlight) return;
-    if (paused) return;
-    inFlight = (async () => {
-      try {
-        await params.coordinator.tickOnce();
-      } catch (error) {
-        params.onTickError(error);
-      } finally {
-        inFlight = null;
-      }
-    })();
-  }, tickMs);
+  const intervalHandle = setIntervalImpl(runTick, tickMs);
   (intervalHandle as unknown as { unref?: () => void })?.unref?.();
 
   return {
@@ -126,6 +135,8 @@ export function startConnectedServiceQuotasLoop(params: Readonly<{
     },
     resume: () => {
       paused = false;
+      if (wakeRequested) runTick();
     },
+    wake,
   };
 }

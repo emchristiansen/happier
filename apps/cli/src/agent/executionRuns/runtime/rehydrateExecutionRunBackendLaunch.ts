@@ -27,12 +27,14 @@ export type ExecutionRunResumeBackendOptions = Readonly<{
   accountSettings?: Readonly<Record<string, unknown>> | null;
   connectedServicesEnv?: Readonly<Record<string, string>> | null;
   connectedServicesCleanup?: (() => Promise<void>) | null;
+  connectedServicesRegistration?: PreparedExecutionRunConnectedServices['registration'];
 }>;
 
 export type PrepareExecutionRunConnectedServicesForResume = (params: Readonly<{
   backendTarget: BackendTargetRefV1;
   connectedServices: unknown;
   sessionId: string;
+  previousMaterializedRoot?: string;
 }>) => Promise<PreparedExecutionRunConnectedServices | null>;
 
 function selectionHasConnectedBinding(selection: ConnectedServiceBindingsV1 | null | undefined): boolean {
@@ -56,6 +58,7 @@ export async function resolveExecutionRunResumeBackendOptions(args: Readonly<{
     accountSettings?: Readonly<Record<string, unknown>> | null;
     connectedServicesEnv?: Readonly<Record<string, string>> | null;
     connectedServicesCleanup?: (() => Promise<void>) | null;
+    connectedServicesRegistration?: PreparedExecutionRunConnectedServices['registration'];
   } = {
     accountSettings,
   };
@@ -74,6 +77,9 @@ export async function resolveExecutionRunResumeBackendOptions(args: Readonly<{
       // CS owner re-materializes the exact same account/profile rather than re-defaulting.
       connectedServices: selection,
       sessionId: args.run.sessionId,
+      ...(launch?.connectedServicesRegistration?.materializedRoot
+        ? { previousMaterializedRoot: launch.connectedServicesRegistration.materializedRoot }
+        : {}),
     });
     if (!prepared) {
       // A connected account was selected at launch but the bridge produced nothing on resume —
@@ -82,6 +88,7 @@ export async function resolveExecutionRunResumeBackendOptions(args: Readonly<{
     }
     options.connectedServicesEnv = prepared.env;
     options.connectedServicesCleanup = prepared.cleanup;
+    options.connectedServicesRegistration = prepared.registration;
   }
 
   return options;

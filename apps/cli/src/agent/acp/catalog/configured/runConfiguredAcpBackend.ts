@@ -57,13 +57,16 @@ export async function runConfiguredAcpBackend(
     agentMessageType: `acp:${backend.backendId}`,
     machineMetadata: initialMachineMetadata,
     terminalDisplay: TerminalDisplay,
+    // Same configured-backend declaration the ACP protocol owner enforces against the
+    // negotiated handshake, so a backend that promises resume never silently starts fresh.
+    declaredSessionLoadSupport: backend.capabilities.supportsLoadSession,
     beforeInitializeSession: ({ metadata }) => {
       Object.assign(metadata, buildConfiguredAcpBackendSessionMetadata({
         backendId: backend.backendId,
         title: backend.title,
       }));
     },
-    createRuntime: ({ directory, machineId, session, messageBuffer, mcpServers, permissionHandler, setThinking, getPermissionMode, memoryRecallGuidanceEnabled, pendingQueueDrainMaxPopPerWake, providerInputConsumer }) =>
+    createRuntime: ({ directory, machineId, session, messageBuffer, mcpServers, permissionHandler, setThinking, getPermissionMode, memoryRecallGuidanceEnabled, processEnv, pendingQueueDrainMaxPopPerWake, providerInputConsumer }) =>
       createConfiguredAcpRuntime({
         backend,
         loggerLabel: `${backend.title}ACP`,
@@ -73,6 +76,7 @@ export async function runConfiguredAcpBackend(
         mcpServers,
         permissionHandler,
         launchEnv,
+        processEnv,
         onThinkingChange: setThinking,
         getPermissionMode,
         memoryRecallGuidance: {

@@ -123,7 +123,7 @@ describe('serverFetch auth invalidation', () => {
             if (url.endsWith('/v1/auth/ping')) {
                 return { ok: true, status: 200, headers: new Headers() };
             }
-            if (url.endsWith('/v1/account/profile')) {
+            if (new URL(url).pathname === '/v1/account/profile') {
                 const response = profileCalls === 0
                     ? { ok: false, status: 401, headers: new Headers() }
                     : { ok: true, status: 200, headers: new Headers() };
@@ -150,6 +150,6 @@ describe('serverFetch auth invalidation', () => {
             { serverId: 'server-a' },
         );
         expect(getCredentials).toHaveBeenCalledTimes(1);
-        expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/v1/account/profile'))).toHaveLength(2);
+        expect(fetchMock.mock.calls.filter(([input]) => new URL(String(input)).pathname === '/v1/account/profile')).toHaveLength(2);
     });
 });

@@ -1,4 +1,5 @@
 import React, { useCallback } from 'react';
+import { useSessionArchivePending } from '@/hooks/session/useSessionArchivePending';
 import { View } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Typography } from '@/constants/Typography';
@@ -66,7 +67,7 @@ import { completeSessionForkNavigation } from '@/components/sessions/transcript/
 import { createSessionActionTarget } from '@/components/sessions/actions/sessionActionContext';
 import { useSessionAttentionStandingInputs } from '@/hooks/session/useSessionAttentionStandingInputs';
 import { resolveSessionAttentionStanding } from '@/sync/domains/session/organization/attentionStanding';
-import { executeSessionAction } from '@/components/sessions/actions/sessionActionExecution';
+import { confirmSessionStop, executeSessionAction } from '@/components/sessions/actions/sessionActionExecution';
 import {
     SESSION_ACTION_ARCHIVE_ID,
     SESSION_ACTION_DELETE_ID,
@@ -211,66 +212,28 @@ function shallowEqualRecord(
 
 function areSessionInfoStaticFieldsEqual(previous: Session, next: Session): boolean {
     if (previous === next) return true;
+    // Only status-independent counters are excluded; runtime observations must reach useSessionStatus.
     const {
         updatedAt: _previousUpdatedAt,
         seq: _previousSeq,
         lastViewedSessionSeq: _previousLastViewedSessionSeq,
-        activeAt: _previousActiveAt,
         latestReadyEventSeq: _previousLatestReadyEventSeq,
-        latestReadyEventAt: _previousLatestReadyEventAt,
         pendingVersion: _previousPendingVersion,
         metadataVersion: _previousMetadataVersion,
         agentStateVersion: _previousAgentStateVersion,
-        thinkingAt: _previousThinkingAt,
         ...previousStaticFields
     } = previous;
     const {
         updatedAt: _nextUpdatedAt,
         seq: _nextSeq,
         lastViewedSessionSeq: _nextLastViewedSessionSeq,
-        activeAt: _nextActiveAt,
         latestReadyEventSeq: _nextLatestReadyEventSeq,
-        latestReadyEventAt: _nextLatestReadyEventAt,
         pendingVersion: _nextPendingVersion,
         metadataVersion: _nextMetadataVersion,
         agentStateVersion: _nextAgentStateVersion,
-        thinkingAt: _nextThinkingAt,
         ...nextStaticFields
     } = next;
     return shallowEqualRecord(previousStaticFields, nextStaticFields);
-}
-
-function useStableSessionInfoContentSession(session: Session | null): Session | null {
-    return React.useMemo(() => session, [
-        session?.id,
-        session?.serverId,
-        session?.encryptionMode,
-        session?.createdAt,
-        session?.active,
-        session?.archivedAt,
-        session?.pendingCount,
-        session?.pendingPermissionRequestCount,
-        session?.pendingUserActionRequestCount,
-        session?.pendingRequestObservedAt,
-        session?.latestTurnStatus,
-        session?.latestTurnStatusObservedAt,
-        session?.lastRuntimeIssue,
-        session?.metadata,
-        session?.agentState,
-        session?.thinking,
-        session?.presence,
-        session?.optimisticThinkingAt,
-        session?.thinkingGraceUntil,
-        session?.todos,
-        session?.permissionMode,
-        session?.permissionModeUpdatedAt,
-        session?.modelMode,
-        session?.modelModeUpdatedAt,
-        session?.owner,
-        session?.ownerProfile,
-        session?.accessLevel,
-        session?.canApprovePermissions,
-    ]);
 }
 
 function areSessionInfoContentPropsEqual(
@@ -737,8 +700,8 @@ function SessionInfoContent({ session, sessionServerId, sourceMachineIdForHandof
     }), [theme.colors.state.danger.foreground]);
     const archiveInfoItemProps = React.useMemo(() => createSessionActionInfoItemProps({
         actionId: SESSION_ACTION_ARCHIVE_ID,
-        iconColor: theme.colors.state.danger.foreground,
-    }), [theme.colors.state.danger.foreground]);
+        iconColor: theme.colors.accent.blue,
+    }), [theme.colors.accent.blue]);
     const deleteInfoItemProps = React.useMemo(() => createSessionActionInfoItemProps({
         actionId: SESSION_ACTION_DELETE_ID,
         iconColor: theme.colors.state.danger.foreground,
@@ -854,30 +817,23 @@ function SessionInfoContent({ session, sessionServerId, sourceMachineIdForHandof
     const [stoppingSession, performStop] = useHappyAction(handleStopAndMaybeArchive);
 
     const handleStopSession = useCallback(async () => {
-        const confirmed = await Modal.confirm(
-            t('sessionInfo.stopSession'),
-            t('sessionInfo.stopSessionConfirm'),
-            {
-                cancelText: t('common.cancel'),
-                confirmText: t('sessionInfo.stopSession'),
-                destructive: true,
-            },
-        );
-        if (!confirmed) return;
+        if (!await confirmSessionStop()) return;
         await performStop();
     }, [performStop]);
 
     const handleArchive = useCallback(async () => {
-        await executeSessionAction({
+        const result = await executeSessionAction({
             actionId: SESSION_ACTION_ARCHIVE_ID,
             target: sessionActionTarget,
             context: {
                 hideInactiveSessions,
             },
         });
+        if (result === false) return;
         handleExitAfterSessionMutation();
     }, [handleExitAfterSessionMutation, hideInactiveSessions, sessionActionTarget]);
     const [archivingSession, performArchive] = useHappyAction(handleArchive);
+    const archivePending = useSessionArchivePending(session.id, scopedMutationServerId);
 
     // A launcher only, exactly like the Session header: strategy is chosen
     // before any fork effect is issued, from every UI entry point.
@@ -955,16 +911,6 @@ function SessionInfoContent({ session, sessionServerId, sourceMachineIdForHandof
     const [handingOffSession, performHandoff] = useHappyAction(handleHandoffAction);
 
     const handleArchiveSession = useCallback(async () => {
-        const confirmed = await Modal.confirm(
-            t('sessionInfo.archiveSession'),
-            t('sessionInfo.archiveSessionConfirm'),
-            {
-                cancelText: t('common.cancel'),
-                confirmText: t('sessionInfo.archiveSession'),
-                destructive: true,
-            },
-        );
-        if (!confirmed) return;
         await performArchive();
     }, [performArchive]);
 
@@ -1238,13 +1184,14 @@ function SessionInfoContent({ session, sessionServerId, sourceMachineIdForHandof
                             {...stopInfoItemProps}
                             onPress={handleStopSession}
                             loading={stoppingSession}
+                            disabled={archivePending}
                         />
                     )}
                     {canArchiveSession && archiveInfoItemProps && (
                         <Item
                             {...archiveInfoItemProps}
                             onPress={handleArchiveSession}
-                            loading={archivingSession}
+                            loading={archivingSession || archivePending}
                         />
                     )}
                     {canDeleteSession && deleteInfoItemProps && (
@@ -1510,7 +1457,6 @@ export default () => {
     // Handle three states: loading, deleted, and exists.
     // If the session record is already present, fail open and render it even if global hydration
     // is still in progress; otherwise deep links can get stuck in a permanent spinner state.
-    const contentSession = useStableSessionInfoContentSession(session);
 
     if (!session && (!isDataReady || !sessionHydrated) && !sessionMissingAfterHydration) {
         // Still loading data
@@ -1536,7 +1482,7 @@ export default () => {
     return (
         <View testID="session-info-screen" style={{ flex: 1 }}>
             <MemoizedSessionInfoContent
-                session={contentSession ?? session}
+                session={session}
                 sessionServerId={sessionServerId}
                 sourceMachineIdForHandoff={sourceMachineIdForHandoff}
                 runtimeAvailability={runtimeAvailability}

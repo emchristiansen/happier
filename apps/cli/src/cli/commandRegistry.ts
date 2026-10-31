@@ -10,6 +10,7 @@ import { handleCapabilitiesCliCommand } from './commands/capabilities';
 import { handleConnectCliCommand } from './commands/connect';
 import { handleDaemonCliCommand } from './commands/daemon';
 import { handleDoctorCliCommand } from './commands/doctor';
+import { handleHerdrCliCommand } from './commands/herdr';
 import { handleInstallCliCommand } from './commands/install';
 import { handleLogoutCliCommand } from './commands/logout';
 import { handleMachineCliCommand } from './commands/machine';
@@ -65,6 +66,7 @@ export const commandRegistry: Readonly<Record<string, CommandHandler>> = {
   connect: handleConnectCliCommand,
   daemon: handleDaemonCliCommand,
   doctor: handleDoctorCliCommand,
+  herdr: handleHerdrCliCommand,
   install: handleInstallCliCommand,
   logout: handleLogoutCliCommand,
   machine: handleMachineCliCommand,

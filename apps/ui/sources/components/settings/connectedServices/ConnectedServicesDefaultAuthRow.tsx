@@ -4,6 +4,7 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import {
     ConnectedServiceBindingsV1Schema,
+    readConnectedServicesDefaultAuthSettings,
     type ConnectedServiceBindingSelectionV1,
     type ConnectedServiceBindingsV1,
     type ConnectedServiceId,
@@ -45,6 +46,7 @@ export type ConnectedServicesDefaultAuthRowProps = Readonly<{
         connectedServicesProfileLabelByKey: Record<string, string | undefined>;
         connectedServicesDefaultProfileByServiceId: Record<string, string | undefined>;
         connectedServicesDefaultAuthByAgentIdV1?: ConnectedServicesDefaultAuthByAgentIdV1;
+        connectedServicesAdditionalDefaultAuthByAgentIdV1?: ConnectedServicesDefaultAuthByAgentIdV1;
     };
     setDefaultAuthSettings: (next: ConnectedServicesDefaultAuthByAgentIdV1) => void;
     onOpenConnectedServiceSettings: (serviceId: string) => void;
@@ -58,10 +60,6 @@ export type ConnectedServicesDefaultAuthRowProps = Readonly<{
     onDismissPoolAdoptionSuggestion?: (key: string) => void;
 }>;
 
-const EMPTY_DEFAULT_AUTH_SETTINGS: ConnectedServicesDefaultAuthByAgentIdV1 = {
-    v: 1,
-    bindingsByAgentId: {},
-};
 const EMPTY_SERVICE_BINDINGS: Readonly<Record<string, ConnectedServicesServiceBinding | undefined>> = {};
 const DEFAULT_AUTH_PICKER_MAX_HEIGHT = 520;
 
@@ -182,7 +180,10 @@ export function ConnectedServicesDefaultAuthRow(props: ConnectedServicesDefaultA
         supportedServiceIds,
     ]);
 
-    const defaultAuthSettings = props.settings.connectedServicesDefaultAuthByAgentIdV1 ?? EMPTY_DEFAULT_AUTH_SETTINGS;
+    const defaultAuthSettings = React.useMemo(() => readConnectedServicesDefaultAuthSettings(props.settings), [
+        props.settings.connectedServicesDefaultAuthByAgentIdV1,
+        props.settings.connectedServicesAdditionalDefaultAuthByAgentIdV1,
+    ]);
     const persistedBindingsByServiceId = defaultAuthSettings.bindingsByAgentId[props.agentId]?.bindingsByServiceId ?? EMPTY_SERVICE_BINDINGS;
     const [bindingsByServiceId, setBindingsByServiceId] = React.useState<
         Readonly<Record<string, ConnectedServicesServiceBinding | undefined>>

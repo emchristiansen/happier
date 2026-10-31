@@ -6,6 +6,7 @@ import type { ClaudeSessionBundle } from '../../../session/handoff/types';
 import { copySessionHandoffFileSlice } from '../../../session/handoff/sessionHandoffProviderBundleFile';
 import { getProjectPath, resolveClaudeProjectId } from '../utils/path';
 import { resolveConfiguredClaudeConfigDir } from '../utils/resolveConfiguredClaudeConfigDir';
+import { resolveClaudeConfigDirEnvOverlay } from '../utils/resolveClaudeConfigDirEnvOverlay';
 
 function resolveClaudeTranscriptPath(projectDir: string, remoteSessionId: string): string {
   if (!remoteSessionId || remoteSessionId.includes('/') || remoteSessionId.includes('\\')) {
@@ -44,9 +45,7 @@ export async function importClaudeSessionBundle(params: Readonly<{
       directory: params.targetPath,
       agent: 'claude',
       resume: params.bundle.remoteSessionId,
-      environmentVariables: {
-        CLAUDE_CONFIG_DIR: resolvedClaudeConfigDir,
-      },
+      environmentVariables: resolveClaudeConfigDirEnvOverlay(params.env),
       transcriptStorage: params.sessionStorageMode === 'persisted' ? 'persisted' : 'direct',
       approvedNewDirectoryCreation: true,
     },

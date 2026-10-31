@@ -78,6 +78,8 @@ describe('scenarioCatalog: ACP capability/model-set scenarios', () => {
 
     const cursorScenario = build(acpProvider('cursor'));
     expect(cursorScenario.id).toBe('acp_set_model_dynamic');
+    expect(build(acpProvider('devin')).id).toBe('acp_set_model_dynamic');
+    expect(build(acpProvider('kimi')).id).toBe('acp_set_model_dynamic');
     const grokStubScenario = build({
       ...acpProvider('grok_acp_stub'),
       cli: { subcommand: 'grok' },
@@ -89,7 +91,6 @@ describe('scenarioCatalog: ACP capability/model-set scenarios', () => {
     const build = (scenarioCatalog as Record<string, any>).acp_set_model_dynamic;
     expect(typeof build).toBe('function');
     expect(() => build(acpProvider('qwen'))).toThrow(/dynamic model/i);
-    expect(() => build(acpProvider('kimi'))).toThrow(/dynamic model/i);
   });
 
   it('defines acp_set_model_inventory for gemini only', () => {

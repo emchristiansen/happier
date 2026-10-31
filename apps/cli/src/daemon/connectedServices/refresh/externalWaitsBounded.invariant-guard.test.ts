@@ -86,8 +86,8 @@ describe('connected service external wait boundedness invariant guard', () => {
 
     expectSourceContains(
       serviceRefreshers,
-      /const CONNECTED_SERVICE_OAUTH_REFRESH_FETCH_TIMEOUT_MS = \d[\d_]*;[\s\S]*AbortSignal\.timeout\(CONNECTED_SERVICE_OAUTH_REFRESH_FETCH_TIMEOUT_MS\)[\s\S]*fetch\(config\.tokenUrl,[\s\S]*signal: buildRefreshAbortSignal\(\)/u,
-      'OAuth token refresh must pass a bounded AbortSignal to fetch',
+      /const CONNECTED_SERVICE_OAUTH_REFRESH_FETCH_TIMEOUT_MS = \d[\d_]*;[\s\S]*AbortSignal\.timeout\(CONNECTED_SERVICE_OAUTH_REFRESH_FETCH_TIMEOUT_MS\)[\s\S]*AbortSignal\.any\(\[containingSignal, timeout\]\)[\s\S]*fetch\(config\.tokenUrl,[\s\S]*signal: buildRefreshAbortSignal\(params\.signal\)/u,
+      'OAuth token refresh must preserve containing cancellation and its bounded timeout',
     );
 
     expectSourceContains(

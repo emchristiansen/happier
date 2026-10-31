@@ -1,3 +1,4 @@
+import { readNonBlankOpaqueIdentifier } from '@happier-dev/protocol';
 import type { Message } from '@/sync/domains/messages/messageTypes';
 
 import type { SessionSubagent } from './types';
@@ -49,7 +50,7 @@ export function deriveSessionSubagentPendingPermissionIds(params: Readonly<{
     const transcriptFallbackByToolId = new Map<string, SessionSubagent[]>();
 
     for (const subagent of params.subagents) {
-        const sidechainId = subagent.transcript.sidechainId?.trim();
+        const sidechainId = readNonBlankOpaqueIdentifier(subagent.transcript.sidechainId);
         const sidechainMessages = sidechainId ? params.reducerState?.sidechains?.get(sidechainId) : null;
 
         if (Array.isArray(sidechainMessages) && sidechainMessages.length > 0) {

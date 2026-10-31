@@ -8,6 +8,7 @@ import type { AgentId } from '@/agents/catalog/catalog';
 import type { ProviderLocalAuthLaunch } from '@/agents/providers/shared/providerLocalAuthPlugin';
 import { useMachine } from '@/sync/domains/state/storage';
 import { t } from '@/text';
+import { randomUUID } from '@/platform/randomUUID';
 import { isMachineOnline } from '@/utils/sessions/machineUtils';
 import { buildTerminalAutoExitCommand } from './buildTerminalAutoExitCommand';
 
@@ -29,9 +30,12 @@ export const ProviderAuthenticationTerminalPane = React.memo(function ProviderAu
         const machineHomeDir = String(props.machineHomeDir ?? '').trim();
         return machineHomeDir || '/';
     }, [props.machineHomeDir]);
+    // session_attach is daemon-keyed and shared; only auth launches preserve a private client key.
+    const sharedAttachment = props.authLaunch?.launch?.kind === 'session_attach';
+    const launchIdentity = JSON.stringify(props.authLaunch ?? null);
     const terminalKey = React.useMemo(
-        () => `provider-login:${props.machineId ?? 'none'}:${props.providerId}:${props.authLaunch?.kind ?? 'none'}`,
-        [props.authLaunch?.kind, props.machineId, props.providerId],
+        () => `provider-login:${props.machineId ?? 'none'}:${props.providerId}:${props.authLaunch?.kind ?? 'none'}${sharedAttachment ? '' : `:${randomUUID()}`}`,
+        [launchIdentity, props.machineId, props.providerId, sharedAttachment],
     );
     const controller = useMachineTerminalSession({
         machineId: props.machineId,
@@ -40,10 +44,11 @@ export const ProviderAuthenticationTerminalPane = React.memo(function ProviderAu
         machineRpcTargetAvailable,
         terminalKey,
         terminalRef: terminalRendererRef,
+        launch: props.authLaunch?.launch ?? null,
         initialCommand: props.authLaunch?.initialCommand
             ? buildTerminalAutoExitCommand(props.authLaunch.initialCommand, machine?.metadata?.platform)
             : null,
-        closeOnUnmount: true,
+        closeOnUnmount: !sharedAttachment,
     });
 
     const didNotifyExitRef = React.useRef(false);

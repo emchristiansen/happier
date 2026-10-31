@@ -1,53 +1,46 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const acquireSessionRunnerLock = vi.fn(async () => ({ ok: false as const, reason: 'already_running' as const, heldByPid: 999 }));
+import { reloadConfiguration } from '@/configuration';
+import { acquireSessionRunnerLock, readSessionRunnerLockStatus } from '@/daemon/sessionRunnerLock';
+import { logger } from '@/ui/logger';
+import { runBackendSessionCliCommand } from './runBackendSessionCliCommand';
 
-vi.mock('@/daemon/sessionRunnerLock', () => ({
-  acquireSessionRunnerLock,
-}));
-
-vi.mock('@/ui/auth', () => ({
-  authAndSetupMachineIfNeeded: vi.fn(async () => ({ credentials: { token: 'x' } })),
-}));
-
-vi.mock('@/persistence', () => ({
-  readCredentials: vi.fn(async () => ({ token: 'x' })),
-  readSettings: vi.fn(async () => ({ machineId: 'machine-1' })),
-}));
-
-vi.mock('@/settings/accountSettings/bootstrapAccountSettingsContext', () => ({
-  bootstrapAccountSettingsContext: vi.fn(async () => ({
-    source: 'none',
-    settings: {},
-    settingsVersion: 0,
-    loadedAtMs: Date.now(),
-    whenRefreshed: null,
-  })),
-}));
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  reloadConfiguration();
+});
 
 describe('runBackendSessionCliCommand (session runner lock)', () => {
-  it('exits when --existing-session is already running on this machine', async () => {
+  it('refuses an existing Session without entering its runner or releasing the current owner', async () => {
+    const happyHomeDir = await mkdtemp(join(tmpdir(), 'happier-existing-runner-'));
+    vi.stubEnv('HAPPIER_HOME_DIR', happyHomeDir);
+    reloadConfiguration();
+    const sessionId = 'session-already-running';
+    const lock = await acquireSessionRunnerLock({ sessionId });
+    if (!lock.ok) throw new Error('Unable to establish the running Session fixture');
+    vi.spyOn(logger, 'fatal').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
-      throw new Error(`exit:${code}`);
-    }) as any);
-
-    const { runBackendSessionCliCommand } = await import('./runBackendSessionCliCommand');
-
-    const run = vi.fn().mockResolvedValue(undefined);
-    const loadRun = vi.fn().mockResolvedValue(run);
-
-    await expect(
-      runBackendSessionCliCommand({
-        context: { args: ['codex', '--existing-session', 'sess_1'], terminalRuntime: null } as any,
-        loadRun,
-        agentIdForAccountSettings: 'codex' as any,
-      }),
-    ).rejects.toThrow('exit:1');
-
-    expect(acquireSessionRunnerLock).toHaveBeenCalledTimes(1);
-    expect(loadRun).not.toHaveBeenCalled();
-    expect(run).not.toHaveBeenCalled();
-    expect(exitSpy).toHaveBeenCalledWith(1);
+    vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('runner-exit'); });
+    let runnerLoaded = false;
+    try {
+      await expect(runBackendSessionCliCommand({
+        context: { args: ['codex', '--existing-session', sessionId], rawArgv: [], terminalRuntime: null },
+        loadRun: async () => {
+          runnerLoaded = true;
+          return async () => {};
+        },
+      })).rejects.toThrow('runner-exit');
+      expect(runnerLoaded).toBe(false);
+      await expect(readSessionRunnerLockStatus({ sessionId })).resolves.toMatchObject({
+        ok: true, lock: { sessionId, pid: process.pid, acquiredAtMs: lock.acquiredAtMs },
+      });
+    } finally {
+      await lock.release();
+      await rm(happyHomeDir, { recursive: true, force: true });
+    }
   });
 });

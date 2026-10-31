@@ -178,7 +178,7 @@ export function buildCursorSessionModelsFromConfigOptions(
   if (!configOptions || configOptions.length === 0) return null;
   const modelOption = findCursorModelConfigOption(configOptions);
   const choices = modelOption?.options;
-  if (!modelOption || !choices || choices.length === 0) return null;
+  if (!modelOption || !choices) return null;
 
   const currentModelValue = stringifyConfigValue(modelOption.currentValue);
   const currentDisplayModelId = currentModelValue ? toDisplayModelId(currentModelValue) : 'default';

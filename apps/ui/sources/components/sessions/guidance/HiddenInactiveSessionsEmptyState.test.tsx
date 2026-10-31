@@ -50,7 +50,7 @@ vi.mock('@/modal', async () => {
 });
 
 vi.mock('expo-clipboard', () => ({
-    setStringAsync: vi.fn(async () => {}),
+    setStringAsync: vi.fn(async () => true),
 }));
 
 describe('HiddenInactiveSessionsEmptyState', () => {

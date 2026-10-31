@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AgentBackend, SessionId } from '@/agent/core/AgentBackend';
 import type { ExecutionRunController } from '@/agent/executionRuns/controllers/types';
 import { ExecutionRunManager } from '@/agent/executionRuns/runtime/ExecutionRunManager';
-import { settleExecutionRunControllerOccurrence } from './startExecutionRun';
+import { settleExecutionRunControllerOccurrence } from '@/agent/executionRuns/runtime/settleExecutionRunControllerOccurrence';
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
@@ -99,7 +99,7 @@ describe('settleExecutionRunControllerOccurrence', () => {
     expect(controllers.get(started.runId)).toBe(successor);
   });
 
-  it('long-lived start rejection disposes and settles only its captured occurrence', async () => {
+  it('long-lived provisioning rejection terminalizes and settles only its captured occurrence after start returns', async () => {
     const provision = createDeferred<{ sessionId: SessionId }>();
     const oldDispose = vi.fn(async () => {});
     const manager = new ExecutionRunManager({
@@ -109,7 +109,7 @@ describe('settleExecutionRunControllerOccurrence', () => {
       sendAcp: () => {},
     });
 
-    const start = manager.start({
+    const started = await manager.start({
       sessionId: 'session-1',
       intent: 'delegate',
       backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
@@ -118,7 +118,8 @@ describe('settleExecutionRunControllerOccurrence', () => {
       runClass: 'long_lived',
       ioMode: 'request_response',
     });
-    const [runId, oldController] = await waitForController(manager);
+    const runId = started.runId;
+    const [, oldController] = await waitForController(manager);
     const controllers = readControllers(manager);
     const oldResolveTerminal = vi.fn(oldController.resolveTerminal);
     oldController.resolveTerminal = oldResolveTerminal;
@@ -135,7 +136,8 @@ describe('settleExecutionRunControllerOccurrence', () => {
 
     provision.reject(new Error('old occurrence start failed'));
 
-    await expect(start).rejects.toThrow('old occurrence start failed');
+    await manager.waitForTerminal(runId);
+    expect(manager.get(runId)?.status).toBe('failed');
     expect(oldDispose).toHaveBeenCalledOnce();
     expect(oldResolveTerminal).toHaveBeenCalledOnce();
     expect(successorDispose).not.toHaveBeenCalled();
@@ -184,5 +186,89 @@ describe('settleExecutionRunControllerOccurrence', () => {
     expect(sendPrompt).not.toHaveBeenCalled();
     expect(cancel).toHaveBeenCalledWith('late-child-session');
     expect(dispose).toHaveBeenCalled();
+  });
+
+  it('stopping during long-lived provisioning cancels and disposes a late-created backend session without sending work', async () => {
+    const provision = createDeferred<{ sessionId: SessionId }>();
+    const cancel = vi.fn(async () => {});
+    const dispose = vi.fn(async () => {});
+    const sendPrompt = vi.fn(async () => {});
+    const backend: AgentBackend = {
+      startSession: () => provision.promise,
+      sendPrompt,
+      cancel,
+      onMessage() {},
+      dispose,
+      async waitForResponseComplete() {},
+    };
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => backend,
+      sendAcp: () => {},
+    });
+
+    const started = await manager.start({
+      sessionId: 'session-1',
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      instructions: 'Do work.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'resumable',
+      runClass: 'long_lived',
+      ioMode: 'request_response',
+    });
+    await expect(manager.stop(started.runId)).resolves.toEqual({ ok: true });
+
+    provision.resolve({ sessionId: 'late-child-session' as SessionId });
+    for (let attempt = 0; attempt < 50 && cancel.mock.calls.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    expect(manager.get(started.runId)?.status).toBe('cancelled');
+    expect(sendPrompt).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledWith('late-child-session');
+    expect(dispose).toHaveBeenCalled();
+  });
+
+  it('dispatches initial instructions before an immediate external send after delayed long-lived provisioning', async () => {
+    const provision = createDeferred<{ sessionId: SessionId }>();
+    const prompts: string[] = [];
+    const backend: AgentBackend = {
+      startSession: () => provision.promise,
+      async sendPrompt(_sessionId, prompt) { prompts.push(prompt); },
+      async cancel() {},
+      onMessage() {},
+      async dispose() {},
+      async waitForResponseComplete() {},
+    };
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => backend,
+      sendAcp: () => {},
+    });
+
+    const started = await manager.start({
+      sessionId: 'session-1',
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      instructions: 'Initial work.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'resumable',
+      runClass: 'long_lived',
+      ioMode: 'request_response',
+    });
+    const send = manager.send(started.runId, { message: 'Follow-up work.' });
+    await Promise.resolve();
+    expect(prompts).toEqual([]);
+
+    provision.resolve({ sessionId: 'child-session' as SessionId });
+
+    await vi.waitFor(() => expect(prompts).toHaveLength(2));
+    await expect(send).resolves.toEqual({ ok: true });
+    expect(prompts[0]).toContain('Initial work.');
+    expect(prompts[1]).toBe('Follow-up work.');
+    await manager.stop(started.runId);
   });
 });

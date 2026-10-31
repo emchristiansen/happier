@@ -41,12 +41,12 @@ describe('killProcessTree root identity guard', () => {
     vi.restoreAllMocks();
   });
 
-  it('keeps unguarded cleanup exactly as before', async () => {
+  it('keeps unguarded signals and reports the upstream root observation', async () => {
     if (process.platform === 'win32') return;
     psListMock.mockResolvedValue([{ pid: CHILD_PID, ppid: ROOT_PID, name: 'child' }]);
     const { calls } = simulateProcesses({ alive: new Set([ROOT_PID, CHILD_PID]) });
 
-    await expect(killProcessTree({ pid: ROOT_PID }, { graceMs: 1 })).resolves.toBeUndefined();
+    await expect(killProcessTree({ pid: ROOT_PID }, { graceMs: 1 })).resolves.toEqual({ rootObservedAlive: true });
 
     expect(calls).toEqual([
       [ROOT_PID, 'SIGSTOP'],

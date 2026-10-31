@@ -18,6 +18,10 @@ function buildActionBackedTools(): readonly HappierBuiltInToolDefinition[] {
       title: spec.title,
       description: spec.description ?? spec.title,
       inputSchema: spec.inputSchema,
+      annotations: {
+        ...(spec.sideEffectClass === 'read' ? { readOnlyHint: true } : {}),
+        destructiveHint: spec.safety === 'danger',
+      },
     });
   }
 

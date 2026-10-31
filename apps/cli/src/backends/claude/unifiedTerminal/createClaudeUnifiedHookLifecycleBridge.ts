@@ -10,6 +10,7 @@ import {
   createClaudeLocalLifecycleTracker,
   isClaudeTaskNotificationUserPromptHook,
 } from '../localControl/claudeLocalLifecycleTracker';
+import { isClaudeMainChainCompactBoundary } from '../localControl/readClaudeTranscriptTurnSignal';
 import {
   type createClaudeProviderActivityLedger,
 } from '../providerActivity/createClaudeProviderActivityLedger';
@@ -17,7 +18,8 @@ import type { createClaudeProviderRuntimeActivityAdapter } from '../providerActi
 import { isClaudeRuntimeAuthFailureEvidence } from '../connectedServices/classifyClaudeConnectedServiceRuntimeAuthFailure';
 import { containsDefinitiveClaudeOAuthRevocationEvidence } from '../connectedServices/surfaceClaudeRuntimeIssues';
 import {
-  mapClaudeRateLimitEventToUsageDetails,
+  mapClaudeProviderFailureToUsageDetails,
+  mapClaudeRateLimitEventToQuotaEvidence,
   mapClaudeStopFailureHookToUsageDetails,
   type NormalizedProviderUsageLimitDetailsV1,
 } from '../connectedServices/mapClaudeRateLimitEventToUsageDetails';
@@ -35,13 +37,14 @@ import { isClaudeUnifiedTrustedHookActivationEvidence } from './claudeUnifiedHoo
 import { normalizeClaudeUnifiedPromptIdentityText } from './promptIdentity';
 
 export type ClaudeUnifiedSessionHookSubscription = (
-  callback: (data: SessionHookData) => void,
+  callback: (data: SessionHookData, observation?: Readonly<{ observedAt?: number; startupReplay?: true }>) => void,
 ) => (() => void) | null | undefined;
 
 export type ClaudeUnifiedHookLifecycleBridge = ClaudeUnifiedStartableDisposable & Readonly<{
   observeTranscript(message: RawJSONLines): void;
   observeLiveProviderActivityRow(message: unknown, expectedSessionId: string): void;
   handleProviderActivityObservationLoss(reason: string): void;
+  observeProcessExit(): void;
   settleAttemptLocalCommandCompleted(): Promise<void>;
   settleAttemptLocalCommandAborted(source: string): boolean;
 }>;
@@ -113,7 +116,7 @@ function disposeSubscription(dispose: (() => void) | null): void {
 }
 
 function readHookEventName(data: SessionHookData): string {
-  const raw = data.hook_event_name ?? data.hookEventName;
+  const raw = data.hook_event_name ?? data.hookEventName ?? data.eventName;
   return typeof raw === 'string' ? raw : '';
 }
 
@@ -129,12 +132,6 @@ function readHookRequestId(data: SessionHookData): string {
     || readHookString(data, 'id');
 }
 
-function readSystemSubtype(message: RawJSONLines): string {
-  if (message.type !== 'system') return '';
-  const raw = (message as Record<string, unknown>).subtype;
-  return typeof raw === 'string' ? raw : '';
-}
-
 export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   subscribeClaudeSessionHooks: ClaudeUnifiedSessionHookSubscription;
   arbiter: Pick<ClaudeUnifiedInputArbiter, 'observeLifecycle' | 'confirmPromptAcceptedByProvider' | 'drainWhenSafe'>
@@ -146,6 +143,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   onThinkingChange?: ((thinking: boolean) => void) | undefined;
   onReady?: (() => void | Promise<void>) | undefined;
   onUsageLimitDetails?: ((details: NormalizedProviderUsageLimitDetailsV1) => void | Promise<void>) | undefined;
+  onQuotaEvidence?: ((windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => void | Promise<void>) | undefined;
   onRuntimeAuthFailureEvent?: ((error: unknown) => void | Promise<void>) | undefined;
   onProviderPromptStarted?: (() => void | Promise<void>) | undefined;
   /**
@@ -572,8 +570,10 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
         runtimeActivityAdapter: opts.runtimeActivityAdapter ?? null,
         providerActivityLedger: opts.providerActivityLedger,
       });
-      unsubscribe = opts.subscribeClaudeSessionHooks((data) => {
+      unsubscribe = opts.subscribeClaudeSessionHooks((data, observation) => {
         const hookEventName = readHookEventName(data);
+        // The workflow source resolves startup native identity and terminal ordering after replay.
+        if (hookEventName === 'SubagentStart' && observation?.startupReplay) return;
         // Sidechain (subagent) hooks carry an agent_id attribution. They must not
         // drive main-conversation lifecycle behavior: prompt acceptance, compaction
         // gating, turn-terminal projection, release-all permission unblocking, or
@@ -605,17 +605,16 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
             const submittedPrompt = readHookString(data, 'prompt');
             const normalizedSubmittedPrompt = normalizeClaudeUnifiedPromptIdentityText(submittedPrompt);
             if (normalizedSubmittedPrompt && opts.arbiter.confirmPromptAcceptedByProviderIf) {
-              // UserPromptSubmit is authenticated provider evidence. Correlate its exact prompt
-              // before waiting for turn-end arming: a queued steer may be submitted by Claude at
-              // the same boundary, with this hook arriving before any separate idle observation.
-              // Exact matching keeps terminal custody/output from settling a neighbor Pending row.
+              // Claude can emit UserPromptSubmit before a steer leaves its native queue. The
+              // arbiter preserves that custody until the ordered transcript proves consumption;
+              // an exact hook can still accept a prompt injected to start a new turn.
               let matchedBatch: ClaudeUnifiedPromptBatch | null = null;
               void opts.arbiter.confirmPromptAcceptedByProviderIf((batch) => {
                 const matches =
                   normalizeClaudeUnifiedPromptIdentityText(batch.message) === normalizedSubmittedPrompt;
                 if (matches) matchedBatch = batch;
                 return matches;
-              }).then((confirmed) => {
+              }, 'prompt_submit').then((confirmed) => {
                 if (!confirmed || !matchedBatch || !opts.onAcceptedPromptSubmitEvidence) return;
                 const sessionId = readHookString(data, 'session_id') || readHookString(data, 'sessionId');
                 const promptId = readHookString(data, 'prompt_id') || readHookString(data, 'promptId');
@@ -680,13 +679,17 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
     },
     observeTranscript(message) {
       noteTurnStallProgress();
-      if (readSystemSubtype(message) === 'compact_boundary') {
+      if (isClaudeMainChainCompactBoundary(message)) {
         observeCompactionCompleted();
       }
       if (isClaudeRuntimeAuthFailureEvidence(message)) {
         chainTerminalSideEffect('runtime-auth', () => opts.onRuntimeAuthFailureEvent?.(message));
       }
-      const usageLimitDetails = mapClaudeRateLimitEventToUsageDetails(message);
+      const quotaEvidence = mapClaudeRateLimitEventToQuotaEvidence(message);
+      if (quotaEvidence.length > 0) {
+        chainTerminalSideEffect('quota-evidence', () => opts.onQuotaEvidence?.(quotaEvidence));
+      }
+      const usageLimitDetails = mapClaudeProviderFailureToUsageDetails(message);
       if (usageLimitDetails) {
         chainTerminalSideEffect('usage-limit', () => opts.onUsageLimitDetails?.(usageLimitDetails));
       }
@@ -697,6 +700,17 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
     },
     handleProviderActivityObservationLoss(reason) {
       tracker?.handleProviderActivityObservationLoss(reason);
+    },
+    observeProcessExit() {
+      if (tracker) {
+        tracker.observeProcessExit({ providerStopped: true });
+      } else {
+        // Owned process exit may arrive before observer startup or after lifecycle disposal
+        // during teardown. The captured adapter still enforces the session runtime binding.
+        void opts.runtimeActivityAdapter?.handleRuntimeLoss('claude_process_exit', { providerStopped: true }).catch((error) => {
+          logger.debug('[unified]: Claude process-exit activity observation failed', error);
+        });
+      }
     },
     settleAttemptLocalCommandCompleted: settleCompletedTurn,
     settleAttemptLocalCommandAborted(source) {

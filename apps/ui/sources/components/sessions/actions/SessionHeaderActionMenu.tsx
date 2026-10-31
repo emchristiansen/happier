@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { useSessionArchivePending } from '@/hooks/session/useSessionArchivePending';
 import { Pressable, View } from 'react-native';
 import { listActionSpecs } from '@happier-dev/protocol';
 import { useUnistyles } from 'react-native-unistyles';
@@ -42,7 +43,7 @@ import { useSessionHandoffSourceReachability } from '@/sync/domains/sessionHando
 import { useSessionMachineTarget } from '@/components/sessions/model/useSessionMachineTarget';
 import { completeSessionForkNavigation } from '@/components/sessions/transcript/forkContext/completeSessionForkNavigation';
 import { createSessionActionTarget } from '@/components/sessions/actions/sessionActionContext';
-import { executeSessionAction } from '@/components/sessions/actions/sessionActionExecution';
+import { confirmSessionStop, executeSessionAction } from '@/components/sessions/actions/sessionActionExecution';
 import { listVisibleSessionActionIds } from '@/components/sessions/actions/sessionActionAvailability';
 import { createSessionActionDropdownItem } from '@/components/sessions/actions/sessionActionPresentation';
 import {
@@ -60,7 +61,7 @@ import {
 } from '@/components/sessions/actions/sessionActionIds';
 import { buildSessionMetadataStabilitySignature } from '@/sync/domains/session/metadata/sessionMetadataStability';
 import { getSessionName } from '@/utils/sessions/sessionUtils';
-import { SESSION_HEADER_ICON_SIZE_PX } from '@/components/sessions/actions/sessionHeaderIconMetrics';
+import { resolveSessionHeaderActionTargetPx, SESSION_HEADER_ICON_SIZE_PX } from '@/components/sessions/actions/sessionHeaderIconMetrics';
 import { Icon } from '@/components/ui/icons/Icon';
 import { emitSessionResumeRequest } from '@/components/sessions/model/sessionResumeRequests';
 
@@ -179,6 +180,7 @@ function SessionHeaderActionMenuInner(props: SessionHeaderActionMenuProps) {
   const sessionHandoffEnabled = useFeatureEnabled('sessions.handoff');
   const executionRunsEnabled = useFeatureEnabled('execution.runs');
   const sessionServerId = usePreferredServerIdForSession(props.sessionId);
+  const archivePending = useSessionArchivePending(props.sessionId, sessionServerId);
   // Scoped to THIS Session's server, like the in-Session picker: the child is
   // created on that server, so an unrelated selected server must not decide
   // whether this conversation may continue with another Agent.
@@ -290,7 +292,9 @@ function SessionHeaderActionMenuInner(props: SessionHeaderActionMenuProps) {
         iconColor: theme.colors.chrome.header.foreground,
       });
       if (actionItem) {
-        out.push(actionItem);
+        out.push(archivePending && (actionId === SESSION_ACTION_ARCHIVE_ID || actionId === SESSION_ACTION_STOP_ID)
+          ? { ...actionItem, disabled: true }
+          : actionItem);
         existingActionIds.add(actionId);
       }
     }
@@ -307,6 +311,7 @@ function SessionHeaderActionMenuInner(props: SessionHeaderActionMenuProps) {
     return out;
   }, [
     props.extraItems,
+    archivePending,
     agentSwitchingEnabled,
     session,
     sessionActionTarget,
@@ -436,16 +441,9 @@ function SessionHeaderActionMenuInner(props: SessionHeaderActionMenuProps) {
         if (actionId === SESSION_ACTION_STOP_ID || actionId === SESSION_ACTION_ARCHIVE_ID) {
           fireAndForget((async () => {
             const isArchive = actionId === SESSION_ACTION_ARCHIVE_ID;
-            const confirmed = await Modal.confirm(
-              isArchive ? t('sessionInfo.archiveSession') : t('sessionInfo.stopSession'),
-              isArchive ? t('sessionInfo.archiveSessionConfirm') : t('sessionInfo.stopSessionConfirm'),
-              {
-                cancelText: t('common.cancel'),
-                confirmText: isArchive ? t('sessionInfo.archiveSession') : t('sessionInfo.stopSession'),
-                destructive: true,
-              },
-            );
-            if (!confirmed) return;
+            if (!isArchive) {
+              if (!await confirmSessionStop()) return;
+            }
             try {
               await executeSessionAction({
                 actionId: isArchive ? SESSION_ACTION_ARCHIVE_ID : SESSION_ACTION_STOP_ID,
@@ -540,13 +538,12 @@ function SessionHeaderActionMenuInner(props: SessionHeaderActionMenuProps) {
       trigger={({ toggle }) => (
             <Pressable
               onPress={toggle}
-              hitSlop={15}
               testID="session-header-action-menu-trigger"
               accessibilityRole="button"
               accessibilityLabel={t('session.actionMenu.openA11y')}
               style={({ pressed }) => ({
-                width: 44,
-                height: 44,
+                width: resolveSessionHeaderActionTargetPx(),
+                height: resolveSessionHeaderActionTargetPx(),
                 alignItems: 'center',
             justifyContent: 'center',
             opacity: pressed ? 0.7 : 1,

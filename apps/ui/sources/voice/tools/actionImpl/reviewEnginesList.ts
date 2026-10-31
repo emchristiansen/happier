@@ -1,4 +1,5 @@
 import { AGENT_IDS } from '@/agents/catalog/catalog';
+import { resolveBuiltInAgentTitle } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
 import { buildBackendTargetKey } from '@happier-dev/protocol';
 import { getMachineCapabilitiesSnapshot } from '@/hooks/server/useMachineCapabilitiesCache';
 import { extractExecutionRunsBackendsFromMachineCapabilitiesState } from '@/sync/domains/executionRuns/extractExecutionRunsBackendsFromMachineCapabilities';
@@ -11,10 +12,12 @@ function normalizeId(raw: unknown): string {
   return String(raw ?? '').trim();
 }
 
-function titleCaseId(id: string): string {
-  const trimmed = id.trim();
-  if (!trimmed) return '';
-  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+/**
+ * The catalog name the app already shows for a backend ("Factory Droid", not "Droid").
+ * Native review engines are not catalog agents, so they keep their own protocol title.
+ */
+function resolveAgentLabel(agentId: string): string {
+  return resolveBuiltInAgentTitle(agentId) ?? agentId;
 }
 
 export async function listReviewEnginesForVoiceTool(params: Readonly<{ sessionId: string; includeDisabled?: boolean }>): Promise<unknown> {
@@ -40,7 +43,7 @@ export async function listReviewEnginesForVoiceTool(params: Readonly<{ sessionId
   const items = buildAvailableReviewEngineOptions({
     enabledAgentIds: agentIds,
     executionRunsBackends,
-    resolveAgentLabel: (agentId) => titleCaseId(agentId),
+    resolveAgentLabel,
   })
     .map((item) => ({
       engineId: item.id,

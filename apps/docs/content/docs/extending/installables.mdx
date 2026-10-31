@@ -147,6 +147,18 @@ That keeps GitHub CLI installation explicit. Happier does not silently install a
 
 GitLab note: GitLab merge-request workflows can use an authenticated `glab` CLI when it is already available, but `glab` is not currently a Happier-managed installable.
 
+## Optional runtimes in development builds
+
+Current development builds also manage **Local semantic memory** and **Difftastic** here.
+These runtimes are pinned to the machine's CLI version. They install on first use when
+**Auto-install when needed** is enabled, and that first operation waits for acquisition.
+Opening Installables does not start a download. Existing installed copies work offline.
+
+Use **Install** before going offline if you expect to use these features. For local semantic
+memory, also enable your chosen model while online so its model files are cached; installing
+the inference runtime alone does not download the model. If acquisition fails, retry from this
+screen. Memory search keeps its keyword fallback; Difftastic reports the failure to its caller.
+
 ## Scope and expectations
 
 Installables are managed **per machine**.

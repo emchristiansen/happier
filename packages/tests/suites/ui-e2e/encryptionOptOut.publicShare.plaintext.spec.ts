@@ -134,10 +134,6 @@ test.describe('ui e2e: plaintext mode + public share', () => {
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
         HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: 'optional',
         HAPPIER_FEATURE_ENCRYPTION__ALLOW_ACCOUNT_OPTOUT: '1',
-        // Make presence timeouts fast enough for UI E2E reconnect flows.
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -158,8 +154,8 @@ test.describe('ui e2e: plaintext mode + public share', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('toggles account to plaintext, writes a plaintext session, and opens a public link', async ({ page, context }, testInfo) => {
-    test.setTimeout(420_000);
+  test('toggles account to plaintext, writes a plaintext session, and opens a public link', { tag: "@smoke" }, async ({ page, context }, testInfo) => {
+    test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
 
@@ -167,6 +163,14 @@ test.describe('ui e2e: plaintext mode + public share', () => {
     await mkdir(testDir, { recursive: true });
 
     const diagnostics = collectBrowserDiagnostics({ page });
+    const daemonEnv = {
+      ...process.env,
+      HAPPIER_SERVER_URL: server.baseUrl,
+      HAPPIER_WEBAPP_URL: uiBaseUrl,
+      HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
+      HAPPIER_VARIANT: 'dev',
+      HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+    };
 
     let daemon: StartedDaemon | null = null;
     let thrown: unknown = null;
@@ -177,9 +181,7 @@ test.describe('ui e2e: plaintext mode + public share', () => {
         cliHomeDir,
         serverUrl: server.baseUrl,
         uiBaseUrl,
-        extraEnv: {
-          HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
-        },
+        extraEnv: daemonEnv,
       });
 
       await page.goto(`${uiBaseUrl}/settings/account`, { waitUntil: 'domcontentloaded' });
@@ -187,7 +189,7 @@ test.describe('ui e2e: plaintext mode + public share', () => {
 
       const migrateOk = page.waitForResponse(
         (resp) =>
-          resp.url().endsWith('/v1/account/encryption/migrate') && resp.request().method() === 'POST' && resp.status() === 200,
+          new URL(resp.url()).pathname === '/v1/account/encryption/migrate' && resp.request().method() === 'POST' && resp.status() === 200,
         { timeout: 60_000 },
       );
       await page.getByTestId('settings-account-encryption-mode-switch').click();
@@ -195,6 +197,8 @@ test.describe('ui e2e: plaintext mode + public share', () => {
       const migrateJson = (await migrateResp.json()) as { success?: unknown; mode?: unknown };
       expect(migrateJson?.success).toBe(true);
       expect(migrateJson?.mode).toBe('plain');
+      // Converting Machine content retires its previous daemon encryption context.
+      daemon = await daemon.restart();
 
       const tag = `ui-e2e-plain-${run.runId}`;
       const message = `hello from plain ${run.runId}`;

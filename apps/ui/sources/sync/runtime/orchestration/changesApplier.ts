@@ -43,6 +43,7 @@ export async function applyPlannedChangeActions(params: {
     isSessionMessagesLoaded: (sessionId: string) => boolean;
     shouldCatchUpSessionMessages?: (sessionId: string) => boolean;
     getSessionMaterializedMaxSeq?: (sessionId: string) => number;
+    isSessionMessagesDeferred?: (sessionId: string) => boolean;
     concurrencyLimit?: number;
     invalidate: {
         settings?: () => Promise<void>;
@@ -422,7 +423,11 @@ export async function applyPlannedChangeActions(params: {
         ) {
             const targetSeq = getChangeTargetMessageSeq(change);
             const materializedSeq = params.getSessionMaterializedMaxSeq?.(classification.entityId) ?? null;
-            if (targetSeq !== null && (materializedSeq === null || materializedSeq < targetSeq)) {
+            if (
+                targetSeq !== null
+                && (materializedSeq === null || materializedSeq < targetSeq)
+                && params.isSessionMessagesDeferred?.(classification.entityId) !== true
+            ) {
                 return {
                     status: 'partial',
                     safeAdvanceCursor,

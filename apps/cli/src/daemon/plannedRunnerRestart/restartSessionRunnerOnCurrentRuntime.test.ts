@@ -228,6 +228,114 @@ describe('restartSessionRunnerOnCurrentRuntime', () => {
     expect(requestRestart).not.toHaveBeenCalled();
   });
 
+  it('does not signal an unconfirmed restart while the server projects background activity', async () => {
+    const requestRestart = vi.fn(async () => ({ signaled: true }));
+
+    const result = await restartSessionRunnerOnCurrentRuntime({
+      request: {
+        sessionId: 'sess-1',
+        mode: 'if_stale',
+        reason: 'daemon_restart_session_runners_command',
+      },
+      tracked: trackedSession(),
+      currentIdentity: currentIdentity('0.2.11'),
+      requestRestart,
+      readServerRuntimeActivity: async () => ({ runtimeActivityState: 'active', runtimeActivityActiveCount: 2 }),
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      status: 'busy',
+      sessionId: 'sess-1',
+      reasonCode: 'turn_in_progress',
+    });
+    expect(RestartSessionRunnerResultV1Schema.parse(result)).toEqual(result);
+    expect(requestRestart).not.toHaveBeenCalled();
+  });
+
+  it('previews an unconfirmed dry run as busy while the server projects background activity', async () => {
+    const requestRestart = vi.fn(async () => ({ signaled: true }));
+
+    const result = await restartSessionRunnerOnCurrentRuntime({
+      request: {
+        sessionId: 'sess-1',
+        mode: 'if_stale',
+        reason: 'daemon_restart_session_runners_command',
+        dryRun: true,
+      },
+      tracked: trackedSession(),
+      currentIdentity: currentIdentity('0.2.11'),
+      requestRestart,
+      readServerRuntimeActivity: async () => ({ runtimeActivityState: 'active', runtimeActivityActiveCount: 1 }),
+    });
+
+    expect(result).toEqual({ ok: false, status: 'busy', sessionId: 'sess-1', reasonCode: 'turn_in_progress' });
+    expect(requestRestart).not.toHaveBeenCalled();
+  });
+
+  it('restarts an unconfirmed request when the server projects no background activity', async () => {
+    const requestRestart = vi.fn(async () => ({ signaled: true }));
+
+    const result = await restartSessionRunnerOnCurrentRuntime({
+      request: {
+        sessionId: 'sess-1',
+        mode: 'if_stale',
+        reason: 'doctor_repair',
+      },
+      tracked: trackedSession(),
+      currentIdentity: currentIdentity('0.2.11'),
+      requestRestart,
+      readServerRuntimeActivity: async () => ({ runtimeActivityState: 'idle', runtimeActivityActiveCount: 0 }),
+    });
+
+    expect(result).toEqual(expect.objectContaining({ ok: true, status: 'restarted' }));
+    expect(requestRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets the UI-confirmed stale-runner banner restart through background activity', async () => {
+    const requestRestart = vi.fn(async () => ({ signaled: true }));
+    const readServerRuntimeActivity = vi.fn(async () => ({
+      runtimeActivityState: 'active' as const,
+      runtimeActivityActiveCount: 1,
+    }));
+
+    const result = await restartSessionRunnerOnCurrentRuntime({
+      request: {
+        sessionId: 'sess-1',
+        mode: 'if_stale',
+        reason: 'ui_stale_runner_banner',
+      },
+      tracked: trackedSession(),
+      currentIdentity: currentIdentity('0.2.11'),
+      requestRestart,
+      readServerRuntimeActivity,
+    });
+
+    expect(result).toEqual(expect.objectContaining({ ok: true, status: 'restarted' }));
+    expect(readServerRuntimeActivity).not.toHaveBeenCalled();
+  });
+
+  it('does not signal an unconfirmed restart when the server activity read fails', async () => {
+    const requestRestart = vi.fn(async () => ({ signaled: true }));
+
+    const result = await restartSessionRunnerOnCurrentRuntime({
+      request: {
+        sessionId: 'sess-1',
+        mode: 'force_current_cli',
+        reason: 'daemon_restart_session_runners',
+      },
+      tracked: trackedSession(),
+      currentIdentity: currentIdentity('0.2.11'),
+      requestRestart,
+      readServerRuntimeActivity: async () => {
+        throw new Error('server unavailable');
+      },
+    });
+
+    expect(result).toEqual(expect.objectContaining({ ok: false, status: 'busy', reasonCode: 'turn_in_progress' }));
+    expect(requestRestart).not.toHaveBeenCalled();
+  });
+
   it('does not force-restart when the current daemon entrypoint is unknown', async () => {
     const requestRestart = vi.fn(async () => ({ signaled: true }));
 
@@ -618,6 +726,44 @@ describe('restartSessionRunnerOnCurrentRuntime', () => {
     });
 
     expect(result.status).toBe('dry_run_restartable');
+    expect(requestRestart).not.toHaveBeenCalled();
+  });
+
+  it('refreshes a missing tracked resume identity before deciding restart eligibility', async () => {
+    const requestRestart = vi.fn(async () => ({ signaled: true }));
+    const tracked = trackedSession({
+      vendorResumeId: undefined,
+      spawnOptions: {
+        directory: '/tmp/workspace',
+        backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      },
+    });
+    const refreshTrackedSessionRuntimeSnapshot = vi.fn(async () => {
+      tracked.vendorResumeId = 'codex-thread-from-persisted-metadata';
+    });
+
+    const result = await restartSessionRunnerOnCurrentRuntime({
+      request: {
+        sessionId: 'sess-1',
+        mode: 'force_current_cli',
+        dryRun: true,
+        reason: 'daemon_restart_session_runners_command',
+      },
+      tracked,
+      currentIdentity: currentIdentity('0.2.11'),
+      requestRestart,
+      refreshTrackedSessionRuntimeSnapshot,
+    });
+
+    expect(refreshTrackedSessionRuntimeSnapshot).toHaveBeenCalledExactlyOnceWith({
+      sessionId: 'sess-1',
+      tracked,
+    });
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      status: 'dry_run_restartable',
+      sessionId: 'sess-1',
+    }));
     expect(requestRestart).not.toHaveBeenCalled();
   });
 });

@@ -1,51 +1,79 @@
-import type { ConnectedServiceQuotaMeterV1 } from '@happier-dev/protocol';
-import type { ConnectedServiceQuotaFetcher, ConnectedServiceQuotaFetcherDescriptor } from '@/daemon/connectedServices/quotas/types';
+import { ConnectedServiceQuotaSnapshotV1Schema, type ConnectedServiceQuotaMeterV1, type ConnectedServiceQuotaSnapshotV1 } from '@happier-dev/protocol';
+import { ConnectedServiceQuotaFetchError, type ConnectedServiceQuotaFetcher, type ConnectedServiceQuotaFetcherDescriptor } from '@/daemon/connectedServices/quotas/types';
+import { requestGoogleCodeAssist, type GoogleCodeAssistFetchRuntime } from '@/daemon/connectedServices/quotas/googleCodeAssistRequest';
 
-const GEMINI_QUOTA_STALE_AFTER_MS = 5 * 60_000;
+function readRecord(value: unknown): Record<string, unknown> | null { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null; }
+function readString(value: unknown): string | null { return typeof value === 'string' && value.trim() ? value.trim() : null; }
+function readFiniteNumber(value: unknown): number | null { if (value === null || value === undefined || value === '') return null; const n = typeof value === 'number' ? value : Number(value); return Number.isFinite(n) ? n : null; }
+function readResetAtMs(value: unknown): number | null { const text = readString(value); if (!text) return null; const n = Date.parse(text); return Number.isFinite(n) && n >= 0 ? n : null; }
+function clampPercent(value: number): number { return Math.max(0, Math.min(100, value)); }
+function buildMeter(bucket: unknown): ConnectedServiceQuotaMeterV1 | null {
+  const record = readRecord(bucket);
+  if (!record) return null;
+  const modelId = readString(record.modelId);
+  const remainingFraction = readFiniteNumber(record.remainingFraction);
+  if (!modelId || remainingFraction === null) return null;
 
-/**
- * X7 — "connected but quota unknown" placeholder for Gemini.
- *
- * The daemon-side Gemini quota fetcher cannot determine quota independently
- * (quota is surfaced via the runtime auth adapter's probeQuota hook, which
- * requires live API credentials at session-spawn time). Rather than returning
- * null — which produces no display at all — this fetcher returns a snapshot
- * with a quota_unknown placeholder meter so the UI can show "quota unavailable"
- * instead of a blank.
- *
- * This fetcher is intentionally minimal; richer quota data comes from the
- * runtime auth adapter (createGeminiConnectedServiceRuntimeAuthAdapter).
- */
-function buildQuotaUnknownMeter(): ConnectedServiceQuotaMeterV1 {
+  const remainingAmount = readFiniteNumber(record.remainingAmount);
+  const normalizedLimit = 100;
+  const limit = remainingAmount !== null && remainingFraction > 0
+    ? Math.round(remainingAmount / remainingFraction)
+    : normalizedLimit;
+  const remaining = remainingAmount !== null
+    ? Math.max(0, Math.min(limit, remainingAmount))
+    : Math.round(clampPercent(remainingFraction * normalizedLimit));
+  const used = Math.max(0, limit - remaining);
+  const utilizationPct = clampPercent((1 - remainingFraction) * 100);
+
   return {
-    meterId: 'quota_unknown',
-    label: 'Quota',
-    used: null,
-    limit: null,
-    unit: 'unknown',
-    utilizationPct: null,
-    resetsAt: null,
-    status: 'unavailable',
-    details: { code: 'quota_unknown' },
+    meterId: modelId,
+    label: modelId,
+    used,
+    limit,
+    unit: remainingAmount !== null ? 'count' : 'unknown',
+    utilizationPct,
+    resetsAt: readResetAtMs(record.resetTime),
+    status: 'ok',
+    details: {},
   };
 }
 
-export function createGeminiQuotaFetcher(): ConnectedServiceQuotaFetcher {
-  return {
+function mapGeminiQuotaResponseToSnapshot(params: Readonly<{
+  profileId: string;
+  fetchedAt: number;
+  quotaResponse: unknown;
+  staleAfterMs: number;
+}>): ConnectedServiceQuotaSnapshotV1 {
+  const buckets = readRecord(params.quotaResponse)?.buckets;
+  const meters = Array.isArray(buckets)
+    ? buckets.map(buildMeter).filter((meter): meter is ConnectedServiceQuotaMeterV1 => meter !== null)
+    : [];
+
+  return ConnectedServiceQuotaSnapshotV1Schema.parse({
+    v: 1,
     serviceId: 'gemini',
-    fetch: async ({ record, now }) => ({
-      v: 1,
-      serviceId: record.serviceId,
-      profileId: record.profileId,
-      fetchedAt: now,
-      staleAfterMs: GEMINI_QUOTA_STALE_AFTER_MS,
-      planLabel: null,
-      accountLabel: null,
-      meters: [buildQuotaUnknownMeter()],
-    }),
-  };
+    profileId: params.profileId,
+    fetchedAt: Math.max(0, Math.trunc(params.fetchedAt)),
+    staleAfterMs: params.staleAfterMs,
+    planLabel: null,
+    accountLabel: null,
+    meters,
+  });
 }
 
-export const geminiQuotaFetcherDescriptor: ConnectedServiceQuotaFetcherDescriptor = {
-  loadQuota: () => createGeminiQuotaFetcher(),
-};
+
+export function createGeminiQuotaFetcher(deps: Readonly<{ fetchRuntime?: GoogleCodeAssistFetchRuntime; staleAfterMs?: number }> = {}): ConnectedServiceQuotaFetcher {
+  return { serviceId: 'gemini', async fetch({ record, now, signal }) {
+    if (record.serviceId !== 'gemini' || record.kind !== 'oauth' || !record.oauth.accessToken) {
+      throw new ConnectedServiceQuotaFetchError('missing_gemini_oauth_record', { quotaFetchErrorCode: 'missing_auth' });
+    }
+    const request = { fetchRuntime: deps.fetchRuntime ?? fetch, accessToken: record.oauth.accessToken, endpoint: 'https://cloudcode-pa.googleapis.com', signal };
+    const load = await requestGoogleCodeAssist({ ...request, method: 'loadCodeAssist', body: { metadata: {} } });
+    const project = readString(readRecord(load)?.cloudaicompanionProject);
+    if (!project) throw new ConnectedServiceQuotaFetchError('gemini_code_assist_project_unavailable', { quotaFetchErrorCode: 'malformed' });
+    const quotaResponse = await requestGoogleCodeAssist({ ...request, method: 'retrieveUserQuota', body: { project } });
+    if (!Array.isArray(readRecord(quotaResponse)?.buckets)) throw new ConnectedServiceQuotaFetchError('gemini_code_assist_quota_malformed', { quotaFetchErrorCode: 'malformed' });
+    return mapGeminiQuotaResponseToSnapshot({ profileId: record.profileId, fetchedAt: now, quotaResponse, staleAfterMs: deps.staleAfterMs ?? 300_000 });
+  } };
+}
+export const geminiQuotaFetcherDescriptor: ConnectedServiceQuotaFetcherDescriptor = { loadQuota: ({ staleAfterMs }) => createGeminiQuotaFetcher({ staleAfterMs }) };

@@ -27,7 +27,6 @@ const TOOL_ARCHIVE_MANIFEST = [
     { tool: 'zellij', platformDir: 'x64-darwin', archiveName: 'zellij-no-web-x86_64-apple-darwin.tar.gz', archiveType: 'tar.gz', binaryName: 'zellij', version: '0.44.3', licenseName: 'zellij-LICENSE' },
     { tool: 'zellij', platformDir: 'arm64-linux', archiveName: 'zellij-no-web-aarch64-unknown-linux-musl.tar.gz', archiveType: 'tar.gz', binaryName: 'zellij', version: '0.44.3', licenseName: 'zellij-LICENSE' },
     { tool: 'zellij', platformDir: 'x64-linux', archiveName: 'zellij-no-web-x86_64-unknown-linux-musl.tar.gz', archiveType: 'tar.gz', binaryName: 'zellij', version: '0.44.3', licenseName: 'zellij-LICENSE' },
-    { tool: 'zellij', platformDir: 'x64-win32', archiveName: 'zellij-no-web-x86_64-pc-windows-msvc.zip', archiveType: 'zip', binaryName: 'zellij.exe', version: '0.44.3', licenseName: 'zellij-LICENSE' },
 ];
 
 const VERSION_MARKER_NAME = '.happier-tools-manifest.json';
@@ -68,8 +67,15 @@ function getToolArchiveManifest() {
     return TOOL_ARCHIVE_MANIFEST.map((entry) => ({ ...entry }));
 }
 
-function getManifestForPlatform(platformDir) {
-    return TOOL_ARCHIVE_MANIFEST.filter((entry) => entry.platformDir === platformDir);
+function getManifestForPlatform(platformDir, tools) {
+    const entries = TOOL_ARCHIVE_MANIFEST.filter((entry) => entry.platformDir === platformDir);
+    if (!tools) return entries;
+    for (const tool of tools) {
+        if (!entries.some((entry) => entry.tool === tool)) {
+            throw new Error(`Unsupported tool ${tool} for platform: ${platformDir}`);
+        }
+    }
+    return entries.filter((entry) => tools.includes(entry.tool));
 }
 
 function readVersionMarker(unpackedPath) {
@@ -86,14 +92,14 @@ function expectedFilesForEntry(entry) {
     return [entry.binaryName, ...(entry.extraBinaries || []), ...(entry.licenseName ? [entry.licenseName] : [])];
 }
 
-function areToolsUnpacked(toolsDir, platformDir = getPlatformDir()) {
+function areToolsUnpacked(toolsDir, platformDir = getPlatformDir(), tools) {
     const unpackedPath = path.join(toolsDir, 'unpacked');
     
     if (!fs.existsSync(unpackedPath)) {
         return false;
     }
 
-    const entries = getManifestForPlatform(platformDir);
+    const entries = getManifestForPlatform(platformDir, tools);
     const expectedFiles = entries.flatMap(expectedFilesForEntry);
     const filesExist = expectedFiles.every((file) => fs.existsSync(path.join(unpackedPath, file)));
     if (!filesExist) return false;
@@ -291,7 +297,7 @@ async function unpackTools(options = {}) {
         const unpackedPath = path.join(toolsDir, 'unpacked');
         
         // Check if already unpacked
-        if (areToolsUnpacked(toolsDir, platformDir)) {
+        if (areToolsUnpacked(toolsDir, platformDir, options.tools)) {
             console.log(`Tools already unpacked for ${platformDir}`);
             return { success: true, alreadyUnpacked: true };
         }
@@ -303,8 +309,7 @@ async function unpackTools(options = {}) {
             fs.mkdirSync(unpackedPath, { recursive: true });
         }
         
-        // Unpack difftastic
-        const entries = getManifestForPlatform(platformDir);
+        const entries = getManifestForPlatform(platformDir, options.tools);
         if (entries.length === 0) {
             throw new Error(`Unsupported platform: ${platformDir}`);
         }

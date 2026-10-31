@@ -29,6 +29,7 @@ function meter(overrides: Partial<ConnectedServiceQuotaMeterV1> = {}): Connected
 function accountUsageSnapshot(params: Readonly<{
   providerId?: string;
   accountSubjectId?: string;
+  providerOrganizationId?: string;
   state?: ProviderAccountUsageStateV1;
   fetchedAtMs?: number;
   staleAfterMs?: number;
@@ -40,7 +41,8 @@ function accountUsageSnapshot(params: Readonly<{
     providerId,
     accountSubjectId,
     subjectKind: 'account',
-    quotaScope: 'account',
+    quotaScope: params.providerOrganizationId ? 'organization' : 'account',
+    ...(params.providerOrganizationId ? { quotaScopeId: params.providerOrganizationId } : {}),
   } as const;
   return ProviderAccountUsageSnapshotV1Schema.parse({
     v: 1,
@@ -75,6 +77,30 @@ function legacyQuotaSnapshot(): ConnectedServiceQuotaSnapshotV1 {
 }
 
 describe('selectProviderUsageDisplaySnapshot', () => {
+  it('preserves organization scope and supplemental facts through the native account usage display projection', () => {
+    const usage = {
+      ...accountUsageSnapshot({ providerId: 'claude', providerOrganizationId: 'org-work' }),
+      subscription: { status: 'none' as const, renewal: 'unknown' as const, observedAtMs: 1_000, staleAfterMs: 60_000 },
+      recoveryCredits: { kind: 'usage_limit_resets' as const, availableCount: 0, credits: [
+        { kind: 'usage_limit_reset' as const, status: 'unknown' as const, providerCreditId: 'saved' },
+      ] },
+      recoveryCreditDetails: { saved: {
+        remainingCount: 2, appliesToProviderLimitIds: ['seven_day'], unavailableReason: 'paused' as const,
+      } },
+    };
+    const source = selectProviderUsageDisplaySnapshot({
+      providerId: 'claude', metadataRecordIds: [usage.recordId],
+      accountUsageSnapshotsByRecordId: { [usage.recordId]: usage },
+      connectedServiceProfileRef: null, connectedServiceQuotaView: null,
+    });
+    expect(source?.snapshot).toMatchObject({
+      activeAccountId: usage.recordKey.accountSubjectId,
+      providerOrganizationId: 'org-work',
+      subscription: usage.subscription,
+      recoveryCreditDetails: usage.recoveryCreditDetails,
+    });
+  });
+
   it('projects native account usage metadata into a non-connected provider usage display snapshot', () => {
     const usage = accountUsageSnapshot();
 

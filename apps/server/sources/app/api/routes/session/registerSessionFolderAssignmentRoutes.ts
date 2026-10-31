@@ -1,4 +1,4 @@
-import type { FeatureId } from "@happier-dev/protocol";
+import { CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY, readConnectedServiceReaderSupport, type FeatureId } from "@happier-dev/protocol";
 import {
     MoveSessionFolderAssignmentsRequestSchema,
     MoveSessionFolderAssignmentsResponseSchema,
@@ -119,6 +119,7 @@ export function registerSessionFolderAssignmentRoutes(app: Fastify) {
     gated.post("/v2/session-folder-assignments/query", {
         preHandler: app.authenticate,
         schema: {
+            querystring: z.object({ [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional() }).optional(),
             body: QuerySessionFolderSessionsRequestSchema,
             response: {
                 200: QuerySessionFolderSessionsResponseSchema,
@@ -162,6 +163,8 @@ export function registerSessionFolderAssignmentRoutes(app: Fastify) {
             rows,
             userId: request.userId,
             limit: parsedBody.data.limit ?? 50,
+            supportedConnectedServiceIds: readConnectedServiceReaderSupport(
+                request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]),
         }));
     });
 

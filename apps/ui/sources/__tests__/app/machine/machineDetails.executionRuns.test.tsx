@@ -162,7 +162,6 @@ vi.mock('@/utils/system/userInteractionDiagnostics', () => ({
 vi.mock('@/utils/sessions/machineUtils', () => ({ isMachineOnline: () => true }));
 vi.mock('@/utils/sessions/sessionUtils', () => ({ formatPathRelativeToHome: () => '', getSessionName: () => '', getSessionSubtitle: () => '' }));
 vi.mock('@/utils/path/pathUtils', () => ({ resolveAbsolutePath: () => '' }));
-vi.mock('@/sync/domains/settings/terminalSettings', () => ({ resolveTerminalSpawnOptions: () => ({}) }));
 vi.mock('@/sync/domains/session/spawn/windowsRemoteSessionConsole', () => ({ resolveWindowsRemoteSessionConsoleFromMachineMetadata: () => 'visible' }));
 vi.mock('@/sync/domains/session/spawn/windowsRemoteSessionLaunchMode', () => ({
     readMachineWindowsRemoteSessionLaunchMode: () => undefined,

@@ -1,4 +1,5 @@
 export type QuotaUtilizationMeterLike = Readonly<{
+  status?: 'ok' | 'unavailable' | 'estimated';
   used: number | null;
   limit: number | null;
   utilizationPct: number | null;
@@ -11,6 +12,7 @@ export function clampQuotaPct(value: number): number {
 }
 
 export function deriveQuotaUtilizationPct(meter: QuotaUtilizationMeterLike): number | null {
+  if (meter.status === 'unavailable') return null;
   if (typeof meter.utilizationPct === 'number' && Number.isFinite(meter.utilizationPct)) {
     return clampQuotaPct(meter.utilizationPct);
   }
@@ -34,4 +36,20 @@ export function deriveQuotaUtilizationPct(meter: QuotaUtilizationMeterLike): num
   }
 
   return null;
+}
+
+/** Unavailable observations retain their reset/source facts, but assert no numeric usage. */
+export function deriveQuotaMeterValues(meter: QuotaUtilizationMeterLike): Readonly<{
+  usedPct: number | null;
+  remainingPct: number | null;
+  used: number | null;
+  limit: number | null;
+}> {
+  const available = meter.status !== 'unavailable';
+  const usedPct = deriveQuotaUtilizationPct(meter);
+  const remainingPct = !available ? null
+    : typeof meter.remainingPct === 'number' && Number.isFinite(meter.remainingPct)
+    ? clampQuotaPct(meter.remainingPct)
+    : usedPct === null ? null : clampQuotaPct(100 - usedPct);
+  return { usedPct, remainingPct, used: available ? meter.used : null, limit: available ? meter.limit : null };
 }

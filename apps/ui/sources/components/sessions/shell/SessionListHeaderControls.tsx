@@ -147,7 +147,7 @@ export const SessionListHeaderControls = React.memo(function SessionListHeaderCo
     searchOpen?: boolean;
     onSelectedTagsChange: (tags: string[]) => void;
     onSearchQueryChange: (query: string) => void;
-    onSearchFocusChange?: (focused: boolean) => void;
+    onSearchOpenChange: (open: boolean) => void;
     searchTrailingAccessory?: React.ReactNode;
     viewMenu: React.ReactNode;
 }>) {
@@ -158,24 +158,25 @@ export const SessionListHeaderControls = React.memo(function SessionListHeaderCo
         searchQuery,
         searchOpen = false,
         selectedTags,
-        onSearchFocusChange,
+        onSearchOpenChange,
         searchTrailingAccessory,
         viewMenu,
     } = props;
     const styles = stylesheet;
     const { theme } = useUnistyles();
+    const searchTriggerRef = React.useRef<React.ElementRef<typeof Pressable> | null>(null);
+    const returnFocusOnCloseRef = React.useRef(false);
     const inputRef = React.useRef<React.ElementRef<typeof TextInput> | null>(null);
     const searchAnimation = React.useRef(new Animated.Value(searchQuery.trim().length > 0 ? 1 : 0)).current;
-    const [searchFocused, setSearchFocused] = React.useState(false);
     // Keep a local input echo so native TextInput receives the typed value synchronously even if the virtualized header prop lags.
     const [searchInputValue, setSearchInputValue] = React.useState(searchQuery);
     const [tagMenuOpen, setTagMenuOpen] = React.useState(false);
     const iconColor = theme.colors.text.secondary;
     const activeIconColor = theme.colors.accent.blue;
-    const searchIsOpen = searchOpen || searchFocused || searchInputValue.trim().length > 0;
+    const searchIsOpen = searchOpen || searchInputValue.trim().length > 0;
     const searchHasQuery = searchInputValue.trim().length > 0;
     const searchTrailingAccessoryHasContent = React.Children.count(searchTrailingAccessory) > 0;
-    const showSearchClearButton = searchIsOpen && searchHasQuery && !searchTrailingAccessoryHasContent;
+    const showSearchClearButton = searchIsOpen && !searchTrailingAccessoryHasContent;
     const shouldRenderSearchTrailingSlot = searchIsOpen && (
         searchTrailingAccessory !== undefined || showSearchClearButton
     );
@@ -186,8 +187,13 @@ export const SessionListHeaderControls = React.memo(function SessionListHeaderCo
     }, [searchQuery]);
 
     React.useEffect(() => {
-        if (!searchIsOpen) return;
-        inputRef.current?.focus?.();
+        if (searchIsOpen) {
+            inputRef.current?.focus?.();
+        } else if (returnFocusOnCloseRef.current) {
+            // Web changes the shell's host element back to a button on collapse.
+            returnFocusOnCloseRef.current = false;
+            searchTriggerRef.current?.focus?.();
+        }
     }, [searchIsOpen]);
 
     React.useEffect(() => {
@@ -211,41 +217,34 @@ export const SessionListHeaderControls = React.memo(function SessionListHeaderCo
 
     const handleOpenSearch = React.useCallback((event?: unknown) => {
         stopPressEventPropagation(event);
-        onSearchFocusChange?.(true);
-        setSearchFocused(true);
-    }, [onSearchFocusChange]);
-
-    const handleSearchBlur = React.useCallback(() => {
-        onSearchFocusChange?.(false);
-        setSearchFocused(false);
-    }, [onSearchFocusChange]);
+        onSearchOpenChange(true);
+    }, [onSearchOpenChange]);
 
     const handleSearchFocus = React.useCallback(() => {
-        onSearchFocusChange?.(true);
-        setSearchFocused(true);
-    }, [onSearchFocusChange]);
+        onSearchOpenChange(true);
+    }, [onSearchOpenChange]);
 
     const handleSearchQueryChange = React.useCallback((query: string) => {
         setSearchInputValue(query);
         onSearchQueryChange(query);
     }, [onSearchQueryChange]);
 
-    const handleSearchKeyPress = React.useCallback((event: { nativeEvent?: { key?: string } }) => {
-        if (event.nativeEvent?.key !== 'Escape') return;
+    const closeSearch = React.useCallback(() => {
+        returnFocusOnCloseRef.current = true;
         setSearchInputValue('');
         onSearchQueryChange('');
-        onSearchFocusChange?.(false);
-        setSearchFocused(false);
-    }, [onSearchFocusChange, onSearchQueryChange]);
+        onSearchOpenChange(false);
+    }, [onSearchOpenChange, onSearchQueryChange]);
+
+    const handleSearchKeyPress = React.useCallback((event: { nativeEvent?: { key?: string } }) => {
+        if (event.nativeEvent?.key !== 'Escape') return;
+        closeSearch();
+    }, [closeSearch]);
 
     const handleClearSearch = React.useCallback((event?: unknown) => {
         stopPressEventPropagation(event);
-        setSearchInputValue('');
-        onSearchQueryChange('');
-        onSearchFocusChange?.(true);
-        setSearchFocused(true);
-        inputRef.current?.focus?.();
-    }, [onSearchFocusChange, onSearchQueryChange]);
+        closeSearch();
+    }, [closeSearch]);
 
     const tagItems = React.useMemo((): DropdownMenuItem[] => allKnownTags.map((tag) => {
         const selected = selectedTagSet.has(tag);
@@ -271,6 +270,7 @@ export const SessionListHeaderControls = React.memo(function SessionListHeaderCo
     return (
         <View style={styles.controls}>
             <AnimatedPressable
+                ref={searchTriggerRef}
                 testID="session-list-search-trigger"
                 accessibilityRole={searchIsOpen ? undefined : 'button'}
                 accessibilityLabel={searchIsOpen ? undefined : t('sessionsList.searchSessions')}
@@ -308,7 +308,6 @@ export const SessionListHeaderControls = React.memo(function SessionListHeaderCo
                             value={searchInputValue}
                             onChangeText={handleSearchQueryChange}
                             onFocus={handleSearchFocus}
-                            onBlur={handleSearchBlur}
                             onKeyPress={handleSearchKeyPress}
                             autoFocus={true}
                             returnKeyType="search"
@@ -329,7 +328,7 @@ export const SessionListHeaderControls = React.memo(function SessionListHeaderCo
                             <Pressable
                                 testID="session-list-search-clear"
                                 accessibilityRole="button"
-                                accessibilityLabel={t('common.clearSearch')}
+                                accessibilityLabel={searchHasQuery ? t('common.clearSearch') : t('common.close')}
                                 onPress={handleClearSearch}
                                 hitSlop={10}
                                 style={styles.searchClearButton}

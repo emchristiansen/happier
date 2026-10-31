@@ -13,6 +13,7 @@ import type {
 import type { CatalogAgentId } from '@/backends/types';
 import { getConnectedServiceMaterializer } from '@/backends/catalog';
 import { replaceDirectoryAtomically } from '@/utils/fs/replaceDirectoryAtomically';
+import { logger } from '@/ui/logger';
 import {
   HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY,
   HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY,
@@ -26,6 +27,7 @@ import type {
   ConnectedServicesProviderMaterializerInput,
 } from './providerMaterializerTypes';
 import { resolveConnectedServiceMaterializedRootDir } from './resolveConnectedServiceMaterializedRootDir';
+import { resolveConnectedServicePreviousStateRoot } from './resolveConnectedServicePreviousStateRoot';
 import { resolveConnectedServiceTargetMaterializedRoot } from './resolveConnectedServiceTargetMaterializedRoot';
 
 export type ConnectedServiceResolvedSelection =
@@ -76,12 +78,14 @@ export class ConnectedServiceMaterializationSupersededError extends Error {
   }
 }
 
-function bestEffortCleanupDirectory(path: string): () => void {
-  let cleaned = false;
+function bestEffortCleanupDirectory(path: string): () => Promise<void> {
+  let cleanup: Promise<void> | undefined;
   return () => {
-    if (cleaned) return;
-    cleaned = true;
-    void rm(path, { recursive: true, force: true }).catch(() => {});
+    if (!cleanup) {
+      cleanup = rm(path, { recursive: true, force: true });
+      void cleanup.catch((error) => logger.warn('Could not remove connected-service materialization artifacts', error));
+    }
+    return cleanup;
   };
 }
 
@@ -276,6 +280,8 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
   activeServerDir: string;
   baseDir: string;
   sessionDirectory?: string | null;
+  previousMaterializedRoot?: string | null;
+  existingSessionMetadata?: unknown;
   recordsByServiceId: ReadonlyMap<ConnectedServiceId, ConnectedServiceCredentialRecordV1>;
   selectionsByServiceId?: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedSelection>;
   refreshCredentialForMaterialization?: ConnectedServiceMaterializationCredentialRefresh | null;
@@ -283,6 +289,10 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
   processEnv?: NodeJS.ProcessEnv;
   vendorResumeId?: string | null;
   candidatePersistedSessionFile?: string | null;
+  sessionStateMode?: 'existing';
+  materializationPurpose?: 'probe';
+  signal?: AbortSignal;
+  onCleanup?: (cleanup: () => Promise<void>) => void;
   validateGroupMutationCurrentness?: ConnectedServicesProviderMaterializerInput['validateGroupMutationCurrentness'];
   validatePromotedMaterialization?: (input: Readonly<{
     env: Readonly<Record<string, string>>;
@@ -301,6 +311,11 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
     materializationIdentity: params.connectedServiceMaterializationIdentityV1 ?? null,
   });
   return await runSerializedMaterializationForRoot(rootDir, async () => {
+  params.signal?.throwIfAborted();
+  const previousMaterializedRoot = await resolveConnectedServicePreviousStateRoot({
+    previousRoot: params.previousMaterializedRoot ?? rootDir,
+    managedRoots: [params.baseDir, join(params.activeServerDir, 'daemon', 'connected-services', 'homes')],
+  });
   const freshMaterial = await resolveFreshMaterializationRecords({
     recordsByServiceId: params.recordsByServiceId,
     ...(params.selectionsByServiceId ? { selectionsByServiceId: params.selectionsByServiceId } : {}),
@@ -318,14 +333,46 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
     forgetActiveAttemptIfCurrent(rootDir, attemptId);
     return null;
   }
-  await mkdir(attemptRoot, { recursive: true });
+  let disposed = false;
+  let promotedDisposableRoot = false;
+  let artifactWrite: Promise<unknown> | undefined;
+  let promotion: Promise<void> | undefined;
+  let cleanup: Promise<void> | undefined;
+  const assertOpen = () => {
+    params.signal?.throwIfAborted();
+    if (disposed) throw new Error('Connected-service materialization was disposed');
+  };
+  const writeArtifacts = async <T>(write: () => Promise<T>): Promise<T> => {
+    assertOpen();
+    const pending = write();
+    artifactWrite = pending;
+    try {
+      const result = await pending;
+      assertOpen();
+      return result;
+    } finally {
+      if (artifactWrite === pending) artifactWrite = undefined;
+    }
+  };
+  params.onCleanup?.(() => {
+    disposed = true;
+    return cleanup ??= (async () => {
+      await artifactWrite?.catch(() => {});
+      // The last write can settle before atomic promotion has rolled back its target.
+      await promotion?.catch(() => {});
+      await cleanupRoot();
+      if (promotedDisposableRoot) await rm(rootDir, { recursive: true, force: true });
+    })();
+  });
   let materialized: ConnectedServicesMaterializeResult | null;
   try {
+    await writeArtifacts(() => mkdir(attemptRoot, { recursive: true }));
     materialized = await materializer({
       agentId: params.agentId,
       activeServerDir: params.activeServerDir,
       rootDir: attemptRoot,
-      previousMaterializedRoot: rootDir,
+      previousMaterializedRoot,
+      existingSessionMetadata: params.existingSessionMetadata,
       sessionDirectory: params.sessionDirectory ?? null,
       recordsByServiceId: freshMaterial.recordsByServiceId,
       selectionsByServiceId: freshMaterial.selectionsByServiceId,
@@ -333,19 +380,23 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
       processEnv: params.processEnv ?? process.env,
       vendorResumeId: params.vendorResumeId ?? null,
       candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
+      sessionStateMode: params.sessionStateMode,
+      materializationPurpose: params.materializationPurpose,
       cleanupRoot,
+      writeArtifacts,
       ...(params.validateGroupMutationCurrentness
         ? { validateGroupMutationCurrentness: params.validateGroupMutationCurrentness }
         : {}),
     });
+    assertOpen();
   } catch (error) {
-    cleanupRoot();
     forgetActiveAttemptIfCurrent(rootDir, attemptId);
+    await cleanupRoot();
     throw error;
   }
   if (!materialized) {
-    cleanupRoot();
     forgetActiveAttemptIfCurrent(rootDir, attemptId);
+    await cleanupRoot();
     return null;
   }
   const materializedEnv = rewriteEnvRoot(materialized.env, attemptRoot, rootDir);
@@ -371,13 +422,34 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
       ? { [HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY]: serializedMaterializedEnvKeys }
       : null),
   });
+  // Providers already declare their actual native home. A target outside the owned attempt
+  // is durable account/binding state, not a directory this session may replace or release.
+  const targetRelativeToOwnedRoot = targetMaterializedRoot ? relative(rootDir, targetMaterializedRoot) : null;
+  const durableRoot = targetMaterializedRoot && targetRelativeToOwnedRoot !== null
+    && (targetRelativeToOwnedRoot.startsWith('..') || isAbsolute(targetRelativeToOwnedRoot))
+    ? targetMaterializedRoot
+    : null;
   try {
+    if (durableRoot) {
+      assertOpen();
+      await materialized.afterPromote?.({ env: materializedEnv, targetMaterializedRoot, finalRootDir: durableRoot });
+      await params.validatePromotedMaterialization?.({
+        env: buildPromotedEnv(), targetMaterializedRoot, materializationRoot: durableRoot,
+        diagnostics: materialized.diagnostics,
+      });
+      assertOpen();
+      await cleanupRoot();
+      return { ...materialized, materializationRoot: durableRoot,
+        cleanupMaterializationRoot: () => { void cleanupRoot(); }, env: buildPromotedEnv() };
+    }
     await runSerializedPromotion(rootDir, async () => {
+      assertOpen();
       assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
-      await replaceDirectoryAtomically({
+      promotion = replaceDirectoryAtomically({
         stagedDir: attemptRoot,
         targetDir: rootDir,
         preserveUnprovidedEntries: materialized.preserveUnprovidedEntriesAcrossPromotion ?? [],
+        writeArtifacts,
         afterPromote: async () => {
           await materialized.afterPromote?.({
             env: materializedEnv,
@@ -393,8 +465,11 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
           });
           assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
         },
+      }).then(() => {
+        promotedDisposableRoot = true;
+        assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
       });
-      assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
+      await promotion;
     });
     assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
     const cleanupFinalRoot = bestEffortCleanupDirectory(rootDir);

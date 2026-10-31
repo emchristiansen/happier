@@ -6,9 +6,6 @@ vi.mock("./applyReleasedUiV021SessionEnd", () => ({ applyReleasedUiV021SessionEn
 vi.mock("@/utils/logging/log", () => ({ log: vi.fn() }));
 
 import { registerReleasedUiV021SessionEndSocketEvent } from "./registerReleasedUiV021SessionEndSocketEvent";
-import type { ClientConnection } from "@/app/events/eventRouter";
-
-type UserScopedConnection = Extract<ClientConnection, { connectionType: "user-scoped" }>;
 
 describe("released UI v0.2.1 session-end socket adapter", () => {
     beforeEach(() => {
@@ -22,15 +19,9 @@ describe("released UI v0.2.1 session-end socket adapter", () => {
                 if (event === "session-end") handlers.push(registered);
             }),
         };
-        const connection = {
-            connectionType: "user-scoped" as const,
-            userId: "owner",
-            socket,
-        };
         registerReleasedUiV021SessionEndSocketEvent({
             socket: socket as unknown as Socket,
             accountId: "owner",
-            connection: connection as unknown as UserScopedConnection,
             now: () => 2_000,
         });
 
@@ -39,7 +30,6 @@ describe("released UI v0.2.1 session-end socket adapter", () => {
             accountId: "owner",
             sessionId: "session-1",
             observedAt: 2_000,
-            connection,
         }));
     });
 
@@ -53,7 +43,6 @@ describe("released UI v0.2.1 session-end socket adapter", () => {
         registerReleasedUiV021SessionEndSocketEvent({
             socket: socket as unknown as Socket,
             accountId: "owner",
-            connection: { connectionType: "user-scoped", userId: "owner", socket } as unknown as UserScopedConnection,
             now: () => 1_000_000,
         });
 

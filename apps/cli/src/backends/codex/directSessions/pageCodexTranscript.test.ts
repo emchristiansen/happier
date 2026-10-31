@@ -4,6 +4,8 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { withTempDir } from '@/testkit/fs/tempDir';
+
 import { readJsonlFileBackwardPage } from '@/api/directSessions/filePaging/jsonlBackwardPager';
 import {
   createCodexAppServerProcessEnv,
@@ -11,6 +13,9 @@ import {
   writeFakeCodexAppServerThreadListScript,
 } from '@/backends/codex/appServer/testkit/fakeCodexAppServer';
 import { pageCodexTranscript } from './pageCodexTranscript';
+import { DirectSessionsProviderUnavailableError } from '@/backends/directSessions/providerOps';
+import { loadDirectSessionTranscriptItems } from '@/api/directSessions/import/loadDirectSessionTranscriptItems';
+import { listCodexDirectSessionCandidatesViaRollouts } from './listCodexDirectSessionCandidatesViaRollouts';
 
 function sessionMetaLine(payload: Record<string, unknown>): string {
   return `${JSON.stringify({ type: 'session_meta', payload })}\n`;
@@ -44,6 +49,25 @@ describe('pageCodexTranscript', () => {
       direction: 'older', maxBytes: 1024 * 1024, maxItems: 10,
     })).rejects.toThrow('private native domain');
   });
+
+  it('fails an import explicitly when a nine-MiB native record exceeds the existing read allowance', async () => withTempDir('happier-codex-direct-oversized-', async (root) => {
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    await writeFile(join(sessionsDir, `rollout-2026-01-02T00-00-00-${sessionId}.jsonl`),
+      sessionMetaLine({ id: sessionId }) + responseItemLine({ timestamp: '2026-01-02T00:00:01.000Z',
+        payload: { type: 'function_call_output', call_id: 'large-result', output: 'x'.repeat(9 * 1024 * 1024) } }));
+    const candidates = await listCodexDirectSessionCandidatesViaRollouts({ source: { kind: 'codexHome', home: 'user' },
+      env: { CODEX_HOME: codexHome }, activeServerDir: join(root, 'server'), limit: 10 });
+    expect(candidates.candidates.map(candidate => candidate.remoteSessionId)).toContain(sessionId);
+    await expect(loadDirectSessionTranscriptItems({ maxPages: 2, readPage: cursor => pageCodexTranscript({
+      source: { kind: 'codexHome', home: 'user' }, env: { CODEX_HOME: codexHome },
+      activeServerDir: join(root, 'server'), remoteSessionId: sessionId, direction: 'older',
+      maxBytes: 64 * 1024, maxItems: 30, cursor,
+    }) })).rejects.toMatchObject({ code: 'JSONL_RECORD_TOO_LARGE' });
+  }));
+
   it('pages newest-first (direction=older) from a rollout jsonl transcript', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-page-'));
     const codexHome = join(root, 'codex-home');
@@ -178,7 +202,7 @@ describe('pageCodexTranscript', () => {
     });
   });
 
-  it('falls back to app-server preview metadata when rollout files are missing', async () => {
+  it('rejects metadata-only history when rollout files and the native history API are unavailable', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-page-app-server-'));
     const codexHome = join(root, 'codex-home');
     await mkdir(codexHome, { recursive: true });
@@ -195,7 +219,7 @@ describe('pageCodexTranscript', () => {
       }],
     });
 
-    const result = await pageCodexTranscript({
+    await expect(pageCodexTranscript({
       source: { kind: 'codexHome', home: 'user' },
       env: createCodexAppServerProcessEnv(fakeAppServer, { CODEX_HOME: codexHome }),
       activeServerDir: join(root, 'servers', 'cloud'),
@@ -203,23 +227,8 @@ describe('pageCodexTranscript', () => {
       direction: 'older',
       maxBytes: 1024 * 1024,
       maxItems: 10,
-    });
+    })).rejects.toBeInstanceOf(DirectSessionsProviderUnavailableError);
 
-    expect(result.items).toEqual([
-      expect.objectContaining({
-        raw: expect.objectContaining({
-          role: 'agent',
-          content: expect.objectContaining({
-            data: expect.objectContaining({
-              type: 'message',
-              message: 'App server preview',
-            }),
-          }),
-        }),
-      }),
-    ]);
-    expect(result.tailCursor).toBeTruthy();
-    expect(result.hasMore).toBe(false);
   });
 
   it('does not start the Codex app-server metadata fallback when rollout files exist', async () => {
@@ -314,6 +323,36 @@ describe('pageCodexTranscript', () => {
     expect(second.items).toHaveLength(1);
     expect(JSON.stringify(second.items[0] ?? null)).toContain('visible older item');
     expect(second.hasMore).toBe(false);
+  });
+
+  it('classifies an invalid backward cursor as a source discontinuity', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-page-invalid-cursor-'));
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+    const sessionId = 'page-invalid-cursor-session';
+    await writeFile(
+      join(sessionsDir, `rollout-2026-01-02T00-00-00-${sessionId}.jsonl`),
+      responseItemLine({
+        timestamp: '2026-01-02T00:00:01.000Z',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'visible' }] },
+      }),
+      'utf8',
+    );
+
+    const page = await pageCodexTranscript({
+      source: { kind: 'codexHome', home: 'user' },
+      env: { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      activeServerDir: join(root, 'servers', 'cloud'),
+      remoteSessionId: sessionId,
+      direction: 'older',
+      cursor: 'invalid-cursor',
+      maxBytes: 1024,
+      maxItems: 10,
+    });
+
+    expect(page.truncated).toBe(true);
+    expect(page.truncationReason).toBe('source_discontinuity');
   });
 
   it('maps Codex collaboration rollout events into generic SubAgent tool rows for direct transcripts', async () => {

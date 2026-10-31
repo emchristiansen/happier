@@ -21,11 +21,10 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { z } from 'zod';
 
 import { callMcpToolWithResolvedTimeout } from '@/mcp/mcpToolCallRequestOptions';
-import { removeConsumedMcpRuntimeConfigFile } from '@/mcp/runtime/isSafeTmpMcpConfigFilePath';
 import { bindMcpStdioBridgeLifecycle } from '@/mcp/runtime/bindMcpStdioBridgeLifecycle';
 import { withMcpTimeout } from '@/mcp/runtime/withMcpTimeout';
+import { createMcpProgressForwarder } from '@/mcp/bridges/createMcpProgressForwarder';
 
-const REMOTE_BRIDGE_CONFIG_PREFIX = 'happier-mcp-remote-bridge';
 const MCP_BRIDGE_CONNECT_TIMEOUT_MS = 60_000;
 
 const RemoteBridgeConfigSchema = z.object({
@@ -83,7 +82,6 @@ async function main(): Promise<void> {
   let config: RemoteBridgeConfig;
   try {
     const raw = await readFile(configPath, 'utf8');
-    await removeConsumedMcpRuntimeConfigFile(configPath, REMOTE_BRIDGE_CONFIG_PREFIX);
     config = RemoteBridgeConfigSchema.parse(JSON.parse(raw));
   } catch (err) {
     writeStderr(`[happier-mcp-remote-bridge] Failed to read config: ${err instanceof Error ? err.message : String(err)}`);
@@ -100,31 +98,22 @@ async function main(): Promise<void> {
   server.setRequestHandler(ListToolsRequestSchema, async (request) => await remoteClient.listTools(request.params));
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    const progressToken = request.params._meta?.progressToken;
-    const pendingProgressNotifications: Promise<void>[] = [];
-    const onprogress = typeof progressToken === 'string' || typeof progressToken === 'number'
-      ? (progress: Readonly<{ progress: number; total?: number; message?: string }>) => {
-        const notification = extra.sendNotification({
-          method: 'notifications/progress',
-          params: {
-            ...progress,
-            progressToken,
-          },
-        }).catch((err) => {
-          writeStderr(`[happier-mcp-remote-bridge] Failed to forward progress: ${err instanceof Error ? err.message : String(err)}`);
-        });
-        pendingProgressNotifications.push(notification);
-      }
-      : undefined;
+    const progress = createMcpProgressForwarder({
+      requestMetadata: request.params._meta,
+      sendNotification: extra.sendNotification,
+      onError: (err) => {
+        writeStderr(`[happier-mcp-remote-bridge] Failed to forward progress: ${err instanceof Error ? err.message : String(err)}`);
+      },
+    });
 
     const result = await callMcpToolWithResolvedTimeout({
       client: remoteClient,
       toolName: request.params.name,
       args: request.params.arguments,
-      requestMetadata: request.params._meta,
-      onprogress,
+      requestMetadata: progress.requestMetadata,
+      onprogress: progress.onprogress,
     });
-    await Promise.all(pendingProgressNotifications);
+    await progress.flush();
     return result;
   });
 

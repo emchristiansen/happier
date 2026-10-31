@@ -19,7 +19,9 @@ const FLOATING_MIN_BOTTOM_GAP = 8;
  *   report a 0 inset, so this collapses to just the gap.
  *
  * Single source of truth for `FloatingTabBarSurface` — shared by the main `TabBar` and
- * the `CockpitTabBar`, so every bottom bar resolves its clearance the same way.
+ * the `CockpitTabBar`, so every bottom bar resolves its clearance the same way. The
+ * floating new-session composer, which rises into the layer the tab bar vacates, uses
+ * the non-iOS branch so it clears the Android nav the same way.
  */
 export function resolveFloatingTabBarBottomPadding(bottomInset: number, isIos: boolean): number {
     if (isIos) {

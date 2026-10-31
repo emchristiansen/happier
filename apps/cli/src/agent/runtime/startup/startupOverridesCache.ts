@@ -3,6 +3,7 @@ import { configuration } from '@/configuration';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { normalizePermissionModeToIntent } from '@/agent/runtime/permission/permissionModeCanonical';
 
 type CachedOverrides = Readonly<{
   permissionMode: PermissionMode;
@@ -57,8 +58,9 @@ function loadCacheOnce(): CacheFileV1 {
 }
 
 function normalizeCachedOverrides(value: unknown): CachedOverrides | null {
-  const obj = value as any;
-  const permissionMode = typeof obj?.permissionMode === 'string' ? (obj.permissionMode as PermissionMode) : null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  const permissionMode = normalizePermissionModeToIntent(obj.permissionMode);
   const permissionModeUpdatedAt = typeof obj?.permissionModeUpdatedAt === 'number' ? obj.permissionModeUpdatedAt : 0;
   const modelIdRaw = obj?.modelId;
   const modelId = typeof modelIdRaw === 'string' ? modelIdRaw : modelIdRaw === null ? null : null;
@@ -107,7 +109,7 @@ export function writeStartupOverridesCacheForBackend(opts: {
     byBackend: {
       ...cache.byBackend,
       [opts.backendId]: {
-        permissionMode: opts.permissionMode,
+        permissionMode: normalizePermissionModeToIntent(opts.permissionMode) ?? 'default',
         permissionModeUpdatedAt: opts.permissionModeUpdatedAt,
         modelId: opts.modelId,
         modelUpdatedAt: opts.modelUpdatedAt,

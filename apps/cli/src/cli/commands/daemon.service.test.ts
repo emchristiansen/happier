@@ -48,11 +48,13 @@ describe('happier daemon service', () => {
       'HAPPIER_DAEMON_SERVICE_USER_HOME_DIR',
       'HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR',
       'HAPPIER_DAEMON_SERVICE_INSTANCE_ID',
+      'HAPPIER_DAEMON_SERVICE_TARGET_MODE',
     ]);
 
     await withTempDir('happier-daemon-service-', async (tmp) => {
       envScope.patch({
         HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+        HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
         HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: tmp,
         HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: join(tmp, '.happier'),
         HAPPIER_DAEMON_SERVICE_INSTANCE_ID: 'cloud',
@@ -82,11 +84,13 @@ describe('happier daemon service', () => {
       'HAPPIER_DAEMON_SERVICE_USER_HOME_DIR',
       'HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR',
       'HAPPIER_DAEMON_SERVICE_INSTANCE_ID',
+      'HAPPIER_DAEMON_SERVICE_TARGET_MODE',
     ]);
 
     await withTempDir('happier-daemon-service-', async (tmp) => {
       envScope.patch({
         HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+        HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
         HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: tmp,
         HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: join(tmp, '.happier'),
       });

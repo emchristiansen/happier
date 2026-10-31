@@ -71,7 +71,7 @@ import {
   makeGrokAcpStubModelsAndEffortScenario,
   makeGrokAcpStubStructuredQuestionScenario,
 } from './scenarios.grok';
-import { cleanupOutsideWorkspacePath, makeOutsideWorkspacePath } from '../harness/outsideWorkspacePath';
+import { cleanupOutsideWorkspacePath, makeOutsideWorkspacePath, requireOwnedOutsideWorkspacePath, type OwnedOutsideWorkspacePath } from '../harness/outsideWorkspacePath';
 
 type ScenarioFactory = (provider: ProviderUnderTest) => ProviderScenario;
 
@@ -1006,7 +1006,7 @@ await server.connect(new StdioServerTransport());
     if (provider.protocol !== 'acp') {
       throw new Error(`acp_set_model_dynamic only supports ACP providers (got ${provider.protocol})`);
     }
-    if (!['opencode', 'kilo', 'auggie', 'codex', 'cursor', 'grok_acp_stub'].includes(provider.id)) {
+    if (!['opencode', 'kilo', 'auggie', 'codex', 'cursor', 'grok_acp_stub', 'devin', 'fx', 'droid', 'kimi', 'codebuddy'].includes(provider.id)) {
       throw new Error(`acp_set_model_dynamic requires dynamic model providers (got ${provider.id})`);
     }
 
@@ -1328,7 +1328,7 @@ await server.connect(new StdioServerTransport());
 
   permission_surface_outside_workspace: (provider) => {
     if (provider.id === 'claude') {
-      let outsidePath: string | null = null;
+      let outsidePath: OwnedOutsideWorkspacePath | null = null;
       const scenario: ProviderScenario = {
         id: 'permission_surface_outside_workspace',
         title: 'permissions: writing outside workspace surfaces a permission-request trace (approve)',
@@ -1369,21 +1369,22 @@ await server.connect(new StdioServerTransport());
           ['claude/claude/tool-result/Write', 'claude/claude/tool-result/Edit'],
         ],
         verify: async ({ fixtures }) => {
-          const writes = ((fixtures?.examples?.['claude/claude/permission-request/Write'] ?? []) as any[])
-            .concat((fixtures?.examples?.['claude/claude/permission-request/Edit'] ?? []) as any[])
-            .concat((fixtures?.examples?.['claude/claude/tool-call/Write'] ?? []) as any[])
-            .concat((fixtures?.examples?.['claude/claude/tool-call/Edit'] ?? []) as any[]);
-          if (!Array.isArray(writes) || writes.length === 0) throw new Error('Missing outside-workspace write evidence in fixtures');
-          const filepath = writes[0]?.payload?.input?.file_path;
-          const resolvedPath = typeof filepath === 'string' && filepath.length > 0 ? filepath : outsidePath;
-          if (typeof resolvedPath !== 'string' || resolvedPath.length === 0) throw new Error('permission-request/Write missing input.file_path');
+          const ownedPath = outsidePath;
           try {
+            const writes = ((fixtures?.examples?.['claude/claude/permission-request/Write'] ?? []) as any[])
+              .concat((fixtures?.examples?.['claude/claude/permission-request/Edit'] ?? []) as any[])
+              .concat((fixtures?.examples?.['claude/claude/tool-call/Write'] ?? []) as any[])
+              .concat((fixtures?.examples?.['claude/claude/tool-call/Edit'] ?? []) as any[]);
+            if (!Array.isArray(writes) || writes.length === 0) throw new Error('Missing outside-workspace write evidence in fixtures');
+            const filepath = writes[0]?.payload?.input?.file_path;
+            const resolvedPath = requireOwnedOutsideWorkspacePath(ownedPath,
+              typeof filepath === 'string' && filepath.length > 0 ? filepath : ownedPath);
             const content = await readFile(resolvedPath, 'utf8').catch(() => '');
             if (content.trim().length > 0 && !content.includes('OUTSIDE_CLAUDE_E2E')) {
               throw new Error(`Approved permission but expected content was not written: ${resolvedPath}`);
             }
           } finally {
-            await cleanupOutsideWorkspacePath(resolvedPath);
+            await cleanupOutsideWorkspacePath(ownedPath);
             outsidePath = null;
           }
         },
@@ -1475,7 +1476,7 @@ await server.connect(new StdioServerTransport());
 
   permission_deny_outside_workspace: (provider) => {
     if (provider.id === 'claude') {
-      let outsidePath: string | null = null;
+      let outsidePath: OwnedOutsideWorkspacePath | null = null;
       const scenario: ProviderScenario = {
         id: 'permission_deny_outside_workspace',
         title: 'permissions: deny an outside-workspace write and verify it did not happen',
@@ -1516,16 +1517,17 @@ await server.connect(new StdioServerTransport());
           ['claude/claude/tool-call/Write', 'claude/claude/tool-call/Edit'],
         ],
         verify: async ({ fixtures }) => {
-          const permissionRequests = ((fixtures?.examples?.['claude/claude/permission-request/Write'] ?? []) as any[])
-            .concat((fixtures?.examples?.['claude/claude/permission-request/Edit'] ?? []) as any[]);
-          const writes = permissionRequests
-            .concat((fixtures?.examples?.['claude/claude/tool-call/Write'] ?? []) as any[])
-            .concat((fixtures?.examples?.['claude/claude/tool-call/Edit'] ?? []) as any[]);
-          if (!Array.isArray(writes) || writes.length === 0) throw new Error('Missing outside-workspace write evidence in fixtures');
-          const filepath = writes[0]?.payload?.input?.file_path;
-          const resolvedPath = typeof filepath === 'string' && filepath.length > 0 ? filepath : outsidePath;
-          if (typeof resolvedPath !== 'string' || resolvedPath.length === 0) throw new Error('permission-request/Write missing input.file_path');
+          const ownedPath = outsidePath;
           try {
+            const permissionRequests = ((fixtures?.examples?.['claude/claude/permission-request/Write'] ?? []) as any[])
+              .concat((fixtures?.examples?.['claude/claude/permission-request/Edit'] ?? []) as any[]);
+            const writes = permissionRequests
+              .concat((fixtures?.examples?.['claude/claude/tool-call/Write'] ?? []) as any[])
+              .concat((fixtures?.examples?.['claude/claude/tool-call/Edit'] ?? []) as any[]);
+            if (!Array.isArray(writes) || writes.length === 0) throw new Error('Missing outside-workspace write evidence in fixtures');
+            const filepath = writes[0]?.payload?.input?.file_path;
+            const resolvedPath = requireOwnedOutsideWorkspacePath(ownedPath,
+              typeof filepath === 'string' && filepath.length > 0 ? filepath : ownedPath);
             // Enforce denied-write side effects only when the provider surfaced an interactive
             // permission request we could answer. Some Claude runtimes can execute this write
             // directly without emitting permission-request fixtures.
@@ -1533,7 +1535,7 @@ await server.connect(new StdioServerTransport());
               throw new Error(`Denied permission but file exists on disk: ${resolvedPath}`);
             }
           } finally {
-            await cleanupOutsideWorkspacePath(resolvedPath);
+            await cleanupOutsideWorkspacePath(ownedPath);
             outsidePath = null;
           }
         },
@@ -2713,7 +2715,10 @@ await server.connect(new StdioServerTransport());
       title: 'mcp: change_title via Happier MCP server',
       tier: 'extended',
       yolo: true,
-      maxTraceEvents: { toolCalls: 1, toolResults: 1, permissionRequests: 1 },
+      // CodeBuddy resolves deferred MCP tools with a `ToolSearch` call before executing them.
+      maxTraceEvents: provider.id === 'codebuddy'
+        ? { toolCalls: 2, toolResults: 2, permissionRequests: 1 }
+        : { toolCalls: 1, toolResults: 1, permissionRequests: 1 },
       prompt: ({ workspaceDir }) =>
         [
           'Run exactly one tool call:',

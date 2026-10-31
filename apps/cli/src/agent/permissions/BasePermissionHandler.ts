@@ -8,6 +8,7 @@
  */
 
 import { logger } from "@/ui/logger";
+import { isExecutionRunPermissionRequestId } from '@/agent/executionRuns/runtime/runScopedExecutionPermissionHandler';
 import type { ApiSessionClient } from "@/api/session/sessionClient";
 import { AgentState } from "@/api/types";
 import { updateAgentStateBestEffort as updateAgentStateBestEffortShared } from "@/api/session/sessionWritesBestEffort";
@@ -80,14 +81,11 @@ export interface PermissionResponse {
 }
 
 /**
- * Pending permission request stored while awaiting user response.
+ * Local routing and policy metadata; the coordinator owns request waiters.
  */
 export interface PendingRequest {
-    resolve: (value: PermissionResult) => void;
-    reject: (error: Error) => void;
     toolName: string;
     input: unknown;
-    coordinatorManaged?: boolean;
     resolveDecisionIfPolicyChanges?: () => PermissionResult | null;
 }
 
@@ -101,6 +99,7 @@ export abstract class BasePermissionHandler {
     protected pendingRequests = new Map<string, PendingRequest>();
     protected session: ApiSessionClient;
     private isResetting = false;
+    private readonly requestScope: 'foreground' | 'execution_run';
     private allowedToolIdentifiers = new Set<string>();
     private readonly requestStore: AgentStateRequestStore;
     private readonly requestCoordinator: PermissionRequestCoordinator<PermissionResult>;
@@ -129,9 +128,11 @@ export abstract class BasePermissionHandler {
             onAbortRequested?: (() => void | Promise<void>) | null;
             toolTrace?: { protocol: ToolTraceProtocol; provider: string } | null;
             triggerAbortCallbackOnAbortDecision?: boolean;
+            requestScope?: 'foreground' | 'execution_run';
         }
     ) {
         this.session = session;
+        this.requestScope = opts?.requestScope ?? 'foreground';
         this.getAccountSettingsSnapshotFn = typeof opts?.getAccountSettings === 'function' ? opts.getAccountSettings : (() => null);
         this.requestStore = new AgentStateRequestStore({
             session,
@@ -187,20 +188,16 @@ export abstract class BasePermissionHandler {
 
         // If we were mid-permission when the session reference swapped (offline reconnect),
         // republish still-pending items into the new agentState and re-attempt push notifications.
-        for (const [id, pending] of this.pendingRequests.entries()) {
-            if (this.requestCoordinator.isRequestClaimed(id)) continue;
+        for (const id of this.pendingRequests.keys()) {
+            const context = this.requestCoordinator.getResponseContext(id);
+            if (!context) continue;
             if (!this.requestStore.hasOutstandingRequest(id)) {
-                this.requestStore.publishRequest({
-                    requestId: id,
-                    toolName: pending.toolName,
-                    toolInput: pending.input,
-                    createdAt: Date.now(),
-                });
+                this.requestStore.publishRequest(context);
             } else {
                 this.requestStore.notifyPermissionRequestPushBestEffort({
                     permissionId: id,
-                    toolName: pending.toolName,
-                    toolInput: pending.input,
+                    toolName: context.toolName,
+                    toolInput: context.toolInput,
                 });
             }
         }
@@ -342,7 +339,7 @@ export abstract class BasePermissionHandler {
         this.session.rpcHandlerManager.registerHandler<PermissionResponse, void>(
             SESSION_RPC_METHODS.SESSION_PERMISSION_RESPOND_LEGACY,
             async (response) => {
-                this.tryHandlePermissionRpc(response);
+                await this.tryHandlePermissionRpc(response);
             }
         );
         this.session.rpcHandlerManager.registerHandler<unknown, void>(
@@ -352,7 +349,7 @@ export abstract class BasePermissionHandler {
                 if (!parsed.success) {
                     throw new PublicRpcHandlerError(PUBLIC_RPC_HANDLER_ERROR_CODES.STRUCTURED_QUESTION_INVALID);
                 }
-                this.tryHandlePermissionRpc({
+                await this.tryHandlePermissionRpc({
                     id: parsed.data.id,
                     approved: true,
                     structuredAnswersV1: parsed.data.structuredAnswersV1,
@@ -361,9 +358,10 @@ export abstract class BasePermissionHandler {
         );
     }
 
-    private tryHandlePermissionRpc(response: SessionPermissionRpcPayload, requireLocalPending: boolean = false): boolean {
-        const legacyPending = this.pendingRequests.get(response.id);
-        if (requireLocalPending && !legacyPending) return false;
+    private async tryHandlePermissionRpc(response: SessionPermissionRpcPayload, requireLocalPending: boolean = false): Promise<boolean> {
+        const localPending = this.pendingRequests.get(response.id);
+        if (requireLocalPending && !localPending) return false;
+        if (!localPending && !this.ownsPersistedRequest(response.id)) return false;
         const hasStructuredAnswers = response.answers !== undefined || response.structuredAnswersV1 !== undefined;
         const candidateContext = hasStructuredAnswers
             ? null
@@ -371,7 +369,7 @@ export abstract class BasePermissionHandler {
         const requiresLocalQuestionOwner = hasStructuredAnswers
             || (candidateContext !== null && this.isStructuredQuestionContext(candidateContext));
         const context = requiresLocalQuestionOwner
-            ? this.requireLocallyOwnedStructuredResponseContext(response.id, legacyPending)
+            ? this.requireLocallyOwnedStructuredResponseContext(response.id, localPending)
             : candidateContext;
         if (!context) {
             logger.debug(
@@ -392,13 +390,12 @@ export abstract class BasePermissionHandler {
                 })
                 : undefined;
 
-        this.handlePermissionResponseWithContext({
+        return await this.handlePermissionResponseWithContext({
             response,
             context,
-            legacyPending,
+            localPending,
             structuredAnswers,
         });
-        return true;
     }
 
     private requireLocallyOwnedStructuredResponseContext(
@@ -427,55 +424,57 @@ export abstract class BasePermissionHandler {
         return questions as readonly StructuredQuestionLike[];
     }
 
-    private handlePermissionResponseWithContext(params: Readonly<{
+    private async handlePermissionResponseWithContext(params: Readonly<{
         response: PermissionResponse;
         context: PermissionRequestCoordinatorContext;
-        legacyPending: PendingRequest | undefined;
+        localPending: PendingRequest | undefined;
         structuredAnswers?: StructuredQuestionAnswersV1;
-    }>): void {
-                const { response, context, legacyPending, structuredAnswers } = params;
-                const responseAllowedTools = response.allowedTools ?? response.allowTools;
-                const updatedPermissions = response.updatedPermissions;
-                const result = this.buildPermissionResult(response);
-                if (structuredAnswers) result.answers = structuredAnswers;
+    }>): Promise<boolean> {
+        const { response, context, localPending, structuredAnswers } = params;
+        const responseAllowedTools = response.allowedTools ?? response.allowTools;
+        const updatedPermissions = response.updatedPermissions;
+        const result = this.buildPermissionResult(response);
+        if (structuredAnswers) result.answers = structuredAnswers;
 
-                const requestSource = { toolName: context.toolName, input: context.toolInput };
-                if (this.requestCoordinator.isRequestClaimed(response.id)) {
-                    return;
-                }
+        const requestSource = { toolName: context.toolName, input: context.toolInput };
+        if (this.requestCoordinator.isRequestClaimed(response.id)) {
+            return false;
+        }
 
-                this.applyPermissionResponseSideEffects({
-                    response,
-                    result,
-                    responseAllowedTools,
-                    updatedPermissions,
-                    requestSource,
-                    debugMessage:
-                        context.correlation === 'agent_state'
-                            ? 'Permission response received without pending request; finalized agentState best-effort'
-                            : `Permission ${response.approved ? 'approved' : 'denied'} for ${context.toolName}`,
-                });
+        const completedRequest = this.buildCompletedRequestForResponse(
+            response,
+            result,
+            responseAllowedTools,
+            updatedPermissions,
+            requestSource,
+        );
+        const onAdmitted = () => {
+            this.applyPermissionResponseSideEffects({
+                response,
+                result,
+                responseAllowedTools,
+                updatedPermissions,
+                requestSource,
+                debugMessage:
+                    context.correlation === 'agent_state'
+                        ? 'Permission response received without pending request; finalized agentState best-effort'
+                        : `Permission ${response.approved ? 'approved' : 'denied'} for ${context.toolName}`,
+            });
 
-                const completed = this.completePendingPermissionRequest(response.id, context, result, this.buildCompletedRequestForResponse(
-                    response,
-                    result,
-                    responseAllowedTools,
-                    updatedPermissions,
-                    requestSource,
-                ));
+            if (response.approved) {
+                this.autoApproveNowAllowedPendingRequests(response.id);
+            }
 
-                if (!legacyPending?.coordinatorManaged) {
-                    this.pendingRequests.delete(response.id);
-                    legacyPending?.resolve(result);
-                }
-
-                if (response.approved) {
-                    this.autoApproveNowAllowedPendingRequests(response.id);
-                }
-
-                if (!completed && !legacyPending) {
-                    logger.debug(`${this.getLogPrefix()} Permission response did not complete any pending request`);
-                }
+        };
+        const completed = await this.requestCoordinator.completeRpcResponse({
+            context, completion: { result, completedRequest }, onAdmitted,
+        });
+        if (!completed && (structuredAnswers || context.status === 'live')) return false;
+        if (completed) this.pendingRequests.delete(response.id);
+        if (!completed && !localPending) {
+            logger.debug(`${this.getLogPrefix()} Permission response did not complete any pending request`);
+        }
+        return true;
     }
 
     private autoApproveNowAllowedPendingRequests(excludePermissionId: string): void {
@@ -512,7 +511,7 @@ export abstract class BasePermissionHandler {
         const allowedTools = decision === 'approved_for_session'
             ? [makeToolIdentifier(toolName, input)]
             : undefined;
-        this.requestStore.recordCompletedRequest({
+        void this.requestStore.recordCompletedRequest({
             requestId: toolCallId,
             toolName,
             toolInput: input,
@@ -541,14 +540,7 @@ export abstract class BasePermissionHandler {
             this.pendingRequests.set(toolCallId, {
                 toolName,
                 input: normalizedInput,
-                coordinatorManaged: true,
                 resolveDecisionIfPolicyChanges,
-                resolve: (value) => {
-                    this.resolvePendingPermissionRequest(toolCallId, value);
-                },
-                reject: (error) => {
-                    this.rejectPendingPermissionRequest(toolCallId, error);
-                },
             });
         }
 
@@ -561,20 +553,6 @@ export abstract class BasePermissionHandler {
 
         return pending.finally(() => {
             this.pendingRequests.delete(toolCallId);
-        });
-    }
-
-    /**
-     * Add a pending request to the agent state.
-     */
-    protected addPendingRequestToState(toolCallId: string, toolName: string, input: unknown): void {
-        if (this.isPermissionRequestClaimed(toolCallId)) return;
-        this.recordPermissionRequestTrace(toolCallId, toolName, input);
-        this.requestStore.publishRequest({
-            requestId: toolCallId,
-            toolName,
-            toolInput: input,
-            createdAt: Date.now(),
         });
     }
 
@@ -603,11 +581,9 @@ export abstract class BasePermissionHandler {
         completedRequest?: PermissionRequestCoordinatorCompletedRequest,
     ): void {
         if (this.isPermissionRequestClaimed(requestId)) return;
-        const pending = this.pendingRequests.get(requestId);
         const context = this.requestCoordinator.getResponseContext(requestId);
         if (!context) {
             this.pendingRequests.delete(requestId);
-            pending?.resolve(result);
             return;
         }
 
@@ -622,16 +598,12 @@ export abstract class BasePermissionHandler {
         );
     }
 
-    private rejectPendingPermissionRequest(requestId: string, error: Error): void {
-        this.pendingRequests.delete(requestId);
-        this.requestCoordinator.cancelRequest(requestId, error.message);
-    }
-
     private completePendingPermissionRequest(
         requestId: string,
         context: PermissionRequestCoordinatorContext,
         result: PermissionResult,
         completedRequest: PermissionRequestCoordinatorCompletedRequest,
+        onAdmitted?: () => void,
     ): boolean {
         const completed = this.requestCoordinator.completeResponse({
             context,
@@ -639,17 +611,19 @@ export abstract class BasePermissionHandler {
                 result,
                 completedRequest,
             },
+            onAdmitted,
         });
-        if (completed) {
-            this.pendingRequests.delete(requestId);
-        }
         return completed;
+    }
+
+    private ownsPersistedRequest(requestId: string): boolean {
+        return isExecutionRunPermissionRequestId(requestId) === (this.requestScope === 'execution_run');
     }
 
     cancelPendingRequest(requestId: string, reason: string): boolean {
         if (this.isPermissionRequestClaimed(requestId)) return false;
         const context = this.requestCoordinator.getResponseContext(requestId);
-        if (!context) return false;
+        if (!context || (context.correlation === 'agent_state' && !this.ownsPersistedRequest(requestId))) return false;
         return this.completePendingPermissionRequest(
             requestId,
             context,
@@ -662,22 +636,34 @@ export abstract class BasePermissionHandler {
      * Reset state for new sessions.
      * This method is idempotent - safe to call multiple times.
      */
-    private cancelPendingRequests(params: Readonly<{ reason: string; decision?: 'abort' }>): void {
-        const pendingSnapshot = Array.from(this.pendingRequests.values());
-        this.pendingRequests.clear();
-        this.requestCoordinator.cancelAll(params.reason);
-        for (const pending of pendingSnapshot) {
-            if (pending.coordinatorManaged) continue;
-            try {
-                pending.reject(new Error(params.reason));
-            } catch (err) {
-                logger.debug(`${this.getLogPrefix()} Error rejecting legacy pending request:`, err);
+    private async cancelPendingRequests(params: Readonly<{ reason: string }>): Promise<void> {
+        const pendingSnapshot = Array.from(this.pendingRequests.entries());
+        const requests = this.session.getAgentStateSnapshot?.()?.requests ?? {};
+        const stateOnlyRequestIds = Object.keys(requests).filter((requestId) => (
+            this.ownsPersistedRequest(requestId)
+            && this.requestCoordinator.getResponseContext(requestId)?.correlation === 'agent_state'
+        ));
+        await Promise.all([
+            this.requestCoordinator.cancelAll(params.reason),
+            ...(stateOnlyRequestIds.length > 0 ? [this.requestStore.cancelAllRequests({
+                reason: params.reason, decision: 'abort', requestIds: stateOnlyRequestIds,
+            })] : []),
+        ]);
+        for (const [requestId, pending] of pendingSnapshot) {
+            if (this.pendingRequests.get(requestId) === pending) {
+                this.pendingRequests.delete(requestId);
             }
         }
     }
 
     async abortPendingRequestsAndFlush(reason: string = 'Aborted by user'): Promise<void> {
-        this.cancelPendingRequests({ reason, decision: 'abort' });
+        try {
+            await this.cancelPendingRequests({ reason });
+        } catch (error) {
+            // The coordinator retains the exact detached cancellation for retry.
+            // A failed history write must not prevent the caller from stopping the provider.
+            logger.infoFile(`${this.getLogPrefix()} Stop request settlement admission failed; continuing provider abort`, error);
+        }
         try {
             await this.session.flush?.();
         } catch (error) {
@@ -694,11 +680,13 @@ export abstract class BasePermissionHandler {
         this.isResetting = true;
 
         try {
-            this.cancelPendingRequests({ reason: 'Session reset' });
+            void this.cancelPendingRequests({ reason: 'Session reset' }).catch(() => {
+                logger.infoFile(`${this.getLogPrefix()} Reset request settlement admission failed`);
+            });
 
             this.allowedToolIdentifiers.clear();
-            this.unregisterPermissionRpcConsumer?.();
-            this.unregisterPermissionRpcConsumer = null;
+            // A turn reset can be followed by another request on this handler.
+            // Keep its session RPC subscription; updateSession moves it when the session swaps.
             this.requestStore.dispose();
             logger.debug(`${this.getLogPrefix()} Permission handler reset`);
         } finally {

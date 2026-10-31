@@ -3,126 +3,51 @@ import * as React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { renderScreen } from '@/dev/testkit';
 
-
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
+// React Native is the platform boundary. Store, highlighting policy and code rows remain real.
 vi.mock('react-native', async () => {
-    const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
-    return createReactNativeWebMock({
-        Platform: {
-            OS: 'android',
-            select: (options: any) => options?.android ?? options?.native ?? options?.default ?? options?.web ?? options?.ios,
-        },
-    });
+    const { createReactNativeNativeMock } = await import('@/dev/testkit/mocks/reactNative');
+    return createReactNativeNativeMock({ platformOS: 'android' });
 });
-
-vi.mock('@/sync/domains/state/storage', async () => {
-    const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
-    return createStorageModuleStub({
-        useSetting: () => false,
-    });
-});
-
-vi.mock('@/components/ui/code/highlighting/useCodeLinesSyntaxHighlighting', () => ({
-    useCodeLinesSyntaxHighlighting: () => ({
-        mode: 'off',
-        language: null,
-        maxBytes: 1_000_000,
-        maxLines: 10_000,
-        maxLineLength: 10_000,
-    }),
-}));
-
-vi.mock('@/components/ui/code/view/CodeLinesView', () => ({
-    CodeLinesView: (props: Record<string, unknown>) =>
-        React.createElement('CodeLinesView', props),
-}));
-
-function flattenStyle(style: unknown): Record<string, unknown> {
-    if (Array.isArray(style)) {
-        return Object.assign({}, ...style.map((entry) => flattenStyle(entry)));
-    }
-    if (style && typeof style === 'object') {
-        return style as Record<string, unknown>;
-    }
-    return {};
-}
 
 describe('Happier diff viewers horizontal overflow', () => {
-    it('does not force flex sizing for inline non-virtualized diff bodies', async () => {
-        const { HappierTextDiffViewer } = await import('./HappierTextDiffViewer');
-        const { HappierUnifiedDiffViewer } = await import('./HappierUnifiedDiffViewer');
+    it.each(['text', 'unified'] as const)(
+        'scrolls no-wrap %s diff rows horizontally on Android while retaining selection of wrapped changed words',
+        async (mode) => {
+            const { HappierTextDiffViewer } = await import('./HappierTextDiffViewer');
+            const { HappierUnifiedDiffViewer } = await import('./HappierUnifiedDiffViewer');
 
-        const textScreen = await renderScreen(
-            <HappierTextDiffViewer
-                mode="text"
-                oldText={'const value = 1;'}
-                newText={'const value = 2;'}
-                virtualized={false}
-            />,
-        );
-        const textRootView = textScreen.tree.root.findAllByType('View' as any)[0];
-        expect(flattenStyle(textRootView.props.style).flex).toBeUndefined();
+            for (const wrapLines of [false, true]) {
+                const screen = await renderScreen(mode === 'text' ? (
+                    <HappierTextDiffViewer
+                        mode="text"
+                        oldText="const before = 1;"
+                        newText="const after = 1;"
+                        virtualized={false}
+                        wrapLines={wrapLines}
+                    />
+                ) : (
+                    <HappierUnifiedDiffViewer
+                        mode="unified"
+                        unifiedDiff={'@@ -1 +1 @@\n-const before = 1;\n+const after = 1;\n'}
+                        virtualized={false}
+                        wrapLines={wrapLines}
+                    />
+                ));
 
-        const unifiedScreen = await renderScreen(
-            <HappierUnifiedDiffViewer
-                mode="unified"
-                unifiedDiff={'@@ -1 +1 @@\n-const value = 1;\n+const value = 2;\n'}
-                virtualized={false}
-            />,
-        );
-        const unifiedRootView = unifiedScreen.tree.root.findAllByType('View' as any)[0];
-        expect(flattenStyle(unifiedRootView.props.style).flex).toBeUndefined();
-    });
+                expect(screen.tree.root.findAll((node) => typeof node.type === 'string' && String(node.type) === 'GestureHandlerScrollView')).toHaveLength(0);
+                const scrollViews = screen.tree.root.findAll((node) => typeof node.type === 'string' && String(node.type) === 'ScrollView');
+                expect(scrollViews).toHaveLength(wrapLines ? 0 : 1);
+                if (!wrapLines) {
+                    expect(scrollViews[0]!.props.horizontal).toBe(true);
+                    expect(scrollViews[0]!.props.nestedScrollEnabled).toBe(true);
+                }
 
-    it('passes inactive comment affordance visibility through text diffs', async () => {
-        const { HappierTextDiffViewer } = await import('./HappierTextDiffViewer');
-
-        const screen = await renderScreen(
-            <HappierTextDiffViewer
-                mode="text"
-                oldText={'const value = 1;'}
-                newText={'const value = 2;'}
-                showInactiveCommentAffordance={false}
-            />,
-        );
-
-        const codeLinesView = screen.tree.findByType('CodeLinesView' as any);
-        expect(codeLinesView.props.showInactiveCommentAffordance).toBe(false);
-    });
-
-    it('uses a gesture-handler ScrollView for no-wrap text diffs on Android', async () => {
-        const { HappierTextDiffViewer } = await import('./HappierTextDiffViewer');
-
-        const screen = await renderScreen(
-            <HappierTextDiffViewer
-                mode="text"
-                oldText={'const value = 1;'}
-                newText={'const value = 2;'}
-                wrapLines={false}
-            />,
-        );
-
-        const scrollView = screen.tree.findByType('GestureHandlerScrollView' as any);
-        expect(scrollView.props.horizontal).toBe(true);
-        expect(scrollView.props.nestedScrollEnabled).toBe(true);
-        expect(scrollView.props.disallowInterruption).toBe(true);
-    });
-
-    it('uses a gesture-handler ScrollView for no-wrap unified diffs on Android', async () => {
-        const { HappierUnifiedDiffViewer } = await import('./HappierUnifiedDiffViewer');
-
-        const screen = await renderScreen(
-            <HappierUnifiedDiffViewer
-                mode="unified"
-                unifiedDiff={'@@ -1 +1 @@\n-const value = 1;\n+const value = 2;\n'}
-                wrapLines={false}
-            />,
-        );
-
-        const scrollView = screen.tree.findByType('GestureHandlerScrollView' as any);
-        expect(scrollView.props.horizontal).toBe(true);
-        expect(scrollView.props.nestedScrollEnabled).toBe(true);
-        expect(scrollView.props.disallowInterruption).toBe(true);
-    });
+                for (const text of ['before', 'after']) {
+                    const textNodes = screen.tree.root.findAll((node) => typeof node.type === 'string' && String(node.type) === 'Text' && node.props.children === text);
+                    expect(textNodes.length).toBeGreaterThan(0);
+                    expect(textNodes.map((node) => node.props.selectable)).toEqual(textNodes.map(() => wrapLines));
+                }
+            }
+        },
+    );
 });

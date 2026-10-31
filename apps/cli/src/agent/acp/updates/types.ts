@@ -10,9 +10,10 @@ import type { AcpPlanProjection } from '../plans';
 export const DEFAULT_IDLE_TIMEOUT_MS = 500;
 
 /**
- * Default timeout for tool calls if transport doesn't specify (ms).
+ * Generic ACP does not synthesize a tool-call deadline. Provider work remains
+ * active until the provider reports a terminal update or the owning turn is cancelled.
  */
-export const DEFAULT_TOOL_CALL_TIMEOUT_MS = 120_000;
+export const DEFAULT_TOOL_CALL_TIMEOUT_MS: number | null = null;
 
 /**
  * Extended session update structure with all possible fields.

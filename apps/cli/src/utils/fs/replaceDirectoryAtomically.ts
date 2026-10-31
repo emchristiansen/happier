@@ -63,23 +63,29 @@ export async function replaceDirectoryAtomically(params: Readonly<{
   targetDir: string;
   preserveUnprovidedEntries?: readonly PreservedDirectoryEntries[];
   afterPromote?: () => Promise<void> | void;
+  writeArtifacts?: <T>(write: () => Promise<T>) => Promise<T>;
 }>): Promise<void> {
-  await mkdir(dirname(params.targetDir), { recursive: true });
+  const writeArtifacts = params.writeArtifacts ?? (async <T>(write: () => Promise<T>) => await write());
+  await writeArtifacts(() => mkdir(dirname(params.targetDir), { recursive: true }));
   const backupDir = `${params.targetDir}.previous-${randomUUID()}`;
   let hasBackup = false;
   let promoted = false;
   let carriedEntries: string[] = [];
   try {
-    await rename(params.targetDir, backupDir);
-    hasBackup = true;
-  } catch {
-    hasBackup = false;
-  }
-  try {
+    await writeArtifacts(async () => {
+      try {
+        await rename(params.targetDir, backupDir);
+        hasBackup = true;
+      } catch {
+        hasBackup = false;
+      }
+    });
     const snapshots = await snapshotUnprovidedEntrySpecs(params.preserveUnprovidedEntries ?? [], params.stagedDir);
-    await rename(params.stagedDir, params.targetDir);
-    promoted = true;
-    if (hasBackup) carriedEntries = await carryUnprovidedEntriesBestEffort(snapshots, backupDir, params.targetDir);
+    await writeArtifacts(async () => {
+      await rename(params.stagedDir, params.targetDir);
+      promoted = true;
+      if (hasBackup) carriedEntries = await carryUnprovidedEntriesBestEffort(snapshots, backupDir, params.targetDir);
+    });
     await params.afterPromote?.();
     if (hasBackup) {
       await rm(backupDir, { recursive: true, force: true });

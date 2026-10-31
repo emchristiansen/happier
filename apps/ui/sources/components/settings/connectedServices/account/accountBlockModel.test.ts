@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import { lightTheme } from '@/theme';
-import type { ConnectedServiceQuotaGaugeMeterRow } from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
+import type { ConnectedServiceQuotaGaugeMeterRow, ConnectedServiceQuotaGaugeLabelFormatter } from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
 
 import {
     resolveAccountHealthVariant,
     resolveAccountHealthDotColor,
     resolveAccountUsageRows,
+    resolveAccountCapacityRings,
+    resolveAccountCapacityView,
 } from './accountBlockModel';
 
 function meterRow(overrides: Partial<ConnectedServiceQuotaGaugeMeterRow>): ConnectedServiceQuotaGaugeMeterRow {
@@ -26,7 +28,28 @@ function meterRow(overrides: Partial<ConnectedServiceQuotaGaugeMeterRow>): Conne
 }
 
 describe('accountBlockModel', () => {
+    it('keeps the account headline and rings in the canonical comparable family', () => {
+        const formatter: ConnectedServiceQuotaGaugeLabelFormatter = {
+            unavailable: () => '',
+            remaining: () => '', remainingWithReset: () => '', used: () => '',
+            durationNow: () => '', durationOutdated: () => '', durationDaysHours: () => '',
+            durationHoursMinutes: () => '', durationHours: () => '', durationMinutes: () => '',
+            subscriptionEnds: () => '', subscriptionEndsInDays: () => '',
+            subscriptionRenews: () => '', subscriptionRenewsInDays: () => '',
+        };
+        const capacity = resolveAccountCapacityView([
+            { meterId: 'weekly', label: 'Weekly', used: 82, limit: 100, unit: 'count', utilizationPct: null, resetsAt: null, status: 'ok', details: {} },
+            { meterId: 'requests', label: 'Requests', used: 97, limit: 100, unit: 'count', utilizationPct: null, resetsAt: null, status: 'ok', details: { limitCategory: 'rate_limit' } },
+        ], 2_000, formatter);
+        expect(capacity.capacityPct).toBe(18);
+        expect(capacity.rings).toEqual([{ ratio: 0.18, tone: 'warning' }]);
+    });
     describe('resolveAccountUsageRows', () => {
+        it('preserves unknown percentages in details without inventing a capacity ring', () => {
+            const rows = resolveAccountUsageRows([meterRow({ remainingPct: null, usedPct: null })]);
+            expect(rows[0]?.remaining).toBeNull();
+            expect(resolveAccountCapacityRings(rows)).toEqual([]);
+        });
         it('maps gauge meter rows to MeterTone-driven usage rows with a single remaining-first fill', () => {
             const rows = resolveAccountUsageRows([
                 meterRow({ meterId: 'weekly', label: 'Weekly', remainingPct: 60, detailRightLabel: '60% left' }),

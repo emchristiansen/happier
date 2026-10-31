@@ -22,9 +22,17 @@ import {
     getExecutionRun,
     listExecutionRuns,
     normalizeExecutionRunRpcPayload,
+    executeExecutionRunAction,
+    cancelExecutionRunStream,
+    sendExecutionRunMessage,
     startExecutionRun,
+    startExecutionRunStream,
+    stopExecutionRun,
     waitForExecutionRun,
 } from './executionRuns';
+import { fingerprintExecutionRunStartRequest } from '@/agent/executionRuns/executionRunStartFingerprint';
+import { markRpcRequestDisposition } from '@/session/transport/rpc/rpcRequestDisposition';
+import { SocketRpcDisconnectBeforeAcknowledgementError } from '@/session/transport/rpc/socketRpcDisconnectGuard';
 
 function createRun(params: Readonly<{
     runId: string;
@@ -53,6 +61,7 @@ function createMarker(params: Readonly<{
     startedAtMs: number;
     agentId?: 'claude' | 'opencode';
     startRequestId?: string;
+    startRequestFingerprint?: string;
 }>) {
     return {
         happySessionId: 'sess-1',
@@ -68,6 +77,7 @@ function createMarker(params: Readonly<{
         status: params.status,
         startedAtMs: params.startedAtMs,
         ...(params.startRequestId ? { startRequestId: params.startRequestId } : {}),
+        ...(params.startRequestFingerprint ? { startRequestFingerprint: params.startRequestFingerprint } : {}),
         ...(params.status === 'succeeded' ? { finishedAtMs: params.startedAtMs + 1 } : {}),
     };
 }
@@ -571,6 +581,22 @@ describe('startExecutionRun', () => {
         listExecutionRunMarkers.mockReset();
     });
 
+    it('keeps the effectful start request under execution-run lifecycle ownership', async () => {
+        callSessionRpc.mockResolvedValueOnce({ ok: true, data: { runId: 'run-1' } });
+
+        await startExecutionRun({
+            token: 'token',
+            sessionId: 'sess-1',
+            ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
+            request: { intent: 'review' },
+        });
+
+        expect(callSessionRpc).toHaveBeenCalledWith(expect.objectContaining({
+            method: 'sess-1:execution.run.start',
+            timeoutMs: null,
+        }));
+    });
+
     it('reports protocol unsupported when a live runtime lacks the start method', async () => {
         callSessionRpc.mockRejectedValueOnce(new Error('RPC method not available'));
 
@@ -586,14 +612,27 @@ describe('startExecutionRun', () => {
         });
     });
 
-    it('recovers the exact accepted start from its correlated marker after an rpc observation timeout', async () => {
-        callSessionRpc.mockRejectedValueOnce(new Error('RPC call timeout'));
+    it.each([
+        ['acknowledgement timeout', () => markRpcRequestDisposition(new Error('RPC call timeout'), 'outcomeUnknown')],
+        ['post-emission disconnect', () => markRpcRequestDisposition(new SocketRpcDisconnectBeforeAcknowledgementError(), 'outcomeUnknown')],
+    ] as const)('recovers the exact accepted start from its correlated marker after an %s', async (_case, createError) => {
+        const request = {
+            intent: 'plan',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            permissionMode: 'workspace_write',
+            retentionPolicy: 'ephemeral',
+            runClass: 'bounded',
+            ioMode: 'request_response',
+            startRequestId: 'action-request-1',
+        } as const;
+        callSessionRpc.mockRejectedValueOnce(createError());
         listExecutionRunMarkers.mockResolvedValueOnce([
             createMarker({
                 runId: 'run-correlated',
                 status: 'running',
                 startedAtMs: 20,
                 startRequestId: 'action-request-1',
+                startRequestFingerprint: fingerprintExecutionRunStartRequest(request),
             }),
         ]);
 
@@ -601,15 +640,7 @@ describe('startExecutionRun', () => {
             token: 'token',
             sessionId: 'sess-1',
             ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
-            request: {
-                intent: 'plan',
-                backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
-                permissionMode: 'workspace_write',
-                retentionPolicy: 'ephemeral',
-                runClass: 'bounded',
-                ioMode: 'request_response',
-                startRequestId: 'action-request-1',
-            },
+            request,
         })).resolves.toEqual({
             ok: true,
             data: {
@@ -627,8 +658,52 @@ describe('startExecutionRun', () => {
         });
     });
 
-    it('reports an uncorrelated rpc timeout as ambiguous rather than target unavailable', async () => {
+    it('does not recover a marker when the request id matches but its fingerprint differs', async () => {
+        const request = {
+            intent: 'plan',
+            backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+            permissionMode: 'workspace_write',
+            retentionPolicy: 'ephemeral',
+            runClass: 'bounded',
+            ioMode: 'request_response',
+            startRequestId: 'action-request-1',
+        } as const;
         callSessionRpc.mockRejectedValueOnce(new Error('RPC call timeout'));
+        listExecutionRunMarkers.mockResolvedValueOnce([
+            createMarker({
+                runId: 'run-conflicting',
+                status: 'running',
+                startedAtMs: 20,
+                startRequestId: 'action-request-1',
+                startRequestFingerprint: fingerprintExecutionRunStartRequest({
+                    ...request,
+                    instructions: 'A different start request',
+                }),
+            }),
+        ]);
+
+        await expect(startExecutionRun({
+            token: 'token',
+            sessionId: 'sess-1',
+            ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
+            request,
+        })).resolves.toEqual({
+            ok: false,
+            code: 'execution_run_start_ambiguous',
+            message: 'RPC call timeout',
+            details: {
+                startRequestId: 'action-request-1',
+                retrySafe: true,
+                reconcileVia: 'retry_execution_run_start',
+            },
+        });
+    });
+
+    it.each([
+        ['RPC call timeout', () => markRpcRequestDisposition(new Error('RPC call timeout'), 'outcomeUnknown')],
+        ['RPC socket disconnected before acknowledgement', () => markRpcRequestDisposition(new SocketRpcDisconnectBeforeAcknowledgementError(), 'outcomeUnknown')],
+    ] as const)('reports an uncorrelated %s as ambiguous rather than target unavailable', async (message, createError) => {
+        callSessionRpc.mockRejectedValueOnce(createError());
 
         await expect(startExecutionRun({
             token: 'token',
@@ -638,13 +713,16 @@ describe('startExecutionRun', () => {
         })).resolves.toEqual({
             ok: false,
             code: 'execution_run_start_ambiguous',
-            message: 'RPC call timeout',
+            message,
         });
         expect(listExecutionRunMarkers).not.toHaveBeenCalled();
     });
 
-    it('keeps pre-acceptance connection failures distinct from ambiguous observation timeouts', async () => {
-        callSessionRpc.mockRejectedValueOnce(new Error('Socket connect timeout'));
+    it.each([
+        ['Socket connect timeout', () => new Error('Socket connect timeout')],
+        ['RPC socket disconnected before acknowledgement', () => markRpcRequestDisposition(new SocketRpcDisconnectBeforeAcknowledgementError(), 'notSent')],
+    ] as const)('keeps pre-acceptance %s distinct from ambiguous observation failures', async (message, createError) => {
+        callSessionRpc.mockRejectedValueOnce(createError());
 
         await expect(startExecutionRun({
             token: 'token',
@@ -654,7 +732,7 @@ describe('startExecutionRun', () => {
         })).resolves.toEqual({
             ok: false,
             code: 'execution_run_target_unavailable',
-            message: 'Socket connect timeout',
+            message,
         });
         expect(listExecutionRunMarkers).not.toHaveBeenCalled();
     });
@@ -888,6 +966,94 @@ describe('getExecutionRun', () => {
     });
 });
 
+describe('sendExecutionRunMessage', () => {
+    beforeEach(() => {
+        callSessionRpc.mockReset();
+    });
+
+    it('keeps effectful provider admission under execution-run lifecycle ownership', async () => {
+        callSessionRpc.mockResolvedValueOnce({ ok: true });
+
+        await sendExecutionRunMessage({
+            token: 'token',
+            sessionId: 'sess-1',
+            ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
+            request: { runId: 'run-1', message: 'continue', delivery: 'steer_if_supported' },
+        });
+
+        expect(callSessionRpc).toHaveBeenCalledWith(expect.objectContaining({
+            method: 'sess-1:execution.run.send',
+            timeoutMs: null,
+        }));
+    });
+
+    it('returns outcome unknown when transport fails after the send request was emitted', async () => {
+        callSessionRpc.mockRejectedValueOnce(markRpcRequestDisposition(
+            new Error('socket disconnected before acknowledgement'),
+            'outcomeUnknown',
+        ));
+
+        const result = await sendExecutionRunMessage({
+            token: 'token',
+            sessionId: 'sess-1',
+            ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
+            request: { runId: 'run-1', message: 'continue', delivery: 'steer_if_supported' },
+        });
+
+        expect(result).toEqual({
+            ok: false,
+            code: 'execution_run_send_outcome_unknown',
+            message: 'The input may have been accepted before the provider request failed',
+        });
+    });
+
+    it('returns target unavailable when transport proves the send request was not emitted', async () => {
+        callSessionRpc.mockRejectedValueOnce(markRpcRequestDisposition(
+            new Error('socket disconnected before request emission'),
+            'notSent',
+        ));
+
+        const result = await sendExecutionRunMessage({
+            token: 'token',
+            sessionId: 'sess-1',
+            ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
+            request: { runId: 'run-1', message: 'continue', delivery: 'steer_if_supported' },
+        });
+
+        expect(result).toEqual({
+            ok: false,
+            code: 'execution_run_target_unavailable',
+            message: 'socket disconnected before request emission',
+        });
+    });
+});
+
+describe('effectful execution-run controls', () => {
+    beforeEach(() => {
+        callSessionRpc.mockReset();
+        callSessionRpc.mockResolvedValue({ ok: true });
+    });
+
+    it.each([
+        ['execution.run.action', executeExecutionRunAction],
+        ['execution.run.stop', stopExecutionRun],
+        ['execution.run.stream.start', startExecutionRunStream],
+        ['execution.run.stream.cancel', cancelExecutionRunStream],
+    ] as const)('keeps %s under execution-run lifecycle ownership', async (method, invoke) => {
+        await invoke({
+            token: 'token',
+            sessionId: 'sess-1',
+            ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
+            request: { runId: 'run-1' },
+        });
+
+        expect(callSessionRpc).toHaveBeenCalledWith(expect.objectContaining({
+            method: `sess-1:${method}`,
+            timeoutMs: null,
+        }));
+    });
+});
+
 describe('waitForExecutionRun', () => {
     beforeEach(() => {
         callSessionRpc.mockReset();
@@ -899,16 +1065,13 @@ describe('waitForExecutionRun', () => {
         vi.useRealTimers();
     });
 
-    it('does not apply a product timeout when timeoutMs is null', async () => {
-        vi.useFakeTimers();
+    it('waits through one event-driven daemon RPC when timeoutMs is null', async () => {
         const succeededRun = createRun({ runId: 'run_1', status: 'succeeded', startedAtMs: 1 });
-        callSessionRpc
-            .mockResolvedValueOnce({
-                run: createRun({ runId: 'run_1', status: 'running', startedAtMs: 1 }),
-            })
-            .mockResolvedValueOnce({
-                run: succeededRun,
-            });
+        callSessionRpc.mockResolvedValueOnce({
+            ok: true,
+            status: 'succeeded',
+            result: { run: succeededRun },
+        });
 
         const waitPromise = waitForExecutionRun({
             token: 'token',
@@ -916,28 +1079,31 @@ describe('waitForExecutionRun', () => {
             ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
             runId: 'run_1',
             timeoutMs: null,
-            pollIntervalMs: 1_000,
         });
-
-        await vi.advanceTimersByTimeAsync(1_000);
 
         await expect(waitPromise).resolves.toEqual({
             ok: true,
             status: 'succeeded',
             result: { run: succeededRun },
         });
-        expect(callSessionRpc).toHaveBeenCalledTimes(2);
+        expect(callSessionRpc).toHaveBeenCalledOnce();
+        expect(callSessionRpc).toHaveBeenCalledWith(expect.objectContaining({
+            method: 'sess-1:execution.run.wait',
+            request: { runId: 'run_1' },
+            timeoutMs: null,
+        }));
     });
 
-    it('clamps tiny poll intervals to avoid near-zero-delay server loops', async () => {
-        const succeededRun = createRun({ runId: 'run_1', status: 'succeeded', startedAtMs: 1 });
-        callSessionRpc
-            .mockResolvedValueOnce({
-                run: createRun({ runId: 'run_1', status: 'running', startedAtMs: 1 }),
-            })
-            .mockResolvedValueOnce({
-                run: succeededRun,
-            });
+    it('uses the daemon observation timeout without polling get repeatedly', async () => {
+        callSessionRpc.mockResolvedValueOnce({
+            ok: true,
+            status: 'running',
+            disposition: 'observation_timeout',
+            runId: 'run_1',
+            timeoutMs: 1_000,
+            observedAtMs: 1_200,
+            deadlineAtMs: 1_200,
+        });
 
         const waitPromise = waitForExecutionRun({
             token: 'token',
@@ -945,7 +1111,6 @@ describe('waitForExecutionRun', () => {
             ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
             runId: 'run_1',
             timeoutMs: 100,
-            pollIntervalMs: 1,
         });
 
         await expect(waitPromise).resolves.toMatchObject({
@@ -953,8 +1118,39 @@ describe('waitForExecutionRun', () => {
             status: 'running',
             disposition: 'observation_timeout',
             runId: 'run_1',
-            timeoutMs: 100,
+            timeoutMs: 1_000,
         });
-        expect(callSessionRpc).toHaveBeenCalledTimes(1);
+        expect(callSessionRpc).toHaveBeenCalledOnce();
+        expect(callSessionRpc).toHaveBeenCalledWith(expect.objectContaining({
+            method: 'sess-1:execution.run.wait',
+            request: { runId: 'run_1', timeoutSeconds: 1 },
+        }));
+    });
+
+    it('takes one compatibility snapshot then reports unsupported when an older daemon still has a running run', async () => {
+        const runningRun = createRun({ runId: 'run_1', status: 'running', startedAtMs: 1 });
+        callSessionRpc
+            .mockRejectedValueOnce(new Error('Method not found'))
+            .mockResolvedValueOnce({ run: runningRun });
+        listExecutionRunMarkers.mockResolvedValueOnce([]);
+
+        const result = await waitForExecutionRun({
+            token: 'token',
+            sessionId: 'sess-1',
+            ctx: { encryptionKey: new Uint8Array([1, 2, 3, 4]), encryptionVariant: 'legacy' },
+            runId: 'run_1',
+            timeoutMs: null,
+        });
+
+        expect(result).toEqual({
+            ok: false,
+            code: 'execution_run_protocol_unsupported',
+            message: 'Method not found',
+        });
+        expect(callSessionRpc).toHaveBeenCalledTimes(2);
+        expect(callSessionRpc.mock.calls.map(([call]) => call.method)).toEqual([
+            'sess-1:execution.run.wait',
+            'sess-1:execution.run.get',
+        ]);
     });
 });

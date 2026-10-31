@@ -16,6 +16,12 @@ const CREATED_BY_SURFACES = new Set<ApprovalRequestV1['createdBy']['surface']>([
     'system',
 ]);
 
+/** The canonical admission decision for approval artifacts shown by Inbox. */
+export function isOpenApprovalInboxArtifact(artifact: DecryptedArtifact): boolean {
+    return artifact.header?.kind === 'approval_request.v1'
+        && artifact.header.approvalStatus === 'open';
+}
+
 function readString(value: unknown): string {
     return typeof value === 'string' ? value.trim() : '';
 }
@@ -62,7 +68,7 @@ function collectApprovalLinkedSessionIds(
     return ids;
 }
 
-function readApprovalServerId(
+export function readApprovalServerId(
     artifact: DecryptedArtifact,
     approval?: ApprovalRequestV1 | null,
 ): string {
@@ -136,8 +142,7 @@ export function listOpenApprovalArtifactsForSession(
     if (!normalizedSessionId) return [];
 
     return artifacts.flatMap((artifact): OpenApprovalArtifactForSession[] => {
-        if (artifact.header?.kind !== 'approval_request.v1') return [];
-        if (artifact.header?.approvalStatus !== 'open') return [];
+        if (!isOpenApprovalInboxArtifact(artifact)) return [];
         if (!isApprovalLinkedToSession(artifact, normalizedSessionId)) return [];
 
         const approval = artifact.body == null
@@ -155,8 +160,7 @@ export function collectOpenApprovalSessionIds(
     const ids = new Set<string>();
 
     for (const artifact of artifacts) {
-        if (artifact.header?.kind !== 'approval_request.v1') continue;
-        if (artifact.header?.approvalStatus !== 'open') continue;
+        if (!isOpenApprovalInboxArtifact(artifact)) continue;
 
         const approval = artifact.body == null ? null : parseApprovalRequestBody(artifact.body);
         if (artifact.body != null && approval?.status !== 'open') continue;

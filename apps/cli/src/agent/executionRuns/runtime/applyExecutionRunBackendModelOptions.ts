@@ -4,6 +4,7 @@ import {
 } from '@happier-dev/protocol';
 
 import type { AgentBackend, SessionId, StartSessionResult } from '@/agent/core/AgentBackend';
+import type { SessionConfigOption } from '@/agent/acp/AcpBackend';
 import { readNonBlankSessionControlIdentifier } from '@/agent/runtime/sessionControlIdentifiers';
 
 /**
@@ -28,13 +29,36 @@ type ModelConfigurableBackend = AgentBackend &
       configId: string,
       value: string | number | boolean | null,
     ) => Promise<void>;
+    getSessionConfigOptionsState: () => ReadonlyArray<SessionConfigOption> | null;
   }>;
 
 export function withExecutionRunBackendModelOptions(
   backend: AgentBackend,
   options: Readonly<{
     modelId?: string;
+    modelApply?: Readonly<{
+      method: 'set_model' | 'config_option';
+      configOptionId?: string;
+    }>;
     sessionConfigOptionOverrides?: AcpConfigOptionOverridesV1;
+    resolveSessionModelConfigUpdate?: (params: Readonly<{
+      modelId: string;
+      configOptions: ReadonlyArray<SessionConfigOption> | null;
+    }>) => Readonly<{
+      modelId: string;
+      configUpdates?: ReadonlyArray<Readonly<{
+        configId: string;
+        value: string | number | boolean | null;
+      }>>;
+    }> | null;
+    resolveSessionConfigOptionUpdate?: (params: Readonly<{
+      configId: string;
+      value: string | number | boolean | null;
+      configOptions: ReadonlyArray<SessionConfigOption> | null;
+    }>) => Readonly<{ modelId: string }> | Readonly<{
+      configId: string;
+      value: string | number | boolean | null;
+    }> | null;
   }>,
 ): AgentBackend {
   const modelId = readNonBlankSessionControlIdentifier(options.modelId) ?? '';
@@ -52,12 +76,52 @@ export function withExecutionRunBackendModelOptions(
   const target = backend as ModelConfigurableBackend;
 
   const applyOptions = async (sessionId: SessionId): Promise<void> => {
-    if (modelId && typeof target.setSessionModel === 'function') {
-      await target.setSessionModel(sessionId, modelId);
+    const readConfigOptions = () => target.getSessionConfigOptionsState?.() ?? null;
+    const modelConfigOptionId = readNonBlankSessionControlIdentifier(options.modelApply?.configOptionId);
+    const applyModel = async (requestedModelId: string): Promise<void> => {
+      const providerResolved = options.resolveSessionModelConfigUpdate?.({
+        modelId: requestedModelId,
+        configOptions: readConfigOptions(),
+      });
+      const resolved = providerResolved === undefined ? { modelId: requestedModelId } : providerResolved;
+      if (!resolved) return;
+      const resolvedModelId = readNonBlankSessionControlIdentifier(resolved.modelId) ?? '';
+      if (!resolvedModelId) return;
+      if (
+        options.modelApply?.method === 'config_option'
+        && modelConfigOptionId
+        && typeof target.setSessionConfigOption === 'function'
+      ) {
+        await target.setSessionConfigOption(sessionId, modelConfigOptionId, resolvedModelId);
+      } else if (typeof target.setSessionModel === 'function') {
+        await target.setSessionModel(sessionId, resolvedModelId);
+      }
+      if (typeof target.setSessionConfigOption === 'function') {
+        for (const update of resolved.configUpdates ?? []) {
+          await target.setSessionConfigOption(sessionId, update.configId, update.value);
+        }
+      }
+    };
+    if (
+      modelId
+      && (typeof target.setSessionConfigOption === 'function' || typeof target.setSessionModel === 'function')
+    ) {
+      await applyModel(modelId);
     }
     if (overrideEntries.length > 0 && typeof target.setSessionConfigOption === 'function') {
       for (const [configId, value] of overrideEntries) {
-        await target.setSessionConfigOption(sessionId, configId, value);
+        const providerResolved = options.resolveSessionConfigOptionUpdate?.({
+          configId,
+          value,
+          configOptions: readConfigOptions(),
+        });
+        const resolved = providerResolved === undefined ? { configId, value } : providerResolved;
+        if (!resolved) continue;
+        if ('modelId' in resolved) {
+          await applyModel(resolved.modelId);
+        } else {
+          await target.setSessionConfigOption(sessionId, resolved.configId, resolved.value);
+        }
       }
     }
   };

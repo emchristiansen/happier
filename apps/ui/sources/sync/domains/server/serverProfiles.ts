@@ -1,5 +1,6 @@
 import { MMKV } from 'react-native-mmkv';
 import { normalizeServerIdentityIdCapability } from '@happier-dev/protocol';
+import { isTauriDesktop } from '@/utils/platform/tauri';
 import { readStorageScopeFromEnv, scopedStorageId } from '@/utils/system/storageScope';
 import { isStackContext } from './serverContext';
 import { canonicalizeServerUrl, createServerUrlComparableKey } from './url/serverUrlCanonical';
@@ -669,17 +670,19 @@ function writeTabActiveServerId(id: string | null): void {
     }
 }
 
-function getWebSameOriginServerUrl(): string | null {
-    if (!isWebRuntime()) return null;
+export function getWebSameOriginServerUrl(): string | null {
+    // The desktop app's page is its own bundle (http://tauri.localhost on Windows, the devUrl in
+    // `tauri dev`), never a relay, so its origin is neither a profile nor this computer's local relay.
+    if (!isWebRuntime() || isTauriDesktop()) return null;
     const origin = (globalThis as any).window?.location?.origin;
     if (!origin || origin === 'null') return null;
     try {
         const parsed = new URL(origin);
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-        // Official hosted web app (app.happier.dev) is a static SPA; the API lives on api.happier.dev.
-        // When builds are missing EXPO_PUBLIC_HAPPIER_SERVER_URL (and legacy aliases), this prevents the default server
-        // from incorrectly pointing at the web host.
-        if (parsed.hostname.toLowerCase() === 'app.happier.dev') {
+        // Official hosted web origins are static SPAs; the API lives on api.happier.dev.
+        // Keep the legacy app.happier.dev alias valid while preferring cloud.happier.dev
+        // in new links and defaults.
+        if (['cloud.happier.dev', 'app.happier.dev'].includes(parsed.hostname.toLowerCase())) {
             return HAPPIER_CLOUD_SERVER_URL;
         }
         return origin;

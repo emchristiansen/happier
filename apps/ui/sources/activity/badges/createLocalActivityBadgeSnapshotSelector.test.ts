@@ -163,6 +163,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -203,6 +204,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -236,6 +238,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -298,6 +301,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -353,6 +357,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -391,6 +396,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -442,6 +448,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -490,6 +497,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -531,6 +539,49 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
         expect(second).toBe(first);
     });
 
+    it('invalidates the badge when queued input changes without a renderable delta', () => {
+        const params = {
+            badgesEnabled: true,
+            friendRequestCount: 0,
+            hasNonNumericInboxAttention: false,
+            sessionOptions: {
+                showPendingPermissionRequests: false,
+                showPendingUserActionRequests: false,
+                showQueuedUserInput: true,
+                showUnread: false,
+            },
+        };
+        const selector = createLocalActivityBadgeSnapshotSelector(params);
+        const first = selector(createStorageState({
+            sessions: {
+                session1: createSession({ id: 'session1', pendingCount: 0 }),
+            },
+        }));
+        const second = selector(createStorageState({
+            sessions: {
+                session1: createSession({ id: 'session1', pendingCount: 1 }),
+            },
+        }));
+
+        expect(first.count).toBe(0);
+        expect(second.count).toBe(1);
+
+        const renderableSelector = createLocalActivityBadgeSnapshotSelector(params);
+        const firstRenderable = renderableSelector(createStorageState({
+            sessionListRenderables: {
+                session1: createRenderable({ id: 'session1', pendingCount: 0 }),
+            },
+        }));
+        const secondRenderable = renderableSelector(createStorageState({
+            sessionListRenderables: {
+                session1: createRenderable({ id: 'session1', pendingCount: 1 }),
+            },
+        }));
+
+        expect(firstRenderable.count).toBe(0);
+        expect(secondRenderable.count).toBe(1);
+    });
+
     it('counts transcript-only pending permissions from the selector state', () => {
         vi.useFakeTimers();
         vi.setSystemTime(1_000);
@@ -541,6 +592,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -585,6 +637,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -627,6 +680,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -683,6 +737,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -717,7 +772,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
         expect(second).toBe(first);
     });
 
-    it('invalidates the badge snapshot when live pending attention expires', () => {
+    it('keeps live pending attention in the badge past the runtime staleness window until the runtime goes offline', () => {
         vi.useFakeTimers();
         vi.setSystemTime(1_000_000);
         const selector = createLocalActivityBadgeSnapshotSelector({
@@ -727,6 +782,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -747,10 +803,13 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
         const second = selector(createStorageState({
             sessionListRenderables: { session1: renderable },
         }));
+        const offline = selector(createStorageState({
+            sessionListRenderables: { session1: { ...renderable, presence: 1_002_000 } },
+        }));
 
         expect(first.count).toBe(1);
-        expect(second).not.toBe(first);
-        expect(second.count).toBe(0);
+        expect(second.count).toBe(1);
+        expect(offline.count).toBe(0);
     });
 
     it('counts a session once even when several attention reasons are active at the same time', () => {
@@ -763,6 +822,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
             sessionOptions: {
                 showPendingPermissionRequests: true,
                 showPendingUserActionRequests: true,
+                showQueuedUserInput: true,
                 showUnread: true,
             },
         });
@@ -785,6 +845,7 @@ describe('createLocalActivityBadgeSnapshotSelector', () => {
         expect(deriveActivityAttentionFlags(renderable, {
             showPendingPermissionRequests: true,
             showPendingUserActionRequests: true,
+            showQueuedUserInput: true,
             showUnread: true,
             sessionMessagesById: {},
             nowMs: 1_000_000,

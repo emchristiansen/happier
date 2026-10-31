@@ -149,9 +149,6 @@ test.describe('ui e2e: automations authoring', () => {
             extraEnv: {
                 HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
                 HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-                HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '900000',
-                HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '900000',
-                HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
             },
         });
 
@@ -186,6 +183,7 @@ test.describe('ui e2e: automations authoring', () => {
     });
 
     test('creates automations from the inline /new flow and the existing-session authoring flow', async ({ page }) => {
+        // CI 36709793378: this journey passed in 210s; retain its longer test budget.
         test.setTimeout(900_000);
         if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 

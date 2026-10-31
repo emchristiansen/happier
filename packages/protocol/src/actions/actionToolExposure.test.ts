@@ -11,6 +11,18 @@ import {
 import { resolveActionSurfaceAvailability } from './actionSurfaceAvailability.js';
 
 describe('actionToolExposure', () => {
+  it('directly exposes native goal controls while respecting session-agent settings', () => {
+    for (const id of ['session.goal.get', 'session.goal.set', 'session.goal.clear'] as const) {
+      const spec = getActionSpec(id);
+      expect(isActionDirectToolExposedOn(spec, 'session_agent')).toBe(true);
+      const settings = ActionsSettingsV1Schema.parse({
+        v: 1, actions: { [id]: { toolExposureModes: { session_agent: 'discoverable_only' } } },
+      });
+      expect(isActionDirectToolExposedOn(spec, 'session_agent', { settings })).toBe(false);
+      expect(isActionDiscoverableOnToolSurface(spec, 'session_agent', { settings })).toBe(true);
+    }
+  });
+
   it('defaults ordinary session-agent action-backed tools to discoverable-only', () => {
     for (const id of ['subagents.delegate.start', 'execution.run.start', 'session.status.get'] as const) {
       const spec = getActionSpec(id);
@@ -22,7 +34,14 @@ describe('actionToolExposure', () => {
   });
 
   it('keeps the session-agent action discovery bootstrap tools directly exposed', () => {
-    for (const id of ['action.spec.search', 'action.spec.get', 'action.options.resolve'] as const) {
+    for (const id of [
+      'action.spec.search',
+      'action.spec.get',
+      'action.options.resolve',
+      'execution.run.list',
+      'execution.run.get',
+      'execution.run.wait',
+    ] as const) {
       const spec = getActionSpec(id);
 
       expect(resolveActionToolExposureMode(spec, 'session_agent')).toBe('direct');

@@ -39,11 +39,12 @@ const stylesheet = StyleSheet.create((theme) => ({
     },
     input: {
         width: '100%',
-        height: 36,
+        minHeight: 36,
         borderWidth: 1,
         borderColor: theme.colors.border.default,
         borderRadius: 8,
         paddingHorizontal: 10,
+        paddingVertical: 8,
         marginTop: 16,
         fontSize: 14,
         color: theme.colors.text.primary,
@@ -128,7 +129,51 @@ export function WebPromptModal({ config, onClose, onConfirm, showBackdrop = true
             showBackdrop={showBackdrop}
             zIndexBase={zIndexBase}
         >
-            <ModalCardFrame dimensions={{ width: 270, maxHeightRatio: 0.48 }}>
+            <ModalCardFrame
+                dimensions={{ width: 270, maxHeightRatio: 0.48 }}
+                bodyScroll="auto"
+                footer={
+                    <View style={styles.buttonContainer}>
+                        <Pressable
+                            style={({ pressed }) => [
+                                styles.button,
+                                pressed && styles.buttonPressed
+                            ]}
+                            testID="web-prompt-cancel"
+                            accessibilityRole="button"
+                            accessibilityLabel={config.cancelText || t('common.cancel')}
+                            onPress={handleCancel}
+                        >
+                            <Text style={[
+                                styles.buttonText,
+                                styles.cancelText,
+                                Typography.default()
+                            ]}>
+                                {config.cancelText || t('common.cancel')}
+                            </Text>
+                        </Pressable>
+                        <View style={styles.buttonSeparator} />
+                        <Pressable
+                            style={({ pressed }) => [
+                                styles.button,
+                                pressed && styles.buttonPressed
+                            ]}
+                            testID="web-prompt-confirm"
+                            accessibilityRole="button"
+                            accessibilityLabel={config.confirmText || t('common.ok')}
+                            onPressIn={handleConfirm}
+                            onPress={handleConfirm}
+                        >
+                            <Text style={[
+                                styles.buttonText,
+                                Typography.default('semiBold')
+                            ]}>
+                                {config.confirmText || t('common.ok')}
+                            </Text>
+                        </Pressable>
+                    </View>
+                }
+            >
                 <View style={styles.content}>
                     <Text style={[styles.title, Typography.default('semiBold')]}>
                         {config.title}
@@ -154,46 +199,6 @@ export function WebPromptModal({ config, onClose, onConfirm, showBackdrop = true
                         onSubmitEditing={handleConfirm}
                         returnKeyType="done"
                     />
-                </View>
-                
-                <View style={styles.buttonContainer}>
-                    <Pressable
-                        style={({ pressed }) => [
-                            styles.button,
-                            pressed && styles.buttonPressed
-                        ]}
-                        testID="web-prompt-cancel"
-                        accessibilityRole="button"
-                        accessibilityLabel={config.cancelText || t('common.cancel')}
-                        onPress={handleCancel}
-                    >
-                        <Text style={[
-                            styles.buttonText,
-                            styles.cancelText,
-                            Typography.default()
-                        ]}>
-                            {config.cancelText || t('common.cancel')}
-                        </Text>
-                    </Pressable>
-                    <View style={styles.buttonSeparator} />
-                    <Pressable
-                        style={({ pressed }) => [
-                            styles.button,
-                            pressed && styles.buttonPressed
-                        ]}
-                        testID="web-prompt-confirm"
-                        accessibilityRole="button"
-                        accessibilityLabel={config.confirmText || t('common.ok')}
-                        onPressIn={handleConfirm}
-                        onPress={handleConfirm}
-                    >
-                        <Text style={[
-                            styles.buttonText,
-                            Typography.default('semiBold')
-                        ]}>
-                            {config.confirmText || t('common.ok')}
-                        </Text>
-                    </Pressable>
                 </View>
             </ModalCardFrame>
         </BaseModal>

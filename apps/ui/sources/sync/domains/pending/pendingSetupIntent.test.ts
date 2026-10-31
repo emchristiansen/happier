@@ -40,6 +40,37 @@ describe('pendingSetupIntent', () => {
         const { clearPendingSetupIntent } = await importFresh();
         clearPendingSetupIntent();
         vi.restoreAllMocks();
+        vi.unstubAllEnvs();
+    });
+
+    it.each([
+        ['default', undefined, 24 * 60 * 60 * 1000],
+        ['configured', '1000', 1000],
+    ] as const)('expires a warmed setup intent after its %s TTL without changing persisted bytes', async (_label, configuredTtl, ttl) => {
+        vi.stubEnv('EXPO_PUBLIC_PENDING_SETUP_INTENT_TTL_MS', configuredTtl);
+        const now = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+        const createdAt = Date.now();
+        const { clearPendingSetupIntent, setPendingSetupIntent, getPendingSetupIntent } = await importFresh();
+        await activateServerAccount('https://setup-expiry.example.test', 'account-a');
+        clearPendingSetupIntent();
+        setPendingSetupIntent({
+            branch: 'remoteMachine',
+            phase: 'awaiting_auth',
+            relayUrl: 'https://setup-expiry.example.test',
+            machineId: 'machine-expiry',
+        });
+
+        now.mockReturnValue(createdAt + 1);
+        const snapshot = getPendingSetupIntent();
+        expect(snapshot).not.toBeNull();
+        now.mockReturnValue(createdAt + ttl);
+        expect(getPendingSetupIntent()).toBe(snapshot);
+
+        now.mockReturnValue(createdAt + ttl + 1);
+        expect(getPendingSetupIntent()).toBeNull();
+        // Expiry removes the persisted record; moving the clock back cannot revive it.
+        now.mockReturnValue(createdAt + 1);
+        expect(getPendingSetupIntent()).toBeNull();
     });
 
     it('round-trips and clears a pending setup intent payload', async () => {
@@ -111,24 +142,17 @@ describe('pendingSetupIntent', () => {
         expect(getPendingSetupIntent()).toBeNull();
     });
 
-    it('round-trips a dismissed onboarding marker', async () => {
-        const { clearPendingSetupIntent, getPendingSetupIntent, setPendingSetupIntent } = await importFresh();
+    it('reads a marker persisted as dismissed by an older build as no intent at all', async () => {
+        // The phase was removed because nothing ever distinguished it from absence; a record an
+        // older build wrote must therefore read as absence rather than as an unknown state.
+        const { fromRecord } = await import('./pendingSetupIntent.shared');
 
-        await activateServerAccount('https://relay.example.test', 'account-a');
-        setPendingSetupIntent({
-            branch: 'thisComputer',
-            phase: 'dismissed',
-            relayUrl: 'https://relay.example.test/',
-        });
-
-        expect(getPendingSetupIntent()).toEqual({
+        expect(fromRecord({
             branch: 'thisComputer',
             phase: 'dismissed',
             relayUrl: 'https://relay.example.test',
-        });
-
-        clearPendingSetupIntent();
-        expect(getPendingSetupIntent()).toBeNull();
+            createdAtMs: Date.now(),
+        })).toBeNull();
     });
 
     it('round-trips a remote machine resume intent', async () => {

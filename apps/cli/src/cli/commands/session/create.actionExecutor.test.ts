@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { SESSION_PERMISSION_MODES } from '@happier-dev/protocol';
+import { SESSION_PERMISSION_INTENT_INPUTS } from '@happier-dev/protocol';
 
 import { captureConsoleJsonOutput, captureConsoleText } from '@/testkit/logger/captureOutput';
 import { SESSION_CREATE_USAGE } from './create/parseSessionCreateSpawnOptions';
@@ -31,10 +31,11 @@ describe('happier session create (action executor)', () => {
 
       expect(execute).not.toHaveBeenCalled();
       expect(output.text()).toContain(SESSION_CREATE_USAGE);
-      for (const permissionMode of SESSION_PERMISSION_MODES) {
+      for (const permissionMode of SESSION_PERMISSION_INTENT_INPUTS) {
         expect(output.text()).toContain(permissionMode);
       }
-      expect(output.text()).toContain('read_only');
+      expect(output.text()).toContain('--permission-mode <read_only|default|auto|yolo>');
+      expect(output.text()).toContain('workspace_write');
     } finally {
       output.restore();
     }

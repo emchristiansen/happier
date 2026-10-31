@@ -6,15 +6,23 @@ import {
 } from './normalizeConnectedServiceSelectionInput.js';
 
 describe('normalizeConnectedServiceSelectionInput', () => {
-    it('treats undefined/null as no explicit selection (account default)', () => {
+    it('treats undefined as no explicit selection (account default)', () => {
         expect(normalizeConnectedServiceSelectionInput(undefined)).toEqual({
             ok: true,
             bindings: undefined,
             defaultServiceIds: [],
         });
+    });
+
+    it('normalizes the global "native" shorthand and canonical null to an explicit all-services opt-out', () => {
+        expect(normalizeConnectedServiceSelectionInput('native')).toEqual({
+            ok: true,
+            bindings: null,
+            defaultServiceIds: [],
+        });
         expect(normalizeConnectedServiceSelectionInput(null)).toEqual({
             ok: true,
-            bindings: undefined,
+            bindings: null,
             defaultServiceIds: [],
         });
     });
@@ -157,6 +165,13 @@ describe('normalizeConnectedServiceSelectionInput', () => {
 });
 
 describe('normalizeConnectedServiceSelectionForRunStart (settings-less boundary policy)', () => {
+    it('preserves the global native opt-out as canonical null', () => {
+        expect(normalizeConnectedServiceSelectionForRunStart('native')).toEqual({
+            ok: true,
+            bindings: null,
+        });
+    });
+
     it('passes explicit-only selections through as canonical bindings', () => {
         const result = normalizeConnectedServiceSelectionForRunStart('openai-codex:group:happier');
         expect(result.ok).toBe(true);

@@ -19,10 +19,6 @@ const friendRequestsState = vi.hoisted(() => ({
     items: [] as Array<{ id: string }>,
 }));
 
-const inboxState = vi.hoisted(() => ({
-    hasContent: false,
-}));
-
 const socketStatusState = vi.hoisted(() => ({
     status: 'connected' as 'connected' | 'connecting' | 'disconnected' | 'error',
     lastError: null as string | null,
@@ -67,6 +63,7 @@ installNavigationShellCommonModuleMocks({
         return createPartialStorageModuleMock(importOriginal, {
             useSocketStatus: () => ({ status: socketStatusState.status, lastError: socketStatusState.lastError }),
             useFriendRequests: () => friendRequestsState.items,
+            useFriendRequestCount: () => friendRequestsState.items.length,
             useSetting: () => false,
             useSyncError: () => syncErrorState.value as any,
             useRealtimeStatus: () => 'disconnected',
@@ -170,10 +167,6 @@ vi.mock('@/utils/platform/responsive', () => ({
     useHeaderHeight: () => 56,
 }));
 
-vi.mock('@/hooks/inbox/useInboxHasContent', () => ({
-    useInboxHasContent: () => inboxState.hasContent,
-}));
-
 vi.mock('@/hooks/server/useFriendsEnabled', () => ({
     useFriendsEnabled: () => true,
 }));
@@ -233,14 +226,6 @@ vi.mock('./MainView', () => ({
     MainView: 'MainView',
 }));
 
-function hasIndicatorDot(node: ReactTestInstance) {
-    return node.findAll((child: ReactTestInstance) => {
-        if (String(child.type) !== 'View') return false;
-        const style = child.props?.style ?? {};
-        return style.width === 6 && style.height === 6;
-    }).length > 0;
-}
-
 function flattenStyle(style: unknown) {
     if (Array.isArray(style)) {
         return style.reduce<Record<string, unknown>>((acc, item) => {
@@ -273,7 +258,6 @@ describe('SidebarView header automations button', () => {
         automationsSupportState.enabled = true;
         featureEnabledState.voice = false;
         friendRequestsState.items = [];
-        inboxState.hasContent = false;
         socketStatusState.status = 'connected';
         socketStatusState.lastError = null;
         syncErrorState.value = null;
@@ -353,19 +337,14 @@ describe('SidebarView header automations button', () => {
         expect(screen.findAllByType('VoiceSurface')).toHaveLength(1);
     });
 
-    it('shows friend request counts on the friends button and only a dot on inbox', async () => {
+    it('shows friend request counts on the friends header action', async () => {
         friendRequestsState.items = [{ id: 'fr-1' }, { id: 'fr-2' }];
-        inboxState.hasContent = true;
         const { SidebarView } = await import('./SidebarView');
         const screen = await renderScreen(<SidebarView />);
 
-        const inboxButton = screen.findByTestId('sidebar-inbox-button');
         const friendsButton = findTestInstanceByTypeContainingText(screen.tree, 'Pressable', '2');
 
-        expect(inboxButton).toBeTruthy();
         expect(friendsButton).toBeTruthy();
-        expect(findTestInstanceByTypeContainingText(inboxButton!, 'Text', '2')).toBeUndefined();
-        expect(hasIndicatorDot(inboxButton!)).toBe(true);
         expect(findTestInstanceByTypeContainingText(friendsButton!, 'Text', '2')).toBeTruthy();
     });
 
@@ -411,7 +390,6 @@ describe('SidebarView header automations button', () => {
         const screen = await renderScreen(<SidebarView sidebarWidthPx={600} />);
 
         expect(screen.findAllByTestId('sidebar-header-actions-overflow')).toHaveLength(0);
-        expect(screen.findAllByTestId('sidebar-inbox-button').length).toBeGreaterThan(0);
         expect(screen.findAllByTestId('nav-settings').length).toBeGreaterThan(0);
         expect(screen.findAllByTestId('nav-new-session').length).toBeGreaterThan(0);
     });

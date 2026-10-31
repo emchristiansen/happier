@@ -1,3 +1,4 @@
+import { getServerFetchUrl } from '@/dev/testkit/mocks/serverFetch';
 import React from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { storage } from '@/sync/domains/state/storageStore';
@@ -7,12 +8,15 @@ import {
     renderScreen,
     standardCleanup,
 } from '@/dev/testkit';
-import { createAccountFeaturesResponse, getRequestUrl, isFeaturesRequest } from './account.testHelpers';
+import { createAccountFeaturesResponse, isFeaturesRequest } from './account.testHelpers';
 import { installAccountSettingsRouteModuleMocks } from './accountSettingsRouteTestHelpers';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-vi.mock('react-native-reanimated', () => ({}));
+vi.mock('react-native-reanimated', async () => {
+    const { createReanimatedModuleMock } = await import('@/dev/testkit/mocks/reanimated');
+    return createReanimatedModuleMock();
+});
 
 vi.mock('expo-camera', () => ({
     useCameraPermissions: () => [{ granted: true }, async () => ({ granted: true })],
@@ -33,7 +37,7 @@ vi.mock('@/auth/context/AuthContext', () => ({
 }));
 
 const clipboardMocks = vi.hoisted(() => ({
-    setStringAsync: vi.fn(async () => {}),
+    setStringAsync: vi.fn(async () => true),
 }));
 vi.mock('expo-clipboard', () => clipboardMocks);
 
@@ -64,7 +68,7 @@ describe('Settings → Account (secret key copy)', () => {
         storage.getState().applyProfile({ ...profileDefaults, linkedProviders: [], username: null });
 
         const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-            const url = getRequestUrl(input);
+            const url = getServerFetchUrl(input).pathname;
             if (isFeaturesRequest(url)) {
                 return {
                     ok: true,

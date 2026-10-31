@@ -110,7 +110,6 @@ function resolveConnectedServiceBindingGroupMetadata(input: Readonly<{
 }
 
 export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonly<{
-  restartRequestedPids: Set<number>;
   pidToTrackedSession: Map<number, TrackedSession>;
   resolveLifecycleDescriptor: (agentId: CatalogAgentId) => Promise<ConnectedServiceCredentialLifecycleDescriptor>;
   /**
@@ -292,8 +291,6 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
         }) ?? false;
         if (brokered) continue;
       }
-      if (params.restartRequestedPids.has(target.pid)) continue;
-
       if (!tracked) {
         emitBlocked(target, null, null, 'tracked_session_missing');
         continue;
@@ -313,7 +310,6 @@ export function createConnectedServicesAuthUpdatedRestartHandler(params: Readonl
         : resolveConnectedServiceBindingGroupMetadata({ tracked, binding: event.binding });
       // Descriptor lookup can yield; validate the captured request afterward, before reserving.
       if (required && !await requirementIsCurrent()) continue;
-      if (params.restartRequestedPids.has(target.pid)) continue;
       // The canonical queue coalesces pending requests; its executing owner alone reserves the PID.
       // Schedule without retaining refresh custody until a future turn boundary. This call may join
       // another owner's restart, so its own no-signal result grants no reservation cleanup authority.

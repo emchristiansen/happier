@@ -12,10 +12,13 @@ import {
     RpcHandlerConfig,
     type RpcHandlerActiveExecution,
     type RpcAuthorizationResult,
+    type RpcHandlerContext,
 } from './types';
 import { Socket } from 'socket.io-client';
 import {
     SOCKET_RPC_EVENTS,
+    SocketRpcCancellationPayloadSchema,
+    SocketRpcRequestIdSchema,
     SOCKET_RPC_TRANSPORT_RESPONSE_ENVELOPE_VERSION_V1,
     type SocketRpcTransportAcknowledgementV1,
 } from '@happier-dev/protocol/socketRpc';
@@ -24,7 +27,7 @@ import {
     RPC_ERROR_MESSAGES,
     isDelegatedSessionApprovalRpcMethod,
 } from '@happier-dev/protocol/rpc';
-import { isPublicRpcHandlerError, toSocketRpcTargetFailureV1 } from '@happier-dev/protocol/rpcErrors';
+import { isPublicRpcHandlerError, readRpcErrorCode, toSocketRpcTargetFailureV1 } from '@happier-dev/protocol/rpcErrors';
 
 export type RpcHandlerRegistrationReadiness =
     | Readonly<{ status: 'ready' }>
@@ -40,11 +43,17 @@ type RegistrationReadinessWaiter = Readonly<{
     timeout: ReturnType<typeof setTimeout>;
 }>;
 
+type TransportAwareRpcHandler = (
+    params: unknown,
+    legacyLocalOptions?: undefined,
+    context?: RpcHandlerContext,
+) => unknown | Promise<unknown>;
+
 export class RpcHandlerManager {
     private handlers: RpcHandlerMap = new Map();
     private readonly scopePrefix: string;
-    private readonly encryptionKey: Uint8Array;
-    private readonly encryptionVariant: 'legacy' | 'dataKey';
+    private readonly encryptionKey: Uint8Array | null;
+    private readonly encryptionVariant: 'legacy' | 'dataKey' | 'plain';
     private readonly encryptionMode: 'e2ee' | 'plain';
     private readonly logger: (message: string, data?: any) => void;
     private readonly onRegistrationError: RpcHandlerConfig['onRegistrationError'];
@@ -56,6 +65,8 @@ export class RpcHandlerManager {
     private acknowledgedRegistrationMethods = new Set<string>();
     private registrationReadinessWaiters = new Set<RegistrationReadinessWaiter>();
     private inFlightRequestCount = 0;
+    private activeTransportRequestControllers = new Set<AbortController>();
+    private activeTransportRequestControllersByRequestId = new Map<string, AbortController>();
     private idleResolvers = new Set<() => void>();
     private nextHandlerExecutionId = 1;
     private activeHandlerExecutions = new Map<number, Readonly<{
@@ -67,7 +78,7 @@ export class RpcHandlerManager {
         this.scopePrefix = config.scopePrefix;
         this.encryptionKey = config.encryptionKey;
         this.encryptionVariant = config.encryptionVariant;
-        this.encryptionMode = config.encryptionMode ?? 'e2ee';
+        this.encryptionMode = config.encryptionMode ?? (config.encryptionVariant === 'plain' ? 'plain' : 'e2ee');
         this.logger = config.logger || ((msg, data) => defaultLogger.debug(msg, data));
         this.onRegistrationError = config.onRegistrationError;
         this.onRegistrationAcknowledged = config.onRegistrationAcknowledged;
@@ -78,6 +89,7 @@ export class RpcHandlerManager {
 
     private encodeResponse(response: unknown): unknown {
         if (this.encryptionMode === 'plain') return response;
+        if (!this.encryptionKey || this.encryptionVariant === 'plain') throw new Error('Missing RPC encryption material');
         return encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, response));
     }
 
@@ -109,7 +121,28 @@ export class RpcHandlerManager {
     async handleRequest(
         request: RpcRequest,
     ): Promise<any> {
+        const parsedRequestId = request.requestId === undefined
+            ? null
+            : SocketRpcRequestIdSchema.safeParse(request.requestId);
+        if (parsedRequestId && !parsedRequestId.success) {
+            return this.encodeTransportResponse(request, {
+                error: 'Invalid RPC request correlation',
+                errorCode: RPC_ERROR_CODES.FORBIDDEN,
+            });
+        }
+        const requestId = parsedRequestId?.success ? parsedRequestId.data : null;
+        if (requestId && this.activeTransportRequestControllersByRequestId.has(requestId)) {
+            return this.encodeTransportResponse(request, {
+                error: 'RPC request correlation collision',
+                errorCode: RPC_ERROR_CODES.FORBIDDEN,
+            });
+        }
         this.beginInFlightRequest();
+        const controller = new AbortController();
+        this.activeTransportRequestControllers.add(controller);
+        if (requestId) {
+            this.activeTransportRequestControllersByRequestId.set(requestId, controller);
+        }
         let handlerExecutionId: number | null = null;
         try {
             const handler = this.handlers.get(request.method);
@@ -123,10 +156,15 @@ export class RpcHandlerManager {
             // Decrypt the incoming params (unless session is plaintext).
             const decryptedParams = this.encryptionMode === 'plain'
               ? request.params
-              : typeof request.params === 'string'
+              : typeof request.params === 'string' && this.encryptionKey && this.encryptionVariant !== 'plain'
                 ? decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(request.params))
                 : null;
             if (this.encryptionMode !== 'plain' && decryptedParams === null) {
+              defaultLogger.infoFile('[RPC] Unable to decrypt request params; check that the caller and target use matching keys', {
+                reason: 'rpc_params_decryption_failed',
+                method: this.readUnprefixedMethod(request.method),
+                encryptionVariant: this.encryptionVariant,
+              });
               const errorResponse = {
                 error: 'Invalid RPC params',
               };
@@ -151,7 +189,10 @@ export class RpcHandlerManager {
             // Call the handler
             this.logger('[RPC] Calling handler', { method: request.method });
             handlerExecutionId = this.beginHandlerExecution(this.readUnprefixedMethod(request.method));
-            const result = await handler(decryptedParams);
+            const result = await (handler as TransportAwareRpcHandler)(decryptedParams, undefined, Object.freeze({
+                signal: controller.signal,
+                ...(requestId ? { transportRequestId: requestId } : {}),
+            }));
             this.logger('[RPC] Handler returned', { method: request.method, hasResult: result !== undefined });
 
             // Encrypt and return the response
@@ -173,13 +214,24 @@ export class RpcHandlerManager {
             return response;
         } catch (error) {
             this.logger('[RPC] [ERROR] Error handling request', { error });
-            const errorResponse = {
-                error: error instanceof Error ? error.message : 'Unknown error'
-            };
+            const errorCode = readRpcErrorCode(error);
+            const errorResponse = isPublicRpcHandlerError(error)
+                ? toSocketRpcTargetFailureV1(error)
+                : {
+                    error: error instanceof Error ? error.message : 'Unknown error',
+                    ...(errorCode ? { errorCode } : {}),
+                };
             return this.encodeTransportResponse(request, errorResponse);
         } finally {
             if (handlerExecutionId !== null) {
                 this.activeHandlerExecutions.delete(handlerExecutionId);
+            }
+            this.activeTransportRequestControllers.delete(controller);
+            if (
+                requestId
+                && this.activeTransportRequestControllersByRequestId.get(requestId) === controller
+            ) {
+                this.activeTransportRequestControllersByRequestId.delete(requestId);
             }
             this.finishInFlightRequest();
         }
@@ -191,7 +243,11 @@ export class RpcHandlerManager {
      * This is intended for internal control-plane surfaces (e.g. MCP tools) that
      * must delegate to the same handler implementations as session RPC.
      */
-    async invokeLocal(method: string, params: unknown): Promise<unknown> {
+    async invokeLocal(
+        method: string,
+        params: unknown,
+        options?: Readonly<{ signal?: AbortSignal }>,
+    ): Promise<unknown> {
         const prefixedMethod = this.getPrefixedMethod(method);
         const handler = this.handlers.get(prefixedMethod);
         if (!handler) {
@@ -200,7 +256,9 @@ export class RpcHandlerManager {
         this.beginInFlightRequest();
         const handlerExecutionId = this.beginHandlerExecution(method);
         try {
-            return await handler(params as any);
+            return await (handler as TransportAwareRpcHandler)(params, undefined, Object.freeze({
+                signal: options?.signal ?? new AbortController().signal,
+            }));
         } finally {
             this.activeHandlerExecutions.delete(handlerExecutionId);
             this.finishInFlightRequest();
@@ -240,6 +298,14 @@ export class RpcHandlerManager {
             this.settleReadyRegistrationWaiters();
             this.onRegistrationAcknowledged?.(method);
         });
+        socket.on(SOCKET_RPC_EVENTS.CANCEL, (payload: unknown) => {
+            if (this.socket !== socket) return;
+            const parsed = SocketRpcCancellationPayloadSchema.safeParse(payload);
+            if (!parsed.success) return;
+            this.activeTransportRequestControllersByRequestId
+                .get(parsed.data.requestId)
+                ?.abort(new Error('RPC request cancelled by caller'));
+        });
         for (const [prefixedMethod] of this.handlers) {
             socket.emit(SOCKET_RPC_EVENTS.REGISTER, { method: prefixedMethod });
         }
@@ -249,6 +315,10 @@ export class RpcHandlerManager {
         this.socket = null;
         this.acknowledgedRegistrationMethods.clear();
         this.settleRegistrationReadinessWaiters('disconnected');
+        for (const controller of this.activeTransportRequestControllers) {
+            controller.abort(new Error('RPC target transport disconnected'));
+        }
+        this.activeTransportRequestControllersByRequestId.clear();
     }
 
     async waitForRegisteredHandlers(

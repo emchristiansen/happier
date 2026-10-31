@@ -13,7 +13,7 @@ import type { ClaudeWorkflowTaskReference } from './claudeWorkflowTaskReference'
 import type { ClaudeProviderTaskActivity } from '../providerActivity/createClaudeProviderActivityLedger';
 
 import {
-  parseClaudeWorkflowFact,
+  parseClaudeWorkflowFacts,
   type SubagentResultFact,
   type SubagentStartFact,
   type TaskLifecycleFact,
@@ -192,7 +192,7 @@ type MutableRun = {
 
 export type ClaudeWorkflowActivityTracker = Readonly<{
   /** Fold one raw transcript value; returns the per-run change observation for the publisher. */
-  observe(value: unknown, params: Readonly<{ updatedAt: number; live?: boolean }>): WorkflowActivityObservation;
+  observe(value: unknown, params: Readonly<{ updatedAt: number; live?: boolean; authenticatedHook?: true; startupReplay?: true; receiptAvailable?: boolean; historicalTimestampAvailable?: boolean }>): WorkflowActivityObservation;
   /** Runs proven by post-start live observation, excluding startup snapshot replay. */
   getLiveObservedRunIds(): ReadonlySet<string>;
   /** Current projected snapshot for one run, or null if unknown. */
@@ -287,6 +287,13 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
   // payload-identical to any other successful tool result, so this set is the only thing that makes
   // it recognisable — see `parseSubagentToolResult`.
   const subagentToolUseIds = new Set<string>();
+  const childToolUseIdByTaskId = new Map<string, {
+    toolUseId?: string;
+    background: boolean;
+    liveInvocationAt?: number;
+    terminalTimeKnown?: boolean;
+    unroutedTerminal?: Readonly<{ fact: TaskLifecycleFact; updatedAt: number; historicalTimestampAvailable?: boolean }>;
+  }>();
   const liveObservedRunIds = new Set<string>();
   let implicitRunId: string | undefined;
 
@@ -435,6 +442,7 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
     startedAt?: number;
     completedAt?: number;
     attempt?: number;
+    resumed?: true;
     updatedAt: number;
   }>): void {
     // A run that has already finished holds no running work — the same rule `terminalizeRunAgents`
@@ -498,7 +506,8 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
     const isNewerAttempt = agent.attempt !== undefined && (existing.attempt === undefined || agent.attempt > existing.attempt);
     const shouldPreserveTerminalStatus = isTerminalAgentStatus(existing.status)
       && !isTerminalAgentStatus(agent.status)
-      && !isNewerAttempt;
+      && !isNewerAttempt
+      && !agent.resumed;
     if (agent.title && AGENT_TITLE_AUTHORITY[titleSource] >= AGENT_TITLE_AUTHORITY[existing.titleSource]) {
       existing.title = agent.title;
       existing.titleSource = titleSource;
@@ -506,7 +515,7 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
     if (!shouldPreserveTerminalStatus) {
       existing.status = agent.status;
       existing.updatedAt = agent.updatedAt;
-      if (isNewerAttempt && !isTerminalAgentStatus(agent.status)) {
+      if ((isNewerAttempt || agent.resumed) && !isTerminalAgentStatus(agent.status)) {
         delete existing.resultPreview;
         delete existing.summary;
         delete existing.completedAt;
@@ -730,6 +739,12 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
     }
     if (!isTerminalRunStatus(run.status)) run.status = 'active';
     run.updatedAt = updatedAt;
+    const native = fact.taskId ? childToolUseIdByTaskId.get(fact.taskId) : undefined;
+    if (native?.unroutedTerminal) {
+      const terminal = native.unroutedTerminal;
+      delete native.unroutedTerminal;
+      applyTaskLifecycle(terminal.fact, terminal.updatedAt, providerTaskActivities, terminal);
+    }
     return run.runId;
   }
 
@@ -737,9 +752,93 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
     fact: TaskLifecycleFact,
     updatedAt: number,
     providerTaskActivities: ClaudeProviderTaskActivity[],
+    context: Readonly<{ live?: boolean; authenticatedHook?: true; startupReplay?: true; receiptAvailable?: boolean; historicalTimestampAvailable?: boolean }>,
   ): string | null {
     if (isForeignSource(fact.sourceSessionId)) return null;
-    const toolUseId = fact.toolUseId;
+    const knownToolUseId = fact.toolUseId && (
+      subagentToolUseIds.has(fact.toolUseId)
+      || runIdByWorkflowToolUseId.has(fact.toolUseId)
+      || runs.has(fact.toolUseId)
+    ) ? fact.toolUseId : undefined;
+    // Resumed-agent notifications can name the SendMessage invocation rather than the Agent
+    // launch. That tool is not a child identity; the already correlated native task still is.
+    const toolUseId = knownToolUseId
+      ?? (fact.taskId ? childToolUseIdByTaskId.get(fact.taskId)?.toolUseId : undefined)
+      ?? fact.toolUseId;
+    const observedInvocation = fact.taskId ? childToolUseIdByTaskId.get(fact.taskId) : undefined;
+    if (context.live === false && observedInvocation?.liveInvocationAt !== undefined
+      && isTerminalRunStatus(runStatusFromSignal(fact.status))
+      && (context.historicalTimestampAvailable === false || updatedAt <= observedInvocation.liveInvocationAt)) return null;
+    if (fact.taskId && isTerminalRunStatus(runStatusFromSignal(fact.status)) && !fact.knownOnly
+      && !knownToolUseId && !childToolUseIdByTaskId.get(fact.taskId)?.toolUseId && !runIdByTaskId.has(fact.taskId)) {
+      // Trusted SDK/native delivery can settle while parent PostToolUse still awaits its ACK.
+      // Keep that fact in the same native correlation record; it cannot synthesize a child.
+      childToolUseIdByTaskId.set(fact.taskId, { background: false,
+        unroutedTerminal: { fact, updatedAt, historicalTimestampAvailable: context.historicalTimestampAvailable } });
+      return null;
+    }
+    if (toolUseId && subagentToolUseIds.has(toolUseId)) {
+      if (fact.taskId) {
+        const prior = childToolUseIdByTaskId.get(fact.taskId);
+        childToolUseIdByTaskId.set(fact.taskId, { ...prior, toolUseId,
+          background: prior?.background === true || fact.subtype === 'async-launch'
+            || (fact.resumed === true && fact.knownOnly !== true),
+          ...(isTerminalRunStatus(runStatusFromSignal(fact.status)) ? { terminalTimeKnown: context.historicalTimestampAvailable !== false } : {}) });
+      }
+      const pending = pendingImplicitSubagents.get(toolUseId);
+      const native = fact.taskId ? childToolUseIdByTaskId.get(fact.taskId) : undefined;
+      if (native?.unroutedTerminal) {
+        const terminal = native.unroutedTerminal;
+        delete native.unroutedTerminal;
+        return applyTaskLifecycle({ ...terminal.fact, toolUseId }, terminal.updatedAt, providerTaskActivities, terminal);
+      }
+      if (context.authenticatedHook && fact.subtype === 'async-launch' && fact.taskId && fact.sourceSessionId) {
+        providerTaskActivities.push({ type: 'started', source: 'hook-agent-launch',
+          sessionId: fact.sourceSessionId, taskId: fact.taskId });
+      }
+      const owningRunId = runIdByChildToolUseId.get(toolUseId);
+      const existing = pending ?? (owningRunId ? runs.get(owningRunId)?.agentsById.get(toolUseId) : undefined);
+      if (fact.resumed && existing) {
+        const terminal = isTerminalAgentStatus(existing.status);
+        if (context.startupReplay && terminal && native?.terminalTimeKnown !== false && context.receiptAvailable !== false && updatedAt < existing.updatedAt) return null;
+        // Startup receipts and native history use the existing wall-clock convention. A tie or
+        // unavailable receipt cannot identify which invocation owns the terminal outcome.
+        const ambiguous = context.startupReplay === true
+          && (context.receiptAvailable === false || (terminal && (native?.terminalTimeKnown === false || updatedAt === existing.updatedAt)));
+        if (context.startupReplay && existing.status === 'active' && native?.liveInvocationAt !== undefined
+          && (context.receiptAvailable === false || updatedAt <= native.liveInvocationAt)) return null;
+        if (context.authenticatedHook && native?.background && fact.taskId && fact.sourceSessionId) {
+          providerTaskActivities.push({ type: 'started', source: 'hook-agent-resume',
+            sessionId: fact.sourceSessionId, taskId: fact.taskId,
+            ...(ambiguous ? { confirmsActivity: false as const } : {}) });
+          if (!ambiguous) native.liveInvocationAt = updatedAt;
+        }
+        if (pending) {
+          const { resultPreview: _resultPreview, timeUsedSeconds: _timeUsedSeconds, ...prior } = pending;
+          pendingImplicitSubagents.set(toolUseId, { ...prior, status: ambiguous ? 'unknown' : 'active', updatedAt });
+        } else if (ambiguous && owningRunId) {
+          const owner = runs.get(owningRunId)!;
+          const child = owner.agentsById.get(toolUseId)!;
+          upsertAgent(owner, { id: child.id, title: child.title, titleSource: child.titleSource,
+            status: 'unknown', resumed: true, updatedAt });
+          owner.updatedAt = updatedAt;
+          rollUpImplicitRunStatus(owner);
+          return owner.runId;
+        }
+      }
+      if (pending) {
+        if (isTerminalRunStatus(runStatusFromSignal(fact.status))) {
+          pendingImplicitSubagents.set(toolUseId, {
+            ...pending,
+            status: fact.status === 'unknown' ? 'unknown' : fact.status,
+            updatedAt,
+            ...(fact.summary ? { summary: fact.summary } : {}),
+            ...(fact.resultPreview ? { resultPreview: fact.resultPreview } : {}),
+          });
+        }
+        return null;
+      }
+    }
     // Route to an explicit Workflow run if the tool-use id names one, else to a child's owning run,
     // else via the run's learned provider task id (terminal `task_updated` carries only `task_id`).
     let run: MutableRun | undefined;
@@ -761,6 +860,7 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
       && run.providerTaskId
       && fact.taskId !== run.providerTaskId
       && !runIdByTaskId.has(fact.taskId)
+      && !childToolUseIdByTaskId.has(fact.taskId)
     ) {
       return null;
     }
@@ -776,7 +876,16 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
       && run.agentsById.has(toolUseId)
     ) {
       const childStatus = runStatusFromSignal(fact.status);
-      if (!isTerminalRunStatus(childStatus)) return run.runId;
+      if (!isTerminalRunStatus(childStatus)) {
+        if (fact.resumed) {
+          const child = run.agentsById.get(toolUseId)!;
+          upsertAgent(run, { id: child.id, title: child.title, titleSource: child.titleSource,
+            status: 'active', resumed: true, updatedAt });
+          run.updatedAt = updatedAt;
+          rollUpImplicitRunStatus(run);
+        }
+        return run.runId;
+      }
       applyChildAgentTerminal(run, {
         agentId: toolUseId,
         status: fact.status === 'unknown' ? 'unknown' : fact.status,
@@ -1285,9 +1394,9 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
     const agents = [...run.agentsById.values()];
     if (agents.length === 0) return;
     if (!agents.every((agent) => isTerminalAgentStatus(agent.status))) {
-      if (!isTerminalRunStatus(run.status)) return;
-      // A previously-closed run gained live work again (a resumed/new subagent).
-      run.status = 'active';
+      // An uncertain invocation cannot manufacture active work or a successful terminal group.
+      run.status = agents.some(agent => !isTerminalAgentStatus(agent.status) && agent.status !== 'unknown')
+        ? 'active' : 'unknown';
       delete run.completedAt;
       return;
     }
@@ -1391,12 +1500,12 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
 
   function observe(
     value: unknown,
-    observeParams: Readonly<{ updatedAt: number; live?: boolean }>,
+    observeParams: Readonly<{ updatedAt: number; live?: boolean; authenticatedHook?: true; startupReplay?: true; receiptAvailable?: boolean; historicalTimestampAvailable?: boolean }>,
   ): WorkflowActivityObservation {
-    const fact = parseClaudeWorkflowFact(value, {
+    const facts = parseClaudeWorkflowFacts(value, {
       isKnownSubagentToolUseId: (toolUseId) => subagentToolUseIds.has(toolUseId),
     });
-    if (!fact) {
+    if (facts.length === 0) {
       return { changedRunIds: [], startedRunIds: [], terminalRunIds: [], statusChangedRunIds: [] };
     }
 
@@ -1404,31 +1513,36 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
     const priorStatusByRun = new Map<string, SessionWorkflowRunStatusV1>();
     for (const [runId, run] of runs) priorStatusByRun.set(runId, run.status);
 
-    let touchedRunId: string | null = null;
+    const touchedRunIds = new Set<string>();
     const providerTaskActivities: ClaudeProviderTaskActivity[] = [];
-    if (fact.kind === 'workflow-start') {
-      touchedRunId = applyWorkflowStart(fact, observeParams.updatedAt);
-    } else if (fact.kind === 'workflow-launch') {
-      touchedRunId = applyWorkflowLaunch(fact, observeParams.updatedAt, providerTaskActivities);
-    } else if (fact.kind === 'task-lifecycle') {
-      touchedRunId = applyTaskLifecycle(fact, observeParams.updatedAt, providerTaskActivities);
-    } else if (fact.kind === 'workflow-run-record') {
-      touchedRunId = applyWorkflowRunRecord(fact, observeParams.updatedAt);
-    } else if (fact.kind === 'workflow-journal') {
-      touchedRunId = applyWorkflowJournal(fact, observeParams.updatedAt);
-    } else if (fact.kind === 'workflow-agent-profile') {
-      touchedRunId = applyWorkflowAgentProfile(fact, observeParams.updatedAt);
-    } else if (fact.kind === 'subagent-result') {
-      touchedRunId = applySubagentResult(fact, observeParams.updatedAt);
-    } else {
-      touchedRunId = applySubagentStart(fact, observeParams.updatedAt);
-    }
+    for (const fact of facts) {
+      let touchedRunId: string | null = null;
+      if (fact.kind === 'workflow-start') {
+        touchedRunId = applyWorkflowStart(fact, observeParams.updatedAt);
+      } else if (fact.kind === 'workflow-launch') {
+        touchedRunId = applyWorkflowLaunch(fact, observeParams.updatedAt, providerTaskActivities);
+      } else if (fact.kind === 'task-lifecycle') {
+        touchedRunId = applyTaskLifecycle(fact, observeParams.updatedAt, providerTaskActivities, observeParams);
+      } else if (fact.kind === 'workflow-run-record') {
+        touchedRunId = applyWorkflowRunRecord(fact, observeParams.updatedAt);
+      } else if (fact.kind === 'workflow-journal') {
+        touchedRunId = applyWorkflowJournal(fact, observeParams.updatedAt);
+      } else if (fact.kind === 'workflow-agent-profile') {
+        touchedRunId = applyWorkflowAgentProfile(fact, observeParams.updatedAt);
+      } else if (fact.kind === 'subagent-result') {
+        touchedRunId = applySubagentResult(fact, observeParams.updatedAt);
+      } else {
+        touchedRunId = applySubagentStart(fact, observeParams.updatedAt);
+      }
 
-    if (!touchedRunId) {
-      return { changedRunIds: [], startedRunIds: [], terminalRunIds: [], statusChangedRunIds: [] };
+      if (touchedRunId) {
+        touchedRunIds.add(touchedRunId);
+        if (observeParams.live !== false) liveObservedRunIds.add(touchedRunId);
+      }
     }
-    if (observeParams.live !== false) {
-      liveObservedRunIds.add(touchedRunId);
+    if (touchedRunIds.size === 0) {
+      return { changedRunIds: [], startedRunIds: [], terminalRunIds: [], statusChangedRunIds: [],
+        ...(providerTaskActivities.length > 0 ? { providerTaskActivities } : {}) };
     }
 
     // Migration may have dropped the implicit run; recompute change set across all current runs that
@@ -1438,7 +1552,7 @@ export function createClaudeWorkflowActivityTracker(params: Readonly<{
     const terminalRunIds: string[] = [];
     const statusChangedRunIds: string[] = [];
 
-    const candidateRunIds = new Set<string>([touchedRunId]);
+    const candidateRunIds = new Set(touchedRunIds);
     // The implicit run may have lost an agent this event; re-project it too so counts stay correct.
     if (implicitRunId && runs.has(implicitRunId)) candidateRunIds.add(implicitRunId);
 

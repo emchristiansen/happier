@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import type { Message, ToolCallMessage } from '@/sync/domains/messages/messageTypes';
 import type { MessageMeta } from '@/sync/domains/messages/messageMetaTypes';
 import { deriveSessionSubagents } from './deriveSessionSubagents';
+import { deriveSessionSubagentActivityPreview } from './deriveSessionSubagentActivityPreview';
+import { resolveToolTranscriptSidechainId } from '@/components/tools/shell/views/resolveToolTranscriptSidechainId';
 
 function createToolMessage(params: {
     id: string;
@@ -58,6 +60,73 @@ function deriveSubagents(params: {
 }
 
 describe('deriveSessionSubagents', () => {
+    it('binds a proven native child turn to its transcript and preserves explicit interruption', () => {
+        const message = createToolMessage({ id: 'native', name: 'SubAgent', state: 'completed', toolExtras: { id: JSON.stringify(['child', 'turn-1']) }, input: { sidechainId: 'child', threadId: 'child', providerTurnId: 'turn-1' }, result: { sidechainId: 'child', status: 'interrupted' } });
+        expect(deriveSessionSubagents({ session: { metadata: { flavor: 'codex' } }, messages: [message] })[0]).toMatchObject({ status: 'cancelled', transcript: { sidechainId: 'child' } });
+    });
+
+    it('preserves interruption from an error-shaped native occurrence result', () => {
+        const sidechainId = JSON.stringify(['thread-resumed-child', 'child-first']);
+        const message = createToolMessage({ id: 'native-error', name: 'SubAgent', state: 'error',
+            toolExtras: { id: sidechainId },
+            input: { threadId: 'thread-resumed-child', providerTurnId: 'child-first', sidechainId },
+            result: { threadId: 'thread-resumed-child', providerTurnId: 'child-first', sidechainId, status: 'interrupted' },
+        });
+        expect(deriveSessionSubagents({ session: { metadata: { flavor: 'codex' } }, messages: [message] })[0])
+            .toMatchObject({ status: 'cancelled', transcript: { sidechainId, toolId: sidechainId } });
+    });
+
+    it('opens the exact resumed native occurrence while retaining its completed history', () => {
+        const firstSidechainId = JSON.stringify(['thread-resumed-child', 'child-first']);
+        const resumedSidechainId = JSON.stringify(['thread-resumed-child', 'child-resumed']);
+        const first = createToolMessage({ id: 'native-first', name: 'SubAgent', state: 'completed', seq: 1,
+            toolExtras: { id: firstSidechainId },
+            input: { threadId: 'thread-resumed-child', providerTurnId: 'child-first', sidechainId: firstSidechainId },
+            result: { threadId: 'thread-resumed-child', providerTurnId: 'child-first', sidechainId: firstSidechainId, status: 'completed' },
+        });
+        const resumed = createToolMessage({ id: 'native-resumed', name: 'SubAgent', state: 'running', seq: 2,
+            toolExtras: { id: resumedSidechainId },
+            input: { threadId: 'thread-resumed-child', providerTurnId: 'child-resumed', sidechainId: resumedSidechainId },
+        });
+        const reducerState = { sidechains: new Map([
+            [firstSidechainId, [{ text: 'First turn output' }]],
+            [resumedSidechainId, [{ text: 'Resumed turn output' }]],
+        ]) };
+        for (const messages of [[first, resumed], [resumed, first]]) {
+            const rows = deriveSessionSubagents({ session: { metadata: { flavor: 'codex' } }, messages });
+            expect(rows).toHaveLength(2);
+            const current = rows.filter((row) => row.status === 'running');
+            expect(current).toHaveLength(1);
+            expect(current[0]?.transcript).toMatchObject({ sidechainId: resumedSidechainId, toolId: resumedSidechainId });
+            expect(resolveToolTranscriptSidechainId({ tool: resumed.tool, normalizedToolName: 'SubAgent' })).toBe(resumedSidechainId);
+            expect(deriveSessionSubagentActivityPreview({ subagent: current[0]!, reducerState })).toBe('Resumed turn output');
+            const history = rows.find((row) => row.status === 'succeeded');
+            expect(history?.transcript.sidechainId).toBe(firstSidechainId);
+            expect(deriveSessionSubagentActivityPreview({ subagent: history!, reducerState })).toBe('First turn output');
+        }
+    });
+
+    it('projects the newest native turn of a retained child independently of transcript input order', () => {
+        const oldTurn = createToolMessage({ id: 'old', name: 'SubAgent', state: 'completed', toolExtras: { id: JSON.stringify(['child', 'turn-1']) }, input: { sidechainId: 'child' }, result: { sidechainId: 'child', status: 'completed' } });
+        oldTurn.createdAt = 1_000;
+        const newTurn = createToolMessage({ id: 'new', name: 'SubAgent', state: 'running', toolExtras: { id: JSON.stringify(['child', 'turn-2']) }, input: { sidechainId: 'child' } });
+        newTurn.createdAt = 5_000;
+        for (const messages of [[oldTurn, newTurn], [newTurn, oldTurn]]) {
+            const rows = deriveSessionSubagents({ session: { metadata: { flavor: 'codex' } }, messages });
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toMatchObject({ status: 'running', transcript: { sidechainId: 'child', toolId: JSON.stringify(['child', 'turn-2']) } });
+        }
+    });
+
+    it('keeps newer sidechain evidence live after an older runtime loss', () => {
+        const message = createToolMessage({ id: 'launch', name: 'Task', state: 'running', toolExtras: { id: 'child' } });
+        message.createdAt = 1_000;
+        message.tool.createdAt = 1_000;
+        message.tool.startedAt = 1_000;
+        message.children = [{ kind: 'agent-text', id: 'recent-child', localId: null, createdAt: 5_000, text: 'Still working' }];
+        expect(deriveSessionSubagents({ session: { metadata: { flavor: 'claude' } }, messages: [message], runtimeLostSinceMs: 4_000 })[0]?.status).toBe('running');
+    });
+
     it('derives running execution run subagents with control capabilities', async () => {
         const subagents = await deriveSubagents({
             session: { metadata: { flavor: 'claude' } },

@@ -24,6 +24,8 @@ export type SystemTaskExecutionRunner = (params: unknown, context: Readonly<{
   taskId: string;
   signal: AbortSignal;
   now: () => number;
+  /** Live producer callbacks use the same validation/redaction path as yielded events. */
+  emit: (event: unknown) => void;
 }>) => AsyncGenerator<unknown, unknown, void>;
 
 export type SystemTaskRegistryEntry = Readonly<{
@@ -78,6 +80,12 @@ export async function executeSystemTask({
     taskId,
     signal: effectiveSignal,
     now,
+    emit: (rawEvent) => {
+      if (effectiveSignal.aborted) return;
+      const event = buildEvent({ taskId, tsMs: now(), rawEvent });
+      if (!event.ok) throw new SystemTaskExecutionError('invalid_event', event.message);
+      emitEvent?.(event.value);
+    },
   });
 
   try {

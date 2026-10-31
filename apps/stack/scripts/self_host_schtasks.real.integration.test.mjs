@@ -29,6 +29,7 @@ test(
   'compiled hstack self-host install/uninstall works on Windows schtasks host without repo checkout',
   { timeout: SELF_HOST_TEST_TIMEOUT_MS },
   async (t) => {
+    const deadlineAtMs = Date.now() + SELF_HOST_TEST_TIMEOUT_MS;
     if (process.platform !== 'win32') {
       t.skip(`windows-only test (current: ${process.platform})`);
       return;
@@ -66,7 +67,7 @@ test(
         label: 'self-host-schtasks',
         cwd: repoRoot,
         env: { ...process.env },
-        timeoutMs: 10 * 60_000,
+        deadlineAtMs,
       }
     );
     run(
@@ -81,7 +82,7 @@ test(
         label: 'self-host-schtasks',
         cwd: repoRoot,
         env: { ...process.env },
-        timeoutMs: 10 * 60_000,
+        deadlineAtMs,
       }
     );
 

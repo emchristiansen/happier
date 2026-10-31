@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { AgentState } from '@/api/types';
+import { createProviderEnforcedPermissionHandler } from '@/agent/permissions/createProviderEnforcedPermissionHandler';
 import { buildBackendTargetKey } from '@happier-dev/protocol';
+import { createTestAcpRuntime } from '@/testkit/backends/acpRuntime';
+import { createFakeAcpRuntimeBackend } from '@/testkit/backends/acpRuntimeBackend';
+import { createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
+import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
+import { runPermissionModePromptLoop } from './runPermissionModePromptLoop';
+import { createPermissionModeQueueState } from './createPermissionModeQueueState';
 
 import { runStandardAcpProvider, type StandardAcpProviderConfig, type StandardAcpProviderRunOptions } from './runStandardAcpProvider';
 
@@ -599,6 +607,7 @@ describe('runStandardAcpProvider', () => {
 
   it('skips native MCP resolution for shell-bridge providers', async () => {
     const harness = createHarness();
+    harness.config.flavor = 'pi';
 
     let capturedMcpServers: any = null;
     harness.config.createRuntime = (params: any) => {
@@ -633,6 +642,7 @@ describe('runStandardAcpProvider', () => {
 
   it('uses the Happier session id, not the vendor runtime session id, for shell-bridge prompt instructions', async () => {
     const harness = createHarness();
+    harness.config.flavor = 'pi';
 
     harness.runtime.getSessionId = vi.fn(() => 'vendor-session-123');
 
@@ -1049,6 +1059,31 @@ describe('runStandardAcpProvider', () => {
     expect(harness.session.close).toHaveBeenCalledTimes(1);
   });
 
+  it('stops the ACP provider and aborts its controller when cancellation journal admission fails', async () => {
+    const harness = createHarness();
+    let state: AgentState = { requests: {}, completedRequests: {} };
+    Object.assign(harness.session, {
+      getAgentStateSnapshot: () => state,
+      updateAgentState: async (updater: (current: AgentState) => AgentState) => { state = updater(state); },
+      updateAgentStateRequestSettlement: async () => { throw Object.assign(new Error('journal disk full'), { code: 'ENOSPC' }); },
+    });
+    const handler = createProviderEnforcedPermissionHandler({ session: harness.session, logPrefix: '[AcpStopTest]' });
+    harness.deps.createProviderEnforcedPermissionHandlerFn = () => handler;
+    let stoppedSignal: AbortSignal | undefined;
+    harness.deps.runPermissionModePromptLoopFn = async (params: { getAbortSignal: () => AbortSignal }) => {
+      stoppedSignal = params.getAbortSignal();
+      const pending = handler.handleToolCall('acp-stop', 'Bash', { command: ['echo pending'] });
+      const rejected = expect(pending).rejects.toThrow('Aborted by user');
+      await harness.handlers.get('abort')?.();
+      await rejected;
+    };
+    await runStandardAcpProvider(harness.opts, harness.config, harness.deps);
+    expect(stoppedSignal?.aborted).toBe(true);
+    expect(harness.runtime.cancel).toHaveBeenCalledTimes(1);
+    expect(state.requests?.['acp-stop']).toBeDefined();
+    expect(state.completedRequests?.['acp-stop']).toBeUndefined();
+  });
+
   it('invokes abort handler lifecycle when abort RPC fires', async () => {
     const harness = createHarness();
     harness.deps.runPermissionModePromptLoopFn = async () => {
@@ -1164,6 +1199,108 @@ describe('runStandardAcpProvider', () => {
     expect(harness.session.close).toHaveBeenCalled();
     expect(harness.metrics.cleanupCalls).toBe(1);
   });
+
+  it.each(['completed', 'failed', 'flush-failed'] as const)(
+    'resumes queued input immediately after %s Stop cancellation without polling',
+    async (cancelOutcome) => {
+      // Only the provider transport and Session API are faked; the runtime, permissions,
+      // input consumer, queue and prompt loop execute their real production paths.
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const harness = createHarness();
+      const session = createMutableApiSessionClientFixture({
+        metadata: createTestMetadata({ path: '/tmp/workspace', permissionMode: 'default' }),
+        overrides: {
+          ...harness.session,
+          onUserMessage: () => undefined,
+          flush: async () => {
+            if (cancelOutcome === 'flush-failed') throw new Error('Session transport flush failed');
+          },
+          shouldAttemptPendingMaterialization: () => false,
+          waitForMetadataUpdate: (signal) => new Promise<boolean>((resolve) => {
+            if (signal?.aborted) resolve(false);
+            else signal?.addEventListener('abort', () => resolve(false), { once: true });
+          }),
+          waitForPendingEligibilityUpdate: (signal) => new Promise<boolean>((resolve) => {
+            if (signal?.aborted) resolve(false);
+            else signal?.addEventListener('abort', () => resolve(false), { once: true });
+          }),
+        },
+      });
+      harness.deps.initializeBackendRunSessionFn = async () => ({
+        session, reconnectionHandle: null, reportedSessionId: session.sessionId, attachedToExistingSession: false,
+      });
+      delete harness.deps.createProviderEnforcedPermissionHandlerFn;
+      let queueState: ReturnType<typeof createPermissionModeQueueState>;
+      harness.deps.createPermissionModeQueueStateFn = (params: Parameters<typeof createPermissionModeQueueState>[0]) => {
+        queueState = createPermissionModeQueueState(params);
+        queueState.messageQueue.push({ text: 'first prompt', localId: 'local-first' }, { permissionMode: 'default' });
+        return queueState;
+      };
+      let completeResponse!: () => void;
+      const response = new Promise<void>((resolve) => { completeResponse = resolve; });
+      let releaseCancel!: () => void;
+      const cancellation = new Promise<void>((resolve) => { releaseCancel = resolve; });
+      let notifyCancelStarted!: () => void;
+      const cancelStarted = new Promise<void>((resolve) => { notifyCancelStarted = resolve; });
+      let notifyFirstSent!: () => void;
+      const firstSent = new Promise<void>((resolve) => { notifyFirstSent = resolve; });
+      let completed = false;
+      const sent: string[] = [];
+      const backend = createFakeAcpRuntimeBackend({
+        sendPrompt: async (_sessionId, prompt) => { sent.push(prompt); notifyFirstSent(); },
+        waitForResponseComplete: async () => { if (sent.length === 1) await response; },
+        cancel: async () => {
+          notifyCancelStarted();
+          // ACP cancellation can release the turn before the transport cancellation settles.
+          completeResponse();
+          await cancellation;
+          if (cancelOutcome === 'failed') throw new Error('Provider cancel failed');
+        },
+      });
+      harness.config.deliversSystemPromptAtSpawn = true;
+      harness.config.createRuntime = (params: Parameters<StandardAcpProviderConfig['createRuntime']>[0]) =>
+        createTestAcpRuntime({
+          provider: 'qwen', directory: params.directory, session: params.session,
+          messageBuffer: params.messageBuffer, mcpServers: {}, permissionHandler: params.permissionHandler,
+          onThinkingChange: params.setThinking, ensureBackend: async () => backend,
+        });
+      harness.deps.runPermissionModePromptLoopFn = (params: Parameters<typeof runPermissionModePromptLoop>[0]) =>
+        runPermissionModePromptLoop({
+          ...params,
+          shouldExit: () => completed || params.shouldExit(),
+          sendReady: () => { if (sent.length === 2) completed = true; },
+        });
+      const tick = async () => { await new Promise<void>((resolve) => setImmediate(resolve)); };
+      const run = runStandardAcpProvider(harness.opts, harness.config, harness.deps);
+      let abort: Promise<unknown> | undefined;
+      try {
+        await Promise.race([firstSent, run.then(() => { throw new Error('Runner exited before first prompt'); })]);
+        expect(sent).toEqual(['first prompt']);
+        abort = Promise.resolve(harness.handlers.get('abort')?.());
+        await cancelStarted;
+        const repeatedAbort = Promise.resolve(harness.handlers.get('abort')?.());
+        queueState!.messageQueue.push({ text: 'after Stop', localId: 'local-after-stop' }, { permissionMode: 'default' });
+        for (let i = 0; i < 10; i++) await tick();
+        expect(sent).toEqual(['first prompt']);
+        expect(queueState!.messageQueue.size()).toBe(1);
+        releaseCancel();
+        await Promise.all([abort, repeatedAbort]);
+        // No timeout is advanced: recovery must follow cancellation completion itself.
+        for (let i = 0; i < 100 && !completed; i++) await tick();
+        expect(sent).toEqual(['first prompt', 'after Stop']);
+        expect(completed).toBe(true);
+        await run;
+      } finally {
+        completed = true;
+        releaseCancel();
+        completeResponse();
+        await abort;
+        await vi.runAllTimersAsync();
+        await run;
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it('awaits explicit Stop cancellation before API close and backend disposal', async () => {
     const harness = createHarness();
@@ -1423,5 +1560,36 @@ describe('runStandardAcpProvider', () => {
       }),
     );
     expect(observedGetAccountSettingsSecretsReadKeys?.()).toEqual(settingsSecretsReadKeys);
+  });
+
+  /**
+   * The prompt loop's new-session fallback is the only path that can turn an explicit vendor
+   * resume into a fresh vendor session. This runner is its single policy owner: the declared
+   * `session/load` support decides, so no provider leaf can forget to opt in.
+   */
+  it('fails closed on explicit resume for a backend that declares vendor session load support', async () => {
+    const harness = createHarness();
+    harness.config.declaredSessionLoadSupport = true;
+    let observedFailClosed: unknown;
+    harness.deps.runPermissionModePromptLoopFn = async (params: any) => {
+      observedFailClosed = params.failClosedOnResumeFailure;
+    };
+
+    await runStandardAcpProvider(harness.opts, harness.config, harness.deps);
+
+    expect(observedFailClosed).toBe(true);
+  });
+
+  it('keeps the new-session fallback for a backend that never claims vendor session load support', async () => {
+    const harness = createHarness();
+    let observedFailClosed: unknown;
+    harness.deps.runPermissionModePromptLoopFn = async (params: any) => {
+      observedFailClosed = params.failClosedOnResumeFailure;
+    };
+
+    await runStandardAcpProvider(harness.opts, harness.config, harness.deps);
+
+    expect(harness.config.declaredSessionLoadSupport).toBeUndefined();
+    expect(observedFailClosed).toBe(false);
   });
 });

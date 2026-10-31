@@ -48,10 +48,6 @@ test.describe('ui e2e: permission prompts (composer card)', () => {
         // Keep web create-account stable (binding signature is not reliably available on web).
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        // Make presence timeouts fast enough for UI E2E reconnect flows.
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -113,8 +109,8 @@ test.describe('ui e2e: permission prompts (composer card)', () => {
     throw new Error(`Failed to spawn session runner in daemon: HTTP ${response.status}. ${JSON.stringify(response.data)}`);
   }
 
-  test('shows composer permission card and view-tool navigates to the tool in transcript', async ({ page }, testInfo) => {
-    test.setTimeout(420_000);
+  test('shows composer permission card and view-tool navigates to the tool in transcript', { tag: "@smoke" }, async ({ page }, testInfo) => {
+    test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
 

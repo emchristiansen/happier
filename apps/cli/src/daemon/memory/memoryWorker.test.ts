@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { applyEnvValues, restoreEnvValues, snapshotEnvValues } from '@/testkit/env/envSnapshot';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import type { Credentials } from '@/persistence';
+import type { OptionalRuntimeKey } from '@/installables/runtime/optionalRuntimeInstallables';
 
 describe('memoryWorker', () => {
   const envBackup = snapshotEnvValues(['HAPPIER_HOME_DIR', 'HAPPIER_SERVER_URL', 'HAPPIER_WEBAPP_URL']);
@@ -20,10 +21,139 @@ describe('memoryWorker', () => {
   });
 
   afterEach(async () => {
+    vi.doUnmock('@huggingface/transformers');
     restoreEnvValues(envBackup);
     vi.resetModules();
     if (homeDir) await removeTempDir(homeDir);
   });
+
+  it.each([false, true])('exposes the worker while cold inference initializes (disable while pending: %s)', async (disableWhilePending) => {
+    let finishInitialization = () => {};
+    let initializationStarted = () => {};
+    let initializationFinished = () => {};
+    const transformerEnvironment = { cacheDir: '' };
+    const pending = new Promise<void>((resolve) => { finishInitialization = resolve; });
+    const started = new Promise<void>((resolve) => { initializationStarted = resolve; });
+    const finished = new Promise<void>((resolve) => { initializationFinished = resolve; });
+    // Transformers is the native/model-loading boundary; worker/provider lifecycle stays real.
+    vi.doMock('@huggingface/transformers', () => ({
+      env: transformerEnvironment,
+      pipeline: async () => {
+        initializationStarted();
+        await pending;
+        await mkdir(transformerEnvironment.cacheDir, { recursive: true });
+        await writeFile(join(transformerEnvironment.cacheDir, 'model.bin'), 'downloaded fixture');
+        initializationFinished();
+        return async () => ({ data: new Float32Array([1, 0]), dims: [1, 2] });
+      },
+    }));
+    const { writeMemorySettingsToDisk } = await import('@/settings/memorySettings');
+    await writeMemorySettingsToDisk({ v: 1, enabled: true, indexMode: 'deep', embeddings: { mode: 'preset', presetId: 'balanced' } });
+    const { startMemoryWorker } = await import('./memoryWorker');
+    const starting = startMemoryWorker({ credentials: { token: 't', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } }, machineId: 'machine_1' });
+    const worker = await Promise.race([
+      starting,
+      started.then(() => new Promise<null>((resolve) => setImmediate(() => resolve(null)))),
+    ]);
+    try {
+      expect(worker, 'Daemon must be able to register memory RPC while inference is pending').not.toBeNull();
+      expect(worker?.getEmbeddingsDiagnostics()).toMatchObject({ runtimeState: 'downloading' });
+      if (disableWhilePending) {
+        await writeMemorySettingsToDisk({ ...worker!.getSettings(), enabled: false, deleteOnDisable: true });
+        await worker?.reloadSettings();
+      }
+      finishInitialization();
+      if (disableWhilePending) {
+        await finished;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(worker?.getEmbeddingsDiagnostics()).toMatchObject({ runtimeState: 'unavailable', usingFallback: false });
+        await vi.waitFor(async () => {
+          await expect(stat(join(transformerEnvironment.cacheDir, 'model.bin'))).rejects.toBeTruthy();
+        });
+      } else {
+        await vi.waitFor(() => expect(worker?.getEmbeddingsDiagnostics()).toMatchObject({ runtimeState: 'ready', usingFallback: false }));
+      }
+    } finally {
+      finishInitialization();
+      (await starting).stop();
+    }
+  }, 60_000);
+
+  it.each([
+    { trigger: 'account', state: 'persisted-disabled' },
+    { trigger: 'runtime', state: 'persisted-disabled' },
+    { trigger: 'account', state: 'disabled-after-enable' },
+    { trigger: 'runtime', state: 'disabled-after-enable' },
+    { trigger: 'account', state: 'enabled' },
+    { trigger: 'runtime', state: 'enabled' },
+  ] as const)('admits $trigger embedding retries only while memory is enabled ($state)', async ({ trigger, state }) => {
+    const pipeline = vi.fn(async () => { throw new Error('fixture embeddings initialization declined'); });
+    vi.doMock('@huggingface/transformers', () => ({ env: {}, pipeline }));
+    const runtimeListeners = new Set<(key: OptionalRuntimeKey) => void>();
+    vi.doMock('@/installables/runtime/optionalRuntimeInstallables', async (importOriginal) => ({
+      ...await importOriginal<typeof import('@/installables/runtime/optionalRuntimeInstallables')>(),
+      subscribeOptionalRuntimeInstallSuccess: (listener: (key: OptionalRuntimeKey) => void) => {
+        runtimeListeners.add(listener);
+        return () => { runtimeListeners.delete(listener); };
+      },
+    }));
+    const { INSTALLABLE_KEYS, accountSettingsParse } = await import('@happier-dev/protocol');
+    const { commitActiveAccountSettingsSnapshot, resetActiveAccountSettingsSnapshotForTests } = await import('@/settings/accountSettings/activeAccountSettingsSnapshot');
+    const { writeMemorySettingsToDisk } = await import('@/settings/memorySettings');
+    resetActiveAccountSettingsSnapshotForTests();
+    const publishAccountVersion = (version: number) => commitActiveAccountSettingsSnapshot({
+      source: 'network', settings: accountSettingsParse({}), settingsVersion: version,
+      loadedAtMs: Date.now(), settingsSecretsReadKeys: [], scopeKey: 'memory-worker-fixture',
+    });
+    publishAccountVersion(1);
+    await writeMemorySettingsToDisk({
+      v: 1, enabled: state !== 'persisted-disabled', indexMode: 'deep',
+      deleteOnDisable: true, embeddings: { mode: 'preset', presetId: 'balanced' },
+    });
+    const { configuration } = await import('@/configuration');
+    const { startMemoryWorker } = await import('./memoryWorker');
+    const worker = await startMemoryWorker({
+      credentials: { token: 't', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } },
+      machineId: 'machine_1', deps: { fetchDecryptedTranscriptPageAfterSeq: async () => [] },
+    });
+    try {
+      if (state !== 'persisted-disabled') {
+        await vi.waitFor(() => expect(worker.getEmbeddingsDiagnostics().runtimeState).toBe('error'));
+        expect(pipeline).toHaveBeenCalledTimes(1);
+      }
+      if (state === 'disabled-after-enable') {
+        await writeMemorySettingsToDisk({ ...worker.getSettings(), enabled: false });
+        await worker.reloadSettings();
+      }
+      expect(worker.getSettings().embeddings).toMatchObject({ mode: 'preset', presetId: 'balanced' });
+      const previousCalls = pipeline.mock.calls.length;
+      expect(runtimeListeners.size).toBe(1);
+      if (trigger === 'account') {
+        expect(publishAccountVersion(2).didCommit).toBe(true);
+      } else {
+        for (const listener of runtimeListeners) listener(INSTALLABLE_KEYS.LOCAL_EMBEDDINGS);
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (state === 'enabled') {
+        await vi.waitFor(() => expect(pipeline).toHaveBeenCalledTimes(previousCalls + 1));
+      } else {
+        expect(pipeline).toHaveBeenCalledTimes(previousCalls);
+        expect(worker.getEmbeddingsDiagnostics()).toMatchObject({ runtimeState: 'unavailable', usingFallback: false });
+        expect(worker.getWorkerStatus?.().state).toBe('disabled');
+        await expect(stat(join(configuration.activeServerDir, 'memory'))).rejects.toBeTruthy();
+      }
+      const settledCalls = pipeline.mock.calls.length;
+      worker.stop();
+      expect(runtimeListeners.size).toBe(0);
+      expect(publishAccountVersion(3).didCommit).toBe(true);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(pipeline).toHaveBeenCalledTimes(settledCalls);
+    } finally {
+      worker.stop();
+      resetActiveAccountSettingsSnapshotForTests();
+      vi.doUnmock('@/installables/runtime/optionalRuntimeInstallables');
+    }
+  }, 60_000);
 
   it('creates the tier-1 sqlite DB when enabled', async () => {
     const { writeMemorySettingsToDisk } = await import('@/settings/memorySettings');
@@ -122,6 +252,112 @@ describe('memoryWorker', () => {
     });
 
     worker.stop();
+  });
+
+  it('reuses a failed embeddings resolution across background ticks but retries on explicit use and settings reload', async () => {
+    vi.useFakeTimers();
+    const argvBackup = process.argv.slice();
+    let publishInventory = () => {};
+    const inventoryReady = new Promise<void>((resolve) => { publishInventory = resolve; });
+    const fetchSessionsPage = vi.fn(async () => {
+      await inventoryReady;
+      return {
+        sessions: [{ id: 'sess-1', createdAt: 1_000, updatedAt: 2_000, activeAt: 0 }],
+        nextCursor: null,
+        hasNext: false,
+      };
+    });
+    const pipeline = vi.fn(async () => {
+      throw new Error('permanent local embeddings failure');
+    });
+    try {
+      vi.doMock('@huggingface/transformers', () => ({ env: {}, pipeline }));
+      vi.doMock('@/session/transport/http/sessionsHttp', () => ({
+        fetchSessionsPage,
+        fetchSessionById: async () => ({}),
+      }));
+      vi.doMock('@/session/replay/fetchEncryptedTranscriptMessages', () => ({
+        fetchEncryptedTranscriptMessagesPage: async () => ({
+          messages: [],
+          hasMore: false,
+          nextBeforeSeq: null,
+          nextAfterSeq: null,
+        }),
+      }));
+      process.argv = ['node', 'happier', 'daemon', 'start-sync'];
+      vi.doMock('@/configuration', async () => {
+        const actual = await vi.importActual<typeof import('@/configuration')>('@/configuration');
+        return {
+          ...actual,
+          configuration: { ...actual.configuration, isDaemonProcess: true },
+        };
+      });
+
+      const { writeMemorySettingsToDisk } = await import('@/settings/memorySettings');
+      const {
+        resetActiveAccountSettingsSnapshotForTests,
+        setActiveAccountSettingsSnapshot,
+      } = await import('@/settings/accountSettings/activeAccountSettingsSnapshot');
+      const { accountSettingsParse } = await import('@happier-dev/protocol');
+      resetActiveAccountSettingsSnapshotForTests();
+      await writeMemorySettingsToDisk({
+        v: 1,
+        enabled: true,
+        indexMode: 'deep',
+        backfillPolicy: 'new_only',
+        worker: {
+          tickIntervalMs: 500,
+          inventoryRefreshIntervalMs: 5_000,
+          maxSessionsPerTick: 1,
+          sessionListPageLimit: 10,
+        },
+        embeddings: { mode: 'preset', presetId: 'balanced' },
+      });
+
+      const { startMemoryWorker } = await import('./memoryWorker');
+      const worker = await startMemoryWorker({
+        credentials: { token: 't', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(1) } },
+        machineId: 'machine_1',
+        deps: { fetchDecryptedTranscriptPageAfterSeq: async () => [] },
+      });
+      try {
+        await vi.waitFor(() => expect(pipeline).toHaveBeenCalledTimes(1));
+        await vi.waitFor(() => expect(fetchSessionsPage).toHaveBeenCalledTimes(1));
+        publishInventory();
+        await fetchSessionsPage.mock.results[0]!.value;
+        await vi.advanceTimersByTimeAsync(2_500);
+        expect(pipeline).toHaveBeenCalledTimes(1);
+
+        setActiveAccountSettingsSnapshot({
+          source: 'cache',
+          settings: accountSettingsParse({}),
+          settingsVersion: 1,
+          loadedAtMs: Date.now(),
+          settingsSecretsReadKeys: [],
+        });
+        await vi.waitFor(() => expect(pipeline).toHaveBeenCalledTimes(2));
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(pipeline).toHaveBeenCalledTimes(2);
+
+        await worker.ensureUpToDate('sess-1');
+        expect(pipeline).toHaveBeenCalledTimes(3);
+        await vi.advanceTimersByTimeAsync(1_500);
+        expect(pipeline).toHaveBeenCalledTimes(3);
+
+        await worker.reloadSettings();
+        await vi.waitFor(() => expect(pipeline).toHaveBeenCalledTimes(4));
+      } finally {
+        publishInventory();
+        worker.stop();
+        resetActiveAccountSettingsSnapshotForTests();
+      }
+    } finally {
+      vi.doUnmock('@/configuration');
+      vi.doUnmock('@/session/transport/http/sessionsHttp');
+      vi.doUnmock('@/session/replay/fetchEncryptedTranscriptMessages');
+      process.argv = argvBackup;
+      vi.useRealTimers();
+    }
   });
 
   it('deletes DBs when disabled with deleteOnDisable=true', async () => {

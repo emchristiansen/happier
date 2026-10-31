@@ -15,9 +15,11 @@ import type {
 import type { RawJSONLines } from '@/backends/claude/types'
 import type { PermissionMode } from '@/api/types'
 import { normalizeClaudeToolUseNamesInSdkMessage } from './normalizeClaudeToolUseNames'
-import { INTERNAL_CLAUDE_EVENT_TYPES } from './internalClaudeEventTypes'
+import { providers } from '@happier-dev/agents'
 import { buildClaudeSdkResultUsageTelemetry } from './sdkResultUsageTelemetry'
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers'
+import { createClaudeTaskNotificationToolResultProjector, readClaudeTaskLifecycleEnvelope } from '../taskNotifications/claudeTaskLifecycleEnvelope'
+import { formatClaudePeerMessageText, projectClaudePeerMessage } from '../attachments/claudePeerMessageProjection'
 
 /**
  * Context for converting SDK messages to log format
@@ -79,6 +81,7 @@ export class SDKToLogConverter {
     private context: ConversionContext
     private responses?: Map<string, { approved: boolean, mode?: PermissionMode, reason?: string }>
     private sidechainLastUUID = new Map<string, string>();
+    private taskNotificationProjector = createClaudeTaskNotificationToolResultProjector();
 
     constructor(
         context: Omit<ConversionContext, 'parentUuid'>,
@@ -108,14 +111,17 @@ export class SDKToLogConverter {
         this.latestMainAssistantContextUsedTokens = null
         this.context.parentUuid = null
         this.sidechainLastUUID.clear()
+        this.taskNotificationProjector.clear()
     }
 
     /**
      * Convert SDK message to log format
      */
     convert(sdkMessage: SDKMessage): RawJSONLines | null {
+        const fact = readClaudeTaskLifecycleEnvelope(sdkMessage);
         const rawType = (sdkMessage as any)?.type;
-        if (typeof rawType === 'string' && INTERNAL_CLAUDE_EVENT_TYPES.has(rawType)) {
+        if (providers.claude.isClaudeInternalEventType(rawType) && rawType !== 'attachment'
+            && fact?.subtype !== 'task_notification') {
             return null;
         }
 
@@ -144,6 +150,15 @@ export class SDKToLogConverter {
             timestamp
         }
 
+        const peerMessage = projectClaudePeerMessage({ ...sdkMessage, ...baseFields });
+        if (peerMessage) {
+            if (!isSidechain) this.lastMainUuid = uuid;
+            return peerMessage;
+        }
+        const taskResult = this.taskNotificationProjector.project({ ...sdkMessage, ...baseFields }, sidechainId ? { sidechainId } : undefined);
+        if (taskResult || fact?.subtype === 'task_notification') return taskResult;
+        if (providers.claude.isClaudeInternalEventType(rawType)) return null;
+
         let logMessage: RawJSONLines | null = null
         let shouldUpdateLastMainUuid = true
 
@@ -151,10 +166,16 @@ export class SDKToLogConverter {
             case 'user': {
                 const userMsg = sdkMessage as SDKUserMessage
                 const toolUseResult = (sdkMessage as any)?.tool_use_result as unknown;
+                const peerOrigin = asRecord(userMsg.origin);
+                const peerName = typeof peerOrigin?.name === 'string' && peerOrigin.name.trim() ? peerOrigin.name.trim() : null;
+                const message = peerOrigin?.kind === 'peer' && typeof userMsg.message.content === 'string'
+                    ? { ...userMsg.message, content: formatClaudePeerMessageText(peerName, userMsg.message.content) }
+                    : userMsg.message;
                 logMessage = {
                     ...baseFields,
                     type: 'user',
-                    message: userMsg.message
+                    message,
+                    ...(userMsg.origin ? { origin: userMsg.origin } : {}),
                 }
 
                 if (toolUseResult !== undefined && Array.isArray(userMsg.message.content)) {

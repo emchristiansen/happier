@@ -58,7 +58,7 @@ installSessionSettingsEntryModuleMocks({
 });
 
 vi.mock('expo-clipboard', () => ({
-    setStringAsync: vi.fn(async () => {}),
+    setStringAsync: vi.fn(async () => true),
 }));
 
 vi.mock('@/components/ui/layout/layout', () => ({

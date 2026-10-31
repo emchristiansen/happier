@@ -7,7 +7,10 @@ import type {
 import { buildSessionListRowModel } from './buildSessionListRowModel';
 import type { SessionListViewItem } from '@/sync/domains/session/listing/sessionListViewData';
 import { areSessionListRenderablesEqual } from '@/sync/domains/session/listing/sessionListRenderable';
-import { resolveSessionAttentionStanding } from '@/sync/domains/session/organization/attentionStanding';
+import {
+    resolveSessionAttentionStanding,
+    resolveSessionReminderPresentation,
+} from '@/sync/domains/session/organization/attentionStanding';
 import { formatShortRelativeTimeAt } from '@/utils/time/formatShortRelativeTime';
 import { sessionTagKey } from '../sessionTagUtils';
 
@@ -15,7 +18,6 @@ type CacheEntry = Readonly<{
     model: SessionListRowModel;
     inputSignature: string;
     itemRef: SessionListRowSessionItem;
-    dataIndex: number;
     adjacency: Readonly<{ isFirst: boolean; isLast: boolean; isSingle: boolean }>;
     stableSettings: StablePresentationSettingsRefs;
     itemSessionRef: SessionListRowSessionItem['session'];
@@ -30,6 +32,19 @@ export type SessionListRowModelsCache = {
     entries: Map<string, CacheEntry>;
 };
 
+export type SessionListRowModelAdjacency = Readonly<{
+    isFirst: boolean;
+    isLast: boolean;
+    isSingle: boolean;
+}>;
+
+const SESSION_LIST_ROW_MODEL_ADJACENCY_VALUES: ReadonlyArray<SessionListRowModelAdjacency> = Object.freeze([
+    Object.freeze({ isFirst: false, isLast: false, isSingle: false }),
+    Object.freeze({ isFirst: true, isLast: false, isSingle: false }),
+    Object.freeze({ isFirst: false, isLast: true, isSingle: false }),
+    Object.freeze({ isFirst: true, isLast: true, isSingle: true }),
+]);
+
 type StablePresentationSettingsRefs = Readonly<{
     currentUserId: SessionListRowPresentationSettings['currentUserId'];
     density: SessionListRowPresentationSettings['density'];
@@ -39,6 +54,7 @@ type StablePresentationSettingsRefs = Readonly<{
     activeColorMode: SessionListRowPresentationSettings['activeColorMode'];
     workingIndicatorMode: SessionListRowPresentationSettings['workingIndicatorMode'];
     workingTextMode: SessionListRowPresentationSettings['workingTextMode'];
+    backgroundWorkAttentionMode: SessionListRowPresentationSettings['backgroundWorkAttentionMode'];
     hideInactiveSessions: SessionListRowPresentationSettings['hideInactiveSessions'];
     showServerBadge: SessionListRowPresentationSettings['showServerBadge'];
     showPinnedServerBadge: SessionListRowPresentationSettings['showPinnedServerBadge'];
@@ -58,7 +74,6 @@ type StablePresentationSettingsRefs = Readonly<{
 export type BuildCachedSessionListRowModelInput = Readonly<{
     item: SessionListRowSessionItem;
     snapshot: SessionListRowStateSnapshot;
-    dataIndex: number;
     adjacency: Readonly<{ isFirst: boolean; isLast: boolean; isSingle: boolean }>;
     settings: SessionListRowPresentationSettings;
     cache: SessionListRowModelsCache;
@@ -106,6 +121,7 @@ function buildStablePresentationSettingsRefs(
         activeColorMode: settings.activeColorMode,
         workingIndicatorMode: settings.workingIndicatorMode,
         workingTextMode: settings.workingTextMode,
+        backgroundWorkAttentionMode: settings.backgroundWorkAttentionMode,
         hideInactiveSessions: settings.hideInactiveSessions,
         showServerBadge: settings.showServerBadge,
         showPinnedServerBadge: settings.showPinnedServerBadge,
@@ -135,6 +151,7 @@ function areStablePresentationSettingsRefsEqual(
         && previous.activeColorMode === next.activeColorMode
         && previous.workingIndicatorMode === next.workingIndicatorMode
         && previous.workingTextMode === next.workingTextMode
+        && previous.backgroundWorkAttentionMode === next.backgroundWorkAttentionMode
         && previous.hideInactiveSessions === next.hideInactiveSessions
         && previous.showServerBadge === next.showServerBadge
         && previous.showPinnedServerBadge === next.showPinnedServerBadge
@@ -154,7 +171,6 @@ function areStablePresentationSettingsRefsEqual(
 function buildInputSignature(input: Readonly<{
     item: SessionListRowSessionItem;
     rowKey: string;
-    dataIndex: number;
     adjacency: Readonly<{ isFirst: boolean; isLast: boolean; isSingle: boolean }>;
     snapshot: SessionListRowStateSnapshot;
     settings: SessionListRowPresentationSettings;
@@ -164,7 +180,6 @@ function buildInputSignature(input: Readonly<{
     const rowTags = settings.sessionTagsByKey[rowKey] ?? [];
     const reachableDisplay = settings.reachableSessionDisplayByKey[rowKey];
     appendSignaturePart(parts, rowKey);
-    appendSignaturePart(parts, input.dataIndex);
     appendSignaturePart(parts, item.section);
     appendSignaturePart(parts, item.groupKey);
     appendSignaturePart(parts, item.groupKind);
@@ -178,6 +193,7 @@ function buildInputSignature(input: Readonly<{
     appendSignaturePart(parts, item.attentionPromotionReason);
     appendSignaturePart(parts, item.workingPlacementReason);
     appendSignaturePart(parts, item.variant);
+    appendSignaturePart(parts, item.session.archiving === true ? 1 : 0);
     appendSignaturePart(parts, item.serverId);
     appendSignaturePart(parts, item.serverName);
     appendSignaturePart(parts, input.adjacency.isFirst ? 1 : 0);
@@ -191,6 +207,7 @@ function buildInputSignature(input: Readonly<{
     appendSignaturePart(parts, settings.activeColorMode);
     appendSignaturePart(parts, settings.workingIndicatorMode);
     appendSignaturePart(parts, settings.workingTextMode);
+    appendSignaturePart(parts, settings.backgroundWorkAttentionMode);
     appendSignaturePart(parts, settings.hideInactiveSessions ? 1 : 0);
     appendSignaturePart(parts, settings.showServerBadge ? 1 : 0);
     appendSignaturePart(parts, settings.showPinnedServerBadge ? 1 : 0);
@@ -204,7 +221,13 @@ function buildInputSignature(input: Readonly<{
     // policy: a row whose standing did not change must not rebuild when an
     // unrelated session's override lands.
     appendSignaturePart(parts, settings.attentionStandingEnabled ? 1 : 0);
-    appendSignaturePart(parts, resolveSessionAttentionStanding(settings.attentionStandingPolicy, rowKey) ? 1 : 0);
+    appendSignaturePart(parts, resolveSessionAttentionStanding(settings.attentionStandingPolicy, rowKey, settings.runtimeNowMs) ? 1 : 0);
+    const reminder = resolveSessionReminderPresentation(
+        settings.attentionStandingPolicy.overridesBySessionKey[rowKey],
+        settings.runtimeNowMs,
+    );
+    appendSignaturePart(parts, reminder?.state);
+    appendSignaturePart(parts, reminder?.remindAt);
     appendSignaturePart(parts, settings.hasMultipleMachines ? 1 : 0);
     appendSignaturePart(parts, reachableDisplay?.workspaceSubtitle);
     appendSignaturePart(parts, reachableDisplay?.machineLabel);
@@ -267,14 +290,12 @@ function canReuseEntryWithoutSignature(input: Readonly<{
     entry: CacheEntry;
     snapshot: SessionListRowStateSnapshot;
     item: SessionListRowSessionItem;
-    dataIndex: number;
     adjacency: Readonly<{ isFirst: boolean; isLast: boolean; isSingle: boolean }>;
     settings: SessionListRowPresentationSettings;
     stableSettings: StablePresentationSettingsRefs;
 }>): boolean {
     const entry = input.entry;
     return entry.itemRef === input.item
-        && entry.dataIndex === input.dataIndex
         && entry.adjacency.isFirst === input.adjacency.isFirst
         && entry.adjacency.isLast === input.adjacency.isLast
         && entry.adjacency.isSingle === input.adjacency.isSingle
@@ -291,7 +312,7 @@ function canReuseEntryWithoutSignature(input: Readonly<{
 export function resolveSessionListRowModelAdjacency(
     items: ReadonlyArray<SessionListViewItem>,
     index: number,
-): Readonly<{ isFirst: boolean; isLast: boolean; isSingle: boolean }> {
+): SessionListRowModelAdjacency {
     const item = items[index];
     const groupKey = isSessionItem(item) ? String(item.groupKey ?? '').trim() : '';
     const prev = index > 0 ? items[index - 1] : null;
@@ -300,11 +321,7 @@ export function resolveSessionListRowModelAdjacency(
     const nextGroupKey = next && isSessionItem(next) ? String(next.groupKey ?? '').trim() : '';
     const isFirst = !groupKey || prevGroupKey !== groupKey;
     const isLast = !groupKey || nextGroupKey !== groupKey;
-    return {
-        isFirst,
-        isLast,
-        isSingle: isFirst && isLast,
-    };
+    return SESSION_LIST_ROW_MODEL_ADJACENCY_VALUES[(isFirst ? 1 : 0) | (isLast ? 2 : 0)];
 }
 
 export function buildCachedSessionListRowModel(input: BuildCachedSessionListRowModelInput): SessionListRowModel {
@@ -315,7 +332,6 @@ export function buildCachedSessionListRowModel(input: BuildCachedSessionListRowM
         entry: cached,
         snapshot: input.snapshot,
         item: input.item,
-        dataIndex: input.dataIndex,
         adjacency: input.adjacency,
         settings: input.settings,
         stableSettings,
@@ -326,7 +342,6 @@ export function buildCachedSessionListRowModel(input: BuildCachedSessionListRowM
     const inputSignature = buildInputSignature({
         item: input.item,
         rowKey,
-        dataIndex: input.dataIndex,
         adjacency: input.adjacency,
         snapshot: input.snapshot,
         settings: input.settings,
@@ -343,7 +358,6 @@ export function buildCachedSessionListRowModel(input: BuildCachedSessionListRowM
         : buildSessionListRowModel({
             item: input.item,
             state: input.snapshot,
-            dataIndex: input.dataIndex,
             isFirst: input.adjacency.isFirst,
             isLast: input.adjacency.isLast,
             isSingle: input.adjacency.isSingle,
@@ -353,7 +367,6 @@ export function buildCachedSessionListRowModel(input: BuildCachedSessionListRowM
         model,
         inputSignature,
         itemRef: input.item,
-        dataIndex: input.dataIndex,
         adjacency: input.adjacency,
         stableSettings,
         itemSessionRef: input.item.session,

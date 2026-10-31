@@ -39,6 +39,35 @@ describe('AGENT_LOCAL_CLI_CONFIG', () => {
     });
   });
 
+  it('uses Devin auth login as its terminal authentication flow', () => {
+    expect(getAgentLocalCliConfig('devin')).toMatchObject({
+      agentId: 'devin',
+      detectKey: 'devin',
+      machineLoginKey: 'devin',
+      authSupport: 'login_terminal',
+      authLaunches: [{ kind: 'primary', command: 'devin', args: ['auth', 'login'] }],
+    });
+  });
+
+  it('uses the current Kimi Code login command', () => {
+    expect(getAgentLocalCliConfig('kimi')).toMatchObject({
+      authLaunches: [{ kind: 'primary', command: 'kimi', args: ['login'] }],
+    });
+  });
+
+  it('keeps FX and Droid interactive terminal authentication separate from their ACP launch commands', () => {
+    expect(getAgentLocalCliConfig('fx')).toMatchObject({ authLaunches: [{ command: 'fx', args: ['login'] }] });
+    expect(getAgentLocalCliConfig('droid')).toMatchObject({ authLaunches: [{ command: 'droid', args: [] }] });
+  });
+
+  it('signs CodeBuddy Code in through its interactive /login command', () => {
+    expect(getAgentLocalCliConfig('codebuddy')).toMatchObject({
+      machineLoginKey: 'codebuddy',
+      authSupport: 'login_terminal',
+      authLaunches: [{ kind: 'primary', command: 'codebuddy', args: [], initialInput: '/login\r' }],
+    });
+  });
+
   it('keeps Claude login launch metadata centralized', () => {
     expect(getAgentLocalCliConfig('claude')).toMatchObject({
       detectKey: 'claude',

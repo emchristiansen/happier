@@ -42,6 +42,7 @@ const SourceExportRecordSchemaV1 = z.object({
   sessionId: z.string().min(1).optional(),
   sourceMachineId: z.string().min(1).optional(),
   targetMachineId: z.string().min(1).optional(),
+  stateTransfer: z.enum(['existing', 'transfer']).optional(),
   exportedAtMs: z.number().int().nonnegative(),
   workspaceSourceRootPath: z.string().min(1).optional(),
   providerBundle: ProviderBundleFileSchema.optional(),
@@ -202,6 +203,7 @@ export function createSessionHandoffSourceExportStore(input: Readonly<{ activeSe
         ...(record.sessionId ? { sessionId: record.sessionId } : {}),
         ...(record.sourceMachineId ? { sourceMachineId: record.sourceMachineId } : {}),
         ...(record.targetMachineId ? { targetMachineId: record.targetMachineId } : {}),
+        ...(record.stateTransfer ? { stateTransfer: record.stateTransfer } : {}),
         exportedAtMs: record.exportedAtMs,
         ...(record.workspaceSourceRootPath ? { workspaceSourceRootPath: record.workspaceSourceRootPath } : {}),
         ...(record.providerBundle

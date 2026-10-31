@@ -31,6 +31,10 @@ import {
   runDockerReleaseAssetsValidation,
 } from './executors/docker-release-assets.mjs';
 import {
+  resolveDesktopSetupExecution,
+  runDesktopSetupValidation,
+} from './executors/desktop-setup.mjs';
+import {
   resolveDaemonContinuityExecution,
   runDaemonContinuityValidation,
 } from './executors/daemon-continuity.mjs';
@@ -116,6 +120,7 @@ function resolveSource(kind, ref) {
  *     mode?: 'local' | 'npm';
  *     monorepo?: 'local' | 'github';
  *     withRelayUpgrade?: boolean;
+ *     desktopArtifact?: string;
  *   };
  * }} context
  */
@@ -135,6 +140,8 @@ function resolveExecution({ suite, repoRoot, platform, source, update, execution
       return resolveDaemonContinuityExecution({ repoRoot, source });
     case 'session-continuity':
       return resolveSessionContinuityExecution({ repoRoot, source });
+    case 'desktop-setup':
+      return resolveDesktopSetupExecution({ repoRoot, platform, source, options: executionOptions });
     default:
       return null;
   }
@@ -162,6 +169,7 @@ async function main() {
       checksums: { type: 'string', default: '' },
       'public-key': { type: 'string', default: '' },
       'skip-smoke': { type: 'boolean', default: false },
+      'desktop-artifact': { type: 'string', default: '' },
       'dry-run': { type: 'boolean', default: false },
     },
     allowPositionals: false,
@@ -188,6 +196,7 @@ async function main() {
       values.monorepo,
       values.checksums,
       values['public-key'],
+      values['desktop-artifact'],
     ].some((value) => String(value ?? '').trim().length > 0)
       || values['with-relay-upgrade'] === true
       || values['no-relay-upgrade'] === true
@@ -221,6 +230,7 @@ async function main() {
       'cli-update',
       'daemon-continuity',
       'session-continuity',
+      'desktop-setup',
     ])} (got: ${suiteId || '<empty>'})`);
   }
 
@@ -260,8 +270,12 @@ async function main() {
   if ((artifactProduct.length > 0 || artifactVersion.length > 0) && suite.id !== 'artifact-verify') {
     fail('--product/--version are supported only for --suite artifact-verify');
   }
-  if (artifactReleaseChannel.length > 0 && suite.id !== 'artifact-verify' && suite.id !== 'installers-smoke') {
-    fail('--release-channel is supported only for --suite artifact-verify or --suite installers-smoke');
+  if (artifactReleaseChannel.length > 0 && !['artifact-verify', 'installers-smoke', 'desktop-setup'].includes(suite.id)) {
+    fail('--release-channel is supported only for --suite artifact-verify, installers-smoke or desktop-setup');
+  }
+  const desktopArtifact = String(values['desktop-artifact'] ?? '').trim();
+  if (desktopArtifact && suite.id !== 'desktop-setup') {
+    fail('--desktop-artifact is supported only for --suite desktop-setup');
   }
 
   /** @type {{ kind: string; ref: string } | null} */
@@ -323,6 +337,7 @@ async function main() {
     mode: dockerModeRaw ? /** @type {'local' | 'npm'} */ (dockerModeRaw) : undefined,
     monorepo: dockerMonorepoRaw ? /** @type {'local' | 'github'} */ (dockerMonorepoRaw) : undefined,
     withRelayUpgrade: dockerWithRelayUpgrade ? true : dockerNoRelayUpgrade ? false : undefined,
+    desktopArtifact: desktopArtifact || undefined,
   };
   const execution = resolveExecution({ suite, repoRoot, platform, source, update, executionOptions });
 
@@ -376,6 +391,16 @@ async function main() {
     }
     if (suite.id === 'session-continuity') {
       runSessionContinuityValidation({ repoRoot, source });
+      return;
+    }
+    if (suite.id === 'desktop-setup') {
+      runDesktopSetupValidation({
+        repoRoot,
+        platform,
+        source,
+        options: executionOptions,
+        timeBudgetMinutes: suite.timeBudgetMinutes,
+      });
       return;
     }
   }

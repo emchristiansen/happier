@@ -1,5 +1,7 @@
 import { AGENTS_CORE } from '@happier-dev/agents';
 
+import { createAcpSessionListCatalogHook } from '@/agent/acp/catalog/createAcpSessionListCatalogHook';
+
 import { checklists } from './cli/checklists';
 import type { AgentCatalogEntry } from '../types';
 
@@ -11,6 +13,7 @@ export const agent = {
   getCliDetect: async () => (await import('@/backends/copilot/cli/detect')).cliDetect,
   getCliAuthSpec: async () => (await import('@/backends/copilot/cli/auth/copilotCliAuthSpec')).copilotCliAuthSpec,
   vendorResumeSupport: AGENTS_CORE.copilot.resume.vendorResume,
+  ...createAcpSessionListCatalogHook('copilot'),
   getAcpBackendFactory: async () => {
     const { createCopilotBackend } = await import('@/backends/copilot/acp/backend');
     return (opts) => ({ backend: createCopilotBackend(opts as any) });

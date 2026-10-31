@@ -62,13 +62,21 @@ enum DesktopWindowCloseStrategy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DesktopMainWindowLifecycleEvent {
     AppReady,
-    MacOsReopen { has_visible_windows: bool },
+    MacOsReopen {
+        has_visible_windows: bool,
+    },
+    /// Happier was launched again while it runs (single instance).
+    SecondLaunch,
 }
 
 #[cfg(desktop)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DesktopMainWindowPresentationIntent {
+    /// Show the main window, creating it when menu-bar mode released it.
     Show,
+    /// Show the main window only if it exists: a login start in menu-bar mode has none, and app
+    /// start must not create one for it (R16 b).
+    ShowExisting,
 }
 
 #[cfg(desktop)]
@@ -145,8 +153,11 @@ pub(crate) fn resolve_desktop_main_window_presentation_intent(
     event: DesktopMainWindowLifecycleEvent,
 ) -> DesktopMainWindowPresentationIntent {
     match event {
-        DesktopMainWindowLifecycleEvent::AppReady => DesktopMainWindowPresentationIntent::Show,
-        DesktopMainWindowLifecycleEvent::MacOsReopen { .. } => {
+        DesktopMainWindowLifecycleEvent::AppReady => {
+            DesktopMainWindowPresentationIntent::ShowExisting
+        }
+        DesktopMainWindowLifecycleEvent::MacOsReopen { .. }
+        | DesktopMainWindowLifecycleEvent::SecondLaunch => {
             DesktopMainWindowPresentationIntent::Show
         }
     }
@@ -237,8 +248,39 @@ fn emit_desktop_window_state<R: Runtime>(window: &WebviewWindow<R>) {
     );
 }
 
+/// Reveals the main window. In menu-bar mode there is none: it is created again from the app
+/// config (a fresh web UI). A successful rebuild leaves menu-bar mode and restores the Dock icon;
+/// a failed rebuild keeps the tray active so Open can be retried.
 #[cfg(desktop)]
-pub(crate) fn show_main_window<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+pub(crate) fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let window = match app.get_webview_window(MAIN_WINDOW_LABEL) {
+        Some(window) => window,
+        None => {
+            let window = create_main_window(app)?;
+            crate::menu_bar::leave(app);
+            window
+        }
+    };
+    window.unminimize()?;
+    window.show()?;
+    window.set_focus()?;
+    Ok(())
+}
+
+/// WebView2 creation deadlocks in synchronous event handlers (Tauri 2.8.2's builder contract).
+/// Menu, reopen and second-instance events all schedule the existing presentation owner here.
+#[cfg(desktop)]
+pub(crate) fn request_show_main_window(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = show_main_window(&app) {
+            log::warn!("failed to show the main window: {error}");
+        }
+    });
+}
+
+#[cfg(desktop)]
+fn show_existing_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         window.unminimize()?;
         window.show()?;
@@ -248,19 +290,37 @@ pub(crate) fn show_main_window<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::
 }
 
 #[cfg(desktop)]
-pub(crate) fn present_main_window_for_lifecycle_event<R: Runtime>(
-    app: &tauri::AppHandle<R>,
+pub(crate) fn present_main_window_for_lifecycle_event(
+    app: &tauri::AppHandle,
     event: DesktopMainWindowLifecycleEvent,
 ) {
-    if resolve_desktop_main_window_presentation_intent(event)
-        != DesktopMainWindowPresentationIntent::Show
-    {
-        return;
-    }
-
-    if let Err(error) = show_main_window(app) {
+    let result = match resolve_desktop_main_window_presentation_intent(event) {
+        DesktopMainWindowPresentationIntent::Show => {
+            request_show_main_window(app);
+            Ok(())
+        }
+        DesktopMainWindowPresentationIntent::ShowExisting => show_existing_main_window(app),
+    };
+    if let Err(error) = result {
         log::warn!("failed to show main window for lifecycle event {event:?}: {error}");
     }
+}
+
+/// The main window, built from its `tauri.conf.json` entry (`"create": false`: the app creates it
+/// here, so a login start in menu-bar mode never loads a web UI).
+#[cfg(desktop)]
+pub(crate) fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == MAIN_WINDOW_LABEL)
+        .cloned()
+        .ok_or_else(|| tauri::Error::WindowNotFound)?;
+    let window = tauri::WebviewWindowBuilder::from_config(app, &config)?.build()?;
+    configure_main_window(app, &window);
+    Ok(window)
 }
 
 #[cfg(desktop)]
@@ -348,9 +408,7 @@ pub async fn desktop_close_window(window: Window) -> Result<bool, String> {
 
 #[cfg(desktop)]
 #[tauri::command]
-pub async fn desktop_show_main_window<R: Runtime>(
-    app: tauri::AppHandle<R>,
-) -> Result<bool, String> {
+pub async fn desktop_show_main_window(app: tauri::AppHandle) -> Result<bool, String> {
     let has_main_window = app.get_webview_window(MAIN_WINDOW_LABEL).is_some();
     show_main_window(&app).map_err(|error| error.to_string())?;
     Ok(has_main_window)
@@ -371,23 +429,30 @@ pub async fn desktop_start_window_dragging(window: Window) -> Result<bool, Strin
     Ok(true)
 }
 
+/// Creates the main window at app start — unless the app was started at login in menu-bar mode,
+/// which has no window until the tray's Open asks for one.
 #[cfg(desktop)]
-pub fn register<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+pub fn register(app: &mut App) -> tauri::Result<()> {
+    if crate::menu_bar::launched_in_menu_bar_mode(app.handle()) {
         return Ok(());
-    };
+    }
+    create_main_window(app.handle())?;
+    Ok(())
+}
 
+#[cfg(desktop)]
+fn configure_main_window(app: &tauri::AppHandle, window: &WebviewWindow) {
     let policy = resolve_desktop_window_chrome_runtime_policy(
         window.label(),
         resolve_current_desktop_window_platform(),
     );
 
-    if let Err(error) = apply_desktop_window_chrome_runtime_policy(&window, policy) {
+    if let Err(error) = apply_desktop_window_chrome_runtime_policy(window, policy) {
         log::warn!("failed to apply main-window chrome policy: {error}");
     }
 
     if desktop_window_chrome_policy_tracks_maximized_state(policy) {
-        emit_desktop_window_state(&window);
+        emit_desktop_window_state(window);
 
         let window_for_events = window.clone();
         window.on_window_event(move |event| {
@@ -413,7 +478,10 @@ pub fn register<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
         });
     }
 
-    Ok(())
+    #[cfg(target_os = "windows")]
+    crate::tray::follow_tray_theme_from_window(app, window);
+    #[cfg(not(target_os = "windows"))]
+    let _ = app;
 }
 
 #[cfg(test)]
@@ -471,12 +539,13 @@ mod tests {
     }
 
     #[test]
-    fn app_ready_shows_the_main_window_when_it_started_hidden() {
+    fn app_ready_shows_the_main_window_it_created_but_never_creates_one() {
+        // A login start in menu-bar mode has no window at app ready, and must not get one.
         assert_eq!(
             resolve_desktop_main_window_presentation_intent(
                 DesktopMainWindowLifecycleEvent::AppReady
             ),
-            DesktopMainWindowPresentationIntent::Show
+            DesktopMainWindowPresentationIntent::ShowExisting
         );
     }
 
@@ -495,6 +564,16 @@ mod tests {
                 DesktopMainWindowLifecycleEvent::MacOsReopen {
                     has_visible_windows: true,
                 }
+            ),
+            DesktopMainWindowPresentationIntent::Show
+        );
+    }
+
+    #[test]
+    fn a_second_launch_opens_the_main_window_through_the_same_path_as_reopen() {
+        assert_eq!(
+            resolve_desktop_main_window_presentation_intent(
+                DesktopMainWindowLifecycleEvent::SecondLaunch
             ),
             DesktopMainWindowPresentationIntent::Show
         );

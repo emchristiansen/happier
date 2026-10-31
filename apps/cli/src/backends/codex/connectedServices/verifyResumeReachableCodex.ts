@@ -1,5 +1,5 @@
-import { stat } from 'node:fs/promises';
-import { basename, isAbsolute, join } from 'node:path';
+import { realpath, stat } from 'node:fs/promises';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
 
 import type {
   VerifyResumeReachableInput,
@@ -12,6 +12,7 @@ import {
   normalizeCodexVendorResumeId,
 } from '@/backends/codex/utils/codexSessionFiles';
 import { reconcileCodexResumeRolloutPath } from './reconcileCodexResumeRolloutPath';
+import { resolveConfiguredCodexHome } from '@/backends/codex/utils/resolveConfiguredCodexHome';
 
 async function statFile(path: string): Promise<boolean> {
   try {
@@ -39,21 +40,17 @@ function resolveMappingDestinationPaths(params: Readonly<{
 }
 
 /**
- * Codex shares session state via a SYMLINK: the connected `<targetMaterializedRoot>/codex-home/sessions`
- * is linked to the user's native `~/.codex/sessions` (descriptor `state.entries: { path: 'sessions',
- * mode: 'linked' }`). So the native rollout is already visible through the connected home — there is
- * nothing to copy or import. Reachability is purely a question of locating the `rollout-...-<id>.jsonl`
- * file inside that (potentially 25k+ file) store.
+ * Prove the rollout visible in the final Codex home's session store. Shared homes can link their
+ * store to native state; isolated homes must hold their own rollout. An old absolute hint or manifest
+ * mapping is not proof until its real path is contained by a real target store root.
  *
  * Fast-paths first (an absolute persisted hint, then a recorded manifest mapping), then an id-targeted
  * search over `codex-home/sessions` via `findCodexRolloutFileById` (name-only match, newest-date-first
  * traversal, NO file-count cap) so the target is found regardless of how large the linked native store
  * is. A generic capped tree walk would give up before reaching a target in a recent date partition.
  *
- * Codex is inherently target-strict: it only ever searches the final `codex-home/sessions` (the linked
- * native store) and never a separate source/staging root. The cross-provider `input.targetStrict`
- * flag (set by the §2 spawn gate) therefore needs no special handling here — Codex's behavior is
- * unchanged whether it is set or not.
+ * Target strictness applies equally to hints, manifest mappings and id-targeted searches; no separate
+ * source/staging root can satisfy the proof.
  */
 export async function verifyResumeReachableCodex(
   input: VerifyResumeReachableInput,
@@ -62,6 +59,20 @@ export async function verifyResumeReachableCodex(
   if (!vendorResumeId) {
     return { ok: false, reason: 'codex_session_file_not_found' };
   }
+
+  const codexHome = input.targetMaterializedEnv.CODEX_HOME?.trim()
+    ? resolveConfiguredCodexHome(input.targetMaterializedEnv)
+    : join(input.targetMaterializedRoot, 'codex-home');
+  const sessionsRoot = join(codexHome, 'sessions');
+  const canonicalSessionsRoot = await realpath(sessionsRoot).catch(() => null);
+  const isVisibleTargetRollout = async (path: string): Promise<boolean> => {
+    if (!isMatchingCodexRolloutFileName(basename(path), vendorResumeId) || !await statFile(path)) return false;
+    const canonicalPath = await realpath(path).catch(() => null);
+    if (!canonicalPath || !canonicalSessionsRoot) return false;
+    const pathFromRoot = relative(canonicalSessionsRoot, canonicalPath);
+    return pathFromRoot !== '' && pathFromRoot !== '..'
+      && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot);
+  };
 
   const acceptReachablePath = async (resolvedPath: string): Promise<VerifyResumeReachableResult> => {
     const reconciled = await reconcileCodexResumeRolloutPath({
@@ -77,10 +88,7 @@ export async function verifyResumeReachableCodex(
 
   if (typeof input.candidatePersistedSessionFile === 'string' && input.candidatePersistedSessionFile.trim().length > 0) {
     const candidatePath = input.candidatePersistedSessionFile.trim();
-    if (
-      isMatchingCodexRolloutFileName(basename(candidatePath), vendorResumeId) &&
-      await statFile(candidatePath)
-    ) {
+    if (await isVisibleTargetRollout(candidatePath)) {
       return await acceptReachablePath(candidatePath);
     }
   }
@@ -93,15 +101,14 @@ export async function verifyResumeReachableCodex(
       mapping: mapping as unknown as Record<string, unknown>,
     });
     for (const candidatePath of candidatePaths) {
-      if (await statFile(candidatePath)) {
+      if (await isVisibleTargetRollout(candidatePath)) {
         return await acceptReachablePath(candidatePath);
       }
     }
   }
 
-  const sessionsRoot = join(input.targetMaterializedRoot, 'codex-home', 'sessions');
   const discoveredPath = await findCodexRolloutFileById({ sessionsRoot, vendorResumeId });
-  if (discoveredPath) {
+  if (discoveredPath && await isVisibleTargetRollout(discoveredPath)) {
     return await acceptReachablePath(discoveredPath);
   }
 

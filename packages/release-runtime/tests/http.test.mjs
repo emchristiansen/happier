@@ -160,3 +160,33 @@ test('requestBytes supports data urls without global fetch', async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test('requestBytes reports actual received bytes and only a known response total', async () => {
+  await withServer((req, res) => {
+    if (req.url === '/known') res.setHeader('content-length', '5');
+    res.write('hello');
+    res.end();
+  }, async (baseUrl) => {
+    for (const [path, expected] of [['known', { receivedBytes: 5, totalBytes: 5 }], ['unknown', { receivedBytes: 5 }]]) {
+      const samples = [];
+      const bytes = await requestBytes({ url: `${baseUrl}/${path}`, onProgress: (sample) => samples.push(sample) });
+      assert.equal(bytes.toString(), 'hello');
+      assert.deepEqual(samples.at(-1), expected);
+    }
+  });
+});
+
+test('requestBytes aborts the owning request while receiving its body', async () => {
+  await withServer((_req, res) => {
+    res.write('first');
+    const pending = setTimeout(() => res.end('last'), 100);
+    res.on('close', () => clearTimeout(pending));
+  }, async (baseUrl) => {
+    const controller = new AbortController();
+    await assert.rejects(requestBytes({
+      url: baseUrl,
+      signal: controller.signal,
+      onProgress: () => controller.abort(),
+    }), { name: 'AbortError' });
+  });
+});

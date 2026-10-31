@@ -1,3 +1,4 @@
+import { ProviderUsageGaugeSettingsGroup } from './ProviderUsageGaugeSettingsGroup';
 import * as React from 'react';
 import { View } from 'react-native';
 import { useNavigation, useRouter } from 'expo-router';
@@ -11,15 +12,20 @@ import { StatusDot } from '@/components/ui/status/StatusDot';
 import { Text } from '@/components/ui/text/Text';
 import { t } from '@/text';
 import { useProfile, useSettingMutable, useSettings } from '@/sync/store/hooks';
+import { useApplySettings } from '@/sync/store/settingsWriters';
 import { Modal } from '@/modal';
 import { CONNECTED_SERVICES_REGISTRY, getConnectedServiceRegistryEntry } from '@/sync/domains/connectedServices/connectedServiceRegistry';
 import { AGENT_IDS, getAgentCore } from '@/agents/catalog/catalog';
 import {
     ConnectedServicesProviderStateSharingSettingsV1Schema,
+    buildConnectedServicesDefaultAuthSettingsPatch,
+    type ConnectedServicesDefaultAuthByAgentIdV1,
     isConnectedServiceCredentialHealthStatusUsable,
     type ConnectedServiceId,
 } from '@happier-dev/protocol';
 import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
+import { useServerFeaturesRuntimeSnapshot } from '@/sync/domains/features/featureDecisionRuntime';
+import { supportsConnectedServiceOperation } from '@happier-dev/protocol';
 import { ConnectedServiceQuotaBadgesView } from '@/components/settings/connectedServices/ConnectedServiceQuotaBadgesView';
 import { useConnectedServiceQuotaBadges } from '@/hooks/server/connectedServices/useConnectedServiceQuotaBadges';
 import { connectedServiceProfileKey, resolveConnectedServiceDefaultProfileId } from '@/sync/domains/connectedServices/connectedServiceProfilePreferences';
@@ -91,8 +97,10 @@ export const ConnectedServicesSettingsView = React.memo(function ConnectedServic
   const settings = useSettings();
   const [providerStateSharingSettings, setProviderStateSharingSettings] =
     useSettingMutable('connectedServicesProviderStateSharingSettingsV1');
-  const [defaultAuthSettings, setDefaultAuthSettings] =
-    useSettingMutable('connectedServicesDefaultAuthByAgentIdV1');
+  const applySettings = useApplySettings();
+  const setDefaultAuthSettings = React.useCallback((next: ConnectedServicesDefaultAuthByAgentIdV1) => {
+    applySettings(buildConnectedServicesDefaultAuthSettingsPatch(next));
+  }, [applySettings]);
   const [poolAdoptionDismissedByKey, setPoolAdoptionDismissedByKey] =
     useSettingMutable('connectedServicesDefaultAuthPoolAdoptionDismissedByKey');
   const dismissPoolAdoptionSuggestion = React.useCallback((key: string) => {
@@ -105,16 +113,19 @@ export const ConnectedServicesSettingsView = React.memo(function ConnectedServic
   const navigation = useNavigation();
   const connectedServicesEnabled = useFeatureEnabled('connectedServices');
   const accountGroupsEnabled = useFeatureEnabled('connectedServices.accountGroups');
+  const serverFeatures = useServerFeaturesRuntimeSnapshot({ enabled: connectedServicesEnabled });
+  const readyFeatures = serverFeatures.status === 'ready' ? serverFeatures.features : null;
   const normalizedProviderStateSharingSettings = React.useMemo(
     () => ConnectedServicesProviderStateSharingSettingsV1Schema.parse(providerStateSharingSettings),
     [providerStateSharingSettings],
   );
-  const services = profile.connectedServicesV2;
-  const serviceIdsFromProfile = services.map((svc) => svc.serviceId);
-  const allServiceIds = Array.from(new Set<ConnectedServiceId>([
+  const services = React.useMemo(() => profile.connectedServicesV2.filter(
+    (service) => supportsConnectedServiceOperation(readyFeatures, service.serviceId),
+  ), [profile.connectedServicesV2, readyFeatures]);
+  const allServiceIds = React.useMemo(() => Array.from(new Set<ConnectedServiceId>([
     ...CONNECTED_SERVICES_REGISTRY.map((entry) => entry.serviceId),
-    ...serviceIdsFromProfile,
-  ]));
+    ...services.map((service) => service.serviceId),
+  ])).filter((serviceId) => supportsConnectedServiceOperation(readyFeatures, serviceId)), [readyFeatures, services]);
 
   const quotaRequestedProfiles = React.useMemo(() => {
     if (!connectedServicesEnabled) return [];
@@ -139,6 +150,7 @@ export const ConnectedServicesSettingsView = React.memo(function ConnectedServic
   const quotaBadgesByKey = useConnectedServiceQuotaBadges(connectedServicesEnabled ? quotaRequestedProfiles : []);
 
   const openServiceDetail = React.useCallback((serviceId: ConnectedServiceId, label: string, connectCommand: string) => {
+    if (!supportsConnectedServiceOperation(readyFeatures, serviceId)) return;
     try {
       router.push({ pathname: '/settings/connected-services/[serviceId]', params: { serviceId } });
     } catch {
@@ -149,7 +161,7 @@ export const ConnectedServicesSettingsView = React.memo(function ConnectedServic
         [{ text: connectCommand, style: 'default' }, { text: t('common.ok'), style: 'cancel' }],
       );
     }
-  }, [router]);
+  }, [readyFeatures, router]);
 
   // Provider rows: brand mark + worst-of-status health dot, attention-first.
   const serviceRows = React.useMemo(() => allServiceIds
@@ -305,7 +317,8 @@ export const ConnectedServicesSettingsView = React.memo(function ConnectedServic
               settings={{
                 connectedServicesProfileLabelByKey: settings.connectedServicesProfileLabelByKey,
                 connectedServicesDefaultProfileByServiceId: settings.connectedServicesDefaultProfileByServiceId,
-                connectedServicesDefaultAuthByAgentIdV1: defaultAuthSettings,
+                connectedServicesDefaultAuthByAgentIdV1: settings.connectedServicesDefaultAuthByAgentIdV1,
+                connectedServicesAdditionalDefaultAuthByAgentIdV1: settings.connectedServicesAdditionalDefaultAuthByAgentIdV1,
               }}
               setDefaultAuthSettings={setDefaultAuthSettings}
               onOpenConnectedServiceSettings={(serviceId) => router.push({
@@ -329,6 +342,7 @@ export const ConnectedServicesSettingsView = React.memo(function ConnectedServic
           );
         })}
       </ItemGroup>
+      <ProviderUsageGaugeSettingsGroup />
       <ConnectedServicesProviderStateSharingDefaultsGroup
         settings={normalizedProviderStateSharingSettings}
         setSettings={setProviderStateSharingSettings}

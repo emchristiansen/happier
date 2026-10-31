@@ -2,7 +2,7 @@ import * as React from 'react';
 import { View, Pressable } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { useSocketStatus } from '@/sync/domains/state/storage';
-import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+import { ActivitySpinner, HERO_SPINNER_SIZE } from '@/components/ui/feedback/ActivitySpinner';
 import {
     useVisibleSessionListPaneState,
 } from '@/hooks/session/useVisibleSessionListViewData';
@@ -70,6 +70,9 @@ const styles = StyleSheet.create((theme) => ({
     phoneContainer: {
         flex: 1,
     },
+    phoneHeaderContent: {
+        paddingHorizontal: 16,
+    },
     sidebarContentContainer: {
         flex: 1,
         flexBasis: 0,
@@ -127,7 +130,8 @@ const styles = StyleSheet.create((theme) => ({
     },
     titleContainer: {
         flex: 1,
-        alignItems: 'center',
+        alignItems: 'flex-start',
+        marginLeft: -4,
     },
     titleText: {
         fontSize: 16,
@@ -340,7 +344,7 @@ const SidebarMainViewContent = React.memo(function SidebarMainViewContent({
                 {storageChrome}
                 <View style={styles.sidebarContentContainer}>
                     <View style={styles.tabletLoadingContainer}>
-                        <ActivitySpinner size="small" color={theme.colors.text.secondary} />
+                        <ActivitySpinner size={HERO_SPINNER_SIZE} color={theme.colors.text.secondary} />
                     </View>
                 </View>
             </View>
@@ -471,6 +475,7 @@ const PhoneTabbedMainViewContent = React.memo(function PhoneTabbedMainViewConten
                     title={<HeaderTitle activeTab={headerTab} />}
                     headerRight={() => <HeaderRight activeTab={headerTab} />}
                     headerLeft={() => <HeaderLogo />}
+                    headerContentStyle={styles.phoneHeaderContent}
                     headerShadowVisible={false}
                     headerTransparent={true}
                 />

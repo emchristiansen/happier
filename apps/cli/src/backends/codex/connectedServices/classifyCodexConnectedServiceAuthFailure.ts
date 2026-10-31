@@ -1,5 +1,9 @@
+import type { ConnectedServiceRuntimeFailureClassification } from '@/daemon/connectedServices/runtimeAuth/types';
+import { sanitizeConnectedServiceRuntimeFailureClassification } from '@/daemon/connectedServices/runtimeAuth/sanitizeConnectedServiceRuntimeFailureClassification';
 import {
   ConnectedServiceCredentialRevisionV1Schema,
+  buildUsageLimitIssueFingerprint,
+  type SessionRuntimeIssueV1,
   type ConnectedServiceCredentialRevisionV1,
   type ConnectedServiceId,
   type ConnectedServiceLimitCategoryV1,
@@ -18,9 +22,11 @@ export type CodexConnectedServiceRuntimeFailureKind =
   | 'account_changed'
   | 'refresh_failed'
   | 'permission_denied'
+  | 'plan'
   | 'unknown';
 
 export type CodexConnectedServiceRuntimeFailureClassification = Readonly<{
+  runtimeIssueFingerprint?: string | null;
   kind: CodexConnectedServiceRuntimeFailureKind;
   limitCategory?: ConnectedServiceLimitCategoryV1;
   serviceId: ConnectedServiceId;
@@ -30,7 +36,8 @@ export type CodexConnectedServiceRuntimeFailureClassification = Readonly<{
   credentialRevision?: ConnectedServiceCredentialRevisionV1 | null;
   resetsAtMs: number | null;
   retryAfterMs: number | null;
-  quotaScope?: 'provider';
+  quotaScope?: 'provider' | 'model';
+  providerLimitId?: string | null;
   planType: string | null;
   rateLimits: unknown | null;
   sourceProviderAccountId?: string | null;
@@ -100,7 +107,8 @@ export function isCodexProviderCapacityFailure(value: unknown): boolean {
   const evidence = value instanceof Error
     ? { message: value.message }
     : readCodexProviderErrorRecord(value) ?? value;
-  return classifyProviderLimitEvidence(evidence) === 'capacity';
+  if (classifyProviderLimitEvidence(evidence) === 'capacity') return true;
+  return /\bapplication\s+network\s+permission\s+was\s+revoked\b/i.test(readErrorText(value));
 }
 
 function isStructuredUsageLimitCode(value: string | null): boolean {
@@ -129,8 +137,8 @@ function containsRefreshTokenFailureMessage(text: string): boolean {
     || /refresh\s+token\s+(?:(?:has\s+been|was)\s+)?(?:invalidated|revoked)/i.test(text);
 }
 
-function containsChatGptAccountModelIncompatibility(text: string): boolean {
-  return /\bmodel\b[\s\S]{0,180}\bnot supported\b[\s\S]{0,180}\busing Codex with a ChatGPT account\b/i.test(text);
+function readChatGptAccountUnsupportedModel(text: string): string | null {
+  return /The\s+['"]([^'"]+)['"]\s+model\s+is\s+not\s+supported\s+when\s+using\s+Codex\s+with\s+a\s+ChatGPT\s+account\./i.exec(text)?.[1]?.trim() || null;
 }
 
 function readResetAtMs(value: unknown): number | null {
@@ -160,6 +168,7 @@ function buildClassification(
     resetsAtMs?: number | null;
     retryAfterMs?: number | null;
     quotaScope?: CodexConnectedServiceRuntimeFailureClassification['quotaScope'];
+    providerLimitId?: string | null;
     planType?: string | null;
     rateLimits?: unknown | null;
     source: CodexConnectedServiceRuntimeFailureClassification['source'];
@@ -188,6 +197,7 @@ function buildClassification(
     resetsAtMs: params.resetsAtMs ?? null,
     retryAfterMs: params.retryAfterMs ?? null,
     ...(params.quotaScope ? { quotaScope: params.quotaScope } : {}),
+    ...(params.providerLimitId ? { providerLimitId: params.providerLimitId } : {}),
     planType: params.planType ?? null,
     rateLimits: params.rateLimits ?? null,
     ...(sourceProviderAccountId ? { sourceProviderAccountId } : {}),
@@ -234,10 +244,13 @@ export function classifyCodexConnectedServiceAuthFailure(
 
   if (!input.providerErrorPath) return null;
 
-  if (containsChatGptAccountModelIncompatibility(text)) {
+  const unsupportedModel = readChatGptAccountUnsupportedModel(text);
+  if (unsupportedModel) {
     return buildClassification(input, {
-      kind: 'permission_denied',
+      kind: 'plan',
       limitCategory: 'plan_invalid',
+      quotaScope: 'model',
+      providerLimitId: unsupportedModel,
       source: record ? 'structured_provider_error' : 'stable_provider_message',
     });
   }
@@ -302,4 +315,32 @@ export function classifyCodexConnectedServiceAuthFailure(
     });
   }
   return null;
+}
+
+export function readCodexRuntimeAuthClassification(error: unknown): ConnectedServiceRuntimeFailureClassification | null {
+  if (!error || typeof error !== 'object' || Array.isArray(error)) return null;
+  const record = error as Record<string, unknown>;
+  return sanitizeConnectedServiceRuntimeFailureClassification(record.runtimeAuthClassification);
+}
+
+export function attachCodexRuntimeAuthFailureIssue(error: unknown, issue: SessionRuntimeIssueV1): void {
+  const classification = readCodexRuntimeAuthClassification(error);
+  if (!classification) return;
+  Object.assign(error as object, {
+    runtimeAuthClassification: {
+      ...classification,
+      runtimeIssueFingerprint: buildUsageLimitIssueFingerprint(issue),
+    },
+  });
+}
+
+export function createCodexRuntimeAuthFailureTurnHook(
+  reportFailure: (classification: ConnectedServiceRuntimeFailureClassification, error: unknown) => Promise<void>,
+): (failure: Readonly<{ error: unknown; issue?: SessionRuntimeIssueV1 | null }>) => Promise<void> {
+  return async ({ error, issue }) => {
+    if (!issue) return;
+    attachCodexRuntimeAuthFailureIssue(error, issue);
+    const classification = readCodexRuntimeAuthClassification(error);
+    if (classification?.runtimeIssueFingerprint) await reportFailure(classification, error);
+  };
 }

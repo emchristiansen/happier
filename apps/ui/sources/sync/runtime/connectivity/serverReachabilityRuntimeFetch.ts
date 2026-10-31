@@ -1,4 +1,5 @@
 import { runtimeFetch } from '@/utils/system/runtimeFetch';
+import { withConnectedServiceReaderSupport } from '@happier-dev/protocol';
 
 import {
     reportServerAuthFailed,
@@ -89,14 +90,18 @@ export async function runtimeFetchWithServerReachability(params: Readonly<{
     });
 
     try {
-        const response = await runtimeFetch(params.url, { ...params.init, headers });
+        const requestUrl = hasAuth ? withConnectedServiceReaderSupport(params.url) : params.url;
+        const response = await runtimeFetch(requestUrl, { ...params.init, headers });
         await observeUiClientUpgradeRequiredResponse(response);
         if (hasAuth && isAuthenticationResponseStatus(response.status)) {
             reportServerAuthFailed(params.serverUrl, response.status);
         }
         return response;
     } catch (error) {
-        reportServerUnreachable(params.serverUrl, error);
+        // The caller owns intentional cancellation; it does not establish a reachability failure.
+        if (!params.init.signal?.aborted && !params.signal?.aborted) {
+            reportServerUnreachable(params.serverUrl, error);
+        }
         throw error;
     }
 }

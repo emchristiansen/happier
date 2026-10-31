@@ -42,6 +42,8 @@ import { DesktopSettingsSection } from '@/components/settings/desktop/DesktopSet
 import { SettingsBelowFoldSections } from '@/components/settings/SettingsBelowFoldSections';
 import { runAfterInteractionsWithFallback } from '@/utils/timing/runAfterInteractionsWithFallback';
 import { Icon } from '@/components/ui/icons/Icon';
+import { describeUpdatesSettingsSubtitle } from '@/components/updates/describeUpdatesSummary';
+import { useSharedUpdatesSummary } from '@/updates/useUpdatesSummary';
 
 const DEFER_BELOW_FOLD_SETTINGS_SECTIONS_DELAY_MS = 0;
 const DEFER_BELOW_FOLD_SETTINGS_STAGE_DELAY_MS = 16;
@@ -78,6 +80,7 @@ export const SettingsView = React.memo(function SettingsView() {
     const displayName = getDisplayName(profile);
     const avatarUrl = getAvatarUrl(profile);
     const bio = getBio(profile);
+    const updatesSubtitle = describeUpdatesSettingsSubtitle(useSharedUpdatesSummary());
     const pushRoute = React.useCallback((route: Parameters<typeof router.push>[0]) => {
         deferOnWeb(() => {
             navigateWithBlurOnWeb(() => {
@@ -260,6 +263,13 @@ export const SettingsView = React.memo(function SettingsView() {
     const generalSection = React.useMemo(() => (
         <ItemGroup title={t('settings.general')}>
             <Item
+                testID="settings-updates-row"
+                title={t('updates.title')}
+                subtitle={updatesSubtitle}
+                icon={<Icon name="hard-drive-download" size={29} color={theme.colors.accent.blue} />}
+                onPress={() => pushRoute('/settings/updates')}
+            />
+            <Item
                 title={t('settings.appearance')}
                 subtitle={t('settings.appearanceSubtitle')}
                 icon={<Icon name="palette" size={29} color={theme.colors.accent.indigo} />}
@@ -289,6 +299,7 @@ export const SettingsView = React.memo(function SettingsView() {
             ) : null}
         </ItemGroup>
     ), [
+        updatesSubtitle,
         petsCompanionEnabled,
         petsSyncEnabled,
         pushRoute,

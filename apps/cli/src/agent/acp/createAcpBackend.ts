@@ -21,7 +21,7 @@ import {
   type AcpSessionModelAdapter,
 } from './AcpBackend';
 import type { AcpAuthentication } from './AcpAuthentication';
-import type { AgentBackend, McpServerConfig } from '../core';
+import type { McpServerConfig } from '../core';
 import { DefaultTransport, type TransportHandler } from '../transport';
 
 /**
@@ -43,6 +43,9 @@ export interface CreateAcpBackendOptions {
   /** Environment variables to pass to the agent */
   env?: Record<string, string>;
 
+  /** Provider-owned, process-scoped launch materialization performed immediately before spawn. */
+  prepareProcessLaunch?: AcpBackendOptions['prepareProcessLaunch'];
+
   /** Inherited process environment variables to remove before provider env overrides are applied */
   unsetEnv?: readonly string[];
 
@@ -57,6 +60,7 @@ export interface CreateAcpBackendOptions {
 
   /** Optional authentication selected only after a successful ACP initialize response. */
   authentication?: AcpAuthentication;
+  isAuthenticationSetupFailure?: AcpBackendOptions['isAuthenticationSetupFailure'];
 
   /** Optional ACP initialize _meta payload for provider-specific extension negotiation. */
   initializeMeta?: Record<string, unknown>;
@@ -69,6 +73,10 @@ export interface CreateAcpBackendOptions {
 
   /** Provider-owned projection/application for model metadata not standardized by ACP. */
   sessionModelAdapter?: AcpSessionModelAdapter;
+  sessionModesEnabled?: AcpBackendOptions['sessionModesEnabled'];
+
+  /** Configured-catalog policy for session/load. Undefined retains built-in provider behavior. */
+  declaredSessionLoadSupport?: boolean;
 }
 
 /**
@@ -95,22 +103,26 @@ export interface CreateAcpBackendOptions {
  * @param options - Configuration options
  * @returns AgentBackend instance
  */
-export function createAcpBackend(options: CreateAcpBackendOptions): AgentBackend {
+export function createAcpBackend(options: CreateAcpBackendOptions): AcpBackend {
   const backendOptions: AcpBackendOptions = {
     agentName: options.agentName,
     cwd: options.cwd,
     command: options.command,
     args: options.args,
     env: options.env,
+    prepareProcessLaunch: options.prepareProcessLaunch,
     unsetEnv: options.unsetEnv,
     mcpServers: options.mcpServers,
     permissionHandler: options.permissionHandler,
     transportHandler: options.transportHandler ?? new DefaultTransport(options.agentName),
     authentication: options.authentication,
+    isAuthenticationSetupFailure: options.isAuthenticationSetupFailure,
     initializeMeta: options.initializeMeta,
     initializeClientCapabilitiesMeta: options.initializeClientCapabilitiesMeta,
     extensionHandlers: options.extensionHandlers,
     sessionModelAdapter: options.sessionModelAdapter,
+    sessionModesEnabled: options.sessionModesEnabled,
+    declaredSessionLoadSupport: options.declaredSessionLoadSupport,
   };
 
   return new AcpBackend(backendOptions);

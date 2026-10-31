@@ -13,7 +13,11 @@ import {
     sessionFindFirst,
     sessionFindMany,
     sessionPinFindMany,
+    sessionFindUnique,
+    sessionTurnFindMany,
 } from "./sessionRoutes.testkit";
+import { withAuthenticatedTestApp } from "../../testkit/sqliteFastify";
+import { SessionRuntimeIssueV1Schema as ReleasedRuntimeIssueSchema } from "@happier-dev/protocol/testing/releasedV0215RuntimeIssue";
 import { DEFAULT_V2_SESSION_LIST_INITIAL_ATTENTION_ROW_LIMIT } from "./v2SessionListInitialPage";
 import { V2_ACTIVE_SESSION_LIST_ROW_LIMIT } from "./v2SessionListPage";
 
@@ -101,6 +105,64 @@ describe("sessionRoutes v2 sessions snapshot", () => {
         sessionFindMany.mockReset();
     });
 
+    it.each([
+        "/v1/sessions",
+        "/v2/sessions",
+        "/v2/sessions/active",
+        "/v2/sessions/archived",
+        "/v2/sessions/s1",
+        "/v1/sessions/s1/turns",
+        "/v2/session-folder-assignments/query",
+    ])("projects unsupported service references at the HTTP boundary %s", async (url) => {
+        const { sessionRoutes } = await import("./sessionRoutes");
+        const issue: SessionRuntimeIssueV1 = {
+            ...usageLimitRuntimeIssue,
+            provider: "agy",
+            usageLimit: {
+                ...usageLimitRuntimeIssue.usageLimit!,
+                connectedService: { serviceId: "antigravity", profileId: "work", groupId: "pool" },
+                quotaSnapshotRef: { serviceId: "antigravity", profileId: "work", fetchedAtMs: 1_000 },
+            },
+        };
+        const row = { ...pagedSessionRow("s1", { active: true, lastActiveAt: new Date() }), lastRuntimeIssue: JSON.stringify(issue) };
+        sessionFindMany.mockResolvedValue([row]);
+        sessionFindFirst.mockResolvedValue(row);
+        sessionFindUnique.mockResolvedValue({ latestTurnId: "turn-1", updatedAt: new Date(1_000) });
+        sessionTurnFindMany.mockResolvedValue([{
+            turnId: "turn-1", status: "failed", startedAt: 500, updatedAt: 1_000,
+            lastRuntimeIssueJson: JSON.stringify(issue),
+        }]);
+
+        await withAuthenticatedTestApp(
+            (app) => sessionRoutes(app),
+            async (app) => {
+                for (const declaration of [undefined, "malformed", JSON.stringify(["antigravity"])]) {
+                    const response = await app.inject({
+                        method: url.endsWith("/query") ? "POST" : "GET",
+                        url: declaration === undefined ? url : `${url}?happierConnectedServices=${encodeURIComponent(declaration)}`,
+                        headers: { "x-test-user-id": "u1" },
+                        ...(url.endsWith("/query") ? { payload: { folderIds: ["folder-a"] } } : {}),
+                    });
+                    expect(response.statusCode).toBe(200);
+                    const body = response.json();
+                    const actualIssue = (body.session ?? body.sessions?.[0] ?? body.turns?.[0]).lastRuntimeIssue;
+                    expect(actualIssue).toMatchObject({
+                        scope: "primary_session", status: "failed", provider: "agy", code: "usage_limit",
+                        usageLimit: { resetAtMs: null, retryAfterMs: null, recoverability: "wait" },
+                    });
+                    if (declaration !== JSON.stringify(["antigravity"])) {
+                        expect(actualIssue.usageLimit).not.toHaveProperty("connectedService");
+                        expect(actualIssue.usageLimit).not.toHaveProperty("quotaSnapshotRef");
+                        expect(ReleasedRuntimeIssueSchema.safeParse(actualIssue).success).toBe(true);
+                    } else {
+                        expect(actualIssue).toEqual(issue);
+                    }
+                }
+                expect(row.lastRuntimeIssue).toBe(JSON.stringify(issue));
+            },
+        );
+    });
+
     it("exposes the materialized turn status observation time on v2 session rows", () => {
         const now = new Date(1_000);
         const mapped = mapV2SessionListRow({
@@ -116,6 +178,21 @@ describe("sessionRoutes v2 sessions snapshot", () => {
         expect(mapped.latestTurnId).toBe("turn-1");
         expect(mapped.latestTurnStatus).toBe("completed");
         expect(mapped.latestTurnStatusObservedAt).toBe(1_234);
+    });
+
+    it("exposes rollback-eligible turn starts from the selected turn relation", () => {
+        const mapped = mapV2SessionListRow({
+            userId: "u1",
+            row: {
+                ...pagedSessionRow("s_rollback_projection"),
+                turns: [
+                    { rollbackState: "eligible", transcriptAnchorsJson: JSON.stringify({ startUserMessageSeq: 8 }) },
+                    { rollbackState: "eligible", transcriptAnchorsJson: JSON.stringify({ startUserMessageSeq: 2 }) },
+                ],
+            } as any,
+        });
+
+        expect(mapped.rollbackEligibleTurnStarts).toEqual([2, 8]);
     });
 
     it("exposes durable attention and live-work projection fields on v2 session rows", () => {

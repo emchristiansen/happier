@@ -706,6 +706,60 @@ describe('sidechains (provider-agnostic)', () => {
     expect(rootToolCalls2.map((m: any) => m.tool?.name)).toEqual(['Task']);
   });
 
+  it('does not recurse when a sidechain child message id matches the owning tool-call id', () => {
+    const state = createReducer();
+
+    const taskTool: NormalizedMessage = {
+      id: 'msg_task',
+      localId: null,
+      createdAt: 1000,
+      role: 'agent',
+      isSidechain: false,
+      content: [
+        {
+          type: 'tool-call',
+          id: 'tool_task_1',
+          name: 'Task',
+          input: { prompt: 'Search for files' },
+          description: null,
+          uuid: 'uuid_task',
+          parentUUID: null,
+        },
+      ],
+    };
+
+    const sidechainToolCall: NormalizedMessage = {
+      id: 'tool_task_1',
+      localId: null,
+      createdAt: 1100,
+      role: 'agent',
+      isSidechain: true,
+      sidechainId: 'tool_task_1',
+      content: [
+        {
+          type: 'tool-call',
+          id: 'tool_bash_1',
+          name: 'Bash',
+          input: { command: 'ls' },
+          description: 'List files',
+          uuid: 'uuid_sc_tool_call',
+          parentUUID: null,
+        },
+      ],
+    };
+
+    const result = reducer(state, [taskTool, sidechainToolCall]);
+    const toolMessage = result.messages.find((message) => message.kind === 'tool-call' && message.tool.name === 'Task');
+    if (!toolMessage || toolMessage.kind !== 'tool-call') throw new Error('Expected Task tool message');
+
+    expect(toolMessage.children).toHaveLength(1);
+    expect(toolMessage.children[0]).toMatchObject({
+      kind: 'tool-call',
+      tool: { id: 'tool_bash_1', name: 'Bash' },
+      children: [],
+    });
+  });
+
   it('does not emit sidechain child thinking merges as root transcript messages', () => {
     const state = createReducer();
 

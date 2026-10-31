@@ -4,6 +4,7 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { shadowLevelStyle } from '@/shadowElevation';
 import { resolveThemeSurfaceBorderStyle } from '@/components/ui/surfaces/resolveThemeHairlineBorderStyle';
+import { RoundButtonSizeScope } from '@/components/ui/buttons/RoundButton';
 import { ModalCardBody } from './ModalCardBody';
 import { ModalCardHeader } from './ModalCardHeader';
 import { useModalCardDimensions, type ModalCardDimensionOptions, type ModalCardSizePreset } from './useModalCardDimensions';
@@ -51,10 +52,7 @@ const stylesheet = StyleSheet.create((theme) => ({
         flexDirection: 'column',
         minHeight: 0,
     },
-    footer: {
-        borderTopWidth: 1,
-        borderTopColor: theme.colors.border.default,
-    },
+    footer: {},
     bodyFillLayout: {
         flexBasis: 0,
     },
@@ -145,8 +143,8 @@ export function ModalCardFrame(props: ModalCardFrameProps) {
                 )}
 
                 {props.footer != null ? (
-                    <View style={[styles.footer, props.footerStyle]}>
-                        {props.footer}
+                    <View testID="modal-card-footer" style={[styles.footer, props.footerStyle]}>
+                        <RoundButtonSizeScope size="small">{props.footer}</RoundButtonSizeScope>
                     </View>
                 ) : null}
             </View>

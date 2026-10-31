@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { PermissionHandler } from './permissionHandler';
 import { createPermissionHandlerSessionStub } from './permissionHandler.testkit';
@@ -7,6 +7,67 @@ import type { EnhancedMode } from '../loop';
 import type { PermissionRpcPayload } from './permissionRpc';
 
 describe('PermissionHandler (late permission responses)', () => {
+  it('keeps a failed UI approval retryable without completing another pending request', async () => {
+    const { session, client } = createPermissionHandlerSessionStub('approval-retry');
+    const handler = new PermissionHandler(session);
+    const firstController = new AbortController();
+    const backgroundController = new AbortController();
+    const mode = { permissionMode: 'default' } as EnhancedMode;
+    const first = handler.handleToolCall('Bash', { command: 'echo first' }, mode, {
+      signal: firstController.signal, toolUseId: 'first',
+    });
+    const background = handler.handleToolCall('Bash', { command: 'echo background' }, mode, {
+      signal: backgroundController.signal, toolUseId: 'background', agentId: 'background-agent',
+    });
+    let firstSettled = false;
+    void first.then(() => { firstSettled = true; }, () => { firstSettled = true; });
+    const backgroundResult = background.catch(() => undefined);
+    const permissionRpc = client.rpcHandlerManager.getHandler('permission')!;
+    const updateState = client.updateAgentState.bind(client);
+    const write = vi.spyOn(client, 'updateAgentState');
+    write.mockImplementationOnce(() => { throw new Error('state transport unavailable'); });
+
+    try {
+      await expect(permissionRpc({ id: 'first', approved: true })).resolves.toMatchObject({
+        ok: false, errorCode: 'permission_response_failed',
+      });
+      expect(firstSettled).toBe(false);
+      expect(Object.keys(client.agentState.requests).sort()).toEqual(['background', 'first']);
+
+      let release!: () => void;
+      const acknowledgement = new Promise<void>((resolve) => { release = resolve; });
+      Object.defineProperty(client, 'updateAgentState', {
+        configurable: true,
+        value: async (updater: Parameters<typeof client.updateAgentState>[0]) => {
+          await acknowledgement;
+          updateState(updater);
+        },
+      });
+      let rpcSettled = false;
+      const retry = Promise.resolve(permissionRpc({ id: 'first', approved: true })).then((result) => {
+        rpcSettled = true;
+        return result;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(rpcSettled).toBe(false);
+      expect(firstSettled).toBe(false);
+      expect(Object.keys(client.agentState.requests).sort()).toEqual(['background', 'first']);
+      release();
+      await expect(retry).resolves.toEqual({ ok: true });
+      await expect(first).resolves.toMatchObject({ behavior: 'allow' });
+      await client.updateAgentState((state) => ({ ...state, capabilities: { unrelated: true } }));
+      expect(Object.keys(client.agentState.requests)).toEqual(['background']);
+      expect(client.agentState.completedRequests.first).toMatchObject({ status: 'approved' });
+    } finally {
+      write.mockRestore();
+      firstController.abort();
+      backgroundController.abort();
+      await backgroundResult;
+      handler.dispose();
+    }
+  });
+
   async function expectResolvesWithin<T>(promise: Promise<T>, ms = 250): Promise<T> {
     return await new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('timed out')), ms);

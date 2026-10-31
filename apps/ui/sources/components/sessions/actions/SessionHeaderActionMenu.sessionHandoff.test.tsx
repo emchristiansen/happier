@@ -28,6 +28,7 @@ const resolveServerIdForSessionIdFromLocalCacheMock = vi.hoisted(() => vi.fn());
 const resolvePreferredServerIdForSessionIdMock = vi.hoisted(() => vi.fn());
 const usePreferredServerIdForSessionMock = vi.hoisted(() => vi.fn());
 const fireAndForgetMock = vi.hoisted(() => vi.fn());
+const realStorageRef = vi.hoisted(() => ({ current: null as typeof import('@/sync/domains/state/storageStore')['storage'] | null }));
 
 /**
  * `fireAndForget` is an app-wide utility, so a suite cannot assume its own work is the only
@@ -179,20 +180,14 @@ installSessionActionsCommonModuleMocks({
     });
   },
   storage: async () => {
-    const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
-    const storageStore = Object.assign(
-      ((selector?: (state: any) => unknown) =>
-        typeof selector === 'function' ? selector(storageState.current) : storageState.current) as any,
-      {
-        getState: () => storageState.current,
-        getInitialState: () => storageState.current,
-        setState: () => undefined,
-        subscribe: () => () => {},
-        destroy: () => undefined,
-      },
-    );
+    const { createStorageModuleStub, createStorageStoreStub } = await import('@/dev/testkit/mocks/storage');
+    const storageStore = createStorageStoreStub(() => {
+      if (!realStorageRef.current) throw new Error('Real storage must be initialized before rendering');
+      return { ...realStorageRef.current.getState(), ...storageState.current };
+    });
     return createStorageModuleStub({
       storage: storageStore,
+      getStorage: () => storageStore,
       useSessionOrganizationProjection: () => organizationProjectionState.current,
       useSettings: () => storageState.current.settings,
       useSetting: (key: string) => {
@@ -225,15 +220,6 @@ installSessionActionsCommonModuleMocks({
       },
     }).module;
   },
-});
-
-vi.mock('@/sync/domains/state/storageStore', async () => {
-  const { createStorageStoreStub } = await import('@/dev/testkit/mocks/storage');
-  const store = createStorageStoreStub(() => storageState.current);
-  return {
-    storage: store,
-    getStorage: () => store,
-  };
 });
 
 vi.mock('react', async () => {
@@ -410,8 +396,29 @@ vi.mock('@/voice/agent/teleportVoiceAgentToSessionRoot', () => ({
   teleportVoiceAgentToSessionRoot: (args: any) => teleportVoiceAgentToSessionRootMock(args),
 }));
 
+const { storage: realStorage } = await import('@/sync/domains/state/storageStore');
+realStorageRef.current = realStorage;
+const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
+
 describe('SessionHeaderActionMenu handoff', () => {
+  it('disables stop and archive when another surface already committed an archive', async () => {
+    const { storage } = await import('@/sync/domains/state/storageStore');
+    const { createSessionFixture } = await import('@/dev/testkit');
+    const session = createSessionFixture({ id: 'pending-header', active: true, owner: 'user_1' });
+    const operation = storage.getState().beginSessionArchive(session.id, 'server_a');
+    if (!operation) throw new Error('Expected archive admission');
+    try {
+      const screen = await renderScreen(<SessionHeaderActionMenu sessionId={session.id} session={session} />);
+      const items = screen.findByType('DropdownMenu' as any).props.items as Array<{ id: string; disabled?: boolean }>;
+      expect(items.find((item) => item.id === SESSION_ACTION_ARCHIVE_ID)?.disabled).toBe(true);
+      expect(items.find((item) => item.id === SESSION_ACTION_STOP_ID)?.disabled).toBe(true);
+    } finally {
+      storage.getState().finishSessionArchive(operation);
+    }
+  });
+
   beforeEach(async () => {
+    realStorage.setState(realStorage.getInitialState(), true);
     resetSessionActionsCommonModuleMockState();
     runSessionHandoffPickerFlowMock.mockReset();
     createDefaultActionExecutorMock.mockReset();
@@ -483,7 +490,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       canStop: false,
     };
 
-    vi.resetModules();
     const { registerStorageStateReader } = await import('@/sync/domains/state/storageStateReaderBridge');
     registerStorageStateReader(() => storageState.current as any);
     const { voiceSessionBindingStore } = await import('@/voice/sessionBinding/voiceSessionBindingStore');
@@ -493,7 +499,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('delivers an inactive session header resume request to its session listener and awaits completion', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
     const { useSessionResumeRequestListener } = await import('@/components/sessions/model/sessionResumeRequests');
     const session = {
       id: 'sess_resumable',
@@ -556,7 +561,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('shows a resume failure when the header request has no mounted session listener', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
     const session = {
       id: 'sess_without_listener',
       active: false,
@@ -588,7 +592,6 @@ describe('SessionHeaderActionMenu handoff', () => {
     ['active', { active: true, metadata: { flavor: 'claude', claudeSessionId: 'claude_vendor_session' } }],
     ['non-resumable', { active: false, metadata: { flavor: 'unknown-provider' } }],
   ])('does not offer standalone resume for a %s session', async (_label, overrides) => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
     const session = {
       id: 'sess_without_resume',
       owner: 'user_1',
@@ -607,7 +610,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('routes forked child session opens through the shared fork completion helper', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     await renderScreen(<SessionHeaderActionMenu
       sessionId="sess_1"
@@ -646,7 +648,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       machineId: 'machine_source',
       flavor: 'claude',
     };
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
       sessionId="sess_1"
@@ -673,7 +674,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('keeps the closed trigger stable when metadata only changes freshness timestamps', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
       sessionId="sess_1"
@@ -740,7 +740,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       machineId: 'machine_source',
       flavor: 'claude',
     };
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
       sessionId="sess_1"
@@ -786,7 +785,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       remoteMachineId: 'machine_rebound',
     });
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -824,7 +822,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('shows mark-unread for a read session and uses the selected server scope', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_read"
@@ -849,7 +846,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('shows mark-read for an unread session and uses the selected server scope', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_unread"
@@ -887,7 +883,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       sess_stable_read_state: session,
     };
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_stable_read_state"
@@ -923,7 +918,6 @@ describe('SessionHeaderActionMenu handoff', () => {
     attentionStandingSettingsState.promotionMode = 'global';
     storageState.current.sessionOrganizationSnapshotVersionByServerId = { server_a: 3 };
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_standing"
@@ -957,7 +951,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       'sess_standing': { sessionId: 'sess_standing', standing: true, updatedAt: 1 },
     });
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_standing"
@@ -988,7 +981,6 @@ describe('SessionHeaderActionMenu handoff', () => {
     attentionStandingSettingsState.promotionMode = 'off';
     storageState.current.sessionOrganizationSnapshotVersionByServerId = { server_a: 3 };
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_standing"
@@ -1009,7 +1001,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('surfaces central lifecycle actions in the header menu', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_active"
@@ -1032,7 +1023,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('executes archive from the header menu through the central action seam', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_archive"
@@ -1059,13 +1049,12 @@ describe('SessionHeaderActionMenu handoff', () => {
       await pending;
     });
 
-    expect(modalConfirmMock).toHaveBeenCalled();
+    expect(modalConfirmMock).not.toHaveBeenCalled();
     expect(archiveSessionMock).toHaveBeenCalledWith('sess_archive', { serverId: 'server_a' });
   });
 
   it('uses the unarchive failure fallback when header unarchive receives a non-error rejection', async () => {
     unarchiveSessionMock.mockRejectedValueOnce('failed');
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_archived"
@@ -1099,7 +1088,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('does not show mark-read for non-terminal raw session seq', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_non_terminal_raw"
@@ -1118,7 +1106,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   });
 
   it('does not show read-state actions for archived sessions', async () => {
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_archived"
@@ -1155,7 +1142,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       }),
     } as any;
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1193,7 +1179,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       }),
     } as any;
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1231,7 +1216,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       }),
     } as any;
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1269,7 +1253,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       }),
     } as any;
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1290,7 +1273,6 @@ describe('SessionHeaderActionMenu handoff', () => {
   it('reacts when machine-rpc direct-peer viability becomes available after mount', async () => {
     resolveServerIdForSessionIdFromLocalCacheMock.mockReturnValue('server_reactive_header');
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1327,7 +1309,6 @@ describe('SessionHeaderActionMenu handoff', () => {
     });
     machineRpcWithServerScopeMock.mockResolvedValue({ ok: true });
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1356,7 +1337,6 @@ describe('SessionHeaderActionMenu handoff', () => {
     });
     machineRpcWithServerScopeMock.mockResolvedValue({ ok: true });
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1381,7 +1361,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       defaultBackendId: 'claude',
     });
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1449,7 +1428,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       updatedAt: 1,
     });
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1511,7 +1489,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       canStop: false,
     };
 
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"
@@ -1541,7 +1518,6 @@ describe('SessionHeaderActionMenu handoff', () => {
       serverId: 'server_a',
       remoteMachineId: 'machine_source',
     });
-    const { SessionHeaderActionMenu } = await import('./SessionHeaderActionMenu');
 
     const screen = await renderScreen(<SessionHeaderActionMenu
           sessionId="sess_1"

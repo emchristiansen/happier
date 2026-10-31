@@ -17,6 +17,9 @@ import {
 } from './resolveConnectedServiceAuthForSpawn';
 import { resolveConnectedServiceMaterializedRootDir } from './materialize/resolveConnectedServiceMaterializedRootDir';
 import { waitForCondition } from '@/testkit/async/waitFor';
+import { resolveConnectedServiceHomeDir } from './homes/resolveConnectedServiceHomeDir';
+import { openSqliteDatabaseSync } from '@/utils/sqlite/sqliteSync';
+import { resolveSpawnChildEnvironment } from '@/daemon/spawn/resolveSpawnChildEnvironment';
 
 /**
  * K1 increment-3 — the §2 hard post-materialization reachability RE-VERIFY gate.
@@ -73,18 +76,18 @@ function makeCodexOauthRecord(now: number) {
   });
 }
 
-function makeLegacyCredentials(): Credentials {
-  const credentials: Credentials = {
+function makeLegacyCredentials() {
+  const credentials = {
     token: 'happy-token',
     encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-  };
+  } satisfies Credentials;
   if (credentials.encryption.type !== 'legacy') {
     throw new Error('test fixture expected legacy encryption');
   }
   return credentials;
 }
 
-function makeCodexApi(now: number, credentials: Credentials): ApiClient {
+function makeCodexApi(now: number, credentials: ReturnType<typeof makeLegacyCredentials>): ApiClient {
   if (credentials.encryption.type !== 'legacy') {
     throw new Error('test fixture expected legacy encryption');
   }
@@ -106,7 +109,7 @@ function makeCodexApi(now: number, credentials: Credentials): ApiClient {
   } as unknown as ApiClient;
 }
 
-function makePiCodexApi(now: number, credentials: Credentials): ApiClient {
+function makePiCodexApi(now: number, credentials: ReturnType<typeof makeLegacyCredentials>): ApiClient {
   if (credentials.encryption.type !== 'legacy') {
     throw new Error('test fixture expected legacy encryption');
   }
@@ -167,6 +170,59 @@ async function expectPathRemoved(path: string): Promise<void> {
 }
 
 describe('resolveConnectedServiceAuthForSpawn post-materialization resume reachability gate', () => {
+  it('existing-state resume refuses native-only state and preserves the stable indexed rollout when present', async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), 'happier-existing-resume-'));
+    const activeServerDir = join(testRoot, 'server');
+    const sourceCodexHome = join(testRoot, 'native');
+    const stableRoot = resolveConnectedServiceHomeDir({ activeServerDir, serviceId: 'openai-codex', profileId: 'work', agentId: 'codex' });
+    const targetCodexHome = join(stableRoot, 'codex-home');
+    const vendorResumeId = '00000000-0000-4000-8000-000000000042';
+    const rolloutName = `rollout-2026-10-10T12-00-00-${vendorResumeId}.jsonl`;
+    const sourcePath = join(sourceCodexHome, 'sessions', rolloutName);
+    const targetPath = join(targetCodexHome, 'sessions', rolloutName);
+    const credentials = makeLegacyCredentials();
+    const now = 1_000_000;
+    try {
+      await mkdir(join(sourceCodexHome, 'sessions'), { recursive: true });
+      await writeFile(sourcePath, 'native-only transcript\n');
+      const resolveLaunch = async () => {
+        const auth = await resolveConnectedServiceAuthForSpawn({
+        agentId: 'codex', sessionDirectory: testRoot, connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
+        materializationKey: 'existing', activeServerDir, baseDir: join(testRoot, 'materialized'),
+        credentials, api: makeCodexApi(now, credentials), nowMs: () => now,
+        accountSettings: sharedStateAccountSettings(), processEnv: { CODEX_HOME: sourceCodexHome },
+        vendorResumeId, resumeReachabilityRequired: true, sessionStateMode: 'existing',
+        candidatePersistedSessionFile: sourcePath,
+        });
+        const result = await resolveSpawnChildEnvironment({
+          options: { directory: testRoot, backendTarget: { kind: 'builtInAgent', agentId: 'codex' }, resume: vendorResumeId, handoffStateTransfer: 'existing', codexBackendMode: 'appServer' },
+          existingSessionMetadata: { machineId: 'source-machine', flavor: 'codex', codexSessionId: vendorResumeId, codexBackendMode: 'appServer', path: testRoot },
+          profileEnvironmentVariables: {}, daemonSpawnHooks: null, processEnv: { CODEX_HOME: sourceCodexHome },
+          logDebug: () => {}, logInfo: () => {}, logWarn: () => {}, connectedServiceAuth: auth,
+        });
+        return { auth, result };
+      };
+      expect((await resolveLaunch()).result).toMatchObject({ ok: false, errorCode: 'existing_session_state_unavailable' });
+      expect(await pathExists(targetPath)).toBe(false);
+      await mkdir(join(targetCodexHome, 'sessions'), { recursive: true });
+      await writeFile(targetPath, 'already-synced transcript\n');
+      const database = openSqliteDatabaseSync(join(targetCodexHome, 'state_5.sqlite'));
+      try {
+        database.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)');
+        database.prepare('INSERT INTO threads (id, rollout_path) VALUES (?, ?)').run(vendorResumeId, targetPath);
+      } finally {
+        database.close();
+      }
+      const { auth, result } = await resolveLaunch();
+      expect(result.ok).toBe(true);
+      expect(auth?.env.CODEX_HOME).toBe(targetCodexHome);
+      expect(auth?.env.CODEX_SQLITE_HOME).toBe(targetCodexHome);
+      expect(await readFile(targetPath, 'utf8')).toBe('already-synced transcript\n');
+      expect(await readFile(sourcePath, 'utf8')).toBe('native-only transcript\n');
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
   it('recovers a rollout from the previous Codex materialization when the native sessions store was missing', async () => {
     const baseDir = await mkdtemp(join(tmpdir(), 'happier-reverify-codex-recovery-base-'));
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-reverify-codex-recovery-server-'));

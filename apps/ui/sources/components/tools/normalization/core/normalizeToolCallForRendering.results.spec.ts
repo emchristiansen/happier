@@ -4,6 +4,16 @@ import { normalizeToolCallForRendering } from './normalizeToolCallForRendering';
 import { makeTool } from './normalizeToolCallForRendering._testHelpers';
 
 describe('normalizeToolCallForRendering (results)', () => {
+    it('keeps canonical task findings authoritative over the native result alias', () => {
+        const tool = makeTool({
+            name: 'Task',
+            result: { status: 'failed', content: 'canonical findings', result: 'native fallback' },
+        });
+        const normalized = normalizeToolCallForRendering(tool);
+        expect(normalized.result).toBe(tool.result);
+        expect(normalized.result).toMatchObject({ content: 'canonical findings' });
+    });
+
     it('normalizes legacy glob/ls result arrays into named result objects', () => {
         const glob = normalizeToolCallForRendering(
             makeTool({

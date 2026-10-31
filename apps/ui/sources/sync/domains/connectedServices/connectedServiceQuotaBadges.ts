@@ -1,6 +1,6 @@
 import type { ConnectedServiceQuotaSnapshotV1 } from '@happier-dev/protocol';
 
-import { clampQuotaPct, deriveQuotaUtilizationPct } from './deriveQuotaUtilizationPct';
+import { deriveQuotaMeterValues, deriveQuotaUtilizationPct } from './deriveQuotaUtilizationPct';
 import {
   isConnectedServiceQuotaMeterPercentRankable,
   selectComparableConnectedServiceQuotaMeters,
@@ -39,10 +39,7 @@ export function computeConnectedServiceQuotaSummaryBadges(params: Readonly<{
 
   const badgesWithMeta = meterIds.map((meterId, index) => {
     const meter = meters.find((m) => m.meterId === meterId) ?? null;
-    const utilizationPct = meter ? deriveQuotaUtilizationPct(meter) : null;
-    const remainingPct = typeof meter?.remainingPct === 'number' && Number.isFinite(meter.remainingPct)
-      ? clampQuotaPct(meter.remainingPct)
-      : utilizationPct === null ? null : clampQuotaPct(100 - utilizationPct);
+    const remainingPct = meter ? deriveQuotaMeterValues(meter).remainingPct : null;
     const valueText = remainingPct === null ? '—' : `${Math.round(remainingPct)}%`;
     const context = includeMeterContext
       ? resolveQuotaBadgeMeterContext({ meterId, label: meter?.label })

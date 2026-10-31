@@ -162,6 +162,25 @@ function resolveCommandOnPath(command: string, processEnv: NodeJS.ProcessEnv): s
   return null;
 }
 
+function resolveCommandsOnPath(command: string, processEnv: NodeJS.ProcessEnv): string[] {
+  if (process.platform === 'win32') {
+    const resolved = resolveWindowsCommandOnPath(command, processEnv);
+    return resolved ? [resolved] : [];
+  }
+
+  const commands: string[] = [];
+  for (const dir of String(processEnv.PATH ?? '').split(delimiter).map((value) => value.trim()).filter(Boolean)) {
+    const candidate = join(dir, command);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      commands.push(candidate);
+    } catch {
+      // Keep looking: another PATH entry may contain a runnable candidate.
+    }
+  }
+  return commands;
+}
+
 function readFileHeader(candidatePath: string): string | null {
   let fd: number | null = null;
   try {
@@ -268,9 +287,18 @@ function basenameForKnownCandidatePath(path: string): string {
 function resolveKnownCommandCandidate(agentId: AgentId, candidate: ProviderCliKnownCommandCandidate, processEnv: NodeJS.ProcessEnv): ResolvedProviderCliSystemCommand | null {
   const homeDir = resolveHomeDirFromEnvironment(processEnv);
   switch (candidate.kind) {
+    case 'envBinDir':
     case 'homeBinDir': {
+      const root = candidate.kind === 'envBinDir'
+        ? expandHomeDirPath(processEnv[candidate.envVar]?.trim() ?? '', processEnv)
+        : homeDir;
+      if (!root) return null;
       for (const binaryName of getProviderCliBinaryNames(agentId, processEnv)) {
-        const commandPath = join(homeDir, candidate.relativeDir, binaryName);
+        const candidatePath = join(root, candidate.relativeDir, binaryName);
+        const commandPath = process.platform === 'win32'
+          ? resolveWindowsCommandPath(candidatePath, processEnv)
+          : candidatePath;
+        if (!commandPath) continue;
         if (providerCliCandidatePathExists(agentId, commandPath)) return { command: commandPath, binaryName };
       }
       return null;
@@ -347,6 +375,27 @@ function resolveProviderCliSystemCommand(agentId: AgentId, processEnv: NodeJS.Pr
   return commandMatchesAlternativeIdentityProbe(agentId, knownCommand, processEnv) ? knownCommand.command : null;
 }
 
+function resolveProviderCliSystemCommands(agentId: AgentId, processEnv: NodeJS.ProcessEnv): string[] {
+  const resolved: string[] = [];
+  const seen = new Set<string>();
+  const add = (candidate: ResolvedProviderCliSystemCommand | null): void => {
+    if (!candidate || seen.has(candidate.command)) return;
+    if (!commandMatchesAlternativeIdentityProbe(agentId, candidate, processEnv)) return;
+    seen.add(candidate.command);
+    resolved.push(candidate.command);
+  };
+
+  for (const binaryName of getProviderCliBinaryNames(agentId, processEnv)) {
+    for (const command of resolveCommandsOnPath(binaryName, processEnv)) {
+      add({ command, binaryName });
+    }
+  }
+  for (const candidate of getProviderCliRuntimeSpec(agentId).knownCommandCandidates ?? []) {
+    add(resolveKnownCommandCandidate(agentId, candidate, processEnv));
+  }
+  return resolved;
+}
+
 function resolveProviderCliManagedCommand(agentId: AgentId, processEnv: NodeJS.ProcessEnv): string | null {
   const runtimeSpec = getProviderCliRuntimeSpec(agentId);
   if (!runtimeSpec.managedInstall) return null;
@@ -410,4 +459,40 @@ export function resolveProviderCliCommand(
     return { source: 'managed', command: managedCommand };
   }
   return null;
+}
+
+/**
+ * Enumerates every concrete runnable candidate in canonical source order.
+ * An explicit override is intentionally exclusive: callers must classify that
+ * exact executable instead of silently falling back to another installation.
+ */
+export function resolveProviderCliCommandCandidates(
+  agentId: AgentId,
+  opts: Readonly<{ processEnv?: NodeJS.ProcessEnv } & RuntimeResolutionOptions> = {},
+): ProviderCliCommandResolution[] {
+  const processEnv = opts.processEnv ?? process.env;
+  const rawOverride = readProviderCliOverride(agentId, processEnv);
+  if (rawOverride) {
+    const override = resolveProviderCliOverride(agentId, processEnv);
+    return override && isProviderCliPathRunnable(override, processEnv, opts)
+      ? [{ source: 'override', command: override }]
+      : [];
+  }
+
+  const system = resolveProviderCliSystemCommands(agentId, processEnv)
+    .filter((command) => isProviderCliPathRunnable(command, processEnv, opts))
+    .map((command) => ({ source: 'system' as const, command }));
+  const managedCommand = resolveProviderCliManagedCommand(agentId, processEnv);
+  const managed = managedCommand && isProviderCliPathRunnable(managedCommand, processEnv, opts)
+    ? [{ source: 'managed' as const, command: managedCommand }]
+    : [];
+  const ordered = readBackendCliSourcePreference(agentId, processEnv) === 'managed-first'
+    ? [...managed, ...system]
+    : [...system, ...managed];
+  const seen = new Set<string>();
+  return ordered.filter(({ command }) => {
+    if (seen.has(command)) return false;
+    seen.add(command);
+    return true;
+  });
 }

@@ -361,6 +361,41 @@ describe("sessionPendingRoutes (enqueue)", () => {
         });
     });
 
+    it("maps exhausted transaction acquisition to retryable 503 with request correlation", async () => {
+        enqueuePendingMessage.mockResolvedValueOnce({
+            ok: false,
+            error: "transaction-unavailable",
+            retryAfterMs: 1_000,
+            correlationId: "req-enqueue-busy",
+        });
+
+        const { sessionPendingRoutes } = await import("./pendingRoutes");
+        const route = createRouteTestBuilder({
+            method: "POST",
+            path: "/v2/sessions/:sessionId/pending",
+            registerRoutes(app) {
+                sessionPendingRoutes(app as any);
+            },
+        });
+        const { reply, response } = await route.invoke({
+            id: "req-enqueue-busy",
+            userId: "actor",
+            params: { sessionId: "s1" },
+            body: { localId: "l1", ciphertext: "cipher" },
+        });
+
+        expect(enqueuePendingMessage).toHaveBeenCalledWith(expect.objectContaining({
+            diagnosticCorrelationId: "req-enqueue-busy",
+        }));
+        expect(reply.statusCode).toBe(503);
+        expect(reply.headers.get("retry-after")).toBe("1");
+        expect(response).toEqual({
+            error: "transaction-unavailable",
+            retryAfterMs: 1_000,
+            correlationId: "req-enqueue-busy",
+        });
+    });
+
     it("threads exact pending activity time into pending-changed updates", async () => {
         const createdAt = new Date("2026-06-01T12:00:00.000Z");
         enqueuePendingMessage.mockResolvedValueOnce({

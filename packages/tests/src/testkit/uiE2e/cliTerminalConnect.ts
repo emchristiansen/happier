@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
 
 import { resolveCliTestLaunchSpec } from '../process/cliLaunchSpec';
+import { sanitizeCliTestEnv } from '../process/cliTestEnv';
 import {
   inspectOwnedProcess,
   registerProcessOwnershipLease,
@@ -53,17 +54,6 @@ function deriveServerIdFromUrl(url: string): string {
     h = Math.imul(h, 16777619);
   }
   return `env_${(h >>> 0).toString(16)}`;
-}
-
-export function sanitizeCliTerminalConnectEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const sanitized = { ...env };
-  // The harness owns the server profile selected below. Ambient stack/daemon selection can
-  // otherwise override HAPPIER_SERVER_URL and store the freshly approved credentials under a
-  // different server than the daemon that this fixture starts afterwards.
-  delete sanitized.HAPPIER_ACTIVE_SERVER_ID;
-  delete sanitized.HAPPIER_DAEMON_SERVICE_INSTANCE_ID;
-  delete sanitized.HAPPIER_DAEMON_SERVICE_SERVER_URL;
-  return sanitized;
 }
 
 async function ensureActiveServerSelection(params: Readonly<{
@@ -156,7 +146,7 @@ export async function startCliAuthLoginForTerminalConnect(params: Readonly<{
   connectUrlTimeoutMs?: number;
   env: NodeJS.ProcessEnv;
 }>): Promise<StartedCliTerminalConnect> {
-  const sanitizedEnv = sanitizeCliTerminalConnectEnv(params.env);
+  const sanitizedEnv = sanitizeCliTestEnv(params.env);
   const currentOwnerInspection = inspectOwnedProcess(process.pid);
   if (currentOwnerInspection.ok) {
     await sweepProcessOwnershipLeases({

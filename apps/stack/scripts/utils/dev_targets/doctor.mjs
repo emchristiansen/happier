@@ -1,5 +1,6 @@
 import { spawnProc } from '../proc/proc.mjs';
 import { buildRemoteDoctorCommand } from './remote_commands.mjs';
+import { DEV_TARGET_SOURCE_REPO, loadSiblingMutagenOwner } from './mutagen_project.mjs';
 
 async function defaultRunProcess({ label, command, args, env }) {
   const child = spawnProc(label, command, args, env, { silent: true });
@@ -15,15 +16,19 @@ function processResult(result) {
 }
 
 export async function runDevTargetsDoctor(
-  { targets, env = process.env },
+  { targets, stackBaseDir, sourceDir = DEV_TARGET_SOURCE_REPO, env = process.env },
   { runProcess = defaultRunProcess } = {},
 ) {
+  const siblingOwner = await loadSiblingMutagenOwner(sourceDir);
+  const mutagenEnv = siblingOwner
+    ? siblingOwner.resolveRuntime({ stackBaseDir: stackBaseDir ?? sourceDir, sourceDir, env }).env
+    : env;
   const mutagen = processResult(
     await runProcess({
       label: 'mutagen',
       command: 'mutagen',
       args: ['version'],
-      env,
+      env: mutagenEnv,
     }),
   );
   const targetResults = [];

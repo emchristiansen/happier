@@ -4,7 +4,9 @@ import { RPC_METHODS } from './rpc.js';
 
 describe('RPC_METHODS (daemon direct sessions)', () => {
   it('includes daemon.directSessions.* methods', () => {
+    expect((RPC_METHODS as any).DAEMON_DIRECT_SESSIONS_ACP_SESSION_LIST_CAPABILITY_GET).toBe('daemon.directSessions.acpSessionList.capability.get');
     expect((RPC_METHODS as any).DAEMON_DIRECT_SESSIONS_CANDIDATES_LIST).toBe('daemon.directSessions.candidates.list');
+    expect((RPC_METHODS as any).DAEMON_DIRECT_SESSION_CANDIDATE_DELETE).toBe('daemon.directSessions.candidate.delete');
     expect((RPC_METHODS as any).DAEMON_DIRECT_SESSION_LINK_ENSURE).toBe('daemon.directSessions.link.ensure');
     expect((RPC_METHODS as any).DAEMON_DIRECT_SESSION_ATTACH).toBe('daemon.directSessions.attach');
     expect((RPC_METHODS as any).DAEMON_DIRECT_SESSION_DETACH).toBe('daemon.directSessions.detach');

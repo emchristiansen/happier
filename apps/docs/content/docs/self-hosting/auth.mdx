@@ -116,6 +116,7 @@ Keyless account auto-provisioning is intentionally guarded:
   - allowlist providers: `HAPPIER_FEATURE_AUTH_OAUTH__KEYLESS_PROVIDERS=github,okta,...`
   - allow first-login account creation: `HAPPIER_FEATURE_AUTH_OAUTH__KEYLESS_AUTO_PROVISION=1`
 - for mTLS keyless login: see [mTLS auth](/self-hosting/auth-mtls)
+- for headless machines that already hold a user's OIDC access token: see [Token exchange for headless machines](/self-hosting/auth-oidc#token-exchange-for-headless-machines)
 
 Recommended hardening for plaintext/keyless deployments:
 
@@ -194,7 +195,7 @@ HAPPIER_FEATURE_ENCRYPTION__ALLOW_ACCOUNT_OPTOUT=1
 
 If you enable any external OAuth providers (GitHub and/or OIDC), the server must know where to redirect the browser **back to the client app** after OAuth completes.
 
-- If you use the hosted web app, you don’t need to set anything (default is `https://app.happier.dev`).
+- If you use the hosted web app, you don’t need to set anything (default is `https://cloud.happier.dev`).
 - If you self-host the web app (or you’re using a local dev UI), you **must** configure one of:
   - `HAPPIER_WEBAPP_URL` (most common for web)
   - `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE` (often used for mobile deep links or custom paths)

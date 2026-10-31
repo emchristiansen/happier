@@ -1,3 +1,4 @@
+import type { AgentStateWriteOptions } from '@/api/session/sessionWritesBestEffort';
 import type {
   DeferredSessionBufferEntry,
   DeferredSessionBufferDropReason,
@@ -10,15 +11,20 @@ import type { AgentState, Metadata } from '@/api/types';
 import type {
   MaterializeNextPendingOptions,
   MaterializeNextPendingResult,
+  SessionClientPort,
 } from '@/api/session/sessionClientPort';
+import type { SessionProviderInputOutcomeObserver, SessionProviderInputOutcomeProducer } from '@/api/session/sessionClient';
 import type { PendingQueueReadOptions } from '@/api/session/pendingQueueReadPolicy';
 import type { ProviderOwnedUserMessageEchoClassifier } from '@/api/session/providerOwnedUserMessageEcho';
 import type { SessionRuntimeActivitySnapshotPublisher } from '@/session/runtimeActivity/types';
 import type { SessionUserMessageEnqueueResult } from '@/rpc/handlers/sessionUserMessageSend';
 import type { SessionRuntimeControls } from '@/rpc/handlers/sessionControls';
 import { cloneCallableSessionRuntimeControls } from '@/api/session/sessionRuntimeControls';
+import type { SessionTranscriptObservationProvenanceV1 } from '@happier-dev/protocol';
+import type { StreamedTranscriptWriterSession } from '@/api/session/streamedTranscriptWriter';
 
 export type DeferredApiSessionTarget = Readonly<{
+  subscribeToSessionConnectionState?: StreamedTranscriptWriterSession['subscribeToSessionConnectionState'];
   sessionId: string;
   rpcHandlerManager: RpcHandlerManagerLike;
   setSessionRuntimeControls?: (controls: SessionRuntimeControls | null) => void;
@@ -31,20 +37,27 @@ export type DeferredApiSessionTarget = Readonly<{
   recordClaudeJsonlMessageConsumed?: (message: unknown, meta?: unknown) => void;
   setProviderOwnedUserMessageEchoClassifier?: (classifier: ProviderOwnedUserMessageEchoClassifier | null) => void;
   fetchCommittedClaudeJsonlMessageBaseline?: (opts?: { take?: number }) => Promise<import('@/backends/claude/utils/claudeJsonlMessageKey').CommittedClaudeJsonlMessageBaseline>;
+  bindProviderInputOutcomeProducer?: (
+    producer: SessionProviderInputOutcomeProducer,
+  ) => SessionProviderInputOutcomeObserver;
+  hasPendingProviderInputAcceptance?: SessionClientPort['hasPendingProviderInputAcceptance'];
+  hasCanonicalPendingProviderInputDelivery?: SessionClientPort['hasCanonicalPendingProviderInputDelivery'];
+  blockPendingMessageDelivery?: SessionClientPort['blockPendingMessageDelivery'];
+  hasOnlyBlockedPendingWork?: SessionClientPort['hasOnlyBlockedPendingWork'];
   hasActiveCanonicalTurn?: () => boolean;
   fetchRecentTranscriptTextItemsForAcpImport?: (opts?: { take?: number }) => Promise<Array<{ role: 'user' | 'agent'; text: string }>>;
   sendAgentMessage: (provider: unknown, body: unknown, opts?: unknown) => void;
   sendAgentMessageCommitted: (
     provider: unknown,
     body: unknown,
-    opts: { localId: string; meta?: Record<string, unknown> },
+    opts: { localId: string; meta?: Record<string, unknown>; provenance?: SessionTranscriptObservationProvenanceV1 },
   ) => Promise<void>;
   sendCodexMessage: (body: unknown) => void;
   sendCodexMessageCommitted?: (body: unknown, opts: { localId: string }) => Promise<unknown>;
   sendUserTextMessage: (text: string, opts?: { localId?: string; meta?: Record<string, unknown> }) => void;
   sendUserTextMessageCommitted?: (
     text: string,
-    opts: { localId: string; meta?: Record<string, unknown> },
+    opts: { localId: string; meta?: Record<string, unknown>; provenance?: SessionTranscriptObservationProvenanceV1 },
   ) => Promise<void>;
   sendSessionEventCommitted?: (event: unknown, opts: { localId: string }) => Promise<unknown>;
   enqueueSessionUserMessage?: (params: Readonly<{
@@ -53,10 +66,12 @@ export type DeferredApiSessionTarget = Readonly<{
     meta?: Record<string, unknown>;
   }>) => Promise<SessionUserMessageEnqueueResult>;
   updateMetadata: (updater: (metadata: Metadata) => Metadata) => void | Promise<void>;
-  updateAgentState: (updater: (state: AgentState) => AgentState) => void | Promise<void>;
+  updateAgentState: (updater: (state: AgentState) => AgentState, options?: AgentStateWriteOptions) => void | Promise<void>;
+  updateAgentStateRequestSettlement: (updater: (state: AgentState) => AgentState) => Promise<void>;
   getRuntimeActivitySnapshotPublisher?: () => SessionRuntimeActivitySnapshotPublisher | null;
   keepAlive: (thinking: boolean, mode: 'local' | 'remote') => void;
   getMetadataSnapshot: () => Metadata | null;
+  getAgentStateSnapshot?: () => AgentState | null;
   refreshSessionSnapshotFromServerBestEffort?: (opts?: { reason?: 'connect' | 'waitForMetadataUpdate' }) => Promise<void>;
   waitForMetadataUpdate: (abortSignal?: AbortSignal) => Promise<boolean>;
   waitForProviderInputAdmission?: (abortSignal: AbortSignal) => Promise<boolean>;
@@ -92,6 +107,7 @@ export class DeferredApiSessionClient {
     controls: Partial<SessionRuntimeControls>;
     targetDispose: (() => void) | null;
   }>();
+  private readonly pendingSessionBindings = new Set<(target: DeferredApiSessionTarget) => void>();
   private target: DeferredApiSessionTarget | null = null;
   private attachPromise: Promise<void> | null = null;
   private flushInFlight: Promise<void> | null = null;
@@ -215,6 +231,58 @@ export class DeferredApiSessionClient {
     }, 'sendClaudeSessionMessageCommittedExact');
   }
 
+  bindProviderInputOutcomeProducer(producer: SessionProviderInputOutcomeProducer): SessionProviderInputOutcomeObserver {
+    if (this.cancelled || this.runtimeTerminationStarted) return () => {};
+    let observe: SessionProviderInputOutcomeObserver | undefined;
+    const bind = (target: DeferredApiSessionTarget) => {
+      observe = target.bindProviderInputOutcomeProducer?.(producer);
+    };
+    if (this.target) bind(this.target);
+    else this.pendingSessionBindings.add(bind);
+
+    // Unified fast startup can bind before attach. Until the canonical client exists there
+    // is no claimed Pending delivery to settle; it alone validates and fences each producer.
+    return (outcome) => {
+      if (!this.cancelled && !this.runtimeTerminationStarted) observe?.(outcome);
+    };
+  }
+
+  hasPendingProviderInputAcceptance(localId: string): boolean {
+    return this.target?.hasPendingProviderInputAcceptance?.(localId) ?? false;
+  }
+
+  subscribeToSessionConnectionState(
+    listener: Parameters<NonNullable<StreamedTranscriptWriterSession['subscribeToSessionConnectionState']>>[0],
+  ): () => void {
+    if (this.cancelled) return () => {};
+    let disposeTarget: (() => void) | undefined;
+    const bind = (target: DeferredApiSessionTarget) => {
+      disposeTarget = target.subscribeToSessionConnectionState?.(listener);
+    };
+    if (this.target) bind(this.target);
+    else this.pendingSessionBindings.add(bind);
+    return () => {
+      this.pendingSessionBindings.delete(bind);
+      disposeTarget?.();
+      disposeTarget = undefined;
+    };
+  }
+
+  hasCanonicalPendingProviderInputDelivery(localId: string): boolean {
+    // Unknown custody must not be interpreted as an already settled delivery.
+    return this.target?.hasCanonicalPendingProviderInputDelivery?.(localId) ?? true;
+  }
+
+  hasOnlyBlockedPendingWork(): boolean {
+    return this.target?.hasOnlyBlockedPendingWork?.() ?? false;
+  }
+
+  async blockPendingMessageDelivery(
+    params: Parameters<NonNullable<SessionClientPort['blockPendingMessageDelivery']>>[0],
+  ): Promise<boolean> {
+    return await this.withAttachedTarget((target) => target.blockPendingMessageDelivery?.(params) ?? false, false);
+  }
+
   hasActiveCanonicalTurn(): boolean {
     const target = this.target;
     // Unknown state before attach counts as ACTIVE so stale-turn recovery stays fail-closed.
@@ -278,7 +346,7 @@ export class DeferredApiSessionClient {
   sendAgentMessageCommitted(
     _provider: unknown,
     _body: unknown,
-    _opts: { localId: string; meta?: Record<string, unknown> },
+    _opts: { localId: string; meta?: Record<string, unknown>; provenance?: SessionTranscriptObservationProvenanceV1 },
   ): Promise<void> {
     return this.forwardCommittedCall(
       (target) => target.sendAgentMessageCommitted(_provider, _body, _opts),
@@ -326,7 +394,7 @@ export class DeferredApiSessionClient {
 
   sendUserTextMessageCommitted(
     _text: string,
-    _opts: { localId: string; meta?: Record<string, unknown> },
+    _opts: { localId: string; meta?: Record<string, unknown>; provenance?: SessionTranscriptObservationProvenanceV1 },
   ): Promise<void> {
     return this.forwardCommittedCall(
       (target) => {
@@ -421,10 +489,10 @@ export class DeferredApiSessionClient {
     return deferred.promise;
   }
 
-  updateAgentState(_updater: (state: AgentState) => AgentState): void | Promise<void> {
+  updateAgentState(_updater: (state: AgentState) => AgentState, options?: AgentStateWriteOptions): void | Promise<void> {
     const target = this.target;
     if (target && !this.flushInFlight) {
-      return target.updateAgentState(_updater);
+      return target.updateAgentState(_updater, options);
     }
 
     const deferred = createDeferredPromise<void>();
@@ -435,7 +503,7 @@ export class DeferredApiSessionClient {
 
     this.pushBufferedCall(
       async (t) => {
-        await Promise.resolve(t.updateAgentState(_updater));
+        await Promise.resolve(t.updateAgentState(_updater, options));
         deferred.resolve();
       },
       { hint: 'updateAgentState' },
@@ -444,6 +512,25 @@ export class DeferredApiSessionClient {
         onError: (error) => deferred.reject(error),
       },
     );
+    return deferred.promise;
+  }
+
+  updateAgentStateRequestSettlement(updater: (state: AgentState) => AgentState): Promise<void> {
+    const target = this.target;
+    if (target && !this.flushInFlight) return target.updateAgentStateRequestSettlement(updater);
+    const deferred = createDeferredPromise<void>();
+    const dropped = () => deferred.reject(new Error('Request settlement was canceled before durable session attachment'));
+    if (this.cancelled) {
+      dropped();
+      return deferred.promise;
+    }
+    this.pushBufferedCall(async (attached) => {
+      await attached.updateAgentStateRequestSettlement(updater);
+      deferred.resolve();
+    }, { hint: 'updateAgentStateRequestSettlement' }, {
+      onDrop: dropped,
+      onError: (error) => deferred.reject(error),
+    });
     return deferred.promise;
   }
 
@@ -457,6 +544,10 @@ export class DeferredApiSessionClient {
     const target = this.target;
     if (!target) return null;
     return target.getMetadataSnapshot();
+  }
+
+  getAgentStateSnapshot(): AgentState | null {
+    return this.target?.getAgentStateSnapshot?.() ?? null;
   }
 
   async refreshSessionSnapshotFromServerBestEffort(opts?: { reason?: 'connect' | 'waitForMetadataUpdate' }): Promise<void> {
@@ -620,6 +711,9 @@ export class DeferredApiSessionClient {
     this.target = _real;
     this.sessionId = _real.sessionId;
 
+    for (const bind of this.pendingSessionBindings) bind(_real);
+    this.pendingSessionBindings.clear();
+
     for (const [method, handler] of this.registeredHandlers.entries()) {
       _real.rpcHandlerManager.registerHandler(method, handler);
     }
@@ -663,6 +757,7 @@ export class DeferredApiSessionClient {
     if (this.cancelled) return;
     this.cancelled = true;
     this.archiveAdmissionAbort.abort();
+    this.pendingSessionBindings.clear();
     this.pendingWakeDebt = false;
 
     const entries = this.buffer;

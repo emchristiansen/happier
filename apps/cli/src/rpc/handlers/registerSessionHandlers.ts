@@ -83,6 +83,8 @@ export interface SpawnSessionOptions {
      * When set, the CLI will connect to this session instead of creating a new one.
      */
     existingSessionId?: string;
+    /** Internal canonical handoff resume; retain already-present provider state. */
+    handoffStateTransfer?: 'existing';
     /**
      * Internal-only attach payload for a pre-resolved existing Happy session.
      *
@@ -269,7 +271,9 @@ export function registerSessionHandlers(
         setAdditionalAllowedReadDirs?: (dirs: string[]) => void;
         setAdditionalAllowedWriteDirs?: (dirs: string[]) => void;
         accessPolicy?: FilesystemAccessPolicy;
+        hasSessionAgentTransition?: () => boolean;
         sessionRuntimeControls?: SessionRuntimeControls | null;
+        getUsageLimitRecoveryCheckNow?: () => SessionRuntimeControls['checkUsageLimitRecoveryNow'];
         /** QAE-1: daemon-side propagation for successful wait-resume cancels. */
         notifyUsageLimitWaitResumeCancelled?: ((request: Readonly<{
             sessionId: string;
@@ -296,7 +300,9 @@ export function registerSessionHandlers(
 
     registerBashHandler(rpcHandlerManager, effectiveWorkingDirectory, { accessPolicy });
     // Checklist-based machine capability registry (replaces legacy detect-cli / detect-capabilities / dep-status).
-    registerCapabilitiesHandlers(rpcHandlerManager);
+    registerCapabilitiesHandlers(rpcHandlerManager, {
+        hasSessionAgentTransition: opts?.hasSessionAgentTransition,
+    });
     registerPreviewEnvHandler(rpcHandlerManager);
     registerSessionTransferRpcHandlers(rpcHandlerManager, {
         workingDirectory: effectiveWorkingDirectory,
@@ -326,6 +332,7 @@ export function registerSessionHandlers(
         updateSessionMetadataWithResult: opts?.updateSessionMetadataWithResult ?? null,
         sessionRuntimeControls: opts?.sessionRuntimeControls ?? null,
         notifyUsageLimitWaitResumeCancelled: opts?.notifyUsageLimitWaitResumeCancelled ?? null,
+        getUsageLimitRecoveryCheckNow: opts?.getUsageLimitRecoveryCheckNow,
     });
 
     return {

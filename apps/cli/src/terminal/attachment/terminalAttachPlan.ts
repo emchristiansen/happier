@@ -18,6 +18,12 @@ export type TerminalAttachPlan =
       paneId?: string;
     }
   | {
+      type: 'herdr';
+      sessionName: string;
+      socketPath: string;
+      terminalId: string;
+    }
+  | {
       type: 'tmux';
       sessionName: string;
       target: string;
@@ -107,6 +113,16 @@ export function createTerminalAttachPlan(params: {
     };
   }
 
+  if (params.terminal.mode === 'herdr') {
+    const sessionName = params.terminal.herdr?.sessionName?.trim();
+    const socketPath = params.terminal.herdr?.socketPath?.trim();
+    const terminalId = params.terminal.herdr?.terminalId?.trim();
+    if (!sessionName || !socketPath || !terminalId) {
+      return { type: 'not-attachable', reason: 'Session does not include a complete Herdr terminal identity.' };
+    }
+    return { type: 'herdr', sessionName, socketPath, terminalId };
+  }
+
   const target = params.terminal.tmux?.target;
   if (typeof target !== 'string' || target.trim().length === 0) {
     return {
@@ -130,6 +146,7 @@ export function createTerminalAttachPlan(params: {
     typeof tmpDir === 'string' && tmpDir.trim().length > 0 ? { TMUX_TMPDIR: tmpDir } : {};
 
   const hasTmpDir = Object.prototype.hasOwnProperty.call(tmuxCommandEnv, 'TMUX_TMPDIR');
+  const resolvedTarget = parsed.window?.startsWith('@') ? parsed.window : target;
 
   let shouldUnsetTmuxEnv = hasTmpDir;
   let shouldAttach = !params.insideTmux || shouldUnsetTmuxEnv;
@@ -157,11 +174,11 @@ export function createTerminalAttachPlan(params: {
   return {
     type: 'tmux',
     sessionName: parsed.session,
-    target,
+    target: resolvedTarget,
     shouldAttach,
     shouldUnsetTmuxEnv,
     tmuxCommandEnv,
-    selectWindowArgs: ['select-window', '-t', target],
+    selectWindowArgs: ['select-window', '-t', resolvedTarget],
     attachSessionArgs: ['attach-session', '-t', parsed.session],
   };
 }

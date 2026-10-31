@@ -2,6 +2,7 @@ import type { TmuxCommandResult } from './types';
 import type {
   TerminalInjectionDuplicateRisk,
   TerminalInjectionFailurePhase,
+  TerminalPromptInput,
 } from '../terminalHost/_types';
 import { splitStringByCodePoints } from '../terminalHost/chunks';
 import {
@@ -132,12 +133,14 @@ export async function pasteTextViaTmuxBuffer(params: Readonly<{
   text: string;
   bufferName: string;
   submitDelayMs?: number | undefined;
-  submitRetryDelayMs?: number | undefined;
+  postSubmitSettleMs?: number | undefined;
   timeoutMs?: number | undefined;
   wait?: ((delayMs: number) => Promise<void>) | undefined;
   verifyStagedBeforeSubmit?: ((params: Readonly<{ text: string; remainingTimeoutMs?: number | undefined }>) => Promise<boolean>) | undefined;
   verifyAfterSubmit?: ((params: Readonly<{ text: string; remainingTimeoutMs?: number | undefined }>) => Promise<boolean>) | undefined;
   authorizeBeforeWrite?: (() => boolean | Promise<boolean>) | undefined;
+  signal?: AbortSignal | undefined;
+  resolveDeliveryState?: TerminalPromptInput['resolveDeliveryState'];
 }>): Promise<TmuxNativePasteTextResult> {
   const progress: TmuxNativePasteProgress = {
     bufferLoaded: false,
@@ -244,6 +247,8 @@ export async function pasteTextViaTmuxBuffer(params: Readonly<{
 
   const submission = await runTerminalPromptSubmission({
     promptText: normalizedText,
+    signal: params.signal,
+    resolveDeliveryState: params.resolveDeliveryState,
     ...(params.verifyStagedBeforeSubmit
       ? {
         verifyStagedBeforeSubmit: async ({ promptText, remainingTimeoutMs }) => params.verifyStagedBeforeSubmit?.({
@@ -263,7 +268,7 @@ export async function pasteTextViaTmuxBuffer(params: Readonly<{
       : {}),
     remainingTimeoutMs: () => remainingTerminalHostDeadlineMs(submissionDeadline),
     wait: params.wait ?? waitFor,
-    submitRetryDelayMs: params.submitRetryDelayMs ?? 0,
+    postSubmitSettleMs: params.postSubmitSettleMs ?? 0,
   });
   progress.submitMayHaveReachedPane = submission.success ? true : submission.submitMayHaveReachedPane;
   if (!submission.success) {

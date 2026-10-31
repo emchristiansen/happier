@@ -20,6 +20,7 @@ describe('happier mcp serve (env hardening)', () => {
 
     const connect = vi.fn(async () => {});
     const deps: McpCommandDeps = {
+      readSettings: async () => ({ schemaVersion: 6, onboardingCompleted: true }),
       readCredentials: async () => credentials,
       bootstrapAccountSettingsContext: vi.fn(async () => ({}) as any),
       updateAccountSettingsV2WithRetry: vi.fn(async () => ({ version: 1 }) as any),
@@ -60,6 +61,7 @@ describe('happier mcp serve (env hardening)', () => {
 
     const connect = vi.fn(async () => {});
     const deps: McpCommandDeps = {
+      readSettings: async () => ({ schemaVersion: 6, onboardingCompleted: true }),
       readCredentials: async () => credentials,
       bootstrapAccountSettingsContext: vi.fn(async () => ({
         source: 'network',
@@ -109,6 +111,7 @@ describe('happier mcp serve (env hardening)', () => {
     };
 
     const deps: McpCommandDeps = {
+      readSettings: async () => ({ schemaVersion: 6, onboardingCompleted: true }),
       readCredentials: async () => credentials,
       bootstrapAccountSettingsContext: vi.fn(async () => ({}) as any),
       updateAccountSettingsV2WithRetry: vi.fn(async () => ({ version: 1 }) as any),
@@ -154,6 +157,7 @@ describe('happier mcp serve (env hardening)', () => {
 
     await expect(
       runMcpServeCommand(['serve'], {
+        readSettings: async () => ({ schemaVersion: 6, onboardingCompleted: true }),
         readCredentials,
         ensureMachineIdForCredentials: async () => ({ machineId: 'machine_1' }),
         bootstrapAccountSettingsContext: async () => ({
@@ -195,7 +199,8 @@ describe('happier mcp serve (env hardening)', () => {
 
     await expect(
       runMcpServeCommand(['serve'], {
-        readCredentials: async () => ({ token: 't' }) as any,
+        readSettings: async () => ({ schemaVersion: 6, onboardingCompleted: true }),
+      readCredentials: async () => ({ token: 't' }) as any,
         ensureMachineIdForCredentials: async () => ({ machineId: 'machine_1' }),
         bootstrapAccountSettingsContext,
         createExternalMcpServer: () => ({ mcp: { connect: async () => {} } as any, toolNames: [] }),

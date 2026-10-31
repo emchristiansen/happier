@@ -6,6 +6,7 @@ import type { Metadata } from '@/api/types';
 import type { TerminalAttachmentId, TerminalHostHandle } from '@/integrations/terminalHost/_types';
 import { withJsonOwnerFileLock } from '@/utils/fs/jsonOwnerFileLock';
 import { writeJsonAtomic } from '@/utils/fs/writeJsonAtomic';
+import type { OwnedTerminalProcessIdentity } from '@/terminal/runtime/ownedTerminalProcess';
 
 const TERMINAL_ATTACHMENT_LOCK_TIMEOUT_MS = 5_000;
 const TERMINAL_ATTACHMENT_LOCK_STALE_AFTER_MS = 30_000;
@@ -26,7 +27,26 @@ export type BoundTerminalAttachmentInfo = {
   updatedAt: number;
 };
 
-export type TerminalAttachmentInfo = LegacyTerminalAttachmentInfo | BoundTerminalAttachmentInfo;
+/**
+ * Exact identity for a terminal that existed before Happier launched the provider.
+ * Version 3 is intentionally distinct from the owned v2 shape: an older Happier
+ * binary must reject it rather than treating the user's terminal as disposable.
+ */
+export type BorrowedTerminalAttachmentInfo = {
+  version: 3;
+  lifecycle: 'borrowed';
+  /** Optional native client only; never ownership of the surrounding shell pane. */
+  nativeClientProcess?: OwnedTerminalProcessIdentity;
+  attachmentId: TerminalAttachmentId;
+  sessionId: string;
+  handle: TerminalHostHandle & Readonly<{ attachmentId: TerminalAttachmentId }>;
+  terminal: NonNullable<Metadata['terminal']>;
+  updatedAt: number;
+};
+
+export type ExactTerminalAttachmentInfo = BoundTerminalAttachmentInfo | BorrowedTerminalAttachmentInfo;
+
+export type TerminalAttachmentInfo = LegacyTerminalAttachmentInfo | ExactTerminalAttachmentInfo;
 
 export function matchesLegacyTerminalAttachmentSnapshot(
   current: LegacyTerminalAttachmentInfo,
@@ -68,7 +88,7 @@ function normalizeOptionalString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function terminalRootMatchesHandle(
+export function terminalMetadataMatchesHostHandle(
   terminal: NonNullable<Metadata['terminal']>,
   handle: TerminalHostHandle,
 ): boolean {
@@ -96,7 +116,42 @@ function terminalRootMatchesHandle(
       && normalizeOptionalString(terminal.zellij?.paneId) === paneId
       && normalizeOptionalString(terminal.zellij?.socketDirV1) === socketDir;
   }
+  if (handle.kind === 'herdr') {
+    if (terminal.mode !== 'herdr') return false;
+    return normalizeOptionalString(terminal.herdr?.sessionName) === sessionName
+      && normalizeOptionalString(terminal.herdr?.socketPath) === normalizeOptionalString(handle.socketPath)
+      && normalizeOptionalString(terminal.herdr?.terminalId) === normalizeOptionalString(handle.terminalId);
+  }
   return handle.kind === 'windows_console' && terminal.mode === 'windows_console';
+}
+
+/** Match hosting identity, not transient presentation or serviceability fields. */
+export function terminalAttachmentMatchesTerminal(
+  attachment: TerminalAttachmentInfo,
+  terminal: NonNullable<Metadata['terminal']>,
+  expectedAttachmentId?: string,
+): boolean {
+  if (attachment.version !== 1) {
+    const terminalId = normalizeOptionalString(terminal.controlServiceabilityV1?.attachmentId);
+    const expectedId = normalizeOptionalString(expectedAttachmentId);
+    // PTY consoles have no host coordinates in metadata. Only the existing
+    // reported/published attachment identity can prove their exact binding.
+    return (attachment.handle.kind !== 'windows_console' || Boolean(terminalId || expectedId))
+      && (!terminalId || attachment.attachmentId === terminalId)
+      && (!expectedId || attachment.attachmentId === expectedId)
+      && terminalMetadataMatchesHostHandle(terminal, attachment.handle);
+  }
+  if (normalizeOptionalString(expectedAttachmentId)) return false;
+  // Regular Windows hosting retains its released v1 descriptor. Its accepted
+  // runner PID and, for WT, window/tab identity replace a terminal-host handle.
+  if (terminal.mode !== 'windows_console' && terminal.mode !== 'windows_terminal') return false;
+  if (attachment.terminal.mode !== terminal.mode || !terminal.windows) return false;
+  const current = attachment.terminal.windows;
+  if (!current || current.host !== terminal.windows.host || current.pid !== terminal.windows.pid) return false;
+  return terminal.mode === 'windows_console'
+    || (Boolean(normalizeOptionalString(terminal.windows.windowId))
+      && normalizeOptionalString(current.windowId) === normalizeOptionalString(terminal.windows.windowId)
+      && normalizeOptionalString(current.title) === normalizeOptionalString(terminal.windows.title));
 }
 
 function parseTerminalAttachmentInfo(raw: string, sessionId: string): TerminalAttachmentInfo | null {
@@ -108,22 +163,29 @@ function parseTerminalAttachmentInfo(raw: string, sessionId: string): TerminalAt
     parsed.terminal.mode !== 'plain'
     && parsed.terminal.mode !== 'tmux'
     && parsed.terminal.mode !== 'zellij'
+    && parsed.terminal.mode !== 'herdr'
     && parsed.terminal.mode !== 'windows_terminal'
     && parsed.terminal.mode !== 'windows_console'
   ) {
     return null;
   }
   if (parsed.version === 1) return parsed as LegacyTerminalAttachmentInfo;
-  if (parsed.version !== 2) return null;
-  const candidate = parsed as Partial<BoundTerminalAttachmentInfo>;
+  if (parsed.version !== 2 && parsed.version !== 3) return null;
+  const candidate = parsed as Partial<ExactTerminalAttachmentInfo>;
+  if (candidate.version === 3 && candidate.lifecycle !== 'borrowed') return null;
+  if ('nativeClientProcess' in candidate) {
+    const process = candidate.version === 3 ? candidate.nativeClientProcess : undefined;
+    if (candidate.version !== 3 || !process || !Number.isInteger(process.pid) || process.pid <= 1
+      || typeof process.processInstanceFingerprint !== 'string' || !process.processInstanceFingerprint.trim()) return null;
+  }
   if (!candidate.terminal) return null;
   if (typeof candidate.attachmentId !== 'string' || candidate.attachmentId.trim().length === 0) return null;
   if (!candidate.handle || typeof candidate.handle !== 'object') return null;
   if (candidate.handle.attachmentId !== candidate.attachmentId) return null;
-  if (candidate.handle.kind !== 'tmux' && candidate.handle.kind !== 'zellij' && candidate.handle.kind !== 'windows_console') return null;
+  if (candidate.handle.kind !== 'tmux' && candidate.handle.kind !== 'zellij' && candidate.handle.kind !== 'herdr' && candidate.handle.kind !== 'windows_console') return null;
   if (typeof candidate.handle.sessionName !== 'string' || candidate.handle.sessionName.trim().length === 0) return null;
-  if (!terminalRootMatchesHandle(candidate.terminal, candidate.handle)) return null;
-  return candidate as BoundTerminalAttachmentInfo;
+  if (!terminalMetadataMatchesHostHandle(candidate.terminal, candidate.handle)) return null;
+  return candidate as ExactTerminalAttachmentInfo;
 }
 
 function terminalMatchesExpected(
@@ -147,7 +209,7 @@ async function removeTerminalAttachmentInfoPath(params: {
       const parsed = parseTerminalAttachmentInfo(raw, params.sessionId);
       if (!parsed || !terminalMatchesExpected(parsed.terminal, params.expectedTerminal)) return false;
       if (params.expectedAttachmentId) {
-        if (parsed.version !== 2 || parsed.attachmentId !== params.expectedAttachmentId) return false;
+        if (parsed.version === 1 || parsed.attachmentId !== params.expectedAttachmentId) return false;
       } else if (params.expectedLegacyAttachment) {
         if (
           parsed.version !== 1
@@ -171,8 +233,10 @@ export async function writeTerminalAttachmentInfo(params: {
   sessionId: string;
   attachmentId?: TerminalAttachmentId | string | undefined;
   handle?: TerminalHostHandle | undefined;
+  lifecycle?: 'owned' | 'borrowed' | undefined;
+  nativeClientProcess?: OwnedTerminalProcessIdentity;
   terminal: NonNullable<Metadata['terminal']>;
-}): Promise<void> {
+}): Promise<TerminalAttachmentInfo> {
   const dir = sessionsDir(params.happyHomeDir);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   // Best-effort: mkdir does not update permissions for existing dirs.
@@ -181,11 +245,22 @@ export async function writeTerminalAttachmentInfo(params: {
   const attachmentId = typeof params.attachmentId === 'string' && params.attachmentId.trim().length > 0
     ? params.attachmentId as TerminalAttachmentId
     : null;
-  if (attachmentId && params.handle && !terminalRootMatchesHandle(params.terminal, params.handle)) {
+  if (attachmentId && params.handle && !terminalMetadataMatchesHostHandle(params.terminal, params.handle)) {
     throw new Error('Terminal attachment root does not match its bound host handle');
   }
   const info: TerminalAttachmentInfo = attachmentId && params.handle
-    ? {
+    ? params.lifecycle === 'borrowed'
+      ? {
+        version: 3,
+        lifecycle: 'borrowed',
+        ...(params.nativeClientProcess ? { nativeClientProcess: params.nativeClientProcess } : {}),
+        attachmentId,
+        sessionId: params.sessionId,
+        handle: { ...params.handle, attachmentId },
+        terminal: params.terminal,
+        updatedAt: Date.now(),
+      }
+      : {
         version: 2,
         attachmentId,
         sessionId: params.sessionId,
@@ -201,17 +276,19 @@ export async function writeTerminalAttachmentInfo(params: {
       };
 
   const path = sessionFilePath(params.happyHomeDir, params.sessionId);
-  await withTerminalAttachmentLock(path, async () => {
+  const committed = await withTerminalAttachmentLock(path, async () => {
     const current = await readAttachmentFileState(path, params.sessionId);
-    if (info.version === 1 && current.status === 'present' && current.info.version === 2) {
-      return;
+    if (info.version === 1 && current.status === 'present' && current.info.version !== 1) {
+      return current.info;
     }
     if (current.status === 'unreadable') {
       throw new Error('terminal_attachment_descriptor_unreadable');
     }
     await writeJsonAtomic(path, info);
+    return info;
   });
   await chmod(path, 0o600).catch(() => {});
+  return committed;
 }
 
 export async function removeTerminalAttachmentInfo(params: {

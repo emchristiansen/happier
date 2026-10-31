@@ -1,8 +1,7 @@
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { createConnection } from 'node:net';
-import { spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, win32 as win32Path } from 'node:path';
 
@@ -14,6 +13,7 @@ import {
     type ServiceBackend,
     type ServiceSpec,
 } from '../service/index.js';
+import { runCommandCapture } from '../process/runCommandStreaming.js';
 
 import { checkRelayRuntimeHealth, resolveRelayRuntimeDefaults } from './relayRuntime.js';
 import { removeRuntimePayloadPath } from './copyRuntimePayloadTree.js';
@@ -902,16 +902,26 @@ export async function installOrUpdateRelayRuntimeLocal(params: Readonly<{
                     env,
                 });
             } else {
-                const completion = spawnSync(migrationPlan.command, [...migrationPlan.args], {
+                // Captured rather than inherited: the CLI animates a step around this install and the
+                // daemon keeps serving meanwhile, so the migration neither blocks nor writes to a terminal.
+                // Its output joins the relay's own logs, and a failure carries what it printed.
+                const migration = await runCommandCapture({
+                    cmd: migrationPlan.command,
+                    args: migrationPlan.args,
                     cwd: defaults.installRoot,
                     env: { ...process.env, ...env },
-                    stdio: 'inherit',
                 });
-                if (completion.error) {
-                    throw new Error(`[relay-runtime] database migration failed to start: ${completion.error.message}`);
+                if (migration.kind !== 'exited') {
+                    const reason = migration.kind === 'spawn-failed' ? migration.message : migration.kind;
+                    throw new Error(`[relay-runtime] database migration failed to start: ${reason}`);
                 }
-                if (completion.status !== 0) {
-                    throw new Error(`[relay-runtime] database migration exited with status ${completion.status ?? 'unknown'}`);
+                await appendFile(stdoutPath, migration.stdout);
+                await appendFile(stderrPath, migration.stderr);
+                if (migration.status !== 0) {
+                    const printed = migration.stderr.trim() || migration.stdout.trim();
+                    throw new Error(
+                        `[relay-runtime] database migration exited with status ${migration.status ?? 'unknown'}${printed ? `:\n${printed}` : ''}`,
+                    );
                 }
             }
         }

@@ -16,6 +16,7 @@ import {
   type ResolvedCustomHappierToolWarning,
 } from '@/agent/tools/happierTools/customMcp/listResolvedCustomHappierTools';
 import { callResolvedCustomHappierTool } from '@/agent/tools/happierTools/customMcp/callResolvedCustomHappierTool';
+import { fail } from '@happier-dev/cli-common/output';
 
 type BuiltInToolEntry = Awaited<ReturnType<typeof listBuiltInHappierTools>>[number];
 type CustomToolEntry = Awaited<ReturnType<typeof listResolvedCustomHappierTools>>['tools'][number];
@@ -108,6 +109,7 @@ async function resolveCustomToolsRuntimeContext(args: readonly string[], deps: T
   sessionId: string | null;
   directory: string;
   mcpServers: Awaited<ReturnType<typeof resolveCustomHappierToolsContext>>['mcpServers'];
+  cleanup: () => void;
 }>;
 
 async function resolveCustomToolsRuntimeContext(
@@ -119,6 +121,7 @@ async function resolveCustomToolsRuntimeContext(
   sessionId: string;
   directory: string;
   mcpServers: Awaited<ReturnType<typeof resolveCustomHappierToolsContext>>['mcpServers'];
+  cleanup: () => void;
 }>;
 
 async function resolveCustomToolsRuntimeContext(
@@ -130,6 +133,7 @@ async function resolveCustomToolsRuntimeContext(
   sessionId: string | null;
   directory: string;
   mcpServers: Awaited<ReturnType<typeof resolveCustomHappierToolsContext>>['mcpServers'];
+  cleanup: () => void;
 }> {
   const baseContext = options?.requireSessionId === true
     ? await resolveToolsBaseContext(args, deps, { requireSessionId: true })
@@ -152,7 +156,7 @@ async function resolveCustomToolsRuntimeContext(
     directory,
   });
 
-  return { credentials, sessionId, directory, mcpServers: customContext.mcpServers };
+  return { credentials, sessionId, directory, mcpServers: customContext.mcpServers, cleanup: customContext.cleanup };
 }
 
 function printHumanToolList(params: Readonly<{
@@ -190,47 +194,51 @@ export async function handleToolsCommand(args: string[], overrides?: Partial<Too
   try {
     if (subcommand === 'list') {
       const context = await resolveCustomToolsRuntimeContext(args, deps);
-      const builtInTools = await deps.listBuiltInHappierTools();
-      const { tools: customTools, warnings } = await deps.listResolvedCustomHappierTools({ mcpServers: context.mcpServers });
+      try {
+        const builtInTools = await deps.listBuiltInHappierTools();
+        const { tools: customTools, warnings } = await deps.listResolvedCustomHappierTools({ mcpServers: context.mcpServers });
 
-      if (json) {
-        await printJsonEnvelope({
-          ok: true,
-          kind,
-          data: {
-            sources: {
-              happier: builtInTools.map((tool) => ({
-                name: tool.name,
-                title: tool.title,
-                description: tool.description,
-                inputSchema: tool.inputSchema,
-              })),
-              ...Object.fromEntries(
-                Array.from(
-                  customTools.reduce((map, tool) => {
-                    const list = map.get(tool.source) ?? [];
-                    list.push(tool);
-                    map.set(tool.source, list);
-                    return map;
-                  }, new Map<string, CustomToolEntry[]>()),
-                ).map(([source, tools]) => [
-                  source,
-                  tools.map((tool) => ({
-                    name: tool.name,
-                    description: tool.description ?? null,
-                    inputSchema: tool.inputSchema ?? null,
-                  })),
-                ]),
-              ),
+        if (json) {
+          await printJsonEnvelope({
+            ok: true,
+            kind,
+            data: {
+              sources: {
+                happier: builtInTools.map((tool) => ({
+                  name: tool.name,
+                  title: tool.title,
+                  description: tool.description,
+                  inputSchema: tool.inputSchema,
+                })),
+                ...Object.fromEntries(
+                  Array.from(
+                    customTools.reduce((map, tool) => {
+                      const list = map.get(tool.source) ?? [];
+                      list.push(tool);
+                      map.set(tool.source, list);
+                      return map;
+                    }, new Map<string, CustomToolEntry[]>()),
+                  ).map(([source, tools]) => [
+                    source,
+                    tools.map((tool) => ({
+                      name: tool.name,
+                      description: tool.description ?? null,
+                      inputSchema: tool.inputSchema ?? null,
+                    })),
+                  ]),
+                ),
+              },
+              warnings,
             },
-            warnings,
-          },
-        });
-        return;
-      }
+          });
+          return;
+        }
 
-      printHumanToolList({ builtInTools, customTools, warnings });
-      return;
+        printHumanToolList({ builtInTools, customTools, warnings });
+        return;
+      } finally {
+        context.cleanup();
+      }
     }
 
     if (subcommand === 'call') {
@@ -254,12 +262,16 @@ export async function handleToolsCommand(args: string[], overrides?: Partial<Too
         });
       } else {
         const context = await resolveCustomToolsRuntimeContext(args, deps, { requireSessionId: true });
-        result = await deps.callResolvedCustomHappierTool({
-          source,
-          toolName,
-          args: parsedArgs,
-          mcpServers: context.mcpServers,
-        });
+        try {
+          result = await deps.callResolvedCustomHappierTool({
+            source,
+            toolName,
+            args: parsedArgs,
+            mcpServers: context.mcpServers,
+          });
+        } finally {
+          context.cleanup();
+        }
       }
 
       if (json) {
@@ -332,7 +344,7 @@ export async function handleToolsCliCommand(context: CommandContext): Promise<vo
       return;
     }
 
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) console.error(error);
     process.exitCode = typeof process.exitCode === 'number' && process.exitCode > 1 ? process.exitCode : 1;
   }

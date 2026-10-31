@@ -1,17 +1,8 @@
-import { link, symlink } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { link } from 'node:fs/promises';
+
+import { createAbsolutePathSymlink } from '@/utils/fs/createAbsolutePathSymlink';
 
 import type { ConnectedServiceHomeEntryStat } from './connectedServiceHomeEntrySync';
-
-function resolveSymlinkType(sourceStat: ConnectedServiceHomeEntryStat): 'file' | 'dir' | 'junction' {
-  return process.platform === 'win32'
-    ? sourceStat.isDirectory()
-      ? 'junction'
-      : 'file'
-    : sourceStat.isDirectory()
-      ? 'dir'
-      : 'file';
-}
 
 function formatFsCode(error: unknown): string {
   const err = error as NodeJS.ErrnoException;
@@ -53,7 +44,11 @@ export async function createConnectedServiceSharedStateLink(params: Readonly<{
   allowHardLinkFallback: boolean;
 }>): Promise<void> {
   try {
-    await symlink(resolve(params.sourcePath), params.destinationPath, resolveSymlinkType(params.sourceStat));
+    await createAbsolutePathSymlink({
+      sourcePath: params.sourcePath,
+      destinationPath: params.destinationPath,
+      sourceKind: params.sourceStat.isDirectory() ? 'directory' : 'file',
+    });
     return;
   } catch (symlinkError) {
     if (!params.allowHardLinkFallback || params.sourceStat.isDirectory()) {

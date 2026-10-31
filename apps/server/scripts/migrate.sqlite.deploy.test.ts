@@ -3,7 +3,6 @@ import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 
 import { runSqliteMigrationDeploy } from "./migrate.sqlite.deploy";
 
@@ -28,7 +27,7 @@ describe("migrate.sqlite.deploy.ts", () => {
 
     beforeEach(async () => {
         tmpDir = await mkdtemp(join(tmpdir(), "happier-server-light-deploy-"));
-        lightDataDir = join(tmpDir, "happy server light");
+        lightDataDir = join(tmpDir, "happy server #light");
         serverRoot = join(tmpDir, "server");
         migrationsDir = join(serverRoot, "prisma", "sqlite", "migrations");
         await mkdir(lightDataDir, { recursive: true });
@@ -39,7 +38,7 @@ describe("migrate.sqlite.deploy.ts", () => {
         await rm(tmpDir, { recursive: true, force: true });
     });
 
-    it("applies through the real Node adapter and canonical policy using a safe derived file URL", async () => {
+    it("applies through the real Node adapter and canonical policy using the native file path", async () => {
         const migrationName = "20260101000000_first";
         const migrationDir = join(migrationsDir, migrationName);
         await mkdir(migrationDir, { recursive: true });
@@ -92,7 +91,7 @@ describe("migrate.sqlite.deploy.ts", () => {
             db.close();
         }
 
-        const encodedDirExists = await stat(join(tmpDir, "happy%20server%20light"))
+        const encodedDirExists = await stat(join(tmpDir, "happy%20server%20%23light"))
             .then(() => true)
             .catch(() => false);
         expect(encodedDirExists).toBe(false);
@@ -118,7 +117,7 @@ describe("migrate.sqlite.deploy.ts", () => {
                 env: {
                     HAPPY_SERVER_LIGHT_DATA_DIR: lightDataDir,
                     HAPPIER_SERVER_LIGHT_DATA_DIR: lightDataDir,
-                    DATABASE_URL: pathToFileURL(databasePath).href,
+                    DATABASE_URL: `file:${databasePath}`,
                 },
                 serverRoot,
                 runSchemaSync: async () => {},

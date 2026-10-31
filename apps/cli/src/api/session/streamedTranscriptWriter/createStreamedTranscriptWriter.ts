@@ -51,6 +51,8 @@ type SegmentKey = StreamedTranscriptSegmentKey;
 
 type SegmentRuntime = StreamedTranscriptSegmentRuntime;
 
+const DURABLE_COMMIT_FAILURE_RETRY_DELAY_MS = 2_000;
+
 function didSegmentDurablyFlush(segment: SegmentRuntime, expectedState: SegmentState): boolean {
   if (segment.accumulatedText.length === 0) return false;
   return segment.lastCommittedTextVersion === segment.textVersion && segment.lastCommittedState === expectedState;
@@ -58,14 +60,14 @@ function didSegmentDurablyFlush(segment: SegmentRuntime, expectedState: SegmentS
 
 function buildFlushSummary(params: {
   flushedSegments: ReadonlyArray<SegmentRuntime>;
-  expectedState: SegmentState;
+  expectedState: (segment: SegmentRuntime) => SegmentState;
 }): StreamedTranscriptFlushSummary {
   const segments: StreamedTranscriptSegmentFlushSummary[] = params.flushedSegments.map((segment) => ({
     kind: segment.kind,
     sidechainId: segment.sidechainId,
     localId: segment.segmentLocalId,
     sawText: segment.accumulatedText.length > 0,
-    didDurablyFlush: didSegmentDurablyFlush(segment, params.expectedState),
+    didDurablyFlush: didSegmentDurablyFlush(segment, params.expectedState(segment)),
     lastCommittedState: segment.lastCommittedState,
     commitResult: segment.lastCommitResult,
   }));
@@ -115,6 +117,17 @@ export function createStreamedTranscriptWriter(params: {
   const liveCheckpointIntervalMs = resolveLiveCheckpointIntervalMs(params.liveCheckpointIntervalMs);
 
   const segments = new Map<SegmentKey, SegmentRuntime>();
+  // Closed segments retain their identity and terminal intent until persistence
+  // succeeds. They cannot become the append target for a later reply.
+  const terminalSegments = new Map<SegmentRuntime, {
+    state: SegmentState;
+    interruptedReason?: string;
+    drain: Promise<void> | null;
+    failureReported: boolean;
+    retryAfterDrain: boolean;
+  }>();
+  let unsubscribeConnectionState: (() => void) | null = null;
+  let scheduleDurableCheckpoint: (segment: SegmentRuntime) => void;
 
   const clearLiveSnapshotTimer = (segment: SegmentRuntime) => {
     if (!segment.liveSnapshotTimer) return;
@@ -129,6 +142,10 @@ export function createStreamedTranscriptWriter(params: {
   };
 
   const commitDurableSnapshot = (segment: SegmentRuntime, opts: { state: SegmentState; interruptedReason?: string; force?: boolean }) => {
+    if (opts.state === 'streaming' && Date.now() < segment.durableRetryNotBeforeMs) {
+      scheduleDurableCheckpoint(segment);
+      return;
+    }
     clearDurableCheckpointTimer(segment);
     if (!durableCommitsEnabled && opts.force !== true) return;
     commitStreamedTranscriptSegmentSnapshot({
@@ -137,6 +154,8 @@ export function createStreamedTranscriptWriter(params: {
       segment,
       state: opts.state,
       interruptedReason: opts.interruptedReason,
+      failureRetryDelayMs: DURABLE_COMMIT_FAILURE_RETRY_DELAY_MS,
+      onStreamingCommitFailure: () => scheduleDurableCheckpoint(segment),
     });
   };
 
@@ -178,6 +197,8 @@ export function createStreamedTranscriptWriter(params: {
       lastCommitFailedAtMs: 0,
       lastCommitError: null,
       lastCommitResult: null,
+      durableCommitFailure: null,
+      durableRetryNotBeforeMs: 0,
       liveDelivery: createLiveDeliveryState(),
       additionalMeta: {},
       ...(commitProvenance ? { provenance: commitProvenance } : {}),
@@ -212,12 +233,13 @@ export function createStreamedTranscriptWriter(params: {
   };
 
   const commitScheduledDurableSnapshot = (segment: SegmentRuntime) => {
-    if (!segments.has(segment.key)) return;
+    if (segments.get(segment.key) !== segment) return;
     if (!hasDirtyDurableText(segment)) return;
     commitDurableSnapshot(segment, { state: 'streaming' });
   };
 
-  const scheduleDurableCheckpoint = (segment: SegmentRuntime) => {
+  scheduleDurableCheckpoint = (segment: SegmentRuntime) => {
+    if (segments.get(segment.key) !== segment) return;
     if (!durableCommitsEnabled) {
       clearDurableCheckpointTimer(segment);
       return;
@@ -230,7 +252,9 @@ export function createStreamedTranscriptWriter(params: {
 
     const elapsedMs = segment.didWriteDurable ? Date.now() - segment.lastCheckpointAtMs : 0;
     const targetDelayMs = segment.didWriteDurable ? checkpointIntervalMs : initialCheckpointDelayMs;
-    const delayMs = targetDelayMs <= 0 ? 0 : Math.max(0, targetDelayMs - elapsedMs);
+    const cadenceDelayMs = targetDelayMs <= 0 ? 0 : Math.max(0, targetDelayMs - elapsedMs);
+    const failureDelayMs = Math.max(0, segment.durableRetryNotBeforeMs - Date.now());
+    const delayMs = Math.max(cadenceDelayMs, failureDelayMs);
 
     if (delayMs <= 0) {
       commitScheduledDurableSnapshot(segment);
@@ -540,50 +564,115 @@ export function createStreamedTranscriptWriter(params: {
     return true;
   };
 
+  const closeSegments = (opts: {
+    reason: 'tool-call-boundary' | 'turn-end' | 'abort';
+    interruptedReason?: string;
+  }) => {
+    for (const segment of segments.values()) {
+      clearDurableCheckpointTimer(segment);
+      clearLiveSnapshotTimer(segment);
+      terminalSegments.set(segment, {
+        state: opts.reason === 'abort' ? 'interrupted' : 'complete',
+        interruptedReason: opts.interruptedReason,
+        drain: null,
+        failureReported: false,
+        retryAfterDrain: false,
+      });
+    }
+    segments.clear();
+    if (terminalSegments.size > 0 && !unsubscribeConnectionState) {
+      unsubscribeConnectionState = session.subscribeToSessionConnectionState?.((state) => {
+        if (state.phase !== 'online') return;
+        for (const [segment, terminal] of terminalSegments) {
+          // A reconnect can arrive before an offline write has settled. Preserve
+          // that wake until the original attempt releases its drain.
+          if (terminal.drain) terminal.retryAfterDrain = true;
+          else startTerminalCommit(segment, terminal, false);
+        }
+      }) ?? null;
+    }
+    return Array.from(terminalSegments.entries());
+  };
+
+  const startTerminalCommit = (
+    segment: SegmentRuntime,
+    terminal: NonNullable<ReturnType<typeof terminalSegments.get>>,
+    admissionOnly: boolean,
+  ) => {
+    if (terminal.drain) return;
+    terminal.drain = (async () => {
+      requestLivePublication(segment, { state: terminal.state, interruptedReason: terminal.interruptedReason });
+      await waitForLiveDeliveryDrain(segment);
+      const commit = commitStreamedTranscriptSegmentSnapshot({
+        provider,
+        session,
+        segment,
+        state: terminal.state,
+        interruptedReason: terminal.interruptedReason,
+        admissionOnly,
+      });
+      // Admission does not wait for an earlier checkpoint ACK, but still owns
+      // and observes its terminal write. Ordinary flushes drain both writes.
+      if (admissionOnly) await commit;
+      await waitForSegmentDrain(segment);
+      if (didSegmentDurablyFlush(segment, terminal.state)) {
+        terminalSegments.delete(segment);
+      } else if (!terminal.failureReported) {
+        terminal.failureReported = true;
+        logger.infoFile('[StreamedTranscriptWriter] Terminal snapshot delivery unresolved; retained for retry', {
+          localId: segment.segmentLocalId,
+          kind: segment.kind,
+          sidechainId: segment.sidechainId,
+          state: terminal.state,
+          textLength: segment.accumulatedText.length,
+        });
+      }
+      logUnresolvedLiveFailureSummary(segment);
+    })().finally(() => {
+      terminal.drain = null;
+      if (terminal.retryAfterDrain && terminalSegments.has(segment)) {
+        terminal.retryAfterDrain = false;
+        startTerminalCommit(segment, terminal, false);
+      }
+      if (terminalSegments.size === 0) {
+        unsubscribeConnectionState?.();
+        unsubscribeConnectionState = null;
+      }
+    });
+  };
+
   const flushAll = async (opts: {
     reason: 'tool-call-boundary' | 'turn-end' | 'abort';
     interruptedReason?: string;
   }): Promise<StreamedTranscriptFlushSummary> => {
-    const state: SegmentState = opts.reason === 'abort' ? 'interrupted' : 'complete';
-    const drainPromises: Promise<void>[] = [];
-    const flushedSegments = Array.from(segments.values());
-
-    for (const segment of flushedSegments) {
-      clearDurableCheckpointTimer(segment);
-      clearLiveSnapshotTimer(segment);
-      requestLivePublication(segment, { state, interruptedReason: opts.interruptedReason });
-      segments.delete(segment.key);
-      drainPromises.push((async () => {
-        // The durable snapshot replaces the live projection for this localId.
-        // Settle every queued live publication first so a delayed ephemeral
-        // delivery cannot temporarily overwrite the terminal durable state.
-        await waitForLiveDeliveryDrain(segment);
-        commitDurableSnapshot(segment, { state, interruptedReason: opts.interruptedReason, force: true });
-        await waitForSegmentDrain(segment);
-      })());
-    }
-
-    await Promise.all(drainPromises);
-    for (const segment of flushedSegments) {
-      if (
-        segment.commitMode === 'compatibility'
-        && (segment.lastCommitError !== null || !didSegmentDurablyFlush(segment, state))
-      ) {
-        segments.set(segment.key, segment);
-      }
-    }
-    const failedExactSegment = flushedSegments.find((segment) =>
-      segment.commitMode === 'exact'
-      && (segment.lastCommitError !== null || !didSegmentDurablyFlush(segment, state)),
-    );
+    const entries = closeSegments(opts);
+    for (const [segment, terminal] of entries) startTerminalCommit(segment, terminal, false);
+    await Promise.all(entries.map(([, terminal]) => terminal.drain));
+    const failedExactSegment = entries.find(([segment, terminal]) =>
+      segment.commitMode === 'exact' && !didSegmentDurablyFlush(segment, terminal.state),
+    )?.[0];
     if (failedExactSegment) {
       const reason = failedExactSegment.lastCommitError instanceof Error
         ? failedExactSegment.lastCommitError.message
         : 'durable acknowledgement was not received';
       throw new Error(`Exact transcript segment commit failed for ${failedExactSegment.segmentLocalId}: ${reason}`);
     }
-    for (const segment of flushedSegments) logUnresolvedLiveFailureSummary(segment);
-    return buildFlushSummary({ flushedSegments, expectedState: state });
+    const terminalBySegment = new Map(entries);
+    return buildFlushSummary({
+      flushedSegments: entries.map(([segment]) => segment),
+      expectedState: (segment) => terminalBySegment.get(segment)!.state,
+    });
+  };
+
+  const flushAllThroughDurableAdmission = async (opts: {
+    reason: 'tool-call-boundary' | 'turn-end' | 'abort';
+    interruptedReason?: string;
+  }): Promise<void> => {
+    const entries = closeSegments(opts);
+    for (const [segment, terminal] of entries) startTerminalCommit(segment, terminal, true);
+    // Each task enters the session-owned commit queue after live delivery drains;
+    // waiting only on that live drain preserves tool-event admission ordering.
+    await Promise.all(entries.map(([segment]) => waitForLiveDeliveryDrain(segment)));
   };
 
   const enableDurableCommits = () => {
@@ -595,7 +684,9 @@ export function createStreamedTranscriptWriter(params: {
   };
 
   const discard = () => {
-    for (const segment of segments.values()) {
+    unsubscribeConnectionState?.();
+    unsubscribeConnectionState = null;
+    for (const segment of [...segments.values(), ...terminalSegments.keys()]) {
       clearDurableCheckpointTimer(segment);
       clearLiveSnapshotTimer(segment);
       logUnresolvedLiveFailureSummary(segment);
@@ -604,6 +695,7 @@ export function createStreamedTranscriptWriter(params: {
       segment.idleWaiters.splice(0, segment.idleWaiters.length).forEach((resolve) => resolve());
     }
     segments.clear();
+    terminalSegments.clear();
   };
 
   return {
@@ -624,6 +716,8 @@ export function createStreamedTranscriptWriter(params: {
     },
     enableDurableCommits,
     discard,
+    hasPendingSegments: () => segments.size > 0 || terminalSegments.size > 0,
     flushAll,
+    flushAllThroughDurableAdmission,
   };
 }

@@ -129,14 +129,16 @@ export function normalizeClaudeAgentSdkProviderTaskStatus(status: unknown): stri
 }
 
 export function readClaudeAgentSdkProviderTaskStatus(message: unknown): string | null {
-  if (!message || typeof message !== 'object') return null;
-  const record = message as Record<string, unknown>;
+  const record = readClaudeToolResultRecord(message);
+  if (!record) return null;
   const directStatus = normalizeClaudeAgentSdkProviderTaskStatus(record.status);
   if (directStatus) return directStatus;
 
   const patch = record.patch;
-  if (!patch || typeof patch !== 'object') return null;
-  return normalizeClaudeAgentSdkProviderTaskStatus((patch as Record<string, unknown>).status);
+  const patchStatus = patch && typeof patch === 'object'
+    ? normalizeClaudeAgentSdkProviderTaskStatus((patch as Record<string, unknown>).status) : null;
+  return patchStatus ?? readClaudeAgentSdkProviderTaskStatus(record.tool_use_result)
+    ?? readClaudeAgentSdkProviderTaskStatus(record.toolUseResult);
 }
 
 export function isTerminalClaudeAgentSdkProviderTaskStatus(status: unknown): boolean {

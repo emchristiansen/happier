@@ -3,6 +3,17 @@ import { describe, it, expect } from 'vitest';
 import { getAttachCommandForSession, getTmuxFallbackReason, getTmuxTargetForSession } from './terminalSessionDetails';
 
 describe('terminalSessionDetails', () => {
+    it('offers attach for Herdr and Zellij panes with complete identities', () => {
+        expect(getAttachCommandForSession({
+            sessionId: 's-herdr',
+            terminal: { mode: 'herdr', herdr: { sessionName: 'default', socketPath: '/tmp/herdr.sock', terminalId: 'term_1' } },
+        })).toBe('happier attach s-herdr');
+        expect(getAttachCommandForSession({
+            sessionId: 's-zellij',
+            terminal: { mode: 'zellij', zellij: { sessionName: 'happy', paneId: 'terminal_1' } },
+        })).toBe('happier attach s-zellij');
+    });
+
     it('returns an attach command when tmux target exists', () => {
         expect(getAttachCommandForSession({
             sessionId: 's1',

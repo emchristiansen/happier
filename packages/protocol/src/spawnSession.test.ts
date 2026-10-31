@@ -5,6 +5,7 @@ import {
   SPAWN_SESSION_ERROR_DETAIL_KINDS,
   PendingFirstInputV1Schema,
   SpawnSessionExecutionAuthorizationSchema,
+  SpawnSessionTerminalSchema,
   isConnectedServiceUxDiagnosticSpawnErrorDetail,
   isConnectedServiceResumeUnreachableSpawnErrorDetail,
   isSpawnSessionErrorDetail,
@@ -12,6 +13,25 @@ import {
   type SpawnSessionErrorDetail,
   type SpawnSessionResult,
 } from './spawnSession.js';
+
+describe('spawn-session terminal hosts', () => {
+  it('preserves safe terminal-host unavailability without changing the released spawn error code', () => {
+    const detail = { kind: 'terminal_host_unavailable', host: 'herdr', reason: 'installation_unavailable' };
+    expect(normalizeSpawnSessionErrorDetail(detail)).toEqual(detail);
+    expect(isSpawnSessionErrorDetail(detail)).toBe(true);
+    const unsupportedServer = { ...detail, reason: 'server_version_unsupported' };
+    expect(normalizeSpawnSessionErrorDetail(unsupportedServer)).toEqual(unsupportedServer);
+    expect(normalizeSpawnSessionErrorDetail({ ...detail, host: 'other' })).toBeUndefined();
+    expect(normalizeSpawnSessionErrorDetail({ ...detail, reason: 'secret/path' })).toBeUndefined();
+    expect(normalizeSpawnSessionErrorDetail({ ...detail, resolvedPath: '/private/tool' })).toBeUndefined();
+    expect(SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED).toBe('SPAWN_FAILED');
+  });
+  it('accepts Herdr and Zellij without reinterpreting them as tmux', () => {
+    expect(SpawnSessionTerminalSchema.parse({ mode: 'herdr', herdr: { sessionName: 'default' } }))
+      .toEqual({ mode: 'herdr', herdr: { sessionName: 'default' } });
+    expect(SpawnSessionTerminalSchema.parse({ mode: 'zellij' })).toEqual({ mode: 'zellij' });
+  });
+});
 
 describe('spawn-session pending first input', () => {
   it('preserves prompt bytes, opaque identity, and optional message metadata', () => {

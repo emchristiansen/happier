@@ -1,11 +1,54 @@
+import type { Query, SDKMessage, SDKAssistantMessage } from '@anthropic-ai/claude-agent-sdk';
 import { describe, expect, it, vi } from 'vitest';
-import { EventEmitter } from 'node:events';
-import { Readable } from 'node:stream';
 
 import { claudeRemoteAgentSdk } from './claudeRemoteAgentSdk';
 import { makeMode } from './claudeRemoteAgentSdk.testkit';
 
 describe('claudeRemoteAgentSdk stream events', () => {
+    it('keeps rejected allowance availability and sidechain errors out of parent failure recovery', async () => {
+        let sent = false;
+        const failures: unknown[] = [];
+        const quota: unknown[] = [];
+        // The external Agent SDK query is the boundary; stream admission and mapping remain real.
+        const query: Pick<Query, typeof Symbol.asyncIterator | 'close' | 'setPermissionMode' | 'setModel' | 'setMaxThinkingTokens' | 'supportedCommands' | 'supportedModels'> = {
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'overage', utilization: 1, overageStatus: 'rejected', overageDisabledReason: 'org_level_disabled' } } as SDKMessage;
+                const sidechainError = {
+                    type: 'assistant', parent_tool_use_id: 'child-task', isApiErrorMessage: true, apiErrorStatus: 429,
+                    error: 'rate_limit', uuid: '00000000-0000-4000-8000-000000000001', session_id: 'native-main',
+                    message: {
+                        id: 'child-message', type: 'message', role: 'assistant', model: 'claude',
+                        content: [], container: null, context_management: null, stop_reason: 'end_turn', stop_sequence: null,
+                        usage: { input_tokens: 0, output_tokens: 0, cache_creation: null,
+                            cache_creation_input_tokens: null, cache_read_input_tokens: null, inference_geo: null,
+                            iterations: null, server_tool_use: null, service_tier: null, speed: null },
+                    },
+                } satisfies SDKAssistantMessage & { isApiErrorMessage: boolean; apiErrorStatus: number };
+                yield sidechainError;
+                yield { type: 'result', subtype: 'success', is_error: false, session_id: 'native-main', result: 'completed', num_turns: 1, total_cost_usd: 0, duration_ms: 1, duration_api_ms: 1 } as SDKMessage;
+            },
+            close() {}, async setPermissionMode() {}, async setModel() {}, async setMaxThinkingTokens() {},
+            supportedCommands: async () => [], supportedModels: async () => [],
+        };
+        // Only consumed SDK controls are implemented at this external process boundary.
+        const createQuery = () => query as Query;
+        await claudeRemoteAgentSdk({
+            sessionId: null, transcriptPath: null, path: '/tmp', claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }), isAborted: () => false,
+            nextMessage: async () => {
+                if (sent) return null;
+                sent = true;
+                return { message: 'hello', mode: makeMode({ claudeRemoteAgentSdkEnabled: true }) };
+            },
+            onReady() {}, onSessionFound() {}, onMessage() {},
+            onRateLimitEvent: async (details) => { failures.push(details); },
+            onQuotaEvidence: async (windows) => { quota.push(...windows); },
+            createQuery,
+        });
+        expect(failures).toEqual([]);
+        expect(quota.length).toBeGreaterThan(0);
+    });
+
     const runAgentSdkStreamForCompactionEvents = async (
         streamMessages: unknown[],
         options?: Readonly<{ initialMessage?: string }>,
@@ -57,70 +100,133 @@ describe('claudeRemoteAgentSdk stream events', () => {
             );
     };
 
-    it('confirms provider acceptance only after the Agent SDK exact process-transport write callback succeeds', async () => {
+    it('settles a locally handled /clear command instead of leaving its pending claim delivering', async () => {
+        const onPromptAcceptedByProvider = vi.fn();
+        const onSessionReset = vi.fn();
+        const createQuery = vi.fn();
+
+        await claudeRemoteAgentSdk({
+            sessionId: null,
+            transcriptPath: null,
+            path: '/tmp',
+            claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+            isAborted: () => false,
+            nextMessage: async () => ({
+                message: '/clear',
+                mode: makeMode({ claudeRemoteAgentSdkEnabled: true }),
+                maxUserMessageSeq: 4,
+                userMessageLocalIds: ['clear-local-4'],
+            }),
+            onReady: () => {},
+            onSessionFound: () => {},
+            onMessage: () => {},
+            onSessionReset,
+            onPromptAcceptedByProvider,
+            createQuery,
+        } as any);
+
+        expect(onSessionReset).toHaveBeenCalledTimes(1);
+        expect(createQuery).not.toHaveBeenCalled();
+        expect(onPromptAcceptedByProvider).toHaveBeenCalledExactlyOnceWith({
+            maxUserMessageSeq: 4,
+            userMessageLocalIds: ['clear-local-4'],
+        });
+    });
+
+    it('rejects the claimed prompt before effect when Agent SDK preflight fails', async () => {
+        const onPromptTransportFailure = vi.fn();
+
+        await expect(claudeRemoteAgentSdk({
+            sessionId: null,
+            transcriptPath: null,
+            path: '/tmp',
+            claudeArgs: ['--mcp-config', '{invalid-json'],
+            claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+            isAborted: () => false,
+            nextMessage: async () => ({
+                message: 'hello',
+                mode: makeMode({ claudeRemoteAgentSdkEnabled: true }),
+                maxUserMessageSeq: 5,
+                userMessageLocalIds: ['preflight-local-5'],
+            }),
+            onReady: () => {},
+            onSessionFound: () => {},
+            onMessage: () => {},
+            onPromptTransportFailure,
+        } as any)).rejects.toThrow('Invalid --mcp-config');
+
+        expect(onPromptTransportFailure).toHaveBeenCalledExactlyOnceWith({
+            kind: 'rejected_before_effect',
+            maxUserMessageSeq: 5,
+            userMessageLocalIds: ['preflight-local-5'],
+        });
+    });
+
+    it('keeps a prompt accepted after its exact native acknowledgment even if the query later fails', async () => {
+        const onPromptAcceptedByProvider = vi.fn();
+        const onPromptTransportFailure = vi.fn();
+        let didSendPrompt = false;
+        const createQuery = vi.fn((params: any) => ({
+            async *[Symbol.asyncIterator]() {
+                const consumed = await (params.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]().next();
+                if (consumed.done) throw new Error('expected claimed prompt');
+                yield { ...(consumed.value as object), isReplay: true, session_id: 'native-session' };
+                throw new Error('SDK stopped after accepting prompt input');
+            },
+            close: vi.fn(),
+            setPermissionMode: vi.fn(),
+            setModel: vi.fn(),
+            setMaxThinkingTokens: vi.fn(),
+            supportedCommands: vi.fn(async () => []),
+            supportedModels: vi.fn(async () => []),
+        }));
+
+        await expect(claudeRemoteAgentSdk({
+            sessionId: null,
+            transcriptPath: null,
+            path: '/tmp',
+            claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+            isAborted: () => false,
+            nextMessage: async () => {
+                if (didSendPrompt) return null;
+                didSendPrompt = true;
+                return {
+                    message: 'hello',
+                    mode: makeMode({ claudeRemoteAgentSdkEnabled: true }),
+                    maxUserMessageSeq: 6,
+                    userMessageLocalIds: ['agent-sdk-local-6'],
+                };
+            },
+            onReady: () => {},
+            onSessionFound: () => {},
+            onMessage: () => {},
+            onPromptAcceptedByProvider,
+            onPromptTransportFailure,
+            createQuery,
+        } as any)).rejects.toThrow('after accepting prompt input');
+
+        expect(onPromptAcceptedByProvider).toHaveBeenCalledExactlyOnceWith({
+            maxUserMessageSeq: 6,
+            userMessageLocalIds: ['agent-sdk-local-6'],
+        });
+        expect(onPromptTransportFailure).not.toHaveBeenCalled();
+    });
+
+    it('waits for native acknowledgment without depending on the SDK child-process stdin implementation', async () => {
         const onPromptAcceptedByProvider = vi.fn();
         let didSendPrompt = false;
         let acceptedAtCreateQuery = -1;
-        let confirmWrite: (() => void) | null = null;
-        let didWriteExactPrompt = false;
-        let resolveWriteObserved: (() => void) | null = null;
-        const writeObserved = new Promise<void>((resolve) => {
-            resolveWriteObserved = resolve;
-        });
-        const stdin = new EventEmitter() as EventEmitter & {
-            write: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
-            end: () => void;
-            writableEnded: boolean;
-        };
-        stdin.writableEnded = false;
-        stdin.write = (chunk, callback) => {
-            didWriteExactPrompt = chunk.includes('agent-sdk-local-12') === false && chunk.includes('hello');
-            confirmWrite = () => callback?.(null);
-            resolveWriteObserved?.();
-            return true;
-        };
-        stdin.end = () => {
-            stdin.writableEnded = true;
-        };
-        const spawnedProcess = Object.assign(new EventEmitter(), {
-            stdin,
-            stdout: Readable.from([]),
-            killed: false,
-            exitCode: null,
-            kill: vi.fn(() => true),
-        });
-        const spawnClaudeCodeProcess = vi.fn(() => spawnedProcess as any);
         const createQuery = vi.fn((params: any) => {
             acceptedAtCreateQuery = onPromptAcceptedByProvider.mock.calls.length;
-            if (typeof params.options.spawnClaudeCodeProcess !== 'function') {
-                throw new Error('missing Agent SDK prompt transport spawn seam');
-            }
-            const process = params.options.spawnClaudeCodeProcess({
-                command: '/managed/js-runtime',
-                args: ['/resolved/claude-cli.js'],
-                cwd: '/tmp',
-                env: {},
-                signal: new AbortController().signal,
-            });
             return {
                 async *[Symbol.asyncIterator]() {
                     const consumed = await (params.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]().next();
-                    if (consumed.done) throw new Error('expected exact Agent SDK prompt');
-                    process.stdin.write(`${JSON.stringify({
-                        type: 'control_response',
-                        response: { request_id: 'control-before-user' },
-                    })}\n`);
-                    process.stdin.write(`${JSON.stringify(consumed.value)}\n`);
-                    await new Promise<void>((resolve) => {
-                        const poll = () => {
-                            if (onPromptAcceptedByProvider.mock.calls.length > 0) {
-                                resolve();
-                                return;
-                            }
-                            setImmediate(poll);
-                        };
-                        poll();
-                    });
+                    if (consumed.done) throw new Error('expected Agent SDK prompt');
+                    expect(onPromptAcceptedByProvider).not.toHaveBeenCalled();
+                    yield { ...(consumed.value as object), isReplay: true, session_id: 'native-session' };
                     yield { type: 'result' } as any;
                 },
                 close: vi.fn(),
@@ -153,192 +259,14 @@ describe('claudeRemoteAgentSdk stream events', () => {
             onSessionFound: () => {},
             onMessage: () => {},
             onPromptAcceptedByProvider,
-            spawnClaudeCodeProcess,
             createQuery,
         } as any);
 
-        await Promise.race([
-            writeObserved,
-            run.then(
-                () => { throw new Error('Agent SDK run completed before writing the exact prompt'); },
-                (error) => { throw error; },
-            ),
-        ]);
-        expect(createQuery).toHaveBeenCalledTimes(1);
-        expect(spawnClaudeCodeProcess).toHaveBeenCalledTimes(1);
-        expect(acceptedAtCreateQuery).toBe(0);
-        expect(onPromptAcceptedByProvider).not.toHaveBeenCalled();
-        expect(didWriteExactPrompt).toBe(true);
-        (confirmWrite as (() => void) | null)?.();
-        spawnedProcess.emit('error', new Error('later process failure after confirmed write'));
         await run;
+        expect(createQuery).toHaveBeenCalledTimes(1);
+        expect(acceptedAtCreateQuery).toBe(0);
         expect(onPromptAcceptedByProvider).toHaveBeenCalledTimes(1);
         expect(onPromptAcceptedByProvider).toHaveBeenCalledWith({
-            maxUserMessageSeq: 12,
-            userMessageLocalIds: ['agent-sdk-local-12'],
-        });
-    });
-
-    it('reports Agent SDK stdin callback failure after the write attempt as effect-ambiguous', async () => {
-        const onPromptAcceptedByProvider = vi.fn();
-        const onPromptTransportFailure = vi.fn();
-        let didSendPrompt = false;
-        const stdin = new EventEmitter() as EventEmitter & {
-            write: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
-            end: () => void;
-            writableEnded: boolean;
-        };
-        stdin.writableEnded = false;
-        stdin.write = (_chunk, callback) => {
-            callback?.(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
-            return true;
-        };
-        stdin.end = () => {
-            stdin.writableEnded = true;
-        };
-        const spawnedProcess = Object.assign(new EventEmitter(), {
-            stdin,
-            stdout: Readable.from([]),
-            killed: false,
-            exitCode: null,
-            kill: vi.fn(() => true),
-        });
-        const createQuery = vi.fn((params: any) => {
-            if (typeof params.options.spawnClaudeCodeProcess !== 'function') {
-                throw new Error('missing Agent SDK prompt transport spawn seam');
-            }
-            const process = params.options.spawnClaudeCodeProcess({
-                command: '/managed/js-runtime',
-                args: ['/resolved/claude-cli.js'],
-                cwd: '/tmp',
-                env: {},
-                signal: new AbortController().signal,
-            });
-            return {
-                async *[Symbol.asyncIterator]() {
-                    const consumed = await (params.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]().next();
-                    if (consumed.done) throw new Error('expected exact Agent SDK prompt');
-                    process.stdin.write(`${JSON.stringify(consumed.value)}\n`);
-                    throw new Error('Agent SDK transport failed');
-                },
-                close: vi.fn(),
-                setPermissionMode: vi.fn(),
-                setModel: vi.fn(),
-                setMaxThinkingTokens: vi.fn(),
-                supportedCommands: vi.fn(async () => []),
-                supportedModels: vi.fn(async () => []),
-            } as any;
-        });
-
-        await expect(claudeRemoteAgentSdk({
-            sessionId: null,
-            transcriptPath: null,
-            path: '/tmp',
-            claudeExecutablePath: '/tmp/claude',
-            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
-            isAborted: () => false,
-            nextMessage: async () => {
-                if (didSendPrompt) return null;
-                didSendPrompt = true;
-                return {
-                    message: 'hello',
-                    mode: makeMode({ claudeRemoteAgentSdkEnabled: true }),
-                    maxUserMessageSeq: 12,
-                    userMessageLocalIds: ['agent-sdk-local-12'],
-                };
-            },
-            onReady: () => {},
-            onSessionFound: () => {},
-            onMessage: () => {},
-            onPromptAcceptedByProvider,
-            onPromptTransportFailure,
-            spawnClaudeCodeProcess: vi.fn(() => spawnedProcess as any),
-            createQuery,
-        } as any)).rejects.toThrow('Agent SDK transport failed');
-
-        expect(onPromptAcceptedByProvider).not.toHaveBeenCalled();
-        expect(onPromptTransportFailure).toHaveBeenCalledWith({
-            kind: 'effect_may_have_occurred',
-            maxUserMessageSeq: 12,
-            userMessageLocalIds: ['agent-sdk-local-12'],
-        });
-    });
-
-    it('reports a process error before the exact write callback as effect-ambiguous', async () => {
-        const onPromptAcceptedByProvider = vi.fn();
-        const onPromptTransportFailure = vi.fn();
-        let didSendPrompt = false;
-        const stdin = new EventEmitter() as EventEmitter & {
-            write: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
-            end: () => void;
-            writableEnded: boolean;
-        };
-        stdin.writableEnded = false;
-        stdin.write = () => true;
-        stdin.end = () => {
-            stdin.writableEnded = true;
-        };
-        const spawnedProcess = Object.assign(new EventEmitter(), {
-            stdin,
-            stdout: Readable.from([]),
-            killed: false,
-            exitCode: null,
-            kill: vi.fn(() => true),
-        });
-        const createQuery = vi.fn((params: any) => {
-            const process = params.options.spawnClaudeCodeProcess({
-                command: '/managed/js-runtime',
-                args: ['/resolved/claude-cli.js'],
-                cwd: '/tmp',
-                env: {},
-                signal: new AbortController().signal,
-            });
-            return {
-                async *[Symbol.asyncIterator]() {
-                    const consumed = await (params.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]().next();
-                    if (consumed.done) throw new Error('expected exact Agent SDK prompt');
-                    process.stdin.write(`${JSON.stringify(consumed.value)}\n`);
-                    spawnedProcess.emit('error', new Error('process failed before write callback'));
-                    throw new Error('Agent SDK process failed');
-                },
-                close: vi.fn(),
-                setPermissionMode: vi.fn(),
-                setModel: vi.fn(),
-                setMaxThinkingTokens: vi.fn(),
-                supportedCommands: vi.fn(async () => []),
-                supportedModels: vi.fn(async () => []),
-            } as any;
-        });
-
-        await expect(claudeRemoteAgentSdk({
-            sessionId: null,
-            transcriptPath: null,
-            path: '/tmp',
-            claudeExecutablePath: '/tmp/claude',
-            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
-            isAborted: () => false,
-            nextMessage: async () => {
-                if (didSendPrompt) return null;
-                didSendPrompt = true;
-                return {
-                    message: 'hello',
-                    mode: makeMode({ claudeRemoteAgentSdkEnabled: true }),
-                    maxUserMessageSeq: 12,
-                    userMessageLocalIds: ['agent-sdk-local-12'],
-                };
-            },
-            onReady: () => {},
-            onSessionFound: () => {},
-            onMessage: () => {},
-            onPromptAcceptedByProvider,
-            onPromptTransportFailure,
-            spawnClaudeCodeProcess: vi.fn(() => spawnedProcess as any),
-            createQuery,
-        } as any)).rejects.toThrow('Agent SDK process failed');
-
-        expect(onPromptAcceptedByProvider).not.toHaveBeenCalled();
-        expect(onPromptTransportFailure).toHaveBeenCalledExactlyOnceWith({
-            kind: 'effect_may_have_occurred',
             maxUserMessageSeq: 12,
             userMessageLocalIds: ['agent-sdk-local-12'],
         });
@@ -350,10 +278,14 @@ describe('claudeRemoteAgentSdk stream events', () => {
         let secondPromptArrivedBeforeResult = false;
         const steerabilityChanges: boolean[] = [];
         const interrupt = vi.fn(async () => {});
+        const accepted = vi.fn();
+        const onMessage = vi.fn();
         const createQuery = vi.fn((params: any) => ({
             async *[Symbol.asyncIterator]() {
                 const promptIterator = (params.prompt as AsyncIterable<unknown>)[Symbol.asyncIterator]();
-                await promptIterator.next();
+                const first = await promptIterator.next();
+                if (first.done) throw new Error('Expected initial prompt');
+                yield { ...(first.value as object), isReplay: true, session_id: 'native-session' };
                 const timeout = Symbol('timeout');
                 const second = await Promise.race([
                     promptIterator.next(),
@@ -362,6 +294,7 @@ describe('claudeRemoteAgentSdk stream events', () => {
                 if (second !== timeout && !second.done) {
                     receivedSecondPrompt = second.value;
                     secondPromptArrivedBeforeResult = true;
+                    yield { ...(second.value as object), isReplay: true, session_id: 'native-session' };
                 }
                 yield { type: 'result' } as any;
             },
@@ -384,7 +317,7 @@ describe('claudeRemoteAgentSdk stream events', () => {
             nextMessage: async () => {
                 nextMessageCall += 1;
                 if (nextMessageCall === 1) {
-                    return { message: 'initial', mode: makeMode({ claudeRemoteAgentSdkEnabled: true }) };
+                    return { message: 'initial', mode: makeMode({ claudeRemoteAgentSdkEnabled: true }), userMessageLocalIds: ['initial-local'] };
                 }
                 if (nextMessageCall === 2) {
                     return {
@@ -398,7 +331,8 @@ describe('claudeRemoteAgentSdk stream events', () => {
             },
             onReady: () => {},
             onSessionFound: () => {},
-            onMessage: () => {},
+            onMessage,
+            onPromptAcceptedByProvider: accepted,
             onInFlightSteerAvailabilityChange: (available: boolean) => steerabilityChanges.push(available),
             createQuery,
         } as any);
@@ -411,6 +345,8 @@ describe('claudeRemoteAgentSdk stream events', () => {
         }));
         expect(interrupt).not.toHaveBeenCalled();
         expect(steerabilityChanges).toContain(true);
+        expect(accepted.mock.calls.map(([outcome]) => outcome.userMessageLocalIds)).toEqual([['initial-local'], ['steer-local']]);
+        expect(onMessage.mock.calls.some(([message]) => message.type === 'user')).toBe(false);
     });
 
     it('interrupts the active Agent SDK turn before streaming an exact interrupt-and-send action', async () => {
@@ -504,6 +440,7 @@ describe('claudeRemoteAgentSdk stream events', () => {
             } as any;
         });
         const runtimeActivityAdapter = {
+            publishBeforeRuntimeStart: vi.fn(async () => {}),
             activateObservation: vi.fn(async () => {
                 readinessOrder.push('runtime-offered');
                 throw new Error('observer activation failed');

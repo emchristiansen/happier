@@ -244,10 +244,16 @@ describe('app.config.js', () => {
 
         expect(exp.extra?.app?.variant).toBe('preview');
         // Production identity still enables universal links / app links.
-        expect(exp.ios?.associatedDomains).toEqual(['applinks:app.happier.dev']);
+        expect(exp.ios?.associatedDomains).toEqual([
+            'applinks:cloud.happier.dev',
+            'applinks:app.happier.dev',
+        ]);
         const data = exp.android?.intentFilters?.[0]?.data;
         const dataItems = Array.isArray(data) ? data : data ? [data] : [];
-        expect(dataItems[0]?.host).toBe('app.happier.dev');
+        expect(dataItems.map((item) => item?.host)).toEqual([
+            'cloud.happier.dev',
+            'app.happier.dev',
+        ]);
     });
 
     it('uses the ui package.json version for expo.version by default', () => {
@@ -310,6 +316,24 @@ describe('app.config.js', () => {
 
         expect(nativeWorkspaceDeps).toEqual(expect.arrayContaining(['audio-stream-native', 'sherpa-native']));
         expect(pkg.happierExpoRuntimeVersion).not.toBe('0.2.6-native');
+    });
+
+    it('keeps JavaScript requiring Android file actions off the released 0.2.7-native OTA runtime', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'production';
+            return getPublicConfig();
+        });
+        // Released binaries on this train do not contain HappierFileActions.
+        expect(exp.runtimeVersion).not.toBe('0.2.7-native');
+    });
+
+    it('keeps the upgraded Unistyles bindings off the previous native OTA train', () => {
+        const exp = withCleanEnv(() => {
+            process.env.APP_ENV = 'production';
+            return getPublicConfig();
+        });
+        // This train was built with Unistyles 3.2.4 and Nitro Modules 0.35.6.
+        expect(exp.runtimeVersion).not.toBe('0.2.8-native');
     });
 
     it('allows forcing an Expo runtime policy for development diagnostics', () => {

@@ -35,7 +35,7 @@ export function useProviderAuthenticationState(params: Readonly<{
         const authLaunches = supportsLoginTerminal
             ? (params.authPlugin?.buildAuthLaunches?.({ resolvedPath, resolvedCommand, platform: machinePlatform }) ?? [])
             : [];
-        const canLaunchAuth = cliAvailable === true && Boolean(machineId) && authLaunches.some((launch) => Boolean(launch.initialCommand));
+        const canLaunchAuth = cliAvailable === true && Boolean(machineId) && authLaunches.some((launch) => Boolean(launch.initialCommand) || Boolean(launch.launch));
         const loginActionKind = authStatus?.state === 'logged_in' ? 'reauthenticate' : 'login';
 
         return {

@@ -26,4 +26,21 @@ describe('ClaudeConnectedServiceAuthGroupRequestFence', () => {
     await waiting;
     expect(released).toHaveBeenCalledOnce();
   });
+
+  it('retains the latest available group truth for runtime failure attribution', () => {
+    const fence = new ClaudeConnectedServiceAuthGroupRequestFence();
+    fence.applyCurrentTruth({
+      kind: 'current_auth_group_available',
+      groupId: 'group-1',
+      generation: 7,
+      credentialRevision: 'revision-7',
+    });
+
+    expect(fence.readCurrentTruth()).toEqual({
+      kind: 'current_auth_group_available',
+      groupId: 'group-1',
+      generation: 7,
+      credentialRevision: 'revision-7',
+    });
+  });
 });

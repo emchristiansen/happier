@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "tiers": {
+    "smoke": ["acp_probe_capabilities"],
+    "extended": [
+      "acp_probe_models",
+      "acp_resume_load_session",
+      "abort_turn_then_continue",
+      "read_known_file"
+    ]
+  }
+}

@@ -1,9 +1,10 @@
+import { afterAll as j078AfterAll, beforeEach as j078BeforeEach } from 'vitest';
 import { lstatSync, mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 import { parseWorkspaceLockLeaseValue } from '@happier-dev/cli-common/workspaceLockLease';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { ensureCliDistBuilt, ensureCliSharedDepsBuilt, resolveCliDistBuildInvocation, withCliDistBuildLock } from '../../src/testkit/process/cliDist';
 import { resolveCliTestLaunchSpec } from '../../src/testkit/process/cliLaunchSpec';
@@ -128,7 +129,7 @@ describe('providers: CLI dist build invocation', () => {
     expect(invocation.cwd).toBe(repoRoot);
   });
 
-  it('uses the real CLI source entrypoint when explicitly requested for local e2e runs', async () => {
+  it('J078 uses the real CLI source entrypoint when explicitly requested for local e2e runs', async () => {
     const repoRoot = mkdtempSync(join(tmpdir(), 'happier-cli-source-launch-'));
     const sourceEntrypoint = resolve(repoRoot, 'apps', 'cli', 'src', 'index.ts');
     const tsconfigPath = resolve(repoRoot, 'apps', 'cli', 'tsconfig.json');
@@ -152,21 +153,23 @@ describe('providers: CLI dist build invocation', () => {
       },
     );
 
+    const generationDir = resolve(launchSpec.args.at(-1)!, '..', '..');
+    expect(generationDir).toContain('cli-dist-snapshot-generation-');
     expect(launchSpec.command).toBe(process.execPath);
     expect(launchSpec.args).toEqual([
       '--preserve-symlinks',
       '--preserve-symlinks-main',
       '--import',
       expect.stringContaining(`${process.platform === 'win32' ? 'tsx\\dist\\esm\\index.mjs' : 'tsx/dist/esm/index.mjs'}`),
-      snapshotEntrypoint,
+      resolve(generationDir, 'src', 'index.ts'),
     ]);
-    expect(launchSpec.cwd).toBe(snapshotDir);
+    expect(launchSpec.cwd).toBe(generationDir);
     expect(launchSpec.env).toEqual({
-      TSX_TSCONFIG_PATH: snapshotTsconfigPath,
+      TSX_TSCONFIG_PATH: resolve(generationDir, 'tsconfig.json'),
     });
   });
 
-  it('uses the real CLI source entrypoint when the harness prefers source launch', async () => {
+  it('J078 uses the real CLI source entrypoint when the harness prefers source launch', async () => {
     const repoRoot = mkdtempSync(join(tmpdir(), 'happier-cli-source-preferred-launch-'));
     const sourceEntrypoint = resolve(repoRoot, 'apps', 'cli', 'src', 'index.ts');
     const tsconfigPath = resolve(repoRoot, 'apps', 'cli', 'tsconfig.json');
@@ -191,21 +194,23 @@ describe('providers: CLI dist build invocation', () => {
       },
     );
 
+    const generationDir = resolve(launchSpec.args.at(-1)!, '..', '..');
+    expect(generationDir).toContain('cli-dist-snapshot-generation-');
     expect(launchSpec.command).toBe(process.execPath);
     expect(launchSpec.args).toEqual([
       '--preserve-symlinks',
       '--preserve-symlinks-main',
       '--import',
       expect.stringContaining(`${process.platform === 'win32' ? 'tsx\\dist\\esm\\index.mjs' : 'tsx/dist/esm/index.mjs'}`),
-      snapshotEntrypoint,
+      resolve(generationDir, 'src', 'index.ts'),
     ]);
-    expect(launchSpec.cwd).toBe(snapshotDir);
+    expect(launchSpec.cwd).toBe(generationDir);
     expect(launchSpec.env).toEqual({
-      TSX_TSCONFIG_PATH: snapshotTsconfigPath,
+      TSX_TSCONFIG_PATH: resolve(generationDir, 'tsconfig.json'),
     });
   });
 
-  it('falls back to the CLI source entrypoint when dist snapshot preparation fails', async () => {
+  it('J078 falls back to the CLI source entrypoint when dist snapshot preparation fails', async () => {
     const repoRoot = mkdtempSync(join(tmpdir(), 'happier-cli-source-fallback-launch-'));
     const sourceEntrypoint = resolve(repoRoot, 'apps', 'cli', 'src', 'index.ts');
     const tsconfigPath = resolve(repoRoot, 'apps', 'cli', 'tsconfig.json');
@@ -232,21 +237,23 @@ describe('providers: CLI dist build invocation', () => {
       },
     );
 
+    const generationDir = resolve(launchSpec.args.at(-1)!, '..', '..');
+    expect(generationDir).toContain('cli-dist-snapshot-generation-');
     expect(launchSpec.command).toBe(process.execPath);
     expect(launchSpec.args).toEqual([
       '--preserve-symlinks',
       '--preserve-symlinks-main',
       '--import',
       expect.stringContaining(`${process.platform === 'win32' ? 'tsx\\dist\\esm\\index.mjs' : 'tsx/dist/esm/index.mjs'}`),
-      snapshotEntrypoint,
+      resolve(generationDir, 'src', 'index.ts'),
     ]);
-    expect(launchSpec.cwd).toBe(snapshotDir);
+    expect(launchSpec.cwd).toBe(generationDir);
     expect(launchSpec.env).toEqual({
-      TSX_TSCONFIG_PATH: snapshotTsconfigPath,
+      TSX_TSCONFIG_PATH: resolve(generationDir, 'tsconfig.json'),
     });
   });
 
-  it('falls back to the backup dist snapshot when the main dist folder is missing', async () => {
+  it('J078 falls back to the backup dist snapshot when the main dist folder is missing', async () => {
     const repoRoot = mkdtempSync(join(tmpdir(), 'happier-cli-backup-dist-launch-'));
     writeCliBackupDist(repoRoot);
     writeSharedDepsOutputs(repoRoot);
@@ -264,13 +271,15 @@ describe('providers: CLI dist build invocation', () => {
       },
     );
 
+    const generationDir = resolve(launchSpec.args.at(-1)!, '..', '..');
+    expect(generationDir).toContain('cli-dist-snapshot-generation-');
     expect(launchSpec.command).toBe(process.execPath);
     expect(launchSpec.args[0]).toBe('--preserve-symlinks');
     expect(launchSpec.args[1]).toContain('.project');
     expect(launchSpec.args[1]).toContain('cli-dist-snapshot');
   });
 
-  it('launches CLI dist snapshots with --preserve-symlinks', async () => {
+  it('J078 launches CLI dist snapshots with --preserve-symlinks', async () => {
     const repoRoot = mkdtempSync(join(tmpdir(), 'happier-cli-snapshot-symlink-launch-'));
     const distDir = resolve(repoRoot, 'apps', 'cli', 'dist');
     const protocolDistDir = resolve(repoRoot, 'packages', 'protocol', 'dist');
@@ -295,12 +304,14 @@ describe('providers: CLI dist build invocation', () => {
       },
     );
 
+    const generationDir = resolve(launchSpec.args.at(-1)!, '..', '..');
+    expect(generationDir).toContain('cli-dist-snapshot-generation-');
     expect(launchSpec.command).toBe(process.execPath);
     expect(launchSpec.args[0]).toBe('--preserve-symlinks');
-    expect(launchSpec.args[1]).toBe(resolve(snapshotDir, 'dist', 'index.mjs'));
+    expect(launchSpec.args[1]).toBe(resolve(generationDir, 'dist', 'index.mjs'));
   });
 
-  it('replaces a healthy dist snapshot when the canonical CLI dist is newer', async () => {
+  it('J078 replaces a healthy dist snapshot when the canonical CLI dist is newer', async () => {
     const repoRoot = mkdtempSync(join(tmpdir(), 'happier-cli-stale-dist-snapshot-'));
     const distDir = resolve(repoRoot, 'apps', 'cli', 'dist');
     const snapshotDir = resolve(repoRoot, '.project', 'tmp', 'cli-dist-snapshot');
@@ -334,8 +345,9 @@ describe('providers: CLI dist build invocation', () => {
       },
     );
 
-    expect(launchSpec.args[1]).toBe(snapshotEntrypoint);
-    expect(readFileSync(snapshotEntrypoint, 'utf8')).toContain('"fresh"');
+    const generationDir = resolve(launchSpec.args.at(-1)!, '..', '..');
+    expect(launchSpec.args[1]).not.toBe(snapshotEntrypoint);
+    expect(readFileSync(launchSpec.args[1], 'utf8')).toContain('"fresh"');
   });
 });
 
@@ -836,4 +848,64 @@ describe('providers: shared deps build timeout wiring', () => {
 
     expect(observedTimeoutMs).toBe(600_000);
   });
+});
+
+
+// J078: install genuine system boundaries before the real owners load. Fixture cp remains real.
+const j078Boundary = await vi.hoisted(async () => {
+  const { createRequire, syncBuiltinESMExports } = await import('node:module');
+  const req = createRequire(`${process.cwd()}/package.json`);
+  const fs = req('node:fs');
+  const promises = req('node:fs/promises');
+  const cp = req('node:child_process');
+  const http = req('node:http');
+  const https = req('node:https');
+  const net = req('node:net');
+  const original = { read: fs.readFileSync, cpSync: fs.cpSync, cp: promises.cp, kill: process.kill, fetch: globalThis.fetch,
+    child: Object.fromEntries(['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'].map((key) => [key, cp[key]])),
+    httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
+  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
+  const refuse = (name: string) => (..._args: unknown[]) => { state.attempts.push(name); throw new Error(`J078 forbidden external boundary: ${name}`); };
+  for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => state.active ? refuse(key)(...args) : original.child[key](...args);
+  http.request = (...args: unknown[]) => state.active ? refuse('http')(...args) : original.httpRequest(...args);
+  https.request = (...args: unknown[]) => state.active ? refuse('https')(...args) : original.httpsRequest(...args);
+  http.createServer = (...args: unknown[]) => state.active ? refuse('server')(...args) : original.httpServer(...args);
+  net.createServer = (...args: unknown[]) => state.active ? refuse('net')(...args) : original.netServer(...args);
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => state.active ? refuse('fetch')(...args) : original.fetch(...args)) as typeof fetch;
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (!state.active) return original.kill(pid, signal);
+    if (signal !== 0) return refuse('signal')(pid, signal);
+    return true; // Fixture liveness only; never send signal 0.
+  }) as typeof process.kill;
+  fs.readFileSync = (...args: unknown[]) => state.active && typeof args[0] === 'string' && /^\/proc\/\d+\/stat$/.test(args[0])
+    ? `1 (fixture) S ${Array(18).fill('0').join(' ')} 100` : original.read(...args);
+  const allowed = (path: unknown) => {
+    const root = process.env.TMPDIR;
+    if (!root || typeof path !== 'string' || !(path === root || path.startsWith(`${root}/`))) {
+      throw new Error(`J078 fixture copy outside owned TMPDIR: ${String(path)}`);
+    }
+  };
+  fs.cpSync = (...args: unknown[]) => { if (state.active) { allowed(args[0]); allowed(args[1]); } return original.cpSync(...args); };
+  promises.cp = async (src: string, dest: string, ...args: unknown[]) => {
+    if (state.active) { allowed(src); allowed(dest); }
+    const run = () => original.cp(src, dest, ...args) as Promise<void>;
+    return state.active && state.onCopy ? state.onCopy(src, dest, run) : run();
+  };
+  syncBuiltinESMExports();
+  if ((await import('node:child_process')).spawnSync !== cp.spawnSync
+    || (await import('node:fs')).readFileSync !== fs.readFileSync
+    || (await import('node:fs/promises')).cp !== promises.cp) throw new Error('J078 actual builtin binding mismatch');
+  return { state, restore: () => {
+    fs.readFileSync = original.read; fs.cpSync = original.cpSync; promises.cp = original.cp;
+    for (const key of Object.keys(original.child)) cp[key] = original.child[key];
+    http.request = original.httpRequest; https.request = original.httpsRequest;
+    http.createServer = original.httpServer; net.createServer = original.netServer;
+    process.kill = original.kill; globalThis.fetch = original.fetch; syncBuiltinESMExports();
+  } };
+});
+// Unselected legacy cases retain their own existing boundaries and assertions.
+j078BeforeEach(() => { j078Boundary.state.active = Boolean(expect.getState().currentTestName?.includes('J078')); });
+j078AfterAll(() => {
+  try { expect(j078Boundary.state.attempts).toEqual([]); }
+  finally { j078Boundary.restore(); }
 });

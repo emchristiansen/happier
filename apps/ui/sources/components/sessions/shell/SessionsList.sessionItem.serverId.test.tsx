@@ -88,26 +88,6 @@ vi.mock('@expo/vector-icons', () => ({
 vi.mock('@/agents/registry/AgentIcon', () => ({
     AgentIcon: 'AgentIcon',
 }));
-vi.mock('@/constants/Typography', () => ({
-    Typography: {
-        default: () => ({}),
-        mono: () => ({}),
-        tabular: () => ({}),
-        eyebrow: () => ({}),
-        rowTitle: () => ({}),
-        rowMeta: () => ({}),
-        pillLabel: () => ({}),
-        keyHint: () => ({}),
-        timestamp: () => ({}),
-        logo: () => ({}),
-        header: () => ({}),
-        body: () => ({}),
-        legacy: {
-            spaceMono: () => ({}),
-            systemMono: () => ({}),
-        },
-    },
-}));
 vi.mock('@/components/ui/text/Text', () => ({
     Text: 'Text',
     TextInput: 'TextInput',

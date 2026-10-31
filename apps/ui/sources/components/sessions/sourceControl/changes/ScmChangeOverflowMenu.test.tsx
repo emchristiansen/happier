@@ -22,7 +22,7 @@ vi.mock('@/components/ui/lists/ItemRowActions', () => ({
 }));
 
 vi.mock('expo-clipboard', () => ({
-    setStringAsync: vi.fn(async () => {}),
+    setStringAsync: vi.fn(async () => true),
 }));
 
 vi.mock('@/utils/ui/clipboard', () => ({

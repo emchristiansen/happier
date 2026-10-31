@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
+import { logger } from '@/ui/logger';
+
 import { AgentStateRequestStore, type AgentStateOutstandingRequest } from '@/agent/permissions/agentStateRequestStore';
 import {
   createPermissionRequestCoordinator,
@@ -189,6 +191,10 @@ export class ClaudeUnifiedDialogChoiceBroker {
     return this.unresolvedTerminalAnswerIdentity === getClaudeUnifiedDialogIdentity(dialog);
   }
 
+  noteTerminalAnswerStarted(dialog: ClaudeUnifiedVisibleDialog): void {
+    this.unresolvedTerminalAnswerIdentity = getClaudeUnifiedDialogIdentity(dialog);
+  }
+
   noteTerminalAnswerFailed(dialog: ClaudeUnifiedVisibleDialog): void {
     const identity = getClaudeUnifiedDialogIdentity(dialog);
     this.unresolvedTerminalAnswerIdentity = identity;
@@ -249,7 +255,13 @@ export class ClaudeUnifiedDialogChoiceBroker {
       if (this.pendingChoice?.requestId !== requestId) {
         throw new Error('claude_unified_dialog_choice_no_longer_live');
       }
+      // A recorded approval is not yet an applied terminal answer. Keep readiness
+      // paused across the handoff to the terminal control task.
+      this.noteTerminalAnswerStarted(params.dialog);
       return decision;
+    }).catch(async (error: unknown) => {
+      await this.drainSourceCompletions(requestId);
+      throw error;
     }).finally(() => {
       if (this.pendingChoice?.requestId === requestId) {
         this.pendingChoice = null;
@@ -299,12 +311,11 @@ export class ClaudeUnifiedDialogChoiceBroker {
         }),
       }),
       completeRequest: (params) => {
-        this.trackSourceCompletion(
+        return this.trackSourceCompletion(
           params.requestId,
           this.requestStore.completeRequest(params),
         );
       },
-      cancelAllRequests: (params) => { void this.cancelAllSourceOwnedRequests(params.reason); },
       hasOutstandingRequest: (requestId) => this.readSourceOwnedOutstandingRequest(requestId) !== null,
       isOutstandingRequestClaimed: (requestId) => {
         const rawRequest = this.session.client.getAgentStateSnapshot?.()?.requests?.[requestId] ?? null;
@@ -322,15 +333,17 @@ export class ClaudeUnifiedDialogChoiceBroker {
     return isClaudeUnifiedTerminalDialogChoiceAgentStateRequest(rawRequest) ? outstanding : null;
   }
 
-  private tryHandlePermissionRpc(
+  private async tryHandlePermissionRpc(
     payload: PermissionRpcPayload,
-  ): PermissionRpcConsumerOutcome | Promise<PermissionRpcConsumerOutcome> {
+  ): Promise<PermissionRpcConsumerOutcome> {
     const requestId = typeof payload?.id === 'string' ? payload.id : '';
     if (!requestId) return false;
     const context = this.permissionCoordinator.getResponseContext(requestId);
     if (!isDialogChoiceContext(context)) return false;
     if (context.status !== 'live') {
-      void this.completeSourceOwnedCancellation(requestId, 'claude_unified_dialog_choice_no_live_waiter');
+      void this.completeSourceOwnedCancellation(requestId, 'claude_unified_dialog_choice_no_live_waiter').catch(() => {
+        logger.infoFile('[claude-unified-dialog-choice] Cancellation settlement admission failed');
+      });
       return true;
     }
 
@@ -338,7 +351,9 @@ export class ClaudeUnifiedDialogChoiceBroker {
       const reason = typeof payload.reason === 'string' && payload.reason.length > 0
         ? payload.reason
         : 'claude_unified_dialog_choice_denied';
-      void this.completeSourceOwnedCancellation(requestId, reason);
+      void this.completeSourceOwnedCancellation(requestId, reason).catch(() => {
+        logger.infoFile('[claude-unified-dialog-choice] Cancellation settlement admission failed');
+      });
       return true;
     }
 
@@ -354,7 +369,9 @@ export class ClaudeUnifiedDialogChoiceBroker {
       // (e.g. a freeform "Other" entry) cannot be injected. Fail closed with a typed cancellation
       // rather than throwing an opaque `permission_response_failed`; the still-visible dialog is
       // re-surfaced by the next screen observation / turn-end probe.
-      void this.completeSourceOwnedCancellation(requestId, 'claude_unified_dialog_choice_unsupported_freeform_answer');
+      void this.completeSourceOwnedCancellation(requestId, 'claude_unified_dialog_choice_unsupported_freeform_answer').catch(() => {
+        logger.infoFile('[claude-unified-dialog-choice] Cancellation settlement admission failed');
+      });
       return true;
     }
 
@@ -364,12 +381,15 @@ export class ClaudeUnifiedDialogChoiceBroker {
     // Only a remembered choice has a caller-visible mutation after this RPC. Keep its response
     // pending until terminal verification so the UI cannot persist a policy Claude did not apply.
     if (identity && selectedRequestOption?.settingMutation) {
+      if (this.terminalAnswerAcknowledgements.has(identity)) return false;
       let resolvePromise!: (outcome: PermissionRpcConsumerOutcome) => void;
       let rejectPromise!: (reason: Error) => void;
       const promise = new Promise<PermissionRpcConsumerOutcome>((resolve, reject) => {
         resolvePromise = resolve;
         rejectPromise = reject;
       });
+      // Terminal verification may reject while the state acknowledgement is still pending.
+      void promise.catch(() => {});
       acknowledgement = {
         promise,
         resolve: () => resolvePromise(true),
@@ -378,22 +398,28 @@ export class ClaudeUnifiedDialogChoiceBroker {
       this.terminalAnswerAcknowledgements.set(identity, acknowledgement);
     }
 
-    const completion = this.permissionCoordinator.completeResponse({
-      context,
-      completion: {
-        result: decision,
-        completedRequest: {
-          status: 'approved',
-          decision: 'allow',
-          extraCompletedFields: {
-            answers: payload.answers ?? {},
-            dialogId: decision.dialogId,
-            dialogChoice: decision.choice,
-            ...(decision.dialogId === 'safeguard_pause' ? { safeguardChoice: decision.choice } : {}),
+    let completion: boolean;
+    try {
+      completion = await this.permissionCoordinator.completeRpcResponse({
+        context,
+        completion: {
+          result: decision,
+          completedRequest: {
+            status: 'approved',
+            decision: 'allow',
+            extraCompletedFields: {
+              answers: payload.answers ?? {},
+              dialogId: decision.dialogId,
+              dialogChoice: decision.choice,
+              ...(decision.dialogId === 'safeguard_pause' ? { safeguardChoice: decision.choice } : {}),
+            },
           },
         },
-      },
-    });
+      });
+    } catch (error) {
+      if (identity) this.terminalAnswerAcknowledgements.delete(identity);
+      throw error;
+    }
     if (!acknowledgement || completion !== true) {
       if (identity) this.terminalAnswerAcknowledgements.delete(identity);
       return completion;

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { ActionsSettingsV1Schema } from '@happier-dev/protocol';
 
 import {
     SESSION_BULK_ACTION_IDS,
@@ -7,6 +8,29 @@ import {
 import { listSessionBulkActionDescriptors } from './sessionBulkActionPresentation';
 
 describe('listSessionBulkActionDescriptors', () => {
+    it('uses Actions settings for reversible bulk confirmations while protecting active stops', () => {
+        const target: SessionBulkActionTarget = {
+            key: 'session-a', sessionId: 'session-a', active: false, archived: false,
+            hasAdminAccess: true, canArchive: true, canStop: true,
+        };
+        const settings = ActionsSettingsV1Schema.parse({ v: 1, actions: {} });
+        const list = (targets: SessionBulkActionTarget[], actionsSettings = settings) => listSessionBulkActionDescriptors({
+            targets, actionsSettings, tagsEnabled: false, moveEnabled: false,
+        });
+        expect(list([target]).find((item) => item.id === SESSION_BULK_ACTION_IDS.archive))
+            .toMatchObject({ requiresConfirmation: false, destructive: false });
+        expect(list([{ ...target, active: true }]).find((item) => item.id === SESSION_BULK_ACTION_IDS.archive))
+            .toMatchObject({ requiresConfirmation: true, destructive: false });
+        const askFirst = ActionsSettingsV1Schema.parse({ v: 1, actions: {
+            'session.archive': { approvalRequiredSurfaces: ['ui_button'] },
+            'session.unarchive': { approvalRequiredSurfaces: ['ui_button'] },
+        } });
+        expect(list([target], askFirst).find((item) => item.id === SESSION_BULK_ACTION_IDS.archive))
+            .toMatchObject({ requiresConfirmation: true, destructive: false });
+        expect(list([{ ...target, archived: true, canArchive: false }], askFirst)
+            .find((item) => item.id === SESSION_BULK_ACTION_IDS.unarchive))
+            .toMatchObject({ requiresConfirmation: true, destructive: false });
+    });
     it('centralizes bulk action-bar presentation availability for mixed selected sessions', () => {
         const targets: SessionBulkActionTarget[] = [
             {
@@ -60,7 +84,7 @@ describe('listSessionBulkActionDescriptors', () => {
         });
         expect(descriptors.find((descriptor) => descriptor.id === SESSION_BULK_ACTION_IDS.archive)).toMatchObject({
             requiresConfirmation: true,
-            destructive: true,
+            destructive: false,
         });
     });
 

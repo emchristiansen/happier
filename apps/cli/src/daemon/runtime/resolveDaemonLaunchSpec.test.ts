@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
 
 import { withTempDir } from '@/testkit/fs/tempDir';
+import { PINNED_RUNNER_REQUIRED_ASSET_RELATIVE_PATHS } from '@/utils/spawnHappyCLI';
 
 const {
   ensureJavaScriptRuntimeExecutableMock,
@@ -44,18 +45,10 @@ function writeAdmittedDaemonStartupClosure(root: string): Readonly<{
   const entrypoint = join(distDir, 'index.mjs');
   writeFileSync(entrypoint, 'import "./chunk.mjs";\nexport {};\n', 'utf8');
 
-  const scriptsDir = join(root, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  for (const scriptName of [
-    'terminal_launch_spec_runner.cjs',
-    'claude_local_launcher.cjs',
-    'claude_remote_launcher.cjs',
-    'claude_launcher_runtime.cjs',
-    'childProcessOptions.cjs',
-    'ripgrep_launcher.cjs',
-    'node_pty_relay.cjs',
-  ]) {
-    writeFileSync(join(scriptsDir, scriptName), `module.exports = ${JSON.stringify(scriptName)};\n`, 'utf8');
+  for (const relativePath of PINNED_RUNNER_REQUIRED_ASSET_RELATIVE_PATHS) {
+    const assetPath = join(root, ...relativePath);
+    mkdirSync(dirname(assetPath), { recursive: true });
+    writeFileSync(assetPath, `module.exports = ${JSON.stringify(relativePath)};\n`, 'utf8');
   }
 
   const fingerprint = 'abcdef1234567890';

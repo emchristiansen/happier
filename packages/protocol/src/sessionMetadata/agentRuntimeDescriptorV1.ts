@@ -53,6 +53,7 @@ type OpenCodeAgentRuntimeDescriptorProvider = Readonly<{
       vendorSessionId?: string;
       serverBaseUrl?: string;
       serverBaseUrlExplicit?: true;
+      managedServerLaunchFingerprint?: string;
     }>;
   }>;
 }>;
@@ -86,6 +87,7 @@ type CanonicalAgentRuntimeDescriptorByProviderId = {
     vendorSessionId: string | null;
     serverBaseUrl: string | null;
     serverBaseUrlExplicit: boolean;
+    managedServerLaunchFingerprint: string | null;
   }>;
   pi: Readonly<{
     providerId: 'pi';
@@ -158,6 +160,8 @@ function readCanonicalOpenCodeProviderExtra(value: unknown) {
     vendorSessionId: normalizeTrimmedString(runtimeHandle.vendorSessionId),
     serverBaseUrl: normalizeTrimmedString(runtimeHandle.serverBaseUrl),
     serverBaseUrlExplicit: normalizeOpenCodeServerBaseUrlExplicit(runtimeHandle.serverBaseUrlExplicit),
+    managedServerLaunchFingerprint: runtimeHandle.managedServerLaunchFingerprint == null ? null
+      : typeof runtimeHandle.managedServerLaunchFingerprint === 'string' ? runtimeHandle.managedServerLaunchFingerprint.trim() : '',
   };
 }
 
@@ -255,12 +259,15 @@ export function buildOpenCodeAgentRuntimeDescriptorV1(params: Readonly<{
   vendorSessionId?: string | null;
   serverBaseUrl?: string | null;
   serverBaseUrlExplicit?: boolean;
+  managedServerLaunchFingerprint?: string | null;
 }>): OpenCodeAgentRuntimeDescriptorV1 {
   const providerExtraRuntimeHandle = {
     backendMode: params.backendMode,
     ...(params.vendorSessionId ? { vendorSessionId: params.vendorSessionId } : {}),
     ...(params.serverBaseUrl ? { serverBaseUrl: params.serverBaseUrl } : {}),
     ...(params.serverBaseUrlExplicit ? { serverBaseUrlExplicit: true } : {}),
+    ...(params.backendMode === 'server' && !params.serverBaseUrlExplicit && params.managedServerLaunchFingerprint
+      ? { managedServerLaunchFingerprint: params.managedServerLaunchFingerprint } : {}),
   } satisfies NonNullable<NonNullable<OpenCodeAgentRuntimeDescriptorProvider['providerExtra']>['runtimeHandle']>;
 
   return {
@@ -364,6 +371,7 @@ export function readCanonicalAgentRuntimeDescriptorV1ForProvider(
         vendorSessionId: providerExtra?.vendorSessionId ?? normalizeTrimmedString(descriptor.provider.vendorSessionId),
         serverBaseUrl: providerExtra?.serverBaseUrl ?? normalizeTrimmedString(descriptor.provider.serverBaseUrl),
         serverBaseUrlExplicit: providerExtra?.serverBaseUrlExplicit ?? normalizeOpenCodeServerBaseUrlExplicit(descriptor.provider.serverBaseUrlExplicit),
+        managedServerLaunchFingerprint: providerExtra?.managedServerLaunchFingerprint ?? null,
       };
     }
     case 'pi': {

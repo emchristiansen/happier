@@ -67,25 +67,25 @@ function isRunningMarker(marker: ExecutionRunMarker): boolean {
   return marker.status === 'running' && typeof (marker as any).finishedAtMs !== 'number';
 }
 
-async function shouldSkipOverwriteForTerminalMarker(filePath: string, next: ExecutionRunMarker): Promise<boolean> {
+async function shouldSkipOverwriteForTerminalMarker(filePath: string, next: ExecutionRunMarker, allowTerminalToRunning: boolean): Promise<boolean> {
   try {
     const raw = await readFile(filePath, 'utf8');
     const parsed = ExecutionRunMarkerSchema.safeParse(JSON.parse(raw));
     if (!parsed.success) return false;
     if (parsed.data.happyHomeDir !== next.happyHomeDir) return false;
-    if (isTerminalMarker(parsed.data) && isRunningMarker(next)) return true;
+    if (isTerminalMarker(parsed.data) && isRunningMarker(next)) return !allowTerminalToRunning;
   } catch {
     // ignore read/parse issues
   }
   return false;
 }
 
-async function writeJsonAtomic(filePath: string, value: ExecutionRunMarker): Promise<void> {
+async function writeJsonAtomic(filePath: string, value: ExecutionRunMarker, allowTerminalToRunning: boolean): Promise<void> {
   const tmpPath = `${filePath}.tmp-${randomUUID()}`;
   try {
     await writeFile(tmpPath, JSON.stringify(value, null, 2), 'utf-8');
     try {
-      if (await shouldSkipOverwriteForTerminalMarker(filePath, value)) {
+      if (await shouldSkipOverwriteForTerminalMarker(filePath, value, allowTerminalToRunning)) {
         try {
           await unlink(tmpPath);
         } catch {
@@ -97,7 +97,7 @@ async function writeJsonAtomic(filePath: string, value: ExecutionRunMarker): Pro
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
       if (err?.code === 'EEXIST' || err?.code === 'EPERM') {
-        if (await shouldSkipOverwriteForTerminalMarker(filePath, value)) {
+        if (await shouldSkipOverwriteForTerminalMarker(filePath, value, allowTerminalToRunning)) {
           try {
             await unlink(tmpPath);
           } catch {
@@ -125,7 +125,7 @@ async function writeJsonAtomic(filePath: string, value: ExecutionRunMarker): Pro
   }
 }
 
-export async function writeExecutionRunMarker(marker: Omit<ExecutionRunMarker, 'happyHomeDir'>): Promise<void> {
+export async function writeExecutionRunMarker(marker: Omit<ExecutionRunMarker, 'happyHomeDir'>, opts?: Readonly<{ allowTerminalToRunning?: boolean }>): Promise<void> {
   const dir = resolveExecutionRunMarkerDir();
   await mkdir(dir, { recursive: true });
 
@@ -133,7 +133,7 @@ export async function writeExecutionRunMarker(marker: Omit<ExecutionRunMarker, '
     ...marker,
     happyHomeDir: configuration.happyHomeDir,
   });
-  await writeJsonAtomic(resolveExecutionRunMarkerPath(payload.runId), payload);
+  await writeJsonAtomic(resolveExecutionRunMarkerPath(payload.runId), payload, opts?.allowTerminalToRunning === true);
 }
 
 export async function removeExecutionRunMarker(runId: string): Promise<void> {

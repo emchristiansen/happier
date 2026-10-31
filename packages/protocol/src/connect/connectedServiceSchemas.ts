@@ -199,14 +199,14 @@ const OauthCredentialPayloadSchema = z.object({
     tokenType: z.string().min(1).nullable(),
     providerAccountId: z.string().min(1).nullable(),
     providerEmail: z.string().min(1).nullable(),
-    raw: z.unknown().nullable(),
+    raw: z.unknown().nullable().optional(),
 });
 
 const TokenCredentialPayloadSchema = z.object({
     token: z.string().min(1),
     providerAccountId: z.string().min(1).nullable(),
     providerEmail: z.string().min(1).nullable(),
-    raw: z.unknown().nullable(),
+    raw: z.unknown().nullable().optional(),
 });
 
 const ConnectedServiceCredentialBaseSchema = z.object({
@@ -329,6 +329,22 @@ export const ConnectedServiceQuotaRecoveryCreditsV1Schema = z
 export type ConnectedServiceQuotaRecoveryCreditsV1 =
     z.infer<typeof ConnectedServiceQuotaRecoveryCreditsV1Schema>;
 
+/** Presentation facts only; credit status and availableCount own usability. */
+export const ConnectedServiceQuotaRecoveryCreditDetailsV1Schema = z.object({
+    remainingCount: z.number().int().nonnegative(),
+    appliesToProviderLimitIds: z.array(z.string().trim().min(1)).default([]),
+    unavailableReason: z.enum([
+        'paused', 'cooldown', 'ineligible', 'not_selected', 'provider_unavailable',
+        'not_started', 'expired', 'consumed', 'unknown',
+    ]).optional(),
+}).strict();
+export type ConnectedServiceQuotaRecoveryCreditDetailsV1 = z.infer<typeof ConnectedServiceQuotaRecoveryCreditDetailsV1Schema>;
+
+export const ConnectedServiceQuotaRecoveryCreditDetailsByIdV1Schema = z.record(
+    z.string().trim().min(1), ConnectedServiceQuotaRecoveryCreditDetailsV1Schema,
+);
+export type ConnectedServiceQuotaRecoveryCreditDetailsByIdV1 = z.infer<typeof ConnectedServiceQuotaRecoveryCreditDetailsByIdV1Schema>;
+
 export const ConnectedServiceQuotaMeterScopeV1Schema = z.enum([
     'primary',
     'secondary',
@@ -420,6 +436,7 @@ export const ConnectedServiceQuotaMeterV1Schema = z
         resetAtMs: z.number().int().nonnegative().nullable().optional(),
         resetSource: ConnectedServiceQuotaResetSourceV1Schema.optional(),
         providerLimitId: z.string().trim().min(1).optional(),
+        windowDurationMs: z.number().int().positive().optional(),
         modelId: z.string().trim().min(1).nullable().optional(),
         isExhausted: z.boolean().optional(),
         isSoftLimited: z.boolean().optional(),
@@ -437,6 +454,7 @@ export const ConnectedServiceQuotaMeterV1Schema = z
                 note: z.string().min(1).nullable().optional(),
                 code: z.string().trim().min(1).optional(),
                 rawScope: z.string().trim().min(1).optional(),
+                modelDisplayName: z.string().trim().min(1).optional(),
                 remainingPct: z.number().finite().min(0).max(100).nullable().optional(),
                 scope: ConnectedServiceQuotaMeterScopeV1Schema.optional(),
                 providerLimitId: z.string().trim().min(1).optional(),
@@ -479,6 +497,7 @@ export const ConnectedServiceQuotaSnapshotV1Schema = z
         accountLabel: z.string().min(1).nullable(),
         providerId: z.string().trim().min(1).optional(),
         activeAccountId: z.string().trim().min(1).optional(),
+        providerOrganizationId: z.string().trim().min(1).max(256).optional(),
         fetchedAtMs: z.number().int().nonnegative().optional(),
         staleAtMs: z.number().int().nonnegative().optional(),
         source: ConnectedServiceQuotaSourceV1Schema.optional(),
@@ -486,6 +505,7 @@ export const ConnectedServiceQuotaSnapshotV1Schema = z
         evidence: ConnectedServiceQuotaEvidenceV1Schema.optional(),
         meters: z.array(ConnectedServiceQuotaMeterV1Schema),
         recoveryCredits: ConnectedServiceQuotaRecoveryCreditsV1Schema.optional(),
+        recoveryCreditDetails: ConnectedServiceQuotaRecoveryCreditDetailsByIdV1Schema.optional(),
         subscription: ProviderAccountSubscriptionV1Schema.optional(),
     });
 
@@ -495,21 +515,67 @@ export const SealedConnectedServiceQuotaSnapshotV1Schema = z.object({
     format: ConnectedServiceCredentialFormatSchema,
     ciphertext: z.string().min(1),
     subscription: SealedProviderAccountSubscriptionV1Schema.optional(),
+    recoveryCreditDetails: z.object({ ciphertext: z.string().min(1) }).strict().optional(),
 });
 
 export type SealedConnectedServiceQuotaSnapshotV1 = z.infer<typeof SealedConnectedServiceQuotaSnapshotV1Schema>;
 
 // Explicit reader negotiation: older strict V1 readers cannot accept the opt-in field.
 export const CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER = 'accept';
+// CLI-only optional switch provenance; older strict active-profile bodies remain unchanged.
+export const CONNECTED_SERVICE_AUTH_GROUP_SWITCH_REASON_HEADER = 'x-happier-connected-service-switch-reason';
 export const CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE = 'application/json; happier-connected-service-auto-quota-reset=1';
+export const CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY = 'happierAutoDisablePlanInvalidAccounts';
+export const CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY = 'happierPoolQuotaLimitSelection';
+export const CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY = 'happierPoolExpiryFirst';
+export const CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE = '1';
+
+export const ConnectedServiceAuthGroupReaderCapabilitiesQueryV1Schema = z.object({
+    [CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY]: z
+        .literal(CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE)
+        .optional(),
+    [CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY]: z
+        .literal(CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE)
+        .optional(),
+    [CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY]: z
+        .literal(CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE)
+        .optional(),
+});
+
+export type ConnectedServiceAuthGroupReaderCapabilitiesQueryV1 = z.infer<
+    typeof ConnectedServiceAuthGroupReaderCapabilitiesQueryV1Schema
+>;
+
+export function appendConnectedServiceAuthGroupReaderCapabilities(path: string): string {
+    const separator = path.includes('?') ? '&' : '?';
+    return `${path}${separator}${CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}&${CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}&${CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}`;
+}
+
+const ConnectedServiceSelectedProviderLimitIdsSchema = z
+    .array(z.string().trim().min(1))
+    .min(1)
+    .refine((ids) => new Set(ids).size === ids.length, 'Provider limit ids must be unique');
+
+export const ConnectedServiceAuthGroupQuotaLimitSelectionV1Schema = z.discriminatedUnion('mode', [
+    z.object({ mode: z.literal('all'), providerLimitIds: z.array(z.never()).length(0) }).strict(),
+    z.object({ mode: z.literal('selected'), providerLimitIds: ConnectedServiceSelectedProviderLimitIdsSchema }).strict(),
+]);
+
+export type ConnectedServiceAuthGroupQuotaLimitSelectionV1 = z.infer<typeof ConnectedServiceAuthGroupQuotaLimitSelectionV1Schema>;
+
+export const ConnectedServiceAuthGroupStrategyV1Schema = z.enum(['expiry_first', 'priority', 'least_limited', 'manual']);
 
 export const ConnectedServiceAuthGroupPolicyV1Schema = z
     .object({
         v: z.literal(1).default(1),
-        strategy: z.enum(['priority', 'least_limited', 'manual']).default('least_limited'),
+        strategy: ConnectedServiceAuthGroupStrategyV1Schema.default('expiry_first'),
         autoSwitch: z.boolean().default(false),
         // Absence means false. Do not materialize a default in older-reader responses.
         autoUseQuotaResetsWhenExhausted: z.boolean().optional(),
+        // Absence means false. Reader negotiation keeps this out of older strict V1 responses.
+        autoDisablePlanInvalidAccounts: z.boolean().optional(),
+        // Absence is the released all-limits behavior. Keep optional for strict-reader compatibility.
+        quotaLimitSelection: ConnectedServiceAuthGroupQuotaLimitSelectionV1Schema.optional(),
         switchOn: z
             .object({
                 usageLimit: z.boolean(),
@@ -547,9 +613,11 @@ export type ConnectedServiceAuthGroupPolicyV1 = z.infer<typeof ConnectedServiceA
 export const ConnectedServiceAuthGroupPolicyPatchV1Schema = z
     .object({
         v: z.literal(1).optional(),
-        strategy: z.enum(['priority', 'least_limited', 'manual']).optional(),
+        strategy: ConnectedServiceAuthGroupStrategyV1Schema.optional(),
         autoSwitch: z.boolean().optional(),
         autoUseQuotaResetsWhenExhausted: z.boolean().optional(),
+        autoDisablePlanInvalidAccounts: z.boolean().optional(),
+        quotaLimitSelection: ConnectedServiceAuthGroupQuotaLimitSelectionV1Schema.optional(),
         switchOn: z
             .object({
                 usageLimit: z.boolean().optional(),
@@ -584,6 +652,8 @@ export const ConnectedServiceAuthGroupMemberStateV1Schema = z
         capacityLimitedUntilMs: z.number().int().nonnegative().nullable().optional(),
         authInvalidUntilMs: z.number().int().nonnegative().nullable().optional(),
         planUnavailableUntilMs: z.number().int().nonnegative().nullable().optional(),
+        modelUnavailableUntilMsByModelId: z.record(z.string().trim().min(1), z.number().int().nonnegative()).optional(),
+        autoDisabledReason: z.enum(['model_not_entitled']).nullable().optional(),
         validationBlockedUntilMs: z.number().int().nonnegative().nullable().optional(),
         lastFailureKind: z.string().trim().min(1).nullable().optional(),
         lastFailureCode: z.string().trim().min(1).nullable().optional(),
@@ -723,9 +793,20 @@ export const ConnectedServiceAuthGroupMemberPatchRequestV1Schema = z
     .object({
         priority: z.number().int().optional(),
         enabled: z.boolean().optional(),
+        state: ConnectedServiceAuthGroupMemberStateV1Schema.removeDefault().optional(),
         expectedGeneration: ConnectedServiceAuthGroupExpectedGenerationV1Schema,
+        expectedRuntimeStateRevision: z.number().int().nonnegative().optional(),
     })
-    .strict();
+    .strict()
+    .superRefine((request, ctx) => {
+        if (request.state !== undefined && request.expectedRuntimeStateRevision === undefined) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['expectedRuntimeStateRevision'],
+                message: 'expectedRuntimeStateRevision is required when member runtime state is patched',
+            });
+        }
+    });
 
 export type ConnectedServiceAuthGroupMemberPatchRequestV1 = z.infer<typeof ConnectedServiceAuthGroupMemberPatchRequestV1Schema>;
 

@@ -47,6 +47,7 @@ import { runtimeFetch } from '@/utils/system/runtimeFetch';
 import { getServerFeaturesSnapshot } from '@/sync/api/capabilities/serverFeaturesClient';
 import { clearPendingNotificationNav, getPendingNotificationNav } from '@/sync/domains/pending/pendingNotificationNav';
 import { readServerReachabilityProbeTimeoutMs } from '@/sync/runtime/connectivity/serverReachabilityTuning';
+import { selectRelayDirectly } from '@/setup/directRelaySelectionIntent';
 
 type SearchParams = Readonly<{ url?: string | string[]; auto?: string | string[]; source?: string | string[] }>;
 type SwitchServerByIdOptions = Readonly<{
@@ -145,6 +146,23 @@ export function useServerSettingsScreenController(): ServerSettingsController {
         setActiveServer({ serverId, scope: 'device' });
         await switchConnectionToActiveServer();
         await auth.refreshFromActiveServer();
+        if (opts?.normalizeRoute ?? true) {
+            router.replace('/settings/server');
+        }
+    }, [auth, router, setServerSelectionActiveTargetId, setServerSelectionActiveTargetKind]);
+
+    /**
+     * R8/INV7 — a relay the person picked, added or reset to on this screen. It goes through the one
+     * direct-selection operation, which arms the intent the desktop setup gate spends to offer
+     * moving this computer's background service. `switchServerById` above stays the ambient path:
+     * deep-link auto-add and group actions reach it, and neither names one relay a person chose.
+     */
+    const selectServerDirectly = React.useCallback(async (serverId: string, opts?: Readonly<{ normalizeRoute?: boolean }>) => {
+        await selectRelayDirectly({
+            serverId,
+            selectionTarget: { setServerSelectionActiveTargetKind, setServerSelectionActiveTargetId },
+            refreshAuth: auth.refreshFromActiveServer,
+        });
         if (opts?.normalizeRoute ?? true) {
             router.replace('/settings/server');
         }
@@ -324,7 +342,7 @@ export function useServerSettingsScreenController(): ServerSettingsController {
 
     const profileActions = useServerSettingsServerProfileActions({
         authStatusByServerId,
-        onSwitchServerById: async (serverId) => switchServerById(serverId),
+        onSelectServerById: selectServerDirectly,
         onAfterSignedOutSwitch: () => router.replace('/'),
         setRevision,
     });
@@ -426,7 +444,9 @@ export function useServerSettingsScreenController(): ServerSettingsController {
         }
 
         retargetPendingTerminalConnectToServerUrl(profile.serverUrl);
-        await switchServerById(resolveServerProfileScopeId(profile), { normalizeRoute: targetAuthStatus === 'signedOut' ? false : route.source !== 'notification' });
+        // Pressing Add is the person choosing this relay, including when a notification prefilled
+        // the form; only the deep-link auto-add (`useServerAutoAddFromRoute`) is ambient.
+        await selectServerDirectly(resolveServerProfileScopeId(profile), { normalizeRoute: targetAuthStatus === 'signedOut' ? false : route.source !== 'notification' });
         setRevision((r) => r + 1);
 
         if (targetAuthStatus === 'signedOut') {
@@ -442,7 +462,7 @@ export function useServerSettingsScreenController(): ServerSettingsController {
                 router.replace(pending.route);
             }
         }
-    }, [inputName, inputUrl, route.source, route.url, router, switchServerById, validateServerReachable]);
+    }, [inputName, inputUrl, route.source, route.url, router, selectServerDirectly, validateServerReachable]);
 
     const onResetServer = React.useCallback(async () => {
         const confirmed = await Modal.confirm(
@@ -452,12 +472,13 @@ export function useServerSettingsScreenController(): ServerSettingsController {
         );
 
         if (confirmed) {
-            await switchServerById(getResetToDefaultServerId());
+            // A confirmed reset is the person choosing the default relay for this device.
+            await selectServerDirectly(getResetToDefaultServerId());
             setInputUrl('');
             setInputName('');
             setRevision((r) => r + 1);
         }
-    }, [switchServerById]);
+    }, [selectServerDirectly]);
 
     return {
         servers,

@@ -28,10 +28,11 @@ export function useAgentInputActionMenuControls(params: Readonly<{
     resumePopover?: unknown;
     hasAgentPickerOptions: boolean;
     onAgentClick?: () => void;
+    onAgentPickerIntent?: () => void;
     actionBarIsCollapsed: boolean;
     hasAnyActions: boolean;
     tint: string;
-    agentId: AgentId;
+    agentId: AgentId | null;
     profileLabel: string | null;
     profileIcon: string;
     envVarsCount?: number;
@@ -121,13 +122,14 @@ export function useAgentInputActionMenuControls(params: Readonly<{
     }, [params.onResumeClick, params.openSelectionOverlay, params.resumePopover]);
 
     const handleActionMenuAgentClick = React.useCallback(() => {
+        params.onAgentPickerIntent?.();
         if (params.hasAgentPickerOptions) {
             params.closeSelectionOverlay('permission');
             params.openSelectionOverlay('agent', 'actionMenu');
             return;
         }
         params.onAgentClick?.();
-    }, [params.closeSelectionOverlay, params.hasAgentPickerOptions, params.onAgentClick, params.openSelectionOverlay]);
+    }, [params.closeSelectionOverlay, params.hasAgentPickerOptions, params.onAgentClick, params.onAgentPickerIntent, params.openSelectionOverlay]);
 
     const handleActionMenuSessionModeClick = React.useCallback(() => {
         if (params.sessionModeChipInteraction?.kind === 'cycle') {

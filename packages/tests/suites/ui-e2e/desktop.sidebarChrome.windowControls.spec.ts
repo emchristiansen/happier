@@ -53,14 +53,6 @@ async function launchDesktopShell(page: Page, params: Readonly<{
   await createAccountWithoutDaemon({ page, uiBaseUrl: params.uiBaseUrl });
 }
 
-async function readUtilityRowTestIds(page: Page): Promise<string[]> {
-  return await page.getByTestId('desktop-sidebar-chrome-utility-row').evaluate((node) => {
-    return Array.from(node.children)
-      .map((child) => child.getAttribute('data-testid'))
-      .filter((testId): testId is string => typeof testId === 'string' && testId.length > 0);
-  });
-}
-
 async function dragFromMainContentTitlebar(page: Page): Promise<void> {
     const sidebarBox = await page.getByTestId('desktop-sidebar-chrome').boundingBox();
     if (!sidebarBox) throw new Error('missing desktop sidebar chrome bounds');
@@ -123,8 +115,8 @@ test.describe('ui e2e: desktop sidebar chrome window controls', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('renders shell-owned desktop controls and update status in the wide sidebar', async ({ page }) => {
-    test.setTimeout(420_000);
+  test('renders shell-owned desktop controls and update status in the wide sidebar', { tag: "@smoke" }, async ({ page }) => {
+    test.setTimeout(180_000);
     if (!uiBaseUrl) throw new Error('missing ui base url');
 
     await launchDesktopShell(page, { uiBaseUrl, updateVersion: '9.9.9' });
@@ -135,15 +127,11 @@ test.describe('ui e2e: desktop sidebar chrome window controls', () => {
     await expect(page.getByTestId('desktop-window-controls-minimize')).toBeVisible({ timeout: 60_000 });
     await expect(page.getByTestId('desktop-window-controls-toggle-maximize')).toBeVisible({ timeout: 60_000 });
     await expect(page.getByTestId('desktop-window-controls-close')).toBeVisible({ timeout: 60_000 });
-    await expect(page.getByTestId('sidebar-shell-app-update-status-tag')).toHaveCount(1, { timeout: 60_000 });
-
-    await expect.poll(async () => readUtilityRowTestIds(page), { timeout: 60_000 }).toEqual([
-      'sidebar-back-button',
-      'sidebar-forward-button',
-      'sidebar-inbox-button',
-      'nav-settings',
-      'sidebar-collapse-button',
-    ]);
+    // Updates lives in the desktop top rail. This fresh account has no activity needing attention.
+    const utilityRow = page.getByTestId('desktop-sidebar-chrome-utility-row');
+    await expect(utilityRow.getByTestId('desktop-sidebar-updates-button')).toHaveCount(1, { timeout: 60_000 });
+    await expect(utilityRow.getByTestId('desktop-sidebar-action-operations')).toHaveCount(0);
+    await expect(page.getByTestId('desktop-sidebar-action-operations')).toHaveCount(0);
 
     await dragFromMainContentTitlebar(page);
     await expect.poll(async () => readFakeTauriDesktopState(page), { timeout: 60_000 }).toMatchObject({
@@ -173,7 +161,7 @@ test.describe('ui e2e: desktop sidebar chrome window controls', () => {
   });
 
   test('does not render Tauri desktop controls in plain web mode', async ({ page }) => {
-    test.setTimeout(300_000);
+    test.setTimeout(180_000);
     if (!uiBaseUrl) throw new Error('missing ui base url');
 
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -186,7 +174,7 @@ test.describe('ui e2e: desktop sidebar chrome window controls', () => {
   });
 
   test('excludes global desktop chrome from the desktop pet overlay route', async ({ page }) => {
-    test.setTimeout(300_000);
+    test.setTimeout(180_000);
     if (!uiBaseUrl) throw new Error('missing ui base url');
 
     await page.setViewportSize({ width: 800, height: 600 });
@@ -203,7 +191,7 @@ test.describe('ui e2e: desktop sidebar chrome window controls', () => {
     await expect(page.getByTestId('desktop-pet-overlay-root')).toHaveCount(1, { timeout: 120_000 });
     await expect(page.getByTestId('desktop-window-controls-host')).toHaveCount(0);
     await expect(page.getByTestId('desktop-sidebar-chrome')).toHaveCount(0);
-    await expect(page.getByTestId('root-shell-app-update-status-tag')).toHaveCount(0);
-    await expect(page.getByTestId('app-update-status-tag')).toHaveCount(0);
+    await expect(page.getByTestId('root-shell-updates-button')).toHaveCount(0);
+    await expect(page.getByTestId('desktop-sidebar-updates-button')).toHaveCount(0);
   });
 });

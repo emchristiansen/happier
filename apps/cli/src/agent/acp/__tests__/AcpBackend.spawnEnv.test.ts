@@ -1,10 +1,11 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { withTempDir } from '@/testkit/fs/tempDir';
+import { logger } from '@/ui/logger';
 
 import { AcpBackend } from '../AcpBackend';
 import { writeAcpTestAgentScript } from '../testkit/subprocessHarness';
@@ -16,7 +17,7 @@ afterEach(() => {
   envScope.restore();
 });
 
-function writeEnvCapturingAcpAgentScript(params: { dir: string }): string {
+function writeEnvCapturingAcpAgentScript(params: { dir: string; exitAfterSession?: boolean }): string {
   const source = `
     const { writeFileSync } = require('node:fs');
     const decoder = new TextDecoder();
@@ -69,6 +70,7 @@ function writeEnvCapturingAcpAgentScript(params: { dir: string }): string {
 
         if (method === 'session/new') {
           respondOk(id, { sessionId: 'test-session' });
+          if (${params.exitAfterSession === true}) setImmediate(() => process.exit(0));
           continue;
         }
 
@@ -84,7 +86,224 @@ function writeEnvCapturingAcpAgentScript(params: { dir: string }): string {
   });
 }
 
+function writeFailingNewSessionAcpAgentScript(params: { dir: string }): string {
+  return writeAcpTestAgentScript({
+    dir: params.dir,
+    fileName: 'failing-new-session-acp-agent.cjs',
+    source: `
+      const readline = require('node:readline');
+      const lines = readline.createInterface({ input: process.stdin });
+      const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+      lines.on('line', (line) => {
+        const request = JSON.parse(line);
+        if (request.method === 'initialize') {
+          send({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: 1 } });
+          return;
+        }
+        if (request.method === 'session/new') {
+          send({ jsonrpc: '2.0', id: request.id, error: { code: -32603, message: 'new session failed' } });
+        }
+      });
+    `,
+  });
+}
+
+function writeHangingNewSessionAcpAgentScript(params: { dir: string }): string {
+  return writeAcpTestAgentScript({
+    dir: params.dir,
+    fileName: 'hanging-new-session-acp-agent.cjs',
+    source: `
+      const { appendFileSync } = require('node:fs');
+      const readline = require('node:readline');
+      const lines = readline.createInterface({ input: process.stdin });
+      const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+      lines.on('line', (line) => {
+        const request = JSON.parse(line);
+        if (request.method === 'initialize') {
+          send({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: 1 } });
+          return;
+        }
+        if (request.method === 'session/new') {
+          appendFileSync(process.env.HAPPIER_ACP_NEW_SESSION_ATTEMPTS_PATH, 'attempt\\n');
+        }
+      });
+    `,
+  });
+}
+
+function writeRejectedInitializeAcpAgentScript(params: { dir: string; secret: string }): string {
+  return writeAcpTestAgentScript({
+    dir: params.dir,
+    fileName: 'rejected-initialize-acp-agent.cjs',
+    source: `
+      const readline = require('node:readline');
+      const lines = readline.createInterface({ input: process.stdin });
+      lines.on('line', (line) => {
+        const request = JSON.parse(line);
+        if (request.method === 'initialize') {
+          process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id: request.id,
+            error: { code: -32603, message: ${JSON.stringify(`provider rejected: ${params.secret}`)} },
+          }) + '\\n');
+        }
+      });
+    `,
+  });
+}
+
 describe('AcpBackend spawn environment', () => {
+  it('applies an asynchronous process-launch environment and cleans it up on dispose', async () => {
+    await withTempDir('happier-acp-spawn-env-', async (dir) => {
+      const capturePath = join(dir, 'spawn-env.json');
+      const scriptPath = writeEnvCapturingAcpAgentScript({ dir });
+      const cleanup = vi.fn(async () => {});
+      const prepareProcessLaunch = vi.fn(async () => ({
+        env: { [preservedEnvKey]: 'prepared-value' },
+        cleanup,
+      }));
+
+      const backend = new AcpBackend({
+        agentName: 'test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        env: { HAPPIER_ACP_ENV_CAPTURE_PATH: capturePath },
+        prepareProcessLaunch,
+      });
+
+      await backend.startSession();
+      expect(JSON.parse(readFileSync(capturePath, 'utf8'))[preservedEnvKey]).toBe('prepared-value');
+      expect(prepareProcessLaunch).toHaveBeenCalledTimes(1);
+      expect(cleanup).not.toHaveBeenCalled();
+
+      await backend.dispose();
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      await backend.dispose();
+      expect(cleanup).toHaveBeenCalledTimes(1);
+    });
+  }, 20_000);
+
+  it('cleans late preparation without spawning after disposal completes', async () => {
+    await withTempDir('happier-acp-retired-preparation-', async (dir) => {
+      const capturePath = join(dir, 'late-spawn.json');
+      const scriptPath = writeEnvCapturingAcpAgentScript({ dir, exitAfterSession: true });
+      let releasePreparation!: () => void;
+      const preparationGate = new Promise<void>((resolve) => { releasePreparation = resolve; });
+      let markPreparationEntered!: () => void;
+      const preparationEntered = new Promise<void>((resolve) => { markPreparationEntered = resolve; });
+      const cleanup = vi.fn(async () => {});
+      const backend = new AcpBackend({
+        agentName: 'test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        env: { HAPPIER_ACP_ENV_CAPTURE_PATH: capturePath },
+        prepareProcessLaunch: async () => {
+          markPreparationEntered();
+          await preparationGate;
+          return { cleanup };
+        },
+      });
+      // Observe rejection immediately so the controlled disposal cannot create an unhandled rejection.
+      const start = backend.startSession().then(
+        () => ({ kind: 'started' as const }),
+        (error: unknown) => ({ kind: 'failed' as const, error }),
+      );
+      try {
+        await preparationEntered;
+        await backend.dispose();
+        expect(cleanup).not.toHaveBeenCalled();
+        releasePreparation();
+        const result = await start;
+        expect(result.kind).toBe('failed');
+        if (result.kind === 'failed') expect(result.error).toMatchObject({ name: 'AbortError' });
+        expect(existsSync(capturePath)).toBe(false);
+        expect(cleanup).toHaveBeenCalledTimes(1);
+        await backend.dispose();
+        expect(cleanup).toHaveBeenCalledTimes(1);
+      } finally {
+        releasePreparation();
+        await start;
+        await backend.dispose();
+      }
+    });
+  }, 20_000);
+
+  it('cleans prepared launch state after session creation fails and prepares a retry afresh', async () => {
+    await withTempDir('happier-acp-spawn-env-', async (dir) => {
+      const scriptPath = writeFailingNewSessionAcpAgentScript({ dir });
+      const cleanup = vi.fn(async () => {});
+      const prepareProcessLaunch = vi.fn(async () => ({ cleanup }));
+      const backend = new AcpBackend({
+        agentName: 'test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        prepareProcessLaunch,
+      });
+
+      try {
+        await expect(backend.startSession()).rejects.toThrow(/new session failed/i);
+        await expect(backend.startSession()).rejects.toThrow(/new session failed/i);
+        expect(prepareProcessLaunch).toHaveBeenCalledTimes(2);
+        expect(cleanup).toHaveBeenCalledTimes(2);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  }, 20_000);
+
+  it('does not replay session creation after an ambiguous response timeout', async () => {
+    await withTempDir('happier-acp-new-session-', async (dir) => {
+      const attemptsPath = join(dir, 'new-session-attempts.txt');
+      const scriptPath = writeHangingNewSessionAcpAgentScript({ dir });
+      const backend = new AcpBackend({
+        agentName: 'test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        env: { HAPPIER_ACP_NEW_SESSION_ATTEMPTS_PATH: attemptsPath },
+        transportHandler: {
+          agentName: 'test',
+          getInitTimeout: () => 1_000,
+          getToolPatterns: () => [],
+        },
+      });
+
+      try {
+        await expect(backend.startSession()).rejects.toThrow(/new session.*timeout/iu);
+        expect(readFileSync(attemptsPath, 'utf8').trim().split('\n')).toHaveLength(1);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  }, 10_000);
+
+  it('does not log provider-controlled initialization failure contents during cleanup', async () => {
+    await withTempDir('happier-acp-initialize-log-', async (dir) => {
+      const secret = 'Bearer must-not-appear-in-acp-initialization-log';
+      const scriptPath = writeRejectedInitializeAcpAgentScript({ dir, secret });
+      const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => undefined);
+      const backend = new AcpBackend({
+        agentName: 'test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+      });
+
+      try {
+        await expect(backend.startSession()).rejects.toThrow(secret);
+        const logged = debugSpy.mock.calls.flatMap((call) => call).map((value) => (
+          value instanceof Error ? `${value.message}\n${value.stack ?? ''}` : JSON.stringify(value)
+        )).join('\n');
+        expect(logged).not.toContain(secret);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  }, 10_000);
+
   it('removes configured inherited environment variables before spawning', async () => {
     await withTempDir('happier-acp-spawn-env-', async (dir) => {
       envScope.patch({

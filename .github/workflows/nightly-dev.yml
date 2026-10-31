@@ -11,7 +11,7 @@ on:
         default: dev
         type: string
       ci_run_id:
-        description: "Completed canonical push CI run ID for this exact source (required for manual runs; schedules resolve once and never wait)"
+        description: "Completed canonical push CI run ID for this exact source (required for manual runs; schedules select the newest certified dev SHA)"
         required: false
         default: ""
         type: string
@@ -94,11 +94,13 @@ jobs:
       actions: read
       contents: read
     outputs:
-      source_sha: ${{ steps.identity.outputs.source_sha }}
+      source_sha: ${{ steps.ci_evidence.outputs.source_sha }}
+      head_sha: ${{ steps.identity.outputs.head_sha }}
       release_message: ${{ steps.identity.outputs.release_message }}
       release_needed: ${{ steps.release_need.outputs.release_needed }}
       ci_run_id: ${{ steps.ci_evidence.outputs.ci_run_id }}
-      waiting_for_ci: ${{ steps.ci_evidence.outputs.waiting_for_ci }}
+      waiting_for_ci: ${{ steps.release_need.outputs.waiting_for_ci }}
+      decision: ${{ steps.release_need.outputs.decision }}
     steps:
       - name: Checkout requested nightly source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -110,16 +112,16 @@ jobs:
         id: identity
         run: |
           set -euo pipefail
-          source_sha="$(git rev-parse HEAD)"
-          test "$(printf '%s' "$source_sha" | wc -c | tr -d ' ')" = "40"
-          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          head_sha="$(git rev-parse HEAD)"
+          test "$(printf '%s' "$head_sha" | wc -c | tr -d ' ')" = "40"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "release_message=Automated nightly dev release." >> "$GITHUB_OUTPUT"
       - name: Bind completed exact-source CI evidence
         id: ci_evidence
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
-          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          HEAD_SHA: ${{ steps.identity.outputs.head_sha }}
           REQUESTED_CI_RUN_ID: ${{ inputs.ci_run_id }}
         run: |
           set -euo pipefail
@@ -129,72 +131,110 @@ jobs:
               exit 1
             fi
             echo "ci_run_id=$REQUESTED_CI_RUN_ID" >> "$GITHUB_OUTPUT"
-            echo "waiting_for_ci=false" >> "$GITHUB_OUTPUT"
+            echo "source_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            echo "ci_available=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          endpoint="repos/${GITHUB_REPOSITORY}/actions/workflows/tests.yml/runs?branch=dev&head_sha=${SOURCE_SHA}&event=push&status=success&per_page=10"
-          ci_run_id="$(gh api "$endpoint" --jq '.workflow_runs | map(select(.head_sha == "'"$SOURCE_SHA"'" and .head_branch == "dev" and .event == "push" and .status == "completed" and .conclusion == "success")) | sort_by(.id) | last | .id // empty')"
-          if [ -z "$ci_run_id" ]; then
+          endpoint="repos/${GITHUB_REPOSITORY}/actions/workflows/tests.yml/runs?branch=dev&event=push&status=success&per_page=100"
+          read -r ci_run_id candidate_sha <<EOF
+          $(gh api "$endpoint" --jq '.workflow_runs | map(select(.head_branch == "dev" and .event == "push" and .status == "completed" and .conclusion == "success")) | sort_by(.id) | last | if . == null then "" else "\(.id) \(.head_sha)" end')
+          EOF
+          if [ -z "${ci_run_id:-}" ] || [ -z "${candidate_sha:-}" ]; then
             echo "ci_run_id=" >> "$GITHUB_OUTPUT"
-            echo "waiting_for_ci=true" >> "$GITHUB_OUTPUT"
-            echo "No completed canonical CI attestation exists for ${SOURCE_SHA}; this schedule is not releasable yet." >> "$GITHUB_STEP_SUMMARY"
+            echo "source_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            echo "ci_available=false" >> "$GITHUB_OUTPUT"
+            echo "No completed canonical dev CI attestation exists; this schedule is not releasable." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+
+          head_status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${candidate_sha}...${HEAD_SHA}" --jq .status)"
+          if [ "$head_status" != "ahead" ] && [ "$head_status" != "identical" ]; then
+            echo "Newest successful dev CI SHA ${candidate_sha} is not an ancestor of current dev HEAD ${HEAD_SHA}." >&2
+            exit 1
+          fi
           echo "ci_run_id=$ci_run_id" >> "$GITHUB_OUTPUT"
-          echo "waiting_for_ci=false" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "ci_available=true" >> "$GITHUB_OUTPUT"
       - name: Determine whether scheduled publication is needed
         id: release_need
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
-          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
-          WAITING_FOR_CI: ${{ steps.ci_evidence.outputs.waiting_for_ci }}
+          HEAD_SHA: ${{ steps.identity.outputs.head_sha }}
+          SOURCE_SHA: ${{ steps.ci_evidence.outputs.source_sha }}
+          CI_AVAILABLE: ${{ steps.ci_evidence.outputs.ci_available }}
         run: |
           set -euo pipefail
-          echo "release_needed=true" >> "$GITHUB_OUTPUT"
-          if [ "$WAITING_FOR_CI" = "true" ]; then
-            echo "release_needed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           if [ "$EVENT_NAME" != "schedule" ]; then
+            echo "release_needed=true" >> "$GITHUB_OUTPUT"
+            echo "waiting_for_ci=false" >> "$GITHUB_OUTPUT"
+            echo "decision=publish" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if ! prior_run="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow nightly-dev.yml --commit "$SOURCE_SHA" --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"; then
-            echo "::warning::Could not inspect prior nightly runs; publication will proceed."
-            exit 0
-          fi
-          if [ -z "$prior_run" ]; then
+          if [ "$CI_AVAILABLE" != "true" ]; then
+            echo "release_needed=false" >> "$GITHUB_OUTPUT"
+            echo "waiting_for_ci=true" >> "$GITHUB_OUTPUT"
+            echo "decision=blocked_ci" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           resolve_tag_commit() {
             tag="$1"
-            read -r object_type object_sha <<EOF
-          $(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq '.object.type + " " + .object.sha')
-          EOF
+            tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq '.object.type + " " + .object.sha')" || return 1
+            read -r object_type object_sha <<< "$tag_object" || return 1
             while [ "$object_type" = "tag" ]; do
-              read -r object_type object_sha <<EOF
-          $(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.type + " " + .object.sha')
-          EOF
+              tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.type + " " + .object.sha')" || return 1
+              read -r object_type object_sha <<< "$tag_object" || return 1
             done
-            test "$object_type" = "commit"
+            test "$object_type" = "commit" && test -n "$object_sha" || return 1
             printf '%s\n' "$object_sha"
           }
 
-          for tag in server-dev stack-dev cli-dev ui-web-dev; do
+          all_current=true
+          for tag in server-dev stack-dev cli-dev ui-web-dev ui-mobile-dev ui-desktop-dev; do
             if ! actual="$(resolve_tag_commit "$tag")"; then
-              echo "::warning::Could not resolve ${tag}; publication will proceed."
-              exit 0
+              echo "::warning::Could not resolve ${tag}; the certified candidate will repair it."
+              all_current=false
+              continue
             fi
             if [ "$actual" != "$SOURCE_SHA" ]; then
-              exit 0
+              all_current=false
+              promotion_status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${actual}...${SOURCE_SHA}" --jq .status)"
+              if [ "$promotion_status" != "ahead" ]; then
+                echo "Refusing to move ${tag} from ${actual} to non-forward candidate ${SOURCE_SHA} (${promotion_status})." >&2
+                exit 1
+              fi
+            fi
+            if ! release_target="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.target_commitish')"; then
+              echo "::warning::Could not read ${tag} Release metadata; publication is not established."
+              all_current=false
+              continue
+            fi
+            if [ "$release_target" != "$SOURCE_SHA" ]; then
+              echo "::warning::${tag} Release target does not match the certified candidate; publication is needed."
+              all_current=false
             fi
           done
 
-          echo "release_needed=false" >> "$GITHUB_OUTPUT"
-          echo "Exact SHA ${SOURCE_SHA} already completed and all core rolling tags still point to it."
+          if [ "$all_current" = "true" ]; then
+            echo "release_needed=false" >> "$GITHUB_OUTPUT"
+            if [ "$HEAD_SHA" != "$SOURCE_SHA" ]; then
+              echo "waiting_for_ci=true" >> "$GITHUB_OUTPUT"
+              echo "decision=blocked_ci" >> "$GITHUB_OUTPUT"
+              echo "Newest certified SHA ${SOURCE_SHA} is already promoted, but dev HEAD ${HEAD_SHA} is not CI-certified." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "waiting_for_ci=false" >> "$GITHUB_OUTPUT"
+              echo "decision=already_current" >> "$GITHUB_OUTPUT"
+              echo "Exact certified SHA ${SOURCE_SHA} is already promoted."
+            fi
+            exit 0
+          fi
+
+          echo "release_needed=true" >> "$GITHUB_OUTPUT"
+          echo "waiting_for_ci=false" >> "$GITHUB_OUTPUT"
+          echo "decision=publish" >> "$GITHUB_OUTPUT"
 
   verify_source_ci:
     name: Verify exact nightly source CI
@@ -241,7 +281,9 @@ jobs:
       - name: Record non-releasable scheduled source
         env:
           SOURCE_SHA: ${{ needs.prepare_release_candidate.outputs.source_sha }}
-        run: echo "Nightly ${SOURCE_SHA} is waiting for a completed exact-source CI attestation; no build or publication was started." >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "Nightly ${SOURCE_SHA} cannot advance because current dev has no newer CI-certified source; no build or publication was started." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
   nightly_noop:
     name: Skip already completed nightly
@@ -449,13 +491,48 @@ jobs:
       allow_stable: false
       release_message: ${{ needs.prepare_release_candidate.outputs.release_message }}
 
-  ui_mobile:
-    name: UI mobile (dev)
-    needs: [prepare_release_candidate, release_verify]
+  prepare_ui_mobile:
+    name: Prepare UI mobile OTA (dev)
+    if: ${{ needs.prepare_release_candidate.outputs.release_needed == 'true' }}
+    needs: [prepare_release_candidate, verify_source_ci]
+    permissions:
+      contents: write
+      actions: write
     uses: ./.github/workflows/publish-ui-mobile-dev.yml
     secrets: inherit
     with:
       source_ref: ${{ needs.prepare_release_candidate.outputs.source_sha }}
+      preparation_only: true
+      publish_ota: true
+      publish_android_apk: false
+      submit_ios_testflight: false
+      release_message: ${{ needs.prepare_release_candidate.outputs.release_message }}
+
+  prepare_ui_desktop:
+    name: Prepare unsigned UI desktop (dev)
+    if: ${{ needs.prepare_release_candidate.outputs.release_needed == 'true' }}
+    needs: [prepare_release_candidate, verify_source_ci]
+    uses: ./.github/workflows/build-tauri.yml
+    secrets: inherit
+    with:
+      environment: dev
+      resume_run_id: ${{ inputs.resume_run_id }}
+      source_ref: ${{ needs.prepare_release_candidate.outputs.source_sha }}
+      preparation_only: true
+      publish_release: false
+      release_message: ${{ needs.prepare_release_candidate.outputs.release_message }}
+
+  ui_mobile:
+    name: UI mobile (dev)
+    permissions:
+      actions: write
+      contents: write
+    needs: [prepare_release_candidate, release_verify, prepare_ui_mobile]
+    uses: ./.github/workflows/publish-ui-mobile-dev.yml
+    secrets: inherit
+    with:
+      source_ref: ${{ needs.prepare_release_candidate.outputs.source_sha }}
+      use_prepared: true
       publish_ota: true
       publish_android_apk: true
       submit_ios_testflight: true
@@ -464,13 +541,16 @@ jobs:
 
   ui_desktop:
     name: UI desktop (Tauri) (dev)
-    needs: [prepare_release_candidate, release_verify]
+    needs: [prepare_release_candidate, cli, release_verify, prepare_ui_desktop]
     uses: ./.github/workflows/build-tauri.yml
     secrets: inherit
     with:
       environment: dev
+      resume_run_id: ${{ inputs.resume_run_id }}
       source_ref: ${{ needs.prepare_release_candidate.outputs.source_sha }}
+      use_prepared: true
       publish_release: true
+      candidate_cli_version: ${{ needs.cli.outputs.version }}
       release_message: ${{ needs.prepare_release_candidate.outputs.release_message }}
 
   docker:
@@ -491,7 +571,7 @@ jobs:
 
   verify_promoted:
     name: Verify promoted nightly references
-    needs: [prepare_release_candidate, promote_server, promote_hstack, promote_cli, promote_ui_web]
+    needs: [prepare_release_candidate, promote_server, promote_hstack, promote_cli, promote_ui_web, ui_mobile, ui_desktop]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -517,15 +597,17 @@ jobs:
             test "$object_type" = "commit"
             printf '%s\n' "$object_sha"
           }
-          for tag in server-dev stack-dev cli-dev ui-web-dev; do
+          for tag in server-dev stack-dev cli-dev ui-web-dev ui-mobile-dev ui-desktop-dev; do
             actual="$(resolve_tag_commit "$tag")"
             test "$actual" = "$EXPECTED_SHA"
+            release_target="$(gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq '.target_commitish')"
+            test "$release_target" = "$EXPECTED_SHA"
           done
 
   advance_source_issues_to_dev:
     name: Advance shipped issues from source to dev
-    if: ${{ needs.verify_promoted.result == 'success' && needs.snapshot_source_issues.outputs.eligible == 'true' && needs.snapshot_source_issues.outputs.issue_count != '0' }}
-    needs: [snapshot_source_issues, verify_promoted]
+    if: ${{ needs.verify_promoted.result == 'success' && needs.prepare_release_candidate.outputs.source_sha == needs.prepare_release_candidate.outputs.head_sha && needs.snapshot_source_issues.outputs.eligible == 'true' && needs.snapshot_source_issues.outputs.issue_count != '0' }}
+    needs: [snapshot_source_issues, prepare_release_candidate, verify_promoted]
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -558,8 +640,8 @@ jobs:
 
   release_status:
     name: Project terminal nightly release status
-    if: ${{ always() && needs.prepare_release_candidate.outputs.release_needed != 'false' }}
-    needs: [prepare_release_candidate, cli, hstack, server_runtime, ui_web, release_verify, verify_resume_candidates, promote_server, promote_hstack, promote_cli, promote_ui_web, ui_mobile, ui_desktop, docker, verify_promoted, advance_source_issues_to_dev]
+    if: ${{ always() }}
+    needs: [prepare_release_candidate, nightly_waiting_for_ci, nightly_noop, cli, hstack, server_runtime, ui_web, release_verify, verify_resume_candidates, promote_server, promote_hstack, promote_cli, promote_ui_web, ui_mobile, ui_desktop, docker, verify_promoted, advance_source_issues_to_dev]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -585,6 +667,7 @@ jobs:
           RELEASE_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RELEASE_RUN_NAME: NIGHTLY — Dev Releases
           SOURCE_SHA: ${{ needs.prepare_release_candidate.outputs.source_sha || 'unavailable' }}
+          NIGHTLY_DECISION: ${{ needs.prepare_release_candidate.outputs.decision || 'blocked_ci' }}
           CANDIDATE_RESULT: ${{ needs.prepare_release_candidate.result }}
           IMMUTABLE_VERIFICATION_RESULT: ${{ needs.release_verify.result }}
           CLI_CANDIDATE_VERSION: ${{ needs.cli.outputs.version }}
@@ -605,6 +688,7 @@ jobs:
           UI_WEB_RESULT: ${{ needs.promote_ui_web.result }}
           MOBILE_RESULT: ${{ needs.ui_mobile.result }}
           DESKTOP_RESULT: ${{ needs.ui_desktop.result }}
+          DESKTOP_ORIGIN_RUN_ID: ${{ inputs.resume_run_id || github.run_id }}
           DOCKER_RESULT: ${{ needs.docker.result }}
           POST_PROMOTION_RESULT: ${{ needs.verify_promoted.result }}
         run: |

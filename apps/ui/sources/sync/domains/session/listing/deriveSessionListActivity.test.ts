@@ -85,6 +85,23 @@ describe('deriveSessionListAttentionState', () => {
         expect(deriveSessionListAttentionState(input({ hasUnreadMessages: true }))).toBe('unread');
     });
 
+    it('keeps background work working independently of reading a completed reply', () => {
+        const background = input({
+            sessionState: 'background_active',
+            latestTurnStatus: 'completed',
+            latestReadyEventSeq: 4,
+            lastViewedSessionSeq: 1,
+            hasUnreadMessages: true,
+        });
+        expect(deriveSessionListAttentionState(background)).toBe('thinking');
+        expect(deriveSessionListAttentionState({ ...background, lastViewedSessionSeq: 4, hasUnreadMessages: false })).toBe('thinking');
+        expect(deriveSessionListAttentionState({ ...background, backgroundWorkAttentionMode: 'showUnread' })).toBe('unread');
+        expect(deriveSessionListAttentionState({ ...background, backgroundWorkAttentionMode: 'keepWorkingUnread' })).toBe('unread');
+        expect(deriveSessionListAttentionState({ ...background, sessionState: 'waiting' })).toBe('ready');
+        expect(deriveSessionListAttentionState({ ...background, pendingBlockedCount: 1 })).toBe('action_required');
+        expect(deriveSessionListAttentionState({ ...background, sessionState: 'permission_required' })).toBe('permission_required');
+    });
+
     it('preserves explicit permission-required attention over generic unread state', () => {
         expect(deriveSessionListAttentionState(input({
             hasUnreadMessages: true,
@@ -205,7 +222,7 @@ describe('deriveSessionListAttentionState', () => {
         }))).toBe('failed');
     });
 
-    it('uses fresh session status thinking after a failed terminal projection as working attention', () => {
+    it('does not hide the failed primary projection behind a thinking signal', () => {
         expect(deriveSessionListAttentionState(input({
             sessionState: 'thinking',
             latestTurnStatus: 'failed',
@@ -215,7 +232,7 @@ describe('deriveSessionListAttentionState', () => {
             seq: 10,
             latestReadyEventSeq: null,
             lastViewedSessionSeq: 9,
-        }))).toBe('thinking');
+        }))).toBe('failed');
     });
 
     it('does not treat stale in-progress projection as working attention without fresh session status thinking', () => {

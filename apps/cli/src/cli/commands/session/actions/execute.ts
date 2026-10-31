@@ -7,6 +7,7 @@ import { resolveSessionTransportContext } from '@/session/services/resolveSessio
 import { wantsJson, printJsonEnvelope, writeJsonStdout } from '@/cli/output/jsonEnvelope';
 import { hasFlag, readCommandPositionals, readFlagValue } from '@/cli/commands/shared/argvFlags';
 import type { ActionId } from '@happier-dev/protocol';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 function parseInputJsonOrThrow(raw: string | null): unknown {
   const trimmed = (raw ?? '').trim();
@@ -58,7 +59,7 @@ export async function cmdSessionActionsExecute(
       await printJsonEnvelope({ ok: false, kind: 'session_actions_execute', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 

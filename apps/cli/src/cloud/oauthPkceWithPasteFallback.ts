@@ -15,6 +15,10 @@ export type StartOauthPkceWithPasteFallbackOptions<TTokens> = Readonly<{
   mode: OauthPkceMode;
   defaultPort: number;
   callbackPath: `/${string}`;
+  /** Provider-registered callback for pasted redirects; loopback mode retains its local server. */
+  pasteRedirectUri?: string;
+  /** Only provider-declared manual code flows can omit a returned state. */
+  allowRawAuthorizationCode?: boolean;
   buildAuthorizationUrl: (params: {
     port: number;
     state: string;
@@ -42,7 +46,7 @@ export type StartOauthPkceWithPasteFallbackOptions<TTokens> = Readonly<{
     redirectUri: string;
     state: string;
     port: number;
-  }) => void;
+  }) => void | Promise<void>;
   startLoopbackOauthPkceFlowFn?: (opts: StartLoopbackOauthPkceFlowOptions<TTokens>) => Promise<TTokens>;
 }>;
 
@@ -84,18 +88,22 @@ export async function startOauthPkceWithPasteFallback<TTokens>(
   const port = opts.defaultPort;
   const { verifier, challenge } = generatePkce();
   const state = generateState();
-  const redirectUri = `http://localhost:${port}${opts.callbackPath}`;
+  const redirectUri = opts.pasteRedirectUri ?? `http://localhost:${port}${opts.callbackPath}`;
   const authorizationUrl = opts.buildAuthorizationUrl({ port, state, challenge, redirectUri });
 
   // We intentionally do not attempt to open a browser in paste mode; callers should display the URL.
-  opts.onAuthorizationUrl?.({ authorizationUrl, redirectUri, state, port });
+  await opts.onAuthorizationUrl?.({ authorizationUrl, redirectUri, state, port });
 
   const pasted = await prompt();
-  const parsed = parseOauthRedirectPaste({ pasted });
+  const parsed = parseOauthRedirectPaste({
+    pasted,
+    redirectUri: opts.pasteRedirectUri,
+    allowRawAuthorizationCode: opts.allowRawAuthorizationCode,
+  });
   if (!parsed.ok) {
     throw new Error(`Invalid OAuth redirect paste (${parsed.error})`);
   }
-  if (parsed.state !== state) {
+  if (parsed.rawAuthorizationCode !== true && parsed.state !== state) {
     throw new Error('OAuth state mismatch');
   }
 

@@ -9,28 +9,34 @@ export function formatErrorForUi(error: unknown, opts?: { maxChars?: number }): 
   const maxChars = Math.max(1000, opts?.maxChars ?? 50_000);
 
   const msg = (() => {
-    if (error instanceof Error) {
+    if (error instanceof Error && !(error instanceof AggregateError) && error.cause === undefined) {
       return error.stack || error.message || String(error);
     }
 
     if (typeof error === 'object' && error !== null) {
-      const seen = new WeakSet<object>();
+      const ancestors: { value: object; serialized: object }[] = [];
       try {
         return JSON.stringify(
           error,
-          (_key, value) => {
-            if (value instanceof Error) {
-              return {
+          function (this: unknown, _key: string, value: unknown) {
+            // JSON visits children through the projected Error object, while cycles
+            // refer to the original Error. Keep both identities on the current path.
+            while (ancestors.length && ancestors[ancestors.length - 1].serialized !== this) {
+              ancestors.pop();
+            }
+            if (typeof value === 'object' && value !== null) {
+              if (ancestors.some((ancestor) => ancestor.value === value)) return '[Circular]';
+              const serialized = value instanceof Error ? {
                 name: value.name,
                 message: value.message,
                 stack: value.stack,
-              };
+                ...(value instanceof AggregateError ? { errors: value.errors } : {}),
+                cause: value.cause,
+              } : value;
+              ancestors.push({ value, serialized });
+              return serialized;
             }
             if (typeof value === 'bigint') return value.toString();
-            if (typeof value === 'object' && value !== null) {
-              if (seen.has(value)) return '[Circular]';
-              seen.add(value);
-            }
             return value;
           },
           2,

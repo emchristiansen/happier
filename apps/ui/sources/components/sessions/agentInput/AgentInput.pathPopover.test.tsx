@@ -108,7 +108,7 @@ vi.mock('@/agents/catalog/catalog', () => ({
     }),
     getAgentBehavior: (agentId: string) => ({
         sessionUsage: {
-            supportsExactContextUsageBadge: agentId !== 'codex' && agentId !== 'gemini',
+            contextUsageBadge: agentId === 'gemini' ? 'hidden' : agentId === 'codex' ? 'reportedOnly' : 'derived',
         },
     }),
 }));

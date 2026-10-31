@@ -28,7 +28,6 @@ import {
     listServerProfileScopeIds,
     normalizeServerSelectionSettingsForProfileScopeIds,
 } from '@/sync/domains/server/selection/serverSelectionProfileScopeIds';
-import { writeServerSelectionActiveTargetToServer } from '@/sync/domains/server/selection/serverSelectionActiveTarget';
 import { toServerUrlDisplay } from '@/sync/domains/server/url/serverUrlDisplay';
 import { useConnectionTargetActions } from '@/components/navigation/connection/useConnectionTargetActions';
 import { promptSignedOutServerSwitchConfirmation } from '@/components/settings/server/modals/ServerSwitchAuthPrompt';
@@ -36,12 +35,14 @@ import { Text } from '@/components/ui/text/Text';
 import { useConnectionHealth } from '@/components/navigation/connectionStatus/useConnectionHealth';
 import { selectSyncErrorForServer } from '@/sync/runtime/connectivity/syncErrorScope';
 import { setPendingSetupIntent } from '@/sync/domains/pending/pendingSetupIntent';
+import { selectRelayDirectly } from '@/setup/directRelaySelectionIntent';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 import { DropdownMenu, type DropdownMenuItem } from '@/components/ui/forms/dropdown/DropdownMenu';
 import { runGuardedNavigation } from '@/utils/navigation/runGuardedNavigation';
 import { ActionListSection } from '@/components/ui/lists/ActionListSection';
 import { sync } from '@/sync/sync';
 import type { ConnectionHealthPresentation } from './connectionStatus/connectionHealthTypes';
+import { ThisComputerStatusRow } from './connectionStatus/ThisComputerStatusRow';
 import { isAccountSettingsSyncAttentionStatus } from '@/sync/domains/settings/accountSettingsSyncStatus';
 import { Icon } from '@/components/ui/icons/Icon';
 
@@ -360,11 +361,16 @@ export const ConnectionStatusControl = React.memo(function ConnectionStatusContr
             if (!server) return;
             const shouldSwitch = await confirmSignedOutSwitch(server.id);
             if (!shouldSwitch) return;
-            writeServerSelectionActiveTargetToServer({
-                setServerSelectionActiveTargetKind,
-                setServerSelectionActiveTargetId,
-            }, target.serverId);
-            await switchServer(target.serverId, 'device');
+            // R8/INV7 — the direct Relay/Home pick: the one direct-selection operation arms the
+            // intent the setup gate spends to offer moving this computer's background service,
+            // then switches. The group branch below records nothing: a group names several relays
+            // and cannot name one daemon target (B2).
+            await selectRelayDirectly({
+                serverId: target.serverId,
+                selectionTarget: { setServerSelectionActiveTargetKind, setServerSelectionActiveTargetId },
+                refreshAuth: auth.refreshFromActiveServer,
+            });
+            setOpen(false);
             if ((authStatusByServerId[target.serverId] ?? 'unknown') === 'signedOut') {
                 markTauriSignedOutServerSwitchForAuth(server.serverUrl);
                 router.replace('/');
@@ -393,6 +399,7 @@ export const ConnectionStatusControl = React.memo(function ConnectionStatusContr
         setOpen(false);
     }, [
         activeServerId,
+        auth,
         authStatusByServerId,
         router,
         setServerSelectionActiveTargetId,
@@ -543,6 +550,15 @@ export const ConnectionStatusControl = React.memo(function ConnectionStatusContr
                                     <Text style={styles.popoverLabel}>{t('settings.machines')}</Text>
                                     <Text style={styles.popoverValue}>{t(connectionHealth.machineLabelKey)}</Text>
                                 </View>
+
+                                {isTauriDesktop() ? (
+                                    <ThisComputerStatusRow
+                                        rowStyle={styles.popoverRow}
+                                        labelStyle={styles.popoverLabel}
+                                        valueStyle={styles.popoverValue}
+                                        actionListStyle={styles.popoverRelayActionList}
+                                    />
+                                ) : null}
 
                                 <View style={styles.popoverRow}>
                                     <Text style={styles.popoverLabel}>{t('connectionStatus.labels.server')}</Text>

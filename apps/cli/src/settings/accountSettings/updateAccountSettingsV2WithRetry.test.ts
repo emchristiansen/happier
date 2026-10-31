@@ -29,12 +29,14 @@ function mutableConfigurationForTest(): {
   apiServerUrl: string;
   publicServerUrl: string;
   webappUrl: string;
+  clientEncryptionRequirement: 'follow_account' | 'require_e2ee';
 } {
   return configuration as unknown as {
     serverUrl: string;
     apiServerUrl: string;
     publicServerUrl: string;
     webappUrl: string;
+    clientEncryptionRequirement: 'follow_account' | 'require_e2ee';
   };
 }
 
@@ -43,6 +45,7 @@ describe('updateAccountSettingsV2WithRetry', () => {
   const originalApiServerUrl = configuration.apiServerUrl;
   const originalPublicServerUrl = configuration.publicServerUrl;
   const originalWebappUrl = configuration.webappUrl;
+  const originalClientEncryptionRequirement = configuration.clientEncryptionRequirement;
 
   afterEach(() => {
     vi.restoreAllMocks();
@@ -51,6 +54,7 @@ describe('updateAccountSettingsV2WithRetry', () => {
       apiServerUrl: originalApiServerUrl,
       publicServerUrl: originalPublicServerUrl,
       webappUrl: originalWebappUrl,
+      clientEncryptionRequirement: originalClientEncryptionRequirement,
     });
   });
 
@@ -58,7 +62,7 @@ describe('updateAccountSettingsV2WithRetry', () => {
     const calls: Array<{ expectedVersion: number; content: AccountSettingsStoredContentEnvelope | null }> = [];
 
     const result = await updateAccountSettingsV2WithRetry({
-      credentials: createLegacyCredentialsStub(),
+      credentials: { token: 'plain-token', encryption: null },
       mutate: (settings: Readonly<Record<string, unknown>>) => ({
         ...settings,
         mcpServersSettingsV1: { v: 1, strictMode: false, servers: [], bindings: [] },
@@ -80,6 +84,107 @@ describe('updateAccountSettingsV2WithRetry', () => {
     expect(calls[0]?.expectedVersion).toBe(5);
     expect(calls[0]?.content?.t).toBe('plain');
     expect((calls[0]?.content as any)?.v?.mcpServersSettingsV1).toEqual({ v: 1, strictMode: false, servers: [], bindings: [] });
+  });
+
+  it.each([
+    { name: 'token-only', credentials: { token: 'plain-token', encryption: null } satisfies Credentials },
+    { name: 'retained-key', credentials: createLegacyCredentialsStub() },
+  ])('initializes empty plaintext settings from account authority for $name credentials', async ({ credentials }) => {
+    Object.assign(mutableConfigurationForTest(), {
+      apiServerUrl: 'https://settings.example.test', clientEncryptionRequirement: 'follow_account',
+    });
+    vi.spyOn(axios, 'get').mockImplementation(async (url) => {
+      if (url === 'https://settings.example.test/v2/account/settings') {
+        return { status: 200, data: { content: null, version: 0 } };
+      }
+      if (url === 'https://settings.example.test/v1/account/encryption') {
+        return { status: 200, data: { mode: 'plain', updatedAt: 1 } };
+      }
+      throw new Error(`Unexpected test HTTP GET: ${url}`);
+    });
+    const post = vi.spyOn(axios, 'post').mockResolvedValue({ status: 200, data: { success: true, version: 1 } });
+    await expect(updateAccountSettingsV2WithRetry({
+      credentials,
+      mutate: (settings) => ({ ...settings, example: 'nonempty' }),
+      deps: { writeCache: async () => {} },
+    })).resolves.toEqual({ version: 1 });
+    expect(post).toHaveBeenCalledWith(
+      'https://settings.example.test/v2/account/settings',
+      { expectedVersion: 0, content: { t: 'plain', v: { example: 'nonempty' } } },
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: `Bearer ${credentials.token}` }) }),
+    );
+  });
+
+  it.each([
+    { mode: 'e2ee', requirement: 'follow_account', error: 'ACCOUNT_ENCRYPTION_KEY_REQUIRED' },
+    { mode: 'plain', requirement: 'require_e2ee', error: 'CLIENT_E2EE_REQUIRED' },
+    { mode: 'unknown', requirement: 'follow_account', error: null },
+  ] as const)('refuses an initial write for $mode authority and $requirement policy', async ({ mode, requirement, error }) => {
+    Object.assign(mutableConfigurationForTest(), { clientEncryptionRequirement: requirement });
+    vi.spyOn(axios, 'get').mockResolvedValue({ status: 200, data: { mode, updatedAt: 1 } });
+    const updateSettings = vi.fn();
+    const result = updateAccountSettingsV2WithRetry({
+      credentials: { token: 'keyless-token', encryption: null },
+      mutate: (settings) => ({ ...settings, example: 'nonempty' }),
+      deps: { fetchSettings: async () => ({ content: null, version: 0 }), updateSettings },
+    });
+    if (error) await expect(result).rejects.toMatchObject({ code: error });
+    else await expect(result).rejects.toThrow('Cannot determine account encryption mode');
+    expect(updateSettings).not.toHaveBeenCalled();
+  });
+
+  it('reapplies a mutation to conflict content instead of the empty initial document', async () => {
+    vi.spyOn(axios, 'get').mockResolvedValue({ status: 200, data: { mode: 'plain', updatedAt: 1 } });
+    const updates: Array<{ expectedVersion: number; content: AccountSettingsStoredContentEnvelope | null }> = [];
+    await expect(updateAccountSettingsV2WithRetry({
+      credentials: { token: 'keyless-token', encryption: null },
+      mutate: (settings) => ({ ...settings, example: 'nonempty' }),
+      deps: {
+        fetchSettings: async () => ({ content: null, version: 0 }),
+        updateSettings: async (req): Promise<AccountSettingsV2UpdateResponse> => {
+          updates.push(req);
+          return updates.length === 1
+            ? { success: false, error: 'version-mismatch', currentVersion: 1,
+              currentContent: { t: 'plain', v: { unknownField: 'preserved' } } }
+            : { success: true, version: 2 };
+        },
+        writeCache: async () => {},
+      },
+    })).resolves.toEqual({ version: 2 });
+    expect(updates).toEqual([
+      { expectedVersion: 0, content: { t: 'plain', v: { example: 'nonempty' } } },
+      { expectedVersion: 1, content: { t: 'plain', v: { unknownField: 'preserved', example: 'nonempty' } } },
+    ]);
+  });
+
+  it('rejects encrypted settings without account key material before mutation', async () => {
+    const mutate = vi.fn((settings: Readonly<Record<string, unknown>>) => ({ ...settings, hello: 'world' }));
+    await expect(updateAccountSettingsV2WithRetry({
+      credentials: { token: 'plain-token', encryption: null },
+      mutate,
+      deps: {
+        fetchSettings: async () => ({ content: { t: 'encrypted', c: 'ciphertext' }, version: 5 }),
+        updateSettings: vi.fn(),
+      },
+    })).rejects.toMatchObject({ code: 'ACCOUNT_ENCRYPTION_KEY_REQUIRED' });
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it('refuses to read or rewrite plaintext settings when the environment requires E2EE', async () => {
+    Object.assign(mutableConfigurationForTest(), { clientEncryptionRequirement: 'require_e2ee' });
+    const updateSettings = vi.fn();
+    await expect(updateAccountSettingsV2WithRetry({
+      credentials: createLegacyCredentialsStub(),
+      mutate: (settings) => ({ ...settings, hello: 'world' }),
+      deps: {
+        fetchSettings: async () => ({
+          content: { t: 'plain', v: accountSettingsParse({ schemaVersion: 2 }) },
+          version: 5,
+        }),
+        updateSettings,
+      },
+    })).rejects.toMatchObject({ code: 'CLIENT_E2EE_REQUIRED' });
+    expect(updateSettings).not.toHaveBeenCalled();
   });
 
   it('decrypts encrypted v2 content, applies mutation, and posts encrypted content back', async () => {
@@ -328,7 +433,8 @@ describe('updateAccountSettingsV2WithRetry', () => {
     ]);
   });
 
-  it('posts sparse plain raw content without adding runtime defaults for empty server settings', async () => {
+  it('posts sparse encrypted raw content without adding runtime defaults for an empty E2EE account', async () => {
+    vi.spyOn(axios, 'get').mockResolvedValue({ status: 200, data: { mode: 'e2ee', updatedAt: 1 } });
     const calls: Array<{ expectedVersion: number; content: AccountSettingsStoredContentEnvelope | null }> = [];
 
     await updateAccountSettingsV2WithRetry({

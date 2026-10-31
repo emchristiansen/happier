@@ -1,4 +1,5 @@
 import type { FeaturesPayloadDelta } from "./types";
+import { ConnectedServiceIdSchema } from "@happier-dev/protocol";
 import { readConnectedServicesFeatureEnv } from "./catalog/readFeatureEnv";
 
 export function resolveConnectedServicesFeature(
@@ -15,15 +16,21 @@ export function resolveConnectedServicesFeature(
             connectedServices: {
                 enabled,
                 quotas: { enabled: quotasEnabled },
+                quotaRecoveryCreditDetails: { enabled: true },
                 subscription: { enabled: true },
                 accountGroups: { enabled: accountGroupsEnabled },
                 accountFallback: { enabled: accountFallbackEnabled },
                 autoQuotaReset: { enabled: true },
+                autoDisablePlanInvalid: { enabled: true },
+                poolQuotaLimitSelection: { enabled: true },
+                poolExpiryFirst: { enabled: true },
             },
         },
         capabilities: {
             connectedServices: {
+                supportedServiceIds: ConnectedServiceIdSchema.options,
                 credentialDelete: { revisionGuard: true },
+                credentialWrite: { revisionGuard: true },
             },
         },
     };

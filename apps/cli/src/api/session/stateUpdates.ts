@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger'
+import { normalizeSessionMetadataForRead, projectSessionMetadataForWire } from '@happier-dev/protocol';
 import { backoff } from '@/utils/time';
 import { emitSocketWithAck } from '@/session/transport/shared/socketAck';
 import type { AgentState, Metadata } from '../types';
@@ -6,7 +7,7 @@ import { decodeBase64, decrypt, encodeBase64, encrypt } from '../encryption';
 import { deriveActivitySummaryFromAgentState } from './deriveActivitySummaryFromAgentState';
 
 type AckableSocket = {
-    emitWithAck: (event: string, ...args: any[]) => Promise<any>;
+    emitWithAck(event: string, ...args: unknown[]): Promise<unknown>;
     timeout?: (ms: number) => AckableSocket;
     connected?: boolean;
 };
@@ -51,6 +52,7 @@ function readLoggedCurrentModeId(metadata: Record<string, unknown> | null | unde
 
 export async function updateSessionMetadataWithAck(opts: {
     socket: AckableSocket;
+    getSocket?: () => AckableSocket;
     sessionId: string;
     sessionEncryptionMode: 'e2ee' | 'plain';
     encryptionKey: Uint8Array;
@@ -70,6 +72,7 @@ export async function updateSessionMetadataWithAck(opts: {
 
 export async function updateSessionMetadataWithAckResult<TResult>(opts: {
     socket: AckableSocket;
+    getSocket?: () => AckableSocket;
     sessionId: string;
     sessionEncryptionMode: 'e2ee' | 'plain';
     encryptionKey: Uint8Array;
@@ -105,10 +108,10 @@ export async function updateSessionMetadataWithAckResult<TResult>(opts: {
         });
         const metadataPayload =
             opts.sessionEncryptionMode === 'plain'
-                ? JSON.stringify(updated)
-                : encodeBase64(encrypt(opts.encryptionKey, opts.encryptionVariant, updated));
+                ? JSON.stringify(projectSessionMetadataForWire(updated))
+                : encodeBase64(encrypt(opts.encryptionKey, opts.encryptionVariant, projectSessionMetadataForWire(updated)));
         const answer = await emitSocketWithAck<any>({
-            socket: opts.socket,
+            socket: opts.getSocket?.() ?? opts.socket,
             event: 'update-metadata',
             payload: {
                 sid: opts.sessionId,
@@ -118,10 +121,10 @@ export async function updateSessionMetadataWithAckResult<TResult>(opts: {
         });
 
         if (answer.result === 'success') {
-            const next =
+            const next = normalizeSessionMetadataForRead<Metadata>(
                 opts.sessionEncryptionMode === 'plain'
                     ? JSON.parse(String(answer.metadata ?? 'null'))
-                    : decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(answer.metadata));
+                    : decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(answer.metadata)));
             logger.debug('[API] updateMetadata success', {
                 version: answer.version,
                 hasModeOverride: Boolean((next as Record<string, unknown> | null)?.acpSessionModeOverrideV1),
@@ -137,10 +140,10 @@ export async function updateSessionMetadataWithAckResult<TResult>(opts: {
         if (answer.result === 'version-mismatch') {
             if (answer.version > opts.getMetadataVersion()) {
                 opts.setMetadataVersion(answer.version);
-                const next =
+                const next = normalizeSessionMetadataForRead<Metadata>(
                     opts.sessionEncryptionMode === 'plain'
                         ? JSON.parse(String(answer.metadata ?? 'null'))
-                        : decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(answer.metadata));
+                        : decrypt(opts.encryptionKey, opts.encryptionVariant, decodeBase64(answer.metadata)));
                 logger.debug('[API] updateMetadata version-mismatch', {
                     version: answer.version,
                     hasModeOverride: Boolean((next as Record<string, unknown> | null)?.acpSessionModeOverrideV1),
@@ -158,11 +161,20 @@ export async function updateSessionMetadataWithAckResult<TResult>(opts: {
             'metadata_update_failed',
             false,
         );
+    }).catch((error: unknown) => {
+        // Report only the settled operation, never metadata or an untrusted ACK/transport payload.
+        logger.infoFile('[API] session_metadata_update_failed', {
+            phase: 'terminal_failure',
+            operation: 'update-metadata',
+            sessionId: opts.sessionId,
+        });
+        throw error;
     });
 }
 
 export async function updateSessionAgentStateWithAck(opts: {
     socket: AckableSocket;
+    getSocket?: () => AckableSocket;
     sessionId: string;
     sessionEncryptionMode: 'e2ee' | 'plain';
     encryptionKey: Uint8Array;
@@ -193,7 +205,7 @@ export async function updateSessionAgentStateWithAck(opts: {
                 : (updated ? encodeBase64(encrypt(opts.encryptionKey, opts.encryptionVariant, updated)) : null);
         const activitySummaryV1 = deriveActivitySummaryFromAgentState(updated);
         const answer = await emitSocketWithAck<any>({
-            socket: opts.socket,
+            socket: opts.getSocket?.() ?? opts.socket,
             event: 'update-state',
             payload: {
                 sid: opts.sessionId,
@@ -235,5 +247,12 @@ export async function updateSessionAgentStateWithAck(opts: {
             'agent_state_update_failed',
             false,
         );
+    }).catch((error: unknown) => {
+        logger.infoFile('[API] session_agent_state_update_failed', {
+            phase: 'terminal_failure',
+            operation: 'update-state',
+            sessionId: opts.sessionId,
+        });
+        throw error;
     });
 }

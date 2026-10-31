@@ -103,7 +103,9 @@ export function normalizeExecutionRunStartToolInput(params: Readonly<{
     ...(typeof parsed.data.initialContextMode !== 'undefined' ? { initialContextMode: parsed.data.initialContextMode } : {}),
     ...(typeof parsed.data.resumeHandle !== 'undefined' ? { resumeHandle: parsed.data.resumeHandle } : {}),
     ...(typeof parsed.data.replay !== 'undefined' ? { replay: parsed.data.replay } : {}),
-    ...(normalizedConnectedServices.bindings ? { connectedServices: normalizedConnectedServices.bindings } : {}),
+    ...(normalizedConnectedServices.bindings !== undefined
+      ? { connectedServices: normalizedConnectedServices.bindings }
+      : {}),
   });
   if (!request.success) {
     return {

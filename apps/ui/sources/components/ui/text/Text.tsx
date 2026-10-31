@@ -11,6 +11,7 @@ import {
 import { Typography } from '@/constants/Typography';
 import { useLocalSetting } from '@/sync/store/hooks';
 
+import { useNativeTextSelectable } from './nativeTextSelection';
 import { scaleTextStyle } from './uiFontScale';
 
 const TextSelectabilityContext = React.createContext<boolean>(false);
@@ -56,7 +57,7 @@ export const Text = React.memo(
         const uiFontScaleSetting = useLocalSetting('uiFontScale');
         const uiFontScale = disableUiFontScaling ? 1 : uiFontScaleSetting;
         const selectableFromScope = React.useContext(TextSelectabilityContext);
-        const effectiveSelectable = selectable ?? selectableFromScope;
+        const effectiveSelectable = useNativeTextSelectable(selectable ?? selectableFromScope);
         const { accessibilityLabel, testID, ...restProps } = props;
 
         const scaledStyle = React.useMemo(() => scaleTextStyle(style as any, uiFontScale), [style, uiFontScale]);

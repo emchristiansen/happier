@@ -78,7 +78,7 @@ describe('buildSetupPlan', () => {
     });
 
     expect(plan.stop).toBeNull();
-    expect(plan.steps.map((step) => step.kind)).toEqual(['authLogin', 'warnNoAgent']);
+    expect(plan.steps.map((step) => step.kind)).toEqual(['authLogin', 'setupAgents']);
   });
 
   it('does not warn when at least one agent is installed', () => {
@@ -88,7 +88,7 @@ describe('buildSetupPlan', () => {
       installedAgentIds: ['codex'],
     });
 
-    expect(plan.steps.map((step) => step.kind)).not.toContain('warnNoAgent');
+    expect(plan.steps.map((step) => step.kind)).not.toContain('setupAgents');
   });
 
   it('re-signs in when a relay is chosen that differs from the active one', () => {
@@ -102,7 +102,7 @@ describe('buildSetupPlan', () => {
     expect(plan.steps.map((step) => step.kind)).toEqual(['selectRelay', 'authLogin']);
   });
 
-  it('names the tailnet a relay on this computer will be reachable over', () => {
+  it('installs before reporting the selected relay reachability', () => {
     const plan = buildSetupPlan({
       ...base,
       relaySelection: { kind: 'thisComputer' },
@@ -117,14 +117,12 @@ describe('buildSetupPlan', () => {
     });
 
     expect(plan.steps.map((step) => step.kind)).toEqual([
-      'explainRelayReachability',
       'installLocalRelay',
       'reportRelayReachability',
       'authLogin',
     ]);
     const reachability = { kind: 'tailnet', tailnetName: 'example.ts.net' };
-    expect(plan.steps[0]).toMatchObject({ reachability });
-    expect(plan.steps[2]).toMatchObject({ reachability });
+    expect(plan.steps[1]).toMatchObject({ reachability });
   });
 
   it('does not call a signed-in but stopped Tailscale reachable', () => {
@@ -144,7 +142,7 @@ describe('buildSetupPlan', () => {
       }),
     });
 
-    expect(plan.steps[0]).toMatchObject({ reachability: { kind: 'tailscaleNotRunning' } });
+    expect(plan.steps[1]).toMatchObject({ reachability: { kind: 'tailscaleNotRunning' } });
     // Tailscale is already installed; offering to install it again would be wrong.
     expect(plan.steps.map((step) => step.kind)).not.toContain('offerTailscaleSetup');
   });
@@ -156,7 +154,7 @@ describe('buildSetupPlan', () => {
       tailscale: tailscaleSnapshot({ daemonReachable: false }),
     });
 
-    expect(plan.steps[0]).toMatchObject({ reachability: { kind: 'tailscaleNotRunning' } });
+    expect(plan.steps[1]).toMatchObject({ reachability: { kind: 'tailscaleNotRunning' } });
     expect(plan.steps.map((step) => step.kind)).not.toContain('offerTailscaleSetup');
   });
 
@@ -168,13 +166,12 @@ describe('buildSetupPlan', () => {
     });
 
     expect(plan.steps.map((step) => step.kind)).toEqual([
-      'explainRelayReachability',
       'installLocalRelay',
       'reportRelayReachability',
       'offerTailscaleSetup',
       'authLogin',
     ]);
-    expect(plan.steps[0]).toMatchObject({ reachability: { kind: 'tailscaleNotInstalled' } });
+    expect(plan.steps[1]).toMatchObject({ reachability: { kind: 'tailscaleNotInstalled' } });
   });
 
   it('says nothing about reachability for a relay it does not host', () => {
@@ -256,14 +253,25 @@ describe('buildSetupPlan — readiness is more than credential bytes', () => {
     expect(plan.stop).toBeNull();
   });
 
-  it('is a no-op only when the relay accepted the credentials and the machine is registered', () => {
+  it('reconciles the service on interactive re-entry when the account and machine are configured', () => {
     const plan = buildSetupPlan({
       ...base,
       auth: { authenticated: true, credentialState: 'valid', machineRegistered: true },
       activeRelayUrl: 'https://api.happier.dev',
     });
 
-    expect(plan.steps.map((step) => step.kind)).toEqual(['alreadyConfigured']);
+    expect(plan.steps.map((step) => step.kind)).toEqual(['authLogin']);
+  });
+
+  it('offers agent setup on interactive re-entry when the configured machine still has no agent', () => {
+    const plan = buildSetupPlan({
+      ...base,
+      auth: { authenticated: true, credentialState: 'valid', machineRegistered: true },
+      activeRelayUrl: 'https://api.happier.dev',
+      installedAgentIds: [],
+    });
+
+    expect(plan.steps.map((step) => step.kind)).toEqual(['authLogin', 'setupAgents']);
   });
 });
 
@@ -333,7 +341,6 @@ describe('buildSetupPlan — unattended runs (--yes)', () => {
     });
 
     expect(plan.steps.map((step) => step.kind)).toEqual([
-      'explainRelayReachability',
       'installLocalRelay',
       'reportRelayReachability',
     ]);

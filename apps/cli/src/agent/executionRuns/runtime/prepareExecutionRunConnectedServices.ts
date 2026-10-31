@@ -164,10 +164,14 @@ async function resolveRunSelection(params: Readonly<{
 }>): Promise<ResolvedRunSelection> {
   const agentId = params.backendTarget.agentId;
 
+  // Canonical null is an explicit whole-run native-auth selection. Decide it before the absent
+  // selection/account-default path so an explicit opt-out can never inherit account defaults.
+  if (params.explicitBindings === null) return null;
+
   // Parse explicit per-service pins first (authoritative; explicit always wins over a bare default).
   let explicitBindingsByServiceId: Record<string, ConnectedServiceBindingSelectionV1> = {};
   let hadValidExplicit = false;
-  if (params.explicitBindings !== undefined && params.explicitBindings !== null) {
+  if (params.explicitBindings !== undefined) {
     const parsed = ConnectedServiceBindingsV1Schema.safeParse(params.explicitBindings);
     if (parsed.success) {
       explicitBindingsByServiceId = { ...parsed.data.bindingsByServiceId };
@@ -239,6 +243,7 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
   credentials: Credentials | null;
   cwd: string;
   sessionId: string;
+  previousMaterializedRoot?: string;
   /** Boundary injection points; default to the canonical control client + session defaulting owner. */
   materializeViaDaemon?: MaterializeViaDaemon;
   releaseViaDaemon?: ReleaseViaDaemon;
@@ -304,6 +309,7 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
       connectedServicesBindingsRaw: selection.bindings,
       sessionDirectory: params.cwd,
       sessionId: params.sessionId,
+      ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
     });
   } catch (error) {
     logger.warn('[EXECUTION RUN] connected services: materialization FAILED; failing run start closed', {

@@ -1,8 +1,8 @@
 {
   "name": "@happier-dev/app",
   "main": "index.ts",
-  "version": "0.2.12",
-  "happierExpoRuntimeVersion": "0.2.7-native",
+  "version": "0.2.19",
+  "happierExpoRuntimeVersion": "0.2.9-native",
   "happier": {
     "installFreshnessInputs": [
       "app.config.js",
@@ -39,7 +39,7 @@
     "ios:publicdev-dev-client": "yarn -s ensure:workspace:built && node ./scripts/runPublicdevDevClientIos.mjs",
     "submit": "eas submit --platform ios",
     "web": "yarn -s ensure:workspace:built && cross-env EXPO_UNSTABLE_WEB_MODAL=1 expo start --web",
-    "test": "yarn -s test:unit && yarn -s test:built-in-prompts && node --test ./scripts/installFreshnessInputs.contract.test.mjs ./tools/postinstall/verifyNativePatchCompilation.test.mjs ./tools/postinstall/verifyReactNativeEnrichedMarkdownPatch.test.mjs ./tools/postinstall/verifyVendoredLegendPatchMarkers.test.mjs ./tools/postinstall/verifyVendoredReanimatedPatchMarkers.test.mjs",
+    "test": "yarn -s test:unit && yarn -s test:built-in-prompts && node --test ./scripts/tauri_deep_link_config.test.mjs ./scripts/installFreshnessInputs.contract.test.mjs ./tools/ensureNohoistPeerLinks.test.mjs ./tools/postinstall/reactNativeUnistylesWebOrientation.test.mjs ./tools/postinstall/reactNativeUnistylesWebLifecycle.test.mjs ./tools/postinstall/reactNativeGlogModuleMap.test.mjs ./tools/postinstall/verifyNativePatchCompilation.test.mjs ./tools/postinstall/verifyReactNativeEnrichedMarkdownPatch.test.mjs ./tools/postinstall/verifyVendoredLegendPatchMarkers.test.mjs ./tools/postinstall/verifyVendoredReanimatedPatchMarkers.test.mjs ./tools/postinstall/workletsRemoteFunctionLifetime.test.mjs",
     "test:unit": "yarn -s ensure:workspace:built && node ./scripts/runVitestShards.mjs --config vitest.config.ts",
     "test:built-in-prompts": "node --test ../../scripts/generateBuiltInPrompts.test.mjs",
     "test:integration": "yarn -s ensure:workspace:built && vitest run --config vitest.integration.config.ts && yarn -s test:integration:legend-native && yarn -s test:integration:legend-fabric",
@@ -85,9 +85,9 @@
     "tauri:mcp:server": "npx -y @hypothesi/tauri-mcp-server",
     "tauri:mcp:cli": "npx -y -p @hypothesi/tauri-mcp-cli tauri-mcp",
     "tauri:mcp:session:start": "npx -y -p @hypothesi/tauri-mcp-cli tauri-mcp driver-session start --port 9223",
-    "tauri:build:dev": "tauri build --config src-tauri/tauri.publicdev.conf.json",
-    "tauri:build:preview": "tauri build --config src-tauri/tauri.preview.conf.json",
-    "tauri:build:production": "tauri build"
+    "tauri:build:dev": "node ./scripts/runTauriCli.mjs build --config src-tauri/tauri.publicdev.conf.json",
+    "tauri:build:preview": "node ./scripts/runTauriCli.mjs build --config src-tauri/tauri.preview.conf.json",
+    "tauri:build:production": "node ./scripts/runTauriCli.mjs build"
   },
   "jest": {
     "preset": "jest-expo"
@@ -142,7 +142,9 @@
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-dismissable-layer": "^1.1.11",
     "@react-native-async-storage/async-storage": "2.2.0",
+    "@react-native-community/datetimepicker": "8.4.4",
     "@react-native-masked-view/masked-view": "0.3.2",
+    "@react-native/normalize-colors": "0.81.5",
     "@react-navigation/bottom-tabs": "^7.4.0",
     "@react-navigation/drawer": "^7.3.9",
     "@react-navigation/native": "^7.1.8",
@@ -150,9 +152,9 @@
     "@sentry/react-native": "^8.1.0",
     "@shopify/flash-list": "2.3.2",
     "@shopify/react-native-skia": "2.2.12",
-    "@tauri-apps/api": "~2.8.0",
-    "@tauri-apps/cli": "~2.8.2",
-    "@tauri-apps/plugin-http": "^2.5.2",
+    "@tauri-apps/api": "~2.12.1",
+    "@tauri-apps/cli": "~2.12.1",
+    "@tauri-apps/plugin-http": "2.5.6",
     "@tauri-apps/plugin-notification": "^2.3.1",
     "@tiptap/core": "^3.23.6",
     "@tiptap/extension-link": "^3.23.6",
@@ -232,7 +234,7 @@
     "react-native-keyboard-controller": "1.18.5",
     "react-native-localize": "^3.5.1",
     "react-native-mmkv": "^3.3.3",
-    "react-native-nitro-modules": "0.35.6",
+    "react-native-nitro-modules": "0.37.1",
     "react-native-purchases": "^9.4.2",
     "react-native-purchases-ui": "^9.4.2",
     "react-native-quick-base64": "^2.2.1",
@@ -242,7 +244,7 @@
     "react-native-screens": "~4.16.0",
     "react-native-svg": "15.12.1",
     "react-native-typography": "^1.4.1",
-    "react-native-unistyles": "3.2.4",
+    "react-native-unistyles": "3.5.3",
     "react-native-view-shot": "4.0.3",
     "react-native-vision-camera": "^4.7.3",
     "react-native-web": "^0.21.0",
@@ -256,7 +258,7 @@
     "textarea-caret": "^3.1.0",
     "uuid": "^11.1.0",
     "vitest": "^3.2.4",
-    "zod": "4.3.6",
+    "zod": "4.6.7",
     "zustand": "^5.0.6"
   },
   "devDependencies": {
@@ -276,7 +278,8 @@
     "jsdom": "^24.1.0",
     "react-test-renderer": "19.1.0",
     "tsx": "^4.20.4",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "yoga-layout": "~3.2.1"
   },
   "private": true,
   "packageManager": "yarn@1.22.22"

@@ -1,6 +1,7 @@
 import type { AgentCoreConfig } from '@/agents/registry/registryCore';
 import { buildCatalogProviderCliUiConfig } from '@/agents/providers/shared/buildCatalogProviderCliUiConfig';
 import { buildAgentConnectedServicesUiConfig } from '@/agents/registry/buildAgentConnectedServicesUiConfig';
+import { buildAgentLocalControlUiConfig } from '@/agents/registry/buildAgentLocalControlUiConfig';
 import { buildAgentResumeUiConfig } from '@/agents/registry/buildAgentResumeUiConfig';
 import { buildAgentSessionStorageUiConfig } from '@/agents/registry/buildAgentSessionStorageUiConfig';
 import { buildAgentToolsUiConfig } from '@/agents/registry/buildAgentToolsUiConfig';
@@ -29,6 +30,7 @@ export const KIMI_CORE: AgentCoreConfig = {
         uiVendorResumeIdLabelKey: 'sessionInfo.kimiSessionId',
         uiVendorResumeIdCopiedKey: 'sessionInfo.kimiSessionIdCopied',
     }),
+    localControl: buildAgentLocalControlUiConfig({ agentId: 'kimi' }),
     toolRendering: {
         hideUnknownToolsByDefault: true,
     },

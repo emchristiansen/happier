@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 
@@ -6,6 +6,17 @@ import { installDaemonService, uninstallDaemonService } from './service/installe
 import { reloadConfiguration } from '@/configuration';
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { withTempDir } from '@/testkit/fs/tempDir';
+
+// Filesystem enumeration is the OS boundary; fixture user files and all service logic stay real.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    readdirSync: (...args: Parameters<typeof actual.readdirSync>) => (
+      args[0] === '/etc/systemd/system' ? [] : actual.readdirSync(...args)
+    ),
+  };
+});
 
 describe('daemon service installer', () => {
   it('installs and uninstalls a linux user service (no systemctl)', async () => {

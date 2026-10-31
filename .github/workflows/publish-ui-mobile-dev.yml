@@ -38,6 +38,16 @@ on:
         type: string
   workflow_call:
     inputs:
+      preparation_only:
+        description: "Prepare same-run OTA artifacts without native build or publication"
+        required: false
+        default: false
+        type: boolean
+      use_prepared:
+        description: "Consume OTA bytes already prepared for this exact SHA in this run"
+        required: false
+        default: false
+        type: boolean
       source_ref:
         required: false
         default: dev
@@ -118,11 +128,24 @@ jobs:
           team_slug: release-admins
           app_id: ${{ secrets.RELEASE_BOT_APP_ID }}
           private_key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+      - name: Validate same-run OTA preparation input
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          PREPARATION_ONLY: ${{ inputs.preparation_only }}
+          USE_PREPARED: ${{ inputs.use_prepared }}
+        run: |
+          set -euo pipefail
+          if [ "$PREPARATION_ONLY" = true ] || [ "$USE_PREPARED" = true ]; then
+            if [[ ! "$SOURCE_REF" =~ ^[a-f0-9]{40}$ ]] || { [ "$PREPARATION_ONLY" = true ] && [ "$USE_PREPARED" = true ]; }; then
+              echo "Same-run OTA preparation requires an exact SHA and one phase." >&2
+              exit 1
+            fi
+          fi
 
   prepare_ota:
     name: Prepare exact dev OTA bytes without credentials
     needs: [release_actor_guard]
-    if: inputs.publish_ota
+    if: ${{ inputs.publish_ota && !inputs.use_prepared }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -190,7 +213,7 @@ jobs:
   publish_ota:
     name: Publish prepared dev OTA bytes from trusted control
     needs: [release_actor_guard, prepare_ota]
-    if: inputs.publish_ota
+    if: ${{ !cancelled() && !inputs.preparation_only && inputs.publish_ota && needs.release_actor_guard.result == 'success' && (needs.prepare_ota.result == 'success' || (inputs.use_prepared && needs.prepare_ota.result == 'skipped')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: release-shared
@@ -224,13 +247,13 @@ jobs:
       - name: Download exact prepared OTA bytes
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: ui-mobile-dev-ota-${{ needs.prepare_ota.outputs.source_sha }}
+          name: ui-mobile-dev-ota-${{ inputs.use_prepared && inputs.source_ref || needs.prepare_ota.outputs.source_sha }}
           path: ${{ runner.temp }}/prepared-ota
       - name: Publish Android OTA from validated bytes
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           RELEASE_MESSAGE: ${{ inputs.release_message }}
-          SOURCE_SHA: ${{ needs.prepare_ota.outputs.source_sha }}
+          SOURCE_SHA: ${{ inputs.use_prepared && inputs.source_ref || needs.prepare_ota.outputs.source_sha }}
         run: |
           set -euo pipefail
           node scripts/pipeline/expo/ota-update.mjs \
@@ -241,7 +264,7 @@ jobs:
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           RELEASE_MESSAGE: ${{ inputs.release_message }}
-          SOURCE_SHA: ${{ needs.prepare_ota.outputs.source_sha }}
+          SOURCE_SHA: ${{ inputs.use_prepared && inputs.source_ref || needs.prepare_ota.outputs.source_sha }}
         run: |
           set -euo pipefail
           node scripts/pipeline/expo/ota-update.mjs \
@@ -250,6 +273,7 @@ jobs:
             --message "$RELEASE_MESSAGE" --eas-cli-version "$EAS_CLI_VERSION"
 
   publish:
+    if: ${{ !inputs.preparation_only }}
     needs: [release_actor_guard]
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -300,14 +324,10 @@ jobs:
           set -euo pipefail
           yarn --cwd apps/ui tsx sources/scripts/parseReleaseNotes.ts
 
-      - name: Android APK (dev lane) + rolling GitHub release
+      - name: Build Android APK (dev lane, cloud)
         if: inputs.publish_android_apk && inputs.eas_builder == 'eas_cloud'
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-          # GitHub App tokens are short-lived and can expire during long native builds.
-          # Use the job-scoped GITHUB_TOKEN for release publishing so the lane stays idempotent.
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           node scripts/pipeline/run.mjs ui-mobile-release \
@@ -321,6 +341,7 @@ jobs:
             --out-dir "dist/ui-mobile" \
             --eas-cli-version "${EAS_CLI_VERSION}" \
             --release-message "${{ inputs.release_message }}" \
+            --publish-apk-release false \
             --secrets-source env
 
       - name: Install Dagger (local Android builds)
@@ -329,15 +350,11 @@ jobs:
         with:
           version: "0.19.11"
 
-      - name: Android APK (dev lane) (local via Dagger) + rolling GitHub release
+      - name: Build Android APK (dev lane, local via Dagger)
         if: inputs.publish_android_apk && inputs.eas_builder == 'eas_local'
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          # GitHub App tokens are short-lived and can expire during long native builds.
-          # Use the job-scoped GITHUB_TOKEN for release publishing so the lane stays idempotent.
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           node scripts/pipeline/run.mjs ui-mobile-release \
@@ -352,7 +369,44 @@ jobs:
             --out-dir "dist/ui-mobile" \
             --eas-cli-version "${EAS_CLI_VERSION}" \
             --release-message "${{ inputs.release_message }}" \
+            --publish-apk-release false \
             --secrets-source env
+
+      - name: Create GitHub App token (APK publishing)
+        if: inputs.publish_android_apk
+        id: apk_token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Publish built dev APK
+        if: inputs.publish_android_apk
+        env:
+          GH_TOKEN: ${{ steps.apk_token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          EAS_BUILDER: ${{ inputs.eas_builder }}
+          RELEASE_MESSAGE: ${{ inputs.release_message }}
+        run: |
+          set -euo pipefail
+          apk="dist/ui-mobile/happier-dev-android.apk"
+          if [ ! -f "$apk" ]; then
+            if [ "$EAS_BUILDER" = 'eas_cloud' ]; then
+              echo 'No cloud Android build was scheduled; skipping APK publication.' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Expected built APK at $apk." >&2
+            exit 1
+          fi
+          AUTHORIZED_SHA="$(git rev-parse HEAD)"
+          node scripts/pipeline/expo/publish-apk-release.mjs \
+            --environment dev \
+            --apk-path "$apk" \
+            --target-sha "$AUTHORIZED_SHA" \
+            --release-message "$RELEASE_MESSAGE"
 
       - name: Note
         run: |
@@ -365,6 +419,9 @@ jobs:
     if: inputs.submit_ios_testflight && inputs.eas_builder == 'eas_cloud'
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    permissions:
+      actions: write
+      contents: read
     environment: release-shared
     continue-on-error: true
     steps:
@@ -441,20 +498,36 @@ jobs:
           # Prefer the job-scoped GITHUB_TOKEN over the short-lived GitHub App token.
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          HAPPIER_PIPELINE_REPO_ROOT: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          node scripts/pipeline/run.mjs ui-mobile-release \
+          node .testflight-preflight-control/scripts/pipeline/run.mjs ui-mobile-release \
             --environment dev \
             --action native_submit \
             --platform ios \
             --profile dev \
             --native-build-mode cloud \
             --fingerprint-mode if-changed \
+            --testflight-distribution-mode deferred \
             --build-json "/tmp/eas_build.ios.json" \
             --out-dir "dist/ui-mobile" \
             --eas-cli-version "${EAS_CLI_VERSION}" \
             --release-message "${{ inputs.release_message }}" \
             --secrets-source env
+
+      - name: Dispatch exact TestFlight reconciliation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_STORE_CONNECT_PUBLICDEV_EXTERNAL_GROUPS: ${{ vars.APP_STORE_CONNECT_PUBLICDEV_EXTERNAL_GROUPS }}
+        run: |
+          set -euo pipefail
+          node .testflight-preflight-control/scripts/pipeline/expo/dispatch-testflight-reconciliation.mjs \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_REF_NAME" \
+            --source-sha "$(git rev-parse HEAD)" \
+            --environment dev \
+            --profile dev \
+            --build-json "/tmp/eas_build.ios.json"
 
   ios_local:
     name: iOS TestFlight submit (dev lane) (local, best-effort)
@@ -462,6 +535,9 @@ jobs:
     if: inputs.submit_ios_testflight && inputs.eas_builder == 'eas_local'
     runs-on: macos-26
     timeout-minutes: 180
+    permissions:
+      actions: write
+      contents: read
     environment: release-shared
     continue-on-error: true
     steps:
@@ -543,9 +619,10 @@ jobs:
           # Prefer the job-scoped GITHUB_TOKEN over the short-lived GitHub App token.
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          HAPPIER_PIPELINE_REPO_ROOT: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          node scripts/pipeline/run.mjs ui-mobile-release \
+          node .testflight-preflight-control/scripts/pipeline/run.mjs ui-mobile-release \
             --environment dev \
             --action native_submit \
             --platform ios \
@@ -553,8 +630,23 @@ jobs:
             --native-build-mode local \
             --native-local-runtime host \
             --fingerprint-mode if-changed \
+            --testflight-distribution-mode deferred \
             --build-json "/tmp/eas_build.ios.json" \
             --out-dir "dist/ui-mobile" \
             --eas-cli-version "${EAS_CLI_VERSION}" \
             --release-message "${{ inputs.release_message }}" \
             --secrets-source env
+
+      - name: Dispatch exact TestFlight reconciliation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_STORE_CONNECT_PUBLICDEV_EXTERNAL_GROUPS: ${{ vars.APP_STORE_CONNECT_PUBLICDEV_EXTERNAL_GROUPS }}
+        run: |
+          set -euo pipefail
+          node .testflight-preflight-control/scripts/pipeline/expo/dispatch-testflight-reconciliation.mjs \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_REF_NAME" \
+            --source-sha "$(git rev-parse HEAD)" \
+            --environment dev \
+            --profile dev \
+            --build-json "/tmp/eas_build.ios.json"

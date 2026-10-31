@@ -160,10 +160,6 @@ export function deriveSessionRuntimePresentationState(
     const freshProviderRuntimeActivity = runtimeActivityState === 'active';
     const working = freshInProgress || freshThinking;
     const backgroundActive = !working && freshProviderRuntimeActivity;
-    const pendingRequestObservedAt = normalizeRuntimeStatusTimestamp(input.pendingRequestObservedAt);
-    const hasFreshPendingRequest =
-        pendingRequestObservedAt !== null
-        && isFreshTimestamp(pendingRequestObservedAt, nowMs, SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS);
     const activityState: SessionRuntimeActivityPresentationState = working
         ? 'working'
         : backgroundActive
@@ -185,15 +181,39 @@ export function deriveSessionRuntimePresentationState(
         activityState,
         runtimeProjectionInProgress: freshInProgress,
         runtimeActivelyWorking,
+        // Keep an outstanding request visible until its count clears or its owning runtime is no
+        // longer live. `pendingRequestObservedAt` need not advance while a request waits, so its age
+        // is not settlement evidence. Updated CLIs retain and retry exact settlement intents;
+        // older producers can leave an unresolved count after a failed cancellation write.
         freshPermissionRequired:
             input.hasPendingPermissionRequests === true
-            && isLiveRuntime
-            && (working || hasFreshPendingRequest),
+            && isLiveRuntime,
         freshActionRequired:
             input.hasPendingUserActionRequests === true
-            && isLiveRuntime
-            && (working || hasFreshPendingRequest),
+            && isLiveRuntime,
     };
+}
+
+/** The last witnessed attachment after the existing reconnect grace expires; never a terminal outcome. */
+export function readSessionRuntimeLostSinceMs(
+    input: Pick<DeriveSessionRuntimePresentationStateInput, 'active' | 'activeAt' | 'presence'>,
+    nowMs: number,
+): number | null {
+    if (input.active !== false || input.presence === 'online') return null;
+    const lastSeenAtMs = normalizeRuntimeStatusTimestamp(input.activeAt);
+    return lastSeenAtMs !== null && !isFreshTimestamp(lastSeenAtMs, nowMs, SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS)
+        ? lastSeenAtMs
+        : null;
+}
+
+/** Newer child evidence can outlive the owning session's last attachment observation. */
+export function isSessionOwnedActivityUnobserved(
+    runtimeLostSinceMs: number | null | undefined,
+    latestObservedAtMs: number | null | undefined,
+): boolean {
+    return runtimeLostSinceMs != null
+        && !(typeof latestObservedAtMs === 'number' && Number.isFinite(latestObservedAtMs)
+            && latestObservedAtMs > runtimeLostSinceMs);
 }
 
 export function readFreshInProgressRuntimeSignalTimestamps(
@@ -241,10 +261,6 @@ export function readSessionRuntimePresentationFreshnessTimestamps(
             .filter((timestamp) => isFreshTimestamp(timestamp, nowMs, SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS));
         if (witnesses.length > 0) timestamps.push(Math.max(...witnesses));
     }
-    if (runtimeStatus.freshPermissionRequired || runtimeStatus.freshActionRequired) {
-        const pendingRequestObservedAt = normalizeRuntimeStatusTimestamp(input.pendingRequestObservedAt);
-        if (pendingRequestObservedAt !== null) timestamps.push(pendingRequestObservedAt);
-    }
     return timestamps;
 }
 
@@ -256,6 +272,12 @@ export function resolveNextSessionRuntimePresentationFreshnessAtMs(
     for (const timestamp of readSessionRuntimePresentationFreshnessTimestamps(input, nowMs)) {
         if (!isFreshTimestamp(timestamp, nowMs, SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS)) continue;
         expirations.push(Math.trunc(timestamp) + SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS);
+    }
+    if (input.active === false && input.presence !== 'online') {
+        const lastSeenAtMs = normalizeRuntimeStatusTimestamp(input.activeAt);
+        if (lastSeenAtMs !== null && isFreshTimestamp(lastSeenAtMs, nowMs, SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS)) {
+            expirations.push(lastSeenAtMs + SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS);
+        }
     }
     if (expirations.length === 0) return null;
     return Math.min(...expirations);

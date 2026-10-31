@@ -151,7 +151,9 @@ export const AddPhoneSettingsView = React.memo(function AddPhoneSettingsView() {
         setApproving(true);
         try {
             const requestedPublicKeyBytes = decodeBase64(status.requestedPublicKey, 'base64');
-            const encrypted = buildAccountLinkResponse(auth.credentials, requestedPublicKeyBytes);
+            const encrypted = await buildAccountLinkResponse(auth.credentials, requestedPublicKeyBytes, {
+                supportsCredentialVariants: status.supportsCredentialVariants === true,
+            });
 
             await authAccountApprove(auth.credentials.token, requestedPublicKeyBytes, encrypted);
 

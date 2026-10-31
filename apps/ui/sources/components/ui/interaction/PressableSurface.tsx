@@ -49,6 +49,8 @@ export type PressableSurfaceProps = Readonly<{
     styleOverride?: StyleProp<ViewStyle>;
     /** Portaled hover/keyboard-focus tooltip on web; a no-op elsewhere. */
     webTooltip?: string;
+    tooltipContent?: React.ReactNode;
+    tooltipPlacement?: 'top' | 'bottom' | 'left' | 'right';
     testID?: string;
 }>;
 
@@ -102,11 +104,29 @@ export const PressableSurface = React.memo((props: PressableSurfaceProps) => {
             accessibilityLabel={props.accessibilityLabel}
             accessibilityHint={props.accessibilityHint}
             accessibilityState={{ ...props.accessibilityState, disabled }}
+            aria-checked={props.accessibilityState?.checked}
+            aria-expanded={props.accessibilityState?.expanded}
+            aria-selected={props.accessibilityState?.selected}
+            aria-busy={props.accessibilityState?.busy}
+            {...(Platform.OS === 'web' && (props.accessibilityRole === 'switch' || props.accessibilityRole === 'checkbox') ? {
+                // RN Web activates Space only for button roles; checkable controls need the same key contract.
+                onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => {
+                    if (event.key !== ' ') return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                },
+                onKeyUp: (event: React.KeyboardEvent<HTMLElement>) => {
+                    if (event.key !== ' ') return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (!disabled) event.currentTarget.click();
+                },
+            } : null)}
             style={resolveStyle}
         >
             {props.children}
             {Platform.OS === 'web' && props.webTooltip && (hovered || ringVisible) ? (
-                <DeferredAnchoredTooltip activationKey={`${hovered}:${focused}`} anchorRef={anchorRef} label={props.webTooltip} testID={props.testID ? `${props.testID}-tooltip` : undefined} />
+                <DeferredAnchoredTooltip activationKey={`${hovered}:${focused}`} anchorRef={anchorRef} label={props.webTooltip} content={props.tooltipContent} placement={props.tooltipPlacement} testID={props.testID ? `${props.testID}-tooltip` : undefined} />
             ) : null}
             {ringMounted ? (
                 <FocusRing

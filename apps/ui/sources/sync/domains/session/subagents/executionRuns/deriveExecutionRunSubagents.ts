@@ -1,3 +1,5 @@
+import { isExecutionRunActive } from '@happier-dev/protocol';
+
 import type { Message } from '@/sync/domains/messages/messageTypes';
 import { canSendMessagesToExecutionRun } from '@/sync/domains/executionRuns/canSendMessagesToExecutionRun';
 
@@ -36,19 +38,19 @@ export function deriveExecutionRunSubagents(params: Readonly<{
         }
     }
 
-    const runningFromExternal = new Set<string>();
+    const runningFromExternal = new Map<string, SessionSubagentActiveExecutionRunState>();
     for (const run of params.activeExecutionRuns ?? []) {
         if (!run || typeof run !== 'object') continue;
         const runId = typeof run.runId === 'string' ? run.runId.trim() : '';
         const status = typeof run.status === 'string' ? run.status.trim().toLowerCase() : '';
         if (!runId || status !== 'running' || explicitlyStoppedRunIds.has(runId)) continue;
-        runningFromExternal.add(runId);
+        runningFromExternal.set(runId, run);
     }
 
     const allRunIds = new Set<string>([
         ...byRunId.keys(),
         ...runningFromAgentText.values(),
-        ...runningFromExternal.values(),
+        ...runningFromExternal.keys(),
     ]);
 
     return Array.from(allRunIds.values()).map((runId) => {
@@ -82,6 +84,11 @@ export function deriveExecutionRunSubagents(params: Readonly<{
             id: `execution_run:${runId}`,
             kind: 'execution_run',
             status: effectiveStatus,
+            isActive: isExecutionRunActive({
+                status: effectiveStatus,
+                runClass: runningFromExternal.get(runId)?.runClass ?? transcriptState?.runClass,
+                turnInFlight: runningFromExternal.get(runId)?.turnInFlight,
+            }),
             display: {
                 title: displayTitle,
                 ...(transcriptState?.intent ? { subtitle: transcriptState.intent } : {}),

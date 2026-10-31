@@ -5,6 +5,7 @@ import {
   AccountEncryptionModeResponseSchema,
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER,
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
+  appendConnectedServiceAuthGroupReaderCapabilities,
   ConnectedServiceAuthGroupErrorResponseV1Schema,
   ConnectedServiceAuthGroupListResponseV1Schema,
   ConnectedServiceAuthGroupResponseV1Schema,
@@ -75,6 +76,7 @@ export type ConnectedServiceCredentialSealedResponse = Readonly<{
     kind: 'oauth' | 'token';
     providerEmail?: string | null;
     providerAccountId?: string | null;
+    providerOrganizationId?: string | null;
     expiresAt?: number | null;
   };
 }> & ConnectedServiceCredentialRevisionBoundaryV1;
@@ -168,6 +170,7 @@ export function createConnectedServiceCredentialApi(
 export async function getAccountEncryptionMode(params: Readonly<{
   token: string;
   signal?: AbortSignal;
+  timeoutMs?: number;
 }>): Promise<'e2ee' | 'plain' | 'unknown'> {
   const serverUrl = resolveServerHttpBaseUrl();
   try {
@@ -175,7 +178,7 @@ export async function getAccountEncryptionMode(params: Readonly<{
       `${serverUrl}/v1/account/encryption`,
       {
         headers: authHeaders(params.token),
-        timeout: resolveConnectedServicesServerApiTimeoutMs(),
+        timeout: params.timeoutMs ?? resolveConnectedServicesServerApiTimeoutMs(),
         signal: params.signal,
       },
     );
@@ -235,6 +238,7 @@ export async function getConnectedServiceCredentialSealed(params: Readonly<{
       kind: z.enum(['oauth', 'token']),
       providerEmail: z.string().nullable().optional(),
       providerAccountId: z.string().nullable().optional(),
+      providerOrganizationId: z.string().nullable().optional(),
       expiresAt: z.number().nullable().optional(),
     }).safeParse((raw as Record<string, unknown>).metadata);
 
@@ -336,9 +340,12 @@ export async function listConnectedServiceAuthGroups(params: Readonly<{
   const serviceId = encodeURIComponent(params.serviceId);
   try {
     const response = await axios.get(
-      `${serverUrl}/v3/connect/${serviceId}/groups`,
+      appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups`),
       {
-        headers: { ...authHeaders(params.token), [CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER]: CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE },
+        headers: {
+          ...authHeaders(params.token),
+          [CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER]: CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
+        },
         timeout: resolveConnectedServicesServerApiTimeoutMs(),
       },
     );
@@ -375,9 +382,12 @@ export async function getConnectedServiceAuthGroup(params: Readonly<{
 
   try {
     const response = await axios.get(
-      `${serverUrl}/v3/connect/${serviceId}/groups/${groupId}`,
+      appendConnectedServiceAuthGroupReaderCapabilities(`${serverUrl}/v3/connect/${serviceId}/groups/${groupId}`),
       {
-        headers: { ...authHeaders(params.token), [CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER]: CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE },
+        headers: {
+          ...authHeaders(params.token),
+          [CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER]: CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
+        },
         timeout: resolveConnectedServicesServerApiTimeoutMs(),
         signal: params.signal,
       },

@@ -20,6 +20,7 @@ for arg in "$@"; do
 done
 SAFE_VM_NAME="${VM_NAME//[^A-Za-z0-9._-]/_}"
 FINALIZED=0
+PLAYWRIGHT_ATTEMPT_OWNED=0
 FAILURE_STAGE=""
 FAILURE_REASON=""
 STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -675,7 +676,7 @@ capture_vm_connectivity_to_host_direct_peer_port_best_effort() {
   local out_file="${REPORT_ROOT}/vm.host-direct-peer.tcp.txt"
   local enabled="${WSREPL_QA_HOST_DIRECT_PEER_VM_CONNECTIVITY_CHECK:-1}"
   local host_port="${1:-}"
-  if [[ -z "${host_port}" && "${enabled}" == "0" ]]; then
+  if [[ "${enabled}" == "0" ]]; then
     printf "%s\n" "(skipped: WSREPL_QA_HOST_DIRECT_PEER_VM_CONNECTIVITY_CHECK=0)" > "${out_file}"
     return 0
   fi
@@ -2723,8 +2724,10 @@ ensure_summary() {
   local host_machine_id="${WSREPL_QA_HOST_MACHINE_ID:-}"
   local vm_machine_id="${WSREPL_QA_VM_MACHINE_ID:-}"
 
+  local current_outdir=""
+  if [[ "${PLAYWRIGHT_ATTEMPT_OWNED}" == "1" ]]; then current_outdir="${PLAYWRIGHT_OUTDIR}"; fi
   local payload
-  payload="$(python3 - "$VM_NAME" "$REPORT_ROOT" "$PLAYWRIGHT_OUTDIR" "$STARTED_AT" "$ended_at" "$status" "$session_id" "$session_path" "$steps_json" "$source_machine_id" "$host_machine_id" "$vm_machine_id" "$FAILURE_STAGE" "$FAILURE_REASON" <<'PY'
+  payload="$(python3 - "$VM_NAME" "$REPORT_ROOT" "$current_outdir" "$STARTED_AT" "$ended_at" "$status" "$session_id" "$session_path" "$steps_json" "$source_machine_id" "$host_machine_id" "$vm_machine_id" "$FAILURE_STAGE" "$FAILURE_REASON" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -2751,6 +2754,7 @@ except Exception:
 meta_session_id = None
 meta_session_path = None
 try:
+  if not playwright_outdir: raise ValueError("No current attempt")
   meta_path = Path(playwright_outdir) / "meta.json"
   if meta_path.exists():
     meta_payload = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -2767,6 +2771,7 @@ except Exception:
 
 fatal_message = None
 try:
+  if not playwright_outdir: raise ValueError("No current attempt")
   fatal_path = Path(playwright_outdir) / "fatal.json"
   if fatal_path.exists():
     fatal_payload = json.loads(fatal_path.read_text(encoding="utf-8"))
@@ -2790,7 +2795,7 @@ elif resolved_failure_reason is None and fatal_message:
   resolved_failure_reason = fatal_message
   resolved_failure_stage = resolved_failure_stage or "playwright"
 
-resolved_session_id = (session_id or "").strip() or meta_session_id
+resolved_session_id = meta_session_id
 resolved_session_path = (session_path or "").strip() or meta_session_path
 payload = {
   "kind": "wsrepl_lima_matrix_wrapper",
@@ -2804,6 +2809,7 @@ payload = {
   "sessionPath": resolved_session_path or None,
   "stepsJson": steps_json or None,
   "parameters": {
+    "requestedSessionId": (session_id or "").strip() or None,
     "hostMachineId": (host_machine_id or "").strip() or None,
     "vmMachineId": (vm_machine_id or "").strip() or None,
     "sourceMachineId": (source_machine_id or "").strip() or None,
@@ -2838,33 +2844,19 @@ PY
 }
 
 resolve_playwright_session_id_best_effort() {
+  if [[ "${PLAYWRIGHT_ATTEMPT_OWNED}" != "1" ]]; then return 0; fi
   python3 - "$PLAYWRIGHT_OUTDIR" "${HAPPIER_QA_SESSION_ID:-}" <<'PY'
 import json
 import sys
 from pathlib import Path
-
-playwright_outdir = Path(sys.argv[1])
-explicit = (sys.argv[2] or "").strip()
-if explicit:
-  print(explicit)
-  raise SystemExit(0)
-
-meta_path = playwright_outdir / "meta.json"
-if not meta_path.exists():
-  print("")
-  raise SystemExit(0)
-
 try:
-  payload = json.loads(meta_path.read_text(encoding="utf-8"))
+  payload = json.loads((Path(sys.argv[1]) / "meta.json").read_text(encoding="utf-8"))
+  raw = payload.get("sessionId") if isinstance(payload, dict) else None
+  expected = (sys.argv[2] or "").strip()
+  if isinstance(raw, str) and raw.strip() and (not expected or raw.strip() == expected):
+    print(raw.strip())
 except Exception:
-  print("")
-  raise SystemExit(0)
-
-raw = payload.get("sessionId") if isinstance(payload, dict) else None
-if isinstance(raw, str) and raw.strip():
-  print(raw.strip())
-else:
-  print("")
+  pass
 PY
 }
 
@@ -2872,47 +2864,50 @@ resolve_final_status() {
   local status="$1"
   RESOLVED_FINAL_STATUS="${status}"
   if [[ "${status}" == "126" || "${status}" == "127" ]]; then
-    if [[ -z "${FAILURE_STAGE}" ]]; then
-      FAILURE_STAGE="early_abort"
-    fi
+    FAILURE_STAGE="${FAILURE_STAGE:-early_abort}"
     if [[ -z "${FAILURE_REASON}" ]]; then
-      if [[ "${status}" == "127" ]]; then
-        FAILURE_REASON="command_not_found"
-      else
-        FAILURE_REASON="command_invocation_failed"
-      fi
+      if [[ "${status}" == "127" ]]; then FAILURE_REASON="command_not_found"; else FAILURE_REASON="command_invocation_failed"; fi
     fi
     return 0
   fi
-
-  # Some Playwright runs can write a fully green summary (ok:true + steps) but still exit nonzero
-  # due to cleanup/interrupt noise. Prefer the harness summary as the source of truth so the
-  # wrapper doesn't report a false-negative failure.
-  if [[ "${status}" != "0" ]]; then
-    if playwright_attempt_wrote_success_summary "${PLAYWRIGHT_OUTDIR}"; then
-      RESOLVED_FINAL_STATUS="0"
-      FAILURE_STAGE=""
-      FAILURE_REASON=""
-      return 0
+  if [[ "${PLAYWRIGHT_ATTEMPT_OWNED}" != "1" ]]; then
+    if [[ "${status}" == "0" ]]; then
+      RESOLVED_FINAL_STATUS="1"
+      FAILURE_STAGE="${FAILURE_STAGE:-playwright}"
+      FAILURE_REASON="${FAILURE_REASON:-missing_current_attempt}"
     fi
+    return 0
   fi
-
+  if [[ -f "${PLAYWRIGHT_OUTDIR}/fatal.json" ]]; then
+    RESOLVED_FINAL_STATUS="1"
+    FAILURE_STAGE="${FAILURE_STAGE:-playwright}"
+    FAILURE_REASON="${FAILURE_REASON:-playwright_fatal_json}"
+    return 0
+  fi
   local resolved_session_id
   resolved_session_id="$(resolve_playwright_session_id_best_effort || true)"
-  resolved_session_id="$(printf "%s" "${resolved_session_id}" | tr -d '\n' | tr -d '\r')"
-
   if [[ -z "${resolved_session_id}" ]]; then
-    FAILURE_STAGE="${FAILURE_STAGE:-playwright}"
-    if [[ -z "${FAILURE_REASON}" && -f "${PLAYWRIGHT_OUTDIR}/fatal.json" ]]; then
-      FAILURE_REASON="playwright_fatal_json"
-    else
-      FAILURE_REASON="${FAILURE_REASON:-missing_session_id}"
-    fi
     RESOLVED_FINAL_STATUS="1"
+    FAILURE_STAGE="${FAILURE_STAGE:-playwright}"
+    FAILURE_REASON="${FAILURE_REASON:-missing_session_id}"
     return 0
   fi
-
-  RESOLVED_FINAL_STATUS="${status}"
+  # An explicit failure cannot be cleared by a nominally successful child.
+  if [[ -n "${FAILURE_REASON}" ]]; then
+    if [[ "${status}" == "0" ]]; then RESOLVED_FINAL_STATUS="1"; fi
+    return 0
+  fi
+  # Every success path requires the same current session and ordered-step result.
+  # A qualified result can still survive a later nonzero cleanup exit.
+  if ! playwright_attempt_wrote_success_summary "${PLAYWRIGHT_OUTDIR}"; then
+    if [[ "${status}" == "0" ]]; then RESOLVED_FINAL_STATUS="1"; fi
+    FAILURE_STAGE="${FAILURE_STAGE:-playwright}"
+    FAILURE_REASON="invalid_current_matrix_result"
+    return 0
+  fi
+  RESOLVED_FINAL_STATUS="0"
+  FAILURE_STAGE=""
+  FAILURE_REASON=""
   return 0
 }
 
@@ -3694,6 +3689,7 @@ fi
 init_daemon_diagnostic_placeholders
 
 echo "[wsrepl-qa] ensure VM exists + port forwarding (reuse-first)..."
+FAILURE_STAGE="ensure_vm"
 {
   echo "date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   echo "vm: ${VM_NAME}"
@@ -3701,6 +3697,7 @@ echo "[wsrepl-qa] ensure VM exists + port forwarding (reuse-first)..."
   echo "lima_yaml: ${LIMA_YAML}"
   ensure_vm_ready
 } 2>&1 | tee "${REPORT_ROOT}/ensure-vm.log"
+FAILURE_STAGE=""
 
 wsrepl_vm_direct_peer_bind_port="$(resolve_wsrepl_vm_direct_peer_bind_port_for_vm "${VM_NAME}")"
 ensure_vm_direct_peer_port_forwarding "${wsrepl_vm_direct_peer_bind_port}"
@@ -3711,6 +3708,7 @@ if [[ "${#EXTRA_VM_NAMES[@]}" -gt 0 ]]; then
     extra_root="${REPORT_ROOT}/vms/${safe_extra_vm}"
     mkdir -p "${extra_root}"
     echo "[wsrepl-qa] ensure additional VM exists + port forwarding (reuse-first): ${extra_vm}"
+    FAILURE_STAGE="ensure_vm"
     (
       VM_NAME="${extra_vm}"
       LIMA_HOME_DIR="${LIMA_HOME:-${HOME}/.lima}"
@@ -3720,6 +3718,7 @@ if [[ "${#EXTRA_VM_NAMES[@]}" -gt 0 ]]; then
       extra_vm_direct_peer_bind_port="$(resolve_wsrepl_vm_direct_peer_bind_port_for_vm "${VM_NAME}")"
       ensure_vm_direct_peer_port_forwarding "${extra_vm_direct_peer_bind_port}"
     ) 2>&1 | tee "${extra_root}/ensure-vm.log"
+    FAILURE_STAGE=""
 
     # Best-effort: seed any provider fixtures needed by the Playwright matrix.
     (
@@ -4039,8 +4038,11 @@ set -e
 echo "[wsrepl-qa] run Playwright matrix (artifacts under report dir)..."
 PLAYWRIGHT_ROOTDIR="${REPORT_ROOT}/playwright"
 PLAYWRIGHT_ATTEMPT=1
+mkdir -p "${PLAYWRIGHT_ROOTDIR}"
+if [[ -e "${PLAYWRIGHT_ROOTDIR}/attempt-01" ]]; then
+  PLAYWRIGHT_ROOTDIR="$(mktemp -d "${PLAYWRIGHT_ROOTDIR}/run.XXXXXXXX")"
+fi
 PLAYWRIGHT_OUTDIR="${PLAYWRIGHT_ROOTDIR}/attempt-01"
-mkdir -p "${PLAYWRIGHT_OUTDIR}"
 
 # Best-effort: expose the stack activeServerDir to the Playwright harness so it can capture
 # `session-handoff/*` durable records for each failed attempt.
@@ -4154,12 +4156,17 @@ fi
 
 FAILURE_STAGE="playwright"
 run_playwright_attempt() {
+  PLAYWRIGHT_ATTEMPT_OWNED=0
   local outdir="${1:-}"
   if [[ -z "${outdir}" ]]; then
     echo "[wsrepl-qa] internal error: missing outdir for Playwright attempt" >&2
     return 2
   fi
-  mkdir -p "${outdir}"
+  if ! mkdir "${outdir}"; then
+    FAILURE_REASON="attempt_directory_already_exists"
+    return 2
+  fi
+  PLAYWRIGHT_ATTEMPT_OWNED=1
 
   start_host_daemon_watchdog_background "${outdir}" "${host_server_url:-}"
 
@@ -4201,26 +4208,23 @@ PY
 
 playwright_attempt_wrote_success_summary() {
   local outdir="${1:-}"
-  if [[ -z "${outdir}" ]]; then
-    return 1
-  fi
-  local summary_path="${outdir}/summary.json"
-  if [[ ! -f "${summary_path}" ]]; then
-    return 1
-  fi
-  python3 - "${summary_path}" <<'PY'
+  if [[ "${PLAYWRIGHT_ATTEMPT_OWNED}" != "1" || -z "${outdir}" ]]; then return 1; fi
+  python3 - "${outdir}" "${HAPPIER_QA_STEPS_JSON:-}" <<'PY'
 import json
 import sys
 from pathlib import Path
-
-path = Path(sys.argv[1])
 try:
-  payload = json.loads(path.read_text(encoding="utf-8"))
+  root = Path(sys.argv[1])
+  summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+  meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+  if not isinstance(summary, dict) or not isinstance(meta, dict): raise ValueError("Invalid result objects")
+  session_id = meta.get("sessionId")
+  if (summary.get("kind") == "wsrepl_handoff_matrix_summary" and summary.get("ok") is True
+      and isinstance(session_id, str) and session_id.strip() and summary.get("sessionId") == session_id
+      and json.loads(meta.get("stepsJson", "")) == json.loads(sys.argv[2])):
+    raise SystemExit(0)
 except Exception:
-  raise SystemExit(1)
-
-if payload.get("ok") is True:
-  raise SystemExit(0)
+  pass
 raise SystemExit(1)
 PY
 }
@@ -4275,6 +4279,11 @@ fi
 
     PLAYWRIGHT_ATTEMPT=2
     PLAYWRIGHT_OUTDIR="${PLAYWRIGHT_ROOTDIR}/attempt-02"
+    # The first attempt's fatal record is retained in its own directory. It must
+    # not reject a separately owned, successful retry; new failures still win.
+    if [[ "${FAILURE_REASON}" == "playwright_fatal_json" ]]; then
+      FAILURE_REASON=""
+    fi
     playwright_status=0
     set +e
     run_playwright_attempt "${PLAYWRIGHT_OUTDIR}"

@@ -6,6 +6,7 @@ import { runTasksWithLimit } from '@/sync/runtime/orchestration/runTasksWithLimi
 import type { MachineDisplayRenderable } from '@/sync/domains/machines/machineDisplayRenderable';
 import type { MachineDisplayCacheEntryV1 } from '@/sync/domains/state/warmCachePersistence';
 import { loadSyncTuning } from '@/sync/runtime/syncTuning';
+import { AccountEncryptionModeResponseSchema, isPlainMachineDataKeyMarker } from '@happier-dev/protocol';
 
 type MachineEncryption = {
     decryptMetadata: (version: number, value: string) => Promise<any>;
@@ -14,7 +15,7 @@ type MachineEncryption = {
 
 type SyncEncryption = {
     decryptEncryptionKeys: (values: readonly string[]) => Promise<Array<Uint8Array | null>>;
-    initializeMachines: (machineKeysMap: Map<string, Uint8Array | null>) => Promise<void>;
+    initializeMachines: (machineKeysMap: Map<string, Uint8Array | null>, options?: Readonly<{ unavailableMachineIds?: ReadonlySet<string>; plainMachineIds?: ReadonlySet<string> }>) => Promise<void>;
     getMachineEncryption: (machineId: string) => MachineEncryption | null;
 };
 
@@ -47,7 +48,7 @@ function warnMachineDataEncryptionKeyDecryptFailureOnce(encryption: SyncEncrypti
     }
     if (warnedMachineIds.has(machineId)) return;
     warnedMachineIds.add(machineId);
-    console.warn(`Failed to decrypt data encryption key for machine ${machineId}; falling back to legacy machine encryption.`);
+    console.warn(`Failed to decrypt data encryption key for machine ${machineId}; machine content is unavailable.`);
 }
 
 function hasOwnField(source: object, field: string): boolean {
@@ -90,11 +91,6 @@ function readReplacementFieldsFromMachineRow(machine: {
         replacementSource: machine.replacementSource ?? null,
         replacementActorUserId: machine.replacementActorUserId ?? null,
     };
-}
-
-function normalizeNonNegativeInteger(value: number | undefined, fallback: number): number {
-    if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
-    return Math.max(0, Math.trunc(value));
 }
 
 function normalizePositiveInteger(value: number | undefined, fallback: number): number {
@@ -211,13 +207,12 @@ export async function fetchAndApplyMachines(params: {
     encryption: SyncEncryption;
     machineDataKeys: Map<string, MachineDataKeyCacheEntry>;
     request?: (path: string, init: RequestInit) => Promise<Response>;
+    getAccountEncryptionMode?: () => Promise<'plain' | 'e2ee'>;
     applyMachines: (machines: Machine[], replace?: boolean) => void;
     getExistingMachine?: (machineId: string) => Machine | null | undefined;
     applyMachineDisplayEntries?: (machines: MachineDisplayRenderable[], options?: { replace?: boolean }) => void;
     cachedMachineDisplayEntries?: Record<string, MachineDisplayCacheEntryV1>;
     machineDisplayHydrationConcurrencyLimit?: number;
-    machineDisplayEagerHydrationCount?: number;
-    machineDisplayBackgroundHydrationMaxRows?: number;
     machineDisplayBackgroundHydrationApplyBatchSize?: number;
     shouldContinue?: () => boolean;
     /**
@@ -244,14 +239,6 @@ export async function fetchAndApplyMachines(params: {
     const concurrencyLimit = normalizePositiveInteger(
         params.machineDisplayHydrationConcurrencyLimit,
         syncTuning.machineDisplayHydrationConcurrencyLimit,
-    );
-    const eagerHydrationCount = normalizeNonNegativeInteger(
-        params.machineDisplayEagerHydrationCount,
-        syncTuning.machineDisplayEagerHydrationCount,
-    );
-    const backgroundHydrationMaxRows = normalizeNonNegativeInteger(
-        params.machineDisplayBackgroundHydrationMaxRows,
-        syncTuning.machineDisplayBackgroundHydrationMaxRows,
     );
     const hydrationApplyBatchSize = normalizePositiveInteger(
         params.machineDisplayBackgroundHydrationApplyBatchSize,
@@ -315,6 +302,26 @@ export async function fetchAndApplyMachines(params: {
         return;
     }
 
+    let accountAllowsPlainMachines = false;
+    if (machines.some((machine) => isPlainMachineDataKeyMarker(machine.dataEncryptionKey))) {
+        try {
+            if (params.getAccountEncryptionMode) {
+                accountAllowsPlainMachines = await params.getAccountEncryptionMode() === 'plain';
+            } else {
+                const modeResponse = await request('/v1/account/encryption', {
+                    method: 'GET',
+                    headers: { Authorization: `Bearer ${credentials.token}`, 'Content-Type': 'application/json' },
+                });
+                if (modeResponse.ok) {
+                    const parsed = AccountEncryptionModeResponseSchema.safeParse(await modeResponse.json());
+                    accountAllowsPlainMachines = parsed.success && parsed.data.mode === 'plain';
+                }
+            }
+        } catch (error) {
+            console.warn('[machinesSnapshot] Could not verify plain account mode; plain machine content is unavailable.', error);
+        }
+    }
+
     // First, collect and decrypt encryption keys for all machines.
     //
     // Unwrap only what this response actually changed. `machineDataKeys` remembers the
@@ -335,6 +342,8 @@ export async function fetchAndApplyMachines(params: {
     // native worker is. Batching also lets the JS reference path release the thread
     // between chunks.
     const machineKeysMap = new Map<string, Uint8Array | null>();
+    const unavailableMachineIds = new Set<string>();
+    const plainMachineIds = new Set<string>();
     const readMachineEnvelope = (machine: { dataEncryptionKey?: string | null }): string | null =>
         typeof machine.dataEncryptionKey === 'string' && machine.dataEncryptionKey.length > 0
             ? machine.dataEncryptionKey
@@ -343,7 +352,23 @@ export async function fetchAndApplyMachines(params: {
     const envelopeMachineIds: string[] = [];
     const envelopes: string[] = [];
     for (const machine of machines) {
+        if (isPlainMachineDataKeyMarker(machine.dataEncryptionKey)) {
+            machineDataKeys.delete(machine.id);
+            if (accountAllowsPlainMachines) {
+                plainMachineIds.add(machine.id);
+            } else {
+                unavailableMachineIds.add(machine.id);
+                console.warn(`Plain content for machine ${machine.id} is unavailable because its account is not in plain mode.`);
+            }
+            continue;
+        }
         const envelope = readMachineEnvelope(machine);
+        if (machine.dataEncryptionKey !== null && machine.dataEncryptionKey !== undefined && !envelope) {
+            machineDataKeys.delete(machine.id);
+            unavailableMachineIds.add(machine.id);
+            warnMachineDataEncryptionKeyDecryptFailureOnce(encryption, machine.id);
+            continue;
+        }
         if (!envelope) continue;
         const cached = machineDataKeys.get(machine.id);
         if (cached && cached.envelope === envelope) {
@@ -366,6 +391,11 @@ export async function fetchAndApplyMachines(params: {
         decryptedKeyByMachineId.set(envelopeMachineIds[index]!, decryptedKeys[index] ?? null);
     }
     for (const machine of machines) {
+        if (unavailableMachineIds.has(machine.id)) continue;
+        if (plainMachineIds.has(machine.id)) {
+            machineKeysMap.set(machine.id, null);
+            continue;
+        }
         const reusedKey = reusedKeyByMachineId.get(machine.id);
         if (reusedKey) {
             machineKeysMap.set(machine.id, reusedKey);
@@ -381,7 +411,7 @@ export async function fetchAndApplyMachines(params: {
         }
         if (!decryptedKey && hasEnvelope) {
             warnMachineDataEncryptionKeyDecryptFailureOnce(encryption, machine.id);
-            machineKeysMap.set(machine.id, null);
+            unavailableMachineIds.add(machine.id);
             continue;
         }
         machineKeysMap.set(machine.id, decryptedKey);
@@ -393,7 +423,7 @@ export async function fetchAndApplyMachines(params: {
     // Initialize machine encryptions
     let machineEncryptionReady = true;
     try {
-        await encryption.initializeMachines(machineKeysMap);
+        await encryption.initializeMachines(machineKeysMap, { unavailableMachineIds, plainMachineIds });
     } catch (error) {
         machineEncryptionReady = false;
         console.error('[machinesSnapshot] Failed to initialize machine encryption; continuing with cached/unencrypted machine rows', error);
@@ -406,6 +436,10 @@ export async function fetchAndApplyMachines(params: {
     const cachedMachineDisplayEntries = params.cachedMachineDisplayEntries ?? {};
     const shouldApplyMachineDisplays = typeof params.applyMachineDisplayEntries === 'function';
     const needsMachineWarmHydration = (machine: typeof machines[number]): boolean => {
+        const existingMachine = params.getExistingMachine?.(machine.id);
+        if (!existingMachine?.metadata || existingMachine.metadataVersion !== machine.metadataVersion) {
+            return true;
+        }
         if (cachedMachineDisplayEntries[machine.id]?.metadataVersion !== machine.metadataVersion) {
             return true;
         }
@@ -429,19 +463,16 @@ export async function fetchAndApplyMachines(params: {
             : null,
     });
 
-    const buildMachineFromRowAndCache = (
+    const buildMachineFromRowAndExisting = (
         machine: typeof machines[number],
-        cachedEntry: MachineDisplayCacheEntryV1 | undefined,
         existingMachine: Machine | null | undefined,
     ): Machine => {
         const hasEncryptedDaemonState = typeof machine.daemonState === 'string' && machine.daemonState.length > 0;
-        const metadata = cachedEntry?.metadataVersion === machine.metadataVersion && existingMachine?.metadata
-            ? {
-                ...existingMachine.metadata,
-                displayName: cachedEntry.displayName ?? existingMachine.metadata.displayName,
-                host: cachedEntry.host ?? existingMachine.metadata.host,
-                homeDir: cachedEntry.homeDir ?? existingMachine.metadata.homeDir,
-            }
+        const canReadMachine = !unavailableMachineIds.has(machine.id);
+        // Refresh placeholders must not erase capabilities that have already been decrypted.
+        // Keep the payload's own version so socket updates can still deliver the newer envelope.
+        const metadata = machine.metadata && machineEncryptionReady && !unavailableMachineIds.has(machine.id) && encryption.getMachineEncryption(machine.id)
+            ? existingMachine?.metadata ?? null
             : null;
         return ({
             id: machine.id,
@@ -452,10 +483,10 @@ export async function fetchAndApplyMachines(params: {
             activeAt: machine.activeAt,
             revokedAt: machine.revokedAt ?? null,
             ...readReplacementFieldsFromMachineRow(machine),
-            metadataVersion: machine.metadataVersion,
+            metadataVersion: metadata && existingMachine ? existingMachine.metadataVersion : machine.metadataVersion,
             metadata,
-            daemonState: hasEncryptedDaemonState ? existingMachine?.daemonState ?? null : null,
-            daemonStateVersion: hasEncryptedDaemonState
+            daemonState: hasEncryptedDaemonState && canReadMachine ? existingMachine?.daemonState ?? null : null,
+            daemonStateVersion: hasEncryptedDaemonState && canReadMachine
                 ? existingMachine?.daemonStateVersion ?? (machine.daemonStateVersion || 0)
                 : (machine.daemonStateVersion || 0),
         });
@@ -463,8 +494,10 @@ export async function fetchAndApplyMachines(params: {
 
     const decryptMachine = async (machine: typeof machines[number]): Promise<Machine | null> => {
         const machineEncryption = encryption.getMachineEncryption(machine.id);
-        if (!machineEncryption) {
-            console.error(`Machine encryption not found for ${machine.id} - this should never happen`);
+        if (!machineEncryption || unavailableMachineIds.has(machine.id)) {
+            if (!unavailableMachineIds.has(machine.id)) {
+                console.error(`Machine encryption not found for ${machine.id}`);
+            }
             return {
                 id: machine.id,
                 seq: machine.seq,
@@ -527,20 +560,17 @@ export async function fetchAndApplyMachines(params: {
         params.applyMachineDisplayEntries!(displayEntries, { replace: params.replace ?? false });
         applyMachines(
             machines.map((machine) =>
-                buildMachineFromRowAndCache(
+                buildMachineFromRowAndExisting(
                     machine,
-                    cachedMachineDisplayEntries[machine.id],
                     params.getExistingMachine?.(machine.id),
                 )),
             params.replace ?? false,
         );
 
-        const maxWarmHydrationRows = eagerHydrationCount + backgroundHydrationMaxRows;
-        const machinesNeedingHydration = machineEncryptionReady && maxWarmHydrationRows > 0
+        const machinesNeedingHydration = machineEncryptionReady
             ? machines
                 .filter((machine) => needsMachineWarmHydration(machine))
                 .sort(compareMachineHydrationPriority)
-                .slice(0, maxWarmHydrationRows)
             : [];
         if (machinesNeedingHydration.length > 0) {
             void runTasksWithLimit(

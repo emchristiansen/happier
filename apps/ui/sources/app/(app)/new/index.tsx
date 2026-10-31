@@ -25,12 +25,15 @@ import { ComposerAuxiliaryFrame } from '@/components/sessions/shell/view/Compose
 import type { AgentInputStatusBadge } from '@/components/sessions/agentInput/agentInputContracts';
 import {
     deleteSessionDraft,
+    getSessionDraftSnapshot,
     setOrdinaryEntryDraftId,
 } from '@/sync/ops/sessionDrafts/sessionDraftRepository';
 import { useNewSessionDraftHostSnapshot } from '@/components/sessions/drafts/useNewSessionDraftProjection';
-import { useAllActionOperations } from '@/sync/domains/actionOperations/useActionOperations';
+import { readAllActionOperations, useAllActionOperations } from '@/sync/domains/actionOperations/useActionOperations';
 import { resolvePersistedNewSessionOperationIdentity } from '@/sync/domains/actionOperations/actionOperationReentry';
 import { NewSessionDraftComposerActions } from '@/components/sessions/drafts/NewSessionDraftComposerActions';
+import { deleteNewSessionDraftAfterConfirmation } from '@/components/sessions/drafts/deleteNewSessionDraftAfterConfirmation';
+import { buildSessionDraftSyncStatusBadge } from '@/components/sessions/drafts/sessionDraftStatusPresentation';
 import { Modal } from '@/modal';
 import { t } from '@/text';
 
@@ -149,23 +152,35 @@ function NewSessionScreenForDraft(props: Readonly<{ draftId: string }>) {
     }, [resolveOrdinaryEntryRoute, router]);
     const deleteDraft = React.useCallback(async () => {
         if (!draftScope || hasUnresolvedLaunch) return;
-        const confirmed = await Modal.confirm(
-            t('sessionDrafts.delete.confirmTitle'),
-            t('sessionDrafts.delete.confirmDescription'),
-            {
-                confirmText: t('common.delete'),
-                cancelText: t('common.cancel'),
-                destructive: true,
+        const deleted = await deleteNewSessionDraftAfterConfirmation({
+            confirm: () => Modal.confirm(
+                t('sessionDrafts.delete.confirmTitle'),
+                t('sessionDrafts.delete.confirmDescription'),
+                {
+                    confirmText: t('common.delete'),
+                    cancelText: t('common.cancel'),
+                    destructive: true,
+                },
+            ),
+            readCurrentDraftDeletionDisposition: () => {
+                const currentDraft = getSessionDraftSnapshot(draftScope, draftAddress);
+                if (!currentDraft) return 'missing';
+                return resolvePersistedNewSessionOperationIdentity({
+                    draftScope,
+                    draftId: props.draftId,
+                    draft: currentDraft.localSupplement,
+                    operations: readAllActionOperations(draftScope.accountId),
+                }) !== null ? 'launch-custody' : 'deletable';
             },
-        );
-        if (!confirmed) return;
-        await deleteSessionDraft({ scope: draftScope, address: draftAddress });
+            deleteDraft: () => deleteSessionDraft({ scope: draftScope, address: draftAddress }),
+        });
+        if (!deleted) return;
         const next = resolveOrdinaryEntryRoute({ forceFresh: true });
         router.replace({
             pathname: '/new',
             params: { draftId: next.draftId, draftOrigin: next.draftOrigin },
         });
-    }, [draftAddress, draftScope, hasUnresolvedLaunch, resolveOrdinaryEntryRoute, router]);
+    }, [draftAddress, draftScope, hasUnresolvedLaunch, props.draftId, resolveOrdinaryEntryRoute, router]);
 
     const tempData = React.useMemo(() => {
         return typeof dataId === 'string' ? peekTempData<NewSessionData>(dataId) : null;
@@ -192,6 +207,10 @@ function NewSessionScreenForDraft(props: Readonly<{ draftId: string }>) {
     }, [machineId, directory, tempData]);
 
     const draftConflictBanner = useSessionDraftConflictComposerBanner(draftSnapshot?.conflict ?? null);
+    const draftSyncStatusBadge = React.useMemo(
+        () => buildSessionDraftSyncStatusBadge(draftSnapshot?.status ?? 'clean'),
+        [draftSnapshot?.status],
+    );
     const composerTopContent = draftScope && draftSnapshot?.materialized && draftSnapshot.conflict && !draftConflictBanner.collapsed ? (
         <ComposerAuxiliaryFrame>
             <SessionDraftConflictResolution
@@ -201,7 +220,10 @@ function NewSessionScreenForDraft(props: Readonly<{ draftId: string }>) {
             />
         </ComposerAuxiliaryFrame>
     ) : null;
-    const statusBadges = draftConflictBanner.statusBadge ? [draftConflictBanner.statusBadge] : undefined;
+    const statusBadges = React.useMemo(() => [
+        ...(draftSyncStatusBadge ? [draftSyncStatusBadge] : []),
+        ...(draftConflictBanner.statusBadge ? [draftConflictBanner.statusBadge] : []),
+    ], [draftConflictBanner.statusBadge, draftSyncStatusBadge]);
     const statusTrailingActions = draftScope && draftSnapshot?.materialized ? (
         <NewSessionDraftComposerActions
             deleteDisabled={hasUnresolvedLaunch}

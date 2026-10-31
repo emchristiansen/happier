@@ -1,3 +1,4 @@
+import { readNonBlankOpaqueIdentifier } from '@happier-dev/protocol';
 import * as React from 'react';
 
 import type { Message } from '@/sync/domains/messages/messageTypes';
@@ -53,8 +54,8 @@ function deriveRosterPreviewSidechainIds(params: Readonly<{
     const seen = new Set<string>();
     for (const pass of [true, false]) {
         for (const subagent of params.subagents) {
-            if ((subagent.status === 'running') !== pass) continue;
-            const sidechainId = subagent.transcript.sidechainId?.trim();
+            if ((subagent.isActive !== false && subagent.status === 'running') !== pass) continue;
+            const sidechainId = readNonBlankOpaqueIdentifier(subagent.transcript.sidechainId);
             if (!sidechainId || seen.has(sidechainId)) continue;
             seen.add(sidechainId);
             sidechainIds.push(sidechainId);
@@ -99,7 +100,7 @@ export function useSessionAgentActivityEnrichment(params: Readonly<{
                 previews.set(subagent.id, preview);
                 continue;
             }
-            const sidechainId = subagent.transcript.sidechainId?.trim();
+            const sidechainId = readNonBlankOpaqueIdentifier(subagent.transcript.sidechainId);
             if (!sidechainId || !previewSidechainIdSet.has(sidechainId)) continue;
             const fallback = resolvePreviewFallback(sidechainHydrationStatus.bySidechainId[sidechainId]?.status);
             if (!fallback) continue;

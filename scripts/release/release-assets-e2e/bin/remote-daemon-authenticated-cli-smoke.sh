@@ -263,15 +263,14 @@ ensure_remote_auth_credentials() {
 }
 
 remote_setup_output="$(mktemp -t remote-daemon-reuse-cli-setup-XXXXXX)"
+# Reuse the primary CLI's own server profile (exported HAPPIER_ACTIVE_SERVER_ID and URLs).
+# --server-url would select the URL-derived server id, whose credentials this home does not hold.
 run_remote_daemon_setup_with_public_flag() {
   hstack remote daemon setup \
     --ssh "$REMOTE_SSH_TARGET" \
     "${remote_channel_args[@]}" \
     --yes \
     --service none \
-    --server-url "$HAPPIER_SERVER_URL" \
-    --webapp-url "$HAPPIER_WEBAPP_URL" \
-    --public-server-url "$HAPPIER_PUBLIC_SERVER_URL" \
     --json
 }
 
@@ -279,6 +278,10 @@ if ! run_remote_daemon_setup_with_public_flag \
   >"$remote_setup_output" 2>&1; then
   echo "[remote-daemon-reuse-cli] remote daemon setup failed; tailing captured output..." >&2
   tail -n 200 "$remote_setup_output" >&2 || true
+  rm -f "$remote_setup_output"
+  exit 1
+fi
+if ! node "$(dirname "$0")/remote-setup-result.mjs" "$remote_setup_output"; then
   rm -f "$remote_setup_output"
   exit 1
 fi
@@ -324,7 +327,7 @@ else
 
   echo "[remote-daemon-reuse-cli] checking remote daemon status..."
   status_out="$(ssh "$REMOTE_SSH_TARGET" "HAPPIER_ACTIVE_SERVER_ID='$selected_server_id' HAPPIER_SERVER_URL='$HAPPIER_SERVER_URL' HAPPIER_PUBLIC_SERVER_URL='$HAPPIER_PUBLIC_SERVER_URL' HAPPIER_WEBAPP_URL='$HAPPIER_WEBAPP_URL' $remote_happier_command daemon status --json" 2>/dev/null || ssh "$REMOTE_SSH_TARGET" "HAPPIER_ACTIVE_SERVER_ID='$selected_server_id' HAPPIER_SERVER_URL='$HAPPIER_SERVER_URL' HAPPIER_PUBLIC_SERVER_URL='$HAPPIER_PUBLIC_SERVER_URL' HAPPIER_WEBAPP_URL='$HAPPIER_WEBAPP_URL' $remote_happier_command daemon status" 2>/dev/null || true)"
-  if ! node -e "const fs=require('fs');const s=String(fs.readFileSync(0,'utf8')).trim();try{const j=JSON.parse(s);const daemonRunning=Boolean(j&&j.daemon&&j.daemon.running===true);const st=String((j&&j.status)||((j&&j.daemon&&j.daemon.status)||''));if(!daemonRunning&&!/running/i.test(st))process.exit(1);process.exit(0);}catch{}; if(!/running/i.test(s))process.exit(1);" <<<"$status_out" >/dev/null 2>&1; then
+  if ! node -e "const fs=require('fs');const s=String(fs.readFileSync(0,'utf8')).trim();let j;try{j=JSON.parse(s);}catch{const plain=require('node:util').stripVTControlCharacters(s);process.exit(/^\s*(?:✓\s+)?Daemon is running\s*$/im.test(plain)?0:1);}const daemonRunning=Boolean(j&&j.daemon&&j.daemon.running===true);if(j&&j.daemon&&typeof j.daemon.running==='boolean')process.exit(daemonRunning?0:1);const st=(j&&j.status)||((j&&j.daemon&&j.daemon.status)||'');process.exit(typeof st==='string'&&/^(?:daemon is )?running$/i.test(st.trim())?0:1);" <<<"$status_out" >/dev/null 2>&1; then
     echo "[remote-daemon-reuse-cli] remote daemon status not running; raw:" >&2
     echo "$status_out" >&2
     exit 1

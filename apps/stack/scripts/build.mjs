@@ -4,6 +4,7 @@ import { getComponentDir, getDefaultAutostartPaths, getRootDir } from './utils/p
 import { ensureDepsInstalled, pmExecBin, requireDir } from './utils/proc/pm.mjs';
 import { resolveServerPortFromEnv } from './utils/server/urls.mjs';
 import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { readFile, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tailscaleServeHttpsUrl } from './tailscale.mjs';
 import { printResult, wantsHelp, wantsJson } from './utils/cli/cli.mjs';
@@ -272,7 +273,13 @@ async function main() {
   if (tauriDebug) {
     tauriArgs.push('--debug');
   }
-  await pmExecBin({ dir: uiDir, bin: 'tauri', args: tauriArgs, env: tauriBuildEnv });
+  const { createTauriActoolEnvironment } = await import(pathToFileURL(join(uiDir, 'scripts', 'tauriActoolEnvironment.mjs')).href);
+  const actool = createTauriActoolEnvironment({ env: tauriBuildEnv });
+  try {
+    await pmExecBin({ dir: uiDir, bin: 'tauri', args: tauriArgs, env: actool.env });
+  } finally {
+    actool.cleanup();
+  }
   if (json) {
     printResult({ json, data: { ok: true, outDir, tauriBuilt: true, tauriServerUrl } });
   } else {

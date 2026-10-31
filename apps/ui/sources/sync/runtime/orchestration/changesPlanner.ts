@@ -41,6 +41,7 @@ export type PlannedSessionTranscriptRepair = Readonly<{
     sessionId: string;
     minSeq: number;
     messageIds: string[];
+    messageSeqs?: Readonly<Record<string, number>>;
 }>;
 
 export type ChangeCheckpointDecision =
@@ -294,7 +295,7 @@ export function classifyChangeForCheckpoint(
 
 export function planSyncActionsFromChanges(changes: ApiChangeEntry[]): PlannedChangeActions {
     const sessionIds = new Set<string>();
-    const sessionTranscriptRepairs = new Map<string, { minSeq: number; messageIds: Set<string> }>();
+    const sessionTranscriptRepairs = new Map<string, { minSeq: number; messageIds: Set<string>; messageSeqs: Record<string, number> }>();
     const unsupportedChanges: UnsupportedChangeMarker[] = [];
     let invalidateSessions = false;
     let invalidateMachines = false;
@@ -393,10 +394,12 @@ export function planSyncActionsFromChanges(changes: ApiChangeEntry[]): PlannedCh
                     if (existing) {
                         existing.minSeq = Math.min(existing.minSeq, updatedMessage.seq);
                         existing.messageIds.add(updatedMessage.messageId);
+                        existing.messageSeqs[updatedMessage.messageId] = updatedMessage.seq;
                     } else {
                         sessionTranscriptRepairs.set(change.entityId, {
                             minSeq: updatedMessage.seq,
                             messageIds: new Set([updatedMessage.messageId]),
+                            messageSeqs: { [updatedMessage.messageId]: updatedMessage.seq },
                         });
                     }
                 }
@@ -502,6 +505,7 @@ export function planSyncActionsFromChanges(changes: ApiChangeEntry[]): PlannedCh
                 sessionId,
                 minSeq: repair.minSeq,
                 messageIds: Array.from(repair.messageIds).sort(),
+                messageSeqs: repair.messageSeqs,
             }))
             .sort((left, right) => left.sessionId.localeCompare(right.sessionId)),
         unsupportedChanges,

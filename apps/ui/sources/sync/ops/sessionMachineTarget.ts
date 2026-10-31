@@ -2,6 +2,7 @@ import { isSameMachineLocality, resolveSessionWorkspaceRootForMachine } from '@h
 import {
   isRpcMethodNotAvailableError,
   isRpcMethodNotFoundError,
+  readRpcErrorCode,
   type RpcErrorCarrier,
 } from '@happier-dev/protocol/rpcErrors';
 import { resolveSessionMachineRpcTarget } from '@/sync/domains/session/resolveSessionReachableMachineId';
@@ -460,6 +461,7 @@ export function resolveMachinePathFromSessionBase(input: {
 }
 
 export function shouldFallbackFromMachineRpc(error: unknown): boolean {
+  if (readRpcErrorCode(error) === 'machine_rpc_context_unavailable') return true;
   if (error instanceof Error && typeof error.message === 'string') {
     if (error.message.includes('Machine encryption not found')) return true;
     if (error.message.includes('Socket not connected')) return true;

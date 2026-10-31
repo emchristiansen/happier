@@ -1,6 +1,6 @@
 import http from 'node:http';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { reloadConfiguration } from '@/configuration';
 import { clearDaemonStateForTests, writeDaemonState } from '@/persistence';
@@ -125,6 +125,41 @@ describe('daemon control client: stopDaemonHttp', () => {
         status: 'incomplete',
         reason: 'runner_exit_timeout',
       });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it.each([undefined, null])('leaves local session Stop under lifecycle ownership with timeout %s', async (timeoutMs) => {
+    const server = http.createServer(async (req, res) => {
+      if (req.method === 'POST' && req.url === '/stop-session') {
+        await readReqBody(req);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ status: 'stopped' }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+
+    try {
+      const { port } = await listen(server);
+      tmpHomeDir = await createTempDir('happier-daemon-client-lifecycle-stop-session-test-');
+      envScope.patch({ HAPPIER_HOME_DIR: tmpHomeDir });
+      reloadConfiguration();
+      writeDaemonState({
+        pid: process.pid,
+        httpPort: port,
+        startedAt: Date.now(),
+        startedWithCliVersion: 'test',
+        controlToken: 'test-token',
+      });
+      const timeout = vi.spyOn(AbortSignal, 'timeout');
+
+      await expect(stopDaemonSession('sess_1', timeoutMs === undefined ? {} : { timeoutMs })).resolves.toEqual({ status: 'stopped' });
+
+      expect(timeout).not.toHaveBeenCalled();
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

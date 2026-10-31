@@ -354,7 +354,6 @@ export function decideSessionMessageDelivery(opts: {
         session,
         nowMs: opts.nowMs,
         preferSteer: opts.explicitMode !== 'server_pending'
-            && configuredMode !== 'server_pending'
             && (opts.busySteerSendPolicy ?? DEFAULT_BUSY_STEER_SEND_POLICY) === 'steer_immediately',
         ...(opts.forceImmediate === true ? { timingOverride: 'send_now' as const } : {}),
     });

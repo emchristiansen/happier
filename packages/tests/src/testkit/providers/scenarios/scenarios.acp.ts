@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { fetchAllMessages, fetchSessionV2 } from '../../sessions';
 import { decryptLegacyBase64 } from '../../messageCrypto';
-import { cleanupOutsideWorkspacePath, makeOutsideWorkspacePath } from '../harness/outsideWorkspacePath';
+import { cleanupOutsideWorkspacePath, makeOutsideWorkspacePath, requireOwnedOutsideWorkspacePath, type OwnedOutsideWorkspacePath } from '../harness/outsideWorkspacePath';
 
 function k(providerId: string, kind: 'tool-call' | 'tool-result' | 'permission-request', toolName: string): string {
   return `acp/${providerId}/${kind}/${toolName}`;
@@ -488,7 +488,7 @@ export function makeAcpPermissionDenyOutsideWorkspaceReadScenario(params: {
   title?: string;
   token: string;
 }): ProviderScenario {
-  let outsidePath: string | null = null;
+  let outsidePath: OwnedOutsideWorkspacePath | null = null;
   return {
     id: params.id ?? 'permission_deny_read_outside_workspace',
     title: params.title ?? 'permission: deny a read tool call outside workspace',
@@ -1003,7 +1003,7 @@ export function makeAcpPermissionOutsideWorkspaceScenario(params: {
   // under sandbox_mode="workspace-write", which would make "outside workspace" edits silently succeed
   // without emitting permission requests. Instead, target the parent dir of the workspace to ensure
   // the path is outside the current working directory but still exists on disk.
-  let outsidePath: string | null = null;
+  let outsidePath: OwnedOutsideWorkspacePath | null = null;
   const permissionDecision = decision === 'deny' ? 'denied' : 'approved';
   const expectsWritten = decision === 'approve';
   const expectWriteCompletion = params.expectWriteCompletion ?? expectsWritten;
@@ -1129,9 +1129,9 @@ export function makeAcpPermissionOutsideWorkspaceScenario(params: {
         : []),
     ],
     verify: async ({ fixtures }) => {
-      let filepath = outsidePath;
+      const ownedPath = outsidePath;
       try {
-        filepath = expectPermissionRequest
+        const reportedPath = expectPermissionRequest
           ? (() => {
               const keys = [
                 k(params.providerId, 'permission-request', 'Edit'),
@@ -1153,6 +1153,7 @@ export function makeAcpPermissionOutsideWorkspaceScenario(params: {
               const requestedPath =
                 reqs[0]?.payload?.options?.input?.filepath ??
                 reqs[0]?.payload?.options?.input?.filePath ??
+                reqs[0]?.payload?.options?.input?.file_path ??
                 reqs[0]?.payload?.options?.input?.path ??
                 reqs[0]?.payload?.options?.input?.metadata?.filepath ??
                 reqs[0]?.payload?.options?.toolCall?.content?.find((entry: any) => typeof entry?.path === 'string')?.path ??
@@ -1163,9 +1164,10 @@ export function makeAcpPermissionOutsideWorkspaceScenario(params: {
               return requestedPath;
             })()
           : (() => {
-              if (!outsidePath) throw new Error('Internal error: outsidePath not initialized');
-              return outsidePath;
+              if (!ownedPath) throw new Error('Internal error: outsidePath not initialized');
+              return ownedPath;
             })();
+        const filepath = requireOwnedOutsideWorkspacePath(ownedPath, reportedPath);
 
         if (expectsWritten) {
           if (expectWriteCompletion) {
@@ -1183,7 +1185,7 @@ export function makeAcpPermissionOutsideWorkspaceScenario(params: {
           throw new Error(`Denied permission but file exists on disk: ${filepath}`);
         }
       } finally {
-        await cleanupOutsideWorkspacePath(filepath);
+        await cleanupOutsideWorkspacePath(ownedPath);
         outsidePath = null;
       }
     },

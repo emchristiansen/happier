@@ -1,4 +1,5 @@
 import type { AgentBackend } from '@/agent/core';
+import type { createAcpRuntime } from '@/agent/acp/runtime/createAcpRuntime';
 import type { ApiSessionClient } from '@/api/session/sessionClient';
 import type { Metadata } from '@/api/types';
 import type { ChecklistId } from '@/capabilities/checklistIds';
@@ -7,7 +8,7 @@ import type { CommandHandler } from '@/cli/commandRegistry';
 import type { CloudConnectTarget } from '@/cloud/connectTypes';
 import type { DaemonSpawnHooks } from '@/daemon/spawnHooks';
 import type { TrackedSession } from '@/daemon/types';
-import type { BoundTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
+import type { ExactTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
 import type { DirectSessionsProviderId } from '@happier-dev/protocol';
 import type {
   BackendTargetRefV1,
@@ -16,6 +17,8 @@ import type {
   ConnectedServiceMaterializationIdentityV1,
   ConnectedServicesProviderConfigSharingModeV1,
   ConnectedServicesProviderStateSharingModeV1,
+  SessionProviderCliAttachPrepareRequestV1,
+  SessionProviderCliAttachPrepareResultV1,
 } from '@happier-dev/protocol';
 import type { DirectSessionProviderOps } from './directSessions/providerOps';
 import type { AcpForkContinuationHandler } from './forking/acpForkContinuationHandler';
@@ -28,6 +31,7 @@ import type { ConnectedServiceRuntimeAuthSelectionMaterializer } from '@/daemon/
 import type { ConnectedServicesProviderMaterializer } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 import type { ConnectedServiceQuotaFetcherDescriptor } from '@/daemon/connectedServices/quotas/types';
+import type { ImportedSessionHandoffBundle } from '@/session/handoff/types';
 import type {
   VerifyResumeReachableInput,
   VerifyResumeReachableResult,
@@ -59,10 +63,18 @@ export type {
 };
 
 export type CatalogAcpBackendCreateResult = Readonly<{ backend: AgentBackend }>;
-export type CatalogAcpBackendFactory = (opts: unknown) => CatalogAcpBackendCreateResult;
+export type CatalogAcpBackendFactory = (
+  opts: unknown,
+) => CatalogAcpBackendCreateResult | Promise<CatalogAcpBackendCreateResult>;
 export type CatalogAcpRuntimeBackendOptionsResolver = (params: Readonly<{
   session: ApiSessionClient;
 }>) => Readonly<Record<string, unknown>>;
+
+export type CatalogAcpRuntimeSessionModelAdapter = Readonly<{
+  resolveSessionModelConfigUpdate: NonNullable<Parameters<typeof createAcpRuntime>[0]['resolveSessionModelConfigUpdate']>;
+  deriveSessionModelsFromConfigOptions: NonNullable<Parameters<typeof createAcpRuntime>[0]['deriveSessionModelsFromConfigOptions']>;
+  resolveSessionConfigOptionUpdate: NonNullable<Parameters<typeof createAcpRuntime>[0]['resolveSessionConfigOptionUpdate']>;
+}>;
 
 export type VendorResumeSupportParams = Readonly<{
   experimentalCodexAcp?: boolean;
@@ -82,7 +94,7 @@ export type ProviderRuntimeLocalHandoffMetadataBuilder = (params: Readonly<{
 export type ProviderTerminalAttachmentRetirementHook = (params: Readonly<{
   happyHomeDir: string;
   sessionId: string;
-  attachmentInfo: BoundTerminalAttachmentInfo;
+  attachmentInfo: ExactTerminalAttachmentInfo;
 }>) => Promise<void>;
 
 export type ProviderTerminalAttachmentControlProbe = (params: Readonly<{
@@ -90,6 +102,11 @@ export type ProviderTerminalAttachmentControlProbe = (params: Readonly<{
   sessionId: string;
   attachmentId?: string;
 }>) => Promise<boolean>;
+
+export type TerminalAttachmentControlDescriptorStatus =
+  | 'available'
+  | 'missing'
+  | 'not_applicable';
 
 export type ProviderAttachScope = 'local' | 'remote';
 
@@ -110,6 +127,7 @@ export type ProviderAttachReachability =
 
 export type ProviderAttachOps = Readonly<{
   evaluateEligibility: (params: Readonly<{
+    sessionId: string;
     metadata: Record<string, unknown>;
     currentMachineId: string | null;
     sessionMachineId: string | null;
@@ -121,6 +139,8 @@ export type ProviderAttachOps = Readonly<{
   runAttach: (params: Readonly<{
     sessionId: string;
     metadata: Record<string, unknown>;
+    prepareProviderCliAttach?: (request: Readonly<SessionProviderCliAttachPrepareRequestV1>) => Promise<SessionProviderCliAttachPrepareResultV1>;
+    terminalClient?: NonNullable<SessionProviderCliAttachPrepareRequestV1['terminalClient']>['herdr'];
   }>) => Promise<number | false>;
 }>;
 
@@ -230,6 +250,14 @@ export type ConnectedServiceSwitchContinuityParams = Readonly<{
 export type ConnectedServicePersistedSessionCandidateParams = Readonly<{
   metadata: unknown;
 }>;
+
+export type ExistingSessionHandoffStateResolver = (params: Readonly<{
+  metadata: Record<string, unknown>;
+  vendorResumeId: string;
+  targetPath: string;
+  env: NodeJS.ProcessEnv;
+  sessionStorageMode: 'direct' | 'persisted';
+}>) => Promise<ImportedSessionHandoffBundle>;
 
 export type AgentChecklistContributions = Partial<
   Record<ChecklistId, ReadonlyArray<Readonly<{ id: string; params?: Record<string, unknown> }>>>
@@ -445,6 +473,10 @@ export type AgentCatalogEntry = Readonly<{
    * attach only their own adapters instead of introducing provider-id branches.
    */
   getAcpRuntimeBackendOptionsResolver?: () => Promise<CatalogAcpRuntimeBackendOptionsResolver>;
+  /** Provider-owned projection for ACP model identifiers encoded in config options. */
+  getAcpRuntimeSessionModelAdapter?: () => Promise<CatalogAcpRuntimeSessionModelAdapter>;
+  /** Provider diagnostics delivered as ordinary assistant chunks use the shared turn owner. */
+  getAcpRuntimeTurnHooks?: () => Promise<NonNullable<Parameters<typeof createAcpRuntime>[0]['hooks']>>;
   /**
    * Optional ACP fork-continuation shaper.
    *
@@ -466,6 +498,8 @@ export type AgentCatalogEntry = Readonly<{
    * provider-specific resume ids and direct-session source metadata.
    */
   buildRuntimeLocalHandoffMetadata?: ProviderRuntimeLocalHandoffMetadataBuilder;
+  /** Verifies native target resume state without exporting, importing, or repairing it. */
+  resolveExistingSessionHandoffState?: ExistingSessionHandoffStateResolver;
   /**
    * Whether probe RPC handlers should load account settings before invoking probe methods.
    *
@@ -499,8 +533,8 @@ export type AgentCatalogEntry = Readonly<{
     processEnv?: NodeJS.ProcessEnv;
   }>) => Readonly<Record<string, unknown>> | null;
   /**
-   * Optional provider-owned adapter for probing dynamic session controls (models/modes/config options)
-   * without starting a full ACP session.
+   * Optional provider-owned adapter for probing dynamic controls and native command/skill catalogs
+   * before starting a Happier session or submitting a user turn.
    *
    * Keep provider-specific implementations in the backend folder and expose them via this catalog hook.
    */

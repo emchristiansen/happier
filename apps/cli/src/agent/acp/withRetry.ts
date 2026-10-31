@@ -2,6 +2,58 @@ import { formatErrorForUi } from '@/ui/formatErrorForUi';
 import { logger } from '@/ui/logger';
 import { createBackoff } from '@/utils/time';
 
+export type AcpRequestOperation =
+  | 'Initialize'
+  | 'Authenticate'
+  | 'NewSession'
+  | 'StartSession'
+  | 'LoadSession'
+  | 'ForkSession';
+
+export type AcpRequestFailureKind = 'transport' | 'timeout' | 'provider_rejection' | 'unknown';
+
+export function classifyAcpRequestFailureForLog(error: unknown): AcpRequestFailureKind {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  const normalized = message.toLowerCase();
+  if (
+    normalized.includes('fetch failed')
+    || normalized.includes('econnrefused')
+    || normalized.includes('econnreset')
+    || normalized.includes('socket hang up')
+    || normalized.includes('connect_error')
+    || normalized.includes('networkerror')
+    || normalized.includes('other side closed')
+  ) {
+    return 'transport';
+  }
+  if (normalized.includes('timeout') || normalized.includes('timed out')) return 'timeout';
+  if (error && typeof error === 'object' && 'code' in error) return 'provider_rejection';
+  return 'unknown';
+}
+
+export function createAcpRequestFailureLogRecord(params: Readonly<{
+  operation: AcpRequestOperation;
+  error: unknown;
+}>): Readonly<{
+  operation: AcpRequestOperation;
+  failureKind: AcpRequestFailureKind;
+  requestErrorCode?: number;
+  authenticationSetupFailure?: true;
+}> {
+  // JSON-RPC numeric codes are diagnostic metadata; provider messages/data may contain credentials.
+  const code = params.error && typeof params.error === 'object' && 'code' in params.error
+    ? params.error.code
+    : undefined;
+  return Object.freeze({
+    operation: params.operation,
+    failureKind: classifyAcpRequestFailureForLog(params.error),
+    ...(params.error && typeof params.error === 'object'
+      && 'authenticationSetupFailure' in params.error
+      && params.error.authenticationSetupFailure === true ? { authenticationSetupFailure: true as const } : {}),
+    ...(typeof code === 'number' && Number.isSafeInteger(code) ? { requestErrorCode: code } : {}),
+  });
+}
+
 /**
  * Helper to run an async operation with retry logic.
  *
@@ -12,7 +64,7 @@ import { createBackoff } from '@/utils/time';
 export async function withRetry<T>(
   operation: () => Promise<T>,
   options: {
-    operationName: string;
+    operationName: AcpRequestOperation;
     maxAttempts: number;
     baseDelayMs: number;
     maxDelayMs: number;
@@ -25,8 +77,6 @@ export async function withRetry<T>(
     minDelay: options.baseDelayMs,
     maxDelay: options.maxDelayMs,
     maxFailureCount: options.maxAttempts,
-    // Always retry — withRetry has no retryable/canTryAgain gating.
-    shouldRetry: () => true,
     onError: (e: unknown, failuresCount: number) => {
       failuresSoFar = failuresCount;
       const error =
@@ -35,9 +85,12 @@ export async function withRetry<T>(
           : new Error(formatErrorForUi(e, { maxChars: 10_000 }), { cause: e });
 
       const attempt = failuresCount;
-      logger.debug(
-        `[AcpBackend] ${options.operationName} failed (attempt ${attempt}/${options.maxAttempts}): ${error.message}. Retrying...`,
-      );
+      logger.debug('[AcpBackend] Retrying ACP request after failure', {
+        ...createAcpRequestFailureLogRecord({ operation: options.operationName, error }),
+        failedAttempt: attempt,
+        nextAttempt: attempt + 1,
+        maxAttempts: options.maxAttempts,
+      });
       options.onRetry?.(attempt, error);
     },
   });

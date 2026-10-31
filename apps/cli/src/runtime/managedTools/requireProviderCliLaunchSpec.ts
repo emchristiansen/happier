@@ -8,7 +8,7 @@ import {
 
 import { isBun } from '@/utils/runtime';
 
-import { buildMissingProviderCliCommandErrorMessage } from './requireProviderCliCommand';
+import { ProviderCliNotFoundError } from './requireProviderCliCommand';
 
 export type ProviderCliLaunchSpec = Readonly<{
   source: ProviderCliCommandResolution['source'];
@@ -17,18 +17,11 @@ export type ProviderCliLaunchSpec = Readonly<{
   args: readonly string[];
 }>;
 
-export function resolveProviderCliLaunchSpec(
-  agentId: AgentId,
+export function buildProviderCliLaunchSpec(
+  resolved: ProviderCliCommandResolution,
   opts: Readonly<{ processEnv?: NodeJS.ProcessEnv }> = {},
 ): ProviderCliLaunchSpec | null {
   const processEnv = opts.processEnv ?? process.env;
-  const resolved = resolveProviderCliCommand(agentId, {
-    processEnv,
-    isBunRuntime: isBun(),
-    currentExecPath: process.execPath,
-  });
-  if (!resolved) return null;
-
   if (!providerCliPathRequiresJavaScriptRuntime(resolved.command)) {
     return {
       source: resolved.source,
@@ -53,11 +46,25 @@ export function resolveProviderCliLaunchSpec(
   };
 }
 
+export function resolveProviderCliLaunchSpec(
+  agentId: AgentId,
+  opts: Readonly<{ processEnv?: NodeJS.ProcessEnv }> = {},
+): ProviderCliLaunchSpec | null {
+  const processEnv = opts.processEnv ?? process.env;
+  const resolved = resolveProviderCliCommand(agentId, {
+    processEnv,
+    isBunRuntime: isBun(),
+    currentExecPath: process.execPath,
+  });
+  if (!resolved) return null;
+  return buildProviderCliLaunchSpec(resolved, { processEnv });
+}
+
 export function requireProviderCliLaunchSpec(
   agentId: AgentId,
   opts: Readonly<{ processEnv?: NodeJS.ProcessEnv }> = {},
 ): ProviderCliLaunchSpec {
   const resolved = resolveProviderCliLaunchSpec(agentId, opts);
   if (resolved) return resolved;
-  throw new ReferenceError(buildMissingProviderCliCommandErrorMessage(agentId, opts));
+  throw new ProviderCliNotFoundError(agentId, opts);
 }

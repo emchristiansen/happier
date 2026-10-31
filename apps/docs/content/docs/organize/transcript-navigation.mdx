@@ -69,6 +69,22 @@ carry an instruction rather than a bare quote. Three placeholders are available:
 A template without `{{MESSAGES}}` is accepted but warned about, since the
 selection would have nowhere to go.
 
+## Copying code blocks and tables
+
+Code blocks and tables that are wider than the screen scroll sideways. A code
+block has a copy button that copies its whole contents. In development builds,
+tables have one too: it copies the table as Markdown, column alignment
+included, so it pastes as a table wherever Markdown renders.
+
+In development builds on Android, text inside horizontally scrolling code blocks
+with a copy button, tables, and diffs shown with line wrapping off can't be
+selected with a long press. Code blocks without a copy button keep native text
+selection. Selection competed with the sideways scroll: a slow drag started
+selecting text and showed the magnifier instead of moving the block. Use the code-block or table
+copy button to copy its contents. Diffs do not have a separate copy button;
+for a Markdown diff block, switch to **Code** to copy its source.
+iOS and web keep text selection.
+
 ## Turning the pieces on
 
 Selection and forwarding are configured under **Settings → Transcript →

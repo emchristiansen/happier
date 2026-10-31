@@ -1,5 +1,7 @@
 import type { EnhancedMode } from '../loop';
 import type { Session } from '../session';
+import { applyClaudeEffectiveModelUpdate } from '../sessionModels/effectiveModelUpdate';
+import type { reconcileClaudeSessionModelsState } from '../sessionModels/reconcileClaudeSessionModelsState';
 import { delay } from '@/utils/time';
 
 import type { ClaudeInFlightSteerAvailabilitySnapshot } from './createClaudeInFlightSteerCapabilityPublisher';
@@ -20,6 +22,7 @@ import {
 } from './runtimeControlIntegration';
 import { createTerminalComposerDraftBlockedEvent } from './terminalComposerDraftBlockedEvent';
 import { DEFAULT_CLAUDE_TUI_CONTROL_TIMINGS } from './tuiControls';
+import type { ClaudeScreenState } from './tuiControls/screenState';
 
 type MetadataRuntimeModeApplier<Mode extends EnhancedMode> =
   (mode: Mode) => Promise<ClaudeUnifiedRuntimeControlApplyResult>;
@@ -43,7 +46,8 @@ type SharedCallbacks<Mode extends EnhancedMode> =
 
 export function createClaudeUnifiedTerminalSharedCallbacks<Mode extends EnhancedMode>(
   params: Readonly<{
-    sessionClient: Pick<Session['client'], 'sendSessionEvent' | 'hasActiveCanonicalTurn'>;
+    sessionClient: Pick<Session['client'], 'sendSessionEvent' | 'hasActiveCanonicalTurn' | 'updateMetadata' | 'getMetadataSnapshot'>;
+    reconcileModels: typeof reconcileClaudeSessionModelsState;
     observeInFlightSteerAvailabilitySnapshot: (snapshot: ClaudeInFlightSteerAvailabilitySnapshot) => void;
     sustainedPendingDeliveryBlockHandler: ReturnType<
       typeof createClaudeUnifiedSustainedPendingDeliveryBlockHandler
@@ -55,6 +59,7 @@ export function createClaudeUnifiedTerminalSharedCallbacks<Mode extends Enhanced
     getMetadataRuntimeModeApplier: () => MetadataRuntimeModeApplier<Mode> | null;
     setMetadataRuntimeModeApplier: (apply: MetadataRuntimeModeApplier<Mode> | null) => void;
     flushPendingMetadataMode: () => Promise<unknown>;
+    onStartupDialogWaitingForUser?: ((screenState: ClaudeScreenState) => void | Promise<void>) | undefined;
     logPrefix: string;
     logDebug: (message: string, error: unknown) => void;
   }>,
@@ -91,8 +96,8 @@ export function createClaudeUnifiedTerminalSharedCallbacks<Mode extends Enhanced
       startupMode,
       isRuntimeControlInFlight,
       onResumeSummaryCompactionSubmitted,
-    }) =>
-      createClaudeUnifiedResumeChoiceStartupResolver({
+    }) => {
+      const resolveStartupDialog = createClaudeUnifiedResumeChoiceStartupResolver({
         choice: startupMode.claudeUnifiedTerminalResumeChoice ?? 'ask_every_time',
         broker: params.dialogChoiceBroker,
         port: controlPort,
@@ -101,10 +106,35 @@ export function createClaudeUnifiedTerminalSharedCallbacks<Mode extends Enhanced
         startupMode,
         isRuntimeControlInFlight,
         onResumeSummaryCompactionSubmitted,
-      }),
+      });
+      return async (input) => {
+        const resolution = await resolveStartupDialog(input);
+        if (resolution.status === 'waiting_for_user') {
+          await params.onStartupDialogWaitingForUser?.(input.screenState);
+        }
+        return resolution;
+      };
+    },
     tuiRuntimeControl: {
       featureEnabled: params.tuiRuntimeControlEnabled,
       emitRuntimeConfigOutcome: (event) => {
+        const effort = event.changes.find(change => change.key === 'reasoningEffort');
+        if (event.status === 'applied'
+          && event.timing !== 'scheduled_for_next_prompt'
+          && event.timing !== 'queued_until_safe_window'
+          && event.timing !== 'next_idle'
+          && effort?.reason !== 'delivered_unverified'
+          && typeof effort?.effective === 'string') {
+          const metadata = params.sessionClient.getMetadataSnapshot?.();
+          const model = event.changes.find(change => change.key === 'model');
+          const modelId = typeof model?.effective === 'string' && model.reason !== 'delivered_unverified'
+            ? model.effective
+            : metadata?.sessionModelsV1?.currentModelId ?? metadata?.acpSessionModelsV1?.currentModelId;
+          if (modelId) applyClaudeEffectiveModelUpdate({
+            client: params.sessionClient, reconcileModels: params.reconcileModels,
+            modelId, reasoningEffort: effort.effective, source: 'control', logPrefix: params.logPrefix,
+          });
+        }
         params.sessionClient.sendSessionEvent(
           buildClaudeUnifiedRuntimeConfigOutcomeSessionEvent(event),
         );

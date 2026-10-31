@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { Machine, Session } from '@/sync/domains/state/storageTypes';
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
@@ -79,6 +79,43 @@ function createMachineRecord(machineId: string): Machine {
 }
 
 describe('applyReachableTargetsToSessionListRenderables', () => {
+    it('returns unchanged input without allocating a replacement record', () => {
+        const sessionId = 'session-stable';
+        const machineId = 'machine-stable';
+        const renderableBase = createRenderableSession({
+            id: sessionId,
+            active: true,
+            path: '/Users/tester/repo',
+            machineId,
+        });
+        const renderable = {
+            ...renderableBase,
+            metadata: { ...renderableBase.metadata!, homeDir: '/Users/tester' },
+        };
+        const sessions = { [sessionId]: renderable };
+        const fromEntries = vi.spyOn(Object, 'fromEntries');
+
+        const result = applyReachableTargetsToSessionListRenderables({
+            sessions,
+            sessionRecords: {
+                [sessionId]: createSessionRecord({
+                    id: sessionId,
+                    active: true,
+                    path: '/Users/tester/repo',
+                    machineId,
+                }),
+            },
+            machines: {},
+            machineRecords: { [machineId]: createMachineRecord(machineId) },
+            getProjectForSession: () => null,
+        });
+
+        expect(result).toBe(sessions);
+        expect(result[sessionId]).toBe(renderable);
+        expect(fromEntries).not.toHaveBeenCalled();
+        fromEntries.mockRestore();
+    });
+
     it('keeps an active worktree session renderable on the session path instead of the linked project path', () => {
         const sessionId = 'session-1';
         const machineId = 'machine-1';

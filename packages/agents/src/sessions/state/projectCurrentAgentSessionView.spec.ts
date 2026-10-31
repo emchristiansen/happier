@@ -55,6 +55,13 @@ function sourceMetadata(): Record<string, unknown> {
 }
 
 describe('projectCurrentAgentSessionView', () => {
+  it('projects an exact configured target and removes the previous opaque ACP identity', () => {
+    const next = projectCurrentAgentSessionView({ metadata: { flavor: 'acp:a', customAcpSessionId: 'a-opaque' },
+      target: { agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'b' }, backendTitle: 'B', updatedAtMs: 3 },
+    });
+    expect(next).toMatchObject({ flavor: 'acp:b', acpConfiguredBackendV1: { v: 1, backendId: 'b', title: 'B', updatedAt: 3 } });
+    expect(next.customAcpSessionId).toBeUndefined();
+  });
   it('leaves exactly one declared identity and no flat vendor resume key', () => {
     const next = projectCurrentAgentSessionView({
       metadata: sourceMetadata(),

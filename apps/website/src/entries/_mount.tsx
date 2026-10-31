@@ -48,8 +48,8 @@ export function mount(locale: Locale): void {
      * hydration finished — on this page those are hundreds of milliseconds
      * apart, and the gap is exactly the interval where a bounced visitor leaves.
      *
-     * initAnalytics() is a no-op when the visitor sends Do Not Track or Global
-     * Privacy Control, when they have opted out, or when the key is missing.
+     * initAnalytics() is a no-op when the visitor sends Global Privacy Control,
+     * when they have opted out, or when the key is missing.
      */
     initAnalytics();
     exposeAnalyticsControls();

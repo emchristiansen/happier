@@ -307,6 +307,11 @@ describe.sequential('resolveCodexAcpSpawn', () => {
   });
 
   it('ignores the legacy npm-style managed codex-acp shim when no system node runtime is available', async () => {
+    envScope.patch({
+      HAPPIER_JS_RUNTIME_PATH: undefined,
+      HAPPIER_MANAGED_NODE_BIN: undefined,
+      HAPPIER_NODE_PATH: undefined,
+    });
     const { dir: codexHome } = await createFakeCodexHome(['context7', 'sequential-thinking', 'playwright']);
     process.env.CODEX_HOME = codexHome;
     const { dir } = await createFakeCodexAcpBinary();

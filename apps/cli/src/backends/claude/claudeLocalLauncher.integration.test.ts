@@ -5,6 +5,8 @@ import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { Session } from './session';
 import { EventEmitter } from 'node:events';
 import type { EnhancedMode } from './loop';
+import { completedNativeChildTranscript } from './workflows/claudeWorkflowActivitySource.testkit';
+import type { SessionWorkflowRunSnapshotV1 } from '@happier-dev/protocol';
 
 vi.mock('@/agent/runtime/createHappierMcpBridge', () => ({
   createHappierMcpBridge: vi.fn(async () => ({
@@ -156,7 +158,8 @@ function createLocalHarness(options?: {
     sessionId: 'happy_sess_1',
     keepAlive: vi.fn(),
     updateMetadata: vi.fn(),
-    updateAgentState: vi.fn(),
+    updateAgentStateRequestSettlement: vi.fn(async () => {}),
+      updateAgentState: vi.fn(),
     sessionTurnLifecycle: {
       failTurn: vi.fn(async () => {}),
     },
@@ -243,19 +246,96 @@ describe('claudeLocalLauncher', () => {
     }
   });
 
-  it('surfaces Claude process errors to the UI', async () => {
-    const { session, sendSessionEvent } = createLocalHarness();
+  it.each(['normal', 'retry', 'switch'] as const)('does not replace an unverified local invocation (%s)', async mode => {
+    const { session, sendSessionEvent, abortHandlerReady } = createLocalHarness();
+    const started = createDeferred<void>();
+    session.sessionId = 'retained-native-session';
+    session.transcriptPath = '/tmp/retained-native-session.jsonl';
+    mockClaudeLocal.mockImplementationOnce(async opts => {
+      started.resolve(undefined);
+      if (mode === 'switch') await waitForAbort(opts.abort);
+      opts.onProcessExit?.({ providerStopped: false });
+      if (mode === 'retry') throw new Error('Local wrapper observation failed');
+    });
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+    const launch = claudeLocalLauncher(session);
+    await started.promise;
+    if (mode === 'switch') await (await abortHandlerReady)();
+    await expect(launch).resolves.toEqual({ type: 'exit', code: mode === 'normal' ? 0 : 1 });
+    expect(mockClaudeLocal).toHaveBeenCalledOnce();
+    if (mode !== 'normal') {
+      expect(session.sessionId).toBe('retained-native-session');
+      expect(session.transcriptPath).toBe('/tmp/retained-native-session.jsonl');
+      expect(sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'message',
+        message: expect.stringContaining('termination') }));
+    }
+  });
+
+  it('projects authenticated local hooks through the real source without injecting visible messages', async () => {
+    const { session, client } = createLocalHarness();
+    session.onSessionFound('claude-session-1');
+    const snapshots: SessionWorkflowRunSnapshotV1[] = [];
+    Object.assign(client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      getMetadataSnapshot: () => ({}),
+      upsertSessionSystemRecord: async (record: { content: { t: string; v?: SessionWorkflowRunSnapshotV1 } }) => {
+        if (record.content.t === 'plain' && record.content.v?.agents) snapshots.push(record.content.v);
+      },
+    });
+    // Delegate the existing test seam to production: source, projector, tracker and writer stay real.
+    const actual = await vi.importActual<typeof import('./workflows/createClaudeWorkflowActivitySourceForSession')>('./workflows/createClaudeWorkflowActivitySourceForSession');
+    let source: Awaited<ReturnType<typeof actual.createClaudeWorkflowActivitySourceForSession>> = null;
+    mockCreateClaudeWorkflowActivitySourceForSession.mockImplementationOnce(async params => {
+      source = await actual.createClaudeWorkflowActivitySourceForSession(params);
+      return source;
+    });
+    mockCreateSessionScanner.mockImplementationOnce(async opts => {
+      for (const row of completedNativeChildTranscript()) opts.onRawJsonlValue?.(row, { historicalReplay: false });
+      await source?.flush();
+      expect(snapshots.at(-1)?.status).toBe('complete');
+      return createSessionScannerStub();
+    });
+    mockClaudeLocal.mockImplementationOnce(async () => {
+      session.onClaudeSessionHook({ hook_event_name: 'SubagentStart', agent_id: 'native-a', session_id: 'claude-session-1' });
+      await source?.flush();
+    });
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+    await claudeLocalLauncher(session);
+    expect(snapshots.some(snapshot => snapshot.status === 'active'
+      && snapshot.agents.find(agent => agent.id === 'a')?.status === 'active'
+      && snapshot.agents.find(agent => agent.id === 'b')?.status === 'complete')).toBe(true);
+    expect(client.sendClaudeSessionMessage).not.toHaveBeenCalled();
+    expect(client.sendClaudeSessionMessageCommittedExact).not.toHaveBeenCalled();
+  });
+
+  it('restores idle activity for owned local relaunches and retries while surfacing process errors', async () => {
+    let activityState = 'unknown';
+    const activityAtLaunch: string[] = [];
+    const { session, sendSessionEvent } = createLocalHarness({
+      providerTasks: {
+        report: async (snapshot) => { activityState = snapshot.state; },
+        markUnknown: async () => { activityState = 'unknown'; },
+        dispose: async () => {},
+      },
+    });
+    const activity = session.getProviderTaskRuntimeActivityAdapter()!;
+    await activity.activateObservation('previous-provider-observer-installed');
+    await activity.handleRuntimeLoss('previous-provider-stopped');
 
     mockClaudeLocal
       .mockImplementationOnce(async () => {
+        activityAtLaunch.push(activityState);
         throw new Error('boom');
       })
-      .mockImplementationOnce(async () => {});
+      .mockImplementationOnce(async () => {
+        activityAtLaunch.push(activityState);
+      });
 
     const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
     const result = await claudeLocalLauncher(session);
 
     expect(result).toEqual({ type: 'exit', code: 0 });
+    expect(activityAtLaunch).toEqual(['idle', 'idle']);
     expect(sendSessionEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         type: 'message',
@@ -286,7 +366,7 @@ describe('claudeLocalLauncher', () => {
     expect(order).toEqual(['scanner-installed', 'runtime-offered', 'provider-started']);
     expect(providerTasks.report).toHaveBeenCalledWith(
       { state: 'idle', activeCount: 0 },
-      'claude-local-provider-observer-installed',
+      expect.any(String),
     );
   });
 
@@ -607,6 +687,76 @@ describe('claudeLocalLauncher', () => {
     await expect(launcherPromise).resolves.toEqual({ type: 'switch' });
   });
 
+  it('stops the local Claude child and exits without a remote switch when runner termination aborts the launcher', async () => {
+    const { session } = createLocalHarness();
+    const localStarted = createDeferred<void>();
+    mockClaudeLocal.mockImplementationOnce(async (opts: LocalLaunchOptions) => {
+      localStarted.resolve(undefined);
+      await waitForAbort(opts.abort);
+      // A SIGTERM'd Claude child exits 143; the launcher owns classifying that exit.
+      const { ExitCodeError } = await import('./claudeLocal');
+      throw new ExitCodeError(143);
+    });
+    const termination = new AbortController();
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+    const launch = claudeLocalLauncher(session, { signal: termination.signal });
+    await localStarted.promise;
+
+    termination.abort('claude-runner-termination');
+
+    const settled = await Promise.race([
+      launch,
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 2_000)),
+    ]);
+    expect(settled).toEqual({ type: 'exit', code: 0 });
+    expect(mockClaudeLocal).toHaveBeenCalledOnce();
+  });
+
+  it('retains the resume identity and one-time args when a mode switch cancels before the child starts', async () => {
+    const { session, switchHandlerReady } = createLocalHarness();
+    session.sessionId = 'retained-native-session';
+    session.transcriptPath = '/tmp/retained-native-session.jsonl';
+    session.claudeArgs = ['--continue'];
+    let switching: Promise<unknown> | undefined;
+    mockClaudeLocal.mockImplementationOnce(async opts => {
+      // The process adapter returns without an exit observation when its pre-spawn guard fires.
+      const switchHandler = await switchHandlerReady;
+      switching = Promise.resolve(switchHandler({ to: 'remote' }));
+      await waitForAbort(opts.abort);
+    });
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+    await switching;
+    expect(session.sessionId).toBe('retained-native-session');
+    expect(session.transcriptPath).toBe('/tmp/retained-native-session.jsonl');
+    expect(session.claudeArgs).toContain('--continue');
+  });
+
+  it('ends a local retry backoff promptly when runner termination aborts the launcher', async () => {
+    const { session } = createLocalHarness();
+    const launchFailed = createDeferred<void>();
+    mockClaudeLocal.mockImplementationOnce(async () => {
+      launchFailed.resolve(undefined);
+      throw new Error('spawn failed');
+    });
+    const termination = new AbortController();
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+    const launch = claudeLocalLauncher(session, { signal: termination.signal });
+    await launchFailed.promise;
+    // Let the launcher enter its post-failure retry backoff (1s for the first error).
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    termination.abort('claude-runner-termination');
+
+    const settled = await Promise.race([
+      launch,
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 300)),
+    ]);
+    expect(settled).toEqual({ type: 'exit', code: 0 });
+    expect(mockClaudeLocal).toHaveBeenCalledOnce();
+  });
+
   it('defers UI-triggered remote switch until the active local Claude turn settles', async () => {
     vi.useFakeTimers();
     const { session } = createLocalHarness();
@@ -803,7 +953,7 @@ describe('claudeLocalLauncher', () => {
         provider: 'claude',
         issue: expect.objectContaining({
           code: 'usage_limit',
-          usageLimit: expect.objectContaining({ providerLimitId: 'rate_limit' }),
+          usageLimit: expect.objectContaining({ quotaScope: 'account' }),
         }),
       }));
     });

@@ -423,6 +423,49 @@ describe('selectSessionListRowStateSnapshot', () => {
         expect(second.sessionListRenderables?.s1).toBe(unreadRenderable);
     });
 
+    it('reuses unchanged runtime-priority inputs across unrelated updates until their freshness boundary', () => {
+        runtimeClockMockState.nowServerMs = 1_000_000;
+        let runtimeReads = 0;
+        const working = {
+            ...createRenderable('s1'),
+            active: true,
+            activeAt: 990_000,
+            get latestTurnStatus() {
+                runtimeReads += 1;
+                return 'in_progress' as const;
+            },
+            latestTurnStatusObservedAt: 995_000,
+        } satisfies SessionListRenderableSession;
+        const scope = { sessionId: 's1', serverId: 'server-a' };
+        const selector = createSessionListRuntimePriorityRowScopeSelector([scope], 'server-a');
+        const renderables = { s1: working, other: createRenderable('other') };
+        const first = selector({ sessionListRenderables: renderables });
+        const initialReads = runtimeReads;
+        expect(first).toEqual([scope]);
+        expect(initialReads).toBeGreaterThan(0);
+
+        runtimeClockMockState.nowServerMs = 1_001_000;
+        expect(selector({ sessionListRenderables: renderables, sessionMessages: { other: messages } })).toBe(first);
+        expect(selector({
+            sessionListRenderables: { ...renderables, other: { ...renderables.other, updatedAt: 1234 } },
+        })).toBe(first);
+        expect(runtimeReads).toBe(initialReads);
+
+        runtimeClockMockState.nowServerMs = 1_115_000;
+        expect(selector({ sessionListRenderables: renderables })).toEqual([]);
+        expect(runtimeReads).toBeGreaterThan(initialReads);
+
+        // A correction of the server clock can make the same input fresh again.
+        runtimeClockMockState.nowServerMs = 1_000_000;
+        expect(selector({ sessionListRenderables: renderables })).toEqual([scope]);
+        expect(selector({
+            sessionListRenderables: {
+                ...renderables,
+                s1: { ...working, latestTurnStatus: 'completed' },
+            },
+        })).toEqual([]);
+    });
+
     it('tracks runtime-priority scopes without changing for non-priority row overlay updates', () => {
         const s1 = createRenderable('s1');
         const s2 = createRenderable('s2');

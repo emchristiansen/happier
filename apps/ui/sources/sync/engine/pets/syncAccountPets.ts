@@ -2,7 +2,7 @@ import type { AuthCredentials } from '@/auth/storage/tokenStorage';
 import { listAccountPets } from '@/sync/api/pets/apiAccountPets';
 import type { AccountPetMetadata } from '@/sync/domains/pets/accountPetLibraryTypes';
 import type { ServerAccountScope } from '@/sync/domains/scope/serverAccountScope';
-import { isRuntimeFeatureEnabled } from '@/sync/domains/features/featureDecisionInputs';
+import { resolveRuntimeFeatureDecisionOrThrow } from '@/sync/domains/features/featureDecisionInputs';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
 
 export async function fetchAndApplyAccountPets(params: Readonly<{
@@ -17,13 +17,12 @@ export async function fetchAndApplyAccountPets(params: Readonly<{
     if (!shouldContinue()) return;
 
     const activeServer = getActiveServerSnapshot();
-    const enabled = await isRuntimeFeatureEnabled({
+    const decision = await resolveRuntimeFeatureDecisionOrThrow({
         featureId: 'pets.sync',
         serverId: activeServer.serverId,
-        timeoutMs: 400,
     });
     if (!shouldContinue()) return;
-    if (!enabled) return;
+    if (decision.state !== 'enabled') return;
 
     const pets = await listAccountPets(params.credentials);
     if (!shouldContinue()) return;

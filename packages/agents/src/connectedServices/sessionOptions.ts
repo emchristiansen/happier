@@ -445,7 +445,12 @@ export function buildConnectedServicesBindingsPayload(params: Readonly<{
         bindingsByServiceId[serviceId] = { source: 'native' };
     }
 
-    return connectedCount > 0
+    // Explicit native choice must reach the daemon so its saved connected
+    // default cannot reappear. An omitted choice still leaves defaulting there.
+    const hasExplicitNativeBinding = params.supportedConnectedServiceIds.some((serviceId) =>
+        params.connectedServicesBindingsByServiceId[serviceId]?.source === 'native',
+    );
+    return connectedCount > 0 || hasExplicitNativeBinding
         ? ConnectedServiceBindingsV1Schema.parse({ v: 1, bindingsByServiceId })
         : null;
 }

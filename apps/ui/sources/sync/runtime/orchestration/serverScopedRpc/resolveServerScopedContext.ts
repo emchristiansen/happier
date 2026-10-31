@@ -6,6 +6,7 @@ import {
     resolveServerProfileScopeIdForIdentifier,
 } from '@/sync/domains/server/serverProfiles';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
+import { parseToken } from '@/utils/auth/parseToken';
 
 import type { ResolvedServerRpcContext, ScopedRpcEncryptionContext } from './serverScopedRpcTypes';
 
@@ -16,15 +17,17 @@ function normalizeId(raw: unknown): string {
 export async function resolveServerScopedContext(params: Readonly<{
     machineId: string;
     serverId?: string | null;
+    accountId?: string | null;
     forceScoped?: boolean;
     timeoutMs?: number;
 }>): Promise<ResolvedServerRpcContext> {
     const machineId = normalizeId(params.machineId);
     const targetServerId = normalizeId(params.serverId);
+    const expectedAccountId = normalizeId(params.accountId);
     const timeoutMs = typeof params.timeoutMs === 'number' && params.timeoutMs > 0 ? params.timeoutMs : 30_000;
     const activeSnapshot = getActiveServerSnapshot();
     const activeServerId = normalizeId(activeSnapshot.serverId);
-    const shouldForceScoped = params.forceScoped === true;
+    const shouldForceScoped = params.forceScoped === true || Boolean(expectedAccountId);
 
     if (!shouldForceScoped && (!targetServerId || areServerProfileIdentifiersEquivalent(targetServerId, activeServerId))) {
         return {
@@ -53,6 +56,9 @@ export async function resolveServerScopedContext(params: Readonly<{
         throw new Error(`No authentication credentials for target server "${resolvedTargetServerId}"`);
     }
 
+    if (expectedAccountId && parseToken(credentials.token) !== expectedAccountId) {
+        throw new Error(`Scoped credentials do not match requested Account "${expectedAccountId}"`);
+    }
     const encryption = await createEncryptionFromAuthCredentials(credentials) as ScopedRpcEncryptionContext;
 
     return {

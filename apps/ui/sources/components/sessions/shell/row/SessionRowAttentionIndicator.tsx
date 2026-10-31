@@ -10,14 +10,25 @@ import type {
 } from './resolveSessionRowPresentation';
 import { resolveSessionRowAttentionIndicatorColor } from './sessionRowAttentionColors';
 
-const DEFAULT_WORKING_SPINNER_SIZE = 12;
+/** Fills the indicator's 16 px slot, so the working mark reads at the scale of the row's agent icons. */
+const DEFAULT_WORKING_SPINNER_SIZE = 16;
+const UNREAD_CENTER_SIZE = 3;
 
-const stylesheet = StyleSheet.create(() => ({
+const stylesheet = StyleSheet.create((theme) => ({
     container: {
         width: 16,
         height: 16,
         alignItems: 'center',
         justifyContent: 'center',
+    },
+    unreadCenter: {
+        position: 'absolute',
+        left: (DEFAULT_WORKING_SPINNER_SIZE - UNREAD_CENTER_SIZE) / 2,
+        top: (DEFAULT_WORKING_SPINNER_SIZE - UNREAD_CENTER_SIZE) / 2,
+        width: UNREAD_CENTER_SIZE,
+        height: UNREAD_CENTER_SIZE,
+        borderRadius: UNREAD_CENTER_SIZE / 2,
+        backgroundColor: theme.colors.text.link,
     },
     stateContainer: {
         width: 16,
@@ -32,6 +43,7 @@ export const SessionRowAttentionIndicator = React.memo(function SessionRowAttent
     sessionId: string;
     attentionState: SessionRowAttentionState;
     accessibilityLabel?: string;
+    hasUnreadMessages?: boolean;
     workingMode?: 'spinner' | 'pulse';
     workingSpinnerTone?: 'info' | 'neutral';
     animationEnabled?: boolean;
@@ -81,6 +93,14 @@ export const SessionRowAttentionIndicator = React.memo(function SessionRowAttent
                         isPulsing={shouldPulse}
                         size={props.indicator === 'permission' || props.indicator === 'action' || props.indicator === 'failed' ? 7 : 6}
                         animationEnabled={props.animationEnabled !== false}
+                    />
+                )}
+                {props.indicator === 'working' && props.hasUnreadMessages && (
+                    <View
+                        testID={`session-row-unread-center-${props.sessionId}`}
+                        pointerEvents="none"
+                        accessible={false}
+                        style={stylesheet.unreadCenter}
                     />
                 )}
             </View>

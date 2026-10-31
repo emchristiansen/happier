@@ -8,7 +8,7 @@ ${chalk.bold('Usage:')}
   happier auth login [--no-open] [--force] [--method web|mobile] [--wait-timeout <seconds>] [--server <name-or-id> | --server-url <url> [--webapp-url <url>] [--persist|--no-persist]]    Authenticate with Happier
   happier auth request --json [--server <name-or-id> | --server-url <url> [--webapp-url <url>] [--persist|--no-persist]]                                    Create a claim-gated auth request (headless-friendly)
   happier auth approve --public-key <base64> --json [--server <name-or-id> | --server-url <url> [--webapp-url <url>] [--persist|--no-persist]]              Approve an auth request using your local credentials
-  happier auth wait --public-key <base64> --json [--server <name-or-id> | --server-url <url> [--webapp-url <url>] [--persist|--no-persist]]                Wait for approval and write credentials for this machine
+  happier auth wait --public-key <base64> --json [--replace-existing] [--server <name-or-id> | --server-url <url> [--webapp-url <url>] [--persist|--no-persist]]                Wait for approval and write credentials for this machine
   happier auth pair-remote --ssh <user@host> [--json] [--no-post-check] [--server-url-for-remote <url> [--remote-webapp-url <url>]]                              Fully automated remote pairing over SSH
   happier auth logout [--all]     Log out (active relay by default)
   happier auth status             Show authentication status
@@ -23,6 +23,7 @@ ${chalk.bold('Options:')}
   --all      When used with logout, remove local data for all relays
   --json       Print machine-readable JSON (recommended for containers)
   --public-key Used with approve/wait; the terminal public key from "auth request --json"
+  --replace-existing  Used with wait; claim the approved request even when this machine already has credentials (switches account, keeps other account machine mappings)
   --ssh        Used with pair-remote; ssh target (e.g. user@host)
   --no-post-check  Skip the post-pair 'doctor repair' handoff on the remote host (defaults to running it)
   --remote-command       Happier command to run on the remote host (default: happier)

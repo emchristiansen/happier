@@ -1,4 +1,9 @@
 import {
+  readServerEnabledBit,
+  readSessionHandoffError,
+  type FeaturesResponse,
+  SessionHandoffCapabilityV2Schema,
+  type SessionHandoffCapabilityV2,
   SessionHandoffCommitResponseSchema,
   SessionHandoffPrepareTargetResultGetResponseSchema,
   SessionHandoffStartResponseSchema,
@@ -13,6 +18,8 @@ import {
   type SessionHandoffStatus,
   type SessionHandoffWorkspaceTransfer,
 } from '@happier-dev/protocol';
+import { resolveMachineTransferRoute, SERVER_TRANSFER_POLICY_UNAVAILABLE_ERROR } from '@happier-dev/transfers';
+import { createRpcCallError, isRpcMethodNotFoundError } from '@happier-dev/protocol/rpcErrors';
 
 export type SessionHandoffCoordinatorInput = Readonly<{
   sessionId: string;
@@ -21,6 +28,7 @@ export type SessionHandoffCoordinatorInput = Readonly<{
   targetPath?: string;
   sessionStorageMode: 'direct' | 'persisted';
   targetSessionStorageMode?: 'direct' | 'persisted';
+  stateTransfer?: 'transfer' | 'existing';
   workspaceTransfer?: SessionHandoffWorkspaceTransfer;
   connectedServices?: unknown;
 }>;
@@ -38,20 +46,18 @@ type CoordinatorFailure = Readonly<{
 
 type CoordinatorExecutionResult = ActionExecuteResult | Readonly<{ kind: 'cancelled' }>;
 
-type TargetCapability = Readonly<{
-  protocolVersion: 2;
-  atomicTargetResume: boolean;
-  targetCleanup: boolean;
-}>;
-
 export type SessionHandoffCoordinatorPort = Readonly<{
+  assertExistingStateSupported: (input: SessionHandoffCoordinatorInput) => Promise<void>;
+  probeSourceCapability?: (input: SessionHandoffCoordinatorInput) => Promise<unknown>;
   probeTargetCapability: (input: SessionHandoffCoordinatorInput) => Promise<unknown>;
   startSource: (request: Readonly<{
     sessionId: string;
     sourceMachineId: string;
     targetMachineId: string;
+    targetPath?: string;
     sessionStorageMode: 'direct' | 'persisted';
-    preferredTransportStrategies: readonly ['server_routed_stream'] | readonly ['direct_peer'];
+    stateTransfer?: 'transfer' | 'existing';
+    preferredTransportStrategies: readonly ('server_routed_stream' | 'direct_peer')[];
     negotiatedTransportStrategy: 'server_routed_stream' | 'direct_peer';
     workspaceTransfer?: SessionHandoffWorkspaceTransfer;
   }>) => Promise<unknown>;
@@ -64,6 +70,7 @@ export type SessionHandoffCoordinatorPort = Readonly<{
     allowServerRoutedFallback: boolean;
     sourceSessionStorageMode: 'direct' | 'persisted';
     targetSessionStorageMode?: 'direct' | 'persisted';
+    stateTransfer?: 'transfer' | 'existing';
     targetPath: string;
     endpointCandidates: SessionHandoffStartResponse['endpointCandidates'];
     handoffMetadataV2?: SessionHandoffMetadataV2;
@@ -94,6 +101,9 @@ export type SessionHandoffCoordinatorPort = Readonly<{
   abortTarget: (request: Readonly<{ handoffId: string; sessionId: string; reason: string }>) => Promise<unknown>;
   abortSource: (request: Readonly<{ handoffId: string; reason: string }>) => Promise<unknown>;
   wait: (signal?: AbortSignal) => Promise<void>;
+  readServerFeatures: (signal?: AbortSignal) => Promise<FeaturesResponse | null>;
+  directPeerAvailable: boolean;
+  preferredTransportStrategies: readonly ('server_routed_stream' | 'direct_peer')[];
   transportStrategy?: 'server_routed_stream' | 'direct_peer';
 }>;
 
@@ -188,13 +198,22 @@ function projectTargetStatusProgress(update: (value: OperationUpdate) => void, v
   phase(update, `workspace_${progress.checkpoint}`, label);
 }
 
-function readCapability(value: unknown): TargetCapability | null {
-  const candidate = record(value);
-  return candidate?.protocolVersion === 2
-    && candidate.atomicTargetResume === true
-    && candidate.targetCleanup === true
-    ? { protocolVersion: 2, atomicTargetResume: true, targetCleanup: true }
-    : null;
+export async function probeSessionHandoffCapability(probe: () => Promise<unknown>): Promise<SessionHandoffCapabilityV2 | null> {
+  try {
+    const value = await probe();
+    const refusal = readSessionHandoffError(value);
+    if (refusal) {
+      throw createRpcCallError({
+        error: refusal.errorMessage,
+        errorCode: refusal.errorCode,
+      });
+    }
+    const parsed = SessionHandoffCapabilityV2Schema.safeParse(value);
+    return parsed.success ? parsed.data : null;
+  } catch (error) {
+    if (isRpcMethodNotFoundError(error)) return null;
+    throw error;
+  }
 }
 
 export function createSessionHandoffCoordinator(port: SessionHandoffCoordinatorPort) {
@@ -202,12 +221,29 @@ export function createSessionHandoffCoordinator(port: SessionHandoffCoordinatorP
     if (!input.sessionId.trim() || !input.sourceMachineId.trim() || !input.targetMachineId.trim()) {
       throw new Error('Invalid session handoff operation input');
     }
-    if (input.sourceMachineId === input.targetMachineId) {
-      throw new Error('Session handoff target must differ from the source machine');
-    }
-    const capability = readCapability(await port.probeTargetCapability(input));
+    const sameMachine = input.sourceMachineId === input.targetMachineId;
+    const capability = await probeSessionHandoffCapability(() => port.probeTargetCapability(input));
     if (!capability) {
       throw new Error('Target daemon does not support safe atomic session handoff v2');
+    }
+    if (input.stateTransfer === 'existing') {
+      if (input.workspaceTransfer?.enabled === true) {
+        throw new Error('Existing session state requires workspace copying to be disabled');
+      }
+      const probeSourceCapability = port.probeSourceCapability;
+      const sourceCapability = probeSourceCapability
+        ? await probeSessionHandoffCapability(() => probeSourceCapability(input))
+        : null;
+      if (!capability.existingState || sourceCapability?.existingState !== true) {
+        throw new Error('Both daemons must support existing session state handoff');
+      }
+      await port.assertExistingStateSupported(input);
+    }
+    if (sameMachine && !capability.sameMachineHandoff) {
+      throw new Error('Target daemon does not support safe same-machine session handoff');
+    }
+    if (sameMachine && !input.targetPath?.trim()) {
+      throw new Error('Same-machine session handoff requires a target directory');
     }
 
     return {
@@ -215,32 +251,32 @@ export function createSessionHandoffCoordinator(port: SessionHandoffCoordinatorP
         update: (value: OperationUpdate) => void;
         signal?: AbortSignal;
       }>): Promise<CoordinatorExecutionResult> => {
-        const strategy = port.transportStrategy ?? 'server_routed_stream';
         let handoffId: string | null = null;
         let targetCommitted = false;
         let cancellationClosed = false;
         let targetWasAddressed = false;
+        const abortRoles = async (reason: string, cancellation: boolean): Promise<boolean> => {
+          if (!handoffId) return true;
+          // Both roles share one durable job locally. The v2 abort owner also handles source-only
+          // staging, so invoking it once avoids competing terminal transitions.
+          const results = await Promise.allSettled(sameMachine
+            ? [port.abortTarget({ handoffId, sessionId: input.sessionId, reason })]
+            : [
+              ...(!cancellation || targetWasAddressed
+                ? [port.abortTarget({ handoffId, sessionId: input.sessionId, reason })]
+                : []),
+              port.abortSource({ handoffId, reason }),
+            ]);
+          return results.every((result) => result.status === 'fulfilled' && isAbortAcknowledged(result.value));
+        };
         const abortBeforeCommit = async (reason: string) => {
           if (!handoffId || targetCommitted) return;
-          await Promise.allSettled([
-            port.abortTarget({ handoffId, sessionId: input.sessionId, reason }),
-            port.abortSource({ handoffId, reason }),
-          ]);
+          await abortRoles(reason, false);
         };
         const acknowledgeCancellation = async (): Promise<CoordinatorExecutionResult | null> => {
           if (!signal?.aborted || cancellationClosed) return null;
           if (!handoffId) return { kind: 'cancelled' };
-          const [targetAbort, sourceAbort] = await Promise.allSettled([
-            targetWasAddressed
-              ? port.abortTarget({ handoffId, sessionId: input.sessionId, reason: 'action_cancelled' })
-              : Promise.resolve(null),
-            port.abortSource({ handoffId, reason: 'action_cancelled' }),
-          ]);
-          if (
-            (!targetWasAddressed || (targetAbort.status === 'fulfilled' && isAbortAcknowledged(targetAbort.value)))
-            && sourceAbort.status === 'fulfilled'
-            && isAbortAcknowledged(sourceAbort.value)
-          ) {
+          if (await abortRoles('action_cancelled', true)) {
             return { kind: 'cancelled' };
           }
           return {
@@ -253,13 +289,39 @@ export function createSessionHandoffCoordinator(port: SessionHandoffCoordinatorP
         try {
           const cancelledBeforeStart = await acknowledgeCancellation();
           if (cancelledBeforeStart) return cancelledBeforeStart;
+          const serverFeatures = await port.readServerFeatures(signal);
+          const cancelledDuringPolicyRead = await acknowledgeCancellation();
+          if (cancelledDuringPolicyRead) return cancelledDuringPolicyRead;
+          if (!serverFeatures) {
+            return { ok: false, errorCode: 'server_features_unavailable', error: SERVER_TRANSFER_POLICY_UNAVAILABLE_ERROR };
+          }
+          if (readServerEnabledBit(serverFeatures, 'sessions.handoff') !== true) {
+            return { ok: false, errorCode: 'handoff_disabled', error: 'Session handoff is disabled on the selected server' };
+          }
+          const transport = sameMachine || input.stateTransfer === 'existing' ? {
+            kind: 'available' as const, strategy: 'direct_peer' as const, allowServerRoutedFallback: false,
+          } : resolveMachineTransferRoute({
+            serverFeatures,
+            preferredStrategies: port.transportStrategy
+              ? [port.transportStrategy, ...port.preferredTransportStrategies]
+              : port.preferredTransportStrategies,
+            directPeerAvailable: port.directPeerAvailable,
+          });
+          if (transport.kind === 'unavailable') {
+            return { ok: false, errorCode: transport.reasonCode, error: 'Machine transfer is disabled on the selected server' };
+          }
+          const strategy = transport.strategy;
           phase(update, 'starting_source', 'Preparing source');
           const startedRaw = await port.startSource({
             sessionId: input.sessionId,
             sourceMachineId: input.sourceMachineId,
             targetMachineId: input.targetMachineId,
+            ...(sameMachine && input.targetPath ? { targetPath: input.targetPath } : {}),
             sessionStorageMode: input.sessionStorageMode,
-            preferredTransportStrategies: [strategy],
+            ...(input.stateTransfer === 'existing' ? { stateTransfer: input.stateTransfer } : {}),
+            preferredTransportStrategies: strategy === 'direct_peer' && transport.allowServerRoutedFallback
+              ? ['direct_peer', 'server_routed_stream']
+              : [strategy],
             negotiatedTransportStrategy: strategy,
             ...(input.workspaceTransfer ? { workspaceTransfer: input.workspaceTransfer } : {}),
           });
@@ -280,9 +342,10 @@ export function createSessionHandoffCoordinator(port: SessionHandoffCoordinatorP
             sourceMachineId: input.sourceMachineId,
             targetMachineId: input.targetMachineId,
             negotiatedTransportStrategy: strategy,
-            allowServerRoutedFallback: false,
+            allowServerRoutedFallback: transport.allowServerRoutedFallback,
             sourceSessionStorageMode: input.sessionStorageMode,
             ...(input.targetSessionStorageMode ? { targetSessionStorageMode: input.targetSessionStorageMode } : {}),
+            ...(input.stateTransfer === 'existing' ? { stateTransfer: input.stateTransfer } : {}),
             targetPath: input.targetPath ?? started.targetPath,
             endpointCandidates: started.endpointCandidates,
             ...(started.handoffMetadataV2 ? { handoffMetadataV2: started.handoffMetadataV2 } : {}),

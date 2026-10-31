@@ -9,7 +9,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from
 import { execSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { existsSync, readFileSync, readdirSync } from 'fs';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
@@ -17,8 +17,6 @@ import { configuration, reloadConfiguration } from '@/configuration';
 import { 
   listDaemonSessions, 
   stopDaemonSession, 
-  spawnDaemonSession, 
-  resolveDaemonSpawnSessionByNonce,
   stopDaemonHttp, 
   notifyDaemonSessionStarted, 
   stopDaemon,
@@ -28,10 +26,10 @@ import { readCredentials, readDaemonState, clearDaemonStateForTests, writeDaemon
 import { Metadata } from '@/api/types';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 import { waitForCondition } from '@/testkit/async/waitFor';
-import type { SpawnDaemonSessionRequest } from '@/rpc/handlers/spawnSessionOptionsContract';
 import {
   ensureDaemonIntegrationCredentialsForActiveServer,
   prepareIsolatedDaemonTestHome,
+  spawnDaemonSessionWithResolvedIdentity,
   type PreparedDaemonTestHome,
 } from './testkit/realIntegration.testkit';
 
@@ -163,8 +161,6 @@ describe('ensureDaemonFullyStoppedBeforeRestart helper', () => {
         throw new Error('Failed to start helper process');
       }
 
-      await writeFile(configuration.daemonLockFile, `${child.pid}\n`, 'utf8');
-
       setTimeout(() => {
         try {
           process.kill(child!.pid!, 'SIGTERM');
@@ -177,7 +173,6 @@ describe('ensureDaemonFullyStoppedBeforeRestart helper', () => {
       await ensureDaemonFullyStoppedBeforeRestart(child.pid);
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(200);
       expect(isProcessAlive(child.pid)).toBe(false);
-      expect(existsSync(configuration.daemonLockFile)).toBe(false);
     } finally {
       if (child?.pid) {
         try {
@@ -268,7 +263,28 @@ async function ensureDaemonFullyStoppedBeforeRestart(previousKnownPid?: number |
     });
   }
 
-  await clearDaemonStateForTests();
+  await waitForCondition(
+    async () => !existsSync(configuration.daemonLockFile),
+    {
+      timeoutMs: 30_000,
+      intervalMs: 250,
+      label: 'daemon lock file cleanup before restart',
+    },
+  );
+
+  await waitForCondition(
+    async () => {
+      const state = await readDaemonState();
+      if (!state) return true;
+      if (typeof state.pid !== 'number' || !Number.isFinite(state.pid) || state.pid <= 0) return true;
+      return !isProcessAlive(state.pid);
+    },
+    {
+      timeoutMs: 30_000,
+      intervalMs: 250,
+      label: 'daemon state to be quiescent before restart',
+    },
+  );
 }
 
 async function waitForSessionCount(count: number, opts: WaitForOptions): Promise<void> {
@@ -283,50 +299,6 @@ async function waitForSessionById(sessionId: string, opts: WaitForOptions): Prom
     const sessions = await listDaemonSessionsTyped();
     return sessions.some((session) => session.happySessionId === sessionId);
   }, opts);
-}
-
-async function spawnDaemonSessionWithResolvedIdentity(
-  request: SpawnDaemonSessionRequest,
-): Promise<{ success: true; sessionId: string }> {
-  const response = await spawnDaemonSession(request) as {
-    success?: unknown;
-    sessionId?: unknown;
-    spawnNonce?: unknown;
-  };
-  if (response.success !== true) {
-    throw new Error(`daemon spawn failed: ${JSON.stringify(response)}`);
-  }
-  if (typeof response.sessionId === 'string' && response.sessionId.length > 0) {
-    return { success: true, sessionId: response.sessionId };
-  }
-
-  const spawnNonce = typeof response.spawnNonce === 'string' ? response.spawnNonce.trim() : '';
-  if (!spawnNonce) {
-    throw new Error(`accepted daemon spawn did not provide a resolution nonce: ${JSON.stringify(response)}`);
-  }
-
-  let resolvedSessionId: string | null = null;
-  let terminalError: string | null = null;
-  await waitForCondition(async () => {
-    const resolution = await resolveDaemonSpawnSessionByNonce(spawnNonce);
-    if (resolution.status === 'success') {
-      resolvedSessionId = resolution.sessionId;
-      return true;
-    }
-    if (resolution.status === 'error') {
-      terminalError = `${resolution.errorCode}: ${resolution.errorMessage}`;
-      return true;
-    }
-    return false;
-  }, {
-    ...SESSION_CONSISTENCY_WAIT,
-    label: 'accepted daemon spawn identity resolution',
-  });
-
-  if (!resolvedSessionId) {
-    throw new Error(terminalError ?? `daemon spawn identity did not resolve for nonce ${spawnNonce}`);
-  }
-  return { success: true, sessionId: resolvedSessionId };
 }
 
 async function waitForDaemonExit(pid: number, opts: WaitForOptions): Promise<void> {
@@ -542,6 +514,9 @@ describe.skipIf(!daemonIntegrationSuiteEnabled)('Daemon Integration Tests', { ti
     const response = await spawnDaemonSessionWithResolvedIdentity({
       directory: '/tmp',
       sessionId: 'spawned-test-456',
+    }, {
+      ...SESSION_CONSISTENCY_WAIT,
+      label: 'accepted daemon spawn identity resolution',
     });
 
     expect(response, `spawnDaemonSession(/tmp) response=${JSON.stringify(response)}`).toHaveProperty('success', true);
@@ -572,6 +547,11 @@ describe.skipIf(!daemonIntegrationSuiteEnabled)('Daemon Integration Tests', { ti
       intervalMs: 250,
       label: 'daemon state cleanup after HTTP stop',
     });
+    if (!daemonPid) {
+      throw new Error('Expected daemon PID from beforeEach');
+    }
+    // Publication disappears before asynchronous shutdown releases the process lock.
+    await waitForDaemonExit(daemonPid, PROCESS_EXIT_WAIT);
   });
 
   it('should track both daemon-spawned and terminal sessions', { timeout: 60_000 }, async () => {
@@ -601,6 +581,9 @@ describe.skipIf(!daemonIntegrationSuiteEnabled)('Daemon Integration Tests', { ti
     const spawnResponse = await spawnDaemonSessionWithResolvedIdentity({
       directory: '/tmp',
       sessionId: 'daemon-session-bbb',
+    }, {
+      ...SESSION_CONSISTENCY_WAIT,
+      label: 'accepted daemon spawn identity resolution',
     });
 
     // List all sessions
@@ -644,7 +627,10 @@ describe.skipIf(!daemonIntegrationSuiteEnabled)('Daemon Integration Tests', { ti
 
   it('should update session metadata when webhook is called', { timeout: 60_000 }, async () => {
     // Spawn a session
-    const spawnResponse = await spawnDaemonSessionWithResolvedIdentity({ directory: '/tmp' });
+    const spawnResponse = await spawnDaemonSessionWithResolvedIdentity({ directory: '/tmp' }, {
+      ...SESSION_CONSISTENCY_WAIT,
+      label: 'accepted daemon spawn identity resolution',
+    });
 
     // Verify webhook was processed (session ID updated)
     await waitForSessionById(spawnResponse.sessionId, {
@@ -685,7 +671,10 @@ describe.skipIf(!daemonIntegrationSuiteEnabled)('Daemon Integration Tests', { ti
       promises.push(
         // Ensure each request is distinct; otherwise the daemon coalesces identical spawn requests
         // to prevent accidental double-spawns (e.g. user double-clicks).
-        spawnDaemonSessionWithResolvedIdentity({ directory: '/tmp', spawnNonce: randomUUID() })
+        spawnDaemonSessionWithResolvedIdentity({ directory: '/tmp', spawnNonce: randomUUID() }, {
+          ...SESSION_CONSISTENCY_WAIT,
+          label: 'accepted daemon spawn identity resolution',
+        })
       );
     }
 

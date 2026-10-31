@@ -73,7 +73,7 @@ installActivityBadgeRuntimeCommonModuleMocks({
                 useAllSessionsForAttention: () => sessionsValue,
                 useAllSessionListRenderablesForAttention: () => sessionListRenderablesValue,
                 useIsDataReady: () => isDataReadyValue,
-                useFriendRequests: () => friendRequestsValue,
+                useFriendRequestCount: () => friendRequestsValue.length,
                 useLocalSettings: () => {
                     if (rejectBroadLocalSettingsRead) {
                         throw new Error('ActivityBadgeRuntime must use focused local setting hooks');
@@ -211,6 +211,53 @@ describe('ActivityBadgeRuntime', () => {
         await act(async () => {
             tree?.unmount();
         });
+    });
+
+    it('applies the queued-input badge setting', async () => {
+        sessionListRenderablesValue = [
+            {
+                id: 'session-queued',
+                seq: 1,
+                createdAt: 1,
+                updatedAt: 10,
+                active: true,
+                activeAt: 10,
+                metadataVersion: 1,
+                agentStateVersion: 0,
+                metadata: null,
+                thinking: false,
+                thinkingAt: 0,
+                presence: 1,
+                hasUnreadMessages: false,
+                pendingCount: 1,
+                pendingBlockedCount: 0,
+            },
+        ];
+        localSettingsValue = {
+            ...localSettingsValue,
+            activityBadgeShowUnread: false,
+            activityBadgeShowPendingPermissionRequests: false,
+            activityBadgeShowPendingUserActionRequests: false,
+            activityBadgeShowQueuedUserInput: true,
+        };
+
+        const { ActivityBadgeRuntime } = await import('./ActivityBadgeRuntime');
+        const screen = await renderScreen(<ActivityBadgeRuntime />);
+
+        expect(applyExpoNativeBadgeState).toHaveBeenLastCalledWith({
+            count: 1,
+            showNonNumericDot: false,
+        });
+
+        localSettingsValue.activityBadgeShowQueuedUserInput = false;
+        await screen.update(<ActivityBadgeRuntime />);
+
+        expect(applyExpoNativeBadgeState).toHaveBeenLastCalledWith({
+            count: 0,
+            showNonNumericDot: false,
+        });
+
+        await screen.unmount();
     });
 
     it('counts a canonical unread session when the renderable unread flag is stale', async () => {
@@ -470,17 +517,40 @@ describe('ActivityBadgeRuntime', () => {
             count: 1,
             showNonNumericDot: false,
         });
-        expect(serverFetch).toHaveBeenCalledWith('/v1/account/activity/badge-snapshot', {
-            method: 'GET',
-        }, { retry: 'none' });
+        expect(serverFetch).not.toHaveBeenCalled();
 
         await act(async () => {
             tree?.unmount();
         });
     });
 
-    it('seeds the native badge from the server snapshot while local session data is bootstrapping', async () => {
+    it('does not use the server snapshot while queued-input badges are enabled', async () => {
         isDataReadyValue = false;
+        serverFetch.mockResolvedValue({
+            ok: true,
+            json: async () => ({ badgeCount: 4 }),
+        });
+
+        const { ActivityBadgeRuntime } = await import('./ActivityBadgeRuntime');
+
+        let tree: renderer.ReactTestRenderer | null = null;
+        tree = (await renderScreen(<ActivityBadgeRuntime />)).tree;
+        await flushHookEffects();
+
+        expect(serverFetch).not.toHaveBeenCalled();
+        expect(applyExpoNativeBadgeState).not.toHaveBeenCalled();
+
+        await act(async () => {
+            tree?.unmount();
+        });
+    });
+
+    it('seeds the native badge from the server snapshot when its fixed policy matches local settings', async () => {
+        isDataReadyValue = false;
+        localSettingsValue = {
+            ...localSettingsValue,
+            activityBadgeShowQueuedUserInput: false,
+        };
         serverFetch.mockResolvedValue({
             ok: true,
             json: async () => ({ badgeCount: 4 }),

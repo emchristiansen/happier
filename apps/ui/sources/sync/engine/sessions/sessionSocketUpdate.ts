@@ -657,7 +657,6 @@ async function handleSessionMessageSocketUpdate(params: HandleSessionMessageSock
 
             if (
                 typeof messageSeq === 'number' &&
-                prevMaterializedMaxSeq > 0 &&
                 messageSeq > prevMaterializedMaxSeq + 1 &&
                 isSessionMessagesLoaded(sessionId)
             ) {

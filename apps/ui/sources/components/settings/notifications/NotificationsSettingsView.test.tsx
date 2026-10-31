@@ -257,6 +257,18 @@ describe('NotificationsSettingsView', () => {
         expect(screen.findRow('settings-notifications-add-webhook')).toBeTruthy();
     });
 
+    it('keeps focused-computer muting opt-in and persists the account setting', async () => {
+        const { NotificationsSettingsView } = await import('./NotificationsSettingsView');
+        const screen = await renderSettingsView(<NotificationsSettingsView />);
+        const row = requireRow(screen, 'settings-notifications-mute-phone-focused-computer');
+        const control = row.props.rightElement;
+        expect(control.props.value).toBe(false);
+        await act(async () => control.props.onValueChange(true));
+        expect(applySettingsMock).toHaveBeenCalledWith(expect.objectContaining({
+            notificationsSettingsV1: expect.objectContaining({ mutePhoneWhenComputerFocused: true }),
+        }));
+    });
+
     it('renders connected-service quota and account-switch notification controls when quota fallback features are enabled', async () => {
         const { NotificationsSettingsView } = await import('./NotificationsSettingsView');
 

@@ -109,48 +109,53 @@ describe('buildBackgroundServiceRepairPlan', () => {
     ]);
   });
 
-  it('removes other same-home services once a compatible default service exists', () => {
+  it('keeps same-home pinned services of other relays while removing pinned services of the current relay', () => {
+    const home = '/home/test/.happier';
+    const unitDir = '/home/test/.config/systemd/user';
+    const pinned = (serverId: string, relayUrl: string | null, releaseChannel: 'stable' | 'preview') => ({
+      serverId,
+      activeServerId: serverId,
+      name: serverId,
+      relayUrl,
+      installed: true,
+      path: `${unitDir}/happier-daemon.${serverId}.service`,
+      platform: 'linux' as const,
+      mode: 'user' as const,
+      happierHomeDir: home,
+      releaseChannel,
+      label: `happier-daemon.${serverId}`,
+      targetMode: 'pinned' as const,
+    });
     const plan = buildBackgroundServiceRepairPlan({
       currentReleaseChannel: 'preview',
-      currentHappierHomeDir: '/home/test/.happier',
-      currentServerId: 'default',
+      currentHappierHomeDir: home,
+      currentServerId: 'cloud',
+      currentServerUrl: 'https://api.happier.dev',
       preferredMode: 'user',
       services: [{
         serverId: 'default',
         name: 'Default background service',
         installed: true,
-        path: '/home/test/.config/systemd/user/happier-daemon.default.service',
+        path: `${unitDir}/happier-daemon.default.service`,
         platform: 'linux',
         mode: 'user',
-        happierHomeDir: '/home/test/.happier',
+        happierHomeDir: home,
         releaseChannel: 'preview',
         label: 'happier-daemon.default',
         targetMode: 'default-following',
-      }, {
-        serverId: 'legacyPinned',
-        name: 'Legacy pinned',
-        installed: true,
-        path: '/home/test/.config/systemd/user/happier-daemon.legacyPinned.service',
-        platform: 'linux',
-        mode: 'user',
-        happierHomeDir: '/home/test/.happier',
-        releaseChannel: 'stable',
-        label: 'happier-daemon.legacyPinned',
-        targetMode: 'pinned',
-      }],
+      },
+      // The 0.2.3 migration's target: a legacy unit pinned to the relay the default service serves.
+      pinned('cloud', 'https://api.happier.dev', 'stable'),
+      // The same relay under another profile id still duplicates the default service.
+      pinned('cloud-alias', 'https://API.happier.dev/', 'preview'),
+      // "Connect to this relay too": this computer's own service for another relay.
+      pinned('company', 'https://company.example.test', 'preview'),
+      pinned('personal', 'https://personal.example.test', 'stable')],
     });
 
-    expect(plan.actions).toEqual([
-      expect.objectContaining({
-        kind: 'remove-service',
-        service: expect.objectContaining({
-          label: 'happier-daemon.legacyPinned',
-          mode: 'user',
-          targetMode: 'pinned',
-          releaseChannel: 'stable',
-        }),
-      }),
-    ]);
+    const removedLabels = plan.actions.flatMap((action) => action.kind === 'remove-service' ? [action.service.label] : []);
+    expect(removedLabels.sort()).toEqual(['happier-daemon.cloud', 'happier-daemon.cloud-alias']);
+    expect(plan.actions.every((action) => action.kind === 'remove-service')).toBe(true);
   });
 
   it('keeps the preferred-mode compatible default service and removes the duplicate from the other mode', () => {

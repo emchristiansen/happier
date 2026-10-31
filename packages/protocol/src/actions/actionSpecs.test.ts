@@ -11,6 +11,10 @@ import {
 import { serializeActionSpec } from './actionCatalog.js';
 import { ActionApprovalSchema, ActionOperationDeclarationV1Schema, ActionSpecSchema, ActionSurfaceSchema, getActionSpec, isActionSpecSurfacedOn, listActionSpecs, listActionSpecsForSurface, listVoicePromptHotPathSpecs, resolveActionApprovalFlow } from './actionSpecs.js';
 
+it('accepts the existing empty mode id to clear a native override', () => {
+  expect(getActionSpec('session.mode.set').inputSchema.safeParse({ modeId: '' }).success).toBe(true);
+});
+
 const RESULT_REQUIRED_BLOCKING_ACTION_IDS = [
   'action.spec.search',
   'action.spec.get',
@@ -21,6 +25,7 @@ const RESULT_REQUIRED_BLOCKING_ACTION_IDS = [
   'session.status.get',
   'session.work_state.get',
   'session.goal.get',
+  'session.goal.clear',
   'session.terminalComposer.clear',
   'session.pendingInput.interruptAndRun',
   'session.pendingInput.markHandled',
@@ -60,7 +65,6 @@ const RESULT_NONE_DEFERRED_ACTION_IDS = [
   'session.permission_mode.set',
   'session.model.set',
   'session.goal.set',
-  'session.goal.clear',
   'session.usageLimit.waitResume.enable',
   'session.usageLimit.waitResume.cancel',
   'session.archive',
@@ -97,6 +101,7 @@ const RESULT_OPTIONAL_DEFERRED_ACTION_IDS = [
 ] as const;
 
 const EXTERNALLY_CONTROLLABLE_SESSION_AGENT_UNSUPPORTED_ACTIONS = {
+  'session.handoff': 'moving the current session between machines stays an external orchestration decision.',
   'voice_agent.start': 'voice-agent launches are a separate user-facing runtime surface, not an in-session self-control primitive.',
   'session.spawn_picker': 'the interactive spawn picker remains UI/external-client only; in-session agents use session.spawn_new.',
   'session.terminalComposer.clear': 'clearing a human terminal composer is an explicit human/UI decision.',
@@ -112,6 +117,12 @@ function sorted(values: readonly string[]): string[] {
 }
 
 describe('Action Spec Registry', () => {
+  it('does not advertise CLI-only localId on shared session send tools', () => {
+    const spec = getActionSpec('session.message.send');
+    const schema = z.toJSONSchema(spec.inputSchema, { target: 'draft-7' });
+    expect(schema.properties).not.toHaveProperty('localId');
+  });
+
   it('recommends current-session omission in execution-run start examples', () => {
     for (const actionId of [
       'review.start',
@@ -605,7 +616,7 @@ describe('Action Spec Registry', () => {
     expect(getActionSpec('session.work_state.get' as any).bindings?.mcpToolName).toBe('session_work_state_get');
     expect(getActionSpec('session.goal.get' as any).approval).toEqual({ result: 'required' });
     expect(getActionSpec('session.goal.set' as any).approval).toEqual({ result: 'none' });
-    expect(getActionSpec('session.goal.clear' as any).approval).toEqual({ result: 'none' });
+    expect(getActionSpec('session.goal.clear').approval).toEqual({ result: 'required' });
     expect(getActionSpec('session.vendor_plugin_catalog.list' as any).bindings?.mcpToolName).toBe('session_vendor_plugin_catalog_list');
     expect(getActionSpec('session.skill_catalog.list' as any).bindings?.mcpToolName).toBe('session_skill_catalog_list');
   });
@@ -679,13 +690,57 @@ describe('Action Spec Registry', () => {
     expect(spec.inputSchema.parse({
       intent: 'delegate',
       backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
-      permissionMode: 'default',
+      permissionMode: 'auto',
       retentionPolicy: 'ephemeral',
       runClass: 'bounded',
       ioMode: 'request_response',
       waitForCompletion: true,
-      waitTimeoutSeconds: 5,
-    })).toMatchObject({ waitForCompletion: true, waitTimeoutSeconds: 5 });
+      waitTimeoutSeconds: 3_600,
+    })).toMatchObject({
+      permissionMode: 'workspace_write',
+      waitForCompletion: true,
+      waitTimeoutSeconds: 3_600,
+    });
+
+    for (const legacyAlias of ['workspace_write', 'safe-yolo', 'acceptEdits']) {
+      expect(spec.inputSchema.parse({
+        intent: 'delegate',
+        backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+        permissionMode: legacyAlias,
+        retentionPolicy: 'ephemeral',
+        runClass: 'bounded',
+        ioMode: 'request_response',
+      }).permissionMode).toBe('workspace_write');
+    }
+    expect(spec.inputSchema.parse({
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      permissionMode: 'bypassPermissions',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+    }).permissionMode).toBe('yolo');
+    expect(spec.inputSchema.safeParse({
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      permissionMode: 'surprise-me',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+    }).success).toBe(false);
+
+    const permissionModeHint = spec.inputHints?.fields.find((field) => field.path === 'permissionMode');
+    expect(permissionModeHint?.description).toContain('read_only | default | auto | yolo');
+    expect(spec.inputSchema.safeParse({
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      permissionMode: 'auto',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+      waitForCompletion: true,
+      waitTimeoutSeconds: 3_601,
+    }).success).toBe(false);
   });
 
   it('exposes execution.run.wait for cli and external mcp surfaces', () => {
@@ -697,11 +752,16 @@ describe('Action Spec Registry', () => {
       sessionId: 'session_1',
       runId: 'run_1',
     });
-    expect(spec.inputSchema.parse({ sessionId: 'session_1', runId: 'run_1', timeoutSeconds: 7_200 })).toEqual({
+    expect(spec.inputSchema.parse({ sessionId: 'session_1', runId: 'run_1', timeoutSeconds: 3_600 })).toEqual({
       sessionId: 'session_1',
       runId: 'run_1',
-      timeoutSeconds: 7_200,
+      timeoutSeconds: 3_600,
     });
+    expect(spec.inputSchema.safeParse({
+      sessionId: 'session_1',
+      runId: 'run_1',
+      timeoutSeconds: 3_601,
+    }).success).toBe(false);
   });
 
   it('keeps the execution-run observation/control surface coherent for session agents', () => {
@@ -1262,10 +1322,11 @@ describe('Action Spec Registry', () => {
       instructions: 'Do it.',
     };
 
-    for (const permissionMode of ['read_only', 'default', 'workspace_write', 'yolo']) {
-      const parsed = (spec.inputSchema as z.ZodTypeAny).safeParse({ ...baseInput, permissionMode });
-      expect(parsed.success, permissionMode).toBe(true);
-    }
+    expect((spec.inputSchema as z.ZodTypeAny).parse({ ...baseInput, permissionMode: 'read_only' }).permissionMode).toBe('read_only');
+    expect((spec.inputSchema as z.ZodTypeAny).parse({ ...baseInput, permissionMode: 'default' }).permissionMode).toBe('default');
+    expect((spec.inputSchema as z.ZodTypeAny).parse({ ...baseInput, permissionMode: 'auto' }).permissionMode).toBe('workspace_write');
+    expect((spec.inputSchema as z.ZodTypeAny).parse({ ...baseInput, permissionMode: 'yolo' }).permissionMode).toBe('yolo');
+    expect((spec.inputSchema as z.ZodTypeAny).parse({ ...baseInput, permissionMode: 'workspace_write' }).permissionMode).toBe('workspace_write');
 
     const invalid = (spec.inputSchema as z.ZodTypeAny).safeParse({
       ...baseInput,
@@ -1274,12 +1335,39 @@ describe('Action Spec Registry', () => {
     expect(invalid.success).toBe(false);
     if (!invalid.success) {
       expect(invalid.error.issues[0]?.path).toEqual(['permissionMode']);
-      expect(invalid.error.issues[0]?.message).toContain('read_only');
-      expect(invalid.error.issues[0]?.message).toContain('workspace_write');
     }
 
     const permissionModeHint = spec.inputHints?.fields.find((field) => field.path === 'permissionMode');
-    expect(permissionModeHint?.description).toContain('read_only | default | workspace_write | yolo');
+    expect(permissionModeHint?.description).toContain('read_only | default | auto | yolo');
+  });
+
+  it('advertises current session permission intent names while accepting compatible aliases', () => {
+    const spec = getActionSpec('session.permission_mode.set');
+
+    expect(spec.description).toContain('read_only/default/auto/yolo');
+    expect((spec.inputSchema as z.ZodTypeAny).parse({
+      sessionId: 'session-1',
+      permissionMode: 'auto',
+    })).toEqual({
+      sessionId: 'session-1',
+      permissionMode: 'safe-yolo',
+    });
+    expect((spec.inputSchema as z.ZodTypeAny).parse({
+      sessionId: 'session-1',
+      permissionMode: 'workspace_write',
+    }).permissionMode).toBe('safe-yolo');
+    expect((spec.inputSchema as z.ZodTypeAny).parse({
+      sessionId: 'session-1',
+      permissionMode: 'acceptEdits',
+    }).permissionMode).toBe('acceptEdits');
+    expect((spec.inputSchema as z.ZodTypeAny).parse({
+      sessionId: 'session-1',
+      permissionMode: 'bypassPermissions',
+    }).permissionMode).toBe('bypassPermissions');
+    expect((spec.inputSchema as z.ZodTypeAny).safeParse({
+      sessionId: 'session-1',
+      permissionMode: 'not-a-mode',
+    }).success).toBe(false);
   });
 
   it('defaults voice agent start to long-lived streaming', () => {

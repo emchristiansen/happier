@@ -15,10 +15,10 @@ import {
   CLAUDE_GOAL_WORK_STATE_ITEM_ID,
   CLAUDE_GOAL_WORK_STATE_SOURCE_FAMILY,
 } from '../workState/claudeGoalStatus';
-import type { ClaudeWorkflowActivitySource } from '../workflows/claudeWorkflowActivitySource';
+import type { ClaudeWorkflowActivitySource, ClaudeWorkflowActivityObservationContext } from '../workflows/claudeWorkflowActivitySource';
 import { filterWorkflowOwnedWorkStateItems } from '../workflows/claudeWorkflowOwnedWorkState';
-import { mapClaudeRateLimitEventToUsageDetails, type NormalizedProviderUsageLimitDetailsV1 } from '../connectedServices/mapClaudeRateLimitEventToUsageDetails';
-import { surfaceClaudeRateLimitRuntimeIssue } from '../connectedServices/surfaceClaudeRuntimeIssues';
+import { mapClaudeRateLimitEventToQuotaEvidence, mapClaudeProviderFailureToUsageDetails, type NormalizedProviderUsageLimitDetailsV1 } from '../connectedServices/mapClaudeRateLimitEventToUsageDetails';
+import { recordClaudeRateLimitQuotaEvidence, surfaceClaudeRateLimitRuntimeIssue } from '../connectedServices/surfaceClaudeRuntimeIssues';
 import {
   buildClaudeCompactBoundaryEventIdentity,
   buildClaudeCompactionCompletedEvent,
@@ -27,6 +27,10 @@ import {
 } from '../contextCompactionEvents';
 import { applyClaudeEffectiveModelUpdate } from '../sessionModels/effectiveModelUpdate';
 import { readClaudeMainChainAssistantModelId } from '../sessionModels/readClaudeMainChainAssistantModelId';
+import {
+  isClaudeMainChainCompactBoundary,
+  isClaudeSidechainTranscriptMessage,
+} from './readClaudeTranscriptTurnSignal';
 
 type ClaudeLocalWorkStateSnapshot = ReturnType<typeof buildClaudeTodoWriteWorkState>
   & Readonly<{ ownedSourceFamilies?: readonly string[] }>;
@@ -91,10 +95,6 @@ function readCompactCommandMarkerKind(message: RawJSONLines): CompactCommandMark
   return null;
 }
 
-function readSystemSubtype(message: RawJSONLines): string | null {
-  return message.type === 'system' ? readString((message as Record<string, unknown>).subtype) : null;
-}
-
 export function createClaudeSessionTranscriptProjector(params: Readonly<{
   session: Session;
   logPrefix: string;
@@ -112,7 +112,7 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
   observeCommitted(message: RawJSONLines): Promise<void>;
   observeRaw(
     value: unknown,
-    observation?: Readonly<{ historicalReplay?: boolean }>,
+    observation?: ClaudeWorkflowActivityObservationContext,
   ): void;
   /**
    * Remove the published Claude goal work-state item (used by the active-session clear effector,
@@ -127,8 +127,8 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
   /** Drain pending workflow-activity writes immediately (turn end / stream close / finalize). No-op without a source. */
   flushWorkflowActivity(): Promise<void>;
   /**
-   * The ONE teardown observation for every shutdown-sensitive source this projector owns. Call it
-   * from an OBSERVED death (a launcher's graceful teardown) immediately BEFORE
+   * The ONE termination observation for every shutdown-sensitive source this projector owns.
+   * Call only after verified provider termination; wrapper teardown alone is insufficient. Call BEFORE
    * `flushWorkflowActivity()`, so the resolved state is what gets drained.
    *
    * - G-6 goal: an active/unmet Claude goal is republished with `statusReason:'interrupted'`
@@ -245,6 +245,7 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
     if (!modelId) return;
     applyClaudeEffectiveModelUpdate({
       client: params.session.client,
+      reconcileModels: params.session.reconcileSessionModels,
       modelId,
       source: 'transcript',
       logPrefix: params.logPrefix,
@@ -258,7 +259,9 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
     sequence: ++compactionSequence,
   });
   const maybeEmitCompactionEvents = (message: RawJSONLines): void => {
-    if (readSystemSubtype(message) === 'compact_boundary') {
+    if (isClaudeSidechainTranscriptMessage(message)) return;
+
+    if (isClaudeMainChainCompactBoundary(message)) {
       const messageRecord = message as Record<string, unknown>;
       const providerSessionId = readString(messageRecord.session_id);
       const providerEventId = buildClaudeCompactBoundaryEventIdentity({
@@ -295,7 +298,7 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
   const observeWithVisibleSender = (
     message: RawJSONLines,
     sender: (visibleMessage: RawJSONLines) => void,
-    options?: Readonly<{ historicalReplay?: boolean }>,
+    options?: ClaudeWorkflowActivityObservationContext,
   ): void => {
       const previousSender = sendVisibleMessage;
       sendVisibleMessage = sender;
@@ -304,7 +307,13 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
         maybeAdoptEffectiveModel(message);
         maybeProjectWorkState(message);
         maybeEmitCompactionEvents(message);
-        const rateLimitDetails = mapClaudeRateLimitEventToUsageDetails(message);
+        const quotaEvidence = mapClaudeRateLimitEventToQuotaEvidence(message);
+        if (quotaEvidence.length > 0) {
+          void recordClaudeRateLimitQuotaEvidence(params.session, quotaEvidence, params.logPrefix).catch(() => {
+            logger.infoFile(`${params.logPrefix} Failed to record Claude quota evidence`);
+          });
+        }
+        const rateLimitDetails = mapClaudeProviderFailureToUsageDetails(message);
         if (rateLimitDetails) surfaceRateLimit(rateLimitDetails);
       }
       if (isClaudeInternalTranscriptMessage(message)) {

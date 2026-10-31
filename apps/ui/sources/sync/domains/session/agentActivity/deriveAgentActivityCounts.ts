@@ -44,6 +44,8 @@ export type AgentActivityCountable = Readonly<{
     id: string;
     kind: AgentActivityCountKind;
     status: AgentActivityStatusV1;
+    /** False means an available retained handle has no current work. */
+    isActive?: boolean;
     /** The unit this one belongs to, when it belongs to one. Grouping and layout only. */
     parentId?: string | null;
     /**
@@ -155,7 +157,7 @@ export const EMPTY_AGENT_ACTIVITY_COUNTS: AgentActivityCounts = Object.freeze({
  * the composer's "never announce success" rule expressed as arithmetic rather than as a branch
  * someone can forget.
  */
-function resolveCountBucket(status: AgentActivityStatusV1): 'live' | 'failed' | null {
+function resolveCountBucket(status: AgentActivityStatusV1, isActive?: boolean): 'live' | 'failed' | null {
     switch (status) {
         case 'failed':
             return 'failed';
@@ -164,7 +166,7 @@ function resolveCountBucket(status: AgentActivityStatusV1): 'live' | 'failed' | 
         case 'running':
         case 'blocked':
         case 'waiting':
-            return 'live';
+            return isActive === false ? null : 'live';
         case 'succeeded':
         case 'timedOut':
         case 'cancelled':
@@ -220,7 +222,7 @@ export function deriveAgentActivityCounts(
     const liveRunEntryIdByRunId = new Map<string, string>();
     for (const entry of entries) {
         if (entry.kind !== 'workflow') continue;
-        if (resolveCountBucket(entry.status) !== 'live') continue;
+        if (resolveCountBucket(entry.status, entry.isActive) !== 'live') continue;
         liveRuns.push(entry);
         liveRunEntryIds.add(entry.id);
         const runId = normalizeId(entry.runId);
@@ -236,7 +238,7 @@ export function deriveAgentActivityCounts(
     const liveNamedMembersByRunEntryId = new Map<string, number>();
     if (liveRuns.length > 0) {
         for (const entry of entries) {
-            if (resolveCountBucket(entry.status) !== 'live') continue;
+            if (resolveCountBucket(entry.status, entry.isActive) !== 'live') continue;
             const runEntryId = resolveDescribingRunId(entry, liveRunEntryIds, liveRunEntryIdByRunId);
             if (runEntryId === null) continue;
             liveNamedMembersByRunEntryId.set(runEntryId, (liveNamedMembersByRunEntryId.get(runEntryId) ?? 0) + 1);
@@ -276,7 +278,7 @@ export function deriveAgentActivityCounts(
     for (const entry of entries) {
         if (groupingIds.has(entry.id)) continue;
         total += 1;
-        const bucket = resolveCountBucket(entry.status);
+        const bucket = resolveCountBucket(entry.status, entry.isActive);
         if (bucket === 'live') {
             if (entry.kind === 'backgroundTask') liveBackgroundTasks += 1;
             else if (

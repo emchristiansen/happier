@@ -1,8 +1,9 @@
 import type * as React from 'react';
+import { DEFAULT_ACTIONS_SETTINGS_V1, type ActionsSettingsV1 } from '@happier-dev/protocol';
 
 import { t } from '@/text';
 
-import { getSessionActionMetadata } from './sessionActionMetadata';
+import { getSessionActionMetadata, resolveSessionArchiveActionPolicy } from './sessionActionMetadata';
 import type { IconName } from '@/components/ui/icons/Icon';
 import {
     SESSION_BULK_ACTION_IDS,
@@ -38,6 +39,7 @@ export function listSessionBulkActionDescriptors(params: Readonly<{
     targets: readonly SessionBulkActionTarget[];
     tagsEnabled: boolean;
     moveEnabled: boolean;
+    actionsSettings?: ActionsSettingsV1;
 }>): SessionBulkActionDescriptor[] {
     const targets = params.targets;
     if (targets.length === 0) return [];
@@ -52,15 +54,24 @@ export function listSessionBulkActionDescriptors(params: Readonly<{
     const hasStanding = targets.some((target) => target.standing === true);
     const hasNonStanding = targets.some((target) => target.standing === false);
     const descriptors: SessionBulkActionDescriptor[] = [];
+    const archivePolicy = resolveSessionArchiveActionPolicy({
+        actionId: SESSION_BULK_ACTION_IDS.archive,
+        settings: params.actionsSettings ?? DEFAULT_ACTIONS_SETTINGS_V1,
+        requiresStop: targets.some((target) => target.active === true && target.canArchive === true && target.archived !== true),
+    });
+    const unarchivePolicy = resolveSessionArchiveActionPolicy({
+        actionId: SESSION_BULK_ACTION_IDS.unarchive,
+        settings: params.actionsSettings ?? DEFAULT_ACTIONS_SETTINGS_V1,
+    });
 
     if (hasStoppableActive) {
         descriptors.push(createBulkDescriptor(SESSION_BULK_ACTION_IDS.stop));
     }
-    if (hasArchivableUnarchived) {
-        descriptors.push(createBulkDescriptor(SESSION_BULK_ACTION_IDS.archive));
+    if (hasArchivableUnarchived && archivePolicy.enabled) {
+        descriptors.push({ ...createBulkDescriptor(SESSION_BULK_ACTION_IDS.archive), ...archivePolicy });
     }
-    if (hasUnarchivableArchived) {
-        descriptors.push(createBulkDescriptor(SESSION_BULK_ACTION_IDS.unarchive));
+    if (hasUnarchivableArchived && unarchivePolicy.enabled) {
+        descriptors.push({ ...createBulkDescriptor(SESSION_BULK_ACTION_IDS.unarchive), ...unarchivePolicy });
     }
     if (hasUnread) {
         descriptors.push(createBulkDescriptor(SESSION_BULK_ACTION_IDS.markRead));
@@ -87,7 +98,7 @@ export function listSessionBulkActionDescriptors(params: Readonly<{
         }
         descriptors.push(createBulkDescriptor(SESSION_BULK_ACTION_IDS.tagsSet));
     }
-    if (params.moveEnabled) {
+    if (params.moveEnabled && targets.some((target) => target.canMoveToFolder !== false)) {
         descriptors.push(createBulkDescriptor(SESSION_BULK_ACTION_IDS.moveToFolder));
     }
 

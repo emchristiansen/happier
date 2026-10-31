@@ -145,4 +145,21 @@ describe('sessionSetAttentionStandingWithServerScope', () => {
             .toBeUndefined();
         credentialsSpy.mockRestore();
     });
+
+    it('clears a reminder through the same standing mutation owner', async () => {
+        const { TokenStorage } = await import('@/auth/storage/tokenStorage');
+        const credentialsSpy = vi.spyOn(TokenStorage, 'getCredentialsForServerUrl')
+            .mockResolvedValue({ token: 'token-a', secret: 'secret-a' });
+        const { sessionClearAttentionReminderWithServerScope } = await import('./setSessionAttentionStanding');
+        apiMocks.setSessionAttentionStanding.mockResolvedValueOnce({ standing: null });
+
+        const result = await sessionClearAttentionReminderWithServerScope('s1', { serverId: SCOPE_ID });
+
+        expect(result).toEqual({ success: true });
+        expect(apiMocks.setSessionAttentionStanding).toHaveBeenCalledWith(expect.objectContaining({
+            sessionId: 's1',
+            request: { remindAt: null },
+        }));
+        credentialsSpy.mockRestore();
+    });
 });

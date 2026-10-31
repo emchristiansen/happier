@@ -340,6 +340,10 @@ test('SSH tunnel owns the reverse forward independently from the monitored worke
     [
       '-T',
       '-o',
+      'ControlMaster=no',
+      '-o',
+      'ControlPath=none',
+      '-o',
       'BatchMode=yes',
       '-o',
       'ExitOnForwardFailure=yes',

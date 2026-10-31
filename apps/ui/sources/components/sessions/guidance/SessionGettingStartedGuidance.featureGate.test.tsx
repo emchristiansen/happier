@@ -7,7 +7,7 @@ import { installSessionGuidanceCommonModuleMocks } from './sessionGuidanceTestHe
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 vi.mock('expo-clipboard', () => ({
-    setStringAsync: vi.fn(async (_text: string) => {}),
+    setStringAsync: vi.fn(async (_text: string) => true),
 }));
 
 vi.mock('expo-constants', () => ({
@@ -31,6 +31,7 @@ vi.mock('@/constants/Typography', () => ({
     Typography: {
         default: () => ({}),
         mono: () => ({}),
+        eyebrow: () => ({}),
     },
 }));
 

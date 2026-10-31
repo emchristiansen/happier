@@ -2,6 +2,7 @@ import {
     SessionAgentTransitionBriefPreviewRequestV1Schema,
     SessionAgentTransitionBriefPreviewV1Schema,
     type SessionAgentTransitionBriefPreviewV1,
+    type BackendTargetRefV1,
 } from '@happier-dev/protocol';
 import { RPC_ERROR_CODES, RPC_METHODS } from '@happier-dev/protocol/rpc';
 
@@ -47,6 +48,8 @@ export type PreviewSessionAgentTransitionBriefOnMachineInput = Readonly<{
     /** The boundary's two Agents, exactly as the divider records them. */
     sourceAgentId: string;
     targetAgentId: string;
+    sourceBackendTarget?: BackendTargetRefV1;
+    targetBackendTarget?: BackendTargetRefV1;
 }>;
 
 /**
@@ -70,6 +73,8 @@ export async function previewSessionAgentTransitionBriefOnMachine(
             : { returningAgentLastSeenSeqInclusive: input.returningAgentLastSeenSeqInclusive }),
         sourceAgentId: input.sourceAgentId,
         targetAgentId: input.targetAgentId,
+        ...(input.sourceBackendTarget ? { sourceBackendTarget: input.sourceBackendTarget } : {}),
+        ...(input.targetBackendTarget ? { targetBackendTarget: input.targetBackendTarget } : {}),
     });
     let raw: unknown;
     try {

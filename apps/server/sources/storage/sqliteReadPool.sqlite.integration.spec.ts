@@ -253,3 +253,25 @@ describe("SQLite without a read pool (shipped default): behaviour unchanged", ()
         expect(text).not.toContain("happier_sqlite_read_pool_");
     });
 });
+
+
+describe("SQLite read-pool startup with a native hash filename", () => {
+    it("initializes both clients on the same physical database", async () => {
+        const harness = await createLightSqliteHarness({
+            tempDirPrefix: "happier-sqlite-read-pool-hash#-",
+            initAuth: false, initEncrypt: false, initFiles: false,
+            env: { HAPPIER_SQLITE_READ_POOL_SIZE: "2" },
+        });
+        try {
+            expect(harness.dbPath).toContain("hash#");
+            const account = await createAccount();
+            await expect(db.account.findUnique({ where: { id: account.id }, select: { publicKey: true } }))
+                .resolves.toEqual({ publicKey: account.publicKey });
+            const databases = await db.$queryRawUnsafe<Array<{ name: string; file: string }>>("PRAGMA database_list");
+            expect(databases.find((database) => database.name === "main")?.file).toBe(harness.dbPath);
+            expect(await db.$metrics.prometheus()).toContain("happier_sqlite_read_pool_prisma_pool_connections_open");
+        } finally {
+            await harness.close();
+        }
+    }, 120_000);
+});

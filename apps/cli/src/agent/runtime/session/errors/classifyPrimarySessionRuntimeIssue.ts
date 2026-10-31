@@ -11,6 +11,8 @@ import {
 } from '@happier-dev/protocol';
 
 import { classifyProviderLimitEvidence } from '@/daemon/connectedServices/quotas/normalization';
+import { classifyProviderOutputFailure } from '@/agent/runtime/classifyProviderOutputFailure';
+import { ProviderCliNotFoundError } from '@/runtime/managedTools/requireProviderCliCommand';
 
 export type PrimarySessionRuntimeIssueCause =
   | 'status_error'
@@ -86,7 +88,7 @@ function refineStatusErrorSource(input: ClassifyPrimarySessionRuntimeIssueInput)
   if (/\btemporar(?:y|ily)\s+limiting\s+requests\b/u.test(text) && /\bnot\s+your\s+usage\s+limit\b/u.test(text)) {
     return 'provider_status_error';
   }
-  if (/\b(unauthorized|unauthenticated|authentication|auth|login required|not logged in|api key|401|403)\b/u.test(text)) {
+  if (classifyProviderOutputFailure(text).authenticationError) {
     return 'auth_error';
   }
   if (/\b(permission denied|permission blocked|blocked by policy|not allowed|access denied)\b/u.test(text)) {
@@ -404,12 +406,13 @@ export function classifyPrimarySessionRuntimeIssue(
   input: ClassifyPrimarySessionRuntimeIssueInput,
 ): SessionRuntimeIssueV1 {
   const provider = normalizeNonEmptyString(input.provider);
+  const missingCli = input.error instanceof ProviderCliNotFoundError ? input.error : null;
   const piBrokerReadinessFailure = provider === 'pi' ? readPiBrokerReadinessFailure(input.error) : null;
   const runtimeAuthClassification = readRuntimeAuthClassification(input.error);
   const runtimeAuthUsageLimit = buildUsageLimitDetailsFromRuntimeAuthClassification(runtimeAuthClassification);
   const runtimeAuthSource = refineRuntimeAuthClassificationSource(runtimeAuthClassification);
   const providerProcessExitAfterSwitch = readProviderProcessExitAfterSwitchDetails(input.error);
-  const source = piBrokerReadinessFailure
+  const source = missingCli || piBrokerReadinessFailure
     ? 'dependency_failure'
     : runtimeAuthSource
     ? runtimeAuthSource
@@ -434,7 +437,7 @@ export function classifyPrimarySessionRuntimeIssue(
     scope: 'primary_session',
     status: 'failed',
     code: temporaryThrottle === null
-      ? piBrokerReadinessFailure?.code ?? piProviderFailure?.code ?? source
+      ? (missingCli ? 'provider_cli_not_found' : null) ?? piBrokerReadinessFailure?.code ?? piProviderFailure?.code ?? source
       : 'provider_temporary_throttle',
     source,
     occurredAt,
@@ -442,7 +445,8 @@ export function classifyPrimarySessionRuntimeIssue(
     ...(provider === null ? {} : { provider }),
     ...(providerTurnId === null ? {} : { providerTurnId }),
     sanitizedPreview: temporaryThrottle === null
-      ? piBrokerReadinessFailure?.sanitizedPreview
+      ? missingCli?.message
+        ?? piBrokerReadinessFailure?.sanitizedPreview
         ?? piProviderFailure?.sanitizedPreview
         ?? buildSafeModelNotFoundPreview(input.error)
         ?? buildSafePiTerminalDiagnosticPreview({ provider, error: input.error })

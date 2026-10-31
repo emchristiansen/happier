@@ -1,3 +1,4 @@
+import type { SessionListBackgroundWorkAttentionMode } from '@/sync/domains/session/listing/sessionListBackgroundWorkAttention';
 import type { SessionListViewItem } from '@/sync/domains/session/listing/sessionListViewData';
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
 import type { Session } from '@/sync/domains/state/storageTypes';
@@ -5,7 +6,7 @@ import type { SessionMessages } from '@/sync/store/domains/messages';
 import type { SessionPending } from '@/sync/store/domains/pending';
 import type { SessionStatus } from '@/utils/sessions/sessionUtils';
 import type { SessionListSecondaryLineMode } from '@/sync/domains/session/listing/deriveSessionListActivity';
-import type { SessionAttentionStandingPolicy } from '@/sync/domains/session/organization/attentionStanding';
+import type { SessionAttentionStandingPolicy, SessionReminderPresentation } from '@/sync/domains/session/organization/attentionStanding';
 import type { SessionRowAttentionState, SessionRowDensity, SessionRowPresentation } from './resolveSessionRowPresentation';
 
 export type SessionListRowSessionItem = Extract<SessionListViewItem, { type: 'session' }>;
@@ -37,6 +38,7 @@ export type SessionListRowPresentationSettings = Readonly<{
     activeColorMode: 'activityAndAttention' | 'attentionOnly' | 'allActive';
     workingIndicatorMode: 'spinner' | 'pulse';
     workingTextMode: 'animated' | 'static';
+    backgroundWorkAttentionMode?: SessionListBackgroundWorkAttentionMode;
     statusColors: Readonly<{
         connected: string;
         connecting: string;
@@ -86,7 +88,6 @@ export type SessionListRowModel = Readonly<{
     serverName?: string;
     treeRowId: string;
     testID: string;
-    dataIndex: number;
     session: Session | SessionListRenderableSession;
     status: SessionStatus;
     statusSignature: string;
@@ -121,6 +122,8 @@ export type SessionListRowModel = Readonly<{
      * remove it from Needs attention.
      */
     isAttentionStanding: boolean;
+    /** The canonical reminder state; rows and menus must never re-derive it independently. */
+    reminder: SessionReminderPresentation | null;
     attentionStandingEnabled: boolean;
     isArchived: boolean;
     isActive: boolean;

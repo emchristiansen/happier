@@ -115,7 +115,7 @@ export function useAgentActivitySurfaceModel(params: Readonly<{
     const foldedWorkingCount = React.useMemo(() => {
         let printed = 0;
         for (const entry of listedEntries) {
-            if (resolveAgentActivitySectionId(entry.status) === 'working') printed += 1;
+            if (resolveAgentActivitySectionId(entry.status, entry.isActive) === 'working') printed += 1;
         }
         return Math.max(0, counts.live - printed);
     }, [counts.live, listedEntries]);

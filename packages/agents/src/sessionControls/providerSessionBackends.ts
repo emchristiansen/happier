@@ -97,28 +97,21 @@ export function resolveOpenCodeSessionBackendMode(params: Readonly<{
   return configuredKind === 'server' || configuredKind === 'acp' ? configuredKind : null;
 }
 
+export function resolveAgentRuntimeKindForSession(params: Readonly<{
+  agentId: AgentId;
+  metadata: unknown;
+  accountSettings?: Record<string, unknown> | null;
+}>): AgentRuntimeKind | null {
+  if (params.agentId === 'codex') return resolveCodexSessionBackendMode(params);
+  if (params.agentId === 'opencode') return resolveOpenCodeSessionBackendMode(params);
+  return null;
+}
+
 export function resolveAgentRuntimeControlSurfaceForSession(params: Readonly<{
   agentId: AgentId;
   metadata: unknown;
   accountSettings?: Record<string, unknown> | null;
 }>): AgentCoreRuntimeControlSurface | null {
-  if (params.agentId === 'codex') {
-    const runtimeKind = resolvePersistedCodexRuntimeIdentity(params.metadata)?.backendMode
-      ?? (() => {
-        const configured = resolveAgentConfiguredRuntimeKind({ agentId: 'codex', accountSettings: params.accountSettings });
-        return normalizeCodexBackendMode(configured);
-      })();
-    return resolveAgentRuntimeControlSurface('codex', runtimeKind);
-  }
-
-  if (params.agentId === 'opencode') {
-    const runtimeKind = readOpenCodeSessionAffinityFromMetadata(params.metadata).backendMode
-      ?? (() => {
-        const configured = resolveAgentConfiguredRuntimeKind({ agentId: 'opencode', accountSettings: params.accountSettings });
-        return configured === 'server' || configured === 'acp' ? configured : null;
-      })();
-    return resolveAgentRuntimeControlSurface('opencode', runtimeKind);
-  }
-
-  return null;
+  const runtimeKind = resolveAgentRuntimeKindForSession(params);
+  return runtimeKind ? resolveAgentRuntimeControlSurface(params.agentId, runtimeKind) : null;
 }

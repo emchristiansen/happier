@@ -55,6 +55,7 @@ describe('Claude launcher refresh capability', () => {
       const client = createMutableApiSessionClientFixture({
         metadata: createTestMetadata({ path: dir, homeDir: dir, happyHomeDir: dir, flavor: 'claude' }),
         overrides: {
+          sessionId: 'happier-refresh-session',
           getAgentStateSnapshot: () => ({ requests: {}, completedRequests: {} }),
           updateAgentState: vi.fn(),
           sendSessionEvent: vi.fn(),
@@ -80,12 +81,18 @@ describe('Claude launcher refresh capability', () => {
         claudeRemoteAgentSdkEnabled: true,
         claudeUnifiedTerminalEnabled: false,
       }, { userMessageLocalId: 'refresh-capability-prompt' });
+      const sdkBoundary = await import('@anthropic-ai/claude-agent-sdk');
+      const daemonBoundary = await import('@/daemon/controlClient');
+      expect(sdkBoundary.query).toBe(query);
+      expect(vi.isMockFunction(sdkBoundary.query)).toBe(true);
+      expect(daemonBoundary.notifyDaemonSessionStarted).toBe(notifyDaemon);
+      expect(vi.isMockFunction(daemonBoundary.notifyDaemonSessionStarted)).toBe(true);
       const { claudeRemoteLauncher } = await import('./claudeRemoteLauncher');
       const launch = claudeRemoteLauncher(session);
       try {
         // A startup rejection must fail the test rather than leave a pending readiness wait.
         await Promise.race([enteredSdk.promise, launch.then(() => { throw new Error('Launcher exited before SDK query'); })]);
-        expect(notifyDaemon.mock.calls).toContainEqual(['claude-refresh-session', expect.objectContaining({
+        expect(notifyDaemon.mock.calls).toContainEqual(['happier-refresh-session', expect.objectContaining({
             claudeSubscriptionAccessTokenRefreshV1: { v: 1, mode: 'unavailable' },
         }), expect.any(Object)]);
       } finally {

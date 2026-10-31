@@ -7,6 +7,7 @@ import {
 } from '@happier-dev/protocol';
 
 import { BasePermissionHandler, type PermissionResult } from './BasePermissionHandler';
+import { SessionPermissionRpcRouter } from './sessionPermissionRpcRouter';
 
 class FakeRpcHandlerManager {
   handlers = new Map<string, (payload: any) => any>();
@@ -32,6 +33,13 @@ class FakeSession {
     return this.agentState;
   }
 
+  async updateAgentStateRequestSettlement(updater: Parameters<FakeSession['updateAgentState']>[0]): Promise<void> {
+
+    await this.updateAgentState(updater);
+
+  }
+
+
   updateAgentState(updater: any) {
     this.agentState = updater(this.agentState);
     return this.agentState;
@@ -43,15 +51,8 @@ class TestPermissionHandler extends BasePermissionHandler {
     return '[Test]';
   }
 
-  publishPending(toolCallId: string, toolName: string, input: unknown): void {
-    this.addPendingRequestToState(toolCallId, toolName, input);
-  }
-
   request(toolCallId: string, toolName: string, input: unknown): Promise<PermissionResult> {
-    return new Promise<PermissionResult>((resolve, reject) => {
-      this.pendingRequests.set(toolCallId, { resolve, reject, toolName, input });
-      this.addPendingRequestToState(toolCallId, toolName, input);
-    });
+    return this.requestPermissionDecision(toolCallId, toolName, input);
   }
 }
 
@@ -111,7 +112,7 @@ describe('BasePermissionHandler push notifications', () => {
     await promise;
   });
 
-  it('dedupes repeated pending publications for the same request id', async () => {
+  it('dedupes pushes when another waiter joins the same request', async () => {
     const sendToAllDevicesAsync = vi.fn(async () => {});
     const session = new FakeSession();
     const settings = accountSettingsParse({
@@ -124,7 +125,7 @@ describe('BasePermissionHandler push notifications', () => {
 
     const input = { path: '/tmp/x', content: 'hi' };
     const p1 = handler.request('perm-1', 'Write', input);
-    handler.publishPending('perm-1', 'Write', input);
+    const p2 = handler.request('perm-1', 'Write', input);
 
     await Promise.resolve();
     await Promise.resolve();
@@ -132,10 +133,13 @@ describe('BasePermissionHandler push notifications', () => {
 
     const rpc = session.rpcHandlerManager.handlers.get('permission');
     await rpc?.({ id: 'perm-1', approved: false, decision: 'denied' });
-    await p1;
+    await expect(Promise.all([p1, p2])).resolves.toEqual([
+      { decision: 'denied' }, { decision: 'denied' },
+    ]);
   });
 
-  it('re-attempts permission-request push after a session swap while still pending', async () => {
+  it('keeps a reconnected permission answerable with its original occurrence and retries its push', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000);
     const sendToAllDevicesAsync = vi
       .fn(async () => {})
       .mockRejectedValueOnce(new Error('offline'))
@@ -144,6 +148,10 @@ describe('BasePermissionHandler push notifications', () => {
     const session1 = new FakeSession();
     const session2 = new FakeSession();
     session2.sessionId = 'session-two';
+    const router1 = new SessionPermissionRpcRouter(session1.rpcHandlerManager);
+    const router2 = new SessionPermissionRpcRouter(session2.rpcHandlerManager);
+    Object.assign(session1, { getOrCreatePermissionRpcRouter: () => router1 });
+    Object.assign(session2, { getOrCreatePermissionRpcRouter: () => router2 });
 
     const settings = accountSettingsParse({
       notificationsSettingsV1: { v: 1, pushEnabled: true, ready: true, permissionRequest: true },
@@ -158,14 +166,21 @@ describe('BasePermissionHandler push notifications', () => {
     await Promise.resolve();
     expect(sendToAllDevicesAsync).toHaveBeenCalledTimes(1);
 
+    const originalRequest = { ...session1.agentState.requests['perm-1'] };
+    clock.mockReturnValue(2_000);
     handler.updateSession(session2 as any);
     await Promise.resolve();
     await Promise.resolve();
     expect(sendToAllDevicesAsync).toHaveBeenCalledTimes(2);
+    expect(session2.agentState.requests['perm-1']).toEqual(originalRequest);
 
     const rpc = session2.rpcHandlerManager.handlers.get('permission');
     await rpc?.({ id: 'perm-1', approved: false, decision: 'denied' });
-    await promise;
+    await expect(promise).resolves.toMatchObject({ decision: 'denied' });
+    expect(session2.agentState.requests['perm-1']).toBeUndefined();
+    expect(session2.agentState.completedRequests['perm-1']).toMatchObject({
+      createdAt: 1_000, status: 'denied',
+    });
   });
 
   it('signs webhook notifications when account settings secrets read keys are provided', async () => {

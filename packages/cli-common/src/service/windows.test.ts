@@ -1,12 +1,131 @@
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  buildListWindowsScheduledTaskFolderPowerShellCommand,
   buildRemoveWindowsScheduledTaskIfPresentPowerShellCommand,
   buildReadWindowsScheduledTaskStatusPowerShellCommand,
   buildStopWindowsScheduledTaskIfRunningPowerShellCommand,
+  parseWindowsScheduledTaskFolderPowerShellJson,
   parseWindowsScheduledTaskStatusPowerShellJson,
   renderWindowsScheduledTaskWrapperPs1,
 } from './windows';
+
+describe('Windows scheduled task folder listing PowerShell helper', () => {
+  it('lists only the requested task folder instead of enumerating every scheduled task', () => {
+    const command = buildListWindowsScheduledTaskFolderPowerShellCommand({ taskFolder: '\\Happier\\' });
+
+    expect(command).toContain('Schedule.Service');
+    expect(command).toContain('.GetFolder("\\Happier")');
+    expect(command).toContain('ConvertTo-Json');
+    expect(command).not.toContain('schtasks');
+  });
+
+  it('parses task paths from invariant JSON and rejects anything else', () => {
+    expect(parseWindowsScheduledTaskFolderPowerShellJson('["\\\\Happier\\\\happier-daemon.default"]'))
+      .toEqual(['\\Happier\\happier-daemon.default']);
+    expect(parseWindowsScheduledTaskFolderPowerShellJson('[]')).toEqual([]);
+    // The COM producer emits explicit [] for an empty inventory; blank output proves nothing.
+    expect(parseWindowsScheduledTaskFolderPowerShellJson('')).toBeNull();
+    expect(parseWindowsScheduledTaskFolderPowerShellJson(' \r\n')).toBeNull();
+    expect(parseWindowsScheduledTaskFolderPowerShellJson('ERROR: The system cannot find the file specified.')).toBeNull();
+    expect(parseWindowsScheduledTaskFolderPowerShellJson('[1]')).toBeNull();
+  });
+
+  it.runIf(process.platform === 'win32')('reports a missing task folder as empty without parsing localized errors', () => {
+    const result = spawnSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+      buildListWindowsScheduledTaskFolderPowerShellCommand({ taskFolder: `\\HappierMissingFolderTest${process.pid}\\` }),
+    ], { encoding: 'utf8', windowsHide: true, timeout: 30_000 });
+
+    expect(result.status).toBe(0);
+    expect(parseWindowsScheduledTaskFolderPowerShellJson(result.stdout)).toEqual([]);
+  });
+});
+
+// Windows PowerShell 5.1 appends redirected streams as UTF-16LE; PowerShell 7 writes UTF-8.
+function readPowerShellLog(path: string): string {
+  const bytes = readFileSync(path);
+  const isUtf16 = (bytes[0] === 0xff && bytes[1] === 0xfe) || bytes.includes(0);
+  return bytes.toString(isUtf16 ? 'utf16le' : 'utf8').replace(/^\uFEFF/u, '');
+}
+
+function runWrapperWithWindowsPowerShell(params: Readonly<{
+  workingDirectory: string;
+  programArgs: readonly string[];
+}>): Readonly<{ status: number | null; stdoutLog: string; stderrLog: string }> {
+  const dir = mkdtempSync(join(tmpdir(), 'happier-wrapper-ps1-'));
+  try {
+    const stdoutPath = join(dir, 'out.log');
+    const stderrPath = join(dir, 'err.log');
+    const wrapperPath = join(dir, 'wrapper.ps1');
+    writeFileSync(wrapperPath, renderWindowsScheduledTaskWrapperPs1({
+      workingDirectory: params.workingDirectory,
+      programArgs: params.programArgs,
+      stdoutPath,
+      stderrPath,
+    }));
+    // The scheduled task action runs Windows PowerShell 5.1 (`powershell.exe`), not pwsh.
+    const result = spawnSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', wrapperPath,
+    ], { encoding: 'utf8', windowsHide: true, timeout: 30_000 });
+    const readIfPresent = (path: string) => {
+      try {
+        return readPowerShellLog(path);
+      } catch {
+        return '';
+      }
+    };
+    return { status: result.status, stdoutLog: readIfPresent(stdoutPath), stderrLog: readIfPresent(stderrPath) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('Windows scheduled task wrapper script', () => {
+  it.runIf(process.platform === 'win32')('keeps the program running when it writes to stderr and propagates its exit code', () => {
+    const result = runWrapperWithWindowsPowerShell({
+      workingDirectory: tmpdir(),
+      programArgs: [
+        process.execPath,
+        '-e',
+        "process.stderr.write('(node) [DEP0169] DeprecationWarning\\n'); setTimeout(() => { process.stdout.write('still-running\\n'); process.exit(3); }, 500);",
+      ],
+    });
+
+    expect(result.stdoutLog).toContain('still-running');
+    expect(result.stderrLog).toContain('DEP0169');
+    expect(result.status).toBe(3);
+  });
+
+  it.runIf(process.platform === 'win32')('records wrapper setup failures in the stderr log and exits non-zero', () => {
+    const result = runWrapperWithWindowsPowerShell({
+      workingDirectory: join(tmpdir(), 'happier-wrapper-missing-dir', 'does-not-exist'),
+      programArgs: [process.execPath, '-e', "process.stdout.write('should-not-run\\n')"],
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdoutLog).not.toContain('should-not-run');
+    expect(result.stderrLog).toContain('does-not-exist');
+  });
+
+  it('keeps the program invocation on a single `& ` line for definition readers', () => {
+    const script = renderWindowsScheduledTaskWrapperPs1({
+      workingDirectory: 'C:\\Users\\tester',
+      programArgs: ['C:\\Users\\tester\\.happier\\bin\\happier.exe', 'daemon', 'start-sync', '--takeover'],
+      stdoutPath: 'C:\\Users\\tester\\.happier\\logs\\out.log',
+      stderrPath: 'C:\\Users\\tester\\.happier\\logs\\err.log',
+    });
+
+    expect(/^& (.*)$/mu.exec(script)?.[1]).toBe(
+      '"C:\\Users\\tester\\.happier\\bin\\happier.exe" "daemon" "start-sync" "--takeover"'
+      + ' 1>> "C:\\Users\\tester\\.happier\\logs\\out.log" 2>> "C:\\Users\\tester\\.happier\\logs\\err.log"',
+    );
+  });
+});
 
 describe('Windows scheduled task PowerShell status helper', () => {
   it('parses launch post-mortem fields from invariant JSON', () => {
@@ -48,37 +167,7 @@ describe('Windows scheduled task PowerShell status helper', () => {
 });
 
 describe('Windows scheduled task lifecycle PowerShell helpers', () => {
-  it('records wrapper startup errors and preserves the managed process exit code', () => {
-    const wrapper = renderWindowsScheduledTaskWrapperPs1({
-      workingDirectory: 'C:\\Happier',
-      programArgs: ['C:\\Happier\\happier-server.exe'],
-      stderrPath: 'C:\\Happier\\logs\\server.err.log',
-    });
-
-    expect(wrapper).toContain('try {');
-    expect(wrapper).toContain('$exitCode = $LASTEXITCODE');
-    expect(wrapper).toContain('Add-Content -LiteralPath');
-    expect(wrapper).toContain('exit $exitCode');
-    expect(wrapper).toContain('exit 1');
-    expect(wrapper).not.toContain('1>> ""');
-  });
-
-  it('captures native stderr without PowerShell converting its first line into a terminating error', () => {
-    const wrapper = renderWindowsScheduledTaskWrapperPs1({
-      programArgs: ['C:\\Happier\\happier-server.exe'],
-      stdoutPath: 'C:\\Happier\\logs\\server.out.log',
-      stderrPath: 'C:\\Happier\\logs\\server.err.log',
-    });
-
-    const nativeInvocation = wrapper.indexOf('& "C:\\Happier\\happier-server.exe"');
-    const nativeErrorPolicy = wrapper.indexOf('$ErrorActionPreference = "Continue"');
-    expect(nativeErrorPolicy).toBeGreaterThan(-1);
-    expect(nativeErrorPolicy).toBeLessThan(nativeInvocation);
-    expect(wrapper).toContain('$LASTEXITCODE = 1');
-    expect(wrapper).toContain('2>> "C:\\Happier\\logs\\server.err.log"');
-  });
-
-  it('waits for an existing task child process to exit before reporting the task stopped', () => {
+  it('stops only an existing running task through typed scheduler state', () => {
     const command = buildStopWindowsScheduledTaskIfRunningPowerShellCommand({
       qualifiedTaskName: 'Happier\\happier-daemon.default',
       definitionPath: 'C:\\Users\\test\\.happier\\services\\happier-daemon.default.ps1',
@@ -88,17 +177,8 @@ describe('Windows scheduled task lifecycle PowerShell helpers', () => {
     expect(command).toContain('[int]$task.State -eq 4');
     expect(command).toContain('Get-CimInstance Win32_Process');
     expect(command).toContain('-File `"C:\\Users\\test\\.happier\\services\\happier-daemon.default.ps1`"');
-    expect(command).toContain('$taskkillProcess = Start-Process -FilePath "taskkill.exe"');
-    expect(command).toContain('-ArgumentList @("/PID", [string]$serviceProcessId, "/T", "/F")');
-    expect(command).toContain('-NoNewWindow -Wait -PassThru');
-    expect(command).toContain('$taskkillExitCode = $taskkillProcess.ExitCode');
-    expect(command).toContain('taskkill exit $taskkillExitCode');
-    expect(command).not.toContain('$LASTEXITCODE');
-    expect(command).not.toContain('| Out-Null');
-    expect(command).toContain('Wait-Process -Id $serviceProcessId -Timeout 10');
-    expect(command).toContain('Failed to wait for scheduled task child process');
-    expect(command.indexOf('Start-Process')).toBeLessThan(command.indexOf('Wait-Process'));
-    expect(command.indexOf('Wait-Process')).toBeLessThan(command.indexOf('Stop-ScheduledTask'));
+    expect(command).toContain('taskkill.exe /PID $serviceProcessId /T /F');
+    expect(command.indexOf('taskkill.exe')).toBeLessThan(command.indexOf('Stop-ScheduledTask'));
     expect(command).toContain('Stop-ScheduledTask');
     expect(command).toContain('-ErrorAction Stop');
     expect(command.trim()).toMatch(/exit 0$/);

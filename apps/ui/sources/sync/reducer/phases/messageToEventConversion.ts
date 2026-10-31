@@ -24,6 +24,7 @@ export function runMessageToEventConversion({
 }): {
   nonSidechainMessages: NormalizedMessage[];
   incomingToolIds: Set<string>;
+  incomingToolResultIds: Set<string>;
   hasReadyEvent: boolean;
   latestReadyEventSeq: number | null;
   readyAt: number | null;
@@ -94,6 +95,7 @@ export function runMessageToEventConversion({
         cacheCreation: 0,
         cacheRead: 0,
         contextSize: 0,
+        contextSizeIsReported: false,
         ...(typeof state.latestUsage?.contextWindowTokens === 'number'
           ? { contextWindowTokens: state.latestUsage.contextWindowTokens }
           : {}),
@@ -118,6 +120,7 @@ export function runMessageToEventConversion({
         cacheCreation: 0,
         cacheRead: 0,
         contextSize: 0,
+        contextSizeIsReported: false,
         ...(typeof state.latestUsage?.contextWindowTokens === 'number'
           ? { contextWindowTokens: state.latestUsage.contextWindowTokens }
           : {}),
@@ -173,15 +176,18 @@ export function runMessageToEventConversion({
 
   // Build a set of incoming tool IDs for quick lookup
   const incomingToolIds = new Set<string>();
+  const incomingToolResultIds = new Set<string>();
   for (const msg of nonSidechainMessages) {
     if (msg.role === 'agent') {
       for (const c of msg.content) {
         if (c.type === 'tool-call') {
           incomingToolIds.add(c.id);
+        } else if (c.type === 'tool-result') {
+          incomingToolResultIds.add(c.tool_use_id);
         }
       }
     }
   }
 
-  return { nonSidechainMessages, incomingToolIds, hasReadyEvent, latestReadyEventSeq, readyAt };
+  return { nonSidechainMessages, incomingToolIds, incomingToolResultIds, hasReadyEvent, latestReadyEventSeq, readyAt };
 }

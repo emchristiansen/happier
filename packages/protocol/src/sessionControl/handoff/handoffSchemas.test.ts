@@ -1,10 +1,109 @@
 import { describe, expect, it } from 'vitest';
+import { SessionHandoffCapabilityV2Schema, readSessionHandoffError } from './handoffSchemas.js';
 
 async function loadHandoffModule() {
   return await import(new URL('./handoffRpc.js', import.meta.url).href).catch((error) => ({ error } as const));
 }
 
 describe('session handoff schemas', () => {
+  it('preserves handoff failure codes and recovery context across both daemon result shapes', () => {
+    const status = { handoffId: 'handoff-1', status: 'pending', phase: 'preparing' };
+    for (const value of [
+      { ok: false, errorCode: 'RPC_FORBIDDEN', error: 'Target denied', status },
+      { errorCode: 'RPC_FORBIDDEN', error: 'Target denied', handoffId: 'handoff-1', status },
+    ]) {
+      expect(readSessionHandoffError(value)).toMatchObject({
+        errorCode: 'RPC_FORBIDDEN', errorMessage: 'Target denied', handoffId: 'handoff-1', status,
+      });
+    }
+    expect(readSessionHandoffError({ error: 'Legacy failure' })).toEqual({
+      errorCode: 'UNEXPECTED', errorMessage: 'Legacy failure',
+    });
+    expect(readSessionHandoffError({ ok: false, errorCode: 'failed' })).toEqual({
+      errorCode: 'failed', errorMessage: 'Session handoff failed',
+    });
+    expect(readSessionHandoffError({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true })).toBeNull();
+  });
+
+  it('defaults omitted optional capability flags to false and authorizes only explicit true', () => {
+    const required = { protocolVersion: 2, atomicTargetResume: true, targetCleanup: true };
+    expect(SessionHandoffCapabilityV2Schema.parse(required)).toEqual({
+      ...required,
+      sameMachineHandoff: false,
+      existingState: false,
+    });
+    expect(SessionHandoffCapabilityV2Schema.parse({
+      ...required,
+      sameMachineHandoff: true,
+      existingState: 'true',
+    })).toEqual({ ...required, sameMachineHandoff: true, existingState: false });
+  });
+
+  it('carries explicit existing-state intent and refuses simultaneous workspace copying', async () => {
+    const mod = await loadHandoffModule();
+    expect(mod).not.toHaveProperty('error');
+    if ('error' in mod) return;
+    const start = { sessionId: 'session_1', sourceMachineId: 'source', targetMachineId: 'target', sessionStorageMode: 'persisted', preferredTransportStrategies: ['direct_peer'], stateTransfer: 'existing' };
+    expect(mod.SessionHandoffStartRequestSchema.parse(start).stateTransfer).toBe('existing');
+    const prepare = { sessionId: 'session_1', handoffId: 'handoff_1', sourceMachineId: 'source', targetMachineId: 'target', sourceSessionStorageMode: 'persisted', negotiatedTransportStrategy: 'direct_peer', targetPath: '/repo', stateTransfer: 'existing' };
+    expect(mod.SessionHandoffPrepareTargetRequestV2Schema.parse(prepare).stateTransfer).toBe('existing');
+    for (const [schema, value] of [[mod.SessionHandoffStartRequestSchema, start], [mod.SessionHandoffPrepareTargetRequestV2Schema, prepare]] as const) {
+      expect(schema.safeParse({ ...value, workspaceTransfer: { enabled: true, conflictPolicy: 'replace_existing' } }).success).toBe(false);
+      expect(schema.safeParse({ ...value, stateTransfer: 'unknown' }).success).toBe(false);
+    }
+  });
+
+  it('preserves every advertised endpoint across source export and target preparation', async () => {
+    const mod = await loadHandoffModule();
+    expect(mod).not.toHaveProperty('error');
+    if ('error' in mod) return;
+
+    // A multi-interface Mac advertised 21 addresses in a real failed handoff.
+    const endpointCandidates = Array.from({ length: 21 }, (_, index) => ({
+      kind: 'http' as const,
+      url: `http://10.0.0.${index + 1}:46001/machine-transfers/direct/bundle`,
+      authorizationToken: 'test-token',
+      expiresAt: 1,
+    }));
+    const handoffMetadataV2 = {
+      providerBundleTransferPublication: {
+        transferId: 'provider-bundle',
+        sizeBytes: 1,
+        manifestHash: 'manifest-hash',
+        endpointCandidates,
+      },
+      workspaceReplicationManifestTransferPublication: {
+        transferId: 'workspace-manifest',
+        endpointCandidates,
+      },
+    };
+    const started = mod.SessionHandoffStartResponseSchema.parse({
+      handoffId: 'handoff_1',
+      status: { handoffId: 'handoff_1', status: 'pending', phase: 'preparing' },
+      targetPath: '/repo',
+      endpointCandidates,
+      handoffMetadataV2,
+    });
+    const prepared = mod.SessionHandoffPrepareTargetRequestV2Schema.parse({
+      sessionId: 'session_1',
+      handoffId: started.handoffId,
+      sourceMachineId: 'source',
+      targetMachineId: 'target',
+      negotiatedTransportStrategy: 'direct_peer',
+      sourceSessionStorageMode: 'persisted',
+      targetPath: '/target',
+      endpointCandidates: started.endpointCandidates,
+      handoffMetadataV2: started.handoffMetadataV2,
+    });
+    expect(prepared.endpointCandidates).toEqual(endpointCandidates);
+    expect(prepared.handoffMetadataV2).toEqual(handoffMetadataV2);
+
+    expect(mod.SessionHandoffStartResponseSchema.safeParse({
+      ...started,
+      endpointCandidates: [...endpointCandidates, { ...endpointCandidates[0], url: 'invalid' }],
+    }).success).toBe(false);
+  });
+
   it('exports the handoff schema surface', async () => {
     const mod = await loadHandoffModule();
     expect(mod).not.toHaveProperty('error');
@@ -397,7 +496,7 @@ describe('session handoff schemas', () => {
 	    ).toBe(false);
 	  });
 
-  it('rejects unbounded transfer metadata (ids, candidate lists, open payloads)', async () => {
+  it('rejects oversized transfer ids and open payloads', async () => {
     const mod = await loadHandoffModule();
     expect(mod).not.toHaveProperty('error');
     if ('error' in mod) return;
@@ -431,21 +530,6 @@ describe('session handoff schemas', () => {
       }).success,
     ).toBe(false);
 
-    expect(
-      mod.SessionHandoffPrepareTargetRequestSchema.safeParse({
-        handoffId: 'handoff_1',
-        sourceMachineId: 'machine_source',
-        targetMachineId: 'machine_target',
-        negotiatedTransportStrategy: 'direct_peer',
-        sourceSessionStorageMode: 'persisted',
-        targetPath: '/repo',
-        endpointCandidates: Array.from({ length: 200 }, (_, index) => ({
-          kind: 'http',
-          url: `http://127.0.0.1:46001/machine-transfers/direct/transfer_${index}`,
-          expiresAt: 1,
-        })),
-      }).success,
-    ).toBe(false);
   });
 
   it('rejects legacy inline prepare-target transfer fields', async () => {

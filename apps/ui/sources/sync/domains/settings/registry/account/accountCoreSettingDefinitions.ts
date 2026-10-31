@@ -10,8 +10,10 @@ import {
     defineSettingDefinitions,
 } from '@happier-dev/protocol';
 import { z } from 'zod';
+import { QUOTA_GAUGE_WINDOW_MODES } from '@/sync/domains/connectedServices/quotaGaugeWindows';
 import { AvatarStyleIdSchema, DEFAULT_AVATAR_STYLE_ID } from './avatarStyleSetting';
 import { SessionFolderViewModeV1Schema } from '@/sync/domains/session/folders';
+import { SESSION_LIST_BACKGROUND_WORK_ATTENTION_MODE_VALUES } from '@/sync/domains/session/listing/sessionListBackgroundWorkAttention';
 import {
     SESSION_LIST_ATTENTION_PROMOTION_MODE_VALUES,
     SESSION_LIST_WORKING_PLACEMENT_MODE_VALUES,
@@ -99,6 +101,13 @@ export const ACCOUNT_CORE_SETTING_DEFINITIONS = defineSettingDefinitions({
         description: 'Whether new sessions should start in tmux by default',
         storageScope: 'account',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
+    },
+    sessionTerminalHost: {
+        schema: z.enum(['legacy', 'none', 'tmux', 'zellij', 'herdr']),
+        default: 'legacy',
+        description: 'Terminal host for new sessions; legacy uses the existing tmux preference',
+        storageScope: 'account',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'person' },
     },
     sessionWindowsRemoteSessionLaunchMode: {
         schema: z.enum(['hidden', 'windows_terminal', 'console']),
@@ -318,6 +327,13 @@ export const ACCOUNT_CORE_SETTING_DEFINITIONS = defineSettingDefinitions({
         storageScope: 'account',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'person' },
     },
+    sessionListBackgroundWorkAttentionModeV1: {
+        schema: z.enum(SESSION_LIST_BACKGROUND_WORK_ATTENTION_MODE_VALUES),
+        default: 'keepWorking',
+        description: 'How unread replies appear while background work continues',
+        storageScope: 'account',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'person' },
+    },
     sessionListAttentionStandingDefaultV1: {
         schema: z.boolean(),
         default: false,
@@ -381,6 +397,11 @@ export const ACCOUNT_CORE_SETTING_DEFINITIONS = defineSettingDefinitions({
         storageScope: 'account',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'person' },
     },
+    sessionUsageGaugeLabels: {
+        schema: z.boolean(), default: false,
+        description: 'Show compact labels for composer context and provider usage gauges',
+        storageScope: 'account',
+    },
     sessionProviderUsageGaugeMode: {
         schema: z.enum(['auto', 'hidden']),
         default: 'auto',
@@ -389,11 +410,17 @@ export const ACCOUNT_CORE_SETTING_DEFINITIONS = defineSettingDefinitions({
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'person' },
     },
     sessionProviderUsageGaugeWindowMode: {
-        schema: z.enum(['most_constrained', 'daily', 'weekly', 'primary', 'secondary', 'session']),
+        schema: z.enum(QUOTA_GAUGE_WINDOW_MODES),
         default: 'most_constrained',
         description: 'Which provider usage quota window the session composer gauge should prefer',
         storageScope: 'account',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'person' },
+    },
+    sessionProviderUsageGaugeWindowModes: {
+        schema: z.array(z.enum(QUOTA_GAUGE_WINDOW_MODES)).min(1).nullable(),
+        default: null,
+        description: 'Composer quota windows for every account. Null preserves the predecessor single-window preference; most_constrained selects one gauge.',
+        storageScope: 'account',
     },
     usageLimitRecoverySettingsV1: {
         schema: UsageLimitRecoverySettingsV1Schema,

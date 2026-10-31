@@ -23,6 +23,29 @@ describe('ensureMachineIdInSettings', () => {
     vi.resetModules();
   });
 
+  it('allocates a selected account identity when only another account has recorded history', async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), 'happier-cli-machine-id-history-'));
+    process.env.HAPPIER_HOME_DIR = homeDir;
+    process.env.HAPPIER_ACTIVE_SERVER_ID = 'cloud';
+    try {
+      const settingsPath = join(homeDir, 'settings.json');
+      writeFileSync(settingsPath, JSON.stringify({ schemaVersion: 6,
+        machineIdByServerId: { cloud: 'machine-a' },
+        machineIdByServerIdByAccountId: { cloud: { 'account-a': 'machine-a' } },
+      }));
+      vi.resetModules();
+      const { ensureMachineIdInSettings } = await import('./auth');
+      const result = await ensureMachineIdInSettings({ accountId: 'account-b' });
+      expect(result.machineId).toBe('00000000-0000-0000-0000-000000000001');
+      const persisted = JSON.parse(readFileSync(settingsPath, 'utf8'));
+      expect(persisted.machineIdByServerIdByAccountId.cloud).toEqual({
+        'account-a': 'machine-a', 'account-b': result.machineId,
+      });
+    } finally {
+      rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
   it('returns the existing per-server machine id when present', async () => {
     const homeDir = mkdtempSync(join(tmpdir(), 'happier-cli-machine-id-binding-'));
     process.env.HAPPIER_HOME_DIR = homeDir;

@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { View } from 'react-native';
+import { resolveAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { evaluateSessionHandoffWorkspaceTransferSourcePathSafety, getActionSpec } from '@happier-dev/protocol';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
@@ -25,9 +26,11 @@ import {
     SESSION_HANDOFF_WORKSPACE_TRANSFER_STRATEGY_OPTIONS,
 } from '@/sync/domains/sessionHandoff/sessionHandoffDefaults';
 import { resolveSessionHandoffPickerSourceMachineId } from '@/sync/domains/sessionHandoff/resolveSessionHandoffPickerSourceMachineId';
+import { useSessionHandoffExistingStateAvailability } from '@/sync/domains/sessionHandoff/useSessionHandoffExistingStateAvailability';
 import { useMachineListByServerId, useMachineRecordValues, useSession, useSessions, useSettingMutable } from '@/sync/domains/state/storage';
 import { sync } from '@/sync/sync';
 import { resolveAbsolutePath } from '@/utils/path/pathUtils';
+import { normalizeLocalPathForComparison } from '@/utils/path/resolvePathRelativeToRoot';
 import { getRecentMachinesFromSessions } from '@/utils/sessions/recentMachines';
 import { canAttemptMachineSpawn } from '@/sync/domains/machines/identity/resolveMachineSpawnReadiness';
 import { useStableRecentPathsForMachine } from '@/utils/sessions/useStableRecentPathsForMachine';
@@ -42,6 +45,8 @@ export type SessionHandoffPickerModalProps = CustomModalInjectedProps & Readonly
     serverId: string | null;
     onResolve: (value: SessionHandoffPickerResult | null) => void;
     onRequestClose?: () => void;
+    inlineErrorCode?: string | null;
+    awaitingAdmission?: boolean;
 }>;
 
 const stylesheet = StyleSheet.create(() => ({
@@ -85,7 +90,7 @@ function mergeMachinesById(machineGroups: readonly (readonly any[] | null | unde
     return Array.from(merged.values());
 }
 
-export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessionId, sourceMachineId, serverId }: SessionHandoffPickerModalProps) {
+export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessionId, sourceMachineId, serverId, inlineErrorCode, awaitingAdmission = false }: SessionHandoffPickerModalProps) {
     const { theme } = useUnistyles();
     const styles = stylesheet;
     const actionSpec = getActionSpec('session.handoff');
@@ -129,23 +134,21 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
         return allServerMachines.find((machine: any) => normalizeId(machine?.id) === resolvedSourceMachineId) ?? null;
     }, [allServerMachines, resolvedSourceMachineId]);
     const isDirectSession = Boolean((currentSession as any)?.metadata?.directSessionV1);
+    const sourceHomeDir = (currentSession as any)?.metadata?.homeDir;
+    const fallbackSourceHomeDir = sourceMachine?.metadata?.homeDir;
+    const sourcePath = resolveAbsolutePath(
+        String((currentSession as any)?.metadata?.path ?? '').trim(),
+        typeof (sourceHomeDir ?? fallbackSourceHomeDir) === 'string'
+            ? String(sourceHomeDir ?? fallbackSourceHomeDir).trim()
+            : undefined,
+    );
     const workspaceTransferPathSafety = React.useMemo(
-        () => {
-            const sourceHomeDir = (currentSession as any)?.metadata?.homeDir;
-            const fallbackSourceHomeDir = (sourceMachine as any)?.metadata?.homeDir;
-            const sourcePath = resolveAbsolutePath(
-                String((currentSession as any)?.metadata?.path ?? '').trim(),
-                typeof (sourceHomeDir ?? fallbackSourceHomeDir) === 'string'
-                    ? String(sourceHomeDir ?? fallbackSourceHomeDir).trim()
-                    : undefined,
-            );
-            return evaluateSessionHandoffWorkspaceTransferSourcePathSafety({
-                sourcePath,
-                sourceHomeDir,
-                fallbackSourceHomeDir,
-            });
-        },
-        [currentSession, sourceMachine],
+        () => evaluateSessionHandoffWorkspaceTransferSourcePathSafety({
+            sourcePath,
+            sourceHomeDir,
+            fallbackSourceHomeDir,
+        }),
+        [fallbackSourceHomeDir, sourceHomeDir, sourcePath],
     );
 
     const machines = React.useMemo(() => {
@@ -153,10 +156,9 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
             const machineId = normalizeId(machine?.id);
             if (!machineId) return false;
             if (machine?.revokedAt) return false;
-            if (resolvedSourceMachineId && machineId === resolvedSourceMachineId) return false;
             return true;
         });
-    }, [allServerMachines, resolvedSourceMachineId]);
+    }, [allServerMachines]);
     const hasSelectableMachine = React.useMemo(
         () => machines.some((machine: any) => normalizeId(machine?.id).length > 0),
         [machines],
@@ -197,9 +199,8 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
     }, [favoriteMachineIds, machines]);
 
     const recentMachines = React.useMemo(() => {
-        const allRecent = getRecentMachinesFromSessions({ machines, sessions });
-        return allRecent.filter((machine: any) => normalizeId(machine?.id) !== resolvedSourceMachineId);
-    }, [machines, resolvedSourceMachineId, sessions]);
+        return getRecentMachinesFromSessions({ machines, sessions });
+    }, [machines, sessions]);
 
     const [selectedMachineId, setSelectedMachineId] = React.useState<string | null>(null);
     const [targetPath, setTargetPath] = React.useState<string | null>(null);
@@ -225,7 +226,27 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
     const handleTargetPathChange = React.useCallback((path: string) => {
         setTargetPath(path.trim() || null);
     }, []);
-    const [workspaceTransferEnabled, setWorkspaceTransferEnabled] = React.useState(sessionHandoffDefaults.workspaceTransferEnabled);
+    const isSameMachine = Boolean(resolvedSourceMachineId && normalizeId(selectedMachineId) === resolvedSourceMachineId);
+    const [transferSessionData, setTransferSessionData] = React.useState(true);
+    const agentId = resolveAgentIdFromSessionMetadata(currentSession?.metadata);
+    const existingStateAvailability = useSessionHandoffExistingStateAvailability({ serverId, sourceMachineId: resolvedSourceMachineId, targetMachineId: selectedMachineId, agentId });
+    const transferChoiceDisabled = awaitingAdmission || existingStateAvailability.status !== 'available';
+    const transferHint = existingStateAvailability.status === 'error'
+        ? existingStateAvailability.errorMessage
+        : t(existingStateAvailability.status === 'unsupported_agent'
+            ? 'sessionHandoff.transferSessionData.agentRequiresTransfer'
+            : existingStateAvailability.status === 'checking'
+            ? 'sessionHandoff.transferSessionData.checking'
+            : 'sessionHandoff.transferSessionData.updateRequired');
+    const normalizedSourcePath = normalizeLocalPathForComparison(sourcePath);
+    const normalizedTargetPath = targetPath
+        ? normalizeLocalPathForComparison(resolveAbsolutePath(targetPath, targetMachineHomeDir))
+        : null;
+    const canStart = Boolean(selectedMachine && canAttemptSelectedMachine
+        && (!isSameMachine || (normalizedSourcePath && normalizedTargetPath && normalizedTargetPath !== normalizedSourcePath)));
+    const [workspaceTransferOverride, setWorkspaceTransferEnabled] = React.useState<boolean | null>(null);
+    const workspaceTransferEnabled = workspaceTransferOverride
+        ?? (isSameMachine ? false : sessionHandoffDefaults.workspaceTransferEnabled);
     const [workspaceTransferStrategy, setWorkspaceTransferStrategy] = React.useState<'transfer_snapshot' | 'sync_changes'>(
         sessionHandoffDefaults.workspaceTransferStrategy,
     );
@@ -234,7 +255,8 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
     const [ignoredIncludeGlobs, setIgnoredIncludeGlobs] = React.useState<string[]>([...sessionHandoffDefaults.ignoredIncludeGlobs]);
     const [directTargetMode, setDirectTargetMode] = React.useState<'keep_direct' | 'convert_to_persisted'>(sessionHandoffDefaults.directTargetMode);
 
-    const effectiveWorkspaceTransferEnabled = workspaceTransferPathSafety.allowed ? workspaceTransferEnabled : false;
+    const existingStateRequested = !isSameMachine && !transferSessionData;
+    const effectiveWorkspaceTransferEnabled = workspaceTransferPathSafety.allowed && !existingStateRequested ? workspaceTransferEnabled : false;
     const workspaceTransferControlsDisabled = !effectiveWorkspaceTransferEnabled;
 
     const handleCancel = React.useCallback(() => {
@@ -243,9 +265,10 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
     }, [onClose, onResolve]);
 
     const handleStart = React.useCallback(() => {
+        if (awaitingAdmission || (!isSameMachine && !transferSessionData && existingStateAvailability.status !== 'available')) return;
         const targetMachineId = normalizeId(selectedMachineId);
         if (!targetMachineId) return;
-        if (!canAttemptSelectedMachine) return;
+        if (!canStart) return;
         const workspaceTransfer = buildSessionHandoffWorkspaceTransfer({
             workspaceTransferEnabled: effectiveWorkspaceTransferEnabled,
             workspaceTransferStrategy,
@@ -255,13 +278,14 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
         });
         onResolve({
             targetMachineId,
+            stateTransfer: isSameMachine || transferSessionData ? 'transfer' : 'existing',
             ...(targetPath ? { targetPath } : {}),
             targetSessionStorageMode: isDirectSession
                 ? (directTargetMode === 'convert_to_persisted' ? 'persisted' : 'direct')
                 : 'persisted',
             ...(workspaceTransfer ? { workspaceTransfer } : {}),
         });
-    }, [canAttemptSelectedMachine, conflictPolicy, directTargetMode, effectiveWorkspaceTransferEnabled, ignoredIncludeGlobs, includeIgnoredMode, isDirectSession, onResolve, selectedMachineId, targetPath, workspaceTransferStrategy]);
+    }, [awaitingAdmission, canStart, conflictPolicy, directTargetMode, effectiveWorkspaceTransferEnabled, existingStateAvailability, ignoredIncludeGlobs, includeIgnoredMode, isDirectSession, isSameMachine, onResolve, selectedMachineId, targetPath, transferSessionData, workspaceTransferStrategy]);
 
     const footer = React.useMemo(() => (
         <View style={styles.footer}>
@@ -270,10 +294,10 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
                 testID="session-handoff-start"
                 title={actionSpec.title}
                 onPress={handleStart}
-                disabled={!selectedMachine || !canAttemptSelectedMachine}
+                disabled={!canStart || awaitingAdmission || (!isSameMachine && !transferSessionData && existingStateAvailability.status !== 'available')}
             />
         </View>
-    ), [actionSpec.title, canAttemptSelectedMachine, handleCancel, handleStart, selectedMachine, styles.footer]);
+    ), [actionSpec.title, awaitingAdmission, canStart, existingStateAvailability, handleCancel, handleStart, isSameMachine, styles.footer, transferSessionData]);
 
     const chrome = React.useMemo(() => ({
         kind: 'card' as const,
@@ -289,7 +313,7 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
 
     return (
         <View style={styles.body}>
-                <ItemList style={{ paddingTop: 0 }}>
+                <ItemList style={{ paddingTop: 0 }} pointerEvents={awaitingAdmission ? 'none' : 'auto'} importantForAccessibility={awaitingAdmission ? 'no-hide-descendants' : 'auto'}>
                     <MachineSelector
                         machines={machines as any}
                         selectedMachine={selectedMachine as any}
@@ -305,8 +329,10 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
                         testIdPrefix="session-handoff-machine"
                         dropdownTestID="session-handoff-machine-dropdown-trigger"
                         onSelect={(machine: any) => {
+                            if (awaitingAdmission) return;
                             setSelectedMachineId(normalizeId(machine?.id) || null);
                             setTargetPath(null);
+                            setTransferSessionData(true);
                         }}
                         onToggleFavorite={(machine: any) => {
                             const machineId = normalizeId(machine?.id);
@@ -330,6 +356,20 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
                             onRequestClose={ignorePathSelectionRequestClose}
                         />
                     </ItemGroup>
+                    {!isSameMachine ? <ItemGroup>
+                        <Item
+                            title={t('sessionHandoff.transferSessionData.title')}
+                            subtitle={existingStateAvailability.status === 'available' ? t('sessionHandoff.transferSessionData.subtitle') : transferHint}
+                            rightElement={<Switch testID="session-handoff-transfer-session-data" value={transferSessionData}
+                                disabled={transferChoiceDisabled}
+                                accessibilityLabel={t('sessionHandoff.transferSessionData.title')}
+                                accessibilityHint={transferChoiceDisabled ? transferHint : t('sessionHandoff.transferSessionData.subtitle')}
+                                onValueChange={(value) => { if (!transferChoiceDisabled) setTransferSessionData(value); }} />}
+                            showChevron={false}
+                            onPress={() => { if (!transferChoiceDisabled) setTransferSessionData(!transferSessionData); }}
+                        />
+                        {inlineErrorCode === 'existing_session_state_unavailable' ? <Text testID="session-handoff-session-data-error" accessibilityRole="alert" accessibilityLiveRegion="polite" style={{ color: theme.colors.text.destructive }}>{t('sessionHandoff.transferSessionData.sessionMissing')}</Text> : null}
+                    </ItemGroup> : null}
                     <ItemGroup
                         title={t('settingsSession.handoff.workspaceTransfer.groupTitle')}
                         footer={t('settingsSession.handoff.workspaceTransfer.groupFooter')}
@@ -338,7 +378,7 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
                             testID="session-handoff-workspace-transfer-enabled"
                             title={t('settingsSession.handoff.workspaceTransfer.title')}
                             subtitle={
-                                workspaceTransferEnabled
+                                effectiveWorkspaceTransferEnabled
                                     && workspaceTransferPathSafety.allowed
                                     ? t('settingsSession.handoff.workspaceTransfer.enabledSubtitle')
                                     : t('settingsSession.handoff.workspaceTransfer.disabledSubtitle')
@@ -346,14 +386,15 @@ export function SessionHandoffPickerModal({ onClose, setChrome, onResolve, sessi
                             icon={<Icon name="folder" size={16} color={theme.colors.text.secondary} />}
                             rightElement={
                                 <Switch
+                                    testID="session-handoff-workspace-transfer-switch"
                                     value={effectiveWorkspaceTransferEnabled}
-                                    disabled={!workspaceTransferPathSafety.allowed}
-                                    onValueChange={setWorkspaceTransferEnabled}
+                                    disabled={awaitingAdmission || existingStateRequested || !workspaceTransferPathSafety.allowed}
+                                    onValueChange={(value) => { if (!awaitingAdmission && !existingStateRequested && workspaceTransferPathSafety.allowed) setWorkspaceTransferEnabled(value); }}
                                 />
                             }
                             showChevron={false}
                             onPress={() => {
-                                if (!workspaceTransferPathSafety.allowed) return;
+                                if (awaitingAdmission || existingStateRequested || !workspaceTransferPathSafety.allowed) return;
                                 setWorkspaceTransferEnabled(!workspaceTransferEnabled);
                             }}
                         />

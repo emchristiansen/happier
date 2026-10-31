@@ -128,6 +128,9 @@ test('docker release-assets plans published stable to immutable server candidate
   assert.equal(plan.relayUpgradeFromChannel, 'stable');
   assert.equal(plan.relayUpgradeToServerTag, 'server-v0.2.11');
   assert.equal(plan.relayUpgradeToServerVersion, '0.2.11');
+  assert.equal(plan.withRemoteServer, false);
+  assert.ok(plan.args.includes('--no-remote-server'));
+  assert.ok(!plan.args.includes('--with-remote-server'));
 });
 
 test('docker release-assets rejects non-linux platforms', () => {

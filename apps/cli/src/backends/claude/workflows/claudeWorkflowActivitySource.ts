@@ -46,11 +46,18 @@ import type { ClaudeWorkflowTaskReference } from './claudeWorkflowTaskReference'
  * and unit-testable; the launcher/projector binds them to the session's credentials/encryption mode
  * + the metadata best-effort writer.
  */
+export type ClaudeWorkflowActivityObservationContext = Readonly<{
+  historicalReplay?: boolean;
+  observedAt?: number;
+  authenticatedHook?: true;
+  startupReplay?: true;
+}>;
+
 export type ClaudeWorkflowActivitySource = Readonly<{
   /** Observe one raw transcript value (same raw channel as the goal source). Non-workflow noise is ignored. */
   observeTranscriptMessage(
     message: unknown,
-    observation?: Readonly<{ historicalReplay?: boolean }>,
+    observation?: ClaudeWorkflowActivityObservationContext,
   ): void;
   /** Workflow-owned subagent/agent tool-use ids — the CWF4 hook to suppress duplicate work-state rows. */
   getWorkflowOwnedAgentToolUseIds(): ReadonlySet<string>;
@@ -179,17 +186,23 @@ export function createClaudeWorkflowActivitySource(params: Readonly<{
 
   const observeTrackerValue = (
     message: unknown,
-    observationContext?: Readonly<{ historicalReplay?: boolean }>,
+    observationContext?: ClaudeWorkflowActivityObservationContext,
   ): void => {
     const isHistoricalReplay = observationContext?.historicalReplay === true;
     // A replayed record is not something happening now, and stamping it with the wall clock made
     // every pre-restart row look freshly updated — falsifying the only age signal the surface's
     // staleness hedge has, on every resume. The record carries its own instant; use it. A live value
     // is observed as it arrives, so the clock IS its instant.
-    const observedAt = (isHistoricalReplay ? readClaudeRecordTimestampMs(message) : undefined) ?? Date.now();
+    const receivedAt = observationContext?.observedAt;
+    const recordTimestamp = isHistoricalReplay ? readClaudeRecordTimestampMs(message) : undefined;
+    const observedAt = (typeof receivedAt === 'number' && Number.isFinite(receivedAt) ? receivedAt : undefined)
+      ?? recordTimestamp ?? Date.now();
     const observation = tracker.observe(message, {
       updatedAt: observedAt,
       live: !isHistoricalReplay,
+      ...(isHistoricalReplay ? { historicalTimestampAvailable: recordTimestamp !== undefined } : {}),
+      ...(observationContext?.authenticatedHook ? { authenticatedHook: true } : {}),
+      ...(observationContext?.startupReplay ? { startupReplay: true, receiptAvailable: typeof receivedAt === 'number' && Number.isFinite(receivedAt) } : {}),
     });
     if (observationContext?.historicalReplay !== true) {
       publishProviderTaskActivities(observation.providerTaskActivities);

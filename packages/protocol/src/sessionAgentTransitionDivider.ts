@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { BackendTargetRefSchema, buildBackendTargetKey, matchesBackendTargetAgentId, type BackendTargetRefV1 } from './backendTargets/backendTargetRef.js';
 
 /**
  * Transition divider contract — the ONLY transition history artifact.
@@ -41,6 +42,8 @@ export const SessionAgentTransitionDividerV1Schema = z
     v: z.literal(1),
     fromAgentId: z.string().trim().min(1).max(128),
     toAgentId: z.string().trim().min(1).max(128),
+    fromBackendTarget: BackendTargetRefSchema.optional(),
+    toBackendTarget: BackendTargetRefSchema.optional(),
     /**
      * UPPER bound: the source transcript cutoff the activation brief was built
      * from — the `upToSeqInclusive` the bounded context pass actually used.
@@ -84,7 +87,14 @@ export const SessionAgentTransitionDividerV1Schema = z
      */
     returningAgentLastSeenSeqInclusive: z.number().int().nonnegative().optional(),
   })
-  .strict();
+  .strict().superRefine((divider, ctx) => {
+    if (divider.fromBackendTarget && !matchesBackendTargetAgentId(divider.fromBackendTarget, divider.fromAgentId)) {
+      ctx.addIssue({ code: 'custom', path: ['fromBackendTarget'], message: 'Source Agent and backend target identities must agree.' });
+    }
+    if (divider.toBackendTarget && !matchesBackendTargetAgentId(divider.toBackendTarget, divider.toAgentId)) {
+      ctx.addIssue({ code: 'custom', path: ['toBackendTarget'], message: 'Target Agent and backend target identities must agree.' });
+    }
+  });
 export type SessionAgentTransitionDividerV1 = z.infer<typeof SessionAgentTransitionDividerV1Schema>;
 
 /**
@@ -101,8 +111,14 @@ export function isSameSessionAgentTransitionDividerV1(
   return left.v === right.v
     && left.fromAgentId === right.fromAgentId
     && left.toAgentId === right.toAgentId
+    && sameBackendTarget(left.fromBackendTarget, right.fromBackendTarget)
+    && sameBackendTarget(left.toBackendTarget, right.toBackendTarget)
     && left.sourceCutoffSeqInclusive === right.sourceCutoffSeqInclusive
     && left.returningAgentLastSeenSeqInclusive === right.returningAgentLastSeenSeqInclusive;
+}
+
+function sameBackendTarget(left: BackendTargetRefV1 | undefined, right: BackendTargetRefV1 | undefined): boolean {
+  return left && right ? buildBackendTargetKey(left) === buildBackendTargetKey(right) : left === right;
 }
 
 /**
@@ -117,10 +133,12 @@ export function isSameSessionAgentTransitionDividerV1(
  */
 export function matchesSessionAgentTransitionDividerAgentsV1(
   divider: Readonly<SessionAgentTransitionDividerV1>,
-  expected: Readonly<Pick<SessionAgentTransitionDividerV1, 'fromAgentId' | 'toAgentId'>>,
+  expected: Readonly<Pick<SessionAgentTransitionDividerV1, 'fromAgentId' | 'toAgentId' | 'fromBackendTarget' | 'toBackendTarget'>>,
 ): boolean {
   return divider.fromAgentId === expected.fromAgentId
-    && divider.toAgentId === expected.toAgentId;
+    && divider.toAgentId === expected.toAgentId
+    && sameBackendTarget(divider.fromBackendTarget, expected.fromBackendTarget)
+    && sameBackendTarget(divider.toBackendTarget, expected.toBackendTarget);
 }
 
 /**

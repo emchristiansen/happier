@@ -1,4 +1,5 @@
 import type { DirectSessionsSource, DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import type { DirectSessionTranscriptReadAfter } from '@/backends/directSessions/providerOps';
 
 import { mapPiSessionToDirectMessages } from './mapPiSessionToDirectMessages';
 import {
@@ -22,11 +23,7 @@ export async function readAfterPiTranscript(params: Readonly<{
   cursor: string;
   maxBytes: number;
   maxItems: number;
-}>): Promise<Readonly<{
-  items: DirectTranscriptRawMessageV1[];
-  nextCursor: string | null;
-  truncated: boolean;
-}>> {
+}>): Promise<DirectSessionTranscriptReadAfter> {
   const resolved = await resolvePiDirectSessionFile({
     source: params.source,
     env: params.env,
@@ -61,16 +58,16 @@ export async function readAfterPiTranscript(params: Readonly<{
 
   const decoded = decodePiForwardCursor(params.cursor);
   if (!decoded) {
-    return { items: [], nextCursor: tailCursor, truncated: true };
+    return { items: [], nextCursor: tailCursor, truncated: true, truncationReason: 'source_discontinuity' };
   }
   if (decoded.delivered > total) {
-    return { items: [], nextCursor: tailCursor, truncated: true };
+    return { items: [], nextCursor: tailCursor, truncated: true, truncationReason: 'source_discontinuity' };
   }
   if (
     decoded.anchorItemId
     && items[decoded.delivered - 1]?.id !== decoded.anchorItemId
   ) {
-    return { items: [], nextCursor: tailCursor, truncated: true };
+    return { items: [], nextCursor: tailCursor, truncated: true, truncationReason: 'source_discontinuity' };
   }
 
   const delivered = decoded.delivered;
@@ -100,5 +97,5 @@ export async function readAfterPiTranscript(params: Readonly<{
     anchorItemId: items[newDelivered - 1]?.id ?? null,
   });
 
-  return { items: pageItems, nextCursor, truncated };
+  return { items: pageItems, nextCursor, truncated, ...(truncated ? { truncationReason: 'page_limit' as const } : {}) };
 }

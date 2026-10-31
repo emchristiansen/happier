@@ -36,6 +36,40 @@ function createHarness(options: Readonly<{
 }
 
 describe('createBackgroundTaskRecordPublisher', () => {
+  it('serializes terminal evidence behind a flush-driven progress write so progress cannot overwrite it', async () => {
+    let releaseProgress!: () => void;
+    const progressGate = new Promise<void>((resolve) => { releaseProgress = resolve; });
+    let progressEntered!: () => void;
+    const progressStarted = new Promise<void>((resolve) => { progressEntered = resolve; });
+    const startedRecords: SessionBackgroundTaskRecordV1[] = [];
+    const committed: SessionBackgroundTaskRecordV1[] = [];
+    const publisher = createBackgroundTaskRecordPublisher({
+      commitRecord: async (record) => {
+        startedRecords.push(record);
+        if (record.summary === 'progress') {
+          progressEntered();
+          await progressGate;
+        }
+        committed.push(record);
+      },
+    });
+    publisher.observe(started());
+    await publisher.flush();
+    startedRecords.length = 0;
+    publisher.observe({ type: 'progress', sessionId: 'claude-session-1', taskId: 'task_1', detail: 'progress' });
+    const flush = publisher.flush();
+    await progressStarted;
+    publisher.observe({ type: 'terminal', sessionId: 'claude-session-1', taskId: 'task_1', status: 'completed', summary: 'done', endedAt: null });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const concurrentWrites = startedRecords.length;
+    releaseProgress();
+    await flush;
+    expect(concurrentWrites).toBe(1);
+    expect(committed.at(-1)?.status).toBe('succeeded');
+    expect(committed.at(-1)?.summary).toBe('done');
+    publisher.dispose();
+  });
+
   it('persists a started headless command with an observed start and no invented fields', async () => {
     const { publisher, committed } = createHarness();
 

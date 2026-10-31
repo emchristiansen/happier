@@ -2,6 +2,7 @@ import { mkdir, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { writeGeneratedTextAtomicallyIfChanged } from '@/utils/fs/writeGeneratedTextAtomicallyIfChanged';
+import { PI_BROKER_PROVIDERS, PI_BROKER_SELECTIONS_ENV, parsePiBrokerSelections } from './piBrokerExtensionEnv';
 import { buildPiBrokerExtensionSource } from './piBrokerExtensionSource';
 
 /**
@@ -57,4 +58,15 @@ export async function ensurePiBrokerExtensionAsset(agentDir: string): Promise<st
     mode: 0o600,
   });
   return path;
+}
+
+export function resolvePiBrokerExtensionArgs(env: Readonly<NodeJS.ProcessEnv>): string[] {
+  const agentDir = env.PI_CODING_AGENT_DIR?.trim();
+  if (!agentDir) return [];
+
+  const selections = parsePiBrokerSelections(env[PI_BROKER_SELECTIONS_ENV]);
+  const hasBrokeredProvider = PI_BROKER_PROVIDERS.some((provider) => selections[provider]);
+  if (!hasBrokeredProvider) return [];
+
+  return ['--extension', resolvePiBrokerExtensionPath(agentDir)];
 }

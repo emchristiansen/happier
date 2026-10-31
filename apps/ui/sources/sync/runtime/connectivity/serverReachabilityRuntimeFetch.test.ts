@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ConnectedServiceIdSchema } from '@happier-dev/protocol';
 
 afterEach(async () => {
     vi.unstubAllGlobals();
@@ -86,7 +87,7 @@ describe('runtimeFetchWithServerReachability', () => {
             if (url.endsWith('/health')) {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
-            if (url.endsWith('/v1/account/profile')) {
+            if (new URL(url).pathname === '/v1/account/profile') {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
             return new Response(null, { status: 200, headers: new Headers() });
@@ -112,8 +113,9 @@ describe('runtimeFetchWithServerReachability', () => {
 
         expect(response.ok).toBe(true);
         expect(runtimeFetchMock.mock.calls.some(([input]) => String(input).endsWith('/v1/auth/ping'))).toBe(true);
-        expect(runtimeFetchMock.mock.calls.some(([input]) => String(input).endsWith('/v1/account/profile'))).toBe(true);
-        const profileCall = runtimeFetchMock.mock.calls.find(([input]) => String(input).endsWith('/v1/account/profile'));
+        const profileCall = runtimeFetchMock.mock.calls.find(([input]) => new URL(String(input)).pathname === '/v1/account/profile');
+        expect(profileCall).toBeDefined();
+        expect(JSON.parse(new URL(String(profileCall?.[0])).searchParams.get('happierConnectedServices') ?? 'null')).toEqual(ConnectedServiceIdSchema.options);
         const profileHeaders = new Headers(profileCall?.[1]?.headers);
         expect(profileHeaders.get('x-happier-session-sync-protocol')).toBeNull();
     });
@@ -129,7 +131,7 @@ describe('runtimeFetchWithServerReachability', () => {
             if (url.endsWith('/v1/auth/ping')) {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
-            if (url.endsWith('/v1/account/profile')) {
+            if (new URL(url).pathname === '/v1/account/profile') {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
             return new Response(null, { status: 200, headers: new Headers() });
@@ -168,7 +170,7 @@ describe('runtimeFetchWithServerReachability', () => {
             if (url.endsWith('/health')) {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
-            if (url.endsWith('/v1/account/profile')) {
+            if (new URL(url).pathname === '/v1/account/profile') {
                 throw new TypeError('Network request failed');
             }
             return new Response(null, { status: 200, headers: new Headers() });
@@ -215,7 +217,7 @@ describe('runtimeFetchWithServerReachability', () => {
             if (url.endsWith('/v1/auth/ping')) {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
-            if (url.endsWith('/v1/account/profile')) {
+            if (new URL(url).pathname === '/v1/account/profile') {
                 return new Response(null, { status: 401, headers: new Headers() });
             }
             return new Response(null, { status: 200, headers: new Headers() });
@@ -262,7 +264,7 @@ describe('runtimeFetchWithServerReachability', () => {
             if (url.endsWith('/v1/auth/ping')) {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
-            if (url.endsWith('/v1/account/profile')) {
+            if (new URL(url).pathname === '/v1/account/profile') {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
             return new Response(null, { status: 200, headers: new Headers() });

@@ -28,7 +28,7 @@ export async function materializeSessionConnectedServiceRuntimeAuthSelection(par
   if (!binding || binding.source !== 'connected') return null;
 
   const previousSelection = findConnectedServiceChildSelection(
-    params.input.tracked.spawnOptions?.environmentVariables ?? {},
+    params.input.tracked?.spawnOptions?.environmentVariables ?? {},
     params.input.serviceId,
   );
   const previousGroupSelection =

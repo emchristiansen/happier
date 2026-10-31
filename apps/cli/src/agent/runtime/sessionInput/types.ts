@@ -15,6 +15,7 @@ export type MessageBatch<Mode, Message> = {
   /** Exact current-vs-old custody marker; not a selectable materialization policy. */
   providerAcceptancePending?: boolean;
   pendingProviderAction?: import('@/agent/runtime/modeMessageQueue').PendingProviderAction;
+  pendingRequestedAction?: import('@happier-dev/protocol').PendingRequestedActionV1;
 };
 
 export type PendingMaterializationReconcileWhenEmpty = PendingQueueReconcileWhenEmpty;
@@ -58,7 +59,11 @@ export type ActiveTurnPendingPumpOptions = Omit<DrainPendingOptions, 'abortSigna
 };
 
 export interface SessionProviderInputConsumer<Mode, Message> {
-  waitForNextInput(opts: { abortSignal: AbortSignal }): Promise<MessageBatch<Mode, Message> | null>;
+  waitForNextInput(opts: {
+    abortSignal: AbortSignal;
+    /** A supplied wait callback overrides the construction callback; null disables it for this wait. */
+    onMetadataUpdate?: ((abortSignal: AbortSignal) => void | Promise<void>) | null | undefined;
+  }): Promise<MessageBatch<Mode, Message> | null>;
   runProviderInputDispatch<Value>(opts: Readonly<{
     abortSignal: AbortSignal;
     dispatch: () => Promise<Value>;

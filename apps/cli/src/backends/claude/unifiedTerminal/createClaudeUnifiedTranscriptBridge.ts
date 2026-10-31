@@ -12,15 +12,14 @@ import { loadClaudeJsonlReplayBaseline } from '../utils/loadClaudeJsonlReplayBas
 import type { SessionHookData } from '../utils/startHookServer';
 import type { ClaudeUnifiedSessionHookSubscription } from './createClaudeUnifiedHookLifecycleBridge';
 import type { ClaudeUnifiedStartableDisposable } from './_types';
-import { createJsonlFollowController, type JsonlFollowController } from '@/agent/localControl/jsonlFollowController';
-import type { JsonlFollowerMetricEvent } from '@/agent/localControl/jsonlFollowMetrics';
-import { createClaudeJsonlResetReplaySuppressor } from '../utils/claudeJsonlReplaySuppression';
+import type { ClaudeWorkflowActivityObservationContext } from '../workflows/claudeWorkflowActivitySource';
+import { readClaudeTaskLifecycleEnvelope } from '../taskNotifications/claudeTaskLifecycleEnvelope';
 import { readClaudeJsonlTimestampMs } from '../utils/claudeJsonlTimestamp';
 
 type ClaudeUnifiedTranscriptBridgeSessionFound = (sessionId: string, data: SessionHookData) => void;
 
 function readHookEventName(data: SessionHookData): string {
-  const raw = data.hook_event_name ?? data.hookEventName;
+  const raw = data.hook_event_name ?? data.hookEventName ?? data.eventName;
   return typeof raw === 'string' ? raw : '';
 }
 
@@ -167,7 +166,7 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
   onTranscriptMessage?: ((message: RawJSONLines) => void) | undefined;
   onRawTranscriptValue?: ((
     value: unknown,
-    observation: Readonly<{ historicalReplay: boolean }>,
+    observation: ClaudeWorkflowActivityObservationContext,
   ) => void) | undefined;
   onLiveProviderTaskJsonlValue?: ((input: Readonly<{
     sessionId: string;
@@ -202,6 +201,7 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
   onTranscriptMissing?: ((info: { sessionId: string; filePath: string }) => void) | undefined;
   transcriptMissingWarningMs?: number | undefined;
   subscribeClaudeSessionHooks?: ClaudeUnifiedSessionHookSubscription | undefined;
+  onStartupReplayComplete?: (() => void) | undefined;
   /**
    * Committed Claude JSONL dedupe baseline for resume replay (Lane N4). The baseline must be
    * loaded BEFORE the scanner replays initial rows; a load FAILURE fails closed (no
@@ -231,8 +231,6 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
       : null;
   const knownResumeTranscript = readKnownResumeTranscriptPath(opts);
   const knownResumeTranscriptPath = knownResumeTranscript?.path ?? null;
-  let knownResumeRawFollower: JsonlFollowController | null = null;
-  const knownResumeRawFollowerReplaySuppressor = createClaudeJsonlResetReplaySuppressor();
   let activeTrustedSessionBinding: Readonly<{
     data: SessionHookData;
     sessionInfo: ClaudeUnifiedSessionStartInfo;
@@ -313,14 +311,13 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
     if (observation.historicalReplay) return;
     const activeSessionStart = activeTrustedSessionBinding;
     if (!opts.proveAcceptedMainTranscript) return;
-    // A canonical known-resume follower is already bound to the exact requested Claude session
-    // and starts at the current EOF, so its fresh authenticated rows may prove exact prompt
-    // acceptance even when an adopted provider never emits a new SessionStart. Once a real
-    // SessionStart arrives, that live identity takes precedence and the old follower cannot settle.
+    // The scanner serializes trusted raw observations behind preceding visible-message commits,
+    // including a known resume whose adopted provider emits no new SessionStart. A real
+    // SessionStart takes precedence over that initial requested identity.
     const trustedSessionId = activeSessionStart?.sessionInfo.sessionId ?? knownResumeSessionId;
-    if (!trustedSessionId) return;
     const sessionId = readTranscriptString(value as RawJSONLines, 'sessionId');
-    if (sessionId !== trustedSessionId) return;
+    if (!sessionId) return;
+    if (trustedSessionId ? sessionId !== trustedSessionId : !promotedDiscoveredMainSessionIds.has(sessionId)) return;
     if (!opts.proveAcceptedMainTranscript(value)) return;
 
     // Acceptance proof is per exact Pending prompt and must keep observing every authenticated
@@ -345,52 +342,6 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
     opts.onLiveProviderTaskJsonlValue?.(input);
   };
 
-  const startKnownResumeRawFollower = async (): Promise<void> => {
-    if (
-      !knownResumeSessionId
-      || !knownResumeTranscriptPath
-      || (!opts.onRawTranscriptValue && !opts.proveAcceptedMainTranscript)
-    ) return;
-    if (knownResumeRawFollower) return;
-    logger.debug('[unified]: known resume raw transcript follower starting', {
-      sessionId: knownResumeSessionId,
-      transcriptPath: knownResumeTranscriptPath,
-      transcriptPathSource: knownResumeTranscript?.source ?? 'none',
-    });
-    const startOffsetBytes = await stat(knownResumeTranscriptPath).then(
-      (snapshot) => snapshot.size,
-      () => 0,
-    );
-    const follower = createJsonlFollowController({
-      filePath: knownResumeTranscriptPath,
-      startOffsetBytes,
-      metrics: {
-        emit: (event: JsonlFollowerMetricEvent) => {
-          if (event.type !== 'file_reset') return;
-          const suppressBeforeMs = knownResumeRawFollowerReplaySuppressor.markReset();
-          logger.debug('[unified]: known resume raw transcript follower reset; suppressing replay-prone rows', {
-            sessionId: knownResumeSessionId,
-            reason: event.reason,
-            suppressBeforeMs,
-          });
-        },
-      },
-      onJson: (value) => {
-        if (disposed) return;
-        if (knownResumeRawFollowerReplaySuppressor.shouldSuppress(value)) return;
-        observeTrustedRawTranscriptValue(value, { historicalReplay: false });
-      },
-      onError: (error) => {
-        logger.debug('[unified]: known resume raw transcript follower error:', error);
-      },
-    });
-    knownResumeRawFollower = follower;
-    await follower.start();
-    if (disposed || knownResumeRawFollower !== follower) {
-      await follower.stop();
-    }
-  };
-
   const flushPendingSessionBindings = () => {
     if (!scanner) return;
     for (const pending of pendingSessionBindings.splice(0)) {
@@ -412,7 +363,18 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
           knownResumeTranscriptPath,
           knownResumeTranscriptPathSource: knownResumeTranscript?.source ?? 'none',
         });
-        unsubscribe = opts.subscribeClaudeSessionHooks((data) => {
+        unsubscribe = opts.subscribeClaudeSessionHooks((data, observation) => {
+          const trustedSessionId = activeTrustedSessionBinding?.sessionInfo.sessionId ?? knownResumeSessionId;
+          const hookSessionId = readHookString(data, 'session_id', 'sessionId');
+          const task = readClaudeTaskLifecycleEnvelope(data);
+          if ((task?.subtype === 'agent-resume' || task?.subtype === 'async-launch')
+            && trustedSessionId && hookSessionId === trustedSessionId) {
+            opts.onRawTranscriptValue?.(data, {
+              historicalReplay: false, authenticatedHook: true,
+              ...(observation?.observedAt !== undefined ? { observedAt: observation.observedAt } : {}),
+              ...(observation?.startupReplay ? { startupReplay: true } : {}),
+            });
+          }
           // A4-MED-2: a subagent (sidechain) SessionStart must never re-key the transcript /
           // resume identity — same shared gate the hook lifecycle bridge uses.
           if (isSidechainSessionHook(data)) {
@@ -446,8 +408,12 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
       let committedClaudeJsonlMessageKeys: ReadonlySet<string> = new Set<string>();
       let replaySuppressRowsBeforeMs: number | null = null;
       const resumesKnownClaudeSession = Boolean(opts.sessionId || opts.transcriptPath);
+      // Capture the live boundary before baseline loading: Claude can append queued-command
+      // evidence while the durable replay baseline is in flight. The scanner owns both paths.
+      const initialLiveTranscriptStartOffsetBytes = waitForSessionStartHook && knownResumeTranscriptPath
+        ? await stat(knownResumeTranscriptPath).then((snapshot) => snapshot.size, () => 0)
+        : undefined;
       if (waitForSessionStartHook) {
-        await startKnownResumeRawFollower();
         const baseline = await loadClaudeJsonlReplayBaseline({
           loadCommittedBaseline: opts.loadCommittedClaudeJsonlMessageBaseline,
           resumesKnownClaudeSession,
@@ -463,8 +429,7 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
       const prebindKnownResumeTranscript = Boolean(
         waitForSessionStartHook
         && knownResumeSessionId
-        && knownResumeTranscriptPath
-        && knownResumeTranscript?.source === 'canonical',
+        && knownResumeTranscriptPath,
       );
       // An adopted terminal may not emit another SessionStart. Seed the same resume-era cutoff
       // before snapshot replay so old lifecycle rows cannot become current-runner activity.
@@ -475,13 +440,20 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
       ) {
         resumeLiveTranscriptAfterMsBySessionId.set(knownResumeSessionId, startedAtMs);
       }
+      const initialBinding = activeTrustedSessionBinding?.sessionInfo;
+      const initialSessionId = waitForSessionStartHook
+        ? (initialBinding?.sessionId ?? (prebindKnownResumeTranscript ? knownResumeSessionId : null))
+        : opts.sessionId;
+      const initialTranscriptPath = waitForSessionStartHook
+        ? (initialBinding ? initialBinding.transcriptPath : (prebindKnownResumeTranscript ? knownResumeTranscriptPath : null))
+        : opts.transcriptPath;
       const nextScanner = await createSessionScanner({
-        sessionId: waitForSessionStartHook
-          ? (prebindKnownResumeTranscript ? knownResumeSessionId : null)
-          : opts.sessionId,
-        transcriptPath: waitForSessionStartHook
-          ? (prebindKnownResumeTranscript ? knownResumeTranscriptPath : null)
-          : opts.transcriptPath,
+        sessionId: initialSessionId,
+        transcriptPath: initialTranscriptPath,
+        initialLiveTranscriptStartOffsetBytes: initialSessionId === knownResumeSessionId
+          && initialTranscriptPath === knownResumeTranscriptPath
+          ? initialLiveTranscriptStartOffsetBytes
+          : undefined,
         claudeConfigDir: opts.claudeConfigDir,
         workingDirectory: opts.workingDirectory,
         onMessage: async (message, observation) => {
@@ -541,6 +513,7 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
       scanner = nextScanner;
       opts.onSubagentFileCollectorChanged?.(nextScanner.subagentFileCollector);
       flushPendingSessionBindings();
+      opts.onStartupReplayComplete?.();
     },
     async dispose() {
       if (disposed) return;
@@ -554,8 +527,6 @@ export function createClaudeUnifiedTranscriptBridge(opts: Readonly<{
       if (scanner) opts.onSubagentFileCollectorChanged?.(null);
       await scanner?.cleanup();
       scanner = null;
-      await knownResumeRawFollower?.stop();
-      knownResumeRawFollower = null;
     },
   };
 }

@@ -101,7 +101,7 @@ export function buildConnectedServiceAuthGroupSwitchStateFromAccountUsage(input:
     if (!profileId) continue;
     const snapshot = snapshotsByProfileId.get(profileId) ?? null;
     const projectedState = snapshot
-      ? projectProviderAccountUsageSnapshotToAuthGroupRuntimeState(snapshot)
+      ? projectProviderAccountUsageSnapshotToAuthGroupRuntimeState(snapshot, input.group.policy.quotaLimitSelection)
       : null;
     memberStatesByProfileId.set(
       profileId,
@@ -123,6 +123,8 @@ export function buildConnectedServiceAuthGroupSwitchStateFromAccountUsage(input:
       serviceId: input.group.serviceId,
       groupId: input.group.groupId,
       activeProfileId: input.group.activeProfileId,
+      lastSwitchReason: input.group.state.lastSwitchReason,
+      lastSwitchAt: input.group.state.lastSwitchAt,
       generation: input.group.generation,
       runtimeStateRevision: input.group.runtimeStateRevision,
       policy: normalizeConnectedServiceAuthGroupPolicy(input.group.policy),

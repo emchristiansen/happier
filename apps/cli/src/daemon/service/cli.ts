@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { basename, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { spawnBackgroundSync } from '@happier-dev/cli-common/process';
 
 import { configuration, reloadConfiguration } from '@/configuration';
 import { readCredentials, readDaemonState, readSettings } from '@/persistence';
@@ -12,7 +13,7 @@ import { buildMissingLocalRelayError, resolveLocalRelay } from '@/utils/localRel
 import { resolveJavaScriptRuntimeExecutable } from '@/runtime/js/resolveJavaScriptRuntimeExecutable';
 import { readPositiveIntEnv } from '@/utils/readPositiveIntEnv';
 import { defaultNameFromUrl, defaultWebappUrlFromServerUrl } from '@/cli/commands/server/commandUtilities';
-import { applyDaemonServiceInstallPlan, runDaemonServiceCommands } from './apply';
+import { applyDaemonServiceInstallPlan, assertDaemonServiceCommandsAvailable, runDaemonServiceCommands } from './apply';
 import { buildServiceCommandEnv } from '@happier-dev/cli-common/service';
 
 import { resolveCliVersionFromBinary } from './resolveCliVersionFromBinary';
@@ -20,6 +21,7 @@ import {
   describeDaemonServiceInstallConflict,
   installDaemonService,
   previewDaemonServiceInstall,
+  readInstalledDaemonServiceDefinition,
   uninstallDaemonService,
 } from './installer';
 import {
@@ -29,6 +31,12 @@ import {
   resolveDaemonServiceLaunchdLabel,
   resolveWindowsDaemonServiceLogPaths,
   resolveWindowsDaemonTaskName,
+  DAEMON_SERVICE_AUTOSTART_ENV_KEY,
+  DAEMON_SERVICE_BUNDLE_ID_ENV_KEY,
+  DAEMON_SERVICE_MANAGED_BY_ENV_KEY,
+  parseDaemonServiceBundleId,
+  parseDaemonServiceManagedBy,
+  type DaemonServiceAutostartMode,
   type DaemonServiceMode,
   type DaemonServicePlannedCommand,
   type DaemonServiceTargetMode,
@@ -37,7 +45,7 @@ import { resolveDaemonServicePaths, type DaemonServiceCliRuntime, type DaemonSer
 import { collectWindowsServiceLaunchDiagnostics } from './collectWindowsServiceLaunchDiagnostics';
 import { commandExistsInPath } from './commandExistsInPath';
 import { resolveDaemonServiceRuntimeTarget } from './runtimeTarget';
-import { resolveDaemonServiceInstallRuntimeTarget } from './resolveDaemonServiceInstallRuntimeTarget';
+import { isManagedCliDaemonServiceLauncher, resolveDaemonServiceInstallRuntimeTarget } from './resolveDaemonServiceInstallRuntimeTarget';
 import { resolveLinuxSystemUserPaths } from './resolveLinuxSystemUserPaths';
 import { getReleaseRingPublicLabel, type PublicReleaseRingId } from '@happier-dev/release-runtime/releaseRings';
 import { expandHomeDirPath } from '@happier-dev/cli-common/providers';
@@ -50,12 +58,22 @@ import { restartDaemonAndWait } from '@/daemon/restartDaemonAndWait';
 import { resolveInvokerName } from '@/cli/runtime/resolveInvokerName';
 
 import { discoverInstalledDaemonServiceEntries } from './discoverInstalledDaemonServiceEntries';
-import { isValidInstalledDaemonServiceFile } from './discoverInstalledDaemonServiceEntries';
+import {
+  isValidInstalledDaemonServiceFile,
+  isInstalledDaemonServiceForHappierHome,
+  resolveInstalledDaemonServiceDefinitionPath,
+  readInstalledDaemonServiceAutostartMode,
+  readInstalledDaemonServiceBundleId,
+  readInstalledDaemonServiceManagedBy,
+  readInstalledDaemonServiceTargetMode,
+} from './discoverInstalledDaemonServiceEntries';
+import { createStepPrinter } from '@happier-dev/cli-common/output';
 import { resolveDaemonServiceDiscoveryTargets } from './resolveDaemonServiceDiscoveryTargets';
 import type { DaemonServiceInstallStrategy } from './daemonInstallConflict';
 import { assertDaemonServiceModeSupported } from './assertDaemonServiceModeSupported';
 import { evaluateCurrentDaemonOwner } from '@/daemon/ownership/evaluateCurrentDaemonOwner';
 import { doesInstalledDaemonServiceDefinitionMatchExpected } from './doesInstalledDaemonServiceDefinitionMatchExpected';
+import { describeDaemonServiceRuntimeReplacement } from './readDaemonServiceDefinitionLauncher';
 import { resolveDaemonStartupSourceServiceManagedState } from '@/daemon/ownership/daemonOwnershipMetadata';
 import { resolveInstalledDaemonServiceInventoryForCurrentRelay, renderDaemonServiceInventory } from '@/daemon/ownership/daemonServiceInventory';
 import {
@@ -156,6 +174,18 @@ function resolveOptionalModeFromText(raw: string, source: string): DaemonService
   return resolveModeFromText(value, source);
 }
 
+function resolveAutostartFromText(raw: string, source: string): DaemonServiceAutostartMode {
+  const value = String(raw ?? '').trim().toLowerCase();
+  if (value === 'at-login' || value === 'on-demand') return value;
+  throw new Error(`Invalid ${source} value "${String(raw ?? '').trim()}" (expected at-login|on-demand)`);
+}
+
+function resolveOptionalAutostartFromText(raw: string, source: string): DaemonServiceAutostartMode | null {
+  const value = String(raw ?? '').trim();
+  if (!value) return null;
+  return resolveAutostartFromText(value, source);
+}
+
 function parseDaemonServiceCliInvocation(argv: readonly string[]): Readonly<{
   argvFiltered: string[];
   flags: Readonly<{
@@ -167,6 +197,7 @@ function parseDaemonServiceCliInvocation(argv: readonly string[]): Readonly<{
     replaceExisting: 'ring' | 'all' | null;
     ring: PublicReleaseRingId | null;
     instanceId: string | null;
+    autostart: DaemonServiceAutostartMode | null;
   }>;
   action: DaemonServiceCliAction;
   mode: DaemonServiceMode;
@@ -182,6 +213,7 @@ function parseDaemonServiceCliInvocation(argv: readonly string[]): Readonly<{
   let replaceExisting: 'ring' | 'all' | null = null;
   let ring: PublicReleaseRingId | null = null;
   let instanceId: string | null = null;
+  let autostart: DaemonServiceAutostartMode | null = null;
 
   for (let i = 0; i < argv.length; i += 1) {
     const a = String(argv[i] ?? '');
@@ -273,6 +305,24 @@ function parseDaemonServiceCliInvocation(argv: readonly string[]): Readonly<{
       continue;
     }
 
+    if (a === '--autostart') {
+      const next = String(argv[i + 1] ?? '');
+      if (!next || next.startsWith('-')) {
+        throw new Error('Missing value for --autostart (expected at-login|on-demand)');
+      }
+      autostart = resolveAutostartFromText(next, '--autostart');
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('--autostart=')) {
+      autostart = resolveAutostartFromText(a.slice('--autostart='.length), '--autostart');
+      continue;
+    }
+    if (a === '--no-autostart') {
+      autostart = 'on-demand';
+      continue;
+    }
+
     if (a === '--system-user') {
       const next = String(argv[i + 1] ?? '');
       if (!next || next.startsWith('-')) {
@@ -300,7 +350,7 @@ function parseDaemonServiceCliInvocation(argv: readonly string[]): Readonly<{
 
   return {
     argvFiltered: filtered,
-    flags: { ...flags, yes, takeover, replaceExisting, ring, instanceId },
+    flags: { ...flags, yes, takeover, replaceExisting, ring, instanceId, autostart },
     action,
     mode,
     modeExplicit,
@@ -320,6 +370,21 @@ function printJson(data: unknown): void {
   process.stdout.write(`${JSON.stringify(data)}\n`);
 }
 
+/**
+ * This very service owns the running daemon, but that daemon does not match this CLI (it still
+ * runs the version from before an update, or another channel). `start` alone cannot converge it on
+ * any platform: `systemctl start` on an active unit and a Windows `/Run` of a running task are
+ * no-ops, so the ownership wait would time out. `start` is therefore promoted to `restart`.
+ */
+function isOwnServiceDaemonOnAnotherCli(
+  ownership: Awaited<ReturnType<typeof evaluateCurrentDaemonOwner>>,
+  expectedServiceLabel: string,
+): boolean {
+  return ownership.kind === 'conflict'
+    && ownership.owner.serviceManaged === true
+    && ownership.owner.state.serviceLabel === expectedServiceLabel;
+}
+
 function shouldStopCurrentWindowsServiceOwnerBeforeLifecycleAction(params: Readonly<{
   platform: SupportedPlatform;
   ownership: Awaited<ReturnType<typeof evaluateCurrentDaemonOwner>>;
@@ -330,16 +395,12 @@ function shouldStopCurrentWindowsServiceOwnerBeforeLifecycleAction(params: Reado
     return false;
   }
 
-  const owner = params.ownership.owner;
-  if (owner.serviceManaged !== true || owner.state.serviceLabel !== params.expectedServiceLabel) {
-    return false;
-  }
-
   if (params.action === 'start') {
-    return params.ownership.kind === 'conflict';
+    return isOwnServiceDaemonOnAnotherCli(params.ownership, params.expectedServiceLabel);
   }
 
-  return true;
+  const owner = params.ownership.owner;
+  return owner.serviceManaged === true && owner.state.serviceLabel === params.expectedServiceLabel;
 }
 
 function describeDaemonServiceLifecycleAction(action: 'install' | 'uninstall' | 'start' | 'stop' | 'restart'): string {
@@ -380,7 +441,7 @@ async function stopCurrentWindowsServiceOwnerIfNeeded(params: Readonly<{
 
 function runCommandCaptureBestEffort(command: Readonly<{ cmd: string; args: readonly string[] }>): { ok: boolean; out: string | null } {
   try {
-    const res = spawnSync(command.cmd, [...command.args], {
+    const res = spawnBackgroundSync(command.cmd, command.args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: buildServiceCommandEnv({ cmd: command.cmd, args: command.args, env: process.env }),
     });
@@ -408,6 +469,25 @@ function resolveDaemonServiceStatusCommand(params: Readonly<{
     uid: params.runtime.uid ?? undefined,
   });
   return plan.commands[0] ?? null;
+}
+
+function assertDaemonServiceDefinitionHome(
+  runtime: DaemonServiceCliRuntime,
+  paths: ReturnType<typeof resolveDaemonServicePaths>,
+  action: 'start' | 'stop' | 'restart' | 'uninstall',
+): string {
+  const path = resolveInstalledDaemonServiceDefinitionPath({
+    platform: runtime.platform, path: paths.installedPath, taskName: paths.taskName,
+  });
+  const definition = { platform: runtime.platform, path, expectedLabel: paths.label };
+  const hasRegisteredWindowsWrapper = runtime.platform === 'win32' && path !== paths.installedPath;
+  if ((isValidInstalledDaemonServiceFile(definition) || hasRegisteredWindowsWrapper)
+    && !isInstalledDaemonServiceForHappierHome({ ...definition, happierHomeDir: runtime.happierHomeDir })) {
+    throw Object.assign(new Error(
+      `foreign_home_service: Background service ${paths.label} belongs to another or unknown Happier home; refusing to ${action} it.`,
+    ), { code: 'foreign_home_service' });
+  }
+  return path;
 }
 
 function resolveDaemonServiceOwnershipHealthCommand(params: Readonly<{
@@ -658,17 +738,18 @@ async function assertExpectedDaemonServiceOwnership(params: Readonly<{
 async function withManualRelayTakeoverRecovery<T>(params: Readonly<{
   shouldTakeOverManualOwner: boolean;
   action: 'install' | 'start' | 'restart';
-  run: () => Promise<T> | T;
+  run: (beforeApply: () => Promise<void>) => Promise<T> | T;
 }>): Promise<T> {
-  if (!params.shouldTakeOverManualOwner) {
-    return await params.run();
-  }
-
-  await stopDaemon();
-
+  let stoppedManualOwner = false;
   try {
-    return await params.run();
+    return await params.run(async () => {
+      if (!params.shouldTakeOverManualOwner) return;
+      await stopDaemon();
+      stoppedManualOwner = true;
+    });
   } catch (error) {
+    // Preflight errors must preserve both the owner and their typed public error.
+    if (!stoppedManualOwner) throw error;
     const restored = await restartDaemonAndWait({ takeover: true }).catch(() => ({ ok: false }));
     const restoredOk = typeof restored === 'boolean' ? restored : restored.ok;
     const originalMessage = error instanceof Error ? error.message : String(error);
@@ -845,14 +926,29 @@ export function resolveDaemonServiceInstallationSnapshotFromEnv(options: Readonl
 }> = {}): DaemonServiceInstallationSnapshot {
   const runtime = resolveDaemonServiceCliRuntimeFromEnv(options);
   const paths = resolveDaemonServicePaths(runtime, { mode: options.mode });
+  const installedPath = resolveInstalledDaemonServiceDefinitionPath({ platform: runtime.platform, path: paths.installedPath, taskName: paths.taskName });
+  const installed = isInstalledDaemonServiceForHappierHome({
+    platform: runtime.platform,
+    path: installedPath,
+    expectedLabel: paths.label,
+    happierHomeDir: runtime.happierHomeDir,
+  });
   return {
     platform: runtime.platform,
-    installed: isValidInstalledDaemonServiceFile({
-      platform: runtime.platform,
-      path: paths.installedPath,
-      expectedLabel: paths.label,
-    }),
+    installed,
     installedPath: paths.installedPath,
+    label: paths.label,
+    targetMode: installed ? readInstalledDaemonServiceTargetMode({
+      platform: runtime.platform,
+      path: installedPath,
+    }) : null,
+    // A file that is not a readable Happier definition proves no mode, so it contributes none.
+    autostart: installed
+      ? readInstalledDaemonServiceAutostartMode({
+        platform: runtime.platform,
+        path: installedPath,
+      })
+      : null,
   };
 }
 
@@ -907,12 +1003,22 @@ export async function resolveDaemonServiceListEntries(
     entryPath: runtime.entryPath,
   }));
 
-  const expectedDefaultPlan = planDaemonServiceInstall({
+  // An installed service declares the autostart mode it was installed with, and the expected
+  // definition has to be built with that same mode — otherwise every on-demand installation
+  // reads as drifted and the repair paths keyed off this field would reinstall it at-login.
+  const buildExpectedDefaultPlan = (
+    autostart: DaemonServiceAutostartMode,
+    managedBy: ReturnType<typeof readInstalledDaemonServiceManagedBy> = null,
+    bundleId: string | null = null,
+  ) => planDaemonServiceInstall({
     platform: runtime.platform,
     mode: options.mode,
     systemUser: options.mode === 'system' ? String(options.systemUser ?? '').trim() : undefined,
     channel: runtime.channel,
     targetMode: 'default-following',
+    autostart,
+    managedBy,
+    bundleId,
     instanceId: runtime.instanceId,
     activeServerId: runtime.activeServerId,
     uid: runtime.uid ?? undefined,
@@ -924,7 +1030,7 @@ export async function resolveDaemonServiceListEntries(
     nodePath: expectedDefaultRuntimeTarget.nodePath,
     entryPath: expectedDefaultRuntimeTarget.entryPath,
   });
-  const expectedDefaultFile = expectedDefaultPlan.files[0] ?? null;
+  const expectedDefaultFile = buildExpectedDefaultPlan('at-login').files[0] ?? null;
   if (!expectedDefaultFile) {
     return resolvedEntries;
   }
@@ -937,13 +1043,27 @@ export async function resolveDaemonServiceListEntries(
       return entry;
     }
 
+    const declaredAutostart = readInstalledDaemonServiceAutostartMode({
+      platform: runtime.platform,
+      path: entry.path,
+    });
+    // The installed marker is kept by every rewrite, so the expected definition carries it too.
+    const managedBy = readInstalledDaemonServiceManagedBy({ platform: runtime.platform, path: entry.path });
+    const bundleId = readInstalledDaemonServiceBundleId({ platform: runtime.platform, path: entry.path });
+    const expectedFile = (declaredAutostart && declaredAutostart !== 'at-login') || managedBy
+      ? buildExpectedDefaultPlan(declaredAutostart ?? 'at-login', managedBy, bundleId).files[0] ?? null
+      : expectedDefaultFile;
+
+    if (!expectedFile || entry.path !== expectedFile.path) {
+      return { ...entry, installedDefinitionMatchesExpected: false };
+    }
+
     return {
       ...entry,
-      installedDefinitionMatchesExpected: entry.path === expectedDefaultFile.path
-        && doesInstalledDaemonServiceDefinitionMatchExpected({
-          installedPath: entry.path,
-          expectedContents: expectedDefaultFile.content,
-        }),
+      installedDefinitionMatchesExpected: doesInstalledDaemonServiceDefinitionMatchExpected({
+        installedPath: entry.path,
+        expectedContents: expectedFile.content,
+      }),
     };
   });
 }
@@ -1062,7 +1182,7 @@ function mapDaemonServiceListEntriesToInventory(
         : ['--user', 'is-active', unitName];
 
       try {
-        const res = spawnSync('systemctl', args, {
+        const res = spawnBackgroundSync('systemctl', args, {
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: runningStateTimeoutMs,
           env: buildServiceCommandEnv({ cmd: 'systemctl', args, env: process.env }),
@@ -1091,7 +1211,7 @@ function mapDaemonServiceListEntriesToInventory(
       }
       const args = ['print', `gui/${uid}/${label}`];
       try {
-        const res = spawnSync('launchctl', args, {
+        const res = spawnBackgroundSync('launchctl', args, {
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: runningStateTimeoutMs,
           env: buildServiceCommandEnv({ cmd: 'launchctl', args, env: process.env }),
@@ -1116,7 +1236,7 @@ function mapDaemonServiceListEntriesToInventory(
       });
       const args = ['/Query', '/TN', taskName, '/FO', 'LIST', '/V'];
       try {
-        const res = spawnSync('schtasks', args, {
+        const res = spawnBackgroundSync('schtasks', args, {
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: runningStateTimeoutMs,
           env: buildServiceCommandEnv({ cmd: 'schtasks', args, env: process.env }),
@@ -1220,6 +1340,15 @@ async function handleLocalRelayFlag(argv: readonly string[]): Promise<string[]> 
   return argv.filter((a) => a !== '--local-relay');
 }
 
+/**
+ * Facts `service list --json` reports about this CLI, for callers that must not rely on its version
+ * alone. `pinnedServiceCoexistence`: a daemon's start-up reap is scoped to its own lifecycle
+ * directory, a pinned install conflicts only with a service of the same relay, and repair never
+ * removes another relay's pinned service — so pinned services for several relays can run side by
+ * side. A CLI without this field must not be asked to run a second relay's service.
+ */
+export const DAEMON_SERVICE_CLI_CAPABILITIES = Object.freeze({ pinnedServiceCoexistence: true });
+
 export async function runDaemonServiceCliCommand(params: Readonly<{
   argv: readonly string[];
   commandPath?: string;
@@ -1233,6 +1362,12 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
     flags.ring || flags.instanceId
       ? 'pinned'
       : resolveDaemonServiceTargetModeFromText(process.env.HAPPIER_DAEMON_SERVICE_TARGET_MODE || 'default-following');
+  // The env value a process started *by* the background service inherits from its own definition.
+  // It is the weakest input on purpose — see `effectiveAutostart` below.
+  const inheritedAutostart: DaemonServiceAutostartMode | null = resolveOptionalAutostartFromText(
+    process.env[DAEMON_SERVICE_AUTOSTART_ENV_KEY] ?? '',
+    DAEMON_SERVICE_AUTOSTART_ENV_KEY,
+  );
   const runtime = resolveDaemonServiceCliRuntimeFromEnv({
     mode,
     systemUser,
@@ -1246,13 +1381,17 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
   const paths = resolveDaemonServicePaths(runtime, { mode });
   const action = parsed.action;
   const commandPath = params.commandPath ?? `${resolveInvokerName() ?? 'happier'} service`;
+  // Lifecycle actions can wait many seconds for the service to take ownership; show that as a timed step.
+  // `--json` keeps stdout machine-readable.
+  const steps = createStepPrinter({ enabled: !flags.json });
 
+  try {
   if (flags.help) {
       if (flags.json) {
         printJson({
           ok: true,
           commands: ['list', 'paths', 'install', 'uninstall', 'repair', 'start', 'stop', 'restart', 'status', 'logs', 'tail'],
-          flags: ['--json', '--dry-run', '--yes', '--takeover', '--replace-existing=ring|all', '--ring', '--instance', '--all'],
+          flags: ['--json', '--dry-run', '--yes', '--takeover', '--replace-existing=ring|all', '--ring', '--instance', '--all', '--autostart=at-login|on-demand', '--no-autostart'],
         });
         return;
     }
@@ -1264,12 +1403,23 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
         '  happier service list [--json]',
         '  happier service paths [--json]',
         '  happier service status [--json]',
-        '  happier service install [--local-relay] [--dry-run] [--yes] [--takeover] [--replace-existing=ring|all] [--json]',
+        '  happier service install [--local-relay] [--dry-run] [--yes] [--takeover] [--replace-existing=ring|all] [--autostart <at-login|on-demand>] [--no-autostart] [--json]',
         '  happier service uninstall [--ring <stable|preview|dev>] [--instance <id>] [--all] [--yes] [--dry-run] [--json]',
         '  happier service repair [--yes] [--json] (legacy alias for `happier doctor repair`)',
         '  happier service start|stop|restart [--dry-run] [--takeover] [--json]',
         '  happier service logs [--json]',
         '  happier service tail',
+        '',
+        'Pinned services:',
+        '  happier --server <profile-id> service install --instance <service-id> [--autostart <at-login|on-demand>]',
+        '  --instance names the service; --server selects its relay and must precede service.',
+        '  Use the same --server and --instance when inspecting or controlling that service.',
+        '',
+        'Autostart:',
+        '  --no-autostart installs the background service without a login trigger, so the',
+        '  daemon runs only while something starts it (the desktop app, or `happier service start`).',
+        '  Re-run install with --autostart at-login to start it at login again. Without either',
+        '  flag an existing installation keeps the mode it already has.',
         '',
         'Compatibility aliases:',
         '  happier daemon service ...',
@@ -1288,6 +1438,7 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
     });
     if (flags.json) {
       printJson({
+        capabilities: DAEMON_SERVICE_CLI_CAPABILITIES,
         entries,
         services: await resolveDaemonServiceInventoryEntries({
           runtime,
@@ -1338,6 +1489,10 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
   }
 
   if (action === 'install') {
+    // Only `install` honors the request; every other rewrite keeps the installed marker.
+    const requestedManagedBy = parseDaemonServiceManagedBy(process.env[DAEMON_SERVICE_MANAGED_BY_ENV_KEY]) ?? undefined;
+    // R16 — the desktop app the managed service belongs to, requested beside the marker.
+    const requestedBundleId = parseDaemonServiceBundleId(process.env[DAEMON_SERVICE_BUNDLE_ID_ENV_KEY]) ?? undefined;
     if (runtime.platform === 'linux' && mode === 'system') {
       if (typeof process.getuid === 'function' && process.getuid() !== 0) {
         throw new Error('Root privileges are required for system mode service install');
@@ -1396,12 +1551,34 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
       return;
     }
 
+    // Resolution order, weakest last: an explicit flag, then the mode the installed service
+    // already declares — so a reinstall, repair or drift refresh never silently restores a login
+    // trigger the user turned off — then the inherited env, which may only decide when there is no
+    // installed definition to inherit from. A process the service itself started carries that env
+    // from the definition it was launched with, so letting it outrank the file would let a stale
+    // value re-arm the login trigger with no flag and no prompt.
+    const effectiveAutostart: DaemonServiceAutostartMode = flags.autostart
+      ?? readInstalledDaemonServiceAutostartMode({
+        platform: installRuntime.platform,
+        path: paths.installedPath,
+      })
+      ?? inheritedAutostart
+      ?? 'at-login';
     const plan = planDaemonServiceInstall({
       platform: installRuntime.platform,
       mode,
       systemUser,
       channel: installRuntime.channel,
       targetMode: installRuntime.targetMode,
+      autostart: effectiveAutostart,
+      managedBy: requestedManagedBy ?? readInstalledDaemonServiceManagedBy({
+        platform: installRuntime.platform,
+        path: paths.installedPath,
+      }),
+      bundleId: requestedBundleId ?? readInstalledDaemonServiceBundleId({
+        platform: installRuntime.platform,
+        path: paths.installedPath,
+      }),
       instanceId: installRuntime.instanceId,
       activeServerId: installRuntime.activeServerId,
       uid: installRuntime.uid ?? undefined,
@@ -1417,6 +1594,13 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
       && ownership.kind !== 'none'
       && ownership.owner.serviceManaged === true
       && ownership.owner.state.serviceLabel === paths.label;
+    const shouldStopWindowsOwner = shouldStopCurrentWindowsServiceOwnerBeforeLifecycleAction({
+      platform: installRuntime.platform,
+      ownership,
+      expectedServiceLabel: paths.label,
+      action: 'install',
+    });
+    const restartRunningDaemon = shouldStopWindowsOwner || isOwnServiceDaemonOnAnotherCli(ownership, paths.label);
 
     const strategy: DaemonServiceInstallStrategy | undefined =
       flags.replaceExisting === 'ring' ? 'replace-ring'
@@ -1434,7 +1618,11 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
         systemUser,
         channel: installRuntime.channel,
         targetMode: installRuntime.targetMode,
+        autostart: effectiveAutostart,
+        managedBy: requestedManagedBy,
+        bundleId: requestedBundleId,
         darwinInstallMode: shouldKickstartCurrentDarwinInstall ? 'kickstart' : undefined,
+        restartRunningDaemon,
         instanceId: installRuntime.instanceId,
         activeServerId: installRuntime.activeServerId,
         strategy,
@@ -1444,15 +1632,26 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
         nodePath: installRuntime.nodePath,
         entryPath: installRuntime.entryPath,
       });
-      const installConflict = describeDaemonServiceInstallConflict({
+      const serviceConflict = describeDaemonServiceInstallConflict({
         exactTargetExists: preview.exactTargetExists,
         strategy: preview.strategy,
         conflictPlan: preview.conflictPlan,
       });
+      const runtimeReplacement = preview.exactTargetRuntimeReplacement;
+      const runtimeReplacementMessage = runtimeReplacement
+        ? `The background service runs ${runtimeReplacement.current}; installing switches it to ${runtimeReplacement.replacement}.`
+        : null;
+      const installConflict = serviceConflict || runtimeReplacementMessage
+        ? {
+            blocking: serviceConflict?.blocking ?? false,
+            message: [serviceConflict?.message, runtimeReplacementMessage].filter(Boolean).join(' '),
+          }
+        : null;
       if (flags.json) {
         printJson({
           ok: true,
           platform: installRuntime.platform,
+          autostart: preview.autostart,
           plan: preview.plan,
           installConflict: installConflict ? {
             blocking: installConflict.blocking,
@@ -1460,11 +1659,17 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
             exactTargetExists: preview.exactTargetExists,
             competingServices: preview.conflictPlan.competingServices,
             servicesToRemove: preview.conflictPlan.servicesToRemove,
+            runtimeReplacement,
           } : undefined,
           takeover: takeoverNotice ? `${takeoverNotice.title} ${takeoverNotice.lines.join(' ')}`.trim() : undefined,
         });
         return;
       }
+      process.stdout.write(
+        preview.autostart === 'on-demand'
+          ? '[dry-run] autostart: on-demand (installed without a login trigger)\n'
+          : '[dry-run] autostart: at-login\n',
+      );
       process.stdout.write(`[dry-run] would write: ${preview.plan.files.map((f) => f.path).join(', ')}\n`);
       for (const c of preview.plan.commands) process.stdout.write(`[dry-run] would run: ${c.cmd} ${c.args.join(' ')}\n`);
       if (installConflict) {
@@ -1480,17 +1685,20 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
     }
 
     try {
-      await withManualRelayTakeoverRecovery({
+      await steps.run('Installing background service', () => withManualRelayTakeoverRecovery({
         shouldTakeOverManualOwner: takeoverDecision.kind === 'manual-owner-takeover',
         action: 'install',
-        run: async () => {
-          await stopCurrentWindowsServiceOwnerIfNeeded({
-            platform: installRuntime.platform,
-            ownership,
-            expectedServiceLabel: paths.label,
-            action: 'install',
-          });
+        run: async (beforeApply) => {
           await installDaemonService({
+            beforeApply: async () => {
+              await beforeApply();
+              await stopCurrentWindowsServiceOwnerIfNeeded({
+                platform: installRuntime.platform,
+                ownership,
+                expectedServiceLabel: paths.label,
+                action: 'install',
+              });
+            },
             platform: installRuntime.platform,
             uid: installRuntime.uid ?? undefined,
             userHomeDir: installRuntime.userHomeDir,
@@ -1499,7 +1707,11 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
             systemUser,
             channel: installRuntime.channel,
             targetMode: installRuntime.targetMode,
+            autostart: effectiveAutostart,
+            managedBy: requestedManagedBy,
+            bundleId: requestedBundleId,
             darwinInstallMode: shouldKickstartCurrentDarwinInstall ? 'kickstart' : undefined,
+            restartRunningDaemon,
             instanceId: installRuntime.instanceId,
             activeServerId: installRuntime.activeServerId,
             serverUrl: installRuntime.serverUrl,
@@ -1539,7 +1751,7 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
               : null,
           });
         },
-      });
+      }), () => 'Installed background service');
     } catch (error) {
       const conflict = error as Error & { code?: string; conflicts?: Array<{ label?: string }> };
       if (flags.json && conflict.code === 'daemon_service_conflict') {
@@ -1563,7 +1775,6 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
       });
       return;
     }
-    process.stdout.write('Background service installed.\n');
     if (takeoverNotice) {
       process.stdout.write(`${takeoverNotice.title}\n`);
       for (const line of takeoverNotice.lines) {
@@ -1628,41 +1839,43 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
         return;
       }
 
-      for (const entry of entries) {
-        const entryMode = entry.mode ?? mode;
-        const discoveryTarget = discoveryTargetByMode.get(entryMode) ?? {
-          mode: entryMode,
-          userHomeDir: runtime.userHomeDir,
-          happierHomeDir: runtime.happierHomeDir,
-        };
-        await stopCurrentWindowsServiceOwnerIfNeeded({
-          platform: runtime.platform,
-          ownership: await evaluateCurrentDaemonOwner(),
-          expectedServiceLabel: entry.label,
-          action: 'uninstall',
-        });
-        await uninstallDaemonService({
-          platform: runtime.platform,
-          uid: runtime.uid ?? undefined,
-          userHomeDir: discoveryTarget.userHomeDir,
-          happierHomeDir: discoveryTarget.happierHomeDir,
-          mode: entryMode,
-          channel: entry.releaseChannel,
-          targetMode: entry.targetMode,
-          instanceId: entry.serverId,
-          installedPath: entry.path,
-          runCommands: true,
-        });
-      }
+      const servicesLabel = `${entries.length} background service${entries.length === 1 ? '' : 's'}`;
+      await steps.run(`Uninstalling ${servicesLabel}`, async () => {
+        for (const entry of entries) {
+          const entryMode = entry.mode ?? mode;
+          const discoveryTarget = discoveryTargetByMode.get(entryMode) ?? {
+            mode: entryMode,
+            userHomeDir: runtime.userHomeDir,
+            happierHomeDir: runtime.happierHomeDir,
+          };
+          await stopCurrentWindowsServiceOwnerIfNeeded({
+            platform: runtime.platform,
+            ownership: await evaluateCurrentDaemonOwner(),
+            expectedServiceLabel: entry.label,
+            action: 'uninstall',
+          });
+          await uninstallDaemonService({
+            platform: runtime.platform,
+            uid: runtime.uid ?? undefined,
+            userHomeDir: discoveryTarget.userHomeDir,
+            happierHomeDir: discoveryTarget.happierHomeDir,
+            mode: entryMode,
+            channel: entry.releaseChannel,
+            targetMode: entry.targetMode,
+            instanceId: entry.serverId,
+            installedPath: entry.path,
+            runCommands: true,
+          });
+        }
+      }, () => `Uninstalled ${servicesLabel}`);
 
       if (flags.json) {
         printJson({ ok: true, platform: runtime.platform, removed: entries.length });
-        return;
       }
-      process.stdout.write(`Removed ${entries.length} background services.\n`);
       return;
     }
 
+    assertDaemonServiceDefinitionHome(runtime, paths, 'uninstall');
     const plan = planDaemonServiceUninstall({
       platform: runtime.platform,
       mode,
@@ -1684,29 +1897,30 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
       return;
     }
 
-    await stopCurrentWindowsServiceOwnerIfNeeded({
-      platform: runtime.platform,
-      ownership: await evaluateCurrentDaemonOwner(),
-      expectedServiceLabel: paths.label,
-      action: 'uninstall',
-    });
-    await uninstallDaemonService({
-      platform: runtime.platform,
-      uid: runtime.uid ?? undefined,
-      userHomeDir: runtime.userHomeDir,
-      happierHomeDir: runtime.happierHomeDir,
-      mode,
-      channel: runtime.channel,
-      targetMode: runtime.targetMode,
-      instanceId: runtime.instanceId,
-      runCommands: true,
-    });
+    await steps.run('Uninstalling background service', async () => {
+      await stopCurrentWindowsServiceOwnerIfNeeded({
+        platform: runtime.platform,
+        ownership: await evaluateCurrentDaemonOwner(),
+        expectedServiceLabel: paths.label,
+        action: 'uninstall',
+      });
+      await uninstallDaemonService({
+        platform: runtime.platform,
+        uid: runtime.uid ?? undefined,
+        userHomeDir: runtime.userHomeDir,
+        happierHomeDir: runtime.happierHomeDir,
+        mode,
+        channel: runtime.channel,
+        targetMode: runtime.targetMode,
+        instanceId: runtime.instanceId,
+        runCommands: true,
+      });
+    }, () => 'Uninstalled background service');
 
     if (flags.json) {
       printJson({ ok: true, platform: runtime.platform });
       return;
     }
-    process.stdout.write('Background service uninstalled.\n');
     return;
   }
 
@@ -1717,9 +1931,10 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
       }
     }
 
+    const installedDefinitionPath = assertDaemonServiceDefinitionHome(runtime, paths, action);
     if (!isValidInstalledDaemonServiceFile({
       platform: runtime.platform,
-      path: paths.installedPath,
+      path: installedDefinitionPath,
       expectedLabel: paths.label,
     })) {
       const msg = `Background service is not installed (${paths.installedPath}). Run: happier service install`;
@@ -1758,6 +1973,21 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
           systemUser: mode === 'system' ? systemUser : undefined,
           channel: runtime.channel,
           targetMode: runtime.targetMode,
+          // Refreshing a drifted definition must not re-arm a login trigger the
+          // user turned off, so the installed declaration decides here.
+          autostart: readInstalledDaemonServiceAutostartMode({
+            platform: runtime.platform,
+            path: paths.installedPath,
+          }) ?? 'at-login',
+          // …and so does its management marker.
+          managedBy: readInstalledDaemonServiceManagedBy({
+            platform: runtime.platform,
+            path: paths.installedPath,
+          }),
+          bundleId: readInstalledDaemonServiceBundleId({
+            platform: runtime.platform,
+            path: paths.installedPath,
+          }),
           instanceId: runtime.instanceId,
           activeServerId: runtime.activeServerId,
           uid: runtime.uid ?? undefined,
@@ -1776,7 +2006,20 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
             installedPath: paths.installedPath,
             expectedContents: expectedFile.content,
           });
-          if (!matches) {
+          // Which CLI the service runs changes only through the consented install (its dry-run
+          // reports this same replacement); starting a service never switches it (plan R10 K3).
+          const runtimeReplacement = matches ? null : describeDaemonServiceRuntimeReplacement({
+            platform: runtime.platform,
+            installedContents: readInstalledDaemonServiceDefinition(paths.installedPath),
+            expectedContents: expectedFile.content,
+            isManagedCliLauncher: (launcher) => isManagedCliDaemonServiceLauncher(launcher, process.env),
+          });
+          if (runtimeReplacement) {
+            process.stderr.write(
+              `Background service runs ${runtimeReplacement.current}; leaving its definition as it is (switching it to ${runtimeReplacement.replacement} needs \`${commandPath} install\`).\n`,
+            );
+          } else if (!matches) {
+            assertDaemonServiceCommandsAvailable(expectedPlan.commands);
             process.stderr.write('Refreshing background service definition (drifted from current template).\n');
             await applyDaemonServiceInstallPlan(expectedPlan, { runCommands: false });
             refreshedInstalledServiceDefinition = true;
@@ -1805,26 +2048,40 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
     const lifecycleAction = action === 'start' && (
       refreshedInstalledServiceDefinition
       || runningDefaultFollowingServiceNeedsRelayRestart
+      || isOwnServiceDaemonOnAnotherCli(ownership, paths.label)
     )
       ? 'restart'
       : action;
-    const lifecyclePlan = planDaemonServiceLifecycle({
-      platform: runtime.platform,
-      action: lifecycleAction,
-      mode,
-      channel: runtime.channel,
-      targetMode: runtime.targetMode,
-      instanceId: runtime.instanceId,
-      userHomeDir: runtime.userHomeDir,
-      happierHomeDir: runtime.happierHomeDir,
-      uid: runtime.uid ?? undefined,
-      darwinStartMode: lifecycleAction === 'start' && shouldKickstartCurrentDarwinService
-        ? 'kickstart'
-        : undefined,
-      darwinRestartMode: lifecycleAction === 'restart' && shouldKickstartCurrentDarwinService && !refreshedInstalledServiceDefinition
-        ? 'kickstart'
-        : undefined,
-    });
+    // `start` means "make sure it is running", and on darwin the only way to start an
+    // already-running launchd job is `kickstart -k` — kill, then start. When this very service
+    // label already owns a compatible, healthy running daemon and its definition is current,
+    // `start` has nothing left to do, so it must run nothing rather than drop the daemon the
+    // user is using. `restart` keeps its meaning: it is asked for when a restart is wanted.
+    const darwinServiceAlreadyStarted = lifecycleAction === 'start'
+      && runtime.platform === 'darwin'
+      && shouldKickstartCurrentDarwinService
+      && ownership.kind === 'compatible'
+      && ownershipHealthCommand !== null
+      && runCommandCaptureBestEffort(ownershipHealthCommand).ok;
+    const lifecyclePlan = darwinServiceAlreadyStarted
+      ? { platform: runtime.platform, commands: [] as DaemonServicePlannedCommand[] }
+      : planDaemonServiceLifecycle({
+        platform: runtime.platform,
+        action: lifecycleAction,
+        mode,
+        channel: runtime.channel,
+        targetMode: runtime.targetMode,
+        instanceId: runtime.instanceId,
+        userHomeDir: runtime.userHomeDir,
+        happierHomeDir: runtime.happierHomeDir,
+        uid: runtime.uid ?? undefined,
+        darwinStartMode: lifecycleAction === 'start' && shouldKickstartCurrentDarwinService
+          ? 'kickstart'
+          : undefined,
+        darwinRestartMode: lifecycleAction === 'restart' && shouldKickstartCurrentDarwinService && !refreshedInstalledServiceDefinition
+          ? 'kickstart'
+          : undefined,
+      });
     const plan = serviceDefinitionReloadCommands.length > 0
       ? { ...lifecyclePlan, commands: [...serviceDefinitionReloadCommands, ...lifecyclePlan.commands] }
       : lifecyclePlan;
@@ -1894,10 +2151,16 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
         return;
       }
 
-      await withManualRelayTakeoverRecovery({
+      // Past tense only once the ownership wait below has succeeded: the service IS the active daemon.
+      const [runningLabel, doneLabel] = action === 'start'
+        ? ['Starting background service', 'Started background service']
+        : ['Restarting background service', 'Restarted background service'];
+      await steps.run(runningLabel, () => withManualRelayTakeoverRecovery({
         shouldTakeOverManualOwner: takeoverDecision.kind === 'manual-owner-takeover',
         action,
-        run: async () => {
+        run: async (beforeApply) => {
+          assertDaemonServiceCommandsAvailable(plan.commands);
+          await beforeApply();
           await stopCurrentWindowsServiceOwnerIfNeeded({
             platform: runtime.platform,
             ownership,
@@ -1936,7 +2199,7 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
               : null,
           });
         },
-      });
+      }), () => doneLabel);
 
       if (flags.json) {
         printJson({
@@ -1946,12 +2209,6 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
         });
         return;
       }
-      // By this point the ownership wait has succeeded (see
-      // assertExpectedDaemonServiceOwnership above) — the service IS the
-      // active daemon. Use past-tense so users see the real outcome, not a
-      // vague "requested" that implies async completion.
-      const pastTense = action === 'start' ? 'started' : action === 'restart' ? 'restarted' : `${action}ed`;
-      process.stdout.write(`✓ Background service ${pastTense}.\n`);
       if (takeoverNotice) {
         process.stdout.write(`${takeoverNotice.title}\n`);
         for (const line of takeoverNotice.lines) {
@@ -1989,13 +2246,18 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
       return;
     }
 
-    await stopCurrentWindowsServiceOwnerIfNeeded({
-      platform: runtime.platform,
-      ownership,
-      expectedServiceLabel: paths.label,
-      action: 'stop',
-    });
-    runDaemonServiceCommands(plan.commands, { failureMode: 'strict' });
+    // `stop` runs bootout (which deregisters the service synchronously at
+    // launchctl-api level even though the process teardown is async). Past
+    // tense reflects what the user can observe via `launchctl list`.
+    await steps.run('Stopping background service', async () => {
+      await stopCurrentWindowsServiceOwnerIfNeeded({
+        platform: runtime.platform,
+        ownership,
+        expectedServiceLabel: paths.label,
+        action: 'stop',
+      });
+      runDaemonServiceCommands(plan.commands, { failureMode: 'strict' });
+    }, () => 'Stopped background service');
 
     if (flags.json) {
       printJson({
@@ -2007,11 +2269,6 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
       });
       return;
     }
-    // `stop` runs bootout (which deregisters the service synchronously at
-    // launchctl-api level even though the process teardown is async). Past
-    // tense reflects what the user can observe via `launchctl list`.
-    const pastTense = action === 'stop' ? 'stopped' : action === 'start' ? 'started' : action === 'restart' ? 'restarted' : `${action}ed`;
-    process.stdout.write(`✓ Background service ${pastTense}.\n`);
     if (stopOwnershipNote) {
       process.stdout.write(`${stopOwnershipNote.title}\n`);
       for (const line of stopOwnershipNote.lines) {
@@ -2022,10 +2279,12 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
   }
 
   if (action === 'status') {
-    const installed = isValidInstalledDaemonServiceFile({
+    const installedDefinitionPath = resolveInstalledDaemonServiceDefinitionPath({ platform: runtime.platform, path: paths.installedPath, taskName: paths.taskName });
+    const installed = isInstalledDaemonServiceForHappierHome({
       platform: runtime.platform,
-      path: paths.installedPath,
+      path: installedDefinitionPath,
       expectedLabel: paths.label,
+      happierHomeDir: runtime.happierHomeDir,
     });
     const ownership = await evaluateCurrentDaemonOwner();
     const services = await resolveInstalledDaemonServiceInventoryForCurrentRelay(runtime);
@@ -2150,4 +2409,11 @@ export async function runDaemonServiceCliCommand(params: Readonly<{
   const msg = `Unknown background service subcommand: ${action}`;
   if (flags.json) printJson({ ok: false, error: 'invalid_subcommand', message: msg });
   else process.stderr.write(`${msg}\n`);
+  } catch (error) {
+    if (flags.json && error instanceof Error && 'code' in error && error.code === 'service_manager_unavailable') {
+      printJson({ ok: false, error: error.code, message: error.message, platform: runtime.platform });
+      return;
+    }
+    throw error;
+  }
 }

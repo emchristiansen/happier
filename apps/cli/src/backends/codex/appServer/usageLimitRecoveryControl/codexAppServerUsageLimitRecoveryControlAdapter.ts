@@ -1,10 +1,12 @@
+import { buildUsageLimitIssueFingerprint } from '@happier-dev/protocol';
+import { readLatestUsageLimitFailureIssue } from '@/session/usageLimitRecoveryControls/readLatestUsageLimitFailureIssue';
 import { readSessionMetadataRuntimeDescriptor } from '@happier-dev/agents';
 import {
   buildRecoveryCreditConsumeIdempotencyKey,
   ConnectedServiceQuotaRecoveryCreditConsumeResponseV1Schema,
   SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY,
   SessionRuntimeIssueV1Schema,
-  SessionUsageLimitRecoveryV1Schema,
+  readSessionUsageLimitRecoveryForIssue,
   type ConnectedServiceQuotaRecoveryCreditsV1,
   type SessionUsageLimitRecoveryV1,
 } from '@happier-dev/protocol';
@@ -90,25 +92,6 @@ function readCodexBackendMode(metadata: MetadataRecord): string | null {
   return typeof backendMode === 'string' && backendMode.trim().length > 0 ? backendMode.trim() : null;
 }
 
-function readRecoveryIntent(metadata: MetadataRecord): SessionUsageLimitRecoveryV1 | null {
-  const parsed = SessionUsageLimitRecoveryV1Schema.safeParse(metadata[SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY]);
-  return parsed.success ? parsed.data : null;
-}
-
-function buildUsageLimitIssueFingerprint(
-  issue: NonNullable<ReturnType<typeof SessionRuntimeIssueV1Schema.safeParse>['data']>,
-): string {
-  return [
-    'usage-limit',
-    issue.provider ?? 'codex',
-    issue.providerTurnId ?? 'unknown-turn',
-    String(issue.occurredAt),
-    issue.usageLimit?.resetAtMs === null || issue.usageLimit?.resetAtMs === undefined
-      ? 'no-reset'
-      : String(issue.usageLimit.resetAtMs),
-  ].join(':');
-}
-
 function buildRecoveryIntentFromLatestUsageLimitIssue(
   params: SessionUsageLimitRecoveryControlAdapterParams,
 ): SessionUsageLimitRecoveryV1 | null {
@@ -124,6 +107,7 @@ function buildRecoveryIntentFromLatestUsageLimitIssue(
   const selectedAuth = resolveUsageLimitRecoverySelectedAuthFromIssue({
     issue: issueParsed.data,
     defaultNativeServiceId: CODEX_CONNECTED_SERVICE_ID,
+    connectedServices: params.metadata.connectedServices ?? null,
   }) ?? { kind: 'native', serviceId: CODEX_CONNECTED_SERVICE_ID };
 
   const timing = deriveUsageLimitRecoveryTiming({
@@ -135,7 +119,7 @@ function buildRecoveryIntentFromLatestUsageLimitIssue(
   return {
     v: 1,
     status: 'waiting',
-    issueFingerprint: buildUsageLimitIssueFingerprint(issueParsed.data),
+    issueFingerprint: buildUsageLimitIssueFingerprint(issueParsed.data, 'codex'),
     armedAtMs: issueParsed.data.occurredAt,
     resetAtMs: timing.resetAtMs,
     nextCheckAtMs: timing.nextCheckAtMs,
@@ -272,7 +256,9 @@ export function createCodexAppServerUsageLimitRecoveryControlAdapter(deps: Reado
       return stableError('codex_quota_probe_unsupported_for_backend_mode');
     }
 
-    const persistedIntent = readRecoveryIntent(params.metadata);
+    const persistedIntent = readSessionUsageLimitRecoveryForIssue(
+        params.metadata[SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY], readLatestUsageLimitFailureIssue(params.rawSession), 'codex',
+      );
     const intent = persistedIntent && persistedIntent.status !== 'cancelled'
       ? persistedIntent
       : buildRecoveryIntentFromLatestUsageLimitIssue(params);
@@ -330,7 +316,9 @@ export function createCodexAppServerUsageLimitRecoveryControlAdapter(deps: Reado
     consumeResetCredit: async (
       params: SessionUsageLimitRecoveryControlAdapterParams,
     ): Promise<CodexAppServerUsageLimitRecoveryControlResult> => {
-      const persistedIntent = readRecoveryIntent(params.metadata);
+      const persistedIntent = readSessionUsageLimitRecoveryForIssue(
+        params.metadata[SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY], readLatestUsageLimitFailureIssue(params.rawSession), 'codex',
+      );
       const intent = persistedIntent && persistedIntent.status !== 'cancelled'
         ? persistedIntent
         : buildRecoveryIntentFromLatestUsageLimitIssue(params);

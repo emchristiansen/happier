@@ -35,3 +35,14 @@ export {
   type MachineIdentityRecord,
   type MachineReplacementRecord,
 } from './identity/canonicalMachineId.js';
+
+export {
+  CliInstallSourceSchema,
+  CliUpdateFactsSchema,
+  CliUpdateLastResultSchema,
+  CliUpdateOutcomeSchema,
+  type CliInstallSource,
+  type CliUpdateFacts,
+  type CliUpdateLastResult,
+  type CliUpdateOutcome,
+} from './cliUpdateFacts.js';

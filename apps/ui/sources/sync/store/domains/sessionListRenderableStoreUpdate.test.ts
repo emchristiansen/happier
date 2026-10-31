@@ -32,6 +32,35 @@ function makeRenderable(
 }
 
 describe('sessionListRenderableStoreUpdate', () => {
+    it.each(['merge', 'patch'] as const)('keeps newer pending flags through an older %s projection', (kind) => {
+        const previous = makeRenderable('s1', {
+            active: true,
+            hasPendingPermissionRequests: false,
+            hasPendingUserActionRequests: false,
+            pendingRequestObservedAt: 200,
+        });
+        const older = {
+            hasPendingPermissionRequests: true,
+            hasPendingUserActionRequests: true,
+            pendingRequestObservedAt: 100,
+        };
+        const plan = kind === 'merge'
+            ? planSessionListRenderableMerge({
+                previousRenderables: { s1: previous },
+                incomingRenderables: [{ ...previous, ...older }],
+                isSessionListViewDataUninitialized: false,
+            })
+            : planSessionListRenderablePatches({
+                previousRenderables: { s1: previous },
+                patches: [{ sessionId: 's1', patch: older }],
+                isSessionListViewDataUninitialized: false,
+            });
+        expect(plan.nextRenderables.s1.hasPendingPermissionRequests).toBe(false);
+        expect(plan.nextRenderables.s1.hasPendingUserActionRequests).toBe(false);
+        expect(plan.nextRenderables.s1.pendingRequestObservedAt).toBe(200);
+        expect(plan.noop).toBe(true);
+    });
+
     it('merges incoming renderables without removing existing rows omitted from an append page', () => {
         const previous = makeRenderable('s_existing', { createdAt: 10 });
         const appended = makeRenderable('s_appended', { createdAt: 5 });

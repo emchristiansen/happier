@@ -14,6 +14,7 @@ import {
 } from '@happier-dev/protocol';
 
 import { projectPath } from '@/projectPath';
+import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { resolvePackagedRuntimeEntrypoint } from '@/runtime/resolvePackagedRuntimeEntrypoint';
 import { resolveCliTsxTsconfigPath, resolveTsxImportHookPath } from '@/utils/spawnHappyCLI';
 
@@ -238,6 +239,8 @@ describe('materializeMcpServerConfigRecord', () => {
 
       const st = await stat(configPath);
       expect(st.mode & 0o777).toBe(0o600);
+      out.cleanup();
+      expect(existsSync(configPath)).toBe(false);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -245,6 +248,8 @@ describe('materializeMcpServerConfigRecord', () => {
 
   it('normalizes package-runner stdio servers through managed pnpm with a neutral launch cwd', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-mcp-stdio-launcher-test-'));
+    const runtimeEnv = createEnvKeyScope(['HAPPIER_JS_RUNTIME_PATH']);
+    runtimeEnv.patch({ HAPPIER_JS_RUNTIME_PATH: process.execPath });
     try {
       const fakePnpmPath = join(dir, 'pnpm');
       await writeFile(fakePnpmPath, '#!/bin/sh\nexit 0\n', 'utf8');
@@ -308,7 +313,10 @@ describe('materializeMcpServerConfigRecord', () => {
       expect(raw).toContain('"cwd":"/safe-home"');
       expect(raw).toContain('"API_KEY":"sk-test"');
       expect(raw).not.toContain('happier-mcp-stdio-launcher.mjs');
+      out.cleanup();
+      expect(existsSync(configPath)).toBe(false);
     } finally {
+      runtimeEnv.restore();
       await rm(dir, { recursive: true, force: true });
     }
   });

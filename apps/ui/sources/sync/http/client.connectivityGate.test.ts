@@ -57,7 +57,7 @@ function installRuntimeFetchMock() {
         if (url.endsWith('/health') || url.endsWith('/v1/auth/ping')) {
             throw new TypeError('Network request failed');
         }
-        if (url.endsWith('/v1/account/profile')) {
+        if (new URL(url).pathname === '/v1/account/profile') {
             return new Response(null, { status: 200, headers: new Headers() });
         }
         return new Response(null, { status: 200, headers: new Headers() });
@@ -175,7 +175,7 @@ describe('serverFetch connectivity supervision', () => {
             if (url.endsWith('/v1/auth/ping')) {
                 return new Response(null, { status: 401, headers: new Headers() });
             }
-            if (url.endsWith('/v1/account/profile')) {
+            if (new URL(url).pathname === '/v1/account/profile') {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
             return new Response(null, { status: 200, headers: new Headers() });
@@ -311,7 +311,7 @@ describe('serverFetch connectivity supervision', () => {
             if (url.endsWith('/v1/auth/ping')) {
                 return new Response(null, { status: 200, headers: new Headers() });
             }
-            if (url.endsWith('/v1/account/profile')) {
+            if (new URL(url).pathname === '/v1/account/profile') {
                 profileStarted.resolve(undefined);
                 await profileGate.promise;
                 if (init?.signal?.aborted) {

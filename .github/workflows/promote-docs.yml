@@ -239,6 +239,10 @@ jobs:
       # bytes, so skipping it would leave nothing to publish. `run_build` is
       # retained as an input for compatibility with callers that still pass it.
       - name: Build docs
+        env:
+          # This is a public browser write key, not a secret. The static Next
+          # export must receive it here; Cloudflare only gets the finished out/.
+          NEXT_PUBLIC_POSTHOG_KEY: ${{ vars.NEXT_PUBLIC_POSTHOG_KEY }}
         run: yarn workspace docs build
 
       - name: Upload the exact built site
@@ -277,6 +281,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
+          permission-workflows: write
 
       - name: Promote source ref to deploy branch
         id: promote_ref

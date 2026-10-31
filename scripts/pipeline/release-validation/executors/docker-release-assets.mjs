@@ -207,13 +207,16 @@ function resolveImmutableServerCandidate(raw) {
  * @param {{ tag: string; version: string } | null} [immutableCandidate]
  */
 function createRelayUpgradePlan(fromChannel, immutableCandidate = null) {
+  // The immutable upgrade runs before rolling CLI promotion. Remote-server setup
+  // would install the previous rolling CLI, not the candidate under validation.
+  const withRemoteServer = immutableCandidate === null;
   return {
     mode: 'local',
     monorepo: 'local',
     stackSpec: null,
     cliSpec: null,
     withRemoteDaemon: true,
-    withRemoteServer: true,
+    withRemoteServer,
     remoteInstaller: 'shim',
     remoteAuthMode: 'reuse-cli',
     withRelayUpgrade: true,
@@ -227,7 +230,7 @@ function createRelayUpgradePlan(fromChannel, immutableCandidate = null) {
       '--mode=local',
       '--monorepo=local',
       '--with-remote-daemon',
-      '--with-remote-server',
+      withRemoteServer ? '--with-remote-server' : '--no-remote-server',
       '--remote-installer=shim',
       '--remote-auth-mode=reuse-cli',
       '--with-relay-upgrade',
@@ -316,10 +319,12 @@ export function resolveDockerReleaseAssetsExecution({ repoRoot, platform, source
 }
 
 /**
- * @param {{ exec?: ExecFileSyncLike }} [opts]
+ * The one Docker availability check for the Docker-backed suites (`suiteId` names the caller).
+ * @param {{ exec?: ExecFileSyncLike; suiteId?: string }} [opts]
  */
 export function assertDockerReleaseAssetsAvailable(opts = {}) {
   const exec = opts.exec ?? execFileSync;
+  const suiteId = opts.suiteId ?? 'docker-release-assets';
   try {
     exec('docker', ['info'], {
       encoding: 'utf8',
@@ -333,7 +338,7 @@ export function assertDockerReleaseAssetsAvailable(opts = {}) {
     ).trim();
     throw new Error(
       [
-        'docker-release-assets requires Docker to be running.',
+        `${suiteId} requires Docker to be running.`,
         'Fix: start Docker Desktop or the local Docker engine, then retry.',
         message ? `Raw error: ${message}` : null,
       ]

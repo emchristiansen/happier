@@ -4,11 +4,18 @@ import { buildSettingArtifacts, type SettingDefinitionMap } from '@happier-dev/p
 import type { ProviderSettingsDefinition } from '../types.js';
 
 export type OpenCodeBackendMode = 'server' | 'acp';
+export type OpenCodeCliGeneration = 'auto' | 'stable' | 'v2';
 
 export function normalizeOpenCodeBackendMode(raw: unknown): OpenCodeBackendMode {
   const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   if (value === 'acp') return 'acp';
   return 'server';
+}
+
+export function normalizeOpenCodeCliGeneration(raw: unknown): OpenCodeCliGeneration {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (value === 'stable' || value === 'v2') return value;
+  return 'auto';
 }
 
 export function normalizeOpenCodeServerBaseUrl(raw: unknown): string | null {
@@ -77,6 +84,13 @@ const OpenCodeServerBaseUrlByServerIdV1Schema = z.preprocess((raw) => {
 }, z.record(z.string().min(1), z.string()).default({}));
 
 export const OPENCODE_PROVIDER_FIELDS = {
+  opencodeCliGeneration: {
+    schema: z.enum(['auto', 'stable', 'v2']),
+    default: 'auto' satisfies OpenCodeCliGeneration,
+    description: 'Preferred OpenCode CLI generation',
+    storageScope: 'account',
+    analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'person' },
+  },
   opencodeBackendMode: {
     schema: z.enum(['server', 'acp']),
     default: 'server' satisfies OpenCodeBackendMode,

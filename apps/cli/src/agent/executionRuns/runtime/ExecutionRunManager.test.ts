@@ -6,6 +6,7 @@ import type {
   SessionRuntimeActivityContribution,
   SessionRuntimeActivityContributionHandle,
 } from '@/session/runtimeActivity/types';
+import { logger } from '@/ui/logger';
 
 import { ExecutionRunManager } from './ExecutionRunManager';
 
@@ -76,6 +77,216 @@ function createDelayedJsonBackend(responseText: string, delayMs: number): AgentB
 }
 
 describe('ExecutionRunManager start request idempotency', () => {
+  it('recreates a terminal resumable occurrence while its original backend disposal is pending', async () => {
+    let releaseDisposal!: () => void;
+    const disposalGate = new Promise<void>((resolve) => { releaseDisposal = resolve; });
+    let markDisposalStarted!: () => void;
+    const disposalStarted = new Promise<void>((resolve) => { markDisposalStarted = resolve; });
+    const loadSession = vi.fn(async (_sessionId: SessionId) => ({ sessionId: 'child_session_1' as SessionId }));
+    const initial = {
+      ...createStaticJsonBackend('{"summary":"Complete","deliverables":[]}'),
+      loadSession,
+      async dispose() { markDisposalStarted(); await disposalGate; },
+    };
+    const replacement = { ...createStaticJsonBackend('{"summary":"Continued","deliverables":[]}'), loadSession };
+    let acquired = 0;
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude', cwd: process.cwd(), sendAcp: () => {},
+      createBackend: () => acquired++ === 0 ? initial : replacement,
+    });
+    const started = await manager.start({
+      sessionId: 'parent-pending-disposal', intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      instructions: 'Complete', permissionMode: 'read_only', retentionPolicy: 'resumable',
+      runClass: 'bounded', ioMode: 'request_response',
+    });
+    try {
+      await disposalStarted;
+      expect(manager.get(started.runId)?.status).toBe('succeeded');
+      await expect(manager.send(started.runId, { message: 'Continue', resume: true })).resolves.toEqual({ ok: true });
+      expect(acquired).toBe(2);
+      expect(loadSession).toHaveBeenCalledWith('child_session_1');
+      expect(manager.get(started.runId)?.status).toBe('running');
+      releaseDisposal();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await expect(manager.send(started.runId, { message: 'Continue again', resume: true })).resolves.toEqual({ ok: true });
+    } finally {
+      releaseDisposal();
+      await manager.dispose();
+    }
+  });
+
+  it('keeps a waiter from the first running publication pending until canonical terminal state', async () => {
+    const backend = createStaticJsonBackend('{"summary":"unused","findings":[]}');
+    backend.sendPrompt = async () => {};
+    backend.waitForResponseComplete = async () => await new Promise<void>(() => {});
+    let manager!: ExecutionRunManager;
+    let waiter: Promise<void> | null = null;
+    let waiterSettled = false;
+    manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => backend,
+      sendAcp: () => {},
+      onPublicStateUpdated: (run) => {
+        if (run.status !== 'running' || waiter) return;
+        waiter = manager.waitForTerminal(run.runId);
+        void waiter.then(() => {
+          waiterSettled = true;
+        });
+      },
+    });
+
+    const started = await manager.start({
+      sessionId: 'parent_session_1',
+      intent: 'review',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      instructions: 'Wait for stop.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+    });
+    await flushAsyncEffects();
+    expect(waiter).not.toBeNull();
+    expect(waiterSettled).toBe(false);
+
+    await manager.stop(started.runId);
+    await expect(waiter).resolves.toBeUndefined();
+    expect(waiterSettled).toBe(true);
+  });
+
+  it('detaches a cancelled terminal wait observer while leaving the run active', async () => {
+    const backend = createStaticJsonBackend('{"summary":"unused","findings":[]}');
+    backend.sendPrompt = async () => {};
+    backend.waitForResponseComplete = async () => await new Promise<void>(() => {});
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => backend,
+      sendAcp: () => {},
+    });
+    const started = await manager.start({
+      sessionId: 'parent_session_1',
+      intent: 'review',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      instructions: 'Wait for stop.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+    });
+    const abort = new AbortController();
+    const removeAbortListener = vi.spyOn(abort.signal, 'removeEventListener');
+    const wait = manager.waitForTerminal(started.runId, { signal: abort.signal });
+    const terminalStateWaiters = (manager as unknown as {
+      terminalStateWaiters: Map<string, Set<unknown>>;
+    }).terminalStateWaiters;
+    expect(terminalStateWaiters.get(started.runId)?.size).toBe(1);
+
+    const cancellation = new Error('caller stopped waiting');
+    abort.abort(cancellation);
+
+    const outcome = await Promise.race([
+      wait.then(
+        () => ({ kind: 'resolved' as const }),
+        (error: unknown) => ({ kind: 'rejected' as const, error }),
+      ),
+      new Promise<{ kind: 'still_waiting' }>((resolve) => {
+        setTimeout(() => resolve({ kind: 'still_waiting' }), 50);
+      }),
+    ]);
+    expect(outcome).toEqual({ kind: 'rejected', error: cancellation });
+    expect(manager.get(started.runId)?.status).toBe('running');
+    expect(terminalStateWaiters.has(started.runId)).toBe(false);
+
+    await manager.stop(started.runId);
+    expect(removeAbortListener).toHaveBeenCalledWith('abort', expect.any(Function));
+  });
+
+  it('does not gate stop acknowledgement or terminal observation on a pending runtime-activity projection', async () => {
+    let reportCount = 0;
+    const backend = createStaticJsonBackend('{"summary":"unused","findings":[]}');
+    backend.sendPrompt = async () => {};
+    backend.waitForResponseComplete = async () => await new Promise<void>(() => {});
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => backend,
+      sendAcp: () => {},
+      runtimeActivityContributionHandle: {
+        report: vi.fn(async () => {
+          reportCount += 1;
+          if (reportCount > 1) await new Promise<void>(() => {});
+        }),
+        markUnknown: vi.fn(async () => {}),
+        dispose: vi.fn(async () => {}),
+      },
+    });
+    const started = await manager.start({
+      sessionId: 'parent_session_1',
+      intent: 'review',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      instructions: 'Wait for stop.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+    });
+    const terminal = manager.waitForTerminal(started.runId);
+
+    const stopOutcome = await Promise.race([
+      manager.stop(started.runId),
+      new Promise<'still_stopping'>((resolve) => setTimeout(() => resolve('still_stopping'), 2_000)),
+    ]);
+
+    expect(stopOutcome).toEqual({ ok: true });
+    await expect(terminal).resolves.toBeUndefined();
+    expect(manager.get(started.runId)?.status).toBe('cancelled');
+  });
+
+  it('logs a rejected terminal runtime-activity projection without changing stop acknowledgement', async () => {
+    let reportCount = 0;
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const backend = createStaticJsonBackend('{"summary":"unused","findings":[]}');
+    backend.sendPrompt = async () => {};
+    backend.waitForResponseComplete = async () => await new Promise<void>(() => {});
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => backend,
+      sendAcp: () => {},
+      runtimeActivityContributionHandle: {
+        report: vi.fn(async () => {
+          reportCount += 1;
+          if (reportCount > 1) throw new Error('projection unavailable');
+        }),
+        markUnknown: vi.fn(async () => {}),
+        dispose: vi.fn(async () => {}),
+      },
+    });
+    const started = await manager.start({
+      sessionId: 'parent_session_1',
+      intent: 'review',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      instructions: 'Wait for stop.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+    });
+
+    try {
+      await expect(manager.stop(started.runId)).resolves.toEqual({ ok: true });
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledWith(
+        '[EXECUTION RUN] Failed to publish terminal runtime activity',
+        expect.objectContaining({ runId: started.runId, error: 'projection unavailable' }),
+      ));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('returns the same run handle for the same correlated start without creating a duplicate backend', async () => {
     const createBackend = vi.fn(() => createStaticJsonBackend('{"summary":"ok","findings":[]}'));
     const manager = new ExecutionRunManager({
@@ -271,6 +482,15 @@ describe('ExecutionRunManager (review intent)', () => {
       intent: 'review',
       backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
       instructions: 'Review this repo.',
+      modelId: 'claude-opus-5',
+      sessionConfigOptionOverrides: {
+        v: 1,
+        updatedAt: 1,
+        overrides: {
+          reasoning_effort: { updatedAt: 1, value: 'high' },
+          api_token: { updatedAt: 1, value: 'must-not-survive' },
+        },
+      },
       permissionMode: 'read_only',
       retentionPolicy: 'ephemeral',
       runClass: 'bounded',
@@ -279,6 +499,10 @@ describe('ExecutionRunManager (review intent)', () => {
 
     expect(started.runId).toMatch(/^run_/);
     expect(started.callId).toMatch(/^subagent_run_/);
+    expect(started.requestedConfiguration).toEqual({
+      modelId: 'claude-opus-5',
+      reasoningEffort: 'high',
+    });
 
     // Wait for completion since the fake backend is async.
     await manager.waitForTerminal(started.runId);
@@ -287,6 +511,10 @@ describe('ExecutionRunManager (review intent)', () => {
     expect(manager.getPublic(started.runId)).toMatchObject({
       status: 'succeeded',
       launchOrigin: { kind: 'session', sessionId: 'initiating_session_2' },
+      requestedConfiguration: {
+        modelId: 'claude-opus-5',
+        reasoningEffort: 'high',
+      },
     });
     // Prompt contract: review runs must include a strict JSON output schema.
     expect(lastPrompt).toContain('"findings"');
@@ -299,6 +527,13 @@ describe('ExecutionRunManager (review intent)', () => {
       kind: 'session',
       sessionId: 'initiating_session_2',
     });
+    expect((toolCall?.body as any)?.input?.requestedConfiguration).toEqual({
+      modelId: 'claude-opus-5',
+      reasoningEffort: 'high',
+    });
+    expect(JSON.stringify(started)).not.toContain('must-not-survive');
+    expect(JSON.stringify(manager.getPublic(started.runId))).not.toContain('must-not-survive');
+    expect(JSON.stringify((toolCall?.body as any)?.input)).not.toContain('must-not-survive');
 
     const sidechainToolCall = sent.find((m) => (m.body as any)?.type === 'tool-call' && (m.body as any)?.name === 'read_file');
     expect(sidechainToolCall).toBeTruthy();
@@ -364,6 +599,7 @@ describe('ExecutionRunManager (review intent)', () => {
 
     expect(parentInputs).toHaveLength(1);
     expect(parentInputs[0]?.text).toContain(started.runId);
+    expect(parentInputs[0]?.text).toContain('Final result:\ndone');
     expect((parentInputs[0]?.meta as any)?.happierStructuredInputV1).toMatchObject({
       v: 1,
       executionRunCompletion: {
@@ -371,6 +607,7 @@ describe('ExecutionRunManager (review intent)', () => {
         runId: started.runId,
         status: 'succeeded',
         canInspect: true,
+        summary: 'done',
       },
     });
     const toolResult = [...sent].reverse().find((m) => (m.body as any)?.type === 'tool-result');
@@ -525,10 +762,8 @@ describe('ExecutionRunManager (review intent)', () => {
 
     const first = await start();
     const second = await start();
-    expect(contribution.reports).toEqual([
-      { state: 'active', activeCount: 1 },
-      { state: 'active', activeCount: 2 },
-    ]);
+    expect(contribution.reports).toContainEqual({ state: 'active', activeCount: 1 });
+    expect(contribution.reports.at(-1)).toEqual({ state: 'active', activeCount: 2 });
 
     completions[0]!();
     await manager.waitForTerminal(first.runId);
@@ -1378,6 +1613,80 @@ describe('ExecutionRunManager (streaming sidechain)', () => {
 });
 
 describe('ExecutionRunManager (long-lived runs)', () => {
+  it('reports current work while retaining idle handles across sibling turns and resume', async () => {
+    const contribution = createRuntimeActivityContributionHarness();
+    const completions: Array<() => void> = [];
+    const observedTurns = new Map<string, boolean | undefined>();
+    const createBackend = (): AgentBackend => {
+      let complete: (() => void) | undefined;
+      let response = Promise.resolve();
+      return {
+        async startSession() { return { sessionId: `child-${completions.length}` as SessionId }; },
+        async loadSessionWithReplayCapture(sessionId) { return { sessionId, replay: [] }; },
+        async sendPrompt() {
+          response = new Promise<void>((resolve) => { complete = resolve; });
+          completions.push(() => complete?.());
+        },
+        async waitForResponseComplete() { await response; },
+        async cancel() { complete?.(); },
+        onMessage() {},
+        async dispose() {},
+      };
+    };
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend,
+      sendAcp: () => {},
+      runtimeActivityContributionHandle: contribution.handle,
+      onPublicStateUpdated: (run) => { observedTurns.set(run.runId, run.turnInFlight); },
+    });
+    const start = () => manager.start({
+      sessionId: 'parent_session_1',
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      instructions: 'Work on this turn.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'resumable',
+      runClass: 'long_lived',
+      ioMode: 'request_response',
+    });
+    const first = await start();
+    const second = await start();
+    try {
+      await expect.poll(() => completions.length).toBe(2);
+      expect(contribution.reports.at(-1)).toEqual({ state: 'active', activeCount: 2 });
+
+      completions[0]!();
+      await expect.poll(() => manager.getPublic(first.runId)?.turnInFlight).toBe(false);
+      await expect.poll(() => contribution.reports.at(-1)).toEqual({ state: 'active', activeCount: 1 });
+      expect(observedTurns.get(first.runId)).toBe(false);
+      expect(manager.getPublic(first.runId)?.status).toBe('running');
+
+      completions[1]!();
+      await expect.poll(() => contribution.reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
+      expect(manager.listPublic().every((run) => run.status === 'running' && run.turnInFlight === false)).toBe(true);
+
+      await expect(manager.send(first.runId, { message: 'Next turn.' })).resolves.toEqual({ ok: true });
+      expect(contribution.reports.at(-1)).toEqual({ state: 'active', activeCount: 1 });
+      expect(observedTurns.get(first.runId)).toBe(true);
+      completions[2]!();
+      await expect.poll(() => contribution.reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
+
+      await manager.stop(first.runId);
+      await expect(manager.ensure(first.runId, { resume: true })).resolves.toEqual({ ok: true });
+      await expect.poll(() => contribution.reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
+      expect(manager.getPublic(first.runId)?.status).toBe('running');
+      await expect(manager.send(first.runId, { message: 'Resumed turn.' })).resolves.toEqual({ ok: true });
+      expect(contribution.reports.at(-1)).toEqual({ state: 'active', activeCount: 1 });
+      await manager.stop(first.runId);
+      await expect.poll(() => contribution.reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
+    } finally {
+      await manager.stop(first.runId);
+      await manager.stop(second.runId);
+    }
+  });
+
   function createPromptEchoBackend(): AgentBackend {
     let handler: AgentMessageHandler | null = null;
     const sessionId: SessionId = 'child_session_1' as SessionId;
@@ -1444,7 +1753,11 @@ describe('ExecutionRunManager (long-lived runs)', () => {
     });
 
     expect(manager.get(started.runId)?.status).toBe('running');
-    expect(sent.filter((m) => (m.body as any)?.type === 'message')).toHaveLength(1);
+    await expect.poll(
+      () => sent.filter((m) => (m.body as any)?.type === 'message').length,
+      { timeout: 1_000 },
+    ).toBe(1);
+    await expect.poll(() => manager.getPublic(started.runId)?.turnInFlight).toBe(false);
 
     const sendPromise = manager.send(started.runId, { message: 'next' });
     const raced = await Promise.race([
@@ -1485,7 +1798,11 @@ describe('ExecutionRunManager (long-lived runs)', () => {
     expect(manager.get(started.runId)?.status).toBe('running');
     expect((manager.getPublic(started.runId) as any)?.display?.groupId).toBe('group_1');
     expect(sent.filter((m) => (m.body as any)?.type === 'tool-result').length).toBe(0);
-    expect(sent.filter((m) => (m.body as any)?.type === 'message').length).toBe(1);
+    await expect.poll(
+      () => sent.filter((m) => (m.body as any)?.type === 'message').length,
+      { timeout: 1_000 },
+    ).toBe(1);
+    await expect.poll(() => manager.getPublic(started.runId)?.turnInFlight).toBe(false);
 
     const sendResult = await manager.send(started.runId, { message: 'next' });
     expect(sendResult.ok).toBe(true);
@@ -1502,6 +1819,58 @@ describe('ExecutionRunManager (long-lived runs)', () => {
     await expect
       .poll(() => sent.filter((m) => (m.body as any)?.type === 'tool-result').length, { timeout: 1_000 })
       .toBe(1);
+  });
+
+  it('publishes Voice current work independently of an unread completed stream', async () => {
+    const contribution = createRuntimeActivityContributionHarness();
+    let completeTurn: (() => void) | undefined;
+    const backend = createPromptEchoBackend();
+    const sendPrompt = backend.sendPrompt.bind(backend);
+    let response = Promise.resolve();
+    backend.sendPrompt = async (sessionId, prompt) => {
+      await sendPrompt(sessionId, prompt);
+      response = new Promise<void>((resolve) => { completeTurn = resolve; });
+    };
+    backend.waitForResponseComplete = async () => { await response; };
+    backend.cancel = async () => { completeTurn?.(); };
+    const observedTurns: Array<boolean | undefined> = [];
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => backend,
+      sendAcp: () => {},
+      runtimeActivityContributionHandle: contribution.handle,
+      onPublicStateUpdated: (run) => { observedTurns.push(run.turnInFlight); },
+    });
+    const started = await manager.start({
+      sessionId: 'parent_session_1',
+      intent: 'voice_agent',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      permissionMode: 'read_only',
+      retentionPolicy: 'resumable',
+      runClass: 'long_lived',
+      ioMode: 'streaming',
+    });
+    try {
+      expect(manager.getPublic(started.runId)?.turnInFlight).toBe(false);
+      expect(contribution.reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
+      const stream = await manager.startTurnStream(started.runId, { message: 'Next Voice turn.' });
+      expect(stream.ok).toBe(true);
+      if (!stream.ok) throw new Error('Expected Voice stream admission');
+      await expect.poll(() => contribution.reports.at(-1)).toEqual({ state: 'active', activeCount: 1 });
+      expect(manager.getPublic(started.runId)?.turnInFlight).toBe(true);
+      expect(observedTurns.at(-1)).toBe(true);
+      await expect.poll(() => typeof completeTurn).toBe('function');
+      completeTurn?.();
+      await expect.poll(() => contribution.reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
+      expect(manager.getPublic(started.runId)?.status).toBe('running');
+      expect(observedTurns.at(-1)).toBe(false);
+      await expect(manager.readTurnStream(started.runId, { streamId: stream.streamId, cursor: 0, maxEvents: 128 }))
+        .resolves.toMatchObject({ ok: true, done: true });
+      expect(contribution.reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
+    } finally {
+      await manager.stop(started.runId);
+    }
   });
 
   it('surfaces transcript persistence in public state for voice_agent runs', async () => {
@@ -1757,6 +2126,174 @@ describe('ExecutionRunManager (long-lived runs)', () => {
 });
 
 describe('ExecutionRunManager (bounded external send)', () => {
+  it('reports outcome unknown when adopted bounded steer admission rejects without pre-effect evidence', async () => {
+    let resolveTurnComplete!: () => void;
+    const turnComplete = new Promise<void>((resolve) => {
+      resolveTurnComplete = resolve;
+    });
+    const sendSteerPrompt = vi.fn(async () => {
+      throw new Error('provider connection closed after steer dispatch');
+    });
+    const backend: AgentBackend = {
+      async startSession(): Promise<{ sessionId: SessionId }> {
+        return { sessionId: 'child_session_1' as SessionId };
+      },
+      async sendPrompt(): Promise<void> {},
+      sendSteerPrompt,
+      async cancel(): Promise<void> {
+        resolveTurnComplete();
+      },
+      onMessage(): void {},
+      async dispose(): Promise<void> {},
+      async waitForResponseComplete(): Promise<void> {
+        await turnComplete;
+      },
+    };
+    const manager = new ExecutionRunManager({
+      parentProvider: 'claude',
+      cwd: process.cwd(),
+      createBackend: () => backend,
+      sendAcp: () => {},
+      getNowMs: () => 1_700_000_000_000,
+    });
+
+    const started = await manager.start({
+      sessionId: 'parent_session_1',
+      intent: 'review',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      instructions: 'Review.',
+      permissionMode: 'read_only',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+    });
+    await expect.poll(
+      () => manager.getPublic(started.runId)?.turnInFlight,
+      { timeout: 2_000 },
+    ).toBe(true);
+
+    await expect(manager.send(started.runId, {
+      message: 'focus on transport handling',
+      delivery: 'steer_if_supported',
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'execution_run_send_outcome_unknown',
+    });
+    expect(sendSteerPrompt).toHaveBeenCalledOnce();
+
+    await expect(manager.send(started.runId, {
+      message: 'must not duplicate an ambiguous steer',
+      delivery: 'steer_if_supported',
+    })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'execution_run_busy',
+    });
+    expect(sendSteerPrompt).toHaveBeenCalledOnce();
+
+    await manager.stop(started.runId);
+  });
+
+  it('applies the ACK timeout only while a bounded external send remains queued', async () => {
+    const previousAckTimeout = process.env.HAPPIER_EXECUTION_RUN_BOUNDED_SEND_ACK_TIMEOUT_MS;
+    process.env.HAPPIER_EXECUTION_RUN_BOUNDED_SEND_ACK_TIMEOUT_MS = '20';
+    vi.useFakeTimers();
+    try {
+      let resolveTurnComplete!: () => void;
+      const turnComplete = new Promise<void>((resolve) => {
+        resolveTurnComplete = resolve;
+      });
+      let resolveSteerAdmission!: () => void;
+      const sendSteerPrompt = vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          resolveSteerAdmission = resolve;
+        });
+      });
+      const backend: AgentBackend = {
+        async startSession(): Promise<{ sessionId: SessionId }> {
+          return { sessionId: 'child_session_1' as SessionId };
+        },
+        async sendPrompt(): Promise<void> {},
+        sendSteerPrompt,
+        async cancel(): Promise<void> {
+          resolveTurnComplete();
+        },
+        onMessage(): void {},
+        async dispose(): Promise<void> {},
+        async waitForResponseComplete(): Promise<void> {
+          await turnComplete;
+        },
+      };
+      const manager = new ExecutionRunManager({
+        parentProvider: 'claude',
+        cwd: process.cwd(),
+        createBackend: () => backend,
+        sendAcp: () => {},
+        getNowMs: () => 1_700_000_000_000,
+      });
+
+      const started = await manager.start({
+        sessionId: 'parent_session_1',
+        intent: 'review',
+        backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+        instructions: 'Review.',
+        permissionMode: 'read_only',
+        retentionPolicy: 'ephemeral',
+        runClass: 'bounded',
+        ioMode: 'request_response',
+      });
+      for (
+        let attempt = 0;
+        attempt < 20 && manager.getPublic(started.runId)?.turnInFlight !== true;
+        attempt += 1
+      ) {
+        await flushAsyncEffects();
+      }
+      expect(manager.getPublic(started.runId)?.turnInFlight).toBe(true);
+
+      let adoptedSendOutcome: Awaited<ReturnType<ExecutionRunManager['send']>> | undefined;
+      const adoptedSend = manager.send(started.runId, {
+        message: 'first',
+        delivery: 'steer_if_supported',
+      });
+      void adoptedSend.then((outcome) => {
+        adoptedSendOutcome = outcome;
+      });
+      for (let attempt = 0; attempt < 20 && sendSteerPrompt.mock.calls.length === 0; attempt += 1) {
+        await flushAsyncEffects();
+      }
+      expect(sendSteerPrompt).toHaveBeenCalledTimes(1);
+
+      const stillQueuedSend = manager.send(started.runId, {
+        message: 'second',
+        delivery: 'steer_if_supported',
+      });
+      let stillQueuedSendOutcome: Awaited<ReturnType<ExecutionRunManager['send']>> | undefined;
+      void stillQueuedSend.then((outcome) => {
+        stillQueuedSendOutcome = outcome;
+      });
+      vi.advanceTimersByTime(20);
+      await flushAsyncEffects();
+
+      expect(adoptedSendOutcome).toBeUndefined();
+      expect(stillQueuedSendOutcome).toMatchObject({
+        ok: false,
+        errorCode: 'execution_run_busy',
+      });
+
+      resolveSteerAdmission();
+      await flushAsyncEffects();
+      expect(adoptedSendOutcome).toEqual({ ok: true });
+      await manager.stop(started.runId);
+    } finally {
+      vi.useRealTimers();
+      if (previousAckTimeout === undefined) {
+        delete process.env.HAPPIER_EXECUTION_RUN_BOUNDED_SEND_ACK_TIMEOUT_MS;
+      } else {
+        process.env.HAPPIER_EXECUTION_RUN_BOUNDED_SEND_ACK_TIMEOUT_MS = previousAckTimeout;
+      }
+    }
+  });
+
   it('rebuilds bounded interrupt prompts using the intent profile (preserves strict JSON guidance)', async () => {
     const prompts: string[] = [];
     let handler: AgentMessageHandler | null = null;

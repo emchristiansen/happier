@@ -1,3 +1,7 @@
+import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { MessageBuffer } from '@/ui/ink/messageBuffer';
@@ -14,6 +18,7 @@ import { createBasicSessionClientWithOverrides } from '@/testkit/backends/sessio
 import { AcpPromptSubmissionPhaseError } from '@/agent/acp/AcpBackend';
 import { ProviderPromptSubmissionRejectedBeforeEffectError } from '@/agent/runtime/providerPromptSubmission';
 import { PiRpcBackend } from '@/backends/pi/rpc/PiRpcBackend';
+import { createPiBackend } from '@/backends/pi/acp/backend';
 
 function createDeferred(): Readonly<{ promise: Promise<void>; resolve: () => void }> {
   let resolve!: () => void;
@@ -24,9 +29,77 @@ function createDeferred(): Readonly<{ promise: Promise<void>; resolve: () => voi
 }
 
 describe('createAcpRuntime (status error surfacing)', () => {
+  it('records failed recovery-hook delivery through the default file diagnostic without leaking its error', async () => {
+    const fileSink = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const backend = createFakeAcpRuntimeBackend({ sessionId: 'hook-diagnostic-session' });
+    const mutations: SessionTurnMutationV1[] = [];
+    const lifecycle = createSessionTurnLifecycle({ sessionId: 'hook-diagnostic-session',
+      enqueueSessionTurn: async (mutation) => { mutations.push(mutation); } });
+    const runtime = createAcpRuntime({ provider: 'codex', directory: '/tmp',
+      session: { ...createBasicSessionClientWithOverrides(), sessionTurnLifecycle: lifecycle },
+      messageBuffer: new MessageBuffer(), mcpServers: {}, permissionHandler: createApprovedPermissionHandler(),
+      onThinkingChange: () => {}, ensureBackend: async () => backend,
+      // Failed filesystem delivery is a genuine hook output boundary, not a mocked runtime owner.
+      hooks: { onTurnFailure: async () => { await readFile(join(tmpdir(), `private-recovery-${randomUUID()}`)); } },
+    });
+    await runtime.startOrLoad({});
+    await lifecycle.beginTurn({ provider: 'codex' });
+    runtime.beginTurn();
+    backend.emit({ type: 'status', status: 'error', detail: 'provider failed' });
+    await expect.poll(() => fileSink.mock.calls.some(([message]) => String(message).includes('accepted_turn_failure_report_unavailable'))).toBe(true);
+    expect(JSON.stringify(fileSink.mock.calls)).not.toContain('private-recovery-');
+    expect(mutations.filter((mutation) => mutation.action === 'fail')).toHaveLength(1);
+    await runtime.reset();
+  });
+
   afterEach(() => {
     delete process.env.HAPPIER_ACP_FAILURE_TRACE;
     vi.restoreAllMocks();
+  });
+
+  it('surfaces an unresolved Pi launch before any provider session exists', async () => {
+    const sent: ACPMessageData[] = [];
+    const mutations: SessionTurnMutationV1[] = [];
+    const sessionTurnLifecycle = createSessionTurnLifecycle({
+      sessionId: 'happy-session-1',
+      createId: () => 'pi-startup-turn',
+      now: () => 123,
+      enqueueSessionTurn: async (mutation) => { mutations.push(mutation); },
+    });
+    const runtime = createAcpRuntime({
+      provider: 'pi',
+      directory: '/tmp',
+      session: {
+        ...createBasicSessionClientWithOverrides({ sendAgentMessage: (_provider, body) => sent.push(body) }),
+        sessionTurnLifecycle,
+      },
+      messageBuffer: new MessageBuffer(),
+      mcpServers: {},
+      permissionHandler: createApprovedPermissionHandler(),
+      onThinkingChange: () => {},
+      ensureBackend: async () => createPiBackend({
+        cwd: '/tmp',
+        env: { HAPPIER_PI_PATH: '/missing-private-path/sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/pi' },
+      }),
+    });
+    runtime.beginTurn();
+    const error = await runtime.startOrLoad({}).then(() => null, (error: unknown) => error);
+    expect(error).toBeInstanceOf(ReferenceError);
+    await runtime.failTurn(error);
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'turn_failed',
+      issue: expect.objectContaining({
+        source: 'dependency_failure',
+        code: 'provider_cli_not_found',
+        sanitizedPreview: expect.stringContaining('HAPPIER_PI_PATH'),
+      }),
+    }));
+    expect(mutations).toContainEqual(expect.objectContaining({
+      action: 'fail',
+      issue: expect.objectContaining({ code: 'provider_cli_not_found' }),
+    }));
+    expect(JSON.stringify({ sent, mutations })).not.toContain('/missing-private-path');
+    expect(JSON.stringify({ sent, mutations })).not.toContain('after prompt acceptance');
   });
 
   it('surfaces non-abort status:error as sanitized primary-session failure', async () => {
@@ -132,11 +205,14 @@ describe('createAcpRuntime (status error surfacing)', () => {
     process.env.HAPPIER_ACP_FAILURE_TRACE = '1';
     const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => undefined);
     const backend = createFakeAcpRuntimeBackend({ sessionId: 'sess_main' });
+    const sent: ACPMessageData[] = [];
 
     const runtime = createAcpRuntime({
       provider: 'pi',
       directory: '/tmp',
-      session: createBasicSessionClientWithOverrides(),
+      session: createBasicSessionClientWithOverrides({
+        sendAgentMessage: (_provider, body) => { sent.push(body); },
+      }),
       messageBuffer: new MessageBuffer(),
       mcpServers: {},
       permissionHandler: createApprovedPermissionHandler(),
@@ -162,11 +238,15 @@ describe('createAcpRuntime (status error surfacing)', () => {
         errorMessageKind: 'other',
         issueSource: 'provider_session_error',
         issueCode: 'provider_session_error',
-        compatibilityMarkerSent: false,
+        compatibilityMarkerSent: true,
       }),
     ]);
 
-    const serialized = JSON.stringify(tracePayloads);
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'turn_failed',
+      issue: expect.objectContaining({ source: 'provider_session_error' }),
+    }));
+    const serialized = JSON.stringify({ tracePayloads, sent });
     expect(serialized).not.toContain('sensitive prompt marker');
     expect(serialized).not.toContain('sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
     expect(serialized).not.toContain('Provider session failed while handling');
@@ -576,10 +656,10 @@ describe('createAcpRuntime (status error surfacing)', () => {
     ]);
   });
 
-  it('terminalizes the failed turn before a delayed transcript flush can admit the next turn', async () => {
+  it('terminalizes the failed turn while delayed transcript settlement is pending', async () => {
     const backend = createFakeAcpRuntimeBackend({ sessionId: 'sess_main' });
     const mutations: SessionTurnMutationV1[] = [];
-    const committed: ACPMessageData[] = [];
+    const published: ACPMessageData[] = [];
     const delayedAssistantCommit = createDeferred();
     let nextTurnId = 0;
     const sessionTurnLifecycle = createSessionTurnLifecycle({
@@ -592,11 +672,12 @@ describe('createAcpRuntime (status error surfacing)', () => {
     });
     const session = createBasicSessionClientWithOverrides({
       sendAgentMessage: (provider, body) => {
+        published.push(body);
         const observed = sessionTurnLifecycle.observeAcpLifecycleMarker({ provider, body });
         void observed.pendingWrite;
       },
       sendAgentMessageCommitted: async (_provider, body) => {
-        committed.push(body);
+        published.push(body);
         if (body.type === 'message' && body.message === 'turn one output') {
           await delayedAssistantCommit.promise;
         }
@@ -619,9 +700,14 @@ describe('createAcpRuntime (status error surfacing)', () => {
     backend.emit({ type: 'status', status: 'running' } satisfies AgentMessage);
     backend.emit({ type: 'model-output', textDelta: 'turn one output' } satisfies AgentMessage);
     backend.emit({ type: 'status', status: 'error', detail: 'Provider failed.' } satisfies AgentMessage);
-    await expect.poll(() => committed.some((body) => body.type === 'message')).toBe(true);
+    await expect.poll(() => published.some((body) => body.type === 'message')).toBe(true);
 
-    await runtime.flushTurn();
+    await expect.poll(() => mutations.map((mutation) => mutation.action)).toEqual(['begin', 'fail']);
+    expect(sessionTurnLifecycle.getActiveTurnId()).toBeNull();
+    expect(published.some((body) => body.type === 'turn_failed')).toBe(false);
+
+    // Start the next turn while the status-error flush is still awaiting the durable commit.
+    // flushTurn itself must await settlement, so awaiting it here would deadlock this fixture.
     runtime.beginTurn();
     backend.emit({ type: 'status', status: 'running' } satisfies AgentMessage);
     delayedAssistantCommit.resolve();
@@ -635,16 +721,16 @@ describe('createAcpRuntime (status error surfacing)', () => {
     expect(mutations[1]?.turnId).toBe('session-turn:turn-1');
     expect(mutations[2]?.turnId).toBe('session-turn:turn-2');
     expect(sessionTurnLifecycle.getActiveTurnId()).toBe('session-turn:turn-2');
-    await expect.poll(() => committed.find((body) => body.type === 'turn_failed')).toEqual(expect.objectContaining({
+    await expect.poll(() => published.find((body) => body.type === 'turn_failed')).toEqual(expect.objectContaining({
       type: 'turn_failed',
       id: mutations[0]?.providerTurnId,
     }));
   });
 
-  it('terminalizes an aborted turn before a delayed transcript flush can admit the next turn', async () => {
+  it('terminalizes an aborted turn while delayed transcript settlement is pending', async () => {
     const backend = createFakeAcpRuntimeBackend({ sessionId: 'sess_main' });
     const mutations: SessionTurnMutationV1[] = [];
-    const committed: ACPMessageData[] = [];
+    const published: ACPMessageData[] = [];
     const delayedAssistantCommit = createDeferred();
     let nextTurnId = 0;
     const sessionTurnLifecycle = createSessionTurnLifecycle({
@@ -657,11 +743,12 @@ describe('createAcpRuntime (status error surfacing)', () => {
     });
     const session = createBasicSessionClientWithOverrides({
       sendAgentMessage: (provider, body) => {
+        published.push(body);
         const observed = sessionTurnLifecycle.observeAcpLifecycleMarker({ provider, body });
         void observed.pendingWrite;
       },
       sendAgentMessageCommitted: async (_provider, body) => {
-        committed.push(body);
+        published.push(body);
         if (body.type === 'message' && body.message === 'turn one output') {
           await delayedAssistantCommit.promise;
         }
@@ -688,9 +775,14 @@ describe('createAcpRuntime (status error surfacing)', () => {
       status: 'error',
       detail: 'Error: OpenCode session aborted\n    at Object.cancel (/tmp/runtime.ts:10:1)',
     } satisfies AgentMessage);
-    await expect.poll(() => committed.some((body) => body.type === 'message')).toBe(true);
+    await expect.poll(() => published.some((body) => body.type === 'message')).toBe(true);
 
-    await runtime.flushTurn();
+    await expect.poll(() => mutations.map((mutation) => mutation.action)).toEqual(['begin', 'cancel']);
+    expect(sessionTurnLifecycle.getActiveTurnId()).toBeNull();
+    expect(published.some((body) => body.type === 'turn_aborted')).toBe(false);
+
+    // Start the next turn while the status-error flush is still awaiting the durable commit.
+    // flushTurn itself must await settlement, so awaiting it here would deadlock this fixture.
     runtime.beginTurn();
     backend.emit({ type: 'status', status: 'running' } satisfies AgentMessage);
     delayedAssistantCommit.resolve();
@@ -704,7 +796,7 @@ describe('createAcpRuntime (status error surfacing)', () => {
     expect(mutations[1]?.turnId).toBe('session-turn:turn-1');
     expect(mutations[2]?.turnId).toBe('session-turn:turn-2');
     expect(sessionTurnLifecycle.getActiveTurnId()).toBe('session-turn:turn-2');
-    await expect.poll(() => committed.find((body) => body.type === 'turn_aborted')).toEqual({
+    await expect.poll(() => published.find((body) => body.type === 'turn_aborted')).toEqual({
       type: 'turn_aborted',
       id: mutations[0]?.providerTurnId,
     });
@@ -713,7 +805,7 @@ describe('createAcpRuntime (status error surfacing)', () => {
   it('terminalizes a prompt failure before a delayed transcript flush can admit the next turn', async () => {
     const backend = createFakeAcpRuntimeBackend({ sessionId: 'sess_main' });
     const mutations: SessionTurnMutationV1[] = [];
-    const committed: ACPMessageData[] = [];
+    const published: ACPMessageData[] = [];
     const delayedAssistantCommit = createDeferred();
     let nextTurnId = 0;
     const sessionTurnLifecycle = createSessionTurnLifecycle({
@@ -726,11 +818,12 @@ describe('createAcpRuntime (status error surfacing)', () => {
     });
     const session = createBasicSessionClientWithOverrides({
       sendAgentMessage: (provider, body) => {
+        published.push(body);
         const observed = sessionTurnLifecycle.observeAcpLifecycleMarker({ provider, body });
         void observed.pendingWrite;
       },
       sendAgentMessageCommitted: async (_provider, body) => {
-        committed.push(body);
+        published.push(body);
         if (body.type === 'message' && body.message === 'turn one output') {
           await delayedAssistantCommit.promise;
         }
@@ -753,14 +846,14 @@ describe('createAcpRuntime (status error surfacing)', () => {
     backend.emit({ type: 'status', status: 'running' } satisfies AgentMessage);
     backend.emit({ type: 'model-output', textDelta: 'turn one output' } satisfies AgentMessage);
     const failure = runtime.failTurn(new Error('Provider session failed'));
-    await expect.poll(() => committed.some((body) => body.type === 'message')).toBe(true);
+    await expect.poll(() => published.some((body) => body.type === 'message')).toBe(true);
 
     runtime.beginTurn();
     backend.emit({ type: 'status', status: 'running' } satisfies AgentMessage);
     delayedAssistantCommit.resolve();
     await failure;
 
-    expect(mutations.map((mutation) => mutation.action)).toEqual([
+    await expect.poll(() => mutations.map((mutation) => mutation.action)).toEqual([
       'begin',
       'fail',
       'begin',
@@ -769,7 +862,7 @@ describe('createAcpRuntime (status error surfacing)', () => {
     expect(mutations[1]?.turnId).toBe('session-turn:turn-1');
     expect(mutations[2]?.turnId).toBe('session-turn:turn-2');
     expect(sessionTurnLifecycle.getActiveTurnId()).toBe('session-turn:turn-2');
-    expect(committed).toContainEqual(expect.objectContaining({
+    expect(published).toContainEqual(expect.objectContaining({
       type: 'turn_failed',
       id: mutations[0]?.providerTurnId,
     }));

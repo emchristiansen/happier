@@ -2,6 +2,7 @@
 
 ARG NODE_VERSION=22
 ARG BUILDPLATFORM
+ARG HAPPIER_RELAY_ARTIFACT_MODE=signed
 
 # Shared deps (alpine) for website/docs/webapp builds
 FROM node:${NODE_VERSION}-alpine AS deps-alpine
@@ -87,22 +88,13 @@ ENV REDISMS_DISABLE_POSTINSTALL=1
 ENV YARN_CACHE_FOLDER=/tmp/.yarn-cache
 
  COPY package.json yarn.lock ./
-RUN mkdir -p apps/ui apps/server apps/cli apps/website apps/docs packages/agents packages/cli-common packages/connection-supervisor packages/privacy-kit packages/protocol packages/release-runtime packages/transfers packages/audio-stream-native packages/sherpa-native scripts/pipeline/expo
- COPY apps/ui/package.json apps/ui/
+RUN mkdir -p apps/server packages/agents packages/cli-common packages/privacy-kit packages/protocol packages/release-runtime scripts/pipeline/expo
  COPY apps/server/package.json apps/server/
- COPY apps/cli/package.json apps/cli/
- COPY apps/website/package.json apps/website/
- COPY apps/docs/package.json apps/docs/
  COPY packages/agents/package.json packages/agents/
  COPY packages/cli-common/package.json packages/cli-common/
- COPY packages/connection-supervisor/package.json packages/connection-supervisor/
  COPY packages/privacy-kit/package.json packages/privacy-kit/
  COPY packages/protocol/package.json packages/protocol/
  COPY packages/release-runtime/package.json packages/release-runtime/
- COPY packages/transfers/package.json packages/transfers/
- COPY packages/audio-stream-native/package.json packages/audio-stream-native/
- COPY packages/sherpa-native/package.json packages/sherpa-native/
-COPY apps/ui/tools/postinstall ./apps/ui/tools/postinstall
 COPY scripts/pipeline/expo/eas-postinstall.mjs scripts/pipeline/expo/
 
 COPY scripts/ci/yarn-install-with-retry.sh /usr/local/bin/yarn-install-with-retry
@@ -295,8 +287,12 @@ COPY packages/release-runtime ./packages/release-runtime
 RUN yarn workspace privacy-kit build
 RUN yarn workspace @happier-dev/protocol postinstall:real && yarn workspace @happier-dev/agents postinstall:real
 RUN yarn workspace @happier-dev/release-runtime postinstall:real
+RUN yarn workspace @happier-dev/cli-common postinstall:real
 RUN yarn workspace @happier-dev/server postinstall:real
 RUN yarn workspace @happier-dev/server build
+# Preserve generated/native outputs while dropping build and validation-only dependencies.
+RUN --mount=type=cache,target=/tmp/.yarn-cache,sharing=locked \
+    yarn-install-with-retry --production=true --ignore-scripts --frozen-lockfile --ignore-engines --network-timeout 600000 --prefer-offline --non-interactive
 
 FROM node:${NODE_VERSION} AS server
 WORKDIR /repo
@@ -345,8 +341,16 @@ ENV HAPPIER_SERVER_UI_REQUIRED=1
 ENV HAPPIER_SQLITE_AUTO_MIGRATE=1
 USER node
 
-# Relay server (self-host default: light + sqlite)
-FROM debian:12-slim AS relay-artifacts
+# Compile the artifact-specific local ingress only when its stage is selected.
+FROM debian:12-slim AS relay-local-ingest-builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends rustc gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/pipeline/docker/ingest-local-relay-artifact.rs /src/ingest-local-relay-artifact.rs
+RUN rustc --edition=2021 -Dwarnings -C opt-level=2 /src/ingest-local-relay-artifact.rs -o /ingest-local-relay-artifact
+
+# Relay server (self-host default: light + sqlite); signed release is unchanged.
+FROM debian:12-slim AS relay-artifacts-signed
 ARG TARGETARCH
 ARG HAPPIER_RELEASE_BASE_URL="https://github.com/happier-dev/happier/releases/download"
 ARG HAPPIER_RELAY_SERVER_RELEASE_TAG=""
@@ -371,7 +375,37 @@ RUN set -eux; \
       --os linux \
       --arch "$artifact_arch" \
       --dest /opt/happier/server \
-      --pubkey /tmp/happier-release.pub; \
+      --pubkey /tmp/happier-release.pub
+
+# Explicit receipt-bound local input does not require remote download/key tools.
+FROM debian:12-slim AS relay-artifacts-local
+ARG TARGETARCH
+ARG HAPPIER_RELAY_SERVER_VERSION=""
+ARG HAPPIER_RELAY_LOCAL_ARCHIVE_SHA256=""
+ARG HAPPIER_RELAY_LOCAL_SOURCE_SHA=""
+ARG SENTRY_RELEASE=""
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tar gzip coreutils mawk \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=relay-local-ingest-builder /ingest-local-relay-artifact /usr/local/bin/ingest-local-relay-artifact
+WORKDIR /opt/happier
+RUN --mount=type=bind,target=/context,readonly \
+    ingest-local-relay-artifact \
+      --directory /context/dist/release-assets/server \
+      --product happier-server \
+      --component happier-server-light \
+      --version "$HAPPIER_RELAY_SERVER_VERSION" \
+      --os linux \
+      --arch x64 \
+      --oci-arch "$TARGETARCH" \
+      --expected-sha256 "$HAPPIER_RELAY_LOCAL_ARCHIVE_SHA256" \
+      --source-sha "$HAPPIER_RELAY_LOCAL_SOURCE_SHA" \
+      --release-source-sha "$SENTRY_RELEASE" \
+      --dest /opt/happier/server
+
+FROM relay-artifacts-${HAPPIER_RELAY_ARTIFACT_MODE} AS relay-artifacts
+ARG TARGETARCH
+RUN set -eux; \
     rm -rf /opt/happier/server/generated/mysql-client /opt/happier/server/prisma/mysql; \
     case "$TARGETARCH" in \
       amd64) \
@@ -400,6 +434,13 @@ RUN chmod +x /usr/local/bin/run-server
 ARG SENTRY_RELEASE=""
 ENV SENTRY_RELEASE=$SENTRY_RELEASE
 ENV HAPPIER_RELEASE_SOURCE_SHA=$SENTRY_RELEASE
+ARG HAPPIER_RELAY_ARTIFACT_MODE
+ARG HAPPIER_RELAY_LOCAL_ARCHIVE_SHA256=""
+ARG HAPPIER_RELAY_LOCAL_SOURCE_SHA=""
+LABEL org.opencontainers.image.revision=$SENTRY_RELEASE \
+      ai.happier.relay.artifact-mode=$HAPPIER_RELAY_ARTIFACT_MODE \
+      ai.happier.relay.local-archive-sha256=$HAPPIER_RELAY_LOCAL_ARCHIVE_SHA256 \
+      ai.happier.relay.local-source-sha=$HAPPIER_RELAY_LOCAL_SOURCE_SHA
 ARG SENTRY_SERVER_CENTRAL_DSN=""
 ENV HAPPIER_SENTRY_CENTRAL_DSN=$SENTRY_SERVER_CENTRAL_DSN
 ENV HAPPIER_SENTRY_USE_CENTRAL_DSN=1

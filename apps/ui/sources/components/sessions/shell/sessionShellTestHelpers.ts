@@ -67,6 +67,7 @@ function resolveSessionItemTestListAttentionState(status: SessionStatus): Sessio
         case 'background_active':
         case 'permission_required':
         case 'action_required':
+        case 'failed':
             return status.state === 'waiting' || status.state === 'background_active'
                 ? 'quiet'
                 : status.state;
@@ -74,6 +75,8 @@ function resolveSessionItemTestListAttentionState(status: SessionStatus): Sessio
         case 'recoverable_unservable':
         case 'resuming':
             return 'quiet';
+        case 'archiving':
+            return 'thinking';
     }
 }
 
@@ -101,7 +104,6 @@ export function createSessionItemTestRowModel(
         serverName: input.serverName,
         treeRowId: `session:${serverId ?? 'local'}:${sessionId}`,
         testID: `session-list-item-${sessionId}`,
-        dataIndex: 0,
         session,
         status,
         statusSignature: `${status.state}|${status.isConnected ? 1 : 0}|${status.statusText}`,
@@ -143,6 +145,7 @@ export function createSessionItemTestRowModel(
         isSelected: input.selected ?? false,
         isPinned: input.pinned ?? false,
         isAttentionStanding: input.attentionStanding ?? false,
+        reminder: null,
         attentionStandingEnabled: input.attentionStandingEnabled ?? false,
         isArchived: session.archivedAt != null,
         isActive: session.active === true,
@@ -220,6 +223,13 @@ export function installSessionShellCommonModuleMocks(
         return createReactNativeWebMock();
     });
 
+    // The global FlashList stub is a host tag; shell tests need rendered rows and auxiliaries.
+    // Reuse each test's RN list boundary while retaining the real engine selector.
+    vi.mock('@shopify/flash-list', async () => {
+        const { FlatList } = await import('react-native');
+        return { FlashList: FlatList };
+    });
+
     vi.mock('react-native-unistyles', async () => {
         const activeOptions = sessionShellModuleState.options;
         if (activeOptions.unistyles) {
@@ -228,6 +238,19 @@ export function installSessionShellCommonModuleMocks(
 
         const { createUnistylesMock } = await import('@/dev/testkit/mocks/unistyles');
         return createUnistylesMock();
+    });
+
+    vi.mock('@/constants/Typography', async (importOriginal) => {
+        const original = await importOriginal<typeof import('@/constants/Typography')>();
+        return {
+            ...original,
+            Typography: new Proxy(original.Typography, {
+                get: (target, property, receiver) => {
+                    const value = Reflect.get(target, property, receiver);
+                    return typeof value === 'function' ? () => ({}) : value;
+                },
+            }),
+        };
     });
 
     vi.mock('@/text', async () => {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AuthCredentials } from '@/auth/storage/tokenStorage';
+import { createMachineFixture } from '@/dev/testkit/fixtures/machineFixtures';
 
 vi.mock('@/log', () => ({
     log: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -134,6 +135,10 @@ describe('fetchAndApplyMachines error propagation', () => {
                     ];
                 },
             } as any)),
+            getExistingMachine: (id) => createMachineFixture({
+                id,
+                metadata: { ...createMachineFixture().metadata!, daemonTerminalSessionAttachSupported: true },
+            }),
             cachedMachineDisplayEntries: {
                 m1: { metadataVersion: 1, displayName: 'one', host: 'h1', homeDir: '/h1' } as any,
                 m2: { metadataVersion: 2, displayName: 'two', host: 'h2', homeDir: '/h2' } as any,
@@ -146,5 +151,9 @@ describe('fetchAndApplyMachines error propagation', () => {
         expect(applyMachines).toHaveBeenCalledTimes(1);
         expect(applyMachineDisplayEntries.mock.calls[0]?.[0]).toHaveLength(2);
         expect(applyMachines.mock.calls[0]?.[0]).toHaveLength(2);
+        expect(applyMachines.mock.calls[0]?.[0]).toEqual([
+            expect.objectContaining({ id: 'm1', metadata: null }),
+            expect.objectContaining({ id: 'm2', metadata: null }),
+        ]);
     });
 });

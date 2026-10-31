@@ -13,7 +13,9 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { Text } from '@/components/ui/text/Text';
 import { t } from '@/text';
 import { resolveOptionalSessionScreenTestId, useSessionScreenTestIdsEnabled } from '../shell/sessionScreenTestIds';
+import { resolveChatHeaderContentInsets } from './chatHeaderLayout';
 import { Icon } from '@/components/ui/icons/Icon';
+import { resolveSessionHeaderActionTargetPx } from '@/components/sessions/actions/sessionHeaderIconMetrics';
 
 
 /** The gutter control's tap target, matching every other header action. */
@@ -40,6 +42,8 @@ interface ChatHeaderViewProps {
     isConnected?: boolean;
     flavor?: string | null;
     constrainWidth?: boolean;
+    /** Space reserved beside the transcript, without moving the trailing header actions. */
+    contentTrailingInsetPx?: number;
     includeTopInset?: boolean;
     /**
      * Defaults to shown. Suppressed where a permanent sidebar is on screen: there is no stack to
@@ -67,6 +71,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
     isConnected = true,
     flavor,
     constrainWidth = true,
+    contentTrailingInsetPx = 0,
     includeTopInset = true,
     showBackButton = true,
     gutterElement,
@@ -89,9 +94,13 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
     const handleWrapperLayout = React.useCallback((event: LayoutChangeEvent) => {
         setWrapperWidth(event.nativeEvent.layout.width);
     }, []);
-    const trailingGutterWidth = constrainWidth && wrapperWidth > 0
-        ? Math.max(0, (wrapperWidth - Math.min(wrapperWidth, maxWidth)) / 2)
-        : 0;
+    const contentInsets = resolveChatHeaderContentInsets({
+        containerWidth: wrapperWidth,
+        maxWidth,
+        contentTrailingInsetPx,
+        constrainWidth,
+    });
+    const trailingGutterWidth = contentInsets.trailing;
     const gutterHoldsElement = gutterElement != null && trailingGutterWidth >= GUTTER_MIN_WIDTH_PX;
     // Half the leftover once the tap target is centred in `headerHeight` — which is also the gap the
     // control leaves above itself. Using it horizontally makes the icon's distance to the window's
@@ -108,7 +117,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
             return agentId ? <AgentIcon agentId={agentId} size={26} /> : null;
         }
         return avatarId
-            ? <Avatar id={avatarId} size={32} monochrome={!isConnected} flavor={flavor} />
+            ? <Avatar id={avatarId} size={32} monochrome={!isConnected} flavor={agentId ?? flavor} />
             : null;
     }, [agentId, avatarId, flavor, identityMode, isConnected]);
 
@@ -121,20 +130,34 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
     };
 
     return (
-        <View style={[styles.container, { paddingTop: includeTopInset ? insets.top : 0, backgroundColor: theme.colors.chrome.header.background }]}>
+        <View style={[styles.container, { paddingTop: includeTopInset ? insets.top : 0, backgroundColor: theme.colors.surface.base }]}>
             <View
                 onLayout={handleWrapperLayout}
                 style={[styles.contentWrapper, constrainWidth ? null : { alignItems: 'stretch' }]}
             >
-                <View style={[styles.content, { height: headerHeight, maxWidth }, constrainWidth ? null : { maxWidth: '100%' }]}>
+                <View style={[
+                    styles.content,
+                    { height: headerHeight, maxWidth },
+                    constrainWidth ? null : { maxWidth: '100%' },
+                    wrapperWidth > 0 && contentTrailingInsetPx > 0 && constrainWidth ? {
+                        alignSelf: 'flex-start',
+                        marginLeft: contentInsets.leading,
+                        width: wrapperWidth - contentInsets.leading - contentInsets.trailing,
+                        maxWidth: '100%',
+                    } : null,
+                ]}>
                 {showBackButton ? (
                     <Pressable
                         onPress={handleBackPress}
                         testID={backButtonTestId}
                         accessibilityRole="button"
                         accessibilityLabel={t('common.back')}
-                        style={styles.backButton}
-                        hitSlop={15}
+                        style={[styles.backButton, {
+                            width: resolveSessionHeaderActionTargetPx(),
+                            height: resolveSessionHeaderActionTargetPx(),
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                        }]}
                     >
                         <Icon
                             name={Platform.OS === 'ios' ? 'caret-left' : 'arrow-left'}

@@ -1,11 +1,19 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  normalizeOpenCodeCliGeneration,
   normalizeOpenCodeServerBaseUrl,
   readOpenCodeExplicitServerBaseUrl,
 } from './opencode.js';
 
 describe('OpenCode provider settings normalization', () => {
+  it('normalizes the requested CLI generation without inventing aliases', () => {
+    expect(normalizeOpenCodeCliGeneration(' v2 ')).toBe('v2');
+    expect(normalizeOpenCodeCliGeneration('STABLE')).toBe('stable');
+    expect(normalizeOpenCodeCliGeneration('beta')).toBe('auto');
+    expect(normalizeOpenCodeCliGeneration(null)).toBe('auto');
+  });
+
   it('accepts localhost http urls', () => {
     expect(normalizeOpenCodeServerBaseUrl(' http://127.0.0.1:4096/ ')).toBe('http://127.0.0.1:4096/');
     expect(normalizeOpenCodeServerBaseUrl('http://localhost:4096')).toBe('http://localhost:4096/');

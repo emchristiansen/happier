@@ -16,6 +16,12 @@ export type PlannedRunnerRestartReason =
   | 'temporary_throttle_recovery'
   | 'version_runtime_refresh';
 
+export type PlannedRunnerRestartIntent = Readonly<{
+  reason: PlannedRunnerRestartReason;
+  tracked: TrackedSession;
+  target?: ConnectedServiceSwitchTarget;
+}>;
+
 export type PlannedRunnerRestartPolicy =
   | 'defer_until_turn_boundary'
   | 'defer_until_idle';
@@ -40,7 +46,8 @@ export type PlannedRunnerRestartNotSignaledReason =
   | 'superseded'
   | 'activity_in_progress'
   | 'duplicate_restart'
-  | 'terminal_restart';
+  | 'terminal_restart'
+  | 'shutting_down';
 
 export type PlannedRunnerRestartSignalActivityGateResult =
   | boolean
@@ -61,8 +68,8 @@ export type PlannedRunnerRestartDeferralQueue = Readonly<{
     policy: PlannedRunnerRestartPolicy;
     source: PlannedRunnerRestartSource;
     target: ConnectedServiceSwitchTarget;
-    runSwitch: () => Promise<void>;
-  }>) => Promise<void>;
+    runSwitch: () => Promise<unknown>;
+  }>) => Promise<unknown>;
 }>;
 
 export type PlannedRunnerRestartDeferral =

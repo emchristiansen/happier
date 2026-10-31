@@ -147,6 +147,31 @@ function buildAssistantRow(params: Readonly<{
 }
 
 describe('createClaudeSessionTranscriptProjector compaction events', () => {
+  it('does not project sidechain compact commands or boundaries as parent compaction events', async () => {
+    const fixture = createSessionFixture();
+    const projector = createClaudeSessionTranscriptProjector({
+      session: fixture.session,
+      logPrefix: '[test]',
+    });
+
+    await projector.observe({
+      type: 'user',
+      uuid: 'sidechain-compact-command',
+      isSidechain: true,
+      message: { content: '/compact' },
+    } as RawJSONLines);
+    await projector.observe({
+      type: 'system',
+      subtype: 'compact_boundary',
+      session_id: 'sidechain-session',
+      uuid: 'sidechain-compact-boundary',
+      timestamp: '2026-09-13T11:45:06.827Z',
+      isSidechain: true,
+    } as RawJSONLines);
+
+    expect(fixture.getSessionEventCalls()).toEqual([]);
+  });
+
   it('derives replayed compact_boundary lifecycle identity from the raw boundary evidence', async () => {
     const firstBoundary = {
       type: 'system',

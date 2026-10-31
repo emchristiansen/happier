@@ -2,6 +2,15 @@ export const HAPPY_PROTOCOL_PACKAGE = '@happier-dev/protocol';
 export { buildRecoveryCreditConsumeIdempotencyKey } from './connect/recoveryCreditConsumeIdempotencyKey.js';
 
 export { PROVIDER_ACCOUNT_SUBSCRIPTION_ACCEPT, ProviderAccountSubscriptionV1Schema, mergeProviderAccountSubscription, type ProviderAccountSubscriptionV1 } from './connect/accountSubscription.js';
+export { ConnectedServiceImportSourceV1Schema, ConnectedServiceImportRequestV1Schema, ConnectedServiceImportResponseV1Schema, ConnectedServiceImportErrorCodeV1Schema } from './connect/connectedServiceImport.js';
+export type { ConnectedServiceImportSourceV1, ConnectedServiceImportRequestV1, ConnectedServiceImportResponseV1 } from './connect/connectedServiceImport.js';
+
+export {
+  compareConnectedServiceQuotaObservationRecency,
+  isConnectedServiceQuotaObservationAtOrBeforeNow,
+  isConnectedServiceQuotaObservationFresh,
+  type ConnectedServiceQuotaObservationRecency,
+} from './connect/quotaObservationTime.js';
 
 export {
   buildExecutionRunCompletionInputV1,
@@ -120,6 +129,8 @@ export {
   SessionUsageLimitWaitResumeEnableRequestV1Schema,
   SessionUsageLimitWaitResumeEnableResponseV1Schema,
   SessionSkillCatalogItemV1Schema,
+  PreflightSessionCatalogsV1Schema,
+  type PreflightSessionCatalogsV1,
   SessionSkillCatalogListRequestV1Schema,
   SessionSkillCatalogListResponseV1Schema,
   SessionVendorPluginCatalogListRequestV1Schema,
@@ -199,6 +210,8 @@ export {
   type SkillCatalogItemIdentityV1,
   type SkillCatalogOriginV1,
 } from './sessionWorkState/index.js';
+
+export { NonBlankOpaqueIdentifierSchema, readNonBlankOpaqueIdentifier } from './strings/opaqueIdentifier.js';
 
 export {
   SESSION_WORKFLOW_ACTIVITY_RECENT_RUNS_LIMIT,
@@ -532,6 +545,7 @@ export {
 
 export {
   collectExpoPushTokensMarkedUnregistered,
+  getExpoErrorCode,
 } from './push/expoPushDelivery.js';
 
 export {
@@ -560,8 +574,10 @@ export {
   openProviderAccountUsageSnapshotCiphertext,
   projectProviderAccountUsageSnapshotToConnectedServiceQuotaSnapshotV1,
   projectProviderAccountUsageToConnectedServiceQuotaSnapshot,
+  isProviderAccountUsageOrganizationContextMatch,
   sealProviderAccountUsageSnapshotCiphertext,
   splitProviderAccountUsageSubscription,
+  splitProviderAccountUsageSupplementalFacets,
   sealProviderAccountUsageSnapshot,
   openSealedProviderAccountUsageSnapshot,
   type ProviderAccountSubjectRefV1,
@@ -570,6 +586,7 @@ export {
   type ProviderAccountUsageQuotaScopeV1,
   type ProviderAccountUsageRecordId,
   type ProviderAccountUsageRecordKeyV1,
+  type ProviderAccountUsageOrganizationContext,
   type ProviderAccountUsageSnapshotV1,
   type ProviderAccountUsageSourceV1,
   type ProviderAccountUsageStateV1,
@@ -579,7 +596,14 @@ export {
 
 export {
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER,
+  CONNECTED_SERVICE_AUTH_GROUP_SWITCH_REASON_HEADER,
   CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
+  CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY,
+  CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY,
+  CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY,
+  CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE,
+  ConnectedServiceAuthGroupReaderCapabilitiesQueryV1Schema,
+  appendConnectedServiceAuthGroupReaderCapabilities,
   ConnectedServiceAuthGroupActiveProfileRequestV1Schema,
   ConnectedServiceAuthGroupCreateRequestV1Schema,
   ConnectedServiceAuthGroupIdSchema,
@@ -591,6 +615,8 @@ export {
   ConnectedServiceAuthGroupPatchRequestV1Schema,
   ConnectedServiceAuthGroupPolicyPatchV1Schema,
   ConnectedServiceAuthGroupPolicyV1Schema,
+  ConnectedServiceAuthGroupStrategyV1Schema,
+  ConnectedServiceAuthGroupQuotaLimitSelectionV1Schema,
   ConnectedServiceAuthGroupErrorResponseV1Schema,
   ConnectedServiceAuthGroupResponseV1Schema,
   ConnectedServiceAuthGroupRouteParamsV1Schema,
@@ -625,6 +651,8 @@ export {
   ConnectedServiceQuotaRecoveryCreditStatusV1Schema,
   ConnectedServiceQuotaRecoveryCreditV1Schema,
   ConnectedServiceQuotaRecoveryCreditsV1Schema,
+  ConnectedServiceQuotaRecoveryCreditDetailsV1Schema,
+  ConnectedServiceQuotaRecoveryCreditDetailsByIdV1Schema,
   ConnectedServiceQuotaSnapshotV1Schema,
   ConnectedServiceQuotaSourceV1Schema,
   ConnectedServiceQuotaUnitV1Schema,
@@ -650,12 +678,14 @@ export {
   type ConnectedServiceAuthGroupPatchRequestV1,
   type ConnectedServiceAuthGroupPolicyPatchV1,
   type ConnectedServiceAuthGroupPolicyV1,
+  type ConnectedServiceAuthGroupQuotaLimitSelectionV1,
   type ConnectedServiceAuthGroupErrorResponseV1,
   type ConnectedServiceAuthGroupResponseV1,
   type ConnectedServiceAuthGroupRouteParamsV1,
   type ConnectedServiceAuthGroupRuntimeStatePatchRequestV1,
   type ConnectedServiceAuthGroupStateV1,
   type ConnectedServiceAuthGroupV1,
+  type ConnectedServiceAuthGroupReaderCapabilitiesQueryV1,
   type ConnectedServiceBindingSelectionV1,
   type ConnectedServiceBindingsV1,
   type ConnectedServiceCredentialFormat,
@@ -681,6 +711,8 @@ export {
   type ConnectedServiceQuotaRecoveryCreditStatusV1,
   type ConnectedServiceQuotaRecoveryCreditV1,
   type ConnectedServiceQuotaRecoveryCreditsV1,
+  type ConnectedServiceQuotaRecoveryCreditDetailsV1,
+  type ConnectedServiceQuotaRecoveryCreditDetailsByIdV1,
   type ConnectedServiceQuotaSnapshotV1,
   type ConnectedServiceQuotaSourceV1,
   type ConnectedServiceQuotaUnitV1,
@@ -705,6 +737,11 @@ export {
 } from './connect/connectedServiceAuthGroupMemberRuntimeStatePolicy.js';
 
 export {
+  resolveConnectedServiceQuotaMeterLimitIdentity,
+  selectConnectedServiceQuotaMetersForLimitSelection,
+} from './connect/connectedServiceQuotaLimitSelection.js';
+
+export {
   openConnectedServiceCredentialCiphertext,
   openConnectedServiceQuotaSnapshotCiphertext,
   sealConnectedServiceCredentialCiphertext,
@@ -718,9 +755,14 @@ export {
 
 export {
   buildConnectedServiceCredentialRecord,
+  buildConnectedServiceCredentialMetadata,
+  connectedServiceUsageRequiresOrganizationId,
+  readConnectedServiceCredentialOrganizationId,
+  type ConnectedServiceCredentialMetadata,
   normalizeConnectedServiceOauthCredentialRawMetadata,
   type ConnectedServiceOauthCredentialRawMetadata,
 } from './connect/buildConnectedServiceCredentialRecord.js';
+export { parseOauthAuthorizationResponse, type OauthAuthorizationResponse } from './connect/oauthAuthorizationResponse.js';
 
 export { parseBooleanEnv, parseOptionalBooleanEnv } from './env/parseBooleanEnv.js';
 export type { ServerRetentionCapabilities } from './features/payload/capabilities/serverRetentionCapabilities.js';
@@ -769,6 +811,17 @@ export {
   type MachineReplacementReason,
   type MachineReplacementRecord,
   type MachineReplacementRegistrationIntent,
+} from './machines/index.js';
+
+export {
+  CliInstallSourceSchema,
+  CliUpdateFactsSchema,
+  CliUpdateLastResultSchema,
+  CliUpdateOutcomeSchema,
+  type CliInstallSource,
+  type CliUpdateFacts,
+  type CliUpdateLastResult,
+  type CliUpdateOutcome,
 } from './machines/index.js';
 
 export {
@@ -833,6 +886,11 @@ export {
   normalizeClaudeTaskToolRecordsToWorkStateItems,
   normalizeClaudeTaskToolUseToWorkStateItem,
   normalizeClaudeSdkInitSkills,
+  normalizeClaudeOauthProfileEntitlement,
+  readClaudeOauthCredentialMetadata,
+  readClaudeOauthCredentialOrganizationId,
+  type ClaudeOauthCredentialMetadata,
+  type ClaudeOauthEntitlementMetadata,
   normalizeClaudeTaskEventToWorkStateItem,
   normalizeClaudeTodoWriteTodosToWorkStateItems,
   readClaudeAgentSdkProviderTaskStatus,
@@ -1005,6 +1063,7 @@ export {
 export {
   TranscriptRawRecordV1Schema,
   ConnectedServiceRuntimeAuthRecoveryTranscriptStatusV1Schema,
+  isConnectedServiceRuntimeAuthRecoveryCancellation,
   ConnectedServiceSwitchAttemptedContinuityModeV1Schema,
   ConnectedServiceSwitchAttemptOutcomeActionV1Schema,
   ConnectedServiceSwitchAttemptOutcomeV1Schema,
@@ -1161,6 +1220,14 @@ export {
 } from './sessionOrganization/index.js';
 
 export {
+  ClientEncryptionRequirementSchema,
+  combineClientEncryptionRequirements,
+  isAccountEncryptionModeAllowedByClientRequirement,
+  isSessionEncryptionModeAllowedByClientRequirement,
+  type ClientEncryptionRequirement,
+} from './encryption/clientEncryptionRequirement.js';
+
+export {
   isSessionEncryptionModeAllowedByStoragePolicy,
   isStoredContentKindAllowedForSessionByStoragePolicy,
   resolveEffectiveDefaultAccountEncryptionMode,
@@ -1205,11 +1272,18 @@ export {
   TERMINAL_PROVISIONING_V2_CONTENT_PRIVATE_KEY_BYTES,
   TERMINAL_PROVISIONING_V2_PLAINTEXT_BYTES,
   TERMINAL_PROVISIONING_V2_VERSION_BYTE,
+  TERMINAL_PROVISIONING_V2_TOKEN_ONLY_TAG,
+  type TerminalProvisioningV2Response,
   isTerminalProvisioningV3Payload,
   openTerminalProvisioningV3Payload,
+  openTerminalProvisioningV3Response,
   openTerminalProvisioningV2Payload,
+  openTerminalProvisioningV2Response,
+  parseTerminalProvisioningV2Plaintext,
   sealTerminalProvisioningV3Payload,
+  sealTerminalProvisioningV3TokenOnlyPayload,
   sealTerminalProvisioningV2Payload,
+  sealTerminalProvisioningV2TokenOnlyPayload,
 } from './crypto/terminalProvisioningV2.js';
 
 export {
@@ -1318,6 +1392,7 @@ export {
   PendingFirstInputV1Schema,
   SPAWN_SESSION_ERROR_CODES,
   SPAWN_SESSION_ERROR_DETAIL_KINDS,
+  TerminalHostUnavailableSpawnErrorDetailSchema,
   SpawnSessionExecutionAuthorizationSchema,
   isConnectedServiceUxDiagnosticSpawnErrorDetail,
   isConnectedServiceResumeUnreachableSpawnErrorDetail,
@@ -1329,6 +1404,7 @@ export {
   type ConnectedServiceUxDiagnosticSpawnErrorDetail,
   type SpawnSessionErrorCode,
   type SpawnSessionErrorDetail,
+  type TerminalHostUnavailableSpawnErrorDetail,
   type SpawnSessionErrorDetailKind,
   type SpawnSessionExecutionAuthorization,
   type SpawnSessionResult,
@@ -1403,6 +1479,8 @@ export {
   SessionAgentTransitionPartialCodeV1Schema,
   SessionAgentTransitionSourceStoppedCodeV1Schema,
   SessionContinuationInspectionRequestV1Schema,
+  SessionContinuationInspectionBatchRequestV1Schema,
+  SessionContinuationInspectionBatchResultV1Schema,
   SessionContinuationInspectionUnavailableReasonV1Schema,
   SessionContinuationInspectionV1Schema,
   SessionContinuationUnavailablePresentationV1Schema,
@@ -1421,6 +1499,8 @@ export {
   type SessionAgentTransitionPartialCodeV1,
   type SessionAgentTransitionSourceStoppedCodeV1,
   type SessionContinuationInspectionRequestV1,
+  type SessionContinuationInspectionBatchRequestV1,
+  type SessionContinuationInspectionBatchResultV1,
   type SessionContinuationInspectionUnavailableReasonV1,
   type SessionContinuationInspectionV1,
   type SessionContinuationMachinePresenceV1,
@@ -1490,6 +1570,8 @@ export {
   GH_BINARY_NAME,
   GH_DEP_ID,
   GH_GITHUB_REPO,
+  AGY_ACP_SERVER_DEP_ID,
+  AGY_ACP_SERVER_VERSION,
   type InstallableAutoUpdateMode,
   type InstallableCatalogEntry,
   type InstallableDefaultPolicy,
@@ -1717,6 +1799,9 @@ export {
   type SessionUsageLimitRecoveryOperationResultOkStatusV1,
   type SessionUsageLimitRecoveryOperationResultV1,
   type SessionUsageLimitRecoveryV1,
+  buildUsageLimitIssueFingerprint,
+  isSessionUsageLimitRecoveryForIssue,
+  readSessionUsageLimitRecoveryForIssue,
   type TurnTerminalStatusV1,
   type V2SessionByIdNotFound,
   type V2SessionByIdResponse,
@@ -1748,6 +1833,13 @@ export {
   type SessionTerminalComposerClearResultV1,
   type SessionTerminalComposerClearSuccessStatusV1,
 } from './sessionControl/sessionTerminalComposerClearV1.js';
+
+export {
+  SessionProviderCliAttachPrepareRequestV1Schema,
+  SessionProviderCliAttachPrepareResultV1Schema,
+  type SessionProviderCliAttachPrepareRequestV1,
+  type SessionProviderCliAttachPrepareResultV1,
+} from './sessionControl/sessionProviderCliAttachPrepareV1.js';
 
 export {
   SessionPendingInputInterruptAndRunRequestV1Schema,
@@ -1887,6 +1979,8 @@ export {
   type SessionTerminalMetadata,
   type TerminalControlServiceabilityPolicy,
   createSessionTerminalMetadataSchema,
+  normalizeSessionMetadataForRead,
+  projectSessionMetadataForWire,
   resolveTerminalControlServiceabilityPolicy,
 } from './sessionMetadata/terminalMetadata.js';
 
@@ -1915,6 +2009,7 @@ export {
 } from './sessionMetadata/windowsTerminalWindowName.js';
 
 export {
+  SESSION_PERMISSION_INTENT_INPUTS,
   SESSION_PERMISSION_MODES,
   SessionPermissionModeInputSchema,
   SessionPermissionModeSchema,
@@ -1937,10 +2032,12 @@ export {
 export {
   SessionMessageMetaSchema,
   SESSION_USER_MESSAGE_DELIVERY_INTENT_META_KEY,
+  SESSION_TOOL_ANSWER_DELIVERY_KIND,
   type SessionMessageMeta,
   type SessionUserMessageDeliveryIntentV1,
   createSessionMessageMetaSchema,
   readSessionUserMessageDeliveryIntentMeta,
+  isSessionToolAnswerDeliveryMeta,
   withSessionUserMessageDeliveryIntentMeta,
 } from './sessionMessages/sessionMessageMeta.js';
 export {
@@ -2351,7 +2448,10 @@ export {
   ExecutionRunTransportErrorCodeSchema,
   ExecutionRunDisplaySchema,
   ExecutionRunLaunchOriginSchema,
+  ExecutionRunRequestedConfigurationSchema,
+  projectExecutionRunRequestedConfiguration,
   ExecutionRunPublicStateSchema,
+  isExecutionRunActive,
   ExecutionRunReplaySeedRequestSchema,
   ExecutionRunStartRequestSchema,
   ExecutionRunStartResponseSchema,
@@ -2392,6 +2492,7 @@ export {
   type ExecutionRunTransportErrorCode,
   type ExecutionRunDisplay,
   type ExecutionRunLaunchOrigin,
+  type ExecutionRunRequestedConfiguration,
   type ExecutionRunPublicState,
   type ExecutionRunReplaySeedRequest,
   type ExecutionRunStartRequest,
@@ -2430,6 +2531,8 @@ export {
   type ExecutionRunTurnStreamEventError,
   type ExecutionRunStatus,
 } from './executionRuns.js';
+
+export { MAX_EXECUTION_RUN_OBSERVATION_TIMEOUT_SECONDS } from './executionRunObservationTimeout.js';
 
 export {
   DaemonExecutionRunMarkerSchema,
@@ -2490,9 +2593,13 @@ export {
 export {
   DirectSessionsProviderIdSchema,
   DirectSessionsSourceSchema,
+  DirectSessionsAcpSessionListCapabilityRequestSchema,
+  DirectSessionsAcpSessionListCapabilityResponseSchema,
   DirectSessionCandidateV1Schema,
   DirectSessionsCandidatesListRequestSchema,
   DirectSessionsCandidatesListResponseSchema,
+  DirectSessionCandidateDeleteRequestSchema,
+  DirectSessionCandidateDeleteResponseSchema,
   DirectSessionLinkEnsureRequestSchema,
   DirectSessionLinkEnsureResponseSchema,
   DirectSessionActivityV1Schema,
@@ -2509,15 +2616,23 @@ export {
   DirectTranscriptPageResponseSchema,
   DirectTranscriptReadAfterRequestSchema,
   DirectTranscriptReadAfterResponseSchema,
+  DirectTranscriptTruncationReasonSchema,
+  resolveDirectTranscriptContinuation,
+  DIRECT_SESSION_TAKEOVER_ACTION_IDS,
   DirectSessionTakeoverRequestSchema,
   DirectSessionTakeoverResponseSchema,
   DirectSessionTakeoverPersistRequestSchema,
   DirectSessionTakeoverPersistResponseSchema,
+  DirectSessionTakeoverPersistStartResponseSchema,
   type DirectSessionsProviderId,
   type DirectSessionsSource,
+  type DirectSessionsAcpSessionListCapabilityRequest,
+  type DirectSessionsAcpSessionListCapabilityResponse,
   type DirectSessionCandidateV1,
   type DirectSessionsCandidatesListRequest,
   type DirectSessionsCandidatesListResponse,
+  type DirectSessionCandidateDeleteRequest,
+  type DirectSessionCandidateDeleteResponse,
   type DirectSessionLinkEnsureRequest,
   type DirectSessionLinkEnsureResponse,
   type DirectSessionActivityV1,
@@ -2534,11 +2649,19 @@ export {
   type DirectTranscriptPageResponse,
   type DirectTranscriptReadAfterRequest,
   type DirectTranscriptReadAfterResponse,
+  type DirectTranscriptTruncationReason,
   type DirectSessionTakeoverRequest,
   type DirectSessionTakeoverResponse,
   type DirectSessionTakeoverPersistRequest,
   type DirectSessionTakeoverPersistResponse,
+  type DirectSessionTakeoverPersistStartResponse,
 } from './directSessions/daemonRpcV1.js';
+
+export {
+  AGENT_PROVIDER_IDS_V1,
+  AgentProviderIdV1Schema,
+  type AgentProviderIdV1,
+} from './providers/agentProviderIdsV1.js';
 
 export {
   applyObservedProgressToDirectSessionAttentionV1,
@@ -2557,6 +2680,9 @@ export {
 
 export {
   SessionHandoffAbortRequestSchema,
+  SessionHandoffCapabilityV2Schema,
+  readSessionHandoffError,
+  type SessionHandoffCapabilityV2,
   SessionHandoffAbortRequestV2Schema,
   SessionHandoffAbortResponseSchema,
   SessionHandoffAbortResponseV2Schema,
@@ -2661,6 +2787,31 @@ export {
   SystemTaskResultErrorSchema,
   SystemTaskResultSchema,
   SystemTaskSpecSchema,
+  classifySetupPairingRequirement,
+  createSetupAccountConsentPromptData,
+  createSetupCliChoicePromptData,
+  createSetupPairingPromptData,
+  createSetupServiceConsentPromptData,
+  parseSetupAccountConsentPromptData,
+  parseSetupCliChoicePromptData,
+  readSetupCliChoiceAnswer,
+  parseSetupPairingPromptData,
+  parseSetupServiceConsentPromptData,
+  setupReplacesValidatedAccount,
+  SETUP_ACCOUNT_CONSENT_PROMPT_KIND,
+  SETUP_CLI_CHOICE_PROMPT_KIND,
+  SETUP_PAIRING_PROMPT_KIND,
+  SETUP_SERVICE_CONSENT_PROMPT_KIND,
+  SETUP_THIS_COMPUTER_SYSTEM_TASK_KIND,
+  type SetupAccountConsentPromptPayload,
+  type SetupCliChoice,
+  type SetupCliChoicePromptPayload,
+  type SetupCliOrigin,
+  type SetupCliProvenance,
+  type SetupPairingPromptPayload,
+  type SetupPairingRequirement,
+  type SetupServiceConsentPromptPayload,
+  type SetupServiceRuntimeReplacement,
   createTailscaleSecureAccessTaskSpec,
   TAILSCALE_SECURE_ACCESS_SYSTEM_TASK_KIND,
   TAILSCALE_SECURE_ACCESS_SYSTEM_TASK_STEP_IDS,
@@ -2679,6 +2830,16 @@ export {
   type TailscaleSecureAccessTaskResult,
   type TailscaleSecureAccessTaskSpec,
 } from './systemTasks/index.js';
+
+export {
+  CLI_ACQUISITION_PROGRESS_EVENT,
+  CliAcquisitionPhaseSchema,
+  CliAcquisitionProgressSchema,
+  parseCliAcquisitionProgress,
+  readCliAcquisitionFailurePhase,
+  type CliAcquisitionPhase,
+  type CliAcquisitionProgress,
+} from './systemTasks/acquisitionProgress.js';
 
 export {
   LlmTaskRunnerConfigV1Schema,
@@ -3309,6 +3470,7 @@ export {
   AccountEncryptionMigrateKeyProofSchema,
   AccountEncryptionMigrateConnectedServicesDirectiveSchema,
   AccountEncryptionMigrateAutomationsDirectiveSchema,
+  AccountEncryptionMigrateMachinesDirectiveSchema,
   AccountEncryptionMigrateSessionDraftItemSchema,
   AccountEncryptionMigrateSessionDraftsDirectiveSchema,
   AccountEncryptionMigrateRequestSchema,
@@ -3324,6 +3486,7 @@ export {
   type AccountEncryptionMigrateKeyProof,
   type AccountEncryptionMigrateConnectedServicesDirective,
   type AccountEncryptionMigrateAutomationsDirective,
+  type AccountEncryptionMigrateMachinesDirective,
   type AccountEncryptionMigrateSessionDraftItem,
   type AccountEncryptionMigrateSessionDraftsDirective,
   type AccountEncryptionMigrateRequest,
@@ -3346,6 +3509,10 @@ export {
   AccountSettingsV2UpdateRequestSchema,
   AccountSettingsV2UpdateResponseSchema,
   ConnectedServicesDefaultAuthByAgentIdV1Schema,
+  ConnectedServicesAdditionalDefaultAuthByAgentIdV1Schema,
+  readConnectedServicesDefaultAuthSettings,
+  buildConnectedServicesDefaultAuthSettingsPatch,
+  type ConnectedServicesDefaultAuthSettings,
   ConnectedServicesProviderConfigSharingModeV1Schema,
   ConnectedServicesProviderStateSharingModeV1Schema,
   ConnectedServicesProviderStateSharingPolicyV1Schema,
@@ -3424,6 +3591,7 @@ export {
   BUG_REPORT_FALLBACK_MAX_LABELS,
   BUG_REPORT_FALLBACK_MAX_LABEL_LENGTH,
   buildBugReportFallbackIssueUrl,
+  buildBugReportExportBundle,
   formatBugReportFallbackIssueBody,
   appendBugReportReporterToSummary,
   hasAcceptedBugReportArtifactKind,
@@ -3443,6 +3611,7 @@ export {
   sanitizeBugReportStackContextPayload,
   sanitizeBugReportUrl,
   searchBugReportSimilarIssues,
+  serializeBugReportExportBundle,
   submitBugReportToService,
   trimBugReportTextToMaxBytes,
   type BugReportArtifactPayload,
@@ -3461,11 +3630,13 @@ export {
 } from './bugReports.js';
 
 export {
+  DoctorSnapshotDaemonStatusSchema,
   DoctorSnapshotSchema,
   DoctorSnapshotServerProfileSchema,
   parseDoctorSnapshotSafe,
   sanitizeDoctorSnapshotUrls,
   type DoctorSnapshot,
+  type DoctorSnapshotDaemonStatus,
   type DoctorSnapshotServerProfile,
 } from './diagnostics/doctorSnapshot.js';
 
@@ -3512,3 +3683,32 @@ export { formatPermissionRequestSummary } from './activity/agentRequestSummary.j
 export { summarizeToolInputForNotification, type RequestNotificationLabels } from './activity/agentRequestNotificationContent.js';
 export { extractShellCommand, stripShellCommandPreludeForDisplay } from './activity/shellCommand.js';
 export { maybeParseJson } from './activity/parseJson.js';
+export {
+  CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY,
+  CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD,
+  RELEASED_CONNECTED_SERVICE_IDS,
+  readConnectedServiceReaderSupport,
+  projectConnectedServiceProfileForReader,
+  projectSessionRuntimeIssueForReader,
+  supportsConnectedServiceOperation,
+  withConnectedServiceReaderSupport,
+} from './connect/connectedServiceReaderSupport.js';
+export {
+  MACHINE_PLAIN_DATA_KEY_MARKER,
+  encodePlainMachineStoredContent,
+  decodePlainMachineStoredContent,
+  isPlainMachineDataKeyMarker,
+  machineStoredContentMatchesAccountMode,
+  machineUpdateMatchesStoredMode,
+} from './machines/machineStoredContent.js';
+export {
+  MachineKeyBasisV1Schema,
+  MachineContentKeyTransitionInputV1Schema,
+  MachineContentKeyTransitionRefusalV1Schema,
+  createMachineContentKeyTransitionResultV1Schema,
+  type MachineKeyBasisV1,
+  type MachineContentKeyTransitionInputV1,
+  type MachineContentKeyTransitionResultV1,
+} from './machines/machineContentKeyTransitionV1.js';
+
+export { assertAccountKeyProvisioningAllowed, AccountKeyProvisioningUnavailableError, verifyAccountContentPublicKeyBinding, createAccountContentPublicKeyBindingMessage } from './auth/accountKeyProvisioning.js';

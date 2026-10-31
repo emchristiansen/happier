@@ -8,6 +8,7 @@ export function resolveDirectBrowseSourceOptions(params: Readonly<{
     providerId: DirectSessionsProviderId;
     profile: Pick<AccountProfile, 'connectedServicesV2'> | null | undefined;
     settings: Pick<Settings, 'connectedServicesProfileLabelByKey'>;
+    directory?: string | null;
 }>): DirectBrowseSourceOption[] {
     const getSourceOptions = getAgentBehavior(params.providerId as AgentId).directSessions?.browse?.getSourceOptions;
     if (!getSourceOptions) return [];
@@ -15,14 +16,21 @@ export function resolveDirectBrowseSourceOptions(params: Readonly<{
         agentId: params.providerId as AgentId,
         profile: params.profile,
         settings: params.settings as Settings,
+        directory: params.directory ?? null,
     })];
 }
 
+/**
+ * Providers offered in the link/open browse list. A resume-only browse source produces a vendor
+ * resume id and nothing else, so it is deliberately excluded: linking it would promise takeover,
+ * following and a readable transcript that the source cannot deliver.
+ */
 export function listDirectBrowseProviderIds(): DirectSessionsProviderId[] {
     return AGENT_IDS
         .filter((agentId) => (
             getAgentCore(agentId).sessionStorage.direct === true
             && typeof getAgentBehavior(agentId).directSessions?.browse?.getSourceOptions === 'function'
+            && getAgentBehavior(agentId).directSessions?.browse?.resumeOnly !== true
         ))
         .sort((a, b) => {
             const orderA = getAgentBehavior(a).directSessions?.browse?.order ?? Number.MAX_SAFE_INTEGER;

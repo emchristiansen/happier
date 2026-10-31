@@ -57,12 +57,6 @@ export const GEMINI_TIMEOUTS = {
   init: 120_000,
   /** Gemini CLI ACP can swallow early stdin during startup; delay initialize to avoid poisoning stdio. */
   initDelay: 3_000,
-  /** Standard tool call timeout */
-  toolCall: 120_000,
-  /** Investigation tools (codebase_investigator) can run for a long time */
-  investigation: 600_000,
-  /** Think tools are usually quick */
-  think: 30_000,
   /** Idle detection after last message chunk */
   idle: 500,
 } as const;
@@ -283,17 +277,8 @@ export class GeminiTransport implements TransportHandler {
     );
   }
 
-  /**
-   * Get timeout for a tool call
-   */
-  getToolCallTimeout(toolCallId: string, toolKind?: string): number {
-    if (this.isInvestigationTool(toolCallId, toolKind)) {
-      return GEMINI_TIMEOUTS.investigation;
-    }
-    if (toolKind === 'think') {
-      return GEMINI_TIMEOUTS.think;
-    }
-    return GEMINI_TIMEOUTS.toolCall;
+  getToolCallTimeout(_toolCallId: string, _toolKind?: string): number | null {
+    return null;
   }
 
   /**

@@ -1,8 +1,10 @@
 import { HappyError } from '@/utils/errors/errors';
 import { storage } from '@/sync/domains/state/storage';
-import { delay } from '@/utils/timing/time';
+import { AsyncTimeoutError, delay } from '@/utils/timing/time';
 import { t } from '@/text';
 import type { SessionStopRecovery } from '@/sync/ops/sessionStopContract';
+import { readSessionArchivePending, resolveSessionArchiveServerId } from '@/sync/domains/session/listing/sessionArchiveState';
+import { withSessionArchiveDeadline, type SessionArchiveRequestOptions } from '@/sync/ops/sessionArchiveLifecycle';
 
 type SessionMutationResult = Readonly<{
     success: boolean;
@@ -13,11 +15,12 @@ type SessionMutationResult = Readonly<{
 
 export type StopSessionAndMaybeArchiveParams = Readonly<{
     sessionId: string;
+    serverId?: string | null;
     hideInactiveSessions: boolean;
     isPinned: boolean;
     archiveAfterStop: 'never' | 'always';
     stopSession: () => Promise<SessionMutationResult>;
-    archiveSession: () => Promise<SessionMutationResult>;
+    archiveSession: (options?: SessionArchiveRequestOptions) => Promise<SessionMutationResult>;
     stopErrorMessage: string;
     archiveErrorMessage: string;
 }>;
@@ -28,14 +31,6 @@ function readSessionArchiveAfterStopRetryDelayMsFromEnv(): number {
     const parsed = Number.parseInt(raw, 10);
     if (!Number.isFinite(parsed)) return 200;
     return Math.max(0, Math.min(5_000, parsed));
-}
-
-function readSessionArchiveAfterStopTimeoutMsFromEnv(): number {
-    const raw = String(process.env.EXPO_PUBLIC_HAPPIER_SESSION_ARCHIVE_AFTER_STOP_TIMEOUT_MS ?? '').trim();
-    if (!raw) return 75_000;
-    const parsed = Number.parseInt(raw, 10);
-    if (!Number.isFinite(parsed)) return 75_000;
-    return Math.max(0, Math.min(5 * 60_000, parsed));
 }
 
 export function isSessionActiveArchiveResult(result: SessionMutationResult): boolean {
@@ -53,74 +48,88 @@ export function resolveSessionStopFailureMessage(
 }
 
 async function archiveAfterStopWithRetry(params: Readonly<{
-    archiveSession: () => Promise<SessionMutationResult>;
+    archiveSession: (options?: SessionArchiveRequestOptions) => Promise<SessionMutationResult>;
     archiveErrorMessage: string;
+    waitForInactive?: boolean;
 }>): Promise<void> {
-    let archiveResult = await params.archiveSession();
-    const deadlineMs = Date.now() + readSessionArchiveAfterStopTimeoutMsFromEnv();
-    const retryDelayMs = readSessionArchiveAfterStopRetryDelayMsFromEnv();
+    try {
+        await withSessionArchiveDeadline(async ({ signal, deadlineMs, retryActiveSession }) => {
+            let archiveResult = await params.archiveSession({ signal });
+            const retryDelayMs = readSessionArchiveAfterStopRetryDelayMsFromEnv();
 
-    while (isSessionActiveArchiveResult(archiveResult) && Date.now() < deadlineMs) {
-        await delay(retryDelayMs);
-        archiveResult = await params.archiveSession();
-    }
+            while (retryActiveSession && params.waitForInactive !== false && isSessionActiveArchiveResult(archiveResult) && Date.now() < deadlineMs) {
+                await delay(Math.min(retryDelayMs, Math.max(0, deadlineMs - Date.now())));
+                if (signal.aborted || Date.now() >= deadlineMs) break;
+                archiveResult = await params.archiveSession({ signal });
+            }
 
-    if (!archiveResult.success) {
-        const message = isSessionActiveArchiveResult(archiveResult)
-            ? params.archiveErrorMessage
-            : archiveResult.message || params.archiveErrorMessage;
-        throw new HappyError(message, false);
+            if (!archiveResult.success) {
+                const message = isSessionActiveArchiveResult(archiveResult)
+                    ? params.archiveErrorMessage
+                    : archiveResult.message || params.archiveErrorMessage;
+                throw new HappyError(message, false);
+            }
+        });
+    } catch (error) {
+        if (error instanceof AsyncTimeoutError) throw new HappyError(params.archiveErrorMessage, false);
+        throw error;
     }
 }
 
-export function keepSessionVisibleWhenInactive(sessionId: string): void {
-    storage.getState().applySessionListRenderablePatches([
-        {
-            sessionId,
-            patch: { keepVisibleWhenInactive: true },
-        },
-    ]);
+export function isSessionArchivePending(sessionId: string, serverId?: string | null): boolean {
+    return readSessionArchivePending(storage.getState(), sessionId, resolveSessionArchiveServerId(serverId));
 }
 
-export function clearSessionVisibleWhenInactive(sessionId: string): void {
-    storage.getState().applySessionListRenderablePatches([
-        {
-            sessionId,
-            patch: { keepVisibleWhenInactive: false },
-        },
-    ]);
-}
-
-export async function stopSessionAndMaybeArchive(params: StopSessionAndMaybeArchiveParams): Promise<void> {
-    const keepVisibleWhenStopping = params.archiveAfterStop === 'always';
-
-    if (keepVisibleWhenStopping) {
-        keepSessionVisibleWhenInactive(params.sessionId);
+export async function archiveSessionWithPendingState<T>(
+    sessionId: string,
+    archiveSession: () => Promise<T>,
+    serverId?: string | null,
+): Promise<T | false> {
+    // Admission is synchronous, after caller-owned confirmation, and shared by every entry point.
+    const operation = storage.getState().beginSessionArchive(sessionId, resolveSessionArchiveServerId(serverId));
+    if (!operation) return false;
+    try {
+        return await archiveSession();
+    } finally {
+        storage.getState().finishSessionArchive(operation);
     }
+}
 
+function isStopAcceptedAndPending(result: SessionMutationResult): boolean {
+    return result.success === false
+        && result.code === 'session_stop_requested'
+        && result.recovery === 'wait_for_inactive';
+}
+
+/** Missing runner control permits one archive attempt; only the server can establish inactivity. */
+function isStopTargetMissing(result: SessionMutationResult): boolean {
+    return result.success === false && result.code === 'session_stop_not_found';
+}
+
+async function stopSessionOnly(params: StopSessionAndMaybeArchiveParams): Promise<void> {
     const stopResult = await params.stopSession();
-    const stopWasAcceptedAndPending = stopResult.success === false
-        && stopResult.code === 'session_stop_requested'
-        && stopResult.recovery === 'wait_for_inactive';
-    if (!stopResult.success && !stopWasAcceptedAndPending) {
-        if (keepVisibleWhenStopping) {
-            clearSessionVisibleWhenInactive(params.sessionId);
-        }
-        throw new HappyError(resolveSessionStopFailureMessage(stopResult, params.stopErrorMessage), false);
-    }
+    if (stopResult.success || isStopAcceptedAndPending(stopResult)) return;
+    throw new HappyError(resolveSessionStopFailureMessage(stopResult, params.stopErrorMessage), false);
+}
 
+export async function stopSessionAndMaybeArchive(params: StopSessionAndMaybeArchiveParams): Promise<void | false> {
     if (params.archiveAfterStop === 'never') {
+        await stopSessionOnly(params);
         return;
     }
 
-    try {
+    return archiveSessionWithPendingState(params.sessionId, async () => {
+        const stopResult = await params.stopSession();
+        const canArchive = stopResult.success
+            || isStopAcceptedAndPending(stopResult)
+            || isStopTargetMissing(stopResult);
+        if (!canArchive) {
+            throw new HappyError(resolveSessionStopFailureMessage(stopResult, params.stopErrorMessage), false);
+        }
         await archiveAfterStopWithRetry({
             archiveSession: params.archiveSession,
             archiveErrorMessage: params.archiveErrorMessage,
+            waitForInactive: !isStopTargetMissing(stopResult),
         });
-    } finally {
-        if (keepVisibleWhenStopping) {
-            clearSessionVisibleWhenInactive(params.sessionId);
-        }
-    }
+    }, params.serverId);
 }

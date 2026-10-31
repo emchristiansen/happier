@@ -180,6 +180,7 @@ describe('session organization protocol contracts', () => {
   it('carries attention standings through the snapshot and its set mutation', () => {
     const request = SessionOrganizationSnapshotRequestSchema.parse({});
     expect(request.includeAttentionStandings).toBe(false);
+    expect(request.includeAttentionReminderTimes).toBe(false);
     expect(SessionOrganizationSnapshotRequestSchema.parse({ includeAttentionStandings: true }).includeAttentionStandings).toBe(true);
 
     const standing = SessionAttentionStandingSchema.parse({ sessionId: 'session_1', standing: true, updatedAt: 10 });
@@ -205,6 +206,21 @@ describe('session organization protocol contracts', () => {
     expect(SetSessionAttentionStandingRequestSchema.parse({ standing: null })).toEqual({ standing: null });
     expect(SetSessionAttentionStandingResponseSchema.parse({ standing: null })).toEqual({ standing: null });
     expect(SetSessionAttentionStandingResponseSchema.parse({ standing }).standing).toEqual(standing);
+  });
+
+  it('models a timed attention reminder on the existing standing contract', () => {
+    const remindAt = 2_000;
+    const standing = SessionAttentionStandingSchema.parse({
+      sessionId: 'session_1',
+      standing: true,
+      remindAt,
+      updatedAt: 10,
+    });
+    expect(standing.remindAt).toBe(remindAt);
+    expect(SetSessionAttentionStandingRequestSchema.parse({ remindAt })).toEqual({ remindAt });
+    expect(SetSessionAttentionStandingRequestSchema.parse({ remindAt: null })).toEqual({ remindAt: null });
+    expect(SetSessionAttentionStandingRequestSchema.safeParse({}).success).toBe(false);
+    expect(SetSessionAttentionStandingRequestSchema.safeParse({ standing: true, remindAt }).success).toBe(false);
   });
 
   it('defines mutations for pins, folder delete defaults, tags, assignments, and ordering', () => {

@@ -1,5 +1,6 @@
 import { Dirent, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
+import { cp, mkdir, mkdtemp, rm } from 'node:fs/promises';
 
 type CopyMissingEntryOptions = {
   mergeExistingDirectoryContents?: boolean;
@@ -262,6 +263,58 @@ function ensureWorkspacePackageManifests(snapshotNodeModulesDir: string, rootDir
 
     const snapshotPackageJsonPath = resolve(snapshotNodeModulesDir, '@happier-dev', scopePackageName, 'package.json');
     ensureCopiedTextFile(snapshotPackageJsonPath, packageJsonPath, { overwriteExisting: true });
+  }
+}
+
+function collectPackageJsonRelativeFileTargets(value: unknown, result: Set<string>): void {
+  if (typeof value === 'string') {
+    if (value.startsWith('./') && !value.includes('*')) {
+      result.add(value.slice(2));
+    }
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectPackageJsonRelativeFileTargets(item, result);
+    return;
+  }
+  for (const nested of Object.values(value)) collectPackageJsonRelativeFileTargets(nested, result);
+}
+
+function ensureWorkspacePackageReferencedFiles(snapshotNodeModulesDir: string, rootDir: string): void {
+  const packagesDir = resolve(rootDir, 'packages');
+  for (const entry of listNodeModulesEntries(packagesDir)) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+
+    const sourcePackageDir = resolve(packagesDir, entry.name);
+    const packageJsonPath = resolve(sourcePackageDir, 'package.json');
+    let packageJson: Record<string, unknown>;
+    try {
+      packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+
+    const packageName = typeof packageJson.name === 'string' ? packageJson.name.trim() : '';
+    if (!packageName.startsWith('@happier-dev/')) continue;
+
+    const scopePackageName = packageName.slice('@happier-dev/'.length).trim();
+    if (!scopePackageName) continue;
+
+    const relativeFileTargets = new Set<string>();
+    collectPackageJsonRelativeFileTargets(packageJson.main, relativeFileTargets);
+    collectPackageJsonRelativeFileTargets(packageJson.module, relativeFileTargets);
+    collectPackageJsonRelativeFileTargets(packageJson.types, relativeFileTargets);
+    collectPackageJsonRelativeFileTargets(packageJson.exports, relativeFileTargets);
+
+    const snapshotPackageDir = resolve(snapshotNodeModulesDir, '@happier-dev', scopePackageName);
+    for (const relativeFilePath of relativeFileTargets) {
+      ensureCopiedTextFile(
+        resolve(snapshotPackageDir, relativeFilePath),
+        resolve(sourcePackageDir, relativeFilePath),
+        { overwriteExisting: true },
+      );
+    }
   }
 }
 
@@ -538,6 +591,7 @@ export function ensureCliDistSnapshotNodeModules(params: {
       resolve(cliNodeModulesDir, '@happier-dev'),
     );
     ensureWorkspacePackageManifests(snapshotNodeModulesDir, params.rootDir);
+    ensureWorkspacePackageReferencedFiles(snapshotNodeModulesDir, params.rootDir);
     ensureWorkspacePackageDistTrees(snapshotNodeModulesDir, params.rootDir);
     ensureWorkspacePackageRuntimeDependencyTrees(snapshotNodeModulesDir, params.rootDir);
     ensureCopiedNodeModulesEntries(cliNodeModulesDir, snapshotNodeModulesDir, new Set(['@happier-dev']));
@@ -548,5 +602,68 @@ export function ensureCliDistSnapshotNodeModules(params: {
 
   if (existsSync(cliNodeModulesDir) && existsSync(rootNodeModulesDir) && cliNodeModulesDir !== rootNodeModulesDir) {
     ensureRootNodeModulesFallback(params.snapshotDistDir, params.rootDir);
+  }
+}
+
+/**
+ * Return a detached, retained CLI generation. Only unpublished allocations may be cleaned here;
+ * the containing test/session root owns the lifetime of every successfully returned directory.
+ */
+export async function createRetainedCliSnapshot(params: {
+  snapshotDir: string;
+  prepare: (privatePayloadDir: string) => Promise<void> | void;
+}): Promise<string> {
+  const namespace = resolve(params.snapshotDir);
+  const parent = dirname(namespace);
+  await mkdir(parent, { recursive: true });
+  const allocate = async (kind: string) => {
+    const path = await mkdtemp(resolve(parent, `${basename(namespace)}-${kind}-`));
+    const identity = lstatSync(path);
+    return { path, identity };
+  };
+  type Allocation = Awaited<ReturnType<typeof allocate>>;
+  const isOwned = (allocation: Allocation): boolean => {
+    const current = lstatSync(allocation.path);
+    return current.isDirectory() && !current.isSymbolicLink()
+      && current.dev === allocation.identity.dev && current.ino === allocation.identity.ino;
+  };
+  const requireOwned = (allocation: Allocation) => {
+    if (!isOwned(allocation)) throw new Error(`CLI snapshot allocation replaced before return: ${allocation.path}`);
+  };
+  const removeUnpublished = async (allocation: Allocation) => {
+    try {
+      if (!isOwned(allocation)) {
+        console.warn('Retaining replaced unpublished CLI snapshot allocation', allocation.path);
+        return;
+      }
+      await rm(allocation.path, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn('Could not clean unpublished CLI snapshot allocation', allocation.path, error);
+      }
+    }
+  };
+  const staging = await allocate('staging');
+  let generation: Allocation | undefined;
+  let returned = false;
+  try {
+    // The outer staging identity stays ours when an existing payload installer replaces payload/.
+    const payload = resolve(staging.path, 'payload');
+    await params.prepare(payload);
+    requireOwned(staging);
+    generation = await allocate('generation');
+    requireOwned(generation);
+    // Hydration may deliberately select live workspace links. Detach their contents before
+    // exposing a consumer path; a required copy error must never publish a partially live tree.
+    await cp(payload, generation.path, {
+      recursive: true, dereference: true, preserveTimestamps: true, force: true,
+    });
+    requireOwned(staging);
+    requireOwned(generation);
+    returned = true;
+    return generation.path;
+  } finally {
+    if (generation && !returned) await removeUnpublished(generation);
+    await removeUnpublished(staging);
   }
 }

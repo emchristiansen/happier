@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MachineKeyBasisV1Schema } from '../machines/machineContentKeyTransitionV1.js';
 
 import { AccountEncryptionModeSchema } from '../features/payload/capabilities/encryptionCapabilities.js';
 import {
@@ -115,6 +116,23 @@ export const AccountEncryptionMigrateSessionDraftsDirectiveSchema = z.object({
 }).strict();
 export type AccountEncryptionMigrateSessionDraftsDirective = z.infer<typeof AccountEncryptionMigrateSessionDraftsDirectiveSchema>;
 
+export const AccountEncryptionMigrateMachinesDirectiveSchema = z.discriminatedUnion('action', [
+  z.object({ action: z.literal('assert_empty') }).strict(),
+  z.object({
+    action: z.literal('migrate'),
+    items: z.array(z.object({
+      machineId: z.string().min(1),
+      expected: MachineKeyBasisV1Schema,
+      next: z.object({
+        dataEncryptionKey: z.string().min(1).nullable(),
+        metadata: z.string(),
+        daemonState: z.string().nullable(),
+      }).strict(),
+    }).strict()),
+  }).strict(),
+]);
+export type AccountEncryptionMigrateMachinesDirective = z.infer<typeof AccountEncryptionMigrateMachinesDirectiveSchema>;
+
 export const AccountEncryptionMigrateRequestSchema = z
   .object({
     toMode: AccountEncryptionMigrateToModeSchema,
@@ -123,6 +141,7 @@ export const AccountEncryptionMigrateRequestSchema = z
     connectedServices: AccountEncryptionMigrateConnectedServicesDirectiveSchema,
     automations: AccountEncryptionMigrateAutomationsDirectiveSchema,
     sessionDrafts: AccountEncryptionMigrateSessionDraftsDirectiveSchema.optional(),
+    machines: AccountEncryptionMigrateMachinesDirectiveSchema.optional(),
     keyProof: AccountEncryptionMigrateKeyProofSchema.optional(),
   })
   .strict();
@@ -151,6 +170,8 @@ export const AccountEncryptionMigrateBadRequestResponseSchema = z.discriminatedU
   z.object({ error: z.literal('connected_services_not_empty') }).strict(),
   z.object({ error: z.literal('automations_not_empty') }).strict(),
   z.object({ error: z.literal('session_drafts_require_upgrade') }).strict(),
+  z.object({ error: z.literal('machines_require_upgrade') }).strict(),
+  z.object({ error: z.literal('machines_migration_incomplete') }).strict(),
   z.object({ error: z.literal('session_drafts_migration_incomplete') }).strict(),
 ]);
 export type AccountEncryptionMigrateBadRequestResponse = z.infer<typeof AccountEncryptionMigrateBadRequestResponseSchema>;

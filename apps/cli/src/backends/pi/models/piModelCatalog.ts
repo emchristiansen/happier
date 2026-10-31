@@ -18,7 +18,8 @@ export function qualifyPiModelId(providerRaw: unknown, modelIdRaw: unknown): str
   const provider = typeof providerRaw === 'string' ? providerRaw.trim() : '';
   const modelId = typeof modelIdRaw === 'string' ? modelIdRaw.trim() : '';
   if (!provider || !modelId) return null;
-  return modelId.includes('/') ? modelId : `${provider}/${modelId}`;
+  const providerPrefix = `${provider}/`;
+  return modelId.startsWith(providerPrefix) ? modelId : `${providerPrefix}${modelId}`;
 }
 
 export function createPiModelCatalogEntry(params: Readonly<{

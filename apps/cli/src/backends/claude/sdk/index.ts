@@ -4,7 +4,7 @@
  */
 
 export { query } from './query'
-export { AbortError } from './types'
+export { AbortError, ClaudeNativeProviderExitUnverifiedError } from './types'
 export type {
     QueryOptions,
     QueryPrompt,

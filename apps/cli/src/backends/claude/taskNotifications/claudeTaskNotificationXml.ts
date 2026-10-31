@@ -51,7 +51,7 @@ export function extractClaudeTaskNotificationEnvelope(value: unknown): ClaudeTas
   const sourceSessionId = readString(message.session_id) ?? readString(message.sessionId) ?? undefined;
   const uuid = readString(message.uuid) ?? undefined;
 
-  if (message.type === 'queue-operation') {
+  if (message.type === 'queue-operation' && message.operation === 'enqueue') {
     const text = readString(message.content);
     if (text && isTaskNotificationXml(text)) {
       return { text, ...(sourceSessionId ? { sourceSessionId } : {}), ...(uuid ? { uuid } : {}) };

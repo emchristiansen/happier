@@ -922,3 +922,19 @@ describe('dispatchActivityNotificationAsync', () => {
     });
   });
 });
+
+
+describe('opt-in focused computer suppression', () => {
+  it.each(['ready', 'permission_request', 'user_action_request'] as const)('opts %s pushes into suppression only when enabled', async (topic) => {
+    const sender = { sendToAllDevicesAsync: vi.fn(async (_title: string, _body: string, _data: Record<string, unknown>, _options?: { suppressIfComputerFocused?: boolean }) => {}) };
+    const event = topic === 'ready'
+      ? { topic, sessionId: 's', waitingForCommandLabel: 'Agent' } as const
+      : { topic, sessionId: 's', requestId: 'r', toolName: 'Bash', toolInput: {} } as const;
+    await dispatchActivityNotificationAsync({ settings: accountSettingsParse({ notificationsSettingsV1: { mutePhoneWhenComputerFocused: true } }), expoPushSender: sender, event });
+    expect(sender.sendToAllDevicesAsync.mock.calls[0]).toHaveLength(4);
+    expect(sender.sendToAllDevicesAsync.mock.calls[0][3]).toEqual({ suppressIfComputerFocused: true });
+    sender.sendToAllDevicesAsync.mockClear();
+    await dispatchActivityNotificationAsync({ settings: accountSettingsParse({}), expoPushSender: sender, event });
+    expect(sender.sendToAllDevicesAsync.mock.calls[0]).toHaveLength(3);
+  });
+});

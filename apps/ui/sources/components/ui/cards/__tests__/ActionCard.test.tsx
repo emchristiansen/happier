@@ -68,6 +68,8 @@ describe('ActionCard', () => {
 
         expect(screen.findByTestId('action-card-primary')?.props.disabled).toBe(true);
         expect(screen.findByTestId('action-card-secondary')?.props.disabled).toBe(true);
+        expect(screen.findByTestId('action-card-primary')?.props.loading).toBe(true);
+        expect(screen.findByTestId('action-card-secondary')?.props.loading).toBe(true);
     });
 
     it('description is optional', async () => {

@@ -45,6 +45,10 @@ export const MOTION_ANIMATIONS = [
     'spinner',
     /** The once-a-second elapsed clock on a running row. */
     'elapsedTick',
+    /** The highlight travelling inside the desktop setup mark's ring while a stage is in progress. */
+    'setupActivity',
+    /** A determinate progress bar's fill catching up with a new value. */
+    'progressFill',
 ] as const;
 
 export type MotionAnimationId = (typeof MOTION_ANIMATIONS)[number];
@@ -99,6 +103,16 @@ const MOTION_REDUCED_MOTION_TABLE = {
     // stopping it. This is the *essential* exception in 4.8, and it is paid for by the cadence drop
     // and by the shared clock's own pause gates (hidden document, backgrounded app).
     elapsedTick: { springRole: null, reduced: 'slowCadence' },
+    // A rotation, not a spring, and the setup surface's only moving object: a short highlight
+    // travelling round the ring track while a stage is in progress (`SetupMark`). Under reduced
+    // motion the track is tinted instead — the same "this is working" fact carried by colour on a
+    // surface whose status sentence already says so in words, so nothing rests on the tint alone.
+    // Hiding the highlight would leave a ring that reads as paused; keeping it turning is exactly
+    // the vestibular travel the preference asks to remove.
+    setupActivity: { springRole: null, reduced: 'substitute' },
+    // A short timing, not a spring. Under reduced motion the fill jumps to the new value: the bar
+    // and its accessible value still report every change, only the glide between them is removed.
+    progressFill: { springRole: null, reduced: 'settleInstantly' },
 } as const satisfies Record<MotionAnimationId, MotionReducedMotionEntry>;
 
 /**

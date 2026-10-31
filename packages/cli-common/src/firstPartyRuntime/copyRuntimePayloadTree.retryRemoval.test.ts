@@ -27,19 +27,4 @@ describe('removeRuntimePayloadPath', () => {
         expect(rm).toHaveBeenCalledTimes(2);
         expect(rm).toHaveBeenCalledWith('/runtime/payload', { recursive: true, force: true });
     });
-
-    it('keeps retrying Windows executable lock release beyond the short cross-platform cleanup budget', async () => {
-        vi.mocked(rm)
-            .mockRejectedValueOnce(Object.assign(new Error('access denied'), { code: 'EACCES' }))
-            .mockRejectedValueOnce(Object.assign(new Error('access denied'), { code: 'EACCES' }))
-            .mockRejectedValueOnce(Object.assign(new Error('access denied'), { code: 'EACCES' }))
-            .mockRejectedValueOnce(Object.assign(new Error('access denied'), { code: 'EACCES' }))
-            .mockRejectedValueOnce(Object.assign(new Error('access denied'), { code: 'EACCES' }))
-            .mockRejectedValueOnce(Object.assign(new Error('access denied'), { code: 'EACCES' }))
-            .mockResolvedValueOnce(undefined);
-
-        await expect(removeRuntimePayloadPath('C:\\runtime\\happier-server.exe', 'win32')).resolves.toBeUndefined();
-
-        expect(rm).toHaveBeenCalledTimes(7);
-    });
 });

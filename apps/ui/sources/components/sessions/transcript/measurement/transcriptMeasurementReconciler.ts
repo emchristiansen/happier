@@ -99,6 +99,7 @@ export type TranscriptMeasurementReconciler = Readonly<{
     resetReservationForStructuralChange(input: Readonly<{
         itemId: string;
         signature: TranscriptItemHeightValiditySignature;
+        invalidateExact?: boolean;
     }>): void;
 
     /**
@@ -452,6 +453,10 @@ export function createTranscriptMeasurementReconciler(
 
         resetReservationForStructuralChange(input) {
             const floorKey = buildFloorKey(input.signature);
+            // A body that mounted open can keep the same stable signature, so its open exact
+            // measurement must be invalidated before the next collapsed onLayout. A prior
+            // collapsed exact measurement remains valid after an expand/collapse cycle.
+            if (input.invalidateExact === true) cache.delete(input.signature);
             // Mark reset-pending (null) rather than deleting: a known-but-reset item re-seeds its
             // floor from the next real onLayout (so a collapse never reserves the pre-collapse height).
             floorsByKey.set(floorKey, {

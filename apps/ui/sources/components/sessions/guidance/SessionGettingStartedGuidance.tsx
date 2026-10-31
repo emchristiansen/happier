@@ -8,8 +8,6 @@ import { t } from '@/text';
 import { router } from 'expo-router';
 import { Modal } from '@/modal';
 import { Image } from 'expo-image';
-import Constants from 'expo-constants';
-import * as Updates from 'expo-updates';
 import { useVisibleSessionListSessionSummary } from '@/hooks/session/useVisibleSessionListViewData';
 import { useResolvedActiveServerSelection } from '@/hooks/server/useEffectiveServerSelection';
 import { useMachineListByServerId, useMachineListStatusByServerId, useSetting } from '@/sync/domains/state/storage';
@@ -18,7 +16,10 @@ import { useConnectTerminal } from '@/hooks/session/useConnectTerminal';
 import type { FeatureId } from '@happier-dev/protocol';
 import { getFeatureBuildPolicyDecision } from '@/sync/domains/features/featureBuildPolicy';
 import { config } from '@/config';
-import { resolveAppVariant, type AppVariant } from '@/sync/runtime/appVariant';
+import {
+    resolveCurrentAppVariant,
+    resolvePreferredPublicReleaseRingLabelForCurrentApp,
+} from '@/sync/runtime/currentAppVariant';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 
 import type { SessionGettingStartedDecisionKind } from './gettingStartedModel';
@@ -33,6 +34,9 @@ import { normalizeNodeForView } from '@/components/ui/rendering/normalizeNodeFor
 import { runAfterInteractionsWithFallback } from '@/utils/timing/runAfterInteractionsWithFallback';
 import { setClipboardStringSafe } from '@/utils/ui/clipboard';
 import { Icon } from '@/components/ui/icons/Icon';
+import { RelayDriftActionCard } from '@/components/settings/server/RelayDriftActionCard';
+import { useRelayDriftBanner } from '@/components/settings/server/useRelayDriftBanner';
+import { useDesktopLocalSetupPanelShowing } from '@/setup/DesktopLocalSetupRuntime';
 import {
     shouldForceFreshNewSessionEntryFromPressEvent,
     useResolveNewSessionOrdinaryEntryRoute,
@@ -81,6 +85,8 @@ const stylesheet = StyleSheet.create((theme) => ({
     },
     contentContainerCentered: {
         justifyContent: 'center',
+        paddingTop: 20,
+        paddingBottom: 32,
     },
     logo: {
         height: 44,
@@ -103,6 +109,12 @@ const stylesheet = StyleSheet.create((theme) => ({
         fontSize: 14,
         color: theme.colors.text.secondary,
         ...Typography.default(),
+    },
+    /** The drift card takes the primary card's place and measure, not its chrome. */
+    thisComputerCard: {
+        width: '100%',
+        maxWidth: 720,
+        marginBottom: 20,
     },
     primaryCard: {
         width: '100%',
@@ -210,12 +222,21 @@ function titleForKind(kind: SessionGettingStartedDecisionKind): string {
     }
 }
 
-function subtitleForKind(kind: SessionGettingStartedDecisionKind, targetLabel: string): string {
+/**
+ * `canSetUpHere` — this app can set up the computer it runs on (desktop). Web and phone cannot, so
+ * their copy points at the computer the person wants to connect instead of a flow they do not
+ * have (U13).
+ */
+function subtitleForKind(kind: SessionGettingStartedDecisionKind, targetLabel: string, canSetUpHere: boolean): string {
     switch (kind) {
         case 'connect_machine':
-            return t('sessionGettingStarted.subtitle.connectMachine', { targetLabel });
+            return canSetUpHere
+                ? t('sessionGettingStarted.subtitle.connectMachine', { targetLabel })
+                : t('sessionGettingStarted.subtitle.connectMachineElsewhere', { targetLabel });
         case 'start_daemon':
-            return t('sessionGettingStarted.subtitle.startDaemon', { targetLabel });
+            return canSetUpHere
+                ? t('sessionGettingStarted.subtitle.startDaemon', { targetLabel })
+                : t('sessionGettingStarted.subtitle.startDaemonElsewhere', { targetLabel });
         case 'create_session':
             return t('sessionGettingStarted.subtitle.createSession');
         case 'select_session':
@@ -226,32 +247,20 @@ function subtitleForKind(kind: SessionGettingStartedDecisionKind, targetLabel: s
     }
 }
 
-function resolveAppVariantForCliInstall(): AppVariant {
-    return (
-        resolveAppVariant({
-            appVariant: config.variant,
-            updatesReleaseChannel: (Updates as any)?.releaseChannel,
-            updatesChannel: (Updates as any)?.channel,
-            manifestReleaseChannel: (Constants as any)?.manifest?.releaseChannel,
-            expoConfigReleaseChannel: (Constants as any)?.expoConfig?.releaseChannel,
-            envAppEnv: process.env.APP_ENV,
-            envExpoPublicAppEnv: process.env.EXPO_PUBLIC_APP_ENV,
-        }) ?? 'production'
-    );
-}
-
 function buildCliInstallCommand(options?: Readonly<{ suppressAutomaticSetup?: boolean }>): string {
     return buildHappierCliInstallCommand({
-        appVariant: resolveAppVariantForCliInstall(),
+        appVariant: resolveCurrentAppVariant(),
         distTagOverride: config.cliNpmDistTag,
+        channelOverride: resolvePreferredPublicReleaseRingLabelForCurrentApp(),
         suppressAutomaticSetup: options?.suppressAutomaticSetup,
     });
 }
 
-function buildCliCommandName(): 'happier' | 'hprev' {
+function buildCliCommandName(): 'happier' | 'hprev' | 'hdev' {
     return buildHappierCliCommandName({
-        appVariant: resolveAppVariantForCliInstall(),
+        appVariant: resolveCurrentAppVariant(),
         distTagOverride: config.cliNpmDistTag,
+        channelOverride: resolvePreferredPublicReleaseRingLabelForCurrentApp(),
     });
 }
 
@@ -284,17 +293,21 @@ function buildSteps(model: SessionGettingStartedGuidanceViewModel): SessionGetti
         case 'connect_machine': {
             const steps: SessionGettingStartedGuidanceStep[] = [];
             const cliCommandName = buildCliCommandName();
-            steps.push({
-                id: 'install_cli',
-                title: t('sessionGettingStarted.steps.installCli.title'),
-                description: t('sessionGettingStarted.steps.installCli.description'),
-                // This card already knows which relay the user is connecting.
-                // Suppress the installer's generic automatic handoff, then let
-                // the one target-bound setup command own relay selection,
-                // authentication, and service reconciliation.
-                command: buildCliInstallCommand({ suppressAutomaticSetup: true }),
-                copyLabel: t('sessionGettingStarted.steps.installCli.copyLabel'),
-            });
+            // On desktop the app already installed the command line on this computer, so the
+            // terminal path starts at setup rather than re-teaching the install (U13).
+            if (!model.onOpenSetup) {
+                steps.push({
+                    id: 'install_cli',
+                    title: t('sessionGettingStarted.steps.installCli.title'),
+                    description: t('sessionGettingStarted.steps.installCli.description'),
+                    // This card already knows which relay the user is connecting.
+                    // Suppress the installer's generic automatic handoff, then let
+                    // the one target-bound setup command own relay selection,
+                    // authentication, and service reconciliation.
+                    command: buildCliInstallCommand({ suppressAutomaticSetup: true }),
+                    copyLabel: t('sessionGettingStarted.steps.installCli.copyLabel'),
+                });
+            }
             steps.push({
                 id: 'auth_login',
                 title: t('sessionGettingStarted.steps.authLogin.title'),
@@ -359,8 +372,10 @@ function SessionGettingStartedGuidanceViewImpl(props: SessionGettingStartedGuida
     const copyFeedback = useTemporaryCopyFeedback();
 
     const title = titleForKind(model.kind);
-    const subtitle = subtitleForKind(model.kind, model.targetLabel);
+    const subtitle = subtitleForKind(model.kind, model.targetLabel, Boolean(model.onOpenSetup));
+    const canSetUpHere = Boolean(model.onOpenSetup);
     const steps = React.useMemo(() => buildSteps(model), [
+        canSetUpHere,
         model.kind,
         model.serverName,
         model.serverUrl,
@@ -369,7 +384,8 @@ function SessionGettingStartedGuidanceViewImpl(props: SessionGettingStartedGuida
     const showLogo = props.variant === 'primaryPane' || props.variant === 'newSessionBlocking';
     const showSetupPrimaryCard = (model.kind === 'connect_machine' || model.kind === 'start_daemon') && Boolean(model.onOpenSetup);
     const [showManualSteps, setShowManualSteps] = React.useState(!showSetupPrimaryCard);
-    const shouldCenterContent = props.variant === 'primaryPane' && model.kind === 'select_session';
+    const shouldCenterContent = props.variant === 'primaryPane'
+        && (model.kind === 'select_session' || showSetupPrimaryCard);
     const shouldDeferCliFollowUp = DEFER_CLI_FOLLOW_UP_VARIANTS.has(props.variant) && !showSetupPrimaryCard;
     const deferredCliFollowUpKey = buildDeferredCliFollowUpKey({ variant: props.variant, model, showSetupPrimaryCard });
     const [deferredCliFollowUpState, setDeferredCliFollowUpState] = React.useState<DeferredCliFollowUpState>(() => ({
@@ -460,6 +476,7 @@ function SessionGettingStartedGuidanceViewImpl(props: SessionGettingStartedGuida
             ) : null}
 
             {model.kind !== 'select_session' && showSetupPrimaryCard ? (
+                <ThisComputerGuidanceSlot variant={props.variant} fallback={(
                 <View testID="session-getting-started-setup-primary-card" style={styles.primaryCard}>
                     <Text style={styles.title}>{title}</Text>
                     <Text style={styles.subtitle}>{subtitle}</Text>
@@ -487,6 +504,7 @@ function SessionGettingStartedGuidanceViewImpl(props: SessionGettingStartedGuida
                         </View>
                     ) : null}
                 </View>
+                )} />
             ) : model.kind !== 'select_session' ? (
                 <>
                     <Text style={styles.title}>{title}</Text>
@@ -600,6 +618,47 @@ function areSessionGettingStartedGuidanceViewPropsEqual(
         && areSessionGettingStartedGuidanceViewModelsEqual(previous.model, next.model);
 }
 
+/**
+ * U7 — on desktop, when this computer's daemon is connected somewhere else, the empty state says
+ * so in the drift projection's own words — one sentence naming the relay host and account, and
+ * the one "Connect this computer here" action — instead of a generic "Set up this computer". It
+ * subscribes where it renders, so the memoized guidance above stays keyed to its own model.
+ */
+function ThisComputerGuidanceSlot(props: Readonly<{
+    variant: SessionGettingStartedGuidanceVariant;
+    fallback: React.ReactElement;
+}>): React.ReactElement {
+    // Only the desktop app has a "this computer" to describe; everywhere else the generic card is
+    // the whole story and no drift projection is mounted.
+    return isTauriDesktop()
+        ? <ThisComputerGuidanceCard fallback={props.fallback} besideHomePanel={props.variant !== 'newSessionBlocking'} />
+        : props.fallback;
+}
+
+function ThisComputerGuidanceCard(props: Readonly<{
+    fallback: React.ReactElement;
+    /**
+     * Whether this card can sit beside the Home's setup panel. `/new`'s blocking guidance is a
+     * modal of its own: the panel under it is not what the person is looking at, so it keeps its
+     * entry.
+     */
+    besideHomePanel: boolean;
+}>): React.ReactElement | null {
+    const banner = useRelayDriftBanner();
+    // R11 — while the Home's setup panel is on screen it is the one owner of "this computer": no
+    // second "Set up this computer" (or drift card) beside the run it is already showing. Once it
+    // goes — ready or declined — this card's own behaviour returns.
+    const setupPanelShowing = useDesktopLocalSetupPanelShowing();
+    if (setupPanelShowing && props.besideHomePanel) {
+        return null;
+    }
+    return banner ? (
+        <View testID="session-getting-started-this-computer-card" style={stylesheet.thisComputerCard}>
+            <RelayDriftActionCard banner={banner} />
+        </View>
+    ) : props.fallback;
+}
+
 export const SessionGettingStartedGuidanceView = React.memo(
     SessionGettingStartedGuidanceViewImpl,
     areSessionGettingStartedGuidanceViewPropsEqual,
@@ -645,7 +704,10 @@ function useSessionGettingStartedGuidanceViewModelBase(): SessionGettingStartedG
     const resolveNewSessionOrdinaryEntryRoute = useResolveNewSessionOrdinaryEntryRoute();
     const canOpenSetup = isTauriDesktop();
     const onOpenSetup = React.useCallback(() => {
-        router.push('/setup' as any);
+        // The manual "set up / repair this computer" surface is the settings one. `/setup` is the
+        // pre-auth relay chooser plus the remote-machine continuation; first-run local setup runs
+        // automatically in the shell's `DesktopLocalSetupRuntime` (R9/INV1/R11).
+        router.push('/settings/machines/this-computer');
     }, []);
 
     const onStartNewSession = React.useCallback((event?: unknown) => {

@@ -68,6 +68,94 @@ Product seams still own the actual compatibility implementation.
 
 Before adding dual writers, parallel persisted formats, rollout modes, operator flags, socket-drain protocols, or a mandatory client floor, compare their lifetime cost with the actual user behavior required. If preserving old-client/new-server behavior for a major change would require substantial machinery, stop and obtain an explicit developer/product decision among: operation-scoped degradation, a documented client update requirement, or the heavier compatibility transition. An agent must not silently choose either forced upgrades or heavy compatibility machinery. This exception is for genuinely incompatible, high-cost transitions; routine server changes must remain compatible and must not manufacture client-update requirements.
 
+### Connected-service reader support in 0.2 development
+
+The Antigravity integration extends a released closed service enum. UI/server
+0.2.15 (`88d45f33`) and CLI 0.2.14 (`df8241c8`) supplied the original failing
+reader contracts; current UI 0.2.16, server 0.2.16 and CLI 0.2.15 stable/preview
+releases are independently resolved at `22ac8263`. Their release records and
+binary metadata establish the published component basis; they do not attest a
+particular deployment.
+
+`packages/protocol/src/connect/connectedServiceReaderSupport.ts` owns the
+recognized-service policy. Authenticated HTTP requests advertise reader support
+with the `happierConnectedServices` query, and sockets use `connectedServiceIds`
+in their auth payload. Missing or malformed declarations retain the released
+service set. This avoids adding a cross-origin request header that old relays
+cannot accept.
+
+Outward profile projection filters profiles/groups and credential revisions
+together. Session-detail/list/turn and socket projections omit unsupported
+optional service/quota references from runtime issues while retaining generic
+failure, retry/reset and status facts. Stored identity is unchanged. Encrypted
+transcript records and recovery metadata retain their existing per-record
+degradation on older clients; the server cannot rewrite encrypted content.
+
+New-service authoring requires the server's typed `supportedServiceIds` operation
+declaration. Session launch separately requires the selected daemon's real
+materialization support. Current clients reject unsupported operations before
+effects, preserving existing services. Deploy server admission/projections before enabling
+new-service authoring; this is an operation-scoped transition, not a fleet-wide
+upgrade requirement.
+
+The settings owner in `account/settings/connectedServicesSettings.ts` splits
+saved defaults into disjoint service subsets: released services remain in
+`connectedServicesDefaultAuthByAgentIdV1`; additional services use
+`connectedServicesAdditionalDefaultAuthByAgentIdV1`. One reader/writer presents
+the combined defaults. New bindings must not be inserted into the released map,
+whose old parser would discard unrelated defaults too. Historical UI
+read/edit/write retention is a required validation gate. An older local CLI
+cannot honor the additional service default and needs an upgrade for that
+operation.
+Fetched settings that reject the canonical schema refuse launch defaulting;
+they do not fall back to cached or native authentication. Ordinary network
+failures retain the existing account-settings cache policy.
+
+Remove these outward/default-carrier adapters when the supported closed-enum
+readers retire, consolidating at their existing owners. The undeployed 0.3 line
+uses qualified account services and its existing one-way upgrade boundary;
+0.2-created Antigravity data still needs its storage-ingress mapping there.
+
+### Quota recovery details (0.2 development)
+
+Reset availability remains in the existing strict recovery-credit inventory.
+Optional `recoveryCreditDetails` supplies quantities, applicability and display
+reasons by provider credit id; these facts do not authorize redemption.
+
+The inspected UI/server 0.2.16 and CLI 0.2.15 readers at
+`22ac8263cfdbcdb845441b9044ff18199cf7652e` reject extra fields inside the strict
+Provider Account Usage body. The canonical supplemental-facet splitter therefore
+extracts both subscription facts and recovery details before writing that body.
+Encrypted details use the existing account-scoped sealing owner and travel beside
+the base ciphertext. The released non-strict sealed envelope ignores this optional
+facet, retaining ordinary usage and the original recovery-credit shape.
+
+Plain V3 writes place details in outer metadata only when the server explicitly
+advertises `connectedServices.quotaRecoveryCreditDetails`. Its canonical dependency
+is `connectedServices.quotas`. A missing or malformed bit keeps the released plain
+body and metadata shape; saved quantities and display reasons are then omitted.
+The current server admits, persists and projects that facet through the existing
+usage-record owner and refuses it when disabled. Subscription gating does not
+erase independently supported recovery details. Tests use the exact released
+strict body and sealed-envelope declarations, rather than reconstructed readers.
+
+### Browser request headers and CORS
+
+A new request header is both a wire-contract change and, for cross-origin web clients,
+a browser CORS change. Before emitting one, verify the new client against the exact
+supported predecessor relay: the browser's `Access-Control-Request-Headers` must be a
+subset of that relay's `Access-Control-Allow-Headers`. Updating only the current server
+allowlist cannot make a new browser client compatible with a relay that is already
+deployed.
+
+Prefer a CORS-safelisted request header, query/URL negotiation, or an existing typed
+request body when those preserve the operation's semantics. If a custom request header
+is necessary, emit it only when the peer has already advertised support, unless every
+supported predecessor already allows it. Test the real `OPTIONS` preflight against a
+provenance-pinned predecessor, including the exact requested header list. A custom
+response header is a separate browser contract and must also appear in
+`Access-Control-Expose-Headers` before browser code can read it.
+
 ### Self-hosted relay release checks
 
 For stable releases, prioritize current UI, CLI, and daemon core flows against
@@ -82,6 +170,14 @@ supported published predecessor exists. That proves one named SQLite/Postgres re
 upgrade; it is not a generic compatibility verdict. Release orchestration never
 waits for client adoption, self-hosted relay upgrades, daemon drain, migration
 cohorts, or a global cutover.
+
+For desktop setup and managed-CLI/service state, the `desktop-setup` suite
+(`scripts/release/release-assets-e2e/README.md`; it gates the production desktop
+publish in `build-tauri.yml`, using the candidate CLI release) runs the
+hsetup shipped in a Linux desktop artifact against a fresh systemd machine, and
+upgrades a machine set up by the previous published stable desktop + CLI (pinned
+immutable tags) to the candidate. It proves the Linux systemd user-service path
+only; macOS launchd and Windows schtasks are not covered by it.
 
 ## Proportionate matrix
 
@@ -127,6 +223,199 @@ Every retained compatibility path records:
 
 Remove the path when its support window has ended and evidence shows no supported reader, writer, or stored shape still requires it. Do not remove a released-data reader merely because current writers stopped producing that shape.
 
+### Native reminder picker on older mobile binaries (0.2.15)
+
+The UI 0.2.12 source at `a357c65536ba89669422977d6f7daf9aa0d17e73`
+does not include `@react-native-community/datetimepicker`, but shares the manual
+`0.2.7-native` OTA runtime with later UI sources that include it. An OTA update
+cannot add that compiled native module to an already-installed app.
+
+The native `SessionReminderPicker` adapter therefore checks the installed
+capability before loading the SDK: the iOS native view, or all four Android
+modules eagerly required by SDK 8.4.4. The reminder modal consumes that same
+availability decision and omits unsupported picker buttons. Its existing manual
+date/time fields and submission rules remain available; equipped binaries retain
+their native picker. Web uses its existing JavaScript picker unchanged.
+
+This is an older-native/new-JavaScript compatibility path, not delivery of new
+native code through OTA. Remove the guard only when no supported binary eligible
+for these updates can lack the SDK. Native renderer fixes and app-link entitlement
+changes still require a native app build.
+
+### Android file actions native runtime (development)
+
+The development UI's Android Save As, Open With, and Share actions require the
+compiled `HappierFileActions` Expo module. Released binaries on the
+`0.2.7-native` OTA runtime do not include it. Non-publicdev lanes use the new
+`0.2.8-native` runtime train for this native surface; publicdev continues to use
+the existing Expo fingerprint policy. Publish a new native build before updates
+for this train, and do not force this JavaScript bundle onto older native runtimes
+using the maintenance override.
+
+This changes the local Android handoff only. Encrypted workspace transfers and
+their daemon-owned limits retain their existing wire contracts. Web and iOS
+downloads keep their existing platform actions.
+
+### Herdr terminal metadata (development)
+
+The released stable UI `ui-web-v0.2.12` and preview
+`ui-web-v0.2.12-preview.4` at
+`a357c65536ba89669422977d6f7daf9aa0d17e73` reject `herdr` in both
+`terminal.mode` and `terminal.requested`. That failure rejects the Session's
+entire metadata, not just its terminal attachment.
+
+`packages/protocol/src/sessionMetadata/terminalMetadata.ts` owns the development
+wire projection: Herdr uses the released `plain` enum value with additive
+`hostKind: 'herdr'` and, independently, `requestedHostKind: 'herdr'` for a Herdr
+preference. The existing Herdr terminal identity and control-serviceability
+fields are preserved. New readers normalize these wire selectors immediately
+to the canonical `herdr` domain values and remove the recognized selectors;
+later domain mutations cannot retain competing host choices. All Session
+metadata write boundaries apply the same projection, before either plaintext
+serialization or encryption. Machine metadata and message bodies are unaffected.
+
+Older UIs retain core Session metadata and can preserve the additive fields when
+editing metadata; they do not acquire Herdr-specific authoring or attachment
+controls. Current UIs and CLIs retain those controls. A provenance-pinned
+released-reader fixture covers current writes through old reads/edits back into
+new readers. The projection may be removed only when UIs with these strict enums
+are no longer supported; readers of persisted additive projections remain needed
+while such Session metadata can still be encountered.
+
+### Terminal-host account settings (development)
+
+The same released UI at `a357c65536ba89669422977d6f7daf9aa0d17e73`
+strips unknown fields inside `sessionTmuxByMachineId` and its machine editor
+writes the complete parsed map. Non-tmux machine choices therefore live in the
+additive top-level `sessionTerminalHostByMachineId` setting, which its raw-baseline
+writeback preserves when editing another machine. `terminalSettings.ts` owns the
+effective host for both launch and presentation. Modern edits update that map and
+the legacy tmux projection in one account-settings patch; none/tmux choices use
+the released boolean settings and retain tmux names, isolation and temporary paths.
+
+A released UI selecting tmux on the same machine remains authoritative through
+`useTmux: true`. A false value also accompanies a non-tmux choice and cannot
+distinguish a repeated old-client echo from an intent to disable Herdr. Older UIs
+do not gain Herdr controls. Current readers normalize the development-only nested
+`terminalHost` shape when the top-level map is absent; an explicit new-map clear
+cannot revive it. Remove this development reader once retained nested development
+settings are no longer encountered.
+
+### Same-machine session handoff (development)
+
+Same-machine session handoff extends the existing tracked handoff operation and target-path field; it adds no session identity, storage format or transport strategy. The v2 daemon capability response adds `sameMachineHandoff`. Admission requires that field to be exactly `true` for a local move and continues to accept older capability responses for cross-machine handoff. Local preparation reuses the source export through the existing direct-peer strategy without requiring a network transfer carrier.
+
+Source start validates a distinct local destination before stopping the session. Once the target is committed, source cleanup preserves its v2 job and does not stop the resumed session on the same daemon. Cancellation addresses that shared job once through the existing abort owner. The v1 cleanup adapter remains available for source cleanup; it cannot mutate an uncommitted v2 target job.
+
+### Existing-state session handoff (development)
+
+The existing Start/Prepare handoff schemas accept optional `stateTransfer: 'existing'`. The public `session.handoff` CLI Action consumes the existing tracked source entry point, whose coordinator requires source and target daemons to advertise `existingState: true` through their v2 capability owner before source stop/export. The raw source handler independently checks target support before effects. Missing or older peer support refuses admission. Explicit `transfer` normalizes to omission on outgoing requests so default transfer retains its existing peer contract.
+
+Existing-state preparation verifies the target's actual native session instead of publishing, receiving, or importing a provider bundle. Workspace transfer must be disabled. Claude requires a resolved transcript file; Codex requires its native index row and the indexed rollout file. The existing durable handoff records carry the selected mode through prepare/status/recovery, and the original target resume/confirm, binding, commit, and abort owners retain authority. A missing target session leaves the canonical source Machine binding intact; stopping the source remains recoverable through the same handoff lifecycle.
+
+The CLI observes the shared Action Operations owner after its historical preparation receipt and reports success only at terminal handoff completion. A daemon restart can make that transient operation observation unavailable while the durable handoff recovery record remains. Inspect recovery before redelivery. This addition is development-only; an already-running predecessor daemon does not acquire support when its checkout changes.
+
+The development picker exposes one default-on **Transfer session data** toggle for
+cross-machine moves. Its Action adapter and delegated start preserve explicit `existing`;
+that selection disables workspace transfer. Both peer capabilities must prove support
+before the option can be turned off, and the shared Agent handoff policy must admit the
+native-state mode. Source admission also requires the actual catalog resolver before it
+stops the session. Missing target-native state is checked after that stop and produces
+`existing_session_state_unavailable` through immediate and persisted prepare results and
+launch-time revalidation. That refusal is
+kept inline in the same picker, without retrying transfer automatically; turning the toggle
+on and submitting again is a new explicit choice. Same-machine moves hide the toggle and
+retain default transfer. The current 0.3 V3 capability is not a V2 compatibility proof.
+
+### Direct-session import and takeover operations (development)
+
+The released `cli-v0.2.14` and `cli-v0.2.14-preview.1` daemon at
+`df8241c8b1068aa964ec7723000ff356ba3a00ef` executes
+`daemon.directSessions.takeoverPersist` synchronously. Updated daemons retain that
+method as a completion-waiting adapter to the shared daemon Action Operations
+runner used by handoff, fork, and session creation. `takeoverPersist.start`
+acknowledges admission with the shared operation snapshot. Direct takeover and
+import admission share writer/auth/source checks and exclude competing requests
+for the same linked session; repeat delivery joins the existing completion.
+The runner owns both the early admission receipt and final completion for tracked
+spawn, fork, handoff, and takeover requests. Reusing a request identity with changed
+canonical input is rejected. Spawn admission uses the existing native nonce identity
+(including trimmed padding) while preserving the forwarded nonce bytes. Handoff
+does not keep a second admission receipt registry. These private changes add no
+fields to the released operation snapshot.
+The development-only `import.status` and `import.cancel` endpoints and dedicated
+import operation store are removed. Status and Stop use the shared
+`actionOperation.list.v1`, `actionOperation.get.v1`, and
+`actionOperation.cancel.v1` methods.
+
+Updated UIs start import through the asynchronous method and observe the daemon's
+phase, message counts, cancellation eligibility, and terminal result through the
+existing account-scoped Action Operations revision stream and connection-time
+reconciliation. The footer and Activity read the same store; the footer does not
+poll a separate import lifecycle. Reconciliation decisions use the newest shared
+snapshot after merging transport responses: a delayed start acknowledgment or
+status response cannot revive an older revision, hide a terminal refresh error,
+or settle the pending send of a newer retry. A transport request deadline does not
+set an import deadline. The existing transcript footer
+also renders for empty imports and remains available through metadata conversion.
+Observation retains the original daemon address until terminal refresh succeeds,
+so conversion cannot strand a pending send; failed refresh remains recoverable
+through the same Refresh action. If the start acknowledgement is
+lost, the UI reconciles the shared operation by request identity without starting
+a second import. A missing method on
+an older daemon asks the user to update the daemon before starting work; it does
+not fall back to the synchronous import path. Existing relay RPC routing requires
+no server schema or persistence change.
+
+Cancellation is cooperative during transcript reading and uploading. The current
+page/media/upload effect may finish before cancellation settles; no next message
+or runner startup follows. Accepted messages remain stored with the existing
+stable import IDs, so retry deduplicates them. Cancellation becomes unavailable
+when runner startup begins. Completion still requires the existing metadata
+conversion. Operations follow the shared daemon-local retention and recovery
+rules: reopening the session recovers status, while daemon restart loses the
+operation record. An authoritative missing record marks status unavailable and
+settles pending UI work without claiming completion. Retry uses a new request
+identity and the existing importer IDs to preserve accepted history.
+
+### ACP session-list browse source
+
+The released `cli-v0.2.12` and `cli-v0.2.12-preview.1` daemon at
+`a357c65536ba89669422977d6f7daf9aa0d17e73` does not register the ACP session-list
+capability method and its direct-session source schema rejects `{ kind: 'acpSessionList' }`.
+Updated UIs therefore probe `daemon.directSessions.acpSessionList.capability.get` through
+the canonical machine direct-sessions operation before sending that source. A missing method
+degrades only ACP candidate listing to `provider_unavailable`; legacy direct-session listing
+continues unchanged. Updated daemons advertise protocol version 1 with `resumeOnly: true`.
+That capability authorizes candidate listing for resume and nothing else: it does not imply
+transcript import, following, takeover, terminal identity, linking, or writer safety.
+
+The probe can be removed only when daemons predating this method are no longer supported.
+Directory validation remains daemon-owned after successful negotiation, and a relative `cwd`
+continues to return `invalid_request` rather than being reclassified as compatibility fallback.
+
+### Priority-pool primary recovery (development)
+
+The group active-member mutation records its cause in the existing
+`state.lastSwitchReason` and `state.lastSwitchAt` fields. Runtime-state refreshes
+preserve recorded provenance. Manual selections, including older clients that
+omit a cause, replace an automatic cause with `manual`; removing or disabling
+the active member does the same when it selects a replacement.
+
+With priority strategy and `autoRestorePrimaryWhenReset` enabled, the canonical
+candidate selector can restore an eligible primary from fresh healthy quota
+observed after an automatic limit fallback, even without a provider reset time
+or surviving member failure marker. Explicit manual provenance prevents this
+override. Older persisted groups without provenance retain the landed-reset
+proof; missing evidence is not treated as an automatic fallback.
+
+The CLI sends the optional `x-happier-connected-service-switch-reason` header,
+leaving the strict V3 mutation body unchanged. The stable and preview server
+readers at `server-v0.2.16` and `server-v0.2.16-preview.1`
+(`22ac8263cfdbcdb845441b9044ff18199cf7652e`) ignore that header and still perform
+the switch, but cannot record its new provenance. The missing-marker recovery
+therefore requires an updated relay. Browser clients do not send this header.
+
 ### Account-pool quota-reset opt-in (development)
 
 `autoUseQuotaResetsWhenExhausted` is optional in the V1 pool policy; absence means
@@ -142,6 +431,25 @@ understand without erasing the opt-in. This projection preserves the strict read
 `cli-v0.2.11` and `server-v0.2.11` (commit `98ea8fb76733b1dd785d38c31360179cafa84824`);
 it can be removed when those strict response readers are no longer supported.
 
+### Model-entitlement pool disable opt-in (development)
+
+`autoDisablePlanInvalidAccounts` is optional and absent means false. Updated V3
+clients negotiate the field independently with the CORS-safe
+`happierAutoDisablePlanInvalidAccounts=1` query parameter; the response boundary
+omits it for older strict readers without disturbing the existing quota-reset
+Accept negotiation. Writes require the corresponding server feature bit.
+
+Only the exact Codex ChatGPT-account unsupported-model response becomes
+model-scoped `plan_invalid` evidence. The daemon records a 24-hour per-model
+exclusion and, when the pool opt-in is true, disables that member. Manual
+re-enable clears the automatic-disable marker and runtime blockers. Generic
+`plan_invalid` evidence does not persistently disable an account.
+
+Updated V3 clients persist the marker and disabled flag together through the
+member PATCH's optional `state` plus `expectedRuntimeStateRevision` fields. They
+send that shape only after observing the negotiated opt-in; older clients never
+author it, and ordinary member PATCH requests retain their predecessor shape.
+
 The same response boundary masks the opt-in while its server feature or dependencies
 are disabled, without changing the stored policy. Existing recovery reads therefore
 observe automatic spending as disabled; re-enabling the feature restores the saved choice.
@@ -151,6 +459,60 @@ persisted-policy parser rejects the new field and falls back to its complete def
 policy. Do not roll back a database containing this opt-in to that reader without a
 separately validated, authorized data reconciliation. No database rewrite is performed
 by the response projection.
+
+### Account-pool quota-limit selection (development)
+
+`quotaLimitSelection` is optional in the V1 pool policy and absence means all
+provider-reported allowances. Updated clients author it only when the server
+advertises `connectedServices.poolQuotaLimitSelection`; `selected` always
+contains at least one unique provider allowance ID, while `all` contains none.
+
+Updated group readers send the CORS-safe
+`happierPoolQuotaLimitSelection=1` query parameter. The existing V3
+group response boundary omits the field for strict predecessor readers while
+preserving the independently negotiated quota-reset and plan-disable fields.
+When the field is absent in storage, a negotiated reader receives the explicit
+`all` shape. Older-client PATCH operations remain merges and cannot erase a
+stored selection.
+
+`windowDurationMs` is an optional additive quota-meter fact. Updated readers use
+it for presentation and expiry-first ranking; absence preserves eligibility semantics and older
+readers safely ignore it. Pool-selected usage projection filters only meters and
+preserves account-, subscription-, freshness-, and recovery-credit fields.
+
+Provider rejection codes (for example Claude's `rate_limit`) are not allowance
+IDs. When the provider does not identify the exhausted allowance, recovery keeps
+that identity unknown and uses the existing account-level recovery policy; only
+an explicit allowance identity can be excluded by the pool selection.
+
+The existing V1 runtime-auth recovery event's `cancelled` carrier also contains
+terminal policy outcomes. Its existing `reason` distinguishes explicit
+cancellation from recovery that stopped without an automatic retry. Current
+readers use the shared protocol interpretation; no new event enum or persisted
+recovery state is introduced. Primary-session failures remain visible even when
+independently owned background runs continue.
+
+### Account-pool expiry-first strategy (development)
+
+The canonical V1 policy defaults to `expiry_first` for newly created or absent
+policies. Explicitly persisted `least_limited`, `priority`, and `manual` choices
+remain unchanged. The daemon's existing candidate selector first prefers fresh
+headroom above the pool's soft-switch threshold, then the earliest future reset
+of its longest selected usage allowance or independently fresh, non-renewing
+subscription end. Ties and candidates without adequate headroom use the existing
+least-limited ranking and priority tie-break. Missing, stale, renewing, and passed
+subscription dates provide no urgency; eligibility, current-account stickiness,
+switch budgets, and hot-auth application are unchanged.
+
+Updated group readers negotiate `happierPoolExpiryFirst=1`. The existing response
+projection represents this strategy as `least_limited` for older strict readers;
+it does not rewrite storage. Unrelated older-client patches preserve the stored
+strategy, while an explicit strategy patch remains an intentional choice. Updated
+UI clients offer the new choice only when `connectedServices.poolExpiryFirst` is
+advertised; this bit controls authoring, not runtime selection. Older daemons
+continue their supported least-limited behavior. As with the other development
+policy extensions above, rollback to a server whose persisted-policy parser
+rejects this enum is not a preservation guarantee.
 
 ### Session draft rollout
 
@@ -323,3 +685,16 @@ The migration edit and its retained-development reconciliation are one work unit
 That reconciliation is an operator/development action, not a shipped compatibility path. Do not add runtime checksum exceptions, migration-name aliases, duplicate no-op migrations, or automatic ledger repair merely to preserve unpublished development history.
 
 Keep PostgreSQL, SQLite, and MySQL migrations aligned by intent. Before publication, validate both a clean migration from the published baseline and the approved reconciliation path for any retained development database. After publication, preserve the exact migration history and test upgrades append-only.
+
+### Unistyles native bindings (development)
+
+The development UI upgrades Unistyles from 3.2.4 to 3.5.3 and Nitro Modules
+from 0.35.6 to 0.37.1. Non-publicdev lanes use the new `0.2.9-native`
+runtime train, so this JavaScript cannot be delivered to binaries containing
+the previous bindings on `0.2.8-native`. Publicdev retains Expo's fingerprint
+policy. Rebuild the native development client after installing these dependencies;
+a Metro reload alone cannot update the native bindings. Publish the matching
+native build before publishing an OTA update for this train.
+React Native's CocoaPods post-install owner marks glog's namespace-fragment
+headers textual, so Swift can import Nitro's public Fabric headers without
+Clang attempting a submodule import inside `namespace google`.

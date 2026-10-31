@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { chmod, link, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { deflateRawSync, gzipSync } from 'node:zlib';
 
 import * as tar from 'tar';
@@ -841,6 +842,133 @@ test('extractArchivePayloadToDirectory rejects gzip decompression bombs without 
   }
 });
 
+test('extractArchivePayloadToDirectory settles a tar staging-directory filesystem error', { timeout: 2000 }, async (t) => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'release-runtime-extract-cwd-error-'));
+  try {
+    const archivePath = join(rootDir, 'payload.tar.gz');
+    const extractDir = join(rootDir, 'extract');
+    await writeFile(archivePath, createTarGzip([{ name: 'file.txt', contents: 'payload' }]));
+    const originalStat = fs.stat;
+    // Inject a real filesystem boundary failure; tar still owns conversion to
+    // CwdError and its native error/entry/reservation lifecycle.
+    t.mock.method(fs, 'stat', (target, ...args) => {
+      if (!relative(rootDir, String(target)).startsWith('.extract.extract-')) {
+        return originalStat(target, ...args);
+      }
+      const error = Object.assign(new Error('staging stat failed'), { code: 'EIO' });
+      queueMicrotask(() => args.at(-1)(error));
+    });
+    await assert.rejects(
+      extractArchivePayloadToDirectory({ archiveName: 'payload.tar.gz', archivePath, extractDir }),
+      { name: 'CwdError', code: 'EIO' },
+    );
+    assert.deepEqual((await readdir(rootDir)).filter((name) => name.includes('.extract-')), []);
+    await assert.rejects(stat(extractDir), { code: 'ENOENT' });
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('extractArchivePayloadToDirectory settles a tar parser abort before removing staging', { timeout: 2000 }, async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'release-runtime-extract-parser-abort-'));
+  try {
+    const damagedGzip = createTarGzip([
+      { name: 'file.txt', contents: 'payload' },
+    ]);
+    damagedGzip[damagedGzip.length - 8] ^= 0xff;
+    const archivePath = join(rootDir, 'payload.tar.gz');
+    const extractDir = join(rootDir, 'extract');
+    // The outer gzip is valid. Its damaged inner gzip reaches tar's own
+    // decompressor, whose parser abort does not emit Unpack's finish event.
+    await writeFile(archivePath, gzipSync(damagedGzip));
+
+    await assert.rejects(
+      extractArchivePayloadToDirectory({ archiveName: 'payload.tar.gz', archivePath, extractDir }),
+      { code: 'Z_DATA_ERROR', tarCode: 'TAR_ABORT' },
+    );
+    assert.deepEqual((await readdir(rootDir)).filter((name) => name.includes('.extract-')), []);
+    await assert.rejects(stat(extractDir), { code: 'ENOENT' });
+    await rename(archivePath, join(rootDir, 'closed.tar.gz'));
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('extractArchivePayloadToDirectory drains accepted and queued entries after a real tar parser abort', { timeout: 2000 }, async (t) => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'release-runtime-extract-parser-drain-'));
+  let releaseStat;
+  t.after(() => releaseStat?.());
+  try {
+    // A small valid tar spans two of the decompressor's 16 KiB output chunks.
+    // The existing ratio limit accepts the first chunk, then aborts the parser
+    // on the second, after it accepted the file and queued directory entries.
+    const innerGzip = createTarGzip([
+      { name: './accepted/file.txt', contents: 'payload' },
+      ...Array.from({ length: 64 }, (_, index) => ({
+        name: `./accepted/dir-${index}/`,
+        type: '5',
+      })),
+    ]);
+    const archivePath = join(rootDir, 'payload.tar.gz');
+    const extractDir = join(rootDir, 'extract');
+    await writeFile(archivePath, gzipSync(innerGzip));
+
+    let onAbort;
+    const aborted = new Promise((resolveAborted) => { onAbort = resolveAborted; });
+    let acceptedFile = false;
+    const originalEmit = tar.Unpack.prototype.emit;
+    // Observe native events without changing tar's parsing or event delivery.
+    t.mock.method(tar.Unpack.prototype, 'emit', function (event, ...args) {
+      if (event === 'entry' && args[0].path === './accepted/file.txt') acceptedFile = true;
+      if (event === 'abort') onAbort();
+      return Reflect.apply(originalEmit, this, [event, ...args]);
+    });
+    let onStat;
+    const statReached = new Promise((resolveStat) => { onStat = resolveStat; });
+    const originalStat = fs.stat;
+    // Hold the real OS callback so accepted extraction work remains pending
+    // while the genuine parser-abort event is observed.
+    t.mock.method(fs, 'stat', (...args) => {
+      const callback = args.at(-1);
+      return originalStat(...args.slice(0, -1), (...result) => {
+        if (!releaseStat) {
+          let released = false;
+          releaseStat = () => {
+            if (released) return;
+            released = true;
+            callback(...result);
+          };
+          onStat();
+        } else {
+          callback(...result);
+        }
+      });
+    });
+    const extraction = extractArchivePayloadToDirectory({
+      archiveName: 'payload.tar.gz', archivePath, extractDir,
+      limits: { maxCompressionRatio: (24 * 1024) / innerGzip.length },
+    });
+    let settled = false;
+    extraction.then(() => { settled = true; }, () => { settled = true; });
+    const rejection = assert.rejects(extraction, (error) => {
+      assert.equal(error.tarCode, 'TAR_ABORT');
+      assert.match(error.message, /max decompression ratio/iu);
+      return true;
+    });
+    await Promise.all([aborted, statReached]);
+    assert.equal(acceptedFile, true);
+    await new Promise((resolveTurn) => setTimeout(resolveTurn, 25));
+    assert.equal(settled, false);
+    releaseStat();
+    await rejection;
+    assert.deepEqual((await readdir(rootDir)).filter((name) => name.includes('.extract-')), []);
+    await assert.rejects(stat(extractDir), { code: 'ENOENT' });
+  } finally {
+    releaseStat?.();
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('extractArchivePayloadToDirectory bounds tar.xz expansion outside node-tar decompression', async () => {
   const rootDir = await mkdtemp(join(tmpdir(), 'release-runtime-extract-xz-budget-'));
   try {
@@ -879,7 +1007,7 @@ test('extractArchivePayloadToDirectory bounds zip entry count and cumulative exp
       ['entries', { maxEntries: 1 }, /too many entries/iu],
       ['files', { maxFiles: 1 }, /too many files/iu],
       ['file-bytes', { maxFileBytes: 3 }, /file exceeds its byte limit/iu],
-      ['bytes', { maxExpandedBytes: 7 }, /expanded-byte limit/iu],
+      ['bytes', { maxExpandedBytes: 7 }, { code: 'archive-expanded-byte-limit' }],
     ]) {
       const extractDir = join(rootDir, `extract-${suffix}`);
       if (suffix === 'bytes') await mkdir(extractDir, { recursive: true });
@@ -959,11 +1087,96 @@ test('extractArchivePayloadToDirectory restricts extraction to declared entry ro
   }
 });
 
+test('extractArchivePayloadToDirectory rejects unsafe tar paths and prefix conflicts before writing output', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'release-runtime-extract-tar-paths-'));
+  try {
+    const createPaxRecord = (key, value) => {
+      const body = `${key}=${value}\n`;
+      let declaredByteLength = Buffer.byteLength(body) + 3;
+      while (true) {
+        const record = `${declaredByteLength} ${body}`;
+        const actualByteLength = Buffer.byteLength(record);
+        if (actualByteLength === declaredByteLength) return record;
+        declaredByteLength = actualByteLength;
+      }
+    };
+    const cases = [
+      {
+        label: 'absolute',
+        entries: [{ name: '/outside.txt', contents: 'escape' }],
+        pattern: /absolute|empty path/iu,
+      },
+      {
+        label: 'traversal',
+        entries: [{ name: 'package/../outside.txt', contents: 'escape' }],
+        pattern: /non-portable path/iu,
+      },
+      {
+        label: 'pax-traversal',
+        entries: [
+          {
+            name: 'PaxHeader',
+            type: 'x',
+            contents: createPaxRecord('path', '../outside-pax.txt'),
+          },
+          { name: 'safe.txt', contents: 'escape' },
+        ],
+        pattern: /non-portable path/iu,
+      },
+      {
+        label: 'file-prefix',
+        entries: [
+          { name: 'package/owner', contents: 'file' },
+          { name: 'package/owner/child', contents: 'child' },
+        ],
+        pattern: /prefix|file.*directory|directory.*file/iu,
+      },
+      {
+        label: 'case-fold-collision',
+        entries: [
+          { name: 'package/Dist/tool', contents: 'first' },
+          { name: 'package/dist/other', contents: 'second' },
+        ],
+        pattern: /collision|duplicate/iu,
+      },
+      {
+        label: 'windows-invalid',
+        entries: [{ name: 'package/payload:stream', contents: 'ads' }],
+        pattern: /windows-invalid/iu,
+      },
+    ];
+
+    for (const { label, entries, pattern } of cases) {
+      const archivePath = join(rootDir, `${label}.tar.gz`);
+      const extractDir = join(rootDir, `extract-${label}`);
+      await writeFile(archivePath, createTarGzip(entries));
+      await assert.rejects(
+        extractArchivePayloadToDirectory({
+          archiveName: `${label}.tar.gz`,
+          archivePath,
+          extractDir,
+        }),
+        pattern,
+      );
+      await assert.rejects(stat(extractDir), { code: 'ENOENT' });
+    }
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('extractArchivePayloadToDirectory honors cancellation and timeout before publishing output', async () => {
   const rootDir = await mkdtemp(join(tmpdir(), 'release-runtime-extract-abort-'));
   try {
     const archivePath = join(rootDir, 'payload.tar.gz');
+    const inFlightArchivePath = join(rootDir, 'in-flight.tar.gz');
     await writeFile(archivePath, createTarGzip([{ name: 'tool', contents: 'payload' }]));
+    await writeFile(inFlightArchivePath, createTarGzip(
+      Array.from({ length: 4000 }, (_, index) => ({
+        name: `payload/${index.toString().padStart(4, '0')}.txt`,
+        contents: 'payload',
+      })),
+    ));
     const controller = new AbortController();
     controller.abort(new Error('caller stopped extraction'));
 
@@ -985,8 +1198,18 @@ test('extractArchivePayloadToDirectory honors cancellation and timeout before pu
       }),
       /timed out/iu,
     );
+    const inFlightController = new AbortController();
+    const inFlightExtraction = extractArchivePayloadToDirectory({
+      archiveName: 'in-flight.tar.gz',
+      archivePath: inFlightArchivePath,
+      extractDir: join(rootDir, 'extract-in-flight'),
+      signal: inFlightController.signal,
+    });
+    setImmediate(() => inFlightController.abort(new Error('caller stopped extraction')));
+    await assert.rejects(inFlightExtraction, /aborted/iu);
     await assert.rejects(stat(join(rootDir, 'extract-aborted')), { code: 'ENOENT' });
     await assert.rejects(stat(join(rootDir, 'extract-timeout')), { code: 'ENOENT' });
+    await assert.rejects(stat(join(rootDir, 'extract-in-flight')), { code: 'ENOENT' });
   } finally {
     await rm(rootDir, { recursive: true, force: true });
   }
@@ -1072,6 +1295,8 @@ test('extractArchivePayloadToDirectory rejects standalone tar symlinks and hardl
       }),
       /link/iu,
     );
+    assert.deepEqual((await readdir(rootDir)).filter((name) => name.includes('.extract-')), []);
+    await assert.rejects(stat(join(rootDir, 'extract-symlink')), { code: 'ENOENT' });
 
     await link(join(payloadDir, 'target'), join(payloadDir, 'hardlink'));
     const hardlinkArchivePath = join(rootDir, 'hardlink.tar.gz');
@@ -1087,6 +1312,8 @@ test('extractArchivePayloadToDirectory rejects standalone tar symlinks and hardl
       }),
       /link/iu,
     );
+    assert.deepEqual((await readdir(rootDir)).filter((name) => name.includes('.extract-')), []);
+    await assert.rejects(stat(join(rootDir, 'extract-hardlink')), { code: 'ENOENT' });
   } finally {
     await rm(rootDir, { recursive: true, force: true });
   }
@@ -1301,7 +1528,7 @@ test('inspectTarArchiveEntries applies the same entry and expanded-byte budgets 
     );
     await assert.rejects(
       inspectTarArchiveEntries({ archivePath, limits: { maxExpandedBytes: 7 } }),
-      /expanded-byte limit/iu,
+      { code: 'archive-expanded-byte-limit' },
     );
   } finally {
     await rm(rootDir, { recursive: true, force: true });

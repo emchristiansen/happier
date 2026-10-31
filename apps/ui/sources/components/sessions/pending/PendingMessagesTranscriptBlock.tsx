@@ -105,7 +105,10 @@ function hasPendingDeliveryResolutionState(visualState: PendingMessageVisualStat
 }
 
 function canUseDirectPendingDeliveryActions(message: PendingMessage, hasDecryptFailure: boolean): boolean {
-    return !isAcceptedLocalPendingProjection(message) && !hasDecryptFailure;
+    // Send/Steer mutate a server Pending row; local delivery remains owned by its sender.
+    return message.source !== 'local_outbound'
+        && !isAcceptedLocalPendingProjection(message)
+        && !hasDecryptFailure;
 }
 
 function supportsInFlightSteerForPendingActions(session: ReturnType<typeof useSession>): boolean {
@@ -406,15 +409,17 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
     }, [props.onEditPendingMessage]);
 
     const handleReorderIds = React.useCallback(async (ids: string[]) => {
-        if (!canReorderPendingMessages || ids.length <= 1) return;
+        if (!canReorderPendingMessages || ids.length <= 1) return 'refused' as const;
         const current = props.pendingMessages.map((m) => m.id);
         if (ids.length === current.length && ids.every((id, idx) => id === current[idx])) {
-            return;
+            return 'unchanged' as const;
         }
         try {
             await sync.reorderPendingMessages(props.sessionId, ids);
+            return 'applied' as const;
         } catch (e) {
             Modal.alert(t('common.error'), e instanceof Error ? e.message : t('session.pendingMessages.errors.reorderFailed'));
+            return 'unknown' as const;
         }
     }, [canReorderPendingMessages, props.pendingMessages, props.sessionId]);
 
@@ -832,7 +837,9 @@ export function PendingMessagesTranscriptBlock(props: Readonly<{
                 }
             } else if (!isCancellationState && canUsePendingQueueActions) {
                 items.push({ id: 'edit', title: t('session.pendingMessages.actions.edit'), icon: <Icon name="pencil" size={16} color={theme.colors.text.secondary} /> });
-                items.push({ id: 'remove', title: t('common.remove'), icon: <Icon name="trash" size={16} color={theme.colors.text.secondary} /> });
+                if (!isSendFailed) {
+                    items.push({ id: 'remove', title: t('common.remove'), icon: <Icon name="trash" size={16} color={theme.colors.text.secondary} /> });
+                }
             }
             if (canSteerNow && canUseDirectDeliveryActions) {
                 items.push({ id: 'steerNow', title: t('session.pendingMessages.actions.steerNow'), icon: <Icon name="navigation-arrow" size={16} color={theme.colors.text.secondary} /> });

@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import type { TranscriptRowShellItem } from '@/components/sessions/transcript/measurement/transcriptRowShellSignature';
+import { collectTranscriptNavigationMessageIdsForItem } from '@/components/sessions/transcript/viewport/lifecycle/transcriptRowClassification';
 
 import type { TranscriptListOrientation } from '@/components/sessions/transcript/listOrientation';
 import {
@@ -68,6 +70,28 @@ function project(overrides: Partial<Parameters<typeof resolveTranscriptRenderWin
 }
 
 describe('resolveTranscriptRenderWindowProjection', () => {
+    it.each(['standard', 'inverted'] as const)('keeps an opaque island and grouped rows whole in %s orientation', (listOrientation) => {
+        const items: TranscriptRowShellItem[] = [
+            { kind: 'message', id: 'old-row', messageId: 'old', createdAt: 100, seq: null },
+            { kind: 'turn', id: 'turn', turn: { id: 'turn', userMessageId: null, content: [{ kind: 'tool_calls', id: 'tools', toolMessageIds: ['tail-tool'] }] } },
+            { kind: 'tool-group-tool', id: 'tool-unit', groupId: 'tools', toolMessageId: 'later-tool', toolMessageIds: ['tail-tool', 'later-tool'], expanded: true, createdAt: 1, seq: null },
+            { kind: 'message', id: 'tail-row', messageId: 'tail', createdAt: 0, seq: null },
+        ];
+        const projection = resolveTranscriptRenderWindowProjection({
+            activeThinkingMessageId: null, createWindowGapItem: gapItem,
+            entrySliceWindow: null, expandedToolCallsAnchorMessageIds: new Set<string>(),
+            items, listOrientation, platformOS: 'ios', rendererKind: 'flashList', sessionId: 'session-1',
+            targetWindowState: inactiveWindow, transcriptNativeHotTailItemCount: 2, transcriptWebHotTailItemCount: 0,
+            tailContiguousBoundary: { kind: 'messageIds', messageIds: ['tail-tool'] },
+            resolveMessageIds: collectTranscriptNavigationMessageIdsForItem,
+        });
+        const canonicalIds = ['transcript-window-gap:tail:older', 'turn', 'tool-unit', 'tail-row'];
+        expect(projection.listData.map((entry) => entry.id)).toEqual(listOrientation === 'inverted' ? [...canonicalIds].reverse() : canonicalIds);
+        expect(projection.hotCold.active).toBe(false);
+        expect(projection.indexMap.sourceIndexToRenderedIndex(0)).toBeNull();
+        expect(items.map((entry) => entry.id)).toEqual(['old-row', 'turn', 'tool-unit', 'tail-row']);
+    });
+
     it('composes entry slice, target window, orientation, and hot/cold carve into one projection', () => {
         const projection = project({
             entrySliceWindow: { anchorRowId: 'row-2', sessionId: 'session-1' },
@@ -306,7 +330,7 @@ describe('resolveTranscriptRenderWindowProjection', () => {
         const tailProjection = project({
             items: [item(401), item(410), item(1951), item(2000)],
             platformOS: 'android',
-            tailContiguousFloorSeq: 1951,
+            tailContiguousBoundary: { kind: 'seq', seq: 1951 },
         });
         const tailFacts = createNativeStandardListFactSource({
             readContentHeight: () => 1_000,
@@ -327,7 +351,7 @@ describe('resolveTranscriptRenderWindowProjection', () => {
     it('keeps one stable tail-gap row until the discontinuity converges, then removes only the gap', () => {
         const open = project({
             items: [item(401), item(410), item(1951), item(2000)],
-            tailContiguousFloorSeq: 1951,
+            tailContiguousBoundary: { kind: 'seq', seq: 1951 },
         });
         expect(open.listData.map((entry) => entry.id)).toEqual([
             'transcript-window-gap:tail:older',
@@ -337,7 +361,7 @@ describe('resolveTranscriptRenderWindowProjection', () => {
 
         const advanced = project({
             items: [item(401), item(410), item(1801), item(1951), item(2000)],
-            tailContiguousFloorSeq: 1801,
+            tailContiguousBoundary: { kind: 'seq', seq: 1801 },
         });
         expect(advanced.listData.map((entry) => entry.id)).toEqual([
             'transcript-window-gap:tail:older',
@@ -348,7 +372,7 @@ describe('resolveTranscriptRenderWindowProjection', () => {
 
         const closed = project({
             items: [item(401), item(410), item(411), item(1801), item(1951), item(2000)],
-            tailContiguousFloorSeq: null,
+            tailContiguousBoundary: null,
         });
         expect(closed.listData.map((entry) => entry.id)).toEqual([
             'row-401',

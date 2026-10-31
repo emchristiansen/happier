@@ -27,7 +27,10 @@ export async function fetchServerAdvertisedUrls(params: Readonly<{
   apiServerUrl: string;
   timeoutMs?: number;
 }>): Promise<ServerAdvertisedUrls | null> {
-  const snapshot = await fetchServerFeaturesSnapshot({ serverUrl: params.apiServerUrl, timeoutMs: params.timeoutMs ?? 1500 });
+  const snapshot = await fetchServerFeaturesSnapshot({
+    serverUrl: params.apiServerUrl,
+    ...(typeof params.timeoutMs === 'number' ? { timeoutMs: params.timeoutMs } : {}),
+  });
   if (snapshot.status !== 'ready') return null;
 
   const serverCaps = snapshot.features.capabilities.server ?? null;

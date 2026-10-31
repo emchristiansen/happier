@@ -1,4 +1,5 @@
-import { createReadStream, existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, closeSync } from 'node:fs';
+import { withWorkspaceBundleLock } from '@happier-dev/cli-common/workspaceBundleLock';
+import { createReadStream, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { appendFile, mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, dirname, resolve as resolvePath } from 'node:path';
@@ -7,7 +8,7 @@ import { repoRootDir } from '../paths';
 import { reserveAvailablePort } from '../network/reserveAvailablePort';
 import { runLoggedCommand } from './spawnProcess';
 import { yarnCommand } from './commands';
-import { applyUiWebExpoNodeHeapEnv, readPositiveEnvInt } from './uiWebEnv';
+import { readPositiveEnvInt } from './uiWebEnv';
 import type { StartedUiWeb } from './uiWebTypes';
 
 export function resolveUiWebExportRootDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -27,105 +28,21 @@ type UiWebRuntimeConfig = Readonly<{
   syncTuningJson: string;
 }>;
 
-type LockOwner = {
-  pid: number | null;
-  createdAtMs: number | null;
-};
-
-function parseLockOwner(raw: string): LockOwner {
-  const text = raw.trim();
-  if (!text) return { pid: null, createdAtMs: null };
-  try {
-    const parsed = JSON.parse(text) as { pid?: unknown; createdAtMs?: unknown };
-    return {
-      pid: typeof parsed.pid === 'number' && Number.isFinite(parsed.pid) && parsed.pid > 0 ? parsed.pid : null,
-      createdAtMs:
-        typeof parsed.createdAtMs === 'number' && Number.isFinite(parsed.createdAtMs) && parsed.createdAtMs > 0
-          ? parsed.createdAtMs
-          : null,
-    };
-  } catch {
-    return { pid: null, createdAtMs: null };
-  }
-}
-
-function isRunningPid(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error: any) {
-    if (error?.code === 'ESRCH') return false;
-    return true;
-  }
-}
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function withUiWebExportLock<T>(
   lockPath: string,
   fn: () => Promise<T>,
   options?: { timeoutMs?: number; staleAfterMs?: number },
 ): Promise<T> {
-  mkdirSync(dirname(lockPath), { recursive: true });
-  const timeoutMs = options?.timeoutMs ?? 900_000;
-  const staleAfterMs = options?.staleAfterMs ?? timeoutMs;
-  const startedAt = Date.now();
-
-  let fd: number | null = null;
-  while (true) {
-    try {
-      fd = openSync(lockPath, 'wx');
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAtMs: Date.now() }), 'utf8');
-      break;
-    } catch (error: any) {
-      if (error?.code !== 'EEXIST') throw error;
-
-      let reclaim = false;
-      try {
-        const owner = parseLockOwner(readFileSync(lockPath, 'utf8'));
-        if (owner.pid == null && owner.createdAtMs == null) reclaim = true;
-        else if (owner.pid != null && !isRunningPid(owner.pid)) reclaim = true;
-        else if (owner.createdAtMs != null && Date.now() - owner.createdAtMs > staleAfterMs) reclaim = true;
-      } catch {
-        reclaim = true;
-      }
-
-      if (reclaim) {
-        try {
-          unlinkSync(lockPath);
-          continue;
-        } catch {
-          // ignore and continue waiting
-        }
-      }
-
-      if (Date.now() - startedAt > timeoutMs) {
-        throw new Error(`Timed out waiting for UI web export build lock: ${lockPath}`);
-      }
-      await sleep(250);
-    }
-  }
-
-  try {
-    return await fn();
-  } finally {
-    try {
-      if (fd != null) closeSync(fd);
-    } catch {
-      // ignore
-    }
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      // ignore
-    }
-  }
+  return await withWorkspaceBundleLock(fn, {
+    lockPath,
+    timeoutMs: options?.timeoutMs ?? 900_000,
+    staleAfterMs: options?.staleAfterMs ?? options?.timeoutMs ?? 900_000,
+    errorLabel: 'UI web export build lock',
+  });
 }
 
 export function resolveUiWebExportBuildTimeoutMs(env: NodeJS.ProcessEnv): number {
-  return readPositiveEnvInt(env.HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS, 600_000);
+  return readPositiveEnvInt(env.HAPPIER_E2E_UI_WEB_EXPORT_TIMEOUT_MS, 240_000);
 }
 
 export function resolveUiWebExportLockTimeoutMs(env: NodeJS.ProcessEnv): number {
@@ -160,7 +77,7 @@ function buildRuntimeConfig(env: NodeJS.ProcessEnv): UiWebRuntimeConfig {
 
 function buildExportEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const debug = String(env.EXPO_PUBLIC_DEBUG ?? '1').trim() || '1';
-  return applyUiWebExpoNodeHeapEnv({
+  return {
     ...process.env,
     ...env,
     CI: '1',
@@ -174,7 +91,7 @@ function buildExportEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     EXPO_PUBLIC_SERVER_URL: '',
     EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: '',
     EXPO_PUBLIC_HAPPIER_SYNC_TUNING_JSON: '',
-  });
+  };
 }
 
 export function resolveUiWebExportSourceFingerprint(): string {

@@ -337,6 +337,26 @@ describe('updates transcript vNext payloads', () => {
     expect(parsed.success).toBe(false);
   });
 
+  it('requires anchored cursor advancement for page-limit direct-session deltas', () => {
+    expect(EphemeralUpdateSchema.safeParse({
+      type: 'direct-session-transcript-delta',
+      sessionId: 'sess_1',
+      items: [],
+      nextCursor: 'cursor-2',
+      truncated: true,
+      truncationReason: 'page_limit',
+    }).success).toBe(false);
+    expect(EphemeralUpdateSchema.safeParse({
+      type: 'direct-session-transcript-delta',
+      sessionId: 'sess_1',
+      items: [],
+      fromCursor: 'cursor-1',
+      nextCursor: null,
+      truncated: true,
+      truncationReason: 'page_limit',
+    }).success).toBe(false);
+  });
+
   it('parses message ack responses with didUpdate', () => {
     const parsed = MessageAckResponseSchema.safeParse({
       ok: true,

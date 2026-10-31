@@ -77,22 +77,18 @@ describe('happier session run wait (integration)', () => {
     const { reloadConfiguration } = await import('@/configuration');
     reloadConfiguration();
 
-    process.env.HAPPIER_SESSION_RUN_WAIT_POLL_INTERVAL_MS = '10';
-
     const { decodeBase64, decrypt, encodeBase64: encodeBase64Rpc, encrypt } = await import('@/api/encryption');
-    let getCount = 0;
     const socket = createApiSessionSocketStub({
       emit: (event: string, args: unknown[]) => {
         const [data, cb] = args as [any, ((value: unknown) => void) | undefined];
         if (event !== SOCKET_RPC_EVENTS.CALL) return;
-        if (String(data.method ?? '') !== `${sessionId}:${SESSION_RPC_METHODS.EXECUTION_RUN_GET}`) return;
+        if (String(data.method ?? '') !== `${sessionId}:${SESSION_RPC_METHODS.EXECUTION_RUN_WAIT}`) return;
 
         const decodedParams = decodeBase64(String(data.params ?? ''), 'base64');
         const decrypted = decrypt(dek, 'dataKey', decodedParams) as any;
         expect(decrypted).toMatchObject({ runId: 'run_1' });
 
-        getCount += 1;
-        const status = getCount >= 2 ? 'succeeded' : 'running';
+        const status = 'succeeded';
         const run = {
           runId: 'run_1',
           callId: 'call_1',
@@ -105,9 +101,9 @@ describe('happier session run wait (integration)', () => {
           ioMode: 'request_response',
           status,
           startedAtMs: 1,
-          ...(status !== 'running' ? { finishedAtMs: 2 } : {}),
+          finishedAtMs: 2,
         };
-        const resultPayload = { run };
+        const resultPayload = { ok: true, status, result: { run } };
         cb?.({ ok: true, result: encodeBase64Rpc(encrypt(dek, 'dataKey', resultPayload), 'base64') });
       },
     });
@@ -125,13 +121,11 @@ describe('happier session run wait (integration)', () => {
     envScope.restore();
     envScope = createEnvKeyScope(envKeys);
 
-    delete process.env.HAPPIER_SESSION_RUN_WAIT_POLL_INTERVAL_MS;
-
     const { reloadConfiguration } = await import('@/configuration');
     reloadConfiguration();
   });
 
-  it('polls run get until terminal and returns a session_run_wait JSON envelope', async () => {
+  it('waits through one daemon RPC and returns a session_run_wait JSON envelope', async () => {
     const { handleSessionCommand } = await import('../index');
 
     const output = captureConsoleJsonOutput();

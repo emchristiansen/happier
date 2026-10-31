@@ -1,10 +1,13 @@
 import type { PermissionMode } from '@/api/types';
+import { readSessionNativeEnvironment } from '@/agent/runtime/sessionNativeEnvironment';
 import { isPermissionMode } from '@/api/types';
 import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers';
 import {
+  buildBackendTargetKey,
   AGENT_IDS,
   LEGACY_ACP_SESSION_MODE_OVERRIDE_KEY,
   inferAgentIdFromSessionMetadata,
+  resolveProviderSessionIdForBackendTarget,
   resolveMetadataStringOverrideStateV1FromAliases,
   resolveMetadataStringOverrideV1,
   resolvePermissionIntentFromSessionMetadata,
@@ -251,12 +254,25 @@ function readModelFromMetadata(
 
 function chooseVendorResumeId(params: ResolveSessionRuntimeSnapshotParams): SessionRuntimeSnapshot['vendorResumeId'] {
   const metadata = params.persistedMetadata ?? null;
+  const backendTarget = params.incomingOptions.backendTarget ?? params.trackedSpawnOptions?.backendTarget;
+  if (backendTarget?.kind === 'configuredAcpBackend') {
+    const metadataProviderSessionId = resolveProviderSessionIdForBackendTarget(backendTarget, metadata);
+    return metadataProviderSessionId ? { value: metadataProviderSessionId, updatedAt: null } : null;
+  }
   const incomingResume = normalizeNonEmptyString(params.incomingOptions.resume);
   if (incomingResume) {
     return { value: incomingResume, updatedAt: null };
   }
-  if (params.incomingOptions.backendTarget?.kind === 'configuredAcpBackend') {
-    return null;
+  if (backendTarget) {
+    const metadataProviderSessionId = resolveProviderSessionIdForBackendTarget(backendTarget, metadata);
+    const trackedTargetMatches = params.trackedSpawnOptions?.backendTarget === undefined
+      || buildBackendTargetKey(params.trackedSpawnOptions.backendTarget) === buildBackendTargetKey(backendTarget);
+    const value =
+      (trackedTargetMatches ? normalizeNonEmptyString(params.trackedSpawnOptions?.resume) : null)
+      ?? (trackedTargetMatches ? normalizeNonEmptyString(params.trackedVendorResumeId) : null)
+      ?? normalizeNonEmptyString(params.persistedVendorResumeId)
+      ?? metadataProviderSessionId;
+    return value ? { value, updatedAt: null } : null;
   }
   const agentId =
     readAgentIdFromOptions(params.incomingOptions)
@@ -287,6 +303,7 @@ function applySnapshotToSpawnOptions(
     pendingFirstInput: _pendingFirstInput,
     initialGoal: _initialGoal,
     existingSessionAttachPayload: _existingSessionAttachPayload,
+    resume: _resume,
     ...durableOptions
   } = options;
   const next: SpawnSessionOptions = { ...durableOptions };
@@ -383,8 +400,19 @@ export function resolveSessionRuntimeSnapshot(
     vendorResumeId: chooseVendorResumeId(params),
   };
 
+  const persistedNativeEnvironment = readSessionNativeEnvironment(params.persistedMetadata?.nativeAgentEnvironmentV1);
+  const trackedNativeEnvironment = readSessionNativeEnvironment(params.trackedSpawnOptions?.environmentVariables);
   return {
     snapshot,
-    spawnOptions: applySnapshotToSpawnOptions(params.incomingOptions, snapshot),
+    spawnOptions: applySnapshotToSpawnOptions({
+      ...params.incomingOptions,
+      ...((persistedNativeEnvironment || trackedNativeEnvironment) ? {
+        environmentVariables: {
+          ...trackedNativeEnvironment,
+          ...persistedNativeEnvironment,
+          ...params.incomingOptions.environmentVariables,
+        },
+      } : {}),
+    }, snapshot),
   };
 }

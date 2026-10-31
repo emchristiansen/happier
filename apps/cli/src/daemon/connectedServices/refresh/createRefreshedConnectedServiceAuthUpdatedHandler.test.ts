@@ -150,7 +150,6 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
       const requestRestartSignal = vi.fn(async (_params: RestartSignalParams) => ({ signaled: true }));
       const tracked: TrackedSession = { pid: 1, startedBy: 'daemon', happySessionId: 's1' };
       const restartAfterAuthUpdated = createConnectedServicesAuthUpdatedRestartHandler({
-        restartRequestedPids: new Set<number>(),
         pidToTrackedSession: new Map([[1, tracked]]),
         resolveLifecycleDescriptor: resolveConnectedServiceCredentialLifecycleDescriptor,
         resolveProcessGroupPid: (session) => session.pid,
@@ -520,7 +519,7 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
       const tracked: TrackedSession = { pid: 1, startedBy: 'daemon', happySessionId: 's1' };
       const requestRestartSignal = vi.fn(async (_input: Parameters<Parameters<typeof createConnectedServicesAuthUpdatedRestartHandler>[0]['requestRestartSignal']>[0]) => ({ signaled: true }));
       const restart = createConnectedServicesAuthUpdatedRestartHandler({
-        restartRequestedPids: new Set(), pidToTrackedSession: new Map([[1, tracked]]),
+        pidToTrackedSession: new Map([[1, tracked]]),
         resolveLifecycleDescriptor: resolveConnectedServiceCredentialLifecycleDescriptor,
         resolveProcessGroupPid: () => 1, requestRestartSignal, restartSignalDelayMs: 0,
       });
@@ -565,7 +564,7 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
     let current = true;
     let selected = true;
     const restart = createConnectedServicesAuthUpdatedRestartHandler({
-      restartRequestedPids: new Set(), pidToTrackedSession: new Map([[1, tracked]]),
+      pidToTrackedSession: new Map([[1, tracked]]),
       resolveLifecycleDescriptor: async () => (await import('@/backends/catalog')).resolveConnectedServiceCredentialLifecycleDescriptor('claude'),
       resolveProcessGroupPid: () => 1, requestRestartSignal, restartSignalDelayMs: 0,
     });
@@ -595,7 +594,7 @@ describe('createRefreshedConnectedServiceAuthUpdatedHandler', () => {
     const tracked: TrackedSession = { pid: 1, startedBy: 'daemon', happySessionId: 's1' };
     const signal = vi.fn(() => new Promise<Readonly<{ signaled: boolean }>>(() => {}));
     const restart = createConnectedServicesAuthUpdatedRestartHandler({
-      restartRequestedPids: new Set(), pidToTrackedSession: new Map([[1, tracked]]),
+      pidToTrackedSession: new Map([[1, tracked]]),
       resolveLifecycleDescriptor: async () => (await import('@/backends/catalog')).resolveConnectedServiceCredentialLifecycleDescriptor('claude'),
       resolveProcessGroupPid: () => 1, requestRestartSignal: signal, restartSignalDelayMs: 0,
     });

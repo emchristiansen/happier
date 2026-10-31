@@ -1,5 +1,395 @@
 # Changelog
 
+## Release 2026-10-22.1 - 2026-10-22
+
+<!-- happier-release-note-projections:v1
+{
+  "expo": { "message": "Happier 0.2.17 adds Antigravity and CodeBuddy Code Agents, automatic Claude resume after usage limits, existing-state session handoff, chat code wrapping and haptics. Local voice, model pack downloads, session archiving and Claude background-task reliability are much improved. Update the native app for the refreshed runtime." },
+  "appStore": { "whatsNew": "Add Antigravity accounts and CodeBuddy Code as Agents. Claude sessions resume automatically after a usage limit resets. Continue a session from existing native state when handing it to another computer. Wrap long lines in chat code blocks, choose where unread replies appear while background work continues, and enable optional haptics for reordering. Local voice is more dependable: model packs download faster with progress and cancel, hands-free speech ends cleanly, and spoken replies are more accurate. Archiving sessions, session lists and Claude background agents are more reliable." },
+  "playStore": { "whatsNew": "New Antigravity and CodeBuddy Code Agents. Claude sessions resume after usage limits reset. Wrap long chat code lines and enable optional haptics. Local voice model packs download faster with progress and cancel. Fixes Android Sherpa speech, the splash logo, navigation-bar overlap and long-press reordering. Update the native app." },
+  "storyDeck": { "summary": "Antigravity and CodeBuddy Agents, automatic Claude resume after usage limits, wrapped chat code, and far more dependable local voice." }
+}
+-->
+
+Happier 0.2.17 adds Antigravity and CodeBuddy Code, automatic Claude resume after usage limits, handoff from existing native session state, wrapped chat code and optional haptics. It also makes local voice, session archiving and Claude background work much more dependable, and gives self-hosters OIDC token exchange, AWS web-identity storage credentials, JSON logs and a stricter proxy-trust setting.
+
+### New Agents and accounts
+
+- **CodeBuddy Code** is available as a catalog-defined Agent, with read-only mode enforced through its own permission mode.
+- **Antigravity** accounts can be connected and used for sessions, including the session modes the Agent advertises. Native provider sign-in choices are kept when you start, resume or hand off a session.
+- Catalog-defined Agents now receive the Happier session id, and custom Agent sessions can be resumed from the app.
+- MiniMax defaults to Flash, and models discovered for your account are kept.
+- OpenCode tool names stay within the 64-character model limit, and OpenCode scripting discovery gives clearer diagnostics.
+- Pi sessions show turns started by the provider and prompts injected by extensions.
+
+### Usage limits and recovery
+
+- Claude turns **resume automatically after a usage limit resets**, keeping the native provider identity.
+- Connected-service recovery keeps the selected account, restores your healthy primary account after an automatic quota fallback, and records why an account switch happened.
+- Recovery credit facts are shown with unavailable actions disabled, and quota refreshes survive navigation.
+
+### Handoff
+
+- A session can be handed to another computer **using the state that already exists there**, instead of always copying it. Happier checks that the destination supports this before stopping the source, and shows the real error in the picker when it cannot.
+
+### Chat and sessions
+
+- **Wrap long lines in chat code**, per block or as a preference, including nested code.
+- Choose where unread replies appear while a session's background work continues; replies and pending requests stay ahead of background activity.
+- Optional **haptic feedback** (device-local setting) for reordering lists, sessions and todos.
+- Archiving is more reliable: you see an archiving state, sessions whose runner is gone can still be archived, archives survive server discovery, and the confirmation setting is honored.
+- Session lists bring a row online when its runtime reattaches, remove rows that are no longer present, and show when a pinned session is not live.
+- Native approval and mode choices are shown correctly in the permission picker.
+- Messages starting with `!` reach Claude Code's bash mode.
+- Smoother typing in the composer, steadier transcript scrolling and lazier loading of unused modules.
+
+### Claude background work
+
+- Agents waiting on their own background work stay active, and stopped, failed or orphaned background tasks settle instead of hanging.
+- Stopping a session waits for the Claude process to exit, and a retry loop ends when the runner is terminated.
+- Restarting a runner that has background agents now asks first, one confirmation at a time.
+- A pending-queue deadlock that could leave queued messages undelivered is fixed.
+
+### Voice
+
+- Local voice model packs download in parallel with progress, can be cancelled with partial files discarded, and resume safely; Android no longer runs out of memory or hits 404s.
+- Hands-free speech recognition stops on trailing silence, Gemini transcription is more reliable, and Android Sherpa recognition is repaired.
+- Spoken replies include the final answer, never read unterminated code, keep links and inline code readable, and can be stopped.
+
+### Desktop, installers and platforms
+
+- Linux downloads offer package formats and compatible builds, and the desktop app starts correctly on NVIDIA Wayland.
+- Windows installation retries GitHub requests without a rejected token, supports PowerShell 5.1, and keeps the service wrapper running; service discovery lists only Happier's scheduled-task folder.
+- Bundled desktop sign-in returns to the app correctly.
+- Android: no square behind the splash logo, the new-session composer clears the navigation bar, headers stay tappable during long-press drag, text selection no longer fights scrolling, and native libraries meet the 16 KB page requirement.
+- The web scrollbar is visible at rest.
+
+### Security
+
+- Server dependencies are updated to patched versions, including Fastify, socket.io components, `ws` and Zod.
+- Forwarded client addresses are trusted only from proxies you list (see operator notes).
+
+### For self-hosters and operators
+
+- `HAPPIER_SERVER_TRUST_PROXY` now takes a comma-separated list of proxy addresses, CIDRs or `loopback`, `linklocal`, `uniquelocal`.
+- OIDC providers can exchange an access token for a Happier token without a browser at `POST /v1/auth/external/:provider/token-exchange`, once `tokenExchange.allowedClientIds` is configured. Provider config can read its client secret from a named environment variable with `clientSecretEnv`.
+- The S3 files backend supports AWS web-identity credentials (IRSA) when no static keys are set.
+- `HAPPIER_SERVER_LOG_FORMAT=json` emits newline-delimited JSON logs.
+- Kubernetes examples are corrected.
+- New opt-in `happier daemon restart-session-runners --on-update on` restarts stale session runners after a CLI update.
+
+### Compatibility and operator notes
+
+- **Action required if you set `HAPPIER_SERVER_TRUST_PROXY` to a number (for example `1`):** the server now refuses to start. Replace it with the proxy address form, such as `10.0.0.0/8` or `loopback`.
+- **Database:** the server adds a migration with two additive columns for pairing and credential support. It runs automatically; older clients are unaffected.
+- **Native app:** the app runtime moves from `0.2.8-native` to `0.2.9-native` (Unistyles and Nitro upgrades). Install the new native app to receive this release; an OTA update does not reach older native builds.
+- **Update the machine's CLI and daemon** to use Antigravity, handoff from existing state and automatic Claude resume. Older daemons keep their previous behavior.
+
+### Thank you
+
+- [@danljungstrom](https://github.com/danljungstrom) for local voice and model packs, session archiving, Claude background-task and runner-termination reliability, Android fixes and Windows installer retries across many pull requests.
+- [@wangdong233](https://github.com/wangdong233) for the pending-queue wake fix, UTF-8 daemon process scans and WebKit header dragging in [#658](https://github.com/happier-dev/happier/pull/658), [#643](https://github.com/happier-dev/happier/pull/643) and [#592](https://github.com/happier-dev/happier/pull/592).
+- [@aron-muon](https://github.com/aron-muon) for OIDC token exchange, client-secret env vars, AWS web identity, JSON logs and proxy trust in [#573](https://github.com/happier-dev/happier/pull/573), [#567](https://github.com/happier-dev/happier/pull/567), [#571](https://github.com/happier-dev/happier/pull/571), [#569](https://github.com/happier-dev/happier/pull/569) and [#576](https://github.com/happier-dev/happier/pull/576).
+- [@duanwei99](https://github.com/duanwei99) for CodeBuddy Code in [#507](https://github.com/happier-dev/happier/pull/507), and [@sergedc](https://github.com/sergedc) for Claude auto-resume after usage limits in [#513](https://github.com/happier-dev/happier/pull/513).
+- [@ravensorb](https://github.com/ravensorb) for catalog Agent session ids in [#631](https://github.com/happier-dev/happier/pull/631) and Windows scheduled-task discovery in [#543](https://github.com/happier-dev/happier/pull/543); [@Kunde21](https://github.com/Kunde21) for Pi provider-initiated turns in [#587](https://github.com/happier-dev/happier/pull/587); [@DiezelPush](https://github.com/DiezelPush) for OpenCode tool names and prompt-loop backoff in [#551](https://github.com/happier-dev/happier/pull/551) and [#556](https://github.com/happier-dev/happier/pull/556).
+- [@octo-patch](https://github.com/octo-patch) for MiniMax Flash in [#625](https://github.com/happier-dev/happier/pull/625); [@johannes-wirtz](https://github.com/johannes-wirtz) for Claude bash-mode messages in [#580](https://github.com/happier-dev/happier/pull/580); [@Jacob-Lasky](https://github.com/Jacob-Lasky) for NVIDIA Wayland in [#585](https://github.com/happier-dev/happier/pull/585); [@galinilin](https://github.com/galinilin) for Windows PowerShell 5.1 in [#549](https://github.com/happier-dev/happier/pull/549); Mani Japra for desktop OAuth return in [#564](https://github.com/happier-dev/happier/pull/564).
+
+## Release 2026-10-09.1 - 2026-10-09
+
+<!-- happier-release-note-projections:v1
+{
+  "expo": { "message": "Remote machine setup over SSH now works on a fresh machine that is not yet signed in. Fix connections to stable OpenCode servers. Claude permission changes apply during running sessions, and delivered cross-session messages are visible." },
+  "appStore": { "whatsNew": "Remote machine setup over SSH now works on a fresh machine that is not yet signed in. Fix connections to stable OpenCode servers. Claude permission changes apply during running sessions, and delivered cross-session messages are visible." },
+  "playStore": { "whatsNew": "Remote machine setup over SSH now works on a fresh machine that is not yet signed in. Fix connections to stable OpenCode servers. Claude permission changes apply during running sessions, and delivered cross-session messages are visible." }
+}
+-->
+
+### Reliability
+
+- Remote machine setup over SSH now works on a fresh machine that is not yet signed in.
+- Fix connections to stable OpenCode servers.
+- Claude permission changes apply during running sessions, and delivered cross-session messages are visible.
+
+## Release 2026-10-07.1 - 2026-10-07
+
+<!-- happier-release-note-projections:v1
+{
+  "expo": {
+    "message": "Happier 0.2.16 adds Herdr terminal sessions, commands and skills before you start a session, a choice of composer usage gauges, and account pools that prefer expiring allowances. You can customize the Happier-mark and H loading indicators, clear due reminders on open, mute phone alerts while using a computer, and stop a direct-session import. Android gains video preview and Save as, Open with and Share with the updated native app. Intel Mac and Windows installation fixes are included."
+  },
+  "appStore": {
+    "whatsNew": "Choose native commands and skills before starting a supported session. Pick the usage windows you want beside the composer and add your pinned account meters. Customize the new Happier-mark and H loading indicators with style, speed and pause controls. Due reminders clear when you open their sessions, and an optional setting silences phone alerts while you work in Happier on a computer. Follow import progress and stop an import you no longer need. Supported Herdr sessions let you follow terminal work from your phone. Queued messages and login links are more dependable."
+  },
+  "playStore": {
+    "whatsNew": "Preview videos in session files. Save downloads where you choose, open them in another app, or share them with Android's native menus. Choose composer usage gauges and native commands or skills before starting supported sessions. Customize Happier-mark and H loading indicators. Clear due reminders on open, stop a session import, and optionally mute phone alerts while working on a computer. Update the native app for the new Android file actions."
+  }
+}
+-->
+
+Happier 0.2.16 brings Herdr terminal sessions to Happier, native commands and skills before a session starts, more control over account-usage gauges, and pools that prefer expiring allowances. It also adds Android video and file actions, refreshed desktop setup, customizable loading indicators, and quieter phone notifications while you work on a computer.
+
+### Work in Herdr and follow along in Happier
+
+Herdr is now a terminal host for Happier on macOS and Linux. Start a supported session in a Herdr pane and follow the same conversation from the Happier desktop, browser or mobile app.
+
+- Run `happier herdr` to open Herdr, then start your Agent there, for example with `happier codex`. If you are already in Herdr, use its existing pane instead of opening a nested client.
+- For sessions started from the app, choose **Settings → Session → Terminal host for new sessions → Herdr**. You can override that choice for an individual computer.
+- Supported shared-control Codex and OpenCode sessions let you send messages and answer approvals from Happier while their native terminal is open. Other, exclusive-control sessions queue app messages until the terminal turn can safely hand control back.
+- Use `happier attach <session-id>` on the session's computer to return to its terminal. **Detach terminal** closes a terminal managed by Happier without ending a shared-control session; an independently opened attach client must be closed in its own terminal.
+- Use `happier resume <session-id>` to reopen a saved Herdr pane after the session has stopped or Herdr has restarted. Keep the original Happier command, account and relay available; if the original custom Herdr server cannot be found, reopen that server before retrying.
+
+Herdr requires a **stable version 0.9.2 or newer**, for both the installed executable and running server, plus the updated Happier CLI and app. It is not a native Windows terminal host. Headless Agents stay headless; choosing Herdr does not add a terminal UI to an Agent that has none. Choosing a host affects new sessions, not those already running.
+
+### Native commands and skills before you start
+
+- Type `/` or `$` in a new-session composer to discover commands or skills offered by the selected Agent, computer, project and connected account, where supported.
+- Your local suggestions stay available while native suggestions load, so you can keep composing.
+- Selecting a native skill uses that Agent's skill directly without adding a copy to your Happier library.
+- OpenCode native commands keep their arguments and supported attachments when sent from Happier.
+
+Discovery requires the Agent and its login to be ready on the computer; it does not install the Agent or open a login browser. Older daemons keep local suggestions.
+
+### See the account usage that matters to you
+
+- Choose which usage windows appear beside the composer in **Settings → Connected services → Provider usage → Gauge windows**. Show several available windows together, or keep the default **Most constrained** gauge.
+- Pin account meters to add them beside the session's gauges as well as in account summaries.
+- Read labeled context and account-usage rings, including Claude's five-hour and weekly allowances when reported. Ring numbers show what is left; details show usage and reset information.
+- Show or hide usage gauges and their labels from either Connected services or Session's provider-usage settings.
+- Empty quota placeholders no longer look like measured capacity. Reported windows without a percentage remain in details when they contain useful information.
+- Claude usage details keep the separate allowances reported by Claude instead of losing them when a limit is reached or a usage check fails.
+
+Usage depends on what the Agent or connected service reports and on your server enabling usage visibility. Pooled sessions show only the pool's selected allowances; a missing window does not turn into a gauge for a different period.
+
+### Prefer allowances that expire sooner
+
+- Choose **Expiring quota first** for an account pool to prefer usable allowances whose reset or non-renewing subscription end is sooner, while respecting the pool's low-quota threshold.
+- New pools use this strategy on supporting servers; existing saved strategy choices stay unchanged.
+- The pool chooses when a switch is needed rather than scheduling extra account swaps or restarting the Agent just because a date is approaching.
+
+The option requires an updated server with account pools enabled and an updated daemon. Missing or stale expiry information does not make an account look more urgent.
+
+### Android videos and file actions
+
+- Preview supported session videos in the file view, with playback controls, seeking and fullscreen. Codec support depends on your device; the file downloads before playback starts.
+- Use **Save as…** to choose where Android keeps a downloaded file, including downloads started from the file tree.
+- Use **Open with…** to choose another installed app for a session file.
+- Use **Share…** to send a downloaded file through Android's share menu.
+- Cancel a transfer while it downloads, or use the system dialog's cancel control after a save picker, chooser or share sheet opens. Canceling Save as leaves no saved file.
+- If a save fails, Happier tries to remove the incomplete document; if Android's document provider refuses, the error tells you which document needs removing.
+
+Opening and sharing use a cached copy, not a permanent saved download. Use **Save as…** to keep a file. These Android actions require the updated native app, not just an over-the-air update.
+
+### A clearer desktop setup and menu bar
+
+- Guided setup shows what this computer needs to connect and lets you continue after navigating away or changing the chosen CLI.
+- See this computer's connections and start, restart or stop Happier-managed background services from the desktop's connection controls and tray/menu bar.
+- Choose whether background services start at login or only when needed. With login startup enabled, quitting the window can leave Happier in the menu bar and keep your sessions available.
+- Choose **Stop background services and quit** when you want them stopped; Happier asks before ending sessions it can see, or when it cannot tell whether work is still running.
+- Removing a relay explains what will happen to this computer and its sessions before you confirm. Services you set up independently are left alone.
+
+### Your loading indicators, reminders and notifications
+
+- Choose dot-based **Happier-mark** or **H** loading styles with live previews in **Settings → Appearance → Loading Indicator**, or keep **Classic Ring**.
+- Adjust loading-indicator speed and the pause between loops. Controls that do not apply to a style are disabled, and indicators respect Reduce Motion.
+- Opening a session clears its due reminder by default, without clearing future reminders. Turn off **Settings → Session → Clear reminders on open** to handle reminders manually.
+- Enable the notification setting to mute phone pushes while Happier is focused on a computer. Phone delivery continues when computer focus cannot be established.
+- Terminal setup, login and installers now show an animated Braille planet and clearer step-by-step progress.
+
+### Control sessions without losing your place
+
+- Follow a direct-session import's progress and use **Stop** if you no longer want it to continue. History already imported remains available; the UI shows when cancellation or an import failure occurs.
+- Use session handoff to continue in a different working directory on the same computer, keeping the session and conversation. Choose the current computer and a different destination directory; this requires an updated daemon. File transfer defaults off.
+- Agents with native goal support can recover a blocked goal through Happier tools by reading, clearing and replacing it. If clearing requires your approval, they wait for your decision.
+- Use **Steer now** to deliver a queued message without interrupting the Agent, including while it is idle. If steering becomes unavailable before submission, the message waits for the next safe input; **Send now** keeps its interrupting behavior.
+- Model, permission-mode and reasoning controls reflect what the Agent is actually using rather than treating a requested change as already applied.
+- Happier now recognizes Claude Sonnet 5.5 in the model picker, with model-specific context and reasoning-effort controls. Availability still depends on your connected account.
+- OpenCode V2 can apply idle model, reasoning and agent-mode changes without another prompt, including before opening its terminal. V1 keeps those changes for the next prompt sent through Happier.
+- CLI scripts can choose a message reference with `happier session send <session-id> "ping" --local-id board-wake-42 --json`, making it easier to find that send in history and correlate retries. Use a nonblank value that does not start with `-` or the reserved `agent-transition:` prefix.
+- Codex connected accounts retain native hooks and their enabled or disabled choices. Previously trusted unchanged hooks remain usable, while edited hooks still require Codex's trust checks.
+- Linked or copied connected-account configuration now includes Claude's user-level `CLAUDE.md` and Codex's installed plugins. Isolated configuration stays isolated.
+- On managed Codex installations that reject Auto approval settings, Happier can fall back to asking you for review without relaxing the workspace sandbox. Auto review is unavailable on that path; if Codex also rejects manual review, the policy error is shown.
+
+### Reliability fixes you will notice
+
+- Intel Macs could fail to install because the signature-checking download supported only Apple Silicon. The macOS installer now uses a build that supports both architectures.
+- Intel desktop setup could receive an Apple Silicon setup helper. Intel bundles now include the Intel helper.
+- Windows installation could stop while checking temporary files or an empty background-service list. Those cases now complete without being treated as errors.
+- On Windows PowerShell 5.1, an installer command could lose its exit result after redirected output completed. Installation now reports the command's actual result rather than a misleading cleanup failure.
+- Windows user-mode background services now register for the signed-in user without asking for a password or administrator access.
+- Windows installation could fail when moving the CLI into place, particularly from temporary paths containing spaces. The installer can now finish that step with the compiled CLI.
+- A queued message could leave an idle Agent waiting even though the message was ready. It now wakes the Agent without depending on a later connection update.
+- Reconnecting no longer brings already-delivered messages back into the pending list.
+- ACP sign-in could lose browser links printed near the end of login. Those links and login output now remain visible through completion.
+- Permission prompts no longer remain waiting after the Agent accepts your answer.
+- OpenCode resume can recover completed terminal messages missing from Happier without duplicating messages already shown. If older history cannot be matched safely, an incomplete-history notice explains the limitation.
+- Codex handoff keeps the earlier history needed to continue the transferred conversation and reports conflicts instead of overwriting a different conversation.
+- Resumed sessions keep their selected startup model, reasoning and permission choices before the first new message.
+- Desktop pairing links now open the intended pairing screen, including links received during startup.
+- File links work in the packaged desktop app and keep the correct screen when navigating back through history.
+- Windows desktop setup can launch its setup helper; titlebar double-click and header buttons work again.
+- Tray menu actions no longer crash the desktop app on an invalid icon.
+- CLI updates keep the chosen Happier home and relay instead of restarting a different installation's service.
+- Pi installations in vendor locations are detected; a missing Pi CLI produces an actionable message.
+- CLI login status and repair messages check the selected relay profile instead of showing another profile's sign-in status.
+- Detached tmux sessions keep their configured size, and newly started Zellij servers keep the launch environment needed by the session.
+- Canceled downloads remain canceled rather than becoming generic failures; failed exports clean up temporary files where the platform allows it.
+- On iOS, files shared out of Happier are cleaned up after the share finishes instead of accumulating unnecessarily.
+- Text in AI option pills can be selected and copied on web and desktop instead of needing to be retyped.
+- Settings cards adapt their columns to the space available.
+- Modal lists keep their content height instead of collapsing inside a card.
+- Pet tiles stay inside narrow panes.
+- The desktop **Updates** button now sits next to back and forward navigation.
+- When you choose another Agent to continue a session, the composer shows that Agent's requested account defaults and permission choices, and its model picker uses the configured connected account. The running Agent's model, mode, configuration and MCP controls are hidden while the switch is selected.
+- With permission changes set to apply on the next prompt, continuing with another Agent carries the permission choice selected for that message. If an older daemon lacks support, or support cannot be confirmed, your draft and selected Agent stay available. A newer permission choice remains pending for a later prompt.
+- Messages sent with attachments to a replacement Agent retain that Agent's selected reasoning settings.
+- Claude terminal sessions now wait for a slow prompt paste to finish before submitting it, and stop waiting once the prompt is accepted, its queued message is canceled, or the session stops. An accepted prompt stays successful even if Happier cannot read the terminal to check the paste.
+- Linux Agent launches respect an inherited lower scheduling priority, avoiding launch failures when Happier cannot raise it.
+- If desktop setup fails, the headline names the failed step when it is known.
+- If Happier already knows it cannot fetch the session for a direct handoff, it refuses the handoff immediately instead of accepting it and failing later.
+- After switching Agents, you can choose another Agent again, including after reopening the session. A newer draft or Agent choice is preserved when the earlier switch finishes.
+- **Move to folder** now works for individual sessions and bulk selections even when folder view is off. Errors are shown instead of the action silently doing nothing.
+
+### Thank you
+
+- [@Rui-li023](https://github.com/Rui-li023) for Claude usage windows and labeled usage rings in [#440](https://github.com/happier-dev/happier/pull/440).
+- [@clemenssautter-ai](https://github.com/clemenssautter-ai) for `session send --local-id` and Codex hook continuity in [#436](https://github.com/happier-dev/happier/pull/436) and [#442](https://github.com/happier-dev/happier/pull/442).
+- [@Nul-led](https://github.com/Nul-led) for Android video preview and file actions in [#487](https://github.com/happier-dev/happier/pull/487).
+- [@sergedc](https://github.com/sergedc) for selectable AI option text and Claude Sonnet 5.5 support in [#500](https://github.com/happier-dev/happier/pull/500) and [#502](https://github.com/happier-dev/happier/pull/502).
+- [@AmT42](https://github.com/AmT42) for restoring Agent choices after a session switch in [#499](https://github.com/happier-dev/happier/pull/499).
+- [@schjonhaug](https://github.com/schjonhaug) for same-computer directory handoff and folder moves with folder view off in [#504](https://github.com/happier-dev/happier/issues/504) and [#501](https://github.com/happier-dev/happier/issues/501).
+- [@artman-shane](https://github.com/artman-shane) for native-goal recovery through Happier tools in [#505](https://github.com/happier-dev/happier/issues/505).
+
+Thank you also to [@fredericrous](https://github.com/fredericrous) and [@emcp-dev](https://github.com/emcp-dev) for the adopted Mac and Windows installation diagnoses; [@TomySpagnoletti](https://github.com/TomySpagnoletti) for desktop pairing and shared account configuration; [@karolzlot](https://github.com/karolzlot) for terminal recovery; [@Kunde21](https://github.com/Kunde21) for Pi installation detection; [@alfdupont](https://github.com/alfdupont), [@wcollani](https://github.com/wcollani) and [@hazem3500](https://github.com/hazem3500) for Agent controls and authentication fixes; and Ash Berlin-Taylor for Codex direct-session attachment. Their incorporated contributions are credited in the relevant commits.
+
+### Compatibility and operator notes
+
+- **Android:** install the new native app for file actions. Its runtime is `0.2.8-native`; an OTA update cannot add these features to `0.2.7-native` and must not be forced onto that runtime.
+- **Direct-session import:** update the machine's CLI/daemon to use import progress and Stop. Older daemons report that an update is needed for this operation.
+- **Self-hosted pools:** update the server and daemon for Expiring quota first. Before rolling the server back, change pools using that strategy to Least limited, Priority or Manual with the current server. No database schema migration is added by this release.
+
+## Release 2026-09-30.1 - 2026-09-30
+
+<!-- happier-release-note-projections:v1
+{
+  "expo": {
+    "message": "Happier 0.2.15 keeps custom session reminders usable on older iOS and Android apps: manual date/time entry remains available when their native picker is missing. Apps with the picker retain native selection."
+  },
+  "appStore": {
+    "whatsNew": "Happier 0.2.15 keeps custom session reminders usable on older iOS and Android apps: manual date/time entry remains available when their native picker is missing. Apps with the picker retain native selection."
+  },
+  "playStore": {
+    "whatsNew": "Happier 0.2.15 keeps custom session reminders usable on older iOS and Android apps: manual date/time entry remains available when their native picker is missing. Apps with the picker retain native selection."
+  }
+}
+-->
+
+Happier 0.2.15 keeps custom session reminders usable on older mobile app installations after an OTA update.
+
+### Session reminders on older mobile apps
+
+- When an installed iOS or Android app lacks the native calendar/time picker, custom reminders retain manual date/time entry instead of attempting to load the unavailable picker.
+- Apps with the picker retain native selection. The web picker is unchanged.
+
+### Compatibility
+
+No new wire format or database migration is introduced. Server and server-runner move to 0.2.15 because they bundle the updated UI; CLI and Stack remain at 0.2.14. OTA updates do not add native modules, which still require a native app update.
+
+## Release 2026-09-29.2 - 2026-09-29
+
+<!-- happier-release-note-projections:v1
+{
+  "expo": {
+    "message": "Happier 0.2.14 brings experimental Devin, Antigravity (Agy), FX, and Factory Droid sessions to refreshed preview and stable builds, and improves Codex takeover, relay installation, setup, updates, and session recovery."
+  },
+  "appStore": {
+    "whatsNew": "Happier 0.2.14 brings experimental Devin, Antigravity (Agy), FX, and Factory Droid sessions to refreshed preview and stable builds, and improves Codex takeover, relay installation, setup, updates, and session recovery."
+  },
+  "playStore": {
+    "whatsNew": "Happier 0.2.14 brings experimental Devin, Antigravity (Agy), FX, and Factory Droid sessions to refreshed preview and stable builds, and improves Codex takeover, relay installation, setup, updates, and session recovery."
+  }
+}
+-->
+
+Happier 0.2.14 carries the 0.2.13 improvements into refreshed preview and stable builds, while fixing Codex session takeover, self-hosted relay installation, and the Agent directory.
+
+### Devin, Antigravity (Agy), FX, and Factory Droid
+
+Experimental sessions for these four Agents are included in the refreshed builds. Devin supports follow-ups and resumable work; Agy uses its ACP server; FX and Droid use their locally installed CLIs and advertise their supported models and modes. Provider installation and sign-in still happen on the computer running the Agent.
+
+### Sessions, setup, and updates
+
+The 0.2.13 guided computer setup, clearer update states, session reminders, account-pool controls, and redacted diagnostics remain included. This patch also keeps live Codex App Server ownership intact during takeover and settles the session when its proxy exits.
+
+### CLI and website fixes
+
+Self-hosted relay installation now accepts the `current` payload symlink created by Happier’s installer. Invalid tar links are rejected without leaving a partial extracted payload or an unhandled gzip error. The website now lists all shipped Agent integrations and aligns its Kimi, Cursor, and other capability claims with the shipped manifests.
+
+### Compatibility
+
+This patch introduces no new wire format or database migration. The compatibility notes for the 0.2.13 features, including session reminders and local draft migration, still apply.
+
+## Release 2026-09-29.1 - 2026-09-29
+
+<!-- happier-release-note-projections:v1
+{
+  "expo": {
+    "message": "Happier 0.2.13 adds experimental Devin, Antigravity, FX, and Factory Droid sessions, guided computer setup, clearer updates, session reminders, stronger recovery, account-pool controls, and redacted diagnostics export."
+  },
+  "appStore": {
+    "whatsNew": "Happier 0.2.13 adds experimental Devin, Antigravity, FX, and Factory Droid sessions, guided computer setup, clearer updates, session reminders, stronger recovery, account-pool controls, and redacted diagnostics export."
+  },
+  "playStore": {
+    "whatsNew": "Happier 0.2.13 adds experimental Devin, Antigravity, FX, and Factory Droid sessions, guided computer setup, clearer updates, session reminders, stronger recovery, account-pool controls, and redacted diagnostics export."
+  }
+}
+-->
+
+Happier 0.2.13 introduces experimental Devin, Antigravity (Agy), FX, and Factory Droid sessions. It also makes computer setup and updates easier to follow, adds session reminders, and strengthens recovery when connections, daemons, or provider sessions are interrupted.
+
+### New experimental Agents: Devin, Antigravity, FX, and Factory Droid
+
+- **Devin CLI:** Start and resume sessions, send follow-ups, cancel work, and run Happier execution runs. Model, reasoning-effort, and speed choices appear when Devin advertises them; Happier does not guess unsupported choices.
+- **Antigravity (Agy):** Start and resume sessions through its ACP server, change advertised models, and run execution runs. On supported platforms, Happier acquires the pinned ACP server. Its ACP login is separate from login to the interactive `agy` CLI.
+- **FX:** Use a locally installed `fx` CLI for new and resumed sessions, execution runs, and provider-advertised models and modes. Where FX reports saved sessions, the new-session flow can list them for *resume*; listing does not imply live terminal takeover.
+- **Factory Droid:** Use a locally installed Droid CLI for new and resumed sessions, execution runs, MCP tools, and the model, reasoning, and autonomy choices Droid advertises.
+- Provider installation and authentication still happen on the computer running the Agent. Unsupported platforms or missing provider capabilities fail visibly rather than being presented as available.
+
+### OpenCode, Codex, Claude, and session control
+
+- OpenCode can negotiate its V1 or V2 server API. An Auto/Stable/V2 preference lets users select the intended installation without treating an executable’s name as proof of its API version.
+- Codex local terminal control and Happier’s daemon can share the same App Server session. Asynchronous Codex questions can be answered after the session resumes.
+- Claude queued follow-ups and in-flight steering use provider evidence to settle delivery, improving continuity through reconnects and native queue transitions.
+- Agent model and mode selections increasingly come from the running provider’s advertised capabilities rather than a static list.
+
+### Guided setup and actionable updates
+
+- Desktop’s Home setup flow shows what this computer needs, the current setup stage, download progress, and a focused recovery action when its CLI is missing or too old.
+- The Updates surface distinguishes available, running, completed, failed, unchecked, and offline states for the app and connected computers. It does not call an uncontacted computer “up to date.”
+- CLI and first-party runtime acquisition support progress and cancellation. Managed CLI replacement more carefully preserves daemon/service ownership and restarts the service that actually belongs to the installation.
+- Guided CLI onboarding improves executable discovery, relay selection, and explicit replacement of existing pairing credentials.
+
+### Sessions, reminders, drafts, and review
+
+- Set a session aside until a reminder time; it can return to the attention inbox without losing its previous standing.
+- Browser session drafts and pending sends use durable local storage and recover more reliably across reloads, reconnects, and interrupted migration.
+- Transcript catch-up better preserves reading position and message continuity when direct and relay sources change or a connection briefly drops. Collapsing a transcript row releases its old height instead of leaving a gap.
+- Rollback actions are tied to turns the active Agent reports as eligible, rather than offering a control for an unsupported turn.
+- Desktop sessions gain a compact action rail for Git, review, terminal, and running-Agent activity.
+
+### Connected Services, privacy, and diagnostics
+
+- Account pools can select which provider-reported quota allowances govern usage and recovery, while retaining account and subscription context in the display.
+- Account settings can require end-to-end encryption; a session that does not satisfy that requirement is not silently accepted as plaintext.
+- The app and CLI can export a redacted diagnostics bundle for a bug report, including a local fallback when report submission is unavailable.
+
+### Downloads and documentation
+
+- The website adds a localized download hub, and the docs include setup and capability guidance for the newly supported Agents.
+
+### Compatibility and self-hosting
+
+The server adds nullable session-reminder fields. New optional client/server features are negotiated rather than assumed. After upgrading the web app, reload older open tabs that hold local drafts; concurrent editing from an unupgraded tab during draft migration is not supported. If a self-hosted operator enables the new automatic account-pool policy for plan-incompatible accounts, rolling that database back to an older server requires explicit policy reconciliation.
+
 ## Release 2026-09-07.1 - 2026-09-07
 
 <!-- happier-release-note-projections:v1

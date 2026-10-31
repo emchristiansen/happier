@@ -30,6 +30,11 @@ function terminal(overrides: Partial<ActionOperationSnapshotV1> = {}): ActionOpe
 }
 
 describe('delegateSessionHandoffToSourceDaemon', () => {
+    it('sends the explicit no-copy policy to the daemon instead of falling back to transfer', async () => {
+        const machineRpc = vi.fn(async () => admission);
+        await delegateSessionHandoffToSourceDaemon({ accountId: 'account-1', sourceMachineId: 'machine-1', targetMachineId: 'machine-2', sessionId: 'session-1', sessionStorageMode: 'persisted', requestId: 'request-1', stateTransfer: 'existing' }, { machineRpc, observeTerminal: async () => terminal() });
+        expect(machineRpc).toHaveBeenCalledWith(expect.objectContaining({ payload: expect.objectContaining({ stateTransfer: 'existing' }) }));
+    });
     it('subscribes before one admission call and returns the pushed terminal result', async () => {
         const order: string[] = [];
         const observeTerminal = vi.fn(async () => {

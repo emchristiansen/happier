@@ -179,10 +179,6 @@ test.describe('ui e2e: transcript background/foreground catch-up (visibility)', 
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        // NOTE: DB lastActiveAt updates are throttled (60s), so keep this comfortably above that, as auth.terminalConnect.daemon.spec.ts notes.
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
       },
     });
 
@@ -221,7 +217,7 @@ test.describe('ui e2e: transcript background/foreground catch-up (visibility)', 
   });
 
   test('catches up transcript after simulated tab hidden/visible', async ({ page }) => {
-    test.setTimeout(540_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     await installViewportTelemetryOverride(page);
@@ -362,22 +358,22 @@ test.describe('ui e2e: transcript background/foreground catch-up (visibility)', 
     const transcript = page.getByTestId('transcript-chat-list');
     await transcript.hover();
 
-    // Seed enough messages to make the list scrollable.
-    for (let i = 0; i < 24; i += 1) {
-      const message = `seed scroll ${i} ${run.runId}`;
-      const sendEnvelope = await runCliJson({
-        testDir,
-        cliHomeDir,
-        serverUrl: server.baseUrl,
-        webappUrl: uiBaseUrl,
-        env: { ...process.env, HOME: cliHomeDir },
-        label: `session-send-seed-scroll-${i}`,
-        args: ['session', 'send', sessionId, message, '--json'],
-        timeoutMs: 120_000,
-      });
-      expect(sendEnvelope.ok).toBe(true);
-      expect(sendEnvelope.kind).toBe('session_send');
-    }
+    // This seed only supplies scrollable content; the separate prompts above and below prove
+    // catch-up. Preserve the seed text in one multiline CLI prompt so process startup does not
+    // consume the viewport journey's budget once per filler paragraph.
+    const scrollSeed = Array.from({ length: 12 }, (_, i) => `seed scroll ${i} ${run.runId}`).join('\n\n');
+    const seedEnvelope = await runCliJson({
+      testDir,
+      cliHomeDir,
+      serverUrl: server.baseUrl,
+      webappUrl: uiBaseUrl,
+      env: { ...process.env, HOME: cliHomeDir },
+      label: 'session-send-seed-scroll',
+      args: ['session', 'send', sessionId, scrollSeed, '--json'],
+      timeoutMs: 120_000,
+    });
+    expect(seedEnvelope.ok).toBe(true);
+    expect(seedEnvelope.kind).toBe('session_send');
 
     // Scroll upward to become unpinned.
     for (let i = 0; i < 12; i += 1) {

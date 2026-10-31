@@ -860,19 +860,7 @@ describe('useNewSessionScreenModel (draft hydration — core)', () => {
         let model: any = null;
         await renderNewSessionScreenModel((nextModel) => { model = nextModel; });
 
-        expect(machineMcpServersPreviewMock).toHaveBeenCalledWith(
-            'machine-2',
-            expect.objectContaining({
-                agentId: 'claude',
-                directory: '/repo/custom',
-                selection: expect.objectContaining({
-                    managedServersEnabled: false,
-                    forceIncludeServerIds: ['server-portable'],
-                    forceExcludeServerIds: ['server-disabled'],
-                }),
-            }),
-            expect.anything(),
-        );
+        expect(machineMcpServersPreviewMock).not.toHaveBeenCalled();
         expect(Array.isArray(model?.simpleProps?.agentInputExtraActionChips)).toBe(true);
         expect(model?.simpleProps?.agentInputExtraActionChips.some((chip: any) => chip?.key === 'new-session-mcp')).toBe(true);
         expect(model?.simpleProps?.agentInputExtraActionChips.find((chip: any) => chip?.key === 'new-session-mcp')?.controlId).toBe('mcp');

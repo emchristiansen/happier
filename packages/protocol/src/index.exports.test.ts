@@ -9,6 +9,10 @@ import type {
 import * as protocol from './index.js';
 
 describe('protocol package root exports', () => {
+    it('exports the consumed terminal-host setup detail schema through the public root', () => {
+        const detail = { kind: 'terminal_host_unavailable', host: 'herdr', reason: 'server_version_unsupported' };
+        expect(protocol.TerminalHostUnavailableSpawnErrorDetailSchema.parse(detail)).toEqual(detail);
+    });
     it('exports the unsuffixed session runtime activity contracts', () => {
         expectTypeOf<SessionRuntimeActivityProjection>().not.toBeNever();
         expectTypeOf<SessionRuntimeActivitySnapshot>().not.toBeNever();
@@ -128,10 +132,41 @@ describe('protocol package root exports', () => {
         expect(protocol.DirectSessionsProviderIdSchema.parse('claude')).toBe('claude');
         expect(protocol.DirectSessionsProviderIdSchema.parse('opencode')).toBe('opencode');
         expect(protocol.DirectSessionsProviderIdSchema.parse('pi')).toBe('pi');
+        expect(protocol.DirectSessionsProviderIdSchema.parse('devin')).toBe('devin');
+        expect(protocol.DirectSessionsProviderIdSchema.parse('auggie')).toBe('auggie');
+        expect(protocol.DirectSessionsProviderIdSchema.parse('qwen')).toBe('qwen');
+        expect(protocol.DirectSessionsProviderIdSchema.parse('kilo')).toBe('kilo');
+        expect(protocol.DirectSessionsProviderIdSchema.parse('copilot')).toBe('copilot');
         expect(protocol.DirectSessionsSourceSchema.safeParse({ kind: 'piAgentDir' }).success).toBe(true);
         expect(protocol.DirectSessionsSourceSchema.safeParse({ kind: 'piAgentDir', agentDir: '/custom/.pi/agent' }).success).toBe(true);
         expect(protocol.DirectSessionsSourceSchema.safeParse({ kind: 'piAgentDir', agentDir: '' }).success).toBe(false);
         expect(typeof protocol.DirectSessionsCandidatesListRequestSchema?.safeParse).toBe('function');
+        expect(protocol.DirectSessionsAcpSessionListCapabilityResponseSchema.parse({
+            ok: true,
+            capability: 'acp_session_list_v1',
+            protocolVersion: 1,
+            sourceKind: 'acpSessionList',
+            resumeOnly: true,
+        })).toEqual({
+            ok: true,
+            capability: 'acp_session_list_v1',
+            protocolVersion: 1,
+            sourceKind: 'acpSessionList',
+            resumeOnly: true,
+        });
+        expect(protocol.DirectSessionsCandidatesListResponseSchema.safeParse({
+            ok: true,
+            candidates: [],
+            nextCursor: null,
+            capabilities: { deleteCandidate: true },
+        }).success).toBe(true);
+        expect(protocol.DirectSessionCandidateDeleteRequestSchema.safeParse({
+            machineId: 'machine-1',
+            providerId: 'kimi',
+            source: { kind: 'acpSessionList' },
+            remoteSessionId: 'provider-session-1',
+        }).success).toBe(true);
+        expect(protocol.DirectSessionCandidateDeleteResponseSchema.safeParse({ ok: true, deleted: true }).success).toBe(true);
         expect(typeof protocol.DirectTranscriptPageRequestSchema?.safeParse).toBe('function');
         expect(typeof protocol.DirectTranscriptReadAfterRequestSchema?.safeParse).toBe('function');
         expect(typeof protocol.DirectSessionLinkEnsureRequestSchema?.safeParse).toBe('function');

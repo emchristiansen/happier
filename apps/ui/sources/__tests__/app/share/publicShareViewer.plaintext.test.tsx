@@ -98,6 +98,52 @@ describe('PublicShareViewerScreen (plaintext)', () => {
         expect(resolvePublicShareTokenParam(':token', '/share/web-token-1')).toBe('web-token-1');
     });
 
+    it.each([
+        { hasMore: false, completedQuestions: 1 },
+        { hasMore: true, completedQuestions: 0 },
+        { hasMore: undefined, completedQuestions: 0 },
+    ])('projects historical completed questions only for explicitly complete public history ($hasMore)', async ({ hasMore, completedQuestions }) => {
+        serverFetchSpy
+            .mockResolvedValueOnce({
+                ok: true, status: 200,
+                json: async () => ({
+                    session: {
+                        id: 's1', seq: 3, encryptionMode: 'plain', createdAt: 1, updatedAt: 3,
+                        active: false, activeAt: 3, metadata: JSON.stringify({ path: '/repo', host: 'devbox' }),
+                        metadataVersion: 1, agentStateVersion: 1,
+                        agentState: JSON.stringify({ completedRequests: {
+                            'old-question': {
+                                tool: 'AskUserQuestion', arguments: { questions: [{ question: 'Choose a mode' }] },
+                                createdAt: 1, completedAt: 2, status: 'approved', answers: { 'Choose a mode': 'Fast' },
+                            },
+                        } }),
+                    },
+                    owner: { id: 'u1', username: 'alice', firstName: null, lastName: null, avatar: null },
+                    accessLevel: 'view', encryptedDataKey: null, isConsentRequired: false,
+                }),
+            })
+            .mockResolvedValueOnce({
+                ok: true, status: 200,
+                json: async () => ({
+                    ...(hasMore === undefined ? {} : { hasMore }),
+                    messages: [{
+                        id: 'm3', seq: 3, localId: null, createdAt: 3, updatedAt: 3,
+                        content: { t: 'plain', v: { role: 'user', content: { type: 'text', text: 'Latest message' } } },
+                    }],
+                }),
+            });
+        const { default: PublicShareViewerScreen } = await import('@/app/(app)/share/[token]');
+        await renderScreen(<PublicShareViewerScreen />);
+        await flushHookEffects({ cycles: 1, turns: 1 });
+        const messages = transcriptListSpy.mock.calls.at(-1)?.[0]?.messages;
+        expect(messages).toEqual(expect.any(Array));
+        const questions = messages.filter((message: { kind: string; tool?: { name: string } }) => (
+            message.kind === 'tool-call' && message.tool?.name === 'AskUserQuestion'
+        ));
+        expect(questions).toHaveLength(completedQuestions);
+        if (completedQuestions) expect(questions[0].tool.result).toEqual({ answers: { 'Choose a mode': 'Fast' } });
+    });
+
     it('does not attempt DEK decryption for plaintext sessions', async () => {
         serverFetchSpy
             .mockResolvedValueOnce({

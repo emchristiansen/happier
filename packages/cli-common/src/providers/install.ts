@@ -13,10 +13,11 @@ import type {
 } from '@happier-dev/agents';
 import { getProviderCliRuntimeSpec } from '@happier-dev/agents';
 import { fetchGitHubLatestRelease } from '@happier-dev/release-runtime';
+import { ArchiveExpandedByteLimitError } from '@happier-dev/release-runtime/archiveExtraction';
 
 import { withWorkspaceBundleLock } from '../../workspaceBundleLock.mjs';
 
-import { commandExistsOnPath, resolveWindowsCommandInvocation } from '../process/index.js';
+import { commandExistsOnPath, runCommandCapture } from '../process/index.js';
 import { createManagedToolScratchDir } from './createManagedToolScratchDir.js';
 import { downloadGitHubReleaseAsset } from './downloadGitHubReleaseAsset.js';
 import { extractGitHubReleaseAsset } from './extractGitHubReleaseAsset.js';
@@ -31,7 +32,10 @@ import {
   resolveProviderCliCommand,
   resolveProviderCliManagedCommandPath,
   resolveProviderCliManagedCommandRelativePath,
+  type ProviderCliCommandResolution,
 } from './resolution.js';
+import { resolveProviderInstallCommandTimeoutMs } from './installCommandTimeout.js';
+import { classifyProviderCliInstall } from './update.js';
 
 export type ProviderCliInstallCommand = Readonly<{
   cmd: string;
@@ -41,6 +45,7 @@ export type ProviderCliInstallCommand = Readonly<{
 }>;
 
 export type ProviderCliInstallMode = 'vendor_recipe' | 'managed_package' | 'github_release_binary';
+export type ProviderCliInstallIntent = 'install' | 'update';
 
 export type ProviderCliInstallPlan = Readonly<{
   providerId: AgentId;
@@ -69,7 +74,9 @@ export type InstallProviderCliResult =
         | 'command-exec-failed'
         | 'command-timed-out'
         | 'command-failed'
-        | 'managed-runtime-unavailable';
+        | 'archive-expanded-byte-limit'
+        | 'managed-runtime-unavailable'
+        | 'update-not-available';
       errorMessage: string;
       plan: ProviderCliInstallPlan | null;
       logPath: string | null;
@@ -83,7 +90,10 @@ type InstallProviderCliDeps = Readonly<{
   ensureManagedJavaScriptRuntimeCommand?: typeof ensureManagedJavaScriptRuntimeCommand;
   removeManagedInstallPath?: typeof rm;
   renameManagedInstallPath?: typeof rename;
+  /** Short, bounded platform probes only (libc/CPU feature checks). */
   spawnSync?: typeof spawnSync;
+  /** Long-running install/update commands; async so the daemon event loop stays free. */
+  runCommand?: typeof runCommandCapture;
 }>;
 
 const MANAGED_RETIRED_INSTALL_DIRECTORY_PATTERN =
@@ -172,18 +182,23 @@ async function promoteVersionedManagedInstallCandidate(params: Readonly<{
   });
 }
 
-async function promoteManagedInstallCandidate(params: Readonly<{
+export type ManagedInstallPromotionDeps = Readonly<{
+  removeManagedInstallPath?: typeof rm;
+  renameManagedInstallPath?: typeof rename;
+}>;
+
+export async function promoteManagedInstallCandidate(params: Readonly<{
   installRoot: string;
   candidateDir: string;
   logPath: string;
-  deps: InstallProviderCliDeps;
+  deps?: ManagedInstallPromotionDeps;
   activateVersionedRelease?: boolean;
 }>): Promise<void> {
   const currentDir = join(params.installRoot, 'current');
   const previousDir = join(params.installRoot, `previous-${randomUUID()}`);
   const activePath = join(params.installRoot, 'active');
-  const removePath = params.deps.removeManagedInstallPath ?? rm;
-  const renamePath = params.deps.renameManagedInstallPath ?? rename;
+  const removePath = params.deps?.removeManagedInstallPath ?? rm;
+  const renamePath = params.deps?.renameManagedInstallPath ?? rename;
 
   await mkdir(params.installRoot, { recursive: true });
   let waitReported = false;
@@ -421,10 +436,6 @@ function buildVendorRecipePath(providerId: AgentId, env: NodeJS.ProcessEnv): str
     .split(delimiter)
     .map((value) => value.trim())
     .filter(Boolean);
-  if (process.platform === 'win32') {
-    return currentEntries.join(delimiter);
-  }
-
   const homeDir = typeof env.HOME === 'string' ? env.HOME.trim() : '';
   if (!homeDir) {
     return currentEntries.join(delimiter);
@@ -445,14 +456,47 @@ function buildVendorRecipePath(providerId: AgentId, env: NodeJS.ProcessEnv): str
   return [...uniqueEntries].join(delimiter);
 }
 
-function resolveVendorInstallTimeoutMs(env: NodeJS.ProcessEnv): number {
-  const raw = typeof env.HAPPIER_VENDOR_INSTALL_TIMEOUT_MS === 'string'
-    ? env.HAPPIER_VENDOR_INSTALL_TIMEOUT_MS.trim()
-    : '';
-  if (raw === '0') return 0;
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed < 250) return 180_000;
-  return Math.min(parsed, 900_000);
+
+type LoggedCommandOutcome =
+  | Readonly<{ kind: 'exited'; status: number | null; signal: NodeJS.Signals | null; stderr: string }>
+  | Readonly<{ kind: 'timed-out'; timeoutMs: number }>
+  | Readonly<{ kind: 'exec-failed'; message: string }>;
+
+/**
+ * The single runner for long-running provider install/update commands: vendor
+ * recipes, native vendor updaters and the managed `pnpm add`. It runs through the
+ * async process owner so a slow installer never blocks the daemon event loop, and
+ * logs every command. `timeoutMs <= 0` means no timeout.
+ */
+async function runLoggedProviderCommand(params: Readonly<{
+  cmd: string;
+  args: ReadonlyArray<string>;
+  env: NodeJS.ProcessEnv;
+  cwd?: string;
+  logPath: string;
+  timeoutMs: number;
+  runCommand: typeof runCommandCapture;
+}>): Promise<LoggedCommandOutcome> {
+  const result = await params.runCommand({
+    cmd: params.cmd,
+    args: params.args,
+    env: params.env,
+    ...(params.cwd ? { cwd: params.cwd } : {}),
+    timeoutMs: params.timeoutMs,
+    resolveCommandOnPath: true,
+  });
+  if (result.kind === 'spawn-failed') {
+    appendCommandLog(params.logPath, params.cmd, params.args, '', result.message, null, null);
+    return { kind: 'exec-failed', message: result.message };
+  }
+  if (result.kind === 'aborted') throw result.error;
+  if (result.kind === 'timed-out') {
+    appendCommandLog(params.logPath, params.cmd, params.args, result.stdout, result.stderr, null, 'SIGTERM');
+    appendLogLine(params.logPath, `# command timed out after ${params.timeoutMs}ms`);
+    return { kind: 'timed-out', timeoutMs: params.timeoutMs };
+  }
+  appendCommandLog(params.logPath, params.cmd, params.args, result.stdout, result.stderr, result.status, result.signal);
+  return { kind: 'exited', status: result.status, signal: result.signal, stderr: result.stderr };
 }
 
 function resolveManagedProviderCommandPathInInstallDir(
@@ -777,27 +821,22 @@ async function installManagedPackageProviderCli(params: Readonly<{
         .join(delimiter);
     }
     const addArgs = ['--dir', workspaceDir, 'add', params.managedInstall.packageName, '--ignore-scripts'];
-    const spawn = params.deps.spawnSync ?? spawnSync;
-    const result = spawn(pnpmCommand, addArgs, {
+    const outcome = await runLoggedProviderCommand({
+      cmd: pnpmCommand,
+      args: addArgs,
       cwd: workspaceDir,
-      encoding: 'utf8',
       env: childEnv,
-      windowsHide: true,
+      logPath: params.logPath,
+      timeoutMs: 0,
+      runCommand: params.deps.runCommand ?? runCommandCapture,
     });
-    appendCommandLog(
-      params.logPath,
-      pnpmCommand,
-      addArgs,
-      String(result.stdout ?? ''),
-      String(result.stderr ?? ''),
-      result.status ?? null,
-      result.signal ?? null,
-    );
-    if (result.error) {
-      throw result.error;
+    if (outcome.kind === 'exec-failed') {
+      throw new Error(outcome.message);
     }
-    if ((result.status ?? 1) !== 0) {
-      throw new Error(String(result.stderr ?? '').trim() || `pnpm add failed (${result.status ?? 'unknown'})`);
+    if (outcome.kind !== 'exited' || (outcome.status ?? 1) !== 0) {
+      const status = outcome.kind === 'exited' ? outcome.status : null;
+      const stderr = outcome.kind === 'exited' ? outcome.stderr.trim() : '';
+      throw new Error(stderr || `pnpm add failed (${status ?? 'unknown'})`);
     }
 
     if (params.managedInstall.packageBinarySetup?.kind === 'opencode_platform_binary') {
@@ -805,7 +844,7 @@ async function installManagedPackageProviderCli(params: Readonly<{
         workspaceDir,
         platform: params.platform,
         env: childEnv,
-        spawnSync: spawn,
+        spawnSync: params.deps.spawnSync ?? spawnSync,
       });
       appendLogLine(params.logPath, `# opencode platform package: ${materialized.packageName}`);
     }
@@ -1015,13 +1054,25 @@ export async function installProviderCli(params: Readonly<{
   dryRun?: boolean;
   skipIfInstalled?: boolean;
   allowVendorRecipeExecution?: boolean;
+  /**
+   * `update` updates the installed CLI through the owner that installed it: a
+   * Happier-managed install is reinstalled from its managed source; a vendor-native
+   * install runs the catalog's verified vendor updater (consent-gated like vendor
+   * recipes); any other owner is refused with `update-not-available`.
+   */
+  intent?: ProviderCliInstallIntent;
+  /** The exact executable to update (as reported by the detect owner); defaults to the current resolution. */
+  updateTarget?: ProviderCliCommandResolution | null;
   deps?: InstallProviderCliDeps;
 }>): Promise<InstallProviderCliResult> {
+  if (params.intent === 'update') {
+    return await updateInstalledProviderCli(params);
+  }
   const env = params.env ?? process.env;
   const skipIfInstalled = params.skipIfInstalled !== false;
   const deps = params.deps ?? {};
   const allowVendorRecipeExecution = params.allowVendorRecipeExecution === true;
-  const spawn = deps.spawnSync ?? spawnSync;
+  const runCommand = deps.runCommand ?? runCommandCapture;
 
   const planned = planProviderCliInstall({ providerId: params.providerId, platform: params.platform });
   if (!planned.ok) {
@@ -1072,46 +1123,32 @@ export async function installProviderCli(params: Readonly<{
         if (!commandExistsOnPath(c.cmd, { env })) {
           return { ok: false, errorCode: 'command-not-found', errorMessage: `Command not found: ${c.cmd}`, plan, logPath };
         }
-        const timeoutMs = resolveVendorInstallTimeoutMs(env);
+        const timeoutMs = resolveProviderInstallCommandTimeoutMs(env);
         const childEnv = {
           ...process.env,
           ...env,
-          PATH: buildVendorRecipePath(params.providerId, {
+          // Windows retains the original case-insensitive Path key. Only POSIX
+          // recipes need the additional user install directories.
+          ...(process.platform === 'win32' ? {} : { PATH: buildVendorRecipePath(params.providerId, {
             ...process.env,
             ...env,
-          }),
+          }) }),
           ...(vendorScratchDir ? { TMPDIR: vendorScratchDir, TMP: vendorScratchDir, TEMP: vendorScratchDir } : {}),
         };
-        const invocation = resolveWindowsCommandInvocation({
-          command: c.cmd,
-          args: c.args,
-          env: childEnv,
-          resolveCommandOnPath: true,
-        });
-        const res = spawn(invocation.command, invocation.args, {
-          encoding: 'utf8',
-          env: childEnv,
-          ...(timeoutMs > 0 ? { timeout: timeoutMs } : {}),
-          windowsHide: true,
-          windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-        });
-        if (res.error) {
-          appendCommandLog(logPath, c.cmd, c.args, '', res.error.message, res.status ?? null, res.signal ?? null);
-          if ((res.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
-            appendLogLine(logPath, `# vendor recipe timed out after ${timeoutMs}ms`);
-            return {
-              ok: false,
-              errorCode: 'command-timed-out',
-              errorMessage: `Vendor install timed out after ${timeoutMs}ms: ${c.cmd}`,
-              plan,
-              logPath,
-            };
-          }
-          return { ok: false, errorCode: 'command-exec-failed', errorMessage: res.error.message, plan, logPath };
+        const outcome = await runLoggedProviderCommand({ cmd: c.cmd, args: c.args, env: childEnv, logPath, timeoutMs, runCommand });
+        if (outcome.kind === 'timed-out') {
+          return {
+            ok: false,
+            errorCode: 'command-timed-out',
+            errorMessage: `Vendor install timed out after ${timeoutMs}ms: ${c.cmd}`,
+            plan,
+            logPath,
+          };
         }
-        const status = typeof res.status === 'number' ? res.status : null;
-        const signal = res.signal ?? null;
-        appendCommandLog(logPath, c.cmd, c.args, String(res.stdout ?? ''), String(res.stderr ?? ''), status, signal);
+        if (outcome.kind === 'exec-failed') {
+          return { ok: false, errorCode: 'command-exec-failed', errorMessage: outcome.message, plan, logPath };
+        }
+        const { status, signal } = outcome;
         if (status !== 0) {
           const resolvedAfterFailure = resolveProviderCliCommand(params.providerId, { processEnv: childEnv });
           if (resolvedAfterFailure) {
@@ -1128,7 +1165,7 @@ export async function installProviderCli(params: Readonly<{
               cmd: c.cmd,
               status,
               signal,
-              stderr: String(res.stderr ?? ''),
+              stderr: outcome.stderr,
             }),
             plan,
             logPath,
@@ -1171,8 +1208,9 @@ export async function installProviderCli(params: Readonly<{
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const code =
-      message.startsWith('Managed pnpm is unavailable') || message.startsWith('Managed JavaScript runtime is unavailable')
+    const code = error instanceof ArchiveExpandedByteLimitError
+      ? error.code
+      : message.startsWith('Managed pnpm is unavailable') || message.startsWith('Managed JavaScript runtime is unavailable')
         ? 'managed-runtime-unavailable'
         : 'command-failed';
     appendInstallLogBestEffort(logPath, message);
@@ -1182,4 +1220,109 @@ export async function installProviderCli(params: Readonly<{
       await rm(vendorScratchDir, { recursive: true, force: true });
     }
   }
+}
+
+async function updateInstalledProviderCli(
+  params: Parameters<typeof installProviderCli>[0],
+): Promise<InstallProviderCliResult> {
+  const env = params.env ?? process.env;
+  const runtimeSpec = getProviderCliRuntimeSpec(params.providerId);
+  const planned = planProviderCliInstall({ providerId: params.providerId, platform: params.platform });
+  const basePlan = planned.ok ? planned.plan : null;
+  const target = params.updateTarget ?? resolveProviderCliCommand(params.providerId, { processEnv: env });
+  if (!target) {
+    return {
+      ok: false,
+      errorCode: 'update-not-available',
+      errorMessage: `${runtimeSpec.title} is not installed on this machine.`,
+      plan: basePlan,
+      logPath: null,
+    };
+  }
+
+  const facts = classifyProviderCliInstall({
+    providerId: params.providerId,
+    command: target.command,
+    source: target.source,
+    platform: params.platform,
+    env,
+  });
+
+  if (facts.installSource === 'managed' && facts.updateSupported) {
+    return await installProviderCli({ ...params, intent: 'install', skipIfInstalled: false, updateTarget: null });
+  }
+
+  if (facts.installSource === 'native' && facts.nativeUpdateArgs) {
+    const command: ProviderCliInstallCommand = {
+      cmd: target.command,
+      args: [...facts.nativeUpdateArgs],
+      requiresAdmin: false,
+      note: null,
+    };
+    const plan: ProviderCliInstallPlan = {
+      providerId: runtimeSpec.id,
+      title: runtimeSpec.title,
+      binaries: [runtimeSpec.binaryName],
+      platform: params.platform,
+      docsUrl: typeof runtimeSpec.docsUrl === 'string' ? runtimeSpec.docsUrl : null,
+      commands: [command],
+      requiresAdmin: false,
+      installMode: 'vendor_recipe',
+      managedInstall: null,
+    };
+    if (params.dryRun) return { ok: true, plan, alreadyInstalled: false, logPath: null };
+    if (params.allowVendorRecipeExecution !== true) {
+      return {
+        ok: false,
+        errorCode: 'vendor-recipe-disallowed',
+        errorMessage: `Updating ${runtimeSpec.title} runs its own updater (${facts.updateCommand}). Re-run with allowVendorRecipeExecution=true after the user confirms.`,
+        plan,
+        logPath: null,
+      };
+    }
+
+    const logPath = resolveLogPath({ providerId: params.providerId, logDir: params.logDir, env });
+    writeLogHeader(logPath, plan);
+    const timeoutMs = resolveProviderInstallCommandTimeoutMs(env);
+    const outcome = await runLoggedProviderCommand({
+      cmd: command.cmd,
+      args: command.args,
+      env: { ...process.env, ...env },
+      logPath,
+      timeoutMs,
+      runCommand: params.deps?.runCommand ?? runCommandCapture,
+    });
+    if (outcome.kind === 'timed-out') {
+      return {
+        ok: false,
+        errorCode: 'command-timed-out',
+        errorMessage: `${runtimeSpec.title} update timed out after ${timeoutMs}ms.`,
+        plan,
+        logPath,
+      };
+    }
+    if (outcome.kind === 'exec-failed') {
+      return { ok: false, errorCode: 'command-exec-failed', errorMessage: outcome.message, plan, logPath };
+    }
+    if (outcome.status !== 0) {
+      return {
+        ok: false,
+        errorCode: 'command-failed',
+        errorMessage: outcome.stderr.trim() || `${facts.updateCommand} exited with ${outcome.status ?? outcome.signal ?? 'unknown'}.`,
+        plan,
+        logPath,
+      };
+    }
+    return { ok: true, plan, alreadyInstalled: false, logPath };
+  }
+
+  return {
+    ok: false,
+    errorCode: 'update-not-available',
+    errorMessage: facts.updateCommand
+      ? `Happier does not update this ${runtimeSpec.title} install. Run: ${facts.updateCommand}`
+      : `Happier cannot update this ${runtimeSpec.title} install at ${target.command}.`,
+    plan: basePlan,
+    logPath: null,
+  };
 }

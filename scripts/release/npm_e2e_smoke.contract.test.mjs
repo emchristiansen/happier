@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..', '..');
@@ -154,10 +155,16 @@ test('npm-e2e-smoke admits the read-only mounted monorepo before hstack clones i
   const entrypointPath = join(smokeDir, 'bin', 'stack-entrypoint.sh');
   const raw = await readFile(entrypointPath, 'utf8');
   const safeDirectory = 'git config --global --add safe.directory "$HSTACK_HAPPIER_REPO"';
+  const safeGitDirectory = 'git config --global --add safe.directory "$HSTACK_HAPPIER_REPO/.git"';
   assert.match(raw, /git config --global --add safe\.directory "\$HSTACK_HAPPIER_REPO"/);
+  assert.ok(raw.includes(safeGitDirectory), 'expected the mounted clone source /repo/.git to be admitted too');
   assert.ok(
     raw.indexOf(safeDirectory) < raw.indexOf('"${HSTACK_PREFIX[@]}" "${setup_args[@]}"'),
     'expected the mounted repository to be admitted before hstack setup asks Git to clone it',
+  );
+  assert.ok(
+    raw.indexOf(safeGitDirectory) < raw.indexOf('"${HSTACK_PREFIX[@]}" "${setup_args[@]}"'),
+    'expected the mounted .git clone source to be admitted before hstack setup',
   );
 });
 
@@ -1030,3 +1037,56 @@ test('remote daemon smoke scripts fail closed when --public-server-url is unsupp
     'expected bootstrap remote daemon smoke to tolerate setup flows that already start/register the remote daemon'
   );
 });
+
+
+for (const name of ['remote-daemon-smoke.sh', 'remote-daemon-authenticated-cli-smoke.sh']) {
+  for (const scenario of [
+    { name: 'refuses a plain not-running fallback', jsonExit: 1, json: '', plain: '• Daemon is not running', accepted: false },
+    { name: 'refuses a stale-state fallback', jsonExit: 1, json: '', plain: '! Daemon state exists but process not running (stale)', accepted: false },
+    { name: 'accepts the real plain positive fallback', jsonExit: 1, json: '', plain: '✓ Daemon is running\n  PID: 123', accepted: true },
+    { name: 'accepts a colored positive fallback', jsonExit: 1, json: '', plain: '\u001b[32m✓\u001b[39m Daemon is running', accepted: true },
+    { name: 'accepts current nested running JSON', jsonExit: 0, json: '{"daemon":{"running":true}}', plain: '', accepted: true },
+    { name: 'refuses current nested stopped JSON', jsonExit: 0, json: '{"daemon":{"running":false}}', plain: '✓ Daemon is running', accepted: false },
+    { name: 'refuses a negative legacy status', jsonExit: 0, json: '{"status":"not running"}', plain: '', accepted: false },
+    { name: 'accepts an affirmative legacy status', jsonExit: 0, json: '{"status":"running"}', plain: '', accepted: true },
+    { name: 'refuses explicit false even with a conflicting legacy status', jsonExit: 0, json: '{"daemon":{"running":false},"status":"running"}', plain: '', accepted: false },
+    { name: 'refuses unrelated status text', jsonExit: 1, json: '', plain: 'waiting for a running daemon', accepted: false },
+  ]) {
+    test(`${name} ${scenario.name}`, async () => {
+      const raw = await readFile(join(smokeDir, 'bin', name), 'utf8');
+      const marker = raw.indexOf('checking remote daemon status...');
+      const start = raw.indexOf('\n  status_out=', marker);
+      const end = raw.indexOf('\n\n  echo ', start);
+      assert.ok(marker >= 0 && start > marker && end > start, 'expected the existing status-check block');
+      const actualBlock = raw.slice(start, end);
+      // Execute the actual public status block. Only its SSH boundary is fake;
+      // installation, credentials, daemon startup and machine polling are excluded.
+      const result = spawnSync('bash', ['-c', `set -euo pipefail
+ssh() {
+  case "$*" in
+    *" daemon status --json") printf '%s' "$FIXTURE_JSON"; return "$FIXTURE_JSON_EXIT" ;;
+    *" daemon status") printf '%s' "$FIXTURE_PLAIN" ;;
+    *) printf '%s\n' 'unexpected SSH call'; return 97 ;;
+  esac
+}
+${actualBlock}
+printf '%s\n' 'STATUS_ACCEPTED'
+`], {
+        env: {
+          ...process.env,
+          REMOTE_SSH_TARGET: 'fixture.invalid',
+          HAPPIER_ACTIVE_SERVER_ID: 'fixture', selected_server_id: 'fixture',
+          HAPPIER_SERVER_URL: 'http://fixture.invalid', HAPPIER_PUBLIC_SERVER_URL: 'http://fixture.invalid',
+          HAPPIER_WEBAPP_URL: 'http://fixture.invalid', remote_happier_command: 'happier',
+          FIXTURE_JSON_EXIT: String(scenario.jsonExit), FIXTURE_JSON: scenario.json, FIXTURE_PLAIN: scenario.plain,
+        },
+        encoding: 'utf8',
+      });
+      assert.ifError(result.error);
+      assert.equal(result.signal, null);
+      assert.equal(result.status, scenario.accepted ? 0 : 1, result.stderr);
+      assert.equal(result.stdout.includes('STATUS_ACCEPTED'), scenario.accepted);
+      assert.doesNotMatch(result.stderr, /unexpected SSH call/);
+    });
+  }
+}

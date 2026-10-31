@@ -8,7 +8,7 @@ import { installMarkdownCommonModuleMocks } from './markdownTestHelpers';
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const clipboardMocks = vi.hoisted(() => ({
-  setStringAsync: vi.fn(async () => {}),
+  setStringAsync: vi.fn(async () => true),
 }));
 const modalMocks = vi.hoisted(() => ({
   alert: vi.fn(),

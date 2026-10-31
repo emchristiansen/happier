@@ -1,3 +1,4 @@
+import { requireEncryptedSessionContext } from '@/session/transport/encryption/sessionEncryptionContext';
 import type { SessionAttachFilePayload } from '@/agent/runtime/sessionAttachPayload';
 import type { Credentials } from '@/persistence';
 import { isAuthenticationError } from '@/api/client/httpStatusError';
@@ -13,6 +14,8 @@ import {
 import { fetchSessionByIdCompat } from '@/session/transport/http/sessionsHttp';
 import type { SessionSnapshotRefreshReasonInput } from '@/api/session/sessionSnapshotRefreshReason';
 import { tryParseJsonRecord } from '@/utils/tryParseJsonRecord';
+import type { BackendTargetRefV1 } from '@happier-dev/protocol';
+import { isSessionEncryptionModeAllowedByEffectiveClientRequirement } from '@/settings/accountSettings/resolveEffectiveClientEncryptionRequirement';
 
 export type ExistingSessionAttachContext = Readonly<{
   ok: true;
@@ -29,7 +32,8 @@ export type ExistingSessionAttachContextFailureReason =
   | 'fetchFailed'
   | 'sessionNotFound'
   | 'missingCredentials'
-  | 'invalidEncryptionKey';
+  | 'invalidEncryptionKey'
+  | 'clientE2eeRequired';
 
 export type ExistingSessionAttachContextFailure = Readonly<{
   ok: false;
@@ -75,15 +79,18 @@ function buildExistingSessionAttachContext(params: Readonly<{
     encryptionMode?: unknown;
     seq?: unknown;
   }>;
-  agent: unknown;
+  backendTarget: BackendTargetRefV1;
   credentials: Credentials | null;
 }>): ExistingSessionAttachContext | ExistingSessionAttachContextFailure {
+  const mode = resolveSessionStoredContentEncryptionMode(params.rawSession);
+  if (!isSessionEncryptionModeAllowedByEffectiveClientRequirement(mode)) {
+    return { ok: false, reason: 'clientE2eeRequired' };
+  }
   const metadata = resolveExistingSessionMetadata({
     rawSession: params.rawSession,
     credentials: params.credentials,
   });
   const sessionPath = resolveExistingSessionPath(metadata);
-  const mode = resolveSessionStoredContentEncryptionMode(params.rawSession);
   const lastObservedMessageSeq = resolveLastObservedMessageSeq(params.rawSession);
   if (mode === 'plain') {
     return {
@@ -94,7 +101,7 @@ function buildExistingSessionAttachContext(params: Readonly<{
         ...(lastObservedMessageSeq !== undefined ? { lastObservedMessageSeq } : {}),
       },
       vendorResumeId: resolveVendorResumeIdForExistingSession({
-        agent: params.agent,
+        backendTarget: params.backendTarget,
         credentials: params.credentials,
         rawSession: params.rawSession,
       }),
@@ -106,6 +113,7 @@ function buildExistingSessionAttachContext(params: Readonly<{
   if (!params.credentials) return { ok: false, reason: 'missingCredentials' };
 
   const ctx = resolveSessionEncryptionContextFromCredentials(params.credentials, params.rawSession);
+  requireEncryptedSessionContext(ctx);
   if (ctx.encryptionKey.length !== 32) return { ok: false, reason: 'invalidEncryptionKey' };
 
   return {
@@ -118,7 +126,7 @@ function buildExistingSessionAttachContext(params: Readonly<{
       ...(lastObservedMessageSeq !== undefined ? { lastObservedMessageSeq } : {}),
     },
     vendorResumeId: resolveVendorResumeIdForExistingSession({
-      agent: params.agent,
+      backendTarget: params.backendTarget,
       credentials: params.credentials,
       rawSession: params.rawSession,
     }),
@@ -130,7 +138,7 @@ function buildExistingSessionAttachContext(params: Readonly<{
 export async function resolveExistingSessionAttachContext(_params: Readonly<{
   token: string;
   sessionId: string;
-  agent: unknown;
+  backendTarget: BackendTargetRefV1;
   credentials: Credentials | null;
   reason?: SessionSnapshotRefreshReasonInput;
 }>): Promise<ExistingSessionAttachContext | ExistingSessionAttachContextFailure> {
@@ -150,7 +158,7 @@ export async function resolveExistingSessionAttachContext(_params: Readonly<{
 
     return buildExistingSessionAttachContext({
       rawSession: raw,
-      agent: _params.agent,
+      backendTarget: _params.backendTarget,
       credentials: _params.credentials,
     });
   } catch (error) {

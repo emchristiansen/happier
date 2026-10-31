@@ -154,6 +154,12 @@ UNIT
   ln -sf /etc/systemd/system/sshd.service /etc/systemd/system/multi-user.target.wants/sshd.service
 fi
 
+# Lingering starts the user's systemd manager (and its bus at /run/user/<uid>/bus) at boot, so
+# `systemctl --user` works for sessions that are not PAM logins (docker exec, sshd with UsePAM no),
+# as it does natively in a desktop session. The daemon's user service needs exactly that.
+install -d -m 755 /var/lib/systemd/linger
+touch "/var/lib/systemd/linger/${remote_user}"
+
 echo "[remote-host-systemd] booting systemd (ssh ready for auth)"
 
 exec /sbin/init

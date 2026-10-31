@@ -1,7 +1,7 @@
 import { TokenStorage } from '@/auth/storage/tokenStorage';
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
 import { toServerUrlDisplay } from '@/sync/domains/server/url/serverUrlDisplay';
-import { redactPublicShareCapabilityUrl } from '@happier-dev/protocol';
+import { redactPublicShareCapabilityUrl, withConnectedServiceReaderSupport } from '@happier-dev/protocol';
 import { runtimeFetch } from '@/utils/system/runtimeFetch';
 import { createEndpointSupervisedRequest } from '@/sync/runtime/connectivity/createEndpointSupervisedRequest';
 import { getEndpointSupervisorForServer } from '@/sync/runtime/connectivity/endpointSupervisorPool';
@@ -12,7 +12,6 @@ import {
     waitForServerReachable,
 } from '@/sync/runtime/connectivity/serverReachabilitySupervisorPool';
 import {
-    readServerFetchWriteTimeoutMs,
     readServerReachabilityWaitTimeoutMs,
 } from '@/sync/runtime/connectivity/serverReachabilityTuning';
 import { observeUiClientUpgradeRequiredResponse } from '@/sync/runtime/clientCompatibility/uiClientUpgradeRequired';
@@ -67,20 +66,18 @@ type ServerFetchOptions = Readonly<{
     retry?: 'default' | 'none';
     /**
      * Per-request upper bound (ms) after which the request is aborted with a retryable
-     * `ServerFetchWriteTimeoutError`. When omitted, mutating requests (POST/PUT/PATCH/DELETE) use
-     * the canonical write timeout (`readServerFetchWriteTimeoutMs`) and reads stay unbounded here.
+     * `ServerFetchWriteTimeoutError`. Requests are unbounded when omitted; the operation
+     * owner must opt in only when it can safely classify and recover an ambiguous timeout.
      * Pass `0` to explicitly disable the bound for a single request.
      */
     timeoutMs?: number;
 }>;
 
-const MUTATING_HTTP_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-
-function resolveRequestTimeoutMs(method: string, optionTimeoutMs: number | undefined): number {
+function resolveRequestTimeoutMs(optionTimeoutMs: number | undefined): number {
     if (typeof optionTimeoutMs === 'number' && Number.isFinite(optionTimeoutMs)) {
         return Math.max(0, Math.trunc(optionTimeoutMs));
     }
-    return MUTATING_HTTP_METHODS.has(method) ? readServerFetchWriteTimeoutMs() : 0;
+    return 0;
 }
 
 const inFlightControllers = new Set<AbortController>();
@@ -166,15 +163,24 @@ function maybeLogRuntimeFetchFailure(params: {
     }
 }
 
-export async function serverFetch(
+export function serverFetch(path: string, init?: RequestInit, options?: ServerFetchOptions): Promise<Response>;
+/** Await response consumption before releasing caller, Home-switch, and opted-in timeout cancellation. */
+export function serverFetch<T>(
+    path: string,
+    init: RequestInit | undefined,
+    options: ServerFetchOptions,
+    consumeResponse: (response: Response) => Promise<T>,
+): Promise<T>;
+export async function serverFetch<T>(
     path: string,
     init?: RequestInit,
     options: ServerFetchOptions = {},
-): Promise<Response> {
+    consumeResponse?: (response: Response) => Promise<T>,
+): Promise<Response | T> {
     const localAbortSequence = abortSequence;
     const snapshot = getActiveServerSnapshot();
     const normalizedPath = normalizePath(path);
-    const requestUrl = normalizedPath.startsWith('http://') || normalizedPath.startsWith('https://')
+    let requestUrl = normalizedPath.startsWith('http://') || normalizedPath.startsWith('https://')
         ? normalizedPath
         : `${snapshot.serverUrl}${normalizedPath}`;
 
@@ -234,6 +240,8 @@ export async function serverFetch(
         }
     }
 
+    if (hasAuthorization) requestUrl = withConnectedServiceReaderSupport(requestUrl);
+
     const requestController = new AbortController();
     inFlightControllers.add(requestController);
     if (abortSequence !== localAbortSequence) {
@@ -254,10 +262,9 @@ export async function serverFetch(
 
     const method = String(init?.method ?? 'GET').toUpperCase();
 
-    // Bound mutating requests so a stalled server (accepts, never responds) cannot hang the await
-    // forever — the silent message-loss class. On expiry we abort the in-flight request and surface
-    // a retryable ServerFetchWriteTimeoutError so the pending outbox re-POSTs with the same localId.
-    const effectiveTimeoutMs = resolveRequestTimeoutMs(method, options.timeoutMs);
+    // A request owner may opt into a bound when it can recover safely from an
+    // ambiguous timeout. Generic reads and writes remain unbounded here.
+    const effectiveTimeoutMs = resolveRequestTimeoutMs(options.timeoutMs);
     let didWriteTimeout = false;
     let writeTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
     if (effectiveTimeoutMs > 0) {
@@ -266,6 +273,20 @@ export async function serverFetch(
             requestController.abort('write-timeout');
         }, effectiveTimeoutMs);
     }
+
+    const throwIfRequestAborted = (error: unknown, reportTimeout: boolean): void => {
+        if (!requestController.signal.aborted && !(error instanceof Error && error.name === 'AbortError')) return;
+        const reason = (requestController.signal as unknown as { reason?: unknown }).reason;
+        if (reason === 'server-switch' || abortSequence !== localAbortSequence) {
+            throw new ServerFetchAbortedForServerSwitchError();
+        }
+        if (didWriteTimeout) {
+            if (reportTimeout) reportServerUnreachable(snapshot.serverUrl, error);
+            throw new ServerFetchWriteTimeoutError();
+        }
+        // Caller cancellation does not establish a server reachability failure.
+        throw error;
+    };
 
     const retryMode: 'default' | 'none' = options.retry ?? 'default';
     const isActiveOrigin =
@@ -295,20 +316,8 @@ export async function serverFetch(
                             acceptAuthFailed: true,
                         });
                     } catch (error) {
-                        const aborted =
-                            requestController.signal.aborted || (error instanceof Error && error.name === 'AbortError');
-                        if (aborted) {
-                            const reason = (requestController.signal as unknown as { reason?: unknown }).reason;
-                            const serverSwitchAbort = reason === 'server-switch' || abortSequence !== localAbortSequence;
-                            if (serverSwitchAbort) {
-                                throw new ServerFetchAbortedForServerSwitchError();
-                            }
-                            if (didWriteTimeout) {
-                                reportServerUnreachable(snapshot.serverUrl, error);
-                                throw new ServerFetchWriteTimeoutError();
-                            }
-                            throw error;
-                        }
+                        // The surrounding transport catch owns timeout reachability reporting.
+                        throwIfRequestAborted(error, false);
                         if (error instanceof ServerReachabilityWaitTimeoutError) {
                             throw new ServerFetchConnectivityTimeoutError();
                         }
@@ -343,24 +352,7 @@ export async function serverFetch(
                     activeServerId: snapshot.serverId,
                     error,
                 });
-                const aborted =
-                    requestController.signal.aborted || (error instanceof Error && error.name === 'AbortError');
-                if (aborted) {
-                    const reason = (requestController.signal as unknown as { reason?: unknown }).reason;
-                    const serverSwitchAbort = reason === 'server-switch' || abortSequence !== localAbortSequence;
-                    if (serverSwitchAbort) {
-                        throw new ServerFetchAbortedForServerSwitchError();
-                    }
-                    if (didWriteTimeout) {
-                        // The server accepted the connection but never responded within the write
-                        // bound. Report unreachable (so backoff/reachability track it) and surface a
-                        // retryable timeout so the pending outbox re-POSTs with the same localId.
-                        reportServerUnreachable(snapshot.serverUrl, error);
-                        throw new ServerFetchWriteTimeoutError();
-                    }
-                    // Caller aborts should not poison reachability state.
-                    throw error;
-                }
+                throwIfRequestAborted(error, true);
                 if (error instanceof ServerFetchConnectivityTimeoutError) {
                     // Reachability wait timeouts already represent a "paused/offline" state; do not report an extra
                     // transport failure which can reset backoff scheduling.
@@ -412,6 +404,23 @@ export async function serverFetch(
 
             break;
         }
+        if (!response) throw new Error('serverFetch did not attempt the request');
+        if (!consumeResponse) return response;
+
+        // A body-consuming owner keeps cancellation attached until its read settles. Parsing
+        // failures stay outside the transport retry/classification path and never replay a write.
+        try {
+            const result = await consumeResponse(response);
+            if (requestController.signal.aborted) {
+                const error = new Error('Aborted');
+                error.name = 'AbortError';
+                throw error;
+            }
+            return result;
+        } catch (error) {
+            throwIfRequestAborted(error, false);
+            throw error;
+        }
     } finally {
         if (writeTimeoutHandle) {
             clearTimeout(writeTimeoutHandle);
@@ -419,10 +428,4 @@ export async function serverFetch(
         removeUpstreamListener();
         inFlightControllers.delete(requestController);
     }
-
-    if (!response) {
-        // Defensive: loop always runs at least once, but keep return type strict.
-        throw new Error('serverFetch did not attempt the request');
-    }
-    return response;
 }

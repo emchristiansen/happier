@@ -8,7 +8,7 @@ export function buildTerminalMetadataFromRuntimeFlags(
   if (!flags) return undefined;
 
   const mode = flags.mode;
-  if (mode !== 'plain' && mode !== 'tmux' && mode !== 'windows_terminal' && mode !== 'windows_console') return undefined;
+  if (mode !== 'plain' && mode !== 'tmux' && mode !== 'zellij' && mode !== 'herdr' && mode !== 'windows_terminal' && mode !== 'windows_console') return undefined;
 
   const terminal: NonNullable<Metadata['terminal']> = {
     mode,
@@ -27,6 +27,8 @@ export function buildTerminalMetadataFromRuntimeFlags(
   if (
     flags.requested === 'plain'
     || flags.requested === 'tmux'
+    || flags.requested === 'zellij'
+    || flags.requested === 'herdr'
     || flags.requested === 'windows_terminal'
     || flags.requested === 'console'
   ) {
@@ -41,6 +43,15 @@ export function buildTerminalMetadataFromRuntimeFlags(
       ...(typeof flags.tmuxTmpDir === 'string' && flags.tmuxTmpDir.trim().length > 0
         ? { tmpDir: flags.tmuxTmpDir }
         : {}),
+    };
+  }
+
+  if (mode === 'herdr' && flags.herdrSessionName?.trim() && flags.herdrSocketPath?.trim() && flags.herdrTerminalId?.trim()) {
+    terminal.herdr = {
+      sessionName: flags.herdrSessionName.trim(),
+      socketPath: flags.herdrSocketPath.trim(),
+      terminalId: flags.herdrTerminalId.trim(),
+      ...(flags.herdrPaneId?.trim() ? { paneId: flags.herdrPaneId.trim() } : {}),
     };
   }
 

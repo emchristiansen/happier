@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -26,6 +26,7 @@ async function withFakeServer<T>(
     goalSetBehavior?: NonNullable<Parameters<typeof writeFakeCodexAppServerScript>[0]['goalSetBehavior']>;
     vendorPlugins?: NonNullable<Parameters<typeof writeFakeCodexAppServerScript>[0]['vendorPlugins']>;
     skills?: NonNullable<Parameters<typeof writeFakeCodexAppServerScript>[0]['skills']>;
+    modelListStatePath?: string;
   }>,
   fn: (server: Readonly<{
     requestLogPath: string;
@@ -43,6 +44,7 @@ async function withFakeServer<T>(
     goalSetBehavior: params.goalSetBehavior,
     vendorPlugins: params.vendorPlugins,
     skills: params.skills,
+    modelListStatePath: params.modelListStatePath,
   });
 
   const child = spawn(process.execPath, [scriptPath], {
@@ -145,6 +147,25 @@ async function withPersistentFakeServer<T>(
 }
 
 describe('fake Codex app-server harness', () => {
+  it('rereads a changed provider catalog and exposes discovery failure without creating a thread', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-fake-models-'));
+    const modelListStatePath = join(dir, 'models.json');
+    try {
+      await writeFile(modelListStatePath, JSON.stringify({ models: [{ id: 'first' }] }));
+      await withFakeServer({ modelListStatePath }, async ({ request, requestLogPath }) => {
+        await expect(request('model/list')).resolves.toMatchObject({ result: [{ id: 'first' }] });
+        await writeFile(modelListStatePath, JSON.stringify({ models: [{ id: 'second' }] }));
+        await expect(request('model/list')).resolves.toMatchObject({ result: [{ id: 'second' }] });
+        await writeFile(modelListStatePath, JSON.stringify({ error: true }));
+        await expect(request('model/list')).resolves.toMatchObject({ error: { code: -32000 } });
+        expect((await readFakeCodexAppServerRequestLog(requestLogPath)).map((entry) => entry.method))
+          .toEqual(['model/list', 'model/list', 'model/list']);
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('models native thread forks used by shared UI and runtime scenarios', async () => {
     await withFakeServer({}, async ({ request, requestLogPath }) => {
       await expect(request('thread/fork', { threadId: 'thread-started' })).resolves.toMatchObject({

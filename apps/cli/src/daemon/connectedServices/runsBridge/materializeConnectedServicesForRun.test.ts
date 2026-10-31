@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,6 +10,8 @@ import {
   HAPPIER_CONNECTED_SERVICE_TARGET_MATERIALIZED_ROOT_ENV_KEY,
 } from '../connectedServiceChildEnvironment';
 import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
+import { rehydrateLiveExecutionRunRuntimeTargets } from '../startup/executionRunTargetRehydration';
+import { createAdoptedExecutionRunRootCleanup } from './createAdoptedExecutionRunRootCleanup';
 import {
   ExecutionRunConnectedServiceMaterializeError,
   createExecutionRunConnectedServicesBridge,
@@ -505,22 +507,44 @@ describe('createExecutionRunConnectedServicesBridge', () => {
     expect(cleanup).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects unsafe adopted cleanup and allows a later valid retry', async () => {
-    const cleanup = vi.fn();
-    const bridge = createExecutionRunConnectedServicesBridge({
-      resolveAuthForSpawn: vi.fn() as unknown as ResolveConnectedServiceAuthForRun,
-      runtimeRegistry: new ConnectedServiceRuntimeRegistry(),
-      createAdoptedRootCleanup: ({ materializedRoot }) => materializedRoot === '/managed/retry' ? cleanup : null,
-    });
+  it('rehydrates and releases a live run without deleting its durable provider home', async () => {
+    const sandbox = await mkdtemp(join(tmpdir(), 'happier-adopted-durable-run-'));
+    try {
+      const durableHome = join(sandbox, 'profiles', 'work', 'codex-home');
+      await mkdir(durableHome, { recursive: true });
+      const registry = new ConnectedServiceRuntimeRegistry();
+      const bridge = createExecutionRunConnectedServicesBridge({
+        resolveAuthForSpawn: async () => { throw new Error('passive adoption must not materialize'); },
+        runtimeRegistry: registry,
+        createAdoptedRootCleanup: (input) => createAdoptedExecutionRunRootCleanup({
+          ...input,
+          materializationBaseDir: join(sandbox, 'materialized'),
+          removeRoot: async (root) => await rm(root, { recursive: true, force: true }),
+        }),
+      });
+      const result = await rehydrateLiveExecutionRunRuntimeTargets({
+        markers: [{
+          runId: 'run-one', happySessionId: 'session-one', pid: 4242, status: 'running',
+          executionRunConnectedServicesLaunchV1: {
+            v: 1, runKey: RUN_KEY, agentId: 'codex',
+            connectedServicesBindings: buildResolved().connectedServicesBindings,
+            materializedRoot: durableHome,
+          },
+        }],
+        runtimeRegistry: registry,
+        proveRunnerLive: () => true,
+        adoptCleanup: bridge.adoptLiveMaterialization,
+      });
 
-    expect(bridge.adoptLiveMaterialization({
-      runId: 'run-one', runKey: RUN_KEY, pid: 4242, agentId: 'codex', materializedRoot: '/outside',
-    })).toBe(false);
-    expect(bridge.adoptLiveMaterialization({
-      runId: 'run-one', runKey: RUN_KEY, pid: 4242, agentId: 'codex', materializedRoot: '/managed/retry',
-    })).toBe(true);
-    await bridge.release({ runId: 'run-one', pid: 4242, materializationKey: RUN_KEY });
-    expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ registeredRunIds: ['run-one'], inactiveRunIds: [] });
+      expect(registry.listRefreshTargets()).toEqual([expect.objectContaining({ materializationKey: RUN_KEY })]);
+      await expect(bridge.release({ runId: 'run-one', pid: 4242, materializationKey: RUN_KEY }))
+        .resolves.toEqual({ released: true });
+      expect(registry.listRefreshTargets()).toEqual([]);
+      expect((await stat(durableHome)).isDirectory()).toBe(true);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
   });
 
   it('retains an adopted cleanup record after a partial failure so explicit release can retry', async () => {

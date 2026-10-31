@@ -4,6 +4,7 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import type { ExecutionRunStatus } from '@happier-dev/protocol';
 import { Text } from '@/components/ui/text/Text';
+import { t } from '@/text';
 
 
 function normalizeStatus(status: unknown): ExecutionRunStatus | 'unknown' {
@@ -19,7 +20,7 @@ function normalizeStatus(status: unknown): ExecutionRunStatus | 'unknown' {
     }
 }
 
-export const ExecutionRunStatusPill = React.memo((props: Readonly<{ status: unknown }>) => {
+export const ExecutionRunStatusPill = React.memo((props: Readonly<{ status: unknown; isActive?: boolean }>) => {
     const { theme } = useUnistyles();
     const status = normalizeStatus(props.status);
 
@@ -43,7 +44,7 @@ export const ExecutionRunStatusPill = React.memo((props: Readonly<{ status: unkn
     return (
         <View style={[styles.pill, { backgroundColor: colors.bg, borderColor: theme.colors.border.default }]}>
             <Text style={[styles.text, { color: colors.fg }]}>
-                {status}
+                {status === 'running' && props.isActive === false ? t('diagnosis.machineRuns.idle') : status}
             </Text>
         </View>
     );
@@ -63,4 +64,3 @@ const styles = StyleSheet.create(() => ({
         fontFamily: 'Menlo',
     },
 }));
-

@@ -1,8 +1,8 @@
 [package]
 name = "app"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "A cross-device companion for coding agents"
+authors = ["Happier contributors"]
 license = ""
 repository = ""
 edition = "2021"
@@ -15,7 +15,7 @@ name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.4.0", features = [] }
+tauri-build = { version = "2.7.1", features = [] }
 flate2 = "1.1"
 
 [dependencies]
@@ -24,20 +24,38 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 libc = "0.2"
 flate2 = "1.1"
-tauri = { version = "2.8.2", features = ["tray-icon", "macos-private-api"] }
+tauri = { version = "2.12.1", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-log = "2"
-tauri-plugin-http = "2"
+tauri-plugin-http = "=2.5.6"
 tauri-plugin-notification = "2"
-tauri-plugin-mcp-bridge = "0.10"
+# Bridge 0.10's Windows screenshot types must match Tauri 2.12's WebView2/Windows SDK.
+# Keep its upstream implementation; remove the local dependency when upstream aligns those SDKs.
+tauri-plugin-mcp-bridge = { version = "0.10", path = "vendor/tauri-plugin-mcp-bridge" }
 tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["sync"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.3.1", features = ["NSEvent", "NSWindow"] }
+objc2-app-kit = { version = "0.3.1", features = ["NSApplication", "NSEvent", "NSImage", "NSResponder", "NSWindow"] }
+objc2 = "0.6.2"
+objc2-foundation = { version = "0.3.1", features = ["NSData"] }
+
+# The tray reads the taskbar theme (Windows) and the settings portal (Linux); both crates are
+# already in the dependency tree (hyper-util, tauri's GTK stack).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-registry = "0.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 tauri-plugin-autostart = "2"
 tauri-plugin-updater = "2.9"
+# One running app per channel: a second launch (Start menu, launcher, Finder) opens the running
+# app's window instead of starting a second process and tray (R16). Keep the existing
+# plugin version during the Tauri upgrade; its ^2.8.2 requirement accepts Tauri 2.12.
+tauri-plugin-single-instance = { version = "=2.3.6", features = ["deep-link"] }
+tauri-plugin-deep-link = "=2.4.9"
 
 [dev-dependencies]
 tempfile = "3.20"

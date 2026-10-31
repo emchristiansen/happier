@@ -10,7 +10,7 @@ Use Claude Code or Codex from anywhere with end-to-end encryption.
 
 <div align="center">
   
-[📱 **iOS App**](https://apps.apple.com/us/app/happier-claude-codex-opencode/id6758537388) • [🤖 **Android App**](https://play.google.com/store/apps/details?id=dev.happier.app) • [🌐 **Web App**](https://app.happier.dev) • [🎥 **See a Demo**](https://youtu.be/GCS0OG9QMSE) • [💬 **Discord**](https://discord.gg/W6Pb8KuHfg)
+[📱 **iOS App**](https://apps.apple.com/us/app/happier-claude-codex-opencode/id6758537388) • [🤖 **Android App**](https://play.google.com/store/apps/details?id=dev.happier.app) • [🌐 **Web App**](https://cloud.happier.dev) • [🎥 **See a Demo**](https://youtu.be/GCS0OG9QMSE) • [💬 **Discord**](https://discord.gg/W6Pb8KuHfg)
 
 </div>
 
@@ -61,7 +61,7 @@ On your computer, run `happier` instead of `claude` or `happier codex` instead o
 - 🔔 **Push notifications** - Get alerted when Claude Code and Codex needs permission or encounters errors  
 - ⚡ **Switch devices instantly** - Take control from phone or desktop with one keypress
 - 🔐 **End-to-end encrypted** - Your code never leaves your devices unencrypted
-- 🛠️ **Open source** - Audit the code yourself. No telemetry, no tracking
+- 🛠️ **Open source** - Audit the code yourself. PostHog usage analytics depend on build configuration and app settings.
 
 ## 📦 Project Components
 

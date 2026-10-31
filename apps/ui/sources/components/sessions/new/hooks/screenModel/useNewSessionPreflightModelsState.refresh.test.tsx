@@ -37,7 +37,7 @@ describe('useNewSessionPreflightModelsState (refresh)', () => {
         const { useNewSessionPreflightModelsState } = await import('./useNewSessionPreflightModelsState');
         const hook = await renderHook(
             () => useNewSessionPreflightModelsState({
-                backendTarget: { kind: 'builtInAgent', agentId: 'qwen' },
+                backendTarget: { kind: 'builtInAgent', agentId: 'kiro' },
                 selectedMachineId: 'machine-1',
                 capabilityServerId: 'server-1',
                 cwd: '/repo',
@@ -46,7 +46,7 @@ describe('useNewSessionPreflightModelsState (refresh)', () => {
 
         expect(machineCapabilitiesInvokeMock).not.toHaveBeenCalled();
         expect(hook.getCurrent().modelOptions.map((o) => o.value)).toEqual(
-            getModelOptionsForAgentType('qwen').map((o) => o.value),
+            getModelOptionsForAgentType('kiro').map((o) => o.value),
         );
         expect(hook.getCurrent().probe.phase).toBe('idle');
         expect(hook.getCurrent().probe.onRefresh).toBeUndefined();
@@ -131,11 +131,12 @@ describe('useNewSessionPreflightModelsState (refresh)', () => {
 
         expect(machineCapabilitiesInvokeMock).toHaveBeenCalledTimes(2);
         expect(hook.getCurrent().modelOptions.some((o) => o.value === 'm2')).toBe(true);
+        expect(machineCapabilitiesInvokeMock.mock.calls[1][1].params.bypassCache).toBe(true);
 
         await hook.unmount();
     });
 
-    it('keeps the previous model list visible while probing a different cwd', async () => {
+    it('clears the previous directory model list while probing a different cwd', async () => {
         vi.resetModules();
         machineCapabilitiesInvokeMock.mockReset();
         resetDynamicModelProbeCacheForTests();
@@ -172,7 +173,7 @@ describe('useNewSessionPreflightModelsState (refresh)', () => {
 
         await hook.rerender({ cwd: '/repo-b' });
         expect(machineCapabilitiesInvokeMock).toHaveBeenCalledTimes(2);
-        expect(hook.getCurrent().modelOptions.some((o) => o.value === 'm1')).toBe(true);
+        expect(hook.getCurrent().preflightModels).toBeNull();
 
         if (!resolveSecondProbe) {
             throw new Error('expected deferred second probe resolver');
@@ -285,7 +286,7 @@ describe('useNewSessionPreflightModelsState (refresh)', () => {
 
         const { useNewSessionPreflightModelsState } = await import('./useNewSessionPreflightModelsState');
         const hook = await renderHook(
-            (props: { backendTarget: { kind: 'builtInAgent'; agentId: 'codex' | 'qwen' } }) =>
+            (props: { backendTarget: { kind: 'builtInAgent'; agentId: 'codex' | 'kiro' } }) =>
                 useNewSessionPreflightModelsState({
                     backendTarget: props.backendTarget,
                     selectedMachineId: 'machine-1',
@@ -299,13 +300,13 @@ describe('useNewSessionPreflightModelsState (refresh)', () => {
         expect(hook.getCurrent().preflightModelsTargetKey).toBe('agent:codex');
         expect(hook.getCurrent().modelOptions.some((option) => option.value === 'gpt-5.5')).toBe(true);
 
-        await hook.rerender({ backendTarget: { kind: 'builtInAgent', agentId: 'qwen' } });
+        await hook.rerender({ backendTarget: { kind: 'builtInAgent', agentId: 'kiro' } });
 
         expect(hook.getCurrent().preflightModels).toBeNull();
         expect(hook.getCurrent().preflightModelsTargetKey).toBeNull();
         expect(hook.getCurrent().modelOptions.some((option) => option.value === 'gpt-5.5')).toBe(false);
         expect(hook.getCurrent().modelOptions.map((option) => option.value)).toEqual(
-            getModelOptionsForAgentType('qwen').map((option) => option.value),
+            getModelOptionsForAgentType('kiro').map((option) => option.value),
         );
         expect(machineCapabilitiesInvokeMock).toHaveBeenCalledTimes(1);
 
@@ -564,28 +565,17 @@ describe('useNewSessionPreflightModelsState (refresh)', () => {
         }));
         machineCapabilitiesInvokeMock.mockRejectedValue(new Error('unexpected probe call'));
 
-        let readCall = 0;
         const cachedValue = {
             availableModels: [{ id: 'm1', name: 'Model 1' }],
             supportsFreeform: false,
         };
-        vi.doMock('@/sync/domains/models/dynamicModelProbeCache', async () => {
-            const actual = await vi.importActual<typeof import('@/sync/domains/models/dynamicModelProbeCache')>(
-                '@/sync/domains/models/dynamicModelProbeCache',
-            );
-            return {
-                ...actual,
-                readDynamicModelProbeCache: (_key: string) => {
-                    readCall++;
-                    return {
-                        kind: 'success' as const,
-                        updatedAt: 123,
-                        expiresAt: Date.now() + 60_000,
-                        value: cachedValue,
-                    };
-                },
-            };
-        });
+        const cache = await import('@/sync/domains/models/dynamicModelProbeCache');
+        const { buildDynamicModelProbeCacheKey } = await import('@/sync/domains/models/dynamicModelProbeCacheKey');
+        cache.resetDynamicModelProbeCacheForTests();
+        cache.writeDynamicModelProbeCacheSuccess(buildDynamicModelProbeCacheKey({
+            machineId: 'machine-1', targetKey: 'agent:codex', serverId: 'server-1', cwd: '/repo',
+            extraKeySuffixParts: ['appServer'],
+        })!, cachedValue);
 
         const { useNewSessionPreflightModelsState } = await import('./useNewSessionPreflightModelsState');
 
@@ -598,13 +588,14 @@ describe('useNewSessionPreflightModelsState (refresh)', () => {
                 cacheKeySuffixParts: ['appServer'],
                 capabilityParams: { runtimeKindOverride: 'appServer' },
             },
-        } as any));
+        }));
 
         expect(hook.getCurrent().modelOptions.some((o) => o.value === 'm1')).toBe(true);
-        expect(readCall).toBe(1);
+        const options = hook.getCurrent().modelOptions;
 
         await hook.rerender();
-        expect(readCall).toBe(1);
+        expect(hook.getCurrent().modelOptions).toBe(options);
+        expect(machineCapabilitiesInvokeMock).not.toHaveBeenCalled();
         await hook.unmount();
     });
 });

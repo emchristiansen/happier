@@ -20,6 +20,7 @@ import { createDeferred } from '@/testkit/async/deferred';
 import { createMutableApiSessionClientFixture } from '@/testkit/backends/sessionFixtures';
 import type { SessionProviderInputConsumerSession } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
 import { CodexAppServerSteerUnavailableError } from './appServer/appServerCompatibility';
+import { createCodexAppServerRpcError } from './appServer/appServerCompatibility';
 
 const modelSyncFlushPendingAfterStartSpy = vi.fn(async () => {});
 const sessionModeSyncFlushPendingAfterStartSpy = vi.fn(async () => {});
@@ -284,6 +285,7 @@ vi.mock('@/ui/logger', () => ({
     debug: vi.fn(),
     debugLargeJson: vi.fn(),
     infoDeveloper: vi.fn(),
+    infoFile: vi.fn(),
     warn: vi.fn(),
     getLogPath: vi.fn(() => '/tmp/happier.log'),
     logFilePath: '/tmp/happier.log',
@@ -332,6 +334,59 @@ vi.mock('./utils/diffProcessor', () => ({
 
 vi.mock('./localControl/createLocalControlSupportResolver', () => ({
   createCodexLocalControlSupportResolver: vi.fn(() => async () => ({ ok: false as const, reason: 'test' })),
+}));
+
+const resolveCodexSharedControlSupportSpy = vi.fn<(...args: any[]) => Promise<any>>(async () => ({
+  ok: false as const,
+  reason: 'unsupported-version' as const,
+}));
+vi.mock('./localControl/resolveCodexSharedControlSupport', () => ({
+  resolveCodexSharedControlSupport: (params: unknown) => resolveCodexSharedControlSupportSpy(params),
+}));
+
+const sharedAppServerDisposeSpy = vi.fn(async () => {});
+const createCodexSharedAppServerSpy = vi.fn<(...args: any[]) => Promise<any>>(async () => ({
+  endpoint: 'unix:///tmp/happier-codex-test/private/app-server.sock',
+  createClient: vi.fn(),
+  dispose: sharedAppServerDisposeSpy,
+}));
+vi.mock('./appServer/createCodexSharedAppServer', () => ({
+  createCodexSharedAppServer: (params: unknown) => createCodexSharedAppServerSpy(params),
+}));
+
+let daemonProxyExitHandler: ((error: Error) => void | Promise<void>) | null = null;
+const daemonProxyClient = {
+  onExit: vi.fn((handler: (error: Error) => void | Promise<void>) => {
+    daemonProxyExitHandler = handler;
+    return () => {};
+  }),
+};
+const createCodexAppServerDaemonProxyClientSpy = vi.fn<(params: unknown) => Promise<typeof daemonProxyClient>>(async () => daemonProxyClient);
+vi.mock('./appServer/daemon/codexAppServerDaemonTransport', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./appServer/daemon/codexAppServerDaemonTransport')>();
+  return {
+    ...actual,
+    createCodexAppServerDaemonProxyClient: (params: unknown) => createCodexAppServerDaemonProxyClientSpy(params),
+  };
+});
+
+const sharedLocalControlDisposeSpy = vi.fn(async () => {});
+const createCodexSharedLocalControlSpy = vi.fn<(...args: any[]) => any>(() => ({
+  onAfterStart: vi.fn(async () => {}),
+  onSessionSwap: vi.fn(async () => {}),
+  resolveKeepAliveMode: vi.fn(() => 'remote'),
+  switchToLocal: vi.fn(async () => true),
+  dispose: sharedLocalControlDisposeSpy,
+}));
+vi.mock('./localControl/createCodexSharedLocalControl', () => ({
+  createCodexSharedLocalControl: (...args: any[]) => createCodexSharedLocalControlSpy(...args),
+}));
+
+const writeCodexSharedControlEndpointSpy = vi.fn(async (_params: unknown) => {});
+const removeCodexSharedControlEndpointSpy = vi.fn(async (_params: unknown) => true);
+vi.mock('./localControl/codexSharedControlEndpoint', () => ({
+  writeCodexSharedControlEndpoint: (params: unknown) => writeCodexSharedControlEndpointSpy(params),
+  removeCodexSharedControlEndpoint: (params: unknown) => removeCodexSharedControlEndpointSpy(params),
 }));
 
 let codexLocalLauncherImpl: ((opts: any) => Promise<any>) | null = null;
@@ -614,6 +669,20 @@ describe('runCodex CodexACP resume behavior', () => {
     sessionModeSyncFlushPendingAfterStartSpy.mockClear();
     configOptionSyncFlushPendingAfterStartSpy.mockClear();
     registerRemoteSwitchHandlerSpy.mockClear();
+    resolveCodexSharedControlSupportSpy.mockReset();
+    resolveCodexSharedControlSupportSpy.mockResolvedValue({
+      ok: false as const,
+      reason: 'unsupported-version' as const,
+    });
+    createCodexSharedAppServerSpy.mockClear();
+    createCodexAppServerDaemonProxyClientSpy.mockClear();
+    daemonProxyClient.onExit.mockClear();
+    daemonProxyExitHandler = null;
+    createCodexSharedLocalControlSpy.mockClear();
+    sharedAppServerDisposeSpy.mockClear();
+    sharedLocalControlDisposeSpy.mockClear();
+    writeCodexSharedControlEndpointSpy.mockClear();
+    removeCodexSharedControlEndpointSpy.mockClear();
     refreshDaemonOpenAiCodexChatGptAuthTokensForBridgeSpy.mockReset();
     refreshDaemonOpenAiCodexChatGptAuthTokensForBridgeSpy.mockImplementation(async () => ({
       accessToken: 'fresh-access',
@@ -630,6 +699,8 @@ describe('runCodex CodexACP resume behavior', () => {
     lastOnSwitchToLocal = null;
     delete process.env[HAPPIER_DAEMON_INITIAL_GOAL_ENV_KEY];
     delete process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
+    delete process.env.HAPPIER_CODEX_APP_SERVER_STARTUP_RPC_TIMEOUT_MS;
+    delete process.env.HAPPIER_CODEX_APP_SERVER_TRANSPORT;
     const experiments = await import('@/backends/codex/experiments');
     (experiments.isExperimentalCodexAcpEnabled as unknown as ReturnType<typeof vi.fn>).mockReturnValue(true);
     const { resolveCodexStartingMode } = await import('./utils/resolveCodexStartingMode');
@@ -1097,6 +1168,7 @@ describe('runCodex CodexACP resume behavior', () => {
   it('wires Happier MCP servers into the future app-server runtime', async () => {
     const experiments = await import('@/backends/codex/experiments');
     (experiments.isExperimentalCodexAcpEnabled as unknown as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    process.env.HAPPIER_CODEX_APP_SERVER_STARTUP_RPC_TIMEOUT_MS = '90000';
     mockAttachedSessionMetadata({ codexSessionId: 'vendor-thread-existing-123', codexBackendMode: 'appServer' });
     resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({
       happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
@@ -1128,12 +1200,14 @@ describe('runCodex CodexACP resume behavior', () => {
     expect(resolveRunnerMcpServersSpy).toHaveBeenCalledTimes(1);
     expect(createCodexAppServerRuntimeSpy).toHaveBeenCalledTimes(1);
     expect(createCodexAppServerRuntimeSpy).toHaveBeenCalledWith(expect.objectContaining({
-      configOverrides: [
+      configOverrides: expect.arrayContaining([
+        'mcp_optional_startup_grace_ms=90000',
         'shell_environment_policy.set.HAPPIER_SESSION_ID="sess_1"',
         'mcp_servers.happier.command="/tmp/happier-mcp-bridge"',
         'mcp_servers.happier.args=["--url","http://127.0.0.1:0"]',
         'mcp_servers.happier.enabled=true',
-      ],
+        'mcp_servers.happier.startup_timeout_sec=90',
+      ]),
     }));
     const runtimeArgs = createCodexAppServerRuntimeSpy.mock.calls[0]?.[0] as {
       processEnv?: NodeJS.ProcessEnv;
@@ -1146,12 +1220,14 @@ describe('runCodex CodexACP resume behavior', () => {
       HAPPIER_SESSION_ID: 'sess_1',
     }));
     expect(runtimeArgs?.transcriptSession?.sendAgentMessageEphemeral).toBeTypeOf('function');
-    expect(runtimeArgs?.configOverrides).toEqual([
+    expect(runtimeArgs?.configOverrides).toEqual(expect.arrayContaining([
+      'mcp_optional_startup_grace_ms=90000',
       'shell_environment_policy.set.HAPPIER_SESSION_ID="sess_1"',
       'mcp_servers.happier.command="/tmp/happier-mcp-bridge"',
       'mcp_servers.happier.args=["--url","http://127.0.0.1:0"]',
       'mcp_servers.happier.enabled=true',
-    ]);
+      'mcp_servers.happier.startup_timeout_sec=90',
+    ]));
     const createdRuntime = createCodexAppServerRuntimeSpy.mock.results[0]?.value as any;
     const startOrLoad = createdRuntime?.startOrLoad as ReturnType<typeof vi.fn> | undefined;
     expect(startOrLoad?.mock.calls[0]?.[0]).toMatchObject({
@@ -1218,6 +1294,43 @@ describe('runCodex CodexACP resume behavior', () => {
         }),
       }),
     ]);
+  });
+
+  it('explains an active Codex writer instead of suggesting that app-server cannot run', async () => {
+    resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({
+      happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
+      mcpServers: {},
+    }));
+    createCodexAppServerRuntimeSpy.mockImplementationOnce(() => ({
+      ...createDefaultCodexAppServerRuntimeMock(),
+      startOrLoad: vi.fn(async () => {
+        throw createCodexAppServerRpcError({
+          method: 'thread/resume',
+          code: -32600,
+          message: 'thread resume-123 already has an active writer',
+        });
+      }),
+    }));
+
+    const { runCodex } = await import('./runCodex');
+    const outcome = await runCodex({
+      credentials: { token: 'test' } as Credentials,
+      startedBy: 'daemon',
+      startingMode: 'remote',
+      resume: 'resume-123',
+      permissionMode: 'default',
+      permissionModeUpdatedAt: 1,
+      codexBackendMode: 'appServer',
+    } as any).then(() => null, (error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/another Codex process.*already writing/i);
+    expect((outcome as Error).message).toMatch(/start a new session in Happier.*happier attach/i);
+    expect((outcome as Error).message).not.toMatch(/ensure Codex app-server can run/i);
+    expect(lastSessionClient?.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      message: expect.stringMatching(/another Codex process.*already writing/i),
+    }));
   });
 
   it('does not report an ordinary metadata-driven app-server resume ready when provider resume fails', async () => {
@@ -1317,6 +1430,114 @@ describe('runCodex CodexACP resume behavior', () => {
     expect(outcome).toMatchObject({ ok: false });
   });
 
+  it.each(['fresh', 'resumed', 'accepted-failed', 'deferred-accepted-failed', 'before-acceptance-failed'] as const)('sends configured instructions only when owed after shared local attachment (%s)', async (lifecycle) => {
+    if (lifecycle === 'resumed') mockAttachedSessionMetadata({ codexSessionId: 'shared-fresh', codexBackendMode: 'appServer' });
+    resolveCodexSharedControlSupportSpy.mockResolvedValueOnce({ ok: true, version: '0.153.4' });
+    resolveRunnerMcpServersSpy.mockResolvedValueOnce({
+      happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() }, mcpServers: {},
+    });
+    const startingMode = await import('./utils/resolveCodexStartingMode');
+    vi.mocked(startingMode.resolveCodexStartingMode).mockReturnValueOnce('local');
+    const support = await import('./localControl/createLocalControlSupportResolver');
+    const actualSupport = await vi.importActual<typeof support>('./localControl/createLocalControlSupportResolver');
+    vi.mocked(support.createCodexLocalControlSupportResolver).mockImplementationOnce(actualSupport.createCodexLocalControlSupportResolver);
+    const modeController = await import('@/agent/localControl/createLocalRemoteModeController');
+    const actualModeController = await vi.importActual<typeof modeController>('@/agent/localControl/createLocalRemoteModeController');
+    const previousModeController = vi.mocked(modeController.createLocalRemoteModeController).getMockImplementation()!;
+    vi.mocked(modeController.createLocalRemoteModeController).mockImplementation(actualModeController.createLocalRemoteModeController);
+    const promptModule = await import('@/agent/prompting/coding/resolveEffectiveCodingPrompt');
+    const actualPrompt = await vi.importActual<typeof promptModule>('@/agent/prompting/coding/resolveEffectiveCodingPrompt');
+    const previousPromptResolver = vi.mocked(promptModule.resolveEffectiveCodingPromptText).getMockImplementation()!;
+    vi.mocked(promptModule.resolveEffectiveCodingPromptText).mockImplementation(actualPrompt.resolveEffectiveCodingPromptText);
+
+    const notifications = new Map<string, (params: unknown) => void | Promise<void>>();
+    const nativePrompts: unknown[] = [];
+    let turnCount = 0;
+    const nativeRequest = vi.fn(async (method: string, params?: unknown) => {
+      if (method === 'thread/start' || method === 'thread/resume' || method === 'thread/read') return { thread: { id: 'shared-fresh', turns: [] } };
+      if (method === 'thread/name/set') return {};
+      if (method === 'collaborationMode/list' || method === 'model/list') return { data: [] };
+      if (method === 'thread/goal/get') return { goal: null };
+      if (method === 'turn/start') {
+        nativePrompts.push(params);
+        const id = `turn-${++turnCount}`;
+        if (turnCount === 1 && lifecycle === 'before-acceptance-failed') {
+          throw new Error('synthetic refusal before turn acceptance');
+        }
+        const failed = turnCount === 1 && (lifecycle === 'accepted-failed' || lifecycle === 'deferred-accepted-failed');
+        const completion = {
+          threadId: 'shared-fresh', turn: {
+            id, status: failed ? 'failed' : 'completed',
+            ...(failed ? { error: { message: 'synthetic failure after turn acceptance' } } : {}),
+          },
+        };
+        if (turnCount === 1 && lifecycle === 'deferred-accepted-failed') {
+          const notify = notifications.get('turn/completed');
+          if (!notify) throw new Error('Native terminal handler missing before turn/start response');
+          await notify(completion);
+        } else {
+          setImmediate(() => { void notifications.get('turn/completed')?.(completion); });
+        }
+        return { turn: { id } };
+      }
+      throw new Error(`Unconfigured synthetic provider request: ${method}`);
+    });
+    // Only the native RPC transport and foreground terminal process are synthetic.
+    const nativeClient = {
+      request: nativeRequest, notify: async () => {}, dispose: async () => {}, onExit: () => () => {},
+      registerRequestHandler: () => () => {},
+      registerNotificationHandler: (method: string, handler: (params: unknown) => void | Promise<void>) => {
+        notifications.set(method, handler); return () => { notifications.delete(method); };
+      },
+    };
+    createCodexSharedAppServerSpy.mockImplementationOnce(async () => ({
+      endpoint: 'unix:///tmp/happier-codex-test/private/app-server.sock',
+      createClient: async () => nativeClient, dispose: sharedAppServerDisposeSpy,
+    }));
+    const actualRuntime = await vi.importActual<typeof import('./appServer/runtime')>('./appServer/runtime');
+    createCodexAppServerRuntimeSpy.mockImplementationOnce((params) =>
+      actualRuntime.createCodexAppServerRuntime({ ...params, processEnv: {} }),
+    );
+    let attached = false;
+    const attach = vi.fn(async () => { attached = true; return true; });
+    const actualSharedControl = await vi.importActual<typeof import('./localControl/createCodexSharedLocalControl')>('./localControl/createCodexSharedLocalControl');
+    createCodexSharedLocalControlSpy.mockImplementationOnce((params) =>
+      actualSharedControl.createCodexSharedLocalControl({ ...params, supervisor: {
+        isAttached: () => attached, attach,
+        detach: async () => { attached = false; }, dispose: async () => { attached = false; },
+      } }),
+    );
+    let inputCount = 0;
+    sessionInputConsumerWaitForNextInputImpl = async (opts) => {
+      if (++inputCount > 2) return null;
+      expect(attached).toBe(true);
+      expect(attach).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'shared-fresh' }));
+      if (!lastOnUserMessageHandler) throw new Error('Ordinary message handler missing');
+      await lastOnUserMessageHandler({
+        content: { text: `ordinary message ${inputCount}` }, localId: `shared-message-${inputCount}`,
+        meta: { appendSystemPrompt: 'configured shared-session instructions' },
+      }, { seq: inputCount });
+      return await opts.messageQueue.waitForMessagesAndGetAsString();
+    };
+    try {
+      const { runCodex } = await import('./runCodex');
+      await runCodex({ credentials: { token: 'test' } as Credentials, startedBy: 'terminal',
+        startingMode: 'local', codexBackendMode: 'appServer', permissionMode: 'default', permissionModeUpdatedAt: 1,
+        ...(lifecycle === 'resumed' ? { existingSessionId: 'existing-123', resume: 'shared-fresh' } : {}),
+      });
+      expect(nativePrompts).toHaveLength(2);
+      expect(nativePrompts[0]).toMatchObject({ input: [{ type: 'text', text: lifecycle !== 'resumed'
+        ? expect.stringContaining('configured shared-session instructions') : 'ordinary message 1' }] });
+      expect(nativePrompts[0]).toMatchObject({ input: [{ type: 'text', text: expect.stringContaining('ordinary message 1') }] });
+      expect(nativePrompts[1]).toMatchObject({ input: [{ type: 'text', text: lifecycle === 'before-acceptance-failed'
+        ? expect.stringContaining('configured shared-session instructions') : 'ordinary message 2' }] });
+      expect(nativePrompts[1]).toMatchObject({ input: [{ type: 'text', text: expect.stringContaining('ordinary message 2') }] });
+    } finally {
+      vi.mocked(modeController.createLocalRemoteModeController).mockImplementation(previousModeController);
+      vi.mocked(promptModule.resolveEffectiveCodingPromptText).mockImplementation(previousPromptResolver);
+    }
+  });
+
   it('keeps fresh app-server session registration lazy without opening a provider thread', async () => {
     resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({
       happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
@@ -1354,6 +1575,78 @@ describe('runCodex CodexACP resume behavior', () => {
     const createdRuntime = createCodexAppServerRuntimeSpy.mock.results[0]?.value as any;
     expect(createdRuntime.startOrLoad).not.toHaveBeenCalled();
     expect(outcome).toMatchObject({ ok: false });
+  });
+
+  it('enables supported shared app-server control for daemon sessions without a launch TTY', async () => {
+    resolveCodexSharedControlSupportSpy.mockResolvedValueOnce({ ok: true as const, version: '0.153.4' });
+    resolveRunnerMcpServersSpy.mockResolvedValueOnce({
+      happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
+      mcpServers: {},
+    });
+    sessionInputConsumerWaitForNextInputImpl = async () => {
+      throw new Error('stop-after-shared-server-start');
+    };
+
+    const { runCodex } = await import('./runCodex');
+    await runCodex({
+      credentials: { token: 'test' } as Credentials,
+      startedBy: 'daemon',
+      startingMode: 'remote',
+      codexBackendMode: 'appServer',
+    } as any).catch(() => undefined);
+
+    expect(resolveCodexSharedControlSupportSpy).toHaveBeenCalledOnce();
+    expect(createCodexSharedAppServerSpy).toHaveBeenCalledOnce();
+    expect(writeCodexSharedControlEndpointSpy).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'sess_1',
+      endpoint: 'unix:///tmp/happier-codex-test/private/app-server.sock',
+    }));
+  });
+
+  it('reuses the existing Codex daemon transport without creating or publishing a Happier-owned server', async () => {
+    process.env.HAPPIER_CODEX_APP_SERVER_TRANSPORT = 'daemonProxy';
+    process.env.HAPPIER_RUNNER_TERMINATION_TIMEOUT_MS = '250';
+    resolveCodexSharedControlSupportSpy.mockResolvedValueOnce({ ok: true as const });
+    resolveRunnerMcpServersSpy.mockResolvedValueOnce({
+      happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
+      mcpServers: {},
+    });
+    sessionInputConsumerWaitForNextInputImpl = async () => {
+      throw new Error('stop-after-existing-daemon-start');
+    };
+
+    const { runCodex } = await import('./runCodex');
+    await runCodex({
+      credentials: { token: 'test' } as Credentials,
+      startedBy: 'daemon',
+      startingMode: 'remote',
+      codexBackendMode: 'appServer',
+    } as any).catch(() => undefined);
+
+    expect(resolveCodexSharedControlSupportSpy).not.toHaveBeenCalled();
+    expect(createCodexSharedAppServerSpy).not.toHaveBeenCalled();
+    expect(writeCodexSharedControlEndpointSpy).not.toHaveBeenCalled();
+    expect(createCodexAppServerRuntimeSpy).toHaveBeenCalledWith(expect.objectContaining({
+      createClient: expect.any(Function),
+    }));
+
+    const runtimeArgs = createCodexAppServerRuntimeSpy.mock.calls[0]?.[0] as {
+      createClient?: () => Promise<unknown>;
+    } | undefined;
+    await expect(runtimeArgs?.createClient?.()).resolves.toBe(daemonProxyClient);
+    expect(daemonProxyClient.onExit).toHaveBeenCalledOnce();
+    expect(daemonProxyExitHandler).toBeTypeOf('function');
+
+    const processExitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      await daemonProxyExitHandler!(new Error('native Codex app-server stopped'));
+      await vi.waitFor(() => {
+        expect(processExitSpy).toHaveBeenCalledWith(0);
+      });
+    } finally {
+      processExitSpy.mockRestore();
+      delete process.env.HAPPIER_RUNNER_TERMINATION_TIMEOUT_MS;
+    }
   });
 
   it('routes Codex ChatGPT refresh bridge requests for connected-service profile selections to the daemon', async () => {
@@ -1890,13 +2183,41 @@ describe('runCodex CodexACP resume behavior', () => {
     expect(outcome).toMatchObject({ ok: true });
   });
 
-  it('cancels the app-server runtime when the session abort RPC is invoked mid-turn', async () => {
+  it.each([false, true])('cancels the app-server runtime and controller on Stop (journal admission fails: %s)', async (admissionFails) => {
     resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({
       happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
       mcpServers: {},
     }));
-    sessionInputConsumerWaitForNextInputImpl = async () => {
-      throw new Error('wait-called');
+    const actualFactory = await vi.importActual<typeof import('./utils/createCodexPermissionHandler')>('./utils/createCodexPermissionHandler');
+    let permissionHandler: ReturnType<typeof createCodexPermissionHandler> | undefined;
+    let state: import('@/api/types').AgentState = { requests: {}, completedRequests: {} };
+    vi.mocked(createCodexPermissionHandler).mockImplementationOnce((params) => {
+      Object.assign(params.session, {
+        getAgentStateSnapshot: () => state,
+        updateAgentState: async (updater: (current: import('@/api/types').AgentState) => import('@/api/types').AgentState) => { state = updater(state); },
+        updateAgentStateRequestSettlement: async (updater: (current: import('@/api/types').AgentState) => import('@/api/types').AgentState) => {
+          if (admissionFails) throw Object.assign(new Error('journal disk full'), { code: 'ENOSPC' });
+          state = updater(state);
+        },
+      });
+      permissionHandler = actualFactory.createCodexPermissionHandler(params);
+      return permissionHandler;
+    });
+    let stoppedSignal: AbortSignal | undefined;
+    let stopCompleted = false;
+    sessionInputConsumerWaitForNextInputImpl = async ({ abortSignal }: { abortSignal: AbortSignal }) => {
+      stoppedSignal = abortSignal;
+      if (!permissionHandler) throw new Error('Expected real Codex permission handler');
+      const pending = permissionHandler.handleToolCall('codex-stop', 'AskUserQuestion', {
+        questions: [{ question: 'Continue?', options: [{ label: 'Yes' }] }],
+      });
+      const rejected = expect(pending).rejects.toThrow('Aborted by user');
+      const abortHandler = registerSessionRpcHandlerMock.mock.calls.find((call) => call[0] === 'abort')?.[1];
+      if (!abortHandler) throw new Error('Expected Stop RPC');
+      await abortHandler();
+      await rejected;
+      stopCompleted = true;
+      throw new Error('test-input-boundary-complete');
     };
     const cancelSpy = vi.fn(async () => {});
     createCodexAppServerRuntimeSpy.mockImplementationOnce(() => ({
@@ -1928,10 +2249,9 @@ describe('runCodex CodexACP resume behavior', () => {
       codexBackendMode: 'appServer',
     } as any).catch(() => undefined);
 
-    const abortHandler = registerSessionRpcHandlerMock.mock.calls.find((call) => call[0] === 'abort')?.[1];
-    await expect(abortHandler?.()).resolves.toBeUndefined();
-    const createdPermissionHandler = (createCodexPermissionHandler as any).mock.results[0]?.value;
-    expect(createdPermissionHandler?.abortPendingRequestsAndFlush).toHaveBeenCalledTimes(1);
+    expect(stopCompleted).toBe(true);
+    expect(stoppedSignal?.aborted).toBe(true);
+    expect(Boolean(state.requests?.['codex-stop'])).toBe(admissionFails);
     expect(cancelSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -3430,7 +3750,8 @@ describe('runCodex CodexACP resume behavior', () => {
         content: { text: 'recover directly from stale steer' },
         meta: {},
         localId: 'local-direct-stale-steer',
-      }, { seq: null, pendingProviderAction });
+      }, { seq: null, pendingProviderAction, providerAcceptancePending: pendingProviderAction === 'steer' });
+      await new Promise((resolve) => setTimeout(resolve, 0));
       const batch = opts.messageQueue.size() > 0
         ? await opts.messageQueue.waitForMessagesAndGetAsString()
         : null;
@@ -3455,18 +3776,10 @@ describe('runCodex CodexACP resume behavior', () => {
       localId: 'local-direct-stale-steer',
       userMessageSeq: null,
     });
-    if (pendingProviderAction === 'steer') {
-      expect(observedSuppressUserEcho).toBeUndefined();
-      expect(providerInputOutcomeObserverMock).toHaveBeenCalledWith({
-        kind: 'rejected_before_effect',
-        localId: 'local-direct-stale-steer',
-        reason: 'steering_unavailable',
-      });
-      expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
-    } else {
-      expect(observedSuppressUserEcho).toBe(true);
-      expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
-    }
+    // These are unbound ordinary/explicit inputs, not conditional or turn-bound
+    // requests. A definite pre-effect refusal may preserve their same queue custody.
+    expect(observedSuppressUserEcho).toBe(true);
+    expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) {
       expect(outcome.error).toEqual(expect.objectContaining({ message: 'stop-after-direct-requeue' }));
@@ -3542,11 +3855,14 @@ describe('runCodex CodexACP resume behavior', () => {
   });
 
   it.each([
-    ['native no-active-turn', Object.assign(new Error('no active turn to steer'), { method: 'turn/steer', code: -32000 }), 'steering_unavailable', 'none'],
-    ['local not-steerable', new CodexAppServerSteerUnavailableError(), 'steering_unavailable', 'none'],
-    ['untyped not-steerable', new Error('Codex app-server active turn is not steerable'), 'ambiguous_terminal_delivery', undefined],
-    ['transport failure', Object.assign(new Error('temporary steer transport failure'), { method: 'turn/steer', code: 'ECONNRESET' }), 'ambiguous_terminal_delivery', undefined],
-  ] as const)('classifies exact pending custody after a stale steer: %s', async (_kind, staleSteerError, reason, providerEffect) => {
+    ['native no-active-turn', Object.assign(new Error('no active turn to steer'), { method: 'turn/steer', code: -32000 }), 'steering_unavailable', 'none', 'steer_if_active'],
+    ['local not-steerable', new CodexAppServerSteerUnavailableError(), 'steering_unavailable', 'none', 'steer_if_active'],
+    ['untyped not-steerable', new Error('Codex app-server active turn is not steerable'), 'ambiguous_terminal_delivery', undefined, 'steer_if_active'],
+    ['transport failure', Object.assign(new Error('temporary steer transport failure'), { method: 'turn/steer', code: 'ECONNRESET' }), 'ambiguous_terminal_delivery', undefined, 'steer_if_active'],
+    ['explicit no-active-turn', createCodexAppServerRpcError({ method: 'turn/steer', code: -32000, message: 'no active turn to steer' }), 'steering_unavailable', 'none', 'steer_now'],
+    ['explicit local not-steerable', new CodexAppServerSteerUnavailableError(), 'steering_unavailable', 'none', 'steer_now'],
+    ['explicit ambiguous transport', Object.assign(new Error('temporary steer transport failure'), { method: 'turn/steer', code: 'ECONNRESET' }), 'ambiguous_terminal_delivery', undefined, 'steer_now'],
+  ] as const)('preserves requested action and exact pending custody after stale steer: %s', async (_kind, staleSteerError, reason, providerEffect, kind) => {
     resolveRunnerMcpServersSpy.mockImplementationOnce(async () => ({
       happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
       mcpServers: {},
@@ -3597,6 +3913,8 @@ describe('runCodex CodexACP resume behavior', () => {
           },
           isolate: false,
           hash: 'hash-stale-steer',
+          pendingProviderAction: 'steer',
+          pendingRequestedAction: { v: 1, kind },
         };
       }
       return null;
@@ -3621,8 +3939,12 @@ describe('runCodex CodexACP resume behavior', () => {
       localId: 'local-stale-steer',
       userMessageSeq: null,
     });
-    expect(sendPrompt).not.toHaveBeenCalled();
-    if (providerEffect === 'none') {
+    if (providerEffect === 'none' && kind === 'steer_now') {
+      expect(sendPrompt).toHaveBeenCalledTimes(1);
+      expect(appServerRuntime.cancel).not.toHaveBeenCalled();
+      expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
+    } else if (providerEffect === 'none') {
+      expect(sendPrompt).not.toHaveBeenCalled();
       expect(providerInputOutcomeObserverMock).toHaveBeenCalledWith({
         kind: 'rejected_before_effect',
         localId: 'local-stale-steer',
@@ -3630,6 +3952,7 @@ describe('runCodex CodexACP resume behavior', () => {
       });
       expect(lastSessionClient?.blockPendingMessageDelivery).not.toHaveBeenCalled();
     } else {
+      expect(sendPrompt).not.toHaveBeenCalled();
       expect(lastSessionClient?.blockPendingMessageDelivery).toHaveBeenCalledWith({
         localIds: ['local-stale-steer'],
         reason,

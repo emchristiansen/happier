@@ -19,6 +19,7 @@ export const ExecutionRunConnectedServiceMaterializeRequestSchema = z.object({
   materializationKey: z.string().min(1),
   connectedServicesBindingsRaw: z.unknown(),
   sessionDirectory: z.string().nullable().optional(),
+  previousMaterializedRoot: z.string().min(1).optional(),
   sessionId: z.string().min(1).optional(),
 });
 

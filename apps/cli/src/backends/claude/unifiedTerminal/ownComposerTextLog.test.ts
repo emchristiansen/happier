@@ -131,6 +131,25 @@ describe('createClaudeOwnComposerTextLog (lane X, incident cmq8y3nlx user_draft 
     expect(log.matches('[Pasted text #1 +3662 lines]')).toBe(false);
   });
 
+  it.each(['record', 'recordPossiblePartialResidue'] as const)('preserves pasted newlines before semantic normalization through %s', (recordMethod) => {
+    const body = Array.from({ length: 14 }, (_, index) => `line ${index}`).join('\n');
+    for (const prompt of [
+      `\n\n${body}\n\n\n`,
+      `\n\n<pasted_content id="probe">\n${body}\n</pasted_content id="probe">\n`.replace(/\n/g, '\r\n'),
+    ]) {
+      const log = createClaudeOwnComposerTextLog();
+      // Same semantic identity, but a different paste. Partial-write recording must retain
+      // the actual newlines rather than updating the earlier normalized entry.
+      log.record(body);
+      log[recordMethod](prompt);
+
+      expect(log.matches('[Pasted text #1 +18 lines]')).toBe(true);
+      expect(log.matches(body)).toBe(true);
+      expect(log.matches('[Pasted text #1 +22 lines]')).toBe(false);
+      expect(log.matches('my draft [Pasted text #1 +18 lines]')).toBe(false);
+    }
+  });
+
   it('does not match a genuine draft that merely contains a Claude collapsed paste marker', () => {
     const log = createClaudeOwnComposerTextLog();
     const prompt = Array.from({ length: 41 }, (_, index) => `line ${index}`).join('\n');
@@ -143,6 +162,8 @@ describe('createClaudeOwnComposerTextLog (lane X, incident cmq8y3nlx user_draft 
     const log = createClaudeOwnComposerTextLog();
     log.record('please continue with the refactor');
     expect(log.matches('[Pasted text #1 +0 lines]')).toBe(false);
+    expect(log.matches('[Pasted text #1 +1 lines]')).toBe(false);
+    expect(log.matches('[Pasted text #1]')).toBe(false);
   });
 
   it('is bounded: oldest entries are evicted beyond the limit', () => {

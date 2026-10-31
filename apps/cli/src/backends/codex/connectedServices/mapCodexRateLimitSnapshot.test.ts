@@ -121,6 +121,61 @@ describe('mapCodexRateLimitSnapshotToQuotaSnapshot', () => {
     }
   });
 
+  it('preserves every app-server allowance identity from rateLimitsByLimitId', () => {
+    const snapshot = mapCodexRateLimitSnapshotToQuotaSnapshot({
+      serviceId: 'openai-codex',
+      profileId: 'work',
+      fetchedAt: 1_768_000_000_000,
+      rawSnapshot: {
+        rateLimits: { limitId: 'standard', primary: { usedPercent: 20 } },
+        rateLimitsByLimitId: {
+          standard: { limitId: 'standard', primary: { usedPercent: 20 } },
+          spark: { limitId: 'spark', limitName: 'Spark', modelId: 'gpt-5-spark', primary: { usedPercent: 75 } },
+        },
+      },
+    });
+
+    expect(snapshot.meters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ meterId: 'standard:primary', providerLimitId: 'standard', utilizationPct: 20 }),
+      expect.objectContaining({ meterId: 'spark:primary', providerLimitId: 'spark', modelId: 'gpt-5-spark', utilizationPct: 75 }),
+    ]));
+    expect(snapshot.meters.filter((meter) => meter.providerLimitId === 'standard')).toHaveLength(1);
+  });
+
+  it('preserves allowance metadata nested inside an additional rate_limit entry', () => {
+    const snapshot = mapCodexRateLimitSnapshotToQuotaSnapshot({
+      serviceId: 'openai-codex',
+      profileId: 'work',
+      fetchedAt: 1_768_000_000_000,
+      rawSnapshot: {
+        additional_rate_limits: [{
+          rate_limit: {
+            limit_id: 'codex_bengalfox',
+            limit_name: 'GPT-5.3-Codex-Spark',
+            model_id: 'gpt-5.3-codex-spark',
+            primary_window: { used_percent: 25 },
+            secondary_window: { used_percent: 40 },
+          },
+        }],
+      },
+    });
+
+    expect(snapshot.meters).toEqual([
+      expect.objectContaining({
+        meterId: 'codex_bengalfox:primary',
+        providerLimitId: 'codex_bengalfox',
+        label: 'GPT-5.3-Codex-Spark · Primary',
+        modelId: 'gpt-5.3-codex-spark',
+      }),
+      expect.objectContaining({
+        meterId: 'codex_bengalfox:secondary',
+        providerLimitId: 'codex_bengalfox',
+        label: 'GPT-5.3-Codex-Spark · Secondary',
+        modelId: 'gpt-5.3-codex-spark',
+      }),
+    ]);
+  });
+
   it('converts relative resets_in_seconds to absolute reset timestamps at mapping time (RD-QUO-1)', () => {
     const fetchedAt = 1_768_000_000_000;
     const snapshot = mapCodexRateLimitSnapshotToQuotaSnapshot({
@@ -145,6 +200,7 @@ describe('mapCodexRateLimitSnapshotToQuotaSnapshot', () => {
       {
         meterId: 'primary',
         utilizationPct: 100,
+        windowDurationMs: 300 * 60_000,
         resetAtMs: fetchedAt + 1_800_000,
         resetsAt: fetchedAt + 1_800_000,
       },

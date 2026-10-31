@@ -24,6 +24,42 @@ export function splitQualifiedWindowsScheduledTaskName(qualifiedTaskName: string
   };
 }
 
+/** Register only the invoking user's interactive task, never an all-users logon trigger. */
+export function buildRegisterWindowsUserScheduledTaskPowerShellCommand(params: Readonly<{
+  qualifiedTaskName: string;
+  definitionPath: string;
+  persistent: boolean;
+}>): string {
+  const { taskName, taskPath } = splitQualifiedWindowsScheduledTaskName(params.qualifiedTaskName);
+  const xmlEscape = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
+  const literal = (value: string) => `'${value.replaceAll("'", "''")}'`;
+  const action = buildWindowsScheduledTaskPowerShellAction({ definitionPath: params.definitionPath });
+  const xml = '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+    + (params.persistent
+      ? '<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>current-user</UserId></LogonTrigger></Triggers>'
+      : '<Triggers/>')
+    + '<Principals><Principal id="Author"><UserId>current-user</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>'
+    + '<Actions Context="Author"><Exec><Command>powershell.exe</Command><Arguments>'
+    + xmlEscape(action.slice('powershell.exe '.length)) + '</Arguments></Exec></Actions></Task>';
+  return [
+    '$ErrorActionPreference = "Stop"',
+    '$userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+    `[xml]$xml = ${literal(xml)}`,
+    '$xml.Task.Principals.Principal.UserId = $userId',
+    ...(params.persistent ? ['$xml.Task.Triggers.LogonTrigger.UserId = $userId'] : []),
+    '$scheduler = New-Object -ComObject Schedule.Service',
+    '$scheduler.Connect()',
+    // Create the existing task namespace only when absent; access failures must remain failures.
+    '$folder = $scheduler.GetFolder("\\")',
+    ...taskPath.split('\\').filter(Boolean).map((part) =>
+      `$child = $folder.GetFolders(0) | Where-Object { $_.Name -eq ${literal(part)} }; if ($null -eq $child) { $child = $folder.CreateFolder(${literal(part)}) }; $folder = $child`),
+    `$taskName = ${literal(taskName)}`,
+    // TASK_CREATE_OR_UPDATE=6, TASK_LOGON_INTERACTIVE_TOKEN=3: no password or elevation.
+    '$folder.RegisterTask($taskName, $xml.OuterXml, 6, $userId, $null, 3, $null) | Out-Null',
+  ].join('; ');
+}
+
 export function buildStopWindowsScheduledTaskIfRunningPowerShellCommand(params: Readonly<{
   qualifiedTaskName: string;
   definitionPath: string;
@@ -48,14 +84,9 @@ export function buildStopWindowsScheduledTaskIfRunningPowerShellCommand(params: 
     '  $wrapperProcessIds = @($allProcesses | Where-Object { ([string]$_.CommandLine).IndexOf($wrapperActionToken, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | ForEach-Object { [int]$_.ProcessId })',
     '  $serviceProcessIds = @($allProcesses | Where-Object { $wrapperProcessIds -contains [int]$_.ParentProcessId } | ForEach-Object { [int]$_.ProcessId })',
     '  foreach ($serviceProcessId in $serviceProcessIds) {',
-    '    $taskkillProcess = Start-Process -FilePath "taskkill.exe" -ArgumentList @("/PID", [string]$serviceProcessId, "/T", "/F") -NoNewWindow -Wait -PassThru',
-    '    $taskkillExitCode = $taskkillProcess.ExitCode',
-    '    if ($taskkillExitCode -ne 0 -and $null -ne (Get-Process -Id $serviceProcessId -ErrorAction SilentlyContinue)) {',
-    '      throw "Failed to stop scheduled task child process $serviceProcessId (taskkill exit $taskkillExitCode)"',
-    '    }',
-    '    Wait-Process -Id $serviceProcessId -Timeout 10 -ErrorAction SilentlyContinue',
-    '    if ($null -ne (Get-Process -Id $serviceProcessId -ErrorAction SilentlyContinue)) {',
-    '      throw "Failed to wait for scheduled task child process $serviceProcessId to exit"',
+    '    & taskkill.exe /PID $serviceProcessId /T /F | Out-Null',
+    '    if ($LASTEXITCODE -ne 0 -and $null -ne (Get-Process -Id $serviceProcessId -ErrorAction SilentlyContinue)) {',
+    '      throw "Failed to stop scheduled task child process $serviceProcessId (taskkill exit $LASTEXITCODE)"',
     '    }',
     '  }',
     '  $task = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue',
@@ -84,6 +115,40 @@ export function buildRemoveWindowsScheduledTaskIfPresentPowerShellCommand(params
     '}',
     'exit 0',
   ].join('; ');
+}
+
+/**
+ * List the tasks in one Task Scheduler folder as invariant JSON (`["\\Happier\\task", ...]`).
+ *
+ * `schtasks /Query` without `/TN` enumerates every task on the machine, which can exceed the
+ * schtasks timeout on hosts with many tasks; with `/TN <folder>` a missing folder is only a
+ * localized error message. The scheduler API reports a missing folder as FileNotFoundException.
+ */
+export function buildListWindowsScheduledTaskFolderPowerShellCommand(params: Readonly<{
+  taskFolder: string;
+}>): string {
+  const folderPath = `\\${String(params.taskFolder ?? '').split(/[\\/]+/u).filter(Boolean).join('\\')}`;
+  return [
+    '$ErrorActionPreference = "Stop"',
+    '$scheduler = New-Object -ComObject Schedule.Service',
+    '$scheduler.Connect()',
+    `try { $folder = $scheduler.GetFolder(${psQuoted(folderPath)}) } catch [System.IO.FileNotFoundException] { "[]"; exit 0 }`,
+    // TASK_ENUM_HIDDEN=1 so hidden tasks are listed too.
+    'ConvertTo-Json -Compress -InputObject @(@($folder.GetTasks(1)) | ForEach-Object { [string]$_.Path })',
+  ].join('; ');
+}
+
+export function parseWindowsScheduledTaskFolderPowerShellJson(text: string): readonly string[] | null {
+  const trimmed = String(text ?? '').trim();
+  // Missing and empty folders both produce explicit []; blank output cannot establish absence.
+  if (!trimmed) return null;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (!Array.isArray(parsed) || !parsed.every((value) => typeof value === 'string')) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 export type WindowsScheduledTaskStatusSnapshot = Readonly<{
@@ -185,33 +250,23 @@ export function renderWindowsScheduledTaskWrapperPs1(params: Readonly<{
     .join('\n');
 
   const cmd = args.length ? `& ${args.map(psQuoted).join(' ')}` : '';
-  const redirect = [
-    out ? `1>> ${psQuoted(out)}` : '',
-    err ? `2>> ${psQuoted(err)}` : '',
-  ].filter(Boolean).join(' ');
-  const body = [
-    wd ? `Set-Location -LiteralPath ${psQuoted(wd)}` : '',
-    envLines,
-    cmd ? '$LASTEXITCODE = 1' : '',
-    cmd ? '$ErrorActionPreference = "Continue"' : '',
-    cmd ? `${cmd}${redirect ? ` ${redirect}` : ''}` : '',
-    cmd ? '$exitCode = $LASTEXITCODE' : '',
-    cmd ? 'exit $exitCode' : '',
-  ].filter(Boolean);
-  const diagnosticPath = err || out;
+  const redirect = out || err ? ` 1>> ${psQuoted(out)} 2>> ${psQuoted(err)}` : '';
 
   return [
     '$ErrorActionPreference = "Stop"',
-    'try {',
-    ...body.map((line) => line.split('\n').map((part) => `  ${part}`).join('\n')),
-    '} catch {',
-    diagnosticPath
-      ? `  ($_ | Out-String) | Add-Content -LiteralPath ${psQuoted(diagnosticPath)}`
-      : '  Write-Error ($_ | Out-String)',
-    '  exit 1',
-    '}',
+    // Setup failures (and a missing program) terminate before any redirect is in place;
+    // record them where launch diagnostics look instead of only in the task's exit code.
+    err ? `trap { $_ | Out-File -LiteralPath ${psQuoted(err)} -Append; exit 1 }` : '',
+    wd ? `Set-Location -LiteralPath ${psQuoted(wd)}` : '',
+    envLines,
+    // Windows PowerShell 5.1 wraps each redirected native stderr line in an ErrorRecord, so
+    // under "Stop" the first warning the program prints would terminate the wrapper (#539).
+    cmd ? '$ErrorActionPreference = "Continue"' : '',
+    cmd ? `${cmd}${redirect}` : '',
+    cmd ? 'exit $LASTEXITCODE' : '',
     '',
   ]
+    .filter(Boolean)
     .join('\n');
 }
 
@@ -234,6 +289,13 @@ export function buildApplyWindowsScheduledTaskServicePolicyPowerShellCommand(par
   restartPolicy: 'always' | 'on-failure' | 'no';
   restartIntervalMinutes?: number;
   restartCount?: number;
+  /**
+   * Whether Task Scheduler may run a *missed* scheduled start as soon as possible
+   * (`-StartWhenAvailable`). Defaults to true, which is what a task with a real login/boot trigger
+   * wants: a machine asleep at logon should still start it. Pass false for a task whose trigger is
+   * deliberately in the past — catching that up is the one way such a trigger could ever fire.
+   */
+  catchUpMissedStart?: boolean;
 }>): string {
   const { taskName, taskPath } = splitQualifiedWindowsScheduledTaskName(params.qualifiedTaskName);
   const restartIntervalMinutes = Number.isFinite(params.restartIntervalMinutes)
@@ -258,7 +320,7 @@ export function buildApplyWindowsScheduledTaskServicePolicyPowerShellCommand(par
     '-ExecutionTimeLimit (New-TimeSpan -Seconds 0)',
     '-AllowStartIfOnBatteries',
     '-DontStopIfGoingOnBatteries',
-    '-StartWhenAvailable',
+    ...(params.catchUpMissedStart === false ? [] : ['-StartWhenAvailable']),
     '-MultipleInstances IgnoreNew',
   ].join(' ');
 

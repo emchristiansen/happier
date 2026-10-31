@@ -3,6 +3,8 @@ import { rm } from 'node:fs/promises';
 import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import type { CatalogAgentId } from '@/backends/types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '../../credentials/lifecycleTypes';
+import type { ConnectedServiceRuntimeRegistry } from '../../runtimeRegistry/registry';
+import { normalizeMaterializationKeyForPath } from '../normalizeMaterializationKeyForPath';
 import {
   listMaterializedAttemptTargets,
   listMaterializedHomeTargets,
@@ -72,6 +74,7 @@ export class ConnectedServiceMaterializedHomeCleanupScheduler {
     removePath?: typeof rm;
     resolveCredentialLifecycleDescriptor?: ResolveCredentialLifecycleDescriptor;
     onCleanupRetryExhausted?: (event: PendingPathCleanupRetryExhaustedEvent<PendingMaterializedCleanupTarget>) => void;
+    runtimeRegistry?: ConnectedServiceRuntimeRegistry;
     hasLiveTarget(input: Readonly<{
       kind: 'home' | 'attempt';
       materializationIdentityId: string;
@@ -103,6 +106,14 @@ export class ConnectedServiceMaterializedHomeCleanupScheduler {
   }
 
   private hasLiveTarget(target: ConnectedServiceMaterializedCleanupTarget): boolean {
+    // Execution runs use a distinct Run-key registry alongside their runner Session. Reuse that
+    // live registration here; a persisted marker's running status is not process liveness.
+    if (this.deps.runtimeRegistry?.listTargets().some((runtimeTarget) => {
+      if (runtimeTarget.agentId !== target.agentId) return false;
+      const identityId = runtimeTarget.connectedServiceMaterializationIdentityV1?.id
+        ?? (runtimeTarget.materializationKey ? normalizeMaterializationKeyForPath(runtimeTarget.materializationKey) : null);
+      return identityId === target.materializationIdentityId;
+    })) return true;
     return this.deps.hasLiveTarget({
       kind: target.kind,
       materializationIdentityId: target.materializationIdentityId,

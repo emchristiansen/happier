@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { join, resolve as resolvePath } from 'node:path';
 
 import { resolveCliTestLaunchSpec } from '../process/cliLaunchSpec';
+import { sanitizeCliTestEnv } from '../process/cliTestEnv';
 import { runLoggedCommand } from '../process/spawnProcess';
 import { repoRootDir } from '../paths';
 
@@ -48,8 +49,9 @@ export async function runCliJson(params: Readonly<{
     skipSharedDepsBuild?: boolean;
   }>;
 }>): Promise<JsonEnvelope> {
+  const sanitizedEnv = sanitizeCliTestEnv(params.env);
   const cliLaunchSpec = await resolveCliTestLaunchSpec(
-    { testDir: params.testDir, env: params.env },
+    { testDir: params.testDir, env: sanitizedEnv },
     {
       snapshotDir: resolvePath(join(params.testDir, 'cli-dist')),
       preferSourceEntrypoint: params.launchOptions?.preferSourceEntrypoint,
@@ -59,7 +61,7 @@ export async function runCliJson(params: Readonly<{
   const stdoutPath = resolvePath(join(params.testDir, `cli.${params.label}.stdout.log`));
   const stderrPath = resolvePath(join(params.testDir, `cli.${params.label}.stderr.log`));
   const env = {
-    ...params.env,
+    ...sanitizedEnv,
     ...(params.launchOptions?.skipSharedDepsBuild
       ? {
           HAPPIER_E2E_PROVIDER_SKIP_CLI_SHARED_DEPS_BUILD: '1',

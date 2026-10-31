@@ -43,7 +43,9 @@ export async function runCursor(opts: StandardAcpProviderRunOptions & {
     providerName: 'Cursor',
     waitingForCommandLabel: 'Cursor',
     agentMessageType: 'cursor',
-    failClosedOnResumeFailure: true,
+    // `CursorAcpBackend` implements `session/load`, so an explicit resume must not silently
+    // fork a fresh Cursor session when the load fails.
+    declaredSessionLoadSupport: true,
     machineMetadata: initialMachineMetadata,
     terminalDisplay: CursorTerminalDisplay,
     resolveRuntimeDirectory: ({ session, metadata }) => session.getMetadataSnapshot()?.path ?? metadata.path,

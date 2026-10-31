@@ -210,4 +210,103 @@ describe('resolveDaemonServiceInstallConflictPlan', () => {
     expect(plan.foreignHomeConflicts).toEqual([pinnedService]);
     expect(plan.servicesToRemove).toEqual([]);
   });
+  describe('pinned targets on one release ring', () => {
+    const home = '/home/alice/.happier';
+    const pinnedTarget = {
+      platform: 'linux' as const,
+      mode: 'user' as const,
+      targetMode: 'pinned' as const,
+      ring: 'stable' as const,
+      instanceId: 'company',
+      activeServerId: 'company',
+      serverUrl: 'https://company.example.test',
+      happierHomeDir: home,
+      defaultFollowingServer: null,
+    };
+    const pinnedService = (serverId: string, relayUrl: string) => ({
+      serverId,
+      activeServerId: serverId,
+      name: serverId,
+      relayUrl,
+      installed: true as const,
+      path: `/home/alice/.config/systemd/user/happier-daemon.${serverId}.service`,
+      platform: 'linux' as const,
+      mode: 'user' as const,
+      happierHomeDir: home,
+      releaseChannel: 'stable' as const,
+      label: `happier-daemon.${serverId}`,
+      targetMode: 'pinned' as const,
+    });
+    const defaultFollowingService = {
+      serverId: 'default',
+      name: 'Default automatic startup',
+      relayUrl: null,
+      installed: true as const,
+      path: '/home/alice/.config/systemd/user/happier-daemon.default.service',
+      platform: 'linux' as const,
+      mode: 'user' as const,
+      happierHomeDir: home,
+      releaseChannel: 'stable' as const,
+      label: 'happier-daemon.default',
+      targetMode: 'default-following' as const,
+    };
+
+    it('lets a pinned service for another relay coexist with the target', () => {
+      const personal = pinnedService('personal', 'https://personal.example.test');
+
+      const plan = resolveDaemonServiceInstallConflictPlan({
+        target: pinnedTarget,
+        strategy: 'replace-ring',
+        services: [personal],
+      });
+
+      expect(plan.competingServices).toEqual([]);
+      expect(plan.servicesToRemove).toEqual([]);
+    });
+
+    it('still treats a pinned service for the same relay under another profile id as competing', () => {
+      const alias = pinnedService('company-alias', 'https://COMPANY.example.test/');
+
+      const plan = resolveDaemonServiceInstallConflictPlan({
+        target: pinnedTarget,
+        strategy: 'replace-ring',
+        services: [alias],
+      });
+
+      expect(plan.competingServices).toEqual([alias]);
+      expect(plan.servicesToRemove).toEqual([alias]);
+    });
+
+    it('lets the target coexist with the default-following service while that service serves another relay', () => {
+      const plan = resolveDaemonServiceInstallConflictPlan({
+        target: {
+          ...pinnedTarget,
+          defaultFollowingServer: { serverId: 'personal', serverUrl: 'https://personal.example.test' },
+        },
+        strategy: 'require-explicit',
+        services: [defaultFollowingService],
+      });
+
+      expect(plan.competingServices).toEqual([]);
+    });
+
+    it('treats the default-following service as competing while it serves the target relay or its relay is unknown', () => {
+      const servingTarget = resolveDaemonServiceInstallConflictPlan({
+        target: {
+          ...pinnedTarget,
+          defaultFollowingServer: { serverId: 'company', serverUrl: 'https://company.example.test' },
+        },
+        strategy: 'require-explicit',
+        services: [defaultFollowingService],
+      });
+      const unknownRelay = resolveDaemonServiceInstallConflictPlan({
+        target: pinnedTarget,
+        strategy: 'require-explicit',
+        services: [defaultFollowingService],
+      });
+
+      expect(servingTarget.competingServices).toEqual([defaultFollowingService]);
+      expect(unknownRelay.competingServices).toEqual([defaultFollowingService]);
+    });
+  });
 });

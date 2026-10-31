@@ -1,6 +1,8 @@
+import { afterAll as j078AfterAll, beforeEach as j078BeforeEach } from 'vitest';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -28,6 +30,7 @@ import {
   resolveTestDaemonOwnershipLeasesDir,
   sanitizeDaemonEnvForSpawn,
   startTestDaemon,
+  waitForDaemonState,
 } from './daemon';
 import { repoRootDir } from '../paths';
 import { spawnDetachedTestProcess } from '../process/testSpawn';
@@ -132,7 +135,23 @@ async function writeReplacementDaemonScript(scriptPath: string, opts: { serverId
 }
 
 describe('startTestDaemon', () => {
-  it('launches the exact caller-supplied prepared daemon snapshot through the canonical resolver', async () => {
+  it('waits for fresh daemon state past a retired root state when the replacement writes per-server state', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'happier-daemon-fresh-state-'));
+    try {
+      await writeFile(resolve(homeDir, 'daemon.state.json'), JSON.stringify({ pid: 111, httpPort: 32_231 }), 'utf8');
+      const serverDir = resolve(homeDir, 'servers', 'replacement');
+      await mkdir(serverDir, { recursive: true });
+      await writeFile(resolve(serverDir, 'daemon.state.json'), JSON.stringify({ pid: 222, httpPort: 32_232 }), 'utf8');
+
+      const state = await waitForDaemonState(homeDir, { excludePid: 111 });
+
+      expect(state).toMatchObject({ pid: 222, httpPort: 32_232 });
+    } finally {
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('launches the exact caller-supplied prepared daemon snapshot and restarts after its process retires', async () => {
     const testDir = await mkdtemp(join(tmpdir(), 'happier-daemon-prepared-dist-exact-candidate-'));
     const homeDir = resolve(testDir, 'home');
     const snapshotDir = resolve(testDir, 'immutable-cli-candidate');
@@ -164,6 +183,13 @@ describe('startTestDaemon', () => {
         'daemon',
         'start-sync',
       ]);
+      const originalPid = daemon.state.pid;
+      const originalArguments = daemon.proc.child.spawnargs;
+      await daemon.proc.stop();
+      cliLaunchSpecMock.resolveCliTestLaunchSpec.mockImplementationOnce(actualResolveCliTestLaunchSpec);
+      daemon = await daemon.restart();
+      expect(daemon.state.pid).not.toBe(originalPid);
+      expect(daemon.proc.child.spawnargs).toEqual(originalArguments);
     } finally {
       if (daemon) await daemon.stop();
       await rm(testDir, { recursive: true, force: true });
@@ -382,7 +408,7 @@ describe('startTestDaemon', () => {
           testDir,
           happyHomeDir: homeDir,
           env: {
-            HAPPIER_E2E_DAEMON_STARTUP_PHASE_TIMEOUT_MS: '5000',
+            HAPPIER_E2E_DAEMON_STARTUP_PHASE_TIMEOUT_MS: '250',
           },
         }).then(
           () => 'started',
@@ -393,7 +419,7 @@ describe('startTestDaemon', () => {
 
       expect(result).toBeInstanceOf(Error);
       expect(String((result as Error).message)).toContain('phase=waitForDaemonState');
-      expect(String((result as Error).message)).toContain('timeoutMs=5000');
+      expect(String((result as Error).message)).toContain('timeoutMs=250');
       expect(String((result as Error).message)).toContain('daemonStateExists=no');
     } finally {
       await rm(testDir, { recursive: true, force: true });
@@ -551,6 +577,10 @@ describe('startTestDaemon', () => {
 
       const staleProc = spawnDetachedTestProcess(process.execPath, [resolve(staleScriptDir, 'index.mjs'), 'daemon', 'start-sync'], {
         stdio: 'ignore',
+        env: {
+          ...process.env,
+          HAPPIER_HOME_DIR: homeDir,
+        },
       });
       stalePid = staleProc.pid ?? null;
       expect(typeof stalePid).toBe('number');
@@ -601,6 +631,7 @@ describe('startTestDaemon', () => {
   it('returns daemon state even if the daemon exits after persisting daemon.state.json', async () => {
     const testDir = await mkdtemp(join(tmpdir(), 'happier-daemon-exit-after-state-'));
     const homeDir = resolve(testDir, 'home');
+    let daemon: Awaited<ReturnType<typeof startTestDaemon>> | null = null;
 
     try {
       const fakeScriptDir = resolve(testDir, 'fake-daemon', 'dist');
@@ -627,19 +658,23 @@ describe('startTestDaemon', () => {
         env: {},
       });
 
-      const daemon = await startTestDaemon({
+      daemon = await startTestDaemon({
         testDir,
         happyHomeDir: homeDir,
         env: {},
         startupTimeoutMs: 15_000,
       });
 
+      // State can become readable before Node observes the fake daemon's exit.
+      if (daemon.proc.child.exitCode === null && daemon.proc.child.signalCode === null) {
+        await once(daemon.proc.child, 'exit');
+      }
+
       expect(daemon.state.httpPort).toBe(32_225);
       expect(daemon.state.pid).toBe(daemon.proc.child.pid);
       expect(daemon.proc.child.exitCode).toBe(1);
-
-      await daemon.stop();
     } finally {
+      if (daemon) await daemon.stop();
       await rm(testDir, { recursive: true, force: true });
     }
   });
@@ -679,6 +714,10 @@ describe('startTestDaemon', () => {
         'start-sync',
       ], {
         stdio: 'ignore',
+        env: {
+          ...process.env,
+          HAPPIER_HOME_DIR: homeDir,
+        },
       });
       originalPid = original.pid ?? null;
       expect(typeof originalPid).toBe('number');
@@ -776,4 +815,249 @@ describe('startTestDaemon', () => {
       await rm(testDir, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+
+// J078: install genuine system boundaries before the real owners load. Fixture cp remains real.
+const j078Boundary = await vi.hoisted(async () => {
+  const { createRequire, syncBuiltinESMExports } = await import('node:module');
+  const req = createRequire(`${process.cwd()}/package.json`);
+  const fs = req('node:fs');
+  const promises = req('node:fs/promises');
+  const cp = req('node:child_process');
+  const http = req('node:http');
+  const https = req('node:https');
+  const net = req('node:net');
+  const original = { read: fs.readFileSync, cpSync: fs.cpSync, cp: promises.cp, kill: process.kill, fetch: globalThis.fetch,
+    child: Object.fromEntries(['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'].map((key) => [key, cp[key]])),
+    httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
+  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>),
+    ps: null as null | { pid: number; command: string }, psCalls: [] as string[][],
+    onKill: null as null | ((pid: number, signal?: NodeJS.Signals | number) => boolean) };
+  const refuse = (name: string) => (..._args: unknown[]) => { state.attempts.push(name); throw new Error(`J078 forbidden external boundary: ${name}`); };
+  for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => {
+    if (!state.active) return original.child[key](...args);
+    if (key === 'spawnSync' && state.ps && args[0] === 'ps'
+      && JSON.stringify(args[1]) === JSON.stringify(['-o', 'command=', '-p', String(state.ps.pid), '-ww'])) {
+      state.psCalls.push([...(args[1] as string[])]);
+      return { status: 0, stdout: `${state.ps.command}\n`, stderr: '' };
+    }
+    return refuse(key)(...args);
+  };
+  http.request = (...args: unknown[]) => state.active ? refuse('http')(...args) : original.httpRequest(...args);
+  https.request = (...args: unknown[]) => state.active ? refuse('https')(...args) : original.httpsRequest(...args);
+  http.createServer = (...args: unknown[]) => state.active ? refuse('server')(...args) : original.httpServer(...args);
+  net.createServer = (...args: unknown[]) => state.active ? refuse('net')(...args) : original.netServer(...args);
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => state.active ? refuse('fetch')(...args) : original.fetch(...args)) as typeof fetch;
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (!state.active) return original.kill(pid, signal);
+    if (state.onKill) return state.onKill(pid, signal);
+    if (signal !== 0) return refuse('signal')(pid, signal);
+    return true; // Fixture liveness only; never send signal 0.
+  }) as typeof process.kill;
+  fs.readFileSync = (...args: unknown[]) => state.active && typeof args[0] === 'string' && /^\/proc\/\d+\/stat$/.test(args[0])
+    ? `1 (fixture) S ${Array(18).fill('0').join(' ')} 100` : original.read(...args);
+  const allowed = (path: unknown) => {
+    const root = process.env.TMPDIR;
+    if (!root || typeof path !== 'string' || !(path === root || path.startsWith(`${root}/`))) {
+      throw new Error(`J078 fixture copy outside owned TMPDIR: ${String(path)}`);
+    }
+  };
+  fs.cpSync = (...args: unknown[]) => { if (state.active) { allowed(args[0]); allowed(args[1]); } return original.cpSync(...args); };
+  promises.cp = async (src: string, dest: string, ...args: unknown[]) => {
+    if (state.active) { allowed(src); allowed(dest); }
+    const run = () => original.cp(src, dest, ...args) as Promise<void>;
+    return state.active && state.onCopy ? state.onCopy(src, dest, run) : run();
+  };
+  syncBuiltinESMExports();
+  if ((await import('node:child_process')).spawnSync !== cp.spawnSync
+    || (await import('node:fs')).readFileSync !== fs.readFileSync
+    || (await import('node:fs/promises')).cp !== promises.cp) throw new Error('J078 actual builtin binding mismatch');
+  return { state, spawnSyncExport: cp.spawnSync, killExport: process.kill, restore: () => {
+    fs.readFileSync = original.read; fs.cpSync = original.cpSync; promises.cp = original.cp;
+    for (const key of Object.keys(original.child)) cp[key] = original.child[key];
+    http.request = original.httpRequest; https.request = original.httpsRequest;
+    http.createServer = original.httpServer; net.createServer = original.netServer;
+    process.kill = original.kill; globalThis.fetch = original.fetch; syncBuiltinESMExports();
+  } };
+});
+// Unselected legacy cases retain their own existing boundaries and assertions.
+j078BeforeEach(() => {
+  j078Boundary.state.active = Boolean(expect.getState().currentTestName?.includes('J078'));
+  j078Boundary.state.ps = null; j078Boundary.state.psCalls = []; j078Boundary.state.onKill = null;
+});
+j078AfterAll(() => {
+  try { expect(j078Boundary.state.attempts).toEqual([]); }
+  finally { j078Boundary.restore(); }
+});
+
+const j078Daemon = vi.hoisted(() => ({ root: null as null | string, spawn: vi.fn(), spawnExport: null as unknown, register: vi.fn(), sweep: vi.fn() }));
+vi.mock('../paths', async (original) => {
+  const actual = await original<typeof import('../paths')>();
+  return { ...actual, repoRootDir: () => j078Daemon.root ?? actual.repoRootDir() };
+});
+vi.mock('../process/processOwnershipLease', async (original) => {
+  const actual = await original<typeof import('../process/processOwnershipLease')>();
+  return { ...actual,
+    inspectOwnedProcess: (...args: Parameters<typeof actual.inspectOwnedProcess>) => j078Daemon.root ? ({ ok: false, reason: 'fixture-no-process-inspection' }) : actual.inspectOwnedProcess(...args),
+    registerProcessOwnershipLease: (...args: Parameters<typeof actual.registerProcessOwnershipLease>) => j078Daemon.root ? j078Daemon.register(...args) : actual.registerProcessOwnershipLease(...args),
+    sweepProcessOwnershipLeases: (...args: Parameters<typeof actual.sweepProcessOwnershipLeases>) => j078Daemon.root ? j078Daemon.sweep(...args) : actual.sweepProcessOwnershipLeases(...args),
+  };
+});
+vi.mock('../process/spawnProcess', async (original) => {
+  const actual = await original<typeof import('../process/spawnProcess')>();
+  const spawn = (...args: Parameters<typeof actual.spawnLoggedProcess>) => j078Daemon.root ? j078Daemon.spawn(...args) : actual.spawnLoggedProcess(...args);
+  j078Daemon.spawnExport = spawn;
+  return { ...actual, spawnLoggedProcess: spawn,
+    runLoggedCommand: async (...args: Parameters<typeof actual.runLoggedCommand>) => { if (j078Daemon.root) throw new Error('J078 real build forbidden'); return actual.runLoggedCommand(...args); } };
+});
+vi.mock('../process/processTree', async (original) => {
+  const actual = await original<typeof import('../process/processTree')>();
+  return { ...actual, terminateProcessTreeByPid: async (...args: Parameters<typeof actual.terminateProcessTreeByPid>) => { if (j078Daemon.root) throw new Error('J078 process tree forbidden'); return actual.terminateProcessTreeByPid(...args); } };
+});
+
+describe('J078 default daemon consumer boundary', () => {
+  it.each(['home-cleanup', 'running-child'] as const)('J078 retains default snapshot at %s boundary', async (boundary) => {
+    const root = await mkdtemp(join(tmpdir(), 'j078-daemon-')); j078Daemon.root = root;
+    const home = resolve(root, 'home'); const canonicalDir = resolve(root, 'apps', 'cli', 'dist');
+    let release!: () => void; let entered!: () => void;
+    const held = new Promise<void>((r) => { release = r; }); const observedCleanup = new Promise<void>((r) => { entered = r; });
+    let first = true; let observedEntry = ''; let observedBytes = '';
+    let result: Awaited<ReturnType<typeof startTestDaemon>> | undefined;
+    try {
+      const fs = await import('node:fs'); const { EventEmitter } = await import('node:events');
+      await mkdir(home, { recursive: true }); await mkdir(canonicalDir, { recursive: true });
+      await writeFile(resolve(canonicalDir, 'index.mjs'), 'export const value = "A";');
+      await writeFile(resolve(canonicalDir, 'lazy.mjs'), 'export const value = "A";');
+      for (const name of ['agents', 'cli-common', 'protocol', 'release-runtime']) {
+        for (const base of [resolve(root, 'packages', name), resolve(root, 'apps', 'cli', 'node_modules', '@happier-dev', name)]) {
+          await mkdir(resolve(base, 'dist'), { recursive: true }); await writeFile(resolve(base, 'package.json'), JSON.stringify({ name: `@happier-dev/${name}` }));
+          await writeFile(resolve(base, 'dist', 'index.js'), 'export {};');
+        }
+      }
+      await writeFile(resolve(root, 'apps', 'cli', 'package.json'), '{"name":"@happier-dev/cli"}');
+      await writeFile(resolve(home, 'daemon.state.json'), JSON.stringify({ pid: 1111, httpPort: 1, controlToken: 'fixture' }));
+      vi.spyOn(process, 'kill').mockImplementation((_pid, signal) => {
+        expect(signal).toBe(0); throw Object.assign(new Error('fixture process absent'), { code: 'ESRCH' });
+      });
+      const fetchMock = vi.fn(async () => {
+        if (first) { first = false; entered(); await held; }
+        return { status: 200 };
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      j078Daemon.register.mockResolvedValue(undefined); j078Daemon.sweep.mockResolvedValue(undefined);
+      j078Daemon.spawn.mockImplementation((params: { args: string[] }) => {
+        observedEntry = params.args[1]; observedBytes = fs.readFileSync(observedEntry, 'utf8');
+        const child = new EventEmitter(); Object.assign(child, { pid: 2222, exitCode: null, killed: false });
+        fs.writeFileSync(resolve(home, 'daemon.state.json'), JSON.stringify({ pid: 2222, httpPort: 2, controlToken: 'fixture' }));
+        return { child, stop: vi.fn(async () => {}), stdoutPath: '', stderrPath: '' };
+      });
+      const actualResolver = cliLaunchSpecMock.actualResolveCliTestLaunchSpec;
+      if (!actualResolver) throw new Error('missing actual resolver');
+      cliLaunchSpecMock.resolveCliTestLaunchSpec.mockImplementation(actualResolver);
+      expect((await import('../process/spawnProcess')).spawnLoggedProcess).toBe(j078Daemon.spawnExport);
+      expect(globalThis.fetch).toBe(fetchMock);
+      const pending = startTestDaemon({ testDir: root, happyHomeDir: home, env: {} });
+      // Attach rejection handling before the held boundary; no detached unhandled rejection.
+      const settled = pending.then((value) => ({ value }), (error: unknown) => ({ error }));
+      await observedCleanup;
+      const advance = async () => {
+        await writeFile(resolve(canonicalDir, 'index.mjs'), 'export const value = "B";');
+        await writeFile(resolve(canonicalDir, 'lazy.mjs'), 'export const value = "B";');
+        fs.utimesSync(resolve(canonicalDir, 'index.mjs'), new Date('2035-01-01'), new Date('2035-01-01'));
+        const { ensureCliDistSnapshotEntrypoint } = await import('../process/cliDist');
+        return await ensureCliDistSnapshotEntrypoint({ testDir: root, env: { HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE: 'symlink' } }, {
+          repoRoot: root, snapshotDir: resolve(root, '.project', 'tmp', 'cli-dist-snapshot'), skipSourceFreshnessCheck: true,
+          runCommand: async () => { throw new Error('unexpected build'); },
+        });
+      };
+      if (boundary === 'home-cleanup') await advance();
+      release(); const outcome = await settled; if ('error' in outcome) throw outcome.error; result = outcome.value;
+      expect(observedBytes).toContain('"A"');
+      if (boundary === 'running-child') await advance();
+      expect(await readFile(resolve(observedEntry, '..', 'lazy.mjs'), 'utf8')).toContain('"A"');
+      await result.stop(); result = undefined;
+      expect(await readFile(observedEntry, 'utf8')).toContain('"A"');
+    } finally {
+      release(); if (result) await result.stop(); j078Daemon.root = null;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+
+// Exercise the real replacement/classifier path; every OS boundary below is an inert fixture.
+describe('J078 generated source daemon replacement compatibility', () => {
+  const hook = '/fixture/node_modules/tsx/dist/esm/index.mjs';
+  const sourceCommand = (entry: string) => `node --import ${hook} ${entry} daemon start-sync`;
+  it.each([
+    { label: 'outside cli-dist retained generation', command: sourceCommand('/outside/cli-dist-generation-ABC123/src/index.ts'), accepted: true },
+    { label: 'outside cli-dist-snapshot retained generation', command: sourceCommand('/outside/cli-dist-snapshot-generation-ABC123/src/index.ts'), accepted: true },
+    { label: 'outside legacy cli-dist', command: sourceCommand('/outside/cli-dist/src/index.ts'), accepted: true },
+    { label: 'outside legacy cli-dist-snapshot', command: sourceCommand('/outside/cli-dist-snapshot/src/index.ts'), accepted: true },
+    { label: 'project tmp generation', command: sourceCommand('/fixture/.project/tmp/cli-dist-generation-ABC123/src/index.ts'), accepted: true },
+    { label: 'project e2e generation', command: sourceCommand('/fixture/.project/logs/e2e/run/cli-dist-generation-ABC123/src/index.ts'), accepted: true },
+    { label: 'ordinary dist command', command: 'node /fixture/dist/index.mjs daemon start-sync', accepted: true },
+    { label: 'missing daemon start-sync', command: `node --import ${hook} /outside/cli-dist-generation-ABC123/src/index.ts other`, accepted: false },
+    { label: 'missing tsx', command: 'node /outside/cli-dist-generation-ABC123/src/index.ts daemon start-sync', accepted: false },
+    { label: 'unrecognized source basename', command: sourceCommand('/outside/other-generation-ABC123/src/index.ts'), accepted: false },
+    { label: 'unpublished staging path', command: sourceCommand('/outside/cli-dist-staging-ABC123/src/index.ts'), accepted: false },
+  ])('J078 replacement classifier: $label', async ({ command, accepted }) => {
+    const root = await mkdtemp(join(tmpdir(), 'j078-replacement-')); const home = resolve(root, 'home');
+    const { EventEmitter } = await import('node:events'); const fs = await import('node:fs');
+    const originalChild = new EventEmitter(); const successorChild = new EventEmitter();
+    const originalPid = 16161; const successorPid = 26262;
+    Object.assign(originalChild, { pid: originalPid, exitCode: null, killed: false });
+    Object.assign(successorChild, { pid: successorPid, exitCode: null, killed: false });
+    const signalCalls: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+    let originalAlive = true; j078Daemon.root = root;
+    const fetchMock = vi.fn(async () => { throw new Error('J078 replacement must not use HTTP'); });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await mkdir(home, { recursive: true });
+      await writeFile(resolve(home, 'daemon.state.json'), JSON.stringify({ pid: originalPid, httpPort: 1234 }));
+      j078Boundary.state.ps = { pid: originalPid, command };
+      j078Boundary.state.onKill = (pid, signal) => {
+        if (pid === originalPid && signal === 'SIGTERM') {
+          signalCalls.push({ pid, signal }); originalAlive = false; originalChild.emit('exit', 0, 'SIGTERM'); return true;
+        }
+        if (signal === 0 && pid === originalPid && !originalAlive) throw Object.assign(new Error('fixture exited'), { code: 'ESRCH' });
+        if (signal === 0 && pid === successorPid) return true;
+        throw new Error(`J078 unexpected fixture signal: ${pid}/${String(signal)}`);
+      };
+      cliLaunchSpecMock.resolveCliTestLaunchSpec.mockReset();
+      cliLaunchSpecMock.resolveCliTestLaunchSpec.mockResolvedValue({ command: process.execPath, args: ['/fixture/dist/index.mjs'], cwd: root });
+      j078Daemon.spawn.mockReset(); j078Daemon.spawn.mockImplementation(() => {
+        fs.writeFileSync(resolve(home, 'daemon.state.json'), JSON.stringify({ pid: successorPid, httpPort: 2345 }));
+        return { child: successorChild, stop: vi.fn(async () => {}), stdoutPath: '', stderrPath: '' };
+      });
+      expect((await import('node:child_process')).spawnSync).toBe(j078Boundary.spawnSyncExport);
+      expect(process.kill).toBe(j078Boundary.killExport);
+      expect((await import('../process/spawnProcess')).spawnLoggedProcess).toBe(j078Daemon.spawnExport);
+      expect(globalThis.fetch).toBe(fetchMock);
+      const originalDaemon = {
+        happyHomeDir: home, state: { pid: originalPid, httpPort: 1234 },
+        proc: { child: originalChild as unknown as Awaited<ReturnType<typeof startTestDaemon>>['proc']['child'], stop: vi.fn(async () => {}), stdoutPath: '', stderrPath: '' },
+        stop: vi.fn(async () => {}), restart: async () => { throw new Error('unexpected fixture restart'); },
+      };
+      const pending = replaceTestDaemonWithoutStoppingSessions({ testDir: root, happyHomeDir: home, env: {}, originalDaemon });
+      if (accepted) {
+        await expect(pending).resolves.toMatchObject({ pid: successorPid, httpPort: 2345 });
+        expect(signalCalls).toEqual([{ pid: originalPid, signal: 'SIGTERM' }]);
+        expect(j078Daemon.spawn).toHaveBeenCalledTimes(1);
+        expect(cliLaunchSpecMock.resolveCliTestLaunchSpec).toHaveBeenCalledTimes(1);
+      } else {
+        await expect(pending).rejects.toThrow('refusing to hard-kill');
+        expect(signalCalls).toEqual([]); expect(j078Daemon.spawn).not.toHaveBeenCalled();
+        expect(cliLaunchSpecMock.resolveCliTestLaunchSpec).not.toHaveBeenCalled();
+      }
+      expect(j078Boundary.state.psCalls).toEqual([['-o', 'command=', '-p', String(originalPid), '-ww']]);
+      expect(fetchMock).not.toHaveBeenCalled(); expect(j078Boundary.state.attempts).toEqual([]);
+    } finally {
+      // Also settle the real owner's exit-wait promise after refusals; its own listener clears its timer.
+      originalChild.emit('exit', 0, null); expect(originalChild.listenerCount('exit')).toBe(0);
+      j078Boundary.state.ps = null; j078Boundary.state.onKill = null; j078Daemon.root = null;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

@@ -11,17 +11,16 @@ import {
   type ConnectedServiceQuotaFetcherDescriptor,
 } from '@/daemon/connectedServices/quotas/types';
 import { isRecord, normalizeNonEmptyString, normalizePct, resolveConnectedServiceQuotaAccountLabel } from '@/daemon/connectedServices/quotas/quotaNormalization';
-import { parseRetryAfterHeader } from '@/daemon/connectedServices/quotas/normalization';
+import { parseProviderTimestampMs, parseRetryAfterHeader } from '@/daemon/connectedServices/quotas/normalization';
 import { createOpenAiCodexSubscriptionFetcher } from './subscriptionFetcher';
 import { normalizeCodexQuotaWindows } from './codexQuotaWindows';
+import { mapCodexRateLimitPayloadToQuotaMeters } from './mapCodexRateLimitSnapshot';
 
 const RESET_AT_PLAUSIBILITY_FLOOR_TOLERANCE_MS = 24 * 60 * 60_000;
 
 function normalizeResetAtMs(value: unknown, nowMs: number): number | null {
-  const num = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(num) || num <= 0) return null;
-  // Heuristic: usage APIs commonly return unix seconds.
-  const epochMs = num > 1_000_000_000_000 ? Math.trunc(num) : Math.trunc(num * 1000);
+  const epochMs = parseProviderTimestampMs(value);
+  if (epochMs === null || epochMs <= 0) return null;
   // Sanity floor (RD-QUO-1): a relative-seconds value misparsed as an epoch lands in the
   // 1970 era. Reject resets implausibly far in the past instead of persisting bogus data.
   if (epochMs < nowMs - RESET_AT_PLAUSIBILITY_FLOOR_TOLERANCE_MS) return null;
@@ -290,7 +289,15 @@ export function createOpenAiCodexQuotaFetcher(params?: Readonly<{
         planLabel,
         accountLabel: resolveAccountLabel(record),
         ...(recoveryCredits ? { recoveryCredits } : {}),
-        meters: normalizeCodexQuotaWindows(rateLimit, now, normalizePct, normalizeWindowResetAtMs),
+        meters: [
+          ...normalizeCodexQuotaWindows(rateLimit, now, normalizePct, normalizeWindowResetAtMs),
+          ...mapCodexRateLimitPayloadToQuotaMeters({
+            additional_rate_limits: data.additional_rate_limits,
+          }, now, {
+            legacyPrimary: { meterId: 'session', label: 'Session' },
+            legacySecondary: { meterId: 'weekly', label: 'Weekly' },
+          }),
+        ],
       };
     },
   };

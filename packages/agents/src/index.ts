@@ -50,6 +50,7 @@ export {
 } from './tools.js';
 export {
   getAgentLocalControlCapability,
+  getAgentLocalControlCapabilityForSession,
   usesProviderAttachForLocalControl,
   type AgentLocalControlCapability,
 } from './localControl.js';
@@ -152,6 +153,8 @@ export {
   BUILT_IN_ACP_CONFIG,
   getBuiltInAcpConfig,
   hasBuiltInAcpConfig,
+  isBuiltInAcpSessionListingDeclared,
+  isAcpSessionListingDeclared,
   type BuiltInAcpConfig,
   type BuiltInAcpTransportProfile,
   type BuiltInAcpYesNoAuto,
@@ -186,9 +189,7 @@ export {
   type ClaudeUnifiedTerminalWorkspaceTrust,
   type ClaudeUnifiedTerminalWorkspaceTrustPolicy,
   normalizeCodexBackendMode,
-  normalizeKimiAcpPythonSelector,
   type CodexBackendMode,
-  type KimiAcpPythonSelector,
   getAllProviderSettingsDefinitions,
   getProviderSettingsDefinition,
   type ProviderSettingsDefinition,
@@ -289,6 +290,16 @@ export {
   GEMINI_CLI_OAUTH_SCOPES,
   GEMINI_CLI_OAUTH_TOKEN_URL,
 } from './providers/gemini/oauth.js';
+export {
+  AGY_OAUTH_AUTHORIZE_URL,
+  AGY_OAUTH_CALLBACK_URL,
+  AGY_OAUTH_CLIENT_ID,
+  AGY_OAUTH_ALLOW_RAW_AUTHORIZATION_CODE,
+  AGY_OAUTH_CLIENT_SECRET,
+  AGY_OAUTH_SCOPES,
+  AGY_OAUTH_TOKEN_URL,
+  AGY_OAUTH_USERINFO_URL,
+} from './providers/agy/oauth.js';
 
 export { computeMonotonicUpdatedAt, type MonotonicUpdatedAtPolicy } from './sessionControls/monotonic.js';
 export {
@@ -335,6 +346,7 @@ export {
   normalizeAgentRuntimeKindOverride,
   resolveAgentConfiguredRuntimeKind,
   resolveAgentRuntimeControlSurfaceForSession,
+  resolveAgentRuntimeKindForSession,
   resolveCodexSessionBackendMode,
   resolveOpenCodeSessionBackendMode,
 } from './sessionControls/providerSessionBackends.js';
@@ -377,6 +389,7 @@ export {
   computeNextModelOverrideMetadataV1,
 } from './sessionControls/publish.js';
 export {
+  resolveProviderSessionIdForBackendTarget,
   resolveVendorResumeIdFromSessionMetadata,
   resolveAgentNativeTranscriptPathFromSessionMetadata,
   evaluateVendorResumeEligibility,
@@ -385,11 +398,14 @@ export {
 } from './sessionControls/vendorResumePolicy.js';
 export {
   evaluateExistingSessionAutomationEligibility,
+  resolveConfiguredAcpSessionResume,
+  type ConfiguredAcpSessionResumeResolution,
   type ExistingSessionAutomationEligibility,
   type ExistingSessionAutomationEligibilityReasonCode,
 } from './sessionControls/existingSessionAutomationPolicy.js';
 export {
   resolveVendorHandoffIdFromSessionMetadata,
+  supportsExistingSessionHandoffState,
   evaluateVendorHandoffEligibility,
   type VendorHandoffEligibility,
   type VendorHandoffEligibilityReasonCode,
@@ -422,8 +438,13 @@ export {
   getProviderCliBinaryNames,
   PROVIDER_CLI_RUNTIME_SPECS,
   getProviderCliRuntimeSpec,
+  resolveProviderCliLatestVersionSource,
+  resolveProviderCliNpmPackageName,
   type ProviderCliInstallCommand,
   type ProviderCliInstallPlatform,
+  type ProviderCliInstallSource,
+  type ProviderCliLatestVersionSource,
+  type ProviderCliNativeUpdateSpec,
   type ProviderCliManagedArchiveEntry,
   type ProviderCliManagedAssetNameByPlatform,
   type ProviderCliAlternativeBinaryIdentityProbe,

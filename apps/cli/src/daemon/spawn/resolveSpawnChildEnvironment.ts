@@ -18,33 +18,15 @@ import {
   serializeSessionConnectedServiceMaterializationIdentityForEnv,
 } from '@/agent/runtime/sessionConnectedServiceMaterializationIdentityEnv';
 import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from './spawnExplicitEnvKeysMarker';
+import { stripDaemonOwnedChildEnvOverrides } from './stripDaemonOwnedChildEnvOverrides';
 import type { ConnectedServicesMaterializationDiagnostic } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
+import { resolveExistingSessionHandoffStateThroughCatalog } from '@/backends/catalog';
+import { ExistingSessionStateUnavailableError } from '@/session/handoff/sessionHandoffErrors';
 
 function sanitizeCodexAcpFallbackDetail(detail: string): string {
   const normalized = detail.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (normalized.length <= 160) return normalized;
   return `${normalized.slice(0, 157)}...`;
-}
-
-const DAEMON_OWNED_CHILD_ENV_KEYS = new Set<string>([
-  'HAPPIER_HOME_DIR',
-  'HAPPIER_ACTIVE_SERVER_ID',
-  'HAPPIER_SERVER_URL',
-  'HAPPIER_WEBAPP_URL',
-  'HAPPIER_PUBLIC_SERVER_URL',
-  'HAPPIER_LOCAL_SERVER_URL',
-  'HAPPIER_DAEMON_SERVICE_INSTANCE_ID',
-  'HAPPIER_DAEMON_SERVICE_SERVER_URL',
-  SESSION_MACHINE_WORKSPACE_PATH_ENV,
-]);
-
-function stripDaemonOwnedChildEnvOverrides(input: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = Object.create(null);
-  for (const [key, value] of Object.entries(input)) {
-    if (DAEMON_OWNED_CHILD_ENV_KEYS.has(key)) continue;
-    out[key] = value;
-  }
-  return out;
 }
 
 type ResolveSpawnChildEnvironmentSuccess = {
@@ -83,6 +65,7 @@ export async function resolveSpawnChildEnvironment(params: {
     cleanupOnExit: (() => void) | null;
     diagnostics?: readonly ConnectedServicesMaterializationDiagnostic[];
   } | null;
+  existingSessionMetadata?: unknown;
 }): Promise<ResolveSpawnChildEnvironmentResult> {
   const connectedCleanupOnFailure = params.connectedServiceAuth?.cleanupOnFailure ?? null;
   const connectedCleanupOnExit = params.connectedServiceAuth?.cleanupOnExit ?? null;
@@ -275,6 +258,33 @@ export async function resolveSpawnChildEnvironment(params: {
   }
   if (codexAcpFallbackMessage) {
     extraEnvForChild.HAPPIER_CODEX_ACP_FALLBACK_TO_MCP_MESSAGE = codexAcpFallbackMessage;
+  }
+
+  if (params.options.handoffStateTransfer === 'existing') {
+    try {
+      const existing = await resolveExistingSessionHandoffStateThroughCatalog({
+        metadata: params.existingSessionMetadata,
+        targetPath: params.options.directory,
+        env: { ...params.processEnv, ...extraEnvForChild },
+        sessionStorageMode: params.options.transcriptStorage,
+      });
+      if (!explicitResumeId || existing.remoteSessionId !== explicitResumeId) {
+        throw new Error('Existing-state handoff resume id does not match the provider session');
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Existing provider session state is unavailable';
+      params.logWarn(`[DAEMON RUN] Existing-state handoff resume validation failed: ${errorMessage}`);
+      return {
+        ok: false,
+        errorCode: error instanceof ExistingSessionStateUnavailableError
+          ? SPAWN_SESSION_ERROR_CODES.EXISTING_SESSION_STATE_UNAVAILABLE
+          : SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+        errorMessage,
+        cleanupOnFailure,
+        cleanupOnExit,
+        ...(materializationDiagnostics ? { materializationDiagnostics } : {}),
+      };
+    }
   }
 
   return {

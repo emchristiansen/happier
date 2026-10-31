@@ -1,8 +1,7 @@
 import * as React from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import { createMachineFixture, createSessionFixture, renderScreen } from '@/dev/testkit';
+import { renderScreen } from '@/dev/testkit';
 import type { DecryptedArtifact } from '@/sync/domains/artifacts/artifactTypes';
-import type { Machine, Session } from '@/sync/domains/state/storageTypes';
 import { installApprovalCommonModuleMocks } from '../../approvals/approvalsTestHelpers';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -23,57 +22,6 @@ function createApprovalArtifact(): DecryptedArtifact {
         },
     };
 }
-
-const sessionFixtures: Record<string, Session> = {
-    'session-1': createSessionFixture({
-        id: 'session-1',
-        metadata: {
-            name: 'Repo session',
-            path: '/Users/leeroy/stale-repo',
-            host: 'tester.local',
-            homeDir: '/Users/leeroy',
-            machineId: 'machine-stale',
-        },
-    }),
-};
-
-const machineFixtures: Record<string, Machine> = {
-    'machine-stale': createMachineFixture({
-        id: 'machine-stale',
-        replacedAt: 1,
-        replacedByMachineId: 'machine-target',
-    }),
-    'machine-target': createMachineFixture({
-        id: 'machine-target',
-        metadata: {
-            displayName: 'Rebound workstation',
-            host: 'workstation.local',
-            platform: 'darwin',
-            happyCliVersion: '0.0.0-test',
-            happyHomeDir: '/Users/leeroy/.happy-dev',
-            homeDir: '/Users/leeroy',
-        },
-    }),
-};
-
-const storageState = {
-    sessions: {
-        'session-1': sessionFixtures['session-1'],
-    },
-    machines: {
-        'machine-stale': machineFixtures['machine-stale'],
-        'machine-target': machineFixtures['machine-target'],
-    },
-    getProjectForSession: (sessionId: string) =>
-        sessionId === 'session-1'
-            ? {
-                key: {
-                    machineId: 'machine-target',
-                    path: '/Volumes/target/repo',
-                },
-            }
-            : null,
-};
 
 installApprovalCommonModuleMocks({
     reactNative: async () => {
@@ -104,16 +52,6 @@ installApprovalCommonModuleMocks({
         const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
         return createTextModuleMock({ translate: (key: string) => key });
     },
-    storage: async () => {
-        const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
-        return createStorageModuleStub({
-            useSession: (sessionId: string) => sessionFixtures[sessionId] ?? null,
-            useMachine: (machineId: string) => machineFixtures[machineId] ?? null,
-            storage: {
-                getState: () => storageState,
-            },
-        });
-    },
 });
 
 vi.mock('@expo/vector-icons', () => ({
@@ -124,17 +62,33 @@ vi.mock('@/components/ui/text/Text', () => ({
     Text: 'Text',
 }));
 
+vi.mock('@/components/ui/lists/Item', () => ({
+    Item: ({ title, subtitle, ...props }: { title: React.ReactNode; subtitle?: React.ReactNode }) => React.createElement(
+        'Item',
+        props,
+        React.createElement('Text', null, title),
+        subtitle ? React.createElement('Text', null, subtitle) : null,
+    ),
+}));
+
 describe('ApprovalInboxCard', () => {
-    it('shows the reachable machine label when the stored session machine id is stale', async () => {
+    it('renders canonical parent-projected workspace context without a raw path', async () => {
         const { ApprovalInboxCard } = await import('./ApprovalInboxCard');
         const screen = await renderScreen(
             <ApprovalInboxCard
                 artifact={createApprovalArtifact()}
+                sessionContext={{
+                    sessionTitle: 'Repo session',
+                    machineLabel: 'Rebound workstation',
+                    workspaceName: 'Happier Core',
+                }}
                 onPress={() => {}}
             />,
         );
 
         expect(screen.getTextContent()).toContain('Rebound workstation');
-        expect(screen.getTextContent()).toContain('/Volumes/target/repo');
+        expect(screen.getTextContent()).toContain('Happier Core');
+        expect(screen.getTextContent()).not.toContain('/Volumes/target/repo');
+        expect(screen.findByType('Item' as never).props.density).toBe('compact');
     });
 });

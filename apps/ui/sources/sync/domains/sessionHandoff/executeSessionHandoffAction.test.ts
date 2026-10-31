@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
 describe('executeSessionHandoffAction', () => {
+  it('preserves existing-state intent and its typed missing-state failure', async () => {
+    const { executeSessionHandoffAction } = await import('./executeSessionHandoffAction');
+    const execute = vi.fn(async () => ({ ok: false as const, errorCode: 'existing_session_state_unavailable', error: 'No native history' }));
+    await expect(executeSessionHandoffAction({ execute, sessionId: 'sess_1', targetMachineId: 'machine_target', stateTransfer: 'existing', context: { surface: 'ui_button', placement: 'session_info' } })).resolves.toEqual({ ok: false, errorCode: 'existing_session_state_unavailable', error: 'No native history' });
+    expect(execute).toHaveBeenCalledWith('session.handoff', expect.objectContaining({ stateTransfer: 'existing' }), expect.anything());
+  });
   it('returns the handoff id when the action executor returns a successful handoff result', async () => {
     const { executeSessionHandoffAction } = await import('./executeSessionHandoffAction');
 
@@ -87,7 +93,7 @@ describe('executeSessionHandoffAction', () => {
       context: { defaultSessionId: 'sess_1', surface: 'ui_button', placement: 'session_info' } as any,
     });
 
-    expect(result).toEqual({ ok: false, error: 'unsupported_action:session.handoff' });
+    expect(result).toEqual({ ok: false, errorCode: 'unsupported_action', error: 'unsupported_action:session.handoff' });
   });
 
   it('fails when the action result does not include a handoff id', async () => {

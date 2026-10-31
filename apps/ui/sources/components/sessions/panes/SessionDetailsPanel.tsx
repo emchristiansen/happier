@@ -17,6 +17,7 @@ import { PinIcon, PinSlashIcon } from '@/components/sessions/shell/sessionPinIco
 import { t } from '@/text';
 import { toTestIdSafeValue } from '@/utils/ui/toTestIdSafeValue';
 import { useWebScrollLockBypass } from '@/components/ui/scroll/useWebScrollLockBypass';
+import { resolveWebScrollableElementWithin } from '@/components/ui/scroll/resolveWebScrollableElement';
 import { deferOnWeb } from '@/utils/platform/deferOnWeb';
 import { IconAction } from '@/components/ui/buttons/IconAction';
 import { SidebarCollapseIcon, SidebarExpandIcon } from '@/components/navigation/shell/SidebarIcons';
@@ -653,6 +654,92 @@ const DetailsPaneLoadingFallback = React.memo((props: Readonly<{ color: string }
 });
 
 const DetailsTabSurface = React.memo((props: Readonly<{ isActive: boolean; children: React.ReactNode }>) => {
+    const rootRef = React.useRef<any>(null);
+    const scrollSnapshotRef = React.useRef<Array<{ testId: string; top: number; left: number }>>([]);
+
+    React.useLayoutEffect(() => {
+        if (Platform.OS !== 'web') return;
+        const raw = rootRef.current as any;
+        const rootEl = (raw?.getScrollableNode?.() ?? raw) as HTMLElement | null;
+        const doc: any = (globalThis as any).document;
+        if (!rootEl || !doc?.defaultView?.getComputedStyle) return;
+        const win = doc.defaultView as Window;
+        const findScrollableWithin = (host: HTMLElement | null): HTMLElement | null => {
+            if (!host) return null;
+            return resolveWebScrollableElementWithin(host, { win, pick: 'best', maxDescendants: 600 });
+        };
+
+        if (!props.isActive) {
+            // Only snapshot scrollables with stable identifiers. Without a `data-testid`, order can
+            // change between renders (virtualized lists, diff viewers), and restoring by index can
+            // accidentally reset the primary scroll container.
+            const dedup = new Map<string, { testId: string; top: number; left: number; score: number }>();
+            const hosts = Array.from(rootEl.querySelectorAll<HTMLElement>('[data-testid]'));
+            for (const host of hosts) {
+                const testId = host.getAttribute('data-testid');
+                if (typeof testId !== 'string' || testId.length === 0) continue;
+                const target = findScrollableWithin(host);
+                if (!target) continue;
+                const top = typeof target.scrollTop === 'number' ? target.scrollTop : 0;
+                const left = typeof target.scrollLeft === 'number' ? target.scrollLeft : 0;
+                const verticalViewport = Math.max(target.clientHeight, 0);
+                const verticalOverflow = Math.max(target.scrollHeight - target.clientHeight, 0);
+                const horizontalOverflow = Math.max(target.scrollWidth - target.clientWidth, 0);
+                const score = verticalViewport * 1_000_000 + verticalOverflow + horizontalOverflow;
+                const prev = dedup.get(testId);
+                if (!prev || score >= prev.score) {
+                    dedup.set(testId, { testId, top, left, score });
+                }
+            }
+            scrollSnapshotRef.current = Array.from(dedup.values()).map(({ testId, top, left }) => ({ testId, top, left }));
+            return;
+        }
+
+        const snapshot = scrollSnapshotRef.current;
+        if (!snapshot || snapshot.length === 0) return;
+
+        for (let i = 0; i < snapshot.length; i += 1) {
+            const s = snapshot[i];
+            const host = rootEl.querySelector<HTMLElement>(`[data-testid="${s.testId}"]`) ?? null;
+            const target = findScrollableWithin(host);
+            if (!target) continue;
+            if (typeof s.top === 'number') target.scrollTop = s.top;
+            if (typeof s.left === 'number') target.scrollLeft = s.left;
+        }
+
+        // Some virtualized scroll views (FlashList, diff viewers) can apply post-layout adjustments
+        // after tab activation, which can override the first restore write. Re-apply for a short,
+        // bounded window so tab switches feel stable and scroll positions don't "jump" when the
+        // tab becomes visible.
+        const raf: (cb: FrameRequestCallback) => number =
+            typeof globalThis.requestAnimationFrame === 'function'
+                ? globalThis.requestAnimationFrame.bind(globalThis)
+                : (cb) => globalThis.setTimeout(() => cb(Date.now()), 0);
+        const apply = () => {
+            for (let i = 0; i < snapshot.length; i += 1) {
+                const s = snapshot[i];
+                const host = rootEl.querySelector<HTMLElement>(`[data-testid="${s.testId}"]`) ?? null;
+                const target = findScrollableWithin(host);
+                if (!target) continue;
+                if (typeof s.top === 'number') target.scrollTop = s.top;
+                if (typeof s.left === 'number') target.scrollLeft = s.left;
+            }
+        };
+        const startedAt = typeof performance !== 'undefined' && typeof performance.now === 'function'
+            ? performance.now()
+            : Date.now();
+        const maxMs = 200;
+        const step = () => {
+            apply();
+            const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
+                ? performance.now()
+                : Date.now();
+            if (now - startedAt >= maxMs) return;
+            raf(() => step());
+        };
+        raf(() => step());
+    }, [props.isActive]);
+
     const a11yHiddenProps =
         Platform.OS === 'web'
             ? null
@@ -662,6 +749,7 @@ const DetailsTabSurface = React.memo((props: Readonly<{ isActive: boolean; child
             };
     return (
         <View
+            ref={rootRef}
             pointerEvents={props.isActive ? 'auto' : 'none'}
             style={[
                 StyleSheet.absoluteFillObject,
@@ -672,14 +760,10 @@ const DetailsTabSurface = React.memo((props: Readonly<{ isActive: boolean; child
                     minHeight: 0,
                     minWidth: 0,
                     opacity: props.isActive ? 1 : 0,
-                    // `display: none` collapses virtualized web lists and resets their native scroll
-                    // state before React can snapshot it. Visibility keeps the absolute-fill subtree
-                    // laid out while removing it from painting, hit-testing, and the accessibility tree.
-                    display: 'flex',
-                    ...(Platform.OS === 'web'
-                        ? { visibility: props.isActive ? 'visible' : 'hidden' }
-                        : null),
-                } as any,
+                    // Keep inactive contents mounted, but do not leave their controls visible to
+                    // the web accessibility tree or locator/user interaction surfaces.
+                    display: Platform.OS === 'web' ? (props.isActive ? 'flex' : 'none') : 'flex',
+                },
             ]}
             {...(a11yHiddenProps ?? {})}
         >

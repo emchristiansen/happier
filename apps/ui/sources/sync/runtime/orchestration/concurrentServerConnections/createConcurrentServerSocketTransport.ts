@@ -1,4 +1,5 @@
 import { io, type Socket } from 'socket.io-client';
+import { ConnectedServiceIdSchema, CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD } from '@happier-dev/protocol';
 import type {
     ManagedConnectionTransport,
     TransportDisconnectEvent,
@@ -20,6 +21,7 @@ export function createConcurrentServerSocketTransport(params: Readonly<{
     const socket = io(params.serverUrl, {
         path: '/v1/updates/',
         auth: {
+            [CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD]: ConnectedServiceIdSchema.options,
             token: params.token,
             clientType: 'user-scoped' as const,
             clientPurpose: 'concurrent-server-cache' as const,

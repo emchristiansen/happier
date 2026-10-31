@@ -18,19 +18,9 @@ import { openSessionActivityRecordPayload } from './sessionActivityRecordContent
  * outcome is durable (PLAN §4.9) — and it is why the count and the roster come from different
  * places: the count is the live projection on the session, the rows are these records.
  *
- * Everything fails soft. A record this build cannot parse, decrypt or reach is skipped rather than
- * rendered as a half-known task: a background command that shows the wrong status is worse than one
- * that has not appeared yet.
+ * Follow the transport's continuation so an old active task is not hidden by newer finished work.
+ * An unavailable page or payload rejects the refresh, preserving the caller's last-known inventory.
  */
-
-/**
- * How many background-task records one session may render.
- *
- * The server orders by `updatedAt` desc, so this keeps the newest. A bound is not a preference: the
- * record family is unbounded over a long session (one per backgrounded command, no TTL exists), and
- * an unbounded list would be paid for on every refresh of a pane that shows a roster, not a log.
- */
-export const SESSION_BACKGROUND_TASK_RECORD_LIMIT = 32;
 
 /** Open one record's envelope and validate it, or `null` when it is not a well-formed task record. */
 export async function openBackgroundTaskSystemRecord(params: Readonly<{
@@ -53,27 +43,33 @@ export async function openBackgroundTaskSystemRecord(params: Readonly<{
 /**
  * Every background task this session has a durable record for, newest first.
  *
- * Returns an empty list on any transport failure, which is also what an old CLI that never writes
- * these records produces — so the degrade path and the empty path are the same code path rather
- * than two behaviours that could diverge.
+ * An old CLI that never writes these records produces an authoritative empty inventory.
  */
 export async function listSessionBackgroundTaskRecords(params: Readonly<{
     sessionId: string;
     limit?: number;
     serverId?: string | null;
 }>): Promise<readonly SessionBackgroundTaskRecordV1[]> {
-    const page = await listSessionSystemRecords({
-        sessionId: params.sessionId,
-        namespace: SESSION_SYSTEM_RECORD_ACTIVITY_NAMESPACE,
-        kind: 'background_task.v1',
-        limit: params.limit ?? SESSION_BACKGROUND_TASK_RECORD_LIMIT,
-        ...(params.serverId !== undefined ? { serverId: params.serverId } : {}),
-    });
-    if (page.records.length === 0) return [];
-
-    const opened = await Promise.all(page.records.map(
-        (record) => openBackgroundTaskSystemRecord({ sessionId: params.sessionId, record })
-            .catch(() => null),
-    ));
-    return opened.filter((record): record is SessionBackgroundTaskRecordV1 => record !== null);
+    const records: SessionBackgroundTaskRecordV1[] = [];
+    let cursor: string | null = null;
+    do {
+        const page = await listSessionSystemRecords({
+            sessionId: params.sessionId,
+            namespace: SESSION_SYSTEM_RECORD_ACTIVITY_NAMESPACE,
+            kind: 'background_task.v1',
+            ...(params.limit !== undefined ? { limit: params.limit } : {}),
+            cursor,
+            ...(params.serverId !== undefined ? { serverId: params.serverId } : {}),
+        });
+        const opened = await Promise.all(page.records.map(
+            (record) => openBackgroundTaskSystemRecord({ sessionId: params.sessionId, record }),
+        ));
+        for (const record of opened) {
+            if (!record) throw new Error('Background task record unavailable');
+            records.push(record);
+        }
+        cursor = page.hasNext ? page.nextCursor : null;
+        if (page.hasNext && cursor === null) throw new Error('Background task inventory continuation unavailable');
+    } while (cursor !== null);
+    return records;
 }

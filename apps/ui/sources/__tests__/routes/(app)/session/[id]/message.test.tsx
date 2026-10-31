@@ -5,6 +5,8 @@ import type { LocalSettings } from '@/sync/domains/settings/localSettings';
 import type { SessionParticipantTarget } from '@/sync/domains/session/participants/participantTargets';
 import type { DeferredPromise } from './testUtils/deferredPromise';
 import { createDeferredPromise } from './testUtils/deferredPromise';
+import { measureScreenContentBottom, PublishBottomChromeHeight } from './testUtils/bottomChromeViewport';
+import { SessionCockpitChromeRegistryProvider } from '@/components/workspaceCockpit/session/SessionCockpitChromeRegistry';
 import { installSessionRouteCommonModuleMocks } from './sessionRouteTestHelpers';
 import {
   flushHookEffects,
@@ -122,9 +124,13 @@ installSessionRouteCommonModuleMocks({
   },
 });
 
-vi.mock('@/sync/store/hooks', () => ({
-  useSessionMessages: () => ({ messages: mockCommittedMessages, isLoaded: mockMessagesLoaded }),
-}));
+vi.mock('@/sync/store/hooks', async () => {
+  const { createUseLocalSettingMock } = await import('@/dev/testkit/mocks/storage');
+  return {
+    useSessionMessages: () => ({ messages: mockCommittedMessages, isLoaded: mockMessagesLoaded }),
+    useLocalSetting: createUseLocalSettingMock(),
+  };
+});
 
 vi.mock('@/sync/sync', () => ({
   sync: {
@@ -233,6 +239,28 @@ describe('Session message route hydration', () => {
   async function renderMessageScreen(Screen: React.ComponentType<any>) {
     return renderScreen(React.createElement(Screen));
   }
+
+  it('keeps the focused transcript viewport above measured bottom chrome as its height changes', async () => {
+    mockMessage = {
+      kind: 'tool-call', id: 'm1', localId: null, createdAt: 1,
+      tool: { id: 'task-1', name: 'Task', input: {}, result: null, state: 'completed' }, children: [],
+    };
+    const { default: MessageScreen } = await import('@/app/(app)/session/[id]/message/[messageId]');
+    const render = (height: number) => (
+      <SessionCockpitChromeRegistryProvider>
+        <PublishBottomChromeHeight height={height} />
+        <MessageScreen />
+      </SessionCockpitChromeRegistryProvider>
+    );
+    const screen = await renderScreen(render(94));
+    for (const height of [94, 121, 0]) {
+      await screen.update(render(height));
+      // Native text/list measurement is outside this test; Yoga exercises the screen's real frame.
+      const route = screen.findAllByType('View').find((node) => node.props.style?.flex === 1 && node.props.style?.minHeight === 0);
+      expect(route).toBeTruthy();
+      expect(measureScreenContentBottom(route!.props.style, 700)).toBe(700 - height);
+    }
+  });
 
   it('renders invalid link fallback when session id param is missing', async () => {
     mockSearchParams = { id: '', messageId: 'message-1' };

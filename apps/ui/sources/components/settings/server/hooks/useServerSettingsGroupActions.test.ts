@@ -44,6 +44,17 @@ vi.mock('@/components/settings/server/modals/ServerSwitchAuthPrompt', () => ({
     promptSignedOutServerSwitchConfirmation: promptSignedOutServerSwitchConfirmationMock,
 }));
 
+/**
+ * R8/INV7 — a group names several relays and cannot name the one relay a person chose for this
+ * device, so switching a group must never arm the direct-relay intent that authorises repointing
+ * this computer's background service.
+ */
+const recordDirectRelaySelectionIntentMock = vi.hoisted(() => vi.fn());
+vi.mock('@/setup/directRelaySelectionIntent', () => ({
+    recordDirectRelaySelectionIntent: recordDirectRelaySelectionIntentMock,
+    consumeDirectRelaySelectionIntent: vi.fn(() => false),
+}));
+
 async function renderHook<T extends object>(
     useValue: () => T,
 ): Promise<T & { __cleanup: () => Promise<void> }> {
@@ -263,5 +274,7 @@ describe('useServerSettingsGroupActions', () => {
         expect(promptSignedOutServerSwitchConfirmationMock).toHaveBeenCalledTimes(1);
         expect(onSwitchServerById).toHaveBeenCalledWith('server-b');
         expect(onAfterSignedOutSwitch).toHaveBeenCalledTimes(1);
+        // The group moved the active server, and still authorised no daemon reconciliation.
+        expect(recordDirectRelaySelectionIntentMock).not.toHaveBeenCalled();
     });
 });

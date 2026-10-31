@@ -56,6 +56,107 @@ In the CLI:
 - `happier connect claude ...`
 - `happier connect gemini`
 
+## Google Antigravity in development builds
+
+The development integration adds **Google Antigravity** as a distinct service,
+using **Sign in with Google** and the existing paste-code flow. The account is
+labelled with its Google email when available, and its profile label remains
+editable. This is separate from Google Gemini: each connection retains its own
+issuing OAuth client, refresh contract and quota context.
+
+After signing in, paste the authorization code displayed on Antigravity's callback
+page into Happier. A complete callback URL is also accepted. Start a fresh sign-in
+if the original attempt was closed or restarted; the code belongs to that attempt's
+PKCE verifier. These paste forms also apply to `happier connect agy`.
+
+The CLI entry point is `happier connect agy`; `happier agy` starts a managed ACP
+session using its explicit account selection or saved default. Explicit native
+authentication remains available. A supporting relay and daemon are required for
+the new service; a current client refuses unsupported operations before sending
+the new selection, while existing services remain usable. Older local CLIs cannot
+honor a saved Antigravity account default.
+
+Selected accounts use private ACP credentials while the existing configuration
+policy supplies skills, hooks and MCP settings. Shared session state links the
+conversation and artifact directories; tokens and mutable authentication settings
+stay private. Isolated state remains selectable and cannot continue the same ACP
+conversation after an account change. Missing shared-state links block continuity
+rather than silently starting another conversation. Account-selected discovery
+uses temporary isolated history without changing that preference.
+
+When switching an account's existing isolated history to shared state, differing
+copies of the same conversation are preserved as separate files. Antigravity
+continues to load the native shared copy under the original conversation ID; the
+imported `.happier-import-*` copy is not automatically merged or selected.
+
+Subscription meters use the selected account's Google quota response, including
+its returned windows and reset information. Context usage is a separate ACP
+signal. Real sign-in, refresh, quota attribution and A→B→A pool resume are still
+being validated; this section does not claim stable availability or completed
+authenticated/platform validation. The integration depends on Antigravity's OAuth
+client and an undocumented Google quota API, which Google may change.
+
+[Google's FAQ](https://www.antigravity.google/docs/faq/) says third-party access
+can lead to account suspension or termination, and consumer-plan account rotation
+is unsupported. This development integration does not establish Google approval
+or an exception for Happier's use of the official ACP server.
+
+See [Antigravity](/agents/agy) for the managed ACP/native CLI boundary.
+
+## Importing a machine's existing login in development builds
+
+The development implementation adds native-login import for Antigravity, Claude
+and Codex. Its provider, app and platform checks are still in progress; this is
+not a stable-release availability claim.
+
+Sign in to Happier first. From the CLI on the machine holding the native login,
+choose a destination profile:
+
+```bash
+happier connect agy --import --source acp --profile work
+happier connect claude --import --source native --profile work
+happier connect codex --import --source native --profile work
+```
+
+The app's import action selects the machine that holds the login. Each agent
+declares the sources it can read; unavailable native storage is reported rather
+than substituted silently. Antigravity's managed ACP login and native `agy`
+login are separate sources.
+
+Import copies the credential into Happier's encrypted account storage. It does
+not switch the native agent's login. The copied login can share a refresh grant
+with the native agent; provider token rotation may require signing in again on
+one side. Import does not promise simultaneous native and Happier use. A profile
+belonging to another account is refused instead of overwritten.
+
+If the storage reply is lost, check or refresh the destination profile before
+trying again. The app holds further imports until that check; an uncertain reply
+is not a successful import. Actual native Keychain/keyring access, refreshed-token
+interoperability and authenticated launch remain validation gates.
+
+## Continuing after a usage limit
+
+Development-only usage-limit recovery lets a waiting session continue after a directly selected account's reported
+usage-limit reset. It requires usage-limit recovery support on the relay and
+automatic resume to be enabled. The same recovery attempt handles checks from
+an active session, the CLI, and MCP; changing how you check does not start a
+separate recovery loop.
+
+Happier sends the configured continuation prompt, not a replay of your original
+request. A queued prompt is not confirmation that the Agent recovered: recovery
+remains pending until the Agent runs successfully. Cancelling the wait, stopping
+the session, or sending newer work takes precedence over automatic continuation.
+
+Development corrections keep recovery state associated with the failure that
+created it. Cancelling an earlier wait does not hide a newer usage-limit failure,
+and checking the newer failure does not revive the earlier wait.
+
+Pool quota selection determines which meters affect account eligibility before
+a request. A supported limit error that actually fails the Agent's main operation
+still follows the pool's configured switching rules and limits. Create separate
+pools when different sessions should use different quota filters; provider-enforced
+usage and spending limits still apply.
+
 ## Model-capacity retries
 
 In development builds, a terminal model-capacity failure such as Codex
@@ -70,9 +171,9 @@ does not reset the delay; a successfully completed model turn does. Authenticati
 failures and exhausted subscription quota follow their separate recovery paths.
 Stopping retries or stopping the session takes precedence over automatic recovery.
 
-## Automatic quota resets for Codex pools
+## Automatic quota resets for subscription pools
 
-In development builds with a supporting relay, a Codex subscription pool's Behavior
+In development builds with a supporting relay, a Codex or Claude subscription pool's Behavior
 section includes **Automatically use quota resets**. It is off by default. Enabling
 it authorizes spending a banked reset only after ordinary recovery finds no ready
 pool account and a quota-exhausted account is eligible for a reset. Normal account
@@ -82,7 +183,7 @@ for authentication failures or unrelated cooldowns.
 The option is hidden on older relays and for services without banked resets. Turning it
 off prevents future automatic spending; it cannot restore a reset already consumed.
 If a reset response is lost or cannot confirm the outcome, Happier pauses further
-automatic resets for that account for the current daemon lifetime; a newer quota
+resets for that account for the current daemon lifetime; a newer quota
 observation alone does not authorize another credit.
 
 Confirmed automatic spending sends a notification through your enabled quota-recovery
@@ -125,6 +226,23 @@ claude setup-token
 ```
 
 Then paste it into Happier.
+
+#### Claude quota identity in development builds
+
+The development correction keeps OAuth quota usage separate when one Claude
+login belongs to different organizations. Profiles for the same user and
+organization share usage evidence, even when their Happier labels differ.
+Personal and work organizations retain their own meters and recovery context.
+
+Older connections can obtain their organization identity during a fresh quota
+check using the connected token. If Claude cannot confirm that context, Happier
+does not infer shared quota ownership from the email or user id alone. Setup
+tokens do not gain OAuth quota telemetry from this correction.
+
+Usage verified with the current credential can still support that profile's local
+recovery when organization information is unavailable. Reconnecting with a
+different credential requires fresh evidence. This does not identify every cause
+of a Claude rate-limit or spend-limit response.
 
 ### Anthropic API key
 
@@ -210,6 +328,38 @@ That picker is dynamic:
 
 If no compatible connected profile exists for a service, Happier keeps that service on native auth and offers a shortcut to open Connected services settings.
 
+## Claude configuration sharing
+
+In development builds with the configuration-sharing correction, Claude connected
+accounts and pools honor the configured sharing mode. Linked configuration is the
+default: shareable entries such as skills, hooks and settings point to the machine's
+native Claude configuration, including a custom `CLAUDE_CONFIG_DIR` when configured.
+File changes are visible through those links without reconnecting the account.
+Claude may still need to reload a setting before using its new value.
+
+Copied configuration is refreshed whenever Happier materializes the account home,
+even when its credential has not changed. Isolated configuration imports none of
+these entries. On systems where a configuration link cannot be created, Happier
+falls back to copying that entry.
+
+Credentials and account metadata remain separate from configuration sharing.
+Session-history sharing follows its own setting; changing configuration sharing
+does not opt in to workspace trust or change that history policy.
+
+### Instructions, plugins, and hook trust in development builds
+
+The development correction for missing configuration also includes Claude's
+user-level `CLAUDE.md` and Codex's installed `plugins` directory in linked and
+copied configuration. Existing managed homes receive these entries the next time
+Happier materializes them; isolated configuration does not import them.
+
+Codex hook decisions use the path of the file defining the hook. When copying
+home-level hooks into a managed home, Happier translates those path keys and
+preserves the existing trust hashes and disabled choices. Decisions already made
+in that managed home take precedence. Codex still checks the hook contents: an
+edited hook is not automatically trusted. This applies to hooks in `hooks.json`
+and `config.toml`, without changing project-level trust.
+
 ## Connected services and browsing sessions (Codex)
 
 For some providers, your connected-service choice affects which provider “home” Happier should use for session browsing.
@@ -279,12 +429,37 @@ dead account.
 
 | Strategy | What it does |
 | --- | --- |
-| **Least limited** *(default)* | Picks whichever member has the most quota left. |
+| **Expiring quota first** *(development default)* | Prefers usable quota whose allowance resets or non-renewing subscription ends soonest, with enough headroom. |
+| **Least limited** | Picks whichever member has the most quota left. |
 | **Priority** | Uses your ordering, falling back down the list. |
 | **Manual** | Never chooses for you; you pick. |
 
+The expiry-first choice requires a server advertising `connectedServices.poolExpiryFirst`.
+It is the default for new pools in development builds; existing saved strategies
+are preserved. It prefers accounts above the pool's low-quota threshold before
+comparing dates, using the longest selected usage window rather than an incidental
+short reset. Missing or stale dates are neutral. It chooses on the next needed
+switch, without adding scheduled swaps or restarting the agent.
+
 Reorder members to set the fallback order, and enable or disable individual
 accounts without removing them.
+
+If a provider reports more than one independent allowance, the pool's
+**Usage limits** row can either track every allowance reported by enabled pool
+accounts now or later (the default) or a selected set. While enabled-account
+usage is refreshing, the selector
+marks the reported-limit list as potentially incomplete. For example, a
+separate Spark or Fable allowance can have its own pool
+without changing the model of any running session. Limits that an enabled
+account is not currently reporting stay visible in the selection and are treated as
+unknown, rather than silently falling back to every allowance.
+
+Pool member capacity, usage rows, and session usage badges use the pool's selected
+allowances. Account-wide facts such as the plan, subscription identity, and reset
+credits remain visible because selecting limits does not change the account itself.
+When the provider reports a window duration, the selector shows that duration (for
+example, `5h + 7d`) instead of a generic window count; a single window with no
+reported duration is left unlabeled rather than shown as “1 window”.
 
 ### When it switches
 
@@ -364,6 +539,25 @@ Each profile detail view lets you:
 - inspect the provider plan label when available
 - pin specific meters so the same meters appear as summary badges elsewhere in the UI
 
+### Composer gauges in development builds
+
+Choose **Gauge windows** under **Settings → Connected services → Provider usage**
+or **Settings → Session → Provider limits and usage → Provider usage**. Both
+locations edit the same preference for all accounts. The default is one
+**Most constrained** gauge; select several windows, such as **Daily** and
+**Weekly**, to display one gauge for each available window.
+
+For pooled sessions, gauges use only the allowances selected in that pool. A
+pool that tracks only Fable allowances shows Fable's selected windows, even if
+the account reports other allowances. Missing windows do not produce extra
+gauges. **Short window** includes allowances such as a five-hour window;
+**Daily** means a daily allowance.
+
+Account favorites select summary meters in account views and add extra composer
+gauges for the account currently used by the session, alongside the global windows.
+Favorites respect the pool’s selected limits and need a reliable percentage to produce a ring. **Show usage labels** and the
+provider-gauge visibility toggle are available in both locations too.
+
 ## When you hit a usage limit
 
 Reaching a provider's usage limit does not silently stall the session. Happier
@@ -386,6 +580,11 @@ What it offers depends on what is actually possible:
 **Always wait and resume** remembers your choice for that account so the banner
 stops asking, and **Ask each time** puts the question back.
 
+In development source, cancelling recovery for an earlier failure does not hide
+a new usage-limit issue. If an older daemon's saved wait cannot be associated
+with the current failure, the banner shows actions for the current issue rather
+than the saved wait's timing or cancellation state.
+
 ### Usage-reset credits
 
 Some Codex accounts receive usage-limit reset credits from the provider. Where
@@ -397,6 +596,23 @@ Happier reports back what actually happened rather than assuming success: the
 reset applied, there was nothing to reset, no credit remained, or the credit had
 already been used. A blocked session continues once the provider starts
 accepting requests again.
+
+In development source, connected Claude OAuth subscription accounts use the same
+account reset controls. Saved grants that Claude does not currently permit using
+appear as unavailable; their presence does not enable **Apply reset**. Setup tokens
+and Anthropic API keys do not provide this reset capability. Discovery preserves
+ordinary usage and extra-usage information when reset information is unavailable.
+
+Claude decides eligibility, the limits a grant clears, and when it expires.
+Automatic spending checks fresh provider evidence that the grant covers an exhausted
+allowance; unrelated model limits do not authorize spending. A confirmed reset refreshes
+usage and grant information. A reset with an uncertain outcome pauses further spending
+for the account in that daemon lifetime, including manual requests.
+
+According to [Claude's limit-reset documentation](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset),
+using a grant cannot be undone and does not change the normal weekly reset schedule.
+Claude reset integration uses an undocumented API. It remains subject to provider
+changes; successful live redemption has not yet been verified for this development change.
 
 ## Security model
 

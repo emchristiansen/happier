@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { join } from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 
 import { reloadConfiguration, configuration } from '@/configuration';
@@ -27,7 +27,14 @@ describe('claude execution run isolation', () => {
     homeDir = null;
   });
 
-  it('adds isolated XDG dirs for Claude Code to avoid shared version locks', () => {
+  it('isolates only Claude settings and preserves inherited user cache directories', async () => {
+    const env = {
+      HOME: '/user/home',
+      XDG_CONFIG_HOME: '/user/config',
+      XDG_DATA_HOME: '/user/data',
+      XDG_STATE_HOME: '/user/state',
+      XDG_CACHE_HOME: '/user/cache',
+    };
     const bundle = resolveIsolation(
       {
         backendId: 'claude',
@@ -35,15 +42,14 @@ describe('claude execution run isolation', () => {
         scope: 'execution_run',
         cwd: '/tmp',
       },
-      { env: {} },
+      { env },
     );
 
-    expect(typeof bundle.env.XDG_DATA_HOME).toBe('string');
-    expect(typeof bundle.env.XDG_STATE_HOME).toBe('string');
-    expect(typeof bundle.env.XDG_CACHE_HOME).toBe('string');
-    expect(bundle.env.XDG_DATA_HOME).toContain(join(configuration.activeServerDir, 'isolation'));
-    expect(bundle.env.XDG_STATE_HOME).toContain(join(configuration.activeServerDir, 'isolation'));
-    expect(bundle.env.XDG_CACHE_HOME).toContain(join(configuration.activeServerDir, 'isolation'));
+    expect(bundle.env).toEqual(env);
+    expect(bundle.settingsPath).toBe(join(configuration.activeServerDir, 'isolation', 'claude', 'execution_run', 'run_1', 'claude', 'settings.json'));
+    expect(JSON.parse(await readFile(bundle.settingsPath!, 'utf8'))).toEqual({});
+    await bundle.cleanup?.();
+    await expect(access(bundle.settingsPath!)).rejects.toThrow();
   });
 
   it('uses the canonical execution-run permission handler', () => {
