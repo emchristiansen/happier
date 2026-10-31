@@ -91,8 +91,31 @@ export const SessionConnectedServiceAuthSwitchRpcParamsSchema = z
         rematerializeServiceId: ConnectedServiceIdSchema.optional(),
         expectedGroupGenerationByServiceId: z.record(z.string(), z.number().int().nonnegative()).optional(),
         accountSettingsVersionHint: z.number().int().nonnegative().optional(),
+        quotaRecovery: z.object({
+            requestId: z.string().min(1),
+            nativeId: z.string().min(1),
+            pid: z.number().int().positive(),
+            processInstanceFingerprint: z.string().min(1),
+            serviceId: z.enum(['openai-codex', 'claude-subscription']),
+            profileId: ConnectedServiceProfileIdSchema,
+            failureAttemptId: z.string().min(1),
+            failureArmedAtMs: z.number().int().nonnegative(),
+            nativePublisherIncarnationId: z.string().min(1),
+            nativeObservationSequence: z.string().regex(/^(0|[1-9][0-9]*)$/),
+            failureObservedAtMs: z.number().int().nonnegative(),
+        }).strict().optional(),
     })
-    .strict();
+    .strict()
+    .superRefine((request, context) => {
+        if (request.quotaRecovery && (
+            request.rematerializeServiceId !== undefined
+            || request.accountSettingsVersionHint !== undefined
+            || request.expectedGroupGenerationByServiceId !== undefined
+        )) {
+            context.addIssue({ code: z.ZodIssueCode.custom,
+                message: 'Quota recovery permits only its guarded account selection', path: ['quotaRecovery'] });
+        }
+    });
 
 export type SessionConnectedServiceAuthSwitchRpcParams = z.infer<
     typeof SessionConnectedServiceAuthSwitchRpcParamsSchema

@@ -116,6 +116,9 @@ import {
   ConnectedServiceTurnLifecycleResultSchema,
   type ConnectedServiceTurnLifecycleRequestBody,
   type ConnectedServiceTurnLifecycleResult,
+  NATIVE_PROVIDER_TURN_SOURCE_HEADER,
+  readNativeProviderTurnSource,
+  type NativeProviderTurnSource,
 } from './connectedServices/connectedServiceTurnLifecycleContract';
 import {
   applyAuthorizedRuntimeAuthFailureSourceBinding,
@@ -364,6 +367,8 @@ export function createDaemonControlApp({
   handleConnectedServiceTurnLifecycle,
   handleConnectedServiceUsageLimitWaitResumeCancel,
   handleSessionConnectedServiceAuthSwitch,
+  inspectSessionQuotaRecovery,
+  beginQuotaFailureSource,
   handleSessionRunnerRestart,
   handleSessionRunnerRestartAll,
   handleSessionRunnerStatusGet,
@@ -437,7 +442,7 @@ export function createDaemonControlApp({
   // post-shutdown work can never reach provider-outcome proof and races a dying endpoint.
   isShuttingDown?: () => boolean;
   handleConnectedServiceTurnLifecycle?: (
-    input: ConnectedServiceTurnLifecycleRequestBody,
+    input: ConnectedServiceTurnLifecycleRequestBody & { nativeProviderSource?: NativeProviderTurnSource },
   ) => Promise<ConnectedServiceTurnLifecycleResult>;
   // QAE-1: user "Stop waiting" propagation — cancels the daemon-side durable
   // recovery wait state (runtime-auth recovery + inactive usage-limit stores).
@@ -446,6 +451,10 @@ export function createDaemonControlApp({
     attemptId: string;
   }>) => Promise<unknown>;
   handleSessionConnectedServiceAuthSwitch?: (input: Readonly<SessionConnectedServiceAuthSwitchRpcParams>) => Promise<unknown>;
+  inspectSessionQuotaRecovery?: (input: Readonly<{ sessionId: string; requestId?: string }>) => unknown;
+  beginQuotaFailureSource?: (input: Readonly<{ sessionId: string;
+    classification: Pick<ConnectedServiceRuntimeFailureClassification, 'kind' | 'serviceId' | 'profileId'>;
+    nativeProviderSource?: NativeProviderTurnSource; reportId?: string }>) => ((attemptId?: string) => void) | undefined;
   handleSessionRunnerRestart?: (input: RestartSessionRunnerRequestV1) => Promise<RestartSessionRunnerResultV1>;
   handleSessionRunnerRestartAll?: (
     input: RestartAllSessionRunnersRequestV1,
@@ -653,6 +662,21 @@ export function createDaemonControlApp({
       ...(normalizedRuntimeId ? { runtimeId: normalizedRuntimeId } : {}),
       ...(DAEMON_DIST_CLOSURE_FINGERPRINT_PATTERN.test(distClosureFingerprint) ? { distClosureFingerprint } : {}),
     };
+  });
+
+  typed.post('/connected-service-auth/session/quota-recovery/inspect', {
+    schema: {
+      body: z.object({ sessionId: z.string().min(1), requestId: z.string().min(1).optional() }).strict(),
+      response: { 200: z.unknown(), 401: authSchema401,
+        501: z.object({ ok: z.literal(false), errorCode: z.literal('quota_recovery_inspection_unavailable') }) },
+    },
+    preHandler: requireAuth,
+  }, async (request, reply) => {
+    if (!inspectSessionQuotaRecovery) {
+      reply.code(501);
+      return { ok: false as const, errorCode: 'quota_recovery_inspection_unavailable' as const };
+    }
+    return inspectSessionQuotaRecovery(request.body);
   });
 
   typed.post('/connected-service-auth/session/switch', {
@@ -899,11 +923,18 @@ export function createDaemonControlApp({
     },
     preHandler: requireAuth,
   }, async (request, reply) => {
+    const finalizeQuotaFailureSource = beginQuotaFailureSource?.({
+      sessionId: request.body.sessionId, classification: request.body.classification, reportId: request.body.reportId,
+      nativeProviderSource: readNativeProviderTurnSource(request.headers[NATIVE_PROVIDER_TURN_SOURCE_HEADER]),
+    });
     return await claimRuntimeAuthReport({
       reportId: request.body.reportId,
       retainSettled: (result) => result.ok === true,
       onResult: (result) => {
-        if (result.ok === true) return;
+        if (result.ok === true) {
+          finalizeQuotaFailureSource?.(result.recoveryReceipt?.attemptId);
+          return;
+        }
         reply.code(result.errorCode === 'connected_service_runtime_auth_handler_unavailable' ? 501 : 503);
       },
       execute: async () => {
@@ -1258,10 +1289,12 @@ export function createDaemonControlApp({
         errorCode: 'connected_service_turn_lifecycle_handler_unavailable' as const,
       };
     }
+    const nativeProviderSource = readNativeProviderTurnSource(request.headers[NATIVE_PROVIDER_TURN_SOURCE_HEADER]);
     const result = await handleConnectedServiceTurnLifecycle({
       sessionId: request.body.sessionId,
       event: request.body.event,
       ...(request.body.terminalStatus ? { terminalStatus: request.body.terminalStatus } : {}),
+      ...(nativeProviderSource ? { nativeProviderSource } : {}),
       ...(request.body.turnId ? { turnId: request.body.turnId } : {}),
       ...(request.body.requestedAction ? { requestedAction: request.body.requestedAction } : {}),
       ...(request.body.activeTurnId !== undefined ? { activeTurnId: request.body.activeTurnId } : {}),
@@ -2281,6 +2314,8 @@ export function startDaemonControlServer({
   handleConnectedServiceTurnLifecycle,
   handleConnectedServiceUsageLimitWaitResumeCancel,
   handleSessionConnectedServiceAuthSwitch,
+  inspectSessionQuotaRecovery,
+  beginQuotaFailureSource,
   handleSessionRunnerRestart,
   handleSessionRunnerRestartAll,
   handleSessionRunnerStatusGet,
@@ -2344,7 +2379,7 @@ export function startDaemonControlServer({
   runtimeAuthRecoveryScheduler?: RuntimeAuthRecoverySchedulerForControlServer;
   isShuttingDown?: () => boolean;
   handleConnectedServiceTurnLifecycle?: (
-    input: ConnectedServiceTurnLifecycleRequestBody,
+    input: ConnectedServiceTurnLifecycleRequestBody & { nativeProviderSource?: NativeProviderTurnSource },
   ) => Promise<ConnectedServiceTurnLifecycleResult>;
   // QAE-1: user "Stop waiting" propagation — cancels the daemon-side durable
   // recovery wait state (runtime-auth recovery + inactive usage-limit stores).
@@ -2353,6 +2388,10 @@ export function startDaemonControlServer({
     attemptId: string;
   }>) => Promise<unknown>;
   handleSessionConnectedServiceAuthSwitch?: (input: Readonly<SessionConnectedServiceAuthSwitchRpcParams>) => Promise<unknown>;
+  inspectSessionQuotaRecovery?: (input: Readonly<{ sessionId: string; requestId?: string }>) => unknown;
+  beginQuotaFailureSource?: (input: Readonly<{ sessionId: string;
+    classification: Pick<ConnectedServiceRuntimeFailureClassification, 'kind' | 'serviceId' | 'profileId'>;
+    nativeProviderSource?: NativeProviderTurnSource; reportId?: string }>) => ((attemptId?: string) => void) | undefined;
   handleSessionRunnerRestart?: (input: RestartSessionRunnerRequestV1) => Promise<RestartSessionRunnerResultV1>;
   handleSessionRunnerRestartAll?: (
     input: RestartAllSessionRunnersRequestV1,
@@ -2411,6 +2450,8 @@ export function startDaemonControlServer({
       handleConnectedServiceTurnLifecycle,
       handleConnectedServiceUsageLimitWaitResumeCancel,
       handleSessionConnectedServiceAuthSwitch,
+  inspectSessionQuotaRecovery,
+  beginQuotaFailureSource,
       handleSessionRunnerRestart,
       handleSessionRunnerRestartAll,
       handleSessionRunnerStatusGet,

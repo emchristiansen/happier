@@ -16,6 +16,8 @@ import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connected
 import { ConnectedServiceSessionAuthSwitchLockRegistry, createConnectedServiceSessionAuthSwitchCore } from '../runtimeAuth/connectedServiceSessionAuthSwitchCore';
 import { createSessionConnectedServiceAuthHotApply } from './sessionConnectedServiceAuthHotApply';
 import { switchSessionConnectedServiceAuth, type SwitchSessionConnectedServiceAuthInput } from './switchSessionConnectedServiceAuth';
+import { createQuotaRecoveryGuard } from './quotaRecoveryGuard';
+import type { RuntimeAuthRecoveryIntent } from '../runtimeAuth/RuntimeAuthRecoveryScheduler';
 
 const credentialRevision = 'csr_abcdefghijklmnopqrstuv';
 afterEach(() => vi.restoreAllMocks());
@@ -194,6 +196,54 @@ function createContinuationStore() {
 }
 
 describe('switchSessionConnectedServiceAuth', () => {
+  it.each(['before_lock', 'during_profile_read'] as const)(
+    'refuses a changed quota source %s before committing bindings or requesting a restart', async (schedule) => {
+      const tracked = trackedSession({
+        vendorResumeId: 'same-native', processInstanceFingerprint: 'fixture-instance', publisherIncarnationId: 'fixture-publisher',
+      });
+      let turnInFlight = false;
+      const guard = createQuotaRecoveryGuard({
+        destinationProfileId: 'new-profile',
+        expected: { sessionId: 'sess_1', agentId: 'claude', nativeId: 'same-native', pid: 123,
+          processInstanceFingerprint: 'fixture-instance', serviceId: 'anthropic',
+          profileId: 'old-profile', failureAttemptId: 'current-refusal', failureArmedAtMs: 100,
+          nativePublisherIncarnationId: 'fixture-publisher', nativeObservationSequence: '1', failureObservedAtMs: 150 },
+        getChildren: () => [tracked], isTurnInFlight: () => turnInFlight,
+        readFailureSource: () => ({ kind: 'usage_limit', serviceId: 'anthropic', profileId: 'old-profile',
+          attemptId: 'current-refusal', armedAtMs: 100, observedAtMs: 150,
+          nativeProviderSource: { nativeId: 'same-native', pid: 123, publisherIncarnationId: 'fixture-publisher', sequence: '1' } }),
+        readRecoveryIntents: () => [{
+          v: 2, sessionId: 'sess_1', serviceId: 'anthropic', profileId: 'old-profile',
+          groupId: null, attemptId: 'current-refusal', armedAtMs: 100, status: 'waiting',
+          nextRetryAtMs: null, attemptCount: 0, maxAttempts: 5, switchesThisTurn: 0,
+          failurePhase: 'handler', failureReason: 'usage_limit', lastError: null,
+          lastErrorClassification: null,
+          classification: { kind: 'usage_limit', serviceId: 'anthropic', profileId: 'old-profile',
+            groupId: null, resetsAtMs: null, planType: null, rateLimits: null, source: 'structured_provider_error' },
+        } satisfies RuntimeAuthRecoveryIntent],
+      });
+      if (schedule === 'before_lock') turnInFlight = true;
+      const before = structuredClone(tracked.spawnOptions);
+      const restartSession = vi.fn();
+      const persistSessionBindings = vi.fn();
+      await expect(switchSessionConnectedServiceAuth(Object.assign({
+        core: createCore(), getChildren: () => [tracked],
+        postSwitchVerificationMode: { kind: 'disabled_for_test_only' as const, reason: 'negative guard fixture; no provider operation permitted' },
+        api: { listConnectedServiceProfiles: async () => {
+          turnInFlight = true;
+          return { serviceId: 'anthropic' as const, profiles: [{ profileId: 'new-profile', status: 'connected' as const }] };
+        }, getConnectedServiceAuthGroup: async () => null },
+        resolveContinuity: async () => ({ mode: 'restart_rematerialize' as const }),
+        restartSession, persistSessionBindings, hotApply: async () => ({ ok: true as const }),
+        registerHotApplyTargets: () => {}, emitSessionEvent: () => {},
+        request: { sessionId: 'sess_1', agentId: 'claude', bindings: bindings('new-profile') },
+      }, { quotaRecoveryGuard: guard }))).rejects.toThrow('quota_recovery_current_source_changed');
+      expect(tracked.spawnOptions).toEqual(before);
+      expect(persistSessionBindings).not.toHaveBeenCalled();
+      expect(restartSession).not.toHaveBeenCalled();
+    },
+  );
+
   it('rejects a missing session without mutating or restarting', async () => {
     const restartSession = vi.fn();
 

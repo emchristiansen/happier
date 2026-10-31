@@ -1,4 +1,5 @@
 import type { HotApplyRestartRequirement } from './sessionConnectedServiceAuthHotApply';
+import type { QuotaRecoveryGuard } from './quotaRecoveryGuard';
 import {
   CONNECTED_SERVICE_UX_DIAGNOSTIC_CODES,
   ConnectedServiceUxDiagnosticCodeV1Schema,
@@ -345,6 +346,7 @@ export type SwitchSessionConnectedServiceAuthInput = Readonly<{
    */
   emitFromProfileIdByServiceId?: ReadonlyMap<ConnectedServiceId, string | null>;
   getChildren: () => ReadonlyArray<TrackedSession>;
+  quotaRecoveryGuard?: QuotaRecoveryGuard;
   resolveInactiveSession?(input: Readonly<{ sessionId: string }>): Promise<Readonly<{
     agentId: CatalogAgentId;
     connectedServices: ConnectedServiceBindingsV1;
@@ -1947,6 +1949,8 @@ export async function switchSessionConnectedServiceAuth(
   const execute = async (
     authoritativeGroupTargetRetriesRemaining = 1,
   ): Promise<SessionConnectedServiceAuthSwitchResult> => {
+      input.quotaRecoveryGuard?.assertCurrent();
+      input.quotaRecoveryGuard?.assertBindings(input.request.bindings);
       const tracked = findTrackedSession(input.getChildren(), input.request.sessionId);
       if (!tracked) {
         const inactive = await input.resolveInactiveSession?.({ sessionId: input.request.sessionId }) ?? null;
@@ -2116,6 +2120,7 @@ export async function switchSessionConnectedServiceAuth(
 	        dryRun: input.dryRun === true,
 	      }));
       if (!normalized.ok) return normalized;
+      input.quotaRecoveryGuard?.assertCurrent();
 
       const previousBindings = readConnectedServiceBindingsOrEmpty(
         resolveTrackedConnectedServiceBindingsRaw(tracked),
@@ -2349,7 +2354,7 @@ export async function switchSessionConnectedServiceAuth(
         ...(runtimeAuthSelectionsByServiceId.size === 0 ? {} : { runtimeAuthSelectionsByServiceId }),
         groupMetadataByServiceId: normalized.groupMetadataByServiceId,
       });
-      tracked.spawnOptions = {
+      const nextSpawnOptions = {
         ...(tracked.spawnOptions ?? { directory: '' }),
         connectedServices: normalized.normalized,
         connectedServicesUpdatedAt: Date.now(),
@@ -2358,6 +2363,8 @@ export async function switchSessionConnectedServiceAuth(
           : {}),
         environmentVariables: nextEnvironmentVariables,
       };
+      input.quotaRecoveryGuard?.acceptAccountChange(nextSpawnOptions);
+      tracked.spawnOptions = nextSpawnOptions;
 
       try {
         if (action === 'hot_applied') {
@@ -2375,6 +2382,7 @@ export async function switchSessionConnectedServiceAuth(
           }
           let hotApplyResult: Awaited<ReturnType<SwitchSessionConnectedServiceAuthInput['hotApply']>>;
           try {
+            input.quotaRecoveryGuard?.assertCurrent();
             hotApplyResult = await input.hotApply({
               tracked,
               normalizedBindings: normalized.normalized,
@@ -2467,6 +2475,7 @@ export async function switchSessionConnectedServiceAuth(
             // daemon route is not held open until the current turn reaches a restart boundary.
           } else {
           try {
+            input.quotaRecoveryGuard?.assertCurrent();
             await input.restartSession(tracked);
           } catch (error) {
             const rolledBack = await rollbackPersistedSessionBindings({

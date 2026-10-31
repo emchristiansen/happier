@@ -16,11 +16,29 @@ export type ResolveRespawnSessionRuntimeSnapshotParams = Readonly<{
   credentials: Credentials | null;
   readCredentials: () => Promise<Credentials | null>;
   resolveAttachContext?: ResolveExistingSessionAttachContext;
+  /** Set only by the daemon-owned guarded quota transition, never an external options dump. */
+  preserveTrackedOptionsForQuotaRecovery?: Readonly<{ nativeId: string }>;
 }>;
 
 export async function resolveRespawnSessionRuntimeSnapshot(
   params: ResolveRespawnSessionRuntimeSnapshotParams,
 ): Promise<SpawnSessionOptions> {
+  const quotaPreservation = params.preserveTrackedOptionsForQuotaRecovery;
+  if (quotaPreservation) {
+    if (
+      !quotaPreservation.nativeId
+      || params.vendorResumeId !== quotaPreservation.nativeId
+      || params.defaultOptions.resume !== quotaPreservation.nativeId
+      || params.defaultOptions.existingSessionId !== params.sessionId
+    ) {
+      throw new Error('quota_recovery_respawn_identity_changed');
+    }
+    // An account-only transition already holds the live tracked options. Re-resolving a
+    // metadata snapshot here could change model/permission or discard still-owned input.
+    // Ordinary crash/manual respawns retain their durable snapshot behavior below.
+    const { spawnNonce: _acceptedRequestNonce, sessionId: _newSessionId, ...retained } = params.spawnOptions;
+    return { ...retained, resume: quotaPreservation.nativeId, existingSessionId: params.sessionId };
+  }
   const resolver = params.resolveAttachContext ?? resolveExistingSessionAttachContext;
   const storedCredentials = await params.readCredentials().catch(() => null);
   const effectiveCredentials = storedCredentials ?? params.credentials;

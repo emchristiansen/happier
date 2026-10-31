@@ -13,6 +13,31 @@ import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers
 import { createSessionRunnerRespawnManager, type SessionRunnerRespawnOptionsResolver } from './sessionRunnerRespawn';
 
 describe('createSessionRunnerRespawnManager', () => {
+  it('admits each distinct guarded quota attempt once without a default intended-restart cap', async () => {
+    vi.useFakeTimers();
+    try {
+      const spawnSession = vi.fn(async (_options: SpawnSessionOptions) => ({ type: 'success' as const, pid: 900 }));
+      const manager = createSessionRunnerRespawnManager({
+        enabled: true, maxRestarts: 1, maxIntendedRestarts: 1,
+        baseDelayMs: 1, maxDelayMs: 1, jitterMs: 0,
+        isSessionAlreadyRunning: async () => false, spawnSession,
+        random: () => 0, logDebug: () => {}, logWarn: () => {},
+      });
+      const tracked: TrackedSession = { startedBy: 'daemon', happySessionId: 'quota-session', pid: 100,
+        vendorResumeId: 'same-native', spawnOptions: { directory: '/fixture', resume: 'same-native' } };
+      for (let index = 0; index < 4; index++) {
+        const attempt = Object.assign({ forceRestart: true }, { quotaRecoveryAttemptId: `guarded-${index}` });
+        manager.handleUnexpectedExit(tracked, { reason: 'process-exit', code: 0, signal: null }, attempt);
+        await vi.advanceTimersByTimeAsync(1);
+        manager.handleUnexpectedExit(tracked, { reason: 'process-exit', code: 0, signal: null }, attempt);
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      expect(spawnSession).toHaveBeenCalledTimes(4);
+      expect(spawnSession.mock.calls.every(([options]) => options.resume === 'same-native'
+        && options.existingSessionId === 'quota-session')).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('spawns a replacement runner after an unexpected termination', async () => {
     vi.useFakeTimers();
     const spawnSession = vi.fn(async (_opts: unknown) => ({ type: 'success' as const, pid: 123 }));

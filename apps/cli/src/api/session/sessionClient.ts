@@ -11,6 +11,7 @@ import { SessionArchiveInputAdmission, type RequestArchivedSessionCleanup } from
 import { LruSet } from '@/utils/collections/lru';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { createSerializedWorkQueueDiagnostics, type SerializedWorkDiagnosticContext } from '@/utils/serializedWorkQueueDiagnostics';
+import { recordRuntimeAuthProviderCompletion } from '@/daemon/connectedServices/runtimeAuth/reportConnectedServiceRuntimeAuthFailureToDaemon';
 import {
     isConditionalPendingSteerClaim,
     normalizeSessionMetadataForRead,
@@ -357,6 +358,7 @@ import { notifyDaemonConnectedServiceTurnLifecycle, notifyDaemonConnectedService
 import {
     ConnectedServiceTurnLifecycleResultSchema,
     type ConnectedServiceTurnLifecycleResult,
+    nativeProviderSourceFromMetadata,
 } from '@/daemon/connectedServices/connectedServiceTurnLifecycleContract';
 import {
     applyKnownPendingQueueState,
@@ -5828,10 +5830,14 @@ export class ApiSessionClient extends EventEmitter {
         requestedAction?: PendingRequestedActionV1,
     ): Promise<ConnectedServiceTurnLifecycleResult | null> {
         if (!this.startedByDaemonProcess) return null;
+        if (event === 'assistant_message_end' && terminalStatus === 'completed') {
+            recordRuntimeAuthProviderCompletion(this.sessionId);
+        }
         let lifecycleResult: ConnectedServiceTurnLifecycleResult | null = null;
+        const nativeProviderSource = nativeProviderSourceFromMetadata(this.getMetadataSnapshot());
         const notify = async (): Promise<void> => {
             try {
-                const result = await notifyDaemonConnectedServiceTurnLifecycle({
+                const body = {
                     sessionId: this.sessionId,
                     event,
                     ...(terminalStatus ? { terminalStatus } : {}),
@@ -5844,7 +5850,10 @@ export class ApiSessionClient extends EventEmitter {
                             activeTurnId: this.sessionTurnLifecycle.getActiveTurnId(),
                         }
                         : {}),
-                });
+                };
+                const result = nativeProviderSource
+                    ? await notifyDaemonConnectedServiceTurnLifecycle(body, { nativeProviderSource })
+                    : await notifyDaemonConnectedServiceTurnLifecycle(body);
                 const parsedResult = ConnectedServiceTurnLifecycleResultSchema.safeParse(result);
                 if (parsedResult.success) {
                     lifecycleResult = parsedResult.data;

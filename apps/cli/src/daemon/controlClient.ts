@@ -44,6 +44,9 @@ import {
 import {
   type ConnectedServiceTurnLifecycleRequestBody,
   type ConnectedServiceTurnLifecycleResult,
+  NATIVE_PROVIDER_TURN_SOURCE_HEADER,
+  NativeProviderTurnSourceSchema,
+  type NativeProviderTurnSource,
 } from '@/daemon/connectedServices/connectedServiceTurnLifecycleContract';
 import { resolveComparableCliVersion } from './resolveComparableCliVersion';
 import {
@@ -55,6 +58,7 @@ import {
   SessionRunnerStatusGetRequestV1Schema,
   type ConnectedServiceBindingsV1,
   type ConnectedServiceId,
+  type SessionConnectedServiceAuthSwitchRpcParams,
   type RestartAllSessionRunnersRequestV1,
   type RestartAllSessionRunnersResultV1,
   type RestartSessionRunnerRequestV1,
@@ -116,6 +120,7 @@ type DaemonPostAuthScope = 'daemon-control' | 'connected-service-broker-refresh'
 
 type DaemonPostOptions = DaemonControlRequestOptions & {
   authScope?: DaemonPostAuthScope;
+  nativeProviderSource?: NativeProviderTurnSource;
 };
 
 const DEFAULT_DAEMON_HTTP_TIMEOUT_MS = 10_000;
@@ -477,6 +482,12 @@ async function daemonPost(path: string, body?: any, options: DaemonPostOptions =
 
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (options.nativeProviderSource) {
+      if (path !== '/connected-service-turn-lifecycle' && path !== '/connected-service-runtime-auth/failure') {
+        throw new Error('Native provider source is scoped to provider observations');
+      }
+      headers[NATIVE_PROVIDER_TURN_SOURCE_HEADER] = JSON.stringify(NativeProviderTurnSourceSchema.parse(options.nativeProviderSource));
+    }
     const authToken = options.authScope === 'connected-service-broker-refresh'
       ? deriveConnectedServiceBrokerRefreshToken(state.controlToken)
       : options.authScope === 'connected-service-run-materialize'
@@ -599,6 +610,7 @@ export async function requestDaemonSessionConnectedServiceAuthSwitch(
     rematerializeServiceId?: string;
     expectedGroupGenerationByServiceId?: Readonly<Record<string, number>>;
     accountSettingsVersionHint?: number;
+    quotaRecovery?: SessionConnectedServiceAuthSwitchRpcParams['quotaRecovery'];
   }>,
   options: DaemonControlRequestOptions = {},
 ): Promise<unknown> {
@@ -606,6 +618,7 @@ export async function requestDaemonSessionConnectedServiceAuthSwitch(
     sessionId: body.sessionId,
     agentId: body.agentId,
     bindings: body.bindings,
+    ...(body.quotaRecovery === undefined ? {} : { quotaRecovery: body.quotaRecovery }),
     ...(body.accountSettingsVersionHint === undefined
       ? {}
       : { accountSettingsVersionHint: body.accountSettingsVersionHint }),
@@ -639,7 +652,7 @@ export async function notifyDaemonConnectedServiceRuntimeAuthFailure(
     classification: unknown;
     resumePromptMode?: 'standard' | 'off' | 'custom';
   }>,
-  options: DaemonControlRequestOptions = {},
+  options: DaemonControlRequestOptions & { nativeProviderSource?: NativeProviderTurnSource } = {},
 ): Promise<{ error?: string } | any> {
   return await daemonPost('/connected-service-runtime-auth/failure', {
     ...(body.reportId ? { reportId: body.reportId } : {}),
@@ -658,7 +671,7 @@ export async function notifyDaemonConnectedServiceRuntimeAuthFailure(
 
 export async function notifyDaemonConnectedServiceTurnLifecycle(
   body: ConnectedServiceTurnLifecycleRequestBody,
-  options: DaemonControlRequestOptions = {},
+  options: DaemonControlRequestOptions & { nativeProviderSource?: NativeProviderTurnSource } = {},
 ): Promise<ConnectedServiceTurnLifecycleResult | { error?: string }> {
   const response = await daemonPost('/connected-service-turn-lifecycle', {
     sessionId: body.sessionId,

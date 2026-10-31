@@ -40,6 +40,55 @@ function credentials(token: string): Credentials {
 }
 
 describe('resolveRespawnSessionRuntimeSnapshot', () => {
+  it('preserves the complete daemon-owned options for an account-only quota restart', async () => {
+    const options = defaultRespawnOptions({
+      resume: 'same-native',
+      modelId: 'selected-model',
+      permissionMode: 'yolo',
+      sessionConfigOptionOverrides: { v: 1, updatedAt: 100,
+        overrides: { reasoning_effort: { value: 'high', updatedAt: 100 } } },
+      pendingFirstInput: { text: 'still owned', localId: 'original-input' },
+      initialGoal: { objective: 'original goal' },
+    });
+    const readCredentials = vi.fn(async () => credentials('token'));
+    const resolveAttachContext = vi.fn(async () => ({
+      ok: true as const,
+      attachPayload: { v: 2 as const, encryptionMode: 'plain' as const },
+      vendorResumeId: 'different-native',
+      sessionPath: '/different',
+      deliveredUserMessageSeq: null,
+      metadata: { modelOverrideV1: { v: 1, modelId: 'other-model', updatedAt: 999 } },
+    }));
+    const result = await resolveRespawnSessionRuntimeSnapshot(Object.assign({
+      sessionId: 'session-1', spawnOptions: options, defaultOptions: options,
+      vendorResumeId: 'same-native', credentials: credentials('token'),
+      readCredentials, resolveAttachContext,
+    }, { preserveTrackedOptionsForQuotaRecovery: { nativeId: 'same-native' } }));
+    expect(result).toEqual(options);
+    expect(readCredentials).not.toHaveBeenCalled();
+    expect(resolveAttachContext).not.toHaveBeenCalled();
+  });
+
+  it('refuses a quota restart whose native identity no longer matches its retained options', async () => {
+    const options = defaultRespawnOptions({ resume: 'different-native' });
+    await expect(resolveRespawnSessionRuntimeSnapshot(Object.assign({
+      sessionId: 'session-1', spawnOptions: options, defaultOptions: options,
+      vendorResumeId: 'same-native', credentials: null, readCredentials: async () => null,
+    }, { preserveTrackedOptionsForQuotaRecovery: { nativeId: 'same-native' } })))
+      .rejects.toThrow('quota_recovery_respawn_identity_changed');
+  });
+
+  it('does not inherit new-directory approval from ordinary respawn defaults', async () => {
+    const options = defaultRespawnOptions({ resume: 'same-native', approvedNewDirectoryCreation: false });
+    const result = await resolveRespawnSessionRuntimeSnapshot({
+      sessionId: 'session-1', spawnOptions: options,
+      defaultOptions: { ...options, approvedNewDirectoryCreation: true },
+      vendorResumeId: 'same-native', credentials: null, readCredentials: async () => null,
+      preserveTrackedOptionsForQuotaRecovery: { nativeId: 'same-native' },
+    });
+    expect(result.approvedNewDirectoryCreation).toBe(false);
+  });
+
   it('applies the persisted runtime snapshot before respawning a tracked session', async () => {
     const readCredentials = vi.fn(async () => credentials('fresh-token'));
     const resolveAttachContext = vi.fn(async () => ({

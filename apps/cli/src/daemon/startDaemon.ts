@@ -2,6 +2,7 @@ import { matchesCurrentQuotaObservationCredential } from './connectedServices/qu
 import fs from 'fs/promises';
 import os from 'os';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { spawn as spawnChildProcess } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { getReleaseRingCatalogEntry } from '@happier-dev/release-runtime/releaseRings';
@@ -391,6 +392,8 @@ import {
   type ConnectedServiceResumeContinuityProofDiagnostics,
   type SessionConnectedServiceAuthSwitchResult,
 } from './connectedServices/sessionAuthSwitch/switchSessionConnectedServiceAuth';
+import { createGuardedQuotaRecovery } from './connectedServices/sessionAuthSwitch/guardedQuotaRecovery';
+import type { QuotaRecoveryGuard } from './connectedServices/sessionAuthSwitch/quotaRecoveryGuard';
 import { resolveManualSwitchPreviousGroupMembers } from './connectedServices/sessionAuthSwitch/resolveManualSwitchPreviousGroupMembers';
 import { buildConnectedServiceAuthGroupCommittedGenerationFact } from './connectedServices/sessionAuthSwitch/connectedServiceAuthSwitchOutcome';
 import { buildConnectedServiceSwitchContinuationAttemptId } from './connectedServices/sessionAuthSwitch/buildConnectedServiceSwitchContinuationAttemptId';
@@ -3196,11 +3199,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
         };
 
+        // Only the internal respawn resolver can mark an options object. No public
+        // request field can bypass the ordinary persisted runtime snapshot.
+        const quotaRespawnOptions = new WeakMap<SpawnSessionOptions, SpawnSessionOptions>();
             // Spawn a new session (sessionId reserved for future Happy session resume; vendor resume uses options.resume).
                 const spawnSession = async (
                   options: SpawnSessionOptions,
                   acceptanceHooks?: SpawnSessionRunnerAcceptanceHooks,
                 ): Promise<SpawnSessionResult> => {
+          const quotaPreservedOptions = quotaRespawnOptions.get(options);
+          quotaRespawnOptions.delete(options);
+          if (quotaPreservedOptions && !isDeepStrictEqual(options, quotaPreservedOptions)) {
+            throw new Error('quota_recovery_respawn_options_changed');
+          }
           let normalizedOptions: SpawnSessionOptions = {
             ...options,
             directory: normalizeSpawnSessionDirectory(options.directory, process.env),
@@ -3597,7 +3608,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 sessionAttachPayload = applyInitialTranscriptAfterSeqToAttachPayload(sessionAttachPayload, initialTranscriptAfterSeq);
               }
 
-              if (normalizedExistingSessionId) {
+              if (normalizedExistingSessionId && !quotaPreservedOptions) {
                 const requestExecutionAuthorization = normalizedOptions.executionAuthorization;
                 const runtimeSnapshot = resolveSessionRuntimeSnapshot({
                   incomingOptions: {
@@ -3711,6 +3722,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 return { type: 'error', errorCode: piResumeEnvironment.errorCode, errorMessage: piResumeEnvironment.errorMessage };
               }
               normalizedOptions = piResumeEnvironment.options;
+              if (quotaPreservedOptions && !isDeepStrictEqual(normalizedOptions, quotaPreservedOptions)) {
+                throw new Error('quota_recovery_respawn_options_changed');
+              }
 
               // This is the single final environment owner. Existing-session recovery and every
               // other spawn normalization must complete before validation snapshots the child env.
@@ -5344,6 +5358,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           return { ok: false, status: 'spawn_failed', diagnostics };
         };
         const connectedServiceRestartAmplificationGuard = createConnectedServiceSessionRestartAmplificationGuard();
+        const guardedQuotaRecovery = createGuardedQuotaRecovery({
+          core: connectedServiceSessionAuthSwitchCore,
+          getChildren: getCurrentChildren,
+          readRecoveryIntents: (sessionId) => runtimeAuthRecoveryScheduler?.readForSession(sessionId) ?? [],
+          isTurnInFlight: (sessionId) => connectedServiceTurnDeferralQueue.isTurnInFlight(sessionId),
+          nowMs: () => Date.now(),
+        });
+
         const sessionRunnerRespawnManager = createSessionRunnerRespawnManager({
           enabled: sessionRespawnEnabled,
           maxRestarts: sessionRespawnMaxRestarts,
@@ -5355,11 +5377,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           isSessionAlreadyRunning,
           spawnSession,
           resolveRespawnOptions: async (input) => {
-            return await resolveRespawnSessionRuntimeSnapshot({
+            const quotaRestart = guardedQuotaRecovery.restartForPid(input.previousPid);
+            const options = await resolveRespawnSessionRuntimeSnapshot({
               ...input,
+              ...(quotaRestart ? {
+                preserveTrackedOptionsForQuotaRecovery: {
+                  nativeId: quotaRestart.nativeId,
+                },
+              } : {}),
               credentials,
               readCredentials,
             });
+            if (quotaRestart) quotaRespawnOptions.set(options, structuredClone(options));
+            return options;
           },
           onRespawnSuccess: ({ sessionId, previousPid }) => {
             connectedServicesRestartRequestedPids.delete(previousPid);
@@ -5369,12 +5399,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               '[DAEMON RUN] Failed to clear connected-service restart intent after respawn success',
             );
             const next = getCurrentChildren().find((child) => child.happySessionId === sessionId) ?? null;
+            guardedQuotaRecovery.settleRestart(previousPid, next);
             sessionRunnerRestartCompletionWaiters.settle(sessionId, previousPid, {
               ok: true,
               ...(next ? { next: summarizeSessionRunnerEndpoint(next) } : {}),
             });
           },
           onRespawnTerminal: ({ sessionId, previousPid, reason, detail }) => {
+            guardedQuotaRecovery.failRestart(previousPid);
             connectedServicesRestartRequestedPids.delete(previousPid);
             connectedServiceRestartAmplificationGuard.completePid(
               previousPid,
@@ -6008,6 +6040,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           onUnexpectedExit: (tracked, exit) => {
             sessionRunnerRespawnManager.handleUnexpectedExit(tracked, exit, {
               forceRestart: connectedServicesRestartRequestedPids.has(tracked.pid),
+              ...(connectedServicesRestartRequestedPids.has(tracked.pid) && guardedQuotaRecovery.restartForPid(tracked.pid) ? {
+                quotaRecoveryAttemptId: guardedQuotaRecovery.restartForPid(tracked.pid)!.requestId,
+              } : {}),
             });
           },
           isExitUnexpectedOverride: (tracked, _exit) => {
@@ -7313,10 +7348,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         });
       },
       handleConnectedServiceUsageLimitWaitResumeCancel: cancelConnectedServiceUsageLimitWaitResumeForSession,
+      inspectSessionQuotaRecovery: ({ sessionId, requestId }) => guardedQuotaRecovery.inspect(sessionId, requestId),
+      beginQuotaFailureSource: (failure) => guardedQuotaRecovery.beginFailureSource(failure),
       handleSessionConnectedServiceAuthSwitch: async (input) => {
+        const execute = async (quotaRecoveryGuard?: QuotaRecoveryGuard) => {
         let diagnostics: SessionConnectedServiceAuthSwitchDiagnostics | undefined;
         const switchStartedAtMs = Date.now();
         const serviceIds = Object.keys(input.bindings.bindingsByServiceId);
+        if (!quotaRecoveryGuard) {
         await clearConnectedServiceRecoveryAfterSupersession({
           sessionId: input.sessionId,
           event: {
@@ -7324,6 +7363,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             reason: 'switch',
           },
         });
+        }
         const trackedForSwitch = getCurrentChildren().find((child) => child.happySessionId === input.sessionId) ?? null;
         const previousBindings = readConnectedServiceBindingsOrEmpty(
           trackedForSwitch ? resolveTrackedConnectedServiceBindingsRaw(trackedForSwitch) : undefined,
@@ -7361,6 +7401,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         // K5:fsm_switch manual (RPC-driven, user-initiated) auth switch through the FSM.
         const result = await switchSessionConnectedServiceAuth({
           core: connectedServiceSessionAuthSwitchCore,
+          quotaRecoveryGuard,
+          ...(quotaRecoveryGuard ? { executionPolicy: { allowRestartResume: true, allowContinuation: false, source: 'runtime' as const } } : {}),
           getChildren: getCurrentChildren,
           emitFromProfileIdByServiceId: manualSwitchPreviousGroupMembers,
           resolveInactiveSession: async ({ sessionId }) => {
@@ -7507,6 +7549,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               },
               transcriptEventOwner: 'switch_fsm',
               onSignalFailureLogMessage: '[DAEMON RUN] Failed to restart connected-service auth-switched session',
+              ...(quotaRecoveryGuard ? { shouldSignal: () => { quotaRecoveryGuard.assertCurrent(); return true; } } : {}),
             });
           },
           hotApply: createSessionConnectedServiceAuthHotApply({
@@ -7584,6 +7627,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           expectedGroupGenerationByServiceId: input.expectedGroupGenerationByServiceId,
         });
         return resultWithDiagnostics;
+        };
+        return input.quotaRecovery
+          ? await guardedQuotaRecovery.run({ ...input, quotaRecovery: input.quotaRecovery }, execute)
+          : await execute();
       },
       handleConnectedServiceRuntimeAuthFailure: handleConnectedServiceRuntimeAuthRecovery,
       authorizeConnectedServiceRuntimeAuthFailure: authorizeRuntimeAuthFailureForSession,
@@ -7597,6 +7644,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       runtimeAuthRecoveryScheduler: runtimeAuthRecoveryScheduler ?? undefined,
       handleConnectedServiceTurnLifecycle: async (input) => {
         const lifecycleObservedAtMs = Date.now();
+        const commitQuotaNativeCompletion = guardedQuotaRecovery.prepareNativeCompletion(input);
         // A starting turn must be visible to restart gates before the awaited marker write; turn
         // ends are recorded once the marker is settled, before any slower recovery cleanup, so a
         // pending or failed cleanup cannot leave the session looking busy.
@@ -7620,6 +7668,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           });
         }
         if (trackedTurnResult.status === 'recorded') {
+          commitQuotaNativeCompletion?.();
           await temporaryThrottleRecoveryScheduler.recordTurnLifecycle({ ...input, observedAtMs: lifecycleObservedAtMs });
         }
         // REV-1: failTurn emits `assistant_message_end` too — a FAILED turn (the

@@ -20,6 +20,24 @@ function expectSchema(name: string): any {
 }
 
 describe('connectedServiceSchemas', () => {
+    it('admits an exact daemon-owned quota guard without weakening ordinary switch requests', () => {
+        const schema = schemas.SessionConnectedServiceAuthSwitchRpcParamsSchema;
+        const request = {
+            sessionId: 'sess_1', agentId: 'codex',
+            bindings: { v: 1, bindingsByServiceId: {
+                'openai-codex': { source: 'connected', selection: 'profile', profileId: 'next' },
+            } },
+            quotaRecovery: { requestId: 'quota-attempt-1', nativeId: 'same-native', pid: 123,
+                processInstanceFingerprint: 'same-instance', serviceId: 'openai-codex', profileId: 'previous',
+                failureAttemptId: 'current-refusal', failureArmedAtMs: 100, nativePublisherIncarnationId: 'same-publisher',
+                nativeObservationSequence: '1', failureObservedAtMs: 150 },
+        };
+        expect(schema.safeParse(request).success).toBe(true);
+        expect(schema.safeParse({ ...request, quotaRecovery: { ...request.quotaRecovery, nativeId: '' } }).success).toBe(false);
+        expect(schema.safeParse({ ...request, rematerializeServiceId: 'openai-codex' }).success).toBe(false);
+        expect(schema.safeParse({ ...request, accountSettingsVersionHint: 1 }).success).toBe(false);
+    });
+
     it('exports the canonical credential mutation contract from the package barrel', () => {
         for (const name of [
             'ConnectedServiceCredentialRevisionV1Schema',

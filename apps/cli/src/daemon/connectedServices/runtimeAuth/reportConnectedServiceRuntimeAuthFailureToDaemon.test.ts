@@ -7,6 +7,7 @@ import {
   CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS,
   reportConnectedServiceRuntimeAuthFailureToDaemon,
   resetConnectedServiceRuntimeAuthFailureReportDedupeForTests,
+  recordRuntimeAuthProviderCompletion,
 } from './reportConnectedServiceRuntimeAuthFailureToDaemon';
 import {
   enqueueRuntimeAuthFailureReportOutboxItem,
@@ -212,6 +213,26 @@ describe('reportConnectedServiceRuntimeAuthFailureToDaemon', () => {
       rateLimits: null,
       source: 'provider_runtime_marker',
     } as const;
+
+    it('separates a new refusal after useful completion without clearing another session', async () => {
+      const outboxDir = await createTempDir('happier-runtime-auth-completion-');
+      const notify = vi.fn(async (body: Readonly<{ reportId: string }>) => ({ ok: true,
+        recoveryReceipt: { reportId: body.reportId, attemptId: 'accepted', transition: 'armed', eventLocalId: 'event' } }));
+      const report = (sessionId: string) => reportConnectedServiceRuntimeAuthFailureToDaemon({
+        sessionId, classification: limitClassification, notify, reportOutboxDir: outboxDir,
+        scheduleOutboxDrain: () => {}, nowMs: () => 1_000,
+      });
+      try {
+        await report('completed-session');
+        await report('other-session');
+        await report('completed-session');
+        expect(notify).toHaveBeenCalledTimes(2);
+        recordRuntimeAuthProviderCompletion('completed-session');
+        await report('completed-session');
+        await report('other-session');
+        expect(notify).toHaveBeenCalledTimes(3);
+      } finally { await removeTempDir(outboxDir); }
+    });
 
     it('suppresses duplicate identical reports within the dedupe window and reuses the first daemon result', async () => {
       const notify = vi.fn(async () => ({ ok: true, result: { status: 'noop' } }));

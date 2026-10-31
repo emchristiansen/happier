@@ -1,3 +1,4 @@
+import { nativeProviderSourceFromMetadata } from '@/daemon/connectedServices/connectedServiceTurnLifecycleContract';
 import { isClaudeSidechainRuntimeEvidence } from '../utils/sessionHookAttribution';
 import {
     buildUsageLimitIssueFingerprint,
@@ -596,6 +597,7 @@ export async function surfaceClaudeRateLimitRuntimeIssue(
         sessionId: session.client.sessionId,
         switchesThisTurn: 0,
         classification,
+        nativeProviderSource: nativeProviderSourceFromMetadata(session.client.getMetadataSnapshot?.()),
         logPrefix,
     });
     projectClaudeRuntimeAuthRecoveryReport({
@@ -689,6 +691,7 @@ export async function surfaceClaudeRuntimeAuthFailure(
         sessionId: session.client.sessionId,
         switchesThisTurn: 0,
         classification,
+        nativeProviderSource: nativeProviderSourceFromMetadata(session.client.getMetadataSnapshot?.()),
         logPrefix,
     });
     projectClaudeRuntimeAuthRecoveryReport({

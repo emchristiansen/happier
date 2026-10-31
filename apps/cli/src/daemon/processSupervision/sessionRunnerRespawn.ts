@@ -23,7 +23,7 @@ export type SessionRunnerRespawnManager = Readonly<{
   handleUnexpectedExit: (
     trackedSession: TrackedSession,
     exit: DaemonChildExit,
-    options?: Readonly<{ forceRestart?: boolean }>,
+    options?: Readonly<{ forceRestart?: boolean; quotaRecoveryAttemptId?: string }>,
   ) => void;
 }>;
 
@@ -162,9 +162,10 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
   logWarn: (message: string) => void;
 }>): SessionRunnerRespawnManager {
   const stopRequestedBySessionId = new Map<string, StopRequest>();
+  const enteredQuotaAttempts = new Set<string>();
   const stateBySessionId = new Map<
     string,
-    { controller: RestartController; timer: NodeJS.Timeout | null; intended: boolean }
+    { controller: RestartController; timer: NodeJS.Timeout | null; intended: boolean; quotaRecoveryAttemptId?: string }
   >();
 
   const getOrCreateController = (sessionId: string): RestartController => {
@@ -204,6 +205,11 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
     controller: RestartController,
     event: TerminationEvent,
   ): ReturnType<RestartController['nextDecisionForTermination']> => {
+    if (stateBySessionId.get(sessionId)?.quotaRecoveryAttemptId) {
+      // One guarded occurrence owns one launch. A technical failure is not another quota
+      // refusal and never silently re-enters either the launch or an ordinary retry budget.
+      return { type: 'no_restart', reason: 'quota_recovery_attempt_failed' };
+    }
     return stateBySessionId.get(sessionId)?.intended === true
       ? controller.nextDecisionForIntendedRestart()
       : controller.nextDecisionForTermination(event);
@@ -228,6 +234,7 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
   const endRespawnCycle = (sessionId: string) => {
     const existing = stateBySessionId.get(sessionId);
     if (!existing) return;
+    delete existing.quotaRecoveryAttemptId;
     if (existing.controller.hasRecentIntendedRestarts()) {
       existing.controller.resetCrashBudget();
       existing.intended = false;
@@ -400,6 +407,10 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
       const sessionId = normalizeSessionId(trackedSession.happySessionId);
       if (!sessionId) return;
       const forceRestart = options?.forceRestart === true;
+      if (options?.quotaRecoveryAttemptId !== undefined && stopRequestedBySessionId.has(sessionId)) {
+        params.onRespawnTerminal?.({ sessionId, previousPid: trackedSession.pid, reason: 'stop_requested' });
+        return;
+      }
       if (forceRestart) {
         // A connected-service-initiated forced restart explicitly supersedes any prior stop request
         // (e.g. a stop request before an explicit connected-service restart). Without this, the forced kill's respawn is
@@ -422,6 +433,25 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
 
       const vendorResumeId = normalizeOptionalString(trackedSession.vendorResumeId);
       const controller = getOrCreateController(sessionId);
+      if (options?.quotaRecoveryAttemptId !== undefined) {
+        const attemptId = options.quotaRecoveryAttemptId;
+        if (!forceRestart || !attemptId || !vendorResumeId) {
+          params.onRespawnTerminal?.({ sessionId, previousPid: trackedSession.pid,
+            reason: 'no_restart', detail: 'quota_recovery_attempt_unbound' });
+          return;
+        }
+        const key = JSON.stringify([sessionId, attemptId]);
+        if (enteredQuotaAttempts.has(key)) return;
+        enteredQuotaAttempts.add(key);
+        const state = stateBySessionId.get(sessionId)!;
+        state.quotaRecoveryAttemptId = attemptId;
+        // Fresh provider refusals have no arbitrary per-session count limit. The daemon's
+        // guarded quota owner supplies each new occurrence; ordinary intended/crash
+        // restarts keep their existing budgets and are never classified as quota here.
+        scheduleSpawn(sessionId, spawnOptions, vendorResumeId, 0, 1,
+          connectedServiceRestartRequestedTerminationEvent, trackedSession.pid);
+        return;
+      }
       if (forceRestart) {
         // Mark this as an intended (connected-service-initiated) restart cycle so its whole storm —
         // the initial relaunch plus any retries — runs on the intended budget, never the generic

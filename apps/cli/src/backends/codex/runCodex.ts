@@ -1,3 +1,4 @@
+import { nativeProviderSourceFromMetadata } from '@/daemon/connectedServices/connectedServiceTurnLifecycleContract';
 import type { RequestArchivedSessionCleanup } from '@/api/session/sessionArchiveInputAdmission';
 import { assertOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { applyPermissionModeToCodexPermissionHandler } from './utils/applyPermissionModeToHandler';
@@ -2058,6 +2059,7 @@ export async function runCodex(opts: {
             sessionId: session.sessionId,
             switchesThisTurn: 0,
             classification,
+            nativeProviderSource: nativeProviderSourceFromMetadata(session.getMetadataSnapshot()),
             logPrefix: '[Codex]',
         });
         let emitted = projectConnectedServiceRuntimeAuthRecoveryReport({
