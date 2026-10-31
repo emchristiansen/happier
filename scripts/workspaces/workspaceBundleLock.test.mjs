@@ -15,6 +15,7 @@ const realFs = { ...fsBoundary };
 let afterCreate = null;
 let afterRead = null;
 let beforeLink = null;
+let afterRemoval = null;
 let realBoundaryAttempts = 0;
 let unreadablePath = null;
 const originalKill = process.kill;
@@ -40,6 +41,12 @@ fsBoundary.linkSync = (...args) => {
   afterCreate?.(String(args[1]));
   return result;
 };
+fsBoundary.renameSync = (...args) => {
+  const result = realFs.renameSync(...args); afterRemoval?.(String(args[0])); return result;
+};
+fsBoundary.unlinkSync = (...args) => {
+  const result = realFs.unlinkSync(...args); afterRemoval?.(String(args[0])); return result;
+};
 fsBoundary.readFileSync = (...args) => {
   if (typeof args[0] === 'string' && /^\/proc\/\d+\/stat$/.test(args[0])) {
     return `1 (fixture) S ${Array(18).fill('0').join(' ')} 100`;
@@ -59,12 +66,12 @@ const { withWorkspaceBundleLock, withWorkspaceBundleLockSync } = await import('.
 
 test.after(() => {
   assert.equal(realBoundaryAttempts, 0);
-  for (const key of ['openSync', 'linkSync', 'readFileSync']) fsBoundary[key] = realFs[key];
+  for (const key of ['openSync', 'linkSync', 'readFileSync', 'renameSync', 'unlinkSync']) fsBoundary[key] = realFs[key];
   process.kill = originalKill;
   globalThis.fetch = originalFetch;
   syncBuiltinESMExports();
 });
-test.afterEach(() => { afterCreate = null; afterRead = null; beforeLink = null; unreadablePath = null; });
+test.afterEach(() => { afterCreate = null; afterRead = null; beforeLink = null; afterRemoval = null; unreadablePath = null; });
 
 test('withWorkspaceBundleLock serializes concurrent workspace bundling through a single lock', async () => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'happier-workspace-bundle-lock-'));
@@ -462,28 +469,51 @@ test('J079 canonical publication is complete before a competing acquirer can obs
   } finally { afterCreate = null; if (second) await second; rmSync(root, { recursive: true, force: true }); }
 });
 
-test('J079 concurrent reclaimers cannot remove the first successor', async () => {
+test('J079 reclaim does not expose a held successor to a third callback', async () => {
   const root = mkdtempSync(join(tmpdir(), 'happier-lock-reclaim-'));
   const lockPath = join(root, 'lock');
   writeFileSync(lockPath, JSON.stringify({ pid: 999999999, token: 'dead', createdAtMs: 1 }));
   let second;
+  let third;
   let secondActive = false;
-  let releaseSecond;
-  const secondGate = new Promise((resolve) => { releaseSecond = resolve; });
-  const events = [];
-  afterRead = (path, value) => {
-    if (String(value).includes('"token":"dead"')) {
-      afterRead = null;
-      second = withWorkspaceBundleLock(async () => { secondActive = true; events.push('second'); await secondGate; secondActive = false; }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
-    }
+  let overlap = false;
+  let release;
+  let deadReads = 0;
+  const gate = new Promise((resolve) => { release = resolve; });
+  afterRead = (_path, value) => {
+    if (!String(value).includes('"token":"dead"') || ++deadReads !== 2) return;
+    // The first read checks the deliberately foreign inherited lease. This second read is the
+    // actual reclaim snapshot in both predecessors and current owner, rather than a preflight.
+    afterRead = null;
+    second = withWorkspaceBundleLock(async () => {
+      secondActive = true;
+      try { await gate; } finally { secondActive = false; }
+    }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
+    afterRemoval = onCanonicalRemoval;
+  };
+  const onCanonicalRemoval = (path) => {
+    if (path !== lockPath) return;
+    afterRemoval = null;
+    // Old rename-away exposes the pathname while the second callback still owns its inode.
+    // Current guarded unlink of the dead record keeps this contender outside the transition.
+    third = withWorkspaceBundleLock(async () => {
+      overlap = secondActive;
+      release();
+      await gate;
+    }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
   };
   try {
-    let overlapped = false;
-    await withWorkspaceBundleLock(() => { overlapped = secondActive; events.push('first'); releaseSecond(); }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
-    await second;
-    assert.equal(overlapped, false, 'competing reclaimed callback must not be active');
-    assert.deepEqual(events, ['first', 'second']);
-  } finally { afterRead = null; releaseSecond(); if (second) await second; rmSync(root, { recursive: true, force: true }); }
+    await withWorkspaceBundleLock(async () => { release(); }, {
+      lockPath, timeoutMs: 500, pollIntervalMs: 1,
+      heldLockValue: JSON.stringify({ v: 1, path: lockPath, token: 'deliberately-foreign' }),
+    });
+    await Promise.all([second, third]);
+    assert.ok(second && third, 'both named contenders must reach the real owner');
+    assert.equal(overlap, false, 'a held successor must exclude the third callback');
+  } finally {
+    afterRead = null; afterRemoval = null; release();
+    await Promise.all([second, third]); rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('J079 orphan transition guard is preserved and blocks callback', async () => {
