@@ -5259,6 +5259,28 @@ test('macos wsrepl lima matrix wrapper seeds host daemon access.key from stack c
   const accessKeyPath = join(stackRoot, 'cli', 'access.key');
   await writeFile(accessKeyPath, JSON.stringify(accessKeyPayload) + '\n', 'utf8');
 
+  const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir; command -v awk; command -v grep; command -v sed; command -v find'], {
+    env: { PATH: process.env.PATH }, encoding: 'utf8',
+  });
+  assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+  const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+  assert.equal(tools.length, 7);
+  const fixtureToolPath = [...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter);
+  const fixturePath = `${binDir}:${fixtureToolPath}:${testEnv.PATH}`;
+  const pythonBoundary = join(root, 'python-boundary');
+  await mkdir(pythonBoundary);
+  await writeFile(join(pythonBoundary, 'sitecustomize.py'), [
+    'import socket',
+    'def fixture_connection_refused(*args, **kwargs):',
+    '    raise ConnectionRefusedError("fake fixture port is not listening")',
+    'socket.create_connection = fixture_connection_refused',
+    'socket.socket.connect = fixture_connection_refused',
+    'socket.socket.connect_ex = fixture_connection_refused',
+  ].join('\n') + '\n');
+  const curlScript = "#!/usr/bin/env bash\nprintf \"%s\\n\" '{}'\n";
+  await writeFile(join(binDir, 'curl'), curlScript);
+  await chmod(join(binDir, 'curl'), 0o755);
+
   const unamePath = join(binDir, 'uname');
   await writeFile(unamePath, ['#!/usr/bin/env bash', 'echo Darwin'].join('\n') + '\n', 'utf8');
   await chmod(unamePath, 0o755);
@@ -5294,7 +5316,7 @@ test('macos wsrepl lima matrix wrapper seeds host daemon access.key from stack c
   );
 
   const nodePath = join(binDir, 'node');
-  await writeScript(nodePath, buildPlaywrightHarnessNodeScript({ passthroughMode: 'silent' }));
+  await writeScript(nodePath, buildPlaywrightHarnessNodeScript({ sessionId: 'sess_test_1', passthroughMode: 'silent' }));
 
   const limactlPath = join(binDir, 'limactl');
   await writeFile(
@@ -5342,7 +5364,8 @@ test('macos wsrepl lima matrix wrapper seeds host daemon access.key from stack c
     ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${testEnv.PATH}`,
+    PATH: fixturePath,
+    PYTHONPATH: pythonBoundary,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -5355,7 +5378,7 @@ test('macos wsrepl lima matrix wrapper seeds host daemon access.key from stack c
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
   };
 
-  const res = spawnSync('bash', [scriptPath, 'happy-wsrepl'], {
+  const res = spawnSync(tools[0], [scriptPath, 'happy-wsrepl'], {
     cwd: root,
     env,
     encoding: 'utf8',
@@ -7199,6 +7222,28 @@ test('macos wsrepl lima matrix wrapper can discover stack credentials from the m
   const accessKeyPath = join(stackRoot, 'cli', 'access.key');
   await writeFile(accessKeyPath, JSON.stringify(accessKeyPayload) + '\n', 'utf8');
 
+  const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir; command -v awk; command -v grep; command -v sed; command -v find'], {
+    env: { PATH: process.env.PATH }, encoding: 'utf8',
+  });
+  assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+  const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+  assert.equal(tools.length, 7);
+  const fixtureToolPath = [...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter);
+  const fixturePath = `${binDir}:${fixtureToolPath}:${testEnv.PATH}`;
+  const pythonBoundary = join(root, 'python-boundary');
+  await mkdir(pythonBoundary);
+  await writeFile(join(pythonBoundary, 'sitecustomize.py'), [
+    'import socket',
+    'def fixture_connection_refused(*args, **kwargs):',
+    '    raise ConnectionRefusedError("fake fixture port is not listening")',
+    'socket.create_connection = fixture_connection_refused',
+    'socket.socket.connect = fixture_connection_refused',
+    'socket.socket.connect_ex = fixture_connection_refused',
+  ].join('\n') + '\n');
+  const curlScript = "#!/usr/bin/env bash\nprintf \"%s\\n\" '{}'\n";
+  await writeFile(join(binDir, 'curl'), curlScript);
+  await chmod(join(binDir, 'curl'), 0o755);
+
   const unamePath = join(binDir, 'uname');
   await writeFile(unamePath, ['#!/usr/bin/env bash', 'echo Darwin'].join('\n') + '\n', 'utf8');
   await chmod(unamePath, 0o755);
@@ -7239,7 +7284,7 @@ test('macos wsrepl lima matrix wrapper can discover stack credentials from the m
   );
 
   const nodePath = join(binDir, 'node');
-  await writeScript(nodePath, buildPlaywrightHarnessNodeScript({ passthroughMode: 'silent' }));
+  await writeScript(nodePath, buildPlaywrightHarnessNodeScript({ sessionId: 'sess_test_1', passthroughMode: 'silent' }));
 
   const limactlPath = join(binDir, 'limactl');
   await writeFile(
@@ -7272,7 +7317,7 @@ test('macos wsrepl lima matrix wrapper can discover stack credentials from the m
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      limaGuestExec,
+      limaGuestExec.replace('exec /bin/bash --noprofile --norc', `exec ${JSON.stringify(tools[0])} --noprofile --norc`),
       '    ;;',
       '  *)',
       '    exit 0',
@@ -7288,7 +7333,8 @@ test('macos wsrepl lima matrix wrapper can discover stack credentials from the m
     ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${testEnv.PATH}`,
+    PATH: fixturePath,
+    PYTHONPATH: pythonBoundary,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: 'auto',
     HAPPIER_QA_SESSION_ID: 'sess_test_1',
@@ -7301,7 +7347,7 @@ test('macos wsrepl lima matrix wrapper can discover stack credentials from the m
     WSREPL_QA_VM_HAPPIER_MODE: 'skip',
   };
 
-  const res = spawnSync('bash', [scriptPath, 'happy-wsrepl'], {
+  const res = spawnSync(tools[0], [scriptPath, 'happy-wsrepl'], {
     cwd: root,
     env,
     encoding: 'utf8',
@@ -9909,6 +9955,38 @@ test('macos wsrepl lima matrix wrapper autoupdate mode does not require a preins
   const limactlLog = join(logDir, 'limactl.log');
   const nodeLog = join(logDir, 'node.log');
 
+  const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir; command -v awk; command -v grep; command -v sed; command -v find; command -v tar'], {
+    env: { PATH: process.env.PATH }, encoding: 'utf8',
+  });
+  assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+  const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+  assert.equal(tools.length, 8);
+  const fixtureToolPath = [...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter);
+  const fixturePath = `${binDir}:${fixtureToolPath}:${testEnv.PATH}`;
+  const pythonBoundary = join(root, 'python-boundary');
+  await mkdir(pythonBoundary);
+  await writeFile(join(pythonBoundary, 'sitecustomize.py'), [
+    'import socket',
+    'def fixture_connection_refused(*args, **kwargs):',
+    '    raise ConnectionRefusedError("fake fixture port is not listening")',
+    'socket.create_connection = fixture_connection_refused',
+    'socket.socket.connect = fixture_connection_refused',
+    'socket.socket.connect_ex = fixture_connection_refused',
+  ].join('\n') + '\n');
+  const curlScript = "#!/usr/bin/env bash\nprintf \"%s\\n\" '{}'\n";
+  await writeFile(join(binDir, 'curl'), curlScript);
+  await chmod(join(binDir, 'curl'), 0o755);
+
+  const gitPath = join(binDir, 'git');
+  await writeFile(gitPath, [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'if [[ "$*" == "rev-parse HEAD" ]]; then printf "%s\\n" "fixture-autoupdate-head"; exit 0; fi',
+    'echo "unexpected fake git command: $*" >&2',
+    'exit 2',
+  ].join('\n') + '\n');
+  await chmod(gitPath, 0o755);
+
   const unamePath = join(binDir, 'uname');
   await writeFile(unamePath, ['#!/usr/bin/env bash', 'echo Darwin'].join('\n') + '\n', 'utf8');
   await chmod(unamePath, 0o755);
@@ -9919,6 +9997,7 @@ test('macos wsrepl lima matrix wrapper autoupdate mode does not require a preins
   await writeScript(
     nodePath,
     buildPlaywrightHarnessNodeScript({
+      sessionId: 'sess_test_auto_no_happier',
       nodeLogPath: nodeLog,
       includeDaemonControl: true,
       includeVmPayloadBuilder: true,
@@ -9963,7 +10042,7 @@ test('macos wsrepl lima matrix wrapper autoupdate mode does not require a preins
       '  shell)',
       '    while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      limaGuestExec,
+      limaGuestExec.replace('exec /bin/bash --noprofile --norc', `exec ${JSON.stringify(tools[0])} --noprofile --norc`),
       '    ;;',
       '  copy)',
       '    recursive=0',
@@ -10002,7 +10081,8 @@ test('macos wsrepl lima matrix wrapper autoupdate mode does not require a preins
     ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${testEnv.PATH}`,
+    PATH: fixturePath,
+    PYTHONPATH: pythonBoundary,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_auto_no_happier',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -10013,7 +10093,7 @@ test('macos wsrepl lima matrix wrapper autoupdate mode does not require a preins
     WSREPL_QA_VM_BUN_TARGET: 'bun-linux-arm64',
   };
 
-  const res = spawnSync('bash', [scriptPath, 'happy-wsrepl'], {
+  const res = spawnSync(tools[0], [scriptPath, 'happy-wsrepl'], {
     cwd: root,
     env,
     encoding: 'utf8',
@@ -10043,6 +10123,38 @@ test('macos wsrepl lima matrix wrapper autoupdate mode installs the current payl
   const limactlLog = join(logDir, 'limactl.log');
   const nodeLog = join(logDir, 'node.log');
 
+  const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir; command -v awk; command -v grep; command -v sed; command -v find; command -v tar'], {
+    env: { PATH: process.env.PATH }, encoding: 'utf8',
+  });
+  assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+  const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+  assert.equal(tools.length, 8);
+  const fixtureToolPath = [...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter);
+  const fixturePath = `${binDir}:${fixtureToolPath}:${testEnv.PATH}`;
+  const pythonBoundary = join(root, 'python-boundary');
+  await mkdir(pythonBoundary);
+  await writeFile(join(pythonBoundary, 'sitecustomize.py'), [
+    'import socket',
+    'def fixture_connection_refused(*args, **kwargs):',
+    '    raise ConnectionRefusedError("fake fixture port is not listening")',
+    'socket.create_connection = fixture_connection_refused',
+    'socket.socket.connect = fixture_connection_refused',
+    'socket.socket.connect_ex = fixture_connection_refused',
+  ].join('\n') + '\n');
+  const curlScript = "#!/usr/bin/env bash\nprintf \"%s\\n\" '{}'\n";
+  await writeFile(join(binDir, 'curl'), curlScript);
+  await chmod(join(binDir, 'curl'), 0o755);
+
+  const gitPath = join(binDir, 'git');
+  await writeFile(gitPath, [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'if [[ "$*" == "rev-parse HEAD" ]]; then printf "%s\\n" "fixture-autoupdate-head"; exit 0; fi',
+    'echo "unexpected fake git command: $*" >&2',
+    'exit 2',
+  ].join('\n') + '\n');
+  await chmod(gitPath, 0o755);
+
   const unamePath = join(binDir, 'uname');
   await writeFile(unamePath, ['#!/usr/bin/env bash', 'echo Darwin'].join('\n') + '\n', 'utf8');
   await chmod(unamePath, 0o755);
@@ -10051,6 +10163,7 @@ test('macos wsrepl lima matrix wrapper autoupdate mode installs the current payl
   await writeScript(
     nodePath,
     buildPlaywrightHarnessNodeScript({
+      sessionId: 'sess_test_auto_multi_vm',
       nodeLogPath: nodeLog,
       includeDaemonControl: true,
       includeVmPayloadBuilder: true,
@@ -10100,7 +10213,7 @@ test('macos wsrepl lima matrix wrapper autoupdate mode installs the current payl
       '    guest_home="${HOME}/guest-homes/${instance}"',
       '    mkdir -p "$guest_home"',
       '    export HOME="$guest_home" LIMA_INSTANCE="$instance"',
-      limaGuestExec,
+      limaGuestExec.replace('exec /bin/bash --noprofile --norc', `exec ${JSON.stringify(tools[0])} --noprofile --norc`),
       '    ;;',
       '  copy)',
       '    recursive=0',
@@ -10139,7 +10252,8 @@ test('macos wsrepl lima matrix wrapper autoupdate mode installs the current payl
     ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${testEnv.PATH}`,
+    PATH: fixturePath,
+    PYTHONPATH: pythonBoundary,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_auto_multi_vm',
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
@@ -10150,7 +10264,7 @@ test('macos wsrepl lima matrix wrapper autoupdate mode installs the current payl
     WSREPL_QA_VM_BUN_TARGET: 'bun-linux-arm64',
   };
 
-  const res = spawnSync('bash', [scriptPath, primaryVm, extraVm], {
+  const res = spawnSync(tools[0], [scriptPath, primaryVm, extraVm], {
     cwd: root,
     env,
     encoding: 'utf8',
@@ -10386,9 +10500,31 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
   await mkdir(reportDir, { recursive: true });
   await mkdir(logDir, { recursive: true });
 
+  const resolvedTools = spawnSync('/bin/sh', ['-c', 'command -v bash; command -v python3; command -v mkdir; command -v awk; command -v grep; command -v sed; command -v find'], {
+    env: { PATH: process.env.PATH }, encoding: 'utf8',
+  });
+  assert.equal(resolvedTools.status, 0, resolvedTools.stderr);
+  const tools = await Promise.all(resolvedTools.stdout.trim().split('\n').map((tool) => realpath(tool)));
+  assert.equal(tools.length, 7);
+  const fixtureToolPath = [...new Set(tools.map((tool) => resolve(tool, '..')))].join(delimiter);
+  const fixturePath = `${binDir}:${fixtureToolPath}:${testEnv.PATH}`;
+  const pythonBoundary = join(root, 'python-boundary');
+  await mkdir(pythonBoundary);
+  await writeFile(join(pythonBoundary, 'sitecustomize.py'), [
+    'import socket',
+    'def fixture_connection_refused(*args, **kwargs):',
+    '    raise ConnectionRefusedError("fake fixture port is not listening")',
+    'socket.create_connection = fixture_connection_refused',
+    'socket.socket.connect = fixture_connection_refused',
+    'socket.socket.connect_ex = fixture_connection_refused',
+  ].join('\n') + '\n');
+  const curlScript = "#!/usr/bin/env bash\nprintf \"%s\\n\" '{}'\n";
+  await writeFile(join(binDir, 'curl'), curlScript);
+  await chmod(join(binDir, 'curl'), 0o755);
+
   const probeLog = join(logDir, 'guest-connectivity-probe');
   await writeScript(join(binDir, 'nc'), [
-    '#!/bin/bash',
+    `#!${tools[0]}`,
     `if [[ "$1 $2 $3" == "-z -w 2" && "$*" == *host.lima.internal* ]]; then printf "%s\\n" "$*" >> ${JSON.stringify(probeLog)}; fi`,
     'exit 1',
   ].join('\n') + '\n');
@@ -10402,7 +10538,7 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
   const nodePath = join(binDir, 'node');
   await writeScript(
     nodePath,
-    buildPlaywrightHarnessNodeScript({ nodeLogPath: nodeLog, includeDaemonControl: true, passthroughMode: 'silent' }),
+    buildPlaywrightHarnessNodeScript({ sessionId: 'sess_test_3', nodeLogPath: nodeLog, includeDaemonControl: true, passthroughMode: 'silent' }),
   );
 
   const limactlPath = join(binDir, 'limactl');
@@ -10438,7 +10574,7 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
       '      shift',
       '    done',
       '    if [[ "${1:-}" == "--" ]]; then shift; fi',
-      limaGuestExec,
+      limaGuestExec.replace('exec /bin/bash --noprofile --norc', `exec ${JSON.stringify(tools[0])} --noprofile --norc`),
       '    ;;',
       '  *)',
       '    exit 0',
@@ -10454,7 +10590,8 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
     ...testEnv,
     HOME: homeDir,
     LIMA_HOME: limaHome,
-    PATH: `${binDir}:${testEnv.PATH}`,
+    PATH: fixturePath,
+    PYTHONPATH: pythonBoundary,
     WSREPL_QA_OUTPUT_DIR: reportDir,
     HAPPIER_QA_SESSION_ID: 'sess_test_3',
     // Intentionally omit WSREPL_QA_VM_MACHINE_NAME_PATTERN; wrapper should derive it from VM name.
@@ -10467,7 +10604,7 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
     WSREPL_QA_VM_HAPPIER_MODE: 'skip',
   };
 
-  const res = spawnSync('bash', [scriptPath, 'happy-wsrepl'], {
+  const res = spawnSync(tools[0], [scriptPath, 'happy-wsrepl'], {
     cwd: root,
     env,
     encoding: 'utf8',
@@ -10485,7 +10622,7 @@ test('macos wsrepl lima matrix wrapper default vm machine name pattern is substr
     { targetMachineId: 'machine_vm_1', strategy: 'sync_changes' },
   ]);
 
-  const enabled = spawnSync('bash', [scriptPath, 'happy-wsrepl'], {
+  const enabled = spawnSync(tools[0], [scriptPath, 'happy-wsrepl'], {
     cwd: root,
     env: { ...env, WSREPL_QA_HOST_DIRECT_PEER_VM_CONNECTIVITY_CHECK: '1' },
     encoding: 'utf8',
