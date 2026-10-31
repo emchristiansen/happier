@@ -1,7 +1,87 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+
+const processBoundary = vi.hoisted(() => ({ spawn: vi.fn(), spawnSync: vi.fn() }));
+vi.mock('node:child_process', () => processBoundary);
+const filesystemBoundary = vi.hoisted(() => ({ streams: [] as Array<import('node:fs').WriteStream> }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    createWriteStream: vi.fn((...args: Parameters<typeof actual.createWriteStream>) => {
+      const stream = actual.createWriteStream(...args);
+      filesystemBoundary.streams.push(stream);
+      return stream;
+    }),
+  };
+});
+
+let disposableCwd = '';
+let capturedChildren: Array<EventEmitter & { stdout: PassThrough; stderr: PassThrough; kill: ReturnType<typeof vi.fn> }> = [];
+let captureStopError: unknown = null;
+let observedStops: string[] = [];
+let refusedFetch: ReturnType<typeof vi.fn>;
+
+beforeEach(async () => {
+  disposableCwd = mkdtempSync(join(tmpdir(), 'maestro-owned-cleanup-'));
+  vi.spyOn(process, 'cwd').mockReturnValue(disposableCwd);
+  vi.spyOn(process, 'kill').mockImplementation(() => { throw new Error('real process signal is forbidden in this fixture'); });
+  refusedFetch = vi.fn(async () => { throw new Error('unexpected real fetch boundary'); });
+  vi.stubGlobal('fetch', refusedFetch);
+  capturedChildren = [];
+  observedStops = [];
+  captureStopError = null;
+  filesystemBoundary.streams = [];
+  processBoundary.spawnSync.mockReset().mockImplementation(() => { throw new Error('unexpected spawnSync boundary'); });
+  processBoundary.spawn.mockReset().mockImplementation((command: string, args: string[]) => {
+    const capture = command === 'adb' && args[0] === 'logcat' ? 'android capture'
+      : command === 'xcrun' && args.join(' ').startsWith('simctl spawn booted log stream') ? 'ios capture' : null;
+    if (!capture) throw new Error(`unexpected spawn boundary: ${command} ${args.join(' ')}`);
+    const child = Object.assign(new EventEmitter(), {
+      pid: 12345,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: vi.fn(() => {
+        observedStops.push(capture);
+        if (captureStopError !== null) throw captureStopError;
+        queueMicrotask(() => child.emit('close', 0));
+        return true;
+      }),
+    });
+    capturedChildren.push(child);
+    return child;
+  });
+  const boundary = await import('node:child_process');
+  expect(boundary.spawn).toBe(processBoundary.spawn);
+  expect(boundary.spawnSync).toBe(processBoundary.spawnSync);
+  expect(vi.isMockFunction(globalThis.fetch)).toBe(true);
+  expect(vi.isMockFunction((await import('node:fs')).createWriteStream)).toBe(true);
+});
+
+afterEach(async () => {
+  const unexpectedSignalCalls = vi.mocked(process.kill).mock.calls.length;
+  for (const child of capturedChildren) {
+    child.stdout.destroy();
+    child.stderr.destroy();
+    child.removeAllListeners();
+  }
+  for (const stream of filesystemBoundary.streams) {
+    if (stream.closed) continue;
+    await new Promise<void>((resolveClose) => {
+      stream.once('close', resolveClose);
+      stream.end();
+    });
+  }
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  rmSync(disposableCwd, { recursive: true, force: true });
+  expect(unexpectedSignalCalls).toBe(0);
+  expect(refusedFetch).not.toHaveBeenCalled();
+});
 
 describe('mobileMaestroRunner', () => {
   it('fails fast when the app is not installed on the target device', async () => {
@@ -690,6 +770,7 @@ describe('mobileMaestroRunner', () => {
           ...process.env,
           MAESTRO_CLI_NO_ANALYTICS: '1',
           HAPPIER_E2E_MOBILE_MANAGE_METRO: '1',
+          HAPPIER_E2E_MOBILE_WARM_DEV_CLIENT_BUNDLE: '0',
         },
       },
       deps,
@@ -1387,4 +1468,149 @@ describe('mobileMaestroRunner', () => {
     await expect(Promise.race([runPromise, delay(4000)])).resolves.not.toBe('timeout');
     expect(runMaestro).toHaveBeenCalledTimes(1);
   });
+});
+
+describe('owned acquisition cleanup', () => {
+  const cases: Array<{
+    name: string;
+    setupFailure?: 'metro' | 'server' | 'prime' | 'resolver' | 'manifest' | 'terminal';
+    platform?: 'android' | 'ios';
+    cleanupFailures?: string[];
+    bodyThrows?: boolean;
+    throwUndefined?: boolean;
+    borrowedServer?: boolean;
+    exitCode?: number;
+  }> = [
+    { name: 'unacquired Metro rejection', setupFailure: 'metro' },
+    { name: 'server rejection after acquired Metro', setupFailure: 'server' },
+    { name: 'Android prime rejection after capture', setupFailure: 'prime' },
+    { name: 'iOS resolver rejection after capture', setupFailure: 'resolver', platform: 'ios' },
+    { name: 'manifest filesystem rejection after acquisition', setupFailure: 'manifest' },
+    { name: 'terminal acquisition rejection', setupFailure: 'terminal' },
+    { name: 'primary body error wins over cleanup', bodyThrows: true, cleanupFailures: ['daemon'] },
+    { name: 'thrown undefined wins over cleanup', bodyThrows: true, throwUndefined: true, cleanupFailures: ['daemon'] },
+    { name: 'daemon rejection does not skip later stops', cleanupFailures: ['daemon'] },
+    { name: 'terminal rejection does not skip later stops', cleanupFailures: ['terminal'] },
+    { name: 'capture rejection does not skip server or Metro', cleanupFailures: ['android capture'] },
+    { name: 'server rejection does not skip Metro', cleanupFailures: ['server'] },
+    { name: 'all cleanup rejections are retained', cleanupFailures: ['daemon', 'terminal', 'server', 'metro'] },
+    { name: 'borrowed URL server remains untouched', borrowedServer: true, setupFailure: 'prime' },
+    { name: 'nonzero Maestro result wins over cleanup', exitCode: 7, cleanupFailures: ['daemon'] },
+    { name: 'successful owned cleanup control' },
+  ];
+
+  for (const scenario of cases) {
+    it(scenario.name, async () => {
+      const { runMobileMaestro } = await import('./mobileMaestroRunner');
+      const primary = scenario.throwUndefined ? undefined : new Error(`primary ${scenario.name}`);
+      const errors = new Map((scenario.cleanupFailures ?? []).map((name) => [name, new Error(`cleanup ${name}`)]));
+      const stop = (name: string) => vi.fn(async () => {
+        observedStops.push(name);
+        if (errors.has(name)) throw errors.get(name);
+      });
+      const metroStop = stop('metro');
+      const serverStop = stop('server');
+      const terminalStop = stop('terminal');
+      const daemonStop = stop('daemon');
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const platform = scenario.platform ?? 'android';
+      const captureName = platform === 'android' ? 'android capture' : 'ios capture';
+      captureStopError = errors.get(captureName) ?? null;
+      const connected = !scenario.setupFailure || scenario.setupFailure === 'terminal';
+      const startDevClientMetro = vi.fn(async () => {
+        if (scenario.setupFailure === 'metro') throw primary;
+        return { baseUrl: 'http://127.0.0.1:8081', stop: metroStop };
+      });
+      const startServerLight = vi.fn(async () => {
+        if (scenario.setupFailure === 'server') throw primary;
+        return { baseUrl: 'http://127.0.0.1:43210', stop: serverStop };
+      });
+      let flowCalls = 0;
+      const runMaestro = vi.fn(async () => {
+        flowCalls += 1;
+        if (scenario.bodyThrows && flowCalls === 2) throw primary;
+        return { exitCode: flowCalls === 2 ? scenario.exitCode ?? 0 : 0 };
+      });
+      let result: Awaited<ReturnType<typeof runMobileMaestro>> | undefined;
+      let outcome: { error: unknown } | null = null;
+      try {
+        result = await runMobileMaestro({
+          argv: ['node', 'fixture', '--platform', platform, '--appId', 'dev.happier.fixture', '--flows', 'fixture.yaml',
+            ...(scenario.borrowedServer ? ['--serverUrl', 'http://borrowed.invalid:43210'] : [])],
+          cwd: disposableCwd,
+          env: {
+            HAPPIER_E2E_MOBILE_MANAGE_METRO: '1',
+            HAPPIER_E2E_ANDROID_PIN_DEV_CLIENT_RUNTIME: '0',
+            HAPPIER_E2E_MOBILE_WARM_DEV_CLIENT_BUNDLE: '0',
+            HAPPIER_E2E_ANDROID_LOGCAT_CAPTURE: '1',
+            HAPPIER_E2E_IOS_SIMULATOR_LOG_CAPTURE: '1',
+            HAPPIER_E2E_ANDROID_LOGCAT_STOP_TIMEOUT_MS: '1',
+            HAPPIER_E2E_IOS_SIMULATOR_LOG_STOP_TIMEOUT_MS: '1',
+            HAPPIER_E2E_MOBILE_CONNECTED_MACHINE_MODE: connected ? 'cli-terminal-daemon' : '',
+          },
+        }, {
+          startDevClientMetro,
+          startServerLight,
+          runMaestro,
+          isAppInstalled: vi.fn(async () => true),
+          adbReversePorts: vi.fn(() => ({ enabled: false, reversedPorts: [] })),
+          primeAppLaunch: vi.fn(async () => {
+            if (scenario.setupFailure === 'prime') throw primary;
+            if (scenario.setupFailure === 'manifest') {
+              const root = join(disposableCwd, '.project/logs/e2e/mobile-maestro');
+              const runDir = join(root, readdirSync(root)[0]!);
+              mkdirSync(join(runDir, 'manifest.json'));
+            }
+          }),
+          resolveMaestroBin: vi.fn(() => {
+            if (scenario.setupFailure === 'resolver') throw primary;
+            return 'fixture-maestro';
+          }),
+          startCliTerminalConnect: vi.fn(async () => {
+            if (scenario.setupFailure === 'terminal') throw primary;
+            return {
+              connectUrl: 'https://example.test/terminal/connect#key=fixture-key&server=http%3A%2F%2F127.0.0.1%3A43210',
+              waitForSuccess: vi.fn(async () => {}), stop: terminalStop,
+            };
+          }),
+          startTestDaemon: vi.fn(async () => ({ stop: daemonStop })),
+        });
+      } catch (error) {
+        outcome = { error };
+      }
+      const acquiredMetro = scenario.setupFailure !== 'metro';
+      const acquiredServer = acquiredMetro && scenario.setupFailure !== 'server' && !scenario.borrowedServer;
+      const acquiredCapture = acquiredMetro && scenario.setupFailure !== 'server';
+      const acquiredConnected = connected && !scenario.setupFailure;
+      const expectedStops = [
+        ...(acquiredConnected ? ['daemon', 'terminal'] : []),
+        ...(acquiredCapture ? [captureName] : []),
+        ...(acquiredServer ? ['server'] : []),
+        ...(acquiredMetro ? ['metro'] : []),
+      ];
+      expect(observedStops).toEqual(expectedStops);
+      if (scenario.borrowedServer) {
+        expect(startServerLight).not.toHaveBeenCalled();
+        expect(serverStop).not.toHaveBeenCalled();
+      }
+      if (scenario.setupFailure === 'manifest') {
+        expect(outcome?.error).toMatchObject({ code: 'EISDIR' });
+      } else if (scenario.setupFailure || scenario.bodyThrows) {
+        expect(outcome).not.toBeNull();
+        expect(outcome!.error).toBe(primary);
+      } else if (errors.size > 0 && !scenario.exitCode) {
+        expect(outcome?.error).toBeInstanceOf(AggregateError);
+        expect((outcome!.error as AggregateError).errors).toEqual([...errors.values()]);
+      } else {
+        expect(outcome).toBeNull();
+        expect(result?.exitCode).toBe(scenario.exitCode ?? 0);
+      }
+      if ((scenario.bodyThrows || scenario.exitCode) && errors.size > 0) {
+        expect(warning).toHaveBeenCalled();
+        const aggregate = warning.mock.calls.flat().find((value) => value instanceof AggregateError) as AggregateError;
+        expect(aggregate.errors).toEqual([...errors.values()]);
+      }
+      if (scenario.setupFailure) expect(runMaestro).not.toHaveBeenCalled();
+    });
+  }
 });

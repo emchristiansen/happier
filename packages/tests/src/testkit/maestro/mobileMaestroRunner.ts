@@ -756,298 +756,304 @@ export async function runMobileMaestro(
   let metro: StartedDevClientMetroLike | null = null;
   let androidDevClientRuntimeVersion: string | null = null;
 
-  if (manageMetro && !explicitHostMetroUrl) {
-    if (!deps.startDevClientMetro) {
-      throw new Error('Missing startDevClientMetro dependency.');
-    }
-    const metroEnv: NodeJS.ProcessEnv = {
-      ...orchestrationEnv,
-    };
-    metroEnv.HAPPIER_E2E_EXPO_CLEAR ??= '1';
-    const shouldPinAndroidRuntime =
-      platform === 'android' &&
-      !String(metroEnv.HAPPIER_EXPO_RUNTIME_VERSION ?? '').trim() &&
-      isTruthyEnv(params.env.HAPPIER_E2E_ANDROID_PIN_DEV_CLIENT_RUNTIME ?? '1');
-    if (shouldPinAndroidRuntime) {
-      const resolveAndroidDevClientRuntimeVersion =
-        deps.resolveAndroidDevClientRuntimeVersion ?? resolveInstalledAndroidDevClientRuntimeVersion;
-      androidDevClientRuntimeVersion = resolveAndroidDevClientRuntimeVersion({
-        appId,
-        env: orchestrationEnv,
-        outputDir: run.testDir('android-dev-client-runtime'),
-      });
-      if (androidDevClientRuntimeVersion) {
-        metroEnv.HAPPIER_EXPO_RUNTIME_VERSION = androidDevClientRuntimeVersion;
-      }
-    }
-    const metroHost = String(params.env.HAPPIER_E2E_DEV_CLIENT_HOST ?? '').trim() || (platform === 'android' ? 'lan' : 'localhost');
-    metro = await deps.startDevClientMetro({
-      testDir: run.testDir('expo-metro'),
-      extraEnv: metroEnv,
-      host: metroHost,
-      port: explicitHostMetroUrl ? extractUrlPort(hostMetroUrlFromEnv) ?? undefined : undefined,
-    });
-  }
-
-  const hostMetroUrl = metro?.baseUrl
-    ? metro.baseUrl.replace(/\/$/, '')
-    : hostMetroUrlFromEnv || 'http://127.0.0.1:8081';
-  if (explicitServerUrl) {
-    server = { baseUrl: explicitServerUrl };
-  } else {
-    if (!deps.startServerLight) {
-      throw new Error('Missing startServerLight dependency (required when serverUrl is not provided).');
-    }
-    const extraEnv: NodeJS.ProcessEnv = {
-      ...orchestrationEnv,
-    };
-    // Prefer the Node `--import` start path to avoid relying on workspace-local `node_modules/.bin` layout.
-    extraEnv.HAPPIER_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT ??= '1';
-    extraEnv.HAPPY_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT ??= '1';
-    server = await deps.startServerLight({
-      testDir: run.testDir('server-light'),
-      extraEnv,
-    });
-  }
-
-  androidLogcatCapture = mobilePlatform === 'android' && shouldCaptureAndroidLogcat(params.env)
-    ? startAndroidLogcatCapture({ cwd: params.cwd, env: orchestrationEnv, runDir: run.runDir })
-    : null;
-  iosSimulatorLogCapture = mobilePlatform === 'ios' && shouldCaptureIosSimulatorLog(params.env)
-    ? startIosSimulatorLogCapture({ cwd: params.cwd, env: orchestrationEnv, runDir: run.runDir })
-    : null;
-
-  const adbReversePorts =
-    deps.adbReversePorts
-      ? deps.adbReversePorts
-      : (reverseParams: Parameters<typeof runAdbReverseIfEnabled>[0]) => runAdbReverseIfEnabled(reverseParams);
-
-  const adbReverse = adbReversePorts({
-    env: orchestrationEnv,
-    platform,
-    urls: [server.baseUrl, hostMetroUrl].filter(Boolean),
-  });
-
-  const deviceServerUrlRaw = server.baseUrl && mobilePlatform
-    ? resolveDeviceVisibleBaseUrl({ platform: mobilePlatform, baseUrl: server.baseUrl, env: params.env })
-    : server.baseUrl;
-
-  const deviceMetroUrlRaw = hostMetroUrl && mobilePlatform
-    ? resolveDeviceVisibleBaseUrl({ platform: mobilePlatform, baseUrl: hostMetroUrl, env: params.env })
-    : hostMetroUrl;
-
-  const deviceServerUrl = (() => {
-    if (platform !== 'android' || !adbReverse.enabled) return deviceServerUrlRaw;
-    const port = deviceServerUrlRaw ? extractUrlPort(deviceServerUrlRaw) : null;
-    if (!port || !adbReverse.reversedPorts.includes(port)) return deviceServerUrlRaw;
-    try {
-      const parsed = new URL(deviceServerUrlRaw);
-      parsed.hostname = '127.0.0.1';
-      parsed.port = String(port);
-      return stripTrailingSlash(parsed.toString());
-    } catch {
-      return deviceServerUrlRaw;
-    }
-  })();
-
-  const deviceMetroUrl = (() => {
-    if (platform !== 'android' || !adbReverse.enabled) return deviceMetroUrlRaw;
-    const port = deviceMetroUrlRaw ? extractUrlPort(deviceMetroUrlRaw) : null;
-    if (!port || !adbReverse.reversedPorts.includes(port)) return deviceMetroUrlRaw;
-    try {
-      const parsed = new URL(deviceMetroUrlRaw);
-      parsed.hostname = '127.0.0.1';
-      parsed.port = String(port);
-      return stripTrailingSlash(parsed.toString());
-    } catch {
-      return deviceMetroUrlRaw;
-    }
-  })();
-  const deviceServerVisibleHostPattern = deviceServerUrl
-    ? resolveVisibleHostPatternFromUrl(deviceServerUrl)
-    : '';
-
-  const mobileAppScheme = resolveMobileAppScheme(params.env, { appId });
-  const devClientScheme = mobilePlatform === 'ios' ? appId : mobileAppScheme;
-  const devClientLaunchUrl = deviceMetroUrl
-    ? resolveExpoDevClientDeepLink({
-        env: params.env,
-        metroUrl: deviceMetroUrl,
-        scheme: devClientScheme,
-      })
-    : '';
-
-  const maestroBin = deps.resolveMaestroBin
-    ? deps.resolveMaestroBin(params.env)
-    : defaultDeps.resolveMaestroBin(params.env);
-
-  const hasWarmableMetro = Boolean(hostMetroUrl && (metro || explicitHostMetroUrl));
-  const warmBundleEnabled = shouldWarmExpoDevClientBundle({
-    env: params.env,
-    platform: mobilePlatform,
-    hasWarmableMetro,
-  });
-  if (warmBundleEnabled && mobilePlatform) {
-    // eslint-disable-next-line no-console
-    console.log(`[tests] warming Expo Dev Client bundle (${mobilePlatform})`);
-    const warmTimeoutMs = resolveWarmExpoDevClientBundleTimeoutMs({
-      env: params.env,
-      platform: mobilePlatform,
-    });
-    const abortController = new AbortController();
-    const hardTimeoutMs = Math.max(50, warmTimeoutMs + 50);
-    const hardTimeoutId = setTimeout(() => abortController.abort(), warmTimeoutMs);
-    try {
-      await withHardTimeout(
-        warmExpoDevClientBundle({
-          platform: mobilePlatform,
-          hostMetroUrl,
-          metroStdoutPath: metro?.stdoutPath,
-          timeoutMs: warmTimeoutMs,
-          signal: abortController.signal,
-        }),
-        hardTimeoutMs,
-      );
-    } catch (err) {
-      // Best-effort optimization only: warming reduces Dev Client flake from first-load
-      // bundling delays, but failures should not prevent the actual Maestro run.
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[tests] warm Expo Dev Client bundle failed (${mobilePlatform}): ${String((err as any)?.message ?? err)}`,
-      );
-    } finally {
-      clearTimeout(hardTimeoutId);
-    }
-  }
-
-  const primeAppLaunch = deps.primeAppLaunch ?? defaultPrimePlatformAppLaunch;
-  if (
-    !skipAppInstallCheck
-    && mobilePlatform === 'android'
-    && isTruthyEnv(params.env.HAPPIER_E2E_ANDROID_PRIME_APP_LAUNCH ?? '1')
-  ) {
-    await primeAppLaunch({
-      env: orchestrationEnv,
-      platform: mobilePlatform,
-      appId,
-    });
-  }
-
-  const connectedMachineMode = resolveConnectedMachineMode(params.env);
-
-  writeFileSync(
-    manifestPath,
-    JSON.stringify(
-      {
-        tool: 'maestro',
-        runId: run.runId,
-        startedAt: new Date().toISOString(),
-        flows,
-        appId,
-        platform: platform || null,
-        serverUrlHost: server?.baseUrl ?? null,
-        serverUrlDevice: deviceServerUrl ?? null,
-        metroUrlHost: hostMetroUrl ?? null,
-        metroUrlDevice: deviceMetroUrl ?? null,
-        devClientLaunchUrl: devClientLaunchUrl || null,
-        connectedMachineMode,
-        passThrough: parsed.passThrough ?? [],
-        artifacts: {
-          ...(androidLogcatCapture ? { androidLogcat: ANDROID_LOGCAT_ARTIFACT } : {}),
-          ...(iosSimulatorLogCapture ? { iosSimulatorLog: IOS_SIMULATOR_LOG_ARTIFACT } : {}),
-          syncPerformanceLogs: [
-            ...(androidLogcatCapture ? [ANDROID_LOGCAT_ARTIFACT] : []),
-            ...(iosSimulatorLogCapture ? [IOS_SIMULATOR_LOG_ARTIFACT] : []),
-            ...(metro ? [
-              'expo-metro/ui.dev-client.metro.stdout.log',
-              'expo-metro/ui.dev-client.metro.stderr.log',
-            ] : []),
-          ],
-        },
-        env: {
-          APP_ENV: params.env.APP_ENV ?? null,
-          mobileAppScheme,
-          devClientScheme,
-          androidAdbReverse: adbReverse.enabled,
-          androidAdbReversePorts: adbReverse.reversedPorts,
-          androidDevClientRuntimeVersion: androidDevClientRuntimeVersion ?? null,
-          manageMetro: manageMetro,
-        },
-      },
-      null,
-      2,
-    ) + '\n',
-    'utf8',
-  );
-
-  if (!deps.runMaestro) {
-    throw new Error('Missing runMaestro dependency.');
-  }
-
-  const buildMaestroEnv = (extraEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
-    ...buildMaestroProcessEnv(params.env, extraEnv),
-    // Disable analytics prompts for deterministic local runs.
-    MAESTRO_CLI_NO_ANALYTICS: String(params.env.MAESTRO_CLI_NO_ANALYTICS ?? '1'),
-    ...(deviceServerUrl ? { HAPPIER_E2E_SERVER_URL: deviceServerUrl } : {}),
-    ...(deviceServerVisibleHostPattern ? { HAPPIER_E2E_SERVER_VISIBLE_HOST_PATTERN: deviceServerVisibleHostPattern } : {}),
-    ...(server?.baseUrl ? { HAPPIER_E2E_SERVER_URL_HOST: server.baseUrl } : {}),
-    ...(platform ? { HAPPIER_E2E_MOBILE_PLATFORM: platform } : {}),
-    ...(devClientLaunchUrl ? { HAPPIER_E2E_DEV_CLIENT_LAUNCH_URL: devClientLaunchUrl } : {}),
-    HAPPIER_E2E_MOBILE_APP_SCHEME: mobileAppScheme,
-    HAPPIER_E2E_MOBILE_APP_ID: appId,
-  });
-
-  const baseSensitiveMaestroEnvEntries = collectSensitiveMaestroEnvEntries(params.env);
-  let runtimeLogSensitiveMaestroEnvEntries = baseSensitiveMaestroEnvEntries;
-
-  const buildMaestroArgs = (
-    flowPath: string,
-    sensitiveMaestroEnvEntries: ReadonlyArray<Readonly<{ key: string; value: string }>>,
-    extraArgs?: string[],
-  ): string[] => [
-    ...(platform ? ['-p', platform] : []),
-    'test',
-    flowPath,
-    '--debug-output',
-    debugOutputDir,
-    '-e',
-    `HAPPIER_E2E_MOBILE_APP_ID=${appId}`,
-    ...(deviceServerUrl ? ['-e', `HAPPIER_E2E_SERVER_URL=${deviceServerUrl}`] : []),
-    ...(deviceServerVisibleHostPattern ? ['-e', `HAPPIER_E2E_SERVER_VISIBLE_HOST_PATTERN=${deviceServerVisibleHostPattern}`] : []),
-    ...(server?.baseUrl ? ['-e', `HAPPIER_E2E_SERVER_URL_HOST=${server.baseUrl}`] : []),
-    ...(platform ? ['-e', `HAPPIER_E2E_MOBILE_PLATFORM=${platform}`] : []),
-    '-e',
-    `HAPPIER_E2E_MOBILE_APP_SCHEME=${mobileAppScheme}`,
-    ...(deviceMetroUrl ? ['-e', `HAPPIER_E2E_DEV_CLIENT_METRO_URL=${deviceMetroUrl}`] : []),
-    ...(devClientLaunchUrl ? ['-e', `HAPPIER_E2E_DEV_CLIENT_LAUNCH_URL=${devClientLaunchUrl}`] : []),
-    ...buildSensitiveMaestroEnvArgs(sensitiveMaestroEnvEntries),
-    ...(extraArgs ?? []),
-    ...(parsed.passThrough ?? []),
-  ];
-
-  const runMaestroFlow = async (flowPath: string, extraEnv?: NodeJS.ProcessEnv, extraArgs?: string[]) => {
-    const maestroEnv = buildMaestroEnv(extraEnv);
-    const sensitiveMaestroEnvEntries = collectSensitiveMaestroEnvEntries({ ...params.env, ...(extraEnv ?? {}) });
-    runtimeLogSensitiveMaestroEnvEntries = [
-      ...runtimeLogSensitiveMaestroEnvEntries,
-      ...sensitiveMaestroEnvEntries,
-    ];
-    try {
-      return await deps.runMaestro!({
-        cwd: params.cwd,
-        env: maestroEnv,
-        maestroBin: maestroBin || maestroCommand(params.env),
-        args: buildMaestroArgs(flowPath, sensitiveMaestroEnvEntries, extraArgs),
-      });
-    } finally {
-      redactSensitiveMaestroDebugArtifacts(debugOutputDir, sensitiveMaestroEnvEntries);
-    }
-  };
-
   let exitCode = 1;
   let startedCliTerminalConnect: StartedCliTerminalConnectLike | null = null;
   let startedDaemon: StartedDaemonLike | null = null;
+  let primaryFailure: { error: unknown } | null = null;
+  let runCompleted = false;
+  // Setup failures acquire cleanup coverage without acquiring artifact-finalization eligibility.
+  let artifactFinalizationEligible = false;
+  let runtimeLogSensitiveMaestroEnvEntries: ReturnType<typeof collectSensitiveMaestroEnvEntries> = [];
   try {
+    if (manageMetro && !explicitHostMetroUrl) {
+      if (!deps.startDevClientMetro) {
+        throw new Error('Missing startDevClientMetro dependency.');
+      }
+      const metroEnv: NodeJS.ProcessEnv = {
+        ...orchestrationEnv,
+      };
+      metroEnv.HAPPIER_E2E_EXPO_CLEAR ??= '1';
+      const shouldPinAndroidRuntime =
+        platform === 'android' &&
+        !String(metroEnv.HAPPIER_EXPO_RUNTIME_VERSION ?? '').trim() &&
+        isTruthyEnv(params.env.HAPPIER_E2E_ANDROID_PIN_DEV_CLIENT_RUNTIME ?? '1');
+      if (shouldPinAndroidRuntime) {
+        const resolveAndroidDevClientRuntimeVersion =
+          deps.resolveAndroidDevClientRuntimeVersion ?? resolveInstalledAndroidDevClientRuntimeVersion;
+        androidDevClientRuntimeVersion = resolveAndroidDevClientRuntimeVersion({
+          appId,
+          env: orchestrationEnv,
+          outputDir: run.testDir('android-dev-client-runtime'),
+        });
+        if (androidDevClientRuntimeVersion) {
+          metroEnv.HAPPIER_EXPO_RUNTIME_VERSION = androidDevClientRuntimeVersion;
+        }
+      }
+      const metroHost = String(params.env.HAPPIER_E2E_DEV_CLIENT_HOST ?? '').trim() || (platform === 'android' ? 'lan' : 'localhost');
+      metro = await deps.startDevClientMetro({
+        testDir: run.testDir('expo-metro'),
+        extraEnv: metroEnv,
+        host: metroHost,
+        port: explicitHostMetroUrl ? extractUrlPort(hostMetroUrlFromEnv) ?? undefined : undefined,
+      });
+    }
+
+    const hostMetroUrl = metro?.baseUrl
+      ? metro.baseUrl.replace(/\/$/, '')
+      : hostMetroUrlFromEnv || 'http://127.0.0.1:8081';
+    if (explicitServerUrl) {
+      server = { baseUrl: explicitServerUrl };
+    } else {
+      if (!deps.startServerLight) {
+        throw new Error('Missing startServerLight dependency (required when serverUrl is not provided).');
+      }
+      const extraEnv: NodeJS.ProcessEnv = {
+        ...orchestrationEnv,
+      };
+      // Prefer the Node `--import` start path to avoid relying on workspace-local `node_modules/.bin` layout.
+      extraEnv.HAPPIER_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT ??= '1';
+      extraEnv.HAPPY_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT ??= '1';
+      server = await deps.startServerLight({
+        testDir: run.testDir('server-light'),
+        extraEnv,
+      });
+    }
+
+    androidLogcatCapture = mobilePlatform === 'android' && shouldCaptureAndroidLogcat(params.env)
+      ? startAndroidLogcatCapture({ cwd: params.cwd, env: orchestrationEnv, runDir: run.runDir })
+      : null;
+    iosSimulatorLogCapture = mobilePlatform === 'ios' && shouldCaptureIosSimulatorLog(params.env)
+      ? startIosSimulatorLogCapture({ cwd: params.cwd, env: orchestrationEnv, runDir: run.runDir })
+      : null;
+
+    const adbReversePorts =
+      deps.adbReversePorts
+        ? deps.adbReversePorts
+        : (reverseParams: Parameters<typeof runAdbReverseIfEnabled>[0]) => runAdbReverseIfEnabled(reverseParams);
+
+    const adbReverse = adbReversePorts({
+      env: orchestrationEnv,
+      platform,
+      urls: [server.baseUrl, hostMetroUrl].filter(Boolean),
+    });
+
+    const deviceServerUrlRaw = server.baseUrl && mobilePlatform
+      ? resolveDeviceVisibleBaseUrl({ platform: mobilePlatform, baseUrl: server.baseUrl, env: params.env })
+      : server.baseUrl;
+
+    const deviceMetroUrlRaw = hostMetroUrl && mobilePlatform
+      ? resolveDeviceVisibleBaseUrl({ platform: mobilePlatform, baseUrl: hostMetroUrl, env: params.env })
+      : hostMetroUrl;
+
+    const deviceServerUrl = (() => {
+      if (platform !== 'android' || !adbReverse.enabled) return deviceServerUrlRaw;
+      const port = deviceServerUrlRaw ? extractUrlPort(deviceServerUrlRaw) : null;
+      if (!port || !adbReverse.reversedPorts.includes(port)) return deviceServerUrlRaw;
+      try {
+        const parsed = new URL(deviceServerUrlRaw);
+        parsed.hostname = '127.0.0.1';
+        parsed.port = String(port);
+        return stripTrailingSlash(parsed.toString());
+      } catch {
+        return deviceServerUrlRaw;
+      }
+    })();
+
+    const deviceMetroUrl = (() => {
+      if (platform !== 'android' || !adbReverse.enabled) return deviceMetroUrlRaw;
+      const port = deviceMetroUrlRaw ? extractUrlPort(deviceMetroUrlRaw) : null;
+      if (!port || !adbReverse.reversedPorts.includes(port)) return deviceMetroUrlRaw;
+      try {
+        const parsed = new URL(deviceMetroUrlRaw);
+        parsed.hostname = '127.0.0.1';
+        parsed.port = String(port);
+        return stripTrailingSlash(parsed.toString());
+      } catch {
+        return deviceMetroUrlRaw;
+      }
+    })();
+    const deviceServerVisibleHostPattern = deviceServerUrl
+      ? resolveVisibleHostPatternFromUrl(deviceServerUrl)
+      : '';
+
+    const mobileAppScheme = resolveMobileAppScheme(params.env, { appId });
+    const devClientScheme = mobilePlatform === 'ios' ? appId : mobileAppScheme;
+    const devClientLaunchUrl = deviceMetroUrl
+      ? resolveExpoDevClientDeepLink({
+          env: params.env,
+          metroUrl: deviceMetroUrl,
+          scheme: devClientScheme,
+        })
+      : '';
+
+    const maestroBin = deps.resolveMaestroBin
+      ? deps.resolveMaestroBin(params.env)
+      : defaultDeps.resolveMaestroBin(params.env);
+
+    const hasWarmableMetro = Boolean(hostMetroUrl && (metro || explicitHostMetroUrl));
+    const warmBundleEnabled = shouldWarmExpoDevClientBundle({
+      env: params.env,
+      platform: mobilePlatform,
+      hasWarmableMetro,
+    });
+    if (warmBundleEnabled && mobilePlatform) {
+      // eslint-disable-next-line no-console
+      console.log(`[tests] warming Expo Dev Client bundle (${mobilePlatform})`);
+      const warmTimeoutMs = resolveWarmExpoDevClientBundleTimeoutMs({
+        env: params.env,
+        platform: mobilePlatform,
+      });
+      const abortController = new AbortController();
+      const hardTimeoutMs = Math.max(50, warmTimeoutMs + 50);
+      const hardTimeoutId = setTimeout(() => abortController.abort(), warmTimeoutMs);
+      try {
+        await withHardTimeout(
+          warmExpoDevClientBundle({
+            platform: mobilePlatform,
+            hostMetroUrl,
+            metroStdoutPath: metro?.stdoutPath,
+            timeoutMs: warmTimeoutMs,
+            signal: abortController.signal,
+          }),
+          hardTimeoutMs,
+        );
+      } catch (err) {
+        // Best-effort optimization only: warming reduces Dev Client flake from first-load
+        // bundling delays, but failures should not prevent the actual Maestro run.
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[tests] warm Expo Dev Client bundle failed (${mobilePlatform}): ${String((err as any)?.message ?? err)}`,
+        );
+      } finally {
+        clearTimeout(hardTimeoutId);
+      }
+    }
+
+    const primeAppLaunch = deps.primeAppLaunch ?? defaultPrimePlatformAppLaunch;
+    if (
+      !skipAppInstallCheck
+      && mobilePlatform === 'android'
+      && isTruthyEnv(params.env.HAPPIER_E2E_ANDROID_PRIME_APP_LAUNCH ?? '1')
+    ) {
+      await primeAppLaunch({
+        env: orchestrationEnv,
+        platform: mobilePlatform,
+        appId,
+      });
+    }
+
+    const connectedMachineMode = resolveConnectedMachineMode(params.env);
+
+    writeFileSync(
+      manifestPath,
+      JSON.stringify(
+        {
+          tool: 'maestro',
+          runId: run.runId,
+          startedAt: new Date().toISOString(),
+          flows,
+          appId,
+          platform: platform || null,
+          serverUrlHost: server?.baseUrl ?? null,
+          serverUrlDevice: deviceServerUrl ?? null,
+          metroUrlHost: hostMetroUrl ?? null,
+          metroUrlDevice: deviceMetroUrl ?? null,
+          devClientLaunchUrl: devClientLaunchUrl || null,
+          connectedMachineMode,
+          passThrough: parsed.passThrough ?? [],
+          artifacts: {
+            ...(androidLogcatCapture ? { androidLogcat: ANDROID_LOGCAT_ARTIFACT } : {}),
+            ...(iosSimulatorLogCapture ? { iosSimulatorLog: IOS_SIMULATOR_LOG_ARTIFACT } : {}),
+            syncPerformanceLogs: [
+              ...(androidLogcatCapture ? [ANDROID_LOGCAT_ARTIFACT] : []),
+              ...(iosSimulatorLogCapture ? [IOS_SIMULATOR_LOG_ARTIFACT] : []),
+              ...(metro ? [
+                'expo-metro/ui.dev-client.metro.stdout.log',
+                'expo-metro/ui.dev-client.metro.stderr.log',
+              ] : []),
+            ],
+          },
+          env: {
+            APP_ENV: params.env.APP_ENV ?? null,
+            mobileAppScheme,
+            devClientScheme,
+            androidAdbReverse: adbReverse.enabled,
+            androidAdbReversePorts: adbReverse.reversedPorts,
+            androidDevClientRuntimeVersion: androidDevClientRuntimeVersion ?? null,
+            manageMetro: manageMetro,
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+      'utf8',
+    );
+
+    if (!deps.runMaestro) {
+      throw new Error('Missing runMaestro dependency.');
+    }
+
+    const buildMaestroEnv = (extraEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
+      ...buildMaestroProcessEnv(params.env, extraEnv),
+      // Disable analytics prompts for deterministic local runs.
+      MAESTRO_CLI_NO_ANALYTICS: String(params.env.MAESTRO_CLI_NO_ANALYTICS ?? '1'),
+      ...(deviceServerUrl ? { HAPPIER_E2E_SERVER_URL: deviceServerUrl } : {}),
+      ...(deviceServerVisibleHostPattern ? { HAPPIER_E2E_SERVER_VISIBLE_HOST_PATTERN: deviceServerVisibleHostPattern } : {}),
+      ...(server?.baseUrl ? { HAPPIER_E2E_SERVER_URL_HOST: server.baseUrl } : {}),
+      ...(platform ? { HAPPIER_E2E_MOBILE_PLATFORM: platform } : {}),
+      ...(devClientLaunchUrl ? { HAPPIER_E2E_DEV_CLIENT_LAUNCH_URL: devClientLaunchUrl } : {}),
+      HAPPIER_E2E_MOBILE_APP_SCHEME: mobileAppScheme,
+      HAPPIER_E2E_MOBILE_APP_ID: appId,
+    });
+
+    const baseSensitiveMaestroEnvEntries = collectSensitiveMaestroEnvEntries(params.env);
+    runtimeLogSensitiveMaestroEnvEntries = baseSensitiveMaestroEnvEntries;
+
+    const buildMaestroArgs = (
+      flowPath: string,
+      sensitiveMaestroEnvEntries: ReadonlyArray<Readonly<{ key: string; value: string }>>,
+      extraArgs?: string[],
+    ): string[] => [
+      ...(platform ? ['-p', platform] : []),
+      'test',
+      flowPath,
+      '--debug-output',
+      debugOutputDir,
+      '-e',
+      `HAPPIER_E2E_MOBILE_APP_ID=${appId}`,
+      ...(deviceServerUrl ? ['-e', `HAPPIER_E2E_SERVER_URL=${deviceServerUrl}`] : []),
+      ...(deviceServerVisibleHostPattern ? ['-e', `HAPPIER_E2E_SERVER_VISIBLE_HOST_PATTERN=${deviceServerVisibleHostPattern}`] : []),
+      ...(server?.baseUrl ? ['-e', `HAPPIER_E2E_SERVER_URL_HOST=${server.baseUrl}`] : []),
+      ...(platform ? ['-e', `HAPPIER_E2E_MOBILE_PLATFORM=${platform}`] : []),
+      '-e',
+      `HAPPIER_E2E_MOBILE_APP_SCHEME=${mobileAppScheme}`,
+      ...(deviceMetroUrl ? ['-e', `HAPPIER_E2E_DEV_CLIENT_METRO_URL=${deviceMetroUrl}`] : []),
+      ...(devClientLaunchUrl ? ['-e', `HAPPIER_E2E_DEV_CLIENT_LAUNCH_URL=${devClientLaunchUrl}`] : []),
+      ...buildSensitiveMaestroEnvArgs(sensitiveMaestroEnvEntries),
+      ...(extraArgs ?? []),
+      ...(parsed.passThrough ?? []),
+    ];
+
+    const runMaestroFlow = async (flowPath: string, extraEnv?: NodeJS.ProcessEnv, extraArgs?: string[]) => {
+      const maestroEnv = buildMaestroEnv(extraEnv);
+      const sensitiveMaestroEnvEntries = collectSensitiveMaestroEnvEntries({ ...params.env, ...(extraEnv ?? {}) });
+      runtimeLogSensitiveMaestroEnvEntries = [
+        ...runtimeLogSensitiveMaestroEnvEntries,
+        ...sensitiveMaestroEnvEntries,
+      ];
+      try {
+        return await deps.runMaestro!({
+          cwd: params.cwd,
+          env: maestroEnv,
+          maestroBin: maestroBin || maestroCommand(params.env),
+          args: buildMaestroArgs(flowPath, sensitiveMaestroEnvEntries, extraArgs),
+        });
+      } finally {
+        redactSensitiveMaestroDebugArtifacts(debugOutputDir, sensitiveMaestroEnvEntries);
+      }
+    };
+
+    artifactFinalizationEligible = true;
     if (connectedMachineMode === 'cli-terminal-daemon') {
       if (!deps.startCliTerminalConnect) {
         throw new Error('Missing startCliTerminalConnect dependency.');
@@ -1103,35 +1109,60 @@ export async function runMobileMaestro(
       const result = await runMaestroFlow(flows);
       exitCode = result.exitCode;
     }
+    runCompleted = true;
+    return {
+      exitCode,
+      runDir: run.runDir,
+      manifestPath,
+      debugOutputDir,
+      server,
+      metro,
+    };
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    if (startedDaemon?.stop) {
-      await startedDaemon.stop();
+    const androidCapture = androidLogcatCapture;
+    const iosCapture = iosSimulatorLogCapture;
+    const cleanupSteps: Array<{ name: string; stop: () => Promise<void>; finalize?: () => void }> = [
+      ...(startedDaemon ? [{ name: 'daemon', stop: startedDaemon.stop.bind(startedDaemon) }] : []),
+      ...(startedCliTerminalConnect ? [{ name: 'terminal connect', stop: startedCliTerminalConnect.stop.bind(startedCliTerminalConnect) }] : []),
+      ...(androidCapture ? [{
+        name: 'Android log capture',
+        stop: androidCapture.stop.bind(androidCapture),
+        finalize: () => redactSensitiveMaestroDebugArtifacts(androidCapture.logPath, runtimeLogSensitiveMaestroEnvEntries),
+      }] : []),
+      ...(iosCapture ? [{
+        name: 'iOS log capture',
+        stop: iosCapture.stop.bind(iosCapture),
+        finalize: () => redactSensitiveMaestroDebugArtifacts(iosCapture.logPath, runtimeLogSensitiveMaestroEnvEntries),
+      }] : []),
+      ...(server?.stop ? [{ name: 'server', stop: server.stop.bind(server) }] : []),
+      ...(metro?.stop ? [{ name: 'Metro', stop: metro.stop.bind(metro) }] : []),
+    ];
+    const cleanupFailures: Array<{ name: string; error: unknown }> = [];
+    for (const step of cleanupSteps) {
+      try {
+        await step.stop();
+        if (artifactFinalizationEligible) step.finalize?.();
+      } catch (error) {
+        cleanupFailures.push({ name: step.name, error });
+        // The old sequential finalizer could not reach later artifact work after a failure.
+        // Continue owned stop attempts while preserving that artifact boundary.
+        artifactFinalizationEligible = false;
+      }
     }
-    if (startedCliTerminalConnect?.stop) {
-      await startedCliTerminalConnect.stop();
-    }
-    if (androidLogcatCapture) {
-      await androidLogcatCapture.stop();
-      redactSensitiveMaestroDebugArtifacts(androidLogcatCapture.logPath, runtimeLogSensitiveMaestroEnvEntries);
-    }
-    if (iosSimulatorLogCapture) {
-      await iosSimulatorLogCapture.stop();
-      redactSensitiveMaestroDebugArtifacts(iosSimulatorLogCapture.logPath, runtimeLogSensitiveMaestroEnvEntries);
-    }
-    if (server?.stop) {
-      await server.stop();
-    }
-    if (metro?.stop) {
-      await metro.stop();
+    if (cleanupFailures.length > 0) {
+      const cleanupError = new AggregateError(
+        cleanupFailures.map(({ error }) => error),
+        `Mobile Maestro cleanup failed: ${cleanupFailures.map(({ name }) => name).join(', ')}`,
+      );
+      if (primaryFailure !== null || (runCompleted && exitCode !== 0)) {
+        // eslint-disable-next-line no-console
+        console.warn('[tests] secondary cleanup failures; preserving the primary run outcome', cleanupError);
+      } else {
+        throw cleanupError;
+      }
     }
   }
-
-  return {
-    exitCode,
-    runDir: run.runDir,
-    manifestPath,
-    debugOutputDir,
-    server,
-    metro,
-  };
 }
