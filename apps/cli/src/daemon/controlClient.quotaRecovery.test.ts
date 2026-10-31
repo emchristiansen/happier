@@ -11,6 +11,36 @@ vi.mock('@/persistence', async (original) => ({
 afterEach(() => vi.restoreAllMocks());
 
 describe('daemon quota native completion source', () => {
+  it('captures the quota source before awaited runtime-auth intake and finalizes only an accepted result', async () => {
+    const events: string[] = [];
+    const begin = vi.fn(() => {
+      events.push('captured');
+      return (_attemptId?: string) => { events.push('acknowledged'); };
+    });
+    const app = createDaemonControlApp({ getChildren: () => [], machineId: 'machine', controlToken: 'inert-token',
+      stopSession: async () => ({ status: 'not_found' as const }),
+      spawnSession: async () => ({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED, errorMessage: 'forbidden' }),
+      requestShutdown: () => {}, onHappySessionWebhook: () => {}, beginQuotaFailureSource: begin,
+      handleConnectedServiceRuntimeAuthFailure: async () => {
+        expect(events).toEqual(['captured']);
+        await Promise.resolve();
+        events.push('handled');
+        return { status: 'switch_reason_disabled' };
+      } });
+    const source = { nativeId: 'native', pid: 123, publisherIncarnationId: 'publisher', sequence: '1' };
+    try {
+      const response = await app.inject({ method: 'POST', url: '/connected-service-runtime-auth/failure',
+        headers: { 'x-happier-daemon-token': 'inert-token', 'x-happier-native-provider-source': JSON.stringify(source) },
+        payload: { reportId: 'runtime-auth-report:fixture', sessionId: 'session', classification: {
+          kind: 'usage_limit', serviceId: 'openai-codex', profileId: 'old', groupId: null,
+          resetsAtMs: null, planType: null, rateLimits: null, source: 'structured_provider_error',
+        } } });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ ok: true });
+      expect(begin).toHaveBeenCalledWith(expect.objectContaining({ nativeProviderSource: source }));
+      expect(events).toEqual(['captured', 'handled', 'acknowledged']);
+    } finally { await app.close(); }
+  });
   it('keeps the guarded switch envelope and refuses unauthenticated inspection', async () => {
     const guard = { requestId: 'once', nativeId: 'native', pid: 123, processInstanceFingerprint: 'instance',
       serviceId: 'openai-codex' as const, profileId: 'old', failureAttemptId: 'failure', failureArmedAtMs: 1,
