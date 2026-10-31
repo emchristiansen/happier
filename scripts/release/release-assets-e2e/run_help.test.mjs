@@ -205,6 +205,135 @@ test('release-assets-e2e documents and validates an exact immutable relay upgrad
   assert.match(incomplete.stderr ?? '', /tag and version must be provided together/i);
 });
 
+// Exercise the real image-selection prefix, stopping before database/container work.
+function createRelayUpgradeImageHarness(t) {
+  const source = fs.readFileSync(runScript, 'utf8');
+  const start = source.indexOf('run_relay_upgrade_smoke() {');
+  const end = source.indexOf('\n  db_cases=()', start);
+  assert.ok(start >= 0 && end > start, 'relay upgrade image-selection boundaries must exist');
+  const prefix = source.slice(start, end);
+  const tmp = mkdtempSync(join(tmpdir(), 'happier-relay-upgrade-image-test-'));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  const image = `happierdev/relay-server:local-upgrade-${sha.slice(0, 12)}`;
+  const readArgs = (name) => fs.readFileSync(join(tmp, name), 'utf8').split('\0').slice(0, -1);
+  const expectedArgs = (version) => [
+    '--tag', image,
+    '--build-arg', 'HAPPIER_EMBEDDED_POLICY_ENV=preview',
+    '--target', version ? 'relay-server' : 'relay-server-local-source',
+    ...(version ? [
+      '--build-arg', `HAPPIER_RELAY_SERVER_RELEASE_TAG=server-v${version}`,
+      '--build-arg', `HAPPIER_RELAY_SERVER_VERSION=${version}`,
+      '--build-arg', `SENTRY_RELEASE=${sha}`,
+    ] : []),
+    tmp,
+  ];
+  return {
+    image,
+    expectedArgs,
+    imageArgs: () => readArgs('image'),
+    attemptedArgs: () => readArgs('attempt'),
+    select(version, failBuild = false) {
+      fs.rmSync(join(tmp, 'attempt'), { force: true });
+      const result = spawnSync('bash', ['-c', `set -euo pipefail
+        repo_root="$TEST_IMAGE_DIR"
+        with_relay_upgrade=1
+        relay_upgrade_from_channel=preview
+        relay_upgrade_to_server_tag="$TEST_RELEASE_TAG"
+        relay_upgrade_to_server_version="$TEST_RELEASE_VERSION"
+        unexpected_boundary() {
+          printf 'unexpected boundary: %s\\n' "$*" >> "$TEST_IMAGE_DIR/errors"
+          exit 97
+        }
+        git() {
+          if [[ "$#" == 4 && "$1" == -C && "$2" == "$repo_root" && "$3 $4" == 'rev-parse HEAD' ]]; then
+            printf '%s\\n' "$TEST_HEAD"
+          else
+            unexpected_boundary git "$@"
+          fi
+        }
+        docker() {
+          if [[ "$#" == 2 && "$1 $2" == 'pull happierdev/relay-server:preview' ]]; then
+            return 0
+          elif [[ "$#" == 5 && "$1 $2 $3" == 'image inspect --format' && "$4" == '{{index .RepoDigests 0}}' && "$5" == 'happierdev/relay-server:preview' ]]; then
+            printf '%s\\n' 'happierdev/relay-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+          elif [[ "$#" == 3 && "$1 $2" == 'image inspect' && "$3" == "$TEST_IMAGE_TAG" ]]; then
+            [[ -f "$TEST_IMAGE_DIR/image" ]]
+          elif [[ "$1" == build ]]; then
+            shift
+            printf '%s\\0' "$@" > "$TEST_IMAGE_DIR/attempt"
+            if [[ "$TEST_FAIL_BUILD" == 1 ]]; then
+              printf 'fake docker: build failed\\n' >&2
+              return 42
+            fi
+            printf '%s\\0' "$@" > "$TEST_IMAGE_DIR/image"
+          else
+            unexpected_boundary docker "$@"
+          fi
+        }
+        ${prefix}
+        }
+        run_relay_upgrade_smoke
+        printf 'selected=%s\\n' "$to_image"
+      `], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          TEST_IMAGE_DIR: tmp,
+          TEST_HEAD: sha,
+          TEST_IMAGE_TAG: image,
+          TEST_RELEASE_TAG: version ? `server-v${version}` : '',
+          TEST_RELEASE_VERSION: version,
+          TEST_FAIL_BUILD: failBuild ? '1' : '0',
+        },
+      });
+      assert.ifError(result.error);
+      assert.equal(result.signal, null, result.stderr);
+      assert.equal(fs.existsSync(join(tmp, 'errors')), false,
+        fs.existsSync(join(tmp, 'errors')) ? fs.readFileSync(join(tmp, 'errors'), 'utf8') : '');
+      return result;
+    },
+  };
+}
+
+for (const [label, previous, current] of [
+  ['published release changes', '0.2.10', '0.2.11'],
+  ['local source to published release', '', '0.2.11'],
+  ['published release to local source', '0.2.10', ''],
+]) {
+  test(`relay upgrade image selection refreshes a retained image when ${label}`, (t) => {
+    const harness = createRelayUpgradeImageHarness(t);
+    for (const version of [previous, current]) {
+      const result = harness.select(version);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, `selected=${harness.image}\n`);
+      assert.deepEqual(harness.imageArgs(), harness.expectedArgs(version),
+        'the selected image must contain the currently requested build inputs at the same checkout HEAD');
+      assert.deepEqual(harness.attemptedArgs(), harness.expectedArgs(version),
+        'current target and arguments must reach Docker even when the image tag already exists');
+    }
+  });
+}
+
+for (const retainedImage of [false, true]) {
+  test(`relay upgrade image selection stops on build failure (${retainedImage ? 'retained image' : 'no image'})`, (t) => {
+    const harness = createRelayUpgradeImageHarness(t);
+    if (retainedImage) {
+      const seed = harness.select('0.2.10');
+      assert.equal(seed.status, 0, seed.stderr);
+      assert.deepEqual(harness.imageArgs(), harness.expectedArgs('0.2.10'));
+    }
+    const result = harness.select('0.2.11', true);
+    assert.equal(result.status, 42, result.stderr);
+    assert.match(result.stderr, /fake docker: build failed/);
+    assert.equal(result.stdout, '', 'failed build must not reach the downstream image-selection continuation');
+    assert.deepEqual(harness.attemptedArgs(), harness.expectedArgs('0.2.11'));
+    if (retainedImage) {
+      assert.deepEqual(harness.imageArgs(), harness.expectedArgs('0.2.10'), 'failed build leaves the prior image untouched');
+    }
+  });
+}
+
 test('npm-e2e-smoke includes dockerhub compose and references published images', () => {
   const composePath = join(here, 'compose.dockerhub.yml');
   assert.ok(fs.existsSync(composePath));
