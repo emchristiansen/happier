@@ -1,22 +1,70 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { existsSync, linkSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 
-import { withWorkspaceBundleLock, withWorkspaceBundleLockSync } from './workspaceBundleLock.mjs';
 
-async function waitForFile(path, { timeoutMs = 1_000 } = {}) {
-  const startedAt = Date.now();
-  while (!existsSync(path)) {
-    if (Date.now() - startedAt > timeoutMs) {
-      throw new Error(`Timed out waiting for ${path}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+// Genuine filesystem/process boundaries are interposed before the real owner is imported.
+// Held synchronous callbacks model another process at the named syscall boundary; no child runs.
+const require = createRequire(import.meta.url);
+const fsBoundary = require('node:fs');
+const cpBoundary = require('node:child_process');
+const realFs = { ...fsBoundary };
+let afterCreate = null;
+let afterRead = null;
+let beforeLink = null;
+let realBoundaryAttempts = 0;
+let unreadablePath = null;
+const originalKill = process.kill;
+const originalFetch = globalThis.fetch;
+process.kill = (pid, signal) => {
+  assert.equal(signal, 0);
+  if (pid === process.pid) return true;
+  throw Object.assign(new Error('fixture absent process'), { code: 'ESRCH' });
+};
+globalThis.fetch = () => { realBoundaryAttempts++; throw new Error('network forbidden'); };
+for (const key of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
+  cpBoundary[key] = () => { realBoundaryAttempts++; throw new Error(`child boundary forbidden: ${key}`); };
 }
+fsBoundary.openSync = (...args) => {
+  if (args[0] === unreadablePath && args[1] === 'r') throw Object.assign(new Error('fixture unreadable'), { code: 'EACCES' });
+  const fd = realFs.openSync(...args);
+  if (args[1] === 'wx') afterCreate?.(String(args[0]));
+  return fd;
+};
+fsBoundary.linkSync = (...args) => {
+  beforeLink?.(...args);
+  const result = realFs.linkSync(...args);
+  afterCreate?.(String(args[1]));
+  return result;
+};
+fsBoundary.readFileSync = (...args) => {
+  if (typeof args[0] === 'string' && /^\/proc\/\d+\/stat$/.test(args[0])) {
+    return `1 (fixture) S ${Array(18).fill('0').join(' ')} 100`;
+  }
+  if (args[0] === unreadablePath) throw Object.assign(new Error('fixture unreadable'), { code: 'EACCES' });
+  const value = realFs.readFileSync(...args);
+  afterRead?.(args[0], value);
+  return value;
+};
+syncBuiltinESMExports();
+const checkedFs = await import('node:fs');
+assert.equal(checkedFs.openSync, fsBoundary.openSync);
+assert.equal(checkedFs.linkSync, fsBoundary.linkSync);
+assert.equal(checkedFs.readFileSync, fsBoundary.readFileSync);
+assert.equal((await import('node:child_process')).spawnSync, cpBoundary.spawnSync);
+const { withWorkspaceBundleLock, withWorkspaceBundleLockSync } = await import('./workspaceBundleLock.mjs');
+
+test.after(() => {
+  assert.equal(realBoundaryAttempts, 0);
+  for (const key of ['openSync', 'linkSync', 'readFileSync']) fsBoundary[key] = realFs[key];
+  process.kill = originalKill;
+  globalThis.fetch = originalFetch;
+  syncBuiltinESMExports();
+});
+test.afterEach(() => { afterCreate = null; afterRead = null; beforeLink = null; unreadablePath = null; });
 
 test('withWorkspaceBundleLock serializes concurrent workspace bundling through a single lock', async () => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'happier-workspace-bundle-lock-'));
@@ -238,7 +286,7 @@ test('withWorkspaceBundleLock reclaims a live reused pid whose process instance 
         pid: process.pid,
         createdAtMs: Date.now(),
         token: 'stale-owner',
-        processInstanceFingerprint: 'process-instance:old',
+        processInstanceFingerprint: 'linux-proc:99',
       }),
       'utf8',
     );
@@ -254,7 +302,7 @@ test('withWorkspaceBundleLock reclaims a live reused pid whose process instance 
         pollIntervalMs: 10,
         staleAfterMs: 1_000,
         isRunningPidImpl: () => true,
-        readProcessInstanceFingerprintImpl: () => 'process-instance:new',
+        readProcessInstanceFingerprintImpl: () => 'linux-proc:100',
       },
     );
 
@@ -322,64 +370,16 @@ test('withWorkspaceBundleLockSync uses the shared workspace bundle lock owner fo
 });
 
 test('withWorkspaceBundleLock does not reclaim a stale lock while the owner pid is alive', async () => {
-  const tempRoot = mkdtempSync(join(tmpdir(), 'happier-workspace-bundle-lock-live-stale-owner-'));
-  const modulePath = fileURLToPath(new URL('./workspaceBundleLock.mjs', import.meta.url));
+  const root = mkdtempSync(join(tmpdir(), 'happier-workspace-live-'));
+  const lockPath = join(root, 'lock');
+  const raw = JSON.stringify({ pid: process.pid, token: 'live', createdAtMs: 1, processInstanceFingerprint: 'linux-proc:100' });
+  writeFileSync(lockPath, raw);
   try {
-    const lockPath = join(tempRoot, 'workspace-bundling.lock');
-    const activePath = join(tempRoot, 'active');
-    const child = spawn(
-      process.execPath,
-      [
-        '--input-type=module',
-        '-e',
-        [
-          "import { rmSync, writeFileSync } from 'node:fs';",
-          `import { withWorkspaceBundleLock } from ${JSON.stringify(modulePath)};`,
-          'function sleepSync(ms) {',
-          '  const arr = new Int32Array(new SharedArrayBuffer(4));',
-          '  Atomics.wait(arr, 0, 0, ms);',
-          '}',
-          'await withWorkspaceBundleLock(() => {',
-          `  writeFileSync(${JSON.stringify(activePath)}, 'active', 'utf8');`,
-          '  sleepSync(350);',
-          `  rmSync(${JSON.stringify(activePath)}, { force: true });`,
-          `}, { lockPath: ${JSON.stringify(lockPath)}, timeoutMs: 2_000, pollIntervalMs: 10, staleAfterMs: 100 });`,
-          '',
-        ].join('\n'),
-      ],
-      { stdio: ['ignore', 'ignore', 'pipe'] },
-    );
-
-    let childStderr = '';
-    child.stderr.on('data', (chunk) => {
-      childStderr += String(chunk);
-    });
-    const childResultPromise = new Promise((resolve) => {
-      child.on('close', (code, signal) => resolve({ code, signal }));
-    });
-
-    await waitForFile(activePath);
-
-    let overlapped = false;
-    await withWorkspaceBundleLock(
-      async () => {
-        overlapped = existsSync(activePath);
-      },
-      {
-        lockPath,
-        timeoutMs: 2_000,
-        pollIntervalMs: 10,
-        staleAfterMs: 100,
-      },
-    );
-
-    const childResult = await childResultPromise;
-
-    assert.deepEqual(childResult, { code: 0, signal: null }, childStderr);
-    assert.equal(overlapped, false, 'expected live lock owner to keep exclusive access even when its heartbeat is stale');
-  } finally {
-    rmSync(tempRoot, { recursive: true, force: true });
-  }
+    await assert.rejects(withWorkspaceBundleLock(() => assert.fail('live callback'), {
+      lockPath, timeoutMs: 20, pollIntervalMs: 1, staleAfterMs: 1,
+    }), { code: 'EWORKSPACEBUNDLELOCKTIMEOUT' });
+    assert.equal(readFileSync(lockPath, 'utf8'), raw);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('withWorkspaceBundleLock heartbeat does not overwrite a successor lock file', async () => {
@@ -407,3 +407,141 @@ test('withWorkspaceBundleLock heartbeat does not overwrite a successor lock file
     rmSync(tempRoot, { recursive: true, force: true });
   }
 });
+
+for (const mode of ['async', 'sync']) {
+  for (const [label, raw] of [['empty', ''], ['malformed', '{'], ['unreadable', 'fixture-owned opaque bytes']]) {
+    test(`J079 ${mode} preserves ${label} unknown owner`, async () => {
+      const root = mkdtempSync(join(tmpdir(), 'happier-lock-unknown-'));
+      const lockPath = join(root, 'lock');
+      writeFileSync(lockPath, raw);
+      if (label === 'unreadable') unreadablePath = lockPath;
+      const options = { lockPath, timeoutMs: 15, pollIntervalMs: 1, staleAfterMs: 1 };
+      try {
+        if (mode === 'sync') assert.throws(() => withWorkspaceBundleLockSync(() => assert.fail('unknown owner entered'), options), { code: 'EWORKSPACEBUNDLELOCKTIMEOUT' });
+        else await assert.rejects(withWorkspaceBundleLock(() => assert.fail('unknown owner entered'), options), { code: 'EWORKSPACEBUNDLELOCKTIMEOUT' });
+        unreadablePath = null;
+        assert.equal(readFileSync(lockPath, 'utf8'), raw);
+      } finally { unreadablePath = null; rmSync(root, { recursive: true, force: true }); }
+    });
+  }
+}
+
+for (const observed of ['linux-ps:Fri Oct 30 00:00:00 2026', null, 'unsupported:new', 'linux-proc:001', 'win32-cim:broken']) {
+  test(`J079 incomparable fingerprint ${String(observed)} is unknown`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'happier-lock-format-'));
+    const lockPath = join(root, 'lock');
+    const raw = JSON.stringify({ pid: process.pid, token: 'old', createdAtMs: 1, processInstanceFingerprint: 'linux-proc:99' });
+    writeFileSync(lockPath, raw);
+    try {
+      await assert.rejects(withWorkspaceBundleLock(() => assert.fail('incomparable entered'), {
+        lockPath, timeoutMs: 15, pollIntervalMs: 1, isRunningPidImpl: () => true,
+        readProcessInstanceFingerprintImpl: () => observed,
+      }), { code: 'EWORKSPACEBUNDLELOCKTIMEOUT' });
+      assert.equal(readFileSync(lockPath, 'utf8'), raw);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+test('J079 canonical publication is complete before a competing acquirer can observe it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'happier-lock-publication-'));
+  const lockPath = join(root, 'lock');
+  const events = [];
+  let second;
+  let observedRaw;
+  afterCreate = (path) => {
+    if (path !== lockPath || second) return;
+    afterCreate = null;
+    observedRaw = realFs.readFileSync(lockPath, 'utf8');
+    second = withWorkspaceBundleLock(async () => { events.push('second'); }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
+  };
+  try {
+    await withWorkspaceBundleLock(async () => { events.push('first'); }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
+    await second;
+    assert.ok(observedRaw, 'canonical record must never be empty at publication');
+    assert.deepEqual(events, ['first', 'second']);
+  } finally { afterCreate = null; if (second) await second; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('J079 concurrent reclaimers cannot remove the first successor', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'happier-lock-reclaim-'));
+  const lockPath = join(root, 'lock');
+  writeFileSync(lockPath, JSON.stringify({ pid: 999999999, token: 'dead', createdAtMs: 1 }));
+  let second;
+  let secondActive = false;
+  let releaseSecond;
+  const secondGate = new Promise((resolve) => { releaseSecond = resolve; });
+  const events = [];
+  afterRead = (path, value) => {
+    if (String(value).includes('"token":"dead"')) {
+      afterRead = null;
+      second = withWorkspaceBundleLock(async () => { secondActive = true; events.push('second'); await secondGate; secondActive = false; }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
+    }
+  };
+  try {
+    let overlapped = false;
+    await withWorkspaceBundleLock(() => { overlapped = secondActive; events.push('first'); releaseSecond(); }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
+    await second;
+    assert.equal(overlapped, false, 'competing reclaimed callback must not be active');
+    assert.deepEqual(events, ['first', 'second']);
+  } finally { afterRead = null; releaseSecond(); if (second) await second; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('J079 orphan transition guard is preserved and blocks callback', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'happier-lock-guard-'));
+  const lockPath = join(root, 'lock');
+  const guard = `${lockPath}.transition`;
+  writeFileSync(guard, 'orphan fixture bytes');
+  try {
+    await assert.rejects(withWorkspaceBundleLock(() => assert.fail('orphan guard entered'), { lockPath, timeoutMs: 15, pollIntervalMs: 1 }), { code: 'EWORKSPACEBUNDLELOCKTIMEOUT' });
+    assert.equal(readFileSync(guard, 'utf8'), 'orphan fixture bytes');
+    assert.equal(existsSync(lockPath), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('J079 publication failure preserves callback identity and leaves no canonical owner', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'happier-lock-link-failure-'));
+  const lockPath = join(root, 'lock');
+  const failure = new Error('fixture link failure');
+  beforeLink = (source, target) => { if (target === lockPath) throw failure; };
+  try {
+    await assert.rejects(withWorkspaceBundleLock(() => assert.fail('failed publication entered'), { lockPath }), (error) => error === failure);
+    assert.deepEqual(realFs.readdirSync(root), []);
+  } finally { beforeLink = null; rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const failProbe of ['permission', 'fingerprint']) {
+  test(`J079 failed ${failProbe} evidence does not authorize reclaim`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'happier-lock-probe-'));
+    const lockPath = join(root, 'lock');
+    const raw = JSON.stringify({ pid: process.pid, token: 'unknown', createdAtMs: 1, processInstanceFingerprint: 'linux-proc:99' });
+    writeFileSync(lockPath, raw);
+    try {
+      await assert.rejects(withWorkspaceBundleLock(() => assert.fail('failed probe entered'), {
+        lockPath, timeoutMs: 15, pollIntervalMs: 1,
+        isRunningPidImpl: () => { if (failProbe === 'permission') throw Object.assign(new Error('fixture permission'), { code: 'EPERM' }); return true; },
+        readProcessInstanceFingerprintImpl: (pid) => { if (failProbe === 'fingerprint') throw new Error('fixture probe failed'); return 'linux-proc:100'; },
+      }), { code: 'EWORKSPACEBUNDLELOCKTIMEOUT' });
+      assert.equal(readFileSync(lockPath, 'utf8'), raw);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+for (const mode of ['async', 'sync']) {
+  test(`J079 ${mode} incomplete release preserves primary thrown identity`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'happier-lock-release-'));
+    const lockPath = join(root, 'lock');
+    const primary = new Error('original callback');
+    const warnings = [];
+    const savedWarn = console.warn;
+    console.warn = (...args) => warnings.push(args);
+    const callback = () => { writeFileSync(`${lockPath}.transition`, 'fixture unknown guard'); throw primary; };
+    try {
+      if (mode === 'sync') assert.throws(() => withWorkspaceBundleLockSync(callback, { lockPath, timeoutMs: 15, pollIntervalMs: 1 }), (error) => error === primary);
+      else await assert.rejects(withWorkspaceBundleLock(callback, { lockPath, timeoutMs: 15, pollIntervalMs: 1 }), (error) => error === primary);
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0][0], /Failed to release/);
+      assert.equal(readFileSync(`${lockPath}.transition`, 'utf8'), 'fixture unknown guard');
+      assert.equal(existsSync(lockPath), true);
+    } finally { console.warn = savedWarn; rmSync(root, { recursive: true, force: true }); }
+  });
+}

@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
+  fstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -25,8 +25,7 @@ export const WORKSPACE_BUNDLE_LOCK_TIMEOUT_ERROR_CODE = 'EWORKSPACEBUNDLELOCKTIM
 
 function sleepSync(ms) {
   if (!ms || ms <= 0) return;
-  const buffer = new SharedArrayBuffer(4);
-  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export function resolveWorkspaceBundleLockPath(repoRoot) {
@@ -34,10 +33,8 @@ export function resolveWorkspaceBundleLockPath(repoRoot) {
 }
 
 function parseLockOwner(raw) {
-  const text = String(raw ?? '').trim();
-  if (!text) return null;
   try {
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' ? parsed : null;
   } catch {
     return null;
@@ -45,20 +42,17 @@ function parseLockOwner(raw) {
 }
 
 function readLockOwnerSnapshot(lockPath) {
-  let stats;
+  let fd = null;
   try {
-    stats = statSync(lockPath);
-  } catch {
-    return { exists: false, readable: false, mtimeMs: 0, raw: null, owner: null };
-  }
-
-  try {
-    const raw = readFileSync(lockPath, 'utf8');
-    return { exists: true, readable: true, mtimeMs: stats.mtimeMs, raw, owner: parseLockOwner(raw) };
-  } catch {
-    // An existing owner that cannot be read cannot be authenticated or safely reclaimed. Keep it
-    // distinct from ENOENT so callers enter the bounded wait/timeout path instead of spinning.
-    return { exists: true, readable: false, mtimeMs: stats.mtimeMs, raw: null, owner: null };
+    fd = openSync(lockPath, 'r');
+    const stats = fstatSync(fd);
+    const raw = readFileSync(fd, 'utf8');
+    return { exists: true, readable: true, raw, owner: parseLockOwner(raw), dev: stats.dev, ino: stats.ino };
+  } catch (error) {
+    // Permission/probe failures and malformed records are not an absent owner.
+    return { exists: error?.code !== 'ENOENT', readable: false, raw: null, owner: null };
+  } finally {
+    if (fd !== null) closeSync(fd);
   }
 }
 
@@ -71,310 +65,213 @@ function isRunningPid(pid) {
   }
 }
 
-function shouldReclaimLockSnapshot(snapshot, staleAfterMs, nowMs, options = {}) {
+function fingerprintKind(value) {
+  if (typeof value !== 'string') return null;
+  if (/^linux-proc:(?:0|[1-9]\d*)$/.test(value)) return 'linux-proc';
+  if (/^win32-cim:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value)) return 'win32-cim';
+  const ps = /^(aix|darwin|freebsd|linux|openbsd|sunos)-ps:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}$/.exec(value);
+  return ps ? `${ps[1]}-ps` : null;
+}
+
+function shouldReclaimLockSnapshot(snapshot, options = {}) {
   if (!snapshot.exists) return true;
-  if (!snapshot.readable) return false;
-  const ownerPid = Number(snapshot.owner?.pid);
-  if (Number.isFinite(ownerPid) && ownerPid > 0) {
-    const isRunningPidImpl = options.isRunningPidImpl ?? isRunningPid;
-    if (!isRunningPidImpl(ownerPid)) return true;
-    const expectedFingerprint = String(snapshot.owner?.processInstanceFingerprint ?? '').trim();
-    if (!expectedFingerprint) return false;
-    const readFingerprint = options.readProcessInstanceFingerprintImpl ?? readProcessInstanceFingerprintSync;
-    const observedFingerprint = readFingerprint(ownerPid);
-    return Boolean(observedFingerprint)
-      && !processInstanceFingerprintMatches(expectedFingerprint, observedFingerprint);
+  if (!snapshot.readable || !snapshot.owner) return false;
+  if (!Number.isFinite(snapshot.owner.createdAtMs) || snapshot.owner.createdAtMs <= 0) return false;
+  const ownerPid = snapshot.owner.pid;
+  if (!Number.isInteger(ownerPid) || ownerPid <= 1) return false;
+  try {
+    const running = (options.isRunningPidImpl ?? isRunningPid)(ownerPid);
+    if (running === false) return true;
+    if (running !== true) return false;
+    const expected = snapshot.owner.processInstanceFingerprint;
+    const observed = (options.readProcessInstanceFingerprintImpl ?? readProcessInstanceFingerprintSync)(ownerPid);
+    const kind = fingerprintKind(expected);
+    // A fallback from proc to ps changes representation, not necessarily the process instance.
+    return kind !== null && kind === fingerprintKind(observed)
+      && !processInstanceFingerprintMatches(expected, observed);
+  } catch {
+    return false;
   }
-  const updatedAtMs = Number(
-    snapshot.owner?.updatedAtMs
-      ?? snapshot.owner?.createdAtMs
-      ?? snapshot.mtimeMs
-      ?? 0,
-  );
-  return updatedAtMs > 0 && nowMs - updatedAtMs > staleAfterMs;
 }
 
 export function isWorkspaceBundleLockActive(lockPath, options = {}) {
   const snapshot = readLockOwnerSnapshot(lockPath);
-  return snapshot.exists && !shouldReclaimLockSnapshot(
-    snapshot,
-    options.staleAfterMs ?? 240_000,
-    options.nowMs ?? Date.now(),
-    options,
-  );
+  return snapshot.exists && !shouldReclaimLockSnapshot(snapshot, options);
 }
 
-function reclaimLockSnapshot(lockPath, expectedRaw) {
-  if (expectedRaw == null) return true;
-  const reclaimPath = `${lockPath}.reclaim-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  try {
-    renameSync(lockPath, reclaimPath);
-  } catch (error) {
-    if (error?.code === 'ENOENT') return true;
-    return false;
-  }
+function sameSnapshot(a, b) {
+  return a.exists && b.exists && a.readable && b.readable
+    && a.dev === b.dev && a.ino === b.ino && a.raw === b.raw;
+}
 
-  let movedRaw = null;
-  try {
-    movedRaw = readFileSync(reclaimPath, 'utf8');
-  } catch {
-    return false;
-  }
+function removeOwnedSnapshot(lockPath, expected) {
+  if (sameSnapshot(readLockOwnerSnapshot(lockPath), expected)) unlinkSync(lockPath);
+}
 
-  if (movedRaw === expectedRaw) {
+// Publish only complete records, using the same private-file/exclusive-link pattern as the
+// first-party mutation owner. No contender can observe a newly published empty record.
+function tryPublishOwner(lockPath, raw) {
+  const privatePath = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
+  let fd = null;
+  let created = false;
+  try {
+    fd = openSync(privatePath, 'wx');
+    created = true;
+    writeFileSync(fd, raw, 'utf8');
+    const stats = fstatSync(fd);
     try {
-      unlinkSync(reclaimPath);
-    } catch {}
-    return true;
+      linkSync(privatePath, lockPath);
+      return { exists: true, readable: true, raw, owner: parseLockOwner(raw), dev: stats.dev, ino: stats.ino };
+    } catch (error) {
+      if (error?.code === 'EEXIST') return null;
+      throw error;
+    }
+  } finally {
+    if (fd !== null) closeSync(fd);
+    if (created) {
+      try { unlinkSync(privatePath); } catch (error) {
+        if (error?.code !== 'ENOENT') console.warn('Failed to remove private workspace lock record', error);
+      }
+    }
   }
-
-  try {
-    writeFileSync(lockPath, movedRaw, { encoding: 'utf8', flag: 'wx' });
-    unlinkSync(reclaimPath);
-  } catch {
-    // A successor owns the canonical path. Preserve the quarantined snapshot for diagnostics.
-  }
-  return false;
 }
 
-function serializeLockOwner({ createdAtMs, updatedAtMs, ownerToken, processInstanceFingerprint }) {
-  return JSON.stringify({
-    pid: process.pid,
-    createdAtMs,
-    updatedAtMs,
-    token: ownerToken,
-    processInstanceFingerprint,
-  });
+function serializeLockOwner(ownerToken, fingerprint) {
+  const now = Date.now();
+  return JSON.stringify({ pid: process.pid, createdAtMs: now, updatedAtMs: now, token: ownerToken, processInstanceFingerprint: fingerprint });
 }
 
 function callerHoldsWorkspaceBundleLock(lockPath, heldLockValue) {
+  if (!heldLockValue) return false;
   const snapshot = readLockOwnerSnapshot(lockPath);
-  return snapshot.exists && workspaceLockLeaseMatchesOwner({
-    lockPath,
-    leaseValue: heldLockValue,
-    owner: snapshot.owner,
-  });
+  return snapshot.exists && workspaceLockLeaseMatchesOwner({ lockPath, leaseValue: heldLockValue, owner: snapshot.owner });
 }
 
-function describeLockOwner(snapshot, nowMs) {
-  if (!snapshot.owner) return 'owner=unknown';
-  const ageMs = Math.max(
-    0,
-    nowMs - Number(snapshot.owner.updatedAtMs ?? snapshot.owner.createdAtMs ?? nowMs),
-  );
-  return `pid=${String(snapshot.owner.pid ?? 'unknown')} ageMs=${ageMs}`;
+// Every cooperating writer, including release, takes this short guard. An orphan guard is
+// deliberately never auto-reclaimed: age or an unreadable record cannot prove abandonment.
+function tryTransition(lockPath, operation) {
+  const guardPath = `${lockPath}.transition`;
+  const guard = tryPublishOwner(guardPath, serializeLockOwner(randomUUID(), null));
+  if (!guard) return { acquired: false };
+  try {
+    return { acquired: true, value: operation() };
+  } finally {
+    removeOwnedSnapshot(guardPath, guard);
+  }
+}
+
+function tryAcquire(lockPath, raw, options) {
+  const transition = tryTransition(lockPath, () => {
+    const before = readLockOwnerSnapshot(lockPath);
+    if (before.exists) {
+      if (!shouldReclaimLockSnapshot(before, options)) return null;
+      // Guard exclusion prevents another cooperating owner changing this path between check
+      // and removal. Identity/raw comparison also preserves an already replaced record.
+      const current = readLockOwnerSnapshot(lockPath);
+      if (!sameSnapshot(current, before)) return null;
+      unlinkSync(lockPath);
+    }
+    return tryPublishOwner(lockPath, raw);
+  });
+  return transition.acquired ? transition.value : null;
 }
 
 function createWorkspaceBundleLockTimeoutError({ errorLabel, lockPath, snapshot }) {
-  const error = new Error(
-    `Timed out waiting for ${errorLabel}: ${lockPath} (${describeLockOwner(snapshot, Date.now())})`,
-  );
+  const owner = snapshot.owner;
+  const detail = owner ? `pid=${String(owner.pid ?? 'unknown')} ageMs=${Math.max(0, Date.now() - Number(owner.updatedAtMs ?? owner.createdAtMs ?? Date.now()))}` : 'owner=unknown';
+  const error = new Error(`Timed out waiting for ${errorLabel}: ${lockPath} (${detail}; unknown records and transition guards require separate recovery)`);
   error.code = WORKSPACE_BUNDLE_LOCK_TIMEOUT_ERROR_CODE;
   return error;
 }
 
-function resolveHeldLockValue(options) {
-  return String(options.heldLockValue ?? options.heldLockPath ?? '').trim();
+function lockSettings(options) {
+  const lockPath = String(options.lockPath ?? '').trim();
+  if (!lockPath) throw new Error('Missing workspace bundle lock path');
+  return {
+    lockPath,
+    timeoutMs: options.timeoutMs ?? 240_000,
+    pollIntervalMs: options.pollIntervalMs ?? 250,
+    staleAfterMs: options.staleAfterMs ?? options.timeoutMs ?? 240_000,
+    heldLockValue: String(options.heldLockValue ?? options.heldLockPath ?? '').trim(),
+    errorLabel: options.errorLabel ?? 'workspace bundle lock',
+  };
 }
 
-function notifyWaiter(options, lockPath, snapshot, startedAt, staleAfterMs, timeoutMs) {
-  if (typeof options.onWait !== 'function') return;
+function checkWait(options, settings, startedAt) {
+  const snapshot = readLockOwnerSnapshot(settings.lockPath);
+  if (Date.now() - startedAt > settings.timeoutMs) throw createWorkspaceBundleLockTimeoutError({ ...settings, snapshot });
   try {
-    options.onWait({
-      lockPath,
-      owner: snapshot.owner,
-      staleAfterMs,
-      timeoutMs,
-      waitedMs: Date.now() - startedAt,
+    options.onWait?.({
+      lockPath: settings.lockPath, owner: snapshot.owner, staleAfterMs: settings.staleAfterMs,
+      timeoutMs: settings.timeoutMs, waitedMs: Date.now() - startedAt,
     });
   } catch {}
 }
 
-function cleanupFailedOwnerInitialization(lockPath, fd, initializationError) {
-  try {
-    if (fd !== null) closeSync(fd);
-  } catch {}
-
-  try {
-    unlinkSync(lockPath);
-  } catch (cleanupError) {
-    throw new AggregateError(
-      [initializationError, cleanupError],
-      `Failed to initialize and clean up workspace bundle lock: ${lockPath}`,
-    );
-  }
+function lockContext(settings, token, waited) {
+  return { waited, lockPath: settings.lockPath, heldLockValue: createWorkspaceLockLeaseValue({ lockPath: settings.lockPath, ownerToken: token }), inherited: false };
 }
 
 export async function withWorkspaceBundleLock(fn, options = {}) {
-  const lockPath = String(options.lockPath ?? '').trim();
-  if (!lockPath) throw new Error('Missing workspace bundle lock path');
-
-  const inheritedValue = resolveHeldLockValue(options);
-  if (callerHoldsWorkspaceBundleLock(lockPath, inheritedValue)) {
-    return await fn({
-      waited: false,
-      lockPath,
-      heldLockValue: inheritedValue,
-      inherited: true,
-    });
+  const settings = lockSettings(options);
+  if (callerHoldsWorkspaceBundleLock(settings.lockPath, settings.heldLockValue)) {
+    return await fn({ waited: false, lockPath: settings.lockPath, heldLockValue: settings.heldLockValue, inherited: true });
   }
-
-  mkdirSync(dirname(lockPath), { recursive: true });
-  const timeoutMs = options.timeoutMs ?? 240_000;
-  const pollIntervalMs = options.pollIntervalMs ?? 250;
-  const staleAfterMs = options.staleAfterMs ?? timeoutMs;
+  mkdirSync(dirname(settings.lockPath), { recursive: true });
   const startedAt = Date.now();
-  const ownerToken = randomUUID();
-  let createdAtMs = 0;
-  let ownLockRaw = null;
-  let fd = null;
-  let heartbeat = null;
+  const token = randomUUID();
+  let fingerprint = null;
+  try { fingerprint = (options.readProcessInstanceFingerprintImpl ?? readProcessInstanceFingerprintSync)(process.pid); } catch {}
+  const raw = serializeLockOwner(token, fingerprint);
+  let owned;
   let waited = false;
-  const readProcessInstanceFingerprintImpl = options.readProcessInstanceFingerprintImpl
-    ?? readProcessInstanceFingerprintSync;
-  const processInstanceFingerprint = readProcessInstanceFingerprintImpl(process.pid);
-
-  while (true) {
-    try {
-      createdAtMs = Date.now();
-      ownLockRaw = serializeLockOwner({
-        createdAtMs,
-        updatedAtMs: createdAtMs,
-        ownerToken,
-        processInstanceFingerprint,
-      });
-      fd = openSync(lockPath, 'wx');
-      try {
-        writeFileSync(fd, ownLockRaw, 'utf8');
-      } catch (initializationError) {
-        cleanupFailedOwnerInitialization(lockPath, fd, initializationError);
-        fd = null;
-        throw initializationError;
-      }
-      break;
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      ownLockRaw = null;
-      const snapshot = readLockOwnerSnapshot(lockPath);
-      if (shouldReclaimLockSnapshot(snapshot, staleAfterMs, Date.now(), options)) {
-        reclaimLockSnapshot(lockPath, snapshot.raw);
-        continue;
-      }
-      if (Date.now() - startedAt > timeoutMs) {
-        const errorLabel = options.errorLabel ?? 'workspace bundle lock';
-        throw createWorkspaceBundleLockTimeoutError({ errorLabel, lockPath, snapshot });
-      }
-      waited = true;
-      notifyWaiter(options, lockPath, snapshot, startedAt, staleAfterMs, timeoutMs);
-      await sleep(pollIntervalMs);
-    }
+  while (!(owned = tryAcquire(settings.lockPath, raw, options))) {
+    checkWait(options, settings, startedAt);
+    waited = true;
+    await sleep(settings.pollIntervalMs);
   }
-
   try {
-    if (staleAfterMs > 0) {
-      heartbeat = setInterval(() => {
-        try {
-          if (readLockOwnerSnapshot(lockPath).raw !== ownLockRaw) return;
-          ownLockRaw = serializeLockOwner({
-            createdAtMs,
-            updatedAtMs: Date.now(),
-            ownerToken,
-            processInstanceFingerprint,
-          });
-          writeFileSync(lockPath, ownLockRaw, 'utf8');
-        } catch {}
-      }, Math.max(250, Math.min(5_000, Math.floor(staleAfterMs / 4) || 250)));
-      heartbeat.unref();
-    }
-
-    return await fn({
-      waited,
-      lockPath,
-      heldLockValue: createWorkspaceLockLeaseValue({ lockPath, ownerToken }),
-      inherited: false,
-    });
+    return await fn(lockContext(settings, token, waited));
   } finally {
-    if (heartbeat) clearInterval(heartbeat);
+    // Like the previous finalizer, release failure does not replace the callback's outcome.
+    // Preserve the still-owned record and report incomplete cleanup instead.
     try {
-      if (fd !== null) closeSync(fd);
-    } catch {}
-    try {
-      if (readLockOwnerSnapshot(lockPath).raw === ownLockRaw) unlinkSync(lockPath);
-    } catch {}
+      const releaseStart = Date.now();
+      while (!tryTransition(settings.lockPath, () => removeOwnedSnapshot(settings.lockPath, owned)).acquired) {
+        checkWait(options, settings, releaseStart);
+        await sleep(settings.pollIntervalMs);
+      }
+    } catch (error) { console.warn('Failed to release workspace bundle lock', error); }
   }
 }
 
 export function withWorkspaceBundleLockSync(fn, options = {}) {
-  const lockPath = String(options.lockPath ?? '').trim();
-  if (!lockPath) throw new Error('Missing workspace bundle lock path');
-
-  const inheritedValue = resolveHeldLockValue(options);
-  if (callerHoldsWorkspaceBundleLock(lockPath, inheritedValue)) {
-    return fn({ waited: false, lockPath, heldLockValue: inheritedValue, inherited: true });
+  const settings = lockSettings(options);
+  if (callerHoldsWorkspaceBundleLock(settings.lockPath, settings.heldLockValue)) {
+    return fn({ waited: false, lockPath: settings.lockPath, heldLockValue: settings.heldLockValue, inherited: true });
   }
-
-  mkdirSync(dirname(lockPath), { recursive: true });
-  const timeoutMs = options.timeoutMs ?? 240_000;
-  const pollIntervalMs = options.pollIntervalMs ?? 250;
-  const staleAfterMs = options.staleAfterMs ?? timeoutMs;
+  mkdirSync(dirname(settings.lockPath), { recursive: true });
   const startedAt = Date.now();
-  const ownerToken = randomUUID();
-  const createdAtMs = Date.now();
-  let ownLockRaw = null;
-  let fd = null;
+  const token = randomUUID();
+  let fingerprint = null;
+  try { fingerprint = (options.readProcessInstanceFingerprintImpl ?? readProcessInstanceFingerprintSync)(process.pid); } catch {}
+  const raw = serializeLockOwner(token, fingerprint);
+  let owned;
   let waited = false;
-  const readProcessInstanceFingerprintImpl = options.readProcessInstanceFingerprintImpl
-    ?? readProcessInstanceFingerprintSync;
-  const processInstanceFingerprint = readProcessInstanceFingerprintImpl(process.pid);
-
-  while (true) {
-    try {
-      ownLockRaw = serializeLockOwner({
-        createdAtMs,
-        updatedAtMs: Date.now(),
-        ownerToken,
-        processInstanceFingerprint,
-      });
-      fd = openSync(lockPath, 'wx');
-      try {
-        writeFileSync(fd, ownLockRaw, 'utf8');
-      } catch (initializationError) {
-        cleanupFailedOwnerInitialization(lockPath, fd, initializationError);
-        fd = null;
-        throw initializationError;
-      }
-      break;
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      ownLockRaw = null;
-      const snapshot = readLockOwnerSnapshot(lockPath);
-      if (shouldReclaimLockSnapshot(snapshot, staleAfterMs, Date.now(), options)) {
-        reclaimLockSnapshot(lockPath, snapshot.raw);
-        continue;
-      }
-      if (Date.now() - startedAt > timeoutMs) {
-        const errorLabel = options.errorLabel ?? 'workspace bundle lock';
-        throw createWorkspaceBundleLockTimeoutError({ errorLabel, lockPath, snapshot });
-      }
-      waited = true;
-      notifyWaiter(options, lockPath, snapshot, startedAt, staleAfterMs, timeoutMs);
-      sleepSync(pollIntervalMs);
-    }
+  while (!(owned = tryAcquire(settings.lockPath, raw, options))) {
+    checkWait(options, settings, startedAt);
+    waited = true;
+    sleepSync(settings.pollIntervalMs);
   }
-
   try {
-    return fn({
-      waited,
-      lockPath,
-      heldLockValue: createWorkspaceLockLeaseValue({ lockPath, ownerToken }),
-      inherited: false,
-    });
+    return fn(lockContext(settings, token, waited));
   } finally {
     try {
-      if (fd !== null) closeSync(fd);
-    } catch {}
-    try {
-      if (readLockOwnerSnapshot(lockPath).raw === ownLockRaw) unlinkSync(lockPath);
-    } catch {}
+      const releaseStart = Date.now();
+      while (!tryTransition(settings.lockPath, () => removeOwnedSnapshot(settings.lockPath, owned)).acquired) {
+        checkWait(options, settings, releaseStart);
+        sleepSync(settings.pollIntervalMs);
+      }
+    } catch (error) { console.warn('Failed to release workspace bundle lock', error); }
   }
 }

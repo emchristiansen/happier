@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -6,6 +7,41 @@ import { EventEmitter } from 'node:events';
 import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
 
 import { repoRootDir } from '../paths';
+
+const j079Ui = vi.hoisted(() => ({ root: null as string | null, blocked: 0 }));
+vi.mock('../paths', async (original) => {
+  const actual = await original<typeof import('../paths')>();
+  return { ...actual, repoRootDir: () => j079Ui.root ?? actual.repoRootDir() };
+});
+vi.mock('node:http', async (original) => {
+  const actual = await original<typeof import('node:http')>();
+  return { ...actual, createServer: (...args: Parameters<typeof actual.createServer>) => {
+    if (j079Ui.root) { j079Ui.blocked++; throw new Error('J079 real HTTP forbidden'); }
+    return actual.createServer(...args);
+  } };
+});
+vi.mock('node:net', async (original) => {
+  const actual = await original<typeof import('node:net')>();
+  return { ...actual, createServer: (...args: Parameters<typeof actual.createServer>) => {
+    if (j079Ui.root) { j079Ui.blocked++; throw new Error('J079 real listen forbidden'); }
+    return actual.createServer(...args);
+  } };
+});
+
+vi.mock('node:fs', async (original) => {
+  const actual = await original<typeof import('node:fs')>();
+  return { ...actual, readFileSync: (...args: Parameters<typeof actual.readFileSync>) => {
+    if (j079Ui.root && /^\/proc\/\d+\/stat$/.test(String(args[0]))) return `1 (fixture) S ${Array(18).fill('0').join(' ')} 100`;
+    return actual.readFileSync(...args);
+  } };
+});
+vi.mock('node:child_process', async (original) => {
+  const actual = await original<typeof import('node:child_process')>();
+  return { ...actual, spawnSync: (...args: Parameters<typeof actual.spawnSync>) => {
+    if (j079Ui.root) { j079Ui.blocked++; throw new Error('J079 external probe forbidden'); }
+    return actual.spawnSync(...args);
+  } };
+});
 
 let lastSpawnArgs: string[] | null = null;
 let lastSpawnEnv: NodeJS.ProcessEnv | null = null;
@@ -458,37 +494,6 @@ describe('startUiWeb baseUrl resolution', () => {
         return error instanceof Error ? error.name : 'failed';
       }
     }, { timeout: 5_000, interval: 100 }).not.toBe('reachable');
-  });
-
-  it('reclaims an unreadable shared export lock before building', async () => {
-    vi.resetModules();
-    const { startUiWeb, resolveUiWebExportRootDir } = await import('./uiWeb');
-    const exportNamespace = buildUniqueUiWebExportNamespace('reclaim-lock');
-
-    const testDir = await mkdtemp(join(tmpdir(), 'happier-uiweb-'));
-    const lockPath = resolve(resolveUiWebExportRootDir({
-      HAPPIER_E2E_UI_WEB_EXPORT_NAMESPACE: exportNamespace,
-    }), 'build.lock');
-    await mkdir(dirname(lockPath), { recursive: true });
-    writeFileSync(lockPath, '', 'utf8');
-
-    const started = await startUiWeb({
-      testDir,
-      env: {
-        HAPPIER_E2E_UI_WEB_EXPORT_NAMESPACE: exportNamespace,
-        EXPO_PUBLIC_POSTHOG_KEY: `phc-lock-${Date.now()}`,
-      },
-    });
-
-    try {
-      expect(runLoggedCalls).toHaveLength(1);
-      expect(existsSync(lockPath)).toBe(false);
-    } finally {
-      await started.stop();
-      if (existsSync(lockPath)) {
-        unlinkSync(lockPath);
-      }
-    }
   });
 
   it('escapes sync tuning JSON before injecting it into exported html', async () => {
@@ -1532,4 +1537,65 @@ describe('startUiWeb baseUrl resolution', () => {
       }
     }
   }, 10_000);
+});
+
+describe('J079 export lock ownership', () => {
+  let root: string;
+  let restoreNativeBoundaries: (() => void) | undefined;
+  beforeEach(async () => {
+    // Also bind actual builtin exports: linked .mjs dependencies may be externalized by Vite.
+    const require = createRequire(import.meta.url);
+    const nativeFs: typeof import('node:fs') = require('node:fs');
+    const nativeCp: typeof import('node:child_process') = require('node:child_process');
+    const savedRead = nativeFs.readFileSync;
+    const savedSpawn = nativeCp.spawnSync;
+    nativeFs.readFileSync = ((...args: Parameters<typeof savedRead>) => {
+      if (/^\/proc\/\d+\/stat$/.test(String(args[0]))) return `1 (fixture) S ${Array(18).fill('0').join(' ')} 100`;
+      return savedRead(...args);
+    }) as typeof savedRead; // Genuine overloaded builtin boundary.
+    nativeCp.spawnSync = (() => { throw new Error('J079 external probe forbidden'); }) as typeof savedSpawn;
+    syncBuiltinESMExports();
+    expect(require('node:fs').readFileSync).toBe(nativeFs.readFileSync);
+    expect(require('node:child_process').spawnSync).toBe(nativeCp.spawnSync);
+    restoreNativeBoundaries = () => { nativeFs.readFileSync = savedRead; nativeCp.spawnSync = savedSpawn; syncBuiltinESMExports(); };
+
+    root = await mkdtemp(join(tmpdir(), 'j079-ui-')); j079Ui.root = root;
+    runLoggedCalls = []; runLoggedFailureQueue = []; spawnCallCount = 0;
+    vi.resetModules();
+    expect((await import('../paths')).repoRootDir()).toBe(root);
+    expect((await import('./spawnProcess')).runLoggedCommand.toString()).toContain('runLoggedCalls');
+    expect((await import('node:http')).createServer.toString()).toContain('J079 real HTTP forbidden');
+    expect((await import('node:net')).createServer.toString()).toContain('J079 real listen forbidden');
+    vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      expect(signal).toBe(0);
+      if (pid === process.pid) return true;
+      throw Object.assign(new Error('fixture absent'), { code: 'ESRCH' });
+    });
+    vi.stubGlobal('fetch', () => { j079Ui.blocked++; throw new Error('J079 fetch forbidden'); });
+    await mkdir(join(root, 'apps', 'ui'), { recursive: true });
+  });
+  afterEach(async () => {
+    expect(j079Ui.blocked).toBe(0); j079Ui.root = null;
+    restoreNativeBoundaries?.();
+    vi.restoreAllMocks(); vi.unstubAllGlobals(); await rm(root, { recursive: true, force: true });
+  });
+  async function callExport(lockBytes: string) {
+    const { startUiWebExport, resolveUiWebExportRootDir } = await import('./uiWebExport');
+    const env = { HAPPIER_E2E_UI_WEB_EXPORT_LOCK_TIMEOUT_MS: '15', RCT_METRO_PORT: '19001' };
+    const lockPath = join(resolveUiWebExportRootDir(env), 'build.lock');
+    await mkdir(dirname(lockPath), { recursive: true }); await writeFile(lockPath, lockBytes);
+    runLoggedFailureQueue.push('J079 fake export reached');
+    return { lockPath, pending: startUiWebExport({ testDir: root, env }) };
+  }
+  it('preserves empty legacy lock before exporter', async () => {
+    const { lockPath, pending } = await callExport('');
+    await expect(pending).rejects.toThrow(/Timed out/);
+    expect(runLoggedCalls).toHaveLength(0);
+    await expect((await import('node:fs/promises')).readFile(lockPath, 'utf8')).resolves.toBe('');
+  });
+  it('recovers a positively absent owner and releases after exporter failure', async () => {
+    const { lockPath, pending } = await callExport(JSON.stringify({ pid: 999999999, token: 'dead', createdAtMs: 1 }));
+    await expect(pending).rejects.toThrow('J079 fake export reached');
+    expect(runLoggedCalls).toHaveLength(1); expect(existsSync(lockPath)).toBe(false);
+  });
 });
