@@ -42,8 +42,8 @@ function resolveDaemonCliSnapshotDir(params: { testDir: string; env: NodeJS.Proc
     return resolve(repoRootDir(), '.project', 'tmp', 'cli-source-snapshot');
   }
 
-  // Default to a shared snapshot to avoid paying the node_modules snapshot cost per test (which can
-  // otherwise consume most of the core slow E2E timeout budget).
+  // This shared name is a preparation namespace. The resolver returns a detached private
+  // generation retained for the consumer lifetime; later preparation does not refresh its path.
   return resolve(repoRootDir(), '.project', 'tmp', 'cli-dist-snapshot');
 }
 
@@ -53,9 +53,8 @@ function resolveDaemonSnapshotNodeModulesMode(env: NodeJS.ProcessEnv): 'symlink'
     return raw;
   }
 
-  // Source-entrypoint daemon runs resolve from the snapshot root with tsx. Keep snapshot node_modules
-  // immutable by default so concurrent package-tree churn in the repo root cannot invalidate in-flight
-  // daemon startup imports.
+  // Select copied staging dependencies for source-entrypoint preparation. The snapshot owner
+  // detaches all generated runtime inputs before returning the consumer generation.
   if (shouldUseCliSourceEntrypoint(env)) {
     return 'copy';
   }

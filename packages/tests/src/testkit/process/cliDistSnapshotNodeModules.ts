@@ -1,5 +1,6 @@
 import { Dirent, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
+import { cp, mkdir, mkdtemp, rm } from 'node:fs/promises';
 
 type CopyMissingEntryOptions = {
   mergeExistingDirectoryContents?: boolean;
@@ -601,5 +602,68 @@ export function ensureCliDistSnapshotNodeModules(params: {
 
   if (existsSync(cliNodeModulesDir) && existsSync(rootNodeModulesDir) && cliNodeModulesDir !== rootNodeModulesDir) {
     ensureRootNodeModulesFallback(params.snapshotDistDir, params.rootDir);
+  }
+}
+
+/**
+ * Return a detached, retained CLI generation. Only unpublished allocations may be cleaned here;
+ * the containing test/session root owns the lifetime of every successfully returned directory.
+ */
+export async function createRetainedCliSnapshot(params: {
+  snapshotDir: string;
+  prepare: (privatePayloadDir: string) => Promise<void> | void;
+}): Promise<string> {
+  const namespace = resolve(params.snapshotDir);
+  const parent = dirname(namespace);
+  await mkdir(parent, { recursive: true });
+  const allocate = async (kind: string) => {
+    const path = await mkdtemp(resolve(parent, `${basename(namespace)}-${kind}-`));
+    const identity = lstatSync(path);
+    return { path, identity };
+  };
+  type Allocation = Awaited<ReturnType<typeof allocate>>;
+  const isOwned = (allocation: Allocation): boolean => {
+    const current = lstatSync(allocation.path);
+    return current.isDirectory() && !current.isSymbolicLink()
+      && current.dev === allocation.identity.dev && current.ino === allocation.identity.ino;
+  };
+  const requireOwned = (allocation: Allocation) => {
+    if (!isOwned(allocation)) throw new Error(`CLI snapshot allocation replaced before return: ${allocation.path}`);
+  };
+  const removeUnpublished = async (allocation: Allocation) => {
+    try {
+      if (!isOwned(allocation)) {
+        console.warn('Retaining replaced unpublished CLI snapshot allocation', allocation.path);
+        return;
+      }
+      await rm(allocation.path, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn('Could not clean unpublished CLI snapshot allocation', allocation.path, error);
+      }
+    }
+  };
+  const staging = await allocate('staging');
+  let generation: Allocation | undefined;
+  let returned = false;
+  try {
+    // The outer staging identity stays ours when an existing payload installer replaces payload/.
+    const payload = resolve(staging.path, 'payload');
+    await params.prepare(payload);
+    requireOwned(staging);
+    generation = await allocate('generation');
+    requireOwned(generation);
+    // Hydration may deliberately select live workspace links. Detach their contents before
+    // exposing a consumer path; a required copy error must never publish a partially live tree.
+    await cp(payload, generation.path, {
+      recursive: true, dereference: true, preserveTimestamps: true, force: true,
+    });
+    requireOwned(staging);
+    requireOwned(generation);
+    returned = true;
+    return generation.path;
+  } finally {
+    if (generation && !returned) await removeUnpublished(generation);
+    await removeUnpublished(staging);
   }
 }

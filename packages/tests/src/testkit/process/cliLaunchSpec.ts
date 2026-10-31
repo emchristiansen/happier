@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 
 import { repoRootDir } from '../paths';
 import { ensureCliDistSnapshotEntrypoint, ensureCliSharedDepsBuilt } from './cliDist';
-import { ensureCliDistSnapshotNodeModules } from './cliDistSnapshotNodeModules';
+import { createRetainedCliSnapshot, ensureCliDistSnapshotNodeModules } from './cliDistSnapshotNodeModules';
 import { resolveTsxImportHookSpecifier } from './tsxImportHook';
 
 export type CliTestLaunchSpec = Readonly<{
@@ -140,17 +140,21 @@ async function resolveCliSourceLaunchSpec(
       buildTimeoutMs: options.buildTimeoutMs,
     });
   }
-  const snapshotDir = options.snapshotDir;
-  ensureCliSourceSnapshot(snapshotDir, rootDir, params.env);
-  const sourceEntrypoint = resolveCliSnapshotSourceEntrypoint(snapshotDir);
-  if (!existsSync(sourceEntrypoint)) {
-    throw new Error(`CLI source entrypoint missing for test launch: ${sourceEntrypoint}`);
-  }
-
   const tsxHookSpecifier = resolveTsxImportHookSpecifier();
   if (!tsxHookSpecifier) {
     throw new Error('tsx import hook is required for CLI source entrypoint mode but could not be resolved');
   }
+
+  const snapshotDir = await createRetainedCliSnapshot({
+    snapshotDir: options.snapshotDir,
+    prepare: (privateDir) => {
+      ensureCliSourceSnapshot(privateDir, rootDir, params.env);
+      const source = resolveCliSnapshotSourceEntrypoint(privateDir);
+      if (!existsSync(source)) throw new Error(`CLI source entrypoint missing for test launch: ${source}`);
+    },
+  });
+  const sourceEntrypoint = resolveCliSnapshotSourceEntrypoint(snapshotDir);
+
 
   return {
     command: process.execPath,

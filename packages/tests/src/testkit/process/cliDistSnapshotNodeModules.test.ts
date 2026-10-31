@@ -1,8 +1,9 @@
+import { afterAll as j078AfterAll, beforeEach as j078BeforeEach } from 'vitest';
 import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ensureCliDistSnapshotNodeModules, ensureCliPackSnapshotRuntimeDependencies } from './cliDistSnapshotNodeModules';
 
@@ -31,7 +32,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     }
   });
 
-  it('copies the bundled @happier-dev scope into the snapshot instead of aliasing the live tree', () => {
+  it('J078 copies the bundled @happier-dev scope into the snapshot instead of aliasing the live tree', () => {
     const rootDir = createRepoRoot();
     const snapshotDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-out-'));
     createdDirs.push(snapshotDir);
@@ -52,7 +53,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     expect(readFileSync(snapshotFile, 'utf8')).toContain('initial');
   });
 
-  it('copies direct CLI dependencies into the snapshot so built dist can resolve them', () => {
+  it('J078 copies direct CLI dependencies into the snapshot so built dist can resolve them', () => {
     const rootDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-direct-deps-'));
     createdDirs.push(rootDir);
     mkdirSync(join(rootDir, 'apps', 'cli', 'node_modules', 'zod'), { recursive: true });
@@ -1018,5 +1019,126 @@ describe('ensureCliDistSnapshotNodeModules', () => {
 
     expect(existsSync(join(snapshotDir, 'node_modules', 'dep-a', 'node_modules', 'dep-b', 'index.js'))).toBe(true);
     expect(existsSync(join(snapshotDir, 'node_modules', 'dep-c', 'node_modules', 'dep-d', 'index.js'))).toBe(false);
+  });
+});
+
+
+// J078: install genuine system boundaries before the real owners load. Fixture cp remains real.
+const j078Boundary = await vi.hoisted(async () => {
+  const { createRequire, syncBuiltinESMExports } = await import('node:module');
+  const req = createRequire(`${process.cwd()}/package.json`);
+  const fs = req('node:fs');
+  const promises = req('node:fs/promises');
+  const cp = req('node:child_process');
+  const http = req('node:http');
+  const https = req('node:https');
+  const net = req('node:net');
+  const original = { read: fs.readFileSync, cpSync: fs.cpSync, cp: promises.cp, kill: process.kill, fetch: globalThis.fetch,
+    child: Object.fromEntries(['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'].map((key) => [key, cp[key]])),
+    httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
+  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
+  const refuse = (name: string) => (..._args: unknown[]) => { state.attempts.push(name); throw new Error(`J078 forbidden external boundary: ${name}`); };
+  for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => state.active ? refuse(key)(...args) : original.child[key](...args);
+  http.request = (...args: unknown[]) => state.active ? refuse('http')(...args) : original.httpRequest(...args);
+  https.request = (...args: unknown[]) => state.active ? refuse('https')(...args) : original.httpsRequest(...args);
+  http.createServer = (...args: unknown[]) => state.active ? refuse('server')(...args) : original.httpServer(...args);
+  net.createServer = (...args: unknown[]) => state.active ? refuse('net')(...args) : original.netServer(...args);
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => state.active ? refuse('fetch')(...args) : original.fetch(...args)) as typeof fetch;
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (!state.active) return original.kill(pid, signal);
+    if (signal !== 0) return refuse('signal')(pid, signal);
+    return true; // Fixture liveness only; never send signal 0.
+  }) as typeof process.kill;
+  fs.readFileSync = (...args: unknown[]) => state.active && typeof args[0] === 'string' && /^\/proc\/\d+\/stat$/.test(args[0])
+    ? `1 (fixture) S ${Array(18).fill('0').join(' ')} 100` : original.read(...args);
+  const allowed = (path: unknown) => {
+    const root = process.env.TMPDIR;
+    if (!root || typeof path !== 'string' || !(path === root || path.startsWith(`${root}/`))) {
+      throw new Error(`J078 fixture copy outside owned TMPDIR: ${String(path)}`);
+    }
+  };
+  fs.cpSync = (...args: unknown[]) => { if (state.active) { allowed(args[0]); allowed(args[1]); } return original.cpSync(...args); };
+  promises.cp = async (src: string, dest: string, ...args: unknown[]) => {
+    if (state.active) { allowed(src); allowed(dest); }
+    const run = () => original.cp(src, dest, ...args) as Promise<void>;
+    return state.active && state.onCopy ? state.onCopy(src, dest, run) : run();
+  };
+  syncBuiltinESMExports();
+  if ((await import('node:child_process')).spawnSync !== cp.spawnSync
+    || (await import('node:fs')).readFileSync !== fs.readFileSync
+    || (await import('node:fs/promises')).cp !== promises.cp) throw new Error('J078 actual builtin binding mismatch');
+  return { state, restore: () => {
+    fs.readFileSync = original.read; fs.cpSync = original.cpSync; promises.cp = original.cp;
+    for (const key of Object.keys(original.child)) cp[key] = original.child[key];
+    http.request = original.httpRequest; https.request = original.httpsRequest;
+    http.createServer = original.httpServer; net.createServer = original.netServer;
+    process.kill = original.kill; globalThis.fetch = original.fetch; syncBuiltinESMExports();
+  } };
+});
+// Unselected legacy cases retain their own existing boundaries and assertions.
+j078BeforeEach(() => { j078Boundary.state.active = Boolean(expect.getState().currentTestName?.includes('J078')); });
+j078AfterAll(() => {
+  try { expect(j078Boundary.state.attempts).toEqual([]); }
+  finally { j078Boundary.restore(); }
+});
+
+describe('J078 detached lazy runtime closure', () => {
+  const roots: string[] = [];
+  afterEach(() => { j078Boundary.state.onCopy = null; for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+  async function launchFixture(mode: 'copy' | 'symlink' = 'copy') {
+    const root = createRepoRoot(); roots.push(root);
+    mkdirSync(resolve(root, 'apps', 'cli', 'src'), { recursive: true });
+    mkdirSync(resolve(root, 'apps', 'cli', 'tools'), { recursive: true });
+    writeFileSync(resolve(root, 'apps', 'cli', 'src', 'index.ts'), 'export {};');
+    writeFileSync(resolve(root, 'apps', 'cli', 'package.json'), '{"name":"@happier-dev/cli"}');
+    writeFileSync(resolve(root, 'apps', 'cli', 'tsconfig.json'), '{}');
+    const { resolveCliTestLaunchSpec } = await import('./cliLaunchSpec');
+    const launch = () => resolveCliTestLaunchSpec({ testDir: root, env: {
+      HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1', HAPPIER_E2E_PROVIDER_SKIP_CLI_SHARED_DEPS_BUILD: '1',
+      HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE: mode,
+    } }, { repoRoot: root, snapshotDir: resolve(root, 'cli-source-snapshot') });
+    return { root, launch };
+  }
+  it.each(['copy', 'symlink'] as const)('J078 retains lazy runtime files selected in %s mode', async (mode) => {
+    const f = await launchFixture(mode); const spec = await f.launch();
+    const lazy = resolve(spec.cwd!, 'node_modules', '@happier-dev', 'protocol', 'node_modules', '@noble', 'hashes', 'hmac.js');
+    const before = readFileSync(lazy, 'utf8');
+    rmSync(resolve(f.root, 'apps', 'cli', 'node_modules'), { recursive: true });
+    expect(readFileSync(lazy, 'utf8')).toBe(before);
+    expect(lstatSync(resolve(spec.cwd!, 'src')).isSymbolicLink()).toBe(false);
+  });
+  it('J078 refuses required dangling scaffolding instead of publishing a live link', async () => {
+    const f = await launchFixture();
+    symlinkSync(resolve(f.root, 'not-present'), resolve(f.root, 'apps', 'cli', 'tools', 'dangling'));
+    await expect(f.launch()).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+  it('J078 refuses cyclic runtime links instead of publishing a partial generation', async () => {
+    const f = await launchFixture('symlink');
+    symlinkSync('cycle', resolve(f.root, 'apps', 'cli', 'node_modules', 'cycle'));
+    await expect(f.launch()).rejects.toThrow();
+  });
+  it('J078 refuses a replaced final allocation even after copy succeeds', async () => {
+    const f = await launchFixture(); let replacement = '';
+    j078Boundary.state.onCopy = async (_src, dest, run) => {
+      await run(); replacement = dest;
+      const fs = await import('node:fs');
+      fs.renameSync(dest, `${dest}-original`); fs.mkdirSync(dest);
+      fs.writeFileSync(resolve(dest, 'replacement'), 'unrelated fixture owner');
+    };
+    await expect(f.launch()).rejects.toThrow('allocation replaced before return');
+    expect(readFileSync(resolve(replacement, 'replacement'), 'utf8')).toBe('unrelated fixture owner');
+  });
+  it('J078 preserves a replacement final allocation when materialization fails', async () => {
+    const f = await launchFixture(); let replacement = '';
+    j078Boundary.state.onCopy = async (_src, dest, _run) => {
+      if (!dest.includes('-generation-')) throw new Error('fixture expected final generation');
+      replacement = dest;
+      const fs = await import('node:fs');
+      fs.renameSync(dest, `${dest}-original`); fs.mkdirSync(dest);
+      fs.writeFileSync(resolve(dest, 'replacement'), 'unrelated fixture owner');
+      throw new Error('fixture materialization rejected');
+    };
+    await expect(f.launch()).rejects.toThrow('fixture materialization rejected');
+    expect(readFileSync(resolve(replacement, 'replacement'), 'utf8')).toBe('unrelated fixture owner');
   });
 });
