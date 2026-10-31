@@ -182,33 +182,39 @@ jobs:
 
           resolve_tag_commit() {
             tag="$1"
-            read -r object_type object_sha <<EOF
-          $(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq '.object.type + " " + .object.sha')
-          EOF
+            tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq '.object.type + " " + .object.sha')" || return 1
+            read -r object_type object_sha <<< "$tag_object" || return 1
             while [ "$object_type" = "tag" ]; do
-              read -r object_type object_sha <<EOF
-          $(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.type + " " + .object.sha')
-          EOF
+              tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.type + " " + .object.sha')" || return 1
+              read -r object_type object_sha <<< "$tag_object" || return 1
             done
-            test "$object_type" = "commit"
+            test "$object_type" = "commit" && test -n "$object_sha" || return 1
             printf '%s\n' "$object_sha"
           }
 
           all_current=true
-          for tag in server-dev stack-dev cli-dev ui-web-dev; do
+          for tag in server-dev stack-dev cli-dev ui-web-dev ui-mobile-dev ui-desktop-dev; do
             if ! actual="$(resolve_tag_commit "$tag")"; then
               echo "::warning::Could not resolve ${tag}; the certified candidate will repair it."
               all_current=false
               continue
             fi
-            if [ "$actual" = "$SOURCE_SHA" ]; then
+            if [ "$actual" != "$SOURCE_SHA" ]; then
+              all_current=false
+              promotion_status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${actual}...${SOURCE_SHA}" --jq .status)"
+              if [ "$promotion_status" != "ahead" ]; then
+                echo "Refusing to move ${tag} from ${actual} to non-forward candidate ${SOURCE_SHA} (${promotion_status})." >&2
+                exit 1
+              fi
+            fi
+            if ! release_target="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.target_commitish')"; then
+              echo "::warning::Could not read ${tag} Release metadata; publication is not established."
+              all_current=false
               continue
             fi
-            all_current=false
-            promotion_status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${actual}...${SOURCE_SHA}" --jq .status)"
-            if [ "$promotion_status" != "ahead" ]; then
-              echo "Refusing to move ${tag} from ${actual} to non-forward candidate ${SOURCE_SHA} (${promotion_status})." >&2
-              exit 1
+            if [ "$release_target" != "$SOURCE_SHA" ]; then
+              echo "::warning::${tag} Release target does not match the certified candidate; publication is needed."
+              all_current=false
             fi
           done
 
