@@ -199,6 +199,7 @@ describe('switchSessionConnectedServiceAuth', () => {
   it.each(['before_lock', 'during_profile_read'] as const)(
     'refuses a changed quota source %s before committing bindings or requesting a restart', async (schedule) => {
       const tracked = trackedSession({
+        spawnOptionsCustody: 'accepted_live_launch',
         vendorResumeId: 'same-native', processInstanceFingerprint: 'fixture-instance', publisherIncarnationId: 'fixture-publisher',
       });
       let turnInFlight = false;
@@ -222,17 +223,19 @@ describe('switchSessionConnectedServiceAuth', () => {
             groupId: null, resetsAtMs: null, planType: null, rateLimits: null, source: 'structured_provider_error' },
         } satisfies RuntimeAuthRecoveryIntent],
       });
+      expect(() => guard.assertCurrent()).not.toThrow();
       if (schedule === 'before_lock') turnInFlight = true;
       const before = structuredClone(tracked.spawnOptions);
       const restartSession = vi.fn();
       const persistSessionBindings = vi.fn();
+      const listConnectedServiceProfiles = vi.fn(async () => {
+        turnInFlight = true;
+        return { serviceId: 'anthropic' as const, profiles: [{ profileId: 'new-profile', status: 'connected' as const }] };
+      });
       await expect(switchSessionConnectedServiceAuth(Object.assign({
         core: createCore(), getChildren: () => [tracked],
         postSwitchVerificationMode: { kind: 'disabled_for_test_only' as const, reason: 'negative guard fixture; no provider operation permitted' },
-        api: { listConnectedServiceProfiles: async () => {
-          turnInFlight = true;
-          return { serviceId: 'anthropic' as const, profiles: [{ profileId: 'new-profile', status: 'connected' as const }] };
-        }, getConnectedServiceAuthGroup: async () => null },
+        api: { listConnectedServiceProfiles, getConnectedServiceAuthGroup: async () => null },
         resolveContinuity: async () => ({ mode: 'restart_rematerialize' as const }),
         restartSession, persistSessionBindings, hotApply: async () => ({ ok: true as const }),
         registerHotApplyTargets: () => {}, emitSessionEvent: () => {},
@@ -241,6 +244,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       expect(tracked.spawnOptions).toEqual(before);
       expect(persistSessionBindings).not.toHaveBeenCalled();
       expect(restartSession).not.toHaveBeenCalled();
+      expect(listConnectedServiceProfiles).toHaveBeenCalledTimes(schedule === 'during_profile_read' ? 1 : 0);
     },
   );
 

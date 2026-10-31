@@ -6955,6 +6955,113 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
   });
 
+  it.each(['preflight', 'adapter_success', 'adapter_failure'] as const)('keeps explicit Stop authoritative while real automatic daemon boundary is held (%s)', async (boundary) => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const refreshBefore = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
+    process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = 'false';
+    const actualManager = await vi.importActual<typeof import('./processSupervision/sessionRunnerRespawn')>('./processSupervision/sessionRunnerRespawn');
+    let manager: import('./processSupervision/sessionRunnerRespawn').SessionRunnerRespawnManager | undefined;
+    let cycleOutcome: unknown;
+    let spawnOutcome: unknown;
+    let completeCycle!: () => void;
+    const cycleCompleted = new Promise<void>((resolve) => { completeCycle = resolve; });
+    const respawnModule = await import('./processSupervision/sessionRunnerRespawn');
+    const createManager = vi.mocked(respawnModule.createSessionRunnerRespawnManager);
+    const previousCreateManager = createManager.getMockImplementation();
+    createManager.mockImplementation((params) => {
+      manager = actualManager.createSessionRunnerRespawnManager({
+        ...params,
+        spawnSession: async (...args) => {
+          try { const result = await params.spawnSession(...args); spawnOutcome = result; return result; }
+          catch (error) { spawnOutcome = String(error); throw error; }
+        },
+        onRespawnSuccess: (event) => { cycleOutcome = event; params.onRespawnSuccess?.(event); completeCycle(); },
+        onRespawnTerminal: (event) => { cycleOutcome = event; params.onRespawnTerminal?.(event); completeCycle(); },
+      });
+      return manager;
+    });
+    const sessionId = 'sess_stop_during_automatic_preflight';
+    let enterArchive!: () => void;
+    const archiveEntered = new Promise<void>((resolve) => { enterArchive = resolve; });
+    let releaseArchive!: () => void;
+    const archiveReleased = new Promise<void>((resolve) => { releaseArchive = resolve; });
+    archiveHttp.read = async (id) => {
+      if (id === sessionId) { enterArchive(); await archiveReleased; }
+      return { status: 200, data: { session: createSessionRecordFixture({ id, archivedAt: null }) } };
+    };
+    const tmux = await import('@/integrations/tmux');
+    const launch = await import('@/utils/spawnHappyCLI');
+    vi.mocked(launch.buildHappyCliSubprocessLaunchSpec).mockImplementation((args) => ({
+      runtime: 'node', filePath: '/test/inert-happier', args: [...args],
+    }));
+    let enterAdapter!: () => void;
+    const adapterEntered = new Promise<void>((resolve) => { enterAdapter = resolve; });
+    let releaseAdapter!: () => void;
+    const adapterReleased = new Promise<void>((resolve) => { releaseAdapter = resolve; });
+    let owned = false;
+    if (boundary !== 'preflight') {
+      vi.mocked(tmux.isTmuxAvailable).mockResolvedValue(true);
+      vi.spyOn(tmux.TmuxUtilities.prototype, 'spawnInTmux').mockImplementation(async () => {
+        enterAdapter();
+        await adapterReleased;
+        if (boundary === 'adapter_failure') return { success: false, error: 'fixture launch rejected', launchDisposition: 'not_started', cleanupIncomplete: false };
+        return { success: true, pid: 12345, sessionId: 'fixture:window', sessionName: 'fixture' };
+      });
+      vi.mocked(waitForSessionWebhook).mockImplementationOnce((params) => completeReportedSession(params, sessionId));
+      sessionRegistryCapture.writeSessionMarker.mockImplementationOnce(async () => { owned = true; });
+      stopSessionMocks.stopSession.mockImplementationOnce(async () => {
+        expect(owned).toBe(boundary === 'adapter_success');
+        return { status: 'stopped' };
+      });
+    }
+    let run: Promise<void> | null = null;
+    try {
+      const registration = harness.waitForSpawnSessionRegistration();
+      run = daemonStartupOwner.startDaemon();
+      await registration;
+      if (!manager || !harness.getStopSession()) throw new Error('Expected real lifecycle registration');
+      const stop = harness.getStopSession()!;
+      const clearStop = vi.spyOn(manager, 'clearStopRequested');
+      manager.handleUnexpectedExit({ startedBy: 'daemon', happySessionId: sessionId, pid: 90001,
+        vendorResumeId: 'same-native', spawnOptions: { directory: tmpdir(), resume: 'same-native',
+          backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+          ...(boundary === 'preflight' ? {} : { terminal: { mode: 'tmux' as const } }) } },
+      { reason: 'process-exit', code: 1, signal: null }, { forceRestart: true, quotaRecoveryAttemptId: 'held-automatic' });
+      await archiveEntered;
+      if (boundary !== 'preflight') {
+        releaseArchive();
+        await Promise.race([adapterEntered, cycleCompleted.then(() => { throw new Error(`Automatic cycle ended before entering held adapter: ${JSON.stringify({ cycleOutcome, spawnOutcome })}`); })]);
+      }
+      const stopping = stop(sessionId);
+      if (boundary === 'preflight') {
+        // Stop must finish without waiting for a canceled network preflight.
+        await stopping;
+        releaseArchive();
+      } else {
+        await Promise.resolve();
+        expect(stopSessionMocks.stopSession).not.toHaveBeenCalled();
+        releaseAdapter();
+        await stopping;
+      }
+      await cycleCompleted;
+      expect(stopSessionMocks.stopSession).toHaveBeenCalledTimes(1);
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
+      expect(spawnChildProcess).not.toHaveBeenCalled();
+      expect(clearStop).not.toHaveBeenCalled();
+    } finally {
+      releaseArchive();
+      releaseAdapter();
+      vi.mocked(tmux.isTmuxAvailable).mockResolvedValue(false);
+      if (run) { harness.requestShutdown('happier-cli'); await run; }
+      vi.mocked(launch.buildHappyCliSubprocessLaunchSpec).mockReset();
+      createManager.mockReset();
+      if (previousCreateManager) createManager.mockImplementation(previousCreateManager);
+      if (refreshBefore === undefined) delete process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
+      else process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = refreshBefore;
+      await restoreDaemonExitBoundary(exitSpy);
+    }
+  });
+
   it('makes explicit Stop supersede every automatic recovery owner without letting cleanup failure block retirement', async () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     const refreshEnvOriginal = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;

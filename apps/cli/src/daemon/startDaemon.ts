@@ -3205,11 +3205,38 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         // Only the internal respawn resolver can mark an options object. No public
         // request field can bypass the ordinary persisted runtime snapshot.
         const quotaRespawnOptions = new WeakMap<SpawnSessionOptions, SpawnSessionOptions>();
+        // Stop cancels automatic preflight, then waits for any already-entered
+        // launch adapter to publish its owned runner before physical cleanup.
+        const automaticSpawnPreparations = new Map<string, Set<Promise<void>>>();
             // Spawn a new session (sessionId reserved for future Happy session resume; vendor resume uses options.resume).
                 const spawnSession = async (
                   options: SpawnSessionOptions,
                   acceptanceHooks?: SpawnSessionRunnerAcceptanceHooks,
+                  automaticRespawnSignal?: AbortSignal,
                 ): Promise<SpawnSessionResult> => {
+          const automaticSessionId = typeof options.existingSessionId === 'string' ? options.existingSessionId.trim() : '';
+          const assertAutomaticAdmission = () => automaticRespawnSignal?.throwIfAborted();
+          let finishAutomaticPreparation = () => {};
+          let preparationEntered = false;
+          const beginAutomaticPreparation = () => {
+            assertAutomaticAdmission();
+            if (!automaticRespawnSignal || preparationEntered) return;
+            if (!automaticSessionId) throw new Error('automatic_respawn_session_missing');
+            preparationEntered = true;
+            let complete!: () => void;
+            const preparation = new Promise<void>((resolve) => { complete = resolve; });
+            const pending = automaticSpawnPreparations.get(automaticSessionId) ?? new Set<Promise<void>>();
+            pending.add(preparation);
+            automaticSpawnPreparations.set(automaticSessionId, pending);
+            finishAutomaticPreparation = () => {
+              pending.delete(preparation);
+              if (pending.size === 0 && automaticSpawnPreparations.get(automaticSessionId) === pending) {
+                automaticSpawnPreparations.delete(automaticSessionId);
+              }
+              complete();
+            };
+          };
+          try {
           const quotaPreservedOptions = quotaRespawnOptions.get(options);
           quotaRespawnOptions.delete(options);
           if (quotaPreservedOptions && !isDeepStrictEqual(options, quotaPreservedOptions)) {
@@ -3234,7 +3261,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               return trackedResult;
             }
           }
-          const key = computeDaemonSpawnRequestKey(normalizedOptions);
+          const requestKey = computeDaemonSpawnRequestKey(normalizedOptions);
+          const key = automaticRespawnSignal
+            ? { ...requestKey, key: `automatic-respawn:${randomUUID()}` }
+            : requestKey;
           return await spawnRequestCoalescer.run(key, async () => {
             if (typeof normalizedOptions.accountSettingsVersionHint === 'number') {
               try {
@@ -3257,12 +3287,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               const inFlightStop = stopSessionInFlightBySessionId.get(normalizedExistingSessionId);
               let precedingStopResult: StopSessionResult | null = null;
               if (inFlightStop) {
+                if (automaticRespawnSignal) throw new Error('automatic_respawn_stop_in_flight');
                 precedingStopResult = await inFlightStop.operation;
               }
               // A new Resume attempt starts a new lifecycle generation. Never let a prior
               // completed Stop make a racing or subsequently failed stop look successful.
-              completedStopSessionIds.delete(normalizedExistingSessionId);
+              if (!automaticRespawnSignal) completedStopSessionIds.delete(normalizedExistingSessionId);
               if (unresolvedTerminalHostSessionIds.has(normalizedExistingSessionId)) {
+                if (automaticRespawnSignal) throw new Error('automatic_respawn_requires_explicit_terminal_repair');
                 const repairResult = precedingStopResult ?? await stopSession(normalizedExistingSessionId);
                 if (repairResult.status === 'stopped' || repairResult.status === 'not_found') {
                   unresolvedTerminalHostSessionIds.delete(normalizedExistingSessionId);
@@ -4252,6 +4284,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 };
               }
             }
+            assertAutomaticAdmission();
 
             const liveRunnerSnapshotFingerprints = resolveLiveRunnerSnapshotFingerprints(getCurrentChildren());
             const runtimeDecision = resolveHappyCliSubprocessRuntimeDecision({ liveRunnerSnapshotFingerprints });
@@ -4319,9 +4352,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   errorMessage: 'Accepted runner custody could not be persisted' });
                 throw error;
               }
-              // Explicit resume supersedes Stop for every host. A stopped session cannot reach
-              // this registration through automatic respawn, which the manager already suppresses.
-              if (normalizedExistingSessionId) {
+              // Only an explicit Resume supersedes Stop. Automatic launches that
+              // entered an adapter before cancellation remain owned for Stop to reap.
+              if (normalizedExistingSessionId && !automaticRespawnSignal) {
                 sessionRunnerRespawnManager.clearStopRequested(normalizedExistingSessionId);
               }
               if (connectedServiceAuth && effectiveConnectedServicesBindings) {
@@ -4348,6 +4381,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 spawnNonce: trackedSpawnOptions.spawnNonce,
                 result: acceptedResult,
               });
+              finishAutomaticPreparation();
               return { acceptedResult, webhookCompletion };
             };
 
@@ -4501,6 +4535,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 }
               }
 
+              beginAutomaticPreparation();
               const tmuxResult = await tmux.spawnInTmux(commandTokens, {
                 sessionName: resolvedTmuxSessionName,
                 windowName: windowName,
@@ -4796,6 +4831,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 });
                 let handle: TerminalHostHandle | null = null;
                 try {
+                  beginAutomaticPreparation();
                   const createdHandle = await adapter.createOrAttachHost({
                     sessionName: params.sessionName,
                     workingDirectory: resolvedDirectory,
@@ -4888,6 +4924,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     fallbackReason: params.fallbackReason,
                   });
                   const launchSpec = buildHappyCliSubprocessLaunchSpec(consoleArgs, runnerLaunchOptions);
+                  beginAutomaticPreparation();
                   const started = await startHappySessionInVisibleWindowsConsole({
                     filePath: launchSpec.filePath,
                     args: launchSpec.args,
@@ -4928,6 +4965,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 	                    title: windowsTerminalIdentity.title,
 	                  });
                   const launchSpec = buildHappyCliSubprocessLaunchSpec(windowsTerminalArgs, runnerLaunchOptions);
+                  beginAutomaticPreparation();
                   const started = await startHappySessionInWindowsTerminal({
                     filePath: launchSpec.filePath,
                     args: launchSpec.args,
@@ -4994,6 +5032,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               const cgroupSelfMigratingLaunchSpec = childLaunchPlan?.launchSpec ?? null;
               const childPlacementIntent: SessionLaunchPlacementIntent = childLaunchPlan?.placement
                 ?? { kind: 'unscoped', probe: { kind: 'unsupported-platform', platform: process.platform } };
+              beginAutomaticPreparation();
               const happyProcess = cgroupSelfMigratingLaunchSpec
                 ? spawnChildProcess(
                   cgroupSelfMigratingLaunchSpec.filePath,
@@ -5152,6 +5191,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   }
               }));
           });
+          } finally {
+            finishAutomaticPreparation();
+          }
                 };
 
         const temporaryThrottleResumeSnapshotsBySessionId = new Map<string, TrackedSession>();
@@ -5379,7 +5421,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           maxDelayMs: sessionRespawnMaxDelayMs,
           jitterMs: sessionRespawnJitterMs,
           isSessionAlreadyRunning,
-          spawnSession,
+          spawnSession: (options, signal) => spawnSession(options, undefined, signal),
           resolveRespawnOptions: async (input) => {
             const quotaRestart = guardedQuotaRecovery.restartForPid(input.previousPid);
             const options = await resolveRespawnSessionRuntimeSnapshot({
@@ -6228,6 +6270,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           const operation = Promise.resolve().then(async (): Promise<StopSessionResult> => {
             const stopStartedAtMs = Date.now();
             sessionRunnerRespawnManager.markStopRequested(normalizedSessionId, { reason: 'daemon_stop_session', requestedAtMs: Date.now() });
+            await Promise.all(automaticSpawnPreparations.get(normalizedSessionId) ?? []);
             if (intent.kind === 'explicit_stop') {
               await supersedeAutomaticRecoveryForExplicitStop(normalizedSessionId);
             }
