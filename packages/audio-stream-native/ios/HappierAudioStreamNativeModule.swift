@@ -16,6 +16,8 @@ private final class AudioStreamSession {
   private var engine: AVAudioEngine?
   private var accumulated = Data()
   private var reportedError = false
+  private var stopped = false
+  private var tapInstalled = false
 
   init(
     queue: DispatchQueue,
@@ -39,6 +41,7 @@ private final class AudioStreamSession {
     do {
       try startEngine(frameMs: frameMs)
     } catch {
+      stop(deactivateAudioSession: false)
       // Leave no active session behind a failed start: it would keep other apps' audio interrupted.
       try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
       throw error
@@ -59,6 +62,7 @@ private final class AudioStreamSession {
     try session.setActive(true, options: [])
 
     let engine = AVAudioEngine()
+    self.engine = engine
     let input = engine.inputNode
 
     // An input-node tap must use the hardware format (AVAudioEngine raises an exception otherwise), so
@@ -109,6 +113,7 @@ private final class AudioStreamSession {
 
       let bytes = Data(bytes: mData, count: byteSize)
       self.queue.async {
+        guard !self.stopped else { return }
         self.accumulated.append(bytes)
 
         while self.accumulated.count >= self.frameBytes {
@@ -124,18 +129,13 @@ private final class AudioStreamSession {
       }
     }
 
-    do {
-      try engine.start()
-    } catch {
-      input.removeTap(onBus: 0)
-      throw error
-    }
-    self.engine = engine
+    tapInstalled = true
+    try engine.start()
   }
 
   private func emitErrorOnce(code: String, message: String) {
     queue.async {
-      if self.reportedError { return }
+      if self.stopped || self.reportedError { return }
       self.reportedError = true
       self.emitError([
         "streamId": self.streamId,
@@ -145,17 +145,24 @@ private final class AudioStreamSession {
     }
   }
 
-  func stop() {
+  func stop(deactivateAudioSession: Bool = true) {
+    stopped = true
+    accumulated.removeAll(keepingCapacity: false)
     guard let engine else { return }
-    engine.inputNode.removeTap(onBus: 0)
+    if tapInstalled {
+      engine.inputNode.removeTap(onBus: 0)
+      tapInstalled = false
+    }
     engine.stop()
     self.engine = nil
-    self.accumulated.removeAll(keepingCapacity: false)
 
-    do {
-      try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-    } catch {
-      // best-effort
+    // Explicit stop keeps its existing shared-session behavior. Module teardown owns only this engine.
+    if deactivateAudioSession {
+      do {
+        try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+      } catch {
+        // Existing explicit-stop compatibility; this is not an exclusive shared-session capability.
+      }
     }
   }
 }
@@ -163,11 +170,45 @@ private final class AudioStreamSession {
 public final class HappierAudioStreamNativeModule: Module {
   private let queue = DispatchQueue(label: "dev.happier.audioStream", qos: .userInitiated)
   private var active: AudioStreamSession? = nil
+  private let queueIdentity = DispatchSpecificKey<Bool>()
+  private let admissionLock = NSLock()
+  private var closed = false
+
+  private func isOpen() -> Bool {
+    admissionLock.lock()
+    defer { admissionLock.unlock() }
+    return !closed
+  }
+
+  private func onQueue<T>(_ body: () throws -> T) rethrows -> T {
+    queue.setSpecific(key: queueIdentity, value: true)
+    if DispatchQueue.getSpecific(key: queueIdentity) == true { return try body() }
+    return try queue.sync(execute: body)
+  }
+
+  private func close() {
+    admissionLock.lock()
+    closed = true
+    admissionLock.unlock()
+    onQueue {
+      active?.stop(deactivateAudioSession: false)
+      active = nil
+    }
+  }
+
+  private func requireOpen() throws {
+    guard isOpen() else {
+      throw NSError(domain: "HappierAudioStreamNative", code: 4, userInfo: [NSLocalizedDescriptionKey: "audio_capture_closed"])
+    }
+  }
 
   public func definition() -> ModuleDefinition {
     Name("HappierAudioStreamNative")
 
     Events("audioFrame", "audioError")
+
+    OnDestroy { [weak self] in self?.close() }
+    OnAppContextDestroys { [weak self] in self?.close() }
 
     AsyncFunction("start") { (params: [String: Any]) -> [String: String] in
       let sampleRate = (params["sampleRate"] as? Double) ?? 16000
@@ -178,7 +219,8 @@ public final class HappierAudioStreamNativeModule: Module {
       if channels != 1 && channels != 2 { throw NSError(domain: "HappierAudioStreamNative", code: 2, userInfo: [NSLocalizedDescriptionKey: "channels must be 1 or 2"]) }
       if frameMs <= 0 { throw NSError(domain: "HappierAudioStreamNative", code: 3, userInfo: [NSLocalizedDescriptionKey: "frameMs must be > 0"]) }
 
-      return try self.queue.sync {
+      return try self.onQueue {
+        try self.requireOpen()
         self.active?.stop()
         self.active = nil
 
@@ -188,10 +230,12 @@ public final class HappierAudioStreamNativeModule: Module {
 
         let session = AudioStreamSession(
           queue: self.queue,
-          emitFrame: { event in
+          emitFrame: { [weak self] event in
+            guard let self, self.isOpen(), self.active?.streamId == streamId else { return }
             self.sendEvent("audioFrame", event)
           },
-          emitError: { event in
+          emitError: { [weak self] event in
+            guard let self, self.isOpen(), self.active?.streamId == streamId else { return }
             self.sendEvent("audioError", event)
           },
           streamId: streamId,
@@ -201,6 +245,10 @@ public final class HappierAudioStreamNativeModule: Module {
         )
 
         try session.start(frameMs: frameMs)
+        do { try self.requireOpen() } catch {
+          session.stop(deactivateAudioSession: false)
+          throw error
+        }
         self.active = session
         return ["streamId": streamId]
       }
@@ -210,7 +258,7 @@ public final class HappierAudioStreamNativeModule: Module {
       let streamId = (params["streamId"] as? String) ?? ""
       if streamId.isEmpty { return }
 
-      self.queue.sync {
+      self.onQueue {
         guard let current = self.active, current.streamId == streamId else { return }
         current.stop()
         self.active = nil
