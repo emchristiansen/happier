@@ -1,3 +1,4 @@
+import { deleteConnectedServiceHomeCredentials } from './connectedServices/credentials/deleteConnectedServiceHomeCredentials';
 import { matchesCurrentQuotaObservationCredential } from './connectedServices/quotas/proof/quotaProbeFreshProof';
 import fs from 'fs/promises';
 import os from 'os';
@@ -7171,7 +7172,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           materializationKey,
           agentId,
           retentionPolicy,
-          removeRoot: async (root) => await fs.rm(root, { recursive: true, force: true }),
+          retireRoot: async (rootDir) => await deleteConnectedServiceHomeCredentials({ rootDir, agentId, kind: 'materialized_home' }),
         });
       },
     });

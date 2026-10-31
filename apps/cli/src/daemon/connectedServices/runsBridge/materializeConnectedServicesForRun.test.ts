@@ -1,3 +1,4 @@
+import { deleteConnectedServiceHomeCredentials } from '../credentials/deleteConnectedServiceHomeCredentials';
 import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -519,7 +520,7 @@ describe('createExecutionRunConnectedServicesBridge', () => {
         createAdoptedRootCleanup: (input) => createAdoptedExecutionRunRootCleanup({
           ...input,
           materializationBaseDir: join(sandbox, 'materialized'),
-          removeRoot: async (root) => await rm(root, { recursive: true, force: true }),
+          retireRoot: async (rootDir) => await deleteConnectedServiceHomeCredentials({ rootDir, agentId: input.agentId, kind: 'materialized_home' }),
         }),
       });
       const result = await rehydrateLiveExecutionRunRuntimeTargets({

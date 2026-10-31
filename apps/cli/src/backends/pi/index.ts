@@ -1,3 +1,4 @@
+import { removeConnectedServiceCredentialFiles } from '@/daemon/connectedServices/credentials/removeConnectedServiceCredentialFiles';
 import { AGENTS_CORE } from '@happier-dev/agents';
 
 import { PI_BROKER_SELECTIONS_ENV, parsePiBrokerSelections } from '@/backends/pi/brokerExtension';
@@ -16,6 +17,11 @@ import { reportPiTurnFailure } from './connectedServices/reportPiTurnFailure';
 
 const piConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCredentialLifecycleDescriptor = {
   providerId: 'pi',
+  credentialStorageCleanup: {
+    async deleteCredentialStorageForHomeRoot({ rootDir }) {
+      await removeConnectedServiceCredentialFiles(rootDir, piConnectedServiceStateSharingDescriptor.authIsolation.secretEntries.map((entry) => `pi-agent-dir/${entry}`));
+    },
+  },
   serviceIds: AGENTS_CORE.pi.connectedServices.supportedServiceIds,
   spawnPreflightOauthRefresh: { mode: 'expiry_window' },
   refreshedCredentialApplication: {
