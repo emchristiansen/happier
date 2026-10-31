@@ -1,6 +1,7 @@
 package dev.happier.sherpa
 
 import android.util.Base64
+import android.util.Log
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
@@ -10,11 +11,25 @@ import java.util.concurrent.RejectedExecutionException
 
 private class SynthesisCancelledException : Exception("Synthesis cancelled")
 
+private enum class AsrAdmission { OPEN, CLOSING, DISPOSED, FAILED }
+
+private data class AsrOwnerHandle(val value: Long) {
+  init { require(value != 0L) }
+}
+
 class HappierSherpaNativeModule : Module() {
   // Expo runs every AsyncFunction of every module on one shared thread. Synthesis takes seconds, so TTS and
   // ASR work runs on their own executors: cancel, mic frames and other modules never wait behind synthesis.
   private val ttsExecutor: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "HappierSherpaTts") }
   private val asrExecutor: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "HappierSherpaAsr") }
+
+  // Admission and the terminal task are ordered together. Native ownership is touched only by this
+  // module's ASR worker, including creates already accepted when OnDestroy closes admission.
+  private val asrAdmissionLock = Any()
+  private var asrAdmission = AsrAdmission.OPEN
+  private var asrCleanupFailure: Throwable? = null
+  private var asrShutdownRequested = false
+  private var asrOwner: AsrOwnerHandle? = null
 
   // Touched only on ttsExecutor, so a handle is never destroyed while a synthesis uses it.
   private val ttsEnginesByAssetsDir = HashMap<String, Long>()
@@ -61,14 +76,112 @@ class HappierSherpaNativeModule : Module() {
     }
   }
 
+  private fun recordAsrCleanupFailure(operation: String, error: Throwable) {
+    synchronized(asrAdmissionLock) {
+      asrAdmission = AsrAdmission.FAILED
+      asrCleanupFailure = error
+    }
+    Log.e("HappierSherpaNative", "ASR $operation failed; native owner cleanup is incomplete", error)
+  }
+
+  private fun runOnAsr(promise: Promise, block: () -> Any?) {
+    synchronized(asrAdmissionLock) {
+      if (asrAdmission != AsrAdmission.OPEN) {
+        reject(promise, IllegalStateException("Streaming ASR module is closed to new work", asrCleanupFailure))
+        return
+      }
+      try {
+        asrExecutor.execute {
+          try {
+            promise.resolve(block())
+          } catch (e: Throwable) {
+            reject(promise, e)
+          }
+        }
+      } catch (e: RejectedExecutionException) {
+        recordAsrCleanupFailure("submission", e)
+        reject(promise, e)
+      }
+    }
+  }
+
+  // Runs only on the ASR worker. The handle never comes from JS or another module instance.
+  private fun requireAsrOwner(): AsrOwnerHandle {
+    asrOwner?.let { return it }
+    val handle = HappierSherpaNativeJni.nativeCreateAsrOwner()
+    if (handle == 0L) throw Exception("Failed to create streaming ASR owner")
+    return AsrOwnerHandle(handle).also { asrOwner = it }
+  }
+
+  private fun cancelStreaming(jobId: String) {
+    synchronized(asrAdmissionLock) {
+      if (asrAdmission == AsrAdmission.FAILED) {
+        throw IllegalStateException("Streaming ASR cleanup is incomplete", asrCleanupFailure)
+      }
+      // The terminal task owns all accepted streams after closing; do not enter JNI from this thread
+      // or look up this job in another module after its executor has stopped accepting work.
+      if (asrAdmission != AsrAdmission.OPEN) return
+      try {
+        asrExecutor.execute {
+          try {
+            asrOwner?.let { HappierSherpaNativeJni.nativeCancelOwnedStreaming(it.value, jobId) }
+          } catch (e: Throwable) {
+            // Retain the owner for terminal disposal. This asynchronous cancel has not proved cleanup.
+            Log.e("HappierSherpaNative", "ASR cancellation failed; stream remains owned until disposal", e)
+          }
+        }
+      } catch (e: RejectedExecutionException) {
+        recordAsrCleanupFailure("cancellation submission", e)
+        throw e
+      }
+    }
+  }
+
+  private fun closeAsr() {
+    synchronized(asrAdmissionLock) {
+      if (asrShutdownRequested) return
+      asrShutdownRequested = true
+      try {
+        // An earlier rejected submission already recorded incomplete cleanup. Do not invent a
+        // successful terminal task in that state, but still let previously accepted work drain.
+        if (asrAdmission == AsrAdmission.OPEN) {
+          asrAdmission = AsrAdmission.CLOSING
+          asrExecutor.execute {
+            try {
+              asrOwner?.let { HappierSherpaNativeJni.nativeDestroyAsrOwner(it.value) }
+              // A failed native disposal must retain the handle and a visible incomplete state.
+              asrOwner = null
+              synchronized(asrAdmissionLock) {
+                if (asrAdmission != AsrAdmission.FAILED) asrAdmission = AsrAdmission.DISPOSED
+              }
+            } catch (e: Throwable) {
+              recordAsrCleanupFailure("terminal disposal", e)
+            }
+          }
+        }
+      } catch (e: RejectedExecutionException) {
+        recordAsrCleanupFailure("terminal submission", e)
+      } finally {
+        try {
+          asrExecutor.shutdown()
+        } catch (e: Throwable) {
+          recordAsrCleanupFailure("executor shutdown", e)
+        }
+      }
+    }
+  }
+
   override fun definition() = ModuleDefinition {
     Name("HappierSherpaNative")
 
     OnDestroy {
       // Queued after any running synthesis, so no handle is destroyed while in use.
-      ttsExecutor.execute { ttsEnginesByAssetsDir.keys.toList().forEach(::destroyTtsEngine) }
-      ttsExecutor.shutdown()
-      asrExecutor.shutdown()
+      try {
+        ttsExecutor.execute { ttsEnginesByAssetsDir.keys.toList().forEach(::destroyTtsEngine) }
+        ttsExecutor.shutdown()
+      } finally {
+        closeAsr()
+      }
     }
 
     AsyncFunction("initialize") { params: Map<String, Any?>, promise: Promise ->
@@ -145,11 +258,7 @@ class HappierSherpaNativeModule : Module() {
       HappierSherpaNativeJni.nativeCancel(jobId)
       // ASR: cancels the streaming job with this id, if any.
       // Streams are only touched on the ASR executor, so destroying one never races a frame being decoded.
-      try {
-        asrExecutor.execute { HappierSherpaNativeJni.nativeCancelStreaming(jobId) }
-      } catch (_: RejectedExecutionException) {
-        // Module destroyed: its streams are gone with it.
-      }
+      cancelStreaming(jobId)
     }
 
     AsyncFunction("release") { params: Map<String, Any?>, promise: Promise ->
@@ -177,11 +286,11 @@ class HappierSherpaNativeModule : Module() {
       val channels = (params["channels"] as? Number)?.toInt() ?: 1
       val language = params["language"] as? String
 
-      runOn(asrExecutor, promise) {
+      runOnAsr(promise) {
         if (jobId.isBlank()) throw Exception("jobId is required")
         if (assetsDir.isEmpty()) throw Exception("assetsDir is required")
 
-        val ok = HappierSherpaNativeJni.nativeCreateStreamingRecognizer(jobId, assetsDir, sampleRate, channels, language ?: "")
+        val ok = HappierSherpaNativeJni.nativeCreateOwnedStreamingRecognizer(requireAsrOwner().value, jobId, assetsDir, sampleRate, channels, language ?: "")
         if (ok != 1) throw Exception("Failed to initialize sherpa streaming ASR (assets may be missing)")
         null
       }
@@ -193,18 +302,20 @@ class HappierSherpaNativeModule : Module() {
       val sampleRate = (params["sampleRate"] as? Number)?.toInt() ?: 16000
       val channels = (params["channels"] as? Number)?.toInt() ?: 1
 
-      runOn(asrExecutor, promise) {
+      runOnAsr(promise) {
         if (jobId.isBlank()) throw Exception("jobId is required")
         val bytes = if (pcm16leBase64.isBlank()) ByteArray(0) else Base64.decode(pcm16leBase64, Base64.DEFAULT)
-        HappierSherpaNativeJni.nativePushAudioFrame(jobId, bytes, sampleRate, channels)
+        val owner = asrOwner
+        if (owner == null) mapOf("text" to "", "isEndpoint" to false)
+        else HappierSherpaNativeJni.nativePushOwnedAudioFrame(owner.value, jobId, bytes, sampleRate, channels)
       }
     }
 
     AsyncFunction("finishStreaming") { params: Map<String, Any?>, promise: Promise ->
       val jobId = params["jobId"] as? String ?: ""
-      runOn(asrExecutor, promise) {
+      runOnAsr(promise) {
         if (jobId.isBlank()) throw Exception("jobId is required")
-        mapOf("text" to HappierSherpaNativeJni.nativeFinishStreaming(jobId))
+        mapOf("text" to (asrOwner?.let { HappierSherpaNativeJni.nativeFinishOwnedStreaming(it.value, jobId) } ?: ""))
       }
     }
   }
@@ -233,9 +344,11 @@ object HappierSherpaNativeJni {
   external fun nativeAcceptSynthesis(jobId: String)
   external fun nativeForgetSynthesis(jobId: String)
 
-  external fun nativeCreateStreamingRecognizer(jobId: String, assetsDir: String, sampleRate: Int, channels: Int, language: String): Int
-  external fun nativePushAudioFrame(jobId: String, pcm16le: ByteArray, sampleRate: Int, channels: Int): Map<String, Any?>
-  external fun nativeFinishStreaming(jobId: String): String
-  external fun nativeCancelStreaming(jobId: String)
+  external fun nativeCreateAsrOwner(): Long
+  external fun nativeDestroyAsrOwner(owner: Long)
+  external fun nativeCreateOwnedStreamingRecognizer(owner: Long, jobId: String, assetsDir: String, sampleRate: Int, channels: Int, language: String): Int
+  external fun nativePushOwnedAudioFrame(owner: Long, jobId: String, pcm16le: ByteArray, sampleRate: Int, channels: Int): Map<String, Any?>
+  external fun nativeFinishOwnedStreaming(owner: Long, jobId: String): String
+  external fun nativeCancelOwnedStreaming(owner: Long, jobId: String)
   external fun nativeReleaseAsrEngine(assetsDir: String)
 }
