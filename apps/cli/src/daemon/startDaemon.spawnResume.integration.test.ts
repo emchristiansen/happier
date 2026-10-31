@@ -1741,6 +1741,17 @@ describe('startDaemon spawn resume wiring (integration)', () => {
 
   it.each(['existing', 'fresh', 'encrypted', 'stale_pid', 'legacy', 'other_machine', 'unknown_process', 'lookup_failed', 'webhook_during_lookup', 'exit_during_lookup', 'locked_runner', 'wrapper', 'windows_dispatcher'] as const)('handles an accepted %s launch before its session webhook', async (startup) => {
     await stubRunnerProcessCensus('codex');
+    const { configuration } = await import('@/configuration');
+    const processBoundary = await import('node:child_process');
+    const runnerBoundary = await import('@/utils/spawnHappyCLI');
+    const httpBoundary = await import('axios');
+    const controlBoundary = await import('./controlServer');
+    expect(runnerBoundary.spawnHappyCLI).toBe(spawnHappyCLI);
+    expect(processBoundary.spawn).toBe(spawnChildProcess);
+    expect(vi.isMockFunction(processBoundary.execFileSync)).toBe(true);
+    expect(vi.isMockFunction(psList)).toBe(true);
+    expect(vi.isMockFunction(httpBoundary.default.get)).toBe(true);
+    expect(vi.isMockFunction(controlBoundary.startDaemonControlServer)).toBe(true);
     const isFresh = startup !== 'existing';
     const actualPsList = await vi.importActual<typeof import('ps-list')>('ps-list');
     const { clearProcessSnapshotCacheForTests } = await import('./processSnapshotCache');
@@ -1796,7 +1807,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     const metadata: Metadata = {
       flavor: 'codex', codexSessionId: 'vendor-existing-startup-pending', path: '/tmp',
       machineId: startup === 'other_machine' ? 'machine-other' : 'machine-1',
-      hostPid: startup === 'wrapper' || startup === 'windows_dispatcher' ? 23456 : 12345, startedBy: 'daemon', happyHomeDir: '/tmp/happy-home',
+      hostPid: startup === 'wrapper' || startup === 'windows_dispatcher' ? 23456 : 12345, startedBy: 'daemon', happyHomeDir: configuration.happyHomeDir,
       host: 'fixture-host', homeDir: '/tmp', happyLibDir: '/tmp/lib', happyToolsDir: '/tmp/tools',
       ...(startup === 'legacy' ? {} : { hostProcessInstanceFingerprint:
         startup === 'stale_pid' ? 'fixture-previous-generation' : 'fixture-current-generation' }),
