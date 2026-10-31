@@ -156,6 +156,20 @@ describe('owned authentication terminal lifetime', () => {
         expect(rpc.machineTerminalClose).toHaveBeenCalledExactlyOnceWith('machine-1', { terminalId: 'terminal-1' });
     });
 
+    it('settles fresh ownership after a reused response from an ordinary replacement and disposal', async () => {
+        const pending = createDeferred<DaemonTerminalEnsureResponse>();
+        rpc.machineTerminalEnsure.mockReturnValueOnce(pending.promise)
+            .mockResolvedValue({ ok: true, terminalId: 'same-private-terminal', reused: true });
+        const params = options({ closeOnUnmount: true });
+        const hook = await mount(params);
+        await hook.rerender({ ...params, cwd: '/replacement' });
+        expect(readTerminalSurfaceState(params.terminalKey)?.terminalId).toBe('same-private-terminal');
+        await hook.unmount();
+        expect(rpc.machineTerminalClose).not.toHaveBeenCalled();
+        await resolveEnsure(pending, fresh('same-private-terminal'));
+        expect(rpc.machineTerminalClose).toHaveBeenCalledExactlyOnceWith('machine-1', { terminalId: 'same-private-terminal' });
+    });
+
     it.each(['refused', 'rejected'])('does not close a late %s acquisition', async (failure) => {
         const pending = createDeferred<DaemonTerminalEnsureResponse>();
         rpc.machineTerminalEnsure.mockReturnValueOnce(pending.promise);

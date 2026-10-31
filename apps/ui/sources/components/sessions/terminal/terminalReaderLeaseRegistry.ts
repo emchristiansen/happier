@@ -72,6 +72,9 @@ export class OwnedTerminalLifetime {
     private pendingAcquisitions = 0;
     private pendingCloses = 0;
     private readonly ownedIds = new Set<string>();
+    // An observed reused ID is not owned. It only identifies our own cached result while
+    // an earlier acquisition may still settle with positive fresh-ID provenance.
+    private readonly observedIds = new Set<string>();
     private readonly closeStarted = new Set<string>();
 
     constructor(
@@ -101,8 +104,9 @@ export class OwnedTerminalLifetime {
             if (settled) return;
             settled = true;
             this.pendingAcquisitions -= 1;
-            if (result && this.state !== 'relinquished' && !result.reused) {
-                this.ownedIds.add(result.terminalId);
+            if (result && this.state !== 'relinquished') {
+                this.observedIds.add(result.terminalId);
+                if (!result.reused) this.ownedIds.add(result.terminalId);
             }
             if (this.state === 'disposing' || this.state === 'incomplete') this.drainDisposal();
         };
@@ -112,7 +116,7 @@ export class OwnedTerminalLifetime {
         if (!this.isActive()) return;
         const reader = terminalReaderOwners.get(this.terminalKey);
         const cachedId = readTerminalSurfaceState(this.terminalKey)?.terminalId;
-        if ((reader && reader !== this.ownerToken) || (cachedId && !this.ownedIds.has(cachedId))) {
+        if ((reader && reader !== this.ownerToken) || (cachedId && !this.observedIds.has(cachedId))) {
             this.relinquish();
             return;
         }
