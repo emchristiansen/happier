@@ -2492,6 +2492,7 @@ test('macos wsrepl lima matrix watchdog probes daemon status using stack-scoped 
 	      `  expected_home=${JSON.stringify(stackCliRoot)}`,
 	      `  expected_id=${JSON.stringify(stackServerId)}`,
 	      '  if [[ "${HAPPIER_HOME_DIR:-}" == "$expected_home" && "${HAPPIER_ACTIVE_SERVER_ID:-}" == "$expected_id" ]]; then',
+      `    if [[ -f ${JSON.stringify(join(homeDir, '.playwright-running'))} ]]; then printf "1" > ${JSON.stringify(join(homeDir, '.watchdog-scoped-probe'))}; fi`,
 	      '    echo "Daemon is running"',
 	      '    exit 0',
       '  fi',
@@ -2590,6 +2591,7 @@ test('macos wsrepl lima matrix watchdog probes daemon status using stack-scoped 
       `  printf "1" > ${JSON.stringify(join(homeDir, '.playwright-running'))}`,
       '  # Give the wrapper background watchdog time to probe the daemon at least once.',
       '  sleep 0.25',
+      `  rm -f ${JSON.stringify(join(homeDir, '.playwright-running'))}`,
       '  exit 0',
       'fi',
       'echo "stub node passthrough"',
@@ -2682,7 +2684,8 @@ test('macos wsrepl lima matrix watchdog probes daemon status using stack-scoped 
 
   assert.equal(res.status, 0, `expected exit 0\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
 
-  const watchdogPath = join(reportDir, 'playwright', 'attempt-01', 'host-daemon-watchdog.log');
+  assert.equal(await fileExists(join(homeDir, '.watchdog-scoped-probe')), true, 'expected a correctly scoped status probe while the fake runner was active');
+  const watchdogPath = join(reportDir, 'playwright', 'host-daemon-watchdog.log');
   assert.equal(await fileExists(watchdogPath), false, 'expected watchdog to avoid restarting daemon when stack-scoped status checks succeed');
 });
 
@@ -2846,6 +2849,7 @@ test('macos wsrepl lima matrix watchdog ignores transient "Daemon is not running
       "  printf '%s\\n' '{\"kind\":\"wsrepl_handoff_matrix_summary\",\"ok\":true,\"sessionId\":\"sess_created_1\"}' > \"$out/summary.json\"",
       `  printf "1" > ${JSON.stringify(join(homeDir, '.playwright-running'))}`,
       '  sleep 0.25',
+      `  rm -f ${JSON.stringify(join(homeDir, '.playwright-running'))}`,
       '  exit 0',
       'fi',
       'exit 0',
@@ -2909,7 +2913,6 @@ test('macos wsrepl lima matrix watchdog ignores transient "Daemon is not running
     WSREPL_QA_OUTPUT_DIR: reportDir,
     WSREPL_QA_HOST_HAPPIER_SOURCE: `explicit:${happierPath}`,
     HAPPIER_QA_STEPS_JSON: JSON.stringify([{ targetMachineId: 'machine_target_1', strategy: 'sync_changes' }]),
-    WSREPL_QA_HOST_HAPPIER_SOURCE: 'stack_runtime',
     WSREPL_QA_HOST_MACHINE_ID: 'machine_host_1',
     WSREPL_QA_VM_MACHINE_ID: 'machine_vm_1',
     HAPPIER_UI_URL: 'http://localhost:19000/?server=http%3A%2F%2Flocalhost%3A53288',
@@ -2927,7 +2930,8 @@ test('macos wsrepl lima matrix watchdog ignores transient "Daemon is not running
 
   assert.equal(res.status, 0, `expected exit 0\nstdout:\n${res.stdout}\nstderr:\n${res.stderr}`);
 
-  const watchdogPath = join(reportDir, 'playwright', 'attempt-01', 'host-daemon-watchdog.log');
+  assert.equal(await fileExists(join(homeDir, '.daemon-not-running-once')), true, 'expected the selected fake CLI to emit its one transient status while the fake runner was active');
+  const watchdogPath = join(reportDir, 'playwright', 'host-daemon-watchdog.log');
   assert.equal(await fileExists(watchdogPath), false, 'expected watchdog to ignore a single transient "Daemon is not running" probe');
 });
 
