@@ -89,6 +89,9 @@ export async function replaceDirectoryAtomically(params: Readonly<{
       if (hasBackup) carriedEntries = await carryUnprovidedEntriesBestEffort(snapshots, backupDir, params.targetDir);
     });
     await params.afterPromote?.();
+    if (hasBackup && !params.retireDirectory) {
+      await rm(backupDir, { recursive: true, force: true });
+    }
   } catch (error) {
     let rejectedDir: string | undefined;
     if (promoted) {
@@ -114,8 +117,7 @@ export async function replaceDirectoryAtomically(params: Readonly<{
     throw error;
   }
   // A retirement failure must not roll back a valid promotion or fall through to recursive rm.
-  if (hasBackup) {
-    if (params.retireDirectory) await params.retireDirectory(backupDir);
-    else await rm(backupDir, { recursive: true, force: true });
+  if (hasBackup && params.retireDirectory) {
+    await params.retireDirectory(backupDir);
   }
 }

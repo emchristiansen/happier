@@ -5,15 +5,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { replaceDirectoryAtomically } from './replaceDirectoryAtomically';
 
-const fsBoundary = vi.hoisted(() => ({ rename: vi.fn<typeof import('node:fs/promises').rename>() }));
+const fsBoundary = vi.hoisted(() => ({
+  rename: vi.fn<typeof import('node:fs/promises').rename>(),
+  rm: vi.fn<typeof import('node:fs/promises').rm>(),
+}));
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   fsBoundary.rename.mockImplementation(actual.rename);
-  return { ...actual, rename: fsBoundary.rename };
+  fsBoundary.rm.mockImplementation(actual.rm);
+  return { ...actual, rename: fsBoundary.rename, rm: fsBoundary.rm };
 });
 beforeEach(async () => {
   const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
   fsBoundary.rename.mockReset().mockImplementation(actual.rename);
+  fsBoundary.rm.mockReset().mockImplementation(actual.rm);
 });
 const roots: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
@@ -111,6 +116,35 @@ describe('atomic home promotion runtime custody', () => {
     expect((await stat(lockPath)).ino).toBe(before.ino);
     expect(await readFile(join(targetDir, 'codex-home', 'provided'), 'utf8')).toBe('old provided data');
     expect(await readdir(root)).toEqual(['target']);
+  });
+
+  it('restores the old target and carried lock if default backup removal fails', async () => {
+    const { root, targetDir, stagedDir } = await fixture();
+    const lockPath = join(targetDir, 'codex-home', 'tmp', 'arg0', '.lock');
+    const held = await open(lockPath, 'r');
+    const failure = new Error('synthetic default backup removal failure');
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    let rejectedBackup = false;
+    fsBoundary.rm.mockImplementation(async (path, options) => {
+      // Only the first backup deletion fails; rollback and fixture cleanup use real fs.
+      if (!rejectedBackup && String(path).startsWith(`${targetDir}.previous-`)) {
+        rejectedBackup = true;
+        throw failure;
+      }
+      await actual.rm(path, options);
+    });
+    try {
+      const before = await held.stat();
+      await expect(replaceDirectoryAtomically({
+        stagedDir, targetDir, preserveUnprovidedEntries: [{ root: 'codex-home', exclude: ['owned'] }],
+      })).rejects.toBe(failure);
+      expect(rejectedBackup).toBe(true);
+      expect(await readFile(join(targetDir, 'codex-home', 'provided'), 'utf8')).toBe('old provided data');
+      expect(await readFile(join(targetDir, 'codex-home', 'owned'), 'utf8')).toBe('old owned data');
+      const restored = await stat(lockPath);
+      expect([restored.dev, restored.ino]).toEqual([before.dev, before.ino]);
+      expect(await readdir(root)).toEqual(['target']);
+    } finally { await held.close(); }
   });
 
   it('merges an unprovided runtime directory recreated after promotion without replacing staged names', async () => {
