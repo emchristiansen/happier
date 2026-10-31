@@ -88,6 +88,7 @@ export const agent = {
   getConnectedServiceCredentialLifecycleDescriptor: async () => claudeConnectedServiceCredentialLifecycleDescriptor,
   getConnectedServiceStateSharingDescriptor: async () => claudeConnectedServiceStateSharingDescriptor,
   connectedServiceQuotaFetcherDescriptor: claudeSubscriptionQuotaFetcherDescriptor,
+  guardedQuotaRecoveryServiceId: 'claude-subscription',
   getSessionUsageLimitRecoveryControlAdapter: async () => claudeUsageLimitRecoveryControlAdapter,
   getSessionGoalControlAdapter: async () => (await import('./goalControl/claudeGoalControlAdapter')).claudeGoalControlAdapter,
   resolveConnectedServiceSwitchContinuity: async (params) => await resolveClaudeConnectedServiceSwitchContinuity(params),

@@ -63,6 +63,33 @@ function fixture() {
 }
 
 describe('daemon guarded quota recovery', () => {
+  it.each([
+    { agentId: 'claude', serviceId: 'claude-subscription', available: true },
+    { agentId: 'gemini', serviceId: 'openai-codex', available: false },
+  ] as const)('uses provider-owned quota support for $agentId', ({ agentId, serviceId, available }) => {
+    const f = fixture();
+    f.tracked.spawnOptions = {
+      ...f.tracked.spawnOptions!,
+      backendTarget: { kind: 'builtInAgent', agentId },
+      connectedServices: { v: 1, bindingsByServiceId: {
+        [serviceId]: { source: 'connected', selection: 'profile', profileId: 'previous' },
+      } },
+    };
+    const refusal = { ...f.refusal, serviceId, classification: { ...f.refusal.classification, serviceId } };
+    const recovery = createGuardedQuotaRecovery({
+      core: createConnectedServiceSessionAuthSwitchCore(), getChildren: () => [f.tracked],
+      readRecoveryIntents: () => [refusal], isTurnInFlight: () => false, nowMs: () => 200,
+    });
+    recovery.beginFailureSource({ sessionId: 'quota-session', classification: refusal.classification,
+      nativeProviderSource: { nativeId: 'same-native', pid: 123, publisherIncarnationId: 'original-publisher', sequence: '1' },
+    })?.(refusal.attemptId);
+    expect(recovery.inspect('quota-session')).toMatchObject(available
+      ? { ok: true, agentId, source: { serviceId } }
+      : { ok: false, errorCode: 'quota_recovery_current_refusal_unavailable' });
+    expect(f.persist).not.toHaveBeenCalled();
+    expect(f.restart).not.toHaveBeenCalled();
+  });
+
   it.each(['unmarked', 'restored', 'foreign'] as const)('refuses %s options without an account effect', async (source) => {
     const f = fixture();
     if (source === 'unmarked') delete f.tracked.spawnOptionsCustody;

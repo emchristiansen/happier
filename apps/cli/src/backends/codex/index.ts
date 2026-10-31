@@ -71,6 +71,7 @@ export const agent = {
   getConnectedServiceMaterializer: async () => createCodexConnectedServicesMaterializer(),
   getConnectedServiceStateSharingDescriptor: async () => codexConnectedServiceStateSharingDescriptor,
   connectedServiceQuotaFetcherDescriptor: openAiCodexQuotaFetcherDescriptor,
+  guardedQuotaRecoveryServiceId: 'openai-codex',
   getConnectedServiceRuntimeAuthAdapter: async () => createCodexConnectedServiceRuntimeAuthAdapter(),
   materializeConnectedServiceRuntimeAuthSelection: materializeCodexConnectedServiceRuntimeAuthSelection,
   getConnectedServiceCredentialLifecycleDescriptor: async () => codexConnectedServiceCredentialLifecycleDescriptor,

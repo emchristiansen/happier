@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 
 import { ConnectedServiceBindingsV1Schema, type SessionConnectedServiceAuthSwitchRpcParams } from '@happier-dev/protocol';
 import type { TrackedSession } from '@/daemon/types';
+import { AGENTS } from '@/backends/catalog';
 import { resolveTrackedSessionCatalogAgentId } from '@/daemon/sessions/resolveTrackedSessionCatalogAgentId';
 import type { RuntimeAuthRecoveryIntent } from '../runtimeAuth/RuntimeAuthRecoveryScheduler';
 import type { ConnectedServiceSessionAuthSwitchCore } from '../runtimeAuth/connectedServiceSessionAuthSwitchCore';
@@ -167,8 +168,7 @@ export function createGuardedQuotaRecovery(input: Readonly<{
         return { ok: false as const, errorCode: 'quota_recovery_source_unavailable' };
       }
       const agentId = resolveTrackedSessionCatalogAgentId(tracked);
-      const serviceId = agentId === 'codex' ? 'openai-codex'
-        : agentId === 'claude' ? 'claude-subscription' : null;
+      const serviceId = AGENTS[agentId]?.guardedQuotaRecoveryServiceId ?? null;
       const nativeId = resolveTrackedConnectedServiceVendorResumeId({ agentId, tracked });
       const bindings = ConnectedServiceBindingsV1Schema.safeParse(tracked.spawnOptions.connectedServices).data;
       const binding = serviceId ? bindings?.bindingsByServiceId[serviceId] : null;
@@ -219,8 +219,7 @@ export function createGuardedQuotaRecovery(input: Readonly<{
         const tracked = input.getChildren().find((child) => child.happySessionId === request.sessionId);
         const agentId = tracked ? resolveTrackedSessionCatalogAgentId(tracked) : null;
         if (!agentId || agentId !== request.agentId
-          || !((agentId === 'codex' && request.quotaRecovery.serviceId === 'openai-codex')
-            || (agentId === 'claude' && request.quotaRecovery.serviceId === 'claude-subscription'))) {
+          || AGENTS[agentId]?.guardedQuotaRecoveryServiceId !== request.quotaRecovery.serviceId) {
           return { ok: false as const, errorCode: 'quota_recovery_source_unavailable' };
         }
         const destination = request.bindings.bindingsByServiceId[request.quotaRecovery.serviceId];

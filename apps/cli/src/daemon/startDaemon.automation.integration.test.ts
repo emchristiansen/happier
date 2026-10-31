@@ -31,10 +31,19 @@ const { spawnChildProcess } = vi.hoisted(() => ({
   })),
 }));
 
-vi.mock('node:child_process', async (importOriginal) => ({
-  ...await importOriginal<typeof import('node:child_process')>(),
-  spawn: spawnChildProcess,
-}));
+vi.mock('node:child_process', async (importOriginal) => {
+  const refuseUnexpectedProcess = vi.fn(() => { throw new Error('Unexpected real process operation in daemon automation fixture'); });
+  return {
+    ...await importOriginal<typeof import('node:child_process')>(),
+    spawn: spawnChildProcess,
+    spawnSync: refuseUnexpectedProcess,
+    exec: refuseUnexpectedProcess,
+    execSync: refuseUnexpectedProcess,
+    execFile: refuseUnexpectedProcess,
+    execFileSync: refuseUnexpectedProcess,
+    fork: refuseUnexpectedProcess,
+  };
+});
 
 const automationCredentials = {
   token: 'token-automation',
@@ -532,7 +541,8 @@ vi.mock('@/settings/accountSettings/refreshAccountSettingsForMinimumVersion', ()
   }),
 }));
 
-vi.mock('./controlClient', () => ({
+vi.mock('./controlClient', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./controlClient')>(),
   cleanupDaemonState: vi.fn(async () => {}),
   isDaemonRunningCurrentlyInstalledHappyVersion: vi.fn(async () => false),
   resolveDaemonSpawnSessionByNonce: vi.fn(async () => null),
@@ -665,7 +675,8 @@ vi.mock('./startup/waitForInitialCredentials', () => ({
   })),
 }));
 
-vi.mock('./spawn/waitForSessionWebhook', () => ({
+vi.mock('./spawn/waitForSessionWebhook', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./spawn/waitForSessionWebhook')>(),
   waitForSessionWebhook: vi.fn(async () => null),
 }));
 

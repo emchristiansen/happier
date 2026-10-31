@@ -17,6 +17,7 @@ import type {
   ConnectedServiceMaterializationIdentityV1,
   ConnectedServicesProviderConfigSharingModeV1,
   ConnectedServicesProviderStateSharingModeV1,
+  SessionConnectedServiceAuthSwitchRpcParams,
   SessionProviderCliAttachPrepareRequestV1,
   SessionProviderCliAttachPrepareResultV1,
 } from '@happier-dev/protocol';
@@ -370,6 +371,8 @@ export type AgentCatalogEntry = Readonly<{
    * endpoint URLs, provider headers, kill switches, and service-specific placeholder behavior.
    */
   connectedServiceQuotaFetcherDescriptor?: ConnectedServiceQuotaFetcherDescriptor;
+  /** Provider-owned service supporting the guarded same-native quota account switch. */
+  guardedQuotaRecoveryServiceId?: NonNullable<SessionConnectedServiceAuthSwitchRpcParams['quotaRecovery']>['serviceId'];
   /**
    * Optional provider-owned continuity resolver for existing-session auth switches.
    *
