@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { act } from 'react-test-renderer';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { renderScreen } from '@/dev/testkit';
+import { renderScreen } from '@/dev/testkit/render/renderScreen';
 import type { AgentId } from '@/agents/catalog/catalog';
 import type { ProviderLocalAuthLaunch } from '@/agents/providers/shared/providerLocalAuthPlugin';
 import type { Machine } from '@/sync/domains/state/storageTypes';
@@ -69,12 +69,9 @@ const createTestProps = (): ProviderAuthenticationTerminalPaneProps => ({
 });
 
 installSettingsViewCommonModuleMocks({
-    storage: async (importOriginal) => {
-        const storage = await importOriginal<typeof import('@/sync/domains/state/storage')>();
-        return {
-            ...storage,
-            useMachine: (_machineId: string) => mockMachine,
-        };
+    storage: async () => {
+        const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
+        return createStorageModuleStub({ useMachine: (_machineId: string) => mockMachine });
     },
 });
 
@@ -83,14 +80,21 @@ vi.mock('@/components/terminal/embedded/EmbeddedTerminalPane', () => ({
 }));
 
 vi.mock('@/hooks/machine/useMachineTerminalSession', () => ({
-    useMachineTerminalSession: (params: unknown) => useMachineTerminalSessionMock(params),
+    useMachineTerminalSession: useMachineTerminalSessionMock,
 }));
 
 vi.mock('@/utils/sessions/machineUtils', () => ({
     isMachineOnline: () => true,
 }));
 
-const providerAuthenticationTerminalPaneModulePromise = import('./ProviderAuthenticationTerminalPane');
+const providerAuthenticationTerminalPaneModulePromise = (async () => {
+    const boundary = await import('@/hooks/machine/useMachineTerminalSession');
+    expect(boundary.useMachineTerminalSession).toBe(useMachineTerminalSessionMock);
+    expect(vi.isMockFunction(boundary.useMachineTerminalSession)).toBe(true);
+    const storage = await import('@/sync/domains/state/storage');
+    expect(storage.useMachine('fixture')).toBe(mockMachine);
+    return import('./ProviderAuthenticationTerminalPane');
+})();
 
 describe('ProviderAuthenticationTerminalPane', () => {
     beforeEach(() => {
@@ -155,4 +159,35 @@ describe('ProviderAuthenticationTerminalPane', () => {
             await screen.unmount();
         });
     });
+    it('keeps a private key on rerender and changes it on remount or target/action changes', async () => {
+        const { ProviderAuthenticationTerminalPane } = await providerAuthenticationTerminalPaneModulePromise;
+        const props = createTestProps();
+        const currentKey = () => (useMachineTerminalSessionMock.mock.lastCall?.[0] as { terminalKey: string }).terminalKey;
+        const screen = await renderScreen(<ProviderAuthenticationTerminalPane {...props} />);
+        const initial = currentKey();
+        await act(async () => screen.tree.update(<ProviderAuthenticationTerminalPane {...props} authLaunch={{ ...props.authLaunch }} />));
+        expect(currentKey()).toBe(initial);
+        await act(async () => screen.tree.update(<ProviderAuthenticationTerminalPane {...props} providerId="agy" />));
+        const providerKey = currentKey();
+        expect(providerKey).not.toBe(initial);
+        await act(async () => screen.tree.update(<ProviderAuthenticationTerminalPane {...props} machineId="machine-2" />));
+        const machineKey = currentKey();
+        expect(machineKey).not.toBe(initial);
+        expect(machineKey).not.toBe(providerKey);
+        await act(async () => screen.tree.update(<ProviderAuthenticationTerminalPane {...props} authLaunch={{ kind: 'primary', initialCommand: 'other-auth' }} />));
+        expect(currentKey()).not.toBe(initial);
+        await screen.unmount();
+        const remounted = await renderScreen(<ProviderAuthenticationTerminalPane {...props} />);
+        expect(currentKey()).not.toBe(initial);
+        await remounted.unmount();
+    });
+
+    it('keeps session attachment shared instead of assigning private cleanup authority', async () => {
+        const { ProviderAuthenticationTerminalPane } = await providerAuthenticationTerminalPaneModulePromise;
+        const screen = await renderScreen(<ProviderAuthenticationTerminalPane {...createTestProps()}
+            authLaunch={{ kind: 'primary', launch: { kind: 'session_attach', sessionId: 'borrowed-session' } }} />);
+        expect(useMachineTerminalSessionMock).toHaveBeenLastCalledWith(expect.objectContaining({ closeOnUnmount: false }));
+        await screen.unmount();
+    });
+
 });
