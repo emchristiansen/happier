@@ -831,9 +831,19 @@ const j078Boundary = await vi.hoisted(async () => {
   const original = { read: fs.readFileSync, cpSync: fs.cpSync, cp: promises.cp, kill: process.kill, fetch: globalThis.fetch,
     child: Object.fromEntries(['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'].map((key) => [key, cp[key]])),
     httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
-  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
+  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>),
+    ps: null as null | { pid: number; command: string }, psCalls: [] as string[][],
+    onKill: null as null | ((pid: number, signal?: NodeJS.Signals | number) => boolean) };
   const refuse = (name: string) => (..._args: unknown[]) => { state.attempts.push(name); throw new Error(`J078 forbidden external boundary: ${name}`); };
-  for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => state.active ? refuse(key)(...args) : original.child[key](...args);
+  for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => {
+    if (!state.active) return original.child[key](...args);
+    if (key === 'spawnSync' && state.ps && args[0] === 'ps'
+      && JSON.stringify(args[1]) === JSON.stringify(['-o', 'command=', '-p', String(state.ps.pid), '-ww'])) {
+      state.psCalls.push([...(args[1] as string[])]);
+      return { status: 0, stdout: `${state.ps.command}\n`, stderr: '' };
+    }
+    return refuse(key)(...args);
+  };
   http.request = (...args: unknown[]) => state.active ? refuse('http')(...args) : original.httpRequest(...args);
   https.request = (...args: unknown[]) => state.active ? refuse('https')(...args) : original.httpsRequest(...args);
   http.createServer = (...args: unknown[]) => state.active ? refuse('server')(...args) : original.httpServer(...args);
@@ -841,6 +851,7 @@ const j078Boundary = await vi.hoisted(async () => {
   globalThis.fetch = ((...args: Parameters<typeof fetch>) => state.active ? refuse('fetch')(...args) : original.fetch(...args)) as typeof fetch;
   process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
     if (!state.active) return original.kill(pid, signal);
+    if (state.onKill) return state.onKill(pid, signal);
     if (signal !== 0) return refuse('signal')(pid, signal);
     return true; // Fixture liveness only; never send signal 0.
   }) as typeof process.kill;
@@ -862,7 +873,7 @@ const j078Boundary = await vi.hoisted(async () => {
   if ((await import('node:child_process')).spawnSync !== cp.spawnSync
     || (await import('node:fs')).readFileSync !== fs.readFileSync
     || (await import('node:fs/promises')).cp !== promises.cp) throw new Error('J078 actual builtin binding mismatch');
-  return { state, restore: () => {
+  return { state, spawnSyncExport: cp.spawnSync, killExport: process.kill, restore: () => {
     fs.readFileSync = original.read; fs.cpSync = original.cpSync; promises.cp = original.cp;
     for (const key of Object.keys(original.child)) cp[key] = original.child[key];
     http.request = original.httpRequest; https.request = original.httpsRequest;
@@ -871,7 +882,10 @@ const j078Boundary = await vi.hoisted(async () => {
   } };
 });
 // Unselected legacy cases retain their own existing boundaries and assertions.
-j078BeforeEach(() => { j078Boundary.state.active = Boolean(expect.getState().currentTestName?.includes('J078')); });
+j078BeforeEach(() => {
+  j078Boundary.state.active = Boolean(expect.getState().currentTestName?.includes('J078'));
+  j078Boundary.state.ps = null; j078Boundary.state.psCalls = []; j078Boundary.state.onKill = null;
+});
 j078AfterAll(() => {
   try { expect(j078Boundary.state.attempts).toEqual([]); }
   finally { j078Boundary.restore(); }
@@ -966,6 +980,83 @@ describe('J078 default daemon consumer boundary', () => {
       expect(await readFile(observedEntry, 'utf8')).toContain('"A"');
     } finally {
       release(); if (result) await result.stop(); j078Daemon.root = null;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+
+// Exercise the real replacement/classifier path; every OS boundary below is an inert fixture.
+describe('J078 generated source daemon replacement compatibility', () => {
+  const hook = '/fixture/node_modules/tsx/dist/esm/index.mjs';
+  const sourceCommand = (entry: string) => `node --import ${hook} ${entry} daemon start-sync`;
+  it.each([
+    { label: 'outside cli-dist retained generation', command: sourceCommand('/outside/cli-dist-generation-ABC123/src/index.ts'), accepted: true },
+    { label: 'outside cli-dist-snapshot retained generation', command: sourceCommand('/outside/cli-dist-snapshot-generation-ABC123/src/index.ts'), accepted: true },
+    { label: 'outside legacy cli-dist', command: sourceCommand('/outside/cli-dist/src/index.ts'), accepted: true },
+    { label: 'outside legacy cli-dist-snapshot', command: sourceCommand('/outside/cli-dist-snapshot/src/index.ts'), accepted: true },
+    { label: 'project tmp generation', command: sourceCommand('/fixture/.project/tmp/cli-dist-generation-ABC123/src/index.ts'), accepted: true },
+    { label: 'project e2e generation', command: sourceCommand('/fixture/.project/logs/e2e/run/cli-dist-generation-ABC123/src/index.ts'), accepted: true },
+    { label: 'ordinary dist command', command: 'node /fixture/dist/index.mjs daemon start-sync', accepted: true },
+    { label: 'missing daemon start-sync', command: `node --import ${hook} /outside/cli-dist-generation-ABC123/src/index.ts other`, accepted: false },
+    { label: 'missing tsx', command: 'node /outside/cli-dist-generation-ABC123/src/index.ts daemon start-sync', accepted: false },
+    { label: 'unrecognized source basename', command: sourceCommand('/outside/other-generation-ABC123/src/index.ts'), accepted: false },
+    { label: 'unpublished staging path', command: sourceCommand('/outside/cli-dist-staging-ABC123/src/index.ts'), accepted: false },
+  ])('J078 replacement classifier: $label', async ({ command, accepted }) => {
+    const root = await mkdtemp(join(tmpdir(), 'j078-replacement-')); const home = resolve(root, 'home');
+    const { EventEmitter } = await import('node:events'); const fs = await import('node:fs');
+    const originalChild = new EventEmitter(); const successorChild = new EventEmitter();
+    const originalPid = 16161; const successorPid = 26262;
+    Object.assign(originalChild, { pid: originalPid, exitCode: null, killed: false });
+    Object.assign(successorChild, { pid: successorPid, exitCode: null, killed: false });
+    const signalCalls: Array<{ pid: number; signal: NodeJS.Signals | number | undefined }> = [];
+    let originalAlive = true; j078Daemon.root = root;
+    const fetchMock = vi.fn(async () => { throw new Error('J078 replacement must not use HTTP'); });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await mkdir(home, { recursive: true });
+      await writeFile(resolve(home, 'daemon.state.json'), JSON.stringify({ pid: originalPid, httpPort: 1234 }));
+      j078Boundary.state.ps = { pid: originalPid, command };
+      j078Boundary.state.onKill = (pid, signal) => {
+        if (pid === originalPid && signal === 'SIGTERM') {
+          signalCalls.push({ pid, signal }); originalAlive = false; originalChild.emit('exit', 0, 'SIGTERM'); return true;
+        }
+        if (signal === 0 && pid === originalPid && !originalAlive) throw Object.assign(new Error('fixture exited'), { code: 'ESRCH' });
+        if (signal === 0 && pid === successorPid) return true;
+        throw new Error(`J078 unexpected fixture signal: ${pid}/${String(signal)}`);
+      };
+      cliLaunchSpecMock.resolveCliTestLaunchSpec.mockReset();
+      cliLaunchSpecMock.resolveCliTestLaunchSpec.mockResolvedValue({ command: process.execPath, args: ['/fixture/dist/index.mjs'], cwd: root });
+      j078Daemon.spawn.mockReset(); j078Daemon.spawn.mockImplementation(() => {
+        fs.writeFileSync(resolve(home, 'daemon.state.json'), JSON.stringify({ pid: successorPid, httpPort: 2345 }));
+        return { child: successorChild, stop: vi.fn(async () => {}), stdoutPath: '', stderrPath: '' };
+      });
+      expect((await import('node:child_process')).spawnSync).toBe(j078Boundary.spawnSyncExport);
+      expect(process.kill).toBe(j078Boundary.killExport);
+      expect((await import('../process/spawnProcess')).spawnLoggedProcess).toBe(j078Daemon.spawnExport);
+      expect(globalThis.fetch).toBe(fetchMock);
+      const originalDaemon = {
+        happyHomeDir: home, state: { pid: originalPid, httpPort: 1234 },
+        proc: { child: originalChild as unknown as Awaited<ReturnType<typeof startTestDaemon>>['proc']['child'], stop: vi.fn(async () => {}), stdoutPath: '', stderrPath: '' },
+        stop: vi.fn(async () => {}), restart: async () => { throw new Error('unexpected fixture restart'); },
+      };
+      const pending = replaceTestDaemonWithoutStoppingSessions({ testDir: root, happyHomeDir: home, env: {}, originalDaemon });
+      if (accepted) {
+        await expect(pending).resolves.toMatchObject({ pid: successorPid, httpPort: 2345 });
+        expect(signalCalls).toEqual([{ pid: originalPid, signal: 'SIGTERM' }]);
+        expect(j078Daemon.spawn).toHaveBeenCalledTimes(1);
+        expect(cliLaunchSpecMock.resolveCliTestLaunchSpec).toHaveBeenCalledTimes(1);
+      } else {
+        await expect(pending).rejects.toThrow('refusing to hard-kill');
+        expect(signalCalls).toEqual([]); expect(j078Daemon.spawn).not.toHaveBeenCalled();
+        expect(cliLaunchSpecMock.resolveCliTestLaunchSpec).not.toHaveBeenCalled();
+      }
+      expect(j078Boundary.state.psCalls).toEqual([['-o', 'command=', '-p', String(originalPid), '-ww']]);
+      expect(fetchMock).not.toHaveBeenCalled(); expect(j078Boundary.state.attempts).toEqual([]);
+    } finally {
+      // Also settle the real owner's exit-wait promise after refusals; its own listener clears its timer.
+      originalChild.emit('exit', 0, null); expect(originalChild.listenerCount('exit')).toBe(0);
+      j078Boundary.state.ps = null; j078Boundary.state.onKill = null; j078Daemon.root = null;
       await rm(root, { recursive: true, force: true });
     }
   });

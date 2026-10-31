@@ -167,6 +167,7 @@ function looksLikeDaemonCommand(command: string): boolean {
       normalized.includes('@happier-dev/cli') ||
       normalized.includes('/cli-dist-snapshot/src/index.ts') ||
       normalized.includes('/cli-dist/src/index.ts') ||
+      /\/(?:cli-dist|cli-dist-snapshot)-generation-[^/\s]+\/src\/index\.ts(?:\s|$)/.test(normalized) ||
       (
         (normalized.includes('/.project/logs/e2e/') || normalized.includes('/.project/tmp/')) &&
         /\/cli-[^/\s]+\/src\/index\.ts(?:\s|$)/.test(normalized)
