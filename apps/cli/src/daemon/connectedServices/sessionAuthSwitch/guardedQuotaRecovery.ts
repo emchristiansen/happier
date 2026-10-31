@@ -134,14 +134,16 @@ export function createGuardedQuotaRecovery(input: Readonly<{
         if (!record || record.request.quotaRecovery.nativeId !== source.nativeId || atMs <= record.enteredAtMs) return;
         if (record.request.quotaRecovery.nativePublisherIncarnationId === source.publisherIncarnationId
           && BigInt(source.sequence) <= BigInt(record.request.quotaRecovery.nativeObservationSequence)) return;
-        if (!tracked.spawnOptions || !record.preservesOptions?.(tracked.spawnOptions)) return;
+        if (tracked.spawnOptionsCustody !== 'accepted_live_launch'
+          || !tracked.spawnOptions || !record.preservesOptions?.(tracked.spawnOptions)) return;
         const binding = ConnectedServiceBindingsV1Schema.safeParse(tracked.spawnOptions?.connectedServices).data
           ?.bindingsByServiceId[record.request.quotaRecovery.serviceId];
         const destination = record.request.bindings.bindingsByServiceId[record.request.quotaRecovery.serviceId];
         if (binding?.source !== 'connected' || destination?.source !== 'connected'
           || binding.profileId !== destination.profileId) return;
         const commitAcceptedCompletion = () => {
-          if (!matchesSource() || !tracked.spawnOptions || !record.preservesOptions?.(tracked.spawnOptions)
+          if (!matchesSource() || tracked.spawnOptionsCustody !== 'accepted_live_launch'
+            || !tracked.spawnOptions || !record.preservesOptions?.(tracked.spawnOptions)
             || (record.stage !== 'hot_applied' && record.stage !== 'launched')) return;
           record.verification = { ...source, useful: true, kind: 'completion', turnId: completion.turnId!, atMs };
         };
@@ -159,7 +161,9 @@ export function createGuardedQuotaRecovery(input: Readonly<{
       }
       const children = input.getChildren().filter((child) => child.happySessionId === sessionId);
       const tracked = children.length === 1 ? children[0] : undefined;
-      if (!tracked?.spawnOptions || !tracked.processInstanceFingerprint || input.isTurnInFlight(sessionId)) {
+      if (!tracked?.spawnOptions || tracked.startedBy !== 'daemon' || tracked.reattachedFromDiskMarker === true
+        || tracked.spawnOptionsCustody !== 'accepted_live_launch'
+        || !tracked.processInstanceFingerprint || input.isTurnInFlight(sessionId)) {
         return { ok: false as const, errorCode: 'quota_recovery_source_unavailable' };
       }
       const agentId = resolveTrackedSessionCatalogAgentId(tracked);

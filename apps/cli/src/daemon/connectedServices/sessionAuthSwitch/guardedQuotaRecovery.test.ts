@@ -10,6 +10,7 @@ import { switchSessionConnectedServiceAuth } from './switchSessionConnectedServi
 function fixture() {
   const core = createConnectedServiceSessionAuthSwitchCore();
   const tracked: TrackedSession = { startedBy: 'daemon', happySessionId: 'quota-session', pid: 123,
+    spawnOptionsCustody: 'accepted_live_launch',
     processInstanceFingerprint: 'fixture-instance', vendorResumeId: 'same-native', publisherIncarnationId: 'original-publisher',
     spawnOptions: { directory: '/fixture', backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
       resume: 'same-native', modelId: 'selected-model', permissionMode: 'yolo',
@@ -62,6 +63,24 @@ function fixture() {
 }
 
 describe('daemon guarded quota recovery', () => {
+  it.each(['unmarked', 'restored', 'foreign'] as const)('refuses %s options without an account effect', async (source) => {
+    const f = fixture();
+    if (source === 'unmarked') delete f.tracked.spawnOptionsCustody;
+    if (source === 'restored') f.tracked.reattachedFromDiskMarker = true;
+    if (source === 'foreign') f.tracked.startedBy = 'terminal';
+    expect(f.recovery.inspect('quota-session')).toMatchObject({ ok: false });
+    await expect(f.recovery.run(f.request, f.execute)).rejects.toThrow('quota_recovery_current_source_changed');
+    expect(f.persist).not.toHaveBeenCalled();
+    expect(f.restart).not.toHaveBeenCalled();
+  });
+
+  it('refuses loss of live-options custody across an awaited binding write', async () => {
+    const f = fixture();
+    f.persist.mockImplementation(async () => { delete f.tracked.spawnOptionsCustody; });
+    expect(await f.recovery.run(f.request, f.execute)).toMatchObject({ occurrence: { stage: 'unknown' } });
+    expect(f.restart).not.toHaveBeenCalled();
+  });
+
   it('does not refresh a refusal clock on duplicate delivery or accept an older publisher', () => {
     const f = fixture();
     f.advanceClock();

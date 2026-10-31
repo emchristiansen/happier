@@ -1417,6 +1417,9 @@ async function refreshTrackedSessionsRuntimeSnapshot(params: Readonly<{
       trackedVendorResumeId: trackedSession.vendorResumeId ?? null,
     });
     trackedSession.spawnOptions = runtimeSnapshot.spawnOptions;
+    // A metadata-derived snapshot is useful for ordinary resume, but cannot attest
+    // that every original input and callback remains in this daemon's live custody.
+    delete trackedSession.spawnOptionsCustody;
     const vendorResumeId = runtimeSnapshot.snapshot.vendorResumeId?.value;
     if (vendorResumeId) {
       trackedSession.vendorResumeId = vendorResumeId;
@@ -4283,6 +4286,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               createWebhookCompletion: () => ReturnType<typeof waitForSessionWebhook>,
             ): Promise<Readonly<{ acceptedResult: SpawnSessionResult; webhookCompletion: Promise<SpawnSessionResult> }>> => {
               const pid = trackedSession.pid;
+              trackedSession.spawnOptionsCustody = 'accepted_live_launch';
               pidToTrackedSession.set(pid, trackedSession);
               if (spawnResourceCleanupOnExit) {
                 spawnResourceCleanupByPid.set(pid, spawnResourceCleanupOnExit);

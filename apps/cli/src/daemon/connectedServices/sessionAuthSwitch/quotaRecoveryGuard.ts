@@ -82,6 +82,8 @@ export function createQuotaRecoveryGuard(input: Readonly<{
       const witness = input.readFailureSource();
       if (
         !original || !expectedOptions || current !== original
+        || current.startedBy !== 'daemon' || current.reattachedFromDiskMarker === true
+        || current.spawnOptionsCustody !== 'accepted_live_launch'
         || current.pid !== expected.pid
         || !expected.processInstanceFingerprint
         || current.processInstanceFingerprint !== expected.processInstanceFingerprint

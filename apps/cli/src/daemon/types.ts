@@ -30,6 +30,8 @@ export interface TrackedSession {
   publisherIncarnationId?: string;
   /** Spawn options used to start the current runner process (in-memory only). */
   spawnOptions?: SpawnSessionOptions;
+  /** Positive in-memory custody from accepted launch; never restored from markers or metadata. */
+  spawnOptionsCustody?: 'accepted_live_launch';
   /** Vendor resume id (e.g. Claude/Codex session id) supplied/derived at spawn time. */
   vendorResumeId?: string;
   /** Exact session-owned foreground turn currently open in this runner. */
