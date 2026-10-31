@@ -13,9 +13,11 @@ const {
   restartDaemonAndWaitMock,
   restartAllDaemonSessionRunnersMock,
   requestDaemonSessionRunnerRestartMock,
+  requestDaemonSessionPendingQueueWakeMock,
   evaluateDaemonStartupServiceConflictMock,
   startDaemonMock,
 } = vi.hoisted(() => ({
+  requestDaemonSessionPendingQueueWakeMock: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
   evaluateCurrentDaemonOwnerMock: vi.fn(async () => ({ kind: 'none' as const })),
   restartDaemonAndWaitMock: vi.fn(async (): Promise<unknown> => true),
   restartAllDaemonSessionRunnersMock: vi.fn(async () => ({
@@ -60,6 +62,9 @@ vi.mock('@/daemon/controlClient', async (importOriginal) => {
     ...actual,
     restartAllDaemonSessionRunners: restartAllDaemonSessionRunnersMock,
     requestDaemonSessionRunnerRestart: requestDaemonSessionRunnerRestartMock,
+    requestDaemonSessionPendingQueueWake: requestDaemonSessionPendingQueueWakeMock,
+    stopDaemon: vi.fn(async () => { throw new Error('unexpected stop'); }),
+    stopDaemonSession: vi.fn(async () => { throw new Error('unexpected stop session'); }),
   };
 });
 
@@ -503,5 +508,44 @@ describe('handleDaemonCliCommand session runner restart controls', () => {
       expect(outcome).toBe('exit:1');
       expect(output.json()).toEqual(expect.objectContaining({ ok: false, error: 'settings_update_failed' }));
     }, 60_000);
+  });
+});
+
+
+describe('signal-free pending queue wake: CLI', () => {
+  beforeEach(async () => {
+    const persistence = await import('@/persistence');
+    vi.spyOn(persistence, 'readCredentials').mockRejectedValue(new Error('unexpected credential read'));
+    vi.spyOn(persistence, 'updateSettings').mockRejectedValue(new Error('unexpected settings update'));
+    expect(vi.isMockFunction(persistence.readCredentials)).toBe(true);
+    expect(vi.isMockFunction(persistence.updateSettings)).toBe(true);
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected HTTP'));
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw new Error('unexpected signal'); });
+    requestDaemonSessionPendingQueueWakeMock.mockReset();
+    startDaemonMock.mockClear(); restartDaemonAndWaitMock.mockClear();
+    vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { throw new Error(`exit:${code}`); }) as never);
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.resetModules(); });
+  it.each([{ type: 'wake_published' }, { type: 'unavailable', reason: 'rpc_failed' }] as const)('prints exact $type JSON without lifecycle fallback', async (diagnostic) => {
+    const boundary = await import('@/daemon/controlClient');
+    expect(boundary.requestDaemonSessionPendingQueueWake).toBe(requestDaemonSessionPendingQueueWakeMock);
+    requestDaemonSessionPendingQueueWakeMock.mockResolvedValue(diagnostic);
+    const capture = captureStdoutJsonOutput();
+    try {
+      const { handleDaemonCliCommand } = await import('./daemon');
+      const run = handleDaemonCliCommand({ args: ['daemon', 'pending-queue-wake', 'session_full_1', '--json'], rawArgv: [], terminalRuntime: null });
+      if (diagnostic.type === 'unavailable') await expect(run).rejects.toThrow('exit:1'); else await run;
+      expect(capture.json()).toEqual(diagnostic);
+      expect(requestDaemonSessionPendingQueueWakeMock).toHaveBeenCalledExactlyOnceWith({ sessionId: 'session_full_1' });
+      expect(startDaemonMock).not.toHaveBeenCalled(); expect(restartDaemonAndWaitMock).not.toHaveBeenCalled();
+      expect(boundary.stopDaemon).not.toHaveBeenCalled(); expect(boundary.stopDaemonSession).not.toHaveBeenCalled();
+      const persistence = await import('@/persistence');
+      expect(persistence.readCredentials).not.toHaveBeenCalled(); expect(persistence.updateSettings).not.toHaveBeenCalled();
+    } finally { capture.restore(); }
+  });
+  it.each([[], ['--json'], ['session_full_1', '--resume'], ['session_full_1', 'second']].map(tail => ({ tail })))('refuses invalid arguments %j before control work', async ({ tail }) => {
+    const { handleDaemonCliCommand } = await import('./daemon');
+    await expect(handleDaemonCliCommand({ args: ['daemon', 'pending-queue-wake', ...tail], rawArgv: [], terminalRuntime: null })).rejects.toThrow('exit:1');
+    expect(requestDaemonSessionPendingQueueWakeMock).not.toHaveBeenCalled(); expect(startDaemonMock).not.toHaveBeenCalled(); expect(restartDaemonAndWaitMock).not.toHaveBeenCalled();
   });
 });

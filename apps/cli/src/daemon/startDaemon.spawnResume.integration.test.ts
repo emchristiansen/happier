@@ -870,6 +870,7 @@ vi.mock('./controlServer', () => ({
     resolveSpawnSessionByNonce?: (spawnNonce: string) => Promise<unknown> | unknown;
     runtimeAuthRecoveryScheduler?: import('./connectedServices/runtimeAuth/RuntimeAuthRecoveryScheduler').RuntimeAuthRecoveryScheduler;
     handleSessionRunnerStatusGet?: (input: { sessionId: string }) => Promise<any>;
+    handleSessionPendingQueueWake?: (input: { sessionId: string }) => Promise<import('./sessions/pendingQueueWake').SessionPendingQueueWakeDiagnostic>;
   }) => {
     harness.setSpawnSession(spawnSession);
     if (runtimeAuthRecoveryScheduler) {
@@ -1164,6 +1165,14 @@ vi.mock('./machine/metadata', () => ({
 vi.mock('./connectedServices/quotas/resolveConnectedServicesQuotasDaemonEnabled', () => ({
   resolveConnectedServicesQuotasDaemonEnabled: vi.fn(async () => false),
 }));
+
+// The local wake corridor must resolve these external imports to the retained mocks.
+expect((await import('@/session/transport/rpc/sessionRpc')).callSessionRpc).toBe(pendingMaterializationRpcMocks.callSessionRpc);
+expect((await import('@/session/services/resolveSessionTransportContext')).resolveSessionTransportContext).toBe(pendingMaterializationRpcMocks.resolveSessionTransportContext);
+expect(vi.isMockFunction((await import('./controlServer')).startDaemonControlServer)).toBe(true);
+expect(vi.isMockFunction((await import('axios')).default.get)).toBe(true);
+expect(vi.isMockFunction((await import('@/ui/auth')).authAndSetupMachineIfNeeded)).toBe(true);
+expect((await import('node:child_process')).spawn).toBe(spawnChildProcess);
 
 // Load the real startup corridor during collection, not inside a timed lifecycle case.
 const [actualReattachmentOwner, actualChildExitOwner, actualMetadataUpdateOwner, daemonStartupOwner, actualSessionWebhookOwner] = await Promise.all([
@@ -8803,4 +8812,69 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
   });
 
+});
+
+
+// Kept outside the spawn-resume describe: its Herdr Unix-socket fixture is unnecessary here.
+describe('signal-free pending queue wake: daemon injection', () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); harness.resetControlRefs(); archiveHttp.read = null; });
+  it('uses the private archive/credential/transport owner and refuses mismatch, archived and shutdown states', async () => {
+    const processBoundary = await import('node:child_process');
+    vi.spyOn(processBoundary, 'execFileSync').mockImplementation(() => { throw new Error('unexpected native command'); });
+    vi.spyOn(processBoundary, 'execFile').mockImplementation(() => { throw new Error('unexpected native command'); });
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw new Error('unexpected signal'); });
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected HTTP'));
+    vi.mocked(psList).mockResolvedValue([]);
+    processInstanceBoundaryMocks.readProcessInstanceFingerprintSync.mockReturnValue('fixture-daemon-generation');
+    const herdr = await import('@/integrations/herdr/client');
+    vi.mocked(herdr.createHerdrClient).mockImplementation(() => { throw new Error('unexpected Herdr access'); });
+    const persistence = await import('@/persistence');
+    expect(vi.isMockFunction(persistence.readCredentials)).toBe(true);
+    expect(vi.isMockFunction(processBoundary.execFileSync)).toBe(true);
+    expect(vi.isMockFunction(psList)).toBe(true);
+    const control = await import('./controlServer');
+    const controlMock = vi.mocked(control.startDaemonControlServer); controlMock.mockClear();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    vi.stubEnv('HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED', 'false');
+    vi.stubEnv('HAPPIER_DAEMON_SESSION_RESPAWN_ENABLED', 'false');
+    const observedArchiveIds: string[] = [];
+    archiveHttp.read = async (id) => {
+      observedArchiveIds.push(id);
+      return { status: 200, data: { session: createSessionRecordFixture({ id, archivedAt: id === 'archived_full' ? 42 : null }) } };
+    };
+    pendingMaterializationRpcMocks.resolveSessionTransportContext.mockImplementation(async (...args: unknown[]) => {
+      const { idOrPrefix } = args[0] as Parameters<typeof resolveSessionTransportContext>[0];
+      return { ok: true, sessionId: idOrPrefix === 'prefix' ? 'expanded_full_id' : idOrPrefix,
+        rawSession: { id: idOrPrefix, active: true, encryptionMode: 'plain' }, mode: 'plain' as const, ctx: pendingMaterializationRpcMocks.ctx };
+    });
+    pendingMaterializationRpcMocks.callSessionRpc.mockImplementation(async ({ method }) => method.endsWith('wakeCapability.v1.get')
+      ? { ok: true, capability: 'pending_queue_wake_v1', protocolVersion: 1, method: 'session.pendingQueue.wake.v1' }
+      : { ok: true, result: 'wake_published' });
+    pendingMaterializationRpcMocks.callSessionRpc.mockClear();
+    const registration = harness.waitForSpawnSessionRegistration();
+    const run = daemonStartupOwner.startDaemon();
+    try {
+      await registration;
+      const callback = controlMock.mock.calls[0]?.[0].handleSessionPendingQueueWake;
+      expect(typeof callback).toBe('function');
+      await expect(callback!({ sessionId: 'session_full_1' })).resolves.toEqual({ type: 'wake_published' });
+      expect(observedArchiveIds).toContain('session_full_1');
+      expect(pendingMaterializationRpcMocks.resolveSessionTransportContext).toHaveBeenCalledWith(expect.objectContaining({ credentials: expect.objectContaining({ token: 'token-daemon' }), idOrPrefix: 'session_full_1' }));
+      expect(pendingMaterializationRpcMocks.callSessionRpc.mock.calls.map(([request]) => [request.method, request.request])).toEqual([
+        ['session_full_1:session.pendingQueue.wakeCapability.v1.get', {}],
+        ['session_full_1:session.pendingQueue.wake.v1', { protocolVersion: 1 }],
+      ]);
+      for (const [request] of pendingMaterializationRpcMocks.callSessionRpc.mock.calls) expect(request).toMatchObject({ token: 'token-daemon', sessionId: 'session_full_1', mode: 'plain', ctx: pendingMaterializationRpcMocks.ctx });
+      pendingMaterializationRpcMocks.callSessionRpc.mockClear();
+      await expect(callback!({ sessionId: 'prefix' })).resolves.toEqual({ type: 'unavailable', reason: 'session_mismatch' });
+      expect(pendingMaterializationRpcMocks.callSessionRpc).not.toHaveBeenCalled();
+      await expect(callback!({ sessionId: 'archived_full' })).rejects.toThrow('archived');
+      expect(pendingMaterializationRpcMocks.callSessionRpc).not.toHaveBeenCalled();
+      await harness.getBeforeShutdown()!();
+      await expect(callback!({ sessionId: 'session_full_1' })).resolves.toEqual({ type: 'unavailable', reason: 'shutdown' });
+      expect(spawnHappyCLI).not.toHaveBeenCalled(); expect(spawnChildProcess).not.toHaveBeenCalled(); expect(stopSessionMocks.stopSession).not.toHaveBeenCalled();
+    } finally {
+      harness.requestShutdown('happier-cli'); await run; exitSpy.mockRestore();
+    }
+  });
 });

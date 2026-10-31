@@ -8,6 +8,8 @@ import {
   inspectDaemonRunningStateAndCleanupStaleState,
   listDaemonSessions,
   requestDaemonSessionRunnerRestart,
+  requestDaemonSessionPendingQueueWake,
+  DaemonSessionPendingQueueWakeError,
   restartAllDaemonSessionRunners,
   stopDaemon,
   stopDaemonSession,
@@ -86,6 +88,7 @@ ${chalk.bold('Usage:')}
   happier daemon restart [--takeover]  Restart the daemon (stop -> start)
   happier daemon restart --restart-session-runners  Restart the daemon, preserve sessions, then restart tracked session runners on the current CLI
   happier daemon restart-session-runners [--session-id <id>] [--dry-run] [--force-current-cli]  Restart eligible tracked session runners on the current CLI
+  happier daemon pending-queue-wake <full-session-id> [--json]  Request a pending-queue callback without starting or replacing a runner
   happier daemon session-debug-log <on|off|status> <session-id>  Spawn that session's runner with HAPPIER_LOG_LEVEL=debug from its next start (other sessions unchanged)
   happier daemon restart-session-runners --on-update on|off  Automatically restart idle stale session runners whenever the daemon starts on a newer CLI
   happier daemon stop               Stop a manual daemon (sessions stay alive; use happier service stop for installed background services)
@@ -269,6 +272,38 @@ export async function handleDaemonCliCommand(context: CommandContext): Promise<v
     process.exit(await runDaemonSessionDebugLogCommand(args.slice(2), {
       daemonStateDir: dirname(configuration.daemonStateFile),
     }));
+  }
+
+  if (daemonSubcommand === 'pending-queue-wake') {
+    const tail = args.slice(2);
+    const jsonRequested = tail.includes('--json');
+    const sessionId = tail[0];
+    if (!sessionId || sessionId.startsWith('-') || sessionId !== sessionId.trim()
+      || tail.length > 2 || (tail.length === 2 && tail[1] !== '--json')) {
+      const message = 'Expected pending-queue-wake <full-session-id> [--json].';
+      if (jsonRequested) await printDaemonJson({ ok: false, error: 'invalid_arguments', message });
+      else console.error(message);
+      process.exit(1);
+    }
+    let result;
+    try {
+      result = await requestDaemonSessionPendingQueueWake({ sessionId });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (jsonRequested) await printDaemonJson({
+        ok: false,
+        error: message,
+        ...(error instanceof DaemonSessionPendingQueueWakeError && error.errorCode ? { errorCode: error.errorCode } : {}),
+      });
+      else console.error(message);
+      process.exit(1);
+    }
+    if (jsonRequested) await printDaemonJson(result);
+    else console.log(result.type === 'wake_published'
+      ? 'Pending queue callback requested; processing is not confirmed.'
+      : `Pending queue wake unavailable: ${result.reason}`);
+    if (result.type !== 'wake_published') process.exit(1);
+    return;
   }
 
   if (daemonSubcommand === 'stop-session') {

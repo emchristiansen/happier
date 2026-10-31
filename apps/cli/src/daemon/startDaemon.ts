@@ -7226,6 +7226,16 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       runtimeId,
       stopSession,
       prepareStopSession: prepareStopSessionForDaemonStop,
+      handleSessionPendingQueueWake: async ({ sessionId }) => {
+        if (shutdownInitiated || connectedServiceQuotaProducersQuiesced) {
+          return { type: 'unavailable', reason: 'shutdown' };
+        }
+        return await requestPendingQueueWake({
+          sessionId,
+          credentials,
+          isShutdownRequested: () => shutdownInitiated || connectedServiceQuotaProducersQuiesced,
+        });
+      },
       spawnSession,
       resolveSpawnSessionByNonce: async (spawnNonce) => {
         const resolved = daemonSpawnAttemptRegistry.resolve(spawnNonce);

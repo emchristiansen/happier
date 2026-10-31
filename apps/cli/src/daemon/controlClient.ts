@@ -3,6 +3,8 @@
  * Used by CLI commands to interact with running daemon
  */
 
+import { z } from 'zod';
+import type { SessionPendingQueueWakeDiagnostic } from './sessions/pendingQueueWake';
 import { logger } from '@/ui/logger';
 import { readDaemonState, reclaimDeadDaemonPublication } from '@/persistence';
 import { Metadata } from '@/api/types';
@@ -70,6 +72,39 @@ import { isPidAliveBySignal, readProcessRunState } from './processRunState';
 import { classifyDaemonLifecycleProcessByPid } from './doctor';
 import { getRunnerPublisherIncarnationId } from '@/api/session/publisherIncarnation';
 import { readSpawnSessionNonceResolution } from '@/session/services/awaitSpawnedSessionId';
+
+// Local control exposure of the existing daemon-owned wake diagnostic; no new session RPC.
+export const DaemonSessionPendingQueueWakeRequestSchema = z.object({
+  sessionId: z.string().min(1).refine((value) => value === value.trim(), 'Expected an exact full session ID'),
+}).strict();
+export const DaemonSessionPendingQueueWakeResultSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('wake_published') }).strict(),
+  z.object({ type: z.literal('unavailable'), reason: z.enum([
+    'no_token', 'shutdown', 'transport_unavailable', 'session_mismatch', 'rpc_method_unavailable',
+    'runtime_upgrade_required', 'runtime_terminating', 'publisher_recovering', 'publisher_lost',
+    'publisher_lost_respondent_unbound', 'malformed_response', 'rpc_failed',
+  ]) }).strict(),
+]) satisfies z.ZodType<SessionPendingQueueWakeDiagnostic>;
+
+export class DaemonSessionPendingQueueWakeError extends Error {
+  constructor(message: string, readonly errorCode?: string, readonly response?: unknown) {
+    super(message);
+    this.name = 'DaemonSessionPendingQueueWakeError';
+  }
+}
+
+export async function requestDaemonSessionPendingQueueWake(
+  request: z.infer<typeof DaemonSessionPendingQueueWakeRequestSchema>,
+  options: DaemonControlRequestOptions = {},
+): Promise<SessionPendingQueueWakeDiagnostic> {
+  const body = DaemonSessionPendingQueueWakeRequestSchema.parse(request);
+  // Archive admission belongs to the existing daemon lifecycle, not a new phase-local deadline.
+  const result = await daemonPost('/session-pending-queue-wake', body, { timeoutMs: null, ...options });
+  if (result?.error) throw new DaemonSessionPendingQueueWakeError(String(result.error), result.errorCode, result.response);
+  const parsed = DaemonSessionPendingQueueWakeResultSchema.safeParse(result);
+  if (!parsed.success) throw new DaemonSessionPendingQueueWakeError('Invalid daemon pending queue wake response');
+  return parsed.data;
+}
 
 export type DaemonControlRequestOptions = {
   /** `null` leaves a local control request owned by caller/daemon lifecycle. */

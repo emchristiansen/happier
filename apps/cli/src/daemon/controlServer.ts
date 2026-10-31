@@ -1,3 +1,5 @@
+import { DaemonSessionPendingQueueWakeRequestSchema, DaemonSessionPendingQueueWakeResultSchema } from './controlClient';
+import type { SessionPendingQueueWakeDiagnostic } from './sessions/pendingQueueWake';
 /**
  * HTTP control server for daemon management
  * Provides endpoints for listing sessions, stopping sessions, and daemon shutdown
@@ -365,6 +367,7 @@ export function createDaemonControlApp({
   handleSessionRunnerRestart,
   handleSessionRunnerRestartAll,
   handleSessionRunnerStatusGet,
+  handleSessionPendingQueueWake,
   handleConnectedServiceQuotaSnapshot,
   handleConnectedServiceQuotaRecoveryCreditConsume,
   handleCodexChatGptAuthTokensRefresh,
@@ -448,6 +451,7 @@ export function createDaemonControlApp({
     input: RestartAllSessionRunnersRequestV1,
   ) => Promise<RestartAllSessionRunnersResultV1>;
   handleSessionRunnerStatusGet?: (input: SessionRunnerStatusGetRequestV1) => Promise<SessionRunnerRuntimeStateV1>;
+  handleSessionPendingQueueWake?: (input: Readonly<{ sessionId: string }>) => Promise<SessionPendingQueueWakeDiagnostic>;
   handleConnectedServiceQuotaSnapshot?: (input: Readonly<{
     sessionId: string;
     serviceId: ConnectedServiceId;
@@ -677,6 +681,25 @@ export function createDaemonControlApp({
     }
     const result = await handleSessionConnectedServiceAuthSwitch(request.body);
     return { ok: true as const, result };
+  });
+
+  typed.post('/session-pending-queue-wake', {
+    schema: {
+      body: DaemonSessionPendingQueueWakeRequestSchema,
+      response: {
+        200: DaemonSessionPendingQueueWakeResultSchema,
+        401: authSchema401,
+        501: z.object({ ok: z.literal(false), errorCode: z.literal('session_pending_queue_wake_handler_unavailable') }),
+      },
+    },
+    preHandler: requireAuth,
+  }, async (request, reply) => {
+    if (isShuttingDown?.()) return { type: 'unavailable' as const, reason: 'shutdown' as const };
+    if (!handleSessionPendingQueueWake) {
+      reply.code(501);
+      return { ok: false as const, errorCode: 'session_pending_queue_wake_handler_unavailable' as const };
+    }
+    return await handleSessionPendingQueueWake(request.body);
   });
 
   typed.post('/session-runners/restart', {
@@ -2261,6 +2284,7 @@ export function startDaemonControlServer({
   handleSessionRunnerRestart,
   handleSessionRunnerRestartAll,
   handleSessionRunnerStatusGet,
+  handleSessionPendingQueueWake,
   handleConnectedServiceQuotaSnapshot,
   handleConnectedServiceQuotaRecoveryCreditConsume,
   handleCodexChatGptAuthTokensRefresh,
@@ -2334,6 +2358,7 @@ export function startDaemonControlServer({
     input: RestartAllSessionRunnersRequestV1,
   ) => Promise<RestartAllSessionRunnersResultV1>;
   handleSessionRunnerStatusGet?: (input: SessionRunnerStatusGetRequestV1) => Promise<SessionRunnerRuntimeStateV1>;
+  handleSessionPendingQueueWake?: (input: Readonly<{ sessionId: string }>) => Promise<SessionPendingQueueWakeDiagnostic>;
   handleConnectedServiceQuotaSnapshot?: (input: Readonly<{
     sessionId: string;
     serviceId: ConnectedServiceId;
@@ -2389,6 +2414,7 @@ export function startDaemonControlServer({
       handleSessionRunnerRestart,
       handleSessionRunnerRestartAll,
       handleSessionRunnerStatusGet,
+      handleSessionPendingQueueWake,
       handleConnectedServiceQuotaSnapshot,
       handleConnectedServiceQuotaRecoveryCreditConsume,
       handleCodexChatGptAuthTokensRefresh,
