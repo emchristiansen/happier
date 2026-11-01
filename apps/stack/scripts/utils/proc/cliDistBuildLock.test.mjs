@@ -419,7 +419,19 @@ parentPort.close();
     let workerError;
     worker.once('message', (value) => { report = value; });
     worker.once('error', (error) => { workerError = error; });
-    const exitCode = await new Promise((resolve) => worker.once('exit', resolve));
+    // Preserve the old child fixture's one-second budget for this disposable worker.
+    let deadlineExceeded = false;
+    const deadline = setTimeout(() => {
+      deadlineExceeded = true;
+      worker.terminate().catch((error) => { workerError = error; });
+    }, 1_000);
+    let exitCode;
+    try {
+      exitCode = await new Promise((resolve) => worker.once('exit', resolve));
+    } finally {
+      clearTimeout(deadline);
+    }
+    assert.equal(deadlineExceeded, false, 'reclaim fixture worker exceeded one second');
     assert.ifError(workerError);
     assert.equal(exitCode, 0);
     assert.equal(report?.replacements, 1);
