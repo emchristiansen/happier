@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -300,73 +301,129 @@ test('withCliDistBuildLock does not delete a successor owner during stale-owner 
     const script = `
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import childProcess from 'node:child_process';
+import net from 'node:net';
+import http from 'node:http';
+import https from 'node:https';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
+import { parentPort } from 'node:worker_threads';
 
-const originalRenameSync = fs.renameSync;
-const originalRmSync = fs.rmSync;
+const realFs = { ...fs };
 const lockPath = join(${JSON.stringify(tmp)}, 'cli-dist-build.lock');
 const staleOwner = {
   pid: 999999,
   createdAtMs: Date.now() - 60_000,
   updatedAtMs: Date.now() - 60_000,
 };
-const successorOwner = {
+const successorRaw = JSON.stringify({
   pid: process.pid,
   createdAtMs: Date.now() + 1,
   updatedAtMs: Date.now() + 1,
-};
-let replaced = false;
+});
+let replacements = 0;
+let readsAfterReplacement = 0;
 let enteredCriticalSection = false;
+let fakeLivenessReads = 0;
+let fakeFingerprintReads = 0;
+let forbiddenBoundaryCalls = 0;
+const openPaths = new Map();
+const forbidden = () => {
+  forbiddenBoundaryCalls++;
+  throw new Error('real process or network boundary forbidden');
+};
 
-fs.writeFileSync(lockPath, JSON.stringify(staleOwner), 'utf8');
-
-function installSuccessorBeforeReclaim(path) {
-  if (String(path) !== lockPath || replaced) return;
-  replaced = true;
-  fs.writeFileSync(lockPath, JSON.stringify(successorOwner), 'utf8');
+// The real lock owner runs with fake OS/process/network boundaries, as in its canonical tests.
+process.kill = (pid, signal) => {
+  assert.equal(signal, 0);
+  fakeLivenessReads++;
+  if (pid === process.pid) return true;
+  assert.equal(pid, staleOwner.pid);
+  throw Object.assign(new Error('fixture absent process'), { code: 'ESRCH' });
+};
+for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
+  childProcess[name] = forbidden;
 }
-
-fs.renameSync = function patchedRenameSync(oldPath, newPath) {
-  installSuccessorBeforeReclaim(oldPath);
-  return originalRenameSync.call(this, oldPath, newPath);
+childProcess.spawnSync = (command, args) => {
+  if (command === 'ps') {
+    assert.deepEqual(args, ['-o', 'lstart=', '-p', String(process.pid)]);
+    fakeFingerprintReads++;
+    return { status: 0, stdout: 'Mon Jan 01 00:00:00 2024' };
+  }
+  if (command === 'powershell.exe') {
+    assert.ok(args.at(-1).includes('ProcessId=' + process.pid));
+    fakeFingerprintReads++;
+    return { status: 0, stdout: '2024-01-01T00:00:00.000Z' };
+  }
+  return forbidden();
 };
-
-fs.rmSync = function patchedRmSync(path, options) {
-  installSuccessorBeforeReclaim(path);
-  return originalRmSync.call(this, path, options);
+globalThis.fetch = forbidden;
+for (const name of ['connect', 'createConnection', 'createServer']) net[name] = forbidden;
+for (const transport of [http, https]) {
+  for (const name of ['request', 'get', 'createServer']) transport[name] = forbidden;
+}
+fs.openSync = (...args) => {
+  const fd = realFs.openSync(...args);
+  openPaths.set(fd, String(args[0]));
+  return fd;
 };
-
+fs.closeSync = (fd) => {
+  openPaths.delete(fd);
+  return realFs.closeSync(fd);
+};
+fs.readFileSync = (...args) => {
+  if (typeof args[0] === 'string' && args[0].startsWith('/proc/') && args[0].endsWith('/stat')) {
+    fakeFingerprintReads++;
+    return '1 (fixture) S ' + Array(18).fill('0').join(' ') + ' 100';
+  }
+  const raw = realFs.readFileSync(...args);
+  if ((openPaths.get(args[0]) ?? String(args[0])) === lockPath) {
+    if (replacements === 0 && JSON.parse(String(raw)).pid === staleOwner.pid) {
+      // Return the stale snapshot, then replace it before the real owner's identity recheck.
+      replacements++;
+      realFs.writeFileSync(lockPath, successorRaw, 'utf8');
+    } else if (replacements === 1) {
+      readsAfterReplacement++;
+    }
+  }
+  return raw;
+};
 syncBuiltinESMExports();
-
+assert.equal((await import('node:fs')).readFileSync, fs.readFileSync);
+assert.equal((await import('node:child_process')).spawnSync, childProcess.spawnSync);
+assert.equal((await import('node:net')).connect, forbidden);
+assert.equal((await import('node:http')).request, forbidden);
+assert.equal((await import('node:https')).request, forbidden);
+assert.equal(globalThis.fetch, forbidden);
+realFs.writeFileSync(lockPath, JSON.stringify(staleOwner), 'utf8');
 const { withCliDistBuildLock } = await import(${JSON.stringify(moduleUrl)});
-
 await assert.rejects(
-  () =>
-    withCliDistBuildLock(
-      async () => {
-        enteredCriticalSection = true;
-      },
-      {
-        lockPath,
-        timeoutMs: 80,
-        pollIntervalMs: 10,
-        staleAfterMs: 1,
-      },
-    ),
+  () => withCliDistBuildLock(
+    async () => { enteredCriticalSection = true; },
+    { lockPath, timeoutMs: 80, pollIntervalMs: 10, staleAfterMs: 1 },
+  ),
   /Timed out waiting for CLI dist build lock/,
 );
-
+assert.equal(replacements, 1, 'successor injection must reach the actual snapshot boundary');
+assert.ok(readsAfterReplacement >= 1, 'the real owner must inspect the replaced snapshot');
 assert.equal(enteredCriticalSection, false);
-assert.deepEqual(JSON.parse(fs.readFileSync(lockPath, 'utf8')), successorOwner);
+assert.equal(realFs.readFileSync(lockPath, 'utf8'), successorRaw);
+assert.ok(fakeLivenessReads >= 1);
+assert.ok(fakeFingerprintReads >= 1);
+assert.equal(forbiddenBoundaryCalls, 0);
+parentPort.postMessage({ replacements, readsAfterReplacement, forbiddenBoundaryCalls });
+parentPort.close();
 `;
-
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
-      encoding: 'utf8',
-      timeout: 1_000,
-    });
-
-    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const worker = new Worker(new URL(`data:text/javascript,${encodeURIComponent(script)}`));
+    let report;
+    let workerError;
+    worker.once('message', (value) => { report = value; });
+    worker.once('error', (error) => { workerError = error; });
+    const exitCode = await new Promise((resolve) => worker.once('exit', resolve));
+    assert.ifError(workerError);
+    assert.equal(exitCode, 0);
+    assert.equal(report?.replacements, 1);
+    assert.equal(report?.forbiddenBoundaryCalls, 0);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
