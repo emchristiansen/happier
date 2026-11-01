@@ -40,10 +40,16 @@ const offlineBoundary = vi.hoisted(() => {
   for (const key of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
     vi.stubEnv(key, origin);
   }
+  const denyNetwork = vi.fn((operation: string) => { throw new Error(`Unconfigured offline network: ${operation}`); });
+  // Positive boundary check before project imports; subsequent calls must remain zero.
+  try { denyNetwork('boundary-check'); } catch (error) {
+    if (!(error instanceof Error) || error.message !== 'Unconfigured offline network: boundary-check') throw error;
+  }
+  denyNetwork.mockClear();
   const fetch = vi.fn(async (input: string | URL | Request) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
     if (url.origin !== origin || url.pathname !== '/v1/features') {
-      throw new Error(`Unconfigured offline fetch: ${url.href}`);
+      return denyNetwork(`fetch ${url.href}`);
     }
     return new Response(JSON.stringify({
       features: {
@@ -62,14 +68,44 @@ const offlineBoundary = vi.hoisted(() => {
     }), { status: 200 });
   });
   vi.stubGlobal('fetch', fetch);
-  return { origin, fetch };
+  return { origin, fetch, denyNetwork };
 });
+
+// J100 exercises real pending parsers/supervision, with no host process observation.
+const j100ProcessBoundary = vi.hoisted(() => {
+  const denyChild = vi.fn(() => { throw new Error('J100 child process boundary denied'); });
+  const fingerprint = vi.fn((pid: number) => {
+    if (pid !== process.pid) throw new Error('J100 foreign process observation denied');
+    return 'j100-inert-process-instance';
+  });
+  // Verify the denial before SessionClient or any of its project dependencies import.
+  try { denyChild(); } catch (error) {
+    if (!(error instanceof Error) || error.message !== 'J100 child process boundary denied') throw error;
+  }
+  denyChild.mockClear();
+  vi.spyOn(process, 'kill').mockImplementation(denyChild);
+  return { denyChild, fingerprint };
+});
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  const denied = Object.fromEntries(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']
+    .map((name) => [name, j100ProcessBoundary.denyChild]));
+  return { ...actual, ...denied, default: { ...actual, ...denied } };
+});
+vi.mock('@happier-dev/cli-common/processInstance', () => ({
+  readProcessInstanceFingerprintSync: j100ProcessBoundary.fingerprint,
+  processInstanceFingerprintMatches: (expected: string, observed: string) => expected === observed,
+}));
 
 vi.mock('axios', async () => {
   const { createOfflineAxios } = await import('@/testkit/http/offlineAxios');
   return { default: {
     ...createOfflineAxios(async (url) => {
-      throw new Error(`Unconfigured offline GET: ${url}`);
+      // Preserve this fixture's existing unsupported-changes fallback without real HTTP.
+      if (new URL(url).pathname === '/v2/changes') {
+        return { status: 404, data: { error: 'not-found' } };
+      }
+      return offlineBoundary.denyNetwork(`GET ${url}`);
     }),
     isAxiosError: (payload: unknown) => payload !== null && typeof payload === 'object'
       && 'isAxiosError' in payload && payload.isAxiosError === true,
@@ -77,7 +113,7 @@ vi.mock('axios', async () => {
 });
 
 vi.mock('socket.io-client', () => ({
-  io: () => { throw new Error('Unconfigured offline socket'); },
+  io: () => offlineBoundary.denyNetwork('socket.io'),
 }));
 
 // These composed regressions keep the real supervisor and pending wire parser; only sockets/HTTP are offline.
@@ -431,6 +467,9 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
 
   beforeEach(() => {
     useRealSupervisorAndPendingTransport = false;
+    offlineBoundary.denyNetwork.mockClear();
+    j100ProcessBoundary.denyChild.mockClear();
+    vi.spyOn(process, 'kill').mockImplementation(j100ProcessBoundary.denyChild);
     for (const key of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
       vi.stubEnv(key, offlineBoundary.origin);
     }
@@ -477,24 +516,30 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   afterEach(async () => {
-    for (const client of clients.splice(0)) {
-      const pending = client as unknown as {
-        changesSyncInFlight: Promise<void> | null;
-        userSocketSettingsConvergenceInFlight: Promise<void> | null;
-        accountSettingsHintConvergenceInFlight: Promise<void> | null;
-        accountSettingsRequestInFlight: Promise<boolean> | null;
-      };
-      const drains = [pending.changesSyncInFlight, pending.userSocketSettingsConvergenceInFlight,
-        pending.accountSettingsHintConvergenceInFlight, pending.accountSettingsRequestInFlight];
-      await client.close();
-      await Promise.allSettled([...drains, pending.changesSyncInFlight,
-        pending.userSocketSettingsConvergenceInFlight, pending.accountSettingsHintConvergenceInFlight,
-        pending.accountSettingsRequestInFlight]);
+    try {
+      for (const client of clients.splice(0)) {
+        const pending = client as unknown as {
+          changesSyncInFlight: Promise<void> | null;
+          userSocketSettingsConvergenceInFlight: Promise<void> | null;
+          accountSettingsHintConvergenceInFlight: Promise<void> | null;
+          accountSettingsRequestInFlight: Promise<boolean> | null;
+        };
+        const drains = [pending.changesSyncInFlight, pending.userSocketSettingsConvergenceInFlight,
+          pending.accountSettingsHintConvergenceInFlight, pending.accountSettingsRequestInFlight];
+        await client.close();
+        await Promise.allSettled([...drains, pending.changesSyncInFlight,
+          pending.userSocketSettingsConvergenceInFlight, pending.accountSettingsHintConvergenceInFlight,
+          pending.accountSettingsRequestInFlight]);
+      }
+      expect(j100ProcessBoundary.denyChild).not.toHaveBeenCalled();
+      expect(offlineBoundary.denyNetwork).not.toHaveBeenCalled();
+      expect(j100ProcessBoundary.fingerprint.mock.calls.every(([pid]) => pid === process.pid)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
     }
-    vi.useRealTimers();
-    vi.unstubAllEnvs();
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
   });
 
   it('blocks a contract-invalid provider action before invoking provider input', async () => {
@@ -2406,6 +2451,165 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       await waitUntil(() => currentEpoch(client) > previousEpoch && realSupervisor(client).getState().phase === 'online');
       await waitForCurrentPendingInputContract(client);
     };
+
+    it('J100 preserves a newer recovery and its deadline after ordered retry-backed batched ACKs', async () => {
+      useRealSupervisorAndPendingTransport = true;
+      const localId = 'j100-accepted';
+      const initial = createProviderDeliveryMaterializeResult(localId);
+      const materializationAck = createDeferred<unknown>();
+      const retryAck = createDeferred<unknown>();
+      const emissions: string[] = [];
+      let materializations = 0;
+      let settlements = 0;
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
+        sessionSocketEmitWithAck: (event) => {
+          if (event === 'pending-materialize-next') {
+            materializations += 1;
+            if (materializations === 1) return {
+              ok: true, ...initial,
+              message: { ...initial.message, requestedAction: { v: 1, kind: 'send_now' }, providerAction: 'send' },
+            };
+            emissions.push('M');
+            return materializationAck.promise;
+          }
+          if (event === 'pending-delivery-accepted-v1') {
+            emissions.push(`S${settlements++}`);
+            return settlements === 1
+              ? { ok: false, error: 'transaction-unavailable', retryAfterMs: 1250 }
+              : retryAck.promise;
+          }
+          return undefined;
+        },
+      });
+      await waitForCurrentPendingInputContract(client);
+      const delivered = vi.fn();
+      client.onUserMessage(delivered);
+      listDeliveryStatusesMock.mockResolvedValue([{ localId, status: 'delivering' }]);
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toMatchObject({ type: 'materialized', localId });
+      expect(delivered).toHaveBeenCalledTimes(1);
+      vi.useFakeTimers();
+      const warning = vi.spyOn(logger, 'warn');
+      confirmProviderInputAccepted(client, localId);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(emissions).toEqual(['S0']);
+      expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        localId, willRetry: true, retryAfterMs: 1250,
+      }));
+      expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+      const pending = client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(emissions).toEqual(['S0', 'M']);
+      await vi.advanceTimersByTimeAsync(1250);
+      expect(emissions).toEqual(['S0', 'M', 'S1']);
+      expect(materializations).toBe(2); // Initial custody acquisition, then exactly one ordinary M.
+      const recovery = client as unknown as {
+        pendingPublisherRecovery: { state: string };
+        pendingPublisherRecoveryDeadlineTimer: unknown;
+      };
+      let refusedObservation: unknown;
+      let refusedDeadline: unknown;
+      const infoFile = logger.infoFile.bind(logger);
+      vi.spyOn(logger, 'infoFile').mockImplementation((...args) => {
+        if (String(args[0]).includes('session socket lost publisher status')) {
+          refusedObservation = recovery.pendingPublisherRecovery;
+          refusedDeadline = recovery.pendingPublisherRecoveryDeadlineTimer;
+        }
+        return infoFile(...args);
+      });
+      // The external transport delivers FIFO M-success, then S1-forbidden in one batch.
+      // There is no await between these resolutions; all internal parsers remain real.
+      materializationAck.resolve({ ok: true, didMaterialize: false });
+      retryAck.resolve({ ok: false, error: 'forbidden' });
+      await pending;
+      expect(refusedObservation).toEqual({ state: 'reconnect_requested', episode: 1 });
+      expect(refusedDeadline).not.toBeNull();
+      expect(recovery.pendingPublisherRecovery).toBe(refusedObservation);
+      expect(recovery.pendingPublisherRecoveryDeadlineTimer).toBe(refusedDeadline);
+      expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+      expect(delivered).toHaveBeenCalledTimes(1);
+      // The socket boundary does not reconnect: the real episode deadline must remain armed.
+      sessionSocketStub!.connect.mockImplementation(() => sessionSocketStub);
+      await vi.advanceTimersByTimeAsync(configuration.pendingPublisherRecoveryDeadlineMs);
+      expect(recovery.pendingPublisherRecovery.state).toBe('publisher_lost');
+      expect(sessionSocketStub!.disconnect).toHaveBeenCalledTimes(1);
+      expect(delivered).toHaveBeenCalledTimes(1);
+    });
+
+    const holdJ100ReclaimedMaterialization = async () => {
+      const localId = 'j100-reclaimed-accepted';
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+      await waitForCurrentPendingInputContract(client);
+      const delivered = vi.fn();
+      client.onUserMessage(delivered);
+      materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult(localId));
+      await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      const settlement = createDeferred<never>();
+      resolveAcceptedPendingDeliveryMock
+        .mockRejectedValueOnce(new PendingQueueAcceptedSettlementError('forbidden'))
+        .mockReturnValueOnce(settlement.promise);
+      confirmProviderInputAccepted(client, localId);
+      await waitUntil(() => supervisorReportProbeResultMock.mock.calls.length === 1);
+      await reconnect();
+      await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 2);
+      const owner = client as unknown as {
+        pendingPublisherRecovery: { state: string };
+        pendingPublisherRecoveryDeadlineTimer: unknown;
+        sessionSyncPendingInputServerContract: object;
+      };
+      expect(owner.pendingPublisherRecovery.state).toBe('reclaimed');
+      const success = createDeferred<{ didMaterialize: boolean; localId: null; didWrite: boolean }>();
+      materializeNextMock.mockReturnValueOnce(success.promise);
+      const pending = client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      await waitUntil(() => materializeNextMock.mock.calls.length === 2);
+      return { client, localId, owner, delivered, settlement, success, pending };
+    };
+
+    it('J100 keeps a newer terminal observation on the same reclaimed contract', async () => {
+      const held = await holdJ100ReclaimedMaterialization();
+      const contract = held.owner.sessionSyncPendingInputServerContract;
+      held.settlement.reject(new PendingQueueAcceptedSettlementError('forbidden'));
+      await waitUntil(() => held.owner.pendingPublisherRecovery.state === 'publisher_lost');
+      const terminal = held.owner.pendingPublisherRecovery;
+      expect(held.owner.sessionSyncPendingInputServerContract).toBe(contract);
+      held.success.resolve({ didMaterialize: false, localId: null, didWrite: false });
+      await held.pending;
+      expect(held.owner.pendingPublisherRecovery).toBe(terminal);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+      expect(held.client.hasCanonicalPendingProviderInputDelivery(held.localId)).toBe(true);
+      expect(held.delivered).toHaveBeenCalledTimes(1);
+    });
+
+    it('J100 leaves a replacement connection recovery observation intact after old success', async () => {
+      const held = await holdJ100ReclaimedMaterialization();
+      const previousContract = held.owner.sessionSyncPendingInputServerContract;
+      const observation = held.owner.pendingPublisherRecovery;
+      // The actual connection setup replaces the contract/epoch while the old ACK is held.
+      await reconnect();
+      expect(held.owner.sessionSyncPendingInputServerContract).not.toBe(previousContract);
+      held.success.resolve({ didMaterialize: false, localId: null, didWrite: false });
+      await expect(held.pending).resolves.toEqual({ type: 'retryable_transport' });
+      // Settle the originating ACK even if the following regression assertion fails.
+      held.settlement.reject(new PendingQueueAcceptedSettlementError('forbidden'));
+      expect(held.owner.pendingPublisherRecovery).toBe(observation);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+      expect(held.client.hasCanonicalPendingProviderInputDelivery(held.localId)).toBe(true);
+      expect(held.delivered).toHaveBeenCalledTimes(1);
+    });
+
+    it('J100 closes an unchanged reclaimed observation and permits a later refusal episode', async () => {
+      const held = await holdJ100ReclaimedMaterialization();
+      held.success.resolve({ didMaterialize: false, localId: null, didWrite: false });
+      await held.pending;
+      expect(held.owner.pendingPublisherRecovery.state).toBe('current');
+      // This accepted settlement is still owned and was never delivered to the provider twice.
+      held.settlement.reject(new PendingQueueAcceptedSettlementError('forbidden'));
+      await waitUntil(() => supervisorReportProbeResultMock.mock.calls.length === 2);
+      expect(held.owner.pendingPublisherRecovery).toEqual({ state: 'reconnect_requested', episode: 2 });
+      expect(held.owner.pendingPublisherRecoveryDeadlineTimer).not.toBeNull();
+      expect(held.client.hasCanonicalPendingProviderInputDelivery(held.localId)).toBe(true);
+      expect(held.delivered).toHaveBeenCalledTimes(1);
+    });
 
     it('requests a real supervised reconnect for a current publisher refusal', async () => {
       useRealSupervisorAndPendingTransport = true;

@@ -7678,6 +7678,7 @@ export class ApiSessionClient extends EventEmitter {
                 message: releasedResult.message,
             };
         } else {
+            const recoveryBeforeRequest = this.pendingPublisherRecovery;
             try {
                 materializeResult = await runSupervisedRequest({
                     supervisor,
@@ -7757,8 +7758,11 @@ export class ApiSessionClient extends EventEmitter {
                     },
                 };
             }
-            // The server accepted this connection as the current publisher.
-            this.setPendingPublisherRecovery({ state: 'current' });
+            // Success closes only the recovery observation owned by this request. A later
+            // refusal/reclaim must retain its state and deadline, even on the same contract.
+            if (isServerContractCurrent() && this.pendingPublisherRecovery === recoveryBeforeRequest) {
+                this.setPendingPublisherRecovery({ state: 'current' });
+            }
         }
         if (!isServerContractCurrent()) {
             return {
