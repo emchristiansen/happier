@@ -9,6 +9,7 @@ const path = require('node:path');
 const terminalSignalNames = ['SIGINT', 'SIGQUIT'];
 const stderrTailMaxChars = 64 * 1024;
 const claudeMcpConfigFilePrefix = 'happier-claude-mcp-config';
+const claudeSystemPromptDirectoryPrefix = 'happier-claude-system-prompt-';
 
 function isPlainObject(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -34,24 +35,29 @@ function readOptionalBoolean(value, name) {
     return value;
 }
 
-function isSafeClaudeMcpConfigCleanupPath(filePath) {
+function isSafeClaudeArtifactCleanupPath(filePath) {
     if (typeof filePath !== 'string' || filePath.length === 0) return false;
     const tmpRoot = path.resolve(os.tmpdir());
     const resolved = path.resolve(filePath);
     const relative = path.relative(tmpRoot, resolved);
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return false;
     const name = path.basename(resolved);
-    return name.startsWith(`${claudeMcpConfigFilePrefix}.`) && name.endsWith('.json');
+    const isMcpConfig = name.startsWith(`${claudeMcpConfigFilePrefix}.`) && name.endsWith('.json');
+    const isSystemPrompt = name === 'text-artifact.txt'
+        && path.dirname(path.dirname(resolved)) === tmpRoot
+        && path.basename(path.dirname(resolved)).startsWith(claudeSystemPromptDirectoryPrefix);
+    return isMcpConfig || isSystemPrompt;
 }
 
 async function cleanupLaunchSpecPaths(paths) {
     await Promise.allSettled(
         paths
-            .filter(isSafeClaudeMcpConfigCleanupPath)
+            .filter(isSafeClaudeArtifactCleanupPath)
             .map(async (filePath) => {
                 await fs.unlink(filePath).catch(() => undefined);
                 const directory = path.dirname(filePath);
-                if (path.basename(directory).startsWith(`${claudeMcpConfigFilePrefix}-`)) {
+                if (path.basename(directory).startsWith(`${claudeMcpConfigFilePrefix}-`)
+                    || path.basename(directory).startsWith(claudeSystemPromptDirectoryPrefix)) {
                     await fs.rmdir(directory).catch(() => undefined);
                 }
             }),
@@ -252,6 +258,28 @@ function installTerminalSignalGuards() {
     };
 }
 
+function installTerminationSignalForwarding(child) {
+    const signals = process.platform === 'win32' ? ['SIGTERM'] : ['SIGTERM', 'SIGHUP'];
+    const installed = [];
+    let requestedSignal = null;
+    for (const signal of signals) {
+        const listener = () => {
+            requestedSignal ??= signal;
+            if (child.exitCode === null && child.signalCode === null) {
+                try { child.kill(signal); } catch {}
+            }
+        };
+        process.on(signal, listener);
+        installed.push([signal, listener]);
+    }
+    return () => {
+        for (const [signal, listener] of installed) process.off(signal, listener);
+        if (requestedSignal) {
+            try { process.kill(process.pid, requestedSignal); } catch {}
+        }
+    };
+}
+
 function runLaunchSpec(spec) {
     return new Promise((resolve, reject) => {
         let child;
@@ -274,19 +302,33 @@ function runLaunchSpec(spec) {
             process.stderr.write(chunk);
         });
         const removeSignalGuards = installTerminalSignalGuards();
+        const finishTerminationSignalForwarding = installTerminationSignalForwarding(child);
         let settled = false;
         const settle = async (fn) => {
             if (settled) return;
             settled = true;
-            removeSignalGuards();
-            await stderrDiagnostics?.close();
-            await cleanupLaunchSpecPaths(spec.cleanupPaths ?? []);
-            await fn();
+            try {
+                await stderrDiagnostics?.close();
+                await cleanupLaunchSpecPaths(spec.cleanupPaths ?? []);
+                const code = await fn();
+                removeSignalGuards();
+                finishTerminationSignalForwarding();
+                resolve(code);
+            } catch (error) {
+                removeSignalGuards();
+                finishTerminationSignalForwarding();
+                reject(error);
+            }
         };
+        let spawnError = null;
         child.on('error', (error) => {
-            settle(() => reject(error));
+            spawnError = error;
         });
         child.on('close', (code, signal) => {
+            if (spawnError) {
+                void settle(() => { throw spawnError; });
+                return;
+            }
             if (typeof code === 'number') {
                 settle(async () => {
                     if (code !== 0) {
@@ -298,7 +340,7 @@ function runLaunchSpec(spec) {
                             stderrDiagnostics,
                         });
                     }
-                    resolve(code);
+                    return code;
                 });
                 return;
             }
@@ -311,7 +353,7 @@ function runLaunchSpec(spec) {
                         signal,
                         stderrDiagnostics,
                     });
-                    resolve(1);
+                    return 1;
                 });
                 return;
             }
@@ -323,7 +365,7 @@ function runLaunchSpec(spec) {
                     signal: null,
                     stderrDiagnostics,
                 });
-                resolve(1);
+                return 1;
             });
         });
     });

@@ -1,7 +1,7 @@
 import { readFile, rm, stat } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from '@/daemon/spawn/spawnExplicitEnvKeysMarker';
 import {
@@ -10,9 +10,25 @@ import {
 } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 
 import {
-  buildClaudeUnifiedTerminalSpawn,
+  buildClaudeUnifiedTerminalSpawn as buildSpawn,
   type ClaudeUnifiedTerminalSpawn,
 } from './buildClaudeUnifiedTerminalSpawn';
+
+// Windows invocation tests simulate process.platform on a POSIX host; ACL commands are the OS boundary.
+vi.mock('@happier-dev/cli-common/fs/windowsProtectedAcl', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@happier-dev/cli-common/fs/windowsProtectedAcl')>(),
+  createWindowsProtectedAclBoundary: () => ({
+    applyAndVerify: async () => undefined,
+    verify: async () => undefined,
+  }),
+}));
+
+const spawnedArtifacts: ClaudeUnifiedTerminalSpawn[] = [];
+async function buildClaudeUnifiedTerminalSpawn(...args: Parameters<typeof buildSpawn>) {
+  const spawn = await buildSpawn(...args);
+  spawnedArtifacts.push(spawn);
+  return spawn;
+}
 
 const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 
@@ -77,7 +93,8 @@ async function readLaunchSpecFromSpawn(spawn: ClaudeUnifiedTerminalSpawn): Promi
 }
 
 describe('buildClaudeUnifiedTerminalSpawn', () => {
-  afterEach(() => {
+  afterEach(async () => {
+    await Promise.all(spawnedArtifacts.splice(0).map((spawn) => spawn.cleanupUnreadArtifacts?.()));
     if (originalPlatformDescriptor) {
       Object.defineProperty(process, 'platform', originalPlatformDescriptor);
     }
@@ -223,10 +240,8 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     const launchSpec = await readLaunchSpecFromSpawn(spawn);
     const launchArgs = launchSpec.args ?? [];
     expect(launchArgs.filter((arg) => arg === '--allow-dangerously-skip-permissions')).toHaveLength(1);
-    expect(launchArgs.slice(launchArgs.indexOf('--permission-mode'), launchArgs.indexOf('--permission-mode') + 2)).toEqual([
-      '--permission-mode',
-      'bypassPermissions',
-    ]);
+    expect(launchArgs).toContain('--dangerously-skip-permissions');
+    expect(launchArgs).not.toContain('--permission-mode');
     const settingsIndex = launchArgs.indexOf('--settings');
     expect(settingsIndex).toBeGreaterThanOrEqual(0);
     expect(JSON.parse(launchArgs[settingsIndex + 1]!)).toMatchObject({
@@ -258,11 +273,11 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     const launchSpec = await readLaunchSpecFromSpawn(spawn);
     const launchArgs = launchSpec.args ?? [];
     const permissionIndexes = launchArgs
-      .map((arg, index) => arg === '--permission-mode' ? index : -1)
+      .map((arg, index) => arg === '--dangerously-skip-permissions' ? index : -1)
       .filter((index) => index >= 0);
 
     expect(permissionIndexes).toHaveLength(1);
-    expect(launchArgs[permissionIndexes[0]! + 1]).toBe('bypassPermissions');
+    expect(launchArgs).not.toContain('--permission-mode');
     expect(launchArgs.indexOf('--resume')).toBeLessThan(permissionIndexes[0]!);
     expect(launchArgs.slice(launchArgs.indexOf('--plugin-dir'), launchArgs.indexOf('--plugin-dir') + 2)).toEqual([
       '--plugin-dir',
@@ -329,6 +344,7 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     expect(launchSpec.args).toContain('--permission-mode');
     expect(launchSpec.args).toContain('dontAsk');
     expect(launchSpec.args).not.toContain('bypassPermissions');
+    expect(launchSpec.args).not.toContain('--dangerously-skip-permissions');
     expect(launchSpec.env?.HAPPIER_CLAUDE_PATH).toBe('/opt/claude/cli.js');
     expect(launchSpec.env?.DISABLE_AUTOUPDATER).toBe('1');
   });
@@ -1007,7 +1023,7 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
   });
 
   it('keeps long Claude startup payloads out of the terminal host creation command', async () => {
-    const longSystemPrompt = `system-${'s'.repeat(80_000)}`;
+    const longSystemPrompt = `  system-${'λ'.repeat(80_000)}\n`;
     const longMcpConfigJson = JSON.stringify({
       mcpServers: {
         huge: {
@@ -1055,7 +1071,17 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
         expect(specMode).toBe(0o600);
       }
       expect(launchSpec.command).toBe('/usr/local/bin/claude');
-      expect(launchSpec.args).toContain('--append-system-prompt');
+      expect(launchSpec.args).not.toContain('--append-system-prompt');
+      expect(launchSpec.args).not.toContain(longSystemPrompt);
+      const promptIndex = launchSpec.args?.indexOf('--append-system-prompt-file') ?? -1;
+      expect(promptIndex).toBeGreaterThanOrEqual(0);
+      const promptPath = launchSpec.args?.[promptIndex + 1];
+      await expect(readFile(promptPath!, 'utf8')).resolves.toBe(longSystemPrompt);
+      if (process.platform !== 'win32') {
+        expect((await stat(promptPath!)).mode & 0o777).toBe(0o600);
+        expect((await stat(dirname(promptPath!))).mode & 0o777).toBe(0o700);
+      }
+      expect(launchSpec.cleanupPaths).toContain(promptPath);
       expect(launchSpec.args).not.toContain(longMcpConfigJson);
       const mcpConfigIndex = launchSpec.args?.indexOf('--mcp-config') ?? -1;
       expect(mcpConfigIndex).toBeGreaterThanOrEqual(0);
@@ -1065,8 +1091,10 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
       expect(launchSpec.cwd).toBe('/workspace/project');
       expect(launchSpec.env?.DISABLE_AUTOUPDATER).toBe('1');
 
-      await rm(dirname(specPath!), { recursive: true, force: true });
-      await rm(mcpConfigPath!, { force: true });
+      await spawn.cleanupUnreadArtifacts?.();
+      await expect(stat(promptPath!)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(dirname(promptPath!))).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(mcpConfigPath!)).rejects.toMatchObject({ code: 'ENOENT' });
     });
   });
 
@@ -1095,8 +1123,8 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
 
     const launchSpec = await readLaunchSpecFromSpawn(spawn);
     const launchArgs = launchSpec.args ?? [];
-    const appendSystemPromptIndex = launchArgs.indexOf('--append-system-prompt');
-    expect(launchArgs[appendSystemPromptIndex + 1]).toContain('Do not create TODO');
+    const appendSystemPromptIndex = launchArgs.indexOf('--append-system-prompt-file');
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).toContain('Do not create TODO');
     expect(launchArgs).toContain('--setting-sources');
     expect(launchArgs).toContain('project');
     expect(launchArgs).toContain('--strict-mcp-config');
@@ -1185,12 +1213,12 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
       '--system-prompt',
       'raw custom system',
     ]);
-    const appendSystemPromptIndex = launchArgs.indexOf('--append-system-prompt');
-    expect(launchArgs.filter((arg) => arg === '--append-system-prompt')).toHaveLength(1);
-    expect(launchArgs[appendSystemPromptIndex + 1]).toContain('base system');
-    expect(launchArgs[appendSystemPromptIndex + 1]).toContain('raw append system');
-    expect(launchArgs[appendSystemPromptIndex + 1]).toContain('Do not create TODO');
-    expect(launchArgs[appendSystemPromptIndex + 1]).not.toContain('mode append system');
+    const appendSystemPromptIndex = launchArgs.indexOf('--append-system-prompt-file');
+    expect(launchArgs.filter((arg) => arg === '--append-system-prompt-file')).toHaveLength(1);
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).toContain('base system');
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).toContain('raw append system');
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).toContain('Do not create TODO');
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).not.toContain('mode append system');
   });
 
   it('fails closed when unified terminal options cannot be mapped safely', async () => {

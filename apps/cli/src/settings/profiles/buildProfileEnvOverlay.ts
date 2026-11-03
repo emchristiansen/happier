@@ -53,6 +53,39 @@ function resolvePermissionModeSeed(profile: AIBackendProfile, agentId: string): 
   return isPermissionMode(trimmed) ? trimmed : null;
 }
 
+function readProfileSavedSecretBindings(params: Readonly<{
+  profile: AIBackendProfile;
+  accountSettings: Readonly<Record<string, unknown>>;
+  credentials: Credentials;
+}>): Record<string, string> {
+  const { secretBindingsByProfileId } = readProfilesFromAccountSettings(params.accountSettings);
+  const savedSecretsById = indexSavedSecretsByIdFromAccountSettings(params.accountSettings);
+  const settingsSecretsReadKeys = deriveSettingsSecretsReadKeysForCredentials(params.credentials);
+  const bindings: Record<string, string> = {};
+  for (const req of params.profile.envVarRequirements ?? []) {
+    if ((req.kind ?? 'secret') !== 'secret') continue;
+    const bindingId = readSecretBindingId({ secretBindingsByProfileId, profileId: params.profile.id, envVarName: req.name });
+    if (!bindingId) continue;
+    const plaintext = decryptSecretValueWithKeysV1(savedSecretsById.get(bindingId) ?? null, settingsSecretsReadKeys);
+    if (typeof plaintext === 'string' && plaintext.trim().length > 0) {
+      bindings[req.name] = plaintext.trim();
+    }
+  }
+  return bindings;
+}
+
+/** Leave machine environment references for the daemon on the selected target to expand. */
+export function buildProfileEnvOverlayForSpawn(params: Readonly<{
+  profile: AIBackendProfile;
+  accountSettings: Readonly<Record<string, unknown>>;
+  credentials: Credentials;
+}>): Record<string, string> {
+  return {
+    ...getProfileEnvironmentVariables(params.profile),
+    ...readProfileSavedSecretBindings(params),
+  };
+}
+
 export async function buildProfileEnvOverlay(params: Readonly<{
   agentId: string;
   profile: AIBackendProfile;
@@ -95,9 +128,7 @@ export async function buildProfileEnvOverlay(params: Readonly<{
     );
   }
 
-  const { secretBindingsByProfileId } = readProfilesFromAccountSettings(params.accountSettings);
-  const savedSecretsById = indexSavedSecretsByIdFromAccountSettings(params.accountSettings);
-  const settingsSecretsReadKeys = deriveSettingsSecretsReadKeysForCredentials(params.credentials);
+  const savedSecretBindings = readProfileSavedSecretBindings(params);
 
   for (const req of secretRequirements) {
     const fromEnv = readNonEmptyEnv(params.processEnv, req.name);
@@ -106,19 +137,10 @@ export async function buildProfileEnvOverlay(params: Readonly<{
       continue;
     }
 
-    const bindingId = readSecretBindingId({
-      secretBindingsByProfileId,
-      profileId: params.profile.id,
-      envVarName: req.name,
-    });
-
-    if (bindingId) {
-      const container = savedSecretsById.get(bindingId) ?? null;
-      const plaintext = decryptSecretValueWithKeysV1(container, settingsSecretsReadKeys);
-      if (typeof plaintext === 'string' && plaintext.trim().length > 0) {
-        overlayRaw[req.name] = plaintext.trim();
-        continue;
-      }
+    const savedSecret = savedSecretBindings[req.name];
+    if (savedSecret) {
+      overlayRaw[req.name] = savedSecret;
+      continue;
     }
 
     const shouldPrompt = req.required === true && typeof params.promptSecretFn === 'function';

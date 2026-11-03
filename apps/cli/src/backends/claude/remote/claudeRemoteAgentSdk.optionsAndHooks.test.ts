@@ -2521,8 +2521,15 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         // agentModeId === 'plan' still resolves to 'plan' (non-default), so it IS passed
         expect((await runOnce({ permissionMode: 'default', agentModeId: 'plan' }))?.permissionMode).toBe('plan');
         // Non-default explicit modes still forwarded
-        expect((await runOnce({ permissionMode: 'bypassPermissions' }))?.permissionMode).toBe('bypassPermissions');
-        expect((await runOnce({ permissionMode: 'acceptEdits' }))?.permissionMode).toBe('acceptEdits');
+        const bypass = await runOnce({ permissionMode: 'bypassPermissions' });
+        expect(bypass?.permissionMode).toBe('bypassPermissions');
+        expect(bypass?.extraArgs).toMatchObject({ 'dangerously-skip-permissions': null });
+        const planOverride = await runOnce({ permissionMode: 'bypassPermissions', agentModeId: 'plan' });
+        expect(planOverride?.permissionMode).toBe('plan');
+        expect(planOverride?.extraArgs?.['dangerously-skip-permissions']).toBeUndefined();
+        const acceptEdits = await runOnce({ permissionMode: 'acceptEdits' });
+        expect(acceptEdits?.permissionMode).toBe('acceptEdits');
+        expect(acceptEdits?.extraArgs?.['dangerously-skip-permissions']).toBeUndefined();
     });
 
     it('prefers CLI model overrides over mode.model', async () => {

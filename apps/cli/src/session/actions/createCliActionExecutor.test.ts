@@ -865,6 +865,18 @@ describe('createCliActionExecutor', () => {
   });
 
   it('forwards rich session.spawn_new options through the daemon spawn path', async () => {
+    bootstrapAccountSettingsContext.mockResolvedValue({
+      source: 'network',
+      settings: accountSettingsParse({ profiles: [{
+        id: 'profile-1', name: 'Spawn profile',
+        compatibilityByTargetKey: { 'agent:claude': true },
+        environmentVariables: [
+          { name: 'PROFILE_HOME', value: '${HOME}/profile' },
+          { name: 'FEATURE_FLAG', value: 'profile-default' },
+        ],
+      }] }),
+      settingsVersion: 1, loadedAtMs: 1, settingsSecretsReadKeys: [], whenRefreshed: null,
+    });
     const executor = createPlainExecutor({
       rawSession: {
         machineId: 'machine-1',
@@ -972,7 +984,7 @@ describe('createCliActionExecutor', () => {
         },
       },
       profileId: 'profile-1',
-      environmentVariables: { FEATURE_FLAG: 'enabled' },
+      environmentVariables: { FEATURE_FLAG: 'enabled', PROFILE_HOME: '${HOME}/profile' },
       mcpSelection: {
         v: 1,
         managedServersEnabled: false,

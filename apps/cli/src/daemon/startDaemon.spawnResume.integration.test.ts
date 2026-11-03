@@ -557,7 +557,7 @@ const buildCgroupSelfMigratingHappyCliLaunchSpec = vi.hoisted(() => vi.fn(async 
   launchSpec: {
     filePath: '/bin/sh',
     args: [
-      '-lc',
+      '-c',
       'target_dir="$HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR/happier-session-$$.scope" && mkdir -p "$target_dir" && printf "%s\\n" "$$" > "$target_dir/cgroup.procs" && exec "$@"',
       'sh',
       '/tmp/happier-runtime',
@@ -2691,7 +2691,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
       const spawnArgs = spawnCall?.[1];
       const spawnOptions = spawnCall?.[2];
       expect(spawnFilePath).toBe('/bin/sh');
-      expect(spawnArgs).toEqual(expect.arrayContaining(['-lc']));
+      expect(spawnArgs).toEqual(expect.arrayContaining(['-c']));
       expect(spawnArgs?.join(' ')).toContain('happier-session-$$.scope');
       expect(spawnArgs?.join(' ')).toContain('exec "$@"');
       expect(spawnOptions?.env?.HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR).toContain('/sys/fs/cgroup/');

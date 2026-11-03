@@ -323,7 +323,7 @@ export async function claudeRemote(opts: {
         },
     };
     // Start the loop
-    const response = query({
+    const response = await query({
         prompt: providerMessages,
         options: sdkOptions,
         onPromptTransportOutcome: (message, outcome) => {

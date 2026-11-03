@@ -1,6 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -45,7 +45,7 @@ describe('claude sdk query exit handling', () => {
     `);
 
     try {
-      const q = query({
+      const q = await query({
         prompt: 'hi',
         options: {
           cwd: tmpdir(),
@@ -71,7 +71,7 @@ describe('claude sdk query exit handling', () => {
     `);
 
     try {
-      const q = query({
+      const q = await query({
         prompt: 'hi',
         options: {
           cwd: tmpdir(),
@@ -99,7 +99,7 @@ describe('claude sdk query exit handling', () => {
     `);
 
     try {
-      const q = query({
+      const q = await query({
         prompt: 'hi',
         options: {
           cwd: tmpdir(),
@@ -130,7 +130,8 @@ describe('claude sdk query exit handling', () => {
         const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
           stdio: 'ignore',
         });
-        writeFileSync(markerPath, JSON.stringify({ childPid: child.pid }), 'utf8');
+        const promptPath = process.argv[process.argv.indexOf('--append-system-prompt-file') + 1];
+        writeFileSync(markerPath, JSON.stringify({ childPid: child.pid, promptPath }), 'utf8');
 
         // Stay alive until the parent terminates us.
         setInterval(() => {}, 1000);
@@ -159,21 +160,22 @@ describe('claude sdk query exit handling', () => {
     try {
       const { query: reloadedQuery } = await import('./query');
 
-      const q = reloadedQuery({
+      const q = await reloadedQuery({
         prompt: 'hi',
         options: {
           cwd: tmpRoot,
           executable: process.execPath,
           executableArgs: [],
           pathToClaudeCodeExecutable: sleeper,
+          appendSystemPrompt: 'private exit-cleanup prompt',
         },
       });
 
-      const marker = await new Promise<{ childPid: number }>((resolve, reject) => {
+      const marker = await new Promise<{ childPid: number; promptPath: string }>((resolve, reject) => {
         const startedAt = Date.now();
         const poll = () => {
           try {
-            resolve(JSON.parse(readFileSync(markerPath, 'utf8')) as { childPid: number });
+            resolve(JSON.parse(readFileSync(markerPath, 'utf8')) as { childPid: number; promptPath: string });
           } catch (error) {
             if (Date.now() - startedAt > 5_000) {
               reject(error);
@@ -193,7 +195,9 @@ describe('claude sdk query exit handling', () => {
       if (!exitHandler) {
         throw new Error('Expected process exit handler to be registered');
       }
+      expect(existsSync(marker.promptPath)).toBe(true);
       exitHandler();
+      expect(existsSync(dirname(marker.promptPath))).toBe(false);
 
       await withTimeout(
         new Promise<void>((resolve, reject) => {

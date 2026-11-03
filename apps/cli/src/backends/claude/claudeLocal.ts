@@ -1,3 +1,5 @@
+import { buildClaudePermissionModeArgs, extractClaudePermissionModeArgs } from './utils/permissionMode';
+import { materializeClaudeSystemPromptArgsForSpawn, type MaterializedClaudeSystemPromptArgs } from './utils/materializeClaudeSystemPromptArgsForSpawn';
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { mkdirSync, existsSync } from "node:fs";
@@ -283,6 +285,17 @@ export async function claudeLocal(opts: {
     };
 
     let materializedMcpConfig: MaterializedClaudeMcpConfigArgs | null = null;
+    let materializedSystemPrompt: MaterializedClaudeSystemPromptArgs | null = null;
+
+    let artifactsCleanup: Promise<void> | null = null;
+    const cleanupArtifacts = (): Promise<void> => {
+        artifactsCleanup ??= Promise.all([
+            materializedSystemPrompt?.cleanup(),
+            materializedMcpConfig?.cleanup(),
+        ]).then(() => undefined);
+        return artifactsCleanup;
+    };
+    const cleanupOnParentExit = () => materializedSystemPrompt?.cleanupSync();
 
     // Spawn the process
     try {
@@ -299,7 +312,18 @@ export async function claudeLocal(opts: {
                 ? ['--mcp-config', opts.happierMcpConfigJson.trim()]
                 : []),
         ]);
-        const effectiveClaudeArgs = materializedMcpConfig.args;
+        const systemPromptText = typeof opts.systemPromptText === 'string' ? opts.systemPromptText : '';
+        const fallbackPrompt = (() => {
+            const providerBlocks = getClaudeSystemPrompt();
+            const base = HAPPIER_BASE_SYSTEM_PROMPT_V1;
+            return providerBlocks.trim().length > 0 ? `${base}\n\n${providerBlocks}` : base;
+        })();
+        materializedSystemPrompt = await materializeClaudeSystemPromptArgsForSpawn([
+            '--append-system-prompt', systemPromptText.trim() ? systemPromptText : fallbackPrompt,
+            ...materializedMcpConfig.args,
+        ]);
+        process.once('exit', cleanupOnParentExit);
+        const { args: effectiveClaudeArgs, permissionMode } = extractClaudePermissionModeArgs(materializedSystemPrompt.args);
         await new Promise<void>((r, reject) => {
             const args: string[] = []
 
@@ -322,42 +346,22 @@ export async function claudeLocal(opts: {
             }
             // If hasResumeFlag && !startFrom: --resume is in claudeArgs, let Claude handle it
 
-            const systemPromptText = typeof opts.systemPromptText === 'string' ? opts.systemPromptText.trim() : '';
-            const fallbackPrompt = (() => {
-                const providerBlocks = getClaudeSystemPrompt();
-                const base = HAPPIER_BASE_SYSTEM_PROMPT_V1;
-                return providerBlocks.trim().length > 0 ? `${base}\n\n${providerBlocks}` : base;
-            })();
-            args.push('--append-system-prompt', systemPromptText || fallbackPrompt);
+
 
             // Claude CLI treats the first non-flag token as the prompt. If a positional prompt
             // is provided before later flags, those flags can be mis-parsed as prompt text.
             // Ensure positional args come after all flags (including our injected --settings).
             const flagArgs: string[] = [];
             const positionalArgs: string[] = [];
-            let trailingPermissionFlagArgs: string[] = [];
+            let hasExplicitPositionalDelimiter = false;
 
             if (effectiveClaudeArgs.length > 0) {
                 for (let i = 0; i < effectiveClaudeArgs.length; i++) {
                     const arg = effectiveClaudeArgs[i];
-                    if (arg === '--dangerously-skip-permissions') {
-                        trailingPermissionFlagArgs = ['--permission-mode', 'bypassPermissions'];
-                        continue;
-                    }
-                    if (arg === '--permission-mode') {
-                        const nextArg = i + 1 < effectiveClaudeArgs.length ? effectiveClaudeArgs[i + 1] : undefined;
-                        if (typeof nextArg === 'string' && !nextArg.startsWith('-')) {
-                            trailingPermissionFlagArgs = ['--permission-mode', nextArg];
-                            i++;
-                            continue;
-                        }
-                    }
-                    if (arg.startsWith('--permission-mode=')) {
-                        const normalizedValue = arg.slice('--permission-mode='.length).trim();
-                        if (normalizedValue) {
-                            trailingPermissionFlagArgs = ['--permission-mode', normalizedValue];
-                            continue;
-                        }
+                    if (arg === '--') {
+                        hasExplicitPositionalDelimiter = true;
+                        positionalArgs.push(...effectiveClaudeArgs.slice(i + 1));
+                        break;
                     }
                     if (arg.startsWith('-')) {
                         flagArgs.push(arg);
@@ -387,9 +391,6 @@ export async function claudeLocal(opts: {
                 flagArgs.push('--plugin-dir', opts.hookPluginDir);
                 logger.debug(`[ClaudeLocal] Using hook plugin dir: ${opts.hookPluginDir}`);
             }
-            const permissionMode = trailingPermissionFlagArgs[0] === '--permission-mode'
-                ? trailingPermissionFlagArgs[1]
-                : undefined;
             const settingsOverlay = resolveClaudeLaunchSettingsOverlayArg({
                 settingsPath: opts.hookSettingsPath,
                 launchSettings: buildClaudePermissionModeLaunchSettings(permissionMode),
@@ -402,9 +403,7 @@ export async function claudeLocal(opts: {
             if (flagArgs.length > 0) {
                 args.push(...flagArgs);
             }
-            if (trailingPermissionFlagArgs.length > 0) {
-                args.push(...trailingPermissionFlagArgs);
-            }
+            args.push(...buildClaudePermissionModeArgs(permissionMode));
             if (positionalArgs.length > 0) {
                 // Claude Code treats some flags (notably `--mcp-config`) as variadic, so they will
                 // greedily consume subsequent non-flag tokens. Without a `--` delimiter, a user
@@ -415,7 +414,7 @@ export async function claudeLocal(opts: {
                 const hasVariadicFlag =
                     flagArgs.includes('--mcp-config') ||
                     flagArgs.some((arg) => typeof arg === 'string' && arg.startsWith('--mcp-config='));
-                if (hasVariadicFlag) {
+                if (hasVariadicFlag || hasExplicitPositionalDelimiter) {
                     args.push('--');
                 }
                 args.push(...positionalArgs);
@@ -478,6 +477,8 @@ export async function claudeLocal(opts: {
                 windowsHide: true,
                 ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
             });
+
+            const childClosed = new Promise<void>((resolve) => { child.on('close', () => resolve()); });
 
             // Prefer a graceful shutdown path when the launcher is aborted (mode switching, UI takeover).
             // Node's `signal:` AbortSignal option would immediately SIGTERM the child; that can leave
@@ -556,7 +557,12 @@ export async function claudeLocal(opts: {
             // Forward signals to child process to prevent orphaned processes
             // Note: we implement programmatic abort (AbortSignal) ourselves above to be graceful.
             // Direct OS signals (e.g., kill, Ctrl+C) still need explicit forwarding.
-            attachProcessSignalForwardingToChild(child);
+            attachProcessSignalForwardingToChild(child, process, {
+                beforeParentExit: async () => {
+                    await childClosed;
+                    await cleanupArtifacts();
+                },
+            });
 
             // Listen to the custom fd (fd 3) for thinking state tracking
             if (shouldUseNodeLauncher && child.stdio[3]) {
@@ -606,10 +612,11 @@ export async function claudeLocal(opts: {
                     updateThinking(false);
                 });
             }
+            let spawnError: Error | null = null;
             child.on('error', (error) => {
-                // Ignore
+                spawnError = error;
             });
-            child.on('exit', (code, signal) => {
+            child.on('close', (code, signal) => {
                 if (abortListenerAttached) {
                     try {
                         opts.abort.removeEventListener('abort', abortListener);
@@ -620,7 +627,9 @@ export async function claudeLocal(opts: {
                 }
                 clearAbortTimers();
 
-                if (abortTeardownRequested) {
+                if (spawnError) {
+                    reject(spawnError);
+                } else if (abortTeardownRequested) {
                     // Normal termination due to programmatic abort teardown (switching modes / UI takeover).
                     // Do not treat exit codes as fatal while aborting: vendor CLIs sometimes exit with non-zero
                     // after SIGINT/SIGTERM even when shutdown is intentional.
@@ -636,7 +645,8 @@ export async function claudeLocal(opts: {
             });
         });
     } finally {
-        await materializedMcpConfig?.cleanup();
+        await cleanupArtifacts();
+        process.off('exit', cleanupOnParentExit);
         process.stdin.resume();
         clearStopThinkingTimeout();
         activeFetchIds.clear();

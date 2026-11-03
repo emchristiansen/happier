@@ -1,4 +1,5 @@
-import { join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -70,7 +71,7 @@ describe('claude sdk query executable resolution', () => {
 
     const { query } = (await import('./query')) as typeof import('./query');
 
-    expect(() =>
+    await expect(
       query({
         prompt: 'hi',
         options: {
@@ -78,7 +79,7 @@ describe('claude sdk query executable resolution', () => {
           pathToClaudeCodeExecutable: '/tmp/fake-claude.cjs',
         },
       }),
-    ).toThrow(/spawn invoked/);
+    ).rejects.toThrow(/spawn invoked/);
 
     expect(spawnMock).toHaveBeenCalled();
     expect(spawnMock.mock.calls[0]?.[0]).toBe(process.execPath);
@@ -97,14 +98,14 @@ describe('claude sdk query executable resolution', () => {
     });
     const { query } = (await import('./query')) as typeof import('./query');
 
-    expect(() => query({
+    await expect(query({
       prompt: 'hi',
       options: {
         cwd: '/tmp',
         pathToClaudeCodeExecutable: '/tmp/fake-claude.cjs',
         includeHookEvents: true,
       },
-    })).toThrow(/spawn invoked/);
+    })).rejects.toThrow(/spawn invoked/);
 
     const spawnArgs = spawnMock.mock.calls[0]?.[1] as string[];
     expect(spawnArgs).toContain('--include-hook-events');
@@ -129,7 +130,7 @@ describe('claude sdk query executable resolution', () => {
 
     const { query } = (await import('./query')) as typeof import('./query');
 
-    expect(() =>
+    await expect(
       query({
         prompt: 'hi',
         options: {
@@ -139,7 +140,7 @@ describe('claude sdk query executable resolution', () => {
           pathToClaudeCodeExecutable: '/tmp/fake-claude.cjs',
         },
       }),
-    ).toThrow(/spawn invoked/);
+    ).rejects.toThrow(/spawn invoked/);
 
     expect(spawnMock).toHaveBeenCalled();
     expect(spawnMock.mock.calls[0]?.[0]).toBe(process.execPath);
@@ -170,7 +171,7 @@ describe('claude sdk query executable resolution', () => {
 
       const { query } = (await import('./query')) as typeof import('./query');
 
-      expect(() =>
+      await expect(
         query({
           prompt: 'hi',
           options: {
@@ -178,7 +179,7 @@ describe('claude sdk query executable resolution', () => {
             pathToClaudeCodeExecutable: '/tmp/fake-claude.cjs',
           },
         }),
-      ).toThrow(/spawn invoked/);
+      ).rejects.toThrow(/spawn invoked/);
 
       expect(spawnMock).toHaveBeenCalled();
       expect(spawnMock.mock.calls[0]?.[0]).toBe(overridePath);
@@ -212,7 +213,7 @@ describe('claude sdk query executable resolution', () => {
 
       const { query } = (await import('./query')) as typeof import('./query');
 
-      expect(() =>
+      await expect(
         query({
           prompt: 'hi',
           options: {
@@ -222,7 +223,7 @@ describe('claude sdk query executable resolution', () => {
             pathToClaudeCodeExecutable: '/tmp/fake-claude.cjs',
           },
         }),
-      ).toThrow(/spawn invoked/);
+      ).rejects.toThrow(/spawn invoked/);
 
       expect(spawnMock).toHaveBeenCalled();
       expect(spawnMock.mock.calls[0]?.[0]).toBe(overridePath);
@@ -268,7 +269,7 @@ describe('claude sdk query executable resolution', () => {
 
       const { query } = (await import('./query')) as typeof import('./query');
 
-      expect(() =>
+      await expect(
         query({
           prompt: 'hi',
           options: {
@@ -278,7 +279,7 @@ describe('claude sdk query executable resolution', () => {
             pathToClaudeCodeExecutable: '/tmp/fake-claude.cjs',
           },
         }),
-      ).toThrow(/HAPPIER_MANAGED_NODE_BIN/);
+      ).rejects.toThrow(/HAPPIER_MANAGED_NODE_BIN/);
 
       expect(spawnMock).not.toHaveBeenCalled();
     });
@@ -303,7 +304,7 @@ describe('claude sdk query executable resolution', () => {
 
     const { query } = (await import('./query')) as typeof import('./query');
 
-    expect(() =>
+    await expect(
       query({
         prompt: 'hi',
         options: {
@@ -311,7 +312,7 @@ describe('claude sdk query executable resolution', () => {
           pathToClaudeCodeExecutable: 'C:\\\\Users\\\\me\\\\AppData\\\\Local\\\\Claude\\\\claude.exe',
         },
       }),
-    ).toThrow(/spawn invoked/);
+    ).rejects.toThrow(/spawn invoked/);
 
     expect(spawnMock).toHaveBeenCalled();
     const spawnOpts = spawnMock.mock.calls[0]?.[2] as Record<string, unknown> | undefined;
@@ -337,7 +338,7 @@ describe('claude sdk query executable resolution', () => {
 
     const { query } = (await import('./query')) as typeof import('./query');
 
-    expect(() =>
+    await expect(
       query({
         prompt: 'hi',
         options: {
@@ -345,7 +346,7 @@ describe('claude sdk query executable resolution', () => {
           pathToClaudeCodeExecutable: 'C:\\\\Users\\\\me\\\\AppData\\\\Roaming\\\\npm\\\\claude.cmd',
         },
       }),
-    ).toThrow(/spawn invoked/);
+    ).rejects.toThrow(/spawn invoked/);
 
     expect(spawnMock).toHaveBeenCalled();
     const spawnCommand = spawnMock.mock.calls[0]?.[0] as unknown;
@@ -380,7 +381,7 @@ describe('claude sdk query executable resolution', () => {
 
     const { query } = (await import('./query')) as typeof import('./query');
 
-    expect(() =>
+    await expect(
       query({
         prompt: 'hi',
         options: {
@@ -388,7 +389,7 @@ describe('claude sdk query executable resolution', () => {
           pathToClaudeCodeExecutable: '/tmp/fake-claude.cjs',
         },
       }),
-    ).toThrow(/spawn invoked/);
+    ).rejects.toThrow(/spawn invoked/);
 
     expect(spawnMock).toHaveBeenCalled();
     const spawnOpts = spawnMock.mock.calls[0]?.[2] as Record<string, any> | undefined;
@@ -417,7 +418,7 @@ describe('claude sdk query executable resolution', () => {
 
     const { query } = (await import('./query')) as typeof import('./query');
 
-    expect(() =>
+    await expect(
       query({
         prompt: 'hi',
         options: {
@@ -425,7 +426,7 @@ describe('claude sdk query executable resolution', () => {
           pathToClaudeCodeExecutable: '/tmp/fake-claude.cjs',
         },
       }),
-    ).toThrow(/spawn invoked/);
+    ).rejects.toThrow(/spawn invoked/);
 
     expect(spawnMock).toHaveBeenCalled();
     const spawnOpts = spawnMock.mock.calls[0]?.[2] as Record<string, any> | undefined;
@@ -454,7 +455,7 @@ describe('claude sdk query executable resolution', () => {
 
     const { query } = (await import('./query')) as typeof import('./query');
 
-    expect(() =>
+    await expect(
       query({
         prompt: 'hi',
         options: {
@@ -466,11 +467,92 @@ describe('claude sdk query executable resolution', () => {
           },
         },
       }),
-    ).toThrow(/spawn invoked/);
+    ).rejects.toThrow(/spawn invoked/);
 
     expect(spawnMock).toHaveBeenCalled();
     const spawnOpts = spawnMock.mock.calls[0]?.[2] as Record<string, any> | undefined;
     expect(spawnOpts?.env?.CLAUDE_CODE_OAUTH_REFRESH_TOKEN).toBeUndefined();
     expect(spawnOpts?.env?.CLAUDE_CODE_OAUTH_SCOPES).toBeUndefined();
   });
+  it('removes the private append prompt artifact when spawn throws synchronously', async () => {
+    let promptPath = '';
+    const spawnMock = vi.fn((_command: string, args: readonly string[]) => {
+      promptPath = args[args.indexOf('--append-system-prompt-file') + 1] ?? '';
+      expect(readFileSync(promptPath, 'utf8')).toBe('  private prompt\n');
+      throw new Error('spawn failed synchronously');
+    });
+    vi.doMock('node:child_process', async () => {
+      const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      return { ...actual, spawn: spawnMock };
+    });
+    const { query } = await import('./query');
+
+    await expect(Promise.resolve().then(() => query({
+      prompt: 'hello',
+      options: {
+        pathToClaudeCodeExecutable: process.execPath,
+        appendSystemPrompt: '  private prompt\n',
+      },
+    }))).rejects.toThrow('spawn failed synchronously');
+    expect(promptPath).not.toBe('');
+    expect(existsSync(dirname(promptPath))).toBe(false);
+  });
+
+  it('removes the private append prompt artifact after an asynchronous spawn error', async () => {
+    await withTempDir('happier-query-spawn-error-', async (directory) => {
+      let promptPath = '';
+      vi.doMock('node:child_process', async () => {
+        const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+        return {
+          ...actual,
+          spawn: (command: string, args: readonly string[], options: import('node:child_process').SpawnOptions) => {
+            promptPath = args[args.indexOf('--append-system-prompt-file') + 1] ?? '';
+            return actual.spawn(command, args, options);
+          },
+        };
+      });
+      const { query } = await import('./query');
+      const q = await query({
+        prompt: 'hello',
+        options: {
+          pathToClaudeCodeExecutable: process.execPath,
+          cwd: join(directory, 'does-not-exist'),
+          appendSystemPrompt: 'private prompt',
+        },
+      });
+
+      await expect(q.next()).rejects.toThrow('Failed to spawn');
+      expect(promptPath).not.toBe('');
+      await expect.poll(() => existsSync(dirname(promptPath))).toBe(false);
+    });
+  });
+
+  it.each([
+    { mode: 'bypassPermissions', extra: [], prefix: ['--dangerously-skip-permissions'], retained: [] },
+    { mode: 'bypassPermissions', extra: ['--permission-mode', 'plan'], prefix: ['--permission-mode', 'plan'], retained: [] },
+    { mode: 'plan', extra: ['--permission-mode=bypassPermissions'], prefix: ['--dangerously-skip-permissions'], retained: [] },
+    { mode: 'default', extra: ['--dangerously-skip-permissions', '--permission-mode=plan'], prefix: ['--permission-mode', 'plan'], retained: [] },
+    { mode: 'default', extra: ['--permission-mode=plan', '--dangerously-skip-permissions'], prefix: ['--dangerously-skip-permissions'], retained: [] },
+    { mode: 'bypassPermissions', extra: ['--permission-mode=default'], prefix: ['--permission-mode', 'default'], retained: [] },
+    { mode: 'default', extra: ['--system-prompt', '--dangerously-skip-permissions'], prefix: [], retained: ['--system-prompt', '--dangerously-skip-permissions'] },
+    { mode: 'bypassPermissions', extra: ['--system-prompt', '--permission-mode=plan'], prefix: ['--dangerously-skip-permissions'], retained: ['--system-prompt', '--permission-mode=plan'] },
+    { mode: 'plan', extra: ['--', '--dangerously-skip-permissions'], prefix: ['--permission-mode', 'plan'], retained: ['--', '--dangerously-skip-permissions'] },
+    { mode: 'bypassPermissions', extra: ['--', '--permission-mode=plan'], prefix: ['--dangerously-skip-permissions'], retained: ['--', '--permission-mode=plan'] },
+  ] as const)('emits only the effective permission selection for $mode with $extra', async ({ mode, extra, prefix, retained }) => {
+    const spawnMock = vi.fn((_command: string, _args: readonly string[]) => { throw new Error('spawn inspected'); });
+    vi.doMock('node:child_process', async () => ({
+      ...await vi.importActual<typeof import('node:child_process')>('node:child_process'),
+      spawn: spawnMock,
+    }));
+    const { query } = await import('./query');
+    await expect(query({ prompt: 'hello', options: {
+      pathToClaudeCodeExecutable: process.execPath,
+      permissionMode: mode,
+      extraArgs: [...extra],
+    } })).rejects.toThrow('spawn inspected');
+    expect(spawnMock.mock.calls[0]?.[1]).toEqual([
+      ...prefix, '--output-format', 'stream-json', '--verbose', ...retained, '--print', 'hello',
+    ]);
+  });
+
 });
