@@ -1,10 +1,12 @@
 import {
   DEFAULT_SESSION_AGENT_SPAWN_POLICY_V1,
   BackendTargetRefSchema,
+  isProfileCompatibleWithBackendTarget,
   mergeSpawnConfigOptionAliases,
   parseBackendTargetKey,
   readAcpConfiguredBackendV1FromMetadata,
   readAgentRuntimeDescriptorV1,
+  resolveBackendProfile,
   type AcpConfigOptionOverridesV1,
   type ActionSurfaces,
   type BackendTargetRefV1,
@@ -23,6 +25,8 @@ import {
 
 import type { Credentials } from '@/persistence';
 import { bootstrapAccountSettingsContext } from '@/settings/accountSettings/bootstrapAccountSettingsContext';
+import { buildProfileEnvOverlayForSpawn } from '@/settings/profiles/buildProfileEnvOverlay';
+import { readProfilesFromAccountSettings } from '@/settings/profiles/readProfilesFromAccountSettings';
 import {
   CHILD_SESSION_INHERITANCE_FIELD_SETS,
   resolveChildSessionInheritedContextFromMetadata,
@@ -611,7 +615,27 @@ export async function normalizeSessionAgentSpawnActionRequest(params: Readonly<{
   }
 
   const explicitProfileId = normalizeString(input.profileId);
-  const resolvedProfileId = explicitProfileId ?? inherited.spawn.profileId;
+  let resolvedProfileId = explicitProfileId ?? inherited.spawn.profileId;
+  let environmentVariables = input.environmentVariables;
+  // Inherited profile identity is metadata, not a request to reapply current profile settings.
+  if (explicitProfileId) {
+    const { settings } = await bootstrapAccountSettingsContext({
+      credentials: params.credentials,
+      mode: 'blocking',
+      deps: { applySideEffects: () => undefined },
+    });
+    const { customProfiles } = readProfilesFromAccountSettings(settings);
+    const resolved = resolveBackendProfile({ query: explicitProfileId, customProfiles });
+    if (!resolved.ok) throw new Error('Selected launch profile is unavailable or ambiguous.');
+    if (!isProfileCompatibleWithBackendTarget(resolved.profile, backend.backendTarget)) {
+      throw new Error('Selected launch profile is not compatible with the backend target.');
+    }
+    resolvedProfileId = resolved.profile.id;
+    environmentVariables = {
+      ...buildProfileEnvOverlayForSpawn({ profile: resolved.profile, accountSettings: settings, credentials: params.credentials }),
+      ...input.environmentVariables,
+    };
+  }
   if (resolvedProfileId) {
     sources.profileId = sourceForExplicitOrInherited(
       explicitProfileId,
@@ -620,8 +644,8 @@ export async function normalizeSessionAgentSpawnActionRequest(params: Readonly<{
     );
   }
 
-  if (input.environmentVariables) {
-    sources.environmentVariables = { kind: 'explicit', key: 'environmentVariables' };
+  if (environmentVariables) {
+    sources.environmentVariables = { kind: 'explicit', key: input.environmentVariables ? 'environmentVariables' : 'profileId' };
   }
 
   const defaultsResolver =
@@ -685,7 +709,7 @@ export async function normalizeSessionAgentSpawnActionRequest(params: Readonly<{
         : {}),
       ...(resolvedSessionConfigOptionOverrides ? { sessionConfigOptionOverrides: resolvedSessionConfigOptionOverrides } : {}),
       ...(resolvedProfileId ? { profileId: resolvedProfileId } : {}),
-      ...(input.environmentVariables ? { environmentVariables: input.environmentVariables } : {}),
+      ...(environmentVariables ? { environmentVariables } : {}),
       ...(resolvedConnectedServices ? { connectedServices: resolvedConnectedServices } : {}),
       ...(typeof resolvedConnectedServicesUpdatedAt === 'number' && Number.isFinite(resolvedConnectedServicesUpdatedAt)
         ? { connectedServicesUpdatedAt: resolvedConnectedServicesUpdatedAt }
