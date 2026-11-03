@@ -1,3 +1,4 @@
+import { removeConnectedServiceCredentialFiles } from '@/daemon/connectedServices/credentials/removeConnectedServiceCredentialFiles';
 import { AGENTS_CORE } from '@happier-dev/agents';
 import { resolveCodexSessionBackendMode } from '@happier-dev/agents';
 import { INSTALLABLE_KEYS } from '@happier-dev/protocol';
@@ -23,6 +24,11 @@ import type { ConnectedServiceBindingsV1 } from '@happier-dev/protocol';
 
 const codexConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCredentialLifecycleDescriptor = {
   providerId: 'codex',
+  credentialStorageCleanup: {
+    async deleteCredentialStorageForHomeRoot({ rootDir }) {
+      await removeConnectedServiceCredentialFiles(rootDir, codexConnectedServiceStateSharingDescriptor.authIsolation.secretEntries.map((entry) => `codex-home/${entry}`));
+    },
+  },
   serviceIds: AGENTS_CORE.codex.connectedServices.supportedServiceIds,
   spawnPreflightOauthRefresh: { mode: 'expiry_window' },
   refreshedCredentialApplication: {

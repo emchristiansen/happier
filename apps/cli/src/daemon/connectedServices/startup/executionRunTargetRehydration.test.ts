@@ -1,3 +1,4 @@
+import { deleteConnectedServiceHomeCredentials } from '../credentials/deleteConnectedServiceHomeCredentials';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,7 +35,7 @@ const launch = {
 };
 
 describe('rehydrateLiveExecutionRunRuntimeTargets', () => {
-  it('preserves adopted resumable and unknown legacy homes while cleaning explicitly ephemeral homes', async () => {
+  it('preserves adopted resumable and unknown legacy homes while retiring only explicitly ephemeral credentials', async () => {
     const sandbox = await mkdtemp(join(tmpdir(), 'happier-adopted-run-retention-'));
     try {
       const base = join(sandbox, 'materialized');
@@ -45,6 +46,8 @@ describe('rehydrateLiveExecutionRunRuntimeTargets', () => {
         const historyPath = join(root, 'codex-home', 'sessions', 'rollout.jsonl');
         await mkdir(join(root, 'codex-home', 'sessions'), { recursive: true });
         await writeFile(historyPath, 'private retained run history\n');
+        const credentialPath = join(root, 'codex-home', 'auth.json');
+        await writeFile(credentialPath, 'synthetic run credential');
         const registry = new ConnectedServiceRuntimeRegistry();
         const bridge = createExecutionRunConnectedServicesBridge({
           resolveAuthForSpawn: async () => { throw new Error('Passive adoption must not materialize'); },
@@ -52,7 +55,7 @@ describe('rehydrateLiveExecutionRunRuntimeTargets', () => {
           createAdoptedRootCleanup: (input) => createAdoptedExecutionRunRootCleanup({
             ...input,
             materializationBaseDir: base,
-            removeRoot: async (path) => await rm(path, { recursive: true, force: true }),
+            retireRoot: async (rootDir) => await deleteConnectedServiceHomeCredentials({ rootDir, agentId: input.agentId, kind: 'materialized_home' }),
           }),
         });
 
@@ -66,10 +69,11 @@ describe('rehydrateLiveExecutionRunRuntimeTargets', () => {
         expect(await bridge.release({ runId, materializationKey: runKey, pid: 4321 })).toEqual({ released: true });
         expect(registry.listTargets()).toEqual([]);
         if (retentionPolicy === 'ephemeral') {
-          await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' });
+          await expect(stat(credentialPath)).rejects.toMatchObject({ code: 'ENOENT' });
         } else {
-          expect(await readFile(historyPath, 'utf8')).toBe('private retained run history\n');
+          expect(await readFile(credentialPath, 'utf8')).toBe('synthetic run credential');
         }
+        expect(await readFile(historyPath, 'utf8')).toBe('private retained run history\n');
       }
     } finally {
       await rm(sandbox, { recursive: true, force: true });

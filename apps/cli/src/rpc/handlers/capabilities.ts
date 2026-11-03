@@ -47,7 +47,6 @@ import { existsSync, statSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import os from 'node:os';
 import { join } from 'node:path';
-import { rm } from 'node:fs/promises';
 import { configuration } from '@/configuration';
 import { createConnectedServiceMaterializationIdentity } from '@/daemon/connectedServices/materialize/createConnectedServiceMaterializationIdentity';
 import { resolveConnectedServiceAuthForSpawn } from '@/daemon/connectedServices/resolveConnectedServiceAuthForSpawn';
@@ -312,14 +311,7 @@ async function resolveConnectedServiceProbeEnvironment(params: Readonly<{
         processEnv: { ...params.processEnv, ...resolved.env },
         connectedServiceSelectionCacheKey:
             resolved.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY] ?? null,
-        cleanup: async () => {
-            resolved.cleanupOnExit?.();
-            resolved.cleanupOnFailure?.();
-            await rm(join(materializationBaseDir, materializationIdentity.id), {
-                recursive: true,
-                force: true,
-            });
-        },
+        cleanup: resolved.cleanupMaterializationRoot ?? null,
     };
 }
 

@@ -135,6 +135,8 @@ export const DEFAULT_CONNECTED_SERVICE_RUNTIME_AUTH_APPLY_CAPABILITY: ConnectedS
 export type ConnectedServiceCredentialStorageCleanupKind =
   | 'materialized_home'
   | 'materialized_attempt'
+  | 'group_home'
+  | 'retired_home'
   | 'group_home_quarantine';
 
 export type ConnectedServiceCredentialStorageCleanup = Readonly<{

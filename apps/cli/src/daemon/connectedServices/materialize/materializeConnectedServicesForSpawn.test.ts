@@ -1,7 +1,7 @@
-import { lstat, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -1444,8 +1444,20 @@ describe('Codex home materialization preserves runtime custody', () => {
     await writeFile(join(home, 'AGENTS.md'), 'stale config omitted by stage');
     await mkdir(join(home, 'accounts'), { recursive: true });
     await writeFile(join(home, 'accounts', 'stale.json'), 'synthetic stale owned data');
-    await materializeConnectedServicesForSpawn(params);
+    await writeFile(join(home, 'probe-history.jsonl'), 'synthetic promoted history\n');
+    if (purpose === 'probe') {
+      // Directory contents have no qualified credential schema. Refuse retirement, retain both
+      // homes, and keep the newly promoted runtime lock; never recursively erase the old tree.
+      await expect(materializeConnectedServicesForSpawn(params)).rejects.toThrow();
+      await expect(lstat(join(home, 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      const previous = (await readdir(dirname(dirname(home)))).find((entry) => entry.startsWith('codex.previous-'));
+      expect(previous).toBeDefined();
+      expect(await readFile(join(dirname(dirname(home)), previous!, 'codex-home', 'accounts', 'stale.json'), 'utf8')).toBe('synthetic stale owned data');
+    } else {
+      await materializeConnectedServicesForSpawn(params);
+    }
     expect((await stat(lockPath)).ino).toBe(before.ino);
+    expect(await readFile(join(home, 'probe-history.jsonl'), 'utf8')).toBe('synthetic promoted history\n');
     if (purpose === 'probe') {
       await expect(lstat(join(home, 'AGENTS.md'))).rejects.toMatchObject({ code: 'ENOENT' });
       await expect(lstat(join(home, 'accounts', 'stale.json'))).rejects.toMatchObject({ code: 'ENOENT' });
@@ -1454,5 +1466,29 @@ describe('Codex home materialization preserves runtime custody', () => {
       await expect(readFile(join(home, 'AGENTS.md'), 'utf8')).resolves.toBe('stale config omitted by stage');
       await expect(readFile(join(home, 'accounts', 'stale.json'), 'utf8')).resolves.toBe('synthetic stale owned data');
     }
+  });
+});
+
+
+describe('credential retirement retry custody', () => {
+  it('retries an explicit failed release after the unqualified directory is preserved elsewhere', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-retirement-retry-'));
+    const record = buildConnectedServiceCredentialRecord({ now: 10, serviceId: 'openai-codex', profileId: 'synthetic', kind: 'oauth', expiresAt: null,
+      oauth: { accessToken: 'synthetic-access', refreshToken: 'synthetic-refresh', idToken: null, scope: null, tokenType: null, providerAccountId: null, providerEmail: null },
+    });
+    const result = await materializeConnectedServicesForSpawn({
+      agentId: 'codex', materializationKey: 'retry-test', materializationPurpose: 'probe',
+      baseDir: join(root, 'materialized'), activeServerDir: join(root, 'server'),
+      recordsByServiceId: new Map([['openai-codex', record]]), processEnv: { HOME: root, CODEX_HOME: join(root, 'source') },
+    });
+    const home = result!.env.CODEX_HOME!;
+    await mkdir(join(home, 'accounts'), { recursive: true });
+    await writeFile(join(home, 'accounts', 'history.jsonl'), 'preserved retry history\n');
+    await expect(result!.cleanupMaterializationRoot()).rejects.toThrow();
+    await rename(join(home, 'accounts'), join(root, 'retained-accounts'));
+    await writeFile(join(home, 'auth.json'), 'synthetic retry credential');
+    await expect(result!.cleanupMaterializationRoot()).resolves.toBeUndefined();
+    await expect(readFile(join(home, 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(join(root, 'retained-accounts', 'history.jsonl'), 'utf8')).toBe('preserved retry history\n');
   });
 });

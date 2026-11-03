@@ -1185,7 +1185,7 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   onCleanup?: (cleanup: () => Promise<void>) => void;
 }>): Promise<(ConnectedServicesMaterializeResult & Readonly<{
   materializationRoot: string;
-  cleanupMaterializationRoot: () => void;
+  cleanupMaterializationRoot: () => Promise<void>;
 }>) | null> {
   const materialized = await materializeConnectedServicesForSpawn({
     agentId: params.agentId,
@@ -1301,7 +1301,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
 }>): Promise<Readonly<{
   env: Record<string, string>;
   materializationRoot?: string | null;
-  cleanupMaterializationRoot?: (() => void) | null;
+  cleanupMaterializationRoot?: (() => Promise<void>) | null;
   cleanupOnFailure: (() => void) | null;
   cleanupOnExit: (() => void) | null;
   connectedServicesBindings: ConnectedServicesBindingsV1;

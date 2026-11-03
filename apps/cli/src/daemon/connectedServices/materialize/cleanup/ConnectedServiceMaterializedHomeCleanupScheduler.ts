@@ -1,5 +1,3 @@
-import { rm } from 'node:fs/promises';
-
 import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import type { CatalogAgentId } from '@/backends/types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '../../credentials/lifecycleTypes';
@@ -71,7 +69,6 @@ export class ConnectedServiceMaterializedHomeCleanupScheduler {
     rootTtlMs?: number;
     attemptsTtlMs?: number;
     maxCleanupRetries?: number;
-    removePath?: typeof rm;
     resolveCredentialLifecycleDescriptor?: ResolveCredentialLifecycleDescriptor;
     onCleanupRetryExhausted?: (event: PendingPathCleanupRetryExhaustedEvent<PendingMaterializedCleanupTarget>) => void;
     runtimeRegistry?: ConnectedServiceRuntimeRegistry;
@@ -89,7 +86,8 @@ export class ConnectedServiceMaterializedHomeCleanupScheduler {
       ?? resolveConnectedServiceCredentialLifecycleDescriptor;
     this.cleanupQueue = createPendingPathCleanupQueue<PendingMaterializedCleanupTarget>({
       maxCleanupRetries: deps.maxCleanupRetries,
-      removePath: deps.removePath,
+      // The queued operation revokes credentials; age never authorizes transcript deletion.
+      removePath: async () => {},
       beforeRemove: async (target) => {
         await this.deleteTargetCredentialStorage(target);
       },
