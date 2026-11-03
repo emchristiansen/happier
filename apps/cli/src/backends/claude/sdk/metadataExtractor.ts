@@ -37,7 +37,7 @@ export async function extractSDKMetadata(): Promise<SDKMetadata> {
         }
 
         // Run SDK with minimal tools allowed
-        const sdkQuery = query({
+        const sdkQuery = await query({
             prompt: 'hello',
             options: {
                 maxTurns: 1,

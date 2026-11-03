@@ -5,6 +5,7 @@ const flagsWithRequiredValue = new Set<string>([
     '--allowedTools',
     '--allowed-tools',
     '--append-system-prompt',
+    '--append-system-prompt-file',
     '--betas',
     '--debug-file',
     '--disallowedTools',
@@ -31,6 +32,7 @@ const flagsWithRequiredValue = new Set<string>([
     '--setting-sources',
     '--settings',
     '--system-prompt',
+    '--system-prompt-file',
     '--tools',
 ]);
 

@@ -1,3 +1,4 @@
+import { claudeCliFlagCanConsumeNextArg } from '../cli/flagArity';
 import type { QueryOptions } from '@/backends/claude/sdk';
 import type { PermissionMode } from '@/api/types';
 
@@ -49,4 +50,48 @@ export function resolveClaudeSdkPermissionModeFromEnhancedMode(mode: {
     const agentModeId = typeof mode.agentModeId === 'string' ? mode.agentModeId.trim() : '';
     if (agentModeId === 'plan') return 'plan';
     return mapToClaudeMode(mode.permissionMode);
+}
+
+/** Extract only permission options, preserving option values and positional payload verbatim. */
+export function extractClaudePermissionModeArgs(input: readonly string[]): {
+    args: string[];
+    permissionMode: string | undefined;
+} {
+    const args: string[] = [];
+    let permissionMode: string | undefined;
+    for (let index = 0; index < input.length; index++) {
+        const arg = input[index]!;
+        if (arg === '--') {
+            args.push(...input.slice(index));
+            break;
+        }
+        if (arg === '--dangerously-skip-permissions') {
+            permissionMode = 'bypassPermissions';
+            continue;
+        }
+        const next = input[index + 1];
+        if (arg === '--permission-mode' && next && !next.startsWith('-')) {
+            permissionMode = next;
+            index++;
+            continue;
+        }
+        if (arg.startsWith('--permission-mode=') && arg.length > '--permission-mode='.length) {
+            permissionMode = arg.slice('--permission-mode='.length);
+            continue;
+        }
+        args.push(arg);
+        if (claudeCliFlagCanConsumeNextArg(arg, next)) {
+            args.push(next!);
+            index++;
+        }
+    }
+    return { args, permissionMode };
+}
+
+/** Emit the literal bypass switch only when bypass is the final selected mode. */
+export function buildClaudePermissionModeArgs(permissionMode: string | undefined): string[] {
+    if (permissionMode === undefined) return [];
+    return permissionMode === 'bypassPermissions'
+        ? ['--dangerously-skip-permissions']
+        : ['--permission-mode', permissionMode];
 }

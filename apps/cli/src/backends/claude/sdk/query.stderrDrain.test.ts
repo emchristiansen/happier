@@ -49,7 +49,7 @@ describe('claude sdk query', () => {
 
       const abortController = new AbortController();
 
-      const q = query({
+      const q = await query({
         prompt: 'hello',
         options: {
           cwd: tmpRoot,
@@ -92,7 +92,7 @@ describe('claude sdk query', () => {
       const seen: string[] = [];
       let seenText = '';
 
-      const q = query({
+      const q = await query({
         prompt: 'hello',
         options: {
           cwd: tmpRoot,

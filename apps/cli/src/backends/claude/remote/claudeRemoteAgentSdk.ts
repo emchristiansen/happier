@@ -721,6 +721,7 @@ export async function claudeRemoteAgentSdk(opts: {
         });
         const extraArgs = (() => {
             const out: Record<string, string | null> = Object.create(null);
+            if (mappedPermissionMode === 'bypassPermissions') out['dangerously-skip-permissions'] = null;
             if (enableFileCheckpointing) out['replay-user-messages'] = null;
             if (debugEnabled) out.debug = debugCategories.length > 0 ? debugCategories.join(',') : null;
             if (verboseEnabled) out.verbose = null;

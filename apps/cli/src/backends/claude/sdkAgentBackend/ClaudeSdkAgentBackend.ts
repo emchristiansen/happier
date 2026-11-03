@@ -26,7 +26,7 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
   private readonly suppressedExplicitDiffCallIds = new Set<string>();
   private readonly turnChangeTracker = new ClaudeTurnChangeTracker();
   private readonly providerActivityLedger = createClaudeProviderActivityLedger();
-  private query: ReturnType<typeof query> | null = null;
+  private query: Awaited<ReturnType<typeof query>> | null = null;
   private activeTaskId: string | null = null;
   private activeTaskSessionId: string | null = null;
 
@@ -120,7 +120,7 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
       label: 'claude-sdk',
     });
     const runtimeExecutable = await ensureClaudeJsRuntimeExecutable();
-    const q = query({
+    const q = await query({
       prompt: this.promptStream,
       options: {
         cwd: this.opts.cwd,
