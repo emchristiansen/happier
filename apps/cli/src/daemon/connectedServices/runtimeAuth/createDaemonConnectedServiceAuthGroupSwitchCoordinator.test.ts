@@ -14,6 +14,8 @@ import { DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1 } from '../accountGroups
 import { createDaemonConnectedServiceAuthGroupSwitchCoordinator } from './createDaemonConnectedServiceAuthGroupSwitchCoordinator';
 import { classifyCodexConnectedServiceAuthFailure } from '@/backends/codex/connectedServices/classifyCodexConnectedServiceAuthFailure';
 import { handleConnectedServiceRuntimeAuthFailure } from './handleConnectedServiceRuntimeAuthFailure';
+import { handleConnectedServiceRuntimeAuthFailureForSession } from './handleConnectedServiceRuntimeAuthFailureForSession';
+import { createProviderAccountUsageStore } from '../accountUsage/store';
 
 function group(activeProfileId: string, generation: number): ConnectedServiceAuthGroupV1 {
   return {
@@ -243,6 +245,138 @@ describe('createDaemonConnectedServiceAuthGroupSwitchCoordinator', () => {
     }
   });
 
+  it.each([80, 0])('selects before auto-disabling the active member and avoids the server priority fallback (target quota %s)', async (targetQuota) => {
+    let current: ConnectedServiceAuthGroupV1 = {
+      ...group('primary', 1),
+      policy: { ...group('primary', 1).policy, autoDisablePlanInvalidAccounts: true },
+      members: [...group('primary', 1).members, { ...group('primary', 1).members[1]!, profileId: 'compatible', priority: 3 }],
+    };
+    const installed: Array<string | null> = [];
+    const accountUsageStore = createProviderAccountUsageStore();
+    for (const [profileId, remainingPct] of [['primary', 10], ['backup', 0], ['compatible', targetQuota]] as const) {
+      accountUsageStore.recordSnapshot(accountUsageSnapshot(profileId, remainingPct), { sources: [{
+        serviceId: 'openai-codex', profileId, bindingKind: 'group_member', groupId: 'main', groupGeneration: 1,
+      }] });
+    }
+    const coordinator = createTestDaemonConnectedServiceAuthGroupSwitchCoordinator({
+      api: {
+        getConnectedServiceAuthGroup: async () => current,
+        updateConnectedServiceAuthGroupRuntimeState: async ({ memberStates }) => {
+          current = { ...current, runtimeStateRevision: current.runtimeStateRevision + 1,
+            members: current.members.map(member => ({ ...member, state: memberStates.find(state => state.profileId === member.profileId)?.state ?? member.state })) };
+          return current;
+        },
+        updateConnectedServiceAuthGroupMember: async ({ profileId, enabled, state }) => {
+          const members = current.members.map(member => member.profileId === profileId ? { ...member, enabled, state: state ?? member.state } : member);
+          const activeProfileId = members.some(member => member.enabled && member.profileId === current.activeProfileId)
+            ? current.activeProfileId : members.find(member => member.enabled)?.profileId ?? null;
+          current = { ...current, members, activeProfileId, generation: current.generation + 1 };
+          installed.push(activeProfileId);
+          return current;
+        },
+        updateConnectedServiceAuthGroupActiveProfile: async ({ activeProfileId }) => {
+          current = { ...current, activeProfileId, generation: current.generation + 1 };
+          installed.push(activeProfileId);
+          return current;
+        },
+      },
+      accountUsageStore, runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
+      resolveRequiredModelIdsForGroup: () => ['gpt-6.1-sol'],
+      nowMs: () => 1_000, quotaFreshnessMs: 60_000, restartSession: async () => {},
+    });
+    await coordinator.switchAfterClassifiedFailure({
+      serviceId: 'openai-codex', groupId: 'main', reason: 'plan',
+      limitCategory: 'plan_invalid', quotaScope: 'model', providerLimitId: 'gpt-6.1-sol', observedProfileId: 'primary',
+    });
+    if (targetQuota === 0) {
+      expect({ generation: current.generation, activeProfileId: current.activeProfileId, installed }).toEqual({
+        generation: 1, activeProfileId: 'primary', installed: [],
+      });
+      expect(current.members.find(member => member.profileId === 'primary')).toMatchObject({
+        enabled: true, state: { autoDisabledReason: 'model_not_entitled' },
+      });
+      return;
+    }
+    expect(installed.length).toBeGreaterThan(0);
+    expect(installed.every(profileId => profileId === 'compatible')).toBe(true);
+    expect(current.members.find(member => member.profileId === 'primary')).toMatchObject({ enabled: false, state: { lastFailureCode: 'model_not_entitled' } });
+  });
+  it.each(['soft_threshold', 'usage_limit'] as const)('excludes accounts incompatible with a model used by another live pool session (%s)', async (reason) => {
+    let current: ConnectedServiceAuthGroupV1 = {
+      ...group('primary', 1),
+      members: [...group('primary', 1).members, { ...group('primary', 1).members[1]!, profileId: 'compatible', priority: 3 }]
+        .map((member) => ({ ...member, state: member.profileId === 'backup'
+          ? { modelUnavailableUntilMsByModelId: { 'gpt-6.1-sol': 86_401_000 } } : {} })),
+    };
+    const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+    const accountUsageStore = createProviderAccountUsageStore();
+    for (const [profileId, remainingPct] of [['primary', 10], ['backup', 95], ['compatible', 80]] as const) {
+      const snapshot = accountUsageSnapshot(profileId, remainingPct);
+      accountUsageStore.recordSnapshot(snapshot, { sources: [{
+        serviceId: 'openai-codex', profileId, bindingKind: 'group_member', groupId: 'main', groupGeneration: 1,
+      }] });
+    }
+    const coordinator = createTestDaemonConnectedServiceAuthGroupSwitchCoordinator({
+      api: {
+        getConnectedServiceAuthGroup: async () => current,
+        updateConnectedServiceAuthGroupActiveProfile: async ({ activeProfileId }) => (
+          current = { ...current, activeProfileId, generation: current.generation + 1 }
+        ),
+      },
+      runtimeQuotaSnapshots, accountUsageStore,
+      resolveRequiredModelIdsForGroup: () => ['gpt-6.1-sol', 'gpt-6.1-terra'],
+      nowMs: () => 1_000, quotaFreshnessMs: 60_000,
+      restartSession: async () => {},
+      applyConnectedServiceAuthGeneration: async () => ({ ok: true, action: 'hot_applied' }),
+    });
+    const result = reason === 'soft_threshold'
+      ? await coordinator.switchBeforeTurn({ serviceId: 'openai-codex', groupId: 'main', reason })
+      : await coordinator.switchAfterClassifiedFailure({ serviceId: 'openai-codex', groupId: 'main', reason, observedProfileId: 'primary' });
+    expect(result).toMatchObject({ status: 'switched', activeProfileId: 'compatible' });
+    expect(current.activeProfileId).toBe('compatible');
+  });
+  it('recovers an unattributed goal failure through fresh pool probes without stamping an unproven member', async () => {
+    let current = group('primary', 1);
+    current.policy = { ...current.policy, strategy: 'least_limited', recoveryMode: 'switch_or_wait' };
+    const snapshots = new Map<string, ProviderAccountUsageSnapshotV1>();
+    const updateRuntimeState = vi.fn(async () => current);
+    const api = {
+      getConnectedServiceAuthGroup: async () => current,
+      updateConnectedServiceAuthGroupRuntimeState: updateRuntimeState,
+      updateConnectedServiceAuthGroupActiveProfile: async (input: { activeProfileId: string }) => {
+        current = { ...current, activeProfileId: input.activeProfileId, generation: current.generation + 1 };
+        return current;
+      },
+    };
+    const probed: string[] = [];
+    const coordinator = createTestDaemonConnectedServiceAuthGroupSwitchCoordinator({
+      api, runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
+      accountUsageStore: { resolveBySource: ({ profileId }) => snapshots.get(profileId) ?? null },
+      quotaFreshnessMs: 60_000, nowMs: () => 1_000, restartSession: async () => {},
+      probeQuotaSnapshotsForGroup: async ({ profileIds }) => {
+        for (const profileId of profileIds) {
+          probed.push(profileId);
+          snapshots.set(profileId, accountUsageSnapshot(profileId, profileId === 'backup' ? 90 : 0));
+        }
+      },
+    });
+    const tracked = { startedBy: 'daemon' as const, happySessionId: 'goal-pool-failure', pid: 123,
+      spawnOptions: { directory: '/tmp/project' } };
+    const result = await handleConnectedServiceRuntimeAuthFailureForSession({
+      sessionId: tracked.happySessionId, getChildren: () => [tracked], switchesThisTurn: 0,
+      classification: { kind: 'usage_limit', serviceId: 'openai-codex', profileId: null, groupId: null,
+        resetsAtMs: null, planType: null, rateLimits: null, source: 'structured_provider_error' },
+      resolveRegisteredRuntimeAuthFailureSource: () => ({ status: 'bound', binding: { serviceId: 'openai-codex', groupId: 'main',
+        profileId: 'primary', generation: 1, credentialRevision: 'csr_testcredentialrevision' } }),
+      switchCoordinator: coordinator,
+    });
+    expect(result).toMatchObject({ status: 'switch_attempted', result: { status: 'switched', activeProfileId: 'backup' } });
+    expect(probed).toContain('backup');
+    expect(current.activeProfileId).toBe('backup');
+    expect(updateRuntimeState).not.toHaveBeenCalled();
+    expect(current.members.map(member => member.state)).toEqual([{ v: 1 }, { v: 1 }]);
+  });
+
   it('loads group state, commits the selected member, and requests a session restart for rematerialization', async () => {
     const backupRevision = 'csr_abcdefghijklmnopqrstuv';
     const api = {
@@ -294,20 +428,25 @@ describe('createDaemonConnectedServiceAuthGroupSwitchCoordinator', () => {
     });
   });
 
-  it('fails the committed generation when the canonical target credential is legacy-unfenced', async () => {
+  it.each(['legacy_unfenced', 'read_back_failed'])(
+    'applies the selected account when committed credential revision is missing (%s)', async (revisionState) => {
     const restartSession = vi.fn(async () => {});
+    let current = group('primary', 1);
     const coordinator = createTestDaemonConnectedServiceAuthGroupSwitchCoordinator({
       api: {
-        getConnectedServiceAuthGroup: vi.fn(async () => group('primary', 1)),
-        updateConnectedServiceAuthGroupActiveProfile: vi.fn(async () => group('backup', 2)),
-        updateConnectedServiceAuthGroupRuntimeState: vi.fn(async () => group('primary', 1)),
+        getConnectedServiceAuthGroup: vi.fn(async () => current),
+        updateConnectedServiceAuthGroupActiveProfile: vi.fn(async () => (current = group('backup', 2))),
+        updateConnectedServiceAuthGroupRuntimeState: vi.fn(async () => current),
       },
       runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
       quotaFreshnessMs: 60_000,
       nowMs: () => 1_000,
       restartSession,
       resolveCredentialRevision: () => 'csr_staleprojectionrevision',
-      resolveCurrentCredentialRevision: vi.fn(async () => null),
+      resolveCurrentCredentialRevision: vi.fn(async () => {
+        if (revisionState === 'read_back_failed') throw Object.assign(new Error('read failed'), { code: 'ECONNRESET' });
+        return null;
+      }),
     });
 
     await expect(coordinator.switchAfterClassifiedFailure({
@@ -316,13 +455,13 @@ describe('createDaemonConnectedServiceAuthGroupSwitchCoordinator', () => {
       reason: 'usage_limit',
       switchesThisTurn: 0,
     })).resolves.toMatchObject({
-      status: 'generation_apply_failed',
+      status: 'switched',
       activeProfileId: 'backup',
       generation: 2,
-      errorCode: 'credential_revision_missing',
+      credentialRevision: null,
     });
 
-    expect(restartSession).not.toHaveBeenCalled();
+    expect(restartSession).toHaveBeenCalledWith(expect.objectContaining({ activeProfileId: 'backup', generation: 2 }));
   });
 
   it('records runtime auth_failed as credential-unhealthy before selecting a fresh-quota candidate', async () => {
@@ -753,7 +892,7 @@ describe('createDaemonConnectedServiceAuthGroupSwitchCoordinator', () => {
     });
   });
 
-  it('threads exact revisions through application and post-fences a revision-only supersession', async () => {
+  it('accepts application to the selected account after a revision-only refresh', async () => {
     const adoptedRevision = 'csr_aaaaaaaaaaaaaaaaaaaaaa';
     const authoritativeRevision = 'csr_bbbbbbbbbbbbbbbbbbbbbb';
     const applyConnectedServiceAuthGeneration = vi.fn(async () => ({
@@ -786,11 +925,9 @@ describe('createDaemonConnectedServiceAuthGroupSwitchCoordinator', () => {
       credentialRevision: adoptedRevision,
       reason: 'credential_revision_changed',
     })).resolves.toMatchObject({
-      status: 'superseded_after_apply',
+      status: 'observed_generation',
       generation: 2,
       credentialRevision: authoritativeRevision,
-      adoptedGeneration: 2,
-      adoptedCredentialRevision: adoptedRevision,
     });
     expect(applyConnectedServiceAuthGeneration).toHaveBeenCalledWith(expect.objectContaining({
       credentialRevision: adoptedRevision,
@@ -1474,66 +1611,6 @@ describe('createDaemonConnectedServiceAuthGroupSwitchCoordinator', () => {
         }),
       }],
     }));
-  });
-
-  it('persistently disables a model-incompatible member when the pool opts in', async () => {
-    const loadedGroup = {
-      ...group('primary', 1),
-      policy: {
-        ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1,
-        autoSwitch: true,
-        autoDisablePlanInvalidAccounts: true,
-      },
-    };
-    const disabledGroup = {
-      ...loadedGroup,
-      activeProfileId: 'backup',
-      generation: 2,
-      members: loadedGroup.members.map((member) => member.profileId === 'primary'
-        ? { ...member, enabled: false, state: { ...member.state, autoDisabledReason: 'model_not_entitled' as const } }
-        : member),
-    };
-    const api = {
-      getConnectedServiceAuthGroup: vi.fn()
-        .mockResolvedValueOnce(loadedGroup)
-        .mockResolvedValue(disabledGroup),
-      updateConnectedServiceAuthGroupRuntimeState: vi.fn(async () => loadedGroup),
-      updateConnectedServiceAuthGroupMember: vi.fn(async () => disabledGroup),
-      updateConnectedServiceAuthGroupActiveProfile: vi.fn(async () => disabledGroup),
-    };
-    const coordinator = createTestDaemonConnectedServiceAuthGroupSwitchCoordinator({
-      api,
-      runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
-      quotaFreshnessMs: 60_000,
-      nowMs: () => 1_000,
-      restartSession: async () => {},
-    });
-
-    await coordinator.switchAfterClassifiedFailure({
-      serviceId: 'openai-codex',
-      groupId: 'main',
-      reason: 'plan',
-      limitCategory: 'plan_invalid',
-      quotaScope: 'model',
-      providerLimitId: 'gpt-5.6-sol',
-      observedProfileId: 'primary',
-      planType: null,
-    });
-
-    expect(api.updateConnectedServiceAuthGroupMember).toHaveBeenCalledWith({
-      serviceId: 'openai-codex',
-      groupId: 'main',
-      profileId: 'primary',
-      enabled: false,
-      expectedGeneration: 1,
-      expectedRuntimeStateRevision: 0,
-      state: expect.objectContaining({
-        autoDisabledReason: 'model_not_entitled',
-        lastFailureCode: 'model_not_entitled',
-        modelUnavailableUntilMsByModelId: { 'gpt-5.6-sol': 86_401_000 },
-      }),
-    });
-    expect(api.updateConnectedServiceAuthGroupRuntimeState).not.toHaveBeenCalled();
   });
 
   it('records only short herd-backoff evidence when usage-limit provider timing is missing', async () => {

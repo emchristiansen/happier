@@ -1,3 +1,4 @@
+import { removeConnectedServiceCredentialFiles } from '@/daemon/connectedServices/credentials/removeConnectedServiceCredentialFiles';
 import { INSTALLABLE_KEYS } from '@happier-dev/protocol';
 
 import type { AgentCatalogEntry } from '@/backends/types';
@@ -18,6 +19,12 @@ import { classifyAgyAssistantTurnFailure, reportAgyTurnFailure } from './connect
 
 const agyCredentialLifecycle = {
   providerId: 'agy', serviceIds: ['antigravity'],
+  credentialStorageCleanup: {
+    async deleteCredentialStorageForHomeRoot({ rootDir }) {
+      // Stable AGY homes are native roots; private probes wrap that root in gemini-home.
+      await removeConnectedServiceCredentialFiles(rootDir, agyConnectedServiceStateSharingDescriptor.authIsolation.secretEntries.flatMap((entry) => [entry, `gemini-home/${entry}`]));
+    },
+  },
   spawnPreflightOauthRefresh: { mode: 'expiry_window' },
   refreshedCredentialApplication: { mode: 'restart_required' },
   predictiveSoftSwitch: { mode: 'unsupported' },

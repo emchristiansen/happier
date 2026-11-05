@@ -485,6 +485,83 @@ describe('resolveTranscriptRollbackActions', () => {
         });
     });
 
+    it('offers a turn only when both the current projection and the stored starts allow it', () => {
+        const projection: SessionTurnsProjectionV1 = {
+            v: 1,
+            sessionId: 's1',
+            latestTurnId: 'turn-2',
+            updatedAt: 10,
+            turns: [
+                { turnId: 'turn-1', status: 'completed', startedAt: 1, updatedAt: 2, terminalAt: 2, transcriptAnchors: { startUserMessageSeq: 1, userMessageSeqs: [1], startSeqInclusive: 1, endSeqInclusive: 2 }, rollback: { state: 'eligible', updatedAt: 2 } },
+                { turnId: 'turn-2', status: 'completed', startedAt: 3, updatedAt: 4, terminalAt: 4, transcriptAnchors: { startUserMessageSeq: 3, userMessageSeqs: [3], startSeqInclusive: 3, endSeqInclusive: 4 }, rollback: { state: 'eligible', updatedAt: 4 } },
+            ],
+        };
+        const messagesById: Record<string, Message> = {
+            u1: userTextMessage('u1', 1, 'initial prompt'),
+            u2: userTextMessage('u2', 3, 'second prompt'),
+        };
+        const actionsFor = (rollbackEligibleTurnStarts: number[] | undefined) => Object.keys(resolveTranscriptRollbackActions({
+            session: createActiveSession({
+                metadata: { path: '/workspace', host: 'localhost', flavor: 'codex', codexBackendMode: 'appServer' },
+                latestTurnId: 'turn-2',
+                rollbackEligibleTurnStarts,
+                sessionTurns: projection,
+            }),
+            messageIdsOldestFirst: ['u1', 'u2'],
+            messagesById,
+            rollbackRanges: [],
+        }));
+        // A later revocation (socket update or explicit list-row array) wins over the projection.
+        expect(actionsFor([])).toEqual([]);
+        expect(actionsFor([3])).toEqual(['u2']);
+        // Unknown starts leave the projection to decide.
+        expect(actionsFor(undefined)).toEqual(['u1', 'u2']);
+    });
+
+    it('lets only strictly newer ordered starts supersede the projection', () => {
+        const projection: SessionTurnsProjectionV1 = {
+            v: 1,
+            sessionId: 's1',
+            latestTurnId: 'turn-2',
+            updatedAt: 10,
+            turns: [
+                { turnId: 'turn-1', status: 'completed', startedAt: 1, updatedAt: 2, terminalAt: 2, transcriptAnchors: { startUserMessageSeq: 1, userMessageSeqs: [1], startSeqInclusive: 1, endSeqInclusive: 2 }, rollback: { state: 'not_eligible', updatedAt: 2 } },
+                { turnId: 'turn-2', status: 'completed', startedAt: 3, updatedAt: 4, terminalAt: 4, transcriptAnchors: { startUserMessageSeq: 3, userMessageSeqs: [3], startSeqInclusive: 3, endSeqInclusive: 4 }, rollback: { state: 'eligible', updatedAt: 4 } },
+            ],
+        };
+        const messagesById: Record<string, Message> = {
+            u1: userTextMessage('u1', 1, 'initial prompt'),
+            u2: userTextMessage('u2', 3, 'second prompt'),
+        };
+        const actionsFor = (
+            rollbackEligibleTurnStarts: number[],
+            order: Readonly<{ startsObservedAt?: number; projectionObservedAt?: number }>,
+        ) => Object.keys(resolveTranscriptRollbackActions({
+            session: {
+                ...createActiveSession({
+                    metadata: { path: '/workspace', host: 'localhost', flavor: 'codex', codexBackendMode: 'appServer' },
+                    latestTurnId: 'turn-2',
+                    rollbackEligibleTurnStarts,
+                    sessionTurns: projection,
+                }),
+                ...(order.startsObservedAt !== undefined ? { rollbackEligibilityObservedAt: order.startsObservedAt } : {}),
+                ...(order.projectionObservedAt !== undefined ? { sessionTurnsObservedAt: order.projectionObservedAt } : {}),
+            },
+            messageIdsOldestFirst: ['u1', 'u2'],
+            messagesById,
+            rollbackRanges: [],
+        }));
+        // Starts observed after the projection was requested describe the newer server state.
+        expect(actionsFor([1, 3], { startsObservedAt: 9, projectionObservedAt: 5 })).toEqual(['u1', 'u2']);
+        expect(actionsFor([1], { startsObservedAt: 9, projectionObservedAt: 5 })).toEqual(['u1']);
+        expect(actionsFor([], { startsObservedAt: 9, projectionObservedAt: 5 })).toEqual([]);
+        // Same observation, or either side unordered: both sources must allow the turn.
+        expect(actionsFor([1, 3], { startsObservedAt: 5, projectionObservedAt: 5 })).toEqual(['u2']);
+        expect(actionsFor([1, 3], { projectionObservedAt: 5 })).toEqual(['u2']);
+        expect(actionsFor([1, 3], { startsObservedAt: 9 })).toEqual(['u2']);
+        expect(actionsFor([1, 3], {})).toEqual(['u2']);
+    });
+
     it('keeps completed app-server turn rollback actions after the session is no longer active', () => {
         const session = createActiveSession({
             active: false,

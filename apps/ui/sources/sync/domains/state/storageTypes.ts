@@ -339,6 +339,7 @@ const AgentStateObjectSchema = z.object({
         canDetach: z.boolean().nullish(),
     }).nullish(),
     requests: z.record(z.string(), z.object({
+        occurrenceId: z.string().optional(),
         tool: z.string(),
         kind: z.string().optional(),
         source: z.string().optional(),
@@ -465,7 +466,35 @@ export interface Session {
     runtimeActivityRevision?: number | null,
     lastRuntimeIssue?: SessionRuntimeIssueV1 | null,
     sessionTurns?: SessionTurnsProjectionV1 | null,
+    /**
+     * Client-local observation (`nextRollbackEligibilityObservation`) taken when the stored
+     * `sessionTurns` were requested; set and dropped together with them. Stored starts observed
+     * strictly later describe newer eligibility than the projection (`resolveTranscriptRollbackActions`).
+     * Absent means unordered: the projection then still constrains the starts.
+     */
+    sessionTurnsObservedAt?: number,
+    /**
+     * Flattened rollback-eligible turn starts. In a snapshot passed to `applySessions` an array or
+     * `null` replaces the stored value; `undefined` means the source did not carry the projection
+     * (session-list rows, exact reads without the turns projection) and `applySessions` keeps the
+     * stored value, marked stale. On the wire the protocol admits only an array or absence (HTTP
+     * readers drop `null`), so servers clear eligibility with `[]`.
+     */
     rollbackEligibleTurnStarts?: readonly number[] | null,
+    /**
+     * Set when the stored `rollbackEligibleTurnStarts` were carried across a snapshot that did not
+     * carry eligibility, so a missed turn update may have outdated them. Derived by `applySessions`
+     * (see `mergeRollbackEligibility`); a value in an incoming snapshot is ignored.
+     */
+    rollbackEligibilityStale?: boolean,
+    /**
+     * Client-local order of the observation behind the stored `rollbackEligibleTurnStarts`
+     * (`nextRollbackEligibilityObservation`), taken when the read started or the socket update
+     * arrived, or when the session-list request that carried them started. Older evidence cannot
+     * replace newer (see `mergeRollbackEligibility`). Absent for unordered sources such as the warm
+     * cache.
+     */
+    rollbackEligibilityObservedAt?: number,
     latestReadyEventSeq?: number | null,
     latestReadyEventAt?: number | null,
     metadata: Metadata | null,

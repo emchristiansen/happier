@@ -1727,7 +1727,7 @@ describe('switchSessionConnectedServiceAuth', () => {
     expect(continueAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
   });
 
-  it('rejects a revision-only mismatch before unchanged-binding rematerialization side effects', async () => {
+  it('rematerializes an unchanged selected account after a credential refresh', async () => {
     const desiredRevision = 'csr_aaaaaaaaaaaaaaaaaaaaaa';
     const materializedRevision = 'csr_bbbbbbbbbbbbbbbbbbbbbb';
     const tracked = trackedSession({
@@ -1748,7 +1748,6 @@ describe('switchSessionConnectedServiceAuth', () => {
         connectedServiceMaterializationIdentityV1: materializationIdentity,
       },
     });
-    const previousSpawnOptions = tracked.spawnOptions;
     const hotApply = vi.fn(async () => ({ ok: true as const }));
     const persistSessionBindings = vi.fn(async () => {});
     const registerHotApplyTargets = vi.fn();
@@ -1769,7 +1768,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       },
       postSwitchVerificationMode: {
         kind: 'disabled_for_test_only',
-        reason: 'revision fencing aborts before provider adoption verification',
+        reason: 'this test isolates current-credential application',
       },
       getChildren: () => [tracked],
       api: {
@@ -1813,17 +1812,17 @@ describe('switchSessionConnectedServiceAuth', () => {
           },
         },
       },
-    })).rejects.toThrow(
-      'connected_service_auth_generation_apply_failed:credential_revision_superseded',
-    );
+    })).resolves.toMatchObject({ ok: true, action: 'hot_applied' });
 
-    expect(tracked.spawnOptions).toBe(previousSpawnOptions);
-    expect(hotApply).not.toHaveBeenCalled();
-    expect(verifyProviderAccountAdoption).not.toHaveBeenCalled();
-    expect(persistSessionBindings).not.toHaveBeenCalled();
-    expect(registerHotApplyTargets).not.toHaveBeenCalled();
+    expect(hotApply).toHaveBeenCalled();
+    expect(verifyProviderAccountAdoption).toHaveBeenCalled();
     expect(restartSession).not.toHaveBeenCalled();
-    expect(recoverAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
+    expect(recoverAfterRuntimeAuthSwitch).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'hot_applied',
+      runtimeAuthSelectionsByServiceId: new Map([
+        ['anthropic', { credentialRevision: materializedRevision }],
+      ]),
+    }));
     expect(continueAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
   });
 
@@ -5453,7 +5452,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       .toBe(runtimeAuthSelection);
   });
 
-  it('rejects a superseded materialized credential revision before the provider effect', async () => {
+  it('applies a refreshed credential for the selected Codex account', async () => {
     const desiredRevision = 'csr_aaaaaaaaaaaaaaaaaaaaaa';
     const materializedRevision = 'csr_bbbbbbbbbbbbbbbbbbbbbb';
     const tracked = trackedSession({
@@ -5468,7 +5467,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       core: createCore(),
       postSwitchVerificationMode: {
         kind: 'disabled_for_test_only',
-        reason: 'revision fencing aborts before provider adoption verification',
+        reason: 'this test isolates current-credential application',
       },
       getChildren: () => [tracked],
       api: {
@@ -5499,10 +5498,8 @@ describe('switchSessionConnectedServiceAuth', () => {
       expectedCredentialRevisionByServiceId: Readonly<Record<string, string>>;
     }>;
 
-    await expect(switchSessionConnectedServiceAuth(switchInput)).rejects.toThrow(
-      'connected_service_auth_generation_apply_failed:credential_revision_superseded',
-    );
-    expect(hotApply).not.toHaveBeenCalled();
+    await expect(switchSessionConnectedServiceAuth(switchInput)).resolves.toMatchObject({ ok: true, action: 'hot_applied' });
+    expect(hotApply).toHaveBeenCalled();
   });
 
   it('requires direct live Codex apply for usage-limit recovery when the provider declares direct live auth', async () => {

@@ -89,7 +89,7 @@ jobs:
     name: Trusted workflow ref guard
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Admit trusted workflow control ref
@@ -113,7 +113,7 @@ jobs:
     name: Release actor guard
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -146,7 +146,7 @@ jobs:
     name: Prepare exact dev OTA bytes without credentials
     needs: [release_actor_guard]
     if: ${{ inputs.publish_ota && !inputs.use_prepared }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
       contents: read
@@ -169,9 +169,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
       - name: Enable Corepack (Yarn)
         uses: ./.github/actions/enable-corepack-yarn
       - name: Install candidate preparation dependencies
@@ -214,7 +212,7 @@ jobs:
     name: Publish prepared dev OTA bytes from trusted control
     needs: [release_actor_guard, prepare_ota]
     if: ${{ !cancelled() && !inputs.preparation_only && inputs.publish_ota && needs.release_actor_guard.result == 'success' && (needs.prepare_ota.result == 'success' || (inputs.use_prepared && needs.prepare_ota.result == 'skipped')) }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     environment: release-shared
     permissions:
@@ -230,9 +228,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
       - name: Enable Corepack (Yarn)
         uses: ./.github/actions/enable-corepack-yarn
       - name: Install trusted OTA publisher dependencies
@@ -275,7 +271,7 @@ jobs:
   publish:
     if: ${{ !inputs.preparation_only }}
     needs: [release_actor_guard]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     environment: release-shared
     steps:
@@ -300,9 +296,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
 
       - name: Enable Corepack (Yarn)
         uses: ./.github/actions/enable-corepack-yarn
@@ -327,6 +321,7 @@ jobs:
       - name: Build Android APK (dev lane, cloud)
         if: inputs.publish_android_apk && inputs.eas_builder == 'eas_cloud'
         env:
+          RELEASE_MESSAGE: ${{ inputs.release_message }}
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: |
           set -euo pipefail
@@ -340,7 +335,7 @@ jobs:
             --build-json "/tmp/eas_build.json" \
             --out-dir "dist/ui-mobile" \
             --eas-cli-version "${EAS_CLI_VERSION}" \
-            --release-message "${{ inputs.release_message }}" \
+            --release-message="$RELEASE_MESSAGE" \
             --publish-apk-release false \
             --secrets-source env
 
@@ -353,6 +348,7 @@ jobs:
       - name: Build Android APK (dev lane, local via Dagger)
         if: inputs.publish_android_apk && inputs.eas_builder == 'eas_local'
         env:
+          RELEASE_MESSAGE: ${{ inputs.release_message }}
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: |
@@ -368,7 +364,7 @@ jobs:
             --build-json "/tmp/eas_build.json" \
             --out-dir "dist/ui-mobile" \
             --eas-cli-version "${EAS_CLI_VERSION}" \
-            --release-message "${{ inputs.release_message }}" \
+            --release-message="$RELEASE_MESSAGE" \
             --publish-apk-release false \
             --secrets-source env
 
@@ -406,7 +402,7 @@ jobs:
             --environment dev \
             --apk-path "$apk" \
             --target-sha "$AUTHORIZED_SHA" \
-            --release-message "$RELEASE_MESSAGE"
+            --release-message="$RELEASE_MESSAGE"
 
       - name: Note
         run: |
@@ -417,7 +413,7 @@ jobs:
     name: iOS TestFlight submit (dev lane) (cloud, best-effort)
     needs: [release_actor_guard]
     if: inputs.submit_ios_testflight && inputs.eas_builder == 'eas_cloud'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
       actions: write
@@ -455,9 +451,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .testflight-preflight-control/.node-version
 
       - name: Validate configured external TestFlight groups
         working-directory: .testflight-preflight-control
@@ -489,6 +483,7 @@ jobs:
 
       - name: iOS TestFlight submit (dev lane) (best-effort)
         env:
+          RELEASE_MESSAGE: ${{ inputs.release_message }}
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
           APP_STORE_CONNECT_PUBLICDEV_EXTERNAL_GROUPS: ${{ vars.APP_STORE_CONNECT_PUBLICDEV_EXTERNAL_GROUPS }}
@@ -512,7 +507,7 @@ jobs:
             --build-json "/tmp/eas_build.ios.json" \
             --out-dir "dist/ui-mobile" \
             --eas-cli-version "${EAS_CLI_VERSION}" \
-            --release-message "${{ inputs.release_message }}" \
+            --release-message="$RELEASE_MESSAGE" \
             --secrets-source env
 
       - name: Dispatch exact TestFlight reconciliation
@@ -571,9 +566,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .testflight-preflight-control/.node-version
 
       - name: Validate configured external TestFlight groups
         working-directory: .testflight-preflight-control
@@ -610,6 +603,7 @@ jobs:
 
       - name: iOS TestFlight submit (dev lane) (best-effort)
         env:
+          RELEASE_MESSAGE: ${{ inputs.release_message }}
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
           APP_STORE_CONNECT_PUBLICDEV_EXTERNAL_GROUPS: ${{ vars.APP_STORE_CONNECT_PUBLICDEV_EXTERNAL_GROUPS }}
@@ -634,7 +628,7 @@ jobs:
             --build-json "/tmp/eas_build.ios.json" \
             --out-dir "dist/ui-mobile" \
             --eas-cli-version "${EAS_CLI_VERSION}" \
-            --release-message "${{ inputs.release_message }}" \
+            --release-message="$RELEASE_MESSAGE" \
             --secrets-source env
 
       - name: Dispatch exact TestFlight reconciliation

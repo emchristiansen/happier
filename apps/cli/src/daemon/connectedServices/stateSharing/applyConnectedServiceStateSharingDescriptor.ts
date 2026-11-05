@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path';
 
@@ -219,13 +220,19 @@ async function copyEntryWithOptionalTransform(params: Readonly<{
 }
 
 async function writeConfigContentIfChanged(destinationPath: string, content: string): Promise<void> {
-  try {
-    if (await readFile(destinationPath, 'utf8') === content) return;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
-  }
+  // A transformed projection is private to this home. A hardlinked destination (shared inode) is
+  // replaced, never written through, so the source file it aliases keeps its bytes.
+  const destinationStat = await tryLstatConnectedServiceHomeEntry(destinationPath);
+  if (destinationStat?.isFile() && destinationStat.nlink === 1
+    && await readFile(destinationPath, 'utf8') === content) return;
   await mkdir(dirname(destinationPath), { recursive: true });
-  await writeFile(destinationPath, content, { encoding: 'utf8', mode: 0o600 });
+  const temporaryPath = `${destinationPath}.happier-${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    await rename(temporaryPath, destinationPath);
+  } finally {
+    await rm(temporaryPath, { force: true });
+  }
 }
 
 async function preflightStateLink(params: Readonly<{

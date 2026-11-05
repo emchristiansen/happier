@@ -11,7 +11,10 @@ import {
   type ApiSessionSocketStub,
   createApiSessionSocketStub,
 } from '@/testkit/backends/apiSessionSocketHarness';
-import type { SessionMutationOutbox } from '@/api/session/mutations/createSessionMutationOutbox';
+import type {
+  CreateSessionMutationOutboxParams,
+  SessionMutationOutbox,
+} from '@/api/session/mutations/createSessionMutationOutbox';
 import {
   HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY,
   HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY,
@@ -119,9 +122,12 @@ vi.mock('@/api/session/connection/createSessionSocketTransport', () => ({
 }));
 
 vi.mock('@/api/session/mutations/createSessionMutationOutbox', () => ({
-  createSessionMutationOutbox: (): SessionMutationOutbox => ({
+  createSessionMutationOutbox: (params: CreateSessionMutationOutboxParams): SessionMutationOutbox => ({
     enqueueAgentStateRequestSettlement: async () => ({ persisted: true, delivered: true }),
-    enqueueSessionTurn: async () => {},
+    // A delivered turn mutation publishes its turn, which accepted primary-turn Pending awaits.
+    enqueueSessionTurn: async (mutation) => {
+      queueMicrotask(() => params.onSessionTurnDelivered?.(mutation));
+    },
     enqueueTranscriptMessage: async () => ({ persisted: true, delivered: true }),
     enqueueRuntimeActivitySnapshot: async () => ({ persisted: true, delivered: true }),
     setSessionSyncPendingInputServerContract: async () => {},

@@ -9,6 +9,7 @@ import {
 
 import { resolveConfiguredClaudeConfigDir } from '@/backends/claude/utils/resolveConfiguredClaudeConfigDir';
 import { applyConnectedServiceStateSharingDescriptor } from '@/daemon/connectedServices/stateSharing/applyConnectedServiceStateSharingDescriptor';
+import { removeConnectedServiceCredentialFiles } from '@/daemon/connectedServices/credentials/removeConnectedServiceCredentialFiles';
 import { moveConnectedServiceHomeEntryAside } from '@/daemon/connectedServices/stateSharing/connectedServiceHomeEntrySync';
 import { withConnectedServiceStateSharingDestinationLock } from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingLock';
 import {
@@ -26,14 +27,12 @@ import { importConnectedServiceSessionFiles } from '@/daemon/connectedServices/s
 
 import { claudeConnectedServiceStateSharingDescriptor } from './claudeConnectedServiceStateSharingDescriptor';
 import { materializeClaudeWorkspaceTrust } from './materializeClaudeWorkspaceTrust';
-
-const CLAUDE_CREDENTIAL_HOME_ENTRIES = Object.freeze([
-  '.claude.json',
-  '.credentials.json',
-  'credentials.json',
-  'auth.json',
-  'accounts',
-] as const);
+import { CLAUDE_CREDENTIAL_HOME_ENTRIES } from './claudeConnectedServiceCredentialStorageCleanup';
+import {
+  ensureClaudeHomeTranscriptRetention,
+  readClaudeSettingsTranscriptRetention,
+  withClaudeTranscriptRetentionDefault,
+} from './claudeTranscriptRetentionSettings';
 
 type ClaudeStateMode = 'shared' | 'isolated';
 
@@ -74,12 +73,12 @@ async function removeClaudeCredentialEntries(
   targetDir: string,
   opts?: Readonly<{ preserveNativeAuthFiles?: boolean }>,
 ): Promise<void> {
-  for (const entry of CLAUDE_CREDENTIAL_HOME_ENTRIES) {
-    // The native-auth owner reconciles these target-owned files separately. Configuration
-    // refresh must neither delete them nor import their counterparts from the source home.
-    if (opts?.preserveNativeAuthFiles === true && (entry === '.credentials.json' || entry === '.claude.json')) continue;
-    await rm(join(targetDir, entry), { recursive: true, force: true });
-  }
+  // The native-auth owner reconciles these target-owned files separately. Configuration
+  // refresh must neither delete them nor import their counterparts from the source home.
+  const entries = CLAUDE_CREDENTIAL_HOME_ENTRIES.filter((entry) => !(
+    opts?.preserveNativeAuthFiles === true && (entry === '.credentials.json' || entry === '.claude.json')
+  ));
+  await removeConnectedServiceCredentialFiles(targetDir, entries);
 }
 
 function normalizeVendorResumeId(value: string | null | undefined): string | null {
@@ -166,10 +165,9 @@ async function resolveCandidatePersistedClaudeSessionImportPlan(params: Readonly
 }
 
 /**
- * Newest-content-wins reconciliation for `<id>.happier-import-<hash>.jsonl` conflict copies
- * (INC-5): a conflict copy newer than the canonical `<id>.jsonl` is promoted over it (it is the
- * most complete transcript for an append-only vendor jsonl); a stale conflict copy is removed so
- * a Rule-A probe can never validate a divergent file Claude's `--resume <id>` will not read.
+ * Preserve the existing newest-mtime canonical resume choice without assuming that one
+ * transcript contains another. Distinct displaced and stale histories remain available;
+ * only `<id>.jsonl`, never a conflict copy, participates in resume mappings.
  */
 async function reconcileClaudeConflictedSessionImports(params: Readonly<{
   destinationDir: string;
@@ -191,14 +189,16 @@ async function reconcileClaudeConflictedSessionImports(params: Readonly<{
     if (conflictMtimeMs === null) continue;
     const canonicalMtimeMs = await readFileMtimeMs(params.canonicalDestinationPath);
     if (canonicalMtimeMs === null || conflictMtimeMs > canonicalMtimeMs) {
+      let previousCanonical: string | null = null;
       try {
+        previousCanonical = await moveConnectedServiceHomeEntryAside(params.canonicalDestinationPath);
         await rename(conflictPath, params.canonicalDestinationPath);
       } catch {
+        if (previousCanonical) await rename(previousCanonical, params.canonicalDestinationPath).catch(() => {});
         // Keep the conflict copy when promotion fails; the canonical file still wins mappings.
       }
       continue;
     }
-    await rm(conflictPath, { force: true });
   }
 }
 
@@ -491,6 +491,12 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
             },
           ]
         : [];
+    // Without cleanupPeriodDays, Claude Code expires transcripts it can reach after 30 days. A source
+    // that decides it keeps its link or copy. Source settings lacking it become a managed copy with
+    // the default; the source home is only read.
+    const sourceTranscriptRetention = settings.configMode === 'isolated'
+      ? 'missing'
+      : await readClaudeSettingsTranscriptRetention(join(sourceDir, 'settings.json'));
     const applyResult = await applyConnectedServiceStateSharingDescriptor({
       descriptor: claudeConnectedServiceStateSharingDescriptor,
       nativeSourceContext: {
@@ -511,7 +517,15 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
       sessionImportRoots: importSessionRoots,
       resolveVendorResumeIdFromImportedFile: resolveVendorResumeIdFromImportedClaudeSession,
       providerLabel: 'Claude',
+      ...(sourceTranscriptRetention === 'lacking' ? {
+        forceCopiedEntries: ['settings.json'],
+        copyTransformByEntry: { 'settings.json': withClaudeTranscriptRetentionDefault },
+      } : {}),
     });
+    if (sourceTranscriptRetention === 'missing') {
+      // Isolated or absent source configuration: this home's own settings carry the default.
+      await ensureClaudeHomeTranscriptRetention(join(params.targetDir, 'settings.json'));
+    }
 
     await removeClaudeCredentialEntries(params.targetDir, removeCredentialEntriesOptions);
     // No post-descriptor source→target session import is needed: in shared mode the descriptor has

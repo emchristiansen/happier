@@ -131,6 +131,11 @@ trap 'wsrepl_early_terminate_due_to_signal 130 int' INT
 # - captures host + guest diagnostics into a timestamped report directory
 # - runs a Playwright-driven session-handoff workspace-transfer matrix against a real stack UI
 #
+# NOTE: the current driver (scripts/qa/playwright-session-handoff-wsrepl-matrix.mjs) only runs a
+# self-contained fixture spec and refuses requested-matrix inputs (fatal.json reason
+# requested_matrix_unsupported). This wrapper therefore fails closed: success requires the driver's
+# current meta.json/summary.json to bind the requested session and ordered steps.
+#
 # Usage (macOS/Linux host, from the repo root or `packages/tests/`):
 #   ./packages/tests/scripts/wsrepl-lima-matrix.sh [--headed|--headless] [vm-name] [vm-name-2 ...]
 #

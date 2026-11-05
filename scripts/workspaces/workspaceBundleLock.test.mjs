@@ -589,3 +589,146 @@ test('J079 same ps prefix is not comparable without timezone provenance', async 
     assert.equal(readFileSync(lockPath, 'utf8'), raw);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('withWorkspaceBundleLock cancels a live legacy-owner wait without removing its lock', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'happier-bootstrap-lock-cancel-'));
+  const lockPath = join(tempRoot, 'bootstrap.lock');
+  const legacyOwner = JSON.stringify({ pid: process.pid, createdAt: Date.now() - 600_000 });
+  writeFileSync(lockPath, legacyOwner);
+  const controller = new AbortController();
+  const reason = new Error('cancel bootstrap');
+  let entered = false;
+  try {
+    const waiting = withWorkspaceBundleLock(() => { entered = true; }, {
+      lockPath,
+      timeoutMs: null,
+      pollIntervalMs: 50,
+      staleAfterMs: 300_000,
+      signal: controller.signal,
+      onWait: () => controller.abort(reason),
+    });
+    let watchdog;
+    try {
+      await assert.rejects(Promise.race([
+        waiting,
+        new Promise((_resolve, reject) => { watchdog = setTimeout(() => reject(new Error('lock wait did not cancel')), 500); }),
+      ]), (error) => error === reason);
+    } finally {
+      clearTimeout(watchdog);
+      waiting.catch(() => {});
+    }
+    assert.equal(entered, false);
+    assert.equal(readFileSync(lockPath, 'utf8'), legacyOwner);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+// Retained/deployed managed-pnpm producers wrote `{ pid, createdAt: Date.now() }` at the same
+// bootstrap lock path. The fixture process boundary above reports every foreign pid as ESRCH.
+for (const mode of ['async', 'sync']) {
+  test(`TOOL-01 ${mode} reclaims a predecessor-format lock whose owner has exited`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'happier-lock-predecessor-dead-'));
+    const lockPath = join(root, 'bootstrap.lock');
+    writeFileSync(lockPath, JSON.stringify({ pid: 999_999_999, createdAt: Date.now() }));
+    const options = { lockPath, timeoutMs: 200, pollIntervalMs: 1 };
+    try {
+      const result = mode === 'sync'
+        ? withWorkspaceBundleLockSync(({ waited }) => ({ waited }), options)
+        : await withWorkspaceBundleLock(({ waited }) => ({ waited }), options);
+      assert.deepEqual(result, { waited: false });
+      assert.equal(existsSync(lockPath), false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+for (const [label, owner] of [
+  ['live predecessor owner', { pid: process.pid, createdAt: Date.now() - 600_000 }],
+  ['predecessor without a creation stamp', { pid: 999_999_999 }],
+  ['predecessor with a non-numeric creation stamp', { pid: 999_999_999, createdAt: '2026-11-05T00:00:00.000Z' }],
+  ['predecessor with a zero creation stamp', { pid: 999_999_999, createdAt: 0 }],
+  ['current record with an invalid creation stamp', { pid: 999_999_999, createdAtMs: null, createdAt: Date.now() }],
+]) {
+  test(`TOOL-01 preserves ${label}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'happier-lock-predecessor-kept-'));
+    const lockPath = join(root, 'bootstrap.lock');
+    const raw = JSON.stringify(owner);
+    writeFileSync(lockPath, raw);
+    try {
+      await assert.rejects(withWorkspaceBundleLock(() => assert.fail(`${label} entered`), {
+        lockPath, timeoutMs: 15, pollIntervalMs: 1,
+      }), { code: 'EWORKSPACEBUNDLELOCKTIMEOUT' });
+      assert.equal(readFileSync(lockPath, 'utf8'), raw);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+test('TOOL-01 dead predecessor reclaim preserves a successor published after the liveness read', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'happier-lock-predecessor-successor-'));
+  const lockPath = join(root, 'bootstrap.lock');
+  const deadPid = 999_999_999;
+  writeFileSync(lockPath, JSON.stringify({ pid: deadPid, createdAt: Date.now() }));
+  const successor = JSON.stringify({ pid: process.pid, createdAtMs: Date.now(), token: 'successor-owner' });
+  let replaced = false;
+  try {
+    await assert.rejects(withWorkspaceBundleLock(() => assert.fail('successor was displaced'), {
+      lockPath, timeoutMs: 15, pollIntervalMs: 1,
+      isRunningPidImpl: (pid) => {
+        if (pid === deadPid && !replaced) {
+          // A non-cooperating writer replaces the record between snapshot and reclaim.
+          replaced = true;
+          realFs.unlinkSync(lockPath);
+          realFs.writeFileSync(lockPath, successor);
+        }
+        return pid !== deadPid;
+      },
+    }), { code: 'EWORKSPACEBUNDLELOCKTIMEOUT' });
+    assert.equal(replaced, true, 'the dead predecessor must reach the liveness proof');
+    assert.equal(readFileSync(lockPath, 'utf8'), successor);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('withWorkspaceBundleLock permits an explicit unlimited wait beyond the build deadline', async (t) => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'happier-bootstrap-lock-unlimited-'));
+  const lockPath = join(tempRoot, 'bootstrap.lock');
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+  const realNow = Date.now;
+  let elapsed = 0;
+  t.mock.method(Date, 'now', () => realNow() + elapsed);
+  let waits = 0;
+  try {
+    const result = await withWorkspaceBundleLock(() => 'installed', {
+      lockPath,
+      timeoutMs: null,
+      pollIntervalMs: 1,
+      staleAfterMs: 300_000,
+      onWait: () => {
+        elapsed += 300_000;
+        if (++waits === 2) rmSync(lockPath);
+      },
+    });
+    assert.equal(result, 'installed');
+    assert.equal(waits, 2);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('unlimited acquisition still bounds release behind an orphan transition guard', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'happier-lock-release-unlimited-'));
+  const lockPath = join(root, 'lock');
+  const realNow = Date.now; let elapsed = 0;
+  t.mock.method(Date, 'now', () => realNow() + elapsed);
+  const warnings = []; t.mock.method(console, 'warn', (...args) => warnings.push(args));
+  try {
+    const run = withWorkspaceBundleLock(() => { writeFileSync(`${lockPath}.transition`, 'orphan'); return 'done'; },
+      { lockPath, timeoutMs: null, pollIntervalMs: 1, onWait: () => { elapsed += 240_001; } });
+    let watchdog;
+    const result = await Promise.race([run, new Promise((_, r) => { watchdog = setTimeout(() => r(new Error('release hung')), 2_000); })]);
+    clearTimeout(watchdog);
+    assert.equal(result, 'done');
+    assert.equal(warnings.length, 1); assert.match(String(warnings[0][0]), /Failed to release/);
+    assert.equal(readFileSync(`${lockPath}.transition`, 'utf8'), 'orphan');
+    assert.equal(existsSync(lockPath), true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

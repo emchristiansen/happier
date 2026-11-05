@@ -116,6 +116,16 @@ const MAX_PUBLISHER_GENERATION = 9_223_372_036_854_775_807n;
 export function createSessionPublisherPresence(options: Readonly<{ now?: () => Date }> = {}) {
     const now = options.now ?? (() => new Date());
     const registrations = new WeakMap<object, Registration>();
+    // Message writers on a machine-bound socket that has not registered yet wait (bounded) for this
+    // socket's own registration through the canonical paths below. Waiting grants no authority.
+    const registrationWaiters = new WeakMap<object, Set<() => void>>();
+    const disconnectedSockets = new WeakSet<object>();
+    const wakeRegistrationWaiters = (socket: object): void => {
+        const waiters = registrationWaiters.get(socket);
+        if (!waiters) return;
+        registrationWaiters.delete(socket);
+        for (const wake of waiters) wake();
+    };
     const registrationAttempts = new WeakMap<object, RegistrationAttempt>();
     const closeResults = new WeakMap<object, Promise<ClosePublisherResult>>();
     const operationLocks = new WeakMap<object, AsyncLock>();
@@ -226,6 +236,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
             } else {
                 latestIncarnationRegistrationBySession.delete(params.binding.sessionId);
             }
+            wakeRegistrationWaiters(params.socket);
         }
         return result;
     };
@@ -790,6 +801,32 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         }
     };
 
+    /**
+     * Resolves true once this exact socket holds a registration (made only by `registerPublisher` or
+     * `publishSnapshot`), false at the deadline or when the socket disconnects first.
+     */
+    const awaitRegistration = (params: Readonly<{ socket: object; deadlineAtMs: number }>): Promise<boolean> => {
+        if (registrations.has(params.socket)) return Promise.resolve(true);
+        if (disconnectedSockets.has(params.socket)) return Promise.resolve(false);
+        const remainingMs = params.deadlineAtMs - Date.now();
+        if (remainingMs <= 0) return Promise.resolve(false);
+        return new Promise<boolean>((resolve) => {
+            let waiters = registrationWaiters.get(params.socket);
+            if (!waiters) {
+                waiters = new Set();
+                registrationWaiters.set(params.socket, waiters);
+            }
+            const settle = (): void => {
+                clearTimeout(timer);
+                registrationWaiters.get(params.socket)?.delete(settle);
+                resolve(registrations.has(params.socket));
+            };
+            const timer = setTimeout(settle, remainingMs);
+            timer.unref?.();
+            waiters.add(settle);
+        });
+    };
+
     /** Records the runner incarnation a publisher socket named in its handshake, before it registers. */
     const bindPublisherIncarnation = (params: Readonly<{ socket: object; publisherIncarnationId: string }>): void => {
         incarnationsBySocket.set(params.socket, params.publisherIncarnationId);
@@ -802,6 +839,7 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
         captureExplicitMachineStop,
         finalizeExplicitMachineStop,
         bindPublisherIncarnation,
+        awaitRegistration,
         retireExitedPublisher,
         resolveCurrentPublisher,
         runAsCurrentPublisher,
@@ -850,6 +888,8 @@ export function createSessionPublisherPresence(options: Readonly<{ now?: () => D
                 registrations.delete(params.socket);
                 registrationAttempts.delete(params.socket);
                 closeResults.delete(params.socket);
+                disconnectedSockets.add(params.socket);
+                wakeRegistrationWaiters(params.socket);
             }
         }),
     };

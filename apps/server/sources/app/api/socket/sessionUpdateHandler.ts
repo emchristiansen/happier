@@ -110,7 +110,7 @@ function scheduleSessionParticipantBadgeRefresh(params: Parameters<typeof refres
 
 type TrustedTranscriptObservationPublisher = Readonly<{
     presence: Pick<ReturnType<typeof createSessionPublisherPresence>, "resolveCurrentPublisher">
-        & Partial<Pick<ReturnType<typeof createSessionPublisherPresence>, "runAsCurrentPublisher" | "runAsCurrentPublisherInTx">>;
+        & Partial<Pick<ReturnType<typeof createSessionPublisherPresence>, "runAsCurrentPublisher" | "runAsCurrentPublisherInTx" | "awaitRegistration">>;
     binding: Readonly<{ accountId: string; machineId: string; sessionId: string }>;
 }>;
 
@@ -187,13 +187,14 @@ function warnPendingPublisherAuthorityRefused(params: Readonly<{
     );
 }
 
-async function resolveAuthorizedCurrentTranscriptPublisher(params: Readonly<{
+/** This socket's publisher status for `sessionId`, or null when it may not publish there at all. */
+async function resolveAuthorizedTranscriptPublisher(params: Readonly<{
     socket: Socket;
     connection: ClientConnection;
     userId: string;
     sessionId: string;
     trusted?: TrustedTranscriptObservationPublisher;
-}>): Promise<Extract<CurrentPublisherResult, { status: "current" }> | null> {
+}>): Promise<CurrentPublisherResult | null> {
     const trusted = params.trusted;
     if (!trusted || trusted.binding.sessionId !== params.sessionId) return null;
     if (!await authorizeSessionRelayPublish({
@@ -202,11 +203,55 @@ async function resolveAuthorizedCurrentTranscriptPublisher(params: Readonly<{
         userId: params.userId,
         sessionId: params.sessionId,
     })) return null;
-    const publisher = await trusted.presence.resolveCurrentPublisher({
+    return await trusted.presence.resolveCurrentPublisher({
         socket: params.socket,
         binding: trusted.binding,
     });
-    return publisher.status === "current" ? publisher : null;
+}
+
+async function resolveAuthorizedCurrentTranscriptPublisher(
+    params: Parameters<typeof resolveAuthorizedTranscriptPublisher>[0],
+): Promise<Extract<CurrentPublisherResult, { status: "current" }> | null> {
+    const publisher = await resolveAuthorizedTranscriptPublisher(params);
+    return publisher?.status === "current" ? publisher : null;
+}
+
+/**
+ * Bounded wait for a freshly connected machine-bound socket to register itself before its first
+ * released `message` write. Released runners (0.2.x) emit agent output as soon as the socket
+ * connects and register on their first heartbeat / Runtime Activity snapshot; an in-memory
+ * registration does not survive a relay restart or reconnect. The budget runs from the message's
+ * receipt, so time queued behind earlier messages on the same socket is part of it and every
+ * answer stays below the released client's 10s socket ACK timeout.
+ */
+const UNREGISTERED_PUBLISHER_MESSAGE_GRACE_MS = 5_000;
+
+async function resolveMessageTranscriptPublisher(params: Readonly<{
+    socket: Socket;
+    connection: ClientConnection;
+    userId: string;
+    sessionId: string;
+    trusted: TrustedTranscriptObservationPublisher;
+    registrationDeadlineAtMs: number;
+}>): Promise<
+    | Readonly<{ ok: true; publisher: Extract<CurrentPublisherResult, { status: "current" }> }>
+    | Readonly<{ ok: false; error: "forbidden" | "transaction-unavailable" }>
+> {
+    let publisher = await resolveAuthorizedTranscriptPublisher(params);
+    const awaitRegistration = params.trusted.presence.awaitRegistration;
+    if (publisher?.status === "unregistered" && awaitRegistration) {
+        // Waiting grants nothing: only this socket's own canonical registration can make it current,
+        // and the whole authorization is re-resolved afterwards.
+        const registered = await awaitRegistration({
+            socket: params.socket,
+            deadlineAtMs: params.registrationDeadlineAtMs,
+        });
+        if (registered) publisher = await resolveAuthorizedTranscriptPublisher(params);
+    }
+    if (publisher?.status === "current") return { ok: true, publisher };
+    // Still unregistered: a typed retryable refusal (released runners retry the same intent).
+    // Unauthorized, superseded and rejected sockets keep the permanent `forbidden`.
+    return { ok: false, error: publisher?.status === "unregistered" ? "transaction-unavailable" : "forbidden" };
 }
 
 export function sessionUpdateHandler(
@@ -805,6 +850,7 @@ export function sessionUpdateHandler(
 
     const receiveMessageLock = new AsyncLock();
     socket.on('message', async (data: any, callback?: (response: any) => void) => {
+        const registrationDeadlineAtMs = Date.now() + UNREGISTERED_PUBLISHER_MESSAGE_GRACE_MS;
         await receiveMessageLock.inLock(async () => {
             const respond = (response: any) => {
                 if (typeof callback === 'function') {
@@ -843,20 +889,22 @@ export function sessionUpdateHandler(
                 // while they remain the current runtime owner. The released `message` event
                 // is still supported for older servers, but a current server must not let a
                 // superseded provider socket keep writing transcript rows.
-                const currentTranscriptPublisher = trustedTranscriptObservationPublisher
-                    ? await resolveAuthorizedCurrentTranscriptPublisher({
+                const messagePublisher = trustedTranscriptObservationPublisher
+                    ? await resolveMessageTranscriptPublisher({
                         socket,
                         connection,
                         userId,
                         sessionId: sid,
                         trusted: trustedTranscriptObservationPublisher,
+                        registrationDeadlineAtMs,
                     })
                     : null;
-                if (trustedTranscriptObservationPublisher && !currentTranscriptPublisher) {
-                    socketMessageAckCounter.inc({ result: 'error', error: 'forbidden' });
-                    respond({ ok: false, error: 'forbidden' });
+                if (messagePublisher && !messagePublisher.ok) {
+                    socketMessageAckCounter.inc({ result: 'error', error: messagePublisher.error });
+                    respond({ ok: false, error: messagePublisher.error });
                     return;
                 }
+                const currentTranscriptPublisher = messagePublisher?.ok ? messagePublisher.publisher : null;
 
                 // Immutable old UIs wrote user prompts directly to the transcript. The Pending
                 // Queue is now the only user-input ingress, so reject this exact release-proven shape

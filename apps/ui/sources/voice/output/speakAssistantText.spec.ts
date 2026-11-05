@@ -119,6 +119,7 @@ async function speak(text: string, tts: Record<string, unknown>, registerPlaybac
     networkTimeoutMs: 15000,
     registerPlaybackStopper,
     onSpeaking: vi.fn(),
+    onFailed: patchLocalVoiceState,
   });
 }
 
@@ -145,7 +146,7 @@ describe('speakAssistantText', () => {
         settings: settingsWithTts({ provider: 'device' }),
         networkTimeoutMs: 15000,
         registerPlaybackStopper: () => () => {},
-        onSpeaking: () => {},
+        onSpeaking: () => {}, onFailed: patchLocalVoiceState,
       });
     }
     expect(speech.speak.mock.calls.map(([spoken]) => spoken).join('').replace(/\s+/gu, ''))
@@ -169,7 +170,7 @@ describe('speakAssistantText', () => {
     for (const text of chunks) {
       await speakAssistantText({
         text, speechTextContext, settings: settingsWithTts({ provider: 'device' }),
-        networkTimeoutMs: 15000, registerPlaybackStopper: () => () => {}, onSpeaking: () => {},
+        networkTimeoutMs: 15000, registerPlaybackStopper: () => () => {}, onSpeaking: () => {}, onFailed: patchLocalVoiceState,
       });
     }
     expect(speech.speak.mock.calls.map(([spoken]) => spoken).join(' ').replace(/\s+/gu, ' '))
@@ -191,7 +192,7 @@ describe('speakAssistantText', () => {
         settings: settingsWithTts({ provider: 'device' }),
         networkTimeoutMs: 15000,
         registerPlaybackStopper: () => () => {},
-        onSpeaking: () => {},
+        onSpeaking: () => {}, onFailed: patchLocalVoiceState,
       });
     }
     expect(speech.speak.mock.calls.map(([spoken]) => spoken).join('')).toBe(expected);
@@ -211,7 +212,7 @@ describe('speakAssistantText', () => {
           settings: settingsWithTts({ provider: 'device' }),
           networkTimeoutMs: 15000,
           registerPlaybackStopper: () => () => {},
-          onSpeaking: () => {},
+          onSpeaking: () => {}, onFailed: patchLocalVoiceState,
         });
       }
     };

@@ -1,4 +1,4 @@
-import { buildBackendTargetKey, decryptSecretValueWithKeysV1, getProfileEnvironmentVariables, type AIBackendProfile } from '@happier-dev/protocol';
+import { buildBackendTargetKey, decryptSecretValueWithKeysV1, getProfileEnvironmentVariables, type AIBackendProfile, type BackendTargetRefV1 } from '@happier-dev/protocol';
 
 import { isPermissionMode, type PermissionMode } from '@/api/types';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
@@ -44,8 +44,8 @@ function readSecretBindingId(params: Readonly<{
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function resolvePermissionModeSeed(profile: AIBackendProfile, agentId: string): PermissionMode | null {
-  const targetKey = buildBackendTargetKey({ kind: 'builtInAgent', agentId });
+function resolvePermissionModeSeed(profile: AIBackendProfile, backendTarget: BackendTargetRefV1): PermissionMode | null {
+  const targetKey = buildBackendTargetKey(backendTarget);
   const raw = profile.defaultPermissionModeByTargetKey?.[targetKey];
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim();
@@ -53,19 +53,80 @@ function resolvePermissionModeSeed(profile: AIBackendProfile, agentId: string): 
   return isPermissionMode(trimmed) ? trimmed : null;
 }
 
-export async function buildProfileEnvOverlay(params: Readonly<{
+type ProfileSavedSecretBinding = Readonly<{
+  bindingId: string;
+  /** Decrypted, trimmed value; null when the binding exists but cannot be decrypted / is empty. */
+  plaintext: string | null;
+}>;
+
+function readProfileSavedSecretBindingStates(params: Readonly<{
+  profile: AIBackendProfile;
+  accountSettings: Readonly<Record<string, unknown>>;
+  credentials: Credentials;
+}>): Record<string, ProfileSavedSecretBinding> {
+  const { secretBindingsByProfileId } = readProfilesFromAccountSettings(params.accountSettings);
+  const savedSecretsById = indexSavedSecretsByIdFromAccountSettings(params.accountSettings);
+  const settingsSecretsReadKeys = deriveSettingsSecretsReadKeysForCredentials(params.credentials);
+  const bindings: Record<string, ProfileSavedSecretBinding> = {};
+  for (const req of params.profile.envVarRequirements ?? []) {
+    if ((req.kind ?? 'secret') !== 'secret') continue;
+    const bindingId = readSecretBindingId({ secretBindingsByProfileId, profileId: params.profile.id, envVarName: req.name });
+    if (!bindingId) continue;
+    const plaintext = decryptSecretValueWithKeysV1(savedSecretsById.get(bindingId) ?? null, settingsSecretsReadKeys);
+    bindings[req.name] = {
+      bindingId,
+      plaintext: typeof plaintext === 'string' && plaintext.trim().length > 0 ? plaintext.trim() : null,
+    };
+  }
+  return bindings;
+}
+
+function readProfileSavedSecretBindings(params: Readonly<{
+  profile: AIBackendProfile;
+  accountSettings: Readonly<Record<string, unknown>>;
+  credentials: Credentials;
+}>): Record<string, string> {
+  const bindings: Record<string, string> = {};
+  for (const [name, state] of Object.entries(readProfileSavedSecretBindingStates(params))) {
+    if (state.plaintext) bindings[name] = state.plaintext;
+  }
+  return bindings;
+}
+
+/** Leave machine environment references for the daemon on the selected target to expand. */
+export function buildProfileEnvOverlayForSpawn(params: Readonly<{
+  profile: AIBackendProfile;
+  accountSettings: Readonly<Record<string, unknown>>;
+  credentials: Credentials;
+}>): Record<string, string> {
+  return {
+    ...getProfileEnvironmentVariables(params.profile),
+    ...readProfileSavedSecretBindings(params),
+  };
+}
+
+export async function buildProfileEnvOverlay(params: Readonly<({
   agentId: string;
+  backendTarget?: never;
+} | {
+  backendTarget: BackendTargetRefV1;
+  agentId?: never;
+}) & {
   profile: AIBackendProfile;
   accountSettings: Readonly<Record<string, unknown>>;
   credentials: Credentials;
   processEnv: NodeJS.ProcessEnv;
+  /** Explicit session values take precedence over saved bindings and ambient shell values. */
+  environmentVariables?: Readonly<Record<string, string>>;
   promptSecretFn: SecretPromptFn | null;
   startedBy: 'terminal' | 'daemon' | undefined;
 }>): Promise<BuildProfileEnvOverlayResult> {
+  const backendTarget: BackendTargetRefV1 = params.backendTarget ?? { kind: 'builtInAgent', agentId: params.agentId! };
   const requiredConfigMissing: string[] = [];
 
   const overlayRaw: Record<string, string> = {
     ...getProfileEnvironmentVariables(params.profile),
+    ...params.environmentVariables,
   };
 
   const requiredEnvNames = new Set<string>(
@@ -79,7 +140,8 @@ export async function buildProfileEnvOverlay(params: Readonly<{
     .filter((r) => (r.kind ?? 'secret') === 'config');
 
   for (const req of configRequirements) {
-    const value = readNonEmptyEnv(params.processEnv, req.name);
+    const value = readNonEmptyEnv(params.environmentVariables ?? {}, req.name)
+      ?? readNonEmptyEnv(params.processEnv, req.name);
     if (value) {
       overlayRaw[req.name] = value;
       continue;
@@ -95,29 +157,25 @@ export async function buildProfileEnvOverlay(params: Readonly<{
     );
   }
 
-  const { secretBindingsByProfileId } = readProfilesFromAccountSettings(params.accountSettings);
-  const savedSecretsById = indexSavedSecretsByIdFromAccountSettings(params.accountSettings);
-  const settingsSecretsReadKeys = deriveSettingsSecretsReadKeysForCredentials(params.credentials);
+  const savedSecretBindings = readProfileSavedSecretBindingStates(params);
 
   for (const req of secretRequirements) {
-    const fromEnv = readNonEmptyEnv(params.processEnv, req.name);
+    const savedBinding = savedSecretBindings[req.name] ?? null;
+
+    const fromEnv = readNonEmptyEnv(params.environmentVariables ?? {}, req.name)
+      ?? (params.startedBy === 'daemon' && savedBinding ? null : readNonEmptyEnv(params.processEnv, req.name));
     if (fromEnv) {
       overlayRaw[req.name] = fromEnv;
       continue;
     }
 
-    const bindingId = readSecretBindingId({
-      secretBindingsByProfileId,
-      profileId: params.profile.id,
-      envVarName: req.name,
-    });
-
-    if (bindingId) {
-      const container = savedSecretsById.get(bindingId) ?? null;
-      const plaintext = decryptSecretValueWithKeysV1(container, settingsSecretsReadKeys);
-      if (typeof plaintext === 'string' && plaintext.trim().length > 0) {
-        overlayRaw[req.name] = plaintext.trim();
+    if (savedBinding) {
+      if (savedBinding.plaintext) {
+        overlayRaw[req.name] = savedBinding.plaintext;
         continue;
+      }
+      if (params.startedBy === 'daemon') {
+        throw new Error(`Saved secret binding for ${req.name} in profile "${params.profile.name}" is unavailable.`);
       }
     }
 
@@ -174,6 +232,6 @@ export async function buildProfileEnvOverlay(params: Readonly<{
   return {
     profileId: params.profile.id,
     envOverlayExpanded,
-    permissionModeSeed: resolvePermissionModeSeed(params.profile, params.agentId),
+    permissionModeSeed: resolvePermissionModeSeed(params.profile, backendTarget),
   };
 }

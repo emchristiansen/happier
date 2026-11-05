@@ -1,3 +1,4 @@
+import { removeConnectedServiceCredentialFiles } from '@/daemon/connectedServices/credentials/removeConnectedServiceCredentialFiles';
 import { AGENTS_CORE } from '@happier-dev/agents';
 
 import { checklists } from './cli/checklists';
@@ -7,12 +8,16 @@ import { geminiConnectedServiceStateSharingDescriptor } from '@/backends/gemini/
 import { geminiUsageLimitRecoveryControlAdapter } from '@/backends/gemini/connectedServices/geminiUsageLimitRecoveryControlAdapter';
 import { geminiQuotaFetcherDescriptor } from '@/backends/gemini/connectedServices/quotaFetcher';
 import { resolveGeminiConnectedServiceSwitchContinuity } from '@/backends/gemini/connectedServices/resolveGeminiConnectedServiceSwitchContinuity';
-import { geminiDaemonSpawnHooks } from '@/backends/gemini/daemon/spawnHooks';
 import type { AgentCatalogEntry } from '../types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 
 const geminiConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCredentialLifecycleDescriptor = {
   providerId: 'gemini',
+  credentialStorageCleanup: {
+    async deleteCredentialStorageForHomeRoot({ rootDir }) {
+      await removeConnectedServiceCredentialFiles(rootDir, geminiConnectedServiceStateSharingDescriptor.authIsolation.secretEntries.map((entry) => `home/${entry}`));
+    },
+  },
   serviceIds: AGENTS_CORE.gemini.connectedServices.supportedServiceIds,
   spawnPreflightOauthRefresh: { mode: 'expiry_window' },
   refreshedCredentialApplication: { mode: 'restart_required' },
@@ -31,7 +36,6 @@ export const agent = {
   getPreflightSessionControlsProbeAdapter: async () => ({ connectedServiceAuth: 'materialized-env' as const }),
   getCliAuthSpec: async () => (await import('@/backends/gemini/cli/auth/geminiCliAuthSpec')).geminiCliAuthSpec,
   getCloudConnectTarget: async () => (await import('@/backends/gemini/cloud/connect')).geminiCloudConnect,
-  getDaemonSpawnHooks: async () => geminiDaemonSpawnHooks,
   getConnectedServiceMaterializer: async () => createGeminiConnectedServicesMaterializer(),
   getConnectedServiceRuntimeAuthAdapter: async () => createGeminiConnectedServiceRuntimeAuthAdapter(),
   getConnectedServiceCredentialLifecycleDescriptor: async () => geminiConnectedServiceCredentialLifecycleDescriptor,

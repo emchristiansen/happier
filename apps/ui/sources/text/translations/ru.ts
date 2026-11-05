@@ -642,7 +642,8 @@ export const ru: TranslationStructure = {
         commands: {
             composerAbortConfirm: 'Подтвердить остановку',
             composerFocus: 'Перейти к вводу',
-            composerSendImmediate: 'Отправить сразу',
+            composerSendImmediate: 'Альтернативная отправка (очередь / направление)',
+            composerSendInterrupt: 'Прервать и отправить',
             composerSendPending: 'Отправить в очередь ожидания',
             commandPaletteOpen: 'Открыть палитру команд',
             modeCycle: 'Переключить режим',
@@ -678,6 +679,14 @@ export const ru: TranslationStructure = {
   },
 
   transcript: {
+
+    quote: {
+
+      action: 'Цитировать',
+
+      actionA11y: 'Процитировать выделенный текст в сообщении',
+
+    },
 
     selection: {
 
@@ -1188,6 +1197,15 @@ export const ru: TranslationStructure = {
   },
 
   appCrash: {
+      saveDiagnostics: "Сохранить диагностику",
+      diagnosticsSaveFailed: "Не удалось сохранить диагностику. Сведения об ошибке по-прежнему доступны. Повторите попытку или скопируйте их.",
+    copyFailed: "Не удалось скопировать сведения о сбое. Повторите попытку.",
+    discardFailed: "Не удалось удалить сохранённый сбой. Повторите попытку.",
+    restartWithoutReport: "Перезапустить без сохранения",
+    reportSaveFailed: "Не удалось сохранить сведения о сбое. Скопируйте их перед перезапуском или повторите отправку отчёта.",
+    savedReportNotice: "Сохранённый сбой показан ниже. Проверьте и отредактируйте его перед отправкой. Он останется на устройстве до отправки или удаления.",
+    discardSavedReport: "Удалить сохранённый сбой",
+    stackTruncated: "Стек сокращён для этого поля. Полные сведения о сбое сохранены на этом устройстве.",
     title: "Что-то пошло не так",
     subtitle:
       "В Happier произошла непредвиденная ошибка. Можно перезапустить интерфейс приложения или скопировать детали для поддержки.",
@@ -1377,6 +1395,8 @@ export const ru: TranslationStructure = {
     secretKeyPlaceholder: "XXXXX-XXXXX-XXXXX...",
     linkNewDeviceTitle: "Привязать новое устройство",
     linkNewDeviceSubtitle: "Отсканируйте QR-код, отображаемый на новом устройстве, чтобы привязать его к этой учетной записи",
+    pairingConnectionWarningTitle: "Нет подключения к серверу",
+    pairingConnectionWarningBody: "Для сопряжения сервер должен быть доступен. Проверьте подключение или отсканируйте код другого сервера.",
     linkNewDeviceQrInstructions: "Откройте Happier на новом устройстве и отобразите QR-код",
     scanQrCodeOnDevice: "Сканировать QR-код",
     unsupported: {
@@ -1389,7 +1409,39 @@ export const ru: TranslationStructure = {
   },
 
   bugReports: {
+    reportSession: "Сообщить о проблеме с этой сессией",
+    sessionPickerTitle: "Связанная сессия",
+    sessionPickerSubtitle: "Выберите сессию, к которой относится этот отчёт.",
+    sessionPickerSearchPlaceholder: "Поиск сессий",
+    sessionPickerNoResults: "Подходящих сессий нет",
+    noRelatedSession: "Без связанной сессии",
     composer: {
+      scopeChanged: "Выбранный аккаунт изменился. Выберите сессию заново, прежде чем прикреплять диагностические данные.",
+      addMoreDetails: "Добавить подробности (необязательно)",
+      technicalInformation: "Техническая информация",
+      relatedSession: "Связанная сессия (необязательно)",
+      chooseSession: "Выбрать сессию",
+      changeSession: "Изменить сессию",
+      removeSession: "Убрать сессию",
+      selectedSession: "Сессия выбрана",
+      logOptions: {
+        daemonTitle: "Логи приложения и демона",
+        daemonDetail: "Активность приложения и логи подключения с выбранных компьютера и сервера.",
+        sessionTitle: "Логи сессии Happier",
+        sessionDetail: "Активность сессии, которая помогает нам разобраться в проблеме.",
+        providerTitle: "Переписка с провайдером",
+        providerDetail: "Переписка в сессии провайдера, если потребуется.",
+        technicalOnly: "Только техническая информация",
+        technicalOnlyDetail: "Не включать в этот отчёт никакие необработанные логи.",
+      },
+      collection: {
+        collected: "Прикреплено",
+        unavailable: "Недоступно",
+        disabled: "Не включено",
+        unsupported: "Обновите CLI, чтобы прикрепить эти логи",
+        skipped: "Пропущено",
+        error: "Не удалось собрать",
+      },
       alerts: {
         previewUnavailableTitle: "Предпросмотр недоступен",
         previewUnavailableBody: "Не удалось собрать предпросмотр диагностики.",
@@ -1463,15 +1515,14 @@ export const ru: TranslationStructure = {
       },
       issueDetails: {
         title: "Опишите проблему",
-        subtitle:
-          "Добавьте достаточно деталей, чтобы мы могли быстро воспроизвести и диагностировать.",
+        subtitle: "Для начала достаточно заголовка и краткого описания.",
         titleLabel: "Заголовок (обязательно)",
         titlePlaceholder: "Короткий заголовок",
         githubUsernameLabel: "Имя пользователя GitHub (необязательно)",
         githubUsernamePlaceholder:
           "Используется как контактная информация в тексте issue",
-        summaryLabel: "Краткое описание (обязательно)",
-        summaryPlaceholder: "Описание в один абзац",
+        summaryLabel: "Что произошло? (обязательно)",
+        summaryPlaceholder: "Расскажите, что пошло не так.",
         currentBehaviorLabel: "Текущее поведение (необязательно)",
         currentBehaviorPlaceholder: "Что происходит на самом деле?",
         expectedBehaviorLabel: "Ожидаемое поведение (необязательно)",
@@ -1530,11 +1581,9 @@ export const ru: TranslationStructure = {
         },
       },
       consent: {
-        title: "Согласие",
-        understandTitle:
-          "Я понимаю, что диагностика может включать технические метаданные",
-        understandSubtitle:
-          "Не включайте пароли, токены доступа или приватные ключи.",
+        title: "Перед отправкой",
+        understandTitle: "Поделиться этим отчётом и выбранными диагностическими данными",
+        understandSubtitle: "Текст отчёта общедоступен. Диагностические вложения отправляются приватно сопровождающим Happier. Логи сессии могут содержать фрагменты разговоров.",
       },
       submit: {
         requiredFieldsHint:
@@ -3480,6 +3529,10 @@ export const ru: TranslationStructure = {
   },
 
   settingsDesktop: {
+    nativeTitleBarTitle: 'Использовать строку заголовка Windows',
+    nativeTitleBarSubtitle: 'Показывать стандартную рамку и кнопки управления окном Windows.',
+    nativeTitleBarChangeFailed: 'Не удалось изменить строку заголовка. Попробуйте ещё раз.',
+    nativeTitleBarPersistenceFailed: 'Не удалось загрузить или сохранить настройку строки заголовка. Измените её снова, чтобы повторить попытку.',
     title: 'Рабочий стол',
     footer: 'Управляет поведением Happier на этом компьютере.',
     backgroundServiceTitle: 'Оставаться доступным в фоне',
@@ -3639,6 +3692,17 @@ export const ru: TranslationStructure = {
         openSettingsFailed: 'Не удалось открыть системные настройки.',
     },
     pushTroubleshooting: {
+            remoteTest: {
+                title: "Отправить удалённый тест",
+                subtitle: "Отправьте настоящее push-уведомление на этот телефон через компьютер, подключённый к этому Home.",
+                notRegistered: "Зарегистрируйте токен этого телефона и повторите попытку.",
+                noMachine: "Подключите компьютер к этому Home для отправки удалённого теста.",
+                accepted: "Push-сервис принял тест. Это не подтверждает получение или показ на телефоне. Проверьте уведомления.",
+                rejected: "Push-сервис не подтвердил приём. Проверьте уведомления и регистрацию перед повторной попыткой.",
+                invalidCredentials: "Поставщик push отклонил учётные данные приложения. Проверьте настройки APNs или FCM.",
+                unsupported: "Обновите CLI Happier на подключённом компьютере для отправки удалённых тестов.",
+                unconfirmed: "Не удалось подтвердить результат. Запрос ещё может завершиться; проверьте уведомления перед повторной попыткой.",
+            },
       status: {
         title: "Статус",
         footer: "Проверяет настройку аккаунта, разрешение ОС и состояние регистрации на сервере.",
@@ -3826,7 +3890,12 @@ export const ru: TranslationStructure = {
   },
 
     notifications: {
+        permissionActionNeedsReview: "Не удалось подтвердить ответ, отправленный из уведомления. Проверьте ожидающие запросы, прежде чем отвечать снова.",
+        permissionActionReviewUnavailable: "Не удалось открыть Home и аккаунт этого ответа. Проверьте соединение и вход в настройках, затем ожидающие запросы.",
       actions: {
+            reviewPendingRequests: "Проверить ожидающие запросы",
+            questionReply: "Ответить",
+            questionPlaceholder: "Ваш ответ",
         allow: 'Разрешить',
         deny: 'Отклонить',
         answer: 'Ответить',
@@ -4024,6 +4093,11 @@ export const ru: TranslationStructure = {
     plugins: {
             claude: {
                 title: "Claude Code",
+                responseLocationOptions: {
+                    app_and_terminal: { title: "Приложение и терминал", subtitle: "Отвечайте в приложении Happier или терминале Claude Code." },
+                    app_only: { title: "Запросы в приложении", subtitle: "Используйте существующий процесс запросов в приложении. Claude по-прежнему может принимать ответы в своём терминале." },
+                    terminal_only: { title: "Только терминал", subtitle: "Отвечайте в терминале Claude Code." },
+                },
                 sections: {
                     claudeModelDiscovery: {
                         title: "Обнаружение моделей",
@@ -4036,6 +4110,10 @@ export const ru: TranslationStructure = {
                     claudeCodeExperiments: {
                         title: "Эксперименты Claude Code",
                         footer: "Эти настройки применяются как к локальным сессиям Claude (терминал), так и к удаленным сессиям Claude (Agent SDK), запущенным из Happier."
+                    },
+                    claudeIdleReclaim: {
+                        title: "Неактивные сессии",
+                        footer: "Следующий запрос продолжит ту же сессию Claude и может занять немного больше времени. Состояние в памяти освобождается. Фоновые задачи, запланированная работа и контрольные точки файлов сохраняют процесс активным. Сессии единого терминала остаются активными."
                     },
                     claudeRemoteSdk: {
                         title: "Классический runtime (fallback Agent SDK)",
@@ -4068,6 +4146,14 @@ export const ru: TranslationStructure = {
                                 subtitle: "Использовать встроенный в Happier хост zellij."
                             }
                         }
+                    },
+                    claudeUnifiedTerminalQuestionResponseLocation: {
+                        title: "Ответы на вопросы",
+                        subtitle: "Выберите, где отвечать на вопросы в сеансах единого терминала."
+                    },
+                    claudeUnifiedTerminalPermissionResponseLocation: {
+                        title: "Подтверждение запросов разрешений",
+                        subtitle: "Выберите, где подтверждать запросы разрешений в сеансах единого терминала."
                     },
                     claudeUnifiedTerminalResumeChoice: {
                         title: "Возобновление больших сессий",
@@ -4112,6 +4198,14 @@ export const ru: TranslationStructure = {
                     claudeCodeExperimentalAgentTeamsEnabled: {
                         title: "Принудительно включить Agent Teams",
                         subtitle: "Включает экспериментальный Agent Teams в Claude Code (рой агентов) во всех сессиях Claude, запущенных из Happier."
+                    },
+                    claudeRemoteIdleReclaimEnabled: {
+                        title: "Освобождать неактивные процессы Claude",
+                        subtitle: "Освобождает память после периода бездействия. По умолчанию выключено."
+                    },
+                    claudeRemoteIdleReclaimTimeoutMinutes: {
+                        title: "Время бездействия (минуты)",
+                        subtitle: "Выбери, как долго удалённая сессия Claude с включённой опцией остаётся готовой."
                     },
                     claudeRemoteAgentSdkEnabled: {
                         title: "Использовать fallback Agent SDK",
@@ -4171,7 +4265,7 @@ export const ru: TranslationStructure = {
                     },
                     claudeLocalPermissionBridgeEnabled: {
                         title: "Экспериментально: локальный мост разрешений",
-                        subtitle: "Перенаправляет запросы разрешений Claude в локальном режиме в Happier, чтобы вы могли одобрять или отклонять их из интерфейса."
+                        subtitle: "Передавайте запросы разрешений из классических локальных сеансов Claude в Happier. Сеансы единого терминала используют варианты ответа выше."
                     },
                     claudeLocalPermissionBridgeWaitIndefinitely: {
                         title: "Оставлять запросы открытыми до ответа",
@@ -4322,6 +4416,16 @@ export const ru: TranslationStructure = {
           },
         },
         fields: {
+          codexReasoningSummaries: {
+              title: "Сводки рассуждений",
+              footer: "Определяет, создаёт ли Codex сводки, независимо от отображения в переписке. Применяется при запуске или возобновлении сессии. Доступность зависит от модели.",
+              generation: "Создание",
+              options: {
+                  default: "Использовать конфигурацию Codex или настройку модели по умолчанию.",
+                  enabled: "Запрашивать сводки, если модель их поддерживает.",
+                  disabled: "Не создавать сводки рассуждений.",
+              },
+          },
           codexBackendMode: {
             title: "Режим маршрутизации Codex",
             subtitle: "Выберите App Server, ACP или MCP.",
@@ -4357,6 +4461,8 @@ export const ru: TranslationStructure = {
 
   settingsAppearance: {
     tabBarAppearance: {
+      sideRailTitle: "Вкладки на боковой панели",
+      sideRailSubtitle: "Отключите, чтобы использовать панель вкладок Happier и жесты смахивания.",
       title: 'Панель вкладок',
       footer: 'Настройте нижнюю панель вкладок.',
       showLabels: 'Показывать подписи вкладок',
@@ -4731,6 +4837,8 @@ export const ru: TranslationStructure = {
   },
 
     errors: {
+    quotaRefreshFailed: "Не удалось обновить данные об использовании. Повторите попытку.",
+    quotaRefreshRetryAt: ({ time }: { time: string }) => `Не удалось обновить данные об использовании. Повторите попытку после ${time}.`,
     machineRpcDecryptionFailed: "Не удалось расшифровать данные этого компьютера. Войдите с соответствующим ключом аккаунта и попробуйте снова.",
     machineRpcContextUnavailable: "Подключение к этому компьютеру недоступно. Обновите список компьютеров и попробуйте снова.",
     networkError: "Произошла ошибка сети",
@@ -5478,6 +5586,17 @@ export const ru: TranslationStructure = {
       presetName: 'Название шаблона', movePresetUp: 'Переместить вверх', movePresetDown: 'Переместить вниз',
       noPresets: 'Нет сохранённых шаблонов', noPresetsMessage: 'Сохраните шаблон при следующем выборе своего времени.',
     },
+    appearance: {
+      setColor: 'Задать цвет',
+      customColor: 'Свой цвет…',
+      customColorTitle: 'Свой цвет',
+      customColorMessage: 'Выберите оттенок или введите шестнадцатеричное значение.',
+      invalidColor: 'Используйте шестнадцатеричное значение, например #3A7BD5.',
+      removeColor: 'Убрать цвет',
+      inheritedFromProject: 'Из проекта',
+      customColorLabel: ({ hex }: { hex: string }) => `Свой цвет ${hex}`,
+      colors: { blue: 'Синий', green: 'Зелёный', orange: 'Оранжевый', yellow: 'Жёлтый', red: 'Красный', indigo: 'Индиго', purple: 'Фиолетовый' },
+    },
     workingSectionTitle: 'В работе',
     hideInactiveSessions: 'Скрыть неактивные сессии',
     showInactiveSessions: 'Показать неактивные сессии',
@@ -5649,6 +5768,9 @@ export const ru: TranslationStructure = {
     tmuxFallback: "Запасной tmux",
     copyMetadata: "Копировать метаданные",
     copyDebugInformation: "Копировать информацию",
+    sessionInformation: "Информация о сессии",
+    happierSessionId: "ID сессии Happier",
+    providerSessionId: ({ provider }: { provider: string }) => `ID сессии ${provider}`,
     debugInformationCopyLabel: "Информация",
     providerSessionLogs: ({ provider }: { provider: string }) => `Журналы сеанса ${provider}`,
     agentState: "Состояние агента",
@@ -5661,6 +5783,9 @@ export const ru: TranslationStructure = {
     thinking: "Думает",
     thinkingSince: "Думает с",
     thinkingLevel: "Уровень размышлений",
+    peerReportFrom: ({ name }: { name: string }) => `Отчёт от ${name}`,
+    peerMessageFrom: ({ name }: { name: string }) => `Сообщение от ${name}`,
+    peerUnnamedSender: "другого агента",
     cliVersion: "Версия CLI",
     cliVersionOutdated: "Требуется обновление CLI",
     cliVersionOutdatedMessage: ({
@@ -5678,6 +5803,8 @@ export const ru: TranslationStructure = {
     deleteSessionConfirm: "Удалить сессию навсегда?",
     deleteSessionWarning:
       "Это действие нельзя отменить. Все сообщения и данные, связанные с этой сессией, будут удалены навсегда.",
+    stopAndDeleteSession: "Остановить и удалить",
+    stopAndDeleteSessionWarning: "Сессия будет остановлена, а все её сообщения и данные будут удалены навсегда. Это действие нельзя отменить.",
     failedToDeleteSession: "Не удалось удалить сессию",
     sessionDeleted: "Сессия успешно удалена",
     manageSharing: "Управление доступом",
@@ -6795,6 +6922,11 @@ export const ru: TranslationStructure = {
       },
 
     agentInput: {
+        sendOptions: {
+            title: "Варианты отправки",
+            queue: "В очередь",
+            hint: "Удерживайте, чтобы выбрать способ отправки",
+        },
         chipPicker: {
             selectedOptionAccessibilityLabel: ({ option }: { option: string }) => `${option}. Выбрано.`,
         },
@@ -9880,7 +10012,7 @@ settingsSession: {
       offline: "Некоторые машины не в сети",
       checkedAt: ({ time }: { time: string }) => `Последняя проверка: ${time}`,
       upToDateDescription: "Happier, его командная строка и ваши агенты в актуальном состоянии.",
-      unknownDescription: "Всё, что удалось проверить, актуально. Остальное будет проверено, как только станет доступно.",
+      unknownDescription: "Часть сведений об обновлениях недоступна или взята из кэша. Подробности указаны в соответствующих строках.",
       offlineDescription: "Всё доступное актуально. Машины не в сети будут проверены, когда вернутся.",
     },
     settingsSubtitle: {
@@ -9926,6 +10058,9 @@ settingsSession: {
       appCheckFailed: "Не удалось проверить наличие новой версии.",
       appDownloadFailed: "Загрузка не завершилась.",
       appInstallFailed: "Не удалось установить обновление.",
+      cachedRelease: "Сведения о выпуске из кэша; здесь не обновляются",
+      cachedReleaseChannel: ({ channel }: { channel: string }) => `Сведения о выпуске ${channel} из кэша; здесь не обновляются`,
+      manualUpdateInterruptsSessions: "Обновите на этом компьютере. Службы могут остановиться, а активные сеансы — завершиться.",
       latestUnknown: "Не удалось проверить наличие новой версии",
       rolledBack: ({ kept, target }: { kept: string; target: string }) => `Версия ${target} не запустилась на этой машине, поэтому осталась ${kept}.`,
       installedByYou: "Установлено вами",
@@ -10187,6 +10322,7 @@ settingsSession: {
     cameraPermissionsRequiredToConnectTerminal:
       "Для подключения терминала требуется доступ к камере",
     failedToLinkDevice: "Не удалось связать устройство",
+    deviceLinkRequestNotFound: "На этом ретрансляторе не найден ожидающий запрос на привязку. Убедитесь, что оба устройства используют один и тот же ретранслятор, затем создайте новый QR-код.",
     cameraPermissionsRequiredToScanQr:
       "Для сканирования QR-кодов требуется доступ к камере",
     qrScannerUnavailable:
@@ -11267,6 +11403,13 @@ settingsSession: {
         plan: "Планировать перед выполнением",
         bypassPermissions: "Пропускать все разрешения",
       },
+    },
+    defaultBackend: {
+        title: 'Бэкенд ИИ по умолчанию',
+        footer: 'Запускает новые сессии на этом бэкенде, когда выбран профиль и другой бэкенд не выбран.',
+        noneTitle: 'Без бэкенда по умолчанию',
+        noneSubtitle: 'Happier выбирает бэкенд как обычно.',
+        selectedSubtitle: 'Используется при запуске сессии с этим профилем.',
     },
     defaultPermissions: {
       title: "Разрешения по умолчанию",

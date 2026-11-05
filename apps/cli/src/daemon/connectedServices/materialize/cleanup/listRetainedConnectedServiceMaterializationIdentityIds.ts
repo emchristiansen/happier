@@ -34,7 +34,7 @@ export async function listRetainedConnectedServiceMaterializationIdentityIds(par
   }
   // The predecessor terminal writer omitted the random launch key. Preserve unidentified legacy
   // hash roots from the existing cleanup inventory; only an actual ephemeral launch authorizes
-  // their removal. This is retention, not evidence that a legacy Run can be adopted or resumed.
+  // revoking their credentials. This is retention, not evidence that a legacy Run can be adopted or resumed.
   for (const target of await listMaterializedHomeTargets(params.baseDir)) {
     if (/^[a-f0-9]{64}$/.test(target.materializationIdentityId)
       && !disposableRunRoots.has(resolve(target.path))) {
@@ -42,8 +42,9 @@ export async function listRetainedConnectedServiceMaterializationIdentityIds(par
     }
   }
   // Archiving hides a Session from the ordinary list; it does not surrender its private history.
-  // A partial listing is not deletion authority. Propagate incompleteness to the cleanup loop's
-  // existing error boundary before it can remove either immediate or pending roots.
+  // A partial listing is not revocation authority. Propagate incompleteness to the cleanup loop's
+  // existing error boundary before it can retire either immediate or pending roots. Retirement
+  // revokes credentials only; no listing result authorizes deleting retained history.
   for (const archivedOnly of [false, true]) {
     let cursor: string | undefined;
     const seenCursors = new Set<string>();

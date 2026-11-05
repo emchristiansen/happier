@@ -134,3 +134,12 @@ for (const [name, refinements, expected] of [
     }
   });
 }
+
+test('matching admitted source Binary Smoke replaces only the general source-built suite', () => {
+  const input = { profileId: 'integrated', hasCliCandidate: true, hasServerCandidate: true,
+    hasPublishedRelayPredecessor: false, risks: { cliUpgrade: false, sessionContinuity: false, relayUpgrade: false } };
+  assert.equal(resolveReleaseValidationPlan(input).run_binary_smoke, 'true');
+  const reused = resolveReleaseValidationPlan({ ...input, sourceBinarySmokeValidated: true });
+  assert.equal(reused.run_binary_smoke, 'false');
+  assert.equal(reused.run_artifact_verify, 'true');
+});

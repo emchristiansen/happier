@@ -437,7 +437,16 @@ const j078Boundary = await vi.hoisted(async () => {
     httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
   const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
   const refuse = (name: string) => (..._args: unknown[]) => { state.attempts.push(name); throw new Error(`J078 forbidden external boundary: ${name}`); };
-  for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => state.active ? refuse(key)(...args) : original.child[key](...args);
+  // Keep util.promisify.custom (exec/execFile resolve { stdout, stderr }); a bare wrapper would make promisify resolve stdout only.
+  const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
+  for (const key of Object.keys(original.child)) {
+    const wrapped = (...args: unknown[]) => state.active ? refuse(key)(...args) : original.child[key](...args);
+    const custom = original.child[key][promisifyCustom];
+    if (typeof custom === 'function') {
+      Object.defineProperty(wrapped, promisifyCustom, { value: (...args: unknown[]) => state.active ? refuse(key)(...args) : custom(...args) });
+    }
+    cp[key] = wrapped;
+  }
   http.request = (...args: unknown[]) => state.active ? refuse('http')(...args) : original.httpRequest(...args);
   https.request = (...args: unknown[]) => state.active ? refuse('https')(...args) : original.httpsRequest(...args);
   http.createServer = (...args: unknown[]) => state.active ? refuse('server')(...args) : original.httpServer(...args);

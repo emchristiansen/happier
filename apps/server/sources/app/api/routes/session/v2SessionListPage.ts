@@ -13,6 +13,7 @@ import {
     createV2SessionListVisibilityWhere,
     createV2SessionListLegacyRowSelect,
     createV2SessionListRowSelect,
+    createV2SessionRowByIdSelect,
     getV2SessionListEffectiveActivityAt,
     mapV2SessionListRow,
     projectSessionRowsForReader,
@@ -143,7 +144,7 @@ export async function findV2SessionListRowById(params: Readonly<{
             userId,
             sessionId,
             visibilityWhere,
-            select: createV2SessionListRowSelect({ userId }),
+            select: createV2SessionRowByIdSelect({ userId }),
         }),
         () => findV2SessionListRowByIdWithSelect({
             userId,

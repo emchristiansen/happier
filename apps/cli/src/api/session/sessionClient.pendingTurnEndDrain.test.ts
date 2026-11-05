@@ -15,7 +15,7 @@ import {
   resolveApiSessionSocketDefaultAck,
 } from '@/testkit/backends/apiSessionSocketHarness';
 import { encodeBase64, encrypt } from '../encryption';
-import { accountSettingsParse } from '@happier-dev/protocol';
+import { accountSettingsParse, type AcceptedPendingSettlementResponseV1 } from '@happier-dev/protocol';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import { configuration } from '@/configuration';
@@ -23,7 +23,7 @@ import {
   getActiveAccountSettingsSnapshot,
   setActiveAccountSettingsSnapshot,
 } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
-import type { SessionMutationOutbox } from './mutations/createSessionMutationOutbox';
+import type { CreateSessionMutationOutboxParams, SessionMutationOutbox } from './mutations/createSessionMutationOutbox';
 import { logger } from '@/ui/logger';
 import type { SessionProviderInputOutcomeObserver } from './sessionClient';
 import { createCodexAppServerProviderInputOutcomeBridge } from '@/backends/codex/appServer/codexAppServerProviderInputOutcome';
@@ -200,9 +200,13 @@ const closeOutboxMock = vi.fn(async () => {});
 const setServerContractMock = vi.fn(async (_result: unknown) => {});
 
 vi.mock('./mutations/createSessionMutationOutbox', () => ({
-  createSessionMutationOutbox: (): SessionMutationOutbox => ({
+  createSessionMutationOutbox: (params: CreateSessionMutationOutboxParams): SessionMutationOutbox => ({
     enqueueAgentStateRequestSettlement: async () => ({ persisted: true, delivered: true }),
-    enqueueSessionTurn: (mutation: { action?: unknown }) => enqueueSessionTurnMock(mutation),
+    // Like the real outbox, report a session-turn mutation only after its durable delivery.
+    enqueueSessionTurn: async (mutation: Parameters<SessionMutationOutbox['enqueueSessionTurn']>[0]) => {
+      await enqueueSessionTurnMock(mutation);
+      params.onSessionTurnDelivered?.(mutation);
+    },
     enqueueTranscriptMessage: (mutation: unknown) => enqueueTranscriptMessageMock(mutation),
     enqueueRuntimeActivitySnapshot: async () => ({ persisted: true, delivered: true }),
     setSessionSyncPendingInputServerContract: (result: unknown) => setServerContractMock(result),
@@ -1971,6 +1975,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
     expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
     const bridge = createCodexAppServerProviderInputOutcomeBridge(client, { isCurrentRuntimeMode: () => true });
+    // Native Codex input binds its canonical turn before dispatch (upstream 54642ce03d).
+    await client.sessionTurnLifecycle.beginTurn({ provider: 'codex', startingInputLocalIds: [localId] });
     bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T1' });
     await vi.waitFor(() => expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledWith(expect.objectContaining({ localId })));
   });
@@ -2065,7 +2071,11 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     const { createCodexPendingInputSteerControl, createCodexPendingInputBoundSteerHandler } = await import('@/backends/codex/runCodex');
     const runtime = { getActiveSteerableTurnId: vi.fn().mockResolvedValueOnce('T1').mockResolvedValue('T2') };
     const turnBindings: Parameters<typeof createCodexPendingInputSteerControl>[0]['turnBindings'] = new Map();
-    const steer = vi.fn(async () => { bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T2' }); });
+    const steer = vi.fn(async () => {
+      // Native Codex steering binds its canonical turn before dispatch (upstream 54642ce03d).
+      await client.sessionTurnLifecycle.beginTurn({ provider: 'codex', startingInputLocalIds: [localId] });
+      bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T2' });
+    });
     client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, {
       onBoundCodexSteer: createCodexPendingInputBoundSteerHandler({
         turnBindings, getRuntime: () => runtime, isAdmissionOpen: () => true, steer,
@@ -2146,6 +2156,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     const bridge = createCodexAppServerProviderInputOutcomeBridge(client, { isCurrentRuntimeMode: () => true });
     client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, { onBoundCodexSteer: () => {} });
     await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    // Native Codex input binds its canonical turn before dispatch (upstream 54642ce03d).
+    await client.sessionTurnLifecycle.beginTurn({ provider: 'codex', startingInputLocalIds: [localId] });
     bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T1' });
     await vi.waitFor(() => expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalled());
     const patch = vi.spyOn(axios, 'patch');
@@ -2238,7 +2250,9 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       message: { ...materialized.message, requestedAction: { v: 1, kind: 'steer_now' }, providerAction: 'steer' },
     }).mockResolvedValue({ didMaterialize: false });
     const bridge = createCodexAppServerProviderInputOutcomeBridge(client, { isCurrentRuntimeMode: () => true });
-    client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, { onBoundCodexSteer: () => {
+    client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, { onBoundCodexSteer: async () => {
+      // Native Codex steering binds its canonical turn before dispatch (upstream 54642ce03d).
+      await client.sessionTurnLifecycle.beginTurn({ provider: 'codex', startingInputLocalIds: [localId] });
       bridge.observeAccepted({ localIds: [localId], providerTurnId: 'captured-native-turn' });
     } });
     vi.spyOn(axios, 'patch').mockImplementationOnce(async (_url, body) => {
@@ -3740,30 +3754,37 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   it('rejoins the same operation after a socket ACK timeout without granting unrelated wakes retry authority', async () => {
+    const actualTransport = await vi.importActual<typeof import('./pendingQueueV2Transport')>('./pendingQueueV2Transport');
+    resolveAcceptedPendingDeliveryMock.mockImplementation(actualTransport.resolveAcceptedPendingQueueV2Delivery);
+    const settlementLocalIds: unknown[] = [];
     const client = await createClient({
       latestTurnStatus: 'completed',
       pendingCount: 1,
       pendingVersion: 1,
       metadata: { deliveredUserMessageSeqV1: 0 },
+    }, {
+      // The real transport constructs and parses ACKs; only the socket boundary is fake.
+      sessionSocketEmitWithAck: (event, payload) => {
+        if (event !== 'pending-delivery-accepted-v1') return { ok: true };
+        settlementLocalIds.push((payload as { localId?: unknown }).localId);
+        if (settlementLocalIds.length === 1) throw new Error('operation has timed out');
+        return {
+          ok: true, didResolve: false,
+          pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3,
+          message: {
+            id: 'committed-ack-timeout-settlement',
+            seq: 43,
+            localId: 'ack-timeout-settlement',
+            messageRole: 'user',
+            content: createProviderDeliveryMaterializeResult('ack-timeout-settlement').message.content,
+            createdAt: 1000,
+            updatedAt: 1000,
+          },
+        } satisfies AcceptedPendingSettlementResponseV1;
+      },
     });
     await waitForCurrentPendingInputContract(client);
     materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('ack-timeout-settlement'));
-    const timeoutError = Object.assign(new Error('socket acknowledgement timed out'), {
-      code: 'socket_ack_timeout' as const,
-      retryable: true as const,
-    });
-    resolveAcceptedPendingDeliveryMock
-      .mockRejectedValueOnce(timeoutError)
-      .mockResolvedValueOnce({
-        didResolve: false,
-        pendingQueueState: { known: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3 },
-        message: {
-          ...createProviderDeliveryMaterializeResult('ack-timeout-settlement').message,
-          id: 'committed-ack-timeout-settlement',
-          seq: 43,
-          deliveryState: null,
-        },
-      });
 
     await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
     vi.useFakeTimers();
@@ -3787,8 +3808,12 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(1);
-    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
-    expect((client as any).canonicalPendingDeliveryByLocalId.has('ack-timeout-settlement')).toBe(false);
+    expect(settlementLocalIds).toEqual(['ack-timeout-settlement', 'ack-timeout-settlement']);
+    expect(client.hasCanonicalPendingProviderInputDelivery('ack-timeout-settlement')).toBe(false);
+    expect(client.getCommittedUserMessageSeq('ack-timeout-settlement')).toBe(43);
+    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect(sessionSocketStub?.disconnect).not.toHaveBeenCalled();
+    expect(sessionSocketStub?.close).not.toHaveBeenCalled();
   });
 
   it('continues exact accepted settlement after repeated response loss without reconnecting', async () => {
@@ -4953,6 +4978,11 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       metadata: { deliveredUserMessageSeqV1: 0 },
     });
     await waitForCurrentPendingInputContract(client);
+    // The pump's eligibility wait converges account settings on its user-socket connect.
+    const offlineGet = axios.get;
+    vi.spyOn(axios, 'get').mockImplementation(async (url, config) => String(url).endsWith('/v2/account/settings')
+      ? { status: 200, data: { content: { t: 'plain', v: {} }, version: 0 } } as never
+      : offlineGet(url, config));
     const messageQueue = new MessageQueue2<null>(() => 'mode');
     client.onUserMessage((message) => {
       messageQueue.push(message.content.text, null, { userMessageLocalId: message.localId });

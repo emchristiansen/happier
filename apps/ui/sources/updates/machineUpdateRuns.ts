@@ -104,6 +104,33 @@ export function useUpdateBatch(
     return { batch, updateAll, stopAfterCurrent };
 }
 
+/** Explicit checks outlive the view that started them, just like Update All. */
+const checksByServer = new Map<string, Promise<void>>();
+const checkListeners = new Set<() => void>();
+
+export function useUpdateCheck(serverId: string, check: () => Promise<void>): Readonly<{
+    checking: boolean;
+    checkNow: () => Promise<void>;
+}> {
+    const read = React.useCallback(() => checksByServer.has(serverId), [serverId]);
+    const checking = React.useSyncExternalStore(React.useCallback((listener: () => void) => {
+        checkListeners.add(listener);
+        return () => { checkListeners.delete(listener); };
+    }, []), read, read);
+    const checkNow = React.useCallback(() => {
+        const current = checksByServer.get(serverId);
+        if (current) return current;
+        const pending = Promise.resolve().then(check).finally(() => {
+            checksByServer.delete(serverId);
+            for (const listener of checkListeners) listener();
+        });
+        checksByServer.set(serverId, pending);
+        for (const listener of checkListeners) listener();
+        return pending;
+    }, [check, serverId]);
+    return { checking, checkNow };
+}
+
 export {
     markUpdateCompletionsSeen,
     readUnseenUpdateCompletions,
@@ -207,6 +234,23 @@ export function signatureOfAgentUpdateFacts(snapshot: MachineCapabilitiesSnapsho
     const latestCheckedAt = data?.latestVersionCheckedAt
         ?? (data && Object.prototype.hasOwnProperty.call(data, 'latestVersion') ? probe?.checkedAt ?? null : null);
     return JSON.stringify([data?.version ?? null, data?.latestVersion ?? null, latestCheckedAt]);
+}
+
+/**
+ * Binds an agent CLI's already-current answer to the facts its own settling refresh produced.
+ * A newer release found by that refresh is not hidden: the answer is dropped and fresh facts show.
+ */
+function settleAgentAlreadyCurrent(
+    completed: Extract<RunRecord, Readonly<{ status: 'alreadyCurrent' }>>,
+    snapshot: MachineCapabilitiesSnapshot | null,
+    capabilityId: string,
+): Extract<RunRecord, Readonly<{ status: 'finished' | 'alreadyCurrent' }>> {
+    const latestVersion = readCapabilityResultData(snapshot, capabilityId)?.latestVersion;
+    if (completed.version !== null && typeof latestVersion === 'string' && latestVersion.trim()
+        && latestVersion.trim() !== completed.version) {
+        return { status: 'finished' };
+    }
+    return { ...completed, agentFactsSignature: signatureOfAgentUpdateFacts(snapshot, capabilityId) };
 }
 
 export function signatureOfLastUpdate(lastUpdate: unknown): string {
@@ -324,8 +368,8 @@ async function runRemoteCliUpdate(scope: ServerAccountScope, itemId: string, mac
  * latest version) through the capability-cache owner, so a finished update resolves its row and
  * the pill count from the machine's own answer.
  */
-export function refreshMachineUpdateFacts(serverId: string, machineId: string): void {
-    void prefetchMachineCapabilities({ machineId, serverId, request: { ...buildMachineUpdateFactsRequest(), bypassCache: true } });
+export function refreshMachineUpdateFacts(serverId: string, machineId: string): Promise<void> {
+    return prefetchMachineCapabilities({ machineId, serverId, request: { ...buildMachineUpdateFactsRequest(), bypassCache: true } });
 }
 
 /**
@@ -345,6 +389,7 @@ export async function runMachineItemUpdate(
     setRecord(serverId, item.id, { status: 'running' });
 
     const subject = item.subject;
+    let completed: Extract<RunRecord, Readonly<{ status: 'finished' | 'alreadyCurrent' }>> | null = null;
     try {
         if (subject.kind === 'happier-cli') {
             await runRemoteCliUpdate(scope, item.id, machineId, context.lastUpdateSignature ?? '');
@@ -388,22 +433,26 @@ export async function runMachineItemUpdate(
         }
         const outcome = result.response.result as { alreadyCurrent?: unknown; version?: unknown } | null | undefined;
         if (outcome?.alreadyCurrent === true) {
-            setRecord(serverId, item.id, {
+            // Published after the run's own settling refresh below (upstream ordering). Its facts
+            // signature is stamped there, so only a later check supersedes the answer (fork fix).
+            completed = {
                 status: 'alreadyCurrent',
                 version: typeof outcome.version === 'string' && outcome.version.trim() ? outcome.version.trim() : null,
-                agentFactsSignature: subject.kind === 'agent-cli'
-                    ? signatureOfAgentUpdateFacts(
-                        getMachineCapabilitiesSnapshot(machineId, serverId), buildAgentCliCapabilityId(subject.agentId as AgentId),
-                    )
-                    : null,
-            });
+                agentFactsSignature: null,
+            };
             return;
         }
-        setRecord(serverId, item.id, { status: 'finished' });
-        recordUpdateCompleted(scope, item.id);
+        completed = { status: 'finished' };
     } catch {
         setRecord(serverId, item.id, { status: 'failed', message: t('updates.row.failedGeneric') });
     } finally {
-        refreshMachineUpdateFacts(serverId, machineId);
+        await refreshMachineUpdateFacts(serverId, machineId);
+        if (completed) {
+            setRecord(serverId, item.id, completed.status === 'alreadyCurrent' && subject.kind === 'agent-cli'
+                ? settleAgentAlreadyCurrent(completed, getMachineCapabilitiesSnapshot(machineId, serverId),
+                    buildAgentCliCapabilityId(subject.agentId as AgentId))
+                : completed);
+            if (completed.status === 'finished') recordUpdateCompleted(scope, item.id);
+        }
     }
 }

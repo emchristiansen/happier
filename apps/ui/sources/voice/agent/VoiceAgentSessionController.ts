@@ -474,14 +474,17 @@ export function createVoiceAgentSessionController(): VoiceAgentSessionController
       }
 
       const handle = await getVoiceAgentHandle(sessionId);
+      // The welcome belongs to the agent it was requested from. Once stop() or a reconnect has
+      // replaced that agent, its late outcome must not touch the successor's bookkeeping.
+      const isRequestingAgentCurrent = () => voiceAgentBySessionId.get(sessionId) === handle;
       try {
         const res = await handle.client.welcome({ sessionId: handle.rpcSessionId, voiceAgentId: handle.voiceAgentId });
         const assistantText = String(res?.assistantText ?? '').trim();
         if (!assistantText) return null;
-        voiceAgentWelcomeEpochBySessionId.set(sessionId, epoch);
+        if (isRequestingAgentCurrent()) voiceAgentWelcomeEpochBySessionId.set(sessionId, epoch);
         return assistantText;
       } catch (error) {
-        if (isVoiceAgentNotFoundError(error)) {
+        if (isVoiceAgentNotFoundError(error) && isRequestingAgentCurrent()) {
           voiceAgentBySessionId.delete(sessionId);
         }
         return null;

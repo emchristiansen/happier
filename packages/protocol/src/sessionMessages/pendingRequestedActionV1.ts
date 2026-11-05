@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { lazySchema } from '../lazySchema.js';
 import { PendingLocalIdSchema } from './pendingLocalId.js';
 
 /**
@@ -6,7 +7,7 @@ import { PendingLocalIdSchema } from './pendingLocalId.js';
  *
  * The row already owns sessionId + localId, so this value deliberately carries no selector.
  */
-export const PendingRequestedActionV1Schema = z.union([
+export const PendingRequestedActionV1Schema = lazySchema(() => z.union([
   z.object({
     v: z.literal(1),
     kind: z.enum(['enqueue', 'steer_if_active', 'steer_now', 'send_now']),
@@ -17,6 +18,6 @@ export const PendingRequestedActionV1Schema = z.union([
     // Opaque invocation identity, resolved only by the originating Codex runtime.
     bindingId: PendingLocalIdSchema,
   }).strict(),
-]);
+]));
 
 export type PendingRequestedActionV1 = z.infer<typeof PendingRequestedActionV1Schema>;

@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import { AGENTS } from './data/agents';
 import { ANDROID_APK_URL, ANDROID_PLAY_URL, APP_STORE_URL } from './data/downloads';
-import { ROUTES, fileForRoute, findRoute, headTagsFor, routeManifest } from './routes';
+import { ROUTES, SITE_SCOPED_JSON_LD_IDS, fileForRoute, findRoute, headTagsFor, routeManifest } from './routes';
 
 /**
  * Route-table guards.
@@ -183,5 +183,55 @@ describe('route table', () => {
         expect(redirectTarget('/appstore')).toBe(APP_STORE_URL);
         expect(redirectTarget('/playstore')).toBe(ANDROID_PLAY_URL);
         expect(redirectTarget('/apk')).toBe(ANDROID_APK_URL);
+    });
+});
+
+describe('localised JSON-LD', () => {
+    function jsonLdFor(routePath: string, locale: Parameters<typeof headTagsFor>[1]) {
+        const route = findRoute(routePath);
+        if (!route) throw new Error(`no route for ${routePath}`);
+        const head = headTagsFor(route, locale);
+        return [...head.matchAll(/<script type="application\/ld\+json">(.*?)<\/script>/g)].map(
+            (match) => JSON.parse(match[1]!) as Record<string, any>,
+        );
+    }
+
+    it('keeps English homepage JSON-LD on the English identities', () => {
+        const [page] = jsonLdFor('/', 'en');
+        expect(page!['@id']).toBe('https://happier.dev/#webpage');
+        expect(page!.url).toBe('https://happier.dev/');
+        expect(page!.primaryImageOfPage).toBe('https://happier.dev/images/og.png');
+        expect(page!.isPartOf['@id']).toBe('https://happier.dev/#site');
+        expect(page!.about['@id']).toBe('https://happier.dev/#app');
+        expect(page!.inLanguage).toBe('en');
+    });
+
+    it('localises only the page identity on a non-English homepage, not shared ids or assets', () => {
+        const [page] = jsonLdFor('/', 'fr');
+        expect(page!['@id']).toBe('https://happier.dev/fr#webpage');
+        expect(page!.url).toBe('https://happier.dev/fr');
+        expect(page!.inLanguage).toBe('fr');
+        // Shared, site-scoped identities declared once in index.html.
+        expect(page!.isPartOf['@id']).toBe('https://happier.dev/#site');
+        expect(page!.about['@id']).toBe('https://happier.dev/#app');
+        // Root assets are not locale-prefixed.
+        expect(page!.primaryImageOfPage).toBe('https://happier.dev/images/og.png');
+    });
+
+    it('knows every site-scoped @id that index.html declares', () => {
+        const shell = readFileSync(path.resolve(__dirname, '../index.html'), 'utf8');
+        const declared = new Set([...shell.matchAll(/"@id":\s*"([^"]+)"/g)].map((match) => match[1]!));
+        expect([...declared].sort()).toEqual([...SITE_SCOPED_JSON_LD_IDS].sort());
+    });
+
+    it('localises a non-home page and its page-scoped fragments while keeping shared ids', () => {
+        const [page, list] = jsonLdFor('/agents', 'fr');
+        expect(page!['@id']).toBe('https://happier.dev/fr/agents#webpage');
+        expect(page!.url).toBe('https://happier.dev/fr/agents');
+        expect(page!.isPartOf['@id']).toBe('https://happier.dev/#site');
+        expect(page!.about['@id']).toBe('https://happier.dev/#app');
+        expect(list!['@id']).toBe('https://happier.dev/fr/agents#agent-list');
+        const first = AGENTS[0]!;
+        expect(list!.itemListElement[0].url).toBe(`https://happier.dev/fr/agents/${first.slug}`);
     });
 });

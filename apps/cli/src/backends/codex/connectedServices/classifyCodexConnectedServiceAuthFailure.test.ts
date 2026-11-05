@@ -20,6 +20,14 @@ import {
 } from './classifyCodexConnectedServiceAuthFailure';
 
 describe('classifyCodexConnectedServiceAuthFailure', () => {
+  it.each(['codexErrorInfo', 'codex_error_info'])('classifies a structured %s serverOverloaded discriminator as capacity', (key) => {
+    expect(classifyCodexConnectedServiceAuthFailure({
+      providerErrorPath: true,
+      error: { turn: { error: { message: 'Request failed', [key]: 'serverOverloaded' } } },
+      serviceId: 'openai-codex', profileId: 'work', groupId: 'pool',
+    })).toMatchObject({ kind: 'capacity', limitCategory: 'capacity', quotaScope: 'provider', source: 'structured_provider_error' });
+  });
+
   it.each([
     { label: 'invalid failure kind', overrides: { kind: 'provider-private-kind' }, expected: null },
     {
@@ -62,6 +70,7 @@ describe('classifyCodexConnectedServiceAuthFailure', () => {
     let acceptedIssue: SessionRuntimeIssueV1 | null = null;
     let notifiedClassification: unknown = null;
     let failureSettled = false;
+    let reporting: ReturnType<typeof reportConnectedServiceRuntimeAuthFailureToDaemon> | null = null;
     const lifecycle = createSessionTurnLifecycle({
       sessionId: 'codex-blocked-failure-write',
       enqueueSessionTurn: async (mutation) => {
@@ -89,7 +98,7 @@ describe('classifyCodexConnectedServiceAuthFailure', () => {
       ensureBackend: async () => backend,
       hooks: {
         onTurnFailure: createCodexRuntimeAuthFailureTurnHook(async (acceptedClassification) => {
-          await reportConnectedServiceRuntimeAuthFailureToDaemon({
+          reporting = reportConnectedServiceRuntimeAuthFailureToDaemon({
             sessionId: 'codex-blocked-failure-write', classification: acceptedClassification,
             reportOutboxDir: outboxDir,
             notify: async (body) => {
@@ -99,6 +108,7 @@ describe('classifyCodexConnectedServiceAuthFailure', () => {
               } };
             },
           });
+          await reporting;
         }),
       },
     });
@@ -118,6 +128,9 @@ describe('classifyCodexConnectedServiceAuthFailure', () => {
       releaseWrite();
       await failure;
       await runtime.reset();
+      // The accepted-failure hook runs independently of the durable turn write.
+      // Its outbox work must finish before this fixture removes the directory.
+      await reporting;
       resetConnectedServiceRuntimeAuthFailureReportDedupeForTests();
       await removeTempDir(outboxDir);
     }

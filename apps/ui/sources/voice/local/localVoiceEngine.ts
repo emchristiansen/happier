@@ -13,7 +13,7 @@ import { findVoiceConversationSessionId } from '@/voice/sessionBinding/voiceConv
 import { voiceAgentSessions } from '@/voice/agent/voiceAgentSessions';
 import { speakAssistantText } from '@/voice/output/speakAssistantText';
 import { resolveVoiceNetworkTimeoutMs } from '@/voice/runtime/fetchWithTimeout';
-import { createVoicePlaybackController } from '@/voice/runtime/VoicePlaybackController';
+import { createVoicePlaybackController, scopePlaybackStopperRegistrar } from '@/voice/runtime/VoicePlaybackController';
 import { voiceActivityController } from '@/voice/activity/voiceActivityController';
 import { resetVoiceAgentPersistenceState } from '@/voice/persistence/resetVoiceAgentPersistenceState';
 import { appendVoiceConversationAssistantText } from '@/voice/sessionBinding/voiceConversationTranscript';
@@ -24,9 +24,12 @@ import {
 
 import type { LocalVoiceState, LocalVoiceStatus } from './localVoiceState';
 import {
+  claimLocalVoiceTurnPublication,
+  createLocalVoiceTurnStateWriter,
   getLocalVoiceState,
   patchLocalVoiceState,
   resolveLocalVoiceError,
+  type LocalVoiceTurnStateWriter,
 } from './localVoiceState';
 import {
   isHandsFreeSttEnabled,
@@ -43,6 +46,26 @@ let recorder: InstanceType<typeof AudioModule.AudioRecorder> | null = null;
 let inFlight: Promise<void> | null = null;
 let activeTurnAbortController: AbortController | null = null;
 let activeTurnAbortSessionId: string | null = null;
+/**
+ * The connect-time welcome is not a voice turn, but it speaks and reports failures on the call
+ * surface. Its authority ends when the interaction it was started for does: hang-up, a newer
+ * connect, or a voice turn that takes over the call. Revoking aborts this controller; the welcome
+ * then neither starts speech nor publishes state, and speech it already started is stopped.
+ */
+let activeWelcomeController: AbortController | null = null;
+
+function beginWelcome(): AbortSignal {
+  revokeWelcome();
+  const controller = new AbortController();
+  activeWelcomeController = controller;
+  return controller.signal;
+}
+
+function revokeWelcome(): void {
+  const controller = activeWelcomeController;
+  activeWelcomeController = null;
+  controller?.abort();
+}
 
 const playbackController = createVoicePlaybackController();
 const deviceSttController = createDeviceSttController({
@@ -105,7 +128,8 @@ async function handleVoiceTurnSendFailure(
   runner: (signal: AbortSignal) => Promise<void>,
 ): Promise<void> {
   if (signal.aborted) return;
-  patchLocalVoiceState({ error: null });
+  const turnState = createLocalVoiceTurnStateWriter(signal);
+  turnState.patch({ error: null });
   try {
     await runner(signal);
   } catch (error) {
@@ -115,7 +139,7 @@ async function handleVoiceTurnSendFailure(
     if (getLocalVoiceState().error) {
       return;
     }
-    patchLocalVoiceState({ status: 'idle', sessionId, ...resolveLocalVoiceError(error, 'send_failed') });
+    turnState.patch({ status: 'idle', sessionId, ...resolveLocalVoiceError(error, 'send_failed') });
   }
 }
 
@@ -126,7 +150,12 @@ async function startRecording(sessionId: string): Promise<void> {
     return;
   }
 
-  const nextRecorder = new AudioModule.AudioRecorder(RecordingPresets.HIGH_QUALITY);
+  // Expo's types describe the native module; its web namespace exposes AudioRecorderWeb.
+  const audioModule = AudioModule as typeof AudioModule & {
+    AudioRecorderWeb?: typeof AudioModule.AudioRecorder;
+  };
+  const Recorder = audioModule.AudioRecorderWeb ?? audioModule.AudioRecorder;
+  const nextRecorder = new Recorder(RecordingPresets.HIGH_QUALITY);
   try {
     await nextRecorder.prepareToRecordAsync();
     nextRecorder.record();
@@ -145,15 +174,15 @@ async function startRecording(sessionId: string): Promise<void> {
 }
 
 async function stopAndSendRecordedTurn(sessionId: string): Promise<void> {
-  await runAbortableVoiceTurn(sessionId, async (signal) => {
+  await runAbortableVoiceTurn(sessionId, async (signal, turnState) => {
     if (!recorder) {
-      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+      turnState.patch({ status: 'idle', sessionId, error: null });
       return;
     }
 
     const turnRecorder = recorder;
     recorder = null;
-    patchLocalVoiceState({ status: 'transcribing', error: null });
+    turnState.patch({ status: 'transcribing', error: null });
     let uri: string | null = null;
     try {
       await turnRecorder.stop();
@@ -161,11 +190,11 @@ async function stopAndSendRecordedTurn(sessionId: string): Promise<void> {
       uri = turnRecorder.uri;
     } catch {
       if (signal.aborted) return;
-      patchLocalVoiceState({ status: 'idle', sessionId, error: 'recording_stop_failed' });
+      turnState.patch({ status: 'idle', sessionId, error: 'recording_stop_failed' });
       return;
     }
     if (!uri) {
-      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+      turnState.patch({ status: 'idle', sessionId, error: null });
       return;
     }
 
@@ -177,19 +206,19 @@ async function stopAndSendRecordedTurn(sessionId: string): Promise<void> {
     } catch (error) {
       if (signal.aborted) return;
       if (error instanceof MissingSttBaseUrlError) {
-        patchLocalVoiceState({ status: 'idle', sessionId, error: 'missing_stt_base_url' });
+        turnState.patch({ status: 'idle', sessionId, error: 'missing_stt_base_url' });
         throw error;
       }
       if (error instanceof MissingGeminiApiKeyError) {
-        patchLocalVoiceState({ status: 'idle', sessionId, error: 'missing_stt_api_key' });
+        turnState.patch({ status: 'idle', sessionId, error: 'missing_stt_api_key' });
         throw error;
       }
-      patchLocalVoiceState({ status: 'idle', sessionId, error: resolveSttFailureCode(error) });
+      turnState.patch({ status: 'idle', sessionId, error: resolveSttFailureCode(error) });
       return;
     }
 
     if (!text) {
-      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+      turnState.patch({ status: 'idle', sessionId, error: null });
       return;
     }
 
@@ -207,8 +236,8 @@ async function stopAndSendRecordedTurn(sessionId: string): Promise<void> {
 }
 
 async function stopDeviceSpeechRecognitionAndSend(sessionId: string): Promise<void> {
-  await runAbortableVoiceTurn(sessionId, async (signal) => {
-    patchLocalVoiceState({ status: 'transcribing', error: null });
+  await runAbortableVoiceTurn(sessionId, async (signal, turnState) => {
+    turnState.patch({ status: 'transcribing', error: null });
 
     const text = await deviceSttController.stop(sessionId);
     if (signal.aborted) return;
@@ -217,7 +246,7 @@ async function stopDeviceSpeechRecognitionAndSend(sessionId: string): Promise<vo
         await deviceSttController.start(sessionId);
         return;
       }
-      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+      turnState.patch({ status: 'idle', sessionId, error: null });
       return;
     }
 
@@ -240,8 +269,8 @@ async function stopDeviceSpeechRecognitionAndSend(sessionId: string): Promise<vo
 }
 
 async function stopSherpaSpeechRecognitionAndSend(sessionId: string): Promise<void> {
-  await runAbortableVoiceTurn(sessionId, async (signal) => {
-    patchLocalVoiceState({ status: 'transcribing', error: null });
+  await runAbortableVoiceTurn(sessionId, async (signal, turnState) => {
+    turnState.patch({ status: 'transcribing', error: null });
 
     const text = await sherpaSttController.stop(sessionId);
     if (signal.aborted) return;
@@ -250,7 +279,7 @@ async function stopSherpaSpeechRecognitionAndSend(sessionId: string): Promise<vo
         await sherpaSttController.start(sessionId);
         return;
       }
-      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+      turnState.patch({ status: 'idle', sessionId, error: null });
       return;
     }
 
@@ -331,8 +360,18 @@ export async function sendLocalVoiceAgentTextUpdate(sessionId: string, update: s
   );
 }
 
-async function runAbortableVoiceTurn(sessionId: string, runner: (signal: AbortSignal) => Promise<void>): Promise<void> {
+/**
+ * Runs one abortable voice turn. Starting it aborts the previous turn; cancel and hang-up abort it too.
+ * The run holds the call-state publication right from its start until it completes; the runner
+ * publishes local voice state only through `turnState`, which is silent once aborted or retired.
+ */
+async function runAbortableVoiceTurn(
+  sessionId: string,
+  runner: (signal: AbortSignal, turnState: LocalVoiceTurnStateWriter) => Promise<void>,
+): Promise<void> {
   const controller = new AbortController();
+  // A voice turn takes the call over from a still-running connect-time welcome.
+  revokeWelcome();
   if (activeTurnAbortController) {
     try {
       activeTurnAbortController.abort();
@@ -342,9 +381,13 @@ async function runAbortableVoiceTurn(sessionId: string, runner: (signal: AbortSi
   }
   activeTurnAbortController = controller;
   activeTurnAbortSessionId = sessionId;
+  const retirePublication = claimLocalVoiceTurnPublication(controller.signal);
   try {
-    await runner(controller.signal);
+    await runner(controller.signal, createLocalVoiceTurnStateWriter(controller.signal));
   } finally {
+    // A completed run is retired even though its signal stays live: continuations it left behind
+    // (for example queued speech of a stream that failed after deltas) can no longer publish.
+    retirePublication();
     if (activeTurnAbortController === controller) {
       activeTurnAbortController = null;
       activeTurnAbortSessionId = null;
@@ -405,9 +448,11 @@ export async function toggleLocalVoiceTurn(sessionId: string): Promise<void> {
         const canSpeakWelcome = config?.tts?.autoSpeakReplies !== false;
 
         if (welcomeEnabled && welcomeMode === 'immediate' && canSpeakWelcome) {
+          const welcomeSignal = beginWelcome();
           const assistantText = await voiceAgentSessions.ensureRunningAndMaybeWelcome(sessionId).catch(() => null);
           const text = typeof assistantText === 'string' ? assistantText.trim() : '';
-          if (text) {
+          // A welcome that arrives after hang-up, a newer connect or a voice turn has no call to speak to.
+          if (text && !welcomeSignal.aborted) {
             voiceActivityController.appendAssistantText(sessionId, 'local_conversation', text);
             // The welcome plays while the mic is already being armed for the first turn. It only
             // owns the status when nothing else does, and hands it back when it finishes.
@@ -416,16 +461,22 @@ export async function toggleLocalVoiceTurn(sessionId: string): Promise<void> {
               text,
               settings: params.settings,
               networkTimeoutMs,
-              registerPlaybackStopper: playbackController.registerStopper,
+              // Revoking the welcome also stops its own synthesis and playback, never a newer one's.
+              registerPlaybackStopper: scopePlaybackStopperRegistrar(playbackController.registerStopper, welcomeSignal),
               onSpeaking: () => {
+                if (welcomeSignal.aborted) return;
                 const state = getLocalVoiceState();
                 if (state.status !== 'idle' || state.sessionId !== sessionId) return;
                 welcomeOwnsSpeakingStatus = true;
                 patchLocalVoiceState({ status: 'speaking' });
               },
+              // The welcome reports its own failure only while it still owns the interaction.
+              onFailed: (failure) => {
+                if (!welcomeSignal.aborted) patchLocalVoiceState(failure);
+              },
             });
             const state = getLocalVoiceState();
-            if (welcomeOwnsSpeakingStatus && state.status === 'speaking' && state.sessionId === sessionId) {
+            if (!welcomeSignal.aborted && welcomeOwnsSpeakingStatus && state.status === 'speaking' && state.sessionId === sessionId) {
               patchLocalVoiceState({ status: 'idle' });
             }
           }
@@ -520,6 +571,7 @@ export async function stopLocalVoiceSession(): Promise<void> {
   if (!current.sessionId) return;
 
   playbackController.interrupt();
+  revokeWelcome();
 
   const activeSessionId = current.sessionId;
   if (activeTurnAbortController && activeTurnAbortSessionId === activeSessionId) {

@@ -91,7 +91,7 @@ jobs:
     name: Trusted workflow ref guard
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Admit trusted workflow control ref
@@ -115,7 +115,7 @@ jobs:
     name: Release actor guard
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout trusted workflow control bytes
@@ -133,7 +133,7 @@ jobs:
 
   promote:
     needs: [release_actor_guard]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release-shared
     steps:
@@ -147,7 +147,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
+          node-version-file: .node-version
 
       - name: Validate inputs
         env:

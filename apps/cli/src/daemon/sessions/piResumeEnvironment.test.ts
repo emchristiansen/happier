@@ -105,7 +105,11 @@ describe('Pi resume environment custody', () => {
 
 it('restores before strict validation and carries the stored values into the child environment', async () => {
   const root = home();
-  oldRecord(root, { HAPPIER_PI_PATH: '/stored/pi', PI_CODING_AGENT_DIR: '/stored/config', OP_CONNECT_TOKEN: '' });
+  // Built-in spawns are admitted only when the provider CLI resolves (upstream e628d944), so the
+  // stored path must be runnable; the ambient path stays bogus so admission proves the stored value won.
+  const storedPi = join(root, 'stored-pi');
+  writeFileSync(storedPi, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  oldRecord(root, { HAPPIER_PI_PATH: storedPi, PI_CODING_AGENT_DIR: '/stored/config', OP_CONNECT_TOKEN: '' });
   const prepared = resume(root);
   expect(prepared.ok).toBe(true);
   if (!prepared.ok) throw new Error('Expected synthetic restore to succeed');
@@ -117,5 +121,5 @@ it('restores before strict validation and carries the stored values into the chi
     processEnv: { HAPPIER_PI_PATH: '/ambient/pi', OP_CONNECT_TOKEN: 'synthetic-ambient' },
     logDebug: () => {}, logInfo: () => {}, logWarn: () => {},
   });
-  expect(child).toMatchObject({ ok: true, extraEnvForChild: { HAPPIER_PI_PATH: '/stored/pi', PI_CODING_AGENT_DIR: '/stored/config', OP_CONNECT_TOKEN: '' } });
+  expect(child).toMatchObject({ ok: true, extraEnvForChild: { HAPPIER_PI_PATH: storedPi, PI_CODING_AGENT_DIR: '/stored/config', OP_CONNECT_TOKEN: '' } });
 });

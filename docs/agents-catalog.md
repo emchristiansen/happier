@@ -59,11 +59,50 @@ mode-bearing transport must not be contradicted by a `none` mode descriptor.
 Antigravity uses the shared model/mode probes and startup overrides, with no
 provider-owned picker or static mode catalog.
 
+ACP model selection has one resolver in
+`apps/cli/src/agent/acp/configOptionChoiceNormalization.ts`, shared by runtime
+metadata publication and preflight probing. It prefers the catalog's exact
+`acpModelConfigOptionId`, then an unambiguous Model id/name, then a single
+selector with category `model`. Several model-category fields are not a model
+catalog: agents may use that category for provider or fast controls too. Other
+configuration fields remain available through generic configuration controls;
+observed model-scoped choices apply to the observed model. Full successful
+`set_config_option` response snapshots refresh dependent choices even without
+notifications; rejected setters preserve the previous observed state.
+
+Generic ACP permission mappings may declare ordered native mode candidates.
+The catalog backend uses `resolveAcpPermissionModeId` from `packages/agents` to
+resolve those candidates against the session's advertised modes on both new and
+load, failing closed when none matches. UI permission explanations use the same
+resolver with the matching session's advertised modes. Agent-specific
+candidate ids stay in `packages/agents/src/acp.ts`; string mappings and null
+delegation retain their existing semantics.
+
 The session-control compatibility reader derives an implicit Plan request from
 legacy permission metadata only when the advertised or static options actually
 contain that mode. Explicit requested modes retain their pending state even when
 discovery is unavailable. ACP usage notifications remain the authority for live
 context counts; a mode descriptor or model name cannot supply usage telemetry.
+
+### ACP startup failures (development source)
+
+The generic CLI `AcpBackend` owns MCP startup recovery for both new and loaded
+sessions. It serializes stdio servers in the ACP v1 shape without a transport
+discriminator; the SDK types check that boundary. A provider rejection naming
+exactly one passed MCP server permits one
+new start request without that server. A successful retry publishes an ordinary
+session notice with the server name and sanitized provider reason. An unnamed,
+ambiguous, or persistent rejection fails with the same bounded issue preview;
+deterministic JSON-RPC request rejections are not resent unchanged. Transport and
+other transient failures retain the existing retry policy. No MCP pre-probe is
+performed.
+
+The session runtime records startup failures even before a prompt has opened a
+turn. Issue-bearing `turn_failed` records project through the UI's existing
+transcript notice row; the session lifecycle still owns failure and recovery
+state. New-session model selection is scoped to the backend target, so changing
+Agents adopts the new Agent's default or remembered selection. An explicit
+model choice made with that target change remains authoritative.
 
 ### Session identity in UI (development source)
 
@@ -202,7 +241,9 @@ In development source, the custom ACP backend editor exposes **Supports session 
 
 Kimi Code discovery is a development exception for executable identity: current Kimi Code and legacy Python `kimi-cli` share the command name and cannot be distinguished by version ordering. Its provider-owned discovery uses a no-auth `initialize` fingerprint (including close/delete/fork and SSE), honors explicit executable overrides, and refuses unknown or legacy launches. This does not create a second resume policy. Probe cache identity includes the effective process environment, hashed in memory to avoid retaining credentials in cache keys.
 
-Built-in ACP `supportsModes: 'no'` disables mode projection and both mode mutation paths at the shared backend. Kimi uses that policy until authenticated live mode behavior is verified; model controls remain available.
+Built-in ACP `supportsModes: 'no'` disables mode projection and both mode mutation paths at the shared backend. Kimi retains this policy and explicitly resets new, loaded, and forked sessions to native `default` (manual approval) before exposing them. Happier owns permission decisions; model controls remain available.
+
+In development source, Kimi's ACP connection remains the execution and filesystem owner. A provider-owned reader of that same session's versioned wire journal supplies task-origin continuations omitted by Kimi 2.4.1's ACP stream. The supported journal protocol is 1.5; unknown protocols, replacement, truncation, and read errors fail the session. Historical records are skipped on load. The shared ACP turn owner captures permission context at admitted parent tool calls, registers their exact task descendants, and consumes each registration once. Continuations retain that context across intervening foreground turns and use the existing transcript, plan, activity, and terminal publishers. Native terminal records settle them after earlier updates; arbitrary late ACP chunks do not establish a new turn. Cancellation closes and reloads the native session, stopping pending tasks as well as active continuations. An idle detached shell alone does not create another activity owner.
 
 In development, Antigravity admits the exact quota diagnostic rendered by the pinned ACP 1.3.0 server through its provider-owned turn hook. The shared ACP runtime preserves earlier output and settles the failed turn before reporting the selected profile or pool tuple to the existing daemon recovery owner. Native authentication has no Connected Account recovery target. Advisory reset prose supplies no exact reset timestamp, so inactive recovery uses the existing shared backoff policy. Managed account launches remove only `AGY_ACP_CCPA_BASE_URL` and `AGY_ACP_CCPA_PROJECT`, which otherwise override that account's endpoint and project; native launches retain those customizations. The same provider owns the pinned authentication setup classifier: ACP code `-32000` with the exact onboarding failure reason produces only `authenticationSetupFailure: true` in the canonical request failure log. The peer strips provider error data before downstream consumers; logs retain the numeric request code and fixed boolean, without exposing the reason or credential-bearing values. Generic missing authentication remains distinct from a diagnosed setup failure.
 
@@ -327,6 +368,11 @@ observation without renewing catalog freshness or treating a pending metadata re
 When no effort has been observed, the existing catalog default remains a control fallback rather
 than a verified runtime observation. Override retirement uses the same alias-aware model support
 policy as launch, so a missing bare-alias catalog row cannot erase a supported request.
+In development source, explicit Claude effort selections remain explicit in native launch flags,
+Agent SDK options, and launch hashes even when they equal the catalog default: resumed sessions
+and native user settings may have a different effort. The unified terminal verifies startup effort
+through its existing runtime controller before committing that selection. Model changes and
+ultracode-off controls carry the selected effort so native history cannot substitute another level.
 Effort tiers are resolved once when the session mode is built and travel on the mode, so spawn-time
 resolution and launch-option hashing see the same value and hashing stays pure.
 
@@ -562,6 +608,25 @@ If you’re running this repo via happy-stacks, prefer:
 ---
 
 ## Connected-account quota recovery (development)
+
+Codex app-server reports accepted failures from its terminal turn boundary,
+including provider-started native goal turns. See
+[usage-limit reset continuation](cli-architecture.md#usage-limit-reset-continuation-development)
+for daemon binding authorization, native-login ownership and goal reactivation.
+
+Claude pool sessions can proactively switch accounts during a turn through the
+shared `CLAUDE_CONFIG_DIR` home. The catalog's provider-owned auth descriptor
+declares in-turn application; the shared generation writer and verifier prove
+the selected profile, generation and native auth using that account's current
+credential. Credential revisions fence token writes; a missing committed revision
+or a refresh after commit does not reject application to the same account. The current
+request finishes on the old account and the next request reads the new credentials
+(maintainer live proof, 2026-07-08). External token injection, such as Codex, still
+requires exact runtime identity and refresh-selection resync. The shared predictive
+policy retains suppression or turn-boundary deferral for descriptors that do not
+support in-turn application, and predictive switching cannot fall back to a restart.
+Quota suppression and request-failure reasons use the existing default-on daemon
+quota diagnostic file log.
 
 Claude OAuth profile normalization belongs to
 `packages/protocol/src/providers/claude/oauthProfile.ts`; the agents package

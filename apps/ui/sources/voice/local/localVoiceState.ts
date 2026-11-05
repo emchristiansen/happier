@@ -60,6 +60,51 @@ export function setIdleStateUnlessRecording(sessionId: string): void {
   patchLocalVoiceState({ status: 'idle', sessionId });
 }
 
+/**
+ * The signal of the voice engine run that currently holds the call-state publication right, or null
+ * when no run holds it. Only the engine's run boundary claims and releases it.
+ */
+let publishingTurnSignal: AbortSignal | null = null;
+
+/**
+ * Claims the call-state publication right for an engine run. The returned release retires the run:
+ * once it completed, nothing it left behind (queued speech chunks, late native speech callbacks)
+ * publishes again, even though its signal was never aborted. A later claim supersedes this one.
+ */
+export function claimLocalVoiceTurnPublication(signal: AbortSignal): () => void {
+  publishingTurnSignal = signal;
+  return () => {
+    if (publishingTurnSignal === signal) publishingTurnSignal = null;
+  };
+}
+
+/**
+ * The only way a voice turn publishes local voice state. A turn owns that state only while it is
+ * the engine run holding the publication right (claimed, not yet retired) and its abort signal is
+ * live. Cancel, hang-up and a successor turn abort it before publishing their own state, and the run
+ * boundary retires it when it completes, so every write from an aborted or completed turn's
+ * continuation (for example after a delayed durable enqueue acknowledgement, a queued speech chunk
+ * of a failed stream, or a late native TTS error) is dropped instead of overwriting the newer or
+ * ended interaction. A caller without a signal (a detached text operation such as the composer)
+ * never owns the call state: its durable work continues, but it cannot publish call state.
+ */
+export type LocalVoiceTurnStateWriter = Readonly<{
+  patch: (patch: Partial<LocalVoiceState>) => void;
+  setIdleUnlessRecording: (sessionId: string) => void;
+}>;
+
+export function createLocalVoiceTurnStateWriter(signal: AbortSignal | undefined): LocalVoiceTurnStateWriter {
+  const ownsState = () => signal !== undefined && signal === publishingTurnSignal && !signal.aborted;
+  return {
+    patch: (patch) => {
+      if (ownsState()) patchLocalVoiceState(patch);
+    },
+    setIdleUnlessRecording: (sessionId) => {
+      if (ownsState()) setIdleStateUnlessRecording(sessionId);
+    },
+  };
+}
+
 
 /**
  * Maps a thrown turn failure to the local voice error fields. Errors may carry a specific

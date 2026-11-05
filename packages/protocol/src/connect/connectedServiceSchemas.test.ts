@@ -753,6 +753,7 @@ describe('connectedServiceSchemas', () => {
             validationBlockedUntilMs: 46,
             lastFailureKind: 'usage_limit',
             lastFailureCode: 'usage_limit_reached',
+            lastFailureProviderLimitId: ' five_hour ',
             lastObservedPlanType: 'team',
             lastObservedAtMs: 50,
             providerResetsAtMs: 60,
@@ -768,6 +769,7 @@ describe('connectedServiceSchemas', () => {
             validationBlockedUntilMs: 46,
             lastFailureKind: 'usage_limit',
             lastFailureCode: 'usage_limit_reached',
+            lastFailureProviderLimitId: 'five_hour',
             lastObservedPlanType: 'team',
             lastObservedAtMs: 50,
             providerResetsAtMs: 60,
@@ -922,6 +924,9 @@ describe('connectedServiceSchemas', () => {
         });
 
         expect(parsed.bindingsByServiceId['openai-codex']?.selection).toBe('group');
+        expect(ConnectedServiceBindingSelectionV1Schema.safeParse({
+            source: 'connected', selection: 'group', groupId: 'codex-main', appliedProfileId: 42,
+        }).success).toBe(false);
         expect(parsed.bindingsByServiceId['openai-codex']).toEqual({
             source: 'connected',
             selection: 'group',

@@ -10,6 +10,7 @@ import { writeSyncDebugLog } from '@/sync/runtime/syncDebugLogging';
 import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
 import { nowServerMs } from '@/sync/runtime/time';
 import type { TaskLifecycleEvent } from './taskLifecycle';
+import { nextRollbackEligibilityObservation } from '@/sync/domains/sessionRollback/rollbackEligibilityObservation';
 import { parsePlainSessionAgentState, parsePlainSessionMetadata } from './parsePlainSessionPayload';
 import {
     runSessionMessagesPagePipeline,
@@ -198,6 +199,10 @@ export function buildUpdatedSessionProjectionFromSocketUpdate(params: {
             rollbackEligibleTurnStarts !== undefined
                 ? rollbackEligibleTurnStarts
                 : session.rollbackEligibleTurnStarts,
+        rollbackEligibilityObservedAt:
+            rollbackEligibleTurnStarts !== undefined
+                ? nextRollbackEligibilityObservation()
+                : session.rollbackEligibilityObservedAt,
         archivedAt:
             typeof updateBody.archivedAt === 'number' || updateBody.archivedAt === null
                 ? updateBody.archivedAt

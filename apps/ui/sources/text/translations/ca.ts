@@ -617,7 +617,8 @@ export const ca: TranslationStructure = {
         commands: {
             composerAbortConfirm: 'Confirma la interrupció',
             composerFocus: 'Enfoca el compositor',
-            composerSendImmediate: 'Envia immediatament',
+            composerSendImmediate: 'Enviament alternatiu (cua / orientar)',
+            composerSendInterrupt: 'Interromp i envia',
             composerSendPending: 'Envia a la cua pendent',
             commandPaletteOpen: 'Obre la paleta d’ordres',
             modeCycle: 'Canvia de mode',
@@ -653,6 +654,10 @@ export const ca: TranslationStructure = {
     },
 
     transcript: {
+        quote: {
+            action: 'Cita',
+            actionA11y: 'Cita el text seleccionat al teu missatge',
+        },
         selection: {
             enterA11y: 'Entra al mode de selecció',
             exitA11y: 'Surt del mode de selecció',
@@ -1106,6 +1111,15 @@ export const ca: TranslationStructure = {
     },
 
     appCrash: {
+        saveDiagnostics: "Desa els diagnòstics",
+        diagnosticsSaveFailed: "No s’han pogut desar els diagnòstics. Els detalls de l’error continuen disponibles. Torna-ho a provar o copia’ls.",
+        copyFailed: "No s’han pogut copiar els detalls de l’error. Torna-ho a provar.",
+        discardFailed: "No s’ha pogut descartar l’error desat. Torna-ho a provar.",
+        restartWithoutReport: "Reinicia sense desar",
+        reportSaveFailed: "No s’han pogut desar els detalls de l’error. Copia’ls abans de reiniciar o torna a provar l’informe.",
+        savedReportNotice: "L’error desat es mostra a continuació. Revisa’l i edita’l abans d’enviar-lo. Es conserva en aquest dispositiu fins que l’enviïs o el descartis.",
+        discardSavedReport: "Descarta l’error desat",
+        stackTruncated: "La pila s’ha escurçat per a aquest camp. L’error complet continua desat en aquest dispositiu.",
         title: 'Alguna cosa ha fallat',
         subtitle:
             'Happier ha patit un error inesperat. Pots reiniciar la interfície de l\'app o copiar els detalls per al suport.',
@@ -1362,6 +1376,8 @@ export const ca: TranslationStructure = {
         secretKeyPlaceholder: 'XXXXX-XXXXX-XXXXX...',
         linkNewDeviceTitle: 'Vincular Nou Dispositiu',
         linkNewDeviceSubtitle: 'Escaneja el codi QR que es mostra al teu nou dispositiu per vincular-lo a aquest compte',
+        pairingConnectionWarningTitle: "Servidor desconnectat",
+        pairingConnectionWarningBody: "L’aparellament necessita un servidor accessible. Comprova la connexió o escaneja un codi d’un altre servidor.",
         linkNewDeviceQrInstructions: 'Obre Happier al teu nou dispositiu i mostra el codi QR',
         scanQrCodeOnDevice: 'Escanejar codi QR',
         unsupported: {
@@ -1374,7 +1390,39 @@ export const ca: TranslationStructure = {
     },
 
     bugReports: {
+        reportSession: "Informa d’un problema amb aquesta sessió",
+        sessionPickerTitle: "Sessió relacionada",
+        sessionPickerSubtitle: "Tria la sessió a què fa referència aquest informe.",
+        sessionPickerSearchPlaceholder: "Cerca sessions",
+        sessionPickerNoResults: "No hi ha sessions coincidents",
+        noRelatedSession: "Cap sessió relacionada",
         composer: {
+            scopeChanged: "El compte seleccionat ha canviat. Torna a triar la sessió abans d’adjuntar els diagnòstics.",
+            addMoreDetails: "Afegeix més detalls (opcional)",
+            technicalInformation: "Informació tècnica",
+            relatedSession: "Sessió relacionada (opcional)",
+            chooseSession: "Tria una sessió",
+            changeSession: "Canvia la sessió",
+            removeSession: "Treu la sessió",
+            selectedSession: "Sessió seleccionada",
+            logOptions: {
+                daemonTitle: "Registres de l’app i del daemon",
+                daemonDetail: "Activitat de l’app i registres de connexió de l’ordinador i el servidor seleccionats.",
+                sessionTitle: "Registres de la sessió de Happier",
+                sessionDetail: "Activitat de la sessió que ens ajuda a investigar aquest problema.",
+                providerTitle: "Transcripció del proveïdor",
+                providerDetail: "Transcripció de la sessió del proveïdor, quan calgui.",
+                technicalOnly: "Només informació tècnica",
+                technicalOnlyDetail: "Exclou tots els registres en brut d’aquest informe.",
+            },
+            collection: {
+                collected: "Adjunts",
+                unavailable: "No disponibles",
+                disabled: "No inclosos",
+                unsupported: "Actualitza la CLI per adjuntar aquests registres",
+                skipped: "Omesos",
+                error: "No s’han pogut recollir",
+            },
             alerts: {
                 previewUnavailableTitle: 'Previsualització no disponible',
                 previewUnavailableBody: 'No s\'ha pogut construir la previsualització de diagnòstics.',
@@ -1430,13 +1478,13 @@ export const ca: TranslationStructure = {
             },
             issueDetails: {
                 title: 'Descriu el problema',
-                subtitle: 'Proporciona prou detall perquè el puguem reproduir i diagnosticar ràpidament.',
+                subtitle: "Per començar n’hi ha prou amb un títol i una descripció breu.",
                 titleLabel: 'Títol (obligatori)',
                 titlePlaceholder: 'Títol curt',
                 githubUsernameLabel: 'Usuari de GitHub (opcional)',
                 githubUsernamePlaceholder: 'S’usa com a contacte al cos de l’issue',
-                summaryLabel: 'Resum concís (obligatori)',
-                summaryPlaceholder: 'Resum d’un paràgraf',
+                summaryLabel: "Què ha passat? (obligatori)",
+                summaryPlaceholder: "Explica’ns què ha fallat.",
                 currentBehaviorLabel: 'Comportament actual (opcional)',
                 currentBehaviorPlaceholder: 'Què passa realment?',
                 expectedBehaviorLabel: 'Comportament esperat (opcional)',
@@ -1491,9 +1539,9 @@ export const ca: TranslationStructure = {
                 },
             },
             consent: {
-                title: 'Consentiment',
-                understandTitle: 'Entenc que els diagnòstics poden incloure metadades tècniques',
-                understandSubtitle: 'No incloguis contrasenyes, tokens d’accés o claus privades.',
+                title: "Abans d’enviar",
+                understandTitle: "Comparteix aquest informe i els diagnòstics seleccionats",
+                understandSubtitle: "El text de l’informe és públic. Els adjunts de diagnòstic s’envien de manera privada als mantenidors de Happier. Els registres de sessió poden incloure fragments de converses.",
             },
             submit: {
                 requiredFieldsHint: 'Completa els camps obligatoris per habilitar l’enviament.',
@@ -3339,6 +3387,10 @@ export const ca: TranslationStructure = {
     },
 
     settingsDesktop: {
+        nativeTitleBarTitle: 'Utilitza la barra de títol del Windows',
+        nativeTitleBarSubtitle: 'Mostra el marc i els controls de finestra estàndard del Windows.',
+        nativeTitleBarChangeFailed: 'No s’ha pogut canviar la barra de títol. Torna-ho a provar.',
+        nativeTitleBarPersistenceFailed: 'No s’ha pogut carregar o desar la preferència de la barra de títol. Torna-la a canviar per reintentar-ho.',
         title: 'Escriptori',
         footer: 'Controla com es comporta el Happier en aquest ordinador.',
         backgroundServiceTitle: 'Segueix disponible en segon pla',
@@ -3541,6 +3593,17 @@ export const ca: TranslationStructure = {
             openSettingsFailed: 'No s\'ha pogut obrir la configuració del sistema.',
         },
         pushTroubleshooting: {
+            remoteTest: {
+                title: "Envia una prova remota",
+                subtitle: "Envia una notificació push real a aquest telèfon mitjançant una màquina connectada a aquest Home.",
+                notRegistered: "Registra el token d’aquest telèfon i torna-ho a provar.",
+                noMachine: "Connecta una màquina a aquest Home per enviar una prova remota.",
+                accepted: "El servei push ha acceptat la prova. Això no confirma que el telèfon l’hagi rebut o mostrat. Revisa les notificacions.",
+                rejected: "El servei push no ha confirmat l’acceptació. Revisa les notificacions i el registre abans de tornar-ho a provar.",
+                invalidCredentials: "El proveïdor push ha rebutjat les credencials d’aquesta app. Revisa la configuració d’APNs o FCM.",
+                unsupported: "Actualitza la CLI de Happier de la màquina connectada per enviar proves remotes.",
+                unconfirmed: "No s’ha pogut confirmar el resultat. La sol·licitud encara es pot completar; revisa les notificacions abans de tornar-ho a provar.",
+            },
             status: {
                 title: 'Estat',
                 footer: 'Comprova l’ajust del compte, el permís del sistema i el registre al servidor.',
@@ -3677,7 +3740,12 @@ export const ca: TranslationStructure = {
     },
 
     notifications: {
+        permissionActionNeedsReview: "No s’ha pogut confirmar la resposta enviada des de la notificació. Revisa les sol·licituds pendents abans de tornar a respondre.",
+        permissionActionReviewUnavailable: "No s’han pogut obrir el Home i el compte d’aquesta resposta. Comprova la connexió i l’inici de sessió a Configuració i, després, les sol·licituds pendents.",
         actions: {
+            reviewPendingRequests: "Revisa les sol·licituds pendents",
+            questionReply: "Respon",
+            questionPlaceholder: "La teva resposta",
             allow: 'Permetre',
             deny: 'Denegar',
             answer: 'Respondre',
@@ -3871,6 +3939,11 @@ export const ca: TranslationStructure = {
 	        plugins: {
             claude: {
                 title: "Claude Code",
+                responseLocationOptions: {
+                    app_and_terminal: { title: "App i terminal", subtitle: "Respon a l’app Happier o al terminal de Claude Code." },
+                    app_only: { title: "Sol·licituds a l’app", subtitle: "Fes servir el flux habitual de sol·licituds de l’app. Claude pot continuar acceptant respostes al seu terminal." },
+                    terminal_only: { title: "Només terminal", subtitle: "Respon al terminal de Claude Code." },
+                },
                 sections: {
                     claudeModelDiscovery: {
                         title: "Descobriment de models",
@@ -3883,6 +3956,10 @@ export const ca: TranslationStructure = {
                     claudeCodeExperiments: {
                         title: "Experiments de Claude Code",
                         footer: "Aquests paràmetres s’apliquen tant a les sessions locals de Claude (terminal) com a les remotes de Claude (Agent SDK) iniciades per Happier."
+                    },
+                    claudeIdleReclaim: {
+                        title: "Sessions inactives",
+                        footer: "El pròxim prompt reprèn la mateixa sessió de Claude i pot trigar una mica més. S’allibera l’estat en memòria. Les tasques en segon pla, la feina programada i els punts de control de fitxers la mantenen activa. Les sessions de terminal unificat continuen actives."
                     },
                     claudeRemoteSdk: {
                         title: "Entorn clàssic (alternativa Agent SDK)",
@@ -3915,6 +3992,14 @@ export const ca: TranslationStructure = {
                                 subtitle: "Usa l'amfitrió zellij inclòs amb Happier."
                             }
                         }
+                    },
+                    claudeUnifiedTerminalQuestionResponseLocation: {
+                        title: "Respondre preguntes",
+                        subtitle: "Tria on respondre preguntes durant les sessions de terminal unificat."
+                    },
+                    claudeUnifiedTerminalPermissionResponseLocation: {
+                        title: "Aprovar sol·licituds de permís",
+                        subtitle: "Tria on aprovar sol·licituds de permís durant les sessions de terminal unificat."
                     },
                     claudeUnifiedTerminalResumeChoice: {
                         title: "Represa de sessions grans",
@@ -3959,6 +4044,14 @@ export const ca: TranslationStructure = {
                     claudeCodeExperimentalAgentTeamsEnabled: {
                         title: "Força l’activació d’Agent Teams",
                         subtitle: "Activa Agent Teams experimental de Claude Code (eixam d’agents) a totes les sessions de Claude iniciades per Happier."
+                    },
+                    claudeRemoteIdleReclaimEnabled: {
+                        title: "Allibera els processos inactius de Claude",
+                        subtitle: "Allibera memòria després d’un període sense activitat. Desactivat per defecte."
+                    },
+                    claudeRemoteIdleReclaimTimeoutMinutes: {
+                        title: "Temps d’inactivitat (minuts)",
+                        subtitle: "Tria quant de temps es manté preparada una sessió remota de Claude amb aquesta opció activada."
                     },
                     claudeRemoteAgentSdkEnabled: {
                         title: "Usa l'alternativa Agent SDK",
@@ -4018,7 +4111,7 @@ export const ca: TranslationStructure = {
                     },
                     claudeLocalPermissionBridgeEnabled: {
                         title: "Experimental: pont local de permisos",
-                        subtitle: "Reenvia les sol·licituds de permisos del mode local de Claude a Happier perquè les puguis aprovar o rebutjar des de la interfície."
+                        subtitle: "Envia a Happier les sol·licituds de permís de les sessions locals clàssiques de Claude. Les sessions de terminal unificat fan servir les opcions de resposta anteriors."
                     },
                     claudeLocalPermissionBridgeWaitIndefinitely: {
                         title: "Mantén les sol·licituds obertes fins a respondre",
@@ -4167,6 +4260,16 @@ export const ca: TranslationStructure = {
 	                    },
 	                },
 	                fields: {
+	                    codexReasoningSummaries: {
+	                        title: "Resums del raonament",
+	                        footer: "Controla si Codex genera resums, independentment de la visualització a la conversa. S’aplica en iniciar o reprendre una sessió. La disponibilitat depèn del model.",
+	                        generation: "Generació",
+	                        options: {
+	                            default: "Fes servir la configuració de Codex o el valor per defecte del model.",
+	                            enabled: "Demana resums si el model els admet.",
+	                            disabled: "No generis resums del raonament.",
+	                        },
+	                    },
 	                    codexBackendMode: {
 	                        title: 'Mode d\'encaminament de Codex',
 	                        subtitle: 'Selecciona el servidor d’aplicacions, ACP o MCP.',
@@ -4202,6 +4305,8 @@ export const ca: TranslationStructure = {
 
     settingsAppearance: {
       tabBarAppearance: {
+        sideRailTitle: "Pestanyes a la barra lateral",
+        sideRailSubtitle: "Desactiva aquesta opció per utilitzar la barra de pestanyes de Happier i els seus gestos de lliscament.",
         title: 'Barra de pestanyes',
         footer: 'Personalitza la barra de pestanyes inferior.',
         showLabels: 'Mostra les etiquetes de les pestanyes',
@@ -4530,6 +4635,8 @@ export const ca: TranslationStructure = {
     },
 
     errors: {
+        quotaRefreshFailed: "No s’ha pogut actualitzar l’ús. Torna-ho a provar.",
+        quotaRefreshRetryAt: ({ time }: { time: string }) => `No s’ha pogut actualitzar l’ús. Torna-ho a provar després de ${time}.`,
         machineRpcDecryptionFailed: "No es poden desxifrar les dades d’aquesta màquina. Inicia la sessió amb la clau de compte corresponent i torna-ho a provar.",
         machineRpcContextUnavailable: "La connexió amb aquesta màquina no està disponible. Actualitza les màquines i torna-ho a provar.",
         networkError: 'Error de connexió',
@@ -6175,6 +6282,17 @@ deps: {
             presetName: 'Nom del predefinit', movePresetUp: 'Mou amunt', movePresetDown: 'Mou avall',
             noPresets: 'Cap predefinit desat', noPresetsMessage: 'Desa’n un quan triïs un recordatori personalitzat.',
         },
+        appearance: {
+            setColor: 'Defineix el color',
+            customColor: 'Color personalitzat…',
+            customColorTitle: 'Color personalitzat',
+            customColorMessage: 'Tria un to o introdueix un valor hexadecimal.',
+            invalidColor: 'Fes servir un valor hexadecimal com #3A7BD5.',
+            removeColor: 'Treu el color',
+            inheritedFromProject: 'Del projecte',
+            customColorLabel: ({ hex }: { hex: string }) => `Color personalitzat ${hex}`,
+            colors: { blue: 'Blau', green: 'Verd', orange: 'Taronja', yellow: 'Groc', red: 'Vermell', indigo: 'Indi', purple: 'Porpra' },
+        },
         workingSectionTitle: 'Treballant',
         hideInactiveSessions: 'Amaga sessions inactives',
         showInactiveSessions: 'Mostra sessions inactives',
@@ -6343,6 +6461,9 @@ deps: {
         tmuxFallback: 'Fallback de tmux',
         copyMetadata: 'Copia les metadades',
         copyDebugInformation: 'Copia la informació',
+        sessionInformation: "Informació de la sessió",
+        happierSessionId: "ID de sessió de Happier",
+        providerSessionId: ({ provider }: { provider: string }) => `ID de sessió de ${provider}`,
         debugInformationCopyLabel: 'Informació',
         providerSessionLogs: ({ provider }: { provider: string }) => `Registres de sessió de ${provider}`,
         agentState: 'Estat de l\'agent',
@@ -6355,6 +6476,9 @@ deps: {
         thinking: 'Pensant',
         thinkingSince: 'Pensant des de',
         thinkingLevel: 'Nivell de pensament',
+        peerReportFrom: ({ name }: { name: string }) => `Informe de ${name}`,
+        peerMessageFrom: ({ name }: { name: string }) => `Missatge de ${name}`,
+        peerUnnamedSender: 'un altre agent',
         cliVersion: 'Versió del CLI',
         cliVersionOutdated: 'Actualització del CLI requerida',
         cliVersionOutdatedMessage: ({ currentVersion, requiredVersion }: { currentVersion: string; requiredVersion: string }) =>
@@ -6364,6 +6488,8 @@ deps: {
         deleteSessionSubtitle: 'Elimina permanentment aquesta sessió',
         deleteSessionConfirm: 'Eliminar la sessió permanentment?',
         deleteSessionWarning: 'Aquesta acció no es pot desfer. Tots els missatges i dades associats amb aquesta sessió s\'eliminaran permanentment.',
+        stopAndDeleteSession: "Atura i elimina",
+        stopAndDeleteSessionWarning: "Això aturarà la sessió i eliminarà permanentment tots els seus missatges i dades. Aquesta acció no es pot desfer.",
         failedToDeleteSession: 'Error en eliminar la sessió',
         sessionDeleted: 'Sessió eliminada amb èxit',
         manageSharing: 'Gestiona l\'accés',
@@ -6422,6 +6548,11 @@ deps: {
     },
 
     agentInput: {
+        sendOptions: {
+            title: "Opcions d’enviament",
+            queue: "Posa a la cua",
+            hint: "Mantén premut per triar com enviar",
+        },
         chipPicker: {
             selectedOptionAccessibilityLabel: ({ option }: { option: string }) => `${option}. Seleccionat.`,
         },
@@ -9297,7 +9428,7 @@ settingsSession: {
             offline: 'Algunes màquines estan sense connexió',
             checkedAt: ({ time }: { time: string }) => `Última comprovació: ${time}`,
             upToDateDescription: 'Happier, la seva línia d’ordres i els teus agents estan al dia.',
-            unknownDescription: 'Tot el que s’ha pogut comprovar està al dia. La resta es tornarà a comprovar quan sigui accessible.',
+            unknownDescription: "Alguna informació d’actualització no està disponible o és en memòria cau. Consulta les files afectades.",
             offlineDescription: 'Tot el que és accessible està al dia. Les màquines sense connexió es comprovaran quan tornin.',
         },
         settingsSubtitle: {
@@ -9343,6 +9474,9 @@ settingsSession: {
             appCheckFailed: 'No s’ha pogut comprovar si hi ha una versió més nova.',
             appDownloadFailed: 'La baixada no ha acabat.',
             appInstallFailed: 'No s’ha pogut instal·lar l’actualització.',
+            cachedRelease: 'Informació de versió en memòria cau; no s’actualitza aquí',
+            cachedReleaseChannel: ({ channel }: { channel: string }) => `Informació de versió ${channel} en memòria cau; no s’actualitza aquí`,
+            manualUpdateInterruptsSessions: 'Actualitza en aquesta màquina. Els serveis es poden aturar i les sessions actives poden acabar.',
             latestUnknown: 'No s’ha pogut comprovar si hi ha una versió més nova',
             rolledBack: ({ kept, target }: { kept: string; target: string }) => `${target} no s’ha iniciat en aquesta màquina, així que continua amb la ${kept}.`,
             installedByYou: 'Instal·lat per tu',
@@ -9594,6 +9728,7 @@ settingsSession: {
         failedToConnectTerminal: 'Ha fallat connectar el terminal',
         cameraPermissionsRequiredToConnectTerminal: 'Es requereixen permisos de càmera per connectar el terminal',
         failedToLinkDevice: 'Ha fallat enllaçar el dispositiu',
+        deviceLinkRequestNotFound: "No s’ha trobat cap sol·licitud d’enllaç pendent en aquest relay. Comprova que tots dos dispositius utilitzin el mateix relay i genera un codi QR nou.",
         cameraPermissionsRequiredToScanQr: 'Es requereixen permisos de càmera per escanejar codis QR',
         qrScannerUnavailable: 'No s’ha pogut obrir l’escàner de QR. Torna-ho a provar o introdueix l’URL manualment.'
     },
@@ -10520,6 +10655,13 @@ settingsSession: {
                 plan: 'Planifica abans d\'executar',
                 bypassPermissions: 'Salta tots els permisos',
             },
+        },
+        defaultBackend: {
+            title: 'Backend d\'IA predeterminat',
+            footer: 'Inicia sessions noves en aquest backend quan el perfil està seleccionat i no se\'n tria un altre.',
+            noneTitle: 'Sense predeterminat',
+            noneSubtitle: 'Happier tria el backend com de costum.',
+            selectedSubtitle: 'S\'utilitza en iniciar una sessió amb aquest perfil.',
         },
         defaultPermissions: {
             title: 'Permisos per defecte',

@@ -40,3 +40,41 @@ export function createVoicePlaybackController(): VoicePlaybackController {
     registerStopper,
   };
 }
+
+/**
+ * Ties playback to the lifetime of one owner (for example a connect-time welcome) without giving
+ * that owner power over anyone else's playback. Every stopper registered through the result stays
+ * registered with `registrar`, so a shared interrupt still stops it, and is additionally stopped
+ * when `signal` aborts, immediately if it already has. Each stopper runs at most once.
+ */
+export function scopePlaybackStopperRegistrar(
+  registrar: VoicePlaybackStopperRegistrar,
+  signal: AbortSignal,
+): VoicePlaybackStopperRegistrar {
+  return (stopper) => {
+    let stopped = false;
+    const stopOnce = () => {
+      if (stopped) return;
+      stopped = true;
+      stopper();
+    };
+    if (signal.aborted) {
+      stopOnce();
+      return () => {};
+    }
+    const clearRegistration = registrar(stopOnce);
+    const stopForEndedOwner = () => {
+      clearRegistration();
+      try {
+        stopOnce();
+      } catch {
+        // A failing stopper must not escape into the abort dispatch.
+      }
+    };
+    signal.addEventListener('abort', stopForEndedOwner, { once: true });
+    return () => {
+      signal.removeEventListener('abort', stopForEndedOwner);
+      clearRegistration();
+    };
+  };
+}

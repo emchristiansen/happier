@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger';
+import { createHash } from 'node:crypto';
 import {
   connectedServiceUsageRequiresOrganizationId,
   buildRecoveryCreditConsumeIdempotencyKey,
@@ -10,6 +11,7 @@ import {
   ConnectedServiceUsageSourceV1Schema,
   isConnectedServiceQuotaObservationFresh,
   isProviderAccountUsageOrganizationContextMatch,
+  isProviderAccountUsageRefreshRequestSettled,
   compareConnectedServiceQuotaObservationRecency,
   isConnectedServiceCredentialHealthStatusUsable,
   type ConnectedServiceAuthGroupRuntimeStatePatchRequestV1,
@@ -17,6 +19,7 @@ import {
   openConnectedServiceCredentialCiphertext,
   openConnectedServiceQuotaSnapshotCiphertext,
   openSealedProviderAccountUsageSnapshot,
+  ProviderAccountUsageDiagnosticV1Schema,
   projectProviderAccountUsageSnapshotToConnectedServiceQuotaSnapshotV1,
   sealProviderAccountUsageSnapshot,
   splitProviderAccountUsageSubscription,
@@ -28,6 +31,7 @@ import {
   type ConnectedServiceUsageSourceV1,
   type ProviderAccountUsageRecordKeyV1,
   type ProviderAccountUsageSnapshotV1,
+  type ProviderAccountUsageDiagnosticV1,
   type ProviderAccountSubscriptionV1,
   type ConnectedServiceQuotaRecoveryCreditConsumeReceiptV1,
   type ConnectedServiceQuotaSnapshotV1,
@@ -67,11 +71,15 @@ import {
   type ConnectedServiceUsageSourceRecordRef,
 } from '../accountGroups/switching/buildConnectedServiceAuthGroupSwitchStateFromAccountUsage';
 import {
+  selectConnectedServiceAuthGroupCandidate,
   resolveConnectedServiceAuthGroupPriorityPrimaryProfileId,
   resolveConnectedServiceAuthGroupSoftSwitchSourceEvidence,
   type ConnectedServiceAuthGroupMemberRuntimeState,
 } from '../accountGroups/selection/selectConnectedServiceAuthGroupCandidate';
-import { reconcileMemberRuntimeStateWithFreshQuotaEvidence } from '../accountGroups/memberRuntimeState';
+import {
+  logMemberRuntimeStatePositiveEvidenceClear,
+  reconcileMemberRuntimeStateWithFreshQuotaEvidence,
+} from '../accountGroups/memberRuntimeState';
 import { ConnectedServiceQuotaFetchError, type ConnectedServiceQuotaFetcher, type ConnectedServiceSubscriptionFetcher } from './types';
 import {
   buildQuotaPersistenceKey,
@@ -136,7 +144,7 @@ import {
   type ConnectedServiceRuntimeQuotaTarget,
 } from '../runtimeRegistry/registry';
 import type { ProviderAccountUsageStore } from '../accountUsage/store';
-import type { ProviderAccountUsagePersistenceScheduler } from '../accountUsage/persistence';
+import { deriveProviderAccountUsageStatus, type ProviderAccountUsagePersistenceScheduler } from '../accountUsage/persistence';
 import {
   evaluateConnectedServiceAuthGroupQuotaLifecycle,
   type ConnectedServiceAuthGroupQuotaLifecycleState,
@@ -236,8 +244,14 @@ export type ConnectedServiceGroupQuotaProbeResult = Readonly<{
   requestedProfileCount: number;
   completedProfileCount: number;
   completedProfileIds: ReadonlyArray<string>;
+  deferredProfiles?: ReadonlyArray<Readonly<{ profileId: string; retryAtMs: number }>>;
   reason?: 'deadline_exceeded' | 'probe_unavailable';
+  retryAtMs?: number;
 }>;
+
+type QuotaSnapshotFetchResult =
+  | Readonly<{ type: 'timeout' }>
+  | Readonly<{ type: 'result'; snapshot: ConnectedServiceQuotaSnapshotV1 | null; verifiedCredentialFingerprint?: string }>;
 
 export const DEFAULT_CONNECTED_SERVICE_QUOTA_FETCH_TIMEOUT_MS = 15_000;
 const CONNECTED_SERVICE_GROUP_QUOTA_PROBE_MAX_CONCURRENCY = 4;
@@ -295,6 +309,7 @@ export class ConnectedServiceQuotasCoordinator {
   private readonly quotaPersistenceMinFreshnessRefreshMs: number;
   private quotaFingerprintHmacKey: Uint8Array;
   private readonly authGroupSwitchCoordinator: AuthGroupSwitchCoordinator | null;
+  private readonly resolveRequiredModelIdsForGroup: ((input: Readonly<{ serviceId: ConnectedServiceId; groupId: string }>) => ReadonlyArray<string>) | null;
   private readonly consumeCommittedAuthGroupGeneration: ConsumeCommittedAuthGroupGeneration | null;
   private readonly softSwitchPolicyGuard: ConnectedServiceQuotaSoftSwitchPolicyGuard | null;
   private readonly sameAccountFanoutStrategyResolver: ConnectedServiceSameAccountFanoutStrategyResolver | null;
@@ -311,6 +326,11 @@ export class ConnectedServiceQuotasCoordinator {
   private readonly sameAccountFanoutMinIntervalMs: number;
   private readonly runtimeRegistry: ConnectedServiceRuntimeRegistry;
   private readonly failureStateByBindingKey = new Map<string, FailureState>();
+  private readonly quotaFetchesByKey = new Map<string, {
+    promise: Promise<QuotaSnapshotFetchResult>;
+    controller: AbortController;
+    waiters: number;
+  }>();
   private readonly groupSwitchCheckAtByKey = new Map<string, number>();
   private readonly sameAccountFanoutAtByKey = new Map<string, number>();
   /**
@@ -367,6 +387,7 @@ export class ConnectedServiceQuotasCoordinator {
     quotaPersistenceMinFreshnessRefreshMs?: number;
     quotaPersistenceMaxConsecutiveFailures?: number;
     authGroupSwitchCoordinator?: AuthGroupSwitchCoordinator | null;
+    resolveRequiredModelIdsForGroup?: (input: Readonly<{ serviceId: ConnectedServiceId; groupId: string }>) => ReadonlyArray<string>;
     consumeCommittedAuthGroupGeneration?: ConsumeCommittedAuthGroupGeneration | null;
     softSwitchPolicyGuard?: ConnectedServiceQuotaSoftSwitchPolicyGuard | null;
     sameAccountFanoutStrategyResolver?: ConnectedServiceSameAccountFanoutStrategyResolver | null;
@@ -428,6 +449,7 @@ export class ConnectedServiceQuotasCoordinator {
         : 5_000;
     this.sleepMs = params.sleepMs ?? defaultSleepMs;
     this.authGroupSwitchCoordinator = params.authGroupSwitchCoordinator ?? null;
+    this.resolveRequiredModelIdsForGroup = params.resolveRequiredModelIdsForGroup ?? null;
     this.consumeCommittedAuthGroupGeneration = params.consumeCommittedAuthGroupGeneration ?? null;
     this.softSwitchPolicyGuard = params.softSwitchPolicyGuard ?? null;
     this.sameAccountFanoutStrategyResolver = params.sameAccountFanoutStrategyResolver ?? null;
@@ -741,7 +763,12 @@ export class ConnectedServiceQuotasCoordinator {
     const group = await this.api.getConnectedServiceAuthGroup({
       serviceId: input.serviceId,
       groupId,
-    }).catch(() => null);
+    }).catch(() => {
+      this.recordDiagnostic?.({ event: 'quota_work_suppressed', phase: 'soft_switch',
+        reason: 'soft_switch_group_read_failed', sessionId: input.sessionId,
+        serviceId: input.serviceId, groupId });
+      return null;
+    });
     if (!group) return;
 
     // Reactive preemption: a genuine in-band usage change (delivered outside the poll) is the freshest
@@ -772,7 +799,11 @@ export class ConnectedServiceQuotasCoordinator {
           activeProfileId: changedProfileId,
           groupGeneration: normalizeConnectedServiceQuotaGeneration(input.groupGeneration),
         }],
-      }).catch(() => undefined);
+      }).catch(() => {
+        this.recordDiagnostic?.({ event: 'quota_work_suppressed', phase: 'soft_switch',
+          reason: 'soft_switch_evaluation_failed', sessionId: input.sessionId,
+          serviceId: input.serviceId, groupId, activeProfileId: changedProfileId });
+      });
     }
 
     if (!listener) return;
@@ -1033,8 +1064,14 @@ export class ConnectedServiceQuotasCoordinator {
       groupId: decisionTarget.groupId,
       reason: input.reason,
       observedProfileId: input.observedProfileId,
-    }).catch(() => null);
-    if (!rawDecision || typeof rawDecision !== 'object' || Array.isArray(rawDecision)) return 1;
+    }).catch(() => {
+      this.recordDiagnostic?.({ event: 'quota_work_suppressed', phase: 'soft_switch',
+        reason: 'soft_switch_request_failed', sessionId: decisionTarget.sessionId,
+        serviceId: decisionTarget.serviceId, groupId: decisionTarget.groupId,
+        activeProfileId: input.observedProfileId });
+      return null;
+    });
+    if (!rawDecision || typeof rawDecision !== 'object' || Array.isArray(rawDecision)) return 0;
     const decision = rawDecision as Readonly<Record<string, unknown>>;
     const activeProfileId = typeof decision.activeProfileId === 'string' && decision.activeProfileId.trim()
       ? decision.activeProfileId.trim()
@@ -1572,6 +1609,25 @@ export class ConnectedServiceQuotasCoordinator {
         },
       };
     }
+    const selection = selectConnectedServiceAuthGroupCandidate({
+      ...switchState,
+      nowMs: now,
+      quotaFreshnessMs: this.quotaLifecycleFreshnessMs,
+      switchReason: 'soft_threshold',
+      requiredModelIds: this.resolveRequiredModelIdsForGroup?.(input),
+    });
+    if (!selection.selected) {
+      const retryAtMs = selection.excluded.reduce<number | null>((earliest, exclusion) => {
+        const retryAtMs = exclusion.retryAtMs;
+        return typeof retryAtMs === 'number' && retryAtMs > now
+          ? Math.min(earliest ?? retryAtMs, retryAtMs) : earliest;
+      }, null);
+      return {
+        status: 'no_eligible_target',
+        retryAfterMs: retryAtMs === null ? null : retryAtMs - now,
+        decisionTrace: selection.decisionTrace,
+      };
+    }
     if (sourceEvidence.status === 'above_threshold') {
       const primaryProfileId = switchState.policy.strategy === 'priority'
         && switchState.policy.autoRestorePrimaryWhenReset
@@ -1588,8 +1644,7 @@ export class ConnectedServiceQuotasCoordinator {
           sourceThresholdPercent: sourceEvidence.thresholdPercent,
           sourceProjected: false,
           decisionTrace: {
-            activeProfileId,
-            reason: 'primary_restore_evaluation',
+            ...selection.decisionTrace,
           },
         };
       }
@@ -1608,10 +1663,9 @@ export class ConnectedServiceQuotasCoordinator {
       sourceRemainingPercent: sourceEvidence.remainingPercent,
       sourceThresholdPercent: sourceEvidence.thresholdPercent,
       sourceProjected: sourceEvidence.projected === true,
-      decisionTrace: {
-        activeProfileId,
-        reason: 'source_at_or_below_threshold',
-      },
+      selectedProfileId: selection.selected.profileId,
+      selectedRemainingPercent: selection.selected.leastLimitedScore,
+      decisionTrace: selection.decisionTrace,
     };
   }
 
@@ -2226,6 +2280,7 @@ export class ConnectedServiceQuotasCoordinator {
     snapshot: ConnectedServiceQuotaSnapshotV1;
     materialFingerprint?: string;
     sourceProviderAccountId?: string | null;
+    refreshError?: ProviderAccountUsageDiagnosticV1;
   }>): Promise<void> {
     const run = async (payload: typeof input): Promise<void> => {
       const accountMode = payload.accountMode ?? await resolveConnectedServiceAccountMode(this.api, { refresh: true });
@@ -2262,16 +2317,18 @@ export class ConnectedServiceQuotasCoordinator {
     snapshot: ConnectedServiceQuotaSnapshotV1;
     materialFingerprint?: string;
     sourceProviderAccountId?: string | null;
+    refreshError?: ProviderAccountUsageDiagnosticV1;
   }>): Promise<void> {
     const observedSnapshot = buildProviderAccountUsageSnapshotFromConnectedServiceQuotaObservation({
       snapshot: input.snapshot,
-      observedAtMs: input.snapshot.fetchedAtMs ?? input.snapshot.fetchedAt,
+      observedAtMs: input.refreshError?.observedAtMs ?? input.snapshot.fetchedAtMs ?? input.snapshot.fetchedAt,
       sourceProviderAccountId: input.sourceProviderAccountId,
+      refreshError: input.refreshError,
     });
     const providerAccountUsageSnapshot = this.subscriptionEnabled
       ? observedSnapshot
       : splitProviderAccountUsageSubscription(observedSnapshot).snapshot;
-    const status = deriveQuotaSnapshotStatus(input.snapshot);
+    const status = deriveProviderAccountUsageStatus(providerAccountUsageSnapshot);
     const materialFingerprint = input.materialFingerprint
       ?? computeProviderAccountUsageSnapshotFingerprint(providerAccountUsageSnapshot, this.quotaFingerprintHmacKey);
     const canPersistSourceLink = canRecordProviderAccountUsageSourceLinks({
@@ -2326,6 +2383,7 @@ export class ConnectedServiceQuotasCoordinator {
         staleAfterMs: providerAccountUsageSnapshot.staleAfterMs,
         status,
         materialFingerprint,
+        ...(input.refreshError?.observedAtMs !== undefined ? { refreshErrorAt: input.refreshError.observedAtMs } : {}),
       },
     });
   }
@@ -2372,6 +2430,8 @@ export class ConnectedServiceQuotasCoordinator {
     groupContexts?: ReadonlyArray<ConnectedServiceQuotaGroupContext> | null;
     groupTargets?: ReadonlyArray<ActiveGroupQuotaSwitchTarget> | null;
     persistDurably?: boolean;
+    refreshError?: ProviderAccountUsageDiagnosticV1;
+    onPersistenceAccepted?: () => void;
   }>): Promise<ProviderAccountUsageSnapshotV1 | null> {
     return await recordFetchedQuotaSnapshotAsAccountUsage({
       accountUsageStore: this.accountUsageStore,
@@ -2504,12 +2564,13 @@ export class ConnectedServiceQuotasCoordinator {
       const reconciledState = reconcileMemberRuntimeStateWithFreshQuotaEvidence({
         state: member.state as ConnectedServiceAuthGroupMemberRuntimeState,
         quotaSnapshot,
+        quotaFreshnessMs: this.quotaLifecycleFreshnessMs,
         policy: normalizeConnectedServiceAuthGroupPolicy(group.policy),
         nowMs: input.now,
       });
       if (!reconciledState || reconciledState === member.state) return null;
       try {
-        return await this.api.updateConnectedServiceAuthGroupRuntimeState({
+        const updated = await this.api.updateConnectedServiceAuthGroupRuntimeState({
           serviceId: input.serviceId,
           groupId: input.groupId,
           expectedGeneration: group.generation,
@@ -2519,6 +2580,15 @@ export class ConnectedServiceQuotasCoordinator {
             state: reconciledState,
           }],
         });
+        logMemberRuntimeStatePositiveEvidenceClear({
+          serviceId: input.serviceId,
+          groupId: input.groupId,
+          profileId: input.profileId,
+          evidenceKind: 'fresh_quota',
+          before: member.state,
+          after: reconciledState,
+        });
+        return updated;
       } catch (error) {
         if (!(error instanceof ConnectedServiceAuthGroupRuntimeStateRevisionConflictError) || attempt === 1) return null;
         const latest = await this.api.getConnectedServiceAuthGroup?.({
@@ -2963,6 +3033,8 @@ export class ConnectedServiceQuotasCoordinator {
       .map((profileId) => String(profileId ?? '').trim())
       .filter((profileId) => profileId.length > 0)));
     const completedProfileIdSet = new Set<string>();
+    const deferredProfiles = new Map<string, number>();
+    let retryAtMs: number | undefined;
     const deadlineAtMs = typeof input.deadlineAtMs === 'number' && Number.isFinite(input.deadlineAtMs)
       ? Math.max(0, Math.trunc(input.deadlineAtMs))
       : null;
@@ -2986,7 +3058,11 @@ export class ConnectedServiceQuotasCoordinator {
       requestedProfileCount: profileIds.length,
       completedProfileCount: completedProfileIdSet.size,
       completedProfileIds: profileIds.filter((profileId) => completedProfileIdSet.has(profileId)),
+      ...(deferredProfiles.size > 0 ? {
+        deferredProfiles: Array.from(deferredProfiles, ([profileId, retryAtMs]) => ({ profileId, retryAtMs })),
+      } : {}),
       ...(reason ? { reason } : {}),
+      ...(status === 'incomplete' && retryAtMs !== undefined ? { retryAtMs } : {}),
     });
     let outcome: ConnectedServiceGroupQuotaProbeResult = result('complete');
     let activeProfileId: string | null = null;
@@ -3008,9 +3084,18 @@ export class ConnectedServiceQuotasCoordinator {
         return outcome;
       }
 
-      const accountMode = deadlineAtMs !== null
-        ? await this.api.getAccountEncryptionModeUncached?.({ signal: deadlineController.signal }) ?? 'unknown'
-        : await resolveConnectedServiceAccountMode(this.api);
+      let accountMode: ConnectedServiceAccountMode;
+      try {
+        accountMode = deadlineAtMs !== null
+          ? await this.api.getAccountEncryptionModeUncached?.({ signal: deadlineController.signal }) ?? 'unknown'
+          : await resolveConnectedServiceAccountMode(this.api);
+      } catch {
+        outcome = result('incomplete', deadlineExceeded() ? 'deadline_exceeded' : 'probe_unavailable');
+        logger.warn('[ConnectedServiceQuotas] Group quota probe account-mode read failed', {
+          serviceId, groupId, reason: outcome.reason,
+        });
+        return outcome;
+      }
       if (deadlineExceeded()) {
         outcome = result('incomplete', 'deadline_exceeded');
         return outcome;
@@ -3034,6 +3119,15 @@ export class ConnectedServiceQuotasCoordinator {
 
       const probeProfile = async (profileId: string): Promise<void> => {
         if (deadlineExceeded()) return;
+        const bindingKey = this.makeBindingKey({ serviceId, profileId });
+        const deferUntilBackoff = (): boolean => {
+          const nextAllowedAt = this.failureStateByBindingKey.get(bindingKey)?.nextAllowedAt;
+          if (nextAllowedAt === undefined || this.now() >= nextAllowedAt) return false;
+          deferredProfiles.set(profileId, nextAllowedAt);
+          retryAtMs = Math.min(retryAtMs ?? nextAllowedAt, nextAllowedAt);
+          return true;
+        };
+        if (deferUntilBackoff()) return;
         let expectedCredentialRevision: ConnectedServiceCredentialRevisionV1 | null = null;
         try {
           // Lease acquisition is a mutation. Do not start it after expiry and always await it once started.
@@ -3060,7 +3154,7 @@ export class ConnectedServiceQuotasCoordinator {
                 groupId,
                 profileId,
                 groupGeneration: group?.generation ?? null,
-                snapshot: observedSnapshot,
+                snapshot: observedSnapshot.snapshot,
               });
               if (deadlineExceeded()) return;
               await this.recordFetchedQuotaSnapshotAsAccountUsage({
@@ -3069,7 +3163,8 @@ export class ConnectedServiceQuotasCoordinator {
                 accountMode: accountMode === 'plain' || accountMode === 'e2ee' ? accountMode : null,
                 groupId,
                 groupContexts: this.buildQuotaGroupContextsForProfile({ group, profileId }),
-                snapshot: observedSnapshot,
+                snapshot: observedSnapshot.snapshot,
+                sourceProviderAccountId: observedSnapshot.sourceProviderAccountId,
                 now,
               });
               if (deadlineExceeded()) return;
@@ -3103,7 +3198,7 @@ export class ConnectedServiceQuotasCoordinator {
             serviceId,
             profileId,
             record: credential.record,
-            now,
+            credentialRevision: credential.credentialRevision,
             signal: deadlineAtMs === null ? undefined : deadlineController.signal,
           });
           if (deadlineExceeded()) return;
@@ -3112,6 +3207,7 @@ export class ConnectedServiceQuotasCoordinator {
             return;
           }
           const snapshot = raced.snapshot;
+          this.failureStateByBindingKey.delete(bindingKey);
           runtimeQuotaSnapshots.recordSnapshot({
             serviceId,
             groupId,
@@ -3150,14 +3246,14 @@ export class ConnectedServiceQuotasCoordinator {
             error,
             now,
           }).catch(() => false);
-          const key = this.makeBindingKey({ serviceId, profileId });
-          this.applyFailureBackoff({
-            now,
-            key,
-            retryAfterMs: readQuotaRetryAfterMs(error),
-            retryAfterBackoffMinMs: fetcher.pollPolicy?.retryAfterBackoffMinMs,
-          });
-          completedProfileIdSet.add(profileId);
+          if (!deferUntilBackoff()) {
+            this.applyFailureBackoff({
+              now: this.now(), key: bindingKey,
+              retryAfterMs: readQuotaRetryAfterMs(error),
+              retryAfterBackoffMinMs: fetcher.pollPolicy?.retryAfterBackoffMinMs,
+            });
+            deferUntilBackoff();
+          }
         }
       };
 
@@ -3176,7 +3272,7 @@ export class ConnectedServiceQuotasCoordinator {
         profileIds.length,
       );
       await Promise.all(Array.from({ length: workerCount }, () => worker()));
-      if (deadlineExceeded() || completedProfileIdSet.size !== profileIds.length) {
+      if (deadlineExceeded() || completedProfileIdSet.size + deferredProfiles.size !== profileIds.length) {
         outcome = result('incomplete', 'deadline_exceeded');
         return outcome;
       }
@@ -3457,7 +3553,10 @@ export class ConnectedServiceQuotasCoordinator {
   private shouldForceQuotaRefresh(existing: ExistingQuotaSnapshotResponse, preopenedSnapshot?: ConnectedServiceQuotaSnapshotV1): boolean {
     const fetchedAt = Number(preopenedSnapshot?.fetchedAt ?? existing?.metadata?.fetchedAt ?? 0);
     const refreshRequestedAt = Number(existing?.metadata?.refreshRequestedAt ?? 0);
-    return Number.isFinite(refreshRequestedAt) && refreshRequestedAt > 0 && refreshRequestedAt > fetchedAt;
+    return Number.isFinite(refreshRequestedAt) && refreshRequestedAt > 0
+      && !isProviderAccountUsageRefreshRequestSettled({
+        refreshRequestedAt, fetchedAt, refreshErrorAt: existing?.metadata?.refreshErrorAt,
+      });
   }
 
   private async acquireQuotaFetchLease(input: Readonly<{
@@ -3491,7 +3590,7 @@ export class ConnectedServiceQuotasCoordinator {
     now: number;
     leaseUntil: number;
     signal?: AbortSignal;
-  }>): Promise<ConnectedServiceQuotaSnapshotV1 | null> {
+  }>): Promise<Readonly<{ snapshot: ConnectedServiceQuotaSnapshotV1; sourceProviderAccountId: string | null }> | null> {
     const maxWaitMs = this.quotaFetchLeaseContentionWaitMaxMs;
     if (maxWaitMs > 0) {
       const waitMs = Math.min(maxWaitMs, Math.max(0, Math.trunc(input.leaseUntil - input.now)));
@@ -3522,20 +3621,29 @@ export class ConnectedServiceQuotasCoordinator {
       return null;
     }
     if (!observed) return null;
-    return this.openExistingQuotaSnapshot({
+    const snapshot = this.openExistingQuotaSnapshot({
       storageMode: observed.storageMode,
       serviceId: input.serviceId,
       profileId: input.profileId,
       existing: observed.existing,
       preopenedSnapshot: observed.preopenedSnapshot,
     });
+    if (!snapshot) return null;
+    // Keep identity with the observation that passed freshness/context admission. The
+    // source-link owner must prove this profile still owns the provider account.
+    const credential = observed.credential ?? await this.readCredentialForQuota(input);
+    return {
+      snapshot,
+      sourceProviderAccountId: credential.record ? readCredentialAccountIdentity(credential.record)?.providerAccountId ?? null : null,
+    };
   }
 
   private async runFetcherWithTimeout<TSnapshot>(input: Readonly<{
-    fetcher: Readonly<{ fetch: (params: Readonly<{ record: ConnectedServiceCredentialRecordV1; now: number; signal: AbortSignal }>) => Promise<TSnapshot | null> }>;
+    fetcher: Readonly<{ fetch: (params: Readonly<{ record: ConnectedServiceCredentialRecordV1; now: number; signal: AbortSignal; force?: boolean }>) => Promise<TSnapshot | null> }>;
     record: ConnectedServiceCredentialRecordV1;
     now: number;
     signal?: AbortSignal;
+    force?: boolean;
   }>): Promise<
     | Readonly<{ type: 'timeout' }>
     | Readonly<{ type: 'result'; snapshot: TSnapshot | null }>
@@ -3549,6 +3657,7 @@ export class ConnectedServiceQuotasCoordinator {
       record: buildCredentialRecordForQuotaFetcher(input.record),
       now: input.now,
       signal: controller.signal,
+      ...(input.force ? { force: true } : {}),
     });
 
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
@@ -3571,32 +3680,32 @@ export class ConnectedServiceQuotasCoordinator {
     const settleCallerAbort = (): void => resolveCallerAbort();
     if (input.signal?.aborted) settleCallerAbort();
     else input.signal?.addEventListener('abort', settleCallerAbort, { once: true });
-    const raced = await Promise.race([
-      fetchPromise.then(
-        (snapshot) => ({ type: 'result' as const, snapshot }),
-        (error) => ({ type: 'error' as const, error }),
-      ),
-      timeoutPromise,
-      ...(input.signal ? [callerAbortPromise] : []),
-    ]);
+    try {
+      const raced = await Promise.race([
+        fetchPromise.then(
+          (snapshot) => ({ type: 'result' as const, snapshot }),
+          (error) => ({ type: 'error' as const, error }),
+        ),
+        timeoutPromise,
+        ...(input.signal ? [callerAbortPromise] : []),
+      ]);
 
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-    timeoutHandle = null;
-    input.signal?.removeEventListener('abort', abortFromCaller);
-    input.signal?.removeEventListener('abort', settleCallerAbort);
-
-    if (raced.type === 'timeout') {
-      if (input.signal) {
-        // Deadline-owned pre-spawn probes never detach a provider read. Every registered production
-        // fetcher forwards AbortSignal to fetch (or settles synchronously), so abort and observe its
-        // terminal result before reporting the aggregate probe incomplete.
-        controller.abort('quota-probe-deadline');
-        await fetchPromise.catch(() => null);
+      if (raced.type === 'timeout') {
+        if (input.signal) {
+          // Observe cooperative cancellation, bounded by the same fetch timeout even
+          // if a provider ignores abort. A shared fetch must always release its slot.
+          controller.abort('quota-probe-deadline');
+          await Promise.race([fetchPromise.catch(() => null), timeoutPromise]);
+        }
+        return raced;
       }
+      if (raced.type === 'error') throw raced.error;
       return raced;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      input.signal?.removeEventListener('abort', abortFromCaller);
+      input.signal?.removeEventListener('abort', settleCallerAbort);
     }
-    if (raced.type === 'error') throw raced.error;
-    return raced;
   }
 
   private async runRecoveryCreditConsumerWithTimeout(input: Readonly<{
@@ -3690,24 +3799,91 @@ export class ConnectedServiceQuotasCoordinator {
     serviceId: ConnectedServiceId;
     profileId: string;
     record: ConnectedServiceCredentialRecordV1;
-    now: number;
+    credentialRevision: ConnectedServiceCredentialRevisionV1 | null;
     signal?: AbortSignal;
-  }>): Promise<
-    | Readonly<{ type: 'timeout' }>
-    | Readonly<{ type: 'result'; snapshot: ConnectedServiceQuotaSnapshotV1 | null; verifiedCredentialFingerprint?: string }>
-  > {
-    const result = await this.runFetcherWithTimeout({
-      fetcher: input.fetcher,
-      record: input.record,
-      now: input.now,
-      signal: input.signal,
+    force?: boolean;
+  }>): Promise<QuotaSnapshotFetchResult> {
+    if (input.signal?.aborted) return { type: 'timeout' };
+    // Provider selection is fixed per service on this coordinator. Hash the complete
+    // fetcher-visible credential, including account/context metadata, without retaining
+    // credential plaintext in the key. Group projection and deadlines belong to waiters.
+    const key = JSON.stringify([input.serviceId, input.profileId, input.credentialRevision, input.fetcher.pollPolicy, input.force === true, createHash('sha256')
+      .update(JSON.stringify(buildCredentialRecordForQuotaFetcher(input.record))).digest('hex')]);
+    let shared = this.quotaFetchesByKey.get(key);
+    if (!shared || shared.controller.signal.aborted) {
+      // Lease/credential reads may outlive another caller's provider failure.
+      // Recheck only new work here; an existing observation can still be joined.
+      const now = this.now();
+      const nextAllowedAt = this.failureStateByBindingKey.get(this.makeBindingKey(input))?.nextAllowedAt;
+      if (nextAllowedAt !== undefined && now < nextAllowedAt) {
+        throw new ConnectedServiceQuotaFetchError('Quota read deferred by existing provider backoff', {
+          quotaFetchErrorCode: 'provider_backoff', retryAfterMs: nextAllowedAt - now,
+        });
+      }
+      const controller = new AbortController();
+      const promise: Promise<QuotaSnapshotFetchResult> = this.fetchQuotaSnapshotOnce({ ...input, signal: controller.signal })
+        .finally(() => {
+          if (this.quotaFetchesByKey.get(key)?.promise === promise) this.quotaFetchesByKey.delete(key);
+        });
+      shared = { promise, controller, waiters: 0 };
+      this.quotaFetchesByKey.set(key, shared);
+    }
+    const current = shared;
+    current.waiters += 1;
+    let aborted = false;
+    let onAbort!: () => void;
+    const cancelled = new Promise<QuotaSnapshotFetchResult>((resolve) => {
+      onAbort = () => { aborted = true; resolve({ type: 'timeout' }); };
     });
-    if (result.type !== 'result' || !result.snapshot || isQuotaUnknownFallbackSnapshot(result.snapshot)
-      || input.record.kind !== 'oauth') return result;
-    return {
-      ...result,
-      verifiedCredentialFingerprint: computeConnectedServiceAccessTokenFingerprint(input.record.oauth.accessToken),
-    };
+    input.signal?.addEventListener('abort', onAbort, { once: true });
+    if (input.signal?.aborted) onAbort();
+    try {
+      return await Promise.race([current.promise, cancelled]);
+    } finally {
+      input.signal?.removeEventListener('abort', onAbort);
+      current.waiters -= 1;
+      if (aborted && current.waiters === 0) {
+        current.controller.abort('quota-probe-deadline');
+        await current.promise.catch(() => null);
+      }
+    }
+  }
+
+  private async fetchQuotaSnapshotOnce(input: Readonly<{
+    fetcher: ConnectedServiceQuotaFetcher;
+    serviceId: ConnectedServiceId;
+    profileId: string;
+    record: ConnectedServiceCredentialRecordV1;
+    signal?: AbortSignal;
+    force?: boolean;
+  }>): Promise<QuotaSnapshotFetchResult> {
+    // The observation owner captures time once, shared by every joining caller.
+    // A caller's scheduling time is not an input to the provider read.
+    try {
+      const result = await this.runFetcherWithTimeout({
+        fetcher: input.fetcher,
+        record: input.record,
+        now: Math.max(0, Math.trunc(this.now())),
+        signal: input.signal,
+        ...(input.force ? { force: true } : {}),
+      });
+      if (result.type !== 'result' || !result.snapshot || isQuotaUnknownFallbackSnapshot(result.snapshot)
+        || input.record.kind !== 'oauth') return result;
+      return {
+        ...result,
+        verifiedCredentialFingerprint: computeConnectedServiceAccessTokenFingerprint(input.record.oauth.accessToken),
+      };
+    } catch (error) {
+      // Publish the provider's explicit boundary before releasing its rejection.
+      // Other failures retain health-classification-before-backoff ordering: the
+      // credential owner counts prior failures when deciding whether to refresh.
+      const retryAfterMs = readQuotaRetryAfterMs(error);
+      if (retryAfterMs !== null && !isQuotaAuthFailure(error)) {
+        this.applyFailureBackoff({ now: this.now(), key: this.makeBindingKey(input),
+          retryAfterMs, retryAfterBackoffMinMs: input.fetcher.pollPolicy?.retryAfterBackoffMinMs });
+      }
+      throw error;
+    }
   }
 
   private buildRecoveryCreditConsumeReceipt(input: Readonly<{
@@ -3978,12 +4154,12 @@ export class ConnectedServiceQuotasCoordinator {
         });
       }
 
-      const refreshed = await this.fetchQuotaSnapshot({
+      // A reset needs a new provider observation, not an in-flight pre-reset read.
+      const refreshed = await this.fetchQuotaSnapshotOnce({
         fetcher,
         serviceId,
         profileId,
         record: consumed.record,
-        now,
       });
       if (refreshed.type === 'timeout') {
         return {
@@ -4071,6 +4247,8 @@ export class ConnectedServiceQuotasCoordinator {
     }), subscription };
     await this.recordFetchedQuotaSnapshotAsAccountUsage({ ...input, snapshot,
       now: base?.evidence?.observedAtMs ?? base?.fetchedAtMs ?? base?.fetchedAt ?? 0,
+      refreshError: stored?.state === 'error_last_known_good' && base?.evidence
+        ? ProviderAccountUsageDiagnosticV1Schema.parse(base.evidence) : undefined,
       sourceProviderAccountId: readCredentialAccountIdentity(input.record)?.providerAccountId ?? null,
     });
   }
@@ -4292,6 +4470,12 @@ export class ConnectedServiceQuotasCoordinator {
         let staleSnapshotVerifiedCredentialFingerprint: string | null | undefined;
         let expectedCredentialRevision: ConnectedServiceCredentialRevisionV1 | null = null;
         let subscriptionWork: Promise<void> | null = null;
+        // Keep the verified acquisition identity available to the failure writer.
+        let failureStorageMode: ResolvedQuotaStorageMode | null = null;
+        let failureCredential: ConnectedServiceCredentialRecordV1 | null = null;
+        let quotaAttemptStarted = false;
+        let recordsRefreshOutcome = false;
+        let completeScheduledRefresh: (() => void) | undefined;
         try {
           const bindingKey = this.makeBindingKey({ serviceId, profileId });
           const directGroupTargets = groupSwitchTargetsByBindingKey.get(bindingKey) ?? [];
@@ -4302,12 +4486,16 @@ export class ConnectedServiceQuotasCoordinator {
           });
           const existing = await this.readExistingQuotaSnapshot({ accountMode, serviceId, profileId });
           const scheduledRefreshes = this.listScheduledCurrentSourceRefreshesForBinding({ serviceId, profileId });
+          completeScheduledRefresh = scheduledRefreshes.length > 0
+            ? () => this.clearScheduledCurrentSourceRefreshes(scheduledRefreshes) : undefined;
           const forcedRefresh = this.shouldForceQuotaRefresh(existing.existing, existing.preopenedSnapshot)
             || scheduledRefreshes.length > 0;
+          recordsRefreshOutcome = forcedRefresh;
+          failureStorageMode = existing.storageMode;
 
           const failureState = this.failureStateByBindingKey.get(bindingKey);
           const quotaFresh = fetcher && this.isExistingQuotaSnapshotFresh({ existing: existing.existing, preopenedSnapshot: existing.preopenedSnapshot, now, fetcher, forcedRefresh });
-          const quotaDue = fetcher && !quotaFresh && !(failureState && now < failureState.nextAllowedAt);
+          const quotaDue = fetcher && !quotaFresh && (forcedRefresh || !(failureState && now < failureState.nextAllowedAt));
           const storedSubscription = this.accountUsageStore?.resolveBySource({ serviceId, profileId, bindingKind: 'profile' })?.subscription;
           const previousSubscription = storedSubscription ?? this.openExistingQuotaSnapshot({ storageMode: existing.storageMode,
             serviceId, profileId, existing: existing.existing, preopenedSnapshot: existing.preopenedSnapshot })?.subscription;
@@ -4352,19 +4540,20 @@ export class ConnectedServiceQuotasCoordinator {
               leaseUntil: lease.leaseUntil,
             });
             if (observedSnapshot) {
-              this.recordRuntimeProfileSnapshot({ serviceId, profileId, snapshot: observedSnapshot });
+              this.recordRuntimeProfileSnapshot({ serviceId, profileId, snapshot: observedSnapshot.snapshot });
               await this.recordFetchedQuotaSnapshotAsAccountUsage({
                 serviceId,
                 profileId,
-                snapshot: observedSnapshot,
+                snapshot: observedSnapshot.snapshot,
+                sourceProviderAccountId: observedSnapshot.sourceProviderAccountId,
                 now,
                 accountMode,
                 groupContexts,
                 groupTargets: directGroupTargets,
+                onPersistenceAccepted: completeScheduledRefresh,
               });
               pendingSoftSwitchTargets.push(...directGroupTargets);
               this.failureStateByBindingKey.delete(bindingKey);
-              this.clearScheduledCurrentSourceRefreshes(scheduledRefreshes);
             }
             continue;
           }
@@ -4377,6 +4566,8 @@ export class ConnectedServiceQuotasCoordinator {
           expectedCredentialRevision = credential.credentialRevision;
           const record = credential.record;
           if (!record) continue;
+          failureCredential = record;
+          failureStorageMode = credential.storageMode;
 
           if (subscriptionDue && subscriptionFetcher) {
             subscriptionWork = this.refreshSubscription({ fetcher: subscriptionFetcher, serviceId, profileId, record, now,
@@ -4384,22 +4575,30 @@ export class ConnectedServiceQuotasCoordinator {
           }
           if (!quotaDue || !fetcher) continue;
 
+          quotaAttemptStarted = true;
           const raced = await this.fetchQuotaSnapshot({
             fetcher,
             serviceId,
             profileId,
             record,
-            now,
+            credentialRevision: credential.credentialRevision,
+            force: forcedRefresh,
           });
           if (raced.type === 'timeout') {
-            // Best-effort only: ignore late results. The AbortController should be enough for well-behaved fetchers.
-            continue;
+            if (!forcedRefresh) continue;
+            throw new ConnectedServiceQuotaFetchError('Quota refresh timed out', { quotaFetchErrorCode: 'network' });
           }
 
           const snapshot = raced.snapshot;
-          if (!snapshot) continue;
+          if (!snapshot) {
+            if (!forcedRefresh) continue;
+            throw new ConnectedServiceQuotaFetchError('Quota refresh returned no observation', { quotaFetchErrorCode: 'malformed' });
+          }
 
           if (staleSnapshotForFallback && isQuotaUnknownFallbackSnapshot(snapshot)) {
+            if (forcedRefresh) {
+              throw new ConnectedServiceQuotaFetchError('Quota refresh returned no provider observation', { quotaFetchErrorCode: 'malformed' });
+            }
             this.recordRuntimeProfileSnapshot({
               serviceId,
               profileId,
@@ -4421,11 +4620,11 @@ export class ConnectedServiceQuotasCoordinator {
             sourceProviderAccountId: readCredentialAccountIdentity(record)?.providerAccountId ?? null,
             groupContexts,
             groupTargets: directGroupTargets,
+            onPersistenceAccepted: completeScheduledRefresh,
           });
           pendingSoftSwitchTargets.push(...directGroupTargets);
           void recordedAccountUsage;
           this.failureStateByBindingKey.delete(bindingKey);
-          this.clearScheduledCurrentSourceRefreshes(scheduledRefreshes);
         } catch (error) {
           const bindingKey = this.makeBindingKey({ serviceId, profileId });
           const credentialHealthStatus = await this.persistCredentialHealthForQuotaFailure({
@@ -4434,25 +4633,60 @@ export class ConnectedServiceQuotasCoordinator {
             expectedCredentialRevision,
             error,
             now,
-          }).catch(() => null);
+          }).catch(() => {
+            logger.infoFile('[ConnectedServices] Quota credential health persistence unavailable', { serviceId, profileId });
+            return null;
+          });
           if (credentialHealthStatus === 'needs_reauth') {
             profileHealthByProfileId.set(profileId, 'needs_reauth');
           }
-          this.applyFailureBackoff({
-            now,
-            key: bindingKey,
-            retryAfterMs: readQuotaRetryAfterMs(error),
-            retryAfterBackoffMinMs: fetcher?.pollPolicy?.retryAfterBackoffMinMs,
-          });
-          // X8: keep last-known quota in the runtime store with stale_quota annotation
-          // so the UI can display "stale data" rather than showing nothing.
-          if (staleSnapshotForFallback) {
-            this.recordRuntimeProfileSnapshot({
-              serviceId,
-              profileId,
-              snapshot: annotateSnapshotAsStale(staleSnapshotForFallback),
-              verifiedCredentialFingerprint: staleSnapshotVerifiedCredentialFingerprint,
+          if ((this.failureStateByBindingKey.get(bindingKey)?.nextAllowedAt ?? 0) <= this.now()) {
+            this.applyFailureBackoff({
+              now,
+              key: bindingKey,
+              retryAfterMs: readQuotaRetryAfterMs(error),
+              retryAfterBackoffMinMs: fetcher?.pollPolicy?.retryAfterBackoffMinMs,
             });
+          }
+          // Failure completes the attempt, never the provider observation. The same
+          // PAU owner publishes old meters and empty first-read failures alike.
+          const code = error instanceof ConnectedServiceQuotaFetchError ? error.quotaFetchErrorCode : 'network';
+          const status = error instanceof ConnectedServiceQuotaFetchError ? error.status : null;
+          logger.infoFile('[ConnectedServices] Quota refresh unavailable', { serviceId, profileId, code, status });
+          if (quotaAttemptStarted && recordsRefreshOutcome && failureCredential && failureStorageMode !== null) {
+            const identity = readCredentialAccountIdentity(failureCredential);
+            const failureAt = Math.max(0, Math.trunc(this.now()));
+            const retryAt = this.failureStateByBindingKey.get(bindingKey)?.nextAllowedAt;
+            const failureSnapshot: ConnectedServiceQuotaSnapshotV1 = staleSnapshotForFallback ?? {
+              v: 1, serviceId, profileId, fetchedAt: 0,
+              staleAfterMs: Math.max(1, this.quotaLifecycleFreshnessMs),
+              planLabel: null, accountLabel: identity?.accountLabel ?? null,
+              ...(identity?.providerAccountId ? { activeAccountId: identity.providerAccountId } : {}),
+              ...(identity?.providerOrganizationId ? { providerOrganizationId: identity.providerOrganizationId } : {}),
+              meters: [],
+            };
+            // Runtime fallback is presentation only; persistence owns the error state.
+            this.recordRuntimeProfileSnapshot({ serviceId, profileId,
+              snapshot: annotateSnapshotAsStale(failureSnapshot),
+              verifiedCredentialFingerprint: staleSnapshotVerifiedCredentialFingerprint });
+            try {
+              await this.recordFetchedQuotaSnapshotAsAccountUsage({
+                serviceId, profileId, snapshot: failureSnapshot, now: failureAt,
+                accountMode: failureStorageMode,
+                sourceProviderAccountId: identity?.providerAccountId ?? null,
+                refreshError: { kind: 'provider_http', code, observedAtMs: failureAt,
+                  ...(status !== null ? { status } : {}),
+                  ...(retryAt !== undefined ? { headers: { 'retry-after': new Date(retryAt).toUTCString() } } : {}),
+                },
+                onPersistenceAccepted: completeScheduledRefresh,
+              });
+            } catch {
+              logger.infoFile('[ConnectedServices] Quota refresh outcome persistence unavailable', { serviceId, profileId });
+            }
+          } else if (staleSnapshotForFallback) {
+            this.recordRuntimeProfileSnapshot({ serviceId, profileId,
+              snapshot: annotateSnapshotAsStale(staleSnapshotForFallback),
+              verifiedCredentialFingerprint: staleSnapshotVerifiedCredentialFingerprint });
           }
           // Best-effort only.
           continue;

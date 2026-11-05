@@ -41,7 +41,7 @@ export async function extractSDKMetadata(options?: Readonly<{ claudeCodeIncludeI
         }
 
         // Run SDK with minimal tools allowed
-        const sdkQuery = query({
+        const sdkQuery = await query({
             prompt: 'hello',
             options: {
                 maxTurns: 1,

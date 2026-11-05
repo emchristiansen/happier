@@ -48,6 +48,24 @@ async function fixture(items: readonly unknown[] | null) {
 }
 
 describe('Codex native paginated direct history (0.162.1 contract)', () => {
+  it('imports native reasoning as thinking between the user and answer, without exposing encrypted content', async () => {
+    const f = await fixture([message('u1', 'question', 'user'),
+      { turnId: 'turn-a1', startedAtMs: 1_000, completedAtMs: 2_000,
+        item: { id: 'r1', type: 'reasoning', content: [], summary: ['Check the boundary', 'Then verify'], encrypted_content: 'opaque-private-reasoning' } },
+      { turnId: 'turn-a1', startedAtMs: 1_000, completedAtMs: 2_000,
+        item: { id: 'r2', type: 'reasoning', content: [], summary: [], encrypted_content: 'opaque-private-reasoning' } },
+      message('a1', 'answer', 'agent')]);
+    const items = await loadDirectSessionTranscriptItems({ readPage: cursor => pageCodexTranscript({
+      ...f.params, maxItems: 1, direction: 'older', cursor,
+    }) });
+    expect(items.map(item => item.raw)).toMatchObject([
+      { role: 'user', content: { type: 'text', text: 'question' } },
+      { role: 'agent', content: { type: 'codex', data: { type: 'thinking', text: 'Check the boundary\n\nThen verify' } } },
+      { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'answer' } } },
+    ]);
+    expect(JSON.stringify(items)).not.toContain('opaque-private-reasoning');
+  });
+
   it('imports every native history page instead of importing the list preview, without resuming the thread', async () => {
     const f = await fixture([message('u1', 'question one', 'user'), message('a1', 'answer one', 'agent'),
       message('u2', 'question two', 'user'), message('a2', 'answer two', 'agent')]);
@@ -95,6 +113,30 @@ describe('Codex native paginated direct history (0.162.1 contract)', () => {
     expect(items.map(item => (item.raw.content as { data: { type: string } }).data.type)).toEqual(['tool-call', 'tool-call-result']);
     expect(new Set(items.map(item => item.id)).size).toBe(2);
     expect(items[1]?.raw).toMatchObject({ content: { data: { output: { stdout: '/project', exitCode: 0 } } } });
+  });
+
+  it('imports native web searches, image views, and sleeps as tool rows', async () => {
+    const results = [{ type: 'text_result', ref_id: 'turn0search0', title: 'Fusion benchmark', url: 'https://example.invalid/bench',
+      domain: 'example.invalid', snippet: 'Fused kernels compared.' }];
+    const tool = (item: Record<string, unknown>) => ({ turnId: 'turn-a1', startedAtMs: 1_000, completedAtMs: 2_000, item });
+    const f = await fixture([message('u1', 'compare fused kernels', 'user'),
+      tool({ id: 'search-1', type: 'webSearch', query: 'fused kernels', action: { type: 'search', query: 'fused kernels', queries: null }, results }),
+      tool({ id: 'view-1', type: 'imageView', path: '/project/plot.png' }),
+      tool({ id: 'sleep-1', type: 'sleep', durationMs: 30_000 }),
+      message('a1', 'answer', 'agent')]);
+    const items = await loadDirectSessionTranscriptItems({ readPage: cursor => pageCodexTranscript({
+      ...f.params, direction: 'older', cursor,
+    }) });
+    expect(items.map(item => item.raw.content)).toMatchObject([
+      { type: 'text', text: 'compare fused kernels' },
+      { data: { type: 'tool-call', name: 'WebSearch', input: { query: 'fused kernels' } } },
+      { data: { type: 'tool-call-result', output: { results } } },
+      { data: { type: 'tool-call', name: 'view_image', input: { path: '/project/plot.png' } } },
+      { data: { type: 'tool-call-result' } },
+      { data: { type: 'tool-call', name: 'sleep', input: { durationMs: 30_000 } } },
+      { data: { type: 'tool-call-result' } },
+      { data: { type: 'message', message: 'answer' } },
+    ]);
   });
 
   it('rejects native mixed media instead of importing only its text as complete history', async () => {

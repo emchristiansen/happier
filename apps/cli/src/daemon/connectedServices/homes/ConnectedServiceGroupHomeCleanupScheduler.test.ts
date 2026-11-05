@@ -1,7 +1,8 @@
+import { deleteClaudeCodeMacOsKeychainCredential } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeMacOsKeychain';
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import { buildDefaultConnectedServiceCredentialLifecycleDescriptor } from '../credentials/lifecycleTypes';
@@ -9,7 +10,76 @@ import { ConnectedServiceGroupHomeCleanupScheduler } from './ConnectedServiceGro
 import { resolveConnectedServiceGroupHomeDir } from './resolveConnectedServiceHomeDir';
 import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
 
+vi.mock('@/backends/claude/connectedServices/nativeAuth/claudeCodeMacOsKeychain', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/backends/claude/connectedServices/nativeAuth/claudeCodeMacOsKeychain')>(),
+  deleteClaudeCodeMacOsKeychainCredential: vi.fn(async () => {}),
+}));
+
 describe('ConnectedServiceGroupHomeCleanupScheduler', () => {
+  it('retains history in expired group quarantine while removing only credentials', async () => {
+    const root = await createTempDir('happier-retained-group-history-');
+    try {
+      const home = resolveConnectedServiceGroupHomeDir({
+        activeServerDir: root, serviceId: 'openai-codex', groupId: 'deleted', agentId: 'codex',
+      });
+      await mkdir(join(home, 'codex-home', 'sessions'), { recursive: true });
+      await writeFile(join(home, 'codex-home', 'sessions', 'session.jsonl'), 'distinct deleted-group history\n');
+      await writeFile(join(home, 'codex-home', 'auth.json'), 'synthetic group credential');
+      const scheduler = new ConnectedServiceGroupHomeCleanupScheduler({
+        activeServerDir: root, hasLiveTarget: () => false, nowMs: () => 100_000,
+        quarantineTtlMs: 0,
+      });
+      await scheduler.scheduleDeletedGroupCleanup({
+        serviceId: 'openai-codex', groupId: 'deleted', agentId: 'codex',
+      });
+      // Reconstruct the scheduler to exercise startup against an existing quarantine.
+      await new ConnectedServiceGroupHomeCleanupScheduler({
+        activeServerDir: root, hasLiveTarget: () => false, nowMs: () => 200_000,
+        quarantineTtlMs: 0,
+      }).reconcileDeletedGroupHomes({});
+      const quarantine = join(root, 'daemon', 'connected-services', 'homes', 'openai-codex', '__groups', 'deleted', '.quarantine');
+      const entries = await readdir(quarantine);
+      expect(entries).toHaveLength(1);
+      const retained = join(quarantine, entries[0], 'codex-home');
+      await expect(readFile(join(retained, 'sessions', 'session.jsonl'), 'utf8')).resolves.toBe('distinct deleted-group history\n');
+      await expect(stat(join(retained, 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await removeTempDir(root);
+    }
+  });
+
+  it('revokes the original Claude Keychain identity before rename without touching a recreated live group', async () => {
+    const root = await createTempDir('happier-retained-claude-group-');
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const deletion = vi.mocked(deleteClaudeCodeMacOsKeychainCredential);
+    deletion.mockClear();
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    try {
+      const home = resolveConnectedServiceGroupHomeDir({ activeServerDir: root, serviceId: 'claude-subscription', groupId: 'pool', agentId: 'claude' });
+      await mkdir(join(home, 'claude-config', 'projects'), { recursive: true });
+      await writeFile(join(home, 'claude-config', 'projects', 'session.jsonl'), 'old group history\n');
+      await writeFile(join(home, 'claude-config', '.credentials.json'), 'old synthetic credential');
+      let live = false;
+      const scheduler = new ConnectedServiceGroupHomeCleanupScheduler({
+        activeServerDir: root, hasLiveTarget: () => live, nowMs: () => 100_000, quarantineTtlMs: 0,
+      });
+      await scheduler.scheduleDeletedGroupCleanup({ serviceId: 'claude-subscription', groupId: 'pool', agentId: 'claude' });
+      expect(deletion).toHaveBeenCalledExactlyOnceWith({ claudeConfigDir: join(home, 'claude-config') });
+      await mkdir(join(home, 'claude-config'), { recursive: true });
+      await writeFile(join(home, 'claude-config', '.credentials.json'), 'current synthetic credential');
+      live = true;
+      await scheduler.reconcileDeletedGroupHomes({ groupExists: async () => true });
+      expect(deletion).toHaveBeenCalledTimes(1);
+      expect(await readFile(join(home, 'claude-config', '.credentials.json'), 'utf8')).toBe('current synthetic credential');
+      const retired = join(home, '..', '.quarantine', '100000-claude', 'claude-config');
+      expect(await readFile(join(retired, 'projects', 'session.jsonl'), 'utf8')).toBe('old group history\n');
+      await expect(stat(join(retired, '.credentials.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+      await removeTempDir(root);
+    }
+  });
+
   it('keeps a live execution Run pool home until its canonical runtime registration releases', async () => {
     const root = await createTempDir('happier-group-home-live-run-');
     try {
@@ -87,7 +157,7 @@ describe('ConnectedServiceGroupHomeCleanupScheduler', () => {
     }
   });
 
-  it('deletes quarantined Claude keychain credentials only when purging expired quarantine homes', async () => {
+  it('revokes Claude credentials at the original group path before quarantine and retains expired history', async () => {
     const root = await createTempDir('happier-connected-service-group-home-claude-keychain-cleanup-');
     try {
       const home = resolveConnectedServiceGroupHomeDir({
@@ -122,14 +192,15 @@ describe('ConnectedServiceGroupHomeCleanupScheduler', () => {
         groupId: 'main',
         agentId: 'claude',
       })).resolves.toMatchObject({ cleaned: true });
-      expect(deletedClaudeConfigDirs).toEqual([]);
+      expect(deletedClaudeConfigDirs).toEqual([join(home, 'claude-config')]);
 
       await expect(scheduler.reconcileDeletedGroupHomes({})).resolves.toEqual([]);
       const quarantineRoot = join(root, 'daemon', 'connected-services', 'homes', 'anthropic', '__groups', 'main', '.quarantine');
       expect(deletedClaudeConfigDirs).toEqual([
+        join(home, 'claude-config'),
         join(quarantineRoot, '100000-claude', 'claude-config'),
       ]);
-      await expect(readdir(quarantineRoot)).resolves.toEqual([]);
+      await expect(readdir(quarantineRoot)).resolves.toEqual(['100000-claude']);
     } finally {
       await removeTempDir(root);
     }

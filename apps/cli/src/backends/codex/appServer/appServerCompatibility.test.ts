@@ -5,7 +5,6 @@ import {
     createCodexAppServerRpcError,
     isCodexAppServerExperimentalApiUnavailableError,
     isCodexAppServerInvalidRequestForMethodError,
-    isCodexAppServerInvalidRequestMapExpectedStringError,
     isCodexAppServerInvalidParamsError,
     isCodexAppServerMethodNotFoundError,
     isCodexAppServerNoActiveTurnToSteerError,
@@ -81,9 +80,4 @@ describe('appServerCompatibility', () => {
         expect(isCodexAppServerInvalidRequestForMethodError({ code: -32600, method: 'thread/goal/get' }, 'thread/goal/set')).toBe(false);
     });
 
-    it('detects legacy app-server map/string permission-profile shape errors narrowly', () => {
-        expect(isCodexAppServerInvalidRequestMapExpectedStringError(makeError('Invalid request: invalid type: map, expected a string', -32600))).toBe(true);
-        expect(isCodexAppServerInvalidRequestMapExpectedStringError(makeError('Invalid request: invalid type: map, expected a string', -32602))).toBe(false);
-        expect(isCodexAppServerInvalidRequestMapExpectedStringError(makeError('Invalid request: invalid type: array, expected a string', -32600))).toBe(false);
-    });
 });

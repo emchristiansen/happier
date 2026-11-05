@@ -18,6 +18,7 @@ import {
 } from '@/sync/runtime/connectivity/authErrors';
 
 import { parsePlainSessionAgentState, parsePlainSessionMetadata } from './parsePlainSessionPayload';
+import { nextRollbackEligibilityObservation } from '@/sync/domains/sessionRollback/rollbackEligibilityObservation';
 import { resolveSessionRuntimeActivityProjectionFields } from './sessionRuntimeActivityProjection';
 import {
   looksLikeCurrentV2SessionNotFound404,
@@ -43,6 +44,8 @@ type SessionByIdHttpRead = Readonly<{
   ok: boolean;
   status: number;
   body: unknown;
+  /** Taken when the shared HTTP request started; coalesced callers receive the same value. */
+  rollbackEligibilityObservedAt: number;
 }>;
 
 const sessionByIdHttpReadsByRequest = new WeakMap<SessionByIdRequest, Map<string, Promise<SessionByIdHttpRead>>>();
@@ -93,6 +96,7 @@ async function readSessionByIdHttp(params: Readonly<{
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timeoutId = controller ? setTimeout(() => controller.abort(), Math.max(1, timeoutMs)) : null;
     try {
+      const rollbackEligibilityObservedAt = nextRollbackEligibilityObservation();
       const response = await params.request(`/v2/sessions/${encodeURIComponent(params.sessionId)}`, {
         method: 'GET',
         headers: {
@@ -107,6 +111,7 @@ async function readSessionByIdHttp(params: Readonly<{
         ok: response.ok,
         status: response.status,
         body,
+        rollbackEligibilityObservedAt,
       };
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
@@ -200,6 +205,7 @@ export async function fetchAndApplySessionById(params: Readonly<{
   let responseOk = false;
   let responseStatus = 0;
   let body: unknown = null;
+  let rowObservedAt: number | undefined;
   try {
     const response = await readSessionByIdHttp({
       sessionId,
@@ -211,6 +217,7 @@ export async function fetchAndApplySessionById(params: Readonly<{
     responseOk = response.ok;
     responseStatus = response.status;
     body = response.body;
+    rowObservedAt = response.rollbackEligibilityObservedAt;
   } catch (err) {
     if (isTerminalAuthError(err)) {
       throw err;
@@ -227,27 +234,27 @@ export async function fetchAndApplySessionById(params: Readonly<{
       if (looksLikeCurrentV2SessionNotFound404(body)) {
         return { ok: false, session: null, errorCode: 'not_found', httpStatus: 404 };
       }
-      if (looksLikeMissingV2SessionRoute404(body, sessionId)) {
-        const fallbackRow = await scanSessionByIdFromCompatList({
-          request: params.request,
-          token: params.credentials.token,
-          sessionId,
-        });
-        if (!fallbackRow) {
-          return { ok: false, session: null, errorCode: 'not_found', httpStatus: 404 };
-        }
-        body = { session: fallbackRow };
-      }
     }
-
-    if (body === null) {
-      const status = responseStatus;
-      const errorCode =
-        status === 404 ? 'not_found'
-          : status === 401 ? 'unauthorized'
-              : status === 403 ? 'forbidden'
-                  : 'http_error';
-      return { ok: false, session: null, errorCode, httpStatus: status };
+    if (responseStatus === 404 && looksLikeMissingV2SessionRoute404(body, sessionId)) {
+      rowObservedAt = nextRollbackEligibilityObservation();
+      const fallbackRow = await scanSessionByIdFromCompatList({
+        request: params.request,
+        token: params.credentials.token,
+        sessionId,
+      });
+      if (!fallbackRow) {
+        return { ok: false, session: null, errorCode: 'not_found', httpStatus: 404 };
+      }
+      body = { session: fallbackRow };
+    } else {
+      // Only a recognized missing legacy route can borrow list transport. An explicit failed exact
+      // read remains a failure even if its JSON resembles a row or a subsequent list could find it.
+      return {
+        ok: false,
+        session: null,
+        errorCode: 'http_error',
+        httpStatus: responseStatus,
+      };
     }
   }
 
@@ -326,6 +333,7 @@ export async function fetchAndApplySessionById(params: Readonly<{
 
   const accessLevel = row.share?.accessLevel;
   const normalizedAccessLevel = accessLevel === 'view' || accessLevel === 'edit' || accessLevel === 'admin' ? accessLevel : undefined;
+  const turnsObservedAt = nextRollbackEligibilityObservation();
   const sessionTurns = params.includeTurnsProjection === false
     ? null
     : await fetchSessionTurnsProjection({
@@ -334,9 +342,14 @@ export async function fetchAndApplySessionById(params: Readonly<{
       request: params.request,
       log: params.log,
     });
+  // The fetched turns projection wins; without it, the exact-read row's own (compat-validated)
+  // starts are the eligibility evidence. Absent on both stays `undefined` (not carried). Each is
+  // ordered by when its request started, so a row read that began before a newer delivered
+  // update (possibly shared with an earlier caller) cannot replace that update's eligibility.
   const rollbackEligibleTurnStarts = sessionTurns
     ? listRollbackEligibleTurnStarts(sessionTurns)
-    : undefined;
+    : row.rollbackEligibleTurnStarts;
+  const rollbackEligibilityObservedAt = sessionTurns ? turnsObservedAt : rowObservedAt;
 
   const runtimeActivityProjection = resolveSessionRuntimeActivityProjectionFields({}, row);
   const nextSession = {
@@ -350,8 +363,9 @@ export async function fetchAndApplySessionById(params: Readonly<{
     agentState,
     accessLevel: normalizedAccessLevel,
     canApprovePermissions: row.share?.canApprovePermissions ?? undefined,
-    ...(sessionTurns ? { sessionTurns } : {}),
+    ...(sessionTurns ? { sessionTurns, sessionTurnsObservedAt: turnsObservedAt } : {}),
     rollbackEligibleTurnStarts: rollbackEligibleTurnStarts ? [...rollbackEligibleTurnStarts] : undefined,
+    rollbackEligibilityObservedAt,
   };
 
   const previousSession = params.getExistingSession?.(sessionId);

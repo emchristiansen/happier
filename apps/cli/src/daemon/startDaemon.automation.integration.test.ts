@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { join } from 'node:path';
 
 import type { Metadata } from '@/api/types';
+import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
+import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
+import { createApiSessionSocketStub } from '@/testkit/backends/apiSessionSocketHarness';
+import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
+import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import packageJson from '../../package.json';
 import type {
   ConnectedServiceAuthGroupApi,
@@ -12,7 +18,6 @@ import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from './connectedService
 import { DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1 } from './connectedServices/accountGroups/selection/selectConnectedServiceAuthGroupCandidate';
 import type { TrackedSession } from './types';
 import { PI_BROKER_SELECTION_IDENTITY_ENV } from '@/backends/pi/brokerExtension';
-import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
 
 type ShutdownSource = 'happier-app' | 'happier-cli' | 'os-signal' | 'exception';
 type BuildHappyCliSubprocessLaunchSpec = typeof import('@/utils/spawnHappyCLI').buildHappyCliSubprocessLaunchSpec;
@@ -43,6 +48,18 @@ vi.mock('node:child_process', async (importOriginal) => {
     execFileSync: refuseUnexpectedProcess,
     fork: refuseUnexpectedProcess,
   };
+});
+
+// Synthetic fixture PIDs must not reach the processInstance `ps` probe refused above,
+// nor read a coincidentally live host process's identity.
+vi.mock('@happier-dev/cli-common/processInstance', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@happier-dev/cli-common/processInstance')>(),
+  readProcessInstanceFingerprintSync: () => null,
+}));
+
+vi.mock('socket.io-client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('socket.io-client')>();
+  return { ...actual, io: vi.fn(actual.io) };
 });
 
 const automationCredentials = {
@@ -89,6 +106,70 @@ function createDeferred<T>(): {
   return { promise, resolve, reject };
 }
 
+async function useActualSessionAttachContext(): Promise<() => void> {
+  const module = await import('./sessionEncryption/resolveExistingSessionAttachContext');
+  const actual = await vi.importActual<typeof module>('./sessionEncryption/resolveExistingSessionAttachContext');
+  const previous = vi.mocked(module.resolveExistingSessionAttachContext).getMockImplementation();
+  vi.mocked(module.resolveExistingSessionAttachContext).mockImplementation(actual.resolveExistingSessionAttachContext);
+  return () => {
+    if (previous) vi.mocked(module.resolveExistingSessionAttachContext).mockImplementation(previous);
+    else vi.mocked(module.resolveExistingSessionAttachContext).mockReset();
+  };
+}
+
+async function installConnectedServiceSessionPersistenceFixture() {
+  const { fetchSessionById } = await import('@/session/transport/http/sessionsHttp');
+  const socketIo = await import('socket.io-client');
+  const sessions = new Map<string, ReturnType<typeof createSessionRecordFixture>>();
+  const getSession = (sessionId: string) => {
+    let session = sessions.get(sessionId);
+    if (!session) {
+      session = createSessionRecordFixture({
+        id: sessionId, active: true, activeAt: 1,
+        encryptionMode: 'e2ee',
+        metadata: encodeBase64(encrypt(automationCredentials.encryption.secret, 'legacy', createTestMetadata({
+          connectedServices: {
+            v: 1,
+            bindingsByServiceId: {
+              'claude-subscription': {
+                source: 'connected', selection: 'group', groupId: 'team', profileId: 'claude-primary',
+              },
+            },
+          },
+        })), 'base64'),
+      });
+      sessions.set(sessionId, session);
+    }
+    return session;
+  };
+  vi.mocked(fetchSessionById).mockImplementation(async ({ sessionId }) => getSession(sessionId));
+  // Socket.IO and HTTP are network boundaries; keep the metadata updater and encryption real.
+  vi.mocked(socketIo.io).mockImplementation((_url, options) => {
+    const sessionId = options?.auth && typeof options.auth === 'object'
+      ? String(options.auth.sessionId) : '';
+    const socket = createApiSessionSocketStub({
+      emit: (event, args) => {
+        expect(event).toBe('update-metadata');
+        const [payload, callback] = args as [
+          { sid: string; expectedVersion: number; metadata: string },
+          (ack: unknown) => void,
+        ];
+        const session = getSession(sessionId);
+        expect(payload.sid).toBe(sessionId);
+        expect(payload.expectedVersion).toBe(session.metadataVersion);
+        session.metadata = payload.metadata;
+        session.metadataVersion += 1;
+        callback({ result: 'success', version: session.metadataVersion, metadata: session.metadata });
+      },
+    });
+    // The canonical boundary stub implements the Socket methods this path consumes.
+    return socket as unknown as ReturnType<typeof socketIo.io>;
+  });
+  return (sessionId: string): unknown => decrypt(
+    automationCredentials.encryption.secret, 'legacy', decodeBase64(getSession(sessionId).metadata, 'base64'),
+  );
+}
+
 function restoreProcessEnvValue(name: string, value: string | undefined): void {
   if (value === undefined) {
     delete process.env[name];
@@ -98,6 +179,9 @@ function restoreProcessEnvValue(name: string, value: string | undefined): void {
 }
 
 async function resetAutomationDaemonTestDefaults(): Promise<void> {
+  const socketIo = await import('socket.io-client');
+  const actualSocketIo = await vi.importActual<typeof socketIo>('socket.io-client');
+  vi.mocked(socketIo.io).mockReset().mockImplementation(actualSocketIo.io);
   harness.setMachineSyncClientOverride(null);
   harness.axiosGet.mockReset().mockRejectedValue(new Error('Unexpected HTTP request in daemon automation test'));
   harness.readAccountChangesCursor.mockReset().mockResolvedValue(0);
@@ -380,11 +464,18 @@ vi.mock('@/api/machine/ensureMachineRegistered', () => ({
   })),
 }));
 
-vi.mock('@/session/transport/http/sessionsHttp', async (importOriginal) => ({
-  ...await importOriginal<typeof import('@/session/transport/http/sessionsHttp')>(),
-  fetchSessionById: vi.fn(async () => null),
-  fetchSessionsPage: vi.fn(async () => ({ sessions: [], nextCursor: null, hasNext: false })),
-}));
+vi.mock('@/session/transport/http/sessionsHttp', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/session/transport/http/sessionsHttp')>();
+  const fetchSessionById = vi.fn<typeof actual.fetchSessionById>(async () => null);
+  return {
+    ...actual,
+    // Both network entry points must observe the same server response. Keeping
+    // the compatibility wrapper real would retain its lexical, unmocked fetch.
+    fetchSessionById,
+    fetchSessionByIdCompat: fetchSessionById,
+    fetchSessionsPage: vi.fn(async () => ({ sessions: [], nextCursor: null, hasNext: false })),
+  };
+});
 
 vi.mock('@/ui/logger', () => ({
   logger: {
@@ -416,6 +507,7 @@ vi.mock('@/configuration', () => ({
     webappUrl: 'https://happier.dev',
     activeServerDir: '/tmp/server',
     daemonStateFile: '/tmp/server/daemon.state.json',
+    daemonReattachCatchUpConcurrency: 4,
     daemonSpawnExistingSessionWaitForExitMs: 5_000,
     daemonSpawnExistingSessionWaitForExitPollIntervalMs: 50,
   },
@@ -484,10 +576,12 @@ vi.mock('@/backends/catalog', async (importOriginal) => ({
   notifyTerminalAttachmentRetiredThroughCatalog: vi.fn(async () => {}),
 }));
 
-vi.mock('@/persistence', () => {
+vi.mock('@/persistence', async (importOriginal) => {
+  const { requireEncryptionCredentials } = await importOriginal<typeof import('@/persistence')>();
   const writeDaemonState = vi.fn();
   const clearDaemonState = vi.fn(async () => true);
   return {
+    requireEncryptionCredentials,
     clearDaemonState,
     writeDaemonState,
     writeDaemonStateIfLockOwned: vi.fn((state: unknown) => {
@@ -557,7 +651,8 @@ vi.mock('@/daemon/ownership/daemonServiceInventory', () => ({
   evaluateDaemonStartupServiceConflict: vi.fn(async () => ({ kind: 'none' })),
 }));
 
-vi.mock('./controlServer', () => ({
+vi.mock('./controlServer', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./controlServer')>(),
   startDaemonControlServer: vi.fn(async (params: unknown) => {
     harness.setDaemonControlServerParams(params);
     return {
@@ -1047,6 +1142,114 @@ describe('startDaemon automation wiring (integration)', () => {
     vi.restoreAllMocks();
     harness.setAutoShutdownAfterAutomationStart(true);
     harness.resetDaemonListeners();
+  });
+
+  it('drains a stranded runtime-auth report through source authorization after publishing daemon state', async () => {
+    const restoreAttachContext = await useActualSessionAttachContext();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    harness.setAutoShutdownAfterAutomationStart(false);
+    const activeServerDir = await createTempDir('happier-daemon-startup-report-outbox-');
+    const { configuration } = await import('@/configuration');
+    const previousActiveServerDir = configuration.activeServerDir;
+    Object.assign(configuration, { activeServerDir });
+    const { enqueueRuntimeAuthFailureReportOutboxItem, readRuntimeAuthFailureReportOutboxItems } = await import(
+      './connectedServices/runtimeAuth/reportOutbox/runtimeAuthFailureReportOutbox'
+    );
+    const outboxDir = join(activeServerDir, 'connected-service-runtime-auth-report-outbox');
+    let run: Promise<void> | undefined;
+    try {
+      await enqueueRuntimeAuthFailureReportOutboxItem({
+        outboxDir,
+        report: {
+          reportId: 'runtime-auth-report:stranded-at-restart',
+          sessionId: 'stranded-stopped-session', switchesThisTurn: 0,
+          classification: {
+            kind: 'usage_limit', serviceId: 'openai-codex', profileId: null, groupId: null,
+            resetsAtMs: null, planType: null, rateLimits: null, source: 'structured_provider_error',
+          },
+        },
+      });
+      const { writeDaemonState } = await import('@/persistence');
+      const stateWritten = createDeferred<void>();
+      vi.mocked(writeDaemonState).mockImplementation(() => stateWritten.resolve(undefined));
+      const { fetchSessionById } = await import('@/session/transport/http/sessionsHttp');
+      // The missing session is a genuine HTTP boundary result. Startup must pass
+      // it through source authorization before retiring the stale report.
+      vi.mocked(fetchSessionById).mockImplementation(async () => {
+        expect(writeDaemonState).toHaveBeenCalled();
+        return null;
+      });
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      await stateWritten.promise;
+      await vi.waitFor(async () => {
+        expect(await readRuntimeAuthFailureReportOutboxItems({ outboxDir })).toEqual([]);
+      });
+      expect(fetchSessionById).toHaveBeenCalled();
+    } finally {
+      harness.requestShutdown('happier-cli');
+      await run;
+      Object.assign(configuration, { activeServerDir: previousActiveServerDir });
+      exitSpy.mockRestore();
+      restoreAttachContext();
+      await removeTempDir(activeServerDir);
+    }
+  });
+
+  it('arms a persisted waiting runtime-auth recovery after publishing daemon state', async () => {
+    const restoreAttachContext = await useActualSessionAttachContext();
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    harness.setAutoShutdownAfterAutomationStart(false);
+    const activeServerDir = await createTempDir('happier-daemon-startup-waiting-recovery-');
+    const { configuration } = await import('@/configuration');
+    const previousActiveServerDir = configuration.activeServerDir;
+    Object.assign(configuration, { activeServerDir });
+    let run: Promise<void> | undefined;
+    try {
+      const { createRuntimeAuthRecoverySchedulerForDaemon } = await import(
+        './connectedServices/runtimeAuth/createRuntimeAuthRecoverySchedulerForDaemon'
+      );
+      const previous = createRuntimeAuthRecoverySchedulerForDaemon({
+        activeServerDir, nowMs: () => Date.now() - 60_000,
+        recover: async () => ({ status: 'session_not_found' }),
+      });
+      await previous.scheduler.enqueueHandlerFailure({
+        sessionId: 'waiting-session-after-restart', switchesThisTurn: 0,
+        classification: {
+          kind: 'usage_limit', serviceId: 'openai-codex', profileId: null, groupId: null,
+          resetsAtMs: null, planType: null, rateLimits: null, source: 'structured_provider_error',
+        },
+        error: Object.assign(new Error('daemon unavailable'), { code: 'ECONNRESET' }),
+      });
+      await previous.scheduler.drainPendingVisibleEvents(async () => {});
+      previous.scheduler.dispose();
+      const { writeDaemonState } = await import('@/persistence');
+      const stateWritten = createDeferred<void>();
+      vi.mocked(writeDaemonState).mockImplementation(() => stateWritten.resolve(undefined));
+      const { fetchSessionById } = await import('@/session/transport/http/sessionsHttp');
+      vi.mocked(fetchSessionById).mockImplementation(async () => {
+        expect(writeDaemonState).toHaveBeenCalled();
+        return null;
+      });
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      await stateWritten.promise;
+      await vi.waitFor(() => expect(fetchSessionById).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'waiting-session-after-restart',
+      })));
+      // The timer owns asynchronous persistence after the lookup. Wait for its
+      // stale-session settlement before shutdown and removing the owned fixture.
+      const { createRecoveryIntentFileStore } = await import('./connectedServices/recoveryScheduler/recoveryIntentFileStore');
+      const store = createRecoveryIntentFileStore(join(activeServerDir, 'connected-services', 'runtime-auth-recovery.json'));
+      await vi.waitFor(() => expect(store.readAll?.()).toEqual([]));
+    } finally {
+      harness.requestShutdown('happier-cli');
+      await run;
+      Object.assign(configuration, { activeServerDir: previousActiveServerDir });
+      exitSpy.mockRestore();
+      restoreAttachContext();
+      await removeTempDir(activeServerDir);
+    }
   });
 
   async function startDaemonAndGetSpawnSessionHandler(): Promise<{
@@ -2403,7 +2606,7 @@ describe('startDaemon automation wiring (integration)', () => {
       },
     ],
     [
-      'fetches fresh truth for strict Claude startup after successful passive legacy reconciliation',
+      'fetches fresh truth for strict Claude startup after a revisionless passive projection',
       {
         passiveProfileId: 'lb_bat',
         passiveGeneration: 274,
@@ -2419,11 +2622,43 @@ describe('startDaemon automation wiring (integration)', () => {
     const pid = 7424;
     let run: Promise<void> | null = null;
     let app: Awaited<ReturnType<typeof createCapturedDaemonControlApp>> | null = null;
+    const activeServerDir = await createTempDir('happier-startup-legacy-availability-');
+    const { configuration } = await import('@/configuration');
+    const previousActiveServerDir = configuration.activeServerDir;
+    Object.assign(configuration, { activeServerDir });
     harness.setAutoShutdownAfterAutomationStart(false);
     harness.setActiveAccountSettingsSnapshot(sharedClaudeAccountSettingsSnapshot());
 
     try {
       const webhook = await installActualDaemonClaudeReadinessWebhook(pid);
+      const readPersistedMetadata = await installConnectedServiceSessionPersistenceFixture();
+      const { buildConnectedServiceCredentialRecord } = await import('@happier-dev/protocol');
+      const credentialRevision = 'csr_qMAFYPwqb7Ulai7se9UH-MHchuy3eVAkTXkJwxwv-lE';
+      const record = buildConnectedServiceCredentialRecord({
+        now: 1_000, serviceId: 'claude-subscription', profileId: 'lb_bat', kind: 'token',
+        token: { token: 'sk-ant-oat01-startup-legacy-placeholder', providerAccountId: null, providerEmail: null },
+      });
+      // Real pool servers resolve a digest for legacy rows even when a cached projection lacks it.
+      harness.getConnectedServiceCredentialPlain.mockResolvedValue({
+        revisionSemantics: 'revisioned', credentialRevision, content: { t: 'plain', v: record },
+      });
+      harness.getConnectedServiceAuthGroup.mockResolvedValue({
+        v: 1, serviceId: 'claude-subscription', groupId: 'team', displayName: null,
+        activeProfileId: 'lb_bat', generation: 274, runtimeStateRevision: 0,
+        policy: DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, state: { v: 1 },
+        members: [{ v: 1, serviceId: 'claude-subscription', groupId: 'team', profileId: 'lb_bat',
+          enabled: true, priority: 1, state: { v: 1 }, createdAt: 1, updatedAt: 1 }],
+        createdAt: 1, updatedAt: 1,
+      });
+      // Keep the shared materializer and verifier real, not synthetic adoption proof.
+      const actualApply = await vi.importActual<typeof import('@/backends/claude/connectedServices/applyClaudeSharedGroupGenerationApplication')>(
+        '@/backends/claude/connectedServices/applyClaudeSharedGroupGenerationApplication',
+      );
+      const actualVerify = await vi.importActual<typeof import('@/backends/claude/connectedServices/verifyClaudeSharedGroupGenerationApplication')>(
+        '@/backends/claude/connectedServices/verifyClaudeSharedGroupGenerationApplication',
+      );
+      harness.applyClaudeSharedGroupGenerationApplication.mockImplementation(actualApply.applyClaudeSharedGroupGenerationApplication);
+      harness.verifyClaudeSharedGroupGenerationApplication.mockImplementation(actualVerify.verifyClaudeSharedGroupGenerationApplication);
       const tracked = createDaemonGroupBoundClaudeTrackedSession(pid);
       if (!tracked.spawnOptions) throw new Error('Expected Claude spawn options');
       tracked.spawnOptions = {
@@ -2465,11 +2700,11 @@ describe('startDaemon automation wiring (integration)', () => {
             memberProfileIds: ['lb_bat'],
           }],
         }],
-        // Released v0.2.1 credentials predate revision fencing.
+        // The projection can lack the row revision; credential reads still return the server digest.
         connectedServiceCredentialRevisionsV1: [],
       } as unknown as Awaited<ReturnType<typeof fetchAccountProfile>>);
       const { callSessionRpc } = await import('@/session/transport/rpc/sessionRpc');
-      vi.mocked(callSessionRpc).mockReset();
+      vi.mocked(callSessionRpc).mockReset().mockResolvedValue({ ok: true, appliedVia: 'current_truth_fence' });
 
       const { startDaemon } = await import('./startDaemon');
       run = startDaemon();
@@ -2518,9 +2753,16 @@ describe('startDaemon automation wiring (integration)', () => {
       });
 
       expect(fetchAccountProfile).toHaveBeenCalled();
-      expect(harness.applyClaudeSharedGroupGenerationApplication).not.toHaveBeenCalled();
+      expect(harness.applyClaudeSharedGroupGenerationApplication).toHaveBeenCalledWith(expect.objectContaining({
+        profileId: 'lb_bat', generation: 274, credentialRevision,
+      }));
       expect(response.statusCode).toBe(200);
       expect(response.json()).toEqual({ status: 'ok' });
+      expect(readPersistedMetadata('session-claude-legacy-fresh-registration')).toMatchObject({
+        connectedServices: { bindingsByServiceId: {
+          'claude-subscription': { appliedProfileId: 'lb_bat' },
+        } },
+      });
       expect(webhook.getTrackedSession()).toMatchObject({
         happySessionId: 'session-claude-legacy-fresh-registration',
         spawnOptions: {
@@ -2529,12 +2771,18 @@ describe('startDaemon automation wiring (integration)', () => {
           }),
         },
       });
-      expect(callSessionRpc).not.toHaveBeenCalled();
+      expect(callSessionRpc).toHaveBeenCalledWith(expect.objectContaining({
+        request: expect.objectContaining({ applicationSettled: true, authGeneration: {
+          kind: 'current_auth_group_available', groupId: 'team', generation: 274, credentialRevision,
+        } }),
+      }));
     } finally {
       if (app) await app.close();
       harness.requestShutdown('happier-cli');
       if (run) await run;
       exitSpy.mockRestore();
+      Object.assign(configuration, { activeServerDir: previousActiveServerDir });
+      await removeTempDir(activeServerDir);
     }
   });
 
@@ -2729,6 +2977,23 @@ describe('startDaemon automation wiring (integration)', () => {
     });
 
     try {
+      const { buildConnectedServiceCredentialRecord } = await import('@happier-dev/protocol');
+      // Verification now reads current credentials, independently of cached projection proof.
+      harness.getConnectedServiceCredentialPlain.mockImplementation(async ({ serviceId, profileId }) => ({
+        revisionSemantics: 'revisioned',
+        credentialRevision: profileId === 'claude-primary' ? oldRevision
+          : profileId === 'claude-backup' ? desiredRevision : replacementRevision,
+        content: {
+          t: 'plain',
+          v: buildConnectedServiceCredentialRecord({
+            now: 1_000, serviceId, profileId, kind: 'oauth',
+            oauth: {
+              accessToken: 'exact-registration-fixture-access', refreshToken: 'exact-registration-fixture-refresh',
+              idToken: null, scope: null, tokenType: null, providerAccountId: null, providerEmail: null,
+            },
+          }),
+        },
+      }));
       const webhook = await installActualDaemonClaudeReadinessWebhook(pid);
       const { ClaudeConnectedServiceAuthGroupRequestFence } = await import(
         '@/backends/claude/connectedServices/claudeConnectedServiceAuthGroupRequestFence'
@@ -3351,13 +3616,7 @@ describe('startDaemon automation wiring (integration)', () => {
       });
 
       const { callSessionRpc } = await import('@/session/transport/rpc/sessionRpc');
-      const { fetchSessionById } = await import('@/session/transport/http/sessionsHttp');
-      vi.mocked(fetchSessionById).mockImplementation(async ({ sessionId }) => ({
-        id: sessionId,
-        active: true,
-        activeAt: 1,
-        metadata: null,
-      }) as never);
+      const readPersistedMetadata = await installConnectedServiceSessionPersistenceFixture();
       const { ClaudeConnectedServiceAuthGroupRequestFence } = await import(
         '@/backends/claude/connectedServices/claudeConnectedServiceAuthGroupRequestFence'
       );
@@ -3578,6 +3837,13 @@ describe('startDaemon automation wiring (integration)', () => {
       ]);
       expect(applySharedGenerationApplication).toHaveBeenCalledOnce();
       expect(vi.mocked(callSessionRpc)).toHaveBeenCalledTimes(3);
+      for (const sessionId of ['f092-claude-1', 'f092-claude-2', 'f092-claude-late']) {
+        expect(readPersistedMetadata(sessionId)).toMatchObject({
+          connectedServices: { bindingsByServiceId: {
+            'claude-subscription': { appliedProfileId: 'claude-backup' },
+          } },
+        });
+      }
       expect(vi.mocked(spawnHappyCLI)).not.toHaveBeenCalled();
       expect(killSpy).not.toHaveBeenCalled();
       expect(providerSurface).toEqual({

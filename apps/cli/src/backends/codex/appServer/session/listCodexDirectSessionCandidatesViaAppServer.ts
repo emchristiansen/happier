@@ -6,6 +6,7 @@ import {
 } from '@happier-dev/protocol';
 
 import { deriveDirectSessionActivityFromTimestamp } from '@/api/directSessions/activity/deriveDirectSessionActivityFromTimestamp';
+import { isCodexGuardianReviewSource } from '../../directSessions/isCodexGuardianReviewSource';
 import type { CodexAppServerClient } from '../client/createCodexAppServerClient';
 import { withCodexAppServerClient } from '../client/withCodexAppServerClient';
 import { resolveCodexAppServerProcessEnv } from '../resolveCodexAppServerProcessEnv';
@@ -17,6 +18,7 @@ type CodexAppServerThread = Readonly<{
     createdAt?: number;
     updatedAt?: number;
     cwd?: string;
+    source?: unknown;
 }>;
 
 type ThreadListResult = Readonly<{
@@ -52,7 +54,7 @@ async function listThreadsForArchiveStateWithClient(params: Readonly<{
             archived: params.archived,
             ...(cursor ? { cursor } : {}),
         }) as ThreadListResult;
-        out.push(...asThreadArray(result?.data));
+        out.push(...asThreadArray(result?.data).filter((thread) => !isCodexGuardianReviewSource(thread.source)));
         cursor = typeof result?.nextCursor === 'string' && result.nextCursor.trim()
             ? result.nextCursor
             : null;

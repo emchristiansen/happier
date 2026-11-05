@@ -8,27 +8,33 @@ import {
 } from './claudeEffort';
 
 describe('buildClaudeEffortCliArgs', () => {
-  it('forwards explicit high for Opus 5.5 while omitting its medium default', () => {
+  it('forwards explicit high for Opus 5.5 and keeps medium as its catalog default', () => {
     expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: 'high' })).toEqual(['--effort', 'high']);
-    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: 'medium' })).toEqual([]);
+    expect(resolveClaudeDefaultEffortForModel('claude-opus-5-5')).toBe('medium');
   });
-  it('treats Fable 5 high as the default effort', () => {
-    expect(buildClaudeEffortCliArgs({ modelId: 'claude-fable-5', effort: 'high' })).toEqual([]);
+
+  it('overrides saved native effort on resume even when the selection equals the catalog default', () => {
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: 'medium' })).toEqual(['--effort', 'medium']);
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: undefined })).toEqual([]);
+  });
+
+  it('forwards explicit Fable 5 effort even at the catalog default', () => {
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-fable-5', effort: 'high' })).toEqual(['--effort', 'high']);
     expect(buildClaudeEffortCliArgs({ modelId: 'claude-fable-5', effort: 'xhigh' })).toEqual(['--effort', 'xhigh']);
   });
 
-  it('treats Opus 4.8 high as the default effort', () => {
-    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-4-8', effort: 'high' })).toEqual([]);
+  it('forwards explicit Opus 4.8 effort even at the catalog default', () => {
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-4-8', effort: 'high' })).toEqual(['--effort', 'high']);
     expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-4-8', effort: 'xhigh' })).toEqual(['--effort', 'xhigh']);
   });
 
-  it('treats Opus 5 high as the default effort', () => {
-    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5', effort: 'high' })).toEqual([]);
+  it('forwards explicit Opus 5 effort even at the catalog default', () => {
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5', effort: 'high' })).toEqual(['--effort', 'high']);
     expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5', effort: 'xhigh' })).toEqual(['--effort', 'xhigh']);
   });
 
   it('treats the generic opus alias as the current flagship Claude model for default effort resolution', () => {
-    expect(buildClaudeEffortCliArgs({ modelId: 'opus', effort: 'medium' })).toEqual([]);
+    expect(buildClaudeEffortCliArgs({ modelId: 'opus', effort: 'medium' })).toEqual(['--effort', 'medium']);
     expect(buildClaudeEffortCliArgs({ modelId: 'opus', effort: 'high' })).toEqual(['--effort', 'high']);
     expect(buildClaudeEffortCliArgs({ modelId: 'opus', effort: 'xhigh' })).toEqual(['--effort', 'xhigh']);
   });
@@ -39,7 +45,7 @@ describe('buildClaudeEffortCliArgs', () => {
 
   it('resolves effort for [1m]-suffixed model ids the same as the bare id', () => {
     expect(buildClaudeEffortCliArgs({ modelId: 'claude-fable-5[1m]', effort: 'xhigh' })).toEqual(['--effort', 'xhigh']);
-    expect(buildClaudeEffortCliArgs({ modelId: 'claude-fable-5[1m]', effort: 'high' })).toEqual([]);
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-fable-5[1m]', effort: 'high' })).toEqual(['--effort', 'high']);
     expect(buildClaudeEffortCliArgs({ modelId: 'claude-sonnet-4-6[1m]', effort: 'low' })).toEqual(['--effort', 'low']);
   });
 

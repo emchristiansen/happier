@@ -51,6 +51,10 @@ on:
       version:
         value: ${{ jobs.release_actor_guard.outputs.version }}
     inputs:
+      source_contracts_result:
+        required: false
+        default: ""
+        type: string
       channel: { required: true, type: string }
       source_ref: { required: false, default: auto, type: string }
       authorized_sha: { required: false, default: '', type: string }
@@ -67,10 +71,13 @@ concurrency:
   group: publish-server-runtime-${{ github.repository }}-${{ inputs.channel }}
   cancel-in-progress: false
 
+env:
+  HAPPIER_RELEASE_SOURCE_CONTRACTS_RESULT: ${{ inputs.source_contracts_result }}
+
 jobs:
   trusted_ref_guard:
     name: Trust called workflow repository and ref
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -108,7 +115,7 @@ jobs:
 
   release_actor_guard:
     name: Release actor guard and bind source
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: [trusted_ref_guard]
     permissions:
@@ -133,7 +140,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
+          node-version-file: .node-version
       - name: Enforce stable publishing gate
         if: ${{ inputs.channel == 'stable' && inputs.allow_stable != true }}
         run: exit 1
@@ -219,7 +226,7 @@ jobs:
     name: Build and smoke-test unsigned candidate
     needs: [trusted_ref_guard, release_actor_guard]
     if: ${{ inputs.retry_version == '' && inputs.resume_version == '' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
       contents: read
@@ -233,14 +240,12 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
       - name: Enable Corepack (Yarn)
         uses: ./.github/actions/enable-corepack-yarn
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.4
       - name: Install candidate dependencies without credentials
         env:
           YARN_PRODUCTION: 'false'
@@ -260,7 +265,7 @@ jobs:
         run: |
           node scripts/pipeline/release/publish-server-runtime.mjs \
             --phase build-candidate --channel "$CHANNEL" --base-version "$BASE_VERSION" \
-            --version "$VERSION" --allow-stable "$ALLOW_STABLE" --run-contracts true --check-installers true \
+            --version "$VERSION" --allow-stable "$ALLOW_STABLE" --run-contracts auto --check-installers true \
             --candidate-dir dist/release-assets/server
       - name: Upload opaque unsigned archives
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -299,9 +304,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
       - name: Enable Corepack (Yarn)
         uses: ./.github/actions/enable-corepack-yarn
       - name: Install trusted workflow control dependencies
@@ -398,7 +401,7 @@ jobs:
     name: Validate, sign, manifest, and publish authorized candidate
     needs: [trusted_ref_guard, release_actor_guard, build_candidate, finalize_darwin]
     if: ${{ inputs.retry_version == '' && inputs.resume_version == '' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: release-shared
     permissions:
@@ -413,9 +416,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
       - name: Enable Corepack (Yarn)
         uses: ./.github/actions/enable-corepack-yarn
       - name: Install trusted workflow control dependencies
@@ -474,14 +475,14 @@ jobs:
             --phase finalize-candidate --prepared-artifacts \
             --authorized-sha "$AUTHORIZED_SHA" --base-version "$BASE_VERSION" --version "$VERSION" \
             --channel "$CHANNEL" --allow-stable "$ALLOW_STABLE" \
-            --release-message "$RELEASE_MESSAGE" --run-contracts false --check-installers false \
+            --release-message="$RELEASE_MESSAGE" --run-contracts false --check-installers false \
             --publish-rolling "$PUBLISH_ROLLING"
 
   promote_existing:
     name: Re-promote exact immutable version after interrupted rolling upload
     needs: [trusted_ref_guard, release_actor_guard]
     if: ${{ inputs.retry_version != '' && inputs.resume_version == '' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: release-shared
     permissions:
@@ -498,7 +499,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
+          node-version-file: .node-version
       - name: Enable trusted control Yarn
         uses: ./.github/actions/enable-corepack-yarn
       - name: Install artifact verifier dependencies
@@ -535,7 +536,7 @@ jobs:
           node scripts/pipeline/release/publish-server-runtime.mjs \
             --phase promote-rolling --authorized-sha "$AUTHORIZED_SHA" --version "$VERSION" \
             --base-version "$BASE_VERSION" --channel "$CHANNEL" --allow-stable "$ALLOW_STABLE" \
-            --release-message "$RELEASE_MESSAGE" --run-contracts false --check-installers false
+            --release-message="$RELEASE_MESSAGE" --run-contracts false --check-installers false
           status=$?
           set -e
           if [ "$status" -eq 75 ]; then
@@ -549,7 +550,7 @@ jobs:
     name: Re-promote exact immutable version on a fresh runner
     needs: [trusted_ref_guard, release_actor_guard, promote_existing]
     if: ${{ inputs.retry_version != '' && inputs.resume_version == '' && needs.promote_existing.outputs.requires_fresh_runner_retry == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: release-shared
     permissions:
@@ -564,7 +565,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
+          node-version-file: .node-version
       - name: Enable trusted control Yarn
         uses: ./.github/actions/enable-corepack-yarn
       - name: Install artifact verifier dependencies
@@ -599,4 +600,4 @@ jobs:
           node scripts/pipeline/release/publish-server-runtime.mjs \
             --phase promote-rolling --authorized-sha "$AUTHORIZED_SHA" --version "$VERSION" \
             --base-version "$BASE_VERSION" --channel "$CHANNEL" --allow-stable "$ALLOW_STABLE" \
-            --release-message "$RELEASE_MESSAGE" --run-contracts false --check-installers false
+            --release-message="$RELEASE_MESSAGE" --run-contracts false --check-installers false

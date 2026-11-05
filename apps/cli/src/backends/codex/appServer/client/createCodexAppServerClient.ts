@@ -2,17 +2,19 @@ import { spawn } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { StringDecoder } from 'node:string_decoder';
 import { readFileSync } from 'node:fs';
+import { createConnection } from 'node:net';
+import { Duplex } from 'node:stream';
 import { appendFile, rename, rm, stat } from 'node:fs/promises';
 
 import { expandHomeDirPath } from '@happier-dev/cli-common/providers';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
 
-import { resolveCodexCliInvocation } from '../../utils/resolveCodexCliInvocation';
-import { withCodexNativeStartupLock } from '../../utils/withCodexNativeStartupLock';
+import { CODEX_APP_SERVER_OVERRIDE_ENV_KEYS, resolveCodexCliInvocation } from '../../utils/resolveCodexCliInvocation';
+import { readCodexNativeStartupVersion, withCodexNativeStartupLock } from '../../utils/withCodexNativeStartupLock';
 import { appendCodexCliConfigOverridesArgs } from '../../utils/appendCodexCliConfigOverridesArgs';
 import { resolveConfiguredCodexConfigTomlPath } from '../../utils/resolveConfiguredCodexHome';
 import { createCodexAppServerJsonLineReader } from './codexAppServerJsonLineReader';
-import { createCodexUnixWebSocket, type CodexUnixWebSocket } from './createCodexUnixWebSocket';
+import { createCodexWebSocket, type CodexWebSocket } from './createCodexWebSocket';
 import { readCodexAppServerRequestTimeoutMs } from './codexAppServerRpcTimeout';
 import {
     sanitizeCodexAppServerRpcDiagnosticString,
@@ -455,17 +457,27 @@ export async function createCodexAppServerClient(params: CodexAppServerClientPar
         flush: () => flushPromise ??= Promise.resolve().then(() => selectedOwner.flush()),
     } : null;
     try {
+        params.initializeRequestOptions?.signal?.throwIfAborted();
         if (privateOwner && params.transport && params.transport.kind !== 'stdio') {
             throw new Error('Private Codex app-server I/O requires an owned stdio transport');
         }
         if (params.transport && params.transport.kind !== 'stdio') {
             return await createOwnedCodexAppServerClient(params, privateOwner);
         }
+        const processEnv = sanitizeCodexAppServerEnv(params.processEnv ?? process.env);
+        const baseInvocation = await resolveCodexCliInvocation({
+            args: ['app-server', '--listen', 'stdio://'],
+            cwd: params.cwd,
+            processEnv,
+            overrideEnvVarKeys: CODEX_APP_SERVER_OVERRIDE_ENV_KEYS,
+            targetLabel: 'Codex app-server',
+        });
+        const versionOutput = await readCodexNativeStartupVersion(baseInvocation, processEnv, params.cwd, params.initializeRequestOptions?.signal);
         const timeoutMs = params.initializeRequestOptions?.timeoutMs
             ?? readCodexAppServerRequestTimeoutMs('initialize', params.processEnv ?? process.env);
-        return await withCodexNativeStartupLock(timeoutMs ?? Number.POSITIVE_INFINITY, async () => (
-            await createOwnedCodexAppServerClient(params, privateOwner)
-        ), params.initializeRequestOptions?.signal);
+        return await withCodexNativeStartupLock(timeoutMs ?? Number.POSITIVE_INFINITY, async configOverrides => (
+            await createOwnedCodexAppServerClient({ ...params, configOverrides }, privateOwner, baseInvocation)
+        ), params.initializeRequestOptions?.signal, { processEnv, cwd: params.cwd, configOverrides: params.configOverrides, versionOutput });
     } catch (error) {
         if (!privateOwner) throw error;
         const failure = privateIoFailure(privateOwner, 'construction', error);
@@ -487,6 +499,7 @@ export async function bootstrapCodexNativeHome(params: Omit<CodexAppServerClient
 async function createOwnedCodexAppServerClient(
     params: CodexAppServerClientParameters,
     privateOwner: CodexAppServerPrivateIoOwner | null,
+    resolvedInvocation?: Awaited<ReturnType<typeof resolveCodexCliInvocation>>,
 ): Promise<DisposableCodexAppServerClient> {
     const sdkAuth = params.io?.kind === 'private' ? params.io.sdkAuth : undefined;
     let sdkReady = sdkAuth === undefined;
@@ -516,14 +529,52 @@ async function createOwnedCodexAppServerClient(
     const rpcLogger = privateOwner ? null : createRpcLogger(sourceProcessEnv);
     const processEnv = sanitizeCodexAppServerEnv(sourceProcessEnv);
     const transport = params.transport ?? { kind: 'stdio' };
+    const maxJsonLineChars = readMaxJsonLineChars(sourceProcessEnv);
     const baseOverrides = params.disableUserMcpServers === true
         ? readCodexMcpServerKeysFromConfigToml(processEnv).map((key) => `mcp_servers.${key}.enabled=false`)
         : [];
     let child: ReturnType<typeof spawn> | null = null;
-    let webSocket: CodexUnixWebSocket | null = null;
+    let webSocket: CodexWebSocket | null = null;
     let connectionReady = Promise.resolve();
     if (transport.kind === 'unixWebSocket') {
-        webSocket = createCodexUnixWebSocket(transport.socketPath);
+        webSocket = createCodexWebSocket(() => createConnection(transport.socketPath));
+    } else {
+        const baseInvocation = resolvedInvocation ?? await resolveCodexCliInvocation({
+            args: transport.kind === 'daemonProxy'
+                ? ['app-server', 'proxy']
+                : ['app-server', '--listen', 'stdio://'],
+            cwd: params.cwd,
+            processEnv,
+            overrideEnvVarKeys: CODEX_APP_SERVER_OVERRIDE_ENV_KEYS,
+            targetLabel: 'Codex app-server',
+        });
+        const invocation = appendCodexCliConfigOverridesArgs(baseInvocation, [...baseOverrides, ...(params.configOverrides ?? [])]);
+        params.initializeRequestOptions?.signal?.throwIfAborted();
+        const windowsInvocation = resolveWindowsCommandInvocation({
+            command: invocation.command,
+            args: invocation.args,
+            resolveCommandOnPath: true,
+        });
+        child = spawn(windowsInvocation.command, windowsInvocation.args, {
+            cwd: params.cwd ?? process.cwd(),
+            env: processEnv,
+            stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
+            windowsVerbatimArguments: windowsInvocation.windowsVerbatimArguments,
+        });
+
+        if (!child.stdin || !child.stdout || !child.stderr) {
+            throw new Error('Failed to start Codex app-server with piped stdio');
+        }
+        if (transport.kind === 'daemonProxy') {
+            // Codex's native proxy owns cross-platform AF_UNIX access and relays raw
+            // bytes. The same WebSocket owner performs its HTTP upgrade and framing.
+            // @ts-expect-error @types/node omits Node's documented readable/writable stream pair.
+            const proxyStream = Duplex.from({ readable: child.stdout, writable: child.stdin });
+            webSocket = createCodexWebSocket(() => proxyStream);
+        }
+    }
+    if (webSocket) {
         const socket = webSocket;
         connectionReady = new Promise<void>((resolve, reject) => {
             const onOpen = () => {
@@ -545,34 +596,6 @@ async function createOwnedCodexAppServerClient(
             socket.once('error', onError);
             socket.once('close', onCloseBeforeOpen);
         });
-    } else {
-        const baseInvocation = await resolveCodexCliInvocation({
-            args: transport.kind === 'daemonProxy'
-                ? ['app-server', 'proxy']
-                : ['app-server', '--listen', 'stdio://'],
-            cwd: params.cwd,
-            processEnv,
-            overrideEnvVarKeys: ['HAPPIER_CODEX_APP_SERVER_BIN', 'HAPPIER_CODEX_TUI_BIN', 'HAPPY_CODEX_TUI_BIN'],
-            targetLabel: 'Codex app-server',
-        });
-        const invocation = appendCodexCliConfigOverridesArgs(baseInvocation, [...baseOverrides, ...(params.configOverrides ?? [])]);
-        params.initializeRequestOptions?.signal?.throwIfAborted();
-        const windowsInvocation = resolveWindowsCommandInvocation({
-            command: invocation.command,
-            args: invocation.args,
-            resolveCommandOnPath: true,
-        });
-        child = spawn(windowsInvocation.command, windowsInvocation.args, {
-            cwd: params.cwd ?? process.cwd(),
-            env: processEnv,
-            stdio: ['pipe', 'pipe', 'pipe'],
-            windowsHide: true,
-            windowsVerbatimArguments: windowsInvocation.windowsVerbatimArguments,
-        });
-
-        if (!child.stdin || !child.stdout || !child.stderr) {
-            throw new Error('Failed to start Codex app-server with piped stdio');
-        }
     }
 
     const state: MessageQueueState = {
@@ -823,23 +846,35 @@ async function createOwnedCodexAppServerClient(
     let terminateTransportPromise: Promise<void> | null = null;
     const terminateTransport = (): Promise<void> => {
         if (terminateTransportPromise) return terminateTransportPromise;
-        if (webSocket) {
-            webSocket.terminate();
-            terminateTransportPromise = closedPromise;
-            return terminateTransportPromise;
-        }
-        // Snapshot and terminate descendants before closing stdio. Ending stdin first can let a
-        // JavaScript launcher exit and re-parent its native Codex child before the tree walk.
-        terminateTransportPromise = child
-            ? killProcessTree(child, { graceMs: 250 }).then(() => undefined).catch((error) => {
-                if (privateOwner) throw audienceFailure('process disposal', error);
-            })
-            : Promise.resolve();
+        terminateTransportPromise = (async () => {
+            // Snapshot and terminate descendants before closing stdio. Ending stdin first can let a
+            // JavaScript launcher exit and re-parent its native Codex child before the tree walk.
+            if (child) {
+                await killProcessTree(child, { graceMs: 250 }).then(() => undefined).catch((error) => {
+                    // Private custody must not report an unverified native disposal as complete.
+                    if (privateOwner) throw audienceFailure('process disposal', error);
+                });
+            }
+            const socket = webSocket;
+            if (socket) {
+                await new Promise<void>((resolve) => {
+                    if (socket.readyState === socket.CLOSED) resolve();
+                    else socket.once('close', () => resolve());
+                    socket.terminate();
+                });
+            }
+        })();
         return terminateTransportPromise;
     };
 
     const failWith = (error: unknown, options?: Readonly<{ terminateChild?: boolean; operation?: string }>): void => {
         const failure = audienceFailure(options?.operation ?? 'process', error);
+        if (!privateOwner && state.fatalError === null && stderrBuffer.trim()) {
+            // Preserve the first error's identity and type while retaining native
+            // diagnostics regardless of which transport event reports failure first.
+            // Private stderr is captured by its owner and never enters ordinary diagnostics.
+            failure.message += `\n${sanitizeCodexAppServerRpcDiagnosticString(stderrBuffer.trim())}`;
+        }
         failWaiters(state, failure);
         const fatalFailure = state.fatalError ?? failure;
         failPendingRequests(fatalFailure);
@@ -944,7 +979,7 @@ async function createOwnedCodexAppServerClient(
             }
         },
         {
-            maxBufferedChars: readMaxJsonLineChars(sourceProcessEnv),
+            maxBufferedChars: maxJsonLineChars,
             onOversizedLine: handleOversizedJsonLine,
         },
     );
@@ -969,53 +1004,57 @@ async function createOwnedCodexAppServerClient(
             const failure = new Error(
                 `Codex app-server WebSocket closed before completing the request (code=${String(code ?? 'unknown')})${details ? `: ${details}` : ''}`,
             );
-            failWith(failure, { terminateChild: false });
+            failWith(failure);
         });
-    } else if (child?.stdin && child.stdout && child.stderr) {
+    }
+    if (child?.stdin && child.stdout && child.stderr) {
         child.stdin.on('error', (error) => {
             failWith(error, { operation: 'stdin' });
         });
-        // Private capture sees original bytes before UTF-8 decoding or JSON framing.
-        const stdoutDecoder = privateOwner ? new StringDecoder('utf8') : null;
-        if (!privateOwner) child.stdout.setEncoding('utf8');
-        child.stdout.on('data', (chunk: Buffer | string) => {
-            try {
-                if (privateOwner) capturePrivate({ kind: 'raw', stream: 'stdout', bytes: Buffer.from(chunk) });
-                if (state.fatalError) return;
-                if (sdkAuth) {
-                    incomingBytes = Buffer.concat([incomingBytes, Buffer.from(chunk)]);
-                    let newline: number;
-                    while ((newline = incomingBytes.indexOf(10)) !== -1) {
-                        const line = Buffer.from(incomingBytes.subarray(0, newline + 1));
-                        incomingBytes = incomingBytes.subarray(newline + 1);
-                        if (line.length > readMaxJsonLineChars(sourceProcessEnv)) throw new CodexAppServerJsonLineTooLargeError(readMaxJsonLineChars(sourceProcessEnv));
-                        // Keep full signed-i64/string IDs and original bytes outside
-                        // JSON.parse until the SDK owner explicitly returns Other.
-                        // The SDK must see a second request while a first source
-                        // operation is busy, so it can refuse the overlap. Only
-                        // ordinary JSON dispatch waits for preceding line outcomes.
-                        const route = Promise.resolve().then(async () => {
-                            if (state.fatalError || disposing) return 'handled' as const;
-                            return await invokePrivateCallback(() => sdkAuth.routeIncoming(line));
-                        }).catch((error) => {
-                            failWith(error, { operation: 'SDK incoming route' });
-                            return 'handled' as const;
-                        });
-                        incomingChain = incomingChain.then(async () => {
-                            const result = await route;
-                            if (state.fatalError || disposing) return;
-                            if (result === 'ordinary') jsonLineReader.push(stdoutDecoder!.write(line));
-                            else if (result !== 'handled') throw new CodexAppServerPrivateIoError('invalid SDK route');
-                        }).catch((error) => { failWith(error, { operation: 'SDK incoming route' }); });
+        // The daemon proxy's stdout carries WebSocket frames owned by the WebSocket reader.
+        if (!webSocket) {
+            // Private capture sees original bytes before UTF-8 decoding or JSON framing.
+            const stdoutDecoder = privateOwner ? new StringDecoder('utf8') : null;
+            if (!privateOwner) child.stdout.setEncoding('utf8');
+            child.stdout.on('data', (chunk: Buffer | string) => {
+                try {
+                    if (privateOwner) capturePrivate({ kind: 'raw', stream: 'stdout', bytes: Buffer.from(chunk) });
+                    if (state.fatalError) return;
+                    if (sdkAuth) {
+                        incomingBytes = Buffer.concat([incomingBytes, Buffer.from(chunk)]);
+                        let newline: number;
+                        while ((newline = incomingBytes.indexOf(10)) !== -1) {
+                            const line = Buffer.from(incomingBytes.subarray(0, newline + 1));
+                            incomingBytes = incomingBytes.subarray(newline + 1);
+                            if (line.length > readMaxJsonLineChars(sourceProcessEnv)) throw new CodexAppServerJsonLineTooLargeError(readMaxJsonLineChars(sourceProcessEnv));
+                            // Keep full signed-i64/string IDs and original bytes outside
+                            // JSON.parse until the SDK owner explicitly returns Other.
+                            // The SDK must see a second request while a first source
+                            // operation is busy, so it can refuse the overlap. Only
+                            // ordinary JSON dispatch waits for preceding line outcomes.
+                            const route = Promise.resolve().then(async () => {
+                                if (state.fatalError || disposing) return 'handled' as const;
+                                return await invokePrivateCallback(() => sdkAuth.routeIncoming(line));
+                            }).catch((error) => {
+                                failWith(error, { operation: 'SDK incoming route' });
+                                return 'handled' as const;
+                            });
+                            incomingChain = incomingChain.then(async () => {
+                                const result = await route;
+                                if (state.fatalError || disposing) return;
+                                if (result === 'ordinary') jsonLineReader.push(stdoutDecoder!.write(line));
+                                else if (result !== 'handled') throw new CodexAppServerPrivateIoError('invalid SDK route');
+                            }).catch((error) => { failWith(error, { operation: 'SDK incoming route' }); });
+                        }
+                        if (incomingBytes.length > readMaxJsonLineChars(sourceProcessEnv)) throw new CodexAppServerJsonLineTooLargeError(readMaxJsonLineChars(sourceProcessEnv));
+                        return;
                     }
-                    if (incomingBytes.length > readMaxJsonLineChars(sourceProcessEnv)) throw new CodexAppServerJsonLineTooLargeError(readMaxJsonLineChars(sourceProcessEnv));
-                    return;
+                    jsonLineReader.push(stdoutDecoder ? stdoutDecoder.write(Buffer.from(chunk)) : chunk as string);
+                } catch (error) {
+                    failWith(privateOwner ? error : new Error(`Invalid Codex app-server JSON output: ${error instanceof Error ? error.message : String(error)}`), { operation: 'stdout' });
                 }
-                jsonLineReader.push(stdoutDecoder ? stdoutDecoder.write(Buffer.from(chunk)) : chunk as string);
-            } catch (error) {
-                failWith(privateOwner ? error : new Error(`Invalid Codex app-server JSON output: ${error instanceof Error ? error.message : String(error)}`), { operation: 'stdout' });
-            }
-        });
+            });
+        }
         if (!privateOwner) child.stderr.setEncoding('utf8');
         child.stderr.on('data', (chunk: Buffer | string) => {
             if (privateOwner) {
@@ -1046,10 +1085,8 @@ async function createOwnedCodexAppServerClient(
             if (disposing) {
                 return;
             }
-            const suffix = !privateOwner && stderrBuffer.trim()
-                ? `\n${sanitizeCodexAppServerRpcDiagnosticString(stderrBuffer.trim())}`
-                : '';
-            const failure = new Error(`Codex app-server exited before completing the request (code=${code ?? 'null'} signal=${signal ?? 'null'})${suffix}`);
+            // failWith appends ordinary stderr diagnostics; private stderr stays with its owner.
+            const failure = new Error(`Codex app-server exited before completing the request (code=${code ?? 'null'} signal=${signal ?? 'null'})`);
             failWith(failure, { terminateChild: false, operation: 'exit' });
         });
     }

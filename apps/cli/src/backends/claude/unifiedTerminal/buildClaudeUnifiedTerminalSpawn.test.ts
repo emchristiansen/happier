@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from '@/daemon/spawn/spawnExplicitEnvKeysMarker';
 import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
@@ -15,9 +15,48 @@ import {
 } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 
 import {
-  buildClaudeUnifiedTerminalSpawn,
+  buildClaudeUnifiedTerminalSpawn as buildSpawn,
   type ClaudeUnifiedTerminalSpawn,
 } from './buildClaudeUnifiedTerminalSpawn';
+
+// Windows invocation tests simulate process.platform on a POSIX host; ACL commands are the OS boundary.
+vi.mock('@happier-dev/cli-common/fs/windowsProtectedAcl', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@happier-dev/cli-common/fs/windowsProtectedAcl')>(),
+  createWindowsProtectedAclBoundary: () => ({
+    applyAndVerify: async () => undefined,
+    verify: async () => undefined,
+  }),
+}));
+
+// Root identity is simulated only where Claude Code itself reads it (bypass eligibility). A
+// process-wide getuid() stub would also make protected launch artifacts (PR81 system-prompt
+// files) expect root-owned files that a non-root test host cannot create.
+const simulatedClaudeBypassIdentity = vi.hoisted(() => ({ uid: undefined as number | undefined }));
+vi.mock('../utils/permissionMode', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/permissionMode')>();
+  return {
+    ...actual,
+    shouldAllowClaudePermissionBypass: (env: Readonly<NodeJS.ProcessEnv>): boolean => {
+      const uid = simulatedClaudeBypassIdentity.uid;
+      if (uid === undefined) return actual.shouldAllowClaudePermissionBypass(env);
+      const uidDescriptor = Object.getOwnPropertyDescriptor(process, 'getuid');
+      Object.defineProperty(process, 'getuid', { configurable: true, value: () => uid });
+      try {
+        return actual.shouldAllowClaudePermissionBypass(env);
+      } finally {
+        if (uidDescriptor) Object.defineProperty(process, 'getuid', uidDescriptor);
+        else Reflect.deleteProperty(process, 'getuid');
+      }
+    },
+  };
+});
+
+const spawnedArtifacts: ClaudeUnifiedTerminalSpawn[] = [];
+async function buildClaudeUnifiedTerminalSpawn(...args: Parameters<typeof buildSpawn>) {
+  const spawn = await buildSpawn(...args);
+  spawnedArtifacts.push(spawn);
+  return spawn;
+}
 
 const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 
@@ -104,6 +143,7 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
   });
 
   afterEach(async () => {
+    await Promise.all(spawnedArtifacts.splice(0).map((spawn) => spawn.cleanupUnreadArtifacts?.()));
     if (originalPlatformDescriptor) {
       Object.defineProperty(process, 'platform', originalPlatformDescriptor);
     }
@@ -111,8 +151,9 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
   });
 
   it.each([
+    { model: 'claude-opus-5-5', current: 'medium', currentUpdatedAt: 30, supportsEffort: true, cliEffort: undefined, expected: 'medium' },
     { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: undefined, expected: 'low' },
-    { model: 'claude-sonnet-5', current: 'high', currentUpdatedAt: 30, supportsEffort: true, cliEffort: undefined, expected: undefined },
+    { model: 'claude-sonnet-5', current: 'high', currentUpdatedAt: 30, supportsEffort: true, cliEffort: undefined, expected: 'high' },
     { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: 'medium', expected: 'medium' },
     { model: 'claude-haiku-4-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: undefined, expected: undefined },
     { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: false, cliEffort: undefined, expected: undefined },
@@ -183,6 +224,45 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     expect(launchArgs.filter((arg) => arg === '--allow-dangerously-skip-permissions')).toHaveLength(1);
     expect(launchArgs).not.toContain('--dangerously-skip-permissions');
     expect(launchArgs).not.toContain('bypassPermissions');
+  });
+
+  it.each([
+    { permissionMode: 'default', sandbox: undefined, allowed: false },
+    { permissionMode: 'safe-yolo', sandbox: undefined, allowed: false },
+    { permissionMode: 'bypassPermissions', sandbox: undefined, allowed: false },
+    { permissionMode: 'default', sandbox: '1', allowed: true },
+  ] as const)('preserves root permission intent using the effective child sandbox ($permissionMode/$sandbox)', async ({ permissionMode, sandbox, allowed }) => {
+    simulatedClaudeBypassIdentity.uid = 0;
+    patchProcessPlatform('linux');
+    try {
+      // The child overlay, rather than the runner's environment, decides sandbox status.
+      await withPatchedEnv({ IS_SANDBOX: '1', CLAUDE_CODE_BUBBLEWRAP: undefined }, async () => {
+        const spawn = await buildClaudeUnifiedTerminalSpawn({
+          path: '/workspace/project',
+          first: { message: 'hello', mode: { permissionMode } },
+          envOverlay: { IS_SANDBOX: sandbox ?? '0' },
+          deps: {
+            resolveClaudeCliPath: () => '/usr/local/bin/claude',
+            isClaudeCliJavaScriptFile: () => false,
+            ensureClaudeJsRuntimeExecutable: async () => '/managed/node',
+            terminalLaunchSpecRunnerPath: '/happier/scripts/terminal_launch_spec_runner.cjs',
+            resolveCommandInvocation: ({ command, args }) => ({ command, args: [...args] }),
+          },
+        });
+        const launch = await readLaunchSpecFromSpawn(spawn);
+        expect(launch.args?.includes('--allow-dangerously-skip-permissions')).toBe(allowed);
+        if (permissionMode === 'bypassPermissions') {
+          // Explicit bypass intent is kept as the literal native switch (PR81), never downgraded.
+          expect(launch.args).toContain('--dangerously-skip-permissions');
+          expect(launch.args).not.toContain('--permission-mode');
+        } else if (permissionMode !== 'default') {
+          expect(launch.args).toEqual(expect.arrayContaining(['--permission-mode', permissionMode === 'safe-yolo' ? 'auto' : permissionMode]));
+        }
+        expect(launch.env?.IS_SANDBOX).toBe(sandbox ?? '0');
+      });
+    } finally {
+      simulatedClaudeBypassIdentity.uid = undefined;
+    }
   });
 
   it('writes per-session runner diagnostics paths into the launch spec when a happy session id is available', async () => {
@@ -299,10 +379,8 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     const launchSpec = await readLaunchSpecFromSpawn(spawn);
     const launchArgs = launchSpec.args ?? [];
     expect(launchArgs.filter((arg) => arg === '--allow-dangerously-skip-permissions')).toHaveLength(1);
-    expect(launchArgs.slice(launchArgs.indexOf('--permission-mode'), launchArgs.indexOf('--permission-mode') + 2)).toEqual([
-      '--permission-mode',
-      'bypassPermissions',
-    ]);
+    expect(launchArgs).toContain('--dangerously-skip-permissions');
+    expect(launchArgs).not.toContain('--permission-mode');
     const settingsIndex = launchArgs.indexOf('--settings');
     expect(settingsIndex).toBeGreaterThanOrEqual(0);
     expect(JSON.parse(launchArgs[settingsIndex + 1]!)).toMatchObject({
@@ -334,11 +412,11 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     const launchSpec = await readLaunchSpecFromSpawn(spawn);
     const launchArgs = launchSpec.args ?? [];
     const permissionIndexes = launchArgs
-      .map((arg, index) => arg === '--permission-mode' ? index : -1)
+      .map((arg, index) => arg === '--dangerously-skip-permissions' ? index : -1)
       .filter((index) => index >= 0);
 
     expect(permissionIndexes).toHaveLength(1);
-    expect(launchArgs[permissionIndexes[0]! + 1]).toBe('bypassPermissions');
+    expect(launchArgs).not.toContain('--permission-mode');
     expect(launchArgs.indexOf('--resume')).toBeLessThan(permissionIndexes[0]!);
     expect(launchArgs.slice(launchArgs.indexOf('--plugin-dir'), launchArgs.indexOf('--plugin-dir') + 2)).toEqual([
       '--plugin-dir',
@@ -405,6 +483,7 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     expect(launchSpec.args).toContain('--permission-mode');
     expect(launchSpec.args).toContain('dontAsk');
     expect(launchSpec.args).not.toContain('bypassPermissions');
+    expect(launchSpec.args).not.toContain('--dangerously-skip-permissions');
     expect(launchSpec.env?.HAPPIER_CLAUDE_PATH).toBe('/opt/claude/cli.js');
     expect(launchSpec.env?.DISABLE_AUTOUPDATER).toBe('1');
   });
@@ -1088,7 +1167,7 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
   });
 
   it('keeps long Claude startup payloads out of the terminal host creation command', async () => {
-    const longSystemPrompt = `system-${'s'.repeat(80_000)}`;
+    const longSystemPrompt = `  system-${'λ'.repeat(80_000)}\n`;
     const longMcpConfigJson = JSON.stringify({
       mcpServers: {
         huge: {
@@ -1136,7 +1215,17 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
         expect(specMode).toBe(0o600);
       }
       expect(launchSpec.command).toBe('/usr/local/bin/claude');
-      expect(launchSpec.args).toContain('--append-system-prompt');
+      expect(launchSpec.args).not.toContain('--append-system-prompt');
+      expect(launchSpec.args).not.toContain(longSystemPrompt);
+      const promptIndex = launchSpec.args?.indexOf('--append-system-prompt-file') ?? -1;
+      expect(promptIndex).toBeGreaterThanOrEqual(0);
+      const promptPath = launchSpec.args?.[promptIndex + 1];
+      await expect(readFile(promptPath!, 'utf8')).resolves.toBe(longSystemPrompt);
+      if (process.platform !== 'win32') {
+        expect((await stat(promptPath!)).mode & 0o777).toBe(0o600);
+        expect((await stat(dirname(promptPath!))).mode & 0o777).toBe(0o700);
+      }
+      expect(launchSpec.cleanupPaths).toContain(promptPath);
       expect(launchSpec.args).not.toContain(longMcpConfigJson);
       const mcpConfigIndex = launchSpec.args?.indexOf('--mcp-config') ?? -1;
       expect(mcpConfigIndex).toBeGreaterThanOrEqual(0);
@@ -1146,8 +1235,10 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
       expect(launchSpec.cwd).toBe('/workspace/project');
       expect(launchSpec.env?.DISABLE_AUTOUPDATER).toBe('1');
 
-      await rm(dirname(specPath!), { recursive: true, force: true });
-      await rm(mcpConfigPath!, { force: true });
+      await spawn.cleanupUnreadArtifacts?.();
+      await expect(stat(promptPath!)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(dirname(promptPath!))).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(mcpConfigPath!)).rejects.toMatchObject({ code: 'ENOENT' });
     });
   });
 
@@ -1176,8 +1267,8 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
 
     const launchSpec = await readLaunchSpecFromSpawn(spawn);
     const launchArgs = launchSpec.args ?? [];
-    const appendSystemPromptIndex = launchArgs.indexOf('--append-system-prompt');
-    expect(launchArgs[appendSystemPromptIndex + 1]).toContain('Do not create TODO');
+    const appendSystemPromptIndex = launchArgs.indexOf('--append-system-prompt-file');
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).toContain('Do not create TODO');
     expect(launchArgs).toContain('--setting-sources');
     expect(launchArgs).toContain('project');
     expect(launchArgs).toContain('--strict-mcp-config');
@@ -1266,12 +1357,12 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
       '--system-prompt',
       'raw custom system',
     ]);
-    const appendSystemPromptIndex = launchArgs.indexOf('--append-system-prompt');
-    expect(launchArgs.filter((arg) => arg === '--append-system-prompt')).toHaveLength(1);
-    expect(launchArgs[appendSystemPromptIndex + 1]).toContain('base system');
-    expect(launchArgs[appendSystemPromptIndex + 1]).toContain('raw append system');
-    expect(launchArgs[appendSystemPromptIndex + 1]).toContain('Do not create TODO');
-    expect(launchArgs[appendSystemPromptIndex + 1]).not.toContain('mode append system');
+    const appendSystemPromptIndex = launchArgs.indexOf('--append-system-prompt-file');
+    expect(launchArgs.filter((arg) => arg === '--append-system-prompt-file')).toHaveLength(1);
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).toContain('base system');
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).toContain('raw append system');
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).toContain('Do not create TODO');
+    expect(await readFile(launchArgs[appendSystemPromptIndex + 1]!, 'utf8')).not.toContain('mode append system');
   });
 
   it('fails closed when unified terminal options cannot be mapped safely', async () => {

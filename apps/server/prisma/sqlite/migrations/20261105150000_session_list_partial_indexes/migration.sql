@@ -1,0 +1,55 @@
+-- CreateIndex
+-- SQLite only, and hand-written: `schema.prisma` cannot declare a partial index, so both indexes exist
+-- in migration SQL alone. `prisma migrate diff` neither reports nor drops them, but a Prisma-generated
+-- "RedefineTables" rebuild of `Session` would not recreate them, so recreate them by hand in any such
+-- migration. `v2SessionList.partialIndexes.sqlite.integration.spec.ts` fails if either is missing or
+-- differs from the DDL below.
+--
+-- They serve the per-arm statements of `findV2SessionListRowsByEffectiveActivity`
+-- (`v2SessionListPage.ts`), which `GET /v2/sessions` and `GET /v2/sessions/archived`
+-- (`registerSessionListingRoutes.ts`) issue on every page, cursor pages included, for the viewer's own
+-- arm (`accountId = ?`). The shared arm binds `id IN (…)` and reads by primary key. Per arm:
+--   NOT NULL arm: WHERE archivedAt IS [NOT] NULL AND meaningfulActivityAt IS NOT NULL AND accountId = ?
+--                 [AND (meaningfulActivityAt < ? OR (meaningfulActivityAt = ? AND id < ?))]
+--                 ORDER BY meaningfulActivityAt DESC, id DESC LIMIT ?
+--   NULL arm:     WHERE archivedAt IS [NOT] NULL AND meaningfulActivityAt IS NULL AND accountId = ?
+--                 [AND (createdAt < ? OR (createdAt = ? AND id < ?))]
+--                 ORDER BY createdAt DESC, id DESC LIMIT ?
+-- SQLite uses a partial index only when a top-level conjunct of the query's WHERE implies the index's
+-- WHERE. The conjuncts relied on below are the ones these routes emit.
+-- `POST /v2/session-folder-assignments/query` shares the reader and adds a folder-membership EXISTS
+-- residual. Its plans are not pinned by the spec.
+--
+-- 1. Session_accountId_meaningfulActivityAt_id_live_idx — `GET /v2/sessions`, NOT NULL arm (its
+--    `archivedAt IS NULL` conjunct implies the predicate). Without it SQLite (3.46, the engine bundled
+--    with Prisma 6.19.2) walks the full `(accountId, meaningfulActivityAt, id)` index over every
+--    session of the account and rejects archived rows one table row at a time. On an account with
+--    4,876 sessions of which 31 are live that is a whole-account walk for a 31-row answer. With it the
+--    walk covers live rows only and stops at the limit. `/archived` (`archivedAt IS NOT NULL`) cannot
+--    use it and keeps the full index, which already stops early there.
+-- 2. Session_accountId_createdAt_id_nullActivity_idx — the NULL arm of both routes (its
+--    `meaningfulActivityAt IS NULL` conjunct implies the predicate). Without it SQLite reads every
+--    session of the account in that archive state through `(accountId, archivedAt)` and sorts them in a
+--    temp b-tree, whatever the limit. With it, equality on `accountId` is followed by a reverse walk of
+--    `(createdAt, id)` over only the rows without activity, in index order, so no sort is needed.
+--    `archivedAt` stays a residual check on each walked row: the walk passes the account's NULL-activity
+--    rows of the other archive state too, so when both states hold such rows it is bounded by the
+--    account's NULL-activity row count, not by the limit. `archivedAt` is deliberately not a key
+--    column: as a second key it serves `IS NULL` but turns `IS NOT NULL` into a range that defeats the
+--    ordering (temp b-tree again on `/archived`). The initial page's attention read
+--    (`includeAttention`, which adds `needsAttention = ?`) uses it for its NULL arm too, in place of
+--    the `needsAttention` index plus a temp b-tree, with `needsAttention` as a further residual.
+--
+-- Write cost: the live index is maintained by the INSERT of a live row, by an UPDATE that changes
+-- `meaningfulActivityAt` of a live row (the per-message activity write), and by archive/unarchive,
+-- which move a row out of or into it. The NULL-activity index is touched only by an INSERT without
+-- activity and by that row's one NULL -> value transition. Updates that set neither column
+-- (heartbeat, agentState, metadata, seq, counters) touch neither index.
+--
+-- No ANALYZE: these plans are chosen with no `sqlite_stat1`, as production runs. Collecting statistics
+-- later (ANALYZE, `PRAGMA optimize`) must re-verify the session-list plans.
+--
+-- PostgreSQL and MySQL have no counterpart migration: MySQL has no partial indexes, and no
+-- PostgreSQL/MySQL plan evidence motivates tuning there.
+CREATE INDEX "Session_accountId_createdAt_id_nullActivity_idx" ON "Session"("accountId", "createdAt", "id") WHERE "meaningfulActivityAt" IS NULL;
+CREATE INDEX "Session_accountId_meaningfulActivityAt_id_live_idx" ON "Session"("accountId", "meaningfulActivityAt", "id") WHERE "archivedAt" IS NULL;

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -78,6 +78,48 @@ describe('terminal_launch_spec_runner.cjs', () => {
       expect(fakeProcess.send).toHaveBeenCalledWith({ type: 'terminal-native-exited', code: 0, signal: null }, expect.any(Function));
       deliverExit!();
       await expect(result).resolves.toBe(0);
+    }
+  });
+  it('reports a post-spawn operation error while retaining native signal ownership and artifacts until close', async () => {
+    const { child, module, fakeProcess } = createRunnerScriptHarness(true);
+    const kill = vi.fn(() => true);
+    Object.assign(child, { exitCode: null, signalCode: null, kill });
+    const runLaunchSpec = module.exports.runLaunchSpec as (spec: {
+      command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; cleanupPaths: string[];
+    }, signal: AbortSignal, options: { onNativeLifetimeRetained(lifetime: Promise<void>): void }) => Promise<number>;
+    const promptDir = await mkdtemp(join(tmpdir(), 'happier-claude-system-prompt-'));
+    const promptPath = join(promptDir, 'text-artifact.txt');
+    await writeFile(promptPath, 'prompt');
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let lifetime: Promise<void> | undefined;
+    try {
+      const result = runLaunchSpec({ command: 'native', args: [], cwd: tmpdir(), env: {}, cleanupPaths: [promptPath] },
+        new AbortController().signal, { onNativeLifetimeRetained: (retained) => { lifetime = retained; } });
+      child.emit('spawn');
+      const failure = new Error('post-spawn operation failed');
+      child.emit('error', failure);
+      await expect(result).rejects.toBe(failure);
+      expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('terminal_native_operation_failed'));
+      // The runner executes in a vm realm, so its Promise is a cross-realm thenable.
+      expect(typeof lifetime?.then).toBe('function');
+      let retired = false;
+      void lifetime!.then(() => { retired = true; });
+      fakeProcess.emit('message', { type: 'terminal-native-signal', signal: 'SIGINT' });
+      fakeProcess.emit('SIGTERM');
+      expect(kill.mock.calls).toEqual([['SIGINT'], ['SIGTERM']]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(retired).toBe(false);
+      await expect(readFile(promptPath, 'utf8')).resolves.toBe('prompt');
+      expect(fakeProcess.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal-native-exited' }), expect.anything());
+      child.emit('close', null, 'SIGTERM');
+      await lifetime;
+      expect(fakeProcess.send).toHaveBeenCalledWith({ type: 'terminal-native-exited', code: null, signal: 'SIGTERM' }, expect.any(Function));
+      expect(existsSync(promptDir)).toBe(false);
+      expect(fakeProcess.listenerCount('SIGTERM')).toBe(0);
+      expect(fakeProcess.listenerCount('message')).toBe(0);
+    } finally {
+      consoleError.mockRestore();
+      await rm(promptDir, { recursive: true, force: true });
     }
   });
   it('keeps a genuine native spawn receipt when Node reports a later process operation error', async () => {

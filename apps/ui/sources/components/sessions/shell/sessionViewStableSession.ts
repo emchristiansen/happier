@@ -6,6 +6,7 @@ import { storage } from '@/sync/domains/state/storage';
 import { buildSessionMetadataStabilitySignatureValue } from '@/sync/domains/session/metadata/sessionMetadataStability';
 import { resolveServerIdForSessionIdFromLocalState } from '@/sync/runtime/orchestration/serverScopedRpc/resolveServerIdForSessionIdFromLocalCache';
 import { areServerProfileIdentifiersEquivalent } from '@/sync/domains/server/serverProfiles';
+import { areRollbackStartsNewerThanProjection } from '@/sync/domains/sessionRollback/rollbackUiSupport';
 import type { StorageState } from '@/sync/store/types';
 
 type ShellVisibleAgentStateRequestSignature = ReadonlyArray<readonly [
@@ -92,6 +93,9 @@ export function buildSessionViewShellSessionSignature(session: Session): string 
         pendingRequestObservedAt: session.pendingRequestObservedAt ?? null,
         rollbackEligibleTurnStarts: session.rollbackEligibleTurnStarts ?? null,
         sessionTurns: session.sessionTurns ?? null,
+        // Only the order of the two rollback observations reaches the rendered actions, so the shell
+        // follows that order rather than the raw timestamps (which every list refresh may advance).
+        rollbackStartsNewerThanProjection: areRollbackStartsNewerThanProjection(session),
         agentStateRequests: buildShellVisibleAgentStateRequestSignatureValue(session.agentState),
         metadata: buildShellVisibleMetadataSignatureValue(session.metadata),
     });

@@ -86,7 +86,7 @@ export function hashClaudeUnifiedTerminalLaunchOptionsForQueue(mode: EnhancedMod
     return hashObject(buildClaudeUnifiedTerminalLaunchOptionsHashInput(mode));
 }
 
-export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
+export function hashClaudeEnhancedModeForLaunch(mode: EnhancedMode): string {
     const remoteMode = normalizeClaudeRemoteMode(mode);
     const effectiveAgentModeId = resolveEffectiveClaudeAgentModeId(mode);
     const claudeSdkPermissionMode = resolveClaudeSdkPermissionModeFromEnhancedMode({
@@ -95,7 +95,7 @@ export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
     });
 
     // Spawn-only config for Claude: effort is a query-start option in the Agent SDK and has no dynamic setter.
-    // We normalize effort to the effective value the provider would actually apply (treating "high" as default).
+    // Explicit effort remains distinct from inheriting native saved settings, including catalog defaults.
     const supportedLevels = resolveModeEffortLevelsForModel(mode, mode.model);
     const resolvedEffort = resolveClaudeEffortForModel({
         modelId: mode.model,
@@ -158,5 +158,17 @@ export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
         fallbackModel: mode.fallbackModel,
         customSystemPrompt: mode.customSystemPrompt,
         appendSystemPrompt: mode.appendSystemPrompt,
+    });
+}
+
+export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
+    const launchHash = hashClaudeEnhancedModeForLaunch(mode);
+    if (normalizeClaudeRemoteMode(mode).kind === 'unifiedTerminal') return launchHash;
+    // A batching key includes policy as well as launch options: combining prompts with different
+    // policies would keep the first prompt's mode and silently discard a later opt-out.
+    return hashObject({
+        launchHash,
+        claudeRemoteIdleReclaimEnabled: mode.claudeRemoteIdleReclaimEnabled === true,
+        claudeRemoteIdleReclaimTimeoutMinutes: mode.claudeRemoteIdleReclaimTimeoutMinutes,
     });
 }

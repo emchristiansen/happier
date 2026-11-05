@@ -11,6 +11,7 @@ const { reportNativeProcessExited } = require('./native_process_exit.cjs');
 const terminalSignalNames = ['SIGINT', 'SIGQUIT'];
 const stderrTailMaxChars = 64 * 1024;
 const claudeMcpConfigFilePrefix = 'happier-claude-mcp-config';
+const claudeSystemPromptDirectoryPrefix = 'happier-claude-system-prompt-';
 
 function isPlainObject(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -36,14 +37,18 @@ function readOptionalBoolean(value, name) {
     return value;
 }
 
-function isSafeClaudeMcpConfigCleanupPath(filePath) {
+function isSafeClaudeArtifactCleanupPath(filePath) {
     if (typeof filePath !== 'string' || filePath.length === 0) return false;
     const tmpRoot = path.resolve(os.tmpdir());
     const resolved = path.resolve(filePath);
     const relative = path.relative(tmpRoot, resolved);
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return false;
     const name = path.basename(resolved);
-    return name.startsWith(`${claudeMcpConfigFilePrefix}.`) && name.endsWith('.json');
+    const isMcpConfig = name.startsWith(`${claudeMcpConfigFilePrefix}.`) && name.endsWith('.json');
+    const isSystemPrompt = name === 'text-artifact.txt'
+        && path.dirname(path.dirname(resolved)) === tmpRoot
+        && path.basename(path.dirname(resolved)).startsWith(claudeSystemPromptDirectoryPrefix);
+    return isMcpConfig || isSystemPrompt;
 }
 
 function reportArtifactCleanupFailure(diagnostics, phase) {
@@ -71,11 +76,12 @@ async function cleanupLaunchSpecPaths(paths, diagnostics) {
     };
     await Promise.all(
         paths
-            .filter(isSafeClaudeMcpConfigCleanupPath)
+            .filter(isSafeClaudeArtifactCleanupPath)
             .map(async (filePath) => {
                 await remove(() => fs.unlink(filePath));
                 const directory = path.dirname(filePath);
-                if (path.basename(directory).startsWith(`${claudeMcpConfigFilePrefix}-`)) {
+                if (path.basename(directory).startsWith(`${claudeMcpConfigFilePrefix}-`)
+                    || path.basename(directory).startsWith(claudeSystemPromptDirectoryPrefix)) {
                     await remove(() => fs.rmdir(directory));
                 }
             }),
@@ -314,7 +320,29 @@ function installTerminalSignalGuards() {
     };
 }
 
-function runLaunchSpec(spec, controllerSignal) {
+function installTerminationSignalForwarding(child) {
+    const signals = process.platform === 'win32' ? ['SIGTERM'] : ['SIGTERM', 'SIGHUP'];
+    const installed = [];
+    let requestedSignal = null;
+    for (const signal of signals) {
+        const listener = () => {
+            requestedSignal ??= signal;
+            if (child.exitCode === null && child.signalCode === null) {
+                try { child.kill(signal); } catch {}
+            }
+        };
+        process.on(signal, listener);
+        installed.push([signal, listener]);
+    }
+    return () => {
+        for (const [signal, listener] of installed) process.off(signal, listener);
+        if (requestedSignal) {
+            try { process.kill(process.pid, requestedSignal); } catch {}
+        }
+    };
+}
+
+function runLaunchSpec(spec, controllerSignal, options = {}) {
     return new Promise((resolve, reject) => {
         if (controllerSignal?.aborted) {
             cleanupLaunchSpecPaths(spec.cleanupPaths ?? [], spec.diagnostics).then(() => resolve(1), reject);
@@ -372,7 +400,9 @@ function runLaunchSpec(spec, controllerSignal) {
                 reportSignalFailure();
             }
         };
+        let nativeSpawned = false;
         child.once('spawn', () => {
+            nativeSpawned = true;
             reportNativeSpawnResult('spawned');
             if (controllerChannel && process.connected) process.send({ type: 'terminal-native-spawned' }, (error) => {
                 if (error) onControllerClosed();
@@ -390,28 +420,69 @@ function runLaunchSpec(spec, controllerSignal) {
             });
         };
         controllerSignal?.addEventListener('abort', onControllerClosed, { once: true });
+        const finishTerminationSignalForwarding = installTerminationSignalForwarding(child);
         let settled = false;
+        // Native lifetime ends only when the observed child settles below. A post-spawn
+        // operation error is reported before then, without settling this ownership.
+        let retireNativeLifetime;
+        const nativeLifetime = new Promise((resolveLifetime) => { retireNativeLifetime = resolveLifetime; });
+        let operationErrorReported = false;
         const settle = async (fn) => {
             if (settled) return;
             settled = true;
             controllerSignal?.removeEventListener('abort', onControllerClosed);
             if (controllerChannel) process.off('message', onNativeSignal);
-            removeSignalGuards();
-            await controllerCleanup;
-            await stderrDiagnostics?.close();
-            await cleanupLaunchSpecPaths(spec.cleanupPaths ?? [], spec.diagnostics);
-            await fn();
+            try {
+                // Keep terminal guards and SIGTERM/SIGHUP forwarding installed until the
+                // retained child has settled and its private launch artifacts are removed.
+                await controllerCleanup;
+                await stderrDiagnostics?.close();
+                await cleanupLaunchSpecPaths(spec.cleanupPaths ?? [], spec.diagnostics);
+                const code = await fn();
+                removeSignalGuards();
+                finishTerminationSignalForwarding();
+                resolve(code);
+            } catch (error) {
+                removeSignalGuards();
+                finishTerminationSignalForwarding();
+                reject(error);
+            } finally {
+                retireNativeLifetime();
+            }
         };
-        child.on('error', (error) => {
-            reportNativeSpawnResult('failed');
-            settle(() => reject(error));
-        });
         // The Windows invocation owner sets verbatim arguments when it inserts ComSpec.
         // That shell's exit cannot prove provider shutdown or await inherited provider pipes.
         const providerIsChild = spec.windowsVerbatimArguments !== true;
+        let spawnError = null;
+        child.on('error', (error) => {
+            reportNativeSpawnResult('failed');
+            spawnError = error;
+            // A post-spawn operation error is a launcher outcome, not a native exit. Report it
+            // now, but the provider may still be running: controller cancellation, signal
+            // forwarding, exit observation and its launch artifacts stay owned until the
+            // native close below settles them.
+            if (nativeSpawned) {
+                if (!settled && !operationErrorReported) {
+                    operationErrorReported = true;
+                    console.error('Native terminal operation failed after startup; native ownership retained until exit (terminal_native_operation_failed)');
+                    options.onNativeLifetimeRetained?.(nativeLifetime);
+                    reject(error);
+                }
+                return;
+            }
+            // A failed spawn has no process; the Windows 'exit' path below never fires for it,
+            // so settle that case here instead of hanging.
+            if (!providerIsChild && child.pid === undefined) {
+                void settle(() => { throw error; });
+            }
+        });
         child.on(providerIsChild ? 'close' : 'exit', async (code, signal) => {
             if (!providerIsChild) child.stderr?.destroy();
             if (controllerChannel && providerIsChild) await reportNativeProcessExited(process, code, signal);
+            if (spawnError) {
+                void settle(() => { throw spawnError; });
+                return;
+            }
             if (typeof code === 'number') {
                 settle(async () => {
                     if (code !== 0) {
@@ -423,7 +494,7 @@ function runLaunchSpec(spec, controllerSignal) {
                             stderrDiagnostics,
                         });
                     }
-                    resolve(code);
+                    return code;
                 });
                 return;
             }
@@ -436,7 +507,7 @@ function runLaunchSpec(spec, controllerSignal) {
                         signal,
                         stderrDiagnostics,
                     });
-                    resolve(1);
+                    return 1;
                 });
                 return;
             }
@@ -448,7 +519,7 @@ function runLaunchSpec(spec, controllerSignal) {
                     signal: null,
                     stderrDiagnostics,
                 });
-                resolve(1);
+                return 1;
             });
         });
     });
@@ -463,8 +534,16 @@ async function runLaunchSpecFile(specPath) {
         process.once('disconnect', onControllerClosed);
         if (!process.connected) lifetime.abort();
     }
+    let retainedNativeLifetime = null;
     try {
-        return await runLaunchSpec(await readLaunchSpecFile(specPath), lifetime?.signal);
+        return await runLaunchSpec(await readLaunchSpecFile(specPath), lifetime?.signal, {
+            onNativeLifetimeRetained: (nativeLifetime) => { retainedNativeLifetime = nativeLifetime; },
+        });
+    } catch (error) {
+        // A reported post-spawn operation error leaves a live native child. Keep the
+        // controller channel, its loss detection and this process until that child exits.
+        await retainedNativeLifetime;
+        throw error;
     } finally {
         if (lifetime) {
             process.off('disconnect', onControllerClosed);

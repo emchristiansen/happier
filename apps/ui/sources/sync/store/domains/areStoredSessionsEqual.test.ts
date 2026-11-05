@@ -85,6 +85,13 @@ describe('areStoredSessionsEqual', () => {
         )).toBe(false);
     });
 
+    it('detects a changed turns-projection observation, which orders the projection against the starts', () => {
+        expect(areStoredSessionsEqual(
+            session({ rollbackEligibleTurnStarts: [1], rollbackEligibilityObservedAt: 9, sessionTurnsObservedAt: 5 }),
+            session({ rollbackEligibleTurnStarts: [1], rollbackEligibilityObservedAt: 9, sessionTurnsObservedAt: 9 }),
+        )).toBe(false);
+    });
+
     it('detects structured session turn projection changes when legacy rollback starts are unchanged', () => {
         const sessionTurns = {
             v: 1 as const,

@@ -64,7 +64,8 @@ import { adoptReasoningEffortOverrideFromMetadata } from './utils/adoptReasoning
 import { adoptUltracodeOverrideFromMessageMeta, adoptUltracodeOverrideFromMetadata } from './utils/adoptUltracodeOverride';
 import { resolveSessionModeOverrideFromMetadataSnapshot } from '@/agent/runtime/permission/permissionModeFromMetadata';
 import { initializeBackendApiContext } from '@/agent/runtime/initializeBackendApiContext';
-import { ClaudeLocalPermissionBridge, DEFAULT_LOCAL_PERMISSION_HOOK_RESPONSE } from '@/backends/claude/localPermissions/localPermissionBridge';
+import { ClaudeLocalPermissionBridge } from '@/backends/claude/localPermissions/localPermissionBridge';
+import { isClaudeLocalPermissionBridgeNeeded, routeClaudePermissionHook } from './localPermissions/routeClaudePermissionHook';
 import { formatErrorForUi } from '@/ui/formatErrorForUi';
 import { registerRunnerTerminationHandlers } from '@/agent/runtime/runnerTerminationHandlers';
 import { settleClaudeRunnerLoop, type ClaudeRunnerLoopSettlement } from './claudeRunnerLoopSettlement';
@@ -113,19 +114,6 @@ import type { SessionRuntimeActivityContributionHandle } from '@/session/runtime
 import type { RuntimeActivityApplicability } from '@/session/runtimeActivity/types';
 import { createClaudeProviderRuntimeActivityBindingOwner } from './providerActivity/createClaudeProviderRuntimeActivityAdapter';
 import { createPendingFirstInputCommitter } from '@/daemon/spawn/pendingFirstInput';
-
-type ClaudePermissionLifecycleHookEventName = 'PermissionRequest' | 'PermissionRequestCompleted';
-
-function buildPermissionLifecycleSessionHook(
-    data: PermissionHookData,
-    hookEventName: ClaudePermissionLifecycleHookEventName,
-): SessionHookData {
-    return {
-        ...data,
-        hook_event_name: hookEventName,
-        hookEventName,
-    };
-}
 
 function routeClaudeSessionHookAtCallerBoundary(params: Readonly<{
     session: Pick<import('./session').Session, 'onSessionFound' | 'onClaudeSessionHook'>;
@@ -522,6 +510,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         credentials,
         settings: options.accountSettings ?? null,
         profileId: session.getMetadataSnapshot()?.profileId ?? null,
+        sessionMetadata: session.getMetadataSnapshot(),
         executionRunsFeatureEnabled: resolveCliFeatureDecision({
             featureId: 'execution.runs',
             env: process.env,
@@ -665,6 +654,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const unifiedTerminalRuntimeActive = sessionRuntimeModeKind === 'unifiedTerminal';
     const adoptEndpointRecovery = unifiedTerminalRuntimeActive
         ? await resolveClaudeAdoptEndpointRecovery({
+            observeNativeToolPrompts: true,
             // claimSessionRunnerOwnership above admitted this exact continuation
             // before retained hook/MCP endpoints can be rebound.
             ...(existingSessionId ? { existingSession: {
@@ -687,10 +677,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     }
 
     await runClaudeStartupPhase('terminal_side_effects', startupPhaseContext, async () => {
-        if (!unifiedTerminalRuntimeActive) {
-            await persistTerminalAttachmentInfoIfNeeded({ sessionId: baseSession.id, terminal, startedBy: options.startedBy ?? 'terminal' });
-            await bindHerdrAgentIfNeeded({ session, sessionId: baseSession.id, agent: 'claude', terminal });
-        }
+        if (unifiedTerminalRuntimeActive) return;
+        await persistTerminalAttachmentInfoIfNeeded({ sessionId: baseSession.id, terminal, startedBy: options.startedBy ?? 'terminal' });
+        await bindHerdrAgentIfNeeded({ session, sessionId: baseSession.id, agent: 'claude', terminal });
         sendTerminalFallbackMessageIfNeeded({ session, terminal });
     });
 
@@ -725,7 +714,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         cwd: workingDirectory,
         timeoutMs: resolveClaudeHelpProbeTimeoutMs(),
     });
-    let localPermissionBridgeEnabled = currentClaudeRemoteMetaState.claudeLocalPermissionBridgeEnabled === true;
+    let localPermissionBridgeEnabled = isClaudeLocalPermissionBridgeNeeded(currentClaudeRemoteMetaState, unifiedTerminalRuntimeActive);
     let localPermissionBridgeWaitIndefinitely = currentClaudeRemoteMetaState.claudeLocalPermissionBridgeWaitIndefinitely === true;
     let localPermissionBridgeTimeoutMs = localPermissionBridgeWaitIndefinitely
         ? null
@@ -747,12 +736,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         }
         localPermissionBridge = new ClaudeLocalPermissionBridge(currentSession, { responseTimeoutMs: localPermissionBridgeTimeoutMs });
         localPermissionBridge.activate();
-    };
-    const publishPermissionLifecycleHook = (
-        data: PermissionHookData,
-        hookEventName: ClaudePermissionLifecycleHookEventName,
-    ) => {
-        currentSession?.onClaudeSessionHook(buildPermissionLifecycleSessionHook(data, hookEventName));
     };
 
     // Start Hook server for receiving Claude session notifications
@@ -781,7 +764,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 localPermissionBridge?.handleSessionHook(data);
             }
         },
-        onPermissionHook: async (data) => {
+        onPermissionHook: async (data, options) => {
             const hookTool = typeof (data as any)?.tool_name === 'string'
                 ? (data as any).tool_name
                 : (typeof (data as any)?.toolName === 'string' ? (data as any).toolName : 'unknown_tool');
@@ -791,15 +774,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             logger.debug(
                 `[START] Permission hook received: tool=${hookTool} id=${hookId || 'unknown'} bridge=${localPermissionBridgeEnabled ? 'enabled' : 'disabled'}`,
             );
-            publishPermissionLifecycleHook(data, 'PermissionRequest');
-            try {
-                if (!localPermissionBridgeEnabled || !localPermissionBridge) {
-                    return DEFAULT_LOCAL_PERMISSION_HOOK_RESPONSE;
-                }
-                return localPermissionBridge.handlePermissionHook(data);
-            } finally {
-                publishPermissionLifecycleHook(data, 'PermissionRequestCompleted');
-            }
+            return await routeClaudePermissionHook({
+                data, options, session: currentSession, settings: currentClaudeRemoteMetaState,
+                unifiedTerminalActive: unifiedTerminalRuntimeActive, bridge: localPermissionBridge,
+            });
         },
         permissionHookSecret,
         permissionRequestTimeoutMs: localPermissionBridgeWaitIndefinitely ? null : localPermissionBridgeTimeoutMs,
@@ -827,6 +805,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         ?? await runClaudeStartupPhase('hook_plugin_generate', startupPhaseContext, () =>
             generateHookPluginDirWithEnsuredRuntime(hookServer.port, {
                 enableLocalPermissionBridge: true,
+                observeNativeToolPrompts: unifiedTerminalRuntimeActive,
                 permissionHookSecret,
                 sessionHookPluginId: baseSession.id,
                 // Keep the provider-side permission hook ceiling aligned with the local permission bridge's
@@ -1024,7 +1003,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         }
 
             currentClaudeRemoteMetaState = pinClaudeUnifiedTerminalSelection(applyClaudeRemoteMetaState(currentClaudeRemoteMetaState, message.meta), daemonUnifiedTerminalPin);
-        const nextLocalPermissionBridgeEnabled = currentClaudeRemoteMetaState.claudeLocalPermissionBridgeEnabled === true;
+        const nextLocalPermissionBridgeEnabled = isClaudeLocalPermissionBridgeNeeded(currentClaudeRemoteMetaState, unifiedTerminalRuntimeActive);
         const nextLocalPermissionBridgeWaitIndefinitely = currentClaudeRemoteMetaState.claudeLocalPermissionBridgeWaitIndefinitely === true;
         const nextLocalPermissionBridgeTimeoutMs = nextLocalPermissionBridgeWaitIndefinitely
             ? null
@@ -1324,6 +1303,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             terminalRuntime: initialTerminalRuntime,
             messageQueue,
             session,
+            observeClaudePermissionTranscript: (value) => localPermissionBridge?.observeTranscript(value),
             pushSender: api.push(),
             accountSettings,
             runtimeActivityContributions: {
@@ -1621,7 +1601,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
             preserveHostOnClose: herdrReportPreserveHostOnClose,
         });
     };
-    let localPermissionBridgeEnabled = currentClaudeRemoteMetaState.claudeLocalPermissionBridgeEnabled === true;
+    let localPermissionBridgeEnabled = isClaudeLocalPermissionBridgeNeeded(currentClaudeRemoteMetaState, unifiedTerminalRuntimeActive);
     let localPermissionBridgeWaitIndefinitely = currentClaudeRemoteMetaState.claudeLocalPermissionBridgeWaitIndefinitely === true;
     let localPermissionBridgeTimeoutMs = localPermissionBridgeWaitIndefinitely
         ? null
@@ -1643,12 +1623,6 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
         localPermissionBridge = new ClaudeLocalPermissionBridge(currentSession, { responseTimeoutMs: localPermissionBridgeTimeoutMs });
         localPermissionBridge.activate();
     };
-    const publishPermissionLifecycleHook = (
-        data: PermissionHookData,
-        hookEventName: ClaudePermissionLifecycleHookEventName,
-    ) => {
-        currentSession?.onClaudeSessionHook(buildPermissionLifecycleSessionHook(data, hookEventName));
-    };
 
     const statuslineApplier = createClaudeStatuslineApplier({ logPrefix: '[claude]' });
     const hookServerOptions: Parameters<typeof startHookServer>[0] = {
@@ -1668,16 +1642,11 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                 localPermissionBridge?.handleSessionHook(data);
             }
         },
-        onPermissionHook: async (data) => {
-            publishPermissionLifecycleHook(data, 'PermissionRequest');
-            try {
-                if (!localPermissionBridgeEnabled || !localPermissionBridge) {
-                    return DEFAULT_LOCAL_PERMISSION_HOOK_RESPONSE;
-                }
-                return localPermissionBridge.handlePermissionHook(data);
-            } finally {
-                publishPermissionLifecycleHook(data, 'PermissionRequestCompleted');
-            }
+        onPermissionHook: async (data, options) => {
+            return await routeClaudePermissionHook({
+                data, options, session: currentSession, settings: currentClaudeRemoteMetaState,
+                unifiedTerminalActive: unifiedTerminalRuntimeActive, bridge: localPermissionBridge,
+            });
         },
         permissionHookSecret,
         permissionRequestTimeoutMs: localPermissionBridgeWaitIndefinitely ? null : localPermissionBridgeTimeoutMs,
@@ -1722,6 +1691,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                 generateHookPluginDir: async (port) => {
                     return await generateHookPluginDirWithEnsuredRuntime(port, {
                         enableLocalPermissionBridge: true,
+                        observeNativeToolPrompts: unifiedTerminalRuntimeActive,
                         permissionHookSecret,
                         ...(existingSessionId ? { sessionHookPluginId: existingSessionId } : {}),
                     });
@@ -1868,6 +1838,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                     credentials,
                     settings: options.accountSettings ?? null,
                     profileId: session.getMetadataSnapshot()?.profileId ?? null,
+                    sessionMetadata: session.getMetadataSnapshot(),
                     executionRunsFeatureEnabled: resolveCliFeatureDecision({
                         featureId: 'execution.runs',
                         env: process.env,
@@ -1982,7 +1953,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                     }
 
                         currentClaudeRemoteMetaState = pinClaudeUnifiedTerminalSelection(applyClaudeRemoteMetaState(currentClaudeRemoteMetaState, message.meta), daemonUnifiedTerminalPin);
-                    const nextLocalPermissionBridgeEnabled = currentClaudeRemoteMetaState.claudeLocalPermissionBridgeEnabled === true;
+                    const nextLocalPermissionBridgeEnabled = isClaudeLocalPermissionBridgeNeeded(currentClaudeRemoteMetaState, unifiedTerminalRuntimeActive);
                     const nextLocalPermissionBridgeWaitIndefinitely = currentClaudeRemoteMetaState.claudeLocalPermissionBridgeWaitIndefinitely === true;
                     const nextLocalPermissionBridgeTimeoutMs = nextLocalPermissionBridgeWaitIndefinitely
                         ? null
@@ -2094,6 +2065,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                     }),
                     allowOfflineStub: true,
                     startupSideEffectsOrder: 'persist-first',
+                    terminalHostOwner: unifiedTerminalRuntimeActive ? 'runtime' : 'startup',
                     runtimeActivityLifecycle: runtimeActivity.lifecycle,
                     deferPendingFirstInputCommitUntilRuntimeReady: true,
                     onSessionSwap: (newSession) => {
@@ -2154,6 +2126,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                         credentials,
                         settings: options.accountSettings ?? null,
                         profileId: artifacts.deferredSession.getMetadataSnapshot?.()?.profileId ?? null,
+                        sessionMetadata: artifacts.deferredSession.getMetadataSnapshot?.(),
                         executionRunsFeatureEnabled: resolveCliFeatureDecision({
                             featureId: 'execution.runs',
                             env: process.env,
@@ -2177,6 +2150,7 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                     }, installedRuntimeCapabilities), sessionRuntimeModeKind);
 
                     loopPromise = loop({
+                        observeClaudePermissionTranscript: (value) => localPermissionBridge?.observeTranscript(value),
                         path: workingDirectory,
                         model: options.model,
                         permissionMode: options.permissionMode,

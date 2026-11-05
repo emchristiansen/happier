@@ -11,7 +11,7 @@ export function createAdoptedExecutionRunRootCleanup(input: Readonly<{
   agentId: CatalogAgentId;
   materializationKey: string;
   retentionPolicy?: ExecutionRunRetentionPolicy | null;
-  removeRoot: (root: string) => Promise<void>;
+  retireRoot: (root: string) => Promise<void>;
 }>): (() => Promise<void>) | null {
   const base = resolve(input.materializationBaseDir);
   const root = resolve(input.materializedRoot);
@@ -25,7 +25,8 @@ export function createAdoptedExecutionRunRootCleanup(input: Readonly<{
   if (root !== expectedRoot) return null;
   return async () => {
     // Match the execution-run isolation owner: only an explicit ephemeral policy authorizes
-    // deleting private run state. Unknown legacy policy must never become disposal authority.
+    // revoking private credentials. Transcripts survive even an ephemeral run; unknown legacy
+    // policy must never become disposal authority.
     if (input.retentionPolicy !== 'ephemeral') return;
     try {
       const [realBase, realRoot] = await Promise.all([realpath(base), realpath(root)]);
@@ -35,6 +36,6 @@ export function createAdoptedExecutionRunRootCleanup(input: Readonly<{
       // follow a symlinked ancestor or guess at a filesystem target.
       return;
     }
-    await input.removeRoot(root);
+    await input.retireRoot(root);
   };
 }

@@ -340,6 +340,7 @@ export function createSessionProviderInputConsumer<Mode, Message>(
   let activeProviderInputDispatches = 0;
   let activePendingMaterializationRequests = 0;
   let providerInputBatchReserved = false;
+  let retainedBatch: MessageBatch<Mode, Message> | null = null;
   const activeProviderInputAdmissionWorkDrainWaiters = new Set<() => void>();
 
   const notifyProviderInputAdmissionWorkDrained = (): void => {
@@ -469,7 +470,8 @@ export function createSessionProviderInputConsumer<Mode, Message>(
   const drainPending = async (drainOpts?: DrainPendingOptions): Promise<DrainPendingResult> => {
     const abortSignal = drainOpts?.abortSignal ?? new AbortController().signal;
     const result = await runMaterializationPass(abortSignal, async () => {
-      if (opts.messageQueue.size() > 0) {
+      // A retained dequeued batch still owns delivery order; Pending must not overtake it.
+      if (retainedBatch !== null || opts.messageQueue.size() > 0) {
         return { materialized: 0, stoppedReason: 'drain_disallowed' } as const;
       }
       // Keep the exact localId reservation authoritative before any later claim.
@@ -532,7 +534,7 @@ export function createSessionProviderInputConsumer<Mode, Message>(
         // returned batch has left the dequeue-to-invocation gap. This is the completion signal
         // for long-lived provider dispatches that consume multiple batches within one dispatch.
         providerInputBatchReserved = false;
-        const batch = await waitForNextInput({
+        const batch = retainedBatch ?? await waitForNextInput({
           ...opts,
           onMetadataUpdate: waitOpts.onMetadataUpdate === undefined ? opts.onMetadataUpdate : waitOpts.onMetadataUpdate,
           session: admissionTrackedSession,
@@ -547,14 +549,25 @@ export function createSessionProviderInputConsumer<Mode, Message>(
             (result) => (result?.kind === 'retry' ? result : null),
           ),
         });
+        if (!batch) return null;
+        // Metadata reconciliation can outlive this provider activation. Keep the complete batch
+        // in the session-owned consumer until a live waiter receives it; requeueing would lose
+        // isolation and can let a later control prompt replace its Pending delivery attribution.
+        retainedBatch = batch;
         if (
-          batch?.pendingProviderAction !== undefined
+          batch.pendingProviderAction !== undefined
           && batch.userMessageLocalIds?.length === 1
         ) {
           // The queue no longer exposes this batch, but the provider has not accepted it yet.
           // Reserve local custody across the dequeue-to-dispatch gap.
           providerInputBatchReserved = true;
         }
+        await callMetadataUpdate(
+          waitOpts.onMetadataUpdate === undefined ? opts.onMetadataUpdate : waitOpts.onMetadataUpdate,
+          waitOpts.abortSignal,
+        );
+        if (waitOpts.abortSignal.aborted || !providerInputAdmissionOpen) return null;
+        retainedBatch = null;
         return batch;
       } finally {
         releaseTurn();
@@ -719,13 +732,13 @@ async function waitForNextInput<Mode, Message>(
       if (!batch) {
         const outcome = await opts.materialize(() => materializePendingMessage(opts));
         if (outcome?.kind === 'recheck') recheckAfterMs = outcome.afterMs;
+        if (!opts.isProviderInputAdmissionOpen()) return null;
         batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
       }
+      // A dequeued batch is no longer visible in the queue. Hand it to the session-owned
+      // consumer, which retains it across metadata reconciliation and activation cancellation.
+      if (batch) return batch;
       if (opts.abortSignal.aborted || !opts.isProviderInputAdmissionOpen()) return null;
-      if (batch) {
-        await callMetadataUpdate(opts.onMetadataUpdate, opts.abortSignal);
-        return opts.abortSignal.aborted ? null : batch;
-      }
       if (passDirty) {
         if (!await applyWake(await wakePromise)) return null;
         continue;

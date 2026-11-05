@@ -1,18 +1,18 @@
 import { z } from 'zod';
-
+import { lazySchema } from '../lazySchema.js';
 import { PendingLocalIdSchema } from '../sessionMessages/pendingLocalId.js';
 
-export const SessionPendingInputInterruptAndRunRequestV1Schema = z
+export const SessionPendingInputInterruptAndRunRequestV1Schema = lazySchema(() => z
   .object({
     sessionId: z.string().trim().min(1),
     localId: PendingLocalIdSchema,
     expectedStateAtMs: z.number().int().nonnegative().optional(),
   })
-  .passthrough();
+  .passthrough());
 export type SessionPendingInputInterruptAndRunRequestV1 =
   z.infer<typeof SessionPendingInputInterruptAndRunRequestV1Schema>;
 
-export const SessionPendingInputInterruptAndRunResultV1Schema = z.discriminatedUnion('ok', [
+export const SessionPendingInputInterruptAndRunResultV1Schema = lazySchema(() => z.discriminatedUnion('ok', [
   z.object({
     ok: z.literal(true),
     status: z.enum([
@@ -39,7 +39,7 @@ export const SessionPendingInputInterruptAndRunResultV1Schema = z.discriminatedU
     errorCode: z.string().min(1).optional(),
     error: z.string().min(1).optional(),
   }).passthrough(),
-]);
+]));
 export type SessionPendingInputInterruptAndRunResultV1 =
   z.infer<typeof SessionPendingInputInterruptAndRunResultV1Schema>;
 

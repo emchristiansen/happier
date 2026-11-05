@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
@@ -20,6 +21,8 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 
+// process.cwd() is redirected to a disposable directory below; package fixtures resolve from this file.
+const testsPackageRoot = fileURLToPath(new URL('../../../', import.meta.url));
 let disposableCwd = '';
 let capturedChildren: Array<EventEmitter & { stdout: PassThrough; stderr: PassThrough; kill: ReturnType<typeof vi.fn> }> = [];
 let captureStopError: unknown = null;
@@ -301,10 +304,7 @@ describe('mobileMaestroRunner', () => {
       );
 
       const flowPath = params.args[params.args.indexOf('test') + 1] ?? '';
-      const resolvedFlowPath = existsSync(resolve(process.cwd(), flowPath))
-        ? resolve(process.cwd(), flowPath)
-        : resolve(process.cwd(), 'packages/tests', flowPath);
-      expect(readFileSync(resolvedFlowPath, 'utf8')).toContain('inputText: ${HAPPIER_E2E_RESTORE_KEY_CHUNK_09}');
+      expect(readFileSync(resolve(testsPackageRoot, flowPath), 'utf8')).toContain('inputText: ${HAPPIER_E2E_RESTORE_KEY_CHUNK_09}');
       return { exitCode: 0 };
     });
 

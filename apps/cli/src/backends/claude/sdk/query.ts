@@ -3,7 +3,7 @@
  * Handles spawning Claude process and managing message streams
  */
 
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { existsSync } from 'node:fs'
 import { Stream } from './stream'
@@ -30,13 +30,15 @@ import { createManagedChildProcess } from '@/subprocess/supervision/managedChild
 import { resolveJavaScriptRuntimeExecutable } from '@/runtime/js/resolveJavaScriptRuntimeExecutable'
 import { buildMissingJavaScriptRuntimeMessage } from '@/runtime/js/buildMissingJavaScriptRuntimeMessage'
 import { prepareClaudeSubprocessEnv } from '@/backends/claude/spawn/buildClaudeSubprocessEnv'
-import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process'
+import { spawnBackgroundSync, resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process'
 import { resolveExistingManagedJavaScriptRuntimeCommand } from '@happier-dev/cli-common/providers'
 import { killProcessTree } from '@/agent/runtime/process/killProcessTree'
 import { logClaudeRuntimeAuthEnvDiagnostic } from '@/backends/claude/spawn/logClaudeRuntimeAuthEnvDiagnostic'
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers'
 import { resolveCliRuntimeAssetPath } from '@/runtime/assets/resolveCliRuntimeAssetPath'
 import { isNativeProcessExited, isProviderInLauncher } from '../../../../scripts/native_process_exit.cjs'
+import { buildClaudePermissionModeArgs, extractClaudePermissionModeArgs } from '@/backends/claude/utils/permissionMode'
+import { materializeClaudeSystemPromptArgsForSpawn } from '@/backends/claude/utils/materializeClaudeSystemPromptArgsForSpawn'
 
 /**
  * Query class manages Claude Code process interaction
@@ -271,9 +273,11 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
             if (!toolUseId) {
                 throw new Error('Cannot apply a permission decision without a canonical tool-use ID')
             }
+            const agentId = readNonBlankOpaqueIdentifier(request.request.agent_id ?? request.request.agentId)
             return this.canCallTool(request.request.tool_name, request.request.input, {
                 signal,
                 toolUseId,
+                ...(agentId ? { agentId } : {}),
             })
         }
         
@@ -294,7 +298,7 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
 /**
  * Main query function to interact with Claude Code
  */
-export function query(config: {
+export async function query(config: {
     prompt: QueryPrompt
     options?: QueryOptions
     onMessageReceived?: (message: SDKMessage) => void
@@ -304,7 +308,7 @@ export function query(config: {
         processTreeStopped: boolean
         nativeExited: boolean
     }>) => void | Promise<void>
-}): Query {
+}): Promise<Query> {
 	    const {
 	        prompt,
 	        options: {
@@ -372,13 +376,6 @@ export function query(config: {
 	        args.push(...extraArgs);
 	    }
 
-	    // Handle prompt input
-	    if (typeof prompt === 'string') {
-	        args.push('--print', prompt.trim())
-	    } else {
-        args.push('--input-format', 'stream-json')
-    }
-
     // Determine how to spawn Claude Code
     // - If it's a .js/.cjs file → spawn the resolved JS runtime with [path, ...args]
     // - If it's just 'claude' command → resolve + wrap on Windows (PATHEXT .cmd/.bat)
@@ -404,11 +401,6 @@ export function query(config: {
         throw new ReferenceError(buildMissingJavaScriptRuntimeMessage('Claude Code'))
     }
 
-    const spawnCommand = isJsFile ? resolvedExecutable! : pathToClaudeCodeExecutable
-    const spawnArgs = isJsFile
-        ? [...executableArgs, pathToClaudeCodeExecutable, ...args]
-        : args
-
     // Spawn Claude Code process
     // Use clean env for global claude to avoid local node_modules/.bin taking precedence
     const baseEnv = isCommandOnly ? getCleanEnv() : process.env
@@ -420,23 +412,49 @@ export function query(config: {
         runnerEnv: process.env,
         childEnv: spawnEnv,
     });
-    logDebug(`Spawning Claude Code process: ${spawnCommand} ${spawnArgs.join(' ')} (using ${isCommandOnly ? 'clean' : 'normal'} env)`)
-
-    const invocation = resolveWindowsCommandInvocation({
-        command: spawnCommand,
-        args: spawnArgs,
-        env: spawnEnv,
-    });
-
-    const child = spawn(invocation.command, invocation.args, {
-        cwd,
-        stdio: isFirstPartyWrapper ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['pipe', 'pipe', 'pipe'],
-        signal: config.options?.abort,
-        env: spawnEnv,
-        windowsHide: true,
-        detached: process.platform !== 'win32',
-        ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-    }) as ChildProcessWithoutNullStreams
+    const permissionArgs = extractClaudePermissionModeArgs(args)
+    const materializedPrompt = await materializeClaudeSystemPromptArgsForSpawn([
+        ...buildClaudePermissionModeArgs(permissionArgs.permissionMode),
+        ...permissionArgs.args,
+    ])
+    let child: ChildProcessWithoutNullStreams
+    try {
+        if (config.options?.abort?.aborted) {
+            throw new AbortError('Claude Code process aborted by user')
+        }
+        // The print payload is data, even when it resembles a CLI flag.
+        if (typeof prompt === 'string') {
+            materializedPrompt.args.push('--print', prompt.trim())
+        } else {
+            materializedPrompt.args.push('--input-format', 'stream-json')
+        }
+        const spawnCommand = isJsFile ? resolvedExecutable! : pathToClaudeCodeExecutable
+        const spawnArgs = isJsFile
+            ? [...executableArgs, pathToClaudeCodeExecutable, ...materializedPrompt.args]
+            : materializedPrompt.args
+        logDebug(`Spawning Claude Code process: ${spawnCommand} ${spawnArgs.join(' ')} (using ${isCommandOnly ? 'clean' : 'normal'} env)`)
+        const invocation = resolveWindowsCommandInvocation({
+            command: spawnCommand,
+            args: spawnArgs,
+            env: spawnEnv,
+        })
+        child = spawn(invocation.command, invocation.args, {
+            cwd,
+            stdio: isFirstPartyWrapper ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['pipe', 'pipe', 'pipe'],
+            signal: config.options?.abort,
+            env: spawnEnv,
+            windowsHide: true,
+            detached: process.platform !== 'win32',
+            ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+        }) as ChildProcessWithoutNullStreams
+    } catch (error) {
+        await materializedPrompt.cleanup()
+        throw error
+    }
+    // Abort emits an error before the child necessarily exits. Keep its prompt until close.
+    const promptCleanup = new Promise<void>((resolve) => {
+        child.once('close', () => { void materializedPrompt.cleanup().then(resolve) })
+    })
     const managedChild = createManagedChildProcess(child)
     let nativeExited = false
     let providerInLauncher = false
@@ -485,6 +503,7 @@ export function query(config: {
         })
     }
     const cleanupOnExit = () => {
+        materializedPrompt.cleanupSync()
         if (cleanupStarted) return
         cleanupStarted = true
 
@@ -492,7 +511,7 @@ export function query(config: {
 
         if (process.platform === 'win32') {
             try {
-                const result = spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' })
+                const result = spawnBackgroundSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' })
                 if (!result.error && result.status === 0) return
             } catch {
                 // ignore and fall back to a direct child signal
@@ -520,8 +539,10 @@ export function query(config: {
     config.options?.abort?.addEventListener('abort', cleanupInBackground)
     const cleanupOnSigterm = () => cleanupInBackground()
     const cleanupOnSigint = () => cleanupInBackground()
+    const cleanupOnSighup = () => cleanupInBackground()
     process.on('SIGTERM', cleanupOnSigterm)
     process.on('SIGINT', cleanupOnSigint)
+    if (process.platform !== 'win32') process.on('SIGHUP', cleanupOnSighup)
     process.on('exit', cleanupOnExit)
 
     let processExitObservationError: Error | null = null
@@ -557,6 +578,8 @@ export function query(config: {
         await processExitObservationPromise
         if (processExitObservationError) return
         await processClosedPromise
+        // The protected system-prompt file outlives the child; retire it before settling.
+        await promptCleanup
         if (config.options?.abort?.aborted) {
             query.setError(new AbortError('Claude Code process aborted by user'))
             return
@@ -623,6 +646,7 @@ export function query(config: {
         config.options?.abort?.removeEventListener('abort', cleanupInBackground)
         process.off('SIGTERM', cleanupOnSigterm)
         process.off('SIGINT', cleanupOnSigint)
+        if (process.platform !== 'win32') process.off('SIGHUP', cleanupOnSighup)
         process.off('exit', cleanupOnExit)
     })
 

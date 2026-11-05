@@ -20,6 +20,7 @@ import type { Credentials } from '@/persistence';
 import { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } from './nativeAuth/claudeCodeCredentialScopes';
 import { materializeClaudeConnectedServiceRuntimeAuthSelection } from './materializeClaudeConnectedServiceRuntimeAuthSelection';
 import { resolveClaudeConnectedServiceStableConfigDir } from './resolveClaudeConnectedServiceStableAuthDir';
+import { CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS } from './claudeTranscriptRetentionSettings';
 
 // Server HTTP boundary mock: the persisted-metadata continuity fallback fetches the session
 // snapshot from the server; unit tests must never hit the network.
@@ -281,7 +282,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
         hasCompletedProjectOnboarding: true,
       },
     });
-    await expect(readFile(join(groupClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"ambient"}\n');
+    expect(JSON.parse(await readFile(join(groupClaudeConfigDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'ambient', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
   });
 
   it('returns shared group hot-apply metadata without rewriting the live Claude config dir first', async () => {

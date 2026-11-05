@@ -47,7 +47,6 @@ import { existsSync, statSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import os from 'node:os';
 import { join } from 'node:path';
-import { rm } from 'node:fs/promises';
 import { configuration } from '@/configuration';
 import { createConnectedServiceMaterializationIdentity } from '@/daemon/connectedServices/materialize/createConnectedServiceMaterializationIdentity';
 import { resolveConnectedServiceAuthForSpawn } from '@/daemon/connectedServices/resolveConnectedServiceAuthForSpawn';
@@ -312,20 +311,14 @@ async function resolveConnectedServiceProbeEnvironment(params: Readonly<{
         processEnv: { ...params.processEnv, ...resolved.env },
         connectedServiceSelectionCacheKey:
             resolved.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY] ?? null,
-        cleanup: async () => {
-            resolved.cleanupOnExit?.();
-            resolved.cleanupOnFailure?.();
-            await rm(join(materializationBaseDir, materializationIdentity.id), {
-                recursive: true,
-                force: true,
-            });
-        },
+        cleanup: resolved.cleanupMaterializationRoot ?? null,
     };
 }
 
 async function invokeProviderCliInstall(
     agentId: AgentCatalogEntry['id'],
     params?: Record<string, unknown>,
+    signal?: AbortSignal,
 ): Promise<CapabilitiesInvokeResponse> {
     const dryRun = params?.dryRun === true;
     const allowVendorRecipeExecution = params?.allowVendorRecipeExecution === true;
@@ -341,6 +334,7 @@ async function invokeProviderCliInstall(
             params: { ...sharedParams, dryRun: true },
             env: process.env,
             nodePlatform: process.platform,
+            signal,
         });
 
         if (!preview.ok) {
@@ -370,6 +364,7 @@ async function invokeProviderCliInstall(
         },
         env: process.env,
         nodePlatform: process.platform,
+        signal,
     });
 
     if (!result.ok) {
@@ -595,7 +590,7 @@ function createGenericCliCapability(agentId: AgentCatalogEntry['id']): Capabilit
         invoke: async ({ method, params, signal }) => {
             if (method === 'connectedServiceAuthSupport') return getConnectedServiceAuthSupport(agentId);
             if (method === 'install') {
-                return invokeProviderCliInstall(agentId, params);
+                return invokeProviderCliInstall(agentId, params, signal);
             }
             if (method === 'probeModels') {
                 return invokeCliProbeMethod(agentId, method, params, signal);
@@ -630,7 +625,7 @@ function augmentCliCapabilityWithProbeModels(cap: Capability, agentId: AgentCata
     const invoke: Capability['invoke'] = async ({ method, params, signal }) => {
         if (method === 'connectedServiceAuthSupport') return getConnectedServiceAuthSupport(agentId);
         if (method === 'install') {
-            return invokeProviderCliInstall(agentId, params);
+            return invokeProviderCliInstall(agentId, params, signal);
         }
         if (method === 'probeModels') {
             return invokeCliProbeMethod(agentId, method, params, signal);

@@ -611,6 +611,20 @@ export function localesFor(route: Route): readonly Locale[] {
 }
 
 /**
+ * The site-scoped graph nodes declared once in index.html and shared by every
+ * page in every language. They sit at `${SITE}/#…`, which is also where the
+ * homepage's own `#webpage` lives, so they have to be named to be told apart.
+ */
+export const SITE_SCOPED_JSON_LD_IDS: readonly string[] = [
+    'org',
+    'site',
+    'app',
+    'app-ios',
+    'app-android',
+    'source',
+].map((fragment) => `${SITE}/#${fragment}`);
+
+/**
  * Re-point a page-scoped JSON-LD node at the locale's own URL.
  *
  * `webPage()` mints `@id` and `url` from the English path, which is right for
@@ -619,8 +633,12 @@ export function localesFor(route: Route): readonly Locale[] {
  * what hreflang exists to deny. `inLanguage` moves for the same reason — a
  * Chinese page describing itself as `en` contradicts its own `<html lang>`.
  *
- * Only the prefix is rewritten, so `#webpage` and any `#agent-list` fragment
- * survive and stay unique per URL.
+ * Only page-local references move: the page URL itself, its own `#fragment`
+ * ids (`#webpage`, `#agent-list`), and for non-home pages the URLs beneath it
+ * (`/agents/<slug>`). A bare prefix match is not enough, because the homepage
+ * prefix is the whole origin: it would turn `/images/og.png` into
+ * `/frimages/og.png` and re-point the shared `/#site` and `/#app` identities at
+ * `/fr#site` and `/fr#app`, nodes that no document declares.
  */
 function localizeJsonLd(
     node: Record<string, unknown>,
@@ -630,9 +648,16 @@ function localizeJsonLd(
     if (locale === DEFAULT_LOCALE) return node;
     const englishUrl = `${SITE}${routePath}`;
     const localised = localeUrl(locale, routePath);
+    const isPageLocal = (value: string): boolean => {
+        if (value === englishUrl) return true;
+        if (SITE_SCOPED_JSON_LD_IDS.includes(value)) return false;
+        if (value.startsWith(`${englishUrl}#`)) return true;
+        // Under `/` every URL on the site is a "sub-path", assets included.
+        return routePath !== '/' && value.startsWith(`${englishUrl}/`);
+    };
     const rewrite = (value: unknown): unknown => {
         if (typeof value === 'string') {
-            return value.startsWith(englishUrl) ? localised + value.slice(englishUrl.length) : value;
+            return isPageLocal(value) ? localised + value.slice(englishUrl.length) : value;
         }
         if (Array.isArray(value)) return value.map(rewrite);
         if (typeof value === 'object' && value !== null) {

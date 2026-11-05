@@ -1,7 +1,7 @@
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { ChildProcess, spawn } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { inspect } from 'node:util';
 
@@ -24,7 +24,7 @@ import { ClaudeNativeProviderExitUnverifiedError } from './types';
 // Record real OS children so cleanup assertions wait for the actual close boundary.
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
-  return { ...actual, spawn: vi.fn(actual.spawn) };
+  return { ...actual, spawn: vi.fn(actual.spawn), spawnSync: vi.fn(actual.spawnSync) };
 });
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -58,6 +58,35 @@ describe('claude sdk query exit handling', () => {
     }
   });
 
+  it('hides the Windows exit-time process-tree cleanup command', async () => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'happier-claude-query-exit-console-'));
+    const script = join(tmpRoot, 'provider.cjs');
+    writeFileSync(script, "console.log(JSON.stringify({ type: 'system', subtype: 'init' })); setInterval(() => {}, 1000);");
+    const before = new Set(process.listeners('exit'));
+    const response = await query({ prompt: 'hi', options: {
+      cwd: tmpRoot, executable: process.execPath, pathToClaudeCodeExecutable: script,
+    } });
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const childResult = vi.mocked(spawn).mock.results.at(-1);
+    try {
+      await response.next();
+      const cleanup = process.listeners('exit').find((listener) => !before.has(listener));
+      expect(cleanup).toBeDefined();
+      vi.mocked(spawnSync).mockReturnValueOnce({ pid: 0, output: [], stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), status: 0, signal: null });
+      Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+      try {
+        cleanup!(0);
+      } finally {
+        Object.defineProperty(process, 'platform', platform);
+      }
+      expect(spawnSync).toHaveBeenCalledWith('taskkill', expect.arrayContaining(['/F', '/T', '/PID']), expect.objectContaining({ windowsHide: true, stdio: 'ignore' }));
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+      if (childResult?.type === 'return') await killProcessTree(childResult.value);
+      await response.return();
+    }
+  });
+
   it.runIf(process.platform !== 'win32').each(['native-exit', 'javascript-in-launcher', 'wrapper-operation-error'] as const)('requires positive provider exit proof when the legacy wrapper exits normally (%s)', async (outcome) => {
     tmpRoot = mkdtempSync(join(tmpdir(), 'happier-claude-query-native-proof-'));
     const pidPath = join(tmpRoot, 'native-pid');
@@ -79,7 +108,7 @@ describe('claude sdk query exit handling', () => {
     const adapter = createClaudeProviderRuntimeActivityAdapter({ providerActivityLedger: ledger,
       contributionHandle: { report: async () => {}, markUnknown: async () => {}, dispose: async () => {} } });
     const spawnIndex = vi.mocked(spawn).mock.results.length;
-    const q = query({ prompt: 'hi', options: {
+    const q = await query({ prompt: 'hi', options: {
       cwd: tmpRoot, executable: process.execPath,
       executableArgs: outcome === 'wrapper-operation-error' ? ['--require', preload] : [],
       pathToClaudeCodeExecutable: resolveCliRuntimeAssetPath('scripts', 'claude_remote_launcher.cjs'),
@@ -126,7 +155,7 @@ describe('claude sdk query exit handling', () => {
     });
     await adapter.activateObservation('test-observer-installed');
     let processExited = false;
-    const response = query({
+    const response = await query({
       prompt: 'hi',
       options: { cwd: tmpRoot, executable: process.execPath, pathToClaudeCodeExecutable: script },
       onProcessExited: async () => {
@@ -156,7 +185,7 @@ describe('claude sdk query exit handling', () => {
     ledger.apply({ type: 'started', sessionId: 'owned-session', taskId: 'background-child' });
     const adapter = createClaudeProviderRuntimeActivityAdapter({ providerActivityLedger: ledger,
       contributionHandle: { report: async () => {}, markUnknown: async () => {}, dispose: async () => {} } });
-    const response = query({ prompt: 'hi', options: {
+    const response = await query({ prompt: 'hi', options: {
       cwd: tmpRoot, executable: process.execPath, pathToClaudeCodeExecutable: script, abort: abort.signal,
     }, onProcessExited: () => adapter.handleRuntimeLoss('claude_process_exit', { providerStopped: true }) });
     try {
@@ -183,7 +212,7 @@ describe('claude sdk query exit handling', () => {
       } });
     await adapter.activateObservation('observer-installed');
     const defaultLog = vi.spyOn(logger, 'infoFile');
-    const response = query({ prompt: 'hi',
+    const response = await query({ prompt: 'hi',
       options: { cwd: tmpRoot, executable: process.execPath, pathToClaudeCodeExecutable: script },
       onProcessExited: () => adapter.handleRuntimeLoss('claude_process_exit', { providerStopped: true }),
     });
@@ -205,7 +234,7 @@ describe('claude sdk query exit handling', () => {
     writeFileSync(script, "console.log(JSON.stringify({ type: 'system', subtype: 'init', pid: process.pid })); setInterval(() => {}, 1000);");
     let providerPid: number | undefined;
     let processExited = false;
-    const response = query({
+    const response = await query({
       prompt: 'hi', options: { cwd: tmpRoot, executable: process.execPath, pathToClaudeCodeExecutable: script },
       onMessageReceived: (message) => {
         if ('pid' in message && typeof message.pid === 'number') providerPid = message.pid;
@@ -558,7 +587,7 @@ describe('claude sdk query exit handling', () => {
     `);
 
     try {
-      const q = query({
+      const q = await query({
         prompt: 'hi',
         options: {
           cwd: tmpdir(),
@@ -584,7 +613,7 @@ describe('claude sdk query exit handling', () => {
     `);
 
     try {
-      const q = query({
+      const q = await query({
         prompt: 'hi',
         options: {
           cwd: tmpdir(),
@@ -612,7 +641,7 @@ describe('claude sdk query exit handling', () => {
     `);
 
     try {
-      const q = query({
+      const q = await query({
         prompt: 'hi',
         options: {
           cwd: tmpdir(),
@@ -643,7 +672,8 @@ describe('claude sdk query exit handling', () => {
         const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
           stdio: 'ignore',
         });
-        writeFileSync(markerPath, JSON.stringify({ childPid: child.pid }), 'utf8');
+        const promptPath = process.argv[process.argv.indexOf('--append-system-prompt-file') + 1];
+        writeFileSync(markerPath, JSON.stringify({ childPid: child.pid, promptPath }), 'utf8');
 
         // Stay alive until the parent terminates us.
         setInterval(() => {}, 1000);
@@ -672,21 +702,22 @@ describe('claude sdk query exit handling', () => {
     try {
       const { query: reloadedQuery } = await import('./query');
 
-      const q = reloadedQuery({
+      const q = await reloadedQuery({
         prompt: 'hi',
         options: {
           cwd: tmpRoot,
           executable: process.execPath,
           executableArgs: [],
           pathToClaudeCodeExecutable: sleeper,
+          appendSystemPrompt: 'private exit-cleanup prompt',
         },
       });
 
-      const marker = await new Promise<{ childPid: number }>((resolve, reject) => {
+      const marker = await new Promise<{ childPid: number; promptPath: string }>((resolve, reject) => {
         const startedAt = Date.now();
         const poll = () => {
           try {
-            resolve(JSON.parse(readFileSync(markerPath, 'utf8')) as { childPid: number });
+            resolve(JSON.parse(readFileSync(markerPath, 'utf8')) as { childPid: number; promptPath: string });
           } catch (error) {
             if (Date.now() - startedAt > 5_000) {
               reject(error);
@@ -706,7 +737,9 @@ describe('claude sdk query exit handling', () => {
       if (!exitHandler) {
         throw new Error('Expected process exit handler to be registered');
       }
+      expect(existsSync(marker.promptPath)).toBe(true);
       exitHandler();
+      expect(existsSync(dirname(marker.promptPath))).toBe(false);
 
       await withTimeout(
         new Promise<void>((resolve, reject) => {

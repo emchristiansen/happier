@@ -1,6 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { projectPath } from '@/projectPath';
+import { withTempDir } from '@/testkit/fs/tempDir';
+import { spawnTestProcess } from '@/testkit/process/spawn';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -53,7 +57,7 @@ describe('claude sdk query signal cleanup', () => {
     const sigtermBefore = process.listeners('SIGTERM').length;
     const sigintBefore = process.listeners('SIGINT').length;
 
-    const q = query({
+    const q = await query({
       prompt: 'hi',
       options: {
         cwd: tmpRoot,
@@ -130,6 +134,48 @@ describe('claude sdk query signal cleanup', () => {
           // already gone
         }
       }
+    }
+  });
+});
+
+it.skipIf(process.platform === 'win32')('cleans the SDK child and private prompt when its parent receives SIGHUP', async () => {
+  await withTempDir('happier-sdk-hup-', async (directory) => {
+    const readyPath = join(directory, 'ready.json');
+    const observedPath = join(directory, 'observed.txt');
+    const script = join(directory, 'fake-claude.cjs');
+    const prompt = 'private SDK SIGHUP prompt';
+    writeFileSync(script, `
+      const fs = require('node:fs');
+      const promptPath = process.argv[process.argv.indexOf('--append-system-prompt-file') + 1];
+      process.on('SIGTERM', () => {
+        fs.writeFileSync(${JSON.stringify(observedPath)}, fs.readFileSync(promptPath));
+        process.exit(0);
+      });
+      fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ pid: process.pid, promptPath }));
+      setInterval(() => {}, 1000);
+    `);
+    const parent = spawnTestProcess(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', `
+      import { query } from ${JSON.stringify(pathToFileURL(join(projectPath(), 'src/backends/claude/sdk/query.ts')).href)};
+      const q = await query({ prompt: 'fixture', options: {
+        pathToClaudeCodeExecutable: ${JSON.stringify(script)}, executable: process.execPath,
+        appendSystemPrompt: ${JSON.stringify(prompt)} } });
+      try { for await (const message of q) {} } catch {}
+    `], { cwd: projectPath(), env: { ...process.env, DEBUG: '', HAPPIER_HOME_DIR: join(directory, 'happier') } });
+    const closed = new Promise<void>((resolve) => { parent.once('close', () => resolve()); });
+    let ready: { pid: number; promptPath: string } | undefined;
+    try {
+      await expect.poll(() => {
+        try { ready = JSON.parse(readFileSync(readyPath, 'utf8')); return true; } catch { return false; }
+      }, { timeout: 10_000 }).toBe(true);
+      parent.kill('SIGHUP');
+      await closed;
+      expect(existsSync(ready!.promptPath)).toBe(false);
+      expect(readFileSync(observedPath, 'utf8')).toBe(prompt);
+    } finally {
+      if (ready) { try { process.kill(-ready.pid, 'SIGKILL'); } catch {} }
+      if (parent.exitCode === null && parent.signalCode === null) parent.kill('SIGKILL');
+      await closed;
+      if (ready) rmSync(dirname(ready.promptPath), { recursive: true, force: true });
     }
   });
 });

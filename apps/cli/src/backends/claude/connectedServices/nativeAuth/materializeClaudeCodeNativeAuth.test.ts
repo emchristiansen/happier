@@ -20,6 +20,7 @@ import {
   materializeClaudeCodeNativeAuth,
   materializeClaudeSubscriptionNativeAuthHome,
 } from './materializeClaudeCodeNativeAuth';
+import { CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS } from '../claudeTranscriptRetentionSettings';
 
 const REALISTIC_ISSUED_AT_MS = Date.parse('2026-06-05T12:00:00.000Z');
 const REALISTIC_EXPIRES_AT_MS = REALISTIC_ISSUED_AT_MS + 60 * 60 * 1000;
@@ -154,8 +155,8 @@ describe('materializeClaudeCodeNativeAuth', () => {
     } });
     expect((await readRoot()).oauthAccount.organizationUuid).toBe('organization-b');
     expect(await readRoot()).not.toHaveProperty('modelAccessCache');
-    await expect(readFile(join(profileClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
-    await expect(readFile(join(groupClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
+    expect(JSON.parse(await readFile(join(profileClaudeConfigDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
+    expect(JSON.parse(await readFile(join(groupClaudeConfigDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
 
     expect(profile.identityDiagnostic).toMatchObject({
       serviceId: 'claude-subscription',
@@ -420,7 +421,7 @@ describe('materializeClaudeCodeNativeAuth', () => {
     const credential = JSON.parse(await readFile(join(targetClaudeConfigDir, '.credentials.json'), 'utf8'));
     expect(credential.claudeAiOauth.accessToken).toBe('next-access');
     await expect(readFile(join(targetClaudeConfigDir, 'live-runner-marker.txt'), 'utf8')).resolves.toBe('must survive\n');
-    await expect(readFile(join(targetClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"private"}\n');
+    expect(JSON.parse(await readFile(join(targetClaudeConfigDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'private', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
     await expect(readFile(join(targetClaudeConfigDir, 'commands', 'private.md'), 'utf8')).resolves.toBe('# Private command\n');
     await expect(readFile(join(targetClaudeConfigDir, 'history.jsonl'), 'utf8')).resolves.toBe('{"display":"private history"}\n');
     await expect(readFile(join(targetClaudeConfigDir, 'projects', 'private-project', 'memory', 'MEMORY.md'), 'utf8')).resolves.toBe('# Private memory\n');
@@ -604,7 +605,7 @@ describe('materializeClaudeCodeNativeAuth', () => {
     });
 
     expect(result.status).toBe('materialized');
-    await expect(readFile(join(claudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
+    expect(JSON.parse(await readFile(join(claudeConfigDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
     expect((await lstat(join(claudeConfigDir, 'settings.json'))).isSymbolicLink()).toBe(false);
     await expect(readFile(join(claudeConfigDir, 'projects', 'repo-a', 'resume-123.jsonl'), 'utf8')).rejects.toThrow();
     expect(result.identityDiagnostic).toMatchObject({
@@ -664,7 +665,7 @@ describe('materializeClaudeCodeNativeAuth', () => {
     });
 
     expect(result.status).toBe('materialized');
-    await expect(readFile(join(targetClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"private"}\n');
+    expect(JSON.parse(await readFile(join(targetClaudeConfigDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'private', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
     await expect(readFile(join(targetClaudeConfigDir, 'history.jsonl'), 'utf8')).resolves.toBe('{"display":"private history"}\n');
     await expect(readFile(join(targetClaudeConfigDir, 'commands', 'private.md'), 'utf8')).resolves.toBe('# Private command\n');
     await expect(readFile(join(targetClaudeConfigDir, 'projects', 'private', 'memory', 'MEMORY.md'), 'utf8')).resolves.toBe('# Private memory\n');

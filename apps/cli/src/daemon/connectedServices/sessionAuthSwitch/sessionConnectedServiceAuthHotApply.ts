@@ -13,6 +13,7 @@ import type {
   ConnectedServiceRuntimeAuthTargetInput,
 } from '../runtimeAuth/types';
 import type { TrackedSession } from '@/daemon/types';
+import { isRetryableConnectedServiceCredentialApplyFailure } from '../runtimeAuth/connectedServiceAuthGenerationApplyFailure';
 import type {
   AcceptedConnectedServiceAccountVerification,
   AcceptedConnectedServiceAccountVerificationByServiceId,
@@ -41,7 +42,7 @@ export type HotApplyResult =
     }>
   | Readonly<{
       ok: false;
-      errorCode: 'hot_apply_unavailable' | 'hot_apply_failed' | 'hot_apply_restart_required' | 'credential_revision_superseded';
+      errorCode: 'hot_apply_unavailable' | 'hot_apply_failed' | 'hot_apply_restart_required' | 'credential_revision_missing' | 'credential_revision_superseded';
       serviceId?: string;
       serviceResultsByServiceId?: Readonly<Record<string, HotApplyServiceResult>>;
       underlyingError?: string;
@@ -165,9 +166,10 @@ function readAcceptedVerificationFromHotApplyResult(
 function readHotApplyFailureErrorCode(
   result: Readonly<Record<string, unknown>>,
 ): Exclude<HotApplyResult, Readonly<{ ok: true }>>['errorCode'] {
+  const reason = readString(result.reason) ?? readString(result.errorCode);
+  if (reason && isRetryableConnectedServiceCredentialApplyFailure(reason)) return reason;
   if (
     result.status === 'superseded_after_apply'
-    || result.reason === 'credential_revision_superseded'
     || result.reason === 'shared_generation_application_superseded'
   ) {
     return 'credential_revision_superseded';

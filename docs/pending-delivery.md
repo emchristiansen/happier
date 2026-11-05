@@ -109,23 +109,91 @@ the session supports steering. An explicit per-send Pending intent or the
 **Server pending** busy policy keeps `enqueue`. Runtime readiness and payload
 steerability still gate delivery through the existing Pending owner.
 
+The existing-session composer's send button offers per-message choices on long
+press (or right-click on web): **Steer now** when steering is supported, **Queue**,
+and **Send now (interrupt)**. Selecting a choice submits the current draft through
+the same submission owner, overriding the saved send preference for that message.
+A normal tap keeps the saved behavior; dismissing the menu preserves the draft.
+Voice, Stop, pending-message editing, participant routing, and armed Agent
+continuations retain their own actions without this menu.
+
+Composer shortcuts in development source use the platform modifier: Command on
+Apple platforms and Control elsewhere. Normal submit follows the saved delivery
+preference. `Mod+Enter` selects the other noninterrupting action (steer when the
+default queues; queue when the default steers). `Mod+Shift+Enter` explicitly
+interrupts and sends. With no composer text or attachments, these two shortcuts
+instead steer or interrupt-and-send the first queued row, respectively; they do
+not replay history or create a new copy. An unavailable row or empty queue is a
+no-op. Pending interrupt actions retain their confirmation, and failures leave
+queued custody intact.
+
+The send menu and hover/focus tooltip show the effective shortcuts, including
+custom bindings. The existing persisted `composer.sendImmediate` command id now
+names alternate send; `composer.sendPending` remains rebindable with no default,
+and `composer.sendInterrupt` owns the new Shift binding. No settings format or
+Pending wire shape changes. Explicit steering never selects interrupt as a fallback.
+
+
 ## UI settlement convergence (development)
+
+Voice-agent speech and composer text share `submitDurableVoiceTextTurn`. After
+a successful external handoff, it calls the existing Pending handled operation,
+which commits the original user message and retires its exact pending row in one
+server transaction. This also persists input for the OpenAI-compatible backend,
+whose conversation history otherwise lives in UI memory. Definite pre-provider
+rejections remain failed sends. Aborted or unknown-outcome dispatches and settlement
+failures remain ambiguous and do not automatically resend the provider input. The `handoff_acknowledged` result remains distinct from
+runner-proven provider acceptance.
 
 Provider acceptance carries the exact Pending `localId` to `SessionClient`, which
 requests server settlement. The server transaction commits or updates the
 transcript message and removes that Pending row before publishing the message
 event and the separate Pending count/version event.
 
+In development source, native Codex app-server acceptance explicitly identifies
+primary-turn delivery. `SessionClient` retains the exact Pending row until its
+bound canonical turn's begin has been acknowledged through the existing durable
+mutation outbox. Local journal admission alone does not establish publication.
+The target may already be terminal; delayed acceptance still belongs to the
+captured input and turn. Native steering binds to the existing turn before
+provider dispatch, and retries before acceptance can bind the same input to a
+new turn. Locally handled clear and compact commands explicitly require no turn.
+Provider dispatch does not wait for network publication, and transcript anchors
+still wait for accepted input commitment.
+
+Other accepted-input producers retain their released opaque delivery contract
+and emit a default-level file diagnostic when using it. Their exact Pending
+acceptance does not yet establish a canonical primary-turn publication barrier.
+In particular, Claude terminal queued steering may be consumed by a later turn;
+its submission or acceptance callback cannot safely bind to whichever turn is
+currently active. Missing delivery classification is never interpreted as a
+no-turn command.
+
 In development source, Claude's Agent SDK and legacy remote runtimes share
 `createClaudeRemotePromptSettlementTracker`. They request the documented
 [`--replay-user-messages`](https://code.claude.com/docs/en/cli-reference) acknowledgment and correlate its main-chain user UUID
-with the exact submitted Pending prompt. Local enqueue, SDK iterable consumption,
-and stdin writes do not settle Pending or retire its replay handoff. A submitted
-prompt without acknowledgment has an uncertain delivery outcome; its handoff
+with the exact submitted Pending prompt. Native results that identify an answered
+prompt through `user_message_uuids` (or the older `user_message_uuid`) also settle
+that prompt; their result output remains visible. Local enqueue, SDK iterable
+consumption, and stdin writes do not settle Pending or retire its replay handoff.
+A submitted prompt without acknowledgment has an uncertain delivery outcome; its handoff
 remains available and Pending does not automatically resend it. Inputs rejected
 before submission remain retryable. Matching acknowledgment echoes carry
 provider-only context and are excluded from the visible transcript. Locally
 handled commands retain their explicit local settlement.
+
+The same owner tracks which submitted prompts still await results, separately
+from delivery acknowledgement. An attributable result can finish those prompts
+while `queued_turn_count` still reports other native sends. Earlier or partial
+results retain foreground custody until the remaining submitted prompts have
+outcomes. Attribution is consumed by the ordered result handler, so raw ingress
+read-ahead cannot make an older result finish a newer prompt. Native results
+without attribution retain the existing queue-count boundary. Because native
+attribution lists are capped at 64 entries, an empty-queue result also retains
+the existing closeout for omitted older IDs once the latest submitted prompt
+has an attributable outcome; it does not acknowledge omitted delivery receipts.
+Elapsed silence, server snapshots, background-task counts, and unattributed
+idle events do not establish that a submitted prompt completed or was discarded.
 
 In development source, Claude unified terminal reports exact transcript-proven acceptance before stopping
 for missing required session hooks. The hook failure still stops the wrapper and
@@ -138,6 +206,10 @@ its native queue. `UserPromptSubmit` can fire at enqueue and does not prove that
 Claude has consumed the steer. The arbiter accepts a steer from its exact
 transcript consumption evidence; the existing queued-command matcher correlates
 the native enqueue/remove episode with its main-chain `queued_command` attachment.
+The attachment may precede native queue consumption, so the custody episode joins
+both facts in either order. Native cancellation and plugin-discard removals do
+not establish acceptance, and available native command and delivery identities
+keep a canceled episode separate from an identical replacement.
 The session scanner observes that evidence after awaiting earlier visible-message
 commits, including known resumes and rows appended while the replay baseline loads.
 There is no separate acceptance-only follower of the resume transcript.

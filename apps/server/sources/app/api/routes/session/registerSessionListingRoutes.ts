@@ -38,10 +38,6 @@ import {
 } from "./v2SessionListPage";
 import { createV2SessionListInitialPage } from "./v2SessionListInitialPage";
 import { createV2SessionListServerTiming } from "./v2SessionListServerTiming";
-import {
-    createSessionRollbackEligibleTurnsSelect,
-    readSessionTurnRollbackEligibleStarts,
-} from "@/app/session/turns/sessionRollbackEligibilityProjection";
 
 const V2_ACTIVE_SESSION_LIST_QUERYSTRING_SCHEMA = z.object({
     [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional(),
@@ -56,6 +52,15 @@ const OPTIONAL_BOOLEAN_QUERY_PARAM_SCHEMA = z.preprocess((value) => {
     return value;
 }, z.boolean()).optional();
 
+const OPTIONAL_SESSION_IDS_QUERY_PARAM_SCHEMA = z.preprocess((value) => {
+    if (typeof value !== "string") return value;
+    try {
+        return JSON.parse(value) as unknown;
+    } catch {
+        return value;
+    }
+}, z.array(z.string().min(1))).optional();
+
 const V2_PAGED_SESSION_LIST_QUERYSTRING_SCHEMA = z.object({
     [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional(),
     cursor: z.string().optional(),
@@ -68,6 +73,8 @@ const V2_PAGED_SESSION_LIST_QUERYSTRING_SCHEMA = z.object({
      * the capability.
      */
     includeActive: OPTIONAL_BOOLEAN_QUERY_PARAM_SCHEMA,
+    requiredSessionIds: OPTIONAL_SESSION_IDS_QUERY_PARAM_SCHEMA,
+    requiredOnly: OPTIONAL_BOOLEAN_QUERY_PARAM_SCHEMA,
 }).optional();
 
 function parseInitialIncludeFlag(value: unknown): boolean {
@@ -112,7 +119,6 @@ const V1_SESSION_LIST_ROW_SELECT = {
     pendingActivationRequestedAt: true,
     pendingActivationStatus: true,
     pendingActivationFailureCode: true,
-    turns: createSessionRollbackEligibleTurnsSelect(),
     active: true,
     lastActiveAt: true,
 } as const satisfies Prisma.SessionSelect;
@@ -214,7 +220,6 @@ export function registerSessionListingRoutes(app: Fastify) {
                 pendingBlockedCount: v.pendingBlockedCount,
                 pendingVersion: v.pendingVersion,
                 pendingActivationAuthorization: mapPendingActivationAuthorization(v),
-                rollbackEligibleTurnStarts: readSessionTurnRollbackEligibleStarts(v),
                 dataEncryptionKey: encodeSessionDataEncryptionKey(v.dataEncryptionKey),
                 lastMessage: null,
             })),
@@ -247,7 +252,6 @@ export function registerSessionListingRoutes(app: Fastify) {
                     pendingBlockedCount: v.pendingBlockedCount,
                     pendingVersion: v.pendingVersion,
                     pendingActivationAuthorization: mapPendingActivationAuthorization(v),
-                    rollbackEligibleTurnStarts: readSessionTurnRollbackEligibleStarts(v),
                     dataEncryptionKey:
                         v.encryptionMode === "plain"
                             ? null
@@ -315,15 +319,18 @@ export function registerSessionListingRoutes(app: Fastify) {
             limit = 50,
             includeAttention = false,
             includeActive = false,
+            requiredSessionIds = [],
+            requiredOnly = false,
         } = request.query || {};
-        const initialPinnedSessionIds = !cursor
+        const onlyRequiredRows = parseInitialIncludeFlag(requiredOnly);
+        const initialPinnedSessionIds = !cursor && !onlyRequiredRows
             ? await timing.measureAsync("cursor", async () => fetchSessionOrganizationPinnedSessionIds(userId))
             : [];
-        const includeInitialAttention = !cursor && parseInitialIncludeFlag(includeAttention);
-        const includeInitialActive = !cursor && parseInitialIncludeFlag(includeActive);
+        const includeInitialAttention = !cursor && !onlyRequiredRows && parseInitialIncludeFlag(includeAttention);
+        const includeInitialActive = !cursor && !onlyRequiredRows && parseInitialIncludeFlag(includeActive);
 
         let decodedCursor: { sessionId: string; meaningfulActivityAt: number } | undefined;
-        if (cursor) {
+        if (cursor && !onlyRequiredRows) {
             const decoded = await timing.measureAsync("cursor", async () => resolveV2SessionListCursorForVisibleRows({
                 cursor,
                 userId,
@@ -344,7 +351,7 @@ export function registerSessionListingRoutes(app: Fastify) {
         // read and for every family read the initial page issues, and resolving them per read cost a
         // `SessionShare` statement each.
         const visibilityArms = createV2SessionListVisibilityArmsReader(userId);
-        const sessions = await timing.measureAsync("query", async () => findV2SessionListRows({
+        const sessions = onlyRequiredRows ? [] : await timing.measureAsync("query", async () => findV2SessionListRows({
             userId,
             where,
             orderBy: V2_SESSION_LIST_ORDER_BY,
@@ -353,7 +360,7 @@ export function registerSessionListingRoutes(app: Fastify) {
         }));
 
         let payload;
-        if (!cursor && (initialPinnedSessionIds.length > 0 || includeInitialAttention || includeInitialActive)) {
+        if (onlyRequiredRows || (!cursor && (initialPinnedSessionIds.length > 0 || includeInitialAttention || includeInitialActive || requiredSessionIds.length > 0))) {
             payload = await createV2SessionListInitialPage({
                 userId,
                 pageRows: sessions,
@@ -361,6 +368,7 @@ export function registerSessionListingRoutes(app: Fastify) {
                 pinnedSessionIds: initialPinnedSessionIds,
                 includeAttentionRows: includeInitialAttention,
                 includeActiveRows: includeInitialActive,
+                requiredSessionIds,
                 visibilityArms,
                 timing: timing.initialPageTiming(),
             });

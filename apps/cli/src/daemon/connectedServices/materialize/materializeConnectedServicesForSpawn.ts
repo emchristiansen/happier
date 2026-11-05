@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, rename, rm } from 'node:fs/promises';
+import { lstat, mkdir, rename } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 
 import type {
@@ -14,6 +14,8 @@ import type { CatalogAgentId } from '@/backends/types';
 import { getConnectedServiceMaterializer } from '@/backends/catalog';
 import { replaceDirectoryAtomically } from '@/utils/fs/replaceDirectoryAtomically';
 import { logger } from '@/ui/logger';
+import { deleteConnectedServiceHomeCredentials } from '../credentials/deleteConnectedServiceHomeCredentials';
+import type { ConnectedServiceCredentialStorageCleanupKind } from '../credentials/lifecycleTypes';
 import {
   HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY,
   HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY,
@@ -26,6 +28,11 @@ import type {
   ConnectedServicesMaterializeResult,
   ConnectedServicesProviderMaterializerInput,
 } from './providerMaterializerTypes';
+import {
+  claimRetiredConnectedServiceHome,
+  releaseRetiredConnectedServiceHomeCustody,
+  settleRetiredConnectedServiceHomes,
+} from './cleanup/retiredConnectedServiceHomeCustody';
 import { resolveConnectedServiceMaterializedRootDir } from './resolveConnectedServiceMaterializedRootDir';
 import { resolveConnectedServicePreviousStateRoot } from './resolveConnectedServicePreviousStateRoot';
 import { resolveConnectedServiceTargetMaterializedRoot } from './resolveConnectedServiceTargetMaterializedRoot';
@@ -78,15 +85,53 @@ export class ConnectedServiceMaterializationSupersededError extends Error {
   }
 }
 
-function bestEffortCleanupDirectory(path: string): () => Promise<void> {
+/**
+ * Shares one in-flight or successful release among callers. A failed release keeps its custody:
+ * the rejection reaches every current caller, and the next call retries.
+ */
+function retryableRelease(release: () => Promise<void>): () => Promise<void> {
   let cleanup: Promise<void> | undefined;
   return () => {
     if (!cleanup) {
-      cleanup = rm(path, { recursive: true, force: true });
-      void cleanup.catch((error) => logger.warn('Could not remove connected-service materialization artifacts', error));
+      const pending = release();
+      cleanup = pending;
+      void pending.catch((error) => {
+        if (cleanup === pending) cleanup = undefined;
+        logger.warn('Could not revoke connected-service home credentials', error);
+      });
     }
     return cleanup;
   };
+}
+
+function retireMaterializedHome(
+  rootDir: string, agentId: CatalogAgentId, kind: ConnectedServiceCredentialStorageCleanupKind,
+  expectedRoot?: Readonly<{ dev: number; ino: number }>,
+): () => Promise<void> {
+  const revoke = async () => {
+    if (expectedRoot) {
+      let currentRoot;
+      try { currentRoot = await lstat(rootDir); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw error;
+      }
+      if (currentRoot.dev !== expectedRoot.dev || currentRoot.ino !== expectedRoot.ino) return;
+    }
+    await deleteConnectedServiceHomeCredentials({ rootDir, agentId, kind });
+  };
+  // A late callback belongs to its promoted directory, not a successor using the same key.
+  return retryableRelease(() => expectedRoot ? runSerializedPromotion(rootDir, revoke) : revoke());
+}
+
+/** Throws the single failure as-is, or every failure together; history is retained either way. */
+function throwReleaseFailures(failures: readonly unknown[]): void {
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, 'Connected-service credential retirement failed; history was retained');
+}
+
+async function revokeRetiredHome(input: Readonly<{ rootDir: string; agentId: CatalogAgentId }>): Promise<void> {
+  await deleteConnectedServiceHomeCredentials({ ...input, kind: 'retired_home' });
 }
 
 function forgetActiveAttemptIfCurrent(rootDir: string, attemptId: string): void {
@@ -168,7 +213,8 @@ async function runSerializedOnRootTail<T>(
   }
 }
 
-async function runSerializedPromotion<T>(
+/** Serializes work on a canonical root with its staged promotion, including rollback. */
+export async function runSerializedPromotion<T>(
   rootDir: string,
   promote: () => Promise<T>,
 ): Promise<T> {
@@ -302,7 +348,7 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
   }>) => Promise<void> | void;
 }>): Promise<(ConnectedServicesMaterializeResult & Readonly<{
   materializationRoot: string;
-  cleanupMaterializationRoot: () => void;
+  cleanupMaterializationRoot: () => Promise<void>;
 }>) | null> {
   const rootDir = resolveConnectedServiceMaterializedRootDir({
     baseDir: params.baseDir,
@@ -326,7 +372,7 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
   const attemptRoot = join(params.baseDir, '.attempts', `${materializationSegment}-${params.agentId}-${randomUUID()}`);
   const attemptId = attemptRoot;
   activeMaterializationAttemptByRootDir.set(rootDir, attemptId);
-  const cleanupRoot = bestEffortCleanupDirectory(attemptRoot);
+  const cleanupRoot = retireMaterializedHome(attemptRoot, params.agentId, 'materialized_attempt');
 
   const materializer = await getConnectedServiceMaterializer(params.agentId);
   if (!materializer) {
@@ -334,10 +380,9 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
     return null;
   }
   let disposed = false;
-  let promotedDisposableRoot = false;
+  let cleanupFinalRoot: (() => Promise<void>) | undefined;
   let artifactWrite: Promise<unknown> | undefined;
   let promotion: Promise<void> | undefined;
-  let cleanup: Promise<void> | undefined;
   const assertOpen = () => {
     params.signal?.throwIfAborted();
     if (disposed) throw new Error('Connected-service materialization was disposed');
@@ -354,15 +399,16 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
       if (artifactWrite === pending) artifactWrite = undefined;
     }
   };
+  const cancel = retryableRelease(async () => {
+    await artifactWrite?.catch(() => {});
+    // The last write can settle before atomic promotion has rolled back its target.
+    await promotion?.catch(() => {});
+    const releases = await Promise.allSettled([cleanupRoot(), Promise.resolve().then(() => cleanupFinalRoot?.())]);
+    throwReleaseFailures(releases.flatMap((result) => result.status === 'rejected' ? [result.reason] : []));
+  });
   params.onCleanup?.(() => {
     disposed = true;
-    return cleanup ??= (async () => {
-      await artifactWrite?.catch(() => {});
-      // The last write can settle before atomic promotion has rolled back its target.
-      await promotion?.catch(() => {});
-      await cleanupRoot();
-      if (promotedDisposableRoot) await rm(rootDir, { recursive: true, force: true });
-    })();
+    return cancel();
   });
   let materialized: ConnectedServicesMaterializeResult | null;
   try {
@@ -440,7 +486,7 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
       assertOpen();
       await cleanupRoot();
       return { ...materialized, materializationRoot: durableRoot,
-        cleanupMaterializationRoot: () => { void cleanupRoot(); }, env: buildPromotedEnv() };
+        cleanupMaterializationRoot: cleanupRoot, env: buildPromotedEnv() };
     }
     await runSerializedPromotion(rootDir, async () => {
       assertOpen();
@@ -449,6 +495,15 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
         stagedDir: attemptRoot,
         targetDir: rootDir,
         preserveUnprovidedEntries: materialized.preserveUnprovidedEntriesAcrossPromotion ?? [],
+        // Custody is recorded before each retained sibling exists, so a failed revocation stays
+        // owned by the next promotion of this root and by the materialized-home cleanup scheduler.
+        claimRetiredDirectory: async (retiredRoot, sourceRoot) => {
+          await claimRetiredConnectedServiceHome({ baseDir: params.baseDir, agentId: params.agentId, sourcePath: sourceRoot, retiredPath: retiredRoot });
+        },
+        retireDirectory: async (retiredRoot) => {
+          await revokeRetiredHome({ rootDir: retiredRoot, agentId: params.agentId });
+          await releaseRetiredConnectedServiceHomeCustody(params.baseDir, retiredRoot);
+        },
         writeArtifacts,
         afterPromote: async () => {
           await materialized.afterPromote?.({
@@ -464,15 +519,20 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
             diagnostics: materialized.diagnostics,
           });
           assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
+          // Backup retirement can fail after a valid promotion. Bind the new root before
+          // that retirement so failure and cancellation still revoke its credentials.
+          cleanupFinalRoot = retireMaterializedHome(rootDir, params.agentId, 'materialized_home', await lstat(rootDir));
         },
-      }).then(() => {
-        promotedDisposableRoot = true;
-        assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
       });
       await promotion;
+      // Settle retired siblings that an earlier failed promotion of this root left in custody.
+      const retiredFailures = await settleRetiredConnectedServiceHomes({ baseDir: params.baseDir, revoke: revokeRetiredHome, sourcePath: rootDir });
+      for (const failure of retiredFailures) {
+        logger.warn('Could not revoke retired connected-service home credentials; custody retained for cleanup', failure);
+      }
     });
     assertActiveAttempt({ rootDir, attemptId, cleanupRoot });
-    const cleanupFinalRoot = bestEffortCleanupDirectory(rootDir);
+    if (!cleanupFinalRoot) throw new Error('Connected-service promotion did not establish cleanup custody');
     const cleanupOnFailure = materialized.cleanupOnFailure ? cleanupFinalRoot : materialized.cleanupOnFailure;
     const cleanupOnExit = materialized.cleanupOnExit ? cleanupFinalRoot : materialized.cleanupOnExit;
     return {
@@ -484,12 +544,15 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
       env: buildPromotedEnv(),
     };
   } catch (error) {
-    try {
-      materialized.cleanupOnFailure?.();
-    } catch {
-      // Preserve the validation or promotion failure as the actionable error.
+    const releases = await Promise.allSettled([
+      Promise.resolve().then(() => materialized.cleanupOnFailure?.()),
+      Promise.resolve().then(() => cleanupFinalRoot?.()),
+      cleanupRoot(),
+    ]);
+    const failures = releases.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+    if (failures.length > 0) {
+      throw new AggregateError([error, ...failures], 'Materialization failed and credential retirement failed; history was retained');
     }
-    cleanupRoot();
     throw error;
   } finally {
     forgetActiveAttemptIfCurrent(rootDir, attemptId);

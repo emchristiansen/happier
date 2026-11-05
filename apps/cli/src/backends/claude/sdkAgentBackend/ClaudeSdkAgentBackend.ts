@@ -9,6 +9,7 @@ import { emitCanonicalTurnDiffTool } from '@/agent/runtime/emitCanonicalTurnDiff
 import { ensureClaudeJsRuntimeExecutable } from '@/backends/claude/utils/ensureClaudeJsRuntimeExecutable';
 import { ClaudeTurnChangeTracker } from '../utils/ClaudeTurnChangeTracker';
 import { isClaudeExplicitDiffToolInput } from '../utils/isClaudeExplicitDiffToolInput';
+import { createClaudeSdkResultError } from './failure';
 import type { AcpPermissionHandler } from '@/agent/acp/AcpBackend';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import {
@@ -26,7 +27,7 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
   private readonly suppressedExplicitDiffCallIds = new Set<string>();
   private readonly turnChangeTracker = new ClaudeTurnChangeTracker();
   private readonly providerActivityLedger = createClaudeProviderActivityLedger();
-  private query: ReturnType<typeof query> | null = null;
+  private query: Awaited<ReturnType<typeof query>> | null = null;
   private activeTaskId: string | null = null;
   private activeTaskSessionId: string | null = null;
 
@@ -120,7 +121,7 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
       label: 'claude-sdk',
     });
     const runtimeExecutable = await ensureClaudeJsRuntimeExecutable();
-    const q = query({
+    const q = await query({
       prompt: this.promptStream,
       options: {
         cwd: this.opts.cwd,
@@ -588,7 +589,7 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
         this.pendingTurnCompletion = null;
         this.turnChangeTracker.resetTurn();
         this.suppressedExplicitDiffCallIds.clear();
-        pending.reject(new Error(`Claude SDK error: ${result.subtype}`));
+        pending.reject(createClaudeSdkResultError(result));
       }
       this.settledTurnOrdinal = result.num_turns;
       this.emit({ type: 'status', status: 'error', detail: String(result.subtype) });

@@ -76,8 +76,16 @@ describe('SystemStatusView daemon attribution', () => {
                 machineListByServerId: { [target.id]: [machine] },
                 machineListStatusByServerId: { [target.id]: 'idle' },
             });
+            // The complete bug-report diagnostics response the CLI producer emits; the real parser
+            // (machineCollectBugReportDiagnostics) rejects a partial envelope before caching.
+            const diagnostics = {
+                daemonState: null,
+                daemonLogs: [],
+                runtime: { cwd: '/home/user', platform: 'linux', nodeVersion: 'v22.0.0' },
+                doctorSnapshot: snapshot,
+            };
             const activeRpc = vi.spyOn(apiSocket, 'machineRPC').mockImplementation(async () => {
-                if (scenario === 'active server') return { doctorSnapshot: snapshot };
+                if (scenario === 'active server') return diagnostics;
                 throw new Error('Machine encryption not found on the active server');
             });
             getCredentials.mockResolvedValue(scenario === 'missing target credentials' ? null : { token: 'target-token', secret: 'target-secret' });
@@ -89,7 +97,7 @@ describe('SystemStatusView daemon attribution', () => {
                     ? { mode: 'plain', updatedAt: 1 }
                     : [{ id: machine.id, dataEncryptionKey: plain(null) }],
             }))));
-            const emitWithAck = vi.fn(async () => ({ ok: true, result: { doctorSnapshot: snapshot } }));
+            const emitWithAck = vi.fn(async () => ({ ok: true, result: diagnostics }));
             const disconnect = vi.fn();
             createSocket.mockResolvedValue({ timeout: () => ({ emitWithAck }), disconnect });
             const { SystemStatusView } = await import('./SystemStatusView');

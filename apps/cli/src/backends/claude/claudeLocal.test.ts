@@ -44,6 +44,14 @@ const { mockSpawn, mockClaudeFindLastSession, mockResolveClaudeCliPath, mockIsCl
     mockIsClaudeCliJavaScriptFile: vi.fn(),
 }));
 
+vi.mock('@happier-dev/cli-common/fs/windowsProtectedAcl', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@happier-dev/cli-common/fs/windowsProtectedAcl')>(),
+    createWindowsProtectedAclBoundary: () => ({
+        applyAndVerify: async () => undefined,
+        verify: async () => undefined,
+    }),
+}));
+
 vi.mock('node:child_process', async () => {
     const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     return {
@@ -92,18 +100,23 @@ vi.mock('./utils/claudeCheckSession', () => ({
 
 describe('claudeLocal --continue handling', () => {
     let onSessionFound: (sessionId: string) => void;
+    let spawnedPromptContents: string[];
 
     beforeEach(() => {
         mockResolveClaudeCliPath.mockReturnValue('/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js');
         mockIsClaudeCliJavaScriptFile.mockImplementation((path: unknown) => String(path ?? '').endsWith('.js'));
 
         // Mock spawn to resolve immediately
-        mockSpawn.mockReturnValue({
+        spawnedPromptContents = [];
+        mockSpawn.mockImplementation((_command: string, args: string[]) => {
+            spawnedPromptContents = args.flatMap((arg, index) =>
+                arg === '--append-system-prompt-file' ? [readFileSync(args[index + 1]!, 'utf8')] : []);
+            return {
             stdio: [null, null, null, null],
             on: vi.fn((event, callback) => {
                 // Immediately call the 'exit' callback
                 if (event === 'message') process.nextTick(() => callback({ type: 'terminal-provider-in-launcher' }));
-                if (event === 'exit') {
+                if (event === 'exit' || event === 'close') {
                     process.nextTick(() => callback(0));
                 }
             }),
@@ -116,6 +129,7 @@ describe('claudeLocal --continue handling', () => {
                 on: vi.fn(),
                 end: vi.fn()
             }
+            };
         });
 
         onSessionFound = vi.fn<(sessionId: string) => void>();
@@ -169,7 +183,7 @@ describe('claudeLocal --continue handling', () => {
             stdio: [null, null, null, fd3],
             on: vi.fn((event: string, callback: (value: unknown, signal?: NodeJS.Signals | null) => void) => {
                 if (event === 'message') process.nextTick(() => callback({ type: 'terminal-provider-in-launcher' }));
-                if (event === 'exit') {
+                if (event === 'exit' || event === 'close') {
                     exitHandlers.push(callback);
                 }
             }),
@@ -198,7 +212,7 @@ describe('claudeLocal --continue handling', () => {
                 claudeArgs: [],
             });
 
-            await Promise.resolve();
+            await vi.waitFor(() => expect(exitHandlers.length).toBeGreaterThan(0));
             fd3.write(JSON.stringify({
                 type: 'fetch-start',
                 id: 1,
@@ -242,7 +256,7 @@ describe('claudeLocal --continue handling', () => {
             stdio: [null, null, null, fd3],
             on: vi.fn((event: string, callback: (value: unknown, signal?: NodeJS.Signals | null) => void) => {
                 if (event === 'message') process.nextTick(() => callback({ type: 'terminal-provider-in-launcher' }));
-                if (event === 'exit') {
+                if (event === 'exit' || event === 'close') {
                     exitHandlers.push(callback);
                 }
             }),
@@ -269,7 +283,7 @@ describe('claudeLocal --continue handling', () => {
                 claudeArgs: [],
             });
 
-            await Promise.resolve();
+            await vi.waitFor(() => expect(exitHandlers.length).toBeGreaterThan(0));
             fd3.write(JSON.stringify({ type: 'fetch-start', id: 1, timestamp: Date.now() }) + '\n');
             fd3.write(JSON.stringify({ type: 'fetch-start', id: 2, timestamp: Date.now() }) + '\n');
             fd3.write(JSON.stringify({ type: 'fetch-end', id: 1, timestamp: Date.now() }) + '\n');
@@ -454,8 +468,8 @@ describe('claudeLocal --continue handling', () => {
         expect(maxTurnsIndex).toBeGreaterThan(-1);
         expect(spawnArgs[maxTurnsIndex + 1]).toBe('3');
         expect(spawnArgs).toContain('--strict-mcp-config');
-        expect(spawnArgs).toContain('--append-system-prompt');
-        expect(spawnArgs).toContain('E2E_APPEND_PROMPT');
+        expect(spawnArgs).not.toContain('--append-system-prompt');
+        expect(spawnedPromptContents).toContain('E2E_APPEND_PROMPT');
     });
 
     it('treats -p as a flag-with-value so the prompt is not misclassified as a positional arg', async () => {
@@ -480,6 +494,60 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).not.toContain('--');
     });
 
+    it('delivers the complete large prompt through a private file until the child exits', async () => {
+        const prompt = `  ${'λ'.repeat(80_000)}\n`;
+        const originalSpawn = mockSpawn.getMockImplementation()!;
+        let promptPath = '';
+        mockSpawn.mockImplementationOnce((...args: unknown[]) => {
+            const argv = args[1] as string[];
+            expect(argv).not.toContain('--append-system-prompt');
+            expect(argv).not.toContain(prompt);
+            const index = argv.indexOf('--append-system-prompt-file');
+            expect(index).toBeGreaterThanOrEqual(0);
+            promptPath = argv[index + 1]!;
+            expect(readFileSync(promptPath, 'utf8')).toBe(prompt);
+            return originalSpawn(...args);
+        });
+        await claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: '/tmp',
+            onSessionFound,
+            systemPromptText: prompt,
+        });
+        await expect(stat(promptPath)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(stat(dirname(promptPath))).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+
+    it('rejects a real failed spawn and removes its private prompt artifact', async () => {
+        const { spawn } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+        const directory = mkdtempSync(join(tmpdir(), 'happier-native-spawn-error-'));
+        const missingCommand = join(directory, 'missing-claude');
+        let promptPath = '';
+        mockResolveClaudeCliPath.mockReturnValue(missingCommand);
+        mockIsClaudeCliJavaScriptFile.mockReturnValue(false);
+        mockSpawn.mockImplementationOnce((command: string, args: string[], options: import('node:child_process').SpawnOptions) => {
+            promptPath = args[args.indexOf('--append-system-prompt-file') + 1]!;
+            return spawn(command, args, options);
+        });
+        let outcome: unknown;
+        const result = claudeLocal({
+            abort: new AbortController().signal,
+            sessionId: null,
+            path: directory,
+            onSessionFound,
+            systemPromptText: 'native spawn-error prompt',
+        }).catch((error: unknown) => { outcome = error; });
+        try {
+            await vi.waitFor(() => expect(outcome).toMatchObject({ code: 'ENOENT' }));
+            await result;
+            await expect(stat(dirname(promptPath))).rejects.toMatchObject({ code: 'ENOENT' });
+        } finally {
+            if (promptPath) rmSync(dirname(promptPath), { recursive: true, force: true });
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     it('uses the centralized system prompt text when provided', async () => {
         await claudeLocal({
             abort: new AbortController().signal,
@@ -492,9 +560,9 @@ describe('claudeLocal --continue handling', () => {
 
         expect(mockSpawn).toHaveBeenCalled();
         const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-        const appendIndex = spawnArgs.indexOf('--append-system-prompt');
+        const appendIndex = spawnArgs.indexOf('--append-system-prompt-file');
         expect(appendIndex).toBeGreaterThan(-1);
-        expect(spawnArgs[appendIndex + 1]).toBe('CENTRALIZED_EFFECTIVE_PROMPT');
+        expect(spawnedPromptContents[0]).toBe('CENTRALIZED_EFFECTIVE_PROMPT');
         expect(spawnArgs).not.toContain('test-system-prompt');
     });
 
@@ -511,9 +579,9 @@ describe('claudeLocal --continue handling', () => {
 
         expect(mockSpawn).toHaveBeenCalled();
         const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-        const appendIndex = spawnArgs.indexOf('--append-system-prompt');
+        const appendIndex = spawnArgs.indexOf('--append-system-prompt-file');
         expect(appendIndex).toBeGreaterThan(-1);
-        const appendText = String(spawnArgs[appendIndex + 1] ?? '');
+        const appendText = spawnedPromptContents[0]!;
         expect(appendText).toContain('# Session title');
         expect(appendText).toContain('test-system-prompt');
     });
@@ -788,6 +856,18 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).not.toContain('--session-id');
     });
 
+    it.each([
+        { input: ['--dangerously-skip-permissions', '--permission-mode', 'plan'], expected: ['--permission-mode', 'plan'] },
+        { input: ['--permission-mode=plan', '--dangerously-skip-permissions'], expected: ['--dangerously-skip-permissions'] },
+        { input: ['--permission-mode=bypassPermissions', '--permission-mode=plan'], expected: ['--permission-mode', 'plan'] },
+        { input: ['--', '--permission-mode=bypassPermissions'], expected: ['--', '--permission-mode=bypassPermissions'] },
+    ])('preserves the final native permission selection for $input', async ({ input, expected }) => {
+        await claudeLocal({ abort: new AbortController().signal, sessionId: null, path: '/tmp', onSessionFound, claudeArgs: input });
+        const args = mockSpawn.mock.calls[0][1] as string[];
+        expect(args.slice(-expected.length)).toEqual(expected);
+        if (!expected.includes('--dangerously-skip-permissions')) expect(args).not.toContain('--dangerously-skip-permissions');
+    });
+
     it('normalizes equals-form permission mode so resumed launches keep --resume before the permission flag', async () => {
         const root = mkdtempSync(join(tmpdir(), 'happier-claude-local-yolo-'));
         const hookSettingsPath = join(root, 'hooks.json');
@@ -805,14 +885,14 @@ describe('claudeLocal --continue handling', () => {
 
             const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
             const resumeIndex = spawnArgs.indexOf('--resume');
-            const permissionIndex = spawnArgs.indexOf('--permission-mode');
+            const permissionIndex = spawnArgs.indexOf('--dangerously-skip-permissions');
             const settingsIndex = spawnArgs.indexOf('--settings');
 
             expect(spawnArgs).not.toContain('--permission-mode=bypassPermissions');
             expect(resumeIndex).toBeGreaterThan(-1);
             expect(permissionIndex).toBeGreaterThan(-1);
             expect(permissionIndex).toBeGreaterThan(resumeIndex);
-            expect(spawnArgs[permissionIndex + 1]).toBe('bypassPermissions');
+            expect(spawnArgs).not.toContain('--permission-mode');
             expect(settingsIndex).toBeGreaterThan(-1);
             expect(spawnArgs[settingsIndex + 1]).toBe(hookSettingsPath.replace(/\.json$/, '.overlay.json'));
             expect(JSON.parse(readFileSync(spawnArgs[settingsIndex + 1]!, 'utf8'))).toEqual({
@@ -838,11 +918,11 @@ describe('claudeLocal --continue handling', () => {
 
         const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
         const permissionIndexes = spawnArgs
-            .map((arg, index) => arg === '--permission-mode' ? index : -1)
+            .map((arg, index) => arg === '--dangerously-skip-permissions' ? index : -1)
             .filter((index) => index >= 0);
 
         expect(permissionIndexes).toHaveLength(1);
-        expect(spawnArgs[permissionIndexes[0]! + 1]).toBe('bypassPermissions');
+        expect(spawnArgs).not.toContain('--permission-mode');
         expect(spawnArgs.indexOf('--resume')).toBeLessThan(permissionIndexes[0]!);
         expect(spawnArgs.slice(spawnArgs.indexOf('--plugin-dir'), spawnArgs.indexOf('--plugin-dir') + 2)).toEqual([
             '--plugin-dir',
@@ -862,13 +942,13 @@ describe('claudeLocal --continue handling', () => {
 
         const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
         const resumeIndex = spawnArgs.indexOf('--resume');
-        const permissionIndex = spawnArgs.indexOf('--permission-mode');
+        const permissionIndex = spawnArgs.indexOf('--dangerously-skip-permissions');
 
-        expect(spawnArgs).not.toContain('--dangerously-skip-permissions');
+        expect(spawnArgs).toContain('--dangerously-skip-permissions');
         expect(resumeIndex).toBeGreaterThan(-1);
         expect(permissionIndex).toBeGreaterThan(-1);
         expect(permissionIndex).toBeGreaterThan(resumeIndex);
-        expect(spawnArgs[permissionIndex + 1]).toBe('bypassPermissions');
+        expect(spawnArgs).not.toContain('--permission-mode');
     });
 
     it('should extract and use --resume <id> when session ID is provided', async () => {
@@ -971,6 +1051,7 @@ describe('claudeLocal --continue handling', () => {
             stdio: [null, null, null, null],
             on: vi.fn((event, callback) => {
                 if (event === 'message') process.nextTick(() => callback({ type: 'terminal-provider-in-launcher' }));
+                // Only the provider 'exit' settles the run; 'close' merely gates parent-exit artifact cleanup.
                 if (event === 'exit') {
                     exitCallback = callback;
                     markSpawnReady();
@@ -1085,6 +1166,7 @@ describe('claudeLocal --continue handling', () => {
 
 describe('claudeLocal launcher selection', () => {
     let onSessionFound: (sessionId: string) => void;
+    let spawnedPromptContents: string[];
 
     beforeEach(() => {
         // Mock spawn to resolve immediately
@@ -1092,7 +1174,7 @@ describe('claudeLocal launcher selection', () => {
             stdio: [null, null, null, null],
             on: vi.fn((event, callback) => {
                 if (event === 'message') process.nextTick(() => callback({ type: 'terminal-provider-in-launcher' }));
-                if (event === 'exit') {
+                if (event === 'exit' || event === 'close') {
                     process.nextTick(() => callback(0));
                 }
             }),

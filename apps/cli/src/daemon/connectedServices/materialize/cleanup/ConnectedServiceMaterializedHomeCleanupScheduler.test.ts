@@ -1,4 +1,4 @@
-import { mkdir, rm, stat, utimes } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
@@ -13,7 +13,112 @@ async function touchOld(path: string, nowMs: number, ageMs: number): Promise<voi
 }
 
 describe('ConnectedServiceMaterializedHomeCleanupScheduler', () => {
-  it('keeps live and resumable materialized homes while deleting stale orphan homes', async () => {
+  it.each([
+    ['claude', 'claude-config/projects/project/session.jsonl', 'claude-config/.credentials.json'],
+    ['codex', 'codex-home/sessions/2020/01/01/session.jsonl', 'codex-home/auth.json'],
+    ['gemini', 'home/.gemini/tmp/project/chats/session.json', 'home/.gemini/oauth_creds.json'],
+    ['pi', 'pi-agent-dir/sessions/project/session.jsonl', 'pi-agent-dir/auth.json'],
+    ['agy', 'gemini-home/antigravity-acp/conversations/session.json', 'gemini-home/antigravity-acp/acp_token.json'],
+  ] as const)('retains ancient unreferenced %s history while revoking its file credentials', async (agentId, historyEntry, credentialEntry) => {
+    const baseDir = await createTempDir('happier-retained-provider-history-');
+    try {
+      const home = join(baseDir, 'csm_unreferenced', agentId);
+      const historyPath = join(home, historyEntry);
+      const credentialPath = join(home, credentialEntry);
+      await mkdir(join(historyPath, '..'), { recursive: true });
+      await mkdir(join(credentialPath, '..'), { recursive: true });
+      await writeFile(historyPath, 'distinct synthetic ancient history\n');
+      await writeFile(credentialPath, 'synthetic credential projection');
+      await touchOld(home, 100_000, 60_000);
+      const scheduler = new ConnectedServiceMaterializedHomeCleanupScheduler({
+        baseDir, nowMs: () => 100_000, rootTtlMs: 10_000,
+        hasLiveTarget: () => false, listRetainedIdentityIds: () => [],
+      });
+
+      await scheduler.reconcileMaterializedHomes();
+
+      await expect(readFile(historyPath, 'utf8')).resolves.toBe('distinct synthetic ancient history\n');
+      await expect(stat(credentialPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      // A new scheduler after restart must not expire the retained bytes either.
+      await new ConnectedServiceMaterializedHomeCleanupScheduler({
+        baseDir, nowMs: () => 200_000, rootTtlMs: 10_000,
+        hasLiveTarget: () => false, listRetainedIdentityIds: () => [],
+      }).reconcileMaterializedHomes();
+      await expect(readFile(historyPath, 'utf8')).resolves.toBe('distinct synthetic ancient history\n');
+    } finally {
+      await removeTempDir(baseDir);
+    }
+  });
+
+  it.each([
+    ['codex', 'codex-home/auth.json'],
+    ['gemini', 'home/.gemini/oauth_creds.json'],
+    ['agy', 'gemini-home/antigravity-acp/settings.json'],
+    ['claude', 'claude-config/accounts'],
+  ] as const)('refuses a directory at the %s credential leaf without deleting its history', async (agentId, credentialEntry) => {
+    const baseDir = await createTempDir('happier-wrong-type-credential-');
+    try {
+      const home = join(baseDir, 'csm_unreferenced', agentId);
+      const credentialDirectory = join(home, credentialEntry);
+      await mkdir(credentialDirectory, { recursive: true });
+      await writeFile(join(credentialDirectory, 'history.jsonl'), 'unexpected directory history\n');
+      await touchOld(home, 100_000, 60_000);
+      const scheduler = new ConnectedServiceMaterializedHomeCleanupScheduler({
+        baseDir, nowMs: () => 100_000, rootTtlMs: 10_000, hasLiveTarget: () => false,
+      });
+      const outcome = await scheduler.reconcileMaterializedHomes().then(() => null, (error: unknown) => error);
+      expect(await readFile(join(credentialDirectory, 'history.jsonl'), 'utf8')).toBe('unexpected directory history\n');
+      expect(outcome).toBeInstanceOf(Error);
+    } finally { await removeTempDir(baseDir); }
+  });
+
+  it('does not revoke credentials through a linked provider home', async () => {
+    const root = await createTempDir('happier-linked-credential-custody-');
+    try {
+      const baseDir = join(root, 'materialized');
+      const home = join(baseDir, 'csm_unreferenced', 'codex');
+      const other = join(root, 'another-owned-home');
+      await mkdir(other, { recursive: true });
+      await writeFile(join(other, 'auth.json'), 'synthetic other binding credential');
+      await writeFile(join(other, 'history.jsonl'), 'other binding history\n');
+      await mkdir(home, { recursive: true });
+      await symlink(other, join(home, 'codex-home'), 'dir');
+      await touchOld(home, 100_000, 60_000);
+      await new ConnectedServiceMaterializedHomeCleanupScheduler({
+        baseDir, nowMs: () => 100_000, rootTtlMs: 10_000, hasLiveTarget: () => false,
+      }).reconcileMaterializedHomes();
+      expect(await readFile(join(other, 'auth.json'), 'utf8')).toBe('synthetic other binding credential');
+      expect(await readFile(join(other, 'history.jsonl'), 'utf8')).toBe('other binding history\n');
+    } finally { await removeTempDir(root); }
+  });
+
+  it('retains history when queued cleanup drains after its live owner exits', async () => {
+    const baseDir = await createTempDir('happier-retained-pending-history-');
+    try {
+      const home = join(baseDir, 'csm_queued', 'codex');
+      const historyPath = join(home, 'codex-home', 'archived_sessions', 'session.jsonl');
+      const credentialPath = join(home, 'codex-home', 'auth.json');
+      await mkdir(join(historyPath, '..'), { recursive: true });
+      await writeFile(historyPath, 'distinct archived synthetic history\n');
+      await writeFile(credentialPath, 'synthetic credential projection');
+      await touchOld(home, 100_000, 60_000);
+      let live = true;
+      const scheduler = new ConnectedServiceMaterializedHomeCleanupScheduler({
+        baseDir, nowMs: () => 100_000, rootTtlMs: 10_000,
+        hasLiveTarget: () => live, listRetainedIdentityIds: () => [],
+      });
+      await scheduler.reconcileMaterializedHomes();
+      await expect(readFile(credentialPath, 'utf8')).resolves.toBe('synthetic credential projection');
+      live = false;
+      await scheduler.cleanupPendingMaterializedHomes();
+      await expect(readFile(historyPath, 'utf8')).resolves.toBe('distinct archived synthetic history\n');
+      await expect(stat(credentialPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await removeTempDir(baseDir);
+    }
+  });
+
+  it('keeps live and resumable materialized homes while retiring stale orphan credentials', async () => {
     const baseDir = await createTempDir('happier-connected-service-materialized-cleanup-');
     const nowMs = 100_000;
     try {
@@ -45,13 +150,13 @@ describe('ConnectedServiceMaterializedHomeCleanupScheduler', () => {
       await expect(stat(liveHome)).resolves.toBeTruthy();
       await expect(stat(retainedHome)).resolves.toBeTruthy();
       await expect(stat(recentHome)).resolves.toBeTruthy();
-      await expect(stat(orphanHome)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(orphanHome)).resolves.toBeTruthy();
     } finally {
       await removeTempDir(baseDir);
     }
   });
 
-  it('reaps stale attempt roots only when no active materialization references them', async () => {
+  it('retires stale attempt credentials only when no active materialization references them', async () => {
     const baseDir = await createTempDir('happier-connected-service-materialized-attempt-cleanup-');
     const nowMs = 100_000;
     try {
@@ -76,13 +181,13 @@ describe('ConnectedServiceMaterializedHomeCleanupScheduler', () => {
         expect.objectContaining({ cleaned: true, path: staleAttempt }),
       ]);
       await expect(stat(liveAttempt)).resolves.toBeTruthy();
-      await expect(stat(staleAttempt)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(staleAttempt)).resolves.toBeTruthy();
     } finally {
       await removeTempDir(baseDir);
     }
   });
 
-  it('deletes stale Claude keychain credentials for removed materialized homes and attempts', async () => {
+  it('deletes stale Claude keychain credentials for retained materialized homes and attempts', async () => {
     const baseDir = await createTempDir('happier-connected-service-materialized-claude-keychain-cleanup-');
     const nowMs = 100_000;
     try {
@@ -127,9 +232,9 @@ describe('ConnectedServiceMaterializedHomeCleanupScheduler', () => {
         join(orphanHome, 'claude-config'),
         join(staleAttempt, 'claude-config'),
       ]);
-      await expect(stat(orphanHome)).rejects.toMatchObject({ code: 'ENOENT' });
-      await expect(stat(staleAttempt)).rejects.toMatchObject({ code: 'ENOENT' });
-      await expect(stat(codexHome)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(orphanHome)).resolves.toBeTruthy();
+      await expect(stat(staleAttempt)).resolves.toBeTruthy();
+      await expect(stat(codexHome)).resolves.toBeTruthy();
     } finally {
       await removeTempDir(baseDir);
     }
@@ -184,7 +289,10 @@ describe('ConnectedServiceMaterializedHomeCleanupScheduler', () => {
         rootTtlMs: 10_000,
         attemptsTtlMs: 10_000,
         maxCleanupRetries: 2,
-        removePath,
+        resolveCredentialLifecycleDescriptor: async (agentId) => ({
+          ...buildDefaultConnectedServiceCredentialLifecycleDescriptor(agentId),
+          credentialStorageCleanup: { deleteCredentialStorageForHomeRoot: async () => { await removePath('synthetic'); } },
+        }),
         onCleanupRetryExhausted: ({ path, attempts, error }) => {
           terminalDiagnostics.push({ path, attempts, error });
         },

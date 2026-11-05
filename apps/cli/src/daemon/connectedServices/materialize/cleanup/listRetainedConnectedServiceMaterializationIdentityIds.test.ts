@@ -19,8 +19,9 @@ describe('listRetainedConnectedServiceMaterializationIdentityIds', () => {
         const { listRetainedConnectedServiceMaterializationIdentityIds } = await import('./listRetainedConnectedServiceMaterializationIdentityIds');
         const baseDir = join(home, 'daemon', 'connected-services', 'materialized');
         const root = join(baseDir, 'csm_session_history', 'codex');
-        await mkdir(root, { recursive: true });
+        await mkdir(join(root, 'codex-home'), { recursive: true });
         await writeFile(join(root, 'history.jsonl'), 'private Session history\n');
+        await writeFile(join(root, 'codex-home', 'auth.json'), 'synthetic Session credential');
         await utimes(root, new Date(1), new Date(1));
         const record: V2SessionRecord = {
           id: 'archived-session', seq: 1, createdAt: 1, updatedAt: 2, active: false, activeAt: 1,
@@ -55,12 +56,14 @@ describe('listRetainedConnectedServiceMaterializationIdentityIds', () => {
           await expect(scheduler.reconcileMaterializedHomes()).resolves.toEqual([
             expect.objectContaining({ cleaned: true, path: root }),
           ]);
-          await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' });
+          // A complete unreferenced snapshot authorizes credential revocation, never history disposal.
+          await expect(stat(join(root, 'codex-home', 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
         } else {
           if (snapshot === 'archived') await expect(scheduler.reconcileMaterializedHomes()).resolves.toEqual([]);
           else await expect(scheduler.reconcileMaterializedHomes()).rejects.toThrow();
-          expect(await readFile(join(root, 'history.jsonl'), 'utf8')).toBe('private Session history\n');
+          expect(await readFile(join(root, 'codex-home', 'auth.json'), 'utf8')).toBe('synthetic Session credential');
         }
+        expect(await readFile(join(root, 'history.jsonl'), 'utf8')).toBe('private Session history\n');
       } finally {
         vi.restoreAllMocks(); env.restore();
         await rm(home, { recursive: true, force: true });
@@ -69,7 +72,7 @@ describe('listRetainedConnectedServiceMaterializationIdentityIds', () => {
     },
   );
 
-  it('keeps aged live, retained and unidentified legacy Run homes and cleans explicit disposable Runs', async () => {
+  it('keeps aged live, retained and unidentified legacy Run homes and retires only explicit disposable Run credentials', async () => {
     const home = await createTempDir('happier-run-retention-collector-');
     const env = createEnvKeyScope(['HAPPIER_HOME_DIR']);
     env.patch({ HAPPIER_HOME_DIR: home });
@@ -97,6 +100,7 @@ describe('listRetainedConnectedServiceMaterializationIdentityIds', () => {
         paths[kind] = root;
         await mkdir(join(root, 'codex-home', 'sessions'), { recursive: true });
         await writeFile(join(root, 'codex-home', 'sessions', 'rollout.jsonl'), 'private retained history\n');
+        await writeFile(join(root, 'codex-home', 'auth.json'), `synthetic ${kind} Run credential`);
         await utimes(root, new Date(1), new Date(1));
         await writeExecutionRunMarker({
           pid: 4321, happySessionId: 'parent-session', runId, callId: runId, sidechainId: runId,
@@ -121,6 +125,7 @@ describe('listRetainedConnectedServiceMaterializationIdentityIds', () => {
       });
       await mkdir(join(paths.unknown, 'codex-home', 'sessions'), { recursive: true });
       await writeFile(join(paths.unknown, 'codex-home', 'sessions', 'rollout.jsonl'), 'unresumed legacy history\n');
+      await writeFile(join(paths.unknown, 'codex-home', 'auth.json'), 'synthetic unknown Run credential');
       await utimes(paths.unknown, new Date(1), new Date(1));
       const scheduler = new ConnectedServiceMaterializedHomeCleanupScheduler({
         baseDir, nowMs: () => 40 * 24 * 60 * 60_000, hasLiveTarget: () => false,
@@ -137,14 +142,19 @@ describe('listRetainedConnectedServiceMaterializationIdentityIds', () => {
       expect(await readFile(join(paths.resumable, 'codex-home', 'sessions', 'rollout.jsonl'), 'utf8')).toBe('private retained history\n');
       expect(await readFile(join(paths.live, 'codex-home', 'sessions', 'rollout.jsonl'), 'utf8')).toBe('private retained history\n');
       expect(await readFile(join(paths.unknown, 'codex-home', 'sessions', 'rollout.jsonl'), 'utf8')).toBe('unresumed legacy history\n');
-      await expect(stat(paths.ephemeral)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readFile(join(paths.ephemeral, 'codex-home', 'sessions', 'rollout.jsonl'), 'utf8')).toBe('private retained history\n');
+      await expect(stat(join(paths.ephemeral, 'codex-home', 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readFile(join(paths.resumable, 'codex-home', 'auth.json'), 'utf8')).toBe('synthetic resumable Run credential');
+      expect(await readFile(join(paths.unknown, 'codex-home', 'auth.json'), 'utf8')).toBe('synthetic unknown Run credential');
+      expect(await readFile(join(paths.live, 'codex-home', 'auth.json'), 'utf8')).toBe('synthetic live Run credential');
       registry.unregisterRunKey(liveRunKey);
       // Stale marker status is not liveness: once the canonical runtime target releases, its
       // explicitly ephemeral home leaves the existing pending-cleanup queue normally.
       expect(await scheduler.cleanupPendingMaterializedHomes()).toEqual([
         expect.objectContaining({ cleaned: true, path: paths.live }),
       ]);
-      await expect(stat(paths.live)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readFile(join(paths.live, 'codex-home', 'sessions', 'rollout.jsonl'), 'utf8')).toBe('private retained history\n');
+      await expect(stat(join(paths.live, 'codex-home', 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
     } finally {
       vi.restoreAllMocks();
       env.restore();

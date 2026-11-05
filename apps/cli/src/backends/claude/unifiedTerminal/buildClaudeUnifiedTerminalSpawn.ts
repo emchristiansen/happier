@@ -1,3 +1,4 @@
+import { materializeClaudeSystemPromptArgsForSpawn, type MaterializedClaudeSystemPromptArgs } from '../utils/materializeClaudeSystemPromptArgsForSpawn';
 import { chmodSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createUnreadTerminalArtifactsCleanup, writeTerminalLaunchSpec, type TerminalSpawn } from '@/terminal/runtime/terminalLaunchSpec';
@@ -6,7 +7,7 @@ import type { CommandInvocation } from '@happier-dev/cli-common/process';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
 import { HAPPIER_BASE_SYSTEM_PROMPT_V1 } from '@happier-dev/protocol';
 
-import { resolveClaudeSdkPermissionModeFromEnhancedMode } from '../utils/permissionMode';
+import { buildClaudePermissionModeArgs, resolveClaudeSdkPermissionModeFromEnhancedMode, shouldAllowClaudePermissionBypass } from '../utils/permissionMode';
 import { getClaudeSystemPrompt } from '../utils/systemPrompt';
 import { isClaudeCliJavaScriptFile, resolveClaudeCliPath } from '../utils/resolveClaudeCliPath';
 import { ensureClaudeJsRuntimeExecutable } from '../utils/ensureClaudeJsRuntimeExecutable';
@@ -247,6 +248,7 @@ function resolveStatuslineOverlaySettings<Mode extends EnhancedMode>(params: Rea
 function buildClaudeArgs<Mode extends EnhancedMode>(
   input: ClaudeUnifiedTerminalSpawnInput<Mode>,
   statuslineSettings: ClaudeStatuslineOverlaySettings | undefined,
+  env: Readonly<NodeJS.ProcessEnv>,
 ): string[] {
   const args: string[] = [];
   const terminalOptions = resolveClaudeTerminalCliOptions({
@@ -256,14 +258,14 @@ function buildClaudeArgs<Mode extends EnhancedMode>(
   if (terminalOptions.diagnostics.length > 0) {
     throw new ClaudeUnifiedTerminalUnsupportedOptionError(terminalOptions.diagnostics);
   }
-  const systemPromptText = typeof input.systemPromptText === 'string' ? input.systemPromptText.trim() : '';
+  const systemPromptText = typeof input.systemPromptText === 'string' ? input.systemPromptText : '';
   const appendSystemPrompt = terminalOptions.appendSystemPrompt.trim();
   if (terminalOptions.customSystemPrompt.trim()) {
     args.push('--system-prompt', terminalOptions.customSystemPrompt.trim());
   }
   args.push(
     '--append-system-prompt',
-    [systemPromptText || resolveFallbackSystemPrompt(), appendSystemPrompt].filter(Boolean).join('\n\n'),
+    [systemPromptText.trim() ? systemPromptText : resolveFallbackSystemPrompt(), appendSystemPrompt].filter(Boolean).join('\n\n'),
   );
   appendClaudeArgsWithoutManagedPromptAndSpawnMode(args, input.claudeArgs);
   args.push(...terminalOptions.extraArgs);
@@ -288,10 +290,12 @@ function buildClaudeArgs<Mode extends EnhancedMode>(
     args.push('--mcp-config', input.happierMcpConfigJson.trim());
   }
 
-  args.push('--allow-dangerously-skip-permissions');
+  if (shouldAllowClaudePermissionBypass(env)) {
+    args.push('--allow-dangerously-skip-permissions');
+  }
 
   if (permissionMode !== 'default') {
-    args.push('--permission-mode', permissionMode);
+    args.push(...buildClaudePermissionModeArgs(permissionMode));
   }
   return args;
 }
@@ -420,11 +424,23 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
   }), happierSessionId ?? '');
   const statuslineSettings = resolveStatuslineOverlaySettings({ input, deps, env });
   const materializedMcpConfig = await materializeClaudeMcpConfigArgsForSpawn(
-    buildClaudeArgs(input, statuslineSettings),
+    buildClaudeArgs(input, statuslineSettings, env),
   );
-  const args = materializedMcpConfig.args;
+  let materializedSystemPrompt: MaterializedClaudeSystemPromptArgs | null = null;
+  // Retire both private artifacts even when one cleanup fails; surface every failure.
+  const cleanupArtifacts = async (): Promise<void> => {
+    const failures = (await Promise.allSettled([
+      materializedSystemPrompt?.cleanup(),
+      materializedMcpConfig.cleanup(),
+    ])).flatMap((result) => result.status === 'rejected' ? [result.reason as unknown] : []);
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, 'Claude terminal launch artifact cleanup incomplete');
+  };
 
   try {
+    materializedSystemPrompt = await materializeClaudeSystemPromptArgsForSpawn(materializedMcpConfig.args);
+    const args = materializedSystemPrompt.args;
+    const cleanupPaths = [...materializedMcpConfig.cleanupPaths, ...materializedSystemPrompt.cleanupPaths];
     const nodeExecutable = await deps.ensureClaudeJsRuntimeExecutable();
     if (!nodeExecutable) {
       throw new ReferenceError(buildMissingJavaScriptRuntimeMessage('Claude unified terminal launcher'));
@@ -470,8 +486,8 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
       cwd: input.path,
       env: splitEnv.persistedEnv,
       ...(splitEnv.passthroughKeys.length > 0 ? { envPassthroughKeys: splitEnv.passthroughKeys } : {}),
-      ...(materializedMcpConfig.cleanupPaths.length > 0
-        ? { cleanupPaths: materializedMcpConfig.cleanupPaths }
+      ...(cleanupPaths.length > 0
+        ? { cleanupPaths }
         : {}),
       ...(happySessionId.length > 0
         ? {
@@ -493,11 +509,11 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
       launchSpecPath: specPath,
       cleanupUnreadArtifacts: createUnreadTerminalArtifactsCleanup({
         launchSpecPath: specPath,
-        cleanup: materializedMcpConfig.cleanup,
+        cleanup: cleanupArtifacts,
       }),
     };
   } catch (error) {
-    try { await materializedMcpConfig.cleanup(); } catch (cleanupError) {
+    try { await cleanupArtifacts(); } catch (cleanupError) {
       throw new AggregateError([error, cleanupError], 'Claude terminal launch preparation failed with incomplete cleanup', { cause: error });
     }
     throw error;

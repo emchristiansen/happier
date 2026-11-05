@@ -10,9 +10,11 @@ import {
 } from '@/sync/domains/pets/companionSizeScale';
 import {
     DEFAULT_THEME_PROFILES_LOCAL_STATE,
+    ThemeProfileSelectionSchema,
     ThemeProfilesLocalStateSchema,
 } from '@/theme/profiles/themeProfilePersistence';
 import { SessionListFocusedFolderV1Schema } from '@/sync/domains/session/folders';
+import { AccountPetDesktopOverlayVisibilityModeSchema } from '../account/accountPetSettingDefinitions';
 import {
     DEFAULT_LOADING_INDICATOR_PAUSE_ID,
     DEFAULT_LOADING_INDICATOR_SPEED_ID,
@@ -64,7 +66,7 @@ function serializePetCompanionSizeScaleBucket(value: number): 'small' | 'default
     return 'xlarge';
 }
 
-const PetEnabledOverrideSchema = z.enum(['inherit', 'enabled', 'disabled']);
+export const PetEnabledOverrideSchema = z.enum(['inherit', 'enabled', 'disabled']);
 const PetSelectedOverrideSchema = z.discriminatedUnion('kind', [
     z.object({ kind: z.literal('inherit') }),
     z.object({
@@ -76,13 +78,11 @@ const PetSelectedOverrideSchema = z.discriminatedUnion('kind', [
         sourceKey: z.string().min(1),
     }),
 ]);
-const DesktopPetOverlayVisibilityModeOverrideSchema = z.enum([
+export const DesktopPetOverlayVisibilityModeOverrideSchema = z.enum([
     'inherit',
-    'attentionOrActive',
-    'alwaysWhenEnabled',
-    'attentionOnly',
+    ...AccountPetDesktopOverlayVisibilityModeSchema.options,
 ]);
-const DesktopPetOverlayAnchorSchema = z.enum(['bottomRight', 'bottomLeft', 'topRight', 'topLeft']);
+export const DesktopPetOverlayAnchorSchema = z.enum(['bottomRight', 'bottomLeft', 'topRight', 'topLeft']);
 const DesktopPetOverlayOffsetSchema = z.object({
     x: z.number(),
     y: z.number(),
@@ -168,7 +168,19 @@ export const LOCAL_SETTING_DEFINITIONS = defineSettingDefinitions({
     themeProfiles: {
         schema: ThemeProfilesLocalStateSchema,
         default: DEFAULT_THEME_PROFILES_LOCAL_STATE,
-        description: 'Local custom theme profiles and active profile selection',
+        description: 'Legacy device theme library retained until account migration succeeds',
+        storageScope: 'local',
+    },
+    themeProfileSelection: {
+        schema: ThemeProfileSelectionSchema.nullable(),
+        default: null,
+        description: 'Active light and dark theme profile IDs on this device',
+        storageScope: 'local',
+    },
+    themeProfileLegacyAccountScope: {
+        schema: z.object({ serverId: z.string(), accountId: z.string() }).nullable().catch(null),
+        default: null,
+        description: 'Account receiving the legacy device theme library during migration',
         storageScope: 'local',
     },
     uiBackdropBlurEnabled: {
@@ -181,6 +193,13 @@ export const LOCAL_SETTING_DEFINITIONS = defineSettingDefinitions({
         schema: z.boolean().catch(true),
         default: true,
         description: 'Enable haptic feedback on this device',
+        storageScope: 'local',
+    },
+    systemTabBarEnabled: {
+        // A malformed/newer value must not reset every other device preference.
+        schema: z.boolean().catch(true),
+        default: true,
+        description: 'Show tabs in the system side rail on supported iOS windows',
         storageScope: 'local',
     },
     uiContentWidthMode: {

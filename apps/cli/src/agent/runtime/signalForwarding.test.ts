@@ -71,4 +71,53 @@ describe('attachProcessSignalForwardingToChild', () => {
         expect(proc.kill).toHaveBeenCalledWith(proc.pid, 'SIGINT');
         expect(proc.off).toHaveBeenCalledWith('SIGINT', expect.any(Function));
     });
+    it('waits for owning cleanup before re-signaling, including repeated signals and child close', async () => {
+        const proc = new FakeProc('darwin');
+        const child = new FakeChild() as any;
+        let release!: () => void;
+        const cleanupDone = new Promise<void>((resolve) => { release = resolve; });
+        const beforeParentExit = vi.fn(() => cleanupDone);
+        attachProcessSignalForwardingToChild(child, proc as any, { beforeParentExit });
+
+        proc.handlers.get('SIGTERM')![0]!();
+        await Promise.resolve();
+        child.emit('close', 0, null);
+        proc.handlers.get('SIGHUP')![0]!();
+        expect(beforeParentExit).toHaveBeenCalledTimes(1);
+        expect(proc.kill).not.toHaveBeenCalled();
+        expect(proc.off).not.toHaveBeenCalled();
+
+        release();
+        await vi.waitFor(() => expect(proc.kill).toHaveBeenCalledWith(proc.pid, 'SIGTERM'));
+        expect(child.kill).toHaveBeenCalledTimes(1);
+        expect(proc.handlers.get('SIGTERM')).toEqual([]);
+    });
+
+    it('preserves parent termination when owning cleanup rejects', async () => {
+        const proc = new FakeProc('darwin');
+        const child = new FakeChild() as any;
+        attachProcessSignalForwardingToChild(child, proc as any, {
+            beforeParentExit: async () => { throw new Error('cleanup failed'); },
+        });
+        proc.handlers.get('SIGTERM')![0]!();
+        await vi.waitFor(() => expect(proc.kill).toHaveBeenCalledWith(proc.pid, 'SIGTERM'));
+        expect(proc.handlers.get('SIGTERM')).toEqual([]);
+    });
+
+    it('keeps signals handled between child exit and completion of owning cleanup', async () => {
+        const proc = new FakeProc('darwin');
+        const child = new FakeChild() as any;
+        let release!: () => void;
+        const beforeParentExit = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+        attachProcessSignalForwardingToChild(child, proc as any, { beforeParentExit });
+        child.emit('exit', 0, null);
+        await Promise.resolve();
+        expect(proc.handlers.get('SIGTERM')).toHaveLength(1);
+        proc.handlers.get('SIGTERM')![0]!();
+        expect(proc.kill).not.toHaveBeenCalled();
+        release();
+        await vi.waitFor(() => expect(proc.kill).toHaveBeenCalledWith(proc.pid, 'SIGTERM'));
+        expect(beforeParentExit).toHaveBeenCalledTimes(1);
+    });
+
 });

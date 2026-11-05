@@ -33,6 +33,14 @@ function readSessionTurnsProjection(value: unknown): SessionTurnsProjectionV1 | 
     return parsed.success ? parsed.data : null;
 }
 
+/** The detailed turns projection, only while it still describes the session's latest turn. */
+function readCurrentSessionTurnsProjection(session: Session | null | undefined): SessionTurnsProjectionV1 | null {
+    const projection = readSessionTurnsProjection(session?.sessionTurns);
+    if (!projection) return null;
+    const sessionLatestTurnId = typeof session?.latestTurnId === 'string' ? session.latestTurnId : null;
+    return sessionLatestTurnId == null || projection.latestTurnId === sessionLatestTurnId ? projection : null;
+}
+
 function listTrustedRuntimeTurnStartSeqs(projection: SessionTurnsProjectionV1 | null | undefined): ReadonlySet<number> {
     if (!projection) return new Set();
 
@@ -56,6 +64,29 @@ function listFlattenedRollbackEligibleTurnStartSeqs(value: unknown): ReadonlySet
     return startSeqs;
 }
 
+/**
+ * True when the stored starts were observed strictly after the projection was requested, so they
+ * describe newer eligibility than it (for example an earlier turn made eligible again while the
+ * latest turn stayed the same). Unordered evidence on either side never supersedes.
+ */
+export function areRollbackStartsNewerThanProjection(session: Session | null | undefined): boolean {
+    const startsObservedAt = session?.rollbackEligibilityObservedAt;
+    const projectionObservedAt = session?.sessionTurnsObservedAt;
+    return typeof startsObservedAt === 'number'
+        && typeof projectionObservedAt === 'number'
+        && startsObservedAt > projectionObservedAt;
+}
+
+/** Starts allowed by every present source; an absent source (`null`) constrains nothing. */
+function intersectStartSeqs(
+    projectionSeqs: ReadonlySet<number> | null,
+    storedSeqs: ReadonlySet<number> | null,
+): ReadonlySet<number> {
+    if (projectionSeqs === null) return storedSeqs ?? new Set();
+    if (storedSeqs === null) return projectionSeqs;
+    return new Set([...projectionSeqs].filter((seq) => storedSeqs.has(seq)));
+}
+
 function hasConversationRollbackCapability(session: Session | null | undefined): boolean {
     if (!session) return false;
     const agentId = inferAgentIdFromSessionMetadata(session.metadata);
@@ -64,6 +95,22 @@ function hasConversationRollbackCapability(session: Session | null | undefined):
         capability: 'sessionRollback.conversation',
         metadata: session.metadata,
     }) === 'supported';
+}
+
+/**
+ * True when the session's agent can roll back and the client's eligibility is not confirmed:
+ * either it holds no evidence (no current turns projection, starts `undefined`), or its starts
+ * were carried across a snapshot without eligibility and may be outdated by a missed turn update
+ * (`rollbackEligibilityStale`). Session-list rows do not carry starts, so opening or showing such
+ * a session needs one exact read; the read's starts clear the staleness.
+ */
+export function needsRollbackEligibilityRead(session: Session | null | undefined): boolean {
+    if (!session) return false;
+    if (session.rollbackEligibilityStale !== true) {
+        if (session.rollbackEligibleTurnStarts !== undefined) return false;
+        if (readCurrentSessionTurnsProjection(session)) return false;
+    }
+    return hasConversationRollbackCapability(session);
 }
 
 export function resolveConversationRollbackSupport(params: Readonly<{
@@ -153,17 +200,20 @@ export function resolveTranscriptRollbackActions(params: Readonly<{
 }>): Readonly<Record<string, TranscriptRollbackAction>> {
     const support = resolveConversationRollbackSupport({ session: params.session });
     if (support.supportsRollbackToPoint || hasConversationRollbackCapability(params.session)) {
-        const sessionTurnsProjection = readSessionTurnsProjection(params.session?.sessionTurns);
-        const sessionLatestTurnId = typeof params.session?.latestTurnId === 'string'
-            ? params.session.latestTurnId
+        // The stored starts are the merged, ordered evidence (`mergeRollbackEligibility` refuses
+        // evidence older than what is stored), so they carry a revocation, or a renewal, delivered
+        // after the detailed turns projection was requested. Starts observed strictly later than
+        // the projection therefore decide alone. Otherwise (the same read, or either side
+        // unordered) a turn is offered only when both sources allow it, so revocation from
+        // either source wins.
+        const currentSessionTurnsProjection = readCurrentSessionTurnsProjection(params.session);
+        const storedStarts = (params.session as { rollbackEligibleTurnStarts?: unknown } | null | undefined)?.rollbackEligibleTurnStarts;
+        const storedStartSeqs = storedStarts !== undefined ? listFlattenedRollbackEligibleTurnStartSeqs(storedStarts) : null;
+        const projectionStartSeqs = currentSessionTurnsProjection
+            && !(storedStartSeqs !== null && areRollbackStartsNewerThanProjection(params.session))
+            ? listTrustedRuntimeTurnStartSeqs(currentSessionTurnsProjection)
             : null;
-        const detailedProjectionIsCurrent = sessionTurnsProjection != null
-            && (sessionLatestTurnId == null || sessionTurnsProjection.latestTurnId === sessionLatestTurnId);
-        const trustedStartSeqs = detailedProjectionIsCurrent
-            ? listTrustedRuntimeTurnStartSeqs(sessionTurnsProjection)
-            : listFlattenedRollbackEligibleTurnStartSeqs(
-                (params.session as { rollbackEligibleTurnStarts?: unknown } | null | undefined)?.rollbackEligibleTurnStarts,
-            );
+        const trustedStartSeqs = intersectStartSeqs(projectionStartSeqs, storedStartSeqs);
         if (trustedStartSeqs.size === 0) return EMPTY_TRANSCRIPT_ROLLBACK_ACTIONS;
         const actions: Record<string, TranscriptRollbackAction> = {};
         for (const messageId of params.messageIdsOldestFirst) {

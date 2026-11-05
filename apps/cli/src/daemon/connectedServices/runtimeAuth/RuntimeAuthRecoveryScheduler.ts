@@ -20,7 +20,11 @@ import {
   type ProviderOutcomeProofKind,
 } from '../recovery/providerOutcomeProof';
 import type { ConnectedServiceRuntimeFailureClassification } from './types';
-import { readConnectedServiceAuthGenerationApplyFailure } from './connectedServiceAuthGenerationApplyFailure';
+import {
+  isRetryableConnectedServiceCredentialApplyFailure,
+  readConnectedServiceAuthGenerationApplyFailure,
+} from './connectedServiceAuthGenerationApplyFailure';
+import { ConnectedServiceAuthGroupSwitchLeaseExpiredError } from '../accountGroups/switching/pipeline/switchPipeline';
 import { sanitizeConnectedServiceRuntimeFailureClassification } from './sanitizeConnectedServiceRuntimeFailureClassification';
 import {
   isProvenRuntimeAuthRecoverySuccess,
@@ -185,6 +189,7 @@ export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
     classification: ConnectedServiceRuntimeFailureClassification;
     resumePromptMode: 'standard' | 'off' | 'custom';
     source: 'scheduler_retry';
+    interruptedOriginId?: string;
   }>) => Promise<unknown>;
   readLimitResetCustomResumePrompt?: () => string | null;
   retryAfterLimitReset?: (input: RuntimeAuthLimitResetRetryInput) => Promise<RuntimeAuthLimitResetRetryResult>;
@@ -581,6 +586,15 @@ function isDurableContinuityReconstructionExhausted(
 function classifyApplyFailure(result: unknown): RetryDecision | null {
   const failure = readApplyFailure(result);
   if (!failure) return null;
+  if (isRetryableConnectedServiceCredentialApplyFailure(failure.errorCode)) {
+    return {
+      retryable: true,
+      classification: { kind: 'dependency_unavailable', retryable: true },
+      failurePhase: 'apply',
+      failureReason: failure.errorCode,
+      lastError: failure.errorCode,
+    };
+  }
   if (
     failure.errorCode === 'provider_account_adoption_mismatch'
     || failure.errorCode === 'post_switch_verification_failed'
@@ -764,6 +778,7 @@ function resolveRuntimeAuthRecoveryDisposition(input: Readonly<{
   return resolveRuntimeAuthRecoveryResultDisposition({
     result: input.result,
     classificationFailureKind: input.intent.classification.kind,
+    classificationProfileId: input.intent.classification.profileId,
     classificationResetsAtMs: input.intent.classification.resetsAtMs ?? null,
     additionalWaitCandidatesMs: [input.intent.nextRetryAtMs],
     unknownNoEligibleMemberBackoffMs: input.unknownNoEligibleMemberBackoffMs,
@@ -772,6 +787,15 @@ function resolveRuntimeAuthRecoveryDisposition(input: Readonly<{
 }
 
 function classifyHandlerError(error: unknown): RetryDecision {
+  if (error instanceof ConnectedServiceAuthGroupSwitchLeaseExpiredError) {
+    return {
+      retryable: true,
+      classification: { kind: 'timeout', retryable: true },
+      failurePhase: 'handler',
+      failureReason: 'connected_service_auth_group_switch_lease_expired',
+      lastError: error.message,
+    };
+  }
   const applyFailure = readConnectedServiceAuthGenerationApplyFailure(error);
   if (applyFailure) {
     return classifyApplyFailure({
@@ -830,8 +854,11 @@ function resolveClassifiedFailureRetryAfterMs(input: Readonly<{
 function buildClassifiedFailureIntakeDecision(input: Readonly<{
   classification: ConnectedServiceRuntimeFailureClassification;
   nowMs: number;
+  deferToScheduler?: boolean;
 }>): RetryDecision {
-  const retryAfterMs = resolveClassifiedFailureRetryAfterMs(input);
+  // A superseding target must establish its own quota/reset evidence. The old
+  // member's reset cannot postpone the scheduler's first current-target check.
+  const retryAfterMs = input.deferToScheduler ? undefined : resolveClassifiedFailureRetryAfterMs(input);
   return {
     retryable: true,
     classification: {
@@ -840,7 +867,7 @@ function buildClassifiedFailureIntakeDecision(input: Readonly<{
       ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
     },
     failurePhase: 'handler',
-    failureReason: 'classified_failure_reported',
+    failureReason: input.deferToScheduler ? 'source_tuple_superseded' : 'classified_failure_reported',
     lastError: input.classification.kind,
   };
 }
@@ -954,7 +981,7 @@ function doesRuntimeAuthRecoveryTransitionAdvance(
     || runtimeAuthRecoveryTransitionRank[next] > runtimeAuthRecoveryTransitionRank[previous];
 }
 
-function buildRuntimeAuthRecoveryAttemptId(reportId: string | undefined): string {
+export function buildRuntimeAuthRecoveryAttemptId(reportId: string | undefined): string {
   const opaqueSource = typeof reportId === 'string' && reportId.trim().length > 0
     ? reportId.trim()
     : randomUUID();
@@ -998,7 +1025,10 @@ function mergeRuntimeAuthRecoveryIntent(
     // Only a fresh in-band provider report owns a new recovery epoch. A later handler/apply
     // failure without the original attempt id is still fallout from the settled attempt and must
     // not revive it merely because its caller omitted the report id.
-    return incoming.lastSettledTransition === 'working' ? incoming : previous;
+    // Adopted-successor intake starts scheduled because it has no in-band
+    // executor. It is still a fresh report, unlike handler/apply retry fallout.
+    return incoming.lastSettledTransition === 'working' || incoming.failureReason === 'source_tuple_superseded'
+      ? incoming : previous;
   }
   const limitResetIntake = isRuntimeAuthLimitResetIntent(previous) && isRuntimeAuthLimitResetIntent(incoming);
   const previousProviderReportAttemptId = previous.limitResetLastProviderReportAttemptId ?? previous.attemptId;
@@ -1117,6 +1147,7 @@ function isSameRuntimeFailureClassification(
     && left.sourceProviderAccountId === right.sourceProviderAccountId
     && left.runtimeIssueFingerprint === right.runtimeIssueFingerprint
     && left.sourceProviderOrganizationId === right.sourceProviderOrganizationId
+    && left.providerReportedOrganizationId === right.providerReportedOrganizationId
     && left.failingAccessTokenFingerprint === right.failingAccessTokenFingerprint
     && left.planType === right.planType
     && left.source === right.source;
@@ -1239,6 +1270,7 @@ function isRuntimeAuthLimitResetIntent(intent: RuntimeAuthRecoveryIntent): boole
 
 function isRuntimeAuthDurableWaitIntent(intent: RuntimeAuthRecoveryIntent): boolean {
   return intent.lastError === 'no_eligible_member'
+    || intent.lastError === 'quota_proof_unavailable'
     || intent.lastError === 'switch_limit_reached'
     || intent.lastError === 'awaiting_limit_reset';
 }
@@ -1352,6 +1384,13 @@ export class RuntimeAuthRecoveryScheduler {
     // replace an admitted continuation's existing retry deadline.
     const observeProofWithoutRecovery = (intent: RuntimeAuthRecoveryIntent): boolean =>
       isUntargetedProviderOutcomeProofWait(intent) && !canContinueProfileLimit(intent);
+    // Only initial attempts present before this process took custody lost their
+    // in-band owner. Live intake below must keep its null deadline unarmed.
+    const restoredInitialAttemptIds = new Set((deps.durableStore?.readAll?.() ?? []).flatMap(([, value]) => {
+      const intent = normalizeIntent(value);
+      return intent?.status === 'waiting' && intent.lastSettledTransition === 'working'
+        && intent.nextRetryAtMs === null && intent.attemptId ? [intent.attemptId] : [];
+    }));
     this.scheduler = new DurableBackoffRecoveryScheduler<RuntimeAuthRecoveryIntent>({
       nowMs: deps.nowMs,
       baseBackoffMs: deps.baseBackoffMs,
@@ -1364,7 +1403,11 @@ export class RuntimeAuthRecoveryScheduler {
         : intent.status === 'recovered'
           ? 'cancelled'
           : intent.status,
-      getNextRetryAtMs: (intent) => intent.nextRetryAtMs,
+      getNextRetryAtMs: (intent) => intent.nextRetryAtMs ?? (
+        intent.status === 'waiting' && intent.lastSettledTransition === 'working'
+          && intent.attemptId && restoredInitialAttemptIds.has(intent.attemptId)
+          ? deps.nowMs() : null
+      ),
       getAttemptCount: (intent) => deps.retryAfterLimitReset && isRuntimeAuthLimitResetIntent(intent)
         ? intent.limitResetTrial?.admissionAttemptCount ?? intent.limitResetRetryCount ?? 0
         : intent.attemptCount,
@@ -1576,6 +1619,9 @@ export class RuntimeAuthRecoveryScheduler {
               classification: intent.classification,
               resumePromptMode: readResumePromptMode(intent.resumePromptMode),
               source: 'scheduler_retry',
+              // Predecessor waits have no attempt id; their existing durable key
+              // still identifies that recovery without borrowing a newer user turn.
+              interruptedOriginId: intent.attemptId ?? buildRecoveryKeyForIntent(intent),
             });
           const continuationResult = readSwitchAttemptResult(result);
           if (continuationResult?.status === 'continuation_cancelled') {
@@ -1751,17 +1797,18 @@ export class RuntimeAuthRecoveryScheduler {
           }
           // S2: a connection-level endpoint outage thrown during the recovery fetch
           // (ECONNREFUSED / socket hang up / reset = `network`) is a degraded local condition, not a
-          // provider failure. Route it onto the bounded degraded-retry track so a long local outage
-          // cannot dead-letter the session before the normal attempt budget. A `timeout` is left on
+          // provider failure. Group lease contention likewise waits for local coordination without
+          // spending provider attempts. Both use the existing bounded degraded-retry track. Other timeouts stay on
           // the normal track: a slow-but-reachable endpoint can be a genuine recoverable failure.
-          if (decision.retryable && decision.classification.kind === 'network') {
+          if (decision.classification.kind === 'network'
+            || decision.failureReason === 'connected_service_auth_group_switch_lease_expired') {
             return buildDegradedRecoveryOutcome({
               intent: {
                 ...intent,
                 lastError: decision.lastError,
                 lastErrorClassification: decision.classification,
               },
-              reason: 'session_endpoint_unavailable',
+              reason: decision.failureReason,
               nowMs: deps.nowMs(),
               maxDegradedAttempts: this.maxDegradedAttempts,
               degradedBackoffMs: this.degradedBackoffMs,
@@ -1906,6 +1953,11 @@ export class RuntimeAuthRecoveryScheduler {
   /** Reconstructs persisted recovery state without timers or recovery effects. */
   hydratePassive(): ReadonlyArray<RuntimeAuthRecoveryIntent> {
     return this.scheduler.hydratePassive();
+  }
+
+  /** Arms persisted waits; recovery runs asynchronously through the normal timer gate. */
+  hydrate(): ReadonlyArray<RuntimeAuthRecoveryIntent> {
+    return this.scheduler.hydrate();
   }
 
   /** Delivers only already-authorized presentation events; it never arms recovery execution. */
@@ -2179,6 +2231,7 @@ export class RuntimeAuthRecoveryScheduler {
     const disposition = resolveRuntimeAuthRecoveryResultDisposition({
       result: input.result,
       classificationFailureKind: input.classificationFailureKind,
+      classificationProfileId: intent.classification.profileId,
       classificationResetsAtMs: input.classificationResetsAtMs,
       unknownNoEligibleMemberBackoffMs: computeRuntimeAuthRecoveryBackoffMs({
         attemptCount,
@@ -2392,6 +2445,7 @@ export class RuntimeAuthRecoveryScheduler {
     switchesThisTurn: number;
     classification: ConnectedServiceRuntimeFailureClassification;
     resumePromptMode?: 'standard' | 'off' | 'custom';
+    deferToScheduler?: boolean;
   }>): Promise<RuntimeAuthRecoveryIntakeResult> {
     const classification = sanitizeConnectedServiceRuntimeFailureClassification(input.classification);
     if (!classification) return { status: 'ignored', retryable: false };
@@ -2402,10 +2456,11 @@ export class RuntimeAuthRecoveryScheduler {
       decision: buildClassifiedFailureIntakeDecision({
         classification,
         nowMs: this.deps.nowMs(),
+        deferToScheduler: input.deferToScheduler,
       }),
-      projectScheduled: false,
+      projectScheduled: input.deferToScheduler === true,
       reportId: input.reportId,
-      transition: 'working',
+      transition: input.deferToScheduler ? 'scheduled' : 'working',
       resumePromptMode: readResumePromptMode(input.resumePromptMode),
     });
   }

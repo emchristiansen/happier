@@ -63,6 +63,13 @@ export async function replaceDirectoryAtomically(params: Readonly<{
   targetDir: string;
   preserveUnprovidedEntries?: readonly PreservedDirectoryEntries[];
   afterPromote?: () => Promise<void> | void;
+  /** Connected-service callers revoke credentials and retain the retired home's history. */
+  retireDirectory?: (directory: string) => Promise<void>;
+  /**
+   * Records durable custody of a retained sibling before `source` is renamed to `retired`, so a
+   * failed `retireDirectory` stays discoverable by the caller's cleanup owner after restart.
+   */
+  claimRetiredDirectory?: (retired: string, source: string) => Promise<void>;
   writeArtifacts?: <T>(write: () => Promise<T>) => Promise<T>;
 }>): Promise<void> {
   const writeArtifacts = params.writeArtifacts ?? (async <T>(write: () => Promise<T>) => await write());
@@ -73,6 +80,7 @@ export async function replaceDirectoryAtomically(params: Readonly<{
   let carriedEntries: string[] = [];
   try {
     await writeArtifacts(async () => {
+      if (params.retireDirectory) await params.claimRetiredDirectory?.(backupDir, params.targetDir);
       try {
         await rename(params.targetDir, backupDir);
         hasBackup = true;
@@ -87,17 +95,42 @@ export async function replaceDirectoryAtomically(params: Readonly<{
       if (hasBackup) carriedEntries = await carryUnprovidedEntriesBestEffort(snapshots, backupDir, params.targetDir);
     });
     await params.afterPromote?.();
-    if (hasBackup) {
+    if (hasBackup && !params.retireDirectory) {
       await rm(backupDir, { recursive: true, force: true });
     }
   } catch (error) {
+    let rejectedDir: string | undefined;
+    let claimError: unknown;
     if (promoted) {
       await moveEntriesBetweenRootsBestEffort(carriedEntries, params.targetDir, backupDir);
-      await rm(params.targetDir, { recursive: true, force: true }).catch(() => {});
+      if (params.retireDirectory) {
+        // Restore the old canonical home without deleting the rejected transcript bytes.
+        rejectedDir = `${params.targetDir}.rejected-${randomUUID()}`;
+        // Custody failure must not block rollback; immediate retirement below may still settle it.
+        try { await params.claimRetiredDirectory?.(rejectedDir, params.targetDir); }
+        catch (claimFailure) { claimError = claimFailure; }
+        await rename(params.targetDir, rejectedDir);
+      } else {
+        await rm(params.targetDir, { recursive: true, force: true }).catch(() => {});
+      }
     }
     if (hasBackup) {
-      await rename(backupDir, params.targetDir).catch(() => {});
+      if (params.retireDirectory) await rename(backupDir, params.targetDir);
+      else await rename(backupDir, params.targetDir).catch(() => {});
+    }
+    if (rejectedDir && params.retireDirectory) {
+      try { await params.retireDirectory(rejectedDir); }
+      catch (retirementError) {
+        throw new AggregateError(
+          [error, retirementError, ...(claimError === undefined ? [] : [claimError])],
+          'Promotion failed and credential retirement failed; both homes were retained',
+        );
+      }
     }
     throw error;
+  }
+  // A retirement failure must not roll back a valid promotion or fall through to recursive rm.
+  if (hasBackup && params.retireDirectory) {
+    await params.retireDirectory(backupDir);
   }
 }

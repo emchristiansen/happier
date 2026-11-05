@@ -19,7 +19,7 @@ describe('selected AGY discovery process and temporary-state custody', () => {
   it.each([
     ['probeModels', 'success'], ['probeModels', 'failure'], ['probeModels', 'cancel'],
     ['probeModes', 'success'], ['probeModes', 'cancel'],
-  ] as const)('isolates %s history and disposes the child before removing credentials: %s', async (method, outcome) => {
+  ] as const)('isolates %s history and disposes the child before revoking credentials: %s', async (method, outcome) => {
     await withTempDir('agy-rpc-auth-', async (cwd) => {
       const overrides = { happyHomeDir: cwd, activeServerDir: cwd, privateKeyFile: join(cwd, 'access.key'), legacyPrivateKeyFile: join(cwd, 'legacy.key'),
         apiServerUrl: 'http://agy-auth-boundary.test', clientEncryptionRequirement: 'follow_account' };
@@ -97,7 +97,9 @@ describe('selected AGY discovery process and temporary-state custody', () => {
         expect(observed.inheritedSkill).toBe(false);
         expect(() => process.kill(observed.pid, 0)).toThrow();
         expect(JSON.parse(await readFile(stopped, 'utf8'))).toEqual({ tokenPresent: true });
-        expect(existsSync(observed.home)).toBe(false);
+        // Probe retirement revokes the private credential; the isolated probe history is retained.
+        expect(existsSync(join(observed.home, 'antigravity-acp', 'acp_token.json'))).toBe(false);
+        expect(await readFile(join(observed.home, 'antigravity-acp', 'conversations', 'probe.db'), 'utf8')).toBe('probe');
         expect(await readdir(join(native, 'antigravity-acp', 'conversations'))).toEqual([]);
         expect(await readdir(join(native, 'antigravity-acp', 'brain'))).toEqual([]);
       } finally {

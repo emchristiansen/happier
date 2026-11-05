@@ -77,6 +77,7 @@ const RESULT_NONE_DEFERRED_ACTION_IDS = [
 ] as const;
 
 const RESULT_OPTIONAL_DEFERRED_ACTION_IDS = [
+  'session.config_option.set',
   'review.start',
   'subagents.plan.start',
   'subagents.delegate.start',

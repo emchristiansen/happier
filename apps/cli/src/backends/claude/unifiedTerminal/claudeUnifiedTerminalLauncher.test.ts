@@ -1,21 +1,23 @@
 import { readFileSync } from 'node:fs';
-import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { SessionWorkflowRunSnapshotV1 } from '@happier-dev/protocol';
 import { completedNativeChildTranscript } from '../workflows/claudeWorkflowActivitySource.testkit';
-import { resolve } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { TerminalHostHandle } from '@/integrations/terminalHost/_types';
+import type { TerminalHostAdapter, TerminalHostHandle } from '@/integrations/terminalHost/_types';
 import { TerminalHostStartupError } from '@/integrations/terminalHost/errors';
 import { ZellijActionTimeoutError } from '@/integrations/zellij/actions';
 import type { TerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
 import type { AccountSettings } from '@happier-dev/protocol';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
+import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
+import type { SessionClientPort } from '@/api/session/sessionClientPort';
+import type { SessionProviderInputOutcomeObserver } from '@/api/session/sessionClient';
 
-import type { Session } from '../session';
+import { Session } from '../session';
 import type { SessionHookData } from '../utils/startHookServer';
 import type { EnhancedMode } from '../loop';
 
@@ -68,7 +70,8 @@ vi.mock('@/daemon/connectedServices/runtimeAuth/reportConnectedServiceRuntimeAut
 }));
 
 import { claudeUnifiedTerminalLauncher } from './claudeUnifiedTerminalLauncher';
-import { ClaudeUnifiedTerminalManagedSettingsOptionError } from './buildClaudeUnifiedTerminalSpawn';
+import { buildClaudeUnifiedTerminalSpawn, ClaudeUnifiedTerminalManagedSettingsOptionError } from './buildClaudeUnifiedTerminalSpawn';
+import { getProjectPath } from '../utils/path';
 import { ClaudeUnifiedTerminalReadinessTimeoutError } from './createClaudeUnifiedTerminalReadinessBridge';
 import { createFakeControlPort } from './tuiControls/fakeControlPort';
 import { resolveClaudeUnifiedVisibleDialog } from './tuiControls/dialogRegistry';
@@ -156,18 +159,23 @@ function abortLauncherOnEmptyQueueWait(session: Session, waitNumber = 1): AbortS
   return controller.signal;
 }
 
+const createdSessions: Session[] = [];
+
 function createSession(overrides: Readonly<{
   path?: string;
+  sessionId?: string | null;
+  messageQueue?: MessageQueue2<EnhancedMode>;
   terminalRuntime?: Session['terminalRuntime'];
   metadata?: unknown;
   startedBy?: Session['startedBy'];
 }> = {}): Session {
   let metadata: unknown = overrides.metadata ?? {};
-  return {
+  const fixture = {
     path: overrides.path ?? '/workspace/project',
     client: {
       waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
       sessionId: 'happy-session-id',
+      keepAlive: vi.fn(),
       sendSessionEvent: vi.fn(),
       sendClaudeSessionMessage: vi.fn(),
       sendClaudeSessionMessageCommittedExact: vi.fn(async () => {}),
@@ -214,7 +222,6 @@ function createSession(overrides: Readonly<{
     },
     pushSender: null,
     accountSettings: null,
-    sessionId: 'claude-session-id',
     lastPermissionMode: 'default',
     lastPermissionModeUpdatedAt: 0,
     adoptLastPermissionModeFromMetadata: vi.fn(() => true),
@@ -224,7 +231,7 @@ function createSession(overrides: Readonly<{
     terminalRuntime: overrides.terminalRuntime ?? null,
     hookSettingsPath: undefined,
     hookPluginDir: null,
-    queue: {
+    queue: overrides.messageQueue ?? {
       size: vi.fn(() => 0),
       waitForMessagesSignal: vi.fn(waitUntilAborted),
       waitForMessagesAndGetAsString: vi.fn(),
@@ -238,13 +245,27 @@ function createSession(overrides: Readonly<{
     registerProviderInputConsumer: vi.fn(),
     registerConnectedServiceExactApplicationHandler: vi.fn(() => vi.fn()),
     isWorkflowOwnedTaskReference: vi.fn(() => false),
-    onSessionFound: vi.fn(),
     publishUnifiedTerminalHostMetadata: vi.fn(async () => {}),
     onThinkingChange: vi.fn(),
     setThinkingWithoutTaskLifecycle: vi.fn(),
     noteUserAbortRequested: vi.fn(),
     abortCurrentTaskTurn: vi.fn(),
-  } as unknown as Session;
+  };
+  const session = new Session({
+    client: fixture.client as unknown as SessionClientPort,
+    path: fixture.path,
+    logPath: '/tmp/claude-unified-launcher.log',
+    sessionId: overrides.sessionId === undefined ? 'claude-session-id' : overrides.sessionId,
+    messageQueue: overrides.messageQueue ?? new MessageQueue2<EnhancedMode>(() => 'mode'),
+    onModeChange: () => {},
+    hookSettingsPath: '/tmp/hooks.json',
+    startedBy: overrides.startedBy,
+    terminalRuntime: overrides.terminalRuntime,
+  });
+  // Keep the existing transport/runtime fixture while identity adoption and resumability stay real.
+  Object.assign(session, fixture);
+  createdSessions.push(session);
+  return session;
 }
 
 function readFirstInvocationOrder(
@@ -268,9 +289,95 @@ function getFailTurnSpy(session: Session) {
 
 describe('claudeUnifiedTerminalLauncher', () => {
   afterEach(() => {
+    for (const session of createdSessions.splice(0)) session.cleanup();
     restoreProcessTty();
     mocks.runClaudeUnifiedTerminalSession.mockReset();
     vi.clearAllMocks();
+  });
+
+  it('discovers and accepts a fresh hookless transcript after an unmaterialized session observation', async () => {
+    setProcessTty(false);
+    const dir = await mkdtemp(join(tmpdir(), 'happier-unified-provisional-discovery-'));
+    const workspaceDir = join(dir, 'workspace');
+    const configDir = join(dir, 'claude-config');
+    const projectDir = getProjectPath(workspaceDir, configDir);
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(projectDir, { recursive: true });
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    const queue = new MessageQueue2<EnhancedMode>(() => 'mode');
+    const session = createSession({ path: workspaceDir, sessionId: null, messageQueue: queue });
+    const freshSessionId = '22222222-2222-4222-8222-222222222222';
+    const transcriptPath = join(projectDir, `${freshSessionId}.jsonl`);
+    const abortController = new AbortController();
+    const accepted: string[] = [];
+    const injected: string[] = [];
+    const observeProviderInputOutcome: SessionProviderInputOutcomeObserver = outcome => {
+      if (outcome.kind === 'accepted') {
+        accepted.push(outcome.localId);
+        abortController.abort();
+      }
+    };
+    Object.assign(session.client, { bindProviderInputOutcomeProducer: () => observeProviderInputOutcome });
+    session.onSessionFound('11111111-1111-4111-8111-111111111111', {
+      hook_event_name: 'SessionStart', source: 'startup',
+      transcript_path: join(projectDir, '11111111-1111-4111-8111-111111111111.jsonl'),
+    });
+    await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+    queue.push('Continue in the fresh native conversation', {
+      permissionMode: 'default', claudeUnifiedTerminalEnabled: true, claudeUnifiedTerminalHost: 'tmux',
+    }, { userMessageLocalId: 'fresh-native-input' });
+    const handle: TerminalHostHandle = {
+      kind: 'tmux', sessionName: 'fresh-native-test', paneId: '%1',
+      attachMetadata: { attachStrategy: 'terminal_host', topology: 'shared', locality: 'same_machine', liveProbe: 'required' },
+    };
+    const adapter: TerminalHostAdapter = {
+      kind: 'tmux',
+      createOrAttachHost: async () => handle,
+      evaluateLiveness: async () => ({ paneAlive: true, observedAt: Date.now() }),
+      captureInputState: async () => ({ stable: true, currentInput: IDLE_COMPOSER, observedAt: Date.now() }),
+      injectUserPrompt: async (_handle, input) => {
+        await writeFile(transcriptPath, `${JSON.stringify({
+          type: 'user', uuid: 'fresh-native-echo', sessionId: freshSessionId,
+          timestamp: new Date().toISOString(), message: { role: 'user', content: input.text },
+        })}\n`);
+        injected.push(input.text);
+        return { status: 'injected', at: Date.now(), bytesWritten: input.text.length };
+      },
+      interruptTurn: async () => {},
+      dispose: async () => {},
+    };
+    const actualRuntime = await vi.importActual<typeof import('./runClaudeUnifiedTerminalSession')>('./runClaudeUnifiedTerminalSession');
+    mocks.runClaudeUnifiedTerminalSession.mockImplementationOnce(async (options: Parameters<typeof actualRuntime.runClaudeUnifiedTerminalSession>[0]) => (
+      actualRuntime.runClaudeUnifiedTerminalSession({
+        ...options,
+        resolveHostAdapter: async () => ({ status: 'resolved', adapter, reason: 'test' }),
+        readTerminalHostAttachmentInfo: async () => null,
+        persistTerminalHostAttachmentInfo: async () => {},
+        // Only native executable discovery is replaced; spawn planning and every runtime owner stay real.
+        buildSpawn: input => buildClaudeUnifiedTerminalSpawn({ ...input, deps: {
+          resolveClaudeCliPath: () => '/fixture/claude',
+          ensureClaudeJsRuntimeExecutable: async () => process.execPath,
+        } }),
+        processSignals: null,
+        dialogTurnEndScreenProbeDelaysMs: [],
+        lifecycleCompletionQuiescenceMs: 0,
+      })
+    ));
+    const launch = claudeUnifiedTerminalLauncher(session, { signal: abortController.signal });
+    try {
+      await vi.waitFor(() => expect(injected).toEqual(['Continue in the fresh native conversation']), { timeout: 5_000 });
+      await vi.waitFor(() => expect(accepted).toEqual(['fresh-native-input']), { timeout: 5_000 });
+      expect(session.sessionId).toBe(freshSessionId);
+      expect(session.transcriptPath).toBe(transcriptPath);
+      await expect(launch).resolves.toEqual({ type: 'exit', code: 0 });
+    } finally {
+      abortController.abort();
+      await launch.catch(() => undefined);
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('wires one generalized dialog-choice broker into the unified runtime', async () => {

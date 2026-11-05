@@ -83,13 +83,17 @@ function containsStaticSessionControlAdapterWiring(text: string, agentId: 'claud
     opencode: 'openCodeUsageLimitRecoveryControlAdapter',
   } satisfies Record<typeof agentId, string>;
   const usageAdapter = expectedUsageAdapterByAgentId[agentId];
-  const usagePattern = new RegExp(
-    `id:\\s*AGENTS_CORE\\.${agentId}\\.id[\\s\\S]{0,2500}getSessionUsageLimitRecoveryControlAdapter:\\s*async\\s*\\(\\)\\s*=>\\s*${usageAdapter}`,
-  );
-  if (agentId !== 'codex') return usagePattern.test(text);
-
-  return /id:\s*AGENTS_CORE\.codex\.id[\s\S]{0,2500}getSessionGoalControlAdapter:\s*async\s*\(\)\s*=>\s*codexAppServerGoalControlAdapter[\s\S]{0,500}getSessionCatalogControlAdapter:\s*async\s*\(\)\s*=>\s*codexAppServerCatalogControlAdapter/.test(text)
-    && usagePattern.test(text);
+  // Each getter must belong to this agent's own catalog entry: the scan may cross any of that
+  // entry's other properties but stops where the next agent's `id: AGENTS_CORE.<agent>.id` begins.
+  // A fixed character window instead breaks whenever an unrelated property is added to the entry,
+  // and a window between two getters would accept one that moved into the next entry.
+  const isStaticGetterInOwnEntry = (getter: string, adapter: string) => new RegExp(
+    `id:\\s*AGENTS_CORE\\.${agentId}\\.id(?:(?!id:\\s*AGENTS_CORE\\.)[\\s\\S])*?${getter}:\\s*async\\s*\\(\\)\\s*=>\\s*${adapter}\\b`,
+  ).test(text);
+  if (!isStaticGetterInOwnEntry('getSessionUsageLimitRecoveryControlAdapter', usageAdapter)) return false;
+  if (agentId !== 'codex') return true;
+  return isStaticGetterInOwnEntry('getSessionGoalControlAdapter', 'codexAppServerGoalControlAdapter')
+    && isStaticGetterInOwnEntry('getSessionCatalogControlAdapter', 'codexAppServerCatalogControlAdapter');
 }
 
 async function listDistFiles(distDir: string): Promise<string[]> {

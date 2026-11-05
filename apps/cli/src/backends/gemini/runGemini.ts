@@ -303,6 +303,7 @@ export async function runGemini(opts: {
       credentials: opts.credentials,
       settings: opts.accountSettingsContext?.settings ?? null,
       profileId: session.getMetadataSnapshot()?.profileId ?? null,
+      sessionMetadata: session.getMetadataSnapshot(),
       baseOverride,
       executionRunsFeatureEnabled: resolveCliFeatureDecision({
         featureId: 'execution.runs',
@@ -512,6 +513,7 @@ export async function runGemini(opts: {
   let explicitAbortPromise: Promise<boolean> | null = null;
   let shouldExit = false;
   let geminiBackend: GeminiBackendResult['backend'] | null = null;
+  const providerTurnEventSubscription: { unsubscribe: (() => void) | null } = { unsubscribe: null };
   let providerInputConsumer: SessionProviderInputConsumer<GeminiMode, string> | null = null;
   let providerInputAdmissionClosed = false;
   let providerInputDispatchDrain: Promise<void> = Promise.resolve();
@@ -675,6 +677,8 @@ export async function runGemini(opts: {
 
         if (geminiBackend) {
           const backendToDispose = geminiBackend;
+          providerTurnEventSubscription.unsubscribe?.();
+          providerTurnEventSubscription.unsubscribe = null;
           await backendToDispose.dispose();
         }
 
@@ -732,6 +736,10 @@ export async function runGemini(opts: {
    * This function is called when backend is created or recreated
    */
   function setupGeminiMessageHandler(backend: GeminiBackendResult['backend']): void {
+    providerTurnEventSubscription.unsubscribe?.();
+    providerTurnEventSubscription.unsubscribe = backend.onProviderTurnEvent?.(() => {
+      session.sessionTurnLifecycle?.observeProviderTurnEvent();
+    }) ?? null;
     backend.onMessage(
       createGeminiBackendMessageHandler({
         session,
@@ -882,6 +890,8 @@ export async function runGemini(opts: {
         // Dispose old backend and create new one with new model
         if (geminiBackend) {
           const backendToDispose = geminiBackend;
+          providerTurnEventSubscription.unsubscribe?.();
+          providerTurnEventSubscription.unsubscribe = null;
           await backendToDispose.dispose();
           geminiBackend = null;
         }
@@ -1352,6 +1362,8 @@ export async function runGemini(opts: {
 
     if (geminiBackend) {
       const backendToDispose = geminiBackend;
+      providerTurnEventSubscription.unsubscribe?.();
+      providerTurnEventSubscription.unsubscribe = null;
       await backendToDispose.dispose();
     }
 

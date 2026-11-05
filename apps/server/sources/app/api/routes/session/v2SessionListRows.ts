@@ -96,13 +96,24 @@ const V2_SESSION_LIST_ROW_BASE_SELECT = {
     pendingActivationRequestedAt: true,
     pendingActivationStatus: true,
     pendingActivationFailureCode: true,
-    turns: createSessionRollbackEligibleTurnsSelect(),
     dataEncryptionKey: true,
     active: true,
     lastActiveAt: true,
     shares: {
         select: V2_SESSION_LIST_SHARE_SELECT,
     },
+} as const satisfies Prisma.SessionSelect;
+
+/**
+ * Rollback eligibility is read for one session at a time only. Selected as a relation on a
+ * multi-session list read, Prisma loads every eligible turn of every listed session in one
+ * `sessionId IN (…)` statement with no per-session limit and applies `take` in memory, so the cost
+ * follows each session's whole turn history: ~32k rows for one 200-row archived page on a real
+ * account. List rows therefore carry no `rollbackEligibleTurnStarts` (optional on the wire); clients
+ * keep it current from the session's detailed turns projection and from turn-mutation events.
+ */
+const V2_SESSION_ROW_BY_ID_EXTRA_SELECT = {
+    turns: createSessionRollbackEligibleTurnsSelect(),
 } as const satisfies Prisma.SessionSelect;
 
 const {
@@ -117,20 +128,20 @@ const {
     pendingActivationRequestedAt: _legacySelectPendingActivationRequestedAt,
     pendingActivationStatus: _legacySelectPendingActivationStatus,
     pendingActivationFailureCode: _legacySelectPendingActivationFailureCode,
-    turns: _legacySelectTurns,
     ...V2_SESSION_LIST_ROW_LEGACY_SELECT
 } = V2_SESSION_LIST_ROW_BASE_SELECT;
 
 /**
- * The columns the primary session-list projection selects and the legacy projection does not — the
- * exact set a binary running ahead of `prisma migrate deploy` can be asked for and not get.
+ * The columns the primary session projections (list and single-session) select and the legacy
+ * projection does not — the exact set a binary running ahead of `prisma migrate deploy` can be asked
+ * for and not get.
  *
  * Derived from the two projections instead of restated, because a hand-maintained copy is precisely
  * how `unreadSince` came to be selected by the primary projection while the missing-column matcher
  * still did not recognise it, turning a recoverable old-schema read into a hard failure.
  */
 export const SESSION_LIST_PROJECTION_FALLBACK_COLUMNS: readonly string[] =
-    Object.keys(V2_SESSION_LIST_ROW_BASE_SELECT).filter(
+    Object.keys({ ...V2_SESSION_LIST_ROW_BASE_SELECT, ...V2_SESSION_ROW_BY_ID_EXTRA_SELECT }).filter(
         (column) => !(column in V2_SESSION_LIST_ROW_LEGACY_SELECT),
     );
 
@@ -150,11 +161,15 @@ export type V2SessionListRow = Prisma.SessionGetPayload<{
     select: typeof V2_SESSION_LIST_ROW_BASE_SELECT;
 }>;
 
+type V2SessionRowById = Prisma.SessionGetPayload<{
+    select: typeof V2_SESSION_LIST_ROW_BASE_SELECT & typeof V2_SESSION_ROW_BY_ID_EXTRA_SELECT;
+}>;
+
 type V2SessionListLegacyRow = Prisma.SessionGetPayload<{
     select: typeof V2_SESSION_LIST_ROW_LEGACY_SELECT;
 }>;
 
-export type V2SessionListRowCompat = V2SessionListRow | V2SessionListLegacyRow;
+export type V2SessionListRowCompat = V2SessionListRow | V2SessionRowById | V2SessionListLegacyRow;
 
 /**
  * "Shared with this user" — the single definition of share membership.
@@ -198,6 +213,14 @@ export function createV2SessionListRowSelect(params: Readonly<{ userId: string }
             where: { sharedWithUserId: params.userId },
             select: V2_SESSION_LIST_SHARE_SELECT,
         },
+    } as const satisfies Prisma.SessionSelect;
+}
+
+/** The single-session read: the list projection plus the session's rollback-eligible turns. */
+export function createV2SessionRowByIdSelect(params: Readonly<{ userId: string }>) {
+    return {
+        ...createV2SessionListRowSelect(params),
+        ...V2_SESSION_ROW_BY_ID_EXTRA_SELECT,
     } as const satisfies Prisma.SessionSelect;
 }
 
@@ -250,6 +273,13 @@ export function mapStoredSessionRuntimeActivityProjection(row: object): SessionR
     return normalizeStoredSessionRuntimeActivityProjection(row);
 }
 
+/** Only a single-session read selects `turns`; any other row claims no rollback eligibility. */
+function mapSelectedRollbackEligibleTurnStarts(
+    row: V2SessionListRowCompat,
+): Pick<V2SessionRecord, "rollbackEligibleTurnStarts"> {
+    return "turns" in row ? { rollbackEligibleTurnStarts: readSessionTurnRollbackEligibleStarts(row) } : {};
+}
+
 export function mapV2SessionListRow(params: Readonly<{ row: V2SessionListRowCompat; userId: string }>): V2SessionRecord {
     const { row, userId } = params;
     const viewerShare = row.shares[0] ?? null;
@@ -298,7 +328,7 @@ export function mapV2SessionListRow(params: Readonly<{ row: V2SessionListRowComp
         pendingBlockedCount: row.pendingBlockedCount,
         pendingVersion: row.pendingVersion,
         pendingActivationAuthorization: mapPendingActivationAuthorization(row),
-        rollbackEligibleTurnStarts: readSessionTurnRollbackEligibleStarts(row),
+        ...mapSelectedRollbackEligibleTurnStarts(row),
         dataEncryptionKey: isOwner
             ? encodeSessionDataEncryptionKey(row.dataEncryptionKey)
             : (viewerShare?.encryptedDataKey ? Buffer.from(viewerShare.encryptedDataKey).toString("base64") : null),

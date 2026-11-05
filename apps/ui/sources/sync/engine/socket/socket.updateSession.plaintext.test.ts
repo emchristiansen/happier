@@ -18,6 +18,7 @@ import { EncryptionCache } from '@/sync/encryption/encryptionCache';
 import { SecretBoxEncryption, type Decryptor, type Encryptor } from '@/sync/encryption/encryptor';
 import { getSessionStatus } from '@/utils/sessions/sessionUtils';
 import { subscribeActivityLocalNotifications, type ActivityLocalNotificationEvent } from '@/activity/notifications/runtime/activityLocalNotificationBus';
+import { buildActivityLocalNotificationContent } from '@/activity/notifications/buildActivityLocalNotificationContent';
 import {
     flushActivityUpdates,
     handleUpdateContainer,
@@ -96,6 +97,54 @@ describe('socket update handling: plaintext update-session', () => {
             bindingsByConversationSessionId: {},
         }));
         storage.setState(initialStorageState, true);
+    });
+
+    it('keeps local permission notifications bound to producer occurrences across republishing and request-ID reuse', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(10_000);
+        const sessionId = 's_local_permission_occurrences';
+        storage.getState().applySessions([buildSession(sessionId)]);
+        markSessionVisible(sessionId);
+        const params = buildBaseParams({ applySessions: rows => storage.getState().applySessions(rows) });
+        const events: ActivityLocalNotificationEvent[] = [];
+        const unsubscribe = subscribeActivityLocalNotifications(event => {
+            if (event.kind === 'agent-request' && event.sessionId === sessionId) events.push(event);
+        });
+        const publish = async (requests: unknown, version: number) => {
+            await handleUpdateContainer({
+                ...params,
+                updateData: {
+                    id: `request-update-${version}`, seq: version, createdAt: version * 100,
+                    body: { t: 'update-session', id: sessionId,
+                        agentState: { version, value: JSON.stringify({ requests }) } },
+                },
+            });
+            await vi.advanceTimersByTimeAsync(100);
+        };
+        const occurrenceA = { tool: 'Bash', arguments: { command: 'git status' }, occurrenceId: 'producer-occurrence-a' };
+        const occurrenceB = { ...occurrenceA, occurrenceId: 'producer-occurrence-b' };
+        try {
+            await publish({ reused: occurrenceA }, 2);
+            await publish({ reused: occurrenceA }, 3);
+            // A newer occurrence may arrive without an intermediate empty requests snapshot.
+            await publish({ reused: occurrenceB }, 4);
+            await publish({ reused: occurrenceB, legacy: { tool: 'Read', arguments: { path: '/tmp/file' } } }, 5);
+
+            // Build after the replacement is stored: old events must retain their original
+            // identity, while a legacy request must not borrow a token from current state.
+            const session = storage.getState().sessions[sessionId];
+            const notifications = events.map(event => buildActivityLocalNotificationContent({
+                event, session, serverUrl: 'https://stack.example.test',
+            }));
+            expect(notifications.map(notification => notification.data)).toEqual([
+                { sessionId, serverUrl: 'https://stack.example.test', requestId: 'reused', kind: 'permission', occurrenceId: 'producer-occurrence-a' },
+                { sessionId, serverUrl: 'https://stack.example.test', requestId: 'reused', kind: 'permission', occurrenceId: 'producer-occurrence-b' },
+                { sessionId, serverUrl: 'https://stack.example.test', requestId: 'legacy', kind: 'permission' },
+            ]);
+        } finally {
+            unsubscribe();
+            vi.useRealTimers();
+        }
     });
 
     it.each(['agent-state', 'metadata-without-counts'] as const)('does not restore settled pending counts after delayed %s decryption', async (payload) => {
@@ -2153,6 +2202,79 @@ describe('socket update handling: plaintext update-session', () => {
             latestReadyEventSeq: 3,
             latestReadyEventAt: 3,
         }));
+    });
+
+    it.each([
+        { kind: 'runtime-activity', createdAt: 300 },
+        { kind: 'turn', createdAt: 300 },
+        { kind: 'ready', createdAt: 300 },
+        { kind: 'runtime-activity', createdAt: 400 },
+    ] as const)('accepts independently newer $kind facts behind an unrelated row timestamp ($createdAt)', async ({ kind, createdAt }) => {
+        vi.useFakeTimers();
+        const sessionId = 's_independent_projection_ordering';
+        storage.getState().replaceSessionListRenderables([{
+            ...buildSession(sessionId), updatedAt: 400, activeAt: 10_000,
+            latestTurnId: 'turn-1', latestTurnStatus: kind === 'turn' ? 'in_progress' : 'completed',
+            latestTurnStatusObservedAt: 100,
+            runtimeActivityState: kind === 'runtime-activity' ? 'active' : 'idle',
+            runtimeActivityActiveCount: kind === 'runtime-activity' ? 1 : 0,
+            runtimeActivityObservedAt: 100, runtimeActivityRevision: 1,
+            latestReadyEventSeq: 1, latestReadyEventAt: 100,
+            archivedAt: null, lastViewedSessionSeq: 1, hasUnreadMessages: false,
+        }]);
+        const params = buildBaseParams();
+        if (createdAt === 400) {
+            await handleUpdateContainer({ ...params, updateData: { id: 'newer-envelope', seq: 6, createdAt,
+                body: { t: 'update-session', id: sessionId, archivedAt: null } } });
+            await vi.advanceTimersByTimeAsync(100);
+        }
+        const lifecycle = kind === 'runtime-activity'
+            ? { runtimeActivityState: 'idle' as const, runtimeActivityActiveCount: 0,
+                runtimeActivityObservedAt: 300, runtimeActivityRevision: 2 }
+            : kind === 'turn'
+                ? { latestTurnStatus: 'completed' as const, latestTurnStatusObservedAt: 300 }
+                : { latestReadyEventSeq: 2, latestReadyEventAt: 300 };
+        await handleUpdateContainer({
+            ...params,
+            updateData: { id: 'independently-newer', seq: 4, createdAt,
+                body: { t: 'update-session', id: sessionId, archivedAt: 250, ...lifecycle } },
+        });
+        await vi.advanceTimersByTimeAsync(100);
+
+        expect(storage.getState().sessionListRenderables[sessionId]).toMatchObject({
+            ...lifecycle, updatedAt: 400, archivedAt: null,
+        });
+        if (kind === 'ready') expect(storage.getState().sessionListRenderables[sessionId].hasUnreadMessages).toBe(true);
+        else expect(deriveSessionRuntimePresentationState(storage.getState().sessionListRenderables[sessionId], 10_000).working).toBe(false);
+        expect(params.invalidateSessions).not.toHaveBeenCalled();
+
+        const settledRow = storage.getState().sessionListRenderables[sessionId];
+        let rowNotifications = 0;
+        const unsubscribe = storage.subscribe((state, previous) => {
+            if (state.sessionListRenderables[sessionId] !== previous.sessionListRenderables[sessionId]) rowNotifications++;
+        });
+        try {
+            await handleUpdateContainer({ ...params, updateData: { id: 'duplicate-lifecycle', seq: 4, createdAt,
+                body: { t: 'update-session', id: sessionId, archivedAt: 250, ...lifecycle } } });
+            await vi.advanceTimersByTimeAsync(100);
+            expect(storage.getState().sessionListRenderables[sessionId]).toBe(settledRow);
+            expect(rowNotifications).toBe(0);
+        } finally {
+            unsubscribe();
+        }
+
+        // A later envelope cannot roll back independently ordered facts either.
+        await handleUpdateContainer({
+            ...params,
+            updateData: { id: 'older-lifecycle-newer-envelope', seq: 7, createdAt: 500,
+                body: { t: 'update-session', id: sessionId,
+                    runtimeActivityState: 'active', runtimeActivityActiveCount: 1,
+                    runtimeActivityObservedAt: 50, runtimeActivityRevision: 0,
+                    latestTurnStatus: 'in_progress', latestTurnStatusObservedAt: 50,
+                    latestReadyEventSeq: 0, latestReadyEventAt: 50 } },
+        });
+        await vi.advanceTimersByTimeAsync(100);
+        expect(storage.getState().sessionListRenderables[sessionId]).toMatchObject({ ...lifecycle, updatedAt: 500 });
     });
 
     it('updates cache-only renderables for runtime activity projection payloads without forcing hydration', async () => {

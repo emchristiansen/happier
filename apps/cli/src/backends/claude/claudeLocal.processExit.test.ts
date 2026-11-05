@@ -5,6 +5,15 @@ import { expect, it, vi } from 'vitest';
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import * as childProcess from 'node:child_process';
 
+// The command-wrapper case simulates process.platform on a POSIX host; ACL commands are the OS boundary.
+vi.mock('@happier-dev/cli-common/fs/windowsProtectedAcl', async importOriginal => ({
+    ...await importOriginal<typeof import('@happier-dev/cli-common/fs/windowsProtectedAcl')>(),
+    createWindowsProtectedAclBoundary: () => ({
+        applyAndVerify: async () => undefined,
+        verify: async () => undefined,
+    }),
+}));
+
 // Observe the OS spawn boundary while still launching the real fixture processes.
 vi.mock('node:child_process', async importOriginal => {
     const actual = await importOriginal<typeof import('node:child_process')>();

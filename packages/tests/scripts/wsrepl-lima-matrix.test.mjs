@@ -1830,7 +1830,7 @@ test('macos wsrepl lima matrix wrapper fails closed when Playwright does not pro
 });
 
 for (const runnerExit of [0, 2]) {
-for (const outcome of ['qualified-cleanup', 'missing-meta', 'mismatched-session', 'fatal-with-green', 'reused-stale-green', 'missing-summary', 'false-summary', 'wrong-ordered-steps']) {
+for (const outcome of ['qualified-cleanup', 'missing-meta', 'mismatched-session', 'fatal-with-green', 'reused-stale-green', 'missing-summary', 'false-summary', 'wrong-ordered-steps', 'bare-ok-no-meta', 'bare-ok-with-meta', 'standalone-fixture-summary']) {
   test(`wsrepl current result association: exit ${runnerExit}, ${outcome}`, async () => {
   const root = await mkdtemp(join(tmpdir(), 'hstack-macos-lima-wsrepl-matrix-nonzero-runner-ok-summary-'));
   const binDir = join(root, 'bin');
@@ -1993,6 +1993,10 @@ for (const outcome of ['qualified-cleanup', 'missing-meta', 'mismatched-session'
       "    fatal-with-green) printf \"%s\\n\" '{\"ok\":false,\"reason\":\"current_failure\"}' > \"$out/fatal.json\" ;;",
       "    missing-summary) rm -f \"$out/summary.json\" ;;",
       "    false-summary) printf \"%s\\n\" '{\"kind\":\"wsrepl_handoff_matrix_summary\",\"ok\":false,\"sessionId\":\"sess_created_1\"}' > \"$out/summary.json\" ;;",
+      // HUP-J-090: the standalone driver's bare success summary carries no session/step association.
+      "    bare-ok-no-meta) rm -f \"$out/meta.json\"; printf \"%s\\n\" '{\"ok\":true}' > \"$out/summary.json\" ;;",
+      "    bare-ok-with-meta) printf \"%s\\n\" '{\"ok\":true}' > \"$out/summary.json\" ;;",
+      "    standalone-fixture-summary) printf \"%s\\n\" '{\"kind\":\"wsrepl_handoff_standalone_fixture_summary\",\"ok\":true,\"requestedMatrix\":false}' > \"$out/summary.json\" ;;",
       "    wrong-ordered-steps) python3 - \"$out/meta.json\" <<'PY'",
       "import json, sys",
       "from pathlib import Path",
@@ -2122,6 +2126,11 @@ for (const outcome of ['qualified-cleanup', 'missing-meta', 'mismatched-session'
   } else {
     assert.notEqual(res.status, 0, `unqualified result accepted: ${outcome}\n${res.stdout}\n${res.stderr}`);
     assert.notEqual(summary.status, 0);
+  }
+  if (['bare-ok-no-meta', 'bare-ok-with-meta', 'standalone-fixture-summary'].includes(outcome)) {
+    assert.equal(summary.failureStage, 'playwright');
+    assert.ok(summary.failureReason, `expected a failure reason for ${outcome}`);
+    if (outcome === 'bare-ok-no-meta') assert.equal(summary.sessionId, null);
   }
   if (outcome === 'reused-stale-green') {
     assert.equal(await readFile(join(prior, 'summary.json'), 'utf8'), priorSummary);
@@ -12803,11 +12812,16 @@ test('macos wsrepl lima matrix wrapper defaults host happier source to PATH when
   assert.ok(pathInvocations.includes('path-happier daemon start'), `expected PATH happier to be invoked (got ${pathInvocations})`);
 });
 
-test('wsrepl real driver resolves repository paths and propagates external runner failure', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'wsrepl-real-driver-layout-'));
+const realDriverPath = 'scripts/qa/playwright-session-handoff-wsrepl-matrix.mjs';
+const standaloneFixtureSpec = 'packages/tests/suites/ui-e2e/session.handoff.fromHeaderAction.feat.sessions.handoff.spec.ts';
+
+// Copies the real driver and its runner dependencies into a temp repository layout whose
+// `yarn` is a fake external boundary (records args/cwd, exits WSREPL_DRIVER_FAKE_EXIT).
+async function runRealDriverWithFakeYarn({ prefix, fakeExit = 23, extraEnv = {} }) {
+  const root = await mkdtemp(join(tmpdir(), prefix));
   const repoRoot = resolve(__dirname, '../../..');
   const copied = [
-    'scripts/qa/playwright-session-handoff-wsrepl-matrix.mjs',
+    realDriverPath,
     'scripts/workspaces/execYarnCommand.mjs',
     'packages/cli-common/windowsCommandInvocation.mjs',
     'packages/tests/scripts/run-playwright-with-heartbeat.mjs',
@@ -12816,7 +12830,7 @@ test('wsrepl real driver resolves repository paths and propagates external runne
     'packages/tests/scripts/processTree.mjs',
     'packages/tests/scripts/heartbeatDiagnostic.mjs',
     'packages/tests/playwright.ui.config.mjs',
-    'packages/tests/suites/ui-e2e/session.handoff.fromHeaderAction.feat.sessions.handoff.spec.ts',
+    standaloneFixtureSpec,
   ];
   for (const path of copied) {
     const target = join(root, path);
@@ -12833,20 +12847,67 @@ test('wsrepl real driver resolves repository paths and propagates external runne
     'const args = process.argv.slice(2);',
     "if (args.length !== 6 || args[0] !== '-s' || args[1] !== 'playwright' || args[2] !== 'test' || args[3] !== '-c') throw new Error('Unexpected external invocation');",
     'fs.writeFileSync(process.env.WSREPL_DRIVER_CAPTURE_PATH, JSON.stringify({ args, cwd: process.cwd() }));',
-    'process.exit(23);',
+    'process.exit(Number(process.env.WSREPL_DRIVER_FAKE_EXIT));',
   ].join('\n') + '\n');
   const outdir = join(root, 'output');
-  const res = spawnSync(process.execPath, [join(root, copied[0])], {
+  const res = spawnSync(process.execPath, [join(root, realDriverPath)], {
     cwd: root,
     env: { ...testEnv, PATH: `${binDir}:${testEnv.PATH}`, npm_execpath: '', HAPPIER_QA_OUTDIR: outdir,
-      HAPPIER_CI_DIAGNOSTIC_PATH: join(root, 'heartbeat.ndjson'), WSREPL_DRIVER_CAPTURE_PATH: capture },
+      HAPPIER_CI_DIAGNOSTIC_PATH: join(root, 'heartbeat.ndjson'), WSREPL_DRIVER_CAPTURE_PATH: capture,
+      WSREPL_DRIVER_FAKE_EXIT: String(fakeExit), ...extraEnv },
     encoding: 'utf8',
   });
+  return { root, outdir, capture, res };
+}
+
+test('wsrepl real driver resolves repository paths and propagates external runner failure', async () => {
+  const { root, outdir, capture, res } = await runRealDriverWithFakeYarn({ prefix: 'wsrepl-real-driver-layout-' });
   assert.equal(res.status, 23, `wrong driver boundary: ${res.stdout}\n${res.stderr}`);
   const actual = JSON.parse(await readFile(capture, 'utf8'));
   assert.equal(actual.cwd, root);
   assert.equal(actual.args[4], join(root, 'packages/tests/playwright.ui.config.mjs'));
-  assert.equal(actual.args[5], join(root, 'packages/tests/suites/ui-e2e/session.handoff.fromHeaderAction.feat.sessions.handoff.spec.ts'));
+  assert.equal(actual.args[5], join(root, standaloneFixtureSpec));
   assert.equal(JSON.parse(await readFile(join(outdir, 'fatal.json'), 'utf8')).code, 23);
   assert.equal(await fileExists(join(outdir, 'summary.json')), false);
+});
+
+// HUP-J-090: the driver runs only a self-contained fixture (its own server, UI, daemons and
+// session). It must not report a caller-requested matrix as passed.
+for (const [name, value] of [
+  ['HAPPIER_QA_STEPS_JSON', JSON.stringify([{ targetMachineId: 'machine_vm_1', strategy: 'transfer_snapshot' }])],
+  ['HAPPIER_QA_SESSION_ID', 'sess_requested_1'],
+  ['HAPPIER_QA_CREATE_SESSION', '1'],
+  ['HAPPIER_UI_URL', 'http://localhost:19000/?server=http%3A%2F%2Flocalhost%3A53288'],
+]) {
+  test(`wsrepl real driver refuses requested matrix input ${name} instead of passing the standalone fixture`, async () => {
+    const { outdir, capture, res } = await runRealDriverWithFakeYarn({
+      prefix: 'wsrepl-real-driver-requested-', fakeExit: 0, extraEnv: { [name]: value },
+    });
+    assert.equal(res.status, 2, `requested matrix must be refused: ${res.stdout}\n${res.stderr}`);
+    assert.equal(await fileExists(capture), false, 'standalone fixture must not run for a requested matrix');
+    for (const file of ['fatal.json', 'summary.json']) {
+      const payload = JSON.parse(await readFile(join(outdir, file), 'utf8'));
+      assert.equal(payload.ok, false, `${file} must not report success`);
+      assert.equal(payload.reason, 'requested_matrix_unsupported');
+      assert.deepEqual(payload.requestedInputs, [name]);
+      assert.match(payload.error, /self-contained/);
+    }
+    assert.equal(await fileExists(join(outdir, 'meta.json')), false);
+  });
+}
+
+test('wsrepl real driver success records the standalone fixture it ran, not a matrix result', async () => {
+  const { outdir, capture, res } = await runRealDriverWithFakeYarn({ prefix: 'wsrepl-real-driver-standalone-', fakeExit: 0 });
+  assert.equal(res.status, 0, `${res.stdout}\n${res.stderr}`);
+  assert.equal(await fileExists(capture), true);
+  const summary = JSON.parse(await readFile(join(outdir, 'summary.json'), 'utf8'));
+  assert.deepEqual(summary, {
+    kind: 'wsrepl_handoff_standalone_fixture_summary',
+    ok: true,
+    requestedMatrix: false,
+    spec: standaloneFixtureSpec,
+    subject: 'self_contained_fixture',
+  });
+  assert.equal(await fileExists(join(outdir, 'meta.json')), false);
+  assert.equal(await fileExists(join(outdir, 'fatal.json')), false);
 });

@@ -74,10 +74,18 @@ function fingerprintKind(value) {
   return null;
 }
 
+// The retained/deployed (0.2.12) managed-pnpm bootstrap wrote `{ pid, createdAt: Date.now() }`
+// at its same lock path. That record carries no token or process instance, so only the liveness
+// proof below can release it: any live or unprobeable pid, even a reused one, stays protected.
+function ownerCreatedAtMs(owner) {
+  return Object.hasOwn(owner, 'createdAtMs') ? owner.createdAtMs : owner.createdAt;
+}
+
 function shouldReclaimLockSnapshot(snapshot, options = {}) {
   if (!snapshot.exists) return true;
   if (!snapshot.readable || !snapshot.owner) return false;
-  if (!Number.isFinite(snapshot.owner.createdAtMs) || snapshot.owner.createdAtMs <= 0) return false;
+  const createdAtMs = ownerCreatedAtMs(snapshot.owner);
+  if (!Number.isFinite(createdAtMs) || createdAtMs <= 0) return false;
   const ownerPid = snapshot.owner.pid;
   if (!Number.isInteger(ownerPid) || ownerPid <= 1) return false;
   try {
@@ -190,7 +198,8 @@ function lockSettings(options) {
   if (!lockPath) throw new Error('Missing workspace bundle lock path');
   return {
     lockPath,
-    timeoutMs: options.timeoutMs ?? 240_000,
+    // `null` is an explicit unlimited acquisition wait (e.g. cancelable managed-tool bootstrap).
+    timeoutMs: options.timeoutMs === null ? null : (options.timeoutMs ?? 240_000),
     pollIntervalMs: options.pollIntervalMs ?? 250,
     staleAfterMs: options.staleAfterMs ?? options.timeoutMs ?? 240_000,
     heldLockValue: String(options.heldLockValue ?? options.heldLockPath ?? '').trim(),
@@ -200,7 +209,9 @@ function lockSettings(options) {
 
 function checkWait(options, settings, startedAt) {
   const snapshot = readLockOwnerSnapshot(settings.lockPath);
-  if (Date.now() - startedAt > settings.timeoutMs) throw createWorkspaceBundleLockTimeoutError({ ...settings, snapshot });
+  if (settings.timeoutMs !== null && Date.now() - startedAt > settings.timeoutMs) {
+    throw createWorkspaceBundleLockTimeoutError({ ...settings, snapshot });
+  }
   try {
     options.onWait?.({
       lockPath: settings.lockPath, owner: snapshot.owner, staleAfterMs: settings.staleAfterMs,
@@ -209,11 +220,18 @@ function checkWait(options, settings, startedAt) {
   } catch {}
 }
 
+// An unlimited acquisition wait is cancelable by its signal; release is not, so an orphan
+// transition guard must still surface as incomplete cleanup instead of hanging the caller.
+function releaseWaitSettings(settings) {
+  return settings.timeoutMs === null ? { ...settings, timeoutMs: 240_000 } : settings;
+}
+
 function lockContext(settings, token, waited) {
   return { waited, lockPath: settings.lockPath, heldLockValue: createWorkspaceLockLeaseValue({ lockPath: settings.lockPath, ownerToken: token }), inherited: false };
 }
 
 export async function withWorkspaceBundleLock(fn, options = {}) {
+  options.signal?.throwIfAborted();
   const settings = lockSettings(options);
   if (callerHoldsWorkspaceBundleLock(settings.lockPath, settings.heldLockValue)) {
     return await fn({ waited: false, lockPath: settings.lockPath, heldLockValue: settings.heldLockValue, inherited: true });
@@ -226,10 +244,18 @@ export async function withWorkspaceBundleLock(fn, options = {}) {
   const raw = serializeLockOwner(token, fingerprint);
   let owned;
   let waited = false;
-  while (!(owned = tryAcquire(settings.lockPath, raw, options))) {
+  while (true) {
+    options.signal?.throwIfAborted();
+    if ((owned = tryAcquire(settings.lockPath, raw, options))) break;
     checkWait(options, settings, startedAt);
     waited = true;
-    await sleep(settings.pollIntervalMs);
+    options.signal?.throwIfAborted();
+    try {
+      await sleep(settings.pollIntervalMs, undefined, { signal: options.signal });
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      throw error;
+    }
   }
   try {
     return await fn(lockContext(settings, token, waited));
@@ -238,8 +264,9 @@ export async function withWorkspaceBundleLock(fn, options = {}) {
     // Preserve the still-owned record and report incomplete cleanup instead.
     try {
       const releaseStart = Date.now();
+      const releaseSettings = releaseWaitSettings(settings);
       while (!tryTransition(settings.lockPath, () => removeOwnedSnapshot(settings.lockPath, owned)).acquired) {
-        checkWait(options, settings, releaseStart);
+        checkWait(options, releaseSettings, releaseStart);
         await sleep(settings.pollIntervalMs);
       }
     } catch (error) { console.warn('Failed to release workspace bundle lock', error); }
@@ -269,8 +296,9 @@ export function withWorkspaceBundleLockSync(fn, options = {}) {
   } finally {
     try {
       const releaseStart = Date.now();
+      const releaseSettings = releaseWaitSettings(settings);
       while (!tryTransition(settings.lockPath, () => removeOwnedSnapshot(settings.lockPath, owned)).acquired) {
-        checkWait(options, settings, releaseStart);
+        checkWait(options, releaseSettings, releaseStart);
         sleepSync(settings.pollIntervalMs);
       }
     } catch (error) { console.warn('Failed to release workspace bundle lock', error); }

@@ -46,11 +46,18 @@ export function mergePersistedMemberRuntimeState(
 ): ConnectedServiceAuthGroupMemberRuntimeState {
   const record = readRecord(persistedState);
   if (!record) return runtimeState ?? {};
+  // Parse each persisted field on its own so one malformed sibling cannot discard another.
   const modelState = ConnectedServiceAuthGroupMemberStateV1Schema.safeParse({
     modelUnavailableUntilMsByModelId: record.modelUnavailableUntilMsByModelId,
   });
   const modelUnavailableUntilMsByModelId = modelState.success
     ? modelState.data.modelUnavailableUntilMsByModelId
+    : undefined;
+  const autoDisabledState = ConnectedServiceAuthGroupMemberStateV1Schema.safeParse({
+    autoDisabledReason: record.autoDisabledReason,
+  });
+  const autoDisabledReason = autoDisabledState.success
+    ? autoDisabledState.data.autoDisabledReason
     : undefined;
   const persistedLastFailureKind = readString(record.lastFailureKind);
   const persistedProviderResetsAtMs = readNonNegativeNumber(record.providerResetsAtMs);
@@ -82,6 +89,9 @@ export function mergePersistedMemberRuntimeState(
     capacityLimitedUntilMs: readNonNegativeNumber(record.capacityLimitedUntilMs),
     authInvalidUntilMs: readNonNegativeNumber(record.authInvalidUntilMs),
     planUnavailableUntilMs: readNonNegativeNumber(record.planUnavailableUntilMs),
+    ...(autoDisabledReason ? { autoDisabledReason } : {}),
+    lastFailureCode: readString(record.lastFailureCode),
+    lastFailureProviderLimitId: readString(record.lastFailureProviderLimitId),
     validationBlockedUntilMs: readNonNegativeNumber(record.validationBlockedUntilMs),
     providerResetsAtMs,
     lastFailureKind: persistedLastFailureKind,

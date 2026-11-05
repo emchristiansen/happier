@@ -21,6 +21,9 @@ import {
 import { normalizeAskUserQuestionInputForPublication } from '@/agent/questions/normalizeAskUserQuestionInput';
 import { logger } from '@/ui/logger';
 import { deepEqual } from '@/utils/deterministicJson';
+import { randomUUID } from 'node:crypto';
+import type { ManagedConnectionState } from '@happier-dev/connection-supervisor';
+import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
 
 type AgentStateRequestEntry = NonNullable<AgentState['requests']>[string];
 type AgentStateCompletedEntry = NonNullable<AgentState['completedRequests']>[string];
@@ -55,6 +58,7 @@ export function isSameAgentStateRequestOccurrence(left: unknown, right: unknown)
 
 export type AgentStateOutstandingRequest = Readonly<{
     requestId: string;
+    occurrenceId?: string;
     toolName: string;
     toolInput: unknown;
     createdAt: number;
@@ -69,6 +73,13 @@ type SessionLike = Readonly<{
     updateAgentStateRequestSettlement: (updater: (state: AgentState) => AgentState) => Promise<void>;
     getAgentStateSnapshot?: () => AgentState | null | undefined;
     getMetadataSnapshot?: () => unknown;
+    subscribeToSessionConnectionState?: (listener: (state: ManagedConnectionState) => void) => () => void;
+}>;
+
+type PendingRequestPublication = Readonly<{
+    request: AgentStateRequestEntry;
+    retry: () => void;
+    cancel: () => void;
 }>;
 
 export class AgentStateRequestStore {
@@ -78,6 +89,8 @@ export class AgentStateRequestStore {
     private readonly getAccountSettings: () => AccountSettings | null;
     private readonly getAccountSettingsSecretsReadKeys: () => ReadonlyArray<Uint8Array | null | undefined>;
     private permissionRequestPushNotifier: PermissionRequestPushNotifier | null = null;
+    private readonly pendingPublications = new Map<string, PendingRequestPublication>();
+    private unsubscribePublicationReconnect: (() => void) | null = null;
 
     constructor(params: Readonly<{
         session: SessionLike;
@@ -95,6 +108,7 @@ export class AgentStateRequestStore {
     }
 
     updateSession(session: SessionLike): void {
+        this.cancelPendingPublications();
         this.session = session;
         this.permissionRequestPushNotifier?.dispose();
         this.permissionRequestPushNotifier = null;
@@ -120,6 +134,7 @@ export class AgentStateRequestStore {
 
         return {
             requestId,
+            ...(typeof extendedEntry.occurrenceId === 'string' ? { occurrenceId: extendedEntry.occurrenceId } : {}),
             toolName: entry.tool,
             toolInput: entry.arguments,
             createdAt: entry.createdAt,
@@ -133,6 +148,8 @@ export class AgentStateRequestStore {
 
     publishRequest(params: Readonly<{
         requestId: string;
+        occurrenceId?: string;
+        onOccurrenceAssigned?: (occurrenceId: string) => void;
         toolName: string;
         toolInput: unknown;
         createdAt: number;
@@ -146,26 +163,37 @@ export class AgentStateRequestStore {
     }>): void {
         const normalizedToolInput = normalizeAskUserQuestionInputForPublication(params.toolName, params.toolInput);
         const wasClaimedBeforePublication = this.isOutstandingRequestClaimed(params.requestId);
-        updateAgentStateBestEffort(
-            this.session,
+        const publicationSession = this.session;
+        const entryTemplate = Object.create(null) as AgentStateRequestEntry & { source?: string; permissionSuggestions?: unknown[] };
+        entryTemplate.tool = params.toolName;
+        entryTemplate.kind = params.kind ?? resolveAgentRequestKind(params.toolName);
+        entryTemplate.arguments = normalizedToolInput;
+        entryTemplate.createdAt = params.createdAt;
+        if (typeof params.source === 'string') entryTemplate.source = params.source;
+        const pendingRequest = this.pendingPublications.get(params.requestId)?.request;
+        const candidateOccurrenceId = params.occurrenceId
+            ?? (isSameAgentStateRequestOccurrence(pendingRequest, entryTemplate) ? pendingRequest?.occurrenceId : undefined)
+            ?? randomUUID();
+        entryTemplate.occurrenceId = candidateOccurrenceId;
+        if (Array.isArray(params.permissionSuggestions) && params.permissionSuggestions.length > 0) {
+            entryTemplate.permissionSuggestions = params.permissionSuggestions;
+        }
+        const replacedCompletion = publicationSession.getAgentStateSnapshot?.()?.completedRequests?.[params.requestId];
+        const publication = this.publishRequestWithReconnectRetry(
+            params.requestId,
+            entryTemplate,
             (currentState) => {
                 const requests = cloneStringKeyedRecordToNullProto<AgentStateRequestEntry>(currentState.requests);
                 const completedRequests = cloneStringKeyedRecordToNullProto<AgentStateCompletedEntry>(currentState.completedRequests);
                 const existingRequest = currentState.requests?.[params.requestId];
-                if (params.replaceCompletedRequest) {
+                if (params.replaceCompletedRequest && deepEqual(completedRequests[params.requestId], replacedCompletion)) {
                     delete completedRequests[params.requestId];
                 }
-                const entry = Object.create(null) as AgentStateRequestEntry & { source?: string; permissionSuggestions?: unknown[] };
-                entry.tool = params.toolName;
-                entry.kind = params.kind ?? resolveAgentRequestKind(params.toolName);
-                entry.arguments = normalizedToolInput;
-                entry.createdAt = params.createdAt;
-                if (typeof params.source === 'string') {
-                    entry.source = params.source;
-                }
-                if (Array.isArray(params.permissionSuggestions) && params.permissionSuggestions.length > 0) {
-                    entry.permissionSuggestions = params.permissionSuggestions;
-                }
+                const entry = Object.assign(Object.create(null), entryTemplate) as typeof entryTemplate;
+                entry.occurrenceId = isSameAgentStateRequestOccurrence(existingRequest, entry)
+                    && typeof existingRequest?.occurrenceId === 'string'
+                    ? existingRequest.occurrenceId
+                    : candidateOccurrenceId;
                 if (hasPermissionResponseClaimV1(existingRequest)) {
                     (entry as Record<string, unknown>)[PERMISSION_RESPONSE_CLAIM_V1] = existingRequest[PERMISSION_RESPONSE_CLAIM_V1];
                 }
@@ -178,6 +206,7 @@ export class AgentStateRequestStore {
                     return typeof params.updateState === 'function' ? params.updateState(currentState) : currentState;
                 }
                 requests[params.requestId] = entry;
+                params.onOccurrenceAssigned?.(entry.occurrenceId);
 
                 const nextState: AgentState = {
                     ...currentState,
@@ -186,18 +215,93 @@ export class AgentStateRequestStore {
                 };
                 return typeof params.updateState === 'function' ? params.updateState(nextState) : nextState;
             },
-            this.logPrefix,
-            'publish_request',
         );
 
         if (params.notifyPush !== false && !wasClaimedBeforePublication) {
-            this.notifyPermissionRequestPushBestEffort({
-                permissionId: params.requestId,
-                toolName: params.toolName,
-                toolInput: normalizedToolInput,
-                createdAtMs: params.createdAt,
+            void publication.then((published) => {
+                if (!published) return;
+                if (this.session !== publicationSession) return;
+                const current = publicationSession.getAgentStateSnapshot?.()?.requests?.[params.requestId];
+                if (hasPermissionResponseClaimV1(current)) return;
+                if (!isSameAgentStateRequestOccurrence(current, {
+                    tool: params.toolName, arguments: normalizedToolInput,
+                    createdAt: params.createdAt, source: params.source,
+                })) return;
+                this.notifyPermissionRequestPushBestEffort({
+                    permissionId: params.requestId,
+                    toolName: params.toolName,
+                    toolInput: normalizedToolInput,
+                    createdAtMs: params.createdAt,
+                });
+            }).catch(() => {
+                logger.infoFile(`${this.logPrefix} Request notification publication unavailable`);
             });
         }
+    }
+
+    private publishRequestWithReconnectRetry(
+        requestId: string,
+        request: AgentStateRequestEntry,
+        updater: (state: AgentState) => AgentState,
+    ): Promise<boolean> {
+        this.pendingPublications.get(requestId)?.cancel();
+        const session = this.session;
+        let resolve!: (published: boolean) => void;
+        const result = new Promise<boolean>((settle) => { resolve = settle; });
+        let inFlight = false;
+        let retryRequested = false;
+        const retire = (published: boolean) => {
+            if (this.pendingPublications.get(requestId) === publication) {
+                this.pendingPublications.delete(requestId);
+                if (this.pendingPublications.size === 0) {
+                    this.unsubscribePublicationReconnect?.();
+                    this.unsubscribePublicationReconnect = null;
+                }
+            }
+            resolve(published);
+        };
+        const attempt = () => {
+            if (this.pendingPublications.get(requestId) !== publication) return;
+            if (inFlight) {
+                // A reconnect can precede the failed ACK's rejection. Replay after it settles.
+                retryRequested = true;
+                return;
+            }
+            inFlight = true;
+            let write: Promise<void>;
+            try {
+                write = Promise.resolve(session.updateAgentState((state) => (
+                    this.pendingPublications.get(requestId) === publication ? updater(state) : state
+                )));
+            } catch (error) {
+                write = Promise.reject(error);
+            }
+            void write.then(() => retire(true), (error: unknown) => {
+                logger.infoFile(`${this.logPrefix} Request publication deferred until reconnect`, {
+                    sessionId: session.sessionId,
+                    operation: 'publish_request',
+                    error: serializeAxiosErrorForLog(error),
+                });
+            }).finally(() => {
+                inFlight = false;
+                if (retryRequested) {
+                    retryRequested = false;
+                    attempt();
+                }
+            });
+        };
+        const publication: PendingRequestPublication = { request, retry: attempt, cancel: () => retire(false) };
+        this.pendingPublications.set(requestId, publication);
+        this.unsubscribePublicationReconnect ??= session.subscribeToSessionConnectionState?.((state) => {
+            if (state.phase !== 'online') return;
+            for (const pending of this.pendingPublications.values()) pending.retry();
+        }) ?? null;
+        attempt();
+        return result;
+    }
+
+    private cancelPendingPublications(): void {
+        for (const pending of this.pendingPublications.values()) pending.cancel();
     }
 
     async completeRequest(params: Readonly<{
@@ -209,11 +313,13 @@ export class AgentStateRequestStore {
         allowedTools?: readonly string[] | undefined;
         updatedPermissions?: unknown;
         extraCompletedFields?: Readonly<Record<string, unknown>> | null;
-        fallback?: Readonly<{ toolName: string; toolInput: unknown; createdAt: number; kind?: string; source?: string }> | null;
+        fallback?: Readonly<{ occurrenceId?: string; toolName: string; toolInput: unknown; createdAt: number; kind?: string; source?: string }> | null;
         requireAck?: boolean;
+        expectedOccurrenceId?: string;
         /** An actual provider effect was observed, such as Claude PostToolUse. */
         observedCompletion?: true;
     }>): Promise<void> {
+        const publication = this.pendingPublications.get(params.requestId);
         const requireAck = params.requireAck === true
             || (params.status !== 'canceled' && params.observedCompletion !== true);
         let completedRequest = false;
@@ -223,6 +329,14 @@ export class AgentStateRequestStore {
             completedRequest = false;
             const requests = cloneStringKeyedRecordToNullProto(currentState.requests);
             const existing = requests[params.requestId] as unknown;
+            if (params.expectedOccurrenceId !== undefined) {
+                if (existing) {
+                    if (typeof existing !== 'object' || !('occurrenceId' in existing)
+                        || existing.occurrenceId !== params.expectedOccurrenceId) return currentState;
+                } else if (!expectedCompletion
+                    || expectedCompletion.occurrenceId !== params.expectedOccurrenceId
+                    || !deepEqual(currentState.completedRequests?.[params.requestId], expectedCompletion)) return currentState;
+            }
             if (!existing && !params.fallback) {
                 return currentState;
             }
@@ -246,6 +360,7 @@ export class AgentStateRequestStore {
             const completedEntry = clonePlainObjectToNullProto(existing) ?? Object.create(null);
 
             if (!existing && params.fallback) {
+                if (typeof params.fallback.occurrenceId === 'string') completedEntry.occurrenceId = params.fallback.occurrenceId;
                 completedEntry.tool = params.fallback.toolName;
                 completedEntry.arguments = params.fallback.toolInput;
                 completedEntry.createdAt = params.fallback.createdAt;
@@ -325,6 +440,7 @@ export class AgentStateRequestStore {
                 throw new Error(`Permission request ${params.requestId} was superseded before acknowledgement`);
             }
         }
+        publication?.cancel();
         this.markPermissionRequestCompletedBestEffort(params.requestId);
     }
 
@@ -396,6 +512,12 @@ export class AgentStateRequestStore {
         const selected = new Map(Object.entries(this.session.getAgentStateSnapshot?.()?.requests ?? {})
             .filter(([id, request]) => (!params.requestIds || params.requestIds.includes(id))
                 && (!params.shouldCancel || params.shouldCancel(request))));
+        for (const [id, pending] of this.pendingPublications) {
+            if (params.requestIds && !params.requestIds.includes(id)) continue;
+            if (params.shouldCancel && !params.shouldCancel(pending.request)) continue;
+            if (!selected.has(id)) selected.set(id, pending.request);
+            pending.cancel();
+        }
         return this.settleRequests(
             (currentState) => {
                 const pendingRequests = cloneStringKeyedRecordToNullProto(currentState.requests);
@@ -441,6 +563,7 @@ export class AgentStateRequestStore {
     }
 
     dispose(): void {
+        this.cancelPendingPublications();
         this.permissionRequestPushNotifier?.dispose();
         this.permissionRequestPushNotifier = null;
     }
@@ -454,9 +577,11 @@ export class AgentStateRequestStore {
         const notifier = this.getOrCreatePermissionRequestPushNotifier();
         if (!notifier) return;
 
+        let occurrenceId: string | undefined;
         try {
             const snapshot = this.session.getAgentStateSnapshot?.() ?? null;
             const existing = snapshot?.requests?.[params.permissionId];
+            occurrenceId = existing?.occurrenceId;
             const notifiedAt = typeof existing?.pushNotifiedAt === 'number' ? existing.pushNotifiedAt : null;
             if (typeof notifiedAt === 'number' && Number.isFinite(notifiedAt) && notifiedAt > 0) {
                 notifier.markAlreadyNotified(params.permissionId);
@@ -470,6 +595,7 @@ export class AgentStateRequestStore {
             permissionId: params.permissionId,
             toolName: params.toolName,
             toolInput: params.toolInput,
+            occurrenceId,
             requestKind: resolveAgentRequestKind(params.toolName),
             ...(typeof params.createdAtMs === 'number' ? { createdAtMs: params.createdAtMs } : {}),
         });
@@ -495,10 +621,13 @@ export class AgentStateRequestStore {
             getAgentDisplayName: () => getSessionNotificationAgentDisplayName(this.session.getMetadataSnapshot?.bind(this.session)),
             sessionId: this.session.sessionId,
             logPrefix: this.logPrefix,
-            onNotifiedAt: (permissionId, notifiedAtMs) => {
+            onNotifiedAt: (permissionId, notifiedAtMs, occurrenceId) => {
                 updateAgentStateBestEffort(
                     this.session,
-                    (currentState) => applyAgentStateRequestPushNotifiedAt({ state: currentState, permissionId, notifiedAtMs }),
+                    (currentState) => {
+                        if (occurrenceId !== undefined && currentState.requests?.[permissionId]?.occurrenceId !== occurrenceId) return currentState;
+                        return applyAgentStateRequestPushNotifiedAt({ state: currentState, permissionId, notifiedAtMs });
+                    },
                     this.logPrefix,
                     'permission_request_push_notified_at',
                 );

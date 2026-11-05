@@ -101,6 +101,7 @@ import { createScmConnectedAccountCredentialResolver } from './connectedServices
 import { resolveMachineRegistrationIdentity } from '@/daemon/machineIdentity/resolveMachineRegistrationIdentity';
 import { consumeMachineReplacementCandidateAfterRegistration } from '@/daemon/machineIdentity/machineReplacementCandidates';
 import { readSessionRuntimeActivityProjectionBoundary } from './session/runtimeActivityProjection';
+import { lazySchema } from '@happier-dev/protocol';
 
 export {
   ConnectedServiceAuthGroupGenerationConflictError,
@@ -110,24 +111,24 @@ export {
 
 const CONNECTED_SERVICE_PROFILE_LIST_CACHE_TTL_MS = 10_000;
 const ACCOUNT_ENCRYPTION_MODE_CACHE_TTL_MS = 10_000;
-const ProviderAccountUsageResponseSourcesSchema = z.array(ConnectedServiceUsageSourceV1Schema).optional();
-const ExactProviderAccountUsageSourceResolutionSchema = z.object({
+const ProviderAccountUsageResponseSourcesSchema = lazySchema(() => z.array(ConnectedServiceUsageSourceV1Schema).optional());
+const ExactProviderAccountUsageSourceResolutionSchema = lazySchema(() => z.object({
   source: ConnectedServiceUsageSourceV1Schema,
   recordId: ProviderAccountUsageRecordIdSchema,
   providerAccountId: z.string().trim().min(1).max(512),
   fetchedAt: z.number().int().nonnegative().nullable(),
   staleAfterMs: z.number().int().nonnegative().nullable(),
-}).strict();
-const ExactProviderAccountUsageSourceNotFoundSchema = z.object({
+}).strict());
+const ExactProviderAccountUsageSourceNotFoundSchema = lazySchema(() => z.object({
   error: z.literal('provider_account_usage_source_not_found'),
-}).strict();
-const ProviderAccountUsageWriteSourceOutcomeSchema = z.union([
+}).strict());
+const ProviderAccountUsageWriteSourceOutcomeSchema = lazySchema(() => z.union([
   z.object({ status: z.literal('linked') }).strict(),
   z.object({
     status: z.literal('skipped'),
     reason: z.literal('binding_unavailable'),
   }).strict(),
-]).optional();
+]).optional());
 
 function parseProviderAccountUsageResponseSources(raw: Readonly<Record<string, unknown>>): ConnectedServiceUsageSourceV1[] | undefined {
   const parsed = ProviderAccountUsageResponseSourcesSchema.safeParse(raw.sources);
@@ -1315,7 +1316,6 @@ export class ApiClient {
         {
           headers: {
             'Authorization': `Bearer ${this.credential.token}`,
-            'Content-Type': 'application/json',
             [CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER]: CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
           },
           params: { expectedGeneration },
@@ -1520,6 +1520,7 @@ export class ApiClient {
       staleAfterMs: number;
       status: 'ok' | 'unavailable' | 'estimated' | 'error';
       materialFingerprint?: string;
+      refreshErrorAt?: number;
     };
   }): Promise<void> {
     const serverUrl = resolveServerHttpBaseUrl();
@@ -1584,6 +1585,7 @@ export class ApiClient {
       staleAfterMs: number;
       status: 'ok' | 'unavailable' | 'estimated' | 'error';
       refreshRequestedAt?: number;
+      refreshErrorAt?: number;
     };
   } | null> {
     const serverUrl = resolveServerHttpBaseUrl();
@@ -1623,6 +1625,7 @@ export class ApiClient {
         staleAfterMs: z.number(),
         status: z.enum(['ok', 'unavailable', 'estimated', 'error']),
         refreshRequestedAt: z.number().optional(),
+        refreshErrorAt: z.number().optional(),
       }).safeParse(rawRecord.metadata);
       if (!metadataParsed.success) {
         throw createConnectedServiceQuotaProtocolError('Invalid provider account usage snapshot response', metadataParsed.error);
@@ -1668,6 +1671,8 @@ export class ApiClient {
       fetchedAt: number;
       staleAfterMs: number;
       status: 'ok' | 'unavailable' | 'estimated' | 'error';
+      refreshRequestedAt?: number;
+      refreshErrorAt?: number;
     };
   } | null> {
     const serverUrl = resolveServerHttpBaseUrl();
@@ -1707,6 +1712,7 @@ export class ApiClient {
         staleAfterMs: z.number(),
         status: z.enum(['ok', 'unavailable', 'estimated', 'error']),
         refreshRequestedAt: z.number().optional(),
+        refreshErrorAt: z.number().optional(),
       }).safeParse((raw as any).metadata);
 
       if (!metadataParsed.success) {
@@ -1885,6 +1891,7 @@ export class ApiClient {
       staleAfterMs: number;
       status: 'ok' | 'unavailable' | 'estimated' | 'error';
       refreshRequestedAt?: number;
+      refreshErrorAt?: number;
     };
   } | null> {
     const serverUrl = resolveServerHttpBaseUrl();
@@ -1942,6 +1949,7 @@ export class ApiClient {
         staleAfterMs: z.number(),
         status: z.enum(['ok', 'unavailable', 'estimated', 'error']),
         refreshRequestedAt: z.number().optional(),
+        refreshErrorAt: z.number().optional(),
       }).safeParse(rawRecord.metadata);
       if (!metadataParsed.success) {
         throw createConnectedServiceQuotaProtocolError('Invalid provider account usage snapshot response', metadataParsed.error);
@@ -1988,6 +1996,7 @@ export class ApiClient {
       staleAfterMs: number;
       status: 'ok' | 'unavailable' | 'estimated' | 'error';
       refreshRequestedAt?: number;
+      refreshErrorAt?: number;
     };
   } | null> {
     const serverUrl = resolveServerHttpBaseUrl();
@@ -2035,6 +2044,7 @@ export class ApiClient {
         staleAfterMs: z.number(),
         status: z.enum(['ok', 'unavailable', 'estimated', 'error']),
         refreshRequestedAt: z.number().optional(),
+        refreshErrorAt: z.number().optional(),
       }).safeParse((raw as any).metadata);
 
       if (!metadataParsed.success) {

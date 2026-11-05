@@ -4,6 +4,7 @@
  */
 
 import { z } from 'zod';
+import { lazySchema } from '@happier-dev/protocol';
 import type { SessionPendingQueueWakeDiagnostic } from './sessions/pendingQueueWake';
 import { logger } from '@/ui/logger';
 import { readDaemonState, reclaimDeadDaemonPublication } from '@/persistence';
@@ -78,17 +79,17 @@ import { getRunnerPublisherIncarnationId } from '@/api/session/publisherIncarnat
 import { readSpawnSessionNonceResolution } from '@/session/services/awaitSpawnedSessionId';
 
 // Local control exposure of the existing daemon-owned wake diagnostic; no new session RPC.
-export const DaemonSessionPendingQueueWakeRequestSchema = z.object({
+export const DaemonSessionPendingQueueWakeRequestSchema = lazySchema(() => z.object({
   sessionId: z.string().min(1).refine((value) => value === value.trim(), 'Expected an exact full session ID'),
-}).strict();
-export const DaemonSessionPendingQueueWakeResultSchema = z.discriminatedUnion('type', [
+}).strict());
+export const DaemonSessionPendingQueueWakeResultSchema = lazySchema(() => z.discriminatedUnion('type', [
   z.object({ type: z.literal('wake_published') }).strict(),
   z.object({ type: z.literal('unavailable'), reason: z.enum([
     'no_token', 'shutdown', 'transport_unavailable', 'session_mismatch', 'rpc_method_unavailable',
     'runtime_upgrade_required', 'runtime_terminating', 'publisher_recovering', 'publisher_lost',
     'publisher_lost_respondent_unbound', 'malformed_response', 'rpc_failed',
   ]) }).strict(),
-]) satisfies z.ZodType<SessionPendingQueueWakeDiagnostic>;
+]) satisfies z.ZodType<SessionPendingQueueWakeDiagnostic>);
 
 export class DaemonSessionPendingQueueWakeError extends Error {
   constructor(message: string, readonly errorCode?: string, readonly response?: unknown) {
@@ -680,6 +681,7 @@ export async function notifyDaemonConnectedServiceTurnLifecycle(
     ...(body.turnId ? { turnId: body.turnId } : {}),
     ...(body.requestedAction ? { requestedAction: body.requestedAction } : {}),
     ...(body.activeTurnId !== undefined ? { activeTurnId: body.activeTurnId } : {}),
+    ...(body.providerIdentity ? { providerIdentity: body.providerIdentity } : {}),
   }, options);
   if (
     response

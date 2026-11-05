@@ -47,10 +47,7 @@ import {
   buildConnectedServiceAuthGroupSwitchStateFromAccountUsage,
   type AccountUsageStoreForAuthGroupSwitchState,
 } from './accountGroups/switching/buildConnectedServiceAuthGroupSwitchStateFromAccountUsage';
-import {
-  ConnectedServiceAuthGroupQuotaProbeIncompleteError,
-  type ConnectedServiceAuthGroupSwitchState,
-} from './accountGroups/switching/ConnectedServiceAuthGroupSwitchCoordinator';
+import type { ConnectedServiceAuthGroupSwitchState } from './accountGroups/switching/ConnectedServiceAuthGroupSwitchCoordinator';
 import { evaluatePredictiveSoftSwitchPolicy } from './accountGroups/switching/predictiveSoftSwitchPolicy';
 import type { ConnectedServiceRefreshFailureCategory } from './credentials/lifecycleTypes';
 import { persistCredentialHealthForMaterializationFailure } from './refresh/refreshDiagnostics';
@@ -157,7 +154,7 @@ function readAuthoritativeSpawnSwitchResult(
 }
 
 export class ConnectedServiceSpawnAuthGroupAuthorityError extends Error {
-  readonly kind: 'resolution_unavailable' | 'resolution_failed' | 'group_missing';
+  readonly kind: 'resolution_unavailable' | 'resolution_failed' | 'group_missing' | 'quota_proof_unavailable';
   readonly serviceId: ConnectedServiceId;
   readonly groupId: string;
 
@@ -568,7 +565,16 @@ async function resolveAuthoritativeGroupAfterSpawnSwitchResult(params: Readonly<
   groupId: string;
   api: ConnectedServiceAuthGroupApi;
   result: ConnectedServiceAuthGroupPreTurnSwitchResult;
+  switchReason: string;
 }>): Promise<ConnectedServiceAuthGroupResponse | null> {
+  if (params.result.status === 'quota_proof_unavailable') {
+    if (params.switchReason === 'soft_threshold') return params.group;
+    // A new spawn has no interrupted-turn recovery to schedule. Preserve its retryable launch
+    // rejection; existing sessions consume this same switch result through the durable scheduler.
+    throw new ConnectedServiceSpawnAuthGroupAuthorityError({
+      kind: 'quota_proof_unavailable', serviceId: params.serviceId, groupId: params.groupId,
+    });
+  }
   const authoritative = readAuthoritativeSpawnSwitchResult(params.result);
   if (authoritative.kind === 'none') return null;
   if (authoritative.kind === 'authoritative') {
@@ -659,28 +665,21 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
       allowCurrentProfileRetry: true,
     }).length > 0
   ) {
-    let switched: Awaited<ReturnType<ConnectedServiceAuthGroupPreTurnSwitchCoordinator['switchBeforeTurn']>>;
-    try {
-      switched = await params.authGroupSwitchCoordinator.switchBeforeTurn({
-        ...(params.sessionId ? { sessionId: params.sessionId } : {}),
-        serviceId: params.serviceId,
-        groupId: params.groupId,
-        reason: switchReason,
-        observedProfileId: state.activeProfileId,
-        ...(params.quotaProbeDeadlineAtMs === undefined ? {} : { deadlineAtMs: params.quotaProbeDeadlineAtMs }),
-      });
-    } catch (error) {
-      if (error instanceof ConnectedServiceAuthGroupQuotaProbeIncompleteError && switchReason === 'soft_threshold') {
-        return params.group;
-      }
-      throw error;
-    }
+    const switched = await params.authGroupSwitchCoordinator.switchBeforeTurn({
+      ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+      serviceId: params.serviceId,
+      groupId: params.groupId,
+      reason: switchReason,
+      observedProfileId: state.activeProfileId,
+      ...(params.quotaProbeDeadlineAtMs === undefined ? {} : { deadlineAtMs: params.quotaProbeDeadlineAtMs }),
+    });
     const authoritative = await resolveAuthoritativeGroupAfterSpawnSwitchResult({
       group: params.group,
       serviceId: params.serviceId,
       groupId: params.groupId,
       api: params.api,
       result: switched,
+      switchReason,
     });
     if (authoritative) return authoritative;
     if (switched.status === 'no_eligible_member') {
@@ -703,28 +702,21 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
   const selectedProfileId = selected.selected?.profileId ?? null;
   if (!selectedProfileId || selectedProfileId === readProfileId(state.activeProfileId)) return params.group;
 
-  let switched: Awaited<ReturnType<ConnectedServiceAuthGroupPreTurnSwitchCoordinator['switchBeforeTurn']>>;
-  try {
-    switched = await params.authGroupSwitchCoordinator.switchBeforeTurn({
-      ...(params.sessionId ? { sessionId: params.sessionId } : {}),
-      serviceId: params.serviceId,
-      groupId: params.groupId,
-      reason: switchReason,
-      observedProfileId: state.activeProfileId,
-      ...(params.quotaProbeDeadlineAtMs === undefined ? {} : { deadlineAtMs: params.quotaProbeDeadlineAtMs }),
-    });
-  } catch (error) {
-    if (error instanceof ConnectedServiceAuthGroupQuotaProbeIncompleteError && switchReason === 'soft_threshold') {
-      return params.group;
-    }
-    throw error;
-  }
+  const switched = await params.authGroupSwitchCoordinator.switchBeforeTurn({
+    ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+    serviceId: params.serviceId,
+    groupId: params.groupId,
+    reason: switchReason,
+    observedProfileId: state.activeProfileId,
+    ...(params.quotaProbeDeadlineAtMs === undefined ? {} : { deadlineAtMs: params.quotaProbeDeadlineAtMs }),
+  });
   const authoritative = await resolveAuthoritativeGroupAfterSpawnSwitchResult({
     group: params.group,
     serviceId: params.serviceId,
     groupId: params.groupId,
     api: params.api,
     result: switched,
+    switchReason,
   });
   if (authoritative) return authoritative;
   if (switched.status === 'no_eligible_member') {
@@ -944,6 +936,7 @@ async function applyCanonicalSpawnFailureSwitch(params: Readonly<{
     groupId: group.groupId,
     api: params.api,
     result,
+    switchReason: 'refresh_failed',
   });
   const activeProfileId = readProfileId(authoritative?.activeProfileId);
   if (!activeProfileId || activeProfileId === params.observedProfileId) return false;
@@ -1185,7 +1178,7 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   onCleanup?: (cleanup: () => Promise<void>) => void;
 }>): Promise<(ConnectedServicesMaterializeResult & Readonly<{
   materializationRoot: string;
-  cleanupMaterializationRoot: () => void;
+  cleanupMaterializationRoot: () => Promise<void>;
 }>) | null> {
   const materialized = await materializeConnectedServicesForSpawn({
     agentId: params.agentId,
@@ -1301,7 +1294,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
 }>): Promise<Readonly<{
   env: Record<string, string>;
   materializationRoot?: string | null;
-  cleanupMaterializationRoot?: (() => void) | null;
+  cleanupMaterializationRoot?: (() => Promise<void>) | null;
   cleanupOnFailure: (() => void) | null;
   cleanupOnExit: (() => void) | null;
   connectedServicesBindings: ConnectedServicesBindingsV1;

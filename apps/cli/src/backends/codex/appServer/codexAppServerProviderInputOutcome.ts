@@ -36,7 +36,10 @@ type CodexAppServerProviderInputAcceptance = Readonly<{
 
 export type CodexAppServerProviderInputOutcomeBridge = Readonly<{
     observeAccepted: (input: CodexAppServerProviderInputAcceptance) => boolean;
-    observeAcceptedLocalInput: (input: Readonly<{ localIds?: readonly string[] | null }>) => boolean;
+    observeAcceptedLocalInput: (input: Readonly<{
+        localIds?: readonly string[] | null;
+        delivery?: Readonly<{ kind: 'command' }>;
+    }>) => boolean;
     observeRejectedBeforeEffect: (input: Readonly<{
         localIds?: readonly string[] | null;
         reason: SessionProviderInputRejectedBeforeEffectReason;
@@ -49,6 +52,7 @@ export type CodexAcpProviderInputOutcomeBridge = Readonly<{
     observeAccepted: (input: Readonly<{
         localIds?: readonly string[] | null;
         appliedModelId?: string | null;
+        delivery?: Readonly<{ kind: 'command' }>;
     }>) => boolean;
 }>;
 
@@ -97,14 +101,14 @@ export function createCodexAppServerProviderInputOutcomeBridge(
             if (!observe) return false;
             const acceptance = readExactAcceptance(input);
             if (!acceptance) return false;
-            observe({ kind: 'accepted', ...acceptance });
+            observe({ kind: 'accepted', ...acceptance, delivery: { kind: 'primary_turn' } });
             return true;
         },
-        observeAcceptedLocalInput: ({ localIds }) => {
+        observeAcceptedLocalInput: ({ localIds, delivery }) => {
             if (!observe) return false;
             const localId = readExactLocalInput(localIds);
             if (localId === null) return false;
-            observe({ kind: 'accepted', localId });
+            observe({ kind: 'accepted', localId, delivery: delivery ?? { kind: 'primary_turn' } });
             return true;
         },
         observeEffectMayHaveOccurred: ({ localIds }) => {
@@ -126,7 +130,7 @@ export function createCodexAcpProviderInputOutcomeBridge(
         createCodexAppServerProviderInputProducer(() => true, mode),
     ) ?? null;
     return Object.freeze({
-        observeAccepted: ({ localIds, appliedModelId }) => {
+        observeAccepted: ({ localIds, appliedModelId, delivery }) => {
             if (!observe) return false;
             const localId = readExactLocalInput(localIds);
             if (localId === null) return false;
@@ -134,6 +138,7 @@ export function createCodexAcpProviderInputOutcomeBridge(
             observe({
                 kind: 'accepted',
                 localId,
+                ...(delivery ? { delivery } : {}),
                 ...(normalizedAppliedModelId ? { appliedModelId: normalizedAppliedModelId } : {}),
             });
             return true;

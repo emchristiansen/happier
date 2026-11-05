@@ -39,7 +39,12 @@ import { applyRunnerMcpSessionContext } from '@/mcp/runtime/applyRunnerMcpSessio
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { trimIdent } from "@/utils/trimIdent";
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
-import { readPendingLocalId, type SessionPendingInputInterruptAndRunResultV1 } from '@happier-dev/protocol';
+import {
+    readPendingLocalId,
+    resolveCodexReasoningSummaryOverride,
+    type SessionPendingInputInterruptAndRunResultV1,
+} from '@happier-dev/protocol';
+import { appendCodexCliConfigOverridesArgs } from './utils/appendCodexCliConfigOverridesArgs';
 import { readNewestSessionModelsMetadataStateV1 } from '@happier-dev/agents';
 import type { CodexSessionConfig } from './types';
 import { registerKillSessionHandler } from '@/rpc/handlers/killSession';
@@ -99,7 +104,6 @@ import {
     removeCodexSharedControlEndpoint,
     writeCodexSharedControlEndpoint,
 } from './localControl/codexSharedControlEndpoint';
-import { isCodexAppServerTerminalOwnedGroupRecoveryClassification } from './appServer/recovery/terminalGroupRecovery';
 import {
     readCodexRuntimeAuthClassification as readRuntimeAuthClassification,
     createCodexRuntimeAuthFailureTurnHook,
@@ -116,7 +120,6 @@ import {
     isCodexAppServerSteerRejectedBeforeEffectError,
     isCodexAppServerNoActiveTurnToSteerError,
 } from './appServer/appServerCompatibility';
-import { rememberCodexUsageLimitRecoveryPreference } from './appServer/rememberCodexUsageLimitRecoveryPreference';
 import { resolveConfiguredCodexHome } from './utils/resolveConfiguredCodexHome';
 import { buildCodexAppServerConfigOverrides } from './appServer/buildCodexAppServerConfigOverrides';
 import { reconcileCodexAppServerOverridesBeforeTurn } from './appServer/reconcileCodexAppServerOverridesBeforeTurn';
@@ -166,6 +169,7 @@ import {
     emitReadyIfIdle,
     extractCodexToolErrorText,
     nextStoredSessionIdForResumeAfterAttempt,
+    readCodexTurnFailureSettlement,
 } from './runtime/sessionTurnLifecycle';
 import { createLocalRemoteModeController } from '@/agent/localControl/createLocalRemoteModeController';
 import { createCodexRemoteTerminalUi } from './runtime/createCodexRemoteTerminalUi';
@@ -547,6 +551,8 @@ export async function runCodex(opts: {
     const explicitPermissionMode = opts.permissionMode;
     const hasResumeArg = typeof opts.resume === 'string' && opts.resume.trim().length > 0;
     const loadedAccountSettings = opts.accountSettingsContext?.settings ?? null;
+    const reasoningSummary = resolveCodexReasoningSummaryOverride(loadedAccountSettings?.codexReasoningSummaries);
+    const codexConfigOverrides = reasoningSummary === undefined ? [] : [`model_reasoning_summary=${JSON.stringify(reasoningSummary)}`];
     // Resume suppresses account defaults only for permission seeding. MCP selection is
     // persisted session configuration and must remain available when reattaching.
     const accountSettings = hasResumeArg ? null : loadedAccountSettings;
@@ -607,16 +613,16 @@ export async function runCodex(opts: {
     const confirmProviderAcceptedPrompt = (message: Readonly<{
         userMessageLocalIds?: readonly string[] | null;
         mode?: Readonly<{ localId?: string | null }> | null;
-    }>, appliedModelId?: string | null): void => {
+    }>, appliedModelId?: string | null, delivery?: Readonly<{ kind: 'command' }>): void => {
         const localIds = normalizeProviderPromptLocalIds([
             ...(message.userMessageLocalIds ?? []),
             message.mode?.localId ?? null,
         ]);
         if (useCodexAppServer) {
-            codexAppServerProviderInputOutcomes?.observeAcceptedLocalInput({ localIds });
+            codexAppServerProviderInputOutcomes?.observeAcceptedLocalInput({ localIds, ...(delivery ? { delivery } : {}) });
             return;
         }
-        codexAcpProviderInputOutcomes?.observeAccepted({ localIds, appliedModelId });
+        codexAcpProviderInputOutcomes?.observeAccepted({ localIds, appliedModelId, ...(delivery ? { delivery } : {}) });
     };
     const blockProviderPromptDeliveryBeforeAcceptance = async (input: Readonly<{
         localIds: readonly string[];
@@ -809,6 +815,7 @@ export async function runCodex(opts: {
                     permissionMode: initialPermissionMode,
                     resumeId: resumeIdFromArgs,
                     codexArgs: opts.codexArgs ?? [],
+                    configOverrides: codexConfigOverrides,
                 });
             },
         };
@@ -1015,6 +1022,7 @@ export async function runCodex(opts: {
                 SESSION_CONFIG_OPTIONS_STATE_KEY,
             ],
         startupSideEffectsOrder: 'persist-first',
+        terminalHostOwner: hasHostedTerminal ? 'runtime' : 'startup',
         allowOfflineStub: true,
         deferPendingFirstInputCommitUntilRuntimeReady: true,
         onSessionSwap: (newSession) => {
@@ -1543,6 +1551,7 @@ export async function runCodex(opts: {
                 permissionMode: initialPermissionMode,
                 resumeId: resumeIdFromArgs,
                 codexArgs: opts.codexArgs ?? [],
+                configOverrides: codexConfigOverrides,
             }));
         if (localResult.type === 'exit') {
             await cleanupRunResourcesOnce();
@@ -1658,6 +1667,41 @@ export async function runCodex(opts: {
             allocateTurnWhenIdle: true,
         });
         throw createCodexResumeError(message, cause);
+    };
+    // Mirrors the shared prompt loop's `runtime.failTurn`: a prompt-loop failure that no Codex
+    // runtime owner has settled (startup before any provider turn: missing CLI, client creation,
+    // initialize) becomes one classified failed turn instead of a bare status line on an idle session.
+    // Returns whether a classified failure now represents this error.
+    const failUnsettledCodexTurn = async (error: unknown): Promise<boolean> => {
+        if (useCodexAcp) {
+            try {
+                return (await codexAcpRuntime?.failTurn(error)) === true;
+            } catch (failTurnError) {
+                logger.debug('[CodexACP] Failed to surface prompt-loop failure as a failed turn (non-fatal)', failTurnError);
+                return false;
+            }
+        }
+        // The app-server runtime already ended this turn. Only a recorded failure carries the
+        // error; an interrupted turn does not, so the prompt loop still reports it.
+        const settlement = readCodexTurnFailureSettlement(error);
+        if (settlement) return settlement === 'failed';
+        const remoteRuntime = useCodexAppServer ? getCodexRemoteRuntime() : null;
+        // A failed steer leaves the in-flight provider turn running; the runtime still owns that turn.
+        if (remoteRuntime && (remoteRuntime.hasActiveProviderTurn?.() ?? remoteRuntime.isTurnInFlight())) return false;
+        try {
+            await surfacePrimarySessionRuntimeIssue({
+                provider: 'codex',
+                session,
+                sessionSeq: session.getLastObservedMessageSeq(),
+                cause: 'status_error',
+                error,
+                allocateTurnWhenIdle: true,
+            });
+            return true;
+        } catch (surfaceError) {
+            logger.debug('[Codex] Failed to surface prompt-loop failure as a failed turn (non-fatal)', surfaceError);
+            return false;
+        }
     };
 
 	    if (codexAcpFallbackToMcpMessage && codexAcpFallbackToMcpMessage !== initialCodexAcpFallbackToMcpMessage) {
@@ -1940,7 +1984,10 @@ export async function runCodex(opts: {
     mcpServers = happierBridge.mcpServers;
     if (useCodexAppServer) {
         codexAppServerConfigOverrides = buildCodexAppServerConfigOverrides(mcpServers, {
-            codexArgs: opts.codexArgs,
+            codexArgs: appendCodexCliConfigOverridesArgs(
+                { command: 'codex', args: opts.codexArgs ?? [] },
+                codexConfigOverrides,
+            ).args,
             happierSessionId: codexProviderProcessEnv.HAPPIER_SESSION_ID,
             happierMcpToolCallTimeoutMs: configuration.codexHappierMcpToolCallTimeoutMs,
             processEnv: codexAppServerProcessEnv,
@@ -1951,6 +1998,7 @@ export async function runCodex(opts: {
             credentials: opts.credentials,
             settings: opts.accountSettingsContext?.settings ?? null,
             profileId: session.getMetadataSnapshot()?.profileId ?? null,
+            sessionMetadata: session.getMetadataSnapshot(),
             baseOverride,
             executionRunsFeatureEnabled: resolveCliFeatureDecision({
                 featureId: 'execution.runs',
@@ -1967,6 +2015,7 @@ export async function runCodex(opts: {
             mode: codexMcpServer.mode,
             command: codexMcpServer.command,
             env: codexProviderProcessEnv,
+            onProviderTurnEvent: () => session.sessionTurnLifecycle?.observeProviderTurnEvent(),
         });
     }
 
@@ -2091,6 +2140,7 @@ export async function runCodex(opts: {
     if (useCodexAcp) {
         codexAcpRuntime = createCodexAcpRuntime({
             directory,
+            reasoningSummary,
             processEnv: codexProviderProcessEnv,
             session,
             messageBuffer,
@@ -2126,6 +2176,7 @@ export async function runCodex(opts: {
         const initialConnectedServiceRuntimeIdentity = resolveCodexInitialConnectedServiceRuntimeIdentity(codexAppServerProcessEnv, session);
         codexAppServerRuntime = createCodexAppServerRuntime({
             directory,
+            reasoningSummary,
             activeServerDir: configuration.activeServerDir,
             daemonStatePath: configuration.daemonStateFile,
             processEnv: codexAppServerProcessEnv,
@@ -2242,11 +2293,7 @@ export async function runCodex(opts: {
                 }),
             ...(opts.credentials
                 ? {
-                    rememberUsageLimitRecoveryPreference: async () => {
-                        await rememberCodexUsageLimitRecoveryPreference({
-                            credentials: opts.credentials as Credentials,
-                        });
-                    },
+
                 }
                 : {}),
         });
@@ -2565,6 +2612,7 @@ export async function runCodex(opts: {
                     permissionMode: currentPermissionMode ?? initialPermissionMode,
                     resumeId: storedSessionIdForResume,
                     codexArgs: opts.codexArgs ?? [],
+                    configOverrides: codexConfigOverrides,
                     formatError: formatErrorForUi,
                     launchLocal: codexLocalLauncher,
                 });
@@ -2769,7 +2817,7 @@ export async function runCodex(opts: {
                     shouldExit,
                     sendReady,
                 });
-                confirmProviderAcceptedPrompt(message);
+                confirmProviderAcceptedPrompt(message, undefined, { kind: 'command' });
                 continue;
             }
 
@@ -3036,7 +3084,7 @@ export async function runCodex(opts: {
                         if (shouldLogAcpDebug) {
                             logger.debug('[CodexACP] compactContext complete');
                         }
-                        confirmProviderAcceptedPrompt(message);
+                        confirmProviderAcceptedPrompt(message, undefined, { kind: 'command' });
                         continue;
                     }
 
@@ -3154,6 +3202,7 @@ export async function runCodex(opts: {
                         )
                         : undefined;
                     const startConfig: CodexSessionConfig = buildCodexMcpStartConfigForMessage({
+                        reasoningSummary,
                         message: providerPromptText,
                         first,
                         sandbox: mcpPolicy.sandbox,
@@ -3243,11 +3292,14 @@ export async function runCodex(opts: {
                 } else {
                     let runtimeAuthClassification = readRuntimeAuthClassification(error);
                     let runtimeAuthRecoveryStatusEmitted = false;
-                    if (runtimeAuthClassification) {
-                        const appServerTerminalOwnsRecovery = useCodexAppServer
-                            && isCodexAppServerTerminalOwnedGroupRecoveryClassification(runtimeAuthClassification);
-                        if (appServerTerminalOwnsRecovery) {
-                            // The app-server terminal notification owns this exact group-bound
+                    let classifiedTurnFailureSurfaced = false;
+                    if (runtimeAuthClassification?.kind === 'usage_limit' && !runtimeAuthClassification.profileId && !runtimeAuthClassification.groupId) {
+                        // Native quota waits belong to the shared Session recovery owner.
+                        // Connected Accounts has no authentication selection to repair.
+                        runtimeAuthRecoveryStatusEmitted = true;
+                    } else if (runtimeAuthClassification) {
+                        if (useCodexAppServer) {
+                            // The accepted app-server failure owns every classified
                             // runtime-failure report. It settles the provider turn before delegating to
                             // the shared reporter, including when the outer prompt await has already
                             // failed through a different error path. Do not report or flush it twice.
@@ -3285,12 +3337,16 @@ export async function runCodex(opts: {
                         }
                     } else {
                         logger.warn('Error in codex session:', error);
+                        classifiedTurnFailureSurfaced = await failUnsettledCodexTurn(error);
                     }
                     if (!runtimeAuthRecoveryStatusEmitted) {
                         const details = formatErrorForUi(error);
                         const messageText = `Codex process error: ${details}`;
                         messageBuffer.addMessage(messageText, 'status');
-                        session.sendSessionEvent({ type: 'message', message: messageText });
+                        // The classified failed turn already carries this error for session clients.
+                        if (!classifiedTurnFailureSurfaced) {
+                            session.sendSessionEvent({ type: 'message', message: messageText });
+                        }
                     }
                     // For unexpected errors, keep the ACP session id (best-effort) so a subsequent start can attempt resume.
                     if (useCodexAcp || useCodexAppServer) {

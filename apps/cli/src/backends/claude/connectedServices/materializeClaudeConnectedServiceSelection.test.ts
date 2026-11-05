@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -7,6 +7,7 @@ import { buildConnectedServiceCredentialRecord } from '@happier-dev/protocol';
 
 import { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } from './nativeAuth/claudeCodeCredentialScopes';
 import { materializeClaudeConnectedServiceSelection } from './materializeClaudeConnectedServiceSelection';
+import { CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS } from './claudeTranscriptRetentionSettings';
 
 describe('Claude selection configuration sharing', () => {
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
@@ -75,7 +76,10 @@ describe('Claude selection configuration sharing', () => {
     const refreshedTarget = await materialize('isolated', makeRecord('refreshed-access'), 'isolated');
     expect(refreshedTarget).toBe(target);
     expect((await lstat(target)).ino).toBe(rootStat.ino);
-    expect(await readFile(join(target, 'settings.json'), 'utf8')).toBe('{"theme":"private"}');
+    // Private isolated settings are kept; only the missing transcript retention default is added.
+    expect(JSON.parse(await readFile(join(target, 'settings.json'), 'utf8'))).toEqual({
+      theme: 'private', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS,
+    });
     expect(await readFile(join(target, 'commands', 'private.md'), 'utf8')).toBe('# Private command');
     expect(await readFile(join(target, 'history.jsonl'), 'utf8')).toBe('{"display":"private history"}\n');
     expect(await readFile(join(target, 'projects', 'private', 'session.jsonl'), 'utf8')).toContain('private session');
@@ -102,7 +106,10 @@ describe('Claude selection configuration sharing', () => {
     await materialize('copied');
     expect(await readFile(join(target, 'skills', 'example', 'SKILL.md'), 'utf8')).toBe('updated');
     expect(await readFile(join(target, 'CLAUDE.md'), 'utf8')).toBe('native user instructions');
-    await expect(lstat(join(target, 'settings.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    // A removed source settings file leaves only this home's transcript retention default.
+    expect(JSON.parse(await readFile(join(target, 'settings.json'), 'utf8'))).toEqual({
+      cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS,
+    });
     expect((await lstat(target)).ino).toBe(rootStat.ino);
     expect(await readFile(join(target, 'local-state'), 'utf8')).toBe('preserve');
     const refreshedRoot = JSON.parse(await readFile(join(target, '.claude.json'), 'utf8'));
@@ -121,7 +128,12 @@ describe('Claude selection configuration sharing', () => {
     expect((await lstat(join(target, 'skills'))).isSymbolicLink()).toBe(false);
     await materialize();
     expect((await lstat(join(target, 'skills'))).isSymbolicLink()).toBe(true);
-    expect((await lstat(join(target, 'settings.json'))).isSymbolicLink()).toBe(true);
+    // Source settings without cleanupPeriodDays reach this home as a managed copy carrying the
+    // retention default (a group links its profile home's copy), never as the native source file.
+    expect(await realpath(join(target, 'settings.json'))).not.toBe(await realpath(join(source, 'settings.json')));
+    expect(JSON.parse(await readFile(join(target, 'settings.json'), 'utf8'))).toEqual({
+      theme: 'dark', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS,
+    });
     expect((await lstat(join(target, 'CLAUDE.md'))).isSymbolicLink()).toBe(true);
     await writeFile(join(source, 'CLAUDE.md'), 'updated user instructions');
     expect(await readFile(join(target, 'CLAUDE.md'), 'utf8')).toBe('updated user instructions');
@@ -142,9 +154,22 @@ describe('Claude selection configuration sharing', () => {
     await writeFile(join(target, 'projects', 'repo', 'session.jsonl'), 'session-history');
     await materialize('isolated');
     await expect(lstat(join(target, 'skills'))).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(lstat(join(target, 'settings.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    // Inherited settings are removed; the home keeps only its own transcript retention default.
+    expect(JSON.parse(await readFile(join(target, 'settings.json'), 'utf8'))).toEqual({
+      cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS,
+    });
     await expect(lstat(join(target, 'CLAUDE.md'))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await readFile(join(target, 'projects', 'repo', 'session.jsonl'), 'utf8')).toBe('session-history');
     expect((await lstat(join(target, '.credentials.json'))).isFile()).toBe(true);
+  });
+
+  it.each(['profile', 'group'] as const)('gives the default-linked %s home a non-expiring transcript default without mutating the native source', async (kind) => {
+    const { source, materialize } = await fixture(kind);
+    const target = await materialize();
+    expect(JSON.parse(await readFile(join(target, 'settings.json'), 'utf8'))).toEqual({
+      theme: 'dark', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS,
+    });
+    expect(await realpath(join(target, 'settings.json'))).not.toBe(await realpath(join(source, 'settings.json')));
+    expect(await readFile(join(source, 'settings.json'), 'utf8')).toBe('{"theme":"dark"}');
   });
 });

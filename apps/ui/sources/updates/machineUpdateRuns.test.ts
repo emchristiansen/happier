@@ -257,6 +257,41 @@ describe('runMachineItemUpdate — a remote CLI update is started, then observed
         });
     });
 
+    it.each(['agent-cli', 'installable'] as const)('keeps %s and Update All busy until refreshed facts replace the old version', async (kind) => {
+        vi.useRealTimers();
+        const machineId = `refresh-${kind}`;
+        const item: UpdateItem = { ...remoteCli, id: `${machineId}:tool`, machineId,
+            subject: kind === 'agent-cli' ? { kind, agentId: 'codex' } : { kind, key: 'gh' } };
+        let release!: () => void;
+        let entered!: () => void;
+        const detecting = new Promise<void>((resolve) => { entered = resolve; });
+        const pending = new Promise<void>((resolve) => { release = resolve; });
+        rpc.invoke.mockResolvedValue({ supported: true, response: { ok: true, result: { version: '2' } } });
+        rpc.detect.mockImplementationOnce(async () => {
+            entered(); await pending;
+            const id = kind === 'agent-cli' ? 'cli.codex' : 'dep.gh';
+            return { supported: true, response: { protocolVersion: 1, results: {
+                [id]: { ok: true, checkedAt: Date.now(), data: kind === 'agent-cli'
+                    ? { available: true, version: '2', latestVersion: '2', updateSupported: true }
+                    : { installed: true, installedVersion: '2', latestVersionCheck: { ok: true, latestVersion: '2' } } },
+            } } };
+        });
+        const updating = runs.runUpdateBatch(accountA, [item], (next) => runs.runMachineItemUpdate(next, { scope: accountA }));
+        await detecting;
+        const duringRefresh = runs.observeMachineUpdateRun(runs.readMachineUpdateRuns(accountA.serverId), item.id);
+        const batchDuringRefresh = runs.readUpdateBatch(accountA);
+        const completionDuringRefresh = runs.readUnseenUpdateCompletions(accountA).has(item.id);
+        release();
+        await updating;
+        expect(duringRefresh.running).toBe(true);
+        expect(batchDuringRefresh).toEqual({ done: 0, total: 1, stopping: false });
+        expect(completionDuringRefresh).toBe(false);
+        expect(runs.observeMachineUpdateRun(runs.readMachineUpdateRuns(accountA.serverId), item.id).running).toBe(false);
+        expect(runs.readUnseenUpdateCompletions(accountA).has(item.id)).toBe(true);
+        const result = getMachineCapabilitiesSnapshot(machineId, accountA.serverId)?.response.results[kind === 'agent-cli' ? 'cli.codex' : 'dep.gh'];
+        expect(result).toMatchObject({ ok: true, data: kind === 'agent-cli' ? { version: '2' } : { installedVersion: '2' } });
+    });
+
     it('after an agent update the machine\'s facts are re-read fresh, with the latest version, through the capability cache', async () => {
         rpc.detect.mockClear();
         rpc.invoke.mockImplementation(async () => ({ supported: true, response: { ok: true, result: { previousVersion: '2.1.281', version: '2.1.283' } } }));
@@ -368,6 +403,51 @@ describe('runMachineItemUpdate — a remote CLI update is started, then observed
         expect(rpc.invoke.mock.calls.map((call) => call[1]?.id)).toEqual(['cli.codex']);
         expect(runs.observeMachineUpdateRun(runs.readMachineUpdateRuns(accountA.serverId), second.id).running).toBe(false);
         await reopened.unmount();
+    });
+
+    it('an already-current answer survives its own settling refresh and yields to the next latest check', async () => {
+        const machineId = 'already-current-settle';
+        const claude: UpdateItem = { ...remoteCli, id: `${machineId}:agent:claude`, machineId, subject: { kind: 'agent-cli', agentId: 'claude' }, title: 'Claude' };
+        const detectWith = (version: string, latestVersion: string, checkedAt: number) => rpc.detect.mockImplementation(async () => ({
+            supported: true, response: { protocolVersion: 1, results: {
+                'cli.claude': { ok: true, checkedAt, data: { available: true, version, latestVersion, updateSupported: true } } } } }));
+        const latestCheck = () => prefetchMachineCapabilities({ machineId, serverId: accountA.serverId,
+            request: { bypassCache: true, requests: [{ id: 'cli.claude', params: { includeLatestVersion: true } }] } });
+        detectWith('2.1.281', '2.1.283', 1); await latestCheck();
+        detectWith('2.1.281', '2.1.283', 2); // the settling refresh is a real latest check
+        rpc.invoke.mockImplementation(async () => ({ supported: true, response: { ok: true, result: { alreadyCurrent: true, version: '2.1.283' } } }));
+        await runs.runMachineItemUpdate(claude, { scope: accountA }); await advance(0);
+        const build = () => buildMachineUpdateGroups({
+            machines: [{ id: machineId, active: true, activeAt: Date.now(), metadata: { host: machineId } } as Machine],
+            thisMachineId: machineId, thisComputerItem: null, runs: runs.readMachineUpdateRuns(accountA.serverId),
+            snapshots: new Map([[machineId, getMachineCapabilitiesSnapshot(machineId, accountA.serverId)]]), installables: [],
+        }).groups.flatMap((group) => group.items).find((item) => item.id === claude.id);
+        expect(build()).toMatchObject({ currentVersion: '2.1.283', state: 'upToDate', alreadyCurrent: true });
+        detectWith('2.1.283', '2.1.284', 3); await latestCheck();
+        expect(build()).toMatchObject({ state: 'available', action: { kind: 'run', verb: 'update' } });
+        rpc.detect.mockImplementation(async () => ({ supported: true, response: { protocolVersion: 1, results: {} } }));
+    });
+
+    it('an already-current answer does not hide a newer release found by its own settling refresh', async () => {
+        const machineId = 'already-current-newer-latest';
+        const claude: UpdateItem = { ...remoteCli, id: `${machineId}:agent:claude`, machineId, subject: { kind: 'agent-cli', agentId: 'claude' }, title: 'Claude' };
+        const detectWith = (version: string, latestVersion: string, checkedAt: number) => rpc.detect.mockImplementation(async () => ({
+            supported: true, response: { protocolVersion: 1, results: {
+                'cli.claude': { ok: true, checkedAt, data: { available: true, version, latestVersion, updateSupported: true } } } } }));
+        detectWith('2.1.283', '2.1.283', 1);
+        await prefetchMachineCapabilities({ machineId, serverId: accountA.serverId,
+            request: { bypassCache: true, requests: [{ id: 'cli.claude', params: { includeLatestVersion: true } }] } });
+        detectWith('2.1.283', '2.1.284', 2); // the settling refresh discovers a newer release
+        rpc.invoke.mockImplementation(async () => ({ supported: true, response: { ok: true, result: { alreadyCurrent: true, version: '2.1.283' } } }));
+        await runs.runMachineItemUpdate(claude, { scope: accountA }); await advance(0);
+        const row = buildMachineUpdateGroups({
+            machines: [{ id: machineId, active: true, activeAt: Date.now(), metadata: { host: machineId } } as Machine],
+            thisMachineId: machineId, thisComputerItem: null, runs: runs.readMachineUpdateRuns(accountA.serverId),
+            snapshots: new Map([[machineId, getMachineCapabilitiesSnapshot(machineId, accountA.serverId)]]), installables: [],
+        }).groups.flatMap((group) => group.items).find((item) => item.id === claude.id);
+        expect(row).toMatchObject({ currentVersion: '2.1.283', state: 'available', action: { kind: 'run', verb: 'update' } });
+        expect(row).not.toMatchObject({ alreadyCurrent: true });
+        rpc.detect.mockImplementation(async () => ({ supported: true, response: { protocolVersion: 1, results: {} } }));
     });
 
     it('keeps the initiating account/server and machine order after a failed first update while other machines run concurrently', async () => {

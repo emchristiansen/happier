@@ -10,9 +10,7 @@ import { writeCredentialsLegacy, readCredentials, readSettings, updateSettings, 
 import { generateWebAuthUrl } from "@/api/webAuth";
 import { sanitizeServerIdForFilesystem } from "@/server/serverId";
 import { openBrowser } from '@/ui/openBrowser';
-import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
-import { render } from 'ink';
-import React from 'react';
+import type { AuthMethod } from "./ink/authSelectorInput";
 import { randomUUID } from 'node:crypto';
 import { logger } from './logger';
 import { ensureDaemonRunningForSessionCommand, shouldAutoStartDaemonAfterAuth } from '@/daemon/ensureDaemon';
@@ -363,7 +361,13 @@ async function doBothAuth(params: Readonly<{
 /**
  * Display authentication method selector and return user choice
  */
-function selectAuthenticationMethod(): Promise<AuthMethod | null> {
+async function selectAuthenticationMethod(): Promise<AuthMethod | null> {
+    // Ink and React load only for this interactive prompt, keeping them out of every session runner.
+    const [{ render }, { default: React }, { AuthSelector }] = await Promise.all([
+        import('ink'),
+        import('react'),
+        import('./ink/AuthSelector'),
+    ]);
     return new Promise((resolve) => {
         let hasResolved = false;
 
@@ -786,6 +790,8 @@ export async function ensureMachineIdForCredentials(
  */
 export async function authAndSetupMachineIfNeeded(opts: Readonly<{
     callerIntent?: 'standalone' | 'setup-managed';
+    /** Dispatch applies the selected backend's daemon policy after authentication. */
+    deferDaemonAutostart?: boolean;
 }> = {}): Promise<{
     credentials: Credentials;
     machineId: string;
@@ -816,7 +822,7 @@ export async function authAndSetupMachineIfNeeded(opts: Readonly<{
     rehydrateRelayScopeEnvFromConfiguration();
 
     if (
-      shouldAutoStartDaemonAfterAuth({
+      !opts.deferDaemonAutostart && shouldAutoStartDaemonAfterAuth({
         env: process.env,
         isDaemonProcess: configuration.isDaemonProcess,
         startedBy: 'terminal',

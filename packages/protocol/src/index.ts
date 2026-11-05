@@ -1,4 +1,11 @@
 export const HAPPY_PROTOCOL_PACKAGE = '@happier-dev/protocol';
+export { lazySchema } from './lazySchema.js';
+export {
+  SessionPermissionResponseSchema,
+  SessionPermissionResponseToOccurrenceV1Schema,
+  type SessionPermissionResponse,
+  type SessionPermissionResponseToOccurrenceV1,
+} from './sessionControl/sessionPermissionResponse.js';
 export { buildRecoveryCreditConsumeIdempotencyKey } from './connect/recoveryCreditConsumeIdempotencyKey.js';
 
 export { PROVIDER_ACCOUNT_SUBSCRIPTION_ACCEPT, ProviderAccountSubscriptionV1Schema, mergeProviderAccountSubscription, type ProviderAccountSubscriptionV1 } from './connect/accountSubscription.js';
@@ -561,6 +568,8 @@ export {
   ProviderAccountSubjectRefV1Schema,
   ProviderAccountUsageConfidenceV1Schema,
   ProviderAccountUsageDiagnosticV1Schema,
+  getProviderAccountUsageRefreshErrorAt,
+  isProviderAccountUsageRefreshRequestSettled,
   ProviderAccountUsageQuotaScopeV1Schema,
   ProviderAccountUsageRecordIdSchema,
   ProviderAccountUsageRecordKeyV1Schema,
@@ -835,6 +844,13 @@ export {
 } from './providers/codex/backendMode.js';
 
 export {
+  CODEX_REASONING_SUMMARIES_DEFAULT,
+  CodexReasoningSummariesSchema,
+  resolveCodexReasoningSummaryOverride,
+  type CodexReasoningSummaries,
+} from './providers/codex/reasoningSummary.js';
+
+export {
   CodexAppServerCapabilitiesSchema,
   CodexAppServerGoalSchema,
   CodexAppServerGoalStatusSchema,
@@ -895,6 +911,9 @@ export {
   normalizeClaudeTodoWriteTodosToWorkStateItems,
   readClaudeAgentSdkProviderTaskStatus,
   readClaudeSlashCommandNames,
+  formatClaudePeerMessageText,
+  readClaudePeerMessage,
+  type ClaudePeerMessage,
   type ClaudeActivityStatusSignal,
   type ClaudeSdkSkillsOption,
   type ClaudeTaskEvent,
@@ -1130,6 +1149,7 @@ export {
   SESSION_ORGANIZATION_LABEL_KINDS,
   SESSION_ORGANIZATION_MAX_ASSIGNMENTS_PER_MUTATION,
   SESSION_ORGANIZATION_MAX_ATTENTION_STANDINGS,
+  SESSION_ORGANIZATION_MAX_SESSION_APPEARANCES,
   SESSION_ORGANIZATION_MAX_DISPLAY_ENVELOPE_BYTES,
   SESSION_ORGANIZATION_MAX_FOLDERS,
   SESSION_ORGANIZATION_MAX_ID_LENGTH,
@@ -1167,6 +1187,7 @@ export {
   SessionOrganizationOrderItemKindSchema,
   SessionOrganizationOrderScopeKindSchema,
   SessionAttentionStandingSchema,
+  SessionOrganizationSessionAppearanceSchema,
   SessionOrganizationPinSchema,
   SessionOrganizationSnapshotRequestSchema,
   SessionOrganizationSnapshotResponseSchema,
@@ -1175,6 +1196,8 @@ export {
   SessionTagAssignmentSchema,
   SetSessionAttentionStandingRequestSchema,
   SetSessionAttentionStandingResponseSchema,
+  SetSessionAppearanceRequestSchema,
+  SetSessionAppearanceResponseSchema,
   SetSessionPinRequestSchema,
   SetSessionPinResponseSchema,
   SetSessionTagAssignmentsRequestSchema,
@@ -1203,6 +1226,7 @@ export {
   type SessionOrganizationOrderItemKind,
   type SessionOrganizationOrderScopeKind,
   type SessionAttentionStanding,
+  type SessionOrganizationSessionAppearance,
   type SessionOrganizationPin,
   type SessionOrganizationSnapshot,
   type SessionOrganizationSnapshotRequest,
@@ -1211,6 +1235,8 @@ export {
   type SessionTagAssignment,
   type SetSessionAttentionStandingRequest,
   type SetSessionAttentionStandingResponse,
+  type SetSessionAppearanceRequest,
+  type SetSessionAppearanceResponse,
   type SetSessionPinRequest,
   type SetSessionPinResponse,
   type SetSessionTagAssignmentsRequest,
@@ -1317,11 +1343,13 @@ export {
 } from './mcpServers/resolveEffectiveServersV1.js';
 export {
   areSessionMcpSelectionsEquivalent,
+  isSessionHappierToolsEnabled,
   parseSessionMcpSelectionV1Json,
   readSessionMcpSelectionRestartRequiredV1FromMetadata,
   readSessionMcpSelectionV1FromMetadata,
   SessionMcpSelectionRestartRequiredV1Schema,
   SessionMcpSelectionV1Schema,
+  SessionMcpSelectionV1InputSchema,
   type SessionMcpSelectionRestartRequiredV1,
   type SessionMcpSelectionV1,
 } from './mcpServers/sessionSelectionV1.js';
@@ -1995,6 +2023,8 @@ export {
   type ProviderSessionInfoV1,
   createProviderSessionInfoV1Schema,
 } from './sessionMetadata/providerSessionInfoV1.js';
+
+export { hasSessionTitleInMetadata } from './sessionMetadata/sessionTitle.js';
 
 export {
   WINDOWS_REMOTE_SESSION_LAUNCH_MODES,
@@ -3275,6 +3305,7 @@ export {
   isCodingPromptSessionTitleUpdatesEnabled,
   resolveCodingPromptBehaviorV1,
   resolveCodingPromptSessionTitleUpdatesModeV1,
+  resolveCodingPromptSessionTitleInstructionModeV1,
   type CodingPromptBehaviorModeV1,
   type CodingPromptSessionTitleUpdatesModeV1,
   type CodingPromptBehaviorV1,
@@ -3592,6 +3623,12 @@ export {
   BUG_REPORT_FALLBACK_MAX_LABEL_LENGTH,
   buildBugReportFallbackIssueUrl,
   buildBugReportExportBundle,
+  BugReportLogSelectionSchema,
+  BugReportSessionDiagnosticsSchema,
+  resolveBugReportLogSelection,
+  BUG_REPORT_LOG_SOURCE_KINDS,
+  type BugReportLogSelection,
+  type BugReportSessionDiagnostics,
   formatBugReportFallbackIssueBody,
   appendBugReportReporterToSummary,
   hasAcceptedBugReportArtifactKind,
@@ -3647,6 +3684,7 @@ export {
   EnvironmentVariableSchema,
   SavedSecretSchema,
   getBuiltInBackendProfile,
+  getProfileDefaultBackendTarget,
   getRequiredConfigEnvVarNames,
   getMissingRequiredConfigEnvVarNames,
   getProfileEnvironmentVariables,
@@ -3712,3 +3750,6 @@ export {
 } from './machines/machineContentKeyTransitionV1.js';
 
 export { assertAccountKeyProvisioningAllowed, AccountKeyProvisioningUnavailableError, verifyAccountContentPublicKeyBinding, createAccountContentPublicKeyBindingMessage } from './auth/accountKeyProvisioning.js';
+export { PushNotificationTestRequestSchema, PushNotificationTestResultSchema, type PushNotificationTestResult } from './push/pushNotificationTest.js';
+
+export { projectNotificationQuestion, readNotificationQuestionAnswer, isNotificationQuestionAnswerAction, NotificationQuestionAnswerV1Schema, NOTIFICATION_QUESTION_MAX_CHOICES, type NotificationQuestionAnswerV1 } from './push/notificationQuestionActions.js';
