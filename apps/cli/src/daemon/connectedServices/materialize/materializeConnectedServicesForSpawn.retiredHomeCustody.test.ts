@@ -56,6 +56,28 @@ function failOneUnlink(matches: (path: string) => boolean): { failures: () => nu
   return { failures: () => failures };
 }
 
+/** Fails exactly one custody-record write whose content names a matching sibling. */
+function failOneClaimWrite(retiredNamePart: string): { failures: () => number } {
+  const writeFile = fs.writeFile;
+  let failures = 0;
+  vi.spyOn(fs, 'writeFile').mockImplementation(async (...args: Parameters<typeof fs.writeFile>) => {
+    if (failures === 0 && String(args[0]).includes('/.retired-homes/') && String(args[1]).includes(retiredNamePart)) {
+      failures += 1;
+      throw Object.assign(new Error('one synthetic custody-record write EACCES'), { code: 'EACCES' });
+    }
+    await writeFile(...args);
+  });
+  syncBuiltinESMExports();
+  return { failures: () => failures };
+}
+
+async function custodyRecords(baseDir: string): Promise<Array<{ path: string; ino: string }>> {
+  const custodyDir = join(baseDir, '.retired-homes');
+  if (!await exists(custodyDir)) return [];
+  const names = (await fs.readdir(custodyDir)).filter((name) => name.endsWith('.json'));
+  return await Promise.all(names.map(async (name) => JSON.parse(await fs.readFile(join(custodyDir, name), 'utf8'))));
+}
+
 function reconstructedScheduler(baseDir: string) {
   // A fresh owner after restart: default TTLs, and the canonical successor is live.
   return new ConnectedServiceMaterializedHomeCleanupScheduler({
@@ -124,6 +146,133 @@ describe('retired connected-service home credential custody', () => {
     expect(histories).toEqual(expect.arrayContaining(['old unique history\n', 'new unique history\n']));
     expect(await readSuccessor(successor.materializationRoot)).toEqual(successorBefore);
   }, 30_000);
+
+  it('aborts before anything moves when the rejected-home claim cannot be recorded, leaving every credential with its owner', async () => {
+    const { params } = await fixture();
+    const first = (await materializeConnectedServicesForSpawn(params))!;
+    const home = first.materializationRoot;
+    await fs.writeFile(join(home, 'history-witness.jsonl'), 'old unique history\n');
+    const liveBefore = await readSuccessor(home);
+    const claim = failOneClaimWrite('codex.rejected-');
+    let validated = false;
+
+    await expect(materializeConnectedServicesForSpawn({
+      ...params,
+      validatePromotedMaterialization: async () => { validated = true; throw new Error('synthetic validation rejection'); },
+    })).rejects.toThrow();
+    expect(claim.failures()).toBe(1);
+    expect(validated).toBe(false);
+    // Nothing moved: no retained sibling exists, the live home is untouched and the staged
+    // attempt's credential was retired by its own attempt cleanup.
+    expect((await fs.readdir(dirname(home))).filter((name) => name.includes('.previous-') || name.includes('.rejected-'))).toEqual([]);
+    expect(await readSuccessor(home)).toEqual(liveBefore);
+    const attempts = join(params.baseDir, '.attempts');
+    for (const attempt of await exists(attempts) ? await fs.readdir(attempts) : []) {
+      expect(await exists(join(attempts, attempt, 'codex-home', 'auth.json'))).toBe(false);
+    }
+
+    await materializeConnectedServicesForSpawn(params);
+    await reconstructedScheduler(params.baseDir).reconcileMaterializedHomes();
+    expect((await custodyRecords(params.baseDir)).filter((record) => record.path.includes('.rejected-'))).toEqual([]);
+  });
+
+  it.each(['retry', 'restart'] as const)('holds durable inode-bound custody of the rejected home before it exists, so a failed revocation is recovered via %s', async (recovery) => {
+    const { params } = await fixture();
+    const first = (await materializeConnectedServicesForSpawn(params))!;
+    const home = first.materializationRoot;
+    await fs.writeFile(join(home, 'history-witness.jsonl'), 'old unique history\n');
+    const unlink = failOneUnlink((path) => path.includes('codex.rejected-') && path.endsWith('/codex-home/auth.json'));
+
+    await expect(materializeConnectedServicesForSpawn({
+      ...params,
+      validatePromotedMaterialization: async ({ materializationRoot }) => {
+        await fs.writeFile(join(materializationRoot, 'history-witness.jsonl'), 'new unique history\n');
+        throw new Error('synthetic validation rejection');
+      },
+    })).rejects.toThrow('both homes were retained');
+    expect(unlink.failures()).toBe(1);
+    const retired = join(dirname(home), (await fs.readdir(dirname(home))).find((name) => name.startsWith('codex.rejected-'))!);
+    expect(await exists(join(retired, 'codex-home', 'auth.json'))).toBe(true);
+    // The only state a restarted daemon reads: an on-disk record bound to this sibling's inode.
+    const retiredIno = String((await fs.lstat(retired, { bigint: true })).ino);
+    expect((await custodyRecords(params.baseDir)).filter((record) => record.path === retired).map((record) => record.ino)).toEqual([retiredIno]);
+
+    let successorRoot = home;
+    if (recovery === 'retry') {
+      successorRoot = (await materializeConnectedServicesForSpawn(params))!.materializationRoot;
+      expect(await exists(join(retired, 'codex-home', 'auth.json'))).toBe(false);
+    }
+    await fs.writeFile(join(successorRoot, 'history-witness.jsonl'), 'successor history\n');
+    const successorBefore = await readSuccessor(successorRoot);
+    await reconstructedScheduler(params.baseDir).reconcileMaterializedHomes();
+
+    expect(await exists(join(retired, 'codex-home', 'auth.json'))).toBe(false);
+    await expect(fs.readFile(join(retired, 'history-witness.jsonl'), 'utf8')).resolves.toBe('new unique history\n');
+    expect((await custodyRecords(params.baseDir)).filter((record) => record.path === retired)).toEqual([]);
+    expect(await readSuccessor(successorRoot)).toEqual(successorBefore);
+  }, 30_000);
+
+  it('keeps the live home after a failed claimed previous rename and settles the obsolete claim at the next promotion', async () => {
+    const { params } = await fixture();
+    const first = (await materializeConnectedServicesForSpawn(params))!;
+    const auth = join(first.materializationRoot, 'codex-home', 'auth.json');
+    const before = await fs.readFile(auth, 'utf8');
+    const rename = fs.rename;
+    let failures = 0;
+    vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (failures === 0 && String(to).includes('codex.previous-')) {
+        failures += 1;
+        throw Object.assign(new Error('one synthetic rename EACCES'), { code: 'EACCES' });
+      }
+      await rename(from, to);
+    });
+    syncBuiltinESMExports();
+    await expect(materializeConnectedServicesForSpawn(params)).rejects.toThrow();
+    expect(failures).toBe(1);
+    // The aborted replacement ends its rejected-home claim; the previous-home claim names the live inode.
+    const records = await custodyRecords(params.baseDir);
+    expect(records).toHaveLength(1);
+    expect(records[0]!.path).toContain('codex.previous-');
+    expect(records[0]!.ino).toBe(String((await fs.stat(first.materializationRoot, { bigint: true })).ino));
+    await reconstructedScheduler(params.baseDir).reconcileMaterializedHomes();
+    await expect(fs.readFile(auth, 'utf8')).resolves.toBe(before);
+    await materializeConnectedServicesForSpawn(params);
+    await reconstructedScheduler(params.baseDir).reconcileMaterializedHomes();
+    expect(await custodyRecords(params.baseDir)).toEqual([]);
+  });
+
+  it('propagates a failed release of the previous-home record after revocation and retries it', async () => {
+    const { params } = await fixture();
+    const first = (await materializeConnectedServicesForSpawn(params))!;
+    await fs.writeFile(join(first.materializationRoot, 'history-witness.jsonl'), 'preserve\n');
+    const unlink = fs.unlink;
+    let failures = 0;
+    vi.spyOn(fs, 'unlink').mockImplementation(async (path) => {
+      const target = String(path);
+      if (failures === 0 && target.includes('/.retired-homes/') && target.endsWith('.json')
+        && (await fs.readFile(target, 'utf8').catch(() => '')).includes('codex.previous-')) {
+        failures += 1;
+        throw Object.assign(new Error('one synthetic record unlink EACCES'), { code: 'EACCES' });
+      }
+      await unlink(path);
+    });
+    syncBuiltinESMExports();
+    await expect(materializeConnectedServicesForSpawn(params)).rejects.toThrow();
+    expect(failures).toBe(1);
+    const retained = (await custodyRecords(params.baseDir)).filter((record) => record.path.includes('codex.previous-'));
+    expect(retained).toHaveLength(1);
+    expect(await exists(join(retained[0]!.path, 'codex-home', 'auth.json'))).toBe(false);
+    await reconstructedScheduler(params.baseDir).reconcileMaterializedHomes();
+    expect((await custodyRecords(params.baseDir)).filter((record) => record.path.includes('codex.previous-'))).toEqual([]);
+    await expect(fs.readFile(join(retained[0]!.path, 'history-witness.jsonl'), 'utf8')).resolves.toBe('preserve\n');
+  });
+
+  it('releases the unused rejected-home claim when a promotion commits', async () => {
+    const { params } = await fixture();
+    await materializeConnectedServicesForSpawn(params);
+    await materializeConnectedServicesForSpawn(params);
+    expect((await custodyRecords(params.baseDir)).filter((record) => record.path.includes('.rejected-'))).toEqual([]);
+  });
 
   it('does not revoke a claimed previous home while its promotion can still roll back', async () => {
     const { params } = await fixture();

@@ -1247,10 +1247,13 @@ Run can resume.
 
 Atomic connected-service replacement retains both the previous home and a
 rejected promoted home on rollback, with their credentials retired separately
-under a durable custody record written before each retained sibling exists. A
-failed credential revocation stays owned by the next promotion of that root and
-by the materialized-home cleanup scheduler, bound to the sibling's inode; a
-matching directory name alone grants no authority.
+under a durable custody record written before each retained sibling exists:
+both possible siblings are claimed before anything moves, and a claim that
+cannot be written aborts the replacement while the canonical and staged homes
+remain with their own owners. A failed credential revocation stays owned by the
+next promotion of that root and by the materialized-home cleanup scheduler,
+bound to the sibling's inode; a matching directory name alone grants no
+authority.
 Claude conflict reconciliation keeps every distinct older transcript while
 selecting the newest canonical resume filename. File credentials are revoked by
 the provider's declared cleanup hook; Claude's path-derived Keychain cleanup runs

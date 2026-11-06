@@ -89,37 +89,69 @@ describe('atomic home promotion runtime custody', () => {
     expect(await readFile(join(targetDir, 'history.jsonl'), 'utf8')).toBe(rejectPromotion ? 'old distinct history' : 'new distinct history');
   });
 
-  it.each([false, true])('claims each retained sibling before it exists, and rollback survives a failed claim (%s)', async (rejectPromotion) => {
+  it.each([false, true])('claims both possible retained siblings before anything moves (rejected promotion: %s)', async (rejectPromotion) => {
     const { root, targetDir, stagedDir } = await fixture();
     await writeFile(join(targetDir, 'history.jsonl'), 'old distinct history');
     await writeFile(join(stagedDir, 'history.jsonl'), 'new distinct history');
-    const claims: Array<{ retired: string; source: string; retiredExisted: boolean; sourceHistory: string }> = [];
+    const claims: Array<{ retired: string; canonical: string; identityHistory: string; stagedInPlace: boolean; retiredExisted: boolean }> = [];
+    const released: string[] = [];
     const retired: string[] = [];
     const run = replaceDirectoryAtomically({
       stagedDir, targetDir,
       afterPromote: async () => { if (rejectPromotion) throw new Error('synthetic promotion rejection'); },
-      claimRetiredDirectory: async (retiredDir, source) => {
+      claimRetiredDirectory: async ({ retired: retiredDir, canonical, identity }) => {
         claims.push({
-          retired: retiredDir, source,
+          retired: retiredDir, canonical,
+          identityHistory: await readFile(join(identity, 'history.jsonl'), 'utf8'),
+          stagedInPlace: await stat(stagedDir).then(() => true, () => false),
           retiredExisted: await stat(retiredDir).then(() => true, () => false),
-          sourceHistory: await readFile(join(source, 'history.jsonl'), 'utf8'),
         });
-        if (retiredDir.includes('.rejected-')) throw new Error('synthetic custody claim failure');
       },
+      releaseRetiredDirectoryClaim: async (directory) => { released.push(directory); },
       retireDirectory: async (directory) => { retired.push(directory); },
     });
     if (rejectPromotion) await expect(run).rejects.toThrow('synthetic promotion rejection');
     else await run;
-    const expectedClaims = rejectPromotion
-      ? [{ kind: '.previous-', history: 'old distinct history' }, { kind: '.rejected-', history: 'new distinct history' }]
-      : [{ kind: '.previous-', history: 'old distinct history' }];
-    expect(claims.map((claim) => ({ kind: claim.retired.slice(targetDir.length, targetDir.length + '.previous-'.length), history: claim.sourceHistory }))).toEqual(expectedClaims);
-    expect(claims.every((claim) => claim.source === targetDir && !claim.retiredExisted)).toBe(true);
-    // The rejected sibling is still retired immediately, and the old target is restored.
-    expect(retired).toEqual([claims[claims.length - 1]!.retired]);
+    // The `.previous-*` claim binds the current target; the `.rejected-*` claim binds the staged
+    // directory that a rollback would rename there. Both precede every rename.
+    expect(claims.map((claim) => ({ kind: claim.retired.slice(targetDir.length, targetDir.length + '.previous-'.length), history: claim.identityHistory })))
+      .toEqual([{ kind: '.previous-', history: 'old distinct history' }, { kind: '.rejected-', history: 'new distinct history' }]);
+    expect(claims.every((claim) => claim.canonical === targetDir && claim.stagedInPlace && !claim.retiredExisted)).toBe(true);
+    const [previousClaim, rejectedClaim] = claims;
+    expect(retired).toEqual([rejectPromotion ? rejectedClaim!.retired : previousClaim!.retired]);
+    expect(released).toEqual(rejectPromotion ? [] : [rejectedClaim!.retired]);
     expect(await readFile(join(targetDir, 'history.jsonl'), 'utf8')).toBe(rejectPromotion ? 'old distinct history' : 'new distinct history');
     // Exactly the canonical target and one retained sibling remain; nothing was deleted.
     expect(await readdir(root)).toHaveLength(2);
+  });
+
+  it('aborts before any rename when the rejected-sibling claim fails', async () => {
+    const { root, targetDir, stagedDir } = await fixture();
+    await writeFile(join(targetDir, 'history.jsonl'), 'old distinct history');
+    await writeFile(join(stagedDir, 'history.jsonl'), 'new distinct history');
+    let promoted = false;
+    await expect(replaceDirectoryAtomically({
+      stagedDir, targetDir,
+      afterPromote: async () => { promoted = true; },
+      claimRetiredDirectory: async ({ retired }) => { if (retired.includes('.rejected-')) throw new Error('synthetic custody claim failure'); },
+      retireDirectory: async () => {},
+    })).rejects.toThrow('synthetic custody claim failure');
+    expect(promoted).toBe(false);
+    expect(await readFile(join(targetDir, 'history.jsonl'), 'utf8')).toBe('old distinct history');
+    expect(await readFile(join(stagedDir, 'history.jsonl'), 'utf8')).toBe('new distinct history');
+    expect((await readdir(root)).sort()).toEqual(['stage', 'target']);
+  });
+
+  it('keeps a valid promotion when releasing the unused rejected claim fails', async () => {
+    const { targetDir, stagedDir } = await fixture();
+    await writeFile(join(stagedDir, 'history.jsonl'), 'new distinct history');
+    await replaceDirectoryAtomically({
+      stagedDir, targetDir,
+      claimRetiredDirectory: async () => {},
+      releaseRetiredDirectoryClaim: async () => { throw new Error('synthetic release failure'); },
+      retireDirectory: async () => {},
+    });
+    expect(await readFile(join(targetDir, 'history.jsonl'), 'utf8')).toBe('new distinct history');
   });
 
   it('does not create an unowned retained sibling when the custody claim fails', async () => {

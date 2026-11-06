@@ -495,10 +495,17 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
         stagedDir: attemptRoot,
         targetDir: rootDir,
         preserveUnprovidedEntries: materialized.preserveUnprovidedEntriesAcrossPromotion ?? [],
-        // Custody is recorded before each retained sibling exists, so a failed revocation stays
-        // owned by the next promotion of this root and by the materialized-home cleanup scheduler.
-        claimRetiredDirectory: async (retiredRoot, sourceRoot) => {
-          await claimRetiredConnectedServiceHome({ baseDir: params.baseDir, agentId: params.agentId, sourcePath: sourceRoot, retiredPath: retiredRoot });
+        // Custody of every sibling this promotion may retain is recorded before anything moves, so a
+        // failed revocation stays owned by the next promotion of this root and by the
+        // materialized-home cleanup scheduler, and a claim that cannot be recorded aborts the
+        // promotion while the staged attempt is still owned by its attempt cleanup.
+        claimRetiredDirectory: async ({ retired, canonical, identity }) => {
+          await claimRetiredConnectedServiceHome({
+            baseDir: params.baseDir, agentId: params.agentId, sourcePath: canonical, retiredPath: retired, identityPath: identity,
+          });
+        },
+        releaseRetiredDirectoryClaim: async (retiredRoot) => {
+          await releaseRetiredConnectedServiceHomeCustody(params.baseDir, retiredRoot);
         },
         retireDirectory: async (retiredRoot) => {
           await revokeRetiredHome({ rootDir: retiredRoot, agentId: params.agentId });

@@ -449,7 +449,9 @@ export async function toggleLocalVoiceTurn(sessionId: string): Promise<void> {
 
         if (welcomeEnabled && welcomeMode === 'immediate' && canSpeakWelcome) {
           const welcomeSignal = beginWelcome();
-          const assistantText = await voiceAgentSessions.ensureRunningAndMaybeWelcome(sessionId).catch(() => null);
+          const assistantText = await voiceAgentSessions
+            .ensureRunningAndMaybeWelcome(sessionId, { signal: welcomeSignal })
+            .catch(() => null);
           const text = typeof assistantText === 'string' ? assistantText.trim() : '';
           // A welcome that arrives after hang-up, a newer connect or a voice turn has no call to speak to.
           if (text && !welcomeSignal.aborted) {

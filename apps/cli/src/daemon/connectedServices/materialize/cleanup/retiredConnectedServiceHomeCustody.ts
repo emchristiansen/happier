@@ -11,6 +11,8 @@ import type { CatalogAgentId } from '@/backends/types';
  * history forever, so its credentials must be revoked by an owner that survives a failed attempt
  * and a daemon restart. Custody is granted only by a record written before the rename that
  * creates the sibling, and is bound to the directory's inode; a matching name alone grants none.
+ * A replacement claims every sibling it may retain before anything moves, so a claim that cannot
+ * be written aborts it while the canonical and staged homes are still under their own owners.
  */
 const CUSTODY_DIR_NAME = '.retired-homes';
 
@@ -46,17 +48,22 @@ async function tryLstatIdentity(path: string): Promise<Readonly<{ dev: string; i
   }
 }
 
-/** Records custody before `sourcePath` is renamed to `retiredPath`; a missing source needs none. */
+/**
+ * Records custody before `identityPath` (the directory that would become the sibling) is renamed
+ * to `retiredPath`. `sourcePath` is the canonical home the sibling retires; a missing directory
+ * needs no custody.
+ */
 export async function claimRetiredConnectedServiceHome(input: Readonly<{
   baseDir: string;
   agentId: CatalogAgentId;
   sourcePath: string;
   retiredPath: string;
+  identityPath: string;
 }>): Promise<void> {
-  const source = await tryLstatIdentity(input.sourcePath);
-  if (!source?.directory) return;
+  const identity = await tryLstatIdentity(input.identityPath);
+  if (!identity?.directory) return;
   const record: RetiredHomeCustodyRecordV1 = {
-    v: 1, agentId: input.agentId, path: input.retiredPath, sourcePath: input.sourcePath, dev: source.dev, ino: source.ino,
+    v: 1, agentId: input.agentId, path: input.retiredPath, sourcePath: input.sourcePath, dev: identity.dev, ino: identity.ino,
   };
   const recordPath = custodyRecordPath(input.baseDir, input.retiredPath);
   await mkdir(dirname(recordPath), { recursive: true });
@@ -130,7 +137,8 @@ export async function settleRetiredConnectedServiceHomes(input: Readonly<{
       await serialize(record.sourcePath, async () => {
         const current = await tryLstatIdentity(record.path);
         if (!current) {
-          // The claimed rename did not happen, or a rollback restored it: the canonical home holds it.
+          // The claimed rename did not happen, or a rollback restored it: the canonical home holds it
+          // (for a rejected-home claim, a promotion that committed holds the claimed staged inode).
           const source = await tryLstatIdentity(record.sourcePath);
           if (source && source.dev === record.dev && source.ino === record.ino) return;
           await releaseRetiredConnectedServiceHomeCustody(input.baseDir, record.path);

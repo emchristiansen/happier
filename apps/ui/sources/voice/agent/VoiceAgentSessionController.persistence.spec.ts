@@ -873,6 +873,29 @@ describe('VoiceAgentSessionController (persistence)', () => {
       await expect(controller.ensureRunningAndMaybeWelcome(sessionId)).resolves.toBeNull();
       expect(welcome).toHaveBeenCalledTimes(2);
     });
+
+    it('a welcome its caller revoked does not mark the still-running agent as welcomed', async () => {
+      const revoked = deferred<{ assistantText: string }>();
+      welcome.mockImplementationOnce(() => revoked.promise);
+      welcome.mockResolvedValue({ assistantText: 'Current welcome' });
+      const { sessionId, controller } = await loadWelcomeController();
+
+      const revokedAttempt = new AbortController();
+      const revokedWelcome = controller.ensureRunningAndMaybeWelcome(sessionId, { signal: revokedAttempt.signal });
+      await vi.waitFor(() => expect(welcome).toHaveBeenCalledTimes(1));
+      revokedAttempt.abort();
+      revoked.resolve({ assistantText: 'Revoked welcome' });
+      await revokedWelcome;
+      expect(controller.isActive(sessionId)).toBe(true);
+
+      const currentAttempt = new AbortController();
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId, { signal: currentAttempt.signal })).resolves.toBe('Current welcome');
+      expect(welcome).toHaveBeenCalledTimes(2);
+      // The welcome that was still current when it completed does count.
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId, { signal: new AbortController().signal })).resolves.toBeNull();
+      expect(welcome).toHaveBeenCalledTimes(2);
+      expect(start).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('treats the hidden global voice conversation session as resumable and retries it with resumeHandle when the persisted run is not resumable anymore', async () => {

@@ -14,6 +14,7 @@ import { settingsParse } from '@/sync/domains/settings/settings';
 import { storage } from '@/sync/domains/state/storageStore';
 import { Encryption } from '@/sync/encryption/encryption';
 import { sync } from '@/sync/sync';
+import { VOICE_AGENT_GLOBAL_SESSION_ID } from '@/voice/agent/voiceAgentGlobalSessionId';
 import { voiceSessionBindingStore } from '@/voice/sessionBinding/voiceSessionBindingStore';
 import { patchLocalVoiceState } from './localVoiceState';
 
@@ -375,6 +376,82 @@ describe('local voice engine: connect-time welcome ownership', () => {
     h.welcomeResponses[1]!({ok:true,result:{assistantText:'Second welcome'}});
     await vi.waitFor(()=>expect(speech).toHaveBeenCalledTimes(2));
     expect(speech.mock.calls.map(x=>x[0])).toEqual(['First welcome','Second welcome']);
+  });
+
+  // UI-VOICE-09, from the R12 reviewer's probe (t_17927351 review-r12-voice, reviewerR12WelcomeGlobalV3). A cancel and
+  // rearm on the agent-mode control session keeps the same daemon agent, so only the welcome attempt itself tells a
+  // current welcome from a superseded one.
+  /** The canonical agent-mode control session bound to its hidden conversation (no machine, so always reusable). */
+  function bindAgentControlSession() {
+    voiceSessionBindingStore.getState().bind({
+      adapterId: 'local_conversation', controlSessionId: VOICE_AGENT_GLOBAL_SESSION_ID, conversationSessionId: 'carrier-s1',
+      transcriptMode: 'synthetic', targetSessionId: 's1', updatedAt: 1,
+    });
+    const sessions = storage.getState().sessions;
+    storage.setState({ sessions: { ...sessions, 'carrier-s1': { ...sessions['carrier-s1']!, presence: 'online',
+      metadata: { ...sessions['carrier-s1']!.metadata!, machineId: undefined, systemSessionV1: { v: 1, key: 'voice_conversation', hidden: true } } } } });
+    patchLocalVoiceState({ status: 'idle', sessionId: VOICE_AGENT_GLOBAL_SESSION_ID, error: null });
+    return VOICE_AGENT_GLOBAL_SESSION_ID;
+  }
+
+  /** Connects, then cancels and rearms through the real adapter while the first welcome is still in flight. */
+  async function rearmDuringWelcome() {
+    const h = await daemonWelcomeHarness();
+    const id = bindAgentControlSession();
+    const e = await loadEngine();
+    const rearm = async () => { await e.adapter.interrupt({ sessionId: 's1' }); await e.toggleLocalVoiceTurn(id); };
+    await e.toggleLocalVoiceTurn(id);
+    await vi.waitFor(() => expect(h.welcomeResponses).toHaveLength(1));
+    await rearm();
+    await vi.waitFor(() => expect(h.welcomeResponses).toHaveLength(2));
+    return { h, rearm };
+  }
+
+  it('a superseded welcome on the reused agent cannot suppress a later rearm\'s welcome', async()=>{
+    const { h, rearm } = await rearmDuringWelcome();
+    h.welcomeResponses[0]!({ok:true,result:{assistantText:'Superseded first welcome'}});
+    await drain();
+    // A cancel and rearm while the second welcome is in flight makes a third welcome the current one.
+    await rearm();
+    h.welcomeResponses[1]!({ok:true,result:{assistantText:'Superseded second welcome'}});
+    await drain();
+    expect(speech).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(h.welcomeResponses).toHaveLength(3));
+    h.welcomeResponses[2]!({ok:true,result:{assistantText:'Current third welcome'}});
+    await vi.waitFor(() => expect(speech).toHaveBeenCalledTimes(1));
+    expect(speech.mock.calls.map(x=>x[0])).toEqual(['Current third welcome']);
+    expect(h.runStarts()).toBe(1);
+  });
+
+  it.each(['before','after'] as const)('a superseded welcome arriving %s the current empty welcome leaves the call unwelcomed', async(order)=>{
+    const { h, rearm } = await rearmDuringWelcome();
+    const supersededArrives = async () => { h.welcomeResponses[0]!({ok:true,result:{assistantText:'Superseded welcome'}}); await drain(); };
+    if (order === 'before') await supersededArrives();
+    h.welcomeResponses[1]!({ok:true,result:{assistantText:''}});
+    await drain();
+    if (order === 'after') await supersededArrives();
+    expect(speech).not.toHaveBeenCalled();
+    await rearm();
+    await vi.waitFor(() => expect(h.welcomeResponses).toHaveLength(3));
+    h.welcomeResponses[2]!({ok:true,result:{assistantText:'Retry welcome'}});
+    await vi.waitFor(() => expect(speech).toHaveBeenCalledTimes(1));
+    expect(speech.mock.calls.map(x=>x[0])).toEqual(['Retry welcome']);
+    expect(h.runStarts()).toBe(1);
+  });
+
+  it.each(['superseded-first','current-first'] as const)('a delivered current welcome still deduplicates the next rearm (%s)', async(order)=>{
+    const { h, rearm } = await rearmDuringWelcome();
+    const superseded = () => h.welcomeResponses[0]!({ok:true,result:{assistantText:'Superseded welcome'}});
+    const current = () => h.welcomeResponses[1]!({ok:true,result:{assistantText:'Current welcome'}});
+    if (order === 'superseded-first') { superseded(); await drain(); current(); }
+    else { current(); await drain(); superseded(); }
+    await vi.waitFor(() => expect(speech).toHaveBeenCalledTimes(1));
+    await drain();
+    await rearm();
+    await drain();
+    expect(h.welcomeResponses).toHaveLength(2);
+    expect(speech.mock.calls.map(x=>x[0])).toEqual(['Current welcome']);
+    expect(h.runStarts()).toBe(1);
   });
 
   let audioStarts=0;
