@@ -1735,6 +1735,36 @@ describe('runCodex CodexACP resume behavior', () => {
     }));
   });
 
+  it('keeps daemon sessions on the exclusive stdio app-server when the runtime cannot use shared control', async () => {
+    resolveCodexSharedControlSupportSpy.mockResolvedValueOnce({ ok: false as const, reason: 'unsupported-runtime' as const });
+    resolveRunnerMcpServersSpy.mockResolvedValueOnce({
+      happierMcpServer: { url: 'http://127.0.0.1:0', stop: vi.fn() },
+      mcpServers: {},
+    });
+    sessionInputConsumerWaitForNextInputImpl = async () => {
+      throw new Error('stop-after-exclusive-server-start');
+    };
+
+    const { runCodex } = await import('./runCodex');
+    await runCodex({
+      credentials: { token: 'test' } as Credentials,
+      startedBy: 'daemon',
+      startingMode: 'remote',
+      codexBackendMode: 'appServer',
+    } as any).catch(() => undefined);
+
+    expect(resolveCodexSharedControlSupportSpy).toHaveBeenCalledOnce();
+    expect(createCodexSharedAppServerSpy).not.toHaveBeenCalled();
+    expect(writeCodexSharedControlEndpointSpy).not.toHaveBeenCalled();
+    expect(createCodexSharedLocalControlSpy).not.toHaveBeenCalled();
+    expect(createCodexAppServerDaemonProxyClientSpy).not.toHaveBeenCalled();
+    expect(createCodexAppServerRuntimeSpy).toHaveBeenCalledOnce();
+    // Without a createClient override the runtime starts its own `app-server --listen stdio://` client.
+    const runtimeArgs = createCodexAppServerRuntimeSpy.mock.calls[0]?.[0] as { createClient?: unknown } | undefined;
+    expect(runtimeArgs).toBeDefined();
+    expect(runtimeArgs?.createClient).toBeUndefined();
+  });
+
   it('reuses the existing Codex daemon transport without creating or publishing a Happier-owned server', async () => {
     process.env.HAPPIER_CODEX_APP_SERVER_TRANSPORT = 'daemonProxy';
     process.env.HAPPIER_RUNNER_TERMINATION_TIMEOUT_MS = '250';

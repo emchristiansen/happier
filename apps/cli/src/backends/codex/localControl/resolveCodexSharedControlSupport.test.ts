@@ -17,6 +17,7 @@ describe('resolveCodexSharedControlSupport', () => {
       cwd: '/workspace',
       processEnv: {},
       platform,
+      isBunRuntime: false,
       dependencies: {
         resolveInvocation: async () => ({ command: '/usr/bin/node', args: ['/codex.js', '--version'] }),
         execute,
@@ -25,5 +26,36 @@ describe('resolveCodexSharedControlSupport', () => {
 
     expect(result.ok).toBe(expected);
     expect(execute).toHaveBeenCalledWith('/usr/bin/node', ['/codex.js', '--version'], {});
+  });
+
+  it.each(['linux', 'darwin'] as const)('keeps Bun runners on the stdio app-server on %s', async (platform) => {
+    const execute = vi.fn(() => 'codex-cli 0.162.1');
+    const result = await resolveCodexSharedControlSupport({
+      cwd: '/workspace',
+      processEnv: {},
+      platform,
+      isBunRuntime: true,
+      dependencies: {
+        resolveInvocation: async () => ({ command: '/usr/bin/codex', args: ['--version'] }),
+        execute,
+      },
+    });
+
+    expect(result).toEqual({ ok: false, reason: 'unsupported-runtime' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('detects the current runtime when the caller does not say', async () => {
+    const result = await resolveCodexSharedControlSupport({
+      cwd: '/workspace',
+      processEnv: {},
+      platform: 'linux',
+      dependencies: {
+        resolveInvocation: async () => ({ command: '/usr/bin/codex', args: ['--version'] }),
+        execute: () => 'codex-cli 0.162.1',
+      },
+    });
+
+    expect(result.ok).toBe(typeof process.versions.bun !== 'string');
   });
 });

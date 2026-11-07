@@ -16,8 +16,20 @@ export async function resolveCodexSharedControlSupport(params: Readonly<{
   cwd: string;
   processEnv?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
+  isBunRuntime?: boolean;
   dependencies?: Partial<Dependencies>;
-}>): Promise<Readonly<{ ok: true }> | Readonly<{ ok: false; reason: 'unsupported-version' }>> {
+}>): Promise<
+  | Readonly<{ ok: true }>
+  | Readonly<{ ok: false; reason: 'unsupported-version' }>
+  | Readonly<{ ok: false; reason: 'unsupported-runtime' }>
+> {
+  // Shared control reaches the app-server through a WebSocket over its AF_UNIX socket.
+  // Bun's node:http client neither calls ws's createConnection nor emits 'upgrade'
+  // (verified on Bun 1.3.13), so the handshake dials TCP localhost instead. Keep Bun
+  // runners on the exclusive stdio app-server until Happier owns a Bun-capable transport.
+  if (params.isBunRuntime ?? (typeof process.versions.bun === 'string')) {
+    return { ok: false, reason: 'unsupported-runtime' };
+  }
   const processEnv = params.processEnv ?? process.env;
   const resolveInvocation = params.dependencies?.resolveInvocation ?? resolveCodexCliInvocation;
   const execute = params.dependencies?.execute ?? ((command, args, env) => execFileSync(command, args, {
