@@ -221,6 +221,7 @@ test('dev lifecycle-owner shutdown consumes a fresh preserveDaemon request', { t
     reason: 'restart while preserving daemon',
     preserveDaemon: true,
   });
+  assert.equal(owner.exitCode ?? owner.signalCode, null, `dev owner must still be running when shutdown is requested\nstdout:\n${stdout}\nstderr:\n${stderr}`);
   owner.kill('SIGTERM');
   const exit = await waitFor(async () => {
     const result = await Promise.race([
@@ -231,6 +232,7 @@ test('dev lifecycle-owner shutdown consumes a fresh preserveDaemon request', { t
   }, { label: 'dev owner shutdown' });
 
   assert.equal(exit.code, 0, `stdout:\n${stdout}\nstderr:\n${stderr}`);
+  assert.match(stdout, /\[local\] shutting down/, 'SIGTERM must run the owner shutdown path');
   assert.equal(isPidAlive(daemonPid), true, 'fresh preserveDaemon request must keep the daemon alive');
   assert.equal(await readFile(stopMarkerPath, 'utf8').catch(() => ''), stopMarkerBeforeShutdown);
   const finalized = await readStackRuntimeStateFile(runtimeStatePath);

@@ -196,6 +196,48 @@ describe('startTestDaemon', () => {
     }
   });
 
+  it('launches and restarts a prepared snapshot in the repo-mirror dist generation layout', async () => {
+    const testDir = await mkdtemp(join(tmpdir(), 'happier-daemon-prepared-dist-mirror-'));
+    const homeDir = resolve(testDir, 'home');
+    // A dist generation: the CLI package at apps/cli below the mirror root, root packages in the mirror's node_modules.
+    const mirrorDir = resolve(testDir, 'cli-dist-snapshot-generation-fixture');
+    const snapshotDir = resolve(mirrorDir, 'apps', 'cli');
+    let daemon: Awaited<ReturnType<typeof startTestDaemon>> | null = null;
+
+    try {
+      await mkdir(homeDir, { recursive: true });
+      const snapshotEntrypoint = await writePreparedDaemonSnapshot(snapshotDir, { httpPort: 32_233 });
+      await writeFile(resolve(snapshotDir, '.cli-dist-snapshot.ready.json'), JSON.stringify({ v: 2, layout: 'repo-mirror', createdAt: 'fixture' }), 'utf8');
+      await mkdir(resolve(mirrorDir, 'node_modules'), { recursive: true });
+
+      const actualResolveCliTestLaunchSpec = cliLaunchSpecMock.actualResolveCliTestLaunchSpec;
+      if (!actualResolveCliTestLaunchSpec) throw new Error('missing actual resolveCliTestLaunchSpec');
+      cliLaunchSpecMock.resolveCliTestLaunchSpec.mockImplementationOnce(actualResolveCliTestLaunchSpec);
+
+      daemon = await startTestDaemon({
+        testDir,
+        happyHomeDir: homeDir,
+        env: {},
+        snapshotDir,
+        preparedDistSnapshotOnly: true,
+        startupTimeoutMs: 15_000,
+      });
+
+      expect(daemon.state.httpPort).toBe(32_233);
+      expect(daemon.proc.child.spawnargs).toEqual([process.execPath, '--preserve-symlinks', snapshotEntrypoint, 'daemon', 'start-sync']);
+      const originalPid = daemon.state.pid;
+      const originalArguments = daemon.proc.child.spawnargs;
+      await daemon.proc.stop();
+      cliLaunchSpecMock.resolveCliTestLaunchSpec.mockImplementationOnce(actualResolveCliTestLaunchSpec);
+      daemon = await daemon.restart();
+      expect(daemon.state.pid).not.toBe(originalPid);
+      expect(daemon.proc.child.spawnargs).toEqual(originalArguments);
+    } finally {
+      if (daemon) await daemon.stop();
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
   it.each<{
     label: string;
     snapshotDir: 'whitespace' | 'fixture';
@@ -828,7 +870,7 @@ const j078Boundary = await vi.hoisted(async () => {
   const http = req('node:http');
   const https = req('node:https');
   const net = req('node:net');
-  const original = { read: fs.readFileSync, cpSync: fs.cpSync, cp: promises.cp, kill: process.kill, fetch: globalThis.fetch,
+  const original = { read: fs.readFileSync, cpSync: fs.cpSync, openSync: fs.openSync, cp: promises.cp, rename: promises.rename, kill: process.kill, fetch: globalThis.fetch,
     child: Object.fromEntries(['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'].map((key) => [key, cp[key]])),
     httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
   const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>),
@@ -864,17 +906,30 @@ const j078Boundary = await vi.hoisted(async () => {
     }
   };
   fs.cpSync = (...args: unknown[]) => { if (state.active) { allowed(args[0]); allowed(args[1]); } return original.cpSync(...args); };
+  // The snapshot copier writes files through openSync (no copy_file_range), so bound its write/create opens to TMPDIR too.
+  // Read-only opens are exempt: readFileSync internals and module loading also route through fs.openSync.
+  const isWriteOpen = (flags: unknown) => typeof flags === 'string'
+    ? /[wa+]/.test(flags)
+    : typeof flags === 'number' && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT
+      | fs.constants.O_TRUNC | fs.constants.O_APPEND)) !== 0;
+  fs.openSync = (...args: unknown[]) => { if (state.active && isWriteOpen(args[1])) allowed(args[0]); return original.openSync(...args); };
   promises.cp = async (src: string, dest: string, ...args: unknown[]) => {
     if (state.active) { allowed(src); allowed(dest); }
     const run = () => original.cp(src, dest, ...args) as Promise<void>;
     return state.active && state.onCopy ? state.onCopy(src, dest, run) : run();
   };
+  promises.rename = async (src: string, dest: string) => {
+    if (state.active) { allowed(dest); allowed(src); }
+    return original.rename(src, dest) as Promise<void>;
+  };
   syncBuiltinESMExports();
   if ((await import('node:child_process')).spawnSync !== cp.spawnSync
     || (await import('node:fs')).readFileSync !== fs.readFileSync
-    || (await import('node:fs/promises')).cp !== promises.cp) throw new Error('J078 actual builtin binding mismatch');
+    || (await import('node:fs')).openSync !== fs.openSync
+    || (await import('node:fs/promises')).cp !== promises.cp
+    || (await import('node:fs/promises')).rename !== promises.rename) throw new Error('J078 actual builtin binding mismatch');
   return { state, spawnSyncExport: cp.spawnSync, killExport: process.kill, restore: () => {
-    fs.readFileSync = original.read; fs.cpSync = original.cpSync; promises.cp = original.cp;
+    fs.readFileSync = original.read; fs.cpSync = original.cpSync; fs.openSync = original.openSync; promises.cp = original.cp; promises.rename = original.rename;
     for (const key of Object.keys(original.child)) cp[key] = original.child[key];
     http.request = original.httpRequest; https.request = original.httpsRequest;
     http.createServer = original.httpServer; net.createServer = original.netServer;

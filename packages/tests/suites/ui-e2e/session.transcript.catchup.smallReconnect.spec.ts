@@ -5,15 +5,25 @@ import { join, resolve } from 'node:path';
 import { createRunDirs } from '../../src/testkit/runDir';
 import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
 import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
-import { startTestDaemon, type StartedDaemon } from '../../src/testkit/daemon/daemon';
-import { startCliAuthLoginForTerminalConnect, type StartedCliTerminalConnect } from '../../src/testkit/uiE2e/cliTerminalConnect';
+import {
+  resolveTestDaemonCliLaunchSpec,
+  startTestDaemon,
+  type PreparedTestDaemonCliLaunchSpec,
+  type StartedDaemon,
+} from '../../src/testkit/daemon/daemon';
+import {
+  resolveCliTerminalConnectLaunchSpec,
+  startCliAuthLoginForTerminalConnect,
+  type PreparedCliTerminalConnectLaunchSpec,
+  type StartedCliTerminalConnect,
+} from '../../src/testkit/uiE2e/cliTerminalConnect';
 import {
   createSessionFromNewSessionComposer,
   reloadCreatedSessionFromNewSessionComposer,
 } from '../../src/testkit/uiE2e/createSessionFromNewSessionComposer';
 import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
-import { runCliJson } from '../../src/testkit/uiE2e/cliJson';
+import { resolveCliJsonLaunchSpec, runCliJson, type PreparedCliJsonLaunchSpec } from '../../src/testkit/uiE2e/cliJson';
 import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
 import { waitForDaemonMachineIdFromCliSettings } from '../../src/testkit/uiE2e/daemonMachineId';
 
@@ -24,11 +34,38 @@ test.describe('ui e2e: transcript small reconnect catch-up', () => {
 
   const suiteDir = run.testDir('session-transcript-catchup-small-suite');
   const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+  const t1TestDir = resolve(join(suiteDir, 't1-reconnect-small'));
+  const t1CliLoginEnv = (): NodeJS.ProcessEnv => ({
+    ...process.env,
+    HOME: cliHomeDir,
+    CI: '1',
+    HAPPIER_DISABLE_CAFFEINATE: '1',
+    HAPPIER_VARIANT: 'dev',
+  });
+  const t1DaemonEnv = (serverUrl: string, webappUrl: string): NodeJS.ProcessEnv => ({
+    ...process.env,
+    HOME: cliHomeDir,
+    CI: '1',
+    HAPPIER_HOME_DIR: cliHomeDir,
+    HAPPIER_SERVER_URL: serverUrl,
+    HAPPIER_WEBAPP_URL: webappUrl,
+    HAPPIER_DISABLE_CAFFEINATE: '1',
+    HAPPIER_VARIANT: 'dev',
+    HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
+    HAPPIER_E2E_FAKE_CLAUDE_LOG: resolve(join(t1TestDir, 'fake-claude.jsonl')),
+    HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
+    HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
+  });
+  const t1CliJsonEnv = (): NodeJS.ProcessEnv => ({ ...process.env, HOME: cliHomeDir });
 
   let server: StartedServer | null = null;
   let ui: StartedUiWeb | null = null;
   let uiBaseUrl: string | null = null;
   let daemon: StartedDaemon | null = null;
+  // Immutable CLI launch specs prepared once here (outside the per-test budget) and borrowed by t1.
+  let t1CliLoginLaunchSpec: PreparedCliTerminalConnectLaunchSpec | null = null;
+  let t1DaemonLaunchSpec: PreparedTestDaemonCliLaunchSpec | null = null;
+  let t1CliJsonLaunchSpec: PreparedCliJsonLaunchSpec | null = null;
 
   test.beforeAll(async () => {
     test.setTimeout(resolveUiWebBeforeAllTimeoutMs(process.env));
@@ -65,6 +102,14 @@ test.describe('ui e2e: transcript small reconnect catch-up', () => {
     });
 
     uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+
+    await mkdir(t1TestDir, { recursive: true });
+    t1CliLoginLaunchSpec = await resolveCliTerminalConnectLaunchSpec({ testDir: t1TestDir, env: t1CliLoginEnv() });
+    t1DaemonLaunchSpec = await resolveTestDaemonCliLaunchSpec({
+      testDir: t1TestDir,
+      env: t1DaemonEnv(server.baseUrl, uiBaseUrl),
+    });
+    t1CliJsonLaunchSpec = await resolveCliJsonLaunchSpec({ testDir: t1TestDir, env: t1CliJsonEnv() });
   });
 
   test.afterAll(async () => {
@@ -77,13 +122,16 @@ test.describe('ui e2e: transcript small reconnect catch-up', () => {
   test('uses incremental afterSeq catch-up on reconnect when gap is small', { tag: "@smoke" }, async ({ page }) => {
     test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
+    if (!t1CliLoginLaunchSpec || !t1DaemonLaunchSpec || !t1CliJsonLaunchSpec) {
+      throw new Error('missing prepared CLI launch specs');
+    }
 
     await page.setViewportSize({ width: 1440, height: 900 });
     await gotoDomContentLoadedWithRetries(page, uiBaseUrl);
 
     await ensureAccountReadyForConnect({ page, timeoutMs: 120_000 });
 
-    const testDir = resolve(join(suiteDir, 't1-reconnect-small'));
+    const testDir = t1TestDir;
     await mkdir(testDir, { recursive: true });
 
     const cliLogin: StartedCliTerminalConnect = await startCliAuthLoginForTerminalConnect({
@@ -91,13 +139,8 @@ test.describe('ui e2e: transcript small reconnect catch-up', () => {
       cliHomeDir,
       serverUrl: server.baseUrl,
       webappUrl: uiBaseUrl,
-      env: {
-        ...process.env,
-        HOME: cliHomeDir,
-        CI: '1',
-        HAPPIER_DISABLE_CAFFEINATE: '1',
-        HAPPIER_VARIANT: 'dev',
-      },
+      env: t1CliLoginEnv(),
+      preparedCliLaunchSpec: t1CliLoginLaunchSpec,
     });
 
     await page.goto(cliLogin.connectUrl, { waitUntil: 'domcontentloaded' });
@@ -106,26 +149,11 @@ test.describe('ui e2e: transcript small reconnect catch-up', () => {
     await cliLogin.waitForSuccess();
     await cliLogin.stop().catch(() => {});
 
-    const fakeClaudeLogPath = resolve(join(testDir, 'fake-claude.jsonl'));
-    const fakeClaudePath = fakeClaudeFixturePath();
-
     daemon = await startTestDaemon({
       testDir,
       happyHomeDir: cliHomeDir,
-      env: {
-        ...process.env,
-        HOME: cliHomeDir,
-        CI: '1',
-        HAPPIER_HOME_DIR: cliHomeDir,
-        HAPPIER_SERVER_URL: server.baseUrl,
-        HAPPIER_WEBAPP_URL: uiBaseUrl,
-        HAPPIER_DISABLE_CAFFEINATE: '1',
-        HAPPIER_VARIANT: 'dev',
-        HAPPIER_CLAUDE_PATH: fakeClaudePath,
-        HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
-        HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
-        HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
-      },
+      env: t1DaemonEnv(server.baseUrl, uiBaseUrl),
+      preparedCliLaunchSpec: t1DaemonLaunchSpec,
     });
 
     const machineId = await waitForDaemonMachineIdFromCliSettings({ cliHomeDir, timeoutMs: 120_000 });
@@ -154,10 +182,11 @@ test.describe('ui e2e: transcript small reconnect catch-up', () => {
         cliHomeDir,
         serverUrl: server.baseUrl,
         webappUrl: uiBaseUrl,
-        env: { ...process.env, HOME: cliHomeDir },
+        env: t1CliJsonEnv(),
         label: `session-send-missed-${i}`,
         args: ['session', 'send', sessionId, message, '--json'],
         timeoutMs: 120_000,
+        preparedCliLaunchSpec: t1CliJsonLaunchSpec,
       });
       expect(sendEnvelope.ok).toBe(true);
       expect(sendEnvelope.kind).toBe('session_send');

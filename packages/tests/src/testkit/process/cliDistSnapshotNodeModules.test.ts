@@ -1,11 +1,14 @@
 import { afterAll as j078AfterAll, beforeEach as j078BeforeEach } from 'vitest';
-import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, lstatSync, mkdtempSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, posix, resolve, win32 } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ensureCliDistSnapshotNodeModules, ensureCliPackSnapshotRuntimeDependencies } from './cliDistSnapshotNodeModules';
+import {
+  createRetainedCliSnapshot, ensureCliDistSnapshotNodeModules, ensureCliPackSnapshotRuntimeDependencies, isPathStrictlyInside,
+} from './cliDistSnapshotNodeModules';
 
 const createdDirs: string[] = [];
 
@@ -34,12 +37,12 @@ describe('ensureCliDistSnapshotNodeModules', () => {
 
   it('J078 copies the bundled @happier-dev scope into the snapshot instead of aliasing the live tree', () => {
     const rootDir = createRepoRoot();
-    const snapshotDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-out-'));
-    createdDirs.push(snapshotDir);
-    const snapshotDistDir = resolve(snapshotDir, 'dist');
-    mkdirSync(snapshotDistDir, { recursive: true });
+    const rootMirrorDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-out-'));
+    createdDirs.push(rootMirrorDir);
+    const snapshotDir = resolve(rootMirrorDir, 'apps', 'cli');
+    mkdirSync(resolve(snapshotDir, 'dist'), { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootMirrorDir, rootDir });
 
     const snapshotFile = join(snapshotDir, 'node_modules', '@happier-dev', 'protocol', 'node_modules', '@noble', 'hashes', 'hmac.js');
     expect(readFileSync(snapshotFile, 'utf8')).toContain('initial');
@@ -61,12 +64,12 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     writeFileSync(join(rootDir, 'apps', 'cli', 'node_modules', 'zod', 'package.json'), '{"name":"zod"}', 'utf8');
     writeFileSync(join(rootDir, 'apps', 'cli', 'node_modules', 'zod', 'index.js'), 'export const live = "initial";\n', 'utf8');
 
-    const snapshotDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-direct-deps-out-'));
-    createdDirs.push(snapshotDir);
-    const snapshotDistDir = resolve(snapshotDir, 'dist');
-    mkdirSync(snapshotDistDir, { recursive: true });
+    const rootMirrorDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-direct-deps-out-'));
+    createdDirs.push(rootMirrorDir);
+    const snapshotDir = resolve(rootMirrorDir, 'apps', 'cli');
+    mkdirSync(resolve(snapshotDir, 'dist'), { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootMirrorDir, rootDir });
 
     const snapshotFile = join(snapshotDir, 'node_modules', 'zod', 'index.js');
     expect(readFileSync(snapshotFile, 'utf8')).toContain('initial');
@@ -118,7 +121,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     const snapshotCoreFile = join(
       snapshotDir,
@@ -170,7 +173,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     const snapshotFile = join(
       snapshotDir,
@@ -217,7 +220,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     const snapshotZodDir = join(snapshotDir, 'node_modules', '@happier-dev', 'agents', 'node_modules', 'zod');
     expect(lstatSync(snapshotZodDir).isSymbolicLink()).toBe(false);
@@ -303,7 +306,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     const snapshotZodDir = join(snapshotDir, 'node_modules', '@happier-dev', 'agents', 'node_modules', 'zod');
     expect(existsSync(snapshotZodDir)).toBe(true);
@@ -407,7 +410,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     expect(
       readFileSync(
@@ -484,7 +487,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     expect(
       readFileSync(join(snapshotDir, 'node_modules', '@happier-dev', 'protocol', 'node_modules', 'zod', 'index.js'), 'utf8'),
@@ -520,7 +523,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     expect(readFileSync(join(snapshotDir, 'node_modules', '@happier-dev', 'cli-common', 'dist', 'index.js'), 'utf8')).toContain(
       'stable',
@@ -555,7 +558,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
       'utf8',
     );
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     const snapshotFile = join(snapshotDir, 'node_modules', '@happier-dev', 'release-runtime', 'dist', 'github.js');
     expect(readFileSync(snapshotFile, 'utf8')).toContain('initial');
@@ -594,7 +597,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     const snapshotPackageJson = join(snapshotDir, 'node_modules', '@happier-dev', 'connection-supervisor', 'package.json');
     expect(readFileSync(snapshotPackageJson, 'utf8')).toContain('@happier-dev/connection-supervisor');
@@ -640,7 +643,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     expect(readFileSync(join(snapshotDir, 'node_modules', '@happier-dev', 'cli-common', 'processInstance.mjs'), 'utf8')).toContain(
       'processInstance',
@@ -690,7 +693,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     const snapshotPackageJson = JSON.parse(
       readFileSync(join(snapshotDir, 'node_modules', '@happier-dev', 'agents', 'package.json'), 'utf8'),
@@ -745,7 +748,7 @@ describe('ensureCliDistSnapshotNodeModules', () => {
     const snapshotDistDir = resolve(snapshotDir, 'dist');
     mkdirSync(snapshotDistDir, { recursive: true });
 
-    ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
 
     const snapshotFile = join(snapshotDir, 'node_modules', '@happier-dev', 'release-runtime', 'dist', 'github.js');
     expect(readFileSync(snapshotFile, 'utf8')).toContain('workspace-dist');
@@ -1023,6 +1026,198 @@ describe('ensureCliDistSnapshotNodeModules', () => {
 });
 
 
+
+// Fixture repository whose CLI declares root-hoisted runtime dependencies. j078-direct needs the ROOT version of a name the
+// CLI also carries locally (j078-cli-local@1 versus the CLI's @2) and its own nested j078-nested@3, while j078-transitive
+// needs the root j078-nested@1; j078-direct and j078-transitive depend on each other.
+function writeRuntimePackage(dir: string, manifest: Record<string, unknown>, body: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(resolve(dir, 'package.json'), JSON.stringify({ main: 'index.js', ...manifest }));
+  writeFileSync(resolve(dir, 'index.js'), body);
+}
+function createDeclaredRuntimeRoot(): string {
+  const root = createRepoRoot();
+  const modules = resolve(root, 'node_modules');
+  writeFileSync(resolve(root, 'apps', 'cli', 'package.json'), JSON.stringify({
+    name: '@happier-dev/cli',
+    dependencies: { 'j078-direct': '1', '@j078/scoped': '1', 'j078-cli-local': '2', 'j078-lazy': '1' },
+    optionalDependencies: { 'j078-absent-optional': '1' },
+  }));
+  writeRuntimePackage(resolve(root, 'apps', 'cli', 'node_modules', 'j078-cli-local'), { name: 'j078-cli-local', version: '2.0.0' },
+    "module.exports = 'cli-local@2';\n");
+  writeRuntimePackage(resolve(modules, 'j078-cli-local'), { name: 'j078-cli-local', version: '1.0.0' }, "module.exports = 'cli-local@1';\n");
+  writeRuntimePackage(resolve(modules, 'j078-direct'), {
+    name: 'j078-direct', version: '1.0.0', dependencies: { 'j078-cli-local': '1', 'j078-transitive': '1', 'j078-nested': '3' },
+  }, "module.exports = { direct: '1', cliLocal: require('j078-cli-local'), nested: require('j078-nested'), transitive: require('j078-transitive') };\n");
+  writeRuntimePackage(resolve(modules, 'j078-direct', 'node_modules', 'j078-nested'), { name: 'j078-nested', version: '3.0.0' },
+    "module.exports = 'nested@3';\n");
+  writeRuntimePackage(resolve(modules, 'j078-nested'), { name: 'j078-nested', version: '1.0.0' }, "module.exports = 'nested@1';\n");
+  writeRuntimePackage(resolve(modules, 'j078-transitive'), {
+    name: 'j078-transitive', version: '1.0.0', dependencies: { 'j078-direct': '1', 'j078-nested': '1' },
+  }, "module.exports = { name: 'transitive', nested: require('j078-nested') };\n");
+  writeRuntimePackage(resolve(modules, '@j078', 'scoped'), { name: '@j078/scoped', version: '1.0.0' }, "module.exports = 'scoped';\n");
+  writeRuntimePackage(resolve(modules, 'j078-lazy'), { name: 'j078-lazy', version: '1.0.0' }, "module.exports = 'lazy';\n");
+  writeRuntimePackage(resolve(modules, 'j078-unrelated'), { name: 'j078-unrelated', version: '1.0.0' }, "module.exports = 'unrelated';\n");
+  return root;
+}
+function listTree(dir: string): string[] {
+  return readdirSync(dir, { recursive: true, withFileTypes: true }).map((entry) => {
+    const path = resolve(entry.parentPath, entry.name); const stat = lstatSync(path);
+    return `${path} ${stat.mode} ${stat.mtimeMs} ${entry.isFile() ? readFileSync(path, 'utf8') : ''}`;
+  }).sort();
+}
+
+describe('J078 dist fallback declared runtime closure', () => {
+  const dirs: string[] = [];
+  afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+  // The retained generation is published through the real owner, outside the source root, and detached by it. It mirrors
+  // the repository layout: the CLI package at apps/cli and the root runtime closure in the generation's node_modules.
+  async function prepare(root: string): Promise<string> {
+    const outside = mkdtempSync(join(tmpdir(), 'happier-cli-dist-fallback-'));
+    dirs.push(root, outside);
+    const generation = await createRetainedCliSnapshot({
+      snapshotDir: resolve(outside, 'cli-dist-snapshot'),
+      prepare: (payload) => {
+        const cliDir = resolve(payload, 'apps', 'cli');
+        mkdirSync(resolve(cliDir, 'dist'), { recursive: true });
+        ensureCliDistSnapshotNodeModules({ snapshotDir: cliDir, rootMirrorDir: payload, rootDir: root });
+      },
+    });
+    return resolve(generation, 'apps', 'cli', 'dist');
+  }
+  const rootClosureOf = (distDir: string) => resolve(distDir, '..', '..', '..', 'node_modules');
+  it('J078 dist fallback loads placed packages at their source-tree versions after the source is removed', async () => {
+    const root = createDeclaredRuntimeRoot();
+    const fromSource = createRequire(resolve(root, 'apps', 'cli', 'dist', 'probe.cjs'));
+    const names = ['j078-direct', '@j078/scoped', 'j078-cli-local', 'j078-lazy'];
+    const expected = Object.fromEntries(names.map((name) => [name, fromSource(name)]));
+    const distDir = await prepare(root);
+    rmSync(root, { recursive: true, force: true });
+    const fromGeneration = createRequire(resolve(distDir, 'probe.cjs'));
+    expect(Object.fromEntries(names.map((name) => [name, fromGeneration(name)]))).toEqual(expected);
+    expect(expected['j078-direct']).toEqual({
+      direct: '1', cliLocal: 'cli-local@1', nested: 'nested@3', transitive: { name: 'transitive', nested: 'nested@1' },
+    });
+    // Dist's own import of a CLI-local name keeps the CLI's version.
+    expect(expected['j078-cli-local']).toBe('cli-local@2');
+  });
+  it('J078 dist fallback omits root packages outside the declared runtime closure', async () => {
+    const root = createDeclaredRuntimeRoot(); const distDir = await prepare(root);
+    const closure = rootClosureOf(distDir);
+    expect(readdirSync(closure).sort()).toEqual(['@j078', 'j078-cli-local', 'j078-direct', 'j078-lazy', 'j078-nested', 'j078-transitive']);
+    expect(readdirSync(resolve(closure, '@j078'))).toEqual(['scoped']);
+    // The root copy of a CLI-local name is reached by j078-direct and sits at the root position, behind the CLI's own;
+    // a declared but never-imported dependency is still supplied. Nothing is placed among the dist chunks.
+    expect(readFileSync(resolve(closure, 'j078-cli-local', 'index.js'), 'utf8')).toContain('cli-local@1');
+    expect(readFileSync(resolve(distDir, '..', 'node_modules', 'j078-cli-local', 'index.js'), 'utf8')).toContain('cli-local@2');
+    expect(readFileSync(resolve(closure, 'j078-lazy', 'index.js'), 'utf8')).toContain('lazy');
+    expect(existsSync(resolve(distDir, 'node_modules'))).toBe(false);
+  });
+  it('J078 dist fallback links nothing without a CLI manifest', async () => {
+    const root = createDeclaredRuntimeRoot(); rmSync(resolve(root, 'apps', 'cli', 'package.json'));
+    const distDir = await prepare(root);
+    expect(existsSync(rootClosureOf(distDir)) ? readdirSync(rootClosureOf(distDir)) : []).toEqual([]);
+  });
+  it('J078 dist fallback refuses a root mirror that does not contain the snapshot at the CLI package path', () => {
+    const root = createDeclaredRuntimeRoot();
+    const outside = mkdtempSync(join(tmpdir(), 'happier-cli-dist-mirror-')); dirs.push(root, outside);
+    for (const snapshotDir of [outside, resolve(outside, 'cli'), resolve(outside, 'apps', 'cli', 'dist'), resolve(outside, 'other', 'apps', 'cli')]) {
+      expect(() => ensureCliDistSnapshotNodeModules({ snapshotDir, rootMirrorDir: outside, rootDir: root })).toThrow('is not the CLI package directory');
+    }
+    expect(readdirSync(outside)).toEqual([]);
+  });
+  it('J078 dist fallback recognizes placement descendants under each platform path semantics', () => {
+    // The planner's boundary predicate must hold for native Windows paths (backslashes, drives, case), not only POSIX ones.
+    const cases = [
+      { api: win32, parent: 'C:\\fixture\\snapshot\\dist\\node_modules', inside: ['C:\\fixture\\snapshot\\dist\\node_modules\\axios',
+        'C:\\fixture\\snapshot\\dist\\node_modules\\axios\\node_modules\\follow-redirects', 'c:\\FIXTURE\\snapshot\\dist\\node_modules\\@scope\\pkg'],
+        outside: ['C:\\fixture\\snapshot\\dist\\node_modules', 'C:\\fixture\\snapshot\\dist\\node_modules2\\axios', 'C:\\fixture\\snapshot\\dist',
+          'D:\\fixture\\snapshot\\dist\\node_modules\\axios'] },
+      { api: posix, parent: '/fixture/snapshot/dist/node_modules', inside: ['/fixture/snapshot/dist/node_modules/axios',
+        '/fixture/snapshot/dist/node_modules/axios/node_modules/follow-redirects', '/fixture/snapshot/dist/node_modules/@scope/pkg'],
+        outside: ['/fixture/snapshot/dist/node_modules', '/fixture/snapshot/dist/node_modules2/axios', '/fixture/snapshot/dist', '/other/node_modules/axios'] },
+    ];
+    for (const { api, parent, inside, outside } of cases) {
+      for (const path of inside) expect([path, isPathStrictlyInside(parent, path, api)]).toEqual([path, true]);
+      for (const path of outside) expect([path, isPathStrictlyInside(parent, path, api)]).toEqual([path, false]);
+    }
+  });
+  it('J078 dist fallback never writes into the live source tree', async () => {
+    const root = createDeclaredRuntimeRoot();
+    const before = [listTree(resolve(root, 'node_modules')), listTree(resolve(root, 'apps', 'cli', 'node_modules'))];
+    await prepare(root);
+    expect([listTree(resolve(root, 'node_modules')), listTree(resolve(root, 'apps', 'cli', 'node_modules'))]).toEqual(before);
+  });
+  // One registry module per package instance: a consumer can register a value and another read it back only when both
+  // resolve to the same instance.
+  const registry = (version: number) => 'const entries = new Map();\n'
+    + `module.exports = { version: ${version}, put: (k, v) => entries.set(k, v), get: (k) => entries.get(k) ?? null };\n`;
+  function addCliDependencies(root: string, dependencies: Record<string, string>): void {
+    const manifestPath = resolve(root, 'apps', 'cli', 'package.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    writeFileSync(manifestPath, JSON.stringify({ ...manifest, dependencies: { ...manifest.dependencies, ...dependencies } }));
+  }
+  it('J078 dist fallback shares one root package instance across dependents and keeps distinct instances distinct', async () => {
+    // Root j078-entry depends on root j078-left and j078-right. Both reach the ROOT j078-state@1, while the CLI carries
+    // its own j078-state@2. Both also use j078-tag@1: left reaches the root copy, right its own nested copy of the same
+    // version. In the source tree left and right therefore share one j078-state instance and hold two j078-tag instances.
+    const root = createDeclaredRuntimeRoot();
+    const modules = resolve(root, 'node_modules');
+    addCliDependencies(root, { 'j078-entry': '1', 'j078-state': '2' });
+    writeRuntimePackage(resolve(root, 'apps', 'cli', 'node_modules', 'j078-state'), { name: 'j078-state', version: '2.0.0' }, registry(2));
+    writeRuntimePackage(resolve(modules, 'j078-state'), { name: 'j078-state', version: '1.0.0' }, registry(1));
+    writeRuntimePackage(resolve(modules, 'j078-tag'), { name: 'j078-tag', version: '1.0.0' }, registry(1));
+    writeRuntimePackage(resolve(modules, 'j078-right', 'node_modules', 'j078-tag'), { name: 'j078-tag', version: '1.0.0' }, registry(1));
+    const side = (name: string) => `module.exports = { name: '${name}', state: require('j078-state'), tag: require('j078-tag') };\n`;
+    writeRuntimePackage(resolve(modules, 'j078-left'), { name: 'j078-left', version: '1.0.0', dependencies: { 'j078-state': '1', 'j078-tag': '1' } }, side('left'));
+    writeRuntimePackage(resolve(modules, 'j078-right'), { name: 'j078-right', version: '1.0.0', dependencies: { 'j078-state': '1', 'j078-tag': '1' } }, side('right'));
+    writeRuntimePackage(resolve(modules, 'j078-entry'), {
+      name: 'j078-entry', version: '1.0.0', dependencies: { 'j078-left': '1', 'j078-right': '1' },
+    }, "module.exports = { left: require('j078-left'), right: require('j078-right') };\n");
+    // Source and generation live at distinct paths, so each probe loads its own module instances.
+    const observe = (distDir: string) => {
+      const load = createRequire(resolve(distDir, 'probe.cjs'));
+      const { left, right } = load('j078-entry');
+      const cliState = load('j078-state');
+      left.state.put('key', 'via-left'); left.tag.put('key', 'via-left');
+      return {
+        versions: { left: left.state.version, right: right.state.version, cli: cliState.version, leftTag: left.tag.version, rightTag: right.tag.version },
+        stateSharedWithRight: right.state.get('key'), stateSharedWithCli: cliState.get('key'), tagSharedWithRight: right.tag.get('key'),
+      };
+    };
+    const expected = observe(resolve(root, 'apps', 'cli', 'dist'));
+    expect(expected).toEqual({
+      versions: { left: 1, right: 1, cli: 2, leftTag: 1, rightTag: 1 },
+      stateSharedWithRight: 'via-left', stateSharedWithCli: null, tagSharedWithRight: null,
+    });
+    const distDir = await prepare(root);
+    rmSync(root, { recursive: true, force: true });
+    expect(observe(distDir)).toEqual(expected);
+  });
+  it('J078 dist fallback lets a CLI-local package share the root dependency instance root packages use', async () => {
+    // The CLI's own j078-local-a and the root j078-root-c both depend on j078-root-b, which only the root provides.
+    const root = createDeclaredRuntimeRoot();
+    const modules = resolve(root, 'node_modules');
+    addCliDependencies(root, { 'j078-local-a': '1', 'j078-root-c': '1' });
+    writeRuntimePackage(resolve(modules, 'j078-root-b'), { name: 'j078-root-b', version: '1.0.0' }, registry(1));
+    const user = (name: string) => `module.exports = { name: '${name}', b: require('j078-root-b') };\n`;
+    writeRuntimePackage(resolve(root, 'apps', 'cli', 'node_modules', 'j078-local-a'),
+      { name: 'j078-local-a', version: '1.0.0', dependencies: { 'j078-root-b': '1' } }, user('local-a'));
+    writeRuntimePackage(resolve(modules, 'j078-root-c'), { name: 'j078-root-c', version: '1.0.0', dependencies: { 'j078-root-b': '1' } }, user('root-c'));
+    const observe = (distDir: string) => {
+      const load = createRequire(resolve(distDir, 'probe.cjs'));
+      const a = load('j078-local-a'); const c = load('j078-root-c');
+      a.b.put('key', 'via-local-a');
+      return { versions: [a.b.version, c.b.version], sharedWithRootC: c.b.get('key') };
+    };
+    const expected = observe(resolve(root, 'apps', 'cli', 'dist'));
+    expect(expected).toEqual({ versions: [1, 1], sharedWithRootC: 'via-local-a' });
+    const distDir = await prepare(root);
+    rmSync(root, { recursive: true, force: true });
+    expect(observe(distDir)).toEqual(expected);
+  });
+});
+
 // J078: install genuine system boundaries before the real owners load. Fixture cp remains real.
 const j078Boundary = await vi.hoisted(async () => {
   const { createRequire, syncBuiltinESMExports } = await import('node:module');
@@ -1033,10 +1228,11 @@ const j078Boundary = await vi.hoisted(async () => {
   const http = req('node:http');
   const https = req('node:https');
   const net = req('node:net');
-  const original = { read: fs.readFileSync, cpSync: fs.cpSync, cp: promises.cp, kill: process.kill, fetch: globalThis.fetch,
+  const original = { read: fs.readFileSync, cpSync: fs.cpSync, openSync: fs.openSync, cp: promises.cp, rename: promises.rename, kill: process.kill, fetch: globalThis.fetch,
     child: Object.fromEntries(['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'].map((key) => [key, cp[key]])),
     httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
-  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
+  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>),
+    onRename: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
   const refuse = (name: string) => (..._args: unknown[]) => { state.attempts.push(name); throw new Error(`J078 forbidden external boundary: ${name}`); };
   for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => state.active ? refuse(key)(...args) : original.child[key](...args);
   http.request = (...args: unknown[]) => state.active ? refuse('http')(...args) : original.httpRequest(...args);
@@ -1058,17 +1254,32 @@ const j078Boundary = await vi.hoisted(async () => {
     }
   };
   fs.cpSync = (...args: unknown[]) => { if (state.active) { allowed(args[0]); allowed(args[1]); } return original.cpSync(...args); };
+  // The snapshot copier writes files through openSync (no copy_file_range), so bound its write/create opens to TMPDIR too.
+  // Read-only opens are exempt: readFileSync internals and module loading also route through fs.openSync.
+  const isWriteOpen = (flags: unknown) => typeof flags === 'string'
+    ? /[wa+]/.test(flags)
+    : typeof flags === 'number' && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT
+      | fs.constants.O_TRUNC | fs.constants.O_APPEND)) !== 0;
+  fs.openSync = (...args: unknown[]) => { if (state.active && isWriteOpen(args[1])) allowed(args[0]); return original.openSync(...args); };
   promises.cp = async (src: string, dest: string, ...args: unknown[]) => {
     if (state.active) { allowed(src); allowed(dest); }
     const run = () => original.cp(src, dest, ...args) as Promise<void>;
     return state.active && state.onCopy ? state.onCopy(src, dest, run) : run();
   };
+  // Retained snapshots are published by rename, so bound its source and destination to TMPDIR too.
+  promises.rename = async (src: string, dest: string) => {
+    if (state.active) { allowed(dest); allowed(src); }
+    const run = () => original.rename(src, dest) as Promise<void>;
+    return state.active && state.onRename ? state.onRename(src, dest, run) : run();
+  };
   syncBuiltinESMExports();
   if ((await import('node:child_process')).spawnSync !== cp.spawnSync
     || (await import('node:fs')).readFileSync !== fs.readFileSync
-    || (await import('node:fs/promises')).cp !== promises.cp) throw new Error('J078 actual builtin binding mismatch');
+    || (await import('node:fs')).openSync !== fs.openSync
+    || (await import('node:fs/promises')).cp !== promises.cp
+    || (await import('node:fs/promises')).rename !== promises.rename) throw new Error('J078 actual builtin binding mismatch');
   return { state, restore: () => {
-    fs.readFileSync = original.read; fs.cpSync = original.cpSync; promises.cp = original.cp;
+    fs.readFileSync = original.read; fs.cpSync = original.cpSync; fs.openSync = original.openSync; promises.cp = original.cp; promises.rename = original.rename;
     for (const key of Object.keys(original.child)) cp[key] = original.child[key];
     http.request = original.httpRequest; https.request = original.httpsRequest;
     http.createServer = original.httpServer; net.createServer = original.netServer;
@@ -1083,8 +1294,11 @@ j078AfterAll(() => {
 });
 
 describe('J078 detached lazy runtime closure', () => {
+  // The ownership-bearing final allocation: the publication destination's enclosing allocation when the destination
+  // is <allocation>/<basename(allocation)>, else the destination itself (layouts that publish onto the allocation).
+  const allocationOf = (dest: string) => (basename(dest) === basename(dirname(dest)) ? dirname(dest) : dest);
   const roots: string[] = [];
-  afterEach(() => { j078Boundary.state.onCopy = null; for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+  afterEach(() => { j078Boundary.state.onCopy = null; j078Boundary.state.onRename = null; for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
   async function launchFixture(mode: 'copy' | 'symlink' = 'copy') {
     const root = createRepoRoot(); roots.push(root);
     mkdirSync(resolve(root, 'apps', 'cli', 'src'), { recursive: true });
@@ -1107,6 +1321,85 @@ describe('J078 detached lazy runtime closure', () => {
     expect(readFileSync(lazy, 'utf8')).toBe(before);
     expect(lstatSync(resolve(spec.cwd!, 'src')).isSymbolicLink()).toBe(false);
   });
+  it('J078 does not detach hoisted root packages into an unreachable source-generation dist fallback', async () => {
+    const f = await launchFixture('copy');
+    mkdirSync(resolve(f.root, 'node_modules', 'hoisted-only'), { recursive: true });
+    writeFileSync(resolve(f.root, 'node_modules', 'hoisted-only', 'index.js'), 'module.exports = "root";');
+    const spec = await f.launch();
+    expect(existsSync(resolve(spec.cwd!, 'dist', 'node_modules', 'hoisted-only'))).toBe(false);
+    expect(readFileSync(resolve(spec.cwd!, 'node_modules', '@happier-dev', 'protocol', 'node_modules', '@noble', 'hashes', 'hmac.js'), 'utf8'))
+      .toContain('initial');
+  });
+  it('J078 hydrates linked runtime entries as detached regular files that keep their mode', () => {
+    const rootDir = createRepoRoot();
+    const linkedSource = resolve(rootDir, 'packages', 'linked-runtime');
+    mkdirSync(linkedSource, { recursive: true });
+    writeFileSync(resolve(linkedSource, 'cli.js'), 'export const value = "initial";\n', { mode: 0o755 });
+    chmodSync(resolve(linkedSource, 'cli.js'), 0o755);
+    symlinkSync(linkedSource, resolve(rootDir, 'apps', 'cli', 'node_modules', 'linked-runtime'));
+    const snapshotDir = mkdtempSync(join(tmpdir(), 'happier-cli-dist-snapshot-bytes-'));
+    roots.push(rootDir, snapshotDir);
+
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
+
+    const copiedDir = resolve(snapshotDir, 'node_modules', 'linked-runtime');
+    const copiedFile = resolve(copiedDir, 'cli.js');
+    // linked-runtime is reached through a symlink, so the dereferencing copier materializes it; plain-directory
+    // merging in copyMissingEntry is intentionally unchanged R13 behavior (no mode/timestamp copy).
+    expect(lstatSync(copiedDir).isDirectory()).toBe(true);
+    expect(lstatSync(copiedDir).mode & 0o777).toBe(lstatSync(linkedSource).mode & 0o777);
+    // utimes takes Date (millisecond) values, as cpSync's preserveTimestamps did.
+    expect(Math.abs(lstatSync(copiedDir).mtimeMs - lstatSync(linkedSource).mtimeMs)).toBeLessThan(1);
+    expect(lstatSync(copiedFile).isFile()).toBe(true);
+    expect(lstatSync(copiedFile).mode & 0o777).toBe(0o755);
+    expect(lstatSync(copiedFile).ino).not.toBe(lstatSync(resolve(linkedSource, 'cli.js')).ino);
+    writeFileSync(resolve(linkedSource, 'cli.js'), 'export const value = "mutated";\n');
+    expect(readFileSync(copiedFile, 'utf8')).toContain('initial');
+  });
+  it('J078 refuses hydrated runtime copies outside the owned TMPDIR', () => {
+    const rootDir = createRepoRoot();
+    const linkedSource = resolve(rootDir, 'packages', 'linked-runtime');
+    mkdirSync(linkedSource, { recursive: true });
+    writeFileSync(resolve(linkedSource, 'cli.js'), 'export {};\n');
+    symlinkSync(linkedSource, resolve(rootDir, 'apps', 'cli', 'node_modules', 'linked-runtime'));
+    const outside = resolve(process.cwd(), '.project', 'tmp', `j078-outside-tmpdir-${process.pid}-${Date.now()}`);
+    try {
+      ensureCliDistSnapshotNodeModules({ snapshotDir: outside, rootDir });
+      expect(existsSync(resolve(outside, 'node_modules', 'linked-runtime', 'cli.js'))).toBe(false);
+      // Read-only opens outside TMPDIR (module loading, readFileSync internals) stay unbounded.
+      closeSync(openSync(resolve(process.cwd(), 'package.json'), 'r'));
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+      roots.push(rootDir);
+    }
+  });
+  it.each(['copy', 'symlink'] as const)('J078 returns a generation tree without symbolic links in %s mode', async (mode) => {
+    const f = await launchFixture(mode); const spec = await f.launch();
+    const links: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = resolve(dir, entry.name);
+        if (entry.isSymbolicLink()) links.push(path); else if (entry.isDirectory()) walk(path);
+      }
+    };
+    expect(lstatSync(spec.cwd!).isSymbolicLink()).toBe(false);
+    walk(spec.cwd!);
+    expect(links).toEqual([]);
+    expect(existsSync(resolve(spec.cwd!, 'src', 'index.ts'))).toBe(true);
+  });
+  it('J078 refuses a publication rename outside the owned TMPDIR', async () => {
+    const outside = resolve(process.cwd(), '.project', 'tmp', `j078-outside-tmpdir-rename-${process.pid}-${Date.now()}`);
+    try {
+      await expect(createRetainedCliSnapshot({
+        snapshotDir: resolve(outside, 'cli-source-snapshot'),
+        prepare: (payload) => { mkdirSync(resolve(payload, 'src'), { recursive: true }); },
+      })).rejects.toThrow(/outside owned TMPDIR: .*cli-source-snapshot-generation-/);
+      // Nothing is published, and both unpublished allocations are cleaned as before.
+      expect(readdirSync(outside)).toEqual([]);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
   it('J078 refuses required dangling scaffolding instead of publishing a live link', async () => {
     const f = await launchFixture();
     symlinkSync(resolve(f.root, 'not-present'), resolve(f.root, 'apps', 'cli', 'tools', 'dangling'));
@@ -1119,7 +1412,7 @@ describe('J078 detached lazy runtime closure', () => {
   });
   it('J078 refuses a replaced final allocation even after copy succeeds', async () => {
     const f = await launchFixture(); let replacement = '';
-    j078Boundary.state.onCopy = async (_src, dest, run) => {
+    j078Boundary.state.onRename = async (_src, dest, run) => {
       await run(); replacement = dest;
       const fs = await import('node:fs');
       fs.renameSync(dest, `${dest}-original`); fs.mkdirSync(dest);
@@ -1130,15 +1423,87 @@ describe('J078 detached lazy runtime closure', () => {
   });
   it('J078 preserves a replacement final allocation when materialization fails', async () => {
     const f = await launchFixture(); let replacement = '';
-    j078Boundary.state.onCopy = async (_src, dest, _run) => {
+    j078Boundary.state.onRename = async (_src, dest, _run) => {
       if (!dest.includes('-generation-')) throw new Error('fixture expected final generation');
-      replacement = dest;
+      replacement = allocationOf(dest);
       const fs = await import('node:fs');
-      fs.renameSync(dest, `${dest}-original`); fs.mkdirSync(dest);
-      fs.writeFileSync(resolve(dest, 'replacement'), 'unrelated fixture owner');
+      fs.renameSync(replacement, `${replacement}-original`); fs.mkdirSync(replacement);
+      fs.writeFileSync(resolve(replacement, 'replacement'), 'unrelated fixture owner');
       throw new Error('fixture materialization rejected');
     };
     await expect(f.launch()).rejects.toThrow('fixture materialization rejected');
     expect(readFileSync(resolve(replacement, 'replacement'), 'utf8')).toBe('unrelated fixture owner');
+  });
+  it('J078 refuses a final allocation replaced after publication and preserves the replacement', async () => {
+    const f = await launchFixture(); let replacement = '';
+    j078Boundary.state.onRename = async (_src, dest, run) => {
+      await run(); replacement = allocationOf(dest);
+      const fs = await import('node:fs');
+      fs.renameSync(replacement, `${replacement}-original`); fs.mkdirSync(replacement);
+      fs.writeFileSync(resolve(replacement, 'replacement'), 'unrelated fixture owner');
+    };
+    await expect(f.launch()).rejects.toThrow('allocation replaced before return');
+    expect(readdirSync(replacement)).toEqual(['replacement']);
+    expect(readFileSync(resolve(replacement, 'replacement'), 'utf8')).toBe('unrelated fixture owner');
+  });
+  it('J078 refuses a final allocation replaced before publication without replacing its successor', async () => {
+    const f = await launchFixture(); let successor = ''; let successorIdentity = { dev: -1, ino: -1 };
+    j078Boundary.state.onRename = async (_src, dest, run) => {
+      if (!dest.includes('-generation-')) throw new Error('fixture expected final generation');
+      successor = allocationOf(dest);
+      const fs = await import('node:fs');
+      fs.renameSync(successor, `${successor}-original`); fs.mkdirSync(successor);
+      const { dev, ino } = fs.lstatSync(successor); successorIdentity = { dev, ino };
+      await run();
+    };
+    await expect(f.launch()).rejects.toThrow('allocation replaced before return');
+    const { dev, ino } = lstatSync(successor);
+    expect({ dev, ino }).toEqual(successorIdentity);
+    // The payload that landed inside the successor is taken back; the successor itself is left as it was installed.
+    expect(readdirSync(successor)).toEqual([]);
+  });
+  it('J078 publishes without renaming onto an existing directory', async () => {
+    const f = await launchFixture(); const destinations: string[] = [];
+    j078Boundary.state.onRename = async (_src, dest, run) => {
+      destinations.push(dest);
+      // Model only the documented Windows MoveFileExW refusal of an existing directory destination (not a native run).
+      if (existsSync(dest) && lstatSync(dest).isDirectory()) {
+        throw Object.assign(new Error(`rename onto an existing directory: ${dest}`), { code: 'EPERM' });
+      }
+      await run();
+    };
+    const spec = await f.launch();
+    expect(destinations).toEqual([spec.cwd]);
+    expect(existsSync(resolve(spec.cwd!, 'src', 'index.ts'))).toBe(true);
+  });
+  it('J078 retains a foreign entry at the publication slot and the allocation that holds it', async () => {
+    const f = await launchFixture(); let slot = '';
+    j078Boundary.state.onRename = async (_src, dest, run) => {
+      if (!dest.includes('-generation-')) throw new Error('fixture expected final generation');
+      slot = resolve(allocationOf(dest), basename(allocationOf(dest)));
+      const fs = await import('node:fs');
+      fs.mkdirSync(slot); fs.writeFileSync(resolve(slot, 'foreign'), 'unrelated fixture owner');
+      await run();
+    };
+    await expect(f.launch()).rejects.toThrow();
+    expect(readdirSync(slot)).toEqual(['foreign']);
+    expect(readFileSync(resolve(slot, 'foreign'), 'utf8')).toBe('unrelated fixture owner');
+  });
+  it('J078 retains a successor allocation and the foreign entry inside it', async () => {
+    const f = await launchFixture(); let successor = ''; let slot = ''; let successorIdentity = { dev: -1, ino: -1 };
+    j078Boundary.state.onRename = async (_src, dest, run) => {
+      if (!dest.includes('-generation-')) throw new Error('fixture expected final generation');
+      successor = allocationOf(dest); slot = resolve(successor, basename(successor));
+      const fs = await import('node:fs');
+      fs.renameSync(successor, `${successor}-original`); fs.mkdirSync(successor);
+      const { dev, ino } = fs.lstatSync(successor); successorIdentity = { dev, ino };
+      fs.mkdirSync(slot); fs.writeFileSync(resolve(slot, 'foreign'), 'unrelated fixture owner');
+      await run();
+    };
+    await expect(f.launch()).rejects.toThrow();
+    const { dev, ino } = lstatSync(successor);
+    expect({ dev, ino }).toEqual(successorIdentity);
+    expect(readdirSync(successor)).toEqual([basename(slot)]);
+    expect(readFileSync(resolve(slot, 'foreign'), 'utf8')).toBe('unrelated fixture owner');
   });
 });

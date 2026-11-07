@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { cp } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 
 import {
   resolveWorkspaceBundleLockPath,
@@ -816,6 +816,44 @@ function ensureSnapshotProjectLink(snapshotDir: string, rootDir: string, relPath
   }
 }
 
+/**
+ * Dist generations mirror the repository layout for the CLI package: the CLI package (dist, its own node_modules,
+ * project files and the ready marker) sits at `<generation>/apps/cli` and the CLI's root runtime closure at
+ * `<generation>/node_modules`, so Node resolves the CLI's own packages first and root packages second, as in the source.
+ */
+export const CLI_DIST_GENERATION_LAYOUT = 'repo-mirror';
+
+/** The CLI package directory inside a dist generation (the directory a prepared-snapshot consumer receives). */
+export function resolveCliDistGenerationPackageDir(generationDir: string): string {
+  return resolve(generationDir, 'apps', 'cli');
+}
+
+/**
+ * Reject a prepared CLI snapshot whose ready marker identifies a dist generation of another layout. A marker naming a
+ * layout must name this one and sit at the CLI package path of a repository mirror; a marker written by the earlier
+ * dist producer (`createdAt` without `layout`) placed root packages inside `dist/node_modules`, ahead of the CLI's own.
+ * Markers of other producers (installed release payloads, extracted packages) name no layout and are unaffected.
+ */
+export function assertPreparedCliSnapshotLayout(snapshotDir: string, readyMarkerPath: string): void {
+  let marker: unknown;
+  try {
+    marker = JSON.parse(readFileSync(readyMarkerPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Unreadable CLI snapshot ready marker ${readyMarkerPath}: ${String(error)}`);
+  }
+  const fields = typeof marker === 'object' && marker !== null ? marker as Record<string, unknown> : {};
+  if (fields.layout === undefined) {
+    if ('createdAt' in fields) throw new Error(`Refusing a CLI dist generation of the earlier layout at ${snapshotDir}`);
+    return;
+  }
+  if (fields.layout !== CLI_DIST_GENERATION_LAYOUT) {
+    throw new Error(`Unknown CLI dist generation layout ${JSON.stringify(fields.layout)} at ${snapshotDir}`);
+  }
+  if (relative(resolveCliDistGenerationPackageDir(resolve(snapshotDir, '..', '..')), snapshotDir) !== '') {
+    throw new Error(`Expected the CLI package directory of a ${CLI_DIST_GENERATION_LAYOUT} dist generation, got ${snapshotDir}`);
+  }
+}
+
 export async function ensureCliDistSnapshotEntrypoint(
   params: { testDir: string; env: NodeJS.ProcessEnv },
   options: EnsureCliDistSnapshotOptions,
@@ -840,8 +878,10 @@ export async function ensureCliDistSnapshotEntrypoint(
         }
         const generation = await createRetainedCliSnapshot({
           snapshotDir: options.snapshotDir,
-          prepare: async (snapshotDir) => {
+          prepare: async (generationDir) => {
+            const snapshotDir = resolveCliDistGenerationPackageDir(generationDir);
             const snapshotDistDir = resolve(snapshotDir, 'dist');
+            mkdirSync(snapshotDir, { recursive: true });
             await cp(distDir, snapshotDistDir, { recursive: true });
             const mode = (params.env.HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE ?? '').toString().trim().toLowerCase();
             if (mode === 'symlink') {
@@ -849,7 +889,7 @@ export async function ensureCliDistSnapshotEntrypoint(
               const source = existsSync(cliNodeModules) ? cliNodeModules : resolve(rootDir, 'node_modules');
               if (existsSync(source)) symlinkSync(source, resolve(snapshotDir, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
             } else {
-              ensureCliDistSnapshotNodeModules({ snapshotDir, snapshotDistDir, rootDir });
+              ensureCliDistSnapshotNodeModules({ snapshotDir, rootMirrorDir: generationDir, rootDir });
             }
             ensureSnapshotProjectFile(snapshotDir, rootDir, 'package.json');
             ensureSnapshotProjectFile(snapshotDir, rootDir, 'tsconfig.json');
@@ -861,10 +901,10 @@ export async function ensureCliDistSnapshotEntrypoint(
             if (!existsSync(resolve(snapshotDir, 'node_modules'))) {
               throw new Error(`CLI dist snapshot node_modules missing: ${snapshotDir}`);
             }
-            writeFileSync(resolve(snapshotDir, '.cli-dist-snapshot.ready.json'), JSON.stringify({ v: 1, createdAt: new Date().toISOString() }), 'utf8');
+            writeFileSync(resolve(snapshotDir, '.cli-dist-snapshot.ready.json'), JSON.stringify({ v: 2, layout: CLI_DIST_GENERATION_LAYOUT, createdAt: new Date().toISOString() }), 'utf8');
           },
         });
-        return resolve(generation, 'dist', 'index.mjs');
+        return resolve(resolveCliDistGenerationPackageDir(generation), 'dist', 'index.mjs');
       }, {
         lockPath: distLockPath, timeoutMs: options.timeoutMs, pollIntervalMs: options.pollIntervalMs,
         staleAfterMs: options.staleAfterMs,

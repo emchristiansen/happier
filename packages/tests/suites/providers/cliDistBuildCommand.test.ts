@@ -861,10 +861,11 @@ const j078Boundary = await vi.hoisted(async () => {
   const http = req('node:http');
   const https = req('node:https');
   const net = req('node:net');
-  const original = { read: fs.readFileSync, cpSync: fs.cpSync, cp: promises.cp, kill: process.kill, fetch: globalThis.fetch,
+  const original = { read: fs.readFileSync, cpSync: fs.cpSync, openSync: fs.openSync, cp: promises.cp, rename: promises.rename, kill: process.kill, fetch: globalThis.fetch,
     child: Object.fromEntries(['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'].map((key) => [key, cp[key]])),
     httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
-  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
+  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>),
+    onRename: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
   const refuse = (name: string) => (..._args: unknown[]) => { state.attempts.push(name); throw new Error(`J078 forbidden external boundary: ${name}`); };
   for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => state.active ? refuse(key)(...args) : original.child[key](...args);
   http.request = (...args: unknown[]) => state.active ? refuse('http')(...args) : original.httpRequest(...args);
@@ -886,17 +887,32 @@ const j078Boundary = await vi.hoisted(async () => {
     }
   };
   fs.cpSync = (...args: unknown[]) => { if (state.active) { allowed(args[0]); allowed(args[1]); } return original.cpSync(...args); };
+  // The snapshot copier writes files through openSync (no copy_file_range), so bound its write/create opens to TMPDIR too.
+  // Read-only opens are exempt: readFileSync internals and module loading also route through fs.openSync.
+  const isWriteOpen = (flags: unknown) => typeof flags === 'string'
+    ? /[wa+]/.test(flags)
+    : typeof flags === 'number' && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT
+      | fs.constants.O_TRUNC | fs.constants.O_APPEND)) !== 0;
+  fs.openSync = (...args: unknown[]) => { if (state.active && isWriteOpen(args[1])) allowed(args[0]); return original.openSync(...args); };
   promises.cp = async (src: string, dest: string, ...args: unknown[]) => {
     if (state.active) { allowed(src); allowed(dest); }
     const run = () => original.cp(src, dest, ...args) as Promise<void>;
     return state.active && state.onCopy ? state.onCopy(src, dest, run) : run();
   };
+  // Retained snapshots are published by rename, so bound its source and destination to TMPDIR too.
+  promises.rename = async (src: string, dest: string) => {
+    if (state.active) { allowed(dest); allowed(src); }
+    const run = () => original.rename(src, dest) as Promise<void>;
+    return state.active && state.onRename ? state.onRename(src, dest, run) : run();
+  };
   syncBuiltinESMExports();
   if ((await import('node:child_process')).spawnSync !== cp.spawnSync
     || (await import('node:fs')).readFileSync !== fs.readFileSync
-    || (await import('node:fs/promises')).cp !== promises.cp) throw new Error('J078 actual builtin binding mismatch');
+    || (await import('node:fs')).openSync !== fs.openSync
+    || (await import('node:fs/promises')).cp !== promises.cp
+    || (await import('node:fs/promises')).rename !== promises.rename) throw new Error('J078 actual builtin binding mismatch');
   return { state, restore: () => {
-    fs.readFileSync = original.read; fs.cpSync = original.cpSync; promises.cp = original.cp;
+    fs.readFileSync = original.read; fs.cpSync = original.cpSync; fs.openSync = original.openSync; promises.cp = original.cp; promises.rename = original.rename;
     for (const key of Object.keys(original.child)) cp[key] = original.child[key];
     http.request = original.httpRequest; https.request = original.httpsRequest;
     http.createServer = original.httpServer; net.createServer = original.netServer;

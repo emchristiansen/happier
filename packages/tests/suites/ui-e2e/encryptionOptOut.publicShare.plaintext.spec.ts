@@ -11,8 +11,12 @@ import {
   gotoDomContentLoadedWithRetries,
   normalizeLoopbackBaseUrl,
 } from '../../src/testkit/uiE2e/pageNavigation';
-import { runCliJson } from '../../src/testkit/uiE2e/cliJson';
-import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
+import { resolveCliJsonLaunchSpec, runCliJson, type PreparedCliJsonLaunchSpec } from '../../src/testkit/uiE2e/cliJson';
+import {
+  authenticateAndStartDaemon,
+  resolveAuthenticateAndStartDaemonLaunchSpecs,
+  type PreparedAuthenticateAndStartDaemonLaunchSpecs,
+} from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
 import { fetchJson } from '../../src/testkit/http';
 import { collectBrowserDiagnostics } from '../../src/testkit/uiE2e/browserDiagnostics';
 
@@ -106,10 +110,26 @@ test.describe('ui e2e: plaintext mode + public share', () => {
 
   const suiteDir = run.testDir('encryption-optout-public-share-suite');
   const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+  const t1TestDir = resolve(join(suiteDir, 't1-plaintext-public-share'));
+  const t1DaemonEnv = (serverUrl: string, webappUrl: string): NodeJS.ProcessEnv => ({
+    ...process.env,
+    HAPPIER_SERVER_URL: serverUrl,
+    HAPPIER_WEBAPP_URL: webappUrl,
+    HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
+    HAPPIER_VARIANT: 'dev',
+    HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+  });
+  const t1CliJsonEnv = (): NodeJS.ProcessEnv => ({
+    ...process.env,
+    HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+  });
 
   let server: StartedServer | null = null;
   let ui: StartedUiWeb | null = null;
   let uiBaseUrl: string | null = null;
+  // Immutable CLI launch specs prepared once here (outside the per-test budget) and borrowed by t1.
+  let t1LaunchSpecs: PreparedAuthenticateAndStartDaemonLaunchSpecs | null = null;
+  let t1CliJsonLaunchSpec: PreparedCliJsonLaunchSpec | null = null;
 
   test.beforeAll(async () => {
     const uiWebEnv = {
@@ -146,6 +166,16 @@ test.describe('ui e2e: plaintext mode + public share', () => {
     });
 
     uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+
+    await mkdir(t1TestDir, { recursive: true });
+    t1LaunchSpecs = await resolveAuthenticateAndStartDaemonLaunchSpecs({
+      testDir: t1TestDir,
+      cliHomeDir,
+      serverUrl: server.baseUrl,
+      uiBaseUrl,
+      extraEnv: t1DaemonEnv(server.baseUrl, uiBaseUrl),
+    });
+    t1CliJsonLaunchSpec = await resolveCliJsonLaunchSpec({ testDir: t1TestDir, env: t1CliJsonEnv() });
   });
 
   test.afterAll(async () => {
@@ -158,19 +188,13 @@ test.describe('ui e2e: plaintext mode + public share', () => {
     test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
+    if (!t1LaunchSpecs || !t1CliJsonLaunchSpec) throw new Error('missing prepared CLI launch specs');
 
-    const testDir = resolve(join(suiteDir, 't1-plaintext-public-share'));
+    const testDir = t1TestDir;
     await mkdir(testDir, { recursive: true });
 
     const diagnostics = collectBrowserDiagnostics({ page });
-    const daemonEnv = {
-      ...process.env,
-      HAPPIER_SERVER_URL: server.baseUrl,
-      HAPPIER_WEBAPP_URL: uiBaseUrl,
-      HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
-      HAPPIER_VARIANT: 'dev',
-      HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
-    };
+    const daemonEnv = t1DaemonEnv(server.baseUrl, uiBaseUrl);
 
     let daemon: StartedDaemon | null = null;
     let thrown: unknown = null;
@@ -182,6 +206,7 @@ test.describe('ui e2e: plaintext mode + public share', () => {
         serverUrl: server.baseUrl,
         uiBaseUrl,
         extraEnv: daemonEnv,
+        preparedLaunchSpecs: t1LaunchSpecs,
       });
 
       await page.goto(`${uiBaseUrl}/settings/account`, { waitUntil: 'domcontentloaded' });
@@ -208,13 +233,11 @@ test.describe('ui e2e: plaintext mode + public share', () => {
         cliHomeDir,
         serverUrl: server.baseUrl,
         webappUrl: uiBaseUrl,
-        env: {
-          ...process.env,
-          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
-        },
+        env: t1CliJsonEnv(),
         label: 'session-create',
         args: ['session', 'create', '--tag', tag, '--no-load-existing', '--json'],
         timeoutMs: 120_000,
+        preparedCliLaunchSpec: t1CliJsonLaunchSpec,
       });
       expect(createEnvelope.ok).toBe(true);
       expect(createEnvelope.kind).toBe('session_create');
@@ -231,13 +254,11 @@ test.describe('ui e2e: plaintext mode + public share', () => {
         cliHomeDir,
         serverUrl: server.baseUrl,
         webappUrl: uiBaseUrl,
-        env: {
-          ...process.env,
-          HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
-        },
+        env: t1CliJsonEnv(),
         label: 'session-send',
         args: ['session', 'send', sessionId, message, '--json'],
         timeoutMs: 120_000,
+        preparedCliLaunchSpec: t1CliJsonLaunchSpec,
       });
       expect(sendEnvelope.ok).toBe(true);
       expect(sendEnvelope.kind).toBe('session_send');

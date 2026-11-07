@@ -12,7 +12,7 @@ import {
   sweepProcessOwnershipLeases,
 } from '../process/processOwnershipLease';
 import { spawnLoggedProcess, type SpawnedProcess } from '../process/spawnProcess';
-import { resolveCliTestLaunchSpec, shouldUseCliSourceEntrypoint } from '../process/cliLaunchSpec';
+import { resolveCliTestLaunchSpec, shouldUseCliSourceEntrypoint, type CliTestLaunchSpec } from '../process/cliLaunchSpec';
 import { sanitizeCliTestEnv } from '../process/cliTestEnv';
 import { DEFAULT_CLI_DIST_BUILD_TIMEOUT_MS } from '../process/cliDist';
 import { terminateProcessTreeByPid } from '../process/processTree';
@@ -618,22 +618,121 @@ function resolveDaemonSubprocessEntrypointEnv(cliLaunchSpec: Readonly<{ command:
   };
 }
 
+type TestDaemonCliLaunchSpecResolution = Readonly<{
+  testDir: string;
+  env: NodeJS.ProcessEnv;
+  snapshotDir?: string;
+  preparedDistSnapshotOnly?: boolean;
+}>;
+
+/**
+ * A daemon CLI launch spec resolved ahead of time by `resolveTestDaemonCliLaunchSpec` and lent to
+ * `startTestDaemon` (and its `restart()`), which then launches it without resolving or preparing
+ * anything. It records the testDir and source-entrypoint selection it was resolved for so a launch
+ * with a different testDir or entrypoint mode is rejected instead of guessed.
+ */
+export type PreparedTestDaemonCliLaunchSpec = Readonly<{
+  kind: 'test-daemon';
+  testDir: string;
+  cliSourceEntrypointRequested: boolean;
+  spec: CliTestLaunchSpec;
+}>;
+
+function assertPreparedDistSnapshotOnlyHasSnapshotDir(params: TestDaemonCliLaunchSpecResolution): void {
+  if (params.preparedDistSnapshotOnly === true && !params.snapshotDir?.trim()) {
+    throw new Error('startTestDaemon preparedDistSnapshotOnly requires an explicit snapshotDir');
+  }
+}
+
+function resolveTestDaemonCliLaunchSpecFresh(params: TestDaemonCliLaunchSpecResolution): Promise<CliTestLaunchSpec> {
+  return resolveCliTestLaunchSpec(
+    {
+      testDir: params.testDir,
+      env: {
+        ...params.env,
+        HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE: resolveDaemonSnapshotNodeModulesMode(params.env),
+      },
+    },
+    {
+      snapshotDir: params.snapshotDir ?? resolveDaemonCliSnapshotDir({ testDir: params.testDir, env: params.env }),
+      preparedDistSnapshotOnly: params.preparedDistSnapshotOnly,
+      skipDistIntegrityCheck: true,
+      skipSourceFreshnessCheck: true,
+      buildTimeoutMs: resolveDaemonCliDistBuildTimeoutMs(params.env),
+    },
+  );
+}
+
+/**
+ * Resolves exactly the launch spec `startTestDaemon` would resolve for the same testDir, env and
+ * snapshot options (same mode, namespace, env precedence and skip flags), for a caller that prepares
+ * it once outside a test budget and lends it to `startTestDaemon({ preparedCliLaunchSpec })`.
+ */
+export async function resolveTestDaemonCliLaunchSpec(
+  params: TestDaemonCliLaunchSpecResolution,
+): Promise<PreparedTestDaemonCliLaunchSpec> {
+  assertPreparedDistSnapshotOnlyHasSnapshotDir(params);
+  const spec = await resolveTestDaemonCliLaunchSpecFresh(params);
+  return Object.freeze({
+    kind: 'test-daemon' as const,
+    testDir: resolve(params.testDir),
+    cliSourceEntrypointRequested: shouldUseCliSourceEntrypoint(params.env),
+    spec: Object.freeze({
+      ...spec,
+      args: Object.freeze([...spec.args]) as string[],
+      ...(spec.env ? { env: Object.freeze({ ...spec.env }) } : {}),
+    }),
+  });
+}
+
+function assertBorrowableTestDaemonCliLaunchSpec(
+  prepared: PreparedTestDaemonCliLaunchSpec,
+  params: Readonly<{ testDir: string; env: NodeJS.ProcessEnv; snapshotDir?: string; preparedDistSnapshotOnly?: boolean }>,
+): void {
+  const conflicting = [
+    params.snapshotDir !== undefined ? 'snapshotDir' : null,
+    params.preparedDistSnapshotOnly !== undefined ? 'preparedDistSnapshotOnly' : null,
+  ].filter((name): name is string => name !== null);
+  if (conflicting.length > 0) {
+    throw new Error(
+      `startTestDaemon preparedCliLaunchSpec cannot be combined with ${conflicting.join(', ')}: `
+        + 'those options only select how a launch spec is resolved and a borrowed spec is never resolved again; '
+        + 'pass them to resolveTestDaemonCliLaunchSpec instead',
+    );
+  }
+  if (prepared.kind !== 'test-daemon') {
+    throw new Error(`startTestDaemon preparedCliLaunchSpec must come from resolveTestDaemonCliLaunchSpec (got kind=${String(prepared.kind)})`);
+  }
+  const testDir = resolve(params.testDir);
+  const cliSourceEntrypointRequested = shouldUseCliSourceEntrypoint(params.env);
+  if (prepared.testDir !== testDir || prepared.cliSourceEntrypointRequested !== cliSourceEntrypointRequested) {
+    throw new Error(
+      `startTestDaemon preparedCliLaunchSpec was resolved for testDir=${prepared.testDir} `
+        + `cliSourceEntrypoint=${prepared.cliSourceEntrypointRequested} but this launch has testDir=${testDir} `
+        + `cliSourceEntrypoint=${cliSourceEntrypointRequested}; resolve it with the same testDir and env`,
+    );
+  }
+}
+
 export async function startTestDaemon(params: {
   testDir: string;
   happyHomeDir: string;
   env: NodeJS.ProcessEnv;
   snapshotDir?: string;
   preparedDistSnapshotOnly?: boolean;
+  /** Borrowed launch spec from resolveTestDaemonCliLaunchSpec; this launch and every restart() reuse it unresolved. */
+  preparedCliLaunchSpec?: PreparedTestDaemonCliLaunchSpec;
   startupTimeoutMs?: number;
   cleanupDescendantsOnExit?: boolean;
 }): Promise<StartedDaemon> {
-  if (params.preparedDistSnapshotOnly === true && !params.snapshotDir?.trim()) {
-    throw new Error('startTestDaemon preparedDistSnapshotOnly requires an explicit snapshotDir');
+  if (params.preparedCliLaunchSpec !== undefined) {
+    assertBorrowableTestDaemonCliLaunchSpec(params.preparedCliLaunchSpec, params);
+  } else {
+    assertPreparedDistSnapshotOnlyHasSnapshotDir(params);
   }
   const stdoutPath = resolve(params.testDir, 'daemon.stdout.log');
   const stderrPath = resolve(params.testDir, 'daemon.stderr.log');
   const phaseTimeoutMs = resolveDaemonStartupPhaseTimeoutMs(params.env, params.startupTimeoutMs);
-  const cliDistBuildTimeoutMs = resolveDaemonCliDistBuildTimeoutMs(params.env);
   const launchSpecPhaseTimeoutMs = resolveDaemonLaunchSpecPhaseTimeoutMs(params.env, params.startupTimeoutMs);
   const baseDiagnostics = {
     testDir: params.testDir,
@@ -658,29 +757,16 @@ export async function startTestDaemon(params: {
     );
   }
 
-  const cliLaunchSpec = await runDaemonStartupPhase(
-    'resolveCliTestLaunchSpec',
-    resolveCliTestLaunchSpec(
-      {
-        testDir: params.testDir,
-        env: {
-          ...params.env,
-          HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE: resolveDaemonSnapshotNodeModulesMode(params.env),
+  const cliLaunchSpec = params.preparedCliLaunchSpec !== undefined
+    ? params.preparedCliLaunchSpec.spec
+    : await runDaemonStartupPhase(
+        'resolveCliTestLaunchSpec',
+        resolveTestDaemonCliLaunchSpecFresh(params),
+        {
+          ...baseDiagnostics,
+          timeoutMs: launchSpecPhaseTimeoutMs,
         },
-      },
-      {
-        snapshotDir: params.snapshotDir ?? resolveDaemonCliSnapshotDir({ testDir: params.testDir, env: params.env }),
-        preparedDistSnapshotOnly: params.preparedDistSnapshotOnly,
-        skipDistIntegrityCheck: true,
-        skipSourceFreshnessCheck: true,
-        buildTimeoutMs: cliDistBuildTimeoutMs,
-      },
-    ),
-    {
-      ...baseDiagnostics,
-      timeoutMs: launchSpecPhaseTimeoutMs,
-    },
-  );
+      );
 
   await runDaemonStartupPhase(
     'stopExistingDaemon',

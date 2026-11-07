@@ -2,7 +2,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, wr
 import { dirname, resolve } from 'node:path';
 
 import { repoRootDir } from '../paths';
-import { ensureCliDistSnapshotEntrypoint, ensureCliSharedDepsBuilt } from './cliDist';
+import { assertPreparedCliSnapshotLayout, ensureCliDistSnapshotEntrypoint, ensureCliSharedDepsBuilt } from './cliDist';
 import { createRetainedCliSnapshot, ensureCliDistSnapshotNodeModules } from './cliDistSnapshotNodeModules';
 import { resolveTsxImportHookSpecifier } from './tsxImportHook';
 
@@ -39,6 +39,7 @@ function resolvePreparedDistSnapshotEntrypoint(snapshotDir: string): string {
   if (!existsSync(readyMarker) || !existsSync(entrypoint) || !existsSync(nodeModulesDir)) {
     throw new Error(`Expected an already-prepared CLI dist snapshot at ${snapshotDir}`);
   }
+  assertPreparedCliSnapshotLayout(snapshotDir, readyMarker);
   return entrypoint;
 }
 
@@ -108,11 +109,9 @@ function ensureCliSourceSnapshot(
   })();
 
   if (!snapshotNodeModulesIsSymlink && snapshotNodeModulesMode !== 'symlink') {
-    ensureCliDistSnapshotNodeModules({
-      snapshotDir,
-      snapshotDistDir: resolve(snapshotDir, 'dist'),
-      rootDir,
-    });
+    // A source entrypoint never resolves through dist/node_modules, so no hoisted-root fallback is staged:
+    // the retained generation would otherwise detach a full copy of the unreachable root package tree.
+    ensureCliDistSnapshotNodeModules({ snapshotDir, rootDir });
   }
 
   for (const relPath of ['package.json', 'tsconfig.json']) {

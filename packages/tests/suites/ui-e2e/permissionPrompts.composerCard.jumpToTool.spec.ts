@@ -8,7 +8,11 @@ import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '.
 import { type StartedDaemon } from '../../src/testkit/daemon/daemon';
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
 import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
-import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
+import {
+  authenticateAndStartDaemon,
+  resolveAuthenticateAndStartDaemonLaunchSpecs,
+  type PreparedAuthenticateAndStartDaemonLaunchSpecs,
+} from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
 import { daemonControlPostJson } from '../../src/testkit/daemon/controlServerClient';
 import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
 import { repoRootDir } from '../../src/testkit/paths';
@@ -21,11 +25,22 @@ test.describe('ui e2e: permission prompts (composer card)', () => {
 
   const suiteDir = run.testDir('permission-prompts-composer-card-suite');
   const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+  const t1TestDir = resolve(join(suiteDir, 't1-composer-card-jump'));
+  const t1DaemonExtraEnv = (): NodeJS.ProcessEnv => ({
+    HOME: cliHomeDir,
+    HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
+    HAPPIER_E2E_FAKE_CLAUDE_LOG: resolve(join(t1TestDir, 'fake-claude.jsonl')),
+    HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
+    HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
+    HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: 'permission-prompt-write',
+  });
 
   let server: StartedServer | null = null;
   let ui: StartedUiWeb | null = null;
   let uiBaseUrl: string | null = null;
   let daemon: StartedDaemon | null = null;
+  // Immutable CLI launch specs prepared once here (outside the per-test budget) and borrowed by t1.
+  let t1LaunchSpecs: PreparedAuthenticateAndStartDaemonLaunchSpecs | null = null;
 
   test.beforeAll(async () => {
     const uiWebEnv = {
@@ -60,6 +75,15 @@ test.describe('ui e2e: permission prompts (composer card)', () => {
     });
 
     uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+
+    await mkdir(t1TestDir, { recursive: true });
+    t1LaunchSpecs = await resolveAuthenticateAndStartDaemonLaunchSpecs({
+      testDir: t1TestDir,
+      cliHomeDir,
+      serverUrl: server.baseUrl,
+      uiBaseUrl,
+      extraEnv: t1DaemonExtraEnv(),
+    });
   });
 
   test.afterAll(async () => {
@@ -113,8 +137,9 @@ test.describe('ui e2e: permission prompts (composer card)', () => {
     test.setTimeout(180_000);
     if (!server || !ui) throw new Error('missing server/ui fixtures');
     if (!uiBaseUrl) throw new Error('missing ui base url');
+    if (!t1LaunchSpecs) throw new Error('missing prepared CLI launch specs');
 
-    const testDir = resolve(join(suiteDir, 't1-composer-card-jump'));
+    const testDir = t1TestDir;
     await mkdir(testDir, { recursive: true });
 
     let thrown: unknown = null;
@@ -130,14 +155,8 @@ test.describe('ui e2e: permission prompts (composer card)', () => {
         cliHomeDir,
         serverUrl: server.baseUrl,
         uiBaseUrl,
-        extraEnv: {
-          HOME: cliHomeDir,
-          HAPPIER_CLAUDE_PATH: fakeClaudePath,
-          HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
-          HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
-          HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
-          HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: 'permission-prompt-write',
-        },
+        extraEnv: t1DaemonExtraEnv(),
+        preparedLaunchSpecs: t1LaunchSpecs,
       });
 
       await page.goto(`${uiBaseUrl}/`, { waitUntil: 'domcontentloaded' });

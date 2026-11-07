@@ -94,6 +94,46 @@ describe('connectedServicesLaunchAuth', () => {
     })).toThrow('connected_service_auth_not_found:cs:missing');
   });
 
+  describe('profile credential status', () => {
+    const inventoryWithProfileStatus = (status: unknown) => ({
+      items: [{
+        serviceId: 'claude-subscription',
+        profiles: [status === undefined ? { profileId: 'work' } : { profileId: 'work', status }],
+      }],
+    });
+    const resolveWork = (status: unknown) => resolveConnectedServicesLaunchAuth({
+      intent: parseConnectedServicesLaunchAuth('cs:claude-subscription:profile:work'),
+      supportedServiceIds: ['claude-subscription'],
+      inventory: inventoryWithProfileStatus(status),
+    });
+    const workBinding = {
+      v: 1,
+      bindingsByServiceId: {
+        'claude-subscription': { source: 'connected', selection: 'profile', profileId: 'work' },
+      },
+    };
+
+    it.each(['connected', 'refreshing', 'refresh_failed_retryable'])(
+      'selects a profile whose status %s is usable under the canonical rule',
+      (status) => {
+        expect(resolveWork(status)).toEqual(workBinding);
+      },
+    );
+
+    it('keeps selecting a profile whose inventory entry carries no status', () => {
+      expect(resolveWork(undefined)).toEqual(workBinding);
+    });
+
+    it.each(['needs_reauth', 'unsupported_kind', 'some_future_status'])(
+      'fails closed for a profile whose status %s is not usable',
+      (status) => {
+        expect(() => resolveWork(status)).toThrow(
+          'connected_service_auth_not_found:cs:claude-subscription:profile:work',
+        );
+      },
+    );
+  });
+
   it('consults the canonical inventory only for an explicit connected selector', async () => {
     const listInventory = vi.fn(async () => codexInventory);
 

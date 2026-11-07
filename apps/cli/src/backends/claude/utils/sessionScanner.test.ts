@@ -1582,7 +1582,8 @@ describe('sessionScanner', () => {
       },
     })
 
-    await writeFile(diagnosticFile,
+    const diagnosticTempFile = `${diagnosticFile}.tmp`
+    await writeFile(diagnosticTempFile,
       `${JSON.stringify({
         type: 'user',
         uuid: 'foreign-user-before-diagnostic',
@@ -1604,6 +1605,7 @@ describe('sessionScanner', () => {
         message: { role: 'assistant', content: [{ type: 'text', text: 'private answer from another Claude session' }] },
       } as RawJSONLines)}\n`,
     )
+    await rename(diagnosticTempFile, diagnosticFile)
 
     await waitFor(() => classifications.length === 1)
     await appendFile(diagnosticFile,

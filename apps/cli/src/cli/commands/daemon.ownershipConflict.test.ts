@@ -65,6 +65,17 @@ vi.mock('@/daemon/ownership/daemonServiceInventory', () => ({
     renderDaemonInstalledServiceConflict: renderDaemonInstalledServiceConflictMock,
 }));
 
+// Transform the module graph the cases import during collection, after mock state is initialized,
+// so cold transforms are not charged to a case's budget. Each case still patches its environment,
+// resets modules and imports fresh instances.
+await Promise.all([
+    import('@/configuration'),
+    import('@/persistence'),
+    import('./daemon'),
+    import('@/daemon/service/cli'),
+]);
+vi.resetModules();
+
 describe('handleDaemonCliCommand ownership conflicts', () => {
     const envScope = createEnvKeyScope([
         'HAPPIER_HOME_DIR',

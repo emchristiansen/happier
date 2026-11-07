@@ -1,6 +1,9 @@
-import { Dirent, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { basename, dirname, resolve } from 'node:path';
-import { cp, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import {
+  Dirent, chmodSync, closeSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync,
+  statSync, symlinkSync, utimesSync, writeFileSync, writeSync,
+} from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { cp, lstat, mkdir, mkdtemp, readdir, realpath, rename, rm, rmdir } from 'node:fs/promises';
 
 type CopyMissingEntryOptions = {
   mergeExistingDirectoryContents?: boolean;
@@ -38,6 +41,41 @@ function isDirectoryEntry(path: string): boolean {
   }
 }
 
+const BYTE_COPY_CHUNK_SIZE = 1 << 20;
+
+/**
+ * Dereferencing copy of one missing entry (the `cpSync(src, dest, { recursive, dereference, preserveTimestamps })` contract)
+ * using plain reads and writes. File copies through copy_file_range/FICLONE may block synchronously until freshly written
+ * source data is committed on block-cloning filesystems, stalling the caller's event loop for seconds per file.
+ */
+function copyEntryBytesSync(sourcePath: string, destPath: string): void {
+  const stat = statSync(sourcePath);
+  if (stat.isDirectory()) {
+    mkdirSync(destPath, { recursive: true });
+    for (const name of readdirSync(sourcePath)) copyEntryBytesSync(resolve(sourcePath, name), resolve(destPath, name));
+    chmodSync(destPath, stat.mode & 0o7777);
+    utimesSync(destPath, stat.atime, stat.mtime);
+    return;
+  }
+  if (!stat.isFile()) throw new Error(`Cannot copy non-regular file into CLI snapshot: ${sourcePath}`);
+  const input = openSync(sourcePath, 'r');
+  try {
+    const output = openSync(destPath, 'wx', 0o600);
+    try {
+      const buffer = Buffer.allocUnsafe(BYTE_COPY_CHUNK_SIZE);
+      for (let read = readSync(input, buffer, 0, buffer.length, null); read > 0; read = readSync(input, buffer, 0, buffer.length, null)) {
+        for (let written = 0; written < read;) written += writeSync(output, buffer, written, read - written);
+      }
+    } finally {
+      closeSync(output);
+    }
+  } finally {
+    closeSync(input);
+  }
+  chmodSync(destPath, stat.mode & 0o7777);
+  utimesSync(destPath, stat.atime, stat.mtime);
+}
+
 function copyMissingEntry(destPath: string, sourcePath: string, options: CopyMissingEntryOptions = {}): void {
   const mergeExistingDirectoryContents = options.mergeExistingDirectoryContents ?? true;
   const pruneNestedNodeModules = options.pruneNestedNodeModules ?? false;
@@ -67,7 +105,7 @@ function copyMissingEntry(destPath: string, sourcePath: string, options: CopyMis
   }
 
   try {
-    cpSync(sourcePath, destPath, { recursive: true, dereference: true, preserveTimestamps: true });
+    copyEntryBytesSync(sourcePath, destPath);
   } catch {
     // Best-effort only. Callers must tolerate missing links in constrained environments.
   }
@@ -187,50 +225,76 @@ function ensureWorkspacePackageRuntimeDependencyFallbacks(
   }
 }
 
-function ensureHoistedScopeFallback(scopeName: string, params: {
-  rootNodeModulesDir: string;
-  cliNodeModulesDir: string | null;
-  fallbackNodeModulesDir: string;
-}): void {
-  const rootScopeDir = resolve(params.rootNodeModulesDir, scopeName);
-  const cliScopeDir = params.cliNodeModulesDir ? resolve(params.cliNodeModulesDir, scopeName) : null;
-  const fallbackScopeDir = resolve(params.fallbackNodeModulesDir, scopeName);
+type PathSemantics = { relative: (from: string, to: string) => string; isAbsolute: (path: string) => boolean; sep: string };
 
-  for (const pkgEntry of listScopedPackageEntries(rootScopeDir)) {
-    const rootPackagePath = resolve(rootScopeDir, pkgEntry.name);
-    const cliPackagePath = cliScopeDir ? resolve(cliScopeDir, pkgEntry.name) : null;
-    if (cliPackagePath && existsSync(cliPackagePath)) continue;
-    ensureSymlink(resolve(fallbackScopeDir, pkgEntry.name), rootPackagePath);
-  }
+/** Whether `path` lies strictly inside `dir` under the platform's own path semantics (separators, drives, case). */
+export function isPathStrictlyInside(dir: string, path: string, semantics: PathSemantics = { relative, isAbsolute, sep }): boolean {
+  const fromDir = semantics.relative(dir, path);
+  return fromDir !== '' && fromDir !== '..' && !fromDir.startsWith(`..${semantics.sep}`) && !semantics.isAbsolute(fromDir);
+}
 
-  const scopedFallbackEntries = listScopedPackageEntries(fallbackScopeDir);
-  if (scopedFallbackEntries.length === 0 && existsSync(fallbackScopeDir)) {
-    rmSync(fallbackScopeDir, { recursive: true, force: true });
+/**
+ * Node-style resolution of the package directory for `name` from `fromDir`, bounded at the repository root:
+ * the nearest `<dir>/node_modules/<name>` from `fromDir` up to and including `rootDir`. Nothing above the root is consulted.
+ */
+function resolvePackageDirWithinRoot(fromDir: string, name: string, rootDir: string): string | null {
+  for (let dir = fromDir; ; dir = dirname(dir)) {
+    if (basename(dir) !== 'node_modules') {
+      const candidate = resolve(dir, 'node_modules', ...name.split('/'));
+      if (existsSync(candidate)) return candidate;
+    }
+    if (dir === rootDir || dirname(dir) === dir) return null;
   }
 }
 
-function ensureRootNodeModulesFallback(snapshotDistDir: string, rootDir: string): void {
+/** The top-level `node_modules` entry (`name` or `@scope/name`) that contains `packageDir`, relative to that directory. */
+function topLevelPackagePath(rootNodeModulesDir: string, packageDir: string): string {
+  const [first, second] = relative(rootNodeModulesDir, packageDir).split(sep);
+  return first.startsWith('@') ? join(first, second) : first;
+}
+
+/**
+ * The root `node_modules` entries the CLI's declared runtime closure reaches, as paths relative to the root `node_modules`.
+ * The walk follows Node's own resolution in the source tree from the CLI package, from the CLI's own third-party
+ * packages, and from every root package reached, so each entry is reproduced whole (with its own nested `node_modules`)
+ * and every dependency resolves to the same source package instance in the copy. Workspace packages under the CLI's
+ * `@happier-dev` scope are supplied separately. Unresolvable optional and peer dependencies, and missing manifests,
+ * contribute nothing.
+ */
+function collectRootRuntimeClosure(rootDir: string): string[] {
+  const rootNodeModulesDir = resolve(rootDir, 'node_modules');
+  const cliPackageDir = resolve(rootDir, 'apps', 'cli');
+  const cliNodeModulesDir = resolve(cliPackageDir, 'node_modules');
+  const workspaceScopeDir = resolve(cliNodeModulesDir, '@happier-dev');
+  const entries = new Set<string>();
+  const visited = new Set<string>();
+  const pending = [cliPackageDir];
+  for (let from = pending.pop(); from !== undefined; from = pending.pop()) {
+    for (const dep of collectExternalRuntimeDepNamesFromPackageJson(resolve(from, 'package.json'))) {
+      const packageDir = resolvePackageDirWithinRoot(from, dep.name, rootDir);
+      if (!packageDir || visited.has(packageDir)) continue;
+      const isRootPackage = isPathStrictlyInside(rootNodeModulesDir, packageDir);
+      const isCliLocalPackage = isPathStrictlyInside(cliNodeModulesDir, packageDir) && !isPathStrictlyInside(workspaceScopeDir, packageDir);
+      if (!isRootPackage && !isCliLocalPackage) continue;
+      visited.add(packageDir);
+      if (isRootPackage) entries.add(topLevelPackagePath(rootNodeModulesDir, packageDir));
+      pending.push(packageDir);
+    }
+  }
+  return [...entries].sort();
+}
+
+/**
+ * Reproduce the repository root's position relative to the CLI package: link the CLI's declared root runtime closure into
+ * `<rootMirrorDir>/node_modules`, below which the snapshot's CLI package sits at its repository-relative path. Code in the
+ * snapshot then resolves the CLI's own `node_modules` first and the root closure second, as in the source tree, and every
+ * package instance has exactly one location. Publication detaches the links.
+ */
+function ensureRootRuntimeClosure(rootMirrorDir: string, rootDir: string): void {
   const rootNodeModulesDir = resolve(rootDir, 'node_modules');
   if (!existsSync(rootNodeModulesDir)) return;
-
-  const cliNodeModulesDir = existsSync(resolve(rootDir, 'apps', 'cli', 'node_modules'))
-    ? resolve(rootDir, 'apps', 'cli', 'node_modules')
-    : null;
-  const fallbackNodeModulesDir = resolve(snapshotDistDir, 'node_modules');
-
-  for (const entry of listNodeModulesEntries(rootNodeModulesDir)) {
-    if (entry.name.startsWith('.')) continue;
-    if (entry.name.startsWith('@')) {
-      ensureHoistedScopeFallback(entry.name, {
-        rootNodeModulesDir,
-        cliNodeModulesDir,
-        fallbackNodeModulesDir,
-      });
-      continue;
-    }
-
-    if (cliNodeModulesDir && existsSync(resolve(cliNodeModulesDir, entry.name))) continue;
-    ensureSymlink(resolve(fallbackNodeModulesDir, entry.name), resolve(rootNodeModulesDir, entry.name));
+  for (const entry of collectRootRuntimeClosure(rootDir)) {
+    ensureSymlink(resolve(rootMirrorDir, 'node_modules', entry), resolve(rootNodeModulesDir, entry));
   }
 }
 
@@ -576,13 +640,24 @@ export function ensureCliPackSnapshotRuntimeDependencies(params: {
 }
 
 export function ensureCliDistSnapshotNodeModules(params: {
+  /** The snapshot's CLI package directory. */
   snapshotDir: string;
-  snapshotDistDir: string;
+  /**
+   * The snapshot directory standing for the repository root, given when dist code runs from the snapshot. `snapshotDir`
+   * must sit at the CLI package's repository-relative path below it; the CLI's root runtime closure is placed in its
+   * `node_modules`, and CLI-local packages keep their source layout instead of receiving private dependency copies.
+   */
+  rootMirrorDir?: string;
   rootDir: string;
 }): void {
-  const cliNodeModulesDir = resolve(params.rootDir, 'apps', 'cli', 'node_modules');
+  const cliPackageDir = resolve(params.rootDir, 'apps', 'cli');
+  const cliNodeModulesDir = resolve(cliPackageDir, 'node_modules');
   const rootNodeModulesDir = resolve(params.rootDir, 'node_modules');
   const snapshotNodeModulesDir = resolve(params.snapshotDir, 'node_modules');
+  if (params.rootMirrorDir !== undefined
+    && relative(resolve(params.rootMirrorDir, relative(params.rootDir, cliPackageDir)), params.snapshotDir) !== '') {
+    throw new Error(`CLI snapshot ${params.snapshotDir} is not the CLI package directory of root mirror ${params.rootMirrorDir}`);
+  }
 
   if (existsSync(cliNodeModulesDir)) {
     mkdirSync(snapshotNodeModulesDir, { recursive: true });
@@ -595,13 +670,30 @@ export function ensureCliDistSnapshotNodeModules(params: {
     ensureWorkspacePackageDistTrees(snapshotNodeModulesDir, params.rootDir);
     ensureWorkspacePackageRuntimeDependencyTrees(snapshotNodeModulesDir, params.rootDir);
     ensureCopiedNodeModulesEntries(cliNodeModulesDir, snapshotNodeModulesDir, new Set(['@happier-dev']));
-    ensureExternalPackageRuntimeDependencyTrees(snapshotNodeModulesDir, params.rootDir);
+    // Without a root mirror, CLI-local packages receive private copies of the dependencies they reach elsewhere.
+    if (params.rootMirrorDir === undefined) ensureExternalPackageRuntimeDependencyTrees(snapshotNodeModulesDir, params.rootDir);
   } else if (existsSync(rootNodeModulesDir)) {
     ensureSymlink(snapshotNodeModulesDir, rootNodeModulesDir);
   }
 
-  if (existsSync(cliNodeModulesDir) && existsSync(rootNodeModulesDir) && cliNodeModulesDir !== rootNodeModulesDir) {
-    ensureRootNodeModulesFallback(params.snapshotDistDir, params.rootDir);
+  if (params.rootMirrorDir !== undefined && existsSync(cliNodeModulesDir)) {
+    ensureRootRuntimeClosure(params.rootMirrorDir, params.rootDir);
+  }
+}
+
+/**
+ * Replace every symbolic link under `path` (including `path` itself) with a dereferencing copy of its live target.
+ * Dangling or cyclic links reject (ENOENT/ELOOP) so a partially live tree is never published.
+ */
+async function detachLinkedEntries(path: string): Promise<void> {
+  if ((await lstat(path)).isSymbolicLink()) {
+    const target = await realpath(path);
+    await rm(path);
+    await cp(target, path, { recursive: true, dereference: true, preserveTimestamps: true, force: true });
+    return;
+  }
+  for (const entry of await readdir(path, { withFileTypes: true })) {
+    if (entry.isSymbolicLink() || entry.isDirectory()) await detachLinkedEntries(resolve(path, entry.name));
   }
 }
 
@@ -630,6 +722,23 @@ export async function createRetainedCliSnapshot(params: {
   const requireOwned = (allocation: Allocation) => {
     if (!isOwned(allocation)) throw new Error(`CLI snapshot allocation replaced before return: ${allocation.path}`);
   };
+  const holds = (allocation: Allocation): boolean => {
+    try {
+      return isOwned(allocation);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  };
+  const isPresent = (path: string): boolean => {
+    try {
+      lstatSync(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  };
   const removeUnpublished = async (allocation: Allocation) => {
     try {
       if (!isOwned(allocation)) {
@@ -643,27 +752,57 @@ export async function createRetainedCliSnapshot(params: {
       }
     }
   };
+  // The final allocation encloses the published payload. Take back our payload wherever the publication rename put
+  // it, then release the allocation only while it is still ours and empty: whatever another actor installed at the
+  // allocation path or inside it is retained.
+  const removeUnpublishedGeneration = async (generation: Allocation, published: Allocation | undefined) => {
+    try {
+      if (published && holds(published)) await rm(published.path, { recursive: true, force: true });
+      if (!holds(generation)) {
+        if (isPresent(generation.path)) console.warn('Retaining replaced unpublished CLI snapshot allocation', generation.path);
+        return;
+      }
+      await rmdir(generation.path);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOTEMPTY' || code === 'EEXIST') {
+        console.warn('Retaining unpublished CLI snapshot allocation that holds foreign entries', generation.path);
+      } else if (code !== 'ENOENT') {
+        console.warn('Could not clean unpublished CLI snapshot allocation', generation.path, error);
+      }
+    }
+  };
   const staging = await allocate('staging');
   let generation: Allocation | undefined;
+  let published: Allocation | undefined;
   let returned = false;
   try {
     // The outer staging identity stays ours when an existing payload installer replaces payload/.
     const payload = resolve(staging.path, 'payload');
     await params.prepare(payload);
     requireOwned(staging);
-    generation = await allocate('generation');
-    requireOwned(generation);
     // Hydration may deliberately select live workspace links. Detach their contents before
     // exposing a consumer path; a required copy error must never publish a partially live tree.
-    await cp(payload, generation.path, {
-      recursive: true, dereference: true, preserveTimestamps: true, force: true,
-    });
+    // Links are detached in place from their settled live targets and the private payload is then
+    // published by rename: re-copying freshly written payload data blocks on block-cloning
+    // filesystems (copy_file_range/FICLONE wait for uncommitted source data).
+    if ((await lstat(payload)).isDirectory()) await detachLinkedEntries(payload);
+    else throw new Error(`CLI snapshot payload is not a directory: ${payload}`);
+    requireOwned(staging);
+    // The final allocation keeps its own identity and receives the payload at a name that does not exist yet.
+    // Renaming onto the allocation itself would be refused on Windows (MoveFileExW rejects an existing directory
+    // destination) and, on Linux, would replace whatever directory had taken over the allocation path.
+    generation = await allocate('generation');
+    requireOwned(generation);
+    published = { path: resolve(generation.path, basename(generation.path)), identity: lstatSync(payload) };
+    await rename(payload, published.path);
     requireOwned(staging);
     requireOwned(generation);
+    requireOwned(published);
     returned = true;
-    return generation.path;
+    return published.path;
   } finally {
-    if (generation && !returned) await removeUnpublished(generation);
+    if (generation && !returned) await removeUnpublishedGeneration(generation, published);
     await removeUnpublished(staging);
   }
 }
