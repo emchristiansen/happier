@@ -1,4 +1,4 @@
-import type { ConnectedServiceAuthGroupV1, ConnectedServiceCredentialHealthStatusV1 } from '@happier-dev/protocol';
+import { ConnectedServiceAuthGroupMemberStateV1Schema, type ConnectedServiceAuthGroupV1, type ConnectedServiceCredentialHealthStatusV1 } from '@happier-dev/protocol';
 
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from '../quotas/ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
 import {
@@ -46,6 +46,19 @@ export function mergePersistedMemberRuntimeState(
 ): ConnectedServiceAuthGroupMemberRuntimeState {
   const record = readRecord(persistedState);
   if (!record) return runtimeState ?? {};
+  // Parse each persisted field on its own so one malformed sibling cannot discard another.
+  const modelState = ConnectedServiceAuthGroupMemberStateV1Schema.safeParse({
+    modelUnavailableUntilMsByModelId: record.modelUnavailableUntilMsByModelId,
+  });
+  const modelUnavailableUntilMsByModelId = modelState.success
+    ? modelState.data.modelUnavailableUntilMsByModelId
+    : undefined;
+  const autoDisabledState = ConnectedServiceAuthGroupMemberStateV1Schema.safeParse({
+    autoDisabledReason: record.autoDisabledReason,
+  });
+  const autoDisabledReason = autoDisabledState.success
+    ? autoDisabledState.data.autoDisabledReason
+    : undefined;
   const persistedLastFailureKind = readString(record.lastFailureKind);
   const persistedProviderResetsAtMs = readNonNegativeNumber(record.providerResetsAtMs);
   const runtimeProviderResetsAtMs = readNonNegativeNumber(runtimeState?.providerResetsAtMs);
@@ -67,6 +80,7 @@ export function mergePersistedMemberRuntimeState(
       : runtimeProviderResetsAtMs;
   return {
     ...(runtimeState ?? {}),
+    ...(modelUnavailableUntilMsByModelId === undefined ? {} : { modelUnavailableUntilMsByModelId }),
     ...(readCredentialHealthStatus(record.credentialHealthStatus) ? { credentialHealthStatus: readCredentialHealthStatus(record.credentialHealthStatus) } : {}),
     cooldownUntilMs: readNonNegativeNumber(record.cooldownUntilMs),
     exhaustedUntilMs: readNonNegativeNumber(record.exhaustedUntilMs),
@@ -75,6 +89,9 @@ export function mergePersistedMemberRuntimeState(
     capacityLimitedUntilMs: readNonNegativeNumber(record.capacityLimitedUntilMs),
     authInvalidUntilMs: readNonNegativeNumber(record.authInvalidUntilMs),
     planUnavailableUntilMs: readNonNegativeNumber(record.planUnavailableUntilMs),
+    ...(autoDisabledReason ? { autoDisabledReason } : {}),
+    lastFailureCode: readString(record.lastFailureCode),
+    lastFailureProviderLimitId: readString(record.lastFailureProviderLimitId),
     validationBlockedUntilMs: readNonNegativeNumber(record.validationBlockedUntilMs),
     providerResetsAtMs,
     lastFailureKind: persistedLastFailureKind,
@@ -91,6 +108,7 @@ export function buildConnectedServiceAuthGroupSwitchState(input: Readonly<{
     serviceId: input.group.serviceId,
     groupId: input.group.groupId,
     capturedAtMs: input.nowMs,
+    quotaLimitSelection: input.group.policy.quotaLimitSelection,
   });
   return buildConnectedServiceAuthGroupSwitchStateFromMemberRuntimeStates({
     group: input.group,
@@ -123,6 +141,8 @@ function buildConnectedServiceAuthGroupSwitchStateFromMemberRuntimeStates(input:
     serviceId: input.group.serviceId,
     groupId: input.group.groupId,
     activeProfileId: input.group.activeProfileId,
+    lastSwitchReason: input.group.state.lastSwitchReason,
+    lastSwitchAt: input.group.state.lastSwitchAt,
     generation: input.group.generation,
     runtimeStateRevision: input.group.runtimeStateRevision,
     policy: normalizeConnectedServiceAuthGroupPolicy(input.group.policy),

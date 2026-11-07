@@ -1,8 +1,9 @@
 import * as React from 'react';
-import { ActivityIndicator, Animated, FlatList, Pressable, View } from 'react-native';
+import { Animated, FlatList, Pressable, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { Text } from '@/components/ui/text/Text';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { RelativeTimeText } from '@/components/ui/selectionList/accessories/RelativeTimeText';
 import { Typography } from '@/constants/Typography';
 import { useNowMs } from '@/hooks/time/useNowMs';
@@ -422,7 +423,7 @@ const TimelineEntryRow = React.memo((props: TimelineEntryRowProps) => {
                             <RelativeTimeText atMs={entry.createdAtMs} nowMs={props.nowMs} />
                         ) : null}
                         {props.pressState === 'pending' ? (
-                            <ActivityIndicator
+                            <ActivitySpinner
                                 testID={`${props.testIDPrefix}-entry-pending:${entry.id}`}
                                 size="small"
                                 color={theme.colors.text.secondary}

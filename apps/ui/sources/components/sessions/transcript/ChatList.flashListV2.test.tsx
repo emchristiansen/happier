@@ -1032,8 +1032,7 @@ function routeSessionViewportChangeIntoTestStore(
 
 vi.mock('@/sync/sync', async () => {
     const loadNewerMessages = vi.fn();
-    return (await import('@/dev/testkit/harness/chatListHarness')).createFlashListChatListSyncModuleMock({
-        loadOlderMessages: vi.fn(),
+    const syncModule = (await import('@/dev/testkit/harness/chatListHarness')).createFlashListChatListSyncModuleMock({
         loadTargetWindowMessages: vi.fn(),
         loadNewerMessages,
         hasDeferredNewerMessages: (sessionId: string) => deferredNewerSessionIdsState.has(sessionId),
@@ -1047,6 +1046,9 @@ vi.mock('@/sync/sync', async () => {
         markSessionLiveTailIntent: (sessionId: string) =>
             requireCanonicalSessionViewportSync().markSessionLiveTailIntent(qualifySessionViewportTestId(sessionId)),
     });
+    // Preserve the canonical empty-page result when beforeEach resets per-test overrides.
+    syncModule.sync.loadOlderMessages = vi.fn(syncModule.sync.loadOlderMessages);
+    return syncModule;
 });
 
 vi.mock('@/sync/store/hooks', async (importOriginal) => {
@@ -1112,7 +1114,8 @@ describe('ChatList (FlashList v2)', () => {
 
     beforeEach(async () => {
         const syncMod = await import('@/sync/sync');
-        vi.mocked(syncMod.sync.loadOlderMessages).mockReset();
+        // The real loader always resolves a result; web open-fill may now page older on its own.
+        vi.mocked(syncMod.sync.loadOlderMessages).mockReset().mockResolvedValue({ loaded: 0, hasMore: false, status: 'no_more' });
         vi.mocked(syncMod.sync.loadNewerMessages).mockReset();
         vi.mocked(
             (syncMod.sync as unknown as { loadTargetWindowMessages: ReturnType<typeof vi.fn> }).loadTargetWindowMessages,
@@ -1580,6 +1583,31 @@ describe('ChatList (FlashList v2)', () => {
             return (getCapturedFlashListProps()?.data ?? []).map((item: any) => item.id);
         }
 
+        it('keeps header-only plain groups collapsed with a stable boundary, including after a background toggle', async () => {
+            configureToolTurn(['t1', 't2', 't3', 't4', 't5'], { previewCount: 0, readerMessage: true });
+            settingValues.transcriptToolCallsGroupShowBackground = false;
+            const { ChatList } = await import('./ChatList');
+            const screen = await renderTrackedFlashListChatList(<ChatList session={{ ...sessionState }} />);
+            await screen.settle();
+
+            const plainIds = listDataIds();
+            expect(plainIds).toContain(`${groupId}#header`);
+            expect(plainIds).toContain(`${groupId}#footer`);
+            expect(plainIds).not.toContain(`${groupId}#expand`);
+            expect(plainIds.filter((id) => /^msg:t[1-5]$/.test(id))).toEqual([]);
+
+            settingValues.transcriptToolCallsGroupShowBackground = true;
+            await screen.update(<ChatList session={{ ...sessionState, seq: 1 }} />);
+            await screen.settle();
+            expect(listDataIds()).toContain(`${groupId}#footer`);
+
+            settingValues.transcriptToolCallsGroupShowBackground = false;
+            await screen.update(<ChatList session={{ ...sessionState, seq: 2 }} />);
+            await screen.settle();
+            expect(listDataIds()).toEqual(plainIds);
+            await screen.unmount();
+        });
+
         it('turns a prepend that merges into the visible group into BETWEEN-row insertion with stable keys', async () => {
             configureToolTurn(['t2', 't3']);
 
@@ -1588,8 +1616,8 @@ describe('ChatList (FlashList v2)', () => {
             await screen.settle();
 
             const beforeIds = listDataIds();
-            expect(beforeIds).toContain(`${groupId}#tool:t2`);
-            expect(beforeIds).not.toContain(`${groupId}#tool:t1`);
+            expect(beforeIds).toContain(`msg:t2`);
+            expect(beforeIds).not.toContain(`msg:t1`);
 
             // Prepend t1 merging into the same (sticky-id) group — sticky remap itself is
             // covered by buildTranscriptTurns tests; here the group keeps its id.
@@ -1602,9 +1630,9 @@ describe('ChatList (FlashList v2)', () => {
             expect(afterIds.filter((id) => beforeIds.includes(id))).toEqual(beforeIds);
             // Native FlashList renders newest-first, so the older merged tool is inserted
             // after the newer tool rows and immediately before the group header.
-            const t1Index = afterIds.indexOf(`${groupId}#tool:t1`);
+            const t1Index = afterIds.indexOf(`msg:t1`);
             expect(t1Index).toBeLessThan(afterIds.indexOf(`${groupId}#header`));
-            expect(t1Index).toBeGreaterThan(afterIds.indexOf(`${groupId}#tool:t2`));
+            expect(t1Index).toBeGreaterThan(afterIds.indexOf(`msg:t2`));
             // Per-unit rows stay single-content rows (the N1 row-mutated instrument
             // counts 1 per unit, so intra-row growth cannot fire for tool groups).
             const { resolveTranscriptRowContentCount } = await import('./scroll/transcriptRowEvidence');
@@ -1632,8 +1660,8 @@ describe('ChatList (FlashList v2)', () => {
 
             const afterIds = listDataIds();
             expect(afterIds.filter((id) => beforeIds.includes(id))).toEqual(beforeIds);
-            const newToolIndex = afterIds.indexOf(`${groupId}#tool:t3`);
-            expect(newToolIndex).toBeLessThan(afterIds.indexOf(`${groupId}#tool:t2`));
+            const newToolIndex = afterIds.indexOf(`msg:t3`);
+            expect(newToolIndex).toBeLessThan(afterIds.indexOf(`msg:t2`));
             expect(afterIds[newToolIndex - 1]).toBe(`${groupId}#footer`);
 
             await screen.unmount();
@@ -1653,10 +1681,10 @@ describe('ChatList (FlashList v2)', () => {
             expect(collapsedIds).toEqual(expect.arrayContaining([
                 `${groupId}#header`,
                 `${groupId}#expand`,
-                `${groupId}#tool:t40`,
+                `msg:t40`,
                 `${groupId}#footer`,
             ]));
-            expect(collapsedIds).not.toContain(`${groupId}#tool:t1`);
+            expect(collapsedIds).not.toContain(`msg:t1`);
 
             const headerProps = renderedToolGroupUnitHeaderProps.at(-1);
             expect(typeof headerProps?.setExpanded).toBe('function');
@@ -1668,12 +1696,12 @@ describe('ChatList (FlashList v2)', () => {
             const expandedIds = listDataIds();
             expect(expandedIds).toEqual(expect.arrayContaining([
                 `${groupId}#header`,
-                ...toolIds.map((id) => `${groupId}#tool:${id}`),
+                ...toolIds.map((id) => `msg:${id}`),
                 `${groupId}#footer`,
             ]));
             expect(expandedIds).not.toContain(`${groupId}#expand`);
             // The preview-tail row keeps the SAME key across the toggle.
-            expect(expandedIds).toContain(`${groupId}#tool:t40`);
+            expect(expandedIds).toContain(`msg:t40`);
 
             const expandedHeaderProps = renderedToolGroupUnitHeaderProps.at(-1);
             expect(expandedHeaderProps?.expanded).toBe(true);
@@ -4735,7 +4763,7 @@ describe('ChatList (FlashList v2)', () => {
         syncPerformanceTelemetry.reset();
     });
 
-    it('does not retry web stable paint while telemetry is disabled', async () => {
+    it('keeps web paint telemetry empty while telemetry is disabled', async () => {
         await withWebFlashListFakeTimers(1_000, async () => {
             runtimeMockState.platformOs = 'web';
             sessionMessagesState = {
@@ -4769,11 +4797,8 @@ describe('ChatList (FlashList v2)', () => {
                     await primeFlashListMetrics(640, 1600, { turns: 1 });
                     await screen.settle({ turns: 2 });
 
-                    const renderCountAfterInitialPaint = renderedFlashListCount;
-
                     await screen.settle({ advanceTimersMs: 80, cycles: 1, turns: 2 });
 
-                    expect(renderedFlashListCount).toBe(renderCountAfterInitialPaint);
                     expect(syncPerformanceTelemetry.snapshot().events).toEqual([]);
                 },
                 {
@@ -4790,7 +4815,7 @@ describe('ChatList (FlashList v2)', () => {
         });
     });
 
-    it('does not retry web stable paint after telemetry is already recorded', async () => {
+    it('records web stable paint only once after paint metrics disappear', async () => {
         await withWebFlashListFakeTimers(1_000, async () => {
             runtimeMockState.platformOs = 'web';
             sessionMessagesState = {
@@ -4846,14 +4871,14 @@ describe('ChatList (FlashList v2)', () => {
                     await screen.update(<ChatList session={{ ...sessionState }} />);
                     await screen.settle({ turns: 2 });
 
-                    const renderCountAfterRecordedAwayRender = renderedFlashListCount;
-
                     await screen.settle({ advanceTimersMs: 80, cycles: 1, turns: 2 });
 
-                    expect(renderedFlashListCount).toBe(renderCountAfterRecordedAwayRender);
+                    // Retry activity is checked at the telemetry host: whole-list renders
+                    // also include independent initial-pin and viewport lifecycle work.
                     expect(syncPerformanceTelemetry
                         .snapshot()
-                        .events.filter((event) => event.name === 'ui.sessions.transcript.stablePaint')).toHaveLength(1);
+                        .events.filter((event) => event.name === 'ui.sessions.transcript.stablePaint')
+                        .map((event) => event.count)).toEqual([1]);
                 },
                 {
                     document: { getElementById: vi.fn(() => scrollEl) },

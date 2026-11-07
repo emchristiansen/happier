@@ -10,8 +10,8 @@ async function* exactPrompt(): AsyncIterable<unknown> {
   };
 }
 
-describe('Claude legacy stream-json provider transport boundary', () => {
-  it('does not complete handoff until the exact stdin write callback confirms the record', async () => {
+describe('Claude legacy stream-json stdin pump', () => {
+  it('does not complete the pump until the pending stdin write settles', async () => {
     class DeferredWrite extends EventEmitter {
       destroyed = false;
       writableEnded = false;
@@ -35,12 +35,9 @@ describe('Claude legacy stream-json provider transport boundary', () => {
 
     const stdin = new DeferredWrite();
     let completed = false;
-    const outcomes: string[] = [];
     const handoff = streamToStdin(
       exactPrompt(),
       stdin as unknown as NodeJS.WritableStream,
-      undefined,
-      (_record, outcome) => outcomes.push(outcome),
     )
       .then(() => { completed = true; });
 
@@ -49,15 +46,13 @@ describe('Claude legacy stream-json provider transport boundary', () => {
     });
     await Promise.resolve();
     expect(completed).toBe(false);
-    expect(outcomes).toEqual([]);
 
     stdin.confirm();
     await handoff;
     expect(completed).toBe(true);
-    expect(outcomes).toEqual(['accepted']);
   });
 
-  it('rejects a proven pre-write failure without reporting a successful handoff', async () => {
+  it('rejects a synchronous stdin write failure', async () => {
     class PreWriteFailure extends EventEmitter {
       destroyed = false;
       writableEnded = false;
@@ -71,17 +66,13 @@ describe('Claude legacy stream-json provider transport boundary', () => {
       }
     }
 
-    const outcomes: string[] = [];
     await expect(streamToStdin(
       exactPrompt(),
       new PreWriteFailure() as unknown as NodeJS.WritableStream,
-      undefined,
-      (_record, outcome) => outcomes.push(outcome),
     )).rejects.toMatchObject({ code: 'EBADF' });
-    expect(outcomes).toEqual(['rejected_before_effect']);
   });
 
-  it('does not report success when stdin fails after the write attempt becomes ambiguous', async () => {
+  it('rejects when stdin emits an error during a pending write', async () => {
     class AmbiguousWrite extends EventEmitter {
       destroyed = false;
       writableEnded = false;
@@ -96,13 +87,9 @@ describe('Claude legacy stream-json provider transport boundary', () => {
       }
     }
 
-    const outcomes: string[] = [];
     await expect(streamToStdin(
       exactPrompt(),
       new AmbiguousWrite() as unknown as NodeJS.WritableStream,
-      undefined,
-      (_record, outcome) => outcomes.push(outcome),
     )).rejects.toMatchObject({ code: 'EPIPE' });
-    expect(outcomes).toEqual(['effect_may_have_occurred']);
   });
 });

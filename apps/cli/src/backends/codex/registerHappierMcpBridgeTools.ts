@@ -1,18 +1,18 @@
 import { listBuiltInHappierTools } from '@/agent/tools/happierTools/listBuiltInHappierTools';
 
 type ToolRegistrar = Readonly<{
-  registerTool: (name: string, definition: any, handler: (args: any) => Promise<any>) => void;
+  registerTool: (name: string, definition: any, handler: (args: any, extra?: unknown) => Promise<any>) => void;
 }>;
 
 export function registerHappierMcpBridgeTools(
   server: ToolRegistrar,
   deps: Readonly<{
-    callHttpTool: (name: string, args: unknown) => Promise<any>;
+    callHttpTool: (name: string, args: unknown, extra?: unknown) => Promise<any>;
   }>,
 ): void {
-  const forward = (name: string) => async (args: any) => {
+  const forward = (name: string) => async (args: any, extra?: unknown) => {
     try {
-      return await deps.callHttpTool(name, args);
+      return await deps.callHttpTool(name, args, extra);
     } catch (error) {
       return {
         content: [
@@ -28,6 +28,7 @@ export function registerHappierMcpBridgeTools(
       description: tool.description,
       title: tool.title,
       inputSchema: tool.inputSchema,
+      ...(tool.annotations === undefined ? {} : { annotations: tool.annotations }),
     };
 
     server.registerTool(tool.name, meta, forward(tool.name));

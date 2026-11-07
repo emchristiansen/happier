@@ -65,7 +65,7 @@ test.describe('ui e2e: pets settings', () => {
   });
 
   test('supports daemon-local pet import and hides account sync controls when pets sync is disabled', async ({ page }) => {
-    test.setTimeout(540_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing fixtures');
 
     const testDir = resolve(join(suiteDir, 'settings-local-import'));
@@ -115,6 +115,23 @@ test.describe('ui e2e: pets settings', () => {
         timeout: 60_000,
       });
     }
+    // React Native Web rounds onLayout widths. The tiles must still fit the actual
+    // fractional content box, instead of pushing the fifth tile onto a new row.
+    const previousViewport = page.viewportSize();
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const petGrid = page.getByTestId('settings-pets-device-pet-grid');
+    await expect(petGrid.locator('[data-testid^="settings-pets-built-in-tile-"]')).toHaveCount(5);
+    for (const width of [749.75, 754.75, 759.75]) {
+      await petGrid.evaluate((element, width) => { element.style.width = `${width}px`; }, width);
+      await expect.poll(async () => petGrid.evaluate((element) => {
+        const tops = Array.from(element.querySelectorAll('[data-testid^="settings-pets-built-in-tile-"]'))
+          .map((tile) => tile.getBoundingClientRect().top);
+        return tops.length === 5 ? Math.max(...tops) - Math.min(...tops) : Number.POSITIVE_INFINITY;
+      })).toBeLessThan(1);
+    }
+    await petGrid.evaluate((element) => { element.style.removeProperty('width'); });
+    if (previousViewport) await page.setViewportSize(previousViewport);
+
     await expect(page.getByTestId('settings-pets-built-in-source-holly')).toHaveCount(0);
     await expect(page.getByTestId('settings-pets-account-library-list')).toHaveCount(0);
     await expect(page.locator('[data-testid^="settings-pets-import-to-account"]')).toHaveCount(0);

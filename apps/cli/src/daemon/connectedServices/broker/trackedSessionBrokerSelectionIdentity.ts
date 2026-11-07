@@ -14,7 +14,8 @@ const LEGACY_PROVIDER_BROKER_SELECTION_IDENTITY_ENV_KEYS = [
 export function readTrackedSessionBrokerSelectionIdentity(tracked: Pick<
   TrackedSession,
   'happySessionMetadataFromLocalWebhook' | 'spawnOptions'
->): string | null {
+> | null): string | null {
+  if (!tracked) return null;
   const currentIdentity = readSessionConnectedServiceBrokerSelectionIdentity(
     tracked.happySessionMetadataFromLocalWebhook?.connectedServiceBrokerSelectionIdentityV1,
   ) ?? readSessionConnectedServiceBrokerSelectionIdentity(

@@ -20,6 +20,23 @@ const FUTURE_EXPIRES_AT_MS = Date.now() + 60 * 60 * 1000;
 const ORIGINAL_PLATFORM_DESCRIPTOR = Object.getOwnPropertyDescriptor(process, 'platform');
 
 describe('createClaudeConnectedServiceRuntimeAuthAdapter', () => {
+  it('does not replace explicitly unknown issued-request identity with the current credential record', () => {
+    const record = buildConnectedServiceCredentialRecord({
+      now: 1000, serviceId: 'claude-subscription', profileId: 'later', kind: 'oauth',
+      expiresAt: FUTURE_EXPIRES_AT_MS,
+      oauth: { accessToken: 'placeholder', refreshToken: 'placeholder', idToken: null,
+        scope: CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE, tokenType: 'Bearer',
+        providerAccountId: 'later-account', providerEmail: null,
+        raw: { claudeAiOauth: { organizationUuid: 'later-org' } } },
+    });
+    const classification = createClaudeConnectedServiceRuntimeAuthAdapter().classifyRuntimeAuthFailure({
+      target: { agentId: 'claude' },
+      selection: { serviceId: 'claude-subscription', activeProfileId: 'later', record },
+      error: { type: 'assistant', isApiErrorMessage: true, apiErrorStatus: 429, error: 'rate_limit_error',
+        sourceProviderAccountId: null, sourceProviderOrganizationId: null },
+    });
+    expect(classification).toMatchObject({ sourceProviderAccountId: null, sourceProviderOrganizationId: null });
+  });
   beforeEach(() => {
     if (ORIGINAL_PLATFORM_DESCRIPTOR) {
       Object.defineProperty(process, 'platform', { ...ORIGINAL_PLATFORM_DESCRIPTOR, value: 'linux' });
@@ -47,6 +64,7 @@ describe('createClaudeConnectedServiceRuntimeAuthAdapter', () => {
         tokenType: 'Bearer',
         providerAccountId: 'provider-account',
         providerEmail: 'team@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-team' } },
       },
     });
 
@@ -60,12 +78,11 @@ describe('createClaudeConnectedServiceRuntimeAuthAdapter', () => {
         record,
       },
       error: {
-        type: 'rate_limit_event',
-        rate_limit_info: {
-          status: 'rejected',
-          rateLimitType: 'weekly',
-          utilization: 100,
-        },
+        type: 'assistant',
+        isApiErrorMessage: true,
+        apiErrorStatus: 429,
+        error: 'rate_limit_error',
+        providerLimitId: 'weekly',
       },
     });
 
@@ -77,6 +94,7 @@ describe('createClaudeConnectedServiceRuntimeAuthAdapter', () => {
       groupGeneration: 42,
       sourceProviderAccountId: 'provider-account',
       sourceAccountLabel: 'team@example.com',
+      sourceProviderOrganizationId: 'org-team',
     });
   });
 
@@ -269,6 +287,7 @@ describe('createClaudeConnectedServiceRuntimeAuthAdapter', () => {
         tokenType: 'Bearer',
         providerAccountId: 'provider-account',
         providerEmail: 'member@example.com',
+        raw: { claudeAiOauth: { organizationUuid: 'org-member' } },
       },
     });
     const selection = {
@@ -337,6 +356,13 @@ describe('createClaudeConnectedServiceRuntimeAuthAdapter', () => {
         accountUuid: 'provider-account',
         emailAddress: 'member@example.com',
       },
+    });
+    const rootConfig = JSON.parse(await readFile(join(runtimeClaudeConfigDir, '.claude.json'), 'utf8'));
+    await writeFile(join(runtimeClaudeConfigDir, '.claude.json'), JSON.stringify({
+      ...rootConfig, oauthAccount: { ...rootConfig.oauthAccount, organizationUuid: 'org-other' },
+    }));
+    await expect(adapter.verifyActiveAccount?.({ target: { agentId: 'claude' }, selection })).resolves.toMatchObject({
+      status: 'unavailable', reason: 'claude_code_runtime_account_adoption_unproven',
     });
     expect(await readFile(join(runtimeClaudeConfigDir, 'settings.json'), 'utf8')).toBe(settingsBefore);
     expect(JSON.parse(await readFile(
@@ -433,6 +459,9 @@ describe('createClaudeConnectedServiceRuntimeAuthAdapter', () => {
         },
       },
     });
+    await writeFile(join(runtimeClaudeConfigDir, '.claude.json'), JSON.stringify({
+      oauthAccount: { accountUuid: 'provider-account', emailAddress: 'member@example.com' },
+    }));
     const credentialFingerprint = computeClaudeCodeCredentialFingerprint(JSON.parse(
       await readFile(resolveClaudeCodeCredentialsFilePath(runtimeClaudeConfigDir), 'utf8'),
     ));

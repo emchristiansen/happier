@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { DaemonRunningInspection } from './controlClient';
 
 const stopDaemonMock = vi.fn(async () => undefined);
@@ -34,13 +34,20 @@ const spawnDetachedDaemonStartSyncMock = vi.fn<() => Promise<{ pid?: number; unr
 );
 
 describe('restartDaemonAndWait', () => {
+  beforeAll(async () => {
+    // Load the source graph once outside the 1ms lifecycle budgets. The same
+    // boundary mock objects are reset between cases, so module reload is unnecessary.
+    await importSubject();
+    inspectDaemonRunningStateMock.mockReset();
+    vi.useRealTimers();
+  }, 120_000);
   afterEach(() => {
+    vi.useRealTimers();
     stopDaemonMock.mockReset();
     restartAllDaemonSessionRunnersMock.mockReset();
     inspectDaemonRunningStateMock.mockReset();
     spawnDetachedDaemonStartSyncMock.mockReset();
     vi.restoreAllMocks();
-    vi.resetModules();
     delete process.env.HAPPIER_DAEMON_START_WAIT_TIMEOUT_MS;
     delete process.env.HAPPIER_DAEMON_START_WAIT_POLL_MS;
     delete process.env.HAPPIER_DAEMON_RESTART_STABILITY_TIMEOUT_MS;
@@ -105,7 +112,18 @@ describe('restartDaemonAndWait', () => {
     process.env.HAPPIER_DAEMON_START_WAIT_POLL_MS = '1';
     process.env.HAPPIER_DAEMON_RESTART_STABILITY_TIMEOUT_MS = '1';
 
-    return await import('./restartDaemonAndWait');
+    const subject = await import('./restartDaemonAndWait');
+    // Arm the clock boundary after module loading so a 1ms lifecycle budget
+    // measures the intended polling sequence rather than dynamic import cost.
+    vi.useFakeTimers();
+    return {
+      ...subject,
+      restartDaemonAndWait: async (...args: Parameters<typeof subject.restartDaemonAndWait>) => {
+        const pending = subject.restartDaemonAndWait(...args);
+        await vi.runAllTimersAsync();
+        return await pending;
+      },
+    };
   }
 
   it('restarts through the self-restart takeover path by default', async () => {

@@ -1,7 +1,6 @@
 import * as React from 'react';
 import { Platform, useWindowDimensions } from 'react-native';
 import { router } from 'expo-router';
-import { deriveAccountMachineKeyFromRecoverySecret } from '@happier-dev/protocol';
 import { useAuth } from '@/auth/context/AuthContext';
 import { TokenStorage, type AuthCredentials, isLegacyAuthCredentials } from '@/auth/storage/tokenStorage';
 import { decodeBase64 } from '@/encryption/base64';
@@ -10,6 +9,9 @@ import {
     buildTerminalResponseV1,
     buildTerminalResponseV2,
     buildTerminalResponseV3,
+    buildTerminalResponseV2TokenOnly,
+    buildTerminalResponseV3TokenOnly,
+    resolveTerminalProvisioningContentPrivateKey,
 } from '@/auth/terminal/terminalProvisioning';
 import { Modal } from '@/modal';
 import { t } from '@/text';
@@ -27,22 +29,6 @@ interface UseConnectTerminalOptions {
     onSuccess?: () => void;
     onError?: (error: any) => void;
     allowLoopbackServerOverride?: boolean;
-}
-
-function resolveTerminalProvisioningContentPrivateKey(credentials: AuthCredentials): Uint8Array {
-    if (!isLegacyAuthCredentials(credentials)) {
-        const machineKey = decodeBase64(credentials.encryption.machineKey, 'base64');
-        if (machineKey.length !== 32) {
-            throw new Error('Invalid dataKey credential key lengths');
-        }
-        return machineKey;
-    }
-
-    const secretKey = decodeBase64(credentials.secret, 'base64url');
-    if (secretKey.length !== 32) {
-        throw new Error(`Invalid secret key length: ${secretKey.length}, expected 32`);
-    }
-    return deriveAccountMachineKeyFromRecoverySecret(secretKey);
 }
 
 export function useConnectTerminal(options?: UseConnectTerminalOptions) {
@@ -137,12 +123,12 @@ export function useConnectTerminal(options?: UseConnectTerminalOptions) {
                 storage.getState().settings?.terminalConnectLegacySecretExportEnabled,
             );
 
-            const contentPrivateKey = resolveTerminalProvisioningContentPrivateKey(activeCredentials);
+            const contentPrivateKey = await resolveTerminalProvisioningContentPrivateKey(activeCredentials);
             const pairingSecret = parsed.pairing
                 ? decodeBase64(parsed.pairing.secretB64Url, 'base64url')
                 : null;
-            const responseV2 =
-                parsed.pairing && pairingSecret?.length === 32
+            const responseV2 = contentPrivateKey ?
+                parsed.pairing && pairingSecret
                     ? buildTerminalResponseV3({
                         contentPrivateKey,
                         terminalEphemeralPublicKey: publicKey,
@@ -153,7 +139,17 @@ export function useConnectTerminal(options?: UseConnectTerminalOptions) {
                     : buildTerminalResponseV2({
                         contentPrivateKey,
                         terminalEphemeralPublicKey: publicKey,
-                    });
+                    }) : new Uint8Array();
+            const answerTokenOnly = contentPrivateKey ? undefined : () => (
+                parsed.pairing && pairingSecret
+                    ? buildTerminalResponseV3TokenOnly({
+                        terminalEphemeralPublicKey: publicKey,
+                        pairingSecret,
+                        createdAtMs: parsed.pairing.createdAtMs,
+                        expiresAtMs: parsed.pairing.expiresAtMs,
+                    })
+                    : buildTerminalResponseV2TokenOnly({ terminalEphemeralPublicKey: publicKey })
+            );
 
             const responseV1 =
                 allowLegacySecretExportEnabled && isLegacyAuthCredentials(activeCredentials)
@@ -164,7 +160,7 @@ export function useConnectTerminal(options?: UseConnectTerminalOptions) {
                         })
                     : new Uint8Array();
 
-            const approvalResult = await authApprove(activeCredentials.token, publicKey, responseV1, responseV2);
+            const approvalResult = await authApprove(activeCredentials.token, publicKey, responseV1, responseV2, { answerTokenOnly });
 
             // If we successfully completed a pending connect, clear it.
             clearPendingTerminalConnect();

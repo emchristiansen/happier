@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import axios from 'axios';
+import { ConnectedServiceIdSchema } from '@happier-dev/protocol';
 
 vi.mock('axios');
 
@@ -28,7 +29,9 @@ describe('fetchAccountProfile', () => {
 
     await fetchAccountProfile({ token: 't', signal: controller.signal });
 
-    expect((axios.get as any).mock.calls[0]?.[0]).toBe('http://127.0.0.1:41001/v1/account/profile');
+    const url = new URL(String(vi.mocked(axios.get).mock.calls[0]?.[0]));
+    expect(`${url.origin}${url.pathname}`).toBe('http://127.0.0.1:41001/v1/account/profile');
+    expect(JSON.parse(url.searchParams.get('happierConnectedServices') ?? 'null')).toEqual(ConnectedServiceIdSchema.options);
     expect((axios.get as any).mock.calls[0]?.[1]).toEqual(expect.objectContaining({
       signal: controller.signal,
     }));

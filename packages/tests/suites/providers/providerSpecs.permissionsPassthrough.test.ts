@@ -70,21 +70,8 @@ describe('providers: providerSpec permissions passthrough', () => {
 
     const kimi = providers.find((p) => p.id === 'kimi');
     expect(kimi).toBeTruthy();
-    expect(kimi?.permissions?.v).toBe(1);
-    expect(kimi?.permissions?.acp?.expectToolPermissionPrompts).toBe(false);
-    expect(kimi?.permissions?.acp?.permissionSurfaceOutsideWorkspaceYolo).toBe(true);
-    expectModeMapKeys(kimi?.permissions?.acp?.toolPermissionPromptsByMode);
-    expect(kimi?.permissions?.acp?.toolPermissionPromptsByMode?.default).toBe(false);
-    expect(kimi?.permissions?.acp?.toolPermissionPromptsByMode?.yolo).toBe(false);
-    expectModeMapKeys(kimi?.permissions?.acp?.outsideWorkspaceWriteAllowedByMode);
-    expect(kimi?.permissions?.acp?.outsideWorkspaceWriteAllowedByMode?.default).toBe(false);
-    expect(kimi?.permissions?.acp?.outsideWorkspaceWriteAllowedByMode?.['safe-yolo']).toBe(false);
-    expect(kimi?.permissions?.acp?.outsideWorkspaceWriteAllowedByMode?.['read-only']).toBe(false);
-    expect(kimi?.permissions?.acp?.outsideWorkspaceWriteAllowedByMode?.yolo).toBe(false);
-    expectModeMapKeys(kimi?.permissions?.acp?.outsideWorkspaceWriteMustCompleteByMode);
-    expect(kimi?.permissions?.acp?.outsideWorkspaceWriteMustCompleteByMode?.default).toBe(false);
-    expect(kimi?.permissions?.acp?.outsideWorkspaceWriteMustCompleteByMode?.['safe-yolo']).toBe(false);
-    expect(kimi?.permissions?.acp?.outsideWorkspaceWriteMustCompleteByMode?.['read-only']).toBe(false);
-    expect(kimi?.permissions?.acp?.outsideWorkspaceWriteMustCompleteByMode?.yolo).toBe(false);
+    // Current Kimi Code mode behavior has not been authenticated live. Absence is intentional:
+    // a false-filled matrix would incorrectly claim that unsafe mappings were verified.
+    expect(kimi?.permissions).toBeUndefined();
   });
 });

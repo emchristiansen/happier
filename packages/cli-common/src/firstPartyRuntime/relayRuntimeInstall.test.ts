@@ -1,12 +1,43 @@
-import { access, lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { resolveRelayRuntimeDefaults } from './relayRuntime.js';
 import { installOrUpdateRelayRuntimeLocal } from './relayRuntimeInstall.js';
+
+const windowsLauncherFixture = vi.hoisted(() => ({ path: '' }));
+
+// The packaged Windows service launcher is a release-built native asset that clean checkouts and
+// non-Windows runners do not have. Windows-target installs here stage a minimal launcher PE; the
+// real resolver and the native binary have their own tests.
+vi.mock('../service/windowsLauncher.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../service/windowsLauncher.js')>();
+  return {
+    ...actual,
+    resolvePackagedWindowsServiceLauncherInstallSpec: () =>
+      actual.resolveWindowsServiceLauncherInstallSpec(windowsLauncherFixture.path),
+  };
+});
+
+beforeAll(async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'happier-cli-common-relay-launcher-'));
+  const bytes = Buffer.alloc(512);
+  bytes.writeUInt16LE(0x5a4d, 0);
+  bytes.writeUInt32LE(0x80, 0x3c);
+  bytes.writeUInt32LE(0x00004550, 0x80);
+  bytes.writeUInt16LE(0x8664, 0x84);
+  bytes.writeUInt16LE(0x20b, 0x98);
+  bytes.writeUInt16LE(2, 0x98 + 68);
+  bytes.write('HAPPIER_SERVICE_LAUNCHER_V1', 0x120, 'ascii');
+  windowsLauncherFixture.path = join(dir, 'happier-service-launcher.exe');
+  await writeFile(windowsLauncherFixture.path, bytes);
+  return async () => {
+    await rm(dir, { recursive: true, force: true });
+  };
+});
 
 describe('installOrUpdateRelayRuntimeLocal', () => {
   it('returns the env-overridden baseUrl instead of the default relay port', async () => {
@@ -173,6 +204,82 @@ describe('installOrUpdateRelayRuntimeLocal', () => {
       await expect(readFileText(join(defaults.dataDir, 'handy-master-secret.txt'))).resolves.toBe('secret-before-update\n');
       await expect(readFileText(join(defaults.dataDir, 'session-marker.txt'))).resolves.toBe('session-before-update\n');
       await expect(readFileText(join(defaults.logDir, 'server.out.log'))).resolves.toBe('existing-log\n');
+    } finally {
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  // The CLI shows a live step around the install, and the daemon serves other requests meanwhile:
+  // the migration must not block the event loop or write over the caller's terminal.
+  it('runs the database migration without blocking and keeps its output in the relay logs', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'happier-cli-common-relay-runtime-'));
+    try {
+      const payloadRoot = join(homeDir, 'payload');
+      await mkdir(join(payloadRoot, 'prisma', 'sqlite', 'migrations'), { recursive: true });
+      const serverBinaryPath = join(payloadRoot, 'happier-server');
+      await writeFile(
+        serverBinaryPath,
+        '#!/bin/sh\nif [ "$1" = "--migrate-only" ]; then echo "applied 20200101000000_init"; echo "migration note" >&2; sleep 1; fi\n',
+        'utf8',
+      );
+      await chmod(serverBinaryPath, 0o755);
+
+      let longestStall = 0;
+      let lastTick = Date.now();
+      const ticker = setInterval(() => {
+        const now = Date.now();
+        longestStall = Math.max(longestStall, now - lastTick);
+        lastTick = now;
+      }, 20);
+      try {
+        await installOrUpdateRelayRuntimeLocal({
+          serverBinaryPath,
+          channel: 'preview',
+          mode: 'user',
+          platform: 'linux',
+          arch: 'arm64',
+          homeDir,
+          env: { HAPPIER_SQLITE_AUTO_MIGRATE: '0' },
+          runServiceCommands: false,
+          skipHealthCheck: true,
+        });
+      } finally {
+        clearInterval(ticker);
+      }
+
+      expect(longestStall).toBeLessThan(500);
+      const defaults = resolveRelayRuntimeDefaults({ platform: 'linux', mode: 'user', channel: 'preview', homeDir });
+      await expect(readFileText(join(defaults.logDir, 'server.out.log'))).resolves.toContain('applied 20200101000000_init');
+      await expect(readFileText(join(defaults.logDir, 'server.err.log'))).resolves.toContain('migration note');
+    } finally {
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports what the database migration printed when it fails', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'happier-cli-common-relay-runtime-'));
+    try {
+      const payloadRoot = join(homeDir, 'payload');
+      await mkdir(join(payloadRoot, 'prisma', 'sqlite', 'migrations'), { recursive: true });
+      const serverBinaryPath = join(payloadRoot, 'happier-server');
+      await writeFile(
+        serverBinaryPath,
+        '#!/bin/sh\nif [ "$1" = "--migrate-only" ]; then echo "database is locked" >&2; exit 3; fi\n',
+        'utf8',
+      );
+      await chmod(serverBinaryPath, 0o755);
+
+      await expect(installOrUpdateRelayRuntimeLocal({
+        serverBinaryPath,
+        channel: 'preview',
+        mode: 'user',
+        platform: 'linux',
+        arch: 'arm64',
+        homeDir,
+        env: { HAPPIER_SQLITE_AUTO_MIGRATE: '0' },
+        runServiceCommands: false,
+        skipHealthCheck: true,
+      })).rejects.toThrow(/database migration exited with status 3[\s\S]*database is locked/);
     } finally {
       await rm(homeDir, { recursive: true, force: true });
     }

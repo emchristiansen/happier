@@ -880,7 +880,7 @@ describe('ChatList (FlashList v2 inverted pilot)', () => {
             const screen = await renderFlashListChatList(
                 <ChatList session={flashListChatListHarnessState.sessionState} />,
             );
-            const toolRowId = listDataIds(screen).find((id) => id.includes('#tool:tool-1'));
+            const toolRowId = listDataIds(screen).find((id) => id === 'msg:tool-1');
             expect(toolRowId).toBeTruthy();
             await fireTranscriptItemShellLayout(findTranscriptItemShell(screen, toolRowId!), 44);
             fileFlashListRefHandle.clearLayoutCacheOnUpdate.mockClear();

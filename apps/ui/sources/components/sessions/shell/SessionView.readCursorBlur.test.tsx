@@ -46,7 +46,7 @@ function getStorageStateForTest() {
         sessions: { s1: sessionState.current },
         settings: {},
         localSettings: {},
-        sessionListViewDataByServerId: {},
+        sessionListRenderables: {}, sessionListViewDataByServerId: {},
     };
 }
 
@@ -432,13 +432,6 @@ vi.mock('@/sync/domains/session/resume/resumeSessionBase', () => ({
 vi.mock('@/sync/domains/session/resume/happierReplayPrompt', () => ({
     resolveHappierReplayConfig: () => null,
 }));
-vi.mock('@/sync/domains/session/control/submitMode', () => ({
-    chooseSubmitMode: () => 'submit',
-}));
-vi.mock('@/sync/domains/session/control/sessionLocalControl', () => ({
-    getSessionLocalControlState: () => null,
-    isSessionLocallyAttached: () => true,
-}));
 vi.mock('@/sync/domains/session/control/effectiveRuntimeControlSurface', () => ({
     supportsEffectiveLocalControlForSession: () => true,
     // The in-session Agent picker reads this to decide whether a transcript can be
@@ -451,10 +444,9 @@ vi.mock('@/sync/domains/models/modelOptions', () => ({
         (options ?? []).find((o: any) => o.value === id) ?? (options ?? []).find((o: any) => o.extendedContextModelId === id) ?? null,
     isModelSelectableForSession: () => true,
 }));
-vi.mock('@/sync/domains/session/control/localControlSwitch', () => ({
+vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/sync/domains/session/control/localControlSwitch')>()),
     shouldRenderChatTimelineForSession: () => true,
-    shouldRequestRemoteControl: () => false,
-    shouldRequestRemoteControlAfterPendingEnqueue: () => false,
 }));
 vi.mock('@/sync/domains/session/control/controlSwitchUiTimeout', () => ({
     readControlSwitchUiTimeoutMsFromEnv: () => 1000,

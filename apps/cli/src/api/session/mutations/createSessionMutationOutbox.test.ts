@@ -17,6 +17,7 @@ import {
 vi.mock('axios');
 
 let tempHomeDir: string | null = null;
+let persistenceMockInstalled = false;
 const originalHappyHomeDir = process.env.HAPPIER_HOME_DIR;
 const originalMaxAttempts = process.env.HAPPIER_SESSION_MUTATION_OUTBOX_MAX_ATTEMPTS;
 const originalBaseRetryMs = process.env.HAPPIER_SESSION_MUTATION_OUTBOX_BASE_RETRY_MS;
@@ -34,6 +35,17 @@ function serverContract(mode: SessionSyncPendingInputServerContractMode) {
         sessionConnectionEpoch: 1,
         socket: { connected: true },
     } as const;
+}
+
+type PersistenceMockFactory = Extract<
+    Parameters<typeof vi.doMock<typeof import('./sessionMutationPersistence')>>[1],
+    (...args: never[]) => unknown
+>;
+
+function installPersistenceMock(factory: PersistenceMockFactory): void {
+    vi.resetModules();
+    persistenceMockInstalled = true;
+    vi.doMock('./sessionMutationPersistence', factory);
 }
 
 async function useTempHappyHome(): Promise<void> {
@@ -127,14 +139,42 @@ function createObservationSocket(options: Readonly<{
 
 describe('createSessionMutationOutbox', () => {
     beforeEach(async () => {
-        vi.resetModules();
-        vi.doUnmock('./sessionMutationPersistence');
         vi.mocked(axios.post).mockReset();
         vi.mocked(axios.get).mockReset();
         process.env.HAPPIER_SESSION_MUTATION_OUTBOX_MAX_ATTEMPTS = '2';
         process.env.HAPPIER_SESSION_MUTATION_OUTBOX_BASE_RETRY_MS = '60000';
         process.env.HAPPIER_SESSION_MUTATION_OUTBOX_JITTER_MS = '0';
         await useTempHappyHome();
+        // Rebind the cached real consumers without rebuilding the entire source module graph.
+        const { reloadConfiguration } = await import('@/configuration');
+        reloadConfiguration();
+    });
+
+    it('dequeues a delivered turn and notifies other handles when one delivery observer throws', async () => {
+        const sessionId = 's-turn-delivery-observer-failure';
+        const socket = createApiSessionSocketStub({ connected: true });
+        const { createSessionMutationOutbox } = await import('./createSessionMutationOutbox');
+        const { createSessionTurnMutation } = await import('./sessionMutationTypes');
+        const observed: string[] = [];
+        const common = { token: 'tok', sessionId, getSocket: () => socket, requestReconnect: () => {} };
+        const first = createSessionMutationOutbox({ ...common, onSessionTurnDelivered: () => {
+            throw new Error('observer failed after server ACK');
+        } });
+        const second = createSessionMutationOutbox({ ...common, onSessionTurnDelivered: (mutation) => {
+            if (typeof mutation.turnId !== 'string') throw new Error('Delivered begin is missing its turn identity');
+            observed.push(mutation.turnId);
+        } });
+        try {
+            await first.awaitReady();
+            await first.setSessionSyncPendingInputServerContract(serverContract('session_sync_v2_pending_input_v1'));
+            await first.enqueueSessionTurn(createSessionTurnMutation({ sessionId, action: 'begin', turnId: 'turn-observed' }));
+            await first.flush('flush');
+            expect(observed).toEqual(['turn-observed']);
+            await expect(readPersistedOutboxMutations(sessionId)).resolves.toEqual([]);
+        } finally {
+            await first.close();
+            await second.close();
+        }
     });
 
     it('publishes a generic runtime Activity settlement only after durable admission and dequeue', async () => {
@@ -203,7 +243,7 @@ describe('createSessionMutationOutbox', () => {
 
     it('assigns runtime Activity admission order only after durable custody succeeds', async () => {
         let rejectFirstActivityAdmission = true;
-        vi.doMock('./sessionMutationPersistence', async (importOriginal) => {
+        installPersistenceMock(async (importOriginal) => {
             const actual = await importOriginal<typeof import('./sessionMutationPersistence')>();
             return {
                 ...actual,
@@ -506,7 +546,7 @@ describe('createSessionMutationOutbox', () => {
 
     it('retains exact Activity custody when applied ACK dequeue persistence fails, then settles unchanged retry', async () => {
         let rejectNextEmptySave = false;
-        vi.doMock('./sessionMutationPersistence', async (importOriginal) => {
+        installPersistenceMock(async (importOriginal) => {
             const actual = await importOriginal<typeof import('./sessionMutationPersistence')>();
             return {
                 ...actual,
@@ -588,7 +628,7 @@ describe('createSessionMutationOutbox', () => {
     it('automatically retries restored Activity custody across a detached retry rejection', async () => {
         process.env.HAPPIER_SESSION_MUTATION_OUTBOX_BASE_RETRY_MS = '1';
         let rejectedEmptySavesRemaining = 2;
-        vi.doMock('./sessionMutationPersistence', async (importOriginal) => {
+        installPersistenceMock(async (importOriginal) => {
             const actual = await importOriginal<typeof import('./sessionMutationPersistence')>();
             return {
                 ...actual,
@@ -712,7 +752,7 @@ describe('createSessionMutationOutbox', () => {
         let blockNextDeadLetterAppend = false;
         const appendStarted = createDeferred();
         const appendMayFinish = createDeferred();
-        vi.doMock('./sessionMutationPersistence', async (importOriginal) => {
+        installPersistenceMock(async (importOriginal) => {
             const actual = await importOriginal<typeof import('./sessionMutationPersistence')>();
             return {
                 ...actual,
@@ -925,6 +965,11 @@ describe('createSessionMutationOutbox', () => {
     });
 
     afterEach(async () => {
+        if (persistenceMockInstalled) {
+            vi.doUnmock('./sessionMutationPersistence');
+            vi.resetModules();
+            persistenceMockInstalled = false;
+        }
         vi.unstubAllEnvs();
         process.env.HAPPIER_HOME_DIR = originalHappyHomeDir;
         if (originalMaxAttempts === undefined) {
@@ -1371,6 +1416,8 @@ describe('createSessionMutationOutbox', () => {
         const attemptedUrls: string[] = [];
         vi.stubEnv('HAPPIER_SERVER_URL', 'http://127.0.0.1:41001');
         vi.stubEnv('HAPPIER_LOCAL_SERVER_URL', '');
+        const { reloadConfiguration } = await import('@/configuration');
+        reloadConfiguration();
         vi.mocked(axios.post).mockImplementation(async (url) => {
             attemptedUrls.push(String(url));
             if (attemptedUrls.length === 1) {
@@ -1430,12 +1477,15 @@ describe('createSessionMutationOutbox', () => {
             mutationIds: string[];
             resolve: () => void;
         }> = [];
-        vi.doMock('./sessionMutationPersistence', async (importOriginal) => {
+        installPersistenceMock(async (importOriginal) => {
             const actual = await importOriginal<typeof import('./sessionMutationPersistence')>();
             return {
                 ...actual,
                 loadSessionMutationOutbox: vi.fn(async () => []),
-                saveSessionMutationOutbox: vi.fn(async (_sessionId: string, mutations: readonly { mutationId?: unknown }[]) => {
+                saveSessionMutationOutbox: vi.fn(async (
+                    _context: Parameters<typeof actual.saveSessionMutationOutbox>[0],
+                    mutations: Parameters<typeof actual.saveSessionMutationOutbox>[1],
+                ) => {
                     if (saves.length >= 2) return;
                     const deferred = createDeferred<void>();
                     saves.push({
@@ -1495,7 +1545,7 @@ describe('createSessionMutationOutbox', () => {
         const deliveryStarted = createDeferred<void>();
         let recoveryCallCount = 0;
         let saveCallCount = 0;
-        vi.doMock('./sessionMutationPersistence', async (importOriginal) => {
+        installPersistenceMock(async (importOriginal) => {
             const actual = await importOriginal<typeof import('./sessionMutationPersistence')>();
             return {
                 ...actual,
@@ -2976,12 +3026,15 @@ describe('createSessionMutationOutbox', () => {
             mutationIds: string[];
             resolve: () => void;
         }> = [];
-        vi.doMock('./sessionMutationPersistence', async (importOriginal) => {
+        installPersistenceMock(async (importOriginal) => {
             const actual = await importOriginal<typeof import('./sessionMutationPersistence')>();
             return {
                 ...actual,
                 loadSessionMutationOutbox: vi.fn(async () => []),
-                saveSessionMutationOutbox: vi.fn(async (_sessionId: string, mutations: readonly { mutationId?: unknown }[]) => {
+                saveSessionMutationOutbox: vi.fn(async (
+                    _context: Parameters<typeof actual.saveSessionMutationOutbox>[0],
+                    mutations: Parameters<typeof actual.saveSessionMutationOutbox>[1],
+                ) => {
                     if (saves.length >= 2) return;
                     const deferred = createDeferred<void>();
                     saves.push({

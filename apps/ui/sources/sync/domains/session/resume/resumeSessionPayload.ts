@@ -13,10 +13,12 @@ import {
     type SessionInitialGoalRequestV1,
     type SessionAuthoringValueV1,
 } from '@happier-dev/protocol';
+import { SpawnSessionTerminalSchema } from '@happier-dev/protocol/spawnSession';
 import { isPermissionMode, type PermissionMode } from '../../permissions/permissionTypes';
 
 import { buildCodexBackendTransportFields, type CodexBackendTransportFields } from '../codexBackendTransport';
 import { readNonBlankSessionControlIdentifier } from '@/sync/domains/sessionControl/opaqueIdentifiers';
+import type { TerminalSpawnOptions } from '@/sync/domains/settings/terminalSettings';
 
 export type ResumeHappySessionRpcParams = CodexBackendTransportFields & {
     type: 'resume-session';
@@ -26,6 +28,7 @@ export type ResumeHappySessionRpcParams = CodexBackendTransportFields & {
     resume?: string;
     agentRuntimeDescriptorV1?: AgentRuntimeDescriptorV1;
     environmentVariables?: Record<string, string>;
+    terminal?: TerminalSpawnOptions;
     connectedServices?: SessionAuthoringValueV1['connectedServices'];
     connectedServicesUpdatedAt?: number;
     transcriptStorage?: 'direct' | 'persisted';
@@ -55,6 +58,7 @@ const ResumeHappySessionRpcParamsSchema = z.object({
     resume: z.string().min(1).optional(),
     agentRuntimeDescriptorV1: AgentRuntimeDescriptorV1Schema.optional(),
     environmentVariables: z.record(z.string(), z.string()).optional(),
+    terminal: SpawnSessionTerminalSchema.optional(),
     connectedServices: SessionAuthoringValueV1Schema.shape.connectedServices.optional(),
     connectedServicesUpdatedAt: z.number().optional(),
     transcriptStorage: z.enum(['direct', 'persisted']).optional(),

@@ -1,5 +1,5 @@
 import type { BackendTargetRefV1 } from '@happier-dev/protocol';
-import { resolveAgentConfiguredRuntimeKind } from '@happier-dev/agents';
+import { resolveAgentConfiguredRuntimeKind, resolveAgentRuntimeKindForSession } from '@happier-dev/agents';
 
 import { resolveProviderAgentIdForBackendTarget } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
 import type { Settings } from '@/sync/domains/settings/settings';
@@ -61,12 +61,13 @@ export function buildNewSessionCapabilityProbeContextKey(probeContext: NewSessio
 export function resolveNewSessionCapabilityProbeContext(params: Readonly<{
     backendTarget: BackendTargetRefV1;
     settings: Settings;
+    sessionMetadata?: unknown;
 }>): NewSessionCapabilityProbeContext | null {
     const agentId = resolveProviderAgentIdForBackendTarget(params.backendTarget);
-    const runtimeKind = resolveAgentConfiguredRuntimeKind({
-        agentId,
-        accountSettings: params.settings as unknown as Record<string, unknown>,
-    });
+    const runtimeParams = { agentId, accountSettings: params.settings as unknown as Record<string, unknown> };
+    const runtimeKind = params.sessionMetadata === undefined
+        ? resolveAgentConfiguredRuntimeKind(runtimeParams)
+        : resolveAgentRuntimeKindForSession({ ...runtimeParams, metadata: params.sessionMetadata });
     if (!runtimeKind) return null;
 
     return getOrCreateProbeContextForRuntimeKind(runtimeKind);

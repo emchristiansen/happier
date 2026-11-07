@@ -15,7 +15,7 @@ import type { AgentActivityRowEntry } from '../agentActivityRowEntry';
  * of blinking out and blinking back in somewhere else.
  */
 
-export const AGENT_ACTIVITY_SECTION_IDS = ['working', 'finished'] as const;
+export const AGENT_ACTIVITY_SECTION_IDS = ['working', 'idle', 'finished'] as const;
 
 export type AgentActivitySectionId = (typeof AGENT_ACTIVITY_SECTION_IDS)[number];
 
@@ -47,7 +47,7 @@ export type AgentActivitySectionModel = Readonly<{
  * Which section a status belongs to. Exhaustive by construction: a new protocol status fails to
  * compile here rather than falling into whichever branch happens to be last.
  *
- * **Two sections, and neither is an attention claim (4.7, r4.0).** The roster answers *what is this
+ * **Sections make no attention claim (4.7, r4.0).** The roster answers *what is this
  * session working on*; it does not answer *do you need to act*, which the pending-request card and
  * the session status already own.
  *
@@ -64,7 +64,8 @@ export type AgentActivitySectionModel = Readonly<{
  * can still claim is happening. Completion is evidence-based (4.9.3), and so is liveness — an
  * ambiguous entry must not occupy `working` and inflate what the reader believes is running.
  */
-export function resolveAgentActivitySectionId(status: AgentActivityStatusV1): AgentActivitySectionId {
+export function resolveAgentActivitySectionId(status: AgentActivityStatusV1, isActive?: boolean): AgentActivitySectionId {
+    if (status === 'running' && isActive === false) return 'idle';
     switch (status) {
         case 'waiting':
         case 'queued':
@@ -127,6 +128,7 @@ const COMPARE_BY_SECTION: Record<
     (left: RankedEntry, right: RankedEntry) => number
 > = {
     working: byOldestFirst,
+    idle: byOldestFirst,
     // Newest outcome first: this section answers "what just happened", and the cap below has to
     // keep the rows the reader is actually waiting on. Recency ONLY — a tier that floated failures
     // above the successes would be a lie about what the section is sorted by, and it would smuggle
@@ -186,7 +188,7 @@ export function buildAgentActivitySectionModel(params: Readonly<{
 
     params.entries.forEach((entry, index) => {
         const placement = params.placementById?.get(entry.id)
-            ?? resolveAgentActivitySectionId(entry.status);
+            ?? resolveAgentActivitySectionId(entry.status, entry.isActive);
         buckets.get(placement)!.push({ entry, index });
     });
 
@@ -197,7 +199,7 @@ export function buildAgentActivitySectionModel(params: Readonly<{
 
         ranked.sort(COMPARE_BY_SECTION[id]);
         const ordered = ranked.map((item) => item.entry);
-        const limit = id === 'finished' ? params.finishedLimit : params.workingLimit;
+        const limit = id === 'finished' ? params.finishedLimit : id === 'working' ? params.workingLimit : null;
         const entries = typeof limit === 'number' && limit >= 0 && ordered.length > limit
             ? ordered.slice(0, limit)
             : ordered;

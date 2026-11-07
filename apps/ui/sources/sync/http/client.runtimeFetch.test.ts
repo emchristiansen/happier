@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { resetRuntimeFetch } from './client';
+import { ConnectedServiceIdSchema } from '@happier-dev/protocol';
 
 afterEach(() => {
     resetRuntimeFetch();
@@ -10,6 +11,26 @@ afterEach(() => {
 });
 
 describe('serverFetch runtime fetch override', () => {
+    it.each(['/v1/account/profile', '/v2/sessions?cursor=next', '/v2/sessions/session-1', '/v1/sessions/session-1/turns'])('advertises supported service readers on authenticated %s without adding a CORS header', async (path) => {
+        vi.doMock('@/sync/domains/server/serverRuntime', () => ({
+            getActiveServerSnapshot: () => ({ serverId: 'server-a', serverUrl: 'https://api.example.test', generation: 1 }),
+        }));
+        vi.doMock('@/auth/storage/tokenStorage', () => ({ TokenStorage: { getCredentials: vi.fn(async () => null) } }));
+        const client = await import('./client');
+        const requests: Array<{ url: URL; headers: Headers }> = [];
+        client.setRuntimeFetch(async (input, init) => {
+            requests.push({ url: new URL(String(input)), headers: new Headers(init?.headers) });
+            return new Response(null, { status: 200 });
+        });
+        await client.serverFetch(path, { headers: { Authorization: 'Bearer test-token' } }, { includeAuth: false, retry: 'none' });
+        expect(JSON.parse(requests[0].url.searchParams.get('happierConnectedServices') ?? 'null')).toEqual(ConnectedServiceIdSchema.options);
+        expect(requests[0].url.pathname).toBe(new URL(path, 'https://api.example.test').pathname);
+        expect(requests[0].url.searchParams.get('cursor')).toBe(path.includes('cursor=') ? 'next' : null);
+        expect([...requests[0].headers.keys()]).toEqual(['authorization']);
+        requests.length = 0;
+        await client.serverFetch(path, undefined, { includeAuth: false, retry: 'none' });
+        expect(requests[0].url.searchParams.has('happierConnectedServices')).toBe(false);
+    });
     it('uses the configured runtime fetch implementation instead of global fetch', async () => {
         vi.doMock('@/sync/domains/server/serverRuntime', () => ({
             getActiveServerSnapshot: () => ({

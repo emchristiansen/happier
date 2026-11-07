@@ -1,10 +1,15 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { afterEach, describe, expect, it, onTestFailed, vi } from 'vitest';
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { createSpawnHappyCliEnvScope } from '@/testkit/process/spawnHappyCliHarness';
 import { withTempDir } from '@/testkit/fs/tempDir';
+import * as realSpawnHappyCli from '@/utils/spawnHappyCLI';
+
+// Transform the real owner during collection; each test still imports fresh modules
+// after setting its environment, without charging cold transforms to its operation.
+vi.resetModules();
 
 const envScope = createSpawnHappyCliEnvScope();
 
@@ -67,18 +72,12 @@ function writeTinyRuntimeAssets(root: string, { includeDevCommandWrapper = true 
   const toolsDir = join(root, 'tools', 'unpacked');
   mkdirSync(scriptsDir, { recursive: true });
   mkdirSync(toolsDir, { recursive: true });
-  for (const scriptName of [
-    'terminal_launch_spec_runner.cjs',
-    'claude_local_launcher.cjs',
-    'claude_remote_launcher.cjs',
-    'claude_launcher_runtime.cjs',
-    'childProcessOptions.cjs',
-    ...(includeDevCommandWrapper ? ['env-wrapper.cjs'] : []),
-    'ripgrep_launcher.cjs',
-    'node_pty_relay.cjs',
-  ]) {
-    writeFileSync(join(scriptsDir, scriptName), `module.exports = ${JSON.stringify(scriptName)};\n`, 'utf8');
+  for (const relativePath of realSpawnHappyCli.PINNED_RUNNER_REQUIRED_ASSET_RELATIVE_PATHS) {
+    const assetPath = join(root, ...relativePath);
+    mkdirSync(dirname(assetPath), { recursive: true });
+    writeFileSync(assetPath, `module.exports = ${JSON.stringify(relativePath)};\n`, 'utf8');
   }
+  if (includeDevCommandWrapper) writeFileSync(join(scriptsDir, 'env-wrapper.cjs'), 'module.exports = "env-wrapper.cjs";\n', 'utf8');
   writeFileSync(join(toolsDir, 'rg'), '#!/bin/sh\nexit 0\n', 'utf8');
 }
 
@@ -237,14 +236,22 @@ describe('spawnHappyCLI fallback invocation', () => {
       expect(pinnedEntrypoint).toBeDefined();
       const snapshotRoot = dirname(pinnedEntrypoint!);
       for (const relativeAssetPath of [
-        ['scripts', 'terminal_launch_spec_runner.cjs'],
-        ['scripts', 'claude_local_launcher.cjs'],
+        ...realSpawnHappyCli.PINNED_RUNNER_REQUIRED_ASSET_RELATIVE_PATHS,
         ['scripts', 'env-wrapper.cjs'],
-        ['scripts', 'ripgrep_launcher.cjs'],
         ['tools', 'unpacked', 'rg'],
       ]) {
         expect(existsSync(join(snapshotRoot, ...relativeAssetPath))).toBe(true);
       }
+      // A reused runner may predate a newly required launch sidecar. It must repair its
+      // existing asset directory, not admit a launcher which cannot load its cleanup owner.
+      rmSync(join(snapshotRoot, 'scripts', 'process_tree.cjs'));
+      const reused = mod.buildHappyCliSubprocessInvocation(['claude', '--started-by', 'daemon']);
+      expect(reused.argv).toEqual(inv.argv);
+      expect(existsSync(join(snapshotRoot, 'scripts', 'process_tree.cjs'))).toBe(true);
+      rmSync(join(snapshotRoot, 'scripts', 'native_process_exit.cjs'));
+      const withExitProof = mod.buildHappyCliSubprocessInvocation(['claude', '--started-by', 'daemon']);
+      expect(withExitProof.argv).toEqual(inv.argv);
+      expect(existsSync(join(snapshotRoot, 'scripts', 'native_process_exit.cjs'))).toBe(true);
     });
   });
 
@@ -329,7 +336,10 @@ describe('spawnHappyCLI fallback invocation', () => {
   });
 
   it('uses the admitted pinned closure after mutable dist advances to a newer publication', async () => {
+    let phase = 'temporary directory creation';
+    onTestFailed(() => console.error(`Mutable-dist fixture failed during ${phase}`));
     await withTempDir('happier-admitted-daemon-startup-after-dist-advance-', async (root) => {
+      phase = 'current dist fixture creation';
       const entrypoint = writeTinyDist(root);
       writeTinyRuntimeAssets(root);
       const admittedFingerprint = 'abc123def4567890';
@@ -338,7 +348,10 @@ describe('spawnHappyCLI fallback invocation', () => {
       writeStackRuntimeFingerprint(runtimeStatePath, null);
       patchFreshDistEnv(entrypoint, runtimeStatePath, admittedFingerprint);
 
-      const mod = (await import('@/utils/spawnHappyCLI')) as typeof import('@/utils/spawnHappyCLI');
+      // This case uses real filesystem boundaries and invocation-time environment,
+      // so the collection-loaded owner needs no fresh module graph inside its budget.
+      const mod = realSpawnHappyCli;
+      phase = 'admitted closure preparation';
       const admitted = mod.buildHappyCliSubprocessInvocation(
         ['daemon', 'start-sync'],
         { allowAdmittedDaemonStartupClosure: true },
@@ -346,9 +359,11 @@ describe('spawnHappyCLI fallback invocation', () => {
       const admittedEntrypoint = admitted.argv.find((arg) => arg.endsWith('index.mjs'));
       expect(admittedEntrypoint).toContain(admittedFingerprint);
 
+      phase = 'mutable dist publication advance';
       writeFileSync(join(dirname(entrypoint), 'chunk.mjs'), 'export const marker = "new";\n', 'utf8');
       writeDistBuildManifest(entrypoint, 'fed456abc1230987');
 
+      phase = 'existing admitted closure selection';
       const startup = mod.buildHappyCliSubprocessInvocation(
         ['daemon', 'start-sync'],
         { allowAdmittedDaemonStartupClosure: true },
@@ -357,6 +372,7 @@ describe('spawnHappyCLI fallback invocation', () => {
       expect(startup.runtime).toBe('node');
       expect(startup.argv).toContain(admittedEntrypoint);
       expect(startup.argv).not.toContain(entrypoint);
+      phase = 'temporary directory cleanup';
     });
   });
 

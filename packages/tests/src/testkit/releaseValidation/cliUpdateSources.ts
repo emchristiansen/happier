@@ -1,9 +1,9 @@
 import { existsSync } from 'node:fs';
 import { cp, mkdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
-import { isAbsolute, resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 
 import { repoRootDir } from '../paths';
-import { ensureCliPackSnapshotRuntimeDependencies } from '../process/cliDistSnapshotNodeModules';
+import { createRetainedCliSnapshot, ensureCliPackSnapshotRuntimeDependencies } from '../process/cliDistSnapshotNodeModules';
 import { resolveCliTestLaunchSpec } from '../process/cliLaunchSpec';
 import { runLoggedCommand } from '../process/spawnProcess';
 
@@ -307,8 +307,8 @@ async function prepareLocalBuildCliSourceSnapshot(params: {
     testDir: string;
     snapshotDir: string;
     env: NodeJS.ProcessEnv;
-}): Promise<void> {
-    await resolveCliTestLaunchSpec(
+}): Promise<string> {
+    const launch = await resolveCliTestLaunchSpec(
         {
             testDir: params.testDir,
             env: resolveCliUpdateValidationLaunchEnv({
@@ -323,6 +323,9 @@ async function prepareLocalBuildCliSourceSnapshot(params: {
             skipSourceFreshnessCheck: true,
         },
     );
+    const entrypoint = launch.args.at(-1);
+    if (!entrypoint) throw new Error('CLI update source launch did not return an entrypoint');
+    return dirname(dirname(entrypoint));
 }
 
 export async function prepareCliUpdateSourceSnapshot(params: {
@@ -333,24 +336,25 @@ export async function prepareCliUpdateSourceSnapshot(params: {
 }): Promise<string> {
     const snapshotDir = resolve(params.testDir, `cli-update-${params.role}`);
     if (params.source.kind === 'local-build') {
-        await prepareLocalBuildCliSourceSnapshot({
+        return await prepareLocalBuildCliSourceSnapshot({
             testDir: params.testDir,
             snapshotDir,
             env: params.env,
         });
-        return snapshotDir;
     }
 
-    if (params.source.kind === 'published-channel' || params.source.kind === 'published-tag') {
-        await preparePublishedCliSourceSnapshot({ ...params, snapshotDir });
-        return snapshotDir;
-    }
-
-    const tarballPath = resolveLocalPackPath(params.source.ref);
-    await extractCliPackageTarball({
-        ...params,
-        tarballPath,
+    return await createRetainedCliSnapshot({
         snapshotDir,
+        prepare: async (privateDir) => {
+            if (params.source.kind === 'published-channel' || params.source.kind === 'published-tag') {
+                await preparePublishedCliSourceSnapshot({ ...params, snapshotDir: privateDir });
+                return;
+            }
+            await extractCliPackageTarball({
+                ...params,
+                tarballPath: resolveLocalPackPath(params.source.ref),
+                snapshotDir: privateDir,
+            });
+        },
     });
-    return snapshotDir;
 }

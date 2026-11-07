@@ -175,9 +175,6 @@ test.describe('UI e2e: AgentInput slash command menu', () => {
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_SHARED_DEPS_BUILD: '1',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_GENERATE: '1',
         HAPPIER_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT: '1',
@@ -206,7 +203,7 @@ test.describe('UI e2e: AgentInput slash command menu', () => {
   test('anchors the command menu to the textarea caret and inserts slash, file, and skill mentions', async ({
     page,
   }) => {
-    test.setTimeout(600_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     const browserDiagnostics = collectBrowserDiagnostics({ page });

@@ -12,6 +12,7 @@ export type PaneResource =
 
 export type PaneDriver = Readonly<{
     scopeId: PaneScopeId;
+    renderActionRail?: (ctx: Readonly<{ scopeId: PaneScopeId }>) => React.ReactNode;
     renderRightPane?: (ctx: Readonly<{ scopeId: PaneScopeId }>) => React.ReactNode;
     renderDetailsPane?: (ctx: Readonly<{ scopeId: PaneScopeId }>) => React.ReactNode;
     renderBottomPane?: (ctx: Readonly<{ scopeId: PaneScopeId }>) => React.ReactNode;

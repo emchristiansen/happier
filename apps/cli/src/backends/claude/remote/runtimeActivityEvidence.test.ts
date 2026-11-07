@@ -4,12 +4,63 @@ import { createClaudeProviderRuntimeActivityAdapter } from '@/backends/claude/pr
 import type { SessionRuntimeActivityContribution } from '@/session/runtimeActivity/types';
 import {
   createClaudeRuntimeActivityEvidence,
+  handleClaudeRuntimeActivityLoss,
   observeClaudeProviderTaskRuntimeActivityHook,
   observeClaudeProviderTaskRuntimeActivityRow,
   reconcileClaudeRuntimeActivity,
 } from './runtimeActivityEvidence';
 
 describe('Claude runtime Activity evidence', () => {
+  it('settles the provider task inventory on process exit even without a runtime contribution binding', () => {
+    const evidence = createClaudeRuntimeActivityEvidence();
+    evidence.providerActivityLedger.apply({ type: 'started', sessionId: 's1', taskId: 'background-task' });
+    const params = { evidence, logger: { debug: vi.fn() }, logPrefix: '[unbound-runtime]' };
+
+    handleClaudeRuntimeActivityLoss({ ...params, reason: 'observer-lost' });
+    expect(evidence.providerActivityLedger.hasActiveProviderTasks()).toBe(true);
+
+    handleClaudeRuntimeActivityLoss({ ...params, reason: 'process-exited', providerStopped: true });
+    expect(evidence.providerActivityLedger.hasActiveProviderTasks()).toBe(false);
+  });
+
+  it('keeps a native SDK background child active after its launcher completes without requiring a launch hook', async () => {
+    const reports: SessionRuntimeActivityContribution[] = [];
+    const evidence = createClaudeRuntimeActivityEvidence();
+    const runtimeActivityAdapter = createClaudeProviderRuntimeActivityAdapter({
+      providerActivityLedger: evidence.providerActivityLedger,
+      contributionHandle: { report: async value => { reports.push(value); }, markUnknown: async () => {}, dispose: async () => {} },
+    });
+    await runtimeActivityAdapter.activateObservation('sdk-installed');
+    const params = { evidence, runtimeActivityAdapter, logger: { debug: vi.fn() }, logPrefix: '[nested-sdk]' };
+    const hookStart = (taskId: string) => observeClaudeProviderTaskRuntimeActivityHook({ ...params, hook: {
+      hook_event_name: 'PostToolUse', session_id: 'provider-session', tool_name: 'Agent',
+      tool_response: { status: 'async_launched', agentId: taskId },
+    } });
+    hookStart('launcher');
+    for (const isBackgrounded of [undefined, false]) {
+      observeClaudeProviderTaskRuntimeActivityRow({ ...params, row: {
+        type: 'system', subtype: 'task_started', session_id: 'provider-session', task_id: `foreground-${isBackgrounded}`,
+        task_type: 'local_agent', ...(isBackgrounded === undefined ? {} : { is_backgrounded: isBackgrounded }), spawn_depth: 2,
+      } });
+    }
+    observeClaudeProviderTaskRuntimeActivityRow({ ...params, row: {
+      type: 'system', subtype: 'task_started', session_id: 'provider-session', task_id: 'nested-background',
+      task_type: 'local_agent', is_backgrounded: true, spawn_depth: 2, tool_use_id: 'nested-tool',
+    } });
+    observeClaudeProviderTaskRuntimeActivityRow({ ...params, row: {
+      type: 'system', subtype: 'task_notification', session_id: 'provider-session', task_id: 'launcher', status: 'completed',
+    } });
+    await vi.waitFor(() => expect(reports.at(-1)).toEqual({ state: 'active', activeCount: 1 }));
+    expect(evidence.providerActivityLedger.getActiveProviderTaskCount()).toBe(1);
+    hookStart('nested-background');
+    await runtimeActivityAdapter.publishCurrent('duplicate-hook');
+    expect(evidence.providerActivityLedger.getActiveProviderTaskCount()).toBe(1);
+    observeClaudeProviderTaskRuntimeActivityRow({ ...params, row: {
+      type: 'system', subtype: 'task_notification', session_id: 'provider-session', task_id: 'nested-background', status: 'completed',
+    } });
+    await vi.waitFor(() => expect(reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 }));
+  });
+
   it('routes exact authenticated legacy hook facts through the shared ledger', async () => {
     const reports: SessionRuntimeActivityContribution[] = [];
     const evidence = createClaudeRuntimeActivityEvidence();

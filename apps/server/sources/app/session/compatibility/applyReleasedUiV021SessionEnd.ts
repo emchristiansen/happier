@@ -3,7 +3,6 @@ import { didSessionActivityBadgeContributionChange } from "@/app/activity/accoun
 import {
     buildSessionActivityEphemeral,
     buildUpdateSessionUpdate,
-    type ClientConnection,
     eventRouter,
 } from "@/app/events/eventRouter";
 import { activityCache } from "@/app/presence/sessionCache";
@@ -51,7 +50,6 @@ export async function applyReleasedUiV021SessionEnd(params: Readonly<{
     accountId: string;
     sessionId: string;
     observedAt: number;
-    connection?: ClientConnection;
 }>): Promise<ApplyReleasedUiV021SessionEndResult> {
     const result = await inTx(async (tx) => {
         const session = await tx.session.findUnique({
@@ -194,9 +192,6 @@ export async function applyReleasedUiV021SessionEnd(params: Readonly<{
                 },
             ),
             recipientFilter: { type: "all-interested-in-session", sessionId: params.sessionId },
-            ...(accountId === params.accountId && params.connection
-                ? { skipSenderConnection: params.connection }
-                : {}),
         });
     }));
     await refreshSessionParticipantBadgePushes({

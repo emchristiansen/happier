@@ -303,7 +303,7 @@ describe('pasteTextViaTmuxBuffer', () => {
     });
   });
 
-  it('re-sends Enter once when post-submit evidence still shows the current collapsed paste marker', async () => {
+  it('waits for the collapsed paste marker to clear without resending Enter', async () => {
     const calls: string[][] = [];
     const executor: TmuxCommandExecutor = async (args) => {
       calls.push([...args]);
@@ -323,18 +323,18 @@ describe('pasteTextViaTmuxBuffer', () => {
       target: 'happy:claude.1',
       text: Array.from({ length: 41 }, (_, index) => `line ${index}`).join('\n'),
       bufferName: 'happier-test-buffer',
-      submitRetryDelayMs: 0,
+      postSubmitSettleMs: 0,
+      timeoutMs: 1_000,
       verifyAfterSubmit,
     })).resolves.toEqual({ success: true });
 
     expect(calls.filter((args) => args[0] === 'send-keys')).toEqual([
       ['send-keys', '-t', 'happy:claude.1', 'C-m'],
-      ['send-keys', '-t', 'happy:claude.1', 'C-m'],
     ]);
     expect(verifyAfterSubmit).toHaveBeenCalledTimes(3);
   });
 
-  it('reports ambiguous failure when the collapsed paste marker remains after the bounded Enter retry', async () => {
+  it('reports ambiguous failure when the collapsed paste marker remains without an observation budget', async () => {
     const executor: TmuxCommandExecutor = async (args) => ({
       returncode: 0,
       stdout: '',
@@ -347,7 +347,7 @@ describe('pasteTextViaTmuxBuffer', () => {
       target: 'happy:claude.1',
       text: Array.from({ length: 41 }, (_, index) => `line ${index}`).join('\n'),
       bufferName: 'happier-test-buffer',
-      submitRetryDelayMs: 0,
+      postSubmitSettleMs: 0,
       verifyAfterSubmit: async () => true,
     })).resolves.toEqual({
       success: false,

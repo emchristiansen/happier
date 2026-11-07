@@ -2,6 +2,7 @@ import { deriveManagedConnectionReason } from './managedConnectionEvents.js';
 import { computeManagedConnectionBackoffMs } from './reconnectBackoff.js';
 import type {
   ManagedConnectionState,
+  ManagedProbeReportScope,
   ManagedConnectionSupervisor,
   ManagedConnectionSupervisorConfig,
   ManagedConnectionTransport,
@@ -56,6 +57,17 @@ export function createManagedConnectionSupervisor(
     config.onStateChange?.(state);
   }
 
+  function publishConnecting(attempt: number, initial = false): void {
+    publish({
+      ...state,
+      phase: 'connecting',
+      reason: initial ? 'initial_connect' : state.reason,
+      attempt,
+      nextRetryAt: null,
+      lastErrorMessage: null,
+    });
+  }
+
   function clearRetryTimer(): void {
     if (!retryTimer) return;
     clearTimeout(retryTimer);
@@ -82,6 +94,8 @@ export function createManagedConnectionSupervisor(
       await cleanupTransport();
     }
     if (isStopped) return;
+    // start() owns attempt zero; retries already publish before their readiness probe.
+    if (params.attempt === 0) publishConnecting(params.attempt, params.initial);
 
     if (params.initial && config.probeBeforeInitialConnect) {
       const probe = await config.probeReadiness().catch((error): ReadinessProbeResult => ({
@@ -151,7 +165,7 @@ export function createManagedConnectionSupervisor(
         if (state.phase === 'connecting' && currentTransport === transport && transport.isConnected() !== true) {
           const classifiedProbe = config.classifyTransportErrorToProbeResult?.(error) ?? null;
           if (classifiedProbe) {
-            reportProbeResult(classifiedProbe);
+            void applyExternallyReportedProbeResult(classifiedProbe, { generation: localGeneration });
             return;
           }
           const nextAttempt = Math.max(1, state.attempt + 1);
@@ -177,27 +191,20 @@ export function createManagedConnectionSupervisor(
       }),
     ];
 
-    publish({
-      ...state,
-      phase: 'connecting',
-      reason: params.initial ? 'initial_connect' : state.reason,
-      attempt: params.attempt,
-      nextRetryAt: null,
-      lastErrorMessage: null,
-    });
-
     try {
       await transport.connect();
     } catch (error) {
       if (localGeneration !== generation || isStopped) return;
-      await applyExternallyReportedProbeResult(classifyTransportError(config, error));
+      await applyExternallyReportedProbeResult(classifyTransportError(config, error), { generation: localGeneration });
     }
   }
 
   async function applyExternallyReportedProbeResult(
     probe: Exclude<ReadinessProbeResult, Readonly<{ status: 'ready' }>>,
+    scope: ManagedProbeReportScope,
   ): Promise<void> {
     if (isStopped) return;
+    if (scope.generation !== generation) return;
     if (state.phase !== 'online' && state.phase !== 'connecting' && state.phase !== 'offline') return;
     const localGeneration = ++generation;
     clearRetryTimer();
@@ -234,13 +241,22 @@ export function createManagedConnectionSupervisor(
     scheduleReconnect(nextAttempt, delayMs, probe);
   }
 
-  function reportProbeResult(probe: Exclude<ReadinessProbeResult, Readonly<{ status: 'ready' }>>): void {
-    void applyExternallyReportedProbeResult(probe);
+  function captureProbeReportScope(): ManagedProbeReportScope {
+    return { generation };
+  }
+
+  function reportProbeResult(
+    probe: Exclude<ReadinessProbeResult, Readonly<{ status: 'ready' }>>,
+    scope?: ManagedProbeReportScope,
+  ): void {
+    if (!scope) return;
+    void applyExternallyReportedProbeResult(probe, scope);
   }
 
   async function runProbeAndReconnect(attempt: number): Promise<void> {
     if (isStopped) return;
     const localGeneration = generation;
+    publishConnecting(attempt);
     const probe = await config.probeReadiness().catch((error): ReadinessProbeResult => ({
       status: 'server_unreachable',
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -338,18 +354,22 @@ export function createManagedConnectionSupervisor(
       }
 
       const run = async (): Promise<void> => {
-      if (isStarted && !isStopped) {
-        if (state.phase === 'online' || state.phase === 'connecting') {
+        if (isStarted && !isStopped) {
+          if (
+            state.phase === 'online'
+            || state.phase === 'connecting'
+            || (state.phase === 'offline' && state.nextRetryAt !== null)
+          ) {
+            return;
+          }
+          reconnectAttempt = 0;
+          await establishConnection({ initial: config.probeBeforeInitialConnect === true, attempt: 0 });
           return;
         }
+        isStarted = true;
+        isStopped = false;
         reconnectAttempt = 0;
-        await establishConnection({ initial: config.probeBeforeInitialConnect === true, attempt: 0 });
-        return;
-      }
-      isStarted = true;
-      isStopped = false;
-      reconnectAttempt = 0;
-      await establishConnection({ initial: true, attempt: 0 });
+        await establishConnection({ initial: true, attempt: 0 });
       };
 
       const promise = run();
@@ -376,6 +396,12 @@ export function createManagedConnectionSupervisor(
       await cleanupTransport({ intentional: true });
     },
     reportProbeResult,
+    captureProbeReportScope,
+    resetRetryBackoff(): void {
+      if (isStopped || state.phase !== 'online') return;
+      reconnectAttempt = 0;
+      if (state.attempt !== 0) publish({ ...state, attempt: 0 });
+    },
     getState(): ManagedConnectionState {
       return state;
     },

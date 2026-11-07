@@ -10,7 +10,7 @@ import {
   resolveProcessOwnershipLeasesDir,
   sweepProcessOwnershipLeases,
 } from './processOwnershipLease';
-import { applyUiWebExpoNodeHeapEnv, readPositiveEnvInt, resolveUiWebEntryProbeTimeoutMs } from './uiWebEnv';
+import { readPositiveEnvInt, resolveUiWebEntryProbeTimeoutMs } from './uiWebEnv';
 import { resolveScriptUrlsFromHtml, selectPrimaryAppScriptUrl } from './uiWebHtml';
 import { spawnLoggedProcess } from './spawnProcess';
 import type { StartedUiWeb } from './uiWebTypes';
@@ -70,10 +70,10 @@ type UiWebEntryPageProbe = Readonly<{
   hasScriptTags: boolean;
 }>;
 
-async function inspectUiWebEntryPage(url: string, env: NodeJS.ProcessEnv): Promise<UiWebEntryPageProbe> {
+async function inspectUiWebEntryPage(url: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<UiWebEntryPageProbe> {
   try {
     const timeoutMs = resolveUiWebEntryProbeTimeoutMs(env);
-    const res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetch(url, { method: 'GET', signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
     if (!res.ok) return { isEntryPage: false, hasScriptTags: false };
     const text = await res.text().catch(() => '');
     if (!text.includes('<html') && !text.toLowerCase().includes('<!doctype html')) {
@@ -89,6 +89,7 @@ async function inspectUiWebEntryPage(url: string, env: NodeJS.ProcessEnv): Promi
       hasScriptTags: scripts.length > 0 && Boolean(selectPrimaryAppScriptUrl(scripts)),
     };
   } catch {
+    signal.throwIfAborted();
     return { isEntryPage: false, hasScriptTags: false };
   }
 }
@@ -103,6 +104,7 @@ async function resolveExpoWebBaseUrl(params: {
   timeoutMs: number;
   expectedPort?: number;
   env: NodeJS.ProcessEnv;
+  signal: AbortSignal;
 }): Promise<ResolvedExpoWebBaseUrl> {
   const defaultCandidates = [
     'http://localhost:19006',
@@ -118,6 +120,7 @@ async function resolveExpoWebBaseUrl(params: {
 
   let resolved: ResolvedExpoWebBaseUrl | null = null;
   await waitFor(async () => {
+    params.signal.throwIfAborted();
     const text = await readFile(params.stdoutPath, 'utf8').catch(() => '');
     const stdoutCandidates = extractHttpUrls(text).map((url) => url.replace(/\/+$/, ''));
     const orderedCandidates: string[] = [];
@@ -131,7 +134,7 @@ async function resolveExpoWebBaseUrl(params: {
     }
 
     for (const url of orderedCandidates) {
-      const probe = await inspectUiWebEntryPage(url, params.env);
+      const probe = await inspectUiWebEntryPage(url, params.env, params.signal);
       if (!probe.isEntryPage) continue;
       resolved = { baseUrl: url, hasScriptTags: probe.hasScriptTags };
       return true;
@@ -141,6 +144,7 @@ async function resolveExpoWebBaseUrl(params: {
     timeoutMs: params.timeoutMs,
     intervalMs: 250,
     context: `Expo web entry page from ${params.stdoutPath}`,
+    failFast: true,
   });
 
   if (!resolved) {
@@ -149,13 +153,14 @@ async function resolveExpoWebBaseUrl(params: {
   return resolved;
 }
 
-async function isMetroPackagerReady(baseUrl: string): Promise<boolean> {
+async function isMetroPackagerReady(baseUrl: string, signal: AbortSignal): Promise<boolean> {
   try {
-    const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/status`, { method: 'GET', signal: AbortSignal.timeout(2_000) });
+    const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/status`, { method: 'GET', signal: AbortSignal.any([signal, AbortSignal.timeout(2_000)]) });
     if (!res.ok) return false;
     const text = await res.text().catch(() => '');
     return text.includes('packager-status:running');
   } catch {
+    signal.throwIfAborted();
     return false;
   }
 }
@@ -170,9 +175,9 @@ export function resolveUiWebScriptHtmlRefreshRetryCount(env: NodeJS.ProcessEnv):
 
 type ScriptReadyProbe = 'ready' | 'retry' | 'refresh-html';
 
-async function probeScriptReady(url: string, timeoutMs: number): Promise<ScriptReadyProbe> {
+async function probeScriptReady(url: string, timeoutMs: number, signal: AbortSignal): Promise<ScriptReadyProbe> {
   try {
-    const res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetch(url, { method: 'GET', signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
     if (!res.ok) return 'refresh-html';
     const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
     if (contentType.includes('javascript')) return 'ready';
@@ -181,20 +186,22 @@ async function probeScriptReady(url: string, timeoutMs: number): Promise<ScriptR
       ? 'ready'
       : 'retry';
   } catch {
+    signal.throwIfAborted();
     return 'retry';
   }
 }
 
-async function resolvePrimaryAppScriptUrl(baseUrl: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+async function resolvePrimaryAppScriptUrl(baseUrl: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<string | null> {
   const entryTimeoutMs = resolveUiWebEntryProbeTimeoutMs(env);
-  const html = await fetch(baseUrl, { method: 'GET', signal: AbortSignal.timeout(entryTimeoutMs) })
+  const html = await fetch(baseUrl, { method: 'GET', signal: AbortSignal.any([signal, AbortSignal.timeout(entryTimeoutMs)]) })
     .then((response) => response.ok ? response.text() : '')
     .catch(() => '');
+  signal.throwIfAborted();
   const scripts = resolveScriptUrlsFromHtml(html, baseUrl);
   return scripts.length > 0 ? selectPrimaryAppScriptUrl(scripts) : null;
 }
 
-async function waitForPrimaryAppScriptReady(baseUrl: string, env: NodeJS.ProcessEnv): Promise<void> {
+async function waitForPrimaryAppScriptReady(baseUrl: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<void> {
   const totalTimeoutMs = resolveUiWebScriptFetchTotalTimeoutMs(env);
   const attemptTimeoutMs = resolveUiWebScriptFetchAttemptTimeoutMs(env, totalTimeoutMs);
   const htmlRefreshRetryCount = resolveUiWebScriptHtmlRefreshRetryCount(env);
@@ -202,14 +209,15 @@ async function waitForPrimaryAppScriptReady(baseUrl: string, env: NodeJS.Process
   let retryCountForCurrentScript = 0;
 
   await waitFor(async () => {
+    signal.throwIfAborted();
     if (!primaryAppScriptUrl) {
-      primaryAppScriptUrl = await resolvePrimaryAppScriptUrl(baseUrl, env);
+      primaryAppScriptUrl = await resolvePrimaryAppScriptUrl(baseUrl, env, signal);
       retryCountForCurrentScript = 0;
     }
     if (!primaryAppScriptUrl) {
       return false;
     }
-    const probe = await probeScriptReady(primaryAppScriptUrl, attemptTimeoutMs);
+    const probe = await probeScriptReady(primaryAppScriptUrl, attemptTimeoutMs, signal);
     if (probe === 'ready') return true;
     if (probe === 'refresh-html') {
       primaryAppScriptUrl = null;
@@ -226,6 +234,7 @@ async function waitForPrimaryAppScriptReady(baseUrl: string, env: NodeJS.Process
     timeoutMs: totalTimeoutMs,
     intervalMs: 250,
     context: 'expo web primary script ready',
+    failFast: true,
   });
 }
 
@@ -275,7 +284,7 @@ export async function startUiWebMetro(params: {
     ],
     command: process.execPath,
     cwd: uiWorkspaceDir,
-    env: applyUiWebExpoNodeHeapEnv({
+    env: {
       ...params.env,
       CI: '1',
       EXPO_NO_TELEMETRY: '1',
@@ -284,7 +293,7 @@ export async function startUiWebMetro(params: {
       TMPDIR: tmpDir,
       TMP: tmpDir,
       TEMP: tmpDir,
-    }),
+    },
     stdoutPath,
     stderrPath,
   });
@@ -302,38 +311,37 @@ export async function startUiWebMetro(params: {
   });
 
   let baseUrl: string;
+  const readiness = new AbortController();
+  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+    const detail = signal ? `signal=${signal}` : `code=${code ?? 'null'}`;
+    readiness.abort(new Error(`expo web dev server exited before ready (${detail})`));
+  };
+  proc.child.once('exit', onExit);
   try {
-    const exitedEarly = new Promise<never>((_, reject) => {
-      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-        const detail = signal ? `signal=${signal}` : `code=${code ?? 'null'}`;
-        reject(new Error(`expo web dev server exited before ready (${detail})`));
-      };
-      proc.child.once('exit', onExit);
-      if (proc.child.exitCode !== null || proc.child.signalCode !== null) {
-        proc.child.off('exit', onExit);
-        onExit(proc.child.exitCode, proc.child.signalCode as NodeJS.Signals | null);
-      }
-    });
+    if (proc.child.exitCode !== null || proc.child.signalCode !== null) {
+      onExit(proc.child.exitCode, proc.child.signalCode as NodeJS.Signals | null);
+    }
 
-    const resolved = await Promise.race([
-      resolveExpoWebBaseUrl({
-        stdoutPath,
-        timeoutMs: resolveUiWebBaseUrlTimeoutMs(params.env),
-        expectedPort: metroPort,
-        env: params.env,
-      }),
-      exitedEarly,
-    ]);
+    const resolved = await resolveExpoWebBaseUrl({
+      stdoutPath,
+      timeoutMs: resolveUiWebBaseUrlTimeoutMs(params.env),
+      expectedPort: metroPort,
+      env: params.env,
+      signal: readiness.signal,
+    });
     baseUrl = resolved.baseUrl;
 
     await waitFor(
-      async () =>
-        (await isMetroPackagerReady(`http://localhost:${metroPort}`))
-        || (await isMetroPackagerReady(`http://127.0.0.1:${metroPort}`)),
-      { timeoutMs: resolveUiWebMetroStatusTimeoutMs(params.env), intervalMs: 250, context: 'metro /status ready' },
+      async () => {
+        readiness.signal.throwIfAborted();
+        return (await isMetroPackagerReady(`http://localhost:${metroPort}`, readiness.signal))
+          || (await isMetroPackagerReady(`http://127.0.0.1:${metroPort}`, readiness.signal));
+      },
+      { timeoutMs: resolveUiWebMetroStatusTimeoutMs(params.env), intervalMs: 250, context: 'metro /status ready', failFast: true },
     );
 
-    await waitForPrimaryAppScriptReady(baseUrl, params.env);
+    await waitForPrimaryAppScriptReady(baseUrl, params.env, readiness.signal);
+    readiness.signal.throwIfAborted();
   } catch (e) {
     await proc.stop().catch(() => {});
     const stdoutText = await readFile(stdoutPath, 'utf8').catch(() => '');
@@ -347,6 +355,8 @@ export async function startUiWebMetro(params: {
       `stderrTail=${JSON.stringify(stderrTail)}`,
     ].join(' | ');
     throw new Error(detail);
+  } finally {
+    proc.child.off('exit', onExit);
   }
 
   return {

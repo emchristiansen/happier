@@ -7,6 +7,7 @@ import { isClaudeCliJavaScriptFile } from '@/backends/claude/utils/resolveClaude
 import { readCredentials, readSettings } from '@/persistence';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded, ensureMachineIdForCredentials } from '@/ui/auth';
+import { assertBackendEnabledByAccountSettings } from '@/settings/backendEnabled';
 import { bootstrapAccountSettingsContext } from '@/settings/accountSettings/bootstrapAccountSettingsContext';
 import { resolveSessionStartAccountSettingsContext } from '@/settings/accountSettings/resolveSessionStartAccountSettingsContext';
 import { resolveSessionStartAccountSettingsRefreshMode } from '@/settings/accountSettings/resolveSessionStartAccountSettingsRefreshMode';
@@ -34,8 +35,10 @@ import {
 } from '@/cli/connectedServices/resolveDirectConnectedServiceEnvironment';
 import { resolveDirectCliConnectedServiceBindings } from '@/cli/connectedServices/resolveDirectCliConnectedServiceBindings';
 import { HAPPIER_SESSION_CONNECTED_SERVICES_BINDINGS_ENV_KEY } from '@/agent/runtime/sessionConnectedServicesBindingsEnv';
+import { claimSessionRunnerOwnership, withSessionRunnerOwnership } from '@/daemon/sessionRunnerLock';
 
 import type { CommandContext } from '@/cli/commandRegistry';
+import { fail, warn as presentationWarn } from '@happier-dev/cli-common/output';
 
 function readResumeFlagValue(args: readonly string[] | null | undefined): { flagIndex: number; valueIndex: number; value: string } | null {
   const list = Array.isArray(args) ? args : [];
@@ -70,7 +73,7 @@ export function stripHappyInternalSettingsFlag(
     i++; // Consume the value (if any), like upstream's behavior.
 
     const displayedValue = typeof settingsValue === 'string' ? settingsValue : '<missing>';
-    warn(chalk.yellow(`⚠️  Warning: --settings is used internally by Happier for session tracking.`));
+    warn(presentationWarn('--settings is used internally by Happier for session tracking.'));
     warn(chalk.yellow(`   Your settings file "${displayedValue}" will be ignored.`));
     warn(chalk.yellow(`   To configure Claude, edit ~/.claude/settings.json instead.`));
   }
@@ -280,12 +283,12 @@ ${chalk.bold.cyan(`Claude Code Options (from \`${providerHelpCommand}\`):`)}
   const accountSettingsBootstrapMode = shouldPreferFastBootstrap ? 'fast' : 'blocking';
   const shouldForceAccountSettingsRefresh = refreshSettings || isDaemonStartedRemoteSession;
 
-  let credentials = await readCredentials();
+  let credentials = context.sessionStart?.credentials ?? await readCredentials();
   if (!credentials) {
     const auth = await authAndSetupMachineIfNeeded();
     credentials = auth.credentials;
   } else {
-    await ensureMachineIdForCredentials(credentials);
+    if (!context.sessionStart) await ensureMachineIdForCredentials(credentials);
     if (shouldAutoStartDaemonAfterAuth({ env: process.env, isDaemonProcess: configuration.isDaemonProcess, startedBy })) {
       void ensureDaemonRunningForSessionCommand().catch((error) => {
         logger.debug('[claude] Failed to auto-start daemon (non-fatal)', error);
@@ -310,7 +313,7 @@ ${chalk.bold.cyan(`Claude Code Options (from \`${providerHelpCommand}\`):`)}
   let restoreDirectConnectedServiceEnvironment: (() => void) | null = null;
   let runCompleted = false;
   try {
-    const snapshot = await bootstrapAccountSettingsContext({
+    const snapshot = context.sessionStart?.accountSettingsContext ?? await bootstrapAccountSettingsContext({
       agentId: 'claude',
       credentials,
       mode: accountSettingsBootstrapMode,
@@ -323,7 +326,9 @@ ${chalk.bold.cyan(`Claude Code Options (from \`${providerHelpCommand}\`):`)}
     const effectiveSnapshot = await resolveSessionStartAccountSettingsContext({
       startedBy,
       snapshot,
+      refreshRequested: refreshSettings,
     });
+    assertBackendEnabledByAccountSettings({ agentId: 'claude', settings: effectiveSnapshot.settings });
     options.claudeRemoteMetaDefaults = resolveProviderOutgoingMessageMetaExtras({
       agentId: 'claude',
       settings: effectiveSnapshot.settings,
@@ -388,11 +393,14 @@ ${chalk.bold.cyan(`Claude Code Options (from \`${providerHelpCommand}\`):`)}
       }
     }
     options.terminalRuntime = context.terminalRuntime;
-    await runClaude(credentials, options);
+    await withSessionRunnerOwnership(async () => {
+      if (options.existingSessionId) await claimSessionRunnerOwnership(options.existingSessionId);
+      await runClaude(credentials, options);
+    });
     runCompleted = true;
   } catch (error) {
     logger.fatal(error);
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }

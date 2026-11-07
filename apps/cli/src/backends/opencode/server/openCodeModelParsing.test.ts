@@ -9,7 +9,7 @@ describe('openCodeModelParsing known unavailable replacements', () => {
       modelID: 'claude-2.0',
       nowMs: Date.UTC(2026, 6, 1),
     })).toMatchObject({
-      replacementModelId: 'claude-opus-5',
+      replacementModelId: 'claude-opus-5-5',
     });
   });
 

@@ -66,6 +66,14 @@ if [ "$1" = "api" ]; then
     echo "oldsha"
     exit 0
   fi
+  if echo "$*" | grep -q "repos/test/test/releases/tags/dev-test --jq .id"; then
+    echo "123"
+    exit 0
+  fi
+  if echo "$*" | grep -q "repos/test/test/releases/123 --jq .target_commitish"; then
+    echo "0123456789abcdef0123456789abcdef01234567"
+    exit 0
+  fi
   exit 0
 fi
 
@@ -114,7 +122,7 @@ exit 0
   );
 
   const log = fs.readFileSync(ghLog, 'utf8');
-  assert.match(log, /gh release edit dev-test --title Dev Test --notes Rolling dev build\./);
+  assert.match(log, /gh release edit dev-test --latest=false --title Dev Test --notes Rolling dev build\./);
   assert.match(log, /gh release upload dev-test /);
   assert.doesNotMatch(log, /Full diff:/);
   assert.doesNotMatch(log, /### Commits/);

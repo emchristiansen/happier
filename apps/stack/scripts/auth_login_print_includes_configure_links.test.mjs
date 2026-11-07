@@ -131,6 +131,15 @@ test('hstack auth login --print --json webapp precedence variants', async (t) =>
       },
     },
     {
+      name: '--webapp=hosted uses the preferred hosted client',
+      prefix: 'hstack-auth-webapp-hosted-',
+      stackEnvLines: BASE_ENV_LINES,
+      args: ['--webapp=hosted'],
+      assertParsed(parsed) {
+        assert.equal(parsed.webappUrl, 'https://cloud.happier.dev');
+      },
+    },
+    {
       name: '--webapp=public overrides stack-env hosted webapp',
       prefix: 'hstack-auth-webapp-public-',
       stackEnvLines: [...BASE_ENV_LINES, 'HAPPIER_WEBAPP_URL=https://app.happier.dev'],

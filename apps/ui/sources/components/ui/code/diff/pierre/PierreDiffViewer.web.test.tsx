@@ -65,11 +65,11 @@ vi.mock('@pierre/diffs/react', async () => {
     return {
         ...actual,
         WorkerPoolContext: { Provider: ({ children }: any) => children },
-        Virtualizer: ({ children, ...props }: any) => {
+        Virtualizer: ({ children }: any) => {
             virtualizerSpy();
             // Third-party scroll-container state must survive a patch refresh.
             const [scrollTop, setScrollTop] = React.useState(0);
-            return React.createElement('Virtualizer', { ...props, scrollTop, onScroll: setScrollTop }, children);
+            return React.createElement('Virtualizer', { scrollTop, onScroll: setScrollTop }, children);
         },
         FileDiff: (props: any) => {
             fileDiffSpy(props);
@@ -143,7 +143,7 @@ describe('PierreDiffViewer (web)', () => {
         expect(second).toHaveLength(first.length);
     });
 
-    it('keeps the owned virtualizer bounded by its pane when virtualized', async () => {
+    it('inherits maxHeight on the wrapper when virtualized', async () => {
         fileDiffSpy.mockClear();
         virtualizerSpy.mockClear();
 
@@ -175,20 +175,7 @@ describe('PierreDiffViewer (web)', () => {
         });
 
         const wrapper = screen.findByProps({ 'data-testid': 'pierre-diff-viewer' });
-        expect(wrapper.props.style).toMatchObject({
-            display: 'flex',
-            flex: '1 1 0%',
-            flexDirection: 'column',
-            inset: 0,
-            minHeight: 0,
-            overflow: 'hidden',
-            position: 'absolute',
-        });
-        expect(screen.findByType('Virtualizer' as any).props.style).toMatchObject({
-            flex: '1 1 0%',
-            minHeight: 0,
-            overflowY: 'auto',
-        });
+        expect(wrapper.props.style?.maxHeight).toBe('inherit');
     });
 
     it('publishes scale-aware diff typography CSS variables', async () => {
@@ -394,6 +381,20 @@ describe('PierreDiffViewer (web)', () => {
         expect(tree.findByType('FileDiff').props.renderedFileDiff.cacheKey).not.toBe(firstRenderedKey);
     });
 
+    it('refreshes a non-virtualized Pierre diff when its patch changes', async () => {
+        const { PierreDiffViewer } = await import('./PierreDiffViewer.web');
+        const patch = 'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-foo\n+bar\n';
+        const view = (unifiedDiff: string) => <PierreDiffViewer mode="unified" filePath="a.ts" unifiedDiff={unifiedDiff} virtualized={false} />;
+        const { tree } = await renderScreen(view(patch));
+        const firstRenderedKey = tree.findByType('FileDiff').props.renderedFileDiff.cacheKey;
+
+        await renderer.act(async () => {
+            tree.update(view(patch.replace('+bar', '+updated')));
+        });
+
+        expect(tree.findByType('FileDiff').props.renderedFileDiff.cacheKey).not.toBe(firstRenderedKey);
+    });
+
     it('does not reapply a consumed jump target on a patch refresh', async () => {
         const { PierreDiffViewer } = await import('./PierreDiffViewer.web');
         const root = document.createElement('div');
@@ -417,41 +418,30 @@ describe('PierreDiffViewer (web)', () => {
 
         const { VirtualizerContext } = await import('@pierre/diffs/react');
         const { PierreDiffViewer } = await import('./PierreDiffViewer.web');
-        const patch = [
-            'diff --git a/a.ts b/a.ts',
-            '--- a/a.ts',
-            '+++ b/a.ts',
-            '@@ -1,1 +1,1 @@',
-            '-foo',
-            '+bar',
-            '',
-        ].join('\n');
-        const view = (unifiedDiff: string) => (
-            <VirtualizerContext.Provider value={{} as any}>
-                <PierreDiffViewer
-                    mode="unified"
-                    filePath="src/a.ts"
-                    unifiedDiff={unifiedDiff}
-                    wrapLines={true}
-                    showLineNumbers={true}
-                    showPrefix={true}
-                    virtualized={true}
-                />
-            </VirtualizerContext.Provider>
-        );
 
-        let screen!: Awaited<ReturnType<typeof renderScreen>>;
         await renderer.act(async () => {
-            screen = await renderScreen(view(patch));
+            await renderScreen(<VirtualizerContext.Provider value={{} as any}>
+                    <PierreDiffViewer
+                        mode="unified"
+                        filePath="src/a.ts"
+                        unifiedDiff={[
+                            'diff --git a/a.ts b/a.ts',
+                            '--- a/a.ts',
+                            '+++ b/a.ts',
+                            '@@ -1,1 +1,1 @@',
+                            '-foo',
+                            '+bar',
+                            '',
+                        ].join('\n')}
+                        wrapLines={true}
+                        showLineNumbers={true}
+                        showPrefix={true}
+                        virtualized={true}
+                    />
+                </VirtualizerContext.Provider>);
         });
 
         expect(virtualizerSpy).toHaveBeenCalledTimes(0);
-        expect(screen.findByProps({ 'data-testid': 'pierre-diff-viewer' }).props.style?.position).toBeUndefined();
-        const firstRenderedKey = screen.tree.findByType('FileDiff').props.renderedFileDiff.cacheKey;
-        await renderer.act(async () => {
-            screen.tree.update(view(patch.replace('+bar', '+updated')));
-        });
-        expect(screen.tree.findByType('FileDiff').props.renderedFileDiff.cacheKey).not.toBe(firstRenderedKey);
     });
 
     it('wires Pierre line clicks to onPressLine with a mapped CodeLine', async () => {
@@ -1121,6 +1111,41 @@ describe('PierreDiffViewer (web)', () => {
         expect(screen.findAllByProps({ 'data-testid': 'pierre-diff-fallback' })).toHaveLength(0);
         expect(fileDiffSpy.mock.calls.at(-1)?.[0].fileDiff).toBeTruthy();
     });
+
+    it.each(['git', 'headerless', 'headerless later file', 'paired header-like content'] as const)(
+        'preserves removed SQL comments as hunk content: %s', async (format) => {
+            fileDiffSpy.mockClear();
+            const { PierreDiffViewer } = await import('./PierreDiffViewer.web');
+            const newHeading = format === 'paired header-like content' ? '++ new heading' : '-- new heading';
+            const target = [
+                ...(format === 'git' ? ['diff --git a/schema.sql b/schema.sql'] : []),
+                '--- a/schema.sql',
+                '+++ b/schema.sql',
+                '@@ -1,2 +1,2 @@',
+                '--- old heading',
+                `+${newHeading}`,
+                ' SELECT 1;',
+                '',
+            ].join('\n');
+            const prefix = format === 'headerless later file'
+                ? '--- a/first.sql\n+++ b/first.sql\n@@ -1 +1 @@\n-old\n+new\n'
+                : '';
+            const onPressLine = vi.fn();
+            const screen = await renderScreen(<PierreDiffViewer mode="unified" filePath="schema.sql" unifiedDiff={prefix + target} onPressLine={onPressLine} />);
+            expect(screen.findAllByProps({ 'data-testid': 'pierre-diff-fallback' })).toHaveLength(0);
+            const file = fileDiffSpy.mock.calls.at(-1)?.[0]?.fileDiff;
+            expect(file?.deletionLines.join('')).toContain('-- old heading');
+            expect(file?.additionLines.join('')).toContain(newHeading);
+            expect(file?.deletionLines.join('')).toContain('SELECT 1;');
+            expect(file?.additionLines.join('')).toContain('SELECT 1;');
+            expect(file?.name).toContain('schema.sql');
+            const options = fileDiffSpy.mock.calls.at(-1)?.[0]?.options;
+            await renderer.act(async () => {
+                options.onLineClick({ type: 'diff-line', annotationSide: 'deletions', lineType: 'change-deletion', lineNumber: 1, lineElement: {}, numberElement: {}, numberColumn: false, event: {} });
+            });
+            expect(onPressLine).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'remove', oldLine: 1, renderCodeText: '-- old heading' }));
+        },
+    );
 
     it('sanitizes multi-file unified diffs to a single-file patch for Pierre', async () => {
         fileDiffSpy.mockClear();

@@ -55,14 +55,13 @@ export function useRenderedAgentInputControlRows(params: Readonly<{
     envVarsChipAnchorRef: React.RefObject<View | null>;
     envVarsCount?: number;
     onEnvVarsPress: () => void;
-    agentId: AgentId;
+    agentId: AgentId | null;
     hasAgentSelection: boolean;
     agentChipAnchorRef: React.RefObject<View | null>;
     agentLabel: string;
     engineLabel: string;
-    /** Hover/focus/press-in on the Agent chip, before the picker opens. */
-    onAgentIntent?: () => void;
     onAgentPress: () => void;
+    onAgentIntent?: () => void;
     machineChipAnchorRef: React.RefObject<View | null>;
     onMachinePress?: () => void;
     machineName?: string | null;
@@ -142,8 +141,8 @@ export function useRenderedAgentInputControlRows(params: Readonly<{
             agentChipAnchorRef: params.agentChipAnchorRef,
             agentLabel: params.agentLabel,
             engineLabel: params.engineLabel,
-            onAgentIntent: params.onAgentIntent,
             onAgentPress: params.onAgentPress,
+            onAgentIntent: params.onAgentIntent,
             machineChipAnchorRef: params.machineChipAnchorRef,
             onMachinePress: params.onMachinePress,
             machineName: params.machineName,
@@ -195,7 +194,6 @@ export function useRenderedAgentInputControlRows(params: Readonly<{
         params.agentChipAnchorRef,
         params.agentLabel,
         params.engineLabel,
-        params.onAgentIntent,
         params.chipStyle,
         params.chipStyleAutoHide,
         params.chips,
@@ -216,6 +214,7 @@ export function useRenderedAgentInputControlRows(params: Readonly<{
         params.onAbortPress,
         params.onActionMenuPress,
         params.onAgentPress,
+        params.onAgentIntent,
         params.onEnvVarsPress,
         params.onFileViewerPress,
         params.onMachinePress,

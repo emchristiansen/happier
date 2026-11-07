@@ -107,9 +107,44 @@ hdev self update
 
 There is no separate public daemon installer endpoint today; the daemon rides with the matching CLI lane on that machine.
 
+After a successful `self update`, a daemon that lane's background service is running is restarted so it runs the new
+version. A daemon you started yourself (`happier daemon start`) and another lane's service are left running; restart
+those yourself when you are ready.
+
+Restarting the daemon keeps your sessions running, and each session runner stays on the CLI version it started with.
+To move them onto the new version yourself, run `happier daemon restart-session-runners` (add `--dry-run` to preview).
+
+Restarting a runner stops the agent's process, including any background agents or shells it is running. The command
+skips runners that are mid-turn or that the server reports as running background work, and reports them as busy; run
+it again once that work has finished. Restarting a runner from the app asks you first when background work is
+running, including while a foreground turn is also shown, and only restarts it once you confirm.
+The app also asks when its last activity report is old but still says work is running.
+
+In development builds, you can opt in to automatic runner restarts:
+
+```bash
+hdev daemon restart-session-runners --on-update on
+```
+
+With this on, every time the daemon starts (after `self update`, an update started from the app, or a service
+restart after a manual install) it restarts the daemon-started session runners that are still on an older CLI. The
+sessions retain their identity and history. Runners already on the current version are not touched, and runners that
+are mid-turn or running background work are skipped, as are runners whose background activity the daemon cannot read
+from the server; restart them later with `hdev daemon restart-session-runners`. The setting is off by default, is read
+when the daemon starts, and is turned off again with `--on-update off`.
+
+Turn checks use the daemon's observed turn state. A turn that starts while the daemon is down, or whose turn
+notification fails, can be missed and interrupted by the automatic restart. Leave the setting off and restart runners
+manually when you are ready if you want to avoid this unattended interruption risk.
+
 ### Side-by-side installs (stable vs preview vs dev)
 
 You can install all three public lanes side-by-side (`happier`, `hprev`, `hdev`) without them overwriting each other.
+
+The unsuffixed `happier` command belongs to the lane you installed first, or the one you last picked with the
+installer's `--channel`. Installing or updating another lane — including a desktop app of another lane — adds only
+that lane's own command (`hprev`, `hdev`) and never changes what `happier` runs. The desktop app of another lane
+uses your default lane's CLI and its background service instead of installing a second one.
 
 Daemon runtime state is lane-scoped, and daemon services (LaunchAgent/systemd/Scheduled Task) use lane-scoped service identifiers.
 To inspect the exact service name/label/unit on your platform, run:
@@ -141,8 +176,38 @@ happier daemon service restart
 Platform notes:
 
 - **macOS**: LaunchAgent
-- **Linux**: `systemd --user`
+- **Linux**: `systemd --user`, with `systemctl` available and a working systemd user session. Linux systems without systemd cannot use this automatic startup path.
 - **Windows**: Scheduled Task (user-level)
+
+### Installed, but not started at login
+
+If you would rather have the daemon run only while you are using Happier (for example only while the
+desktop app is open), install the service without its login trigger:
+
+```bash
+happier service install --no-autostart
+```
+
+The service stays installed and `happier service start` / `stop` / `restart` keep working — nothing
+starts it for you at login. On macOS the LaunchAgent is written with `RunAtLoad` off, on Linux the
+`systemd --user` unit is installed but not enabled, and on Windows the Scheduled Task is registered
+with a start date that has already passed instead of a logon trigger — so it is startable but never
+due, and Task Scheduler is told not to catch up a missed start.
+
+On macOS an on-demand LaunchAgent also carries no keep-alive, so launchd does not relaunch the
+daemon if it crashes — start it again yourself, or from the desktop app. On Linux, switching only
+the mode changes the login trigger and leaves a running daemon alone; on macOS and Windows the job
+has to be re-registered to apply the new trigger, which restarts the daemon.
+
+Switch back with:
+
+```bash
+happier service install --autostart at-login
+```
+
+Re-running `install` without either flag keeps whichever mode the service already has, so repairs and
+upgrades never turn the login trigger back on behind your back. `happier service install --dry-run
+--json` reports the mode it would apply as `autostart`.
 
 To remove it:
 
@@ -177,3 +242,23 @@ This is especially useful for provisioning headless servers because you can appr
 - **Check status**: `happier daemon status`
 - **Find logs**: `happier daemon logs`
 - **Service paths**: `happier daemon service paths`
+
+### Linux without systemctl
+
+If `systemctl` is unavailable, automatic startup cannot be installed. After signing in, check
+`happier daemon status`. If no daemon is running for the selected relay, start one manually:
+
+```bash
+happier daemon start
+```
+
+This starts the daemon for the current machine session; it does not arrange startup after login
+or reboot. Missing `systemctl` in your shell does not prove systemd is stopped. Manual recovery
+does not disable an existing service: if its automatic startup resumes later, that service can
+take over a conflicting manually started daemon under the existing ownership rules.
+
+The development CLI checks for missing service commands before installation or doctor repair
+changes service definitions. It also lets manual startup proceed past readable leftover systemd
+units when `systemctl` is absent. Running daemon ownership and unreadable service state still
+protect against conflicting starts. This correction is not yet established as available in a
+published stable or preview release.

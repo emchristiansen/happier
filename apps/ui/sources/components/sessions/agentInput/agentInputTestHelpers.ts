@@ -1,4 +1,5 @@
 import { vi } from 'vitest';
+export { installAgentAssetLoader as installAgentInputAssetLoader } from '@/dev/testkit/mocks/agentAssets';
 
 type AgentInputModuleFactory = () => unknown | Promise<unknown>;
 type AgentInputImportOriginal = <T = unknown>() => Promise<T>;

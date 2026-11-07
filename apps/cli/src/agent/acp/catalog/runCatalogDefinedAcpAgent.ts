@@ -1,7 +1,5 @@
-import React from 'react';
-
 import type { AgentId } from '@happier-dev/agents';
-import { AGENTS_CORE, getProviderCliRuntimeSpec } from '@happier-dev/agents';
+import { AGENTS_CORE, getBuiltInAcpConfig, getProviderCliRuntimeSpec } from '@happier-dev/agents';
 
 import type { Credentials } from '@/persistence';
 import type { PermissionMode } from '@/api/types';
@@ -10,10 +8,7 @@ import { initialMachineMetadata } from '@/daemon/machine/metadata';
 import { formatProviderPromptErrorMessage } from '@/agent/runtime/formatProviderPromptErrorMessage';
 import { runStandardAcpProvider, type StandardAcpProviderRunOptions } from '@/agent/runtime/runStandardAcpProvider';
 import { createCatalogProviderAcpRuntime } from '@/agent/acp/runtime/createCatalogProviderAcpRuntime';
-import type { MessageBuffer } from '@/ui/ink/messageBuffer';
 import { requireCatalogEntry } from '@/backends/catalog';
-
-import { CatalogDefinedAcpTerminalDisplay } from './ui/CatalogDefinedAcpTerminalDisplay';
 
 function normalizeDisplayTitle(agentId: AgentId): string {
   const title = getProviderCliRuntimeSpec(agentId).title.trim();
@@ -28,14 +23,10 @@ export async function runCatalogDefinedAcpAgent(
   },
 ): Promise<void> {
   const displayTitle = normalizeDisplayTitle(agentId);
-  const backendOptionsResolver = await requireCatalogEntry(agentId)
-    .getAcpRuntimeBackendOptionsResolver?.();
-  const TerminalDisplay = (props: Readonly<{
-    messageBuffer: MessageBuffer;
-    logPath?: string;
-    onExit?: () => void | Promise<void>;
-  }>) => React.createElement(CatalogDefinedAcpTerminalDisplay, { ...props, title: displayTitle });
-
+  const catalogEntry = requireCatalogEntry(agentId);
+  const backendOptionsResolver = await catalogEntry.getAcpRuntimeBackendOptionsResolver?.();
+  const sessionModelAdapter = await catalogEntry.getAcpRuntimeSessionModelAdapter?.();
+  const turnHooks = await catalogEntry.getAcpRuntimeTurnHooks?.();
   await runStandardAcpProvider(opts, {
     flavor: agentId,
     backendDisplayName: displayTitle,
@@ -44,7 +35,15 @@ export async function runCatalogDefinedAcpAgent(
     waitingForCommandLabel: displayTitle,
     agentMessageType: agentId,
     machineMetadata: initialMachineMetadata,
-    terminalDisplay: TerminalDisplay,
+    loadTerminalDisplay: async () => {
+      const [{ default: React }, { CatalogDefinedAcpTerminalDisplay }] = await Promise.all([
+        import('react'),
+        import('./ui/CatalogDefinedAcpTerminalDisplay'),
+      ]);
+      return (props) => React.createElement(CatalogDefinedAcpTerminalDisplay, { ...props, title: displayTitle });
+    },
+    // Same catalog declaration the ACP protocol owner enforces against the negotiated handshake.
+    declaredSessionLoadSupport: getBuiltInAcpConfig(agentId)?.supportsLoadSession === true,
     createRuntime: ({
       directory,
       machineId,
@@ -55,6 +54,7 @@ export async function runCatalogDefinedAcpAgent(
       setThinking,
       getPermissionMode,
       memoryRecallGuidanceEnabled,
+      processEnv,
       pendingQueueDrainMaxPopPerWake,
       providerInputConsumer,
     }) => {
@@ -76,8 +76,11 @@ export async function runCatalogDefinedAcpAgent(
           enabled: memoryRecallGuidanceEnabled,
           machineId,
         },
+        processEnv,
         pendingQueueDrainMaxPopPerWake,
         providerInputConsumer,
+        ...(sessionModelAdapter ?? {}),
+        ...(turnHooks ? { hooks: turnHooks } : {}),
         ...(backendOptions ? { backendOptions } : {}),
       });
     },

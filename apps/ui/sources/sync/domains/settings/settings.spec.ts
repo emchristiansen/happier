@@ -134,7 +134,7 @@ describe('settings', () => {
             const settings = settingsParse({});
             expect((settings as any).codingPromptBehaviorV1).toEqual({
                 v: 1,
-                sessionTitleUpdates: 'ongoing',
+                sessionTitleUpdates: 'initial',
                 responseOptions: 'agent',
             });
         });
@@ -218,6 +218,15 @@ describe('settings', () => {
                 viewInline: 'not a boolean'
             };
             expect(settingsParse(invalidSettings)).toEqual(parsedSettingsDefaults);
+        });
+
+        it('keeps legacy gauge preferences and defaults an absent or invalid multi-selection', () => {
+            expect(settingsParse({ sessionProviderUsageGaugeWindowMode: 'weekly' })).toMatchObject({
+                sessionProviderUsageGaugeWindowMode: 'weekly', sessionProviderUsageGaugeWindowModes: null,
+            });
+            expect(settingsParse({ sessionProviderUsageGaugeWindowModes: [] }).sessionProviderUsageGaugeWindowModes).toBeNull();
+            expect(settingsParse({ sessionProviderUsageGaugeWindowModes: ['daily', 'weekly'] }).sessionProviderUsageGaugeWindowModes)
+                .toEqual(['daily', 'weekly']);
         });
 
         it('should preserve unknown fields (loose schema)', () => {

@@ -44,7 +44,7 @@ export function readToolCallStartedAtMs(toolMessage: ToolCallMessage): number | 
  */
 export function readToolCallFinishedAtMs(toolMessage: ToolCallMessage): number | null {
     const tool: ToolCall | undefined = toolMessage.tool;
-    if (!tool || tool.state === 'running') return null;
+    if (!tool || tool.state === 'running' || tool.state === 'unavailable') return null;
     if (tool.state === 'completed' && isClaudeAsyncAgentLaunchToolResult(tool.result)) return null;
     return readFiniteNumber(tool.completedAt);
 }
@@ -56,10 +56,20 @@ export function readToolCallFinishedAtMs(toolMessage: ToolCallMessage): number |
  */
 export function readToolCallObservedAtMs(toolMessage: ToolCallMessage): number | null {
     const finishedAtMs = readToolCallFinishedAtMs(toolMessage);
-    const createdAtMs = readFiniteNumber(toolMessage.createdAt);
-    if (finishedAtMs == null) return createdAtMs;
-    if (createdAtMs == null) return finishedAtMs;
-    return Math.max(finishedAtMs, createdAtMs);
+    let latest = readFiniteNumber(toolMessage.createdAt);
+    if (finishedAtMs !== null) latest = latest === null ? finishedAtMs : Math.max(latest, finishedAtMs);
+    const pending = [...toolMessage.children];
+    while (pending.length > 0) {
+        const child = pending.pop()!;
+        const childAtMs = readFiniteNumber(child.createdAt);
+        if (childAtMs !== null) latest = latest === null ? childAtMs : Math.max(latest, childAtMs);
+        if (child.kind === 'tool-call') {
+            const childFinishedAtMs = readToolCallFinishedAtMs(child);
+            if (childFinishedAtMs !== null) latest = latest === null ? childFinishedAtMs : Math.max(latest, childFinishedAtMs);
+            pending.push(...child.children);
+        }
+    }
+    return latest;
 }
 
 function readFiniteNumber(value: unknown): number | null {

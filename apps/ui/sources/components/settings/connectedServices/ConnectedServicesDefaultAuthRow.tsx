@@ -4,6 +4,7 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import {
     ConnectedServiceBindingsV1Schema,
+    readConnectedServicesDefaultAuthSettings,
     type ConnectedServiceBindingSelectionV1,
     type ConnectedServiceBindingsV1,
     type ConnectedServiceId,
@@ -14,6 +15,7 @@ import { Item } from '@/components/ui/lists/Item';
 import { Text } from '@/components/ui/text/Text';
 import { Modal } from '@/modal';
 import { NewSessionConnectedServicesSelectionContent } from '@/components/sessions/new/components/NewSessionConnectedServicesSelectionContent';
+import { useConnectedServiceAuthGroupsQuery } from '@/hooks/server/connectedServices/useConnectedServiceAuthGroupsQuery';
 import { useActionSettingsNarrowLayout } from '@/components/settings/actions/useActionSettingsNarrowLayout';
 import { t } from '@/text';
 import {
@@ -45,6 +47,7 @@ export type ConnectedServicesDefaultAuthRowProps = Readonly<{
         connectedServicesProfileLabelByKey: Record<string, string | undefined>;
         connectedServicesDefaultProfileByServiceId: Record<string, string | undefined>;
         connectedServicesDefaultAuthByAgentIdV1?: ConnectedServicesDefaultAuthByAgentIdV1;
+        connectedServicesAdditionalDefaultAuthByAgentIdV1?: ConnectedServicesDefaultAuthByAgentIdV1;
     };
     setDefaultAuthSettings: (next: ConnectedServicesDefaultAuthByAgentIdV1) => void;
     onOpenConnectedServiceSettings: (serviceId: string) => void;
@@ -58,10 +61,6 @@ export type ConnectedServicesDefaultAuthRowProps = Readonly<{
     onDismissPoolAdoptionSuggestion?: (key: string) => void;
 }>;
 
-const EMPTY_DEFAULT_AUTH_SETTINGS: ConnectedServicesDefaultAuthByAgentIdV1 = {
-    v: 1,
-    bindingsByAgentId: {},
-};
 const EMPTY_SERVICE_BINDINGS: Readonly<Record<string, ConnectedServicesServiceBinding | undefined>> = {};
 const DEFAULT_AUTH_PICKER_MAX_HEIGHT = 520;
 
@@ -141,7 +140,7 @@ function resolveReadyAutoSwitchPoolForProfile(params: Readonly<{
     const profileId = typeof binding.profileId === 'string' ? binding.profileId.trim() : '';
     if (!profileId) return null;
     for (const group of params.groupOptions) {
-        if (!group.autoSwitch) continue;
+        if (group.autoSwitch !== true) continue;
         if (group.status !== 'ready') continue;
         if (!(group.memberProfileIds ?? []).includes(profileId)) continue;
         return group;
@@ -151,7 +150,6 @@ function resolveReadyAutoSwitchPoolForProfile(params: Readonly<{
 
 export function ConnectedServicesDefaultAuthRow(props: ConnectedServicesDefaultAuthRowProps) {
     const { theme } = useUnistyles();
-    const styles = stylesheet;
     const narrowLayout = useActionSettingsNarrowLayout();
     const [locallyDismissedKeys, setLocallyDismissedKeys] = React.useState<Readonly<Record<string, boolean>>>({});
 
@@ -182,7 +180,10 @@ export function ConnectedServicesDefaultAuthRow(props: ConnectedServicesDefaultA
         supportedServiceIds,
     ]);
 
-    const defaultAuthSettings = props.settings.connectedServicesDefaultAuthByAgentIdV1 ?? EMPTY_DEFAULT_AUTH_SETTINGS;
+    const defaultAuthSettings = React.useMemo(() => readConnectedServicesDefaultAuthSettings(props.settings), [
+        props.settings.connectedServicesDefaultAuthByAgentIdV1,
+        props.settings.connectedServicesAdditionalDefaultAuthByAgentIdV1,
+    ]);
     const persistedBindingsByServiceId = defaultAuthSettings.bindingsByAgentId[props.agentId]?.bindingsByServiceId ?? EMPTY_SERVICE_BINDINGS;
     const [bindingsByServiceId, setBindingsByServiceId] = React.useState<
         Readonly<Record<string, ConnectedServicesServiceBinding | undefined>>
@@ -277,28 +278,6 @@ export function ConnectedServicesDefaultAuthRow(props: ConnectedServicesDefaultA
         supportedServiceIds,
     ]);
 
-    const poolAdoptionSuggestions = React.useMemo((): ReadonlyArray<PoolAdoptionSuggestion> => {
-        const suggestions: PoolAdoptionSuggestion[] = [];
-        for (const serviceId of supportedServiceIds) {
-            const group = resolveReadyAutoSwitchPoolForProfile({
-                binding: bindingsByServiceId[serviceId],
-                groupOptions: accountGroupOptionsByServiceId[serviceId] ?? [],
-            });
-            if (!group) continue;
-            const key = `${props.agentId}:${serviceId}:${group.groupId}`;
-            if (props.dismissedPoolAdoptionSuggestionKeys?.[key] || locallyDismissedKeys[key]) continue;
-            suggestions.push({ key, serviceId, groupId: group.groupId, groupLabel: group.label });
-        }
-        return suggestions;
-    }, [
-        accountGroupOptionsByServiceId,
-        bindingsByServiceId,
-        locallyDismissedKeys,
-        props.agentId,
-        props.dismissedPoolAdoptionSuggestionKeys,
-        supportedServiceIds,
-    ]);
-
     const acceptPoolSuggestion = React.useCallback((suggestion: PoolAdoptionSuggestion) => {
         setBindingForService(suggestion.serviceId, {
             source: 'connected',
@@ -330,42 +309,98 @@ export function ConnectedServicesDefaultAuthRow(props: ConnectedServicesDefaultA
                 showChevron={true}
                 onPress={openPicker}
             />
-            {poolAdoptionSuggestions.map((suggestion) => (
-                <View
-                    key={suggestion.key}
-                    testID={`settings-connected-services-pool-adoption-suggestion-${props.agentId}-${suggestion.serviceId}`}
-                    style={styles.suggestion}
-                >
-                    <Text style={styles.suggestionText}>
-                        {t('connectedServices.defaultAuth.poolSuggestion.body', { pool: suggestion.groupLabel })}
-                    </Text>
-                    <View style={styles.suggestionActions}>
-                        <Pressable
-                            testID={`settings-connected-services-pool-adoption-suggestion-${props.agentId}-${suggestion.serviceId}-dismiss`}
-                            accessibilityRole="button"
-                            accessibilityLabel={t('connectedServices.defaultAuth.poolSuggestion.dismiss')}
-                            onPress={() => dismissPoolSuggestion(suggestion)}
-                            style={styles.suggestionSecondaryButton}
-                        >
-                            <Text style={styles.suggestionSecondaryLabel}>
-                                {t('connectedServices.defaultAuth.poolSuggestion.dismiss')}
-                            </Text>
-                        </Pressable>
-                        <Pressable
-                            testID={`settings-connected-services-pool-adoption-suggestion-${props.agentId}-${suggestion.serviceId}-accept`}
-                            accessibilityRole="button"
-                            accessibilityLabel={t('connectedServices.defaultAuth.poolSuggestion.accept')}
-                            onPress={() => acceptPoolSuggestion(suggestion)}
-                            style={styles.suggestionPrimaryButton}
-                        >
-                            <Text style={styles.suggestionPrimaryLabel}>
-                                {t('connectedServices.defaultAuth.poolSuggestion.accept')}
-                            </Text>
-                        </Pressable>
-                    </View>
-                </View>
-            ))}
+            {props.accountGroupsEnabled && supportedServiceIds.map((serviceId) => {
+                const binding = bindingsByServiceId[serviceId];
+                const projection = props.accountProfileConnectedServicesV2.find((entry) => entry.serviceId === serviceId);
+                if (binding?.source !== 'connected' || binding.selection !== 'profile' || !projection) return null;
+                if (!Array.isArray(projection.groups) || projection.groups.length === 0) return null;
+                return (
+                    <ConnectedServicesPoolAdoptionSuggestion
+                        key={serviceId}
+                        agentId={props.agentId}
+                        serviceId={serviceId}
+                        projection={projection}
+                        binding={binding}
+                        dismissedKeys={props.dismissedPoolAdoptionSuggestionKeys}
+                        locallyDismissedKeys={locallyDismissedKeys}
+                        onAccept={acceptPoolSuggestion}
+                        onDismiss={dismissPoolSuggestion}
+                    />
+                );
+            })}
         </>
+    );
+}
+
+// Policy is demanded only by the visible adoption candidate; pickers keep using the
+// lightweight profile projection and do not issue an extra group read.
+function ConnectedServicesPoolAdoptionSuggestion(props: Readonly<{
+    agentId: string;
+    serviceId: ConnectedServiceId;
+    projection: NewSessionConnectedServiceProjection;
+    binding: ConnectedServicesServiceBinding;
+    dismissedKeys?: Readonly<Record<string, boolean>>;
+    locallyDismissedKeys: Readonly<Record<string, boolean>>;
+    onAccept: (suggestion: PoolAdoptionSuggestion) => void;
+    onDismiss: (suggestion: PoolAdoptionSuggestion) => void;
+}>) {
+    const styles = stylesheet;
+    const { groups, loadStatus } = useConnectedServiceAuthGroupsQuery({
+        serviceId: props.serviceId,
+        enabled: true,
+        serviceProjectionSignature: JSON.stringify(props.projection.groups),
+    });
+    const options = React.useMemo(() => buildConnectedServiceAccountGroupOptionsByServiceId({
+        accountGroupsFeatureEnabled: true,
+        accountProfileConnectedServicesV2: [props.projection],
+        supportedConnectedServiceIds: [props.serviceId],
+        accountGroupsByServiceId: loadStatus === 'loaded' || loadStatus === 'refreshing'
+            ? { [props.serviceId]: groups }
+            : undefined,
+    }), [groups, loadStatus, props.projection, props.serviceId]);
+    const group = resolveReadyAutoSwitchPoolForProfile({
+        binding: props.binding,
+        groupOptions: options[props.serviceId] ?? [],
+    });
+    if (!group) return null;
+    const key = `${props.agentId}:${props.serviceId}:${group.groupId}`;
+    if (props.dismissedKeys?.[key] || props.locallyDismissedKeys[key]) return null;
+    const suggestion: PoolAdoptionSuggestion = {
+        key, serviceId: props.serviceId, groupId: group.groupId, groupLabel: group.label,
+    };
+    return (
+        <View
+            testID={`settings-connected-services-pool-adoption-suggestion-${props.agentId}-${suggestion.serviceId}`}
+            style={styles.suggestion}
+        >
+            <Text style={styles.suggestionText}>
+                {t('connectedServices.defaultAuth.poolSuggestion.body', { pool: suggestion.groupLabel })}
+            </Text>
+            <View style={styles.suggestionActions}>
+                <Pressable
+                    testID={`settings-connected-services-pool-adoption-suggestion-${props.agentId}-${suggestion.serviceId}-dismiss`}
+                    accessibilityRole="button"
+                    accessibilityLabel={t('connectedServices.defaultAuth.poolSuggestion.dismiss')}
+                    onPress={() => props.onDismiss(suggestion)}
+                    style={styles.suggestionSecondaryButton}
+                >
+                    <Text style={styles.suggestionSecondaryLabel}>
+                        {t('connectedServices.defaultAuth.poolSuggestion.dismiss')}
+                    </Text>
+                </Pressable>
+                <Pressable
+                    testID={`settings-connected-services-pool-adoption-suggestion-${props.agentId}-${suggestion.serviceId}-accept`}
+                    accessibilityRole="button"
+                    accessibilityLabel={t('connectedServices.defaultAuth.poolSuggestion.accept')}
+                    onPress={() => props.onAccept(suggestion)}
+                    style={styles.suggestionPrimaryButton}
+                >
+                    <Text style={styles.suggestionPrimaryLabel}>
+                        {t('connectedServices.defaultAuth.poolSuggestion.accept')}
+                    </Text>
+                </Pressable>
+            </View>
+        </View>
     );
 }
 

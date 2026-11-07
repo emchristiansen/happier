@@ -1,13 +1,19 @@
 import axios from 'axios';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { accountSettingsParse } from '@happier-dev/protocol';
 
 import { configuration } from '@/configuration';
+import { encodeBase64, encrypt } from '@/api/encryption';
 import type { Credentials } from '@/persistence';
 
 import { bootstrapAccountSettingsContext, resetInMemoryAccountSettingsContextForTests } from './bootstrapAccountSettingsContext';
 import { setActiveAccountSettingsSnapshot } from './activeAccountSettingsSnapshot';
 import { createAccountSettingsScopeKey } from './accountSettingsScopeKey';
+import { resolveAccountSettingsCachePath, writeAccountSettingsCacheAtomic } from './accountSettingsCache';
+import { normalizeSessionAgentSpawnActionRequest } from '@/session/services/spawn/normalizeSessionAgentSpawnActionRequest';
 
 function createCredentialsStub(): Credentials {
   return {
@@ -24,24 +30,30 @@ function createCredentialsWithToken(token: string): Credentials {
 }
 
 function mutableConfigurationForTest(): {
+  activeServerDir: string;
   serverUrl: string;
   apiServerUrl: string;
   publicServerUrl: string;
   webappUrl: string;
+  clientEncryptionRequirement: 'follow_account' | 'require_e2ee';
 } {
   return configuration as unknown as {
+    activeServerDir: string;
     serverUrl: string;
     apiServerUrl: string;
     publicServerUrl: string;
     webappUrl: string;
+    clientEncryptionRequirement: 'follow_account' | 'require_e2ee';
   };
 }
 
 describe('bootstrapAccountSettingsContext', () => {
+  const originalActiveServerDir = configuration.activeServerDir;
   const originalServerUrl = configuration.serverUrl;
   const originalApiServerUrl = configuration.apiServerUrl;
   const originalPublicServerUrl = configuration.publicServerUrl;
   const originalWebappUrl = configuration.webappUrl;
+  const originalClientEncryptionRequirement = configuration.clientEncryptionRequirement;
 
   beforeEach(() => {
     resetInMemoryAccountSettingsContextForTests();
@@ -50,11 +62,79 @@ describe('bootstrapAccountSettingsContext', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     Object.assign(mutableConfigurationForTest(), {
+      activeServerDir: originalActiveServerDir,
       serverUrl: originalServerUrl,
       apiServerUrl: originalApiServerUrl,
       publicServerUrl: originalPublicServerUrl,
       webappUrl: originalWebappUrl,
+      clientEncryptionRequirement: originalClientEncryptionRequirement,
     });
+  });
+
+  const resolveOmittedAgySelection = () => normalizeSessionAgentSpawnActionRequest({
+    credentials: createCredentialsStub(),
+    surface: 'session_agent',
+    input: { agentId: 'agy', initialMessage: 'Use my saved account' },
+    parentMetadata: null,
+    currentSession: { path: '/repo', host: 'machine', machineId: 'machine-1' },
+  });
+  const selectedAgyDefaults = { v: 1, bindingsByAgentId: {
+    agy: { v: 1, bindingsByServiceId: {
+      antigravity: { source: 'connected', selection: 'profile', profileId: 'saved-google' },
+    } },
+  } };
+
+  it.each([{ withCache: false, encrypted: false }, { withCache: true, encrypted: false }, { withCache: false, encrypted: true }])('refuses fetched malformed additive defaults with omitted launch selection (cache=$withCache, encrypted=$encrypted)', async ({ withCache, encrypted }) => {
+    const directory = await mkdtemp(join(tmpdir(), 'happier-agy-default-bootstrap-'));
+    Object.assign(mutableConfigurationForTest(), { activeServerDir: directory, clientEncryptionRequirement: 'follow_account' });
+    try {
+      if (withCache) await writeAccountSettingsCacheAtomic(resolveAccountSettingsCachePath(createCredentialsStub()), {
+        version: 2, cachedAt: 0, settingsVersion: 1,
+        settingsContent: { t: 'plain', v: { connectedServicesAdditionalDefaultAuthByAgentIdV1: selectedAgyDefaults } },
+      });
+      // HTTP is the system boundary; parsing, bootstrap, disk cache, and launch default resolution are real.
+      const malformedSettings = {
+        connectedServicesAdditionalDefaultAuthByAgentIdV1: { v: 1, bindingsByAgentId: {
+          agy: { v: 1, bindingsByServiceId: { antigravity: { source: 'connected', selection: 'profile' } } },
+        } },
+      };
+      vi.spyOn(axios, 'get').mockResolvedValue({ status: 200, data: {
+        version: 2, content: encrypted
+          ? { t: 'encrypted', c: encodeBase64(encrypt(new Uint8Array(32).fill(1), 'legacy', malformedSettings)) }
+          : { t: 'plain', v: malformedSettings },
+      } });
+      await expect(resolveOmittedAgySelection()).rejects.toThrow('connected_services_default_settings_invalid');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['network', 'encrypted network', 'cache'] as const)('keeps valid omitted-selection defaults from %s', async (source) => {
+    const directory = await mkdtemp(join(tmpdir(), 'happier-agy-default-bootstrap-'));
+    Object.assign(mutableConfigurationForTest(), { activeServerDir: directory, clientEncryptionRequirement: 'follow_account' });
+    try {
+      if (source === 'cache') {
+        await writeAccountSettingsCacheAtomic(resolveAccountSettingsCachePath(createCredentialsStub()), {
+          version: 2, cachedAt: 0, settingsVersion: 1,
+          settingsContent: { t: 'plain', v: { connectedServicesAdditionalDefaultAuthByAgentIdV1: selectedAgyDefaults } },
+        });
+        vi.spyOn(axios, 'get').mockRejectedValue(new Error('offline'));
+      } else {
+        vi.spyOn(axios, 'get').mockResolvedValue({ status: 200, data: {
+          version: 2, content: source === 'encrypted network'
+            ? { t: 'encrypted', c: encodeBase64(encrypt(new Uint8Array(32).fill(1), 'legacy', {
+              connectedServicesAdditionalDefaultAuthByAgentIdV1: selectedAgyDefaults,
+            })) }
+            : { t: 'plain', v: { connectedServicesAdditionalDefaultAuthByAgentIdV1: selectedAgyDefaults } },
+        } });
+      }
+      const result = await resolveOmittedAgySelection();
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error('Expected selected saved account');
+      expect(result.createParams.connectedServices).toEqual(selectedAgyDefaults.bindingsByAgentId.agy);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it('does not reuse in-memory settings across servers (different cache paths)', async () => {
@@ -776,6 +856,52 @@ describe('bootstrapAccountSettingsContext', () => {
     });
     expect(res.settingsVersion).toBe(12);
     expect((res.settings as any).notificationsSettingsV1?.pushEnabled).toBe(false);
+  });
+
+  it('rejects plaintext settings before publishing when the environment requires E2EE', async () => {
+    Object.assign(mutableConfigurationForTest(), { clientEncryptionRequirement: 'require_e2ee' });
+    await expect(bootstrapAccountSettingsContext({
+      credentials: createCredentialsStub(),
+      mode: 'blocking',
+      refresh: 'force',
+      nowMs: 1_000_000,
+      ttlMs: 60_000,
+      deps: {
+        resolveCachePath: () => '/tmp/server/account.settings.cache.json',
+        readCache: async () => null,
+        decryptCiphertext: async () => null,
+        fetchFromServer: async () => ({
+          settingsContent: { t: 'plain', v: {} },
+          settingsVersion: 12,
+        } as any),
+        writeCache: async () => {},
+        applySideEffects: () => {},
+      },
+    })).rejects.toMatchObject({ code: 'CLIENT_E2EE_REQUIRED' });
+  });
+
+  it('rejects plaintext settings that carry a synced E2EE requirement', async () => {
+    await expect(bootstrapAccountSettingsContext({
+      credentials: createCredentialsStub(),
+      mode: 'blocking',
+      refresh: 'force',
+      nowMs: 1_000_000,
+      ttlMs: 60_000,
+      deps: {
+        resolveCachePath: () => '/tmp/server/account.settings.cache.json',
+        readCache: async () => null,
+        decryptCiphertext: async () => null,
+        fetchFromServer: async () => ({
+          settingsContent: {
+            t: 'plain',
+            v: { clientEncryptionRequirementV1: 'require_e2ee' },
+          },
+          settingsVersion: 12,
+        } as any),
+        writeCache: async () => {},
+        applySideEffects: () => {},
+      },
+    })).rejects.toMatchObject({ code: 'CLIENT_E2EE_REQUIRED' });
   });
 
   it('uses apiServerUrl for default v2 fetches when canonical serverUrl differs', async () => {

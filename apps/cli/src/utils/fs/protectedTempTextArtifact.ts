@@ -32,9 +32,11 @@ export async function materializeProtectedTempTextArtifact(params: Readonly<{
   /** mkdtemp prefix; include a trailing dash and a producer-identifying name. */
   prefix: string;
   contents: string;
+  /** Some subprocess loaders require a recognized file extension. */
+  filename?: string;
 }>): Promise<ProtectedTempTextArtifact> {
   const directory = await createProtectedLocalStateDirectory(join(tmpdir(), params.prefix));
-  const path = join(directory, 'text-artifact.txt');
+  const path = join(directory, params.filename ?? 'text-artifact.txt');
   let cleaned = false;
   const cleanup = async (): Promise<void> => {
     if (cleaned) return;

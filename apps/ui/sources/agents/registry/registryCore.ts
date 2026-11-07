@@ -25,11 +25,16 @@ import { QWEN_CORE } from '@/agents/providers/qwen/core';
 import { KIMI_CORE } from '@/agents/providers/kimi/core';
 import { KILO_CORE } from '@/agents/providers/kilo/core';
 import { KIRO_CORE } from '@/agents/providers/kiro/core';
+import { DEVIN_CORE } from '@/agents/providers/devin/core';
 import { CUSTOM_ACP_CORE } from '@/agents/providers/customAcp/core';
 import { PI_CORE } from '@/agents/providers/pi/core';
 import { COPILOT_CORE } from '@/agents/providers/copilot/core';
 import { CURSOR_CORE } from '@/agents/providers/cursor/core';
 import { GROK_CORE } from '@/agents/providers/grok/core';
+import { AGY_CORE } from '@/agents/providers/agy/core';
+import { FX_CORE } from '@/agents/providers/fx/core';
+import { DROID_CORE } from '@/agents/providers/droid/core';
+import { CODEBUDDY_CORE } from '@/agents/providers/codebuddy/core';
 
 export type { AgentId };
 
@@ -220,11 +225,16 @@ export const AGENTS_CORE = Object.freeze({
     kimi: KIMI_CORE,
     kilo: KILO_CORE,
     kiro: KIRO_CORE,
+    devin: DEVIN_CORE,
     customAcp: CUSTOM_ACP_CORE,
     pi: PI_CORE,
     copilot: COPILOT_CORE,
     cursor: CURSOR_CORE,
     grok: GROK_CORE,
+    fx: FX_CORE,
+    droid: DROID_CORE,
+    codebuddy: CODEBUDDY_CORE,
+    agy: AGY_CORE,
 }) satisfies Readonly<Record<string, AgentCoreConfig>>;
 
 export const AGENT_IDS = Object.freeze(

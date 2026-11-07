@@ -8,6 +8,7 @@ import {
   isConnectedServiceAuthGroupSoftSwitchCandidateMeaningfullyBetter,
   reconcileMemberRuntimeStateWithFreshQuotaEvidence,
   reconcileMemberRuntimeStateWithPositiveEvidence,
+  resolveConnectedServiceAuthGroupSoftSwitchSourceEvidence,
   selectConnectedServiceAuthGroupCandidate,
   resolveConnectedServiceAuthGroupQuotaResetCandidates,
   type ConnectedServiceAuthGroupMemberRuntimeState,
@@ -37,6 +38,19 @@ describe('quota reset admission', () => {
     expect(resolve({ ...exhausted, credentialHealthStatus: 'needs_reauth' }).map((candidate) => candidate.profileId)).toEqual(['primary']);
   });
 
+  it('carries only proven exhausted usage limits to automatic reset admission', () => {
+    const backup: ConnectedServiceAuthGroupMemberRuntimeState = { quotaSnapshot: {
+      capturedAtMs: 900, effectiveRemainingPercent: 0, meters: [
+        { meterId: 'display-weekly', providerLimitId: 'seven_day', limitCategory: 'usage_limit', remainingPct: 0, resetAtMs: 100_000 },
+        { meterId: 'display-duplicate', providerLimitId: 'seven_day', limitCategory: 'usage_limit', remainingPct: 0, resetAtMs: 100_000 },
+        { meterId: 'five_hour', providerLimitId: 'five_hour', limitCategory: 'usage_limit', remainingPct: 50, resetAtMs: 100_000 },
+        { meterId: 'unknown-provider-id', providerLimitId: null, limitCategory: 'usage_limit', remainingPct: 0, resetAtMs: 100_000 },
+      ],
+    } };
+    expect(resolve(backup)).toContainEqual(expect.objectContaining({ profileId: 'backup', providerLimitIds: ['seven_day'] }));
+    expect(resolve(backup)).toContainEqual(expect.objectContaining({ profileId: 'primary', providerLimitIds: [] }));
+  });
+
   it('does not turn unknown evidence, transient cooldown, or capacity backoff into quota exhaustion', () => {
     expect(resolve({})).toEqual([]);
     expect(resolve({ cooldownUntilMs: 2_000 })).toEqual([]);
@@ -64,8 +78,8 @@ function member(profileId: string, priority: number, createdAtMs: number) {
 describe('DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1', () => {
   it('is derived from the protocol schema default and stays in lockstep with it', () => {
     // Split-brain hygiene: the daemon default must not diverge from the protocol schema default.
-    // The protocol default strategy is `least_limited`; a hardcoded `priority` literal is drift.
-    expect(DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1.strategy).toBe('least_limited');
+    // The strategy comes from the canonical protocol default.
+    expect(DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1.strategy).toBe('expiry_first');
     expect(DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1).toEqual(
       ConnectedServiceAuthGroupPolicyV1Schema.parse({}),
     );
@@ -73,6 +87,21 @@ describe('DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1', () => {
 });
 
 describe('selectConnectedServiceAuthGroupCandidate', () => {
+  it('excludes a member only for the model whose entitlement cooldown is active', () => {
+    const params = {
+      nowMs: 1_000,
+      quotaFreshnessMs: 60_000,
+      activeProfileId: null,
+      policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({}),
+      members: [member('primary', 1, 1), member('backup', 2, 2)],
+      memberStatesByProfileId: new Map([
+        ['primary', { modelUnavailableUntilMsByModelId: { 'gpt-5.6-sol': 86_401_000 } }],
+      ]),
+    } as const;
+
+    expect(selectConnectedServiceAuthGroupCandidate({ ...params, providerLimitId: 'gpt-5.6-sol' }).selected?.profileId).toBe('backup');
+    expect(selectConnectedServiceAuthGroupCandidate({ ...params, providerLimitId: 'gpt-5.6-terra' }).selected?.profileId).toBe('primary');
+  });
   it('does not treat the active profile as a meaningfully better soft-switch target', () => {
     expect(isConnectedServiceAuthGroupSoftSwitchCandidateMeaningfullyBetter({
       activeProfileId: 'active',
@@ -176,12 +205,37 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       quotaFreshnessMs: 60_000,
       activeProfileId: 'backup',
       allowCurrentProfileRetry: true,
-      policy: { ...basePolicy, strategy: 'priority', autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 15 },
+      policy: { ...basePolicy, strategy: 'priority', autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 15, cooldownMs: 500 },
       members: [member('primary', 10, 1), member('backup', 20, 2), member('other', 30, 3)],
       memberStatesByProfileId: states,
     });
 
     expect(result.selected?.profileId).toBe('primary');
+  });
+
+  it.each([
+    {},
+    { lastFailureKind: 'usage_limit', providerResetsAtMs: null },
+    { lastFailureKind: 'usage_limit', providerResetsAtMs: 500 },
+    { providerResetsAtMs: 5_000 },
+  ])('restores fresh healthy primary quota after an automatic fallback without reset history (%j)', (failureState) => {
+    const input = {
+      nowMs: 1_000,
+      quotaFreshnessMs: 60_000,
+      activeProfileId: 'backup',
+      allowCurrentProfileRetry: true,
+      lastSwitchReason: 'usage_limit',
+      lastSwitchAt: 400,
+      policy: { ...basePolicy, strategy: 'priority' as const, autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 0 },
+      members: [member('primary', 100, 1), member('backup', 200, 2)],
+      memberStatesByProfileId: new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>([
+        ['primary', { ...failureState, quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 37 } }],
+        ['backup', { quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 9 } }],
+      ]),
+    };
+    expect(selectConnectedServiceAuthGroupCandidate(input).selected?.profileId).toBe('primary');
+    expect(selectConnectedServiceAuthGroupCandidate({ ...input, lastSwitchReason: 'manual' }).selected?.profileId).toBe('backup');
+    expect(selectConnectedServiceAuthGroupCandidate({ ...input, lastSwitchAt: 950 }).selected?.profileId).toBe('backup');
   });
 
   it('does not restore the primary when autoRestorePrimaryWhenReset is disabled (default)', () => {
@@ -351,6 +405,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       lastObservedAtMs: 900,
     };
     const reconciled = reconcileMemberRuntimeStateWithFreshQuotaEvidence({
+      quotaFreshnessMs: 60_000,
       state,
       quotaSnapshot: {
         capturedAtMs: 1_000,
@@ -566,6 +621,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
 
   it('removes generic cooldown fields from reconciled runtime state when fresh quota is usable', () => {
     const reconciled = reconcileMemberRuntimeStateWithFreshQuotaEvidence({
+      quotaFreshnessMs: 60_000,
       nowMs: 1_000,
       policy: {
         ...basePolicy,
@@ -764,7 +820,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
           lastObservedAtMs: 500,
           providerResetsAtMs: 10_000,
           quotaSnapshot: {
-            capturedAtMs: 900,
+            capturedAtMs: 1_000,
             effectiveMeterId: 'weekly',
             effectiveRemainingPercent: 75,
             meters: [{
@@ -784,6 +840,28 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
     expect(result.excluded).not.toContainEqual(expect.objectContaining({
       profileId: 'blocked-but-usable',
     }));
+  });
+
+  it('does not treat a future-dated quota observation as fresh soft-switch evidence', () => {
+    expect(resolveConnectedServiceAuthGroupSoftSwitchSourceEvidence({
+      activeProfileId: 'active',
+      policy: {
+        ...basePolicy,
+        softSwitchRemainingPercent: 15,
+      },
+      memberStatesByProfileId: new Map([[
+        'active',
+        {
+          quotaSnapshot: {
+            capturedAtMs: 10_000,
+            effectiveMeterId: 'weekly',
+            effectiveRemainingPercent: 0,
+          },
+        },
+      ]]),
+      nowMs: 1_000,
+      quotaFreshnessMs: 60_000,
+    })).toEqual({ status: 'unknown', reason: 'missing_fresh_quota_snapshot' });
   });
 
   it('keeps a true fresh secondary quota blocker and uses its fresh reset instead of stale persisted reset', () => {
@@ -837,7 +915,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
     });
   });
 
-  it('uses newer fresh usable quota evidence to clear a same-category blocker during the recent failure cooldown', () => {
+  it('retains a same-category blocker when quota evidence was captured during the recent failure cooldown', () => {
     const result = selectConnectedServiceAuthGroupCandidate({
       nowMs: 1_100,
       quotaFreshnessMs: 60_000,
@@ -869,9 +947,10 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       ]),
     });
 
-    expect(result.selected?.profileId).toBe('just-proven-usable');
-    expect(result.excluded).not.toContainEqual(expect.objectContaining({
+    expect(result.selected?.profileId).toBe('fallback');
+    expect(result.excluded).toContainEqual(expect.objectContaining({
       profileId: 'just-proven-usable',
+      reason: 'quota_exhausted',
     }));
   });
 

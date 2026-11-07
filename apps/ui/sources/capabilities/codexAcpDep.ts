@@ -1,6 +1,7 @@
 import type { CapabilitiesDetectRequest, CapabilityDetectResult, CapabilityId, CodexAcpDepData } from '@/sync/api/capabilities/capabilitiesProtocol';
-import { compareVersions, parseVersion } from '@/utils/system/versionUtils';
+import { compareVersionsOrNull } from '@/utils/system/versionUtils';
 import { CODEX_ACP_DEP_ID } from '@happier-dev/protocol/installables';
+import { isLatestVersionCheckDue } from '@/updates/latestVersionCheckFreshness';
 
 function isCodexAcpLatestVersionSuccess(
     value: CodexAcpDepData['latestVersionCheck'],
@@ -60,10 +61,8 @@ export function isCodexAcpUpdateAvailable(data: CodexAcpDepData | null | undefin
     const installed = typeof data.installedVersion === 'string' ? data.installedVersion : null;
     const latest = getCodexAcpLatestVersion(data);
     if (!installed || !latest) return false;
-    const installedParsed = parseVersion(installed);
-    const latestParsed = parseVersion(latest);
-    if (!installedParsed || !latestParsed) return false;
-    return compareVersions(installed, latest) < 0;
+    const comparison = compareVersionsOrNull(installed, latest);
+    return comparison !== null && comparison < 0;
 }
 
 export function shouldPrefetchCodexAcpLatestVersion(params: {
@@ -71,9 +70,6 @@ export function shouldPrefetchCodexAcpLatestVersion(params: {
     data?: CodexAcpLatestVersionAwareData | null;
     requireExistingResult?: boolean;
 }): boolean {
-    const OK_STALE_MS = 24 * 60 * 60 * 1000;
-    const ERROR_RETRY_MS = 30 * 60 * 1000;
-
     const now = Date.now();
     const requireExistingResult = params.requireExistingResult === true;
     const result = params.result ?? null;
@@ -94,10 +90,7 @@ export function shouldPrefetchCodexAcpLatestVersion(params: {
     if (!hasLatestVersionCheck) return true;
     if (checkedAt <= 0) return true;
 
-    const ok = isCodexAcpLatestVersionSuccess(latestVersionCheck);
-    const ageMs = now - checkedAt;
-    const threshold = ok ? OK_STALE_MS : ERROR_RETRY_MS;
-    return ageMs > threshold;
+    return isLatestVersionCheckDue({ checkedAt, ok: isCodexAcpLatestVersionSuccess(latestVersionCheck), now });
 }
 
 export function buildCodexAcpLatestVersionDetectRequest(): CapabilitiesDetectRequest {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -396,3 +396,55 @@ test('secrets-import can optionally remove imported env files when --cleanup-env
 
   assert.equal(fs.existsSync(envFile), false);
 });
+
+
+for (const scenario of [
+  { name: 'overlay without env', selected: ['production'], expected: ['production'], cleanup: true },
+  { name: 'overlay with env', selected: ['production'], env: 'production', expected: ['production'], cleanup: true },
+  { name: 'both explicit overlays', selected: ['preview', 'production'], expected: ['preview', 'production'] },
+  { name: 'mismatched env', selected: ['base', 'production'], env: 'preview', refuses: true },
+  { name: 'missing requested overlay', selected: ['base'], env: 'production', refuses: true },
+  { name: 'empty explicit list', selected: [], list: ',,', refuses: true },
+  { name: 'explicit empty argument', selected: [], list: '', refuses: true },
+  { name: 'omitted list keeps defaults', expected: ['base', 'preview', 'production'] },
+]) {
+  test(`secrets-import consumes only the selected file set: ${scenario.name}`, (t) => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pipeline-explicit-env-'));
+    t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+    const bin = path.join(tmp, 'bin');
+    fs.mkdirSync(bin);
+    const storePath = path.join(tmp, 'keychain.json');
+    const opsPath = path.join(tmp, 'ops.txt');
+    fs.writeFileSync(storePath, '{}');
+    createFakeSecurity({ dir: bin, storePath, opsPath });
+    const files = Object.fromEntries(['base', 'preview', 'production'].map((target) => [
+      target, path.join(tmp, target === 'base' ? '.env.pipeline.local' : `.env.pipeline.${target}.local`),
+    ]));
+    for (const [target, file] of Object.entries(files)) fs.writeFileSync(file, `ORIGIN=${target}\n`);
+    const args = [path.join(repoRoot, 'scripts/pipeline/run.mjs'), 'secrets-import',
+      '--keychain-service', 'fixture', '--keychain-account', 'explicit',
+      '--ignore-missing', 'false', '--cleanup-env-files', scenario.cleanup ? 'true' : 'false'];
+    if (scenario.selected) args.push('--env-files', scenario.list ?? scenario.selected.map((target) => files[target]).join(','));
+    if (scenario.env) args.push('--env', scenario.env);
+    const result = spawnSync(process.execPath, args, { cwd: tmp, encoding: 'utf8',
+      env: { ...process.env, HAPPIER_PIPELINE_REPO_ROOT: tmp, PATH: `${bin}:${process.env.PATH ?? ''}`,
+        SECURITY_STORE_PATH: storePath, SECURITY_OPS_PATH: opsPath },
+    });
+    assert.ifError(result.error);
+    const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    if (scenario.refuses) {
+      assert.notEqual(result.status, 0, 'unsupported explicit selections must refuse before import or cleanup');
+      assert.deepEqual(store, {});
+      assert.equal(fs.existsSync(opsPath), false, 'refusal precedes even the Keychain availability/read boundary');
+      for (const file of Object.values(files)) assert.equal(fs.existsSync(file), true);
+    } else {
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.deepEqual(Object.keys(store).sort(), scenario.expected.map((target) => `fixture::explicit/${target}`).sort());
+      for (const target of scenario.expected) assert.deepEqual(JSON.parse(store[`fixture::explicit/${target}`]), { ORIGIN: target });
+      for (const [target, file] of Object.entries(files)) {
+        assert.equal(fs.existsSync(file), !(scenario.cleanup && scenario.expected.includes(target)), `cleanup must match selected input ${target}`);
+      }
+    }
+  });
+}

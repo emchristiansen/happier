@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -97,6 +97,13 @@ describe('PiRpcBackend (command discovery)', () => {
     backend.onMessage((message) => messages.push(message));
 
     await backend.startSession();
+
+    await vi.waitFor(() => {
+      expect(messages).toContainEqual(expect.objectContaining({
+        type: 'event',
+        name: 'available_commands_update',
+      }));
+    }, { timeout: 10_000 });
 
     const commandUpdate = messages.find(
       (message): message is Extract<AgentMessage, { type: 'event' }> => (

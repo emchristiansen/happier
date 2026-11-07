@@ -7,7 +7,7 @@ import { resolveProviderLocalAuthBaseCommand } from './resolveProviderLocalAuthB
 
 function buildInitialCommand(params: Readonly<{
     providerId: AgentId;
-    launch: ReturnType<typeof getAgentLocalCliConfig>['authLaunches'][number];
+    launch: Extract<ReturnType<typeof getAgentLocalCliConfig>['authLaunches'][number], { target: 'provider_cli' }>;
     resolvedPath?: string | null;
     resolvedCommand?: string | null;
     platform?: NodeJS.Platform | string | null;
@@ -31,11 +31,22 @@ export function createCatalogProviderLocalAuthPlugin(providerId: AgentId): Provi
         docsUrl: getProviderCliInstallGuideUrl(providerId) ?? undefined,
         ...(config.authLaunches.length > 0
             ? {
-                buildAuthLaunches: ({ resolvedPath, resolvedCommand, platform }) => config.authLaunches.map((launch) => ({
-                    kind: launch.kind,
-                    initialCommand: buildInitialCommand({ providerId, launch, resolvedPath, resolvedCommand, platform }),
-                    ...(launch.initialInput ? { initialInput: launch.initialInput } : {}),
-                })),
+                buildAuthLaunches: ({ resolvedPath, resolvedCommand, platform }) => config.authLaunches.map((launch) => {
+                    const shared = {
+                        kind: launch.kind,
+                        ...(launch.initialInput ? { initialInput: launch.initialInput } : {}),
+                    };
+                    if (launch.target === 'happier_cli') {
+                        return {
+                            ...shared,
+                            launch: { kind: 'happier_cli' as const, args: [...launch.args] },
+                        };
+                    }
+                    return {
+                        ...shared,
+                        initialCommand: buildInitialCommand({ providerId, launch, resolvedPath, resolvedCommand, platform }),
+                    };
+                }),
             }
             : {}),
     });

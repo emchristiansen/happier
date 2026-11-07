@@ -13,8 +13,12 @@ import {
   spawnDaemonLikeProcess,
 } from '../testkit/core/spawn_daemon_like_process.mjs';
 
-async function withHealthyStackServer(run) {
+async function withHealthyStackServer(run, { dropConnection = false } = {}) {
   const server = createServer((_request, response) => {
+    if (dropConnection) {
+      response.destroy();
+      return;
+    }
     response.writeHead(200, { 'content-type': 'text/plain' });
     response.end('ok');
   });
@@ -69,6 +73,25 @@ test('background readiness does not await a daemon disabled by --no-daemon', asy
       checkDaemonStateImpl: async () => null, isRunnerAlive: () => false,
     });
   });
+});
+
+test('background dev readiness uses the selected external relay instead of an allocated local port', async () => {
+  const mod = await import('./run_script_with_stack_env.mjs');
+  await withHealthyStackServer(async (internalServerUrl) => {
+    await withHealthyStackServer(async (externalServerUrl) => {
+      for (const selection of [
+        { args: ['--no-server', `--server-url=${externalServerUrl}`], env: {} },
+        { args: [`--server-url=${externalServerUrl}`], env: {} },
+        { args: ['--no-server'], env: { HAPPIER_SERVER_URL: externalServerUrl } },
+      ]) {
+        await mod.waitForBackgroundStackReadiness({
+          stackName: 'external-relay', scriptPath: 'dev.mjs',
+          args: [...selection.args, '--no-daemon'], env: selection.env,
+          runtimeStatePath: '/missing/stack.runtime.json', internalServerUrl, timeoutMs: 1_000,
+        });
+      }
+    });
+  }, { dropConnection: true });
 });
 
 test('boot-failure cleanup awaits the canonical process-tree owner', async () => {

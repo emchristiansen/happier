@@ -22,7 +22,7 @@ export type TranscriptOlderPaginationLoadResult = Readonly<{
     hasMore: boolean;
 }>;
 
-export type TranscriptOlderPaginationLoadTrigger = 'threshold-enter' | 'post-cooldown' | 'readiness-open';
+export type TranscriptOlderPaginationLoadTrigger = 'threshold-enter' | 'post-cooldown' | 'readiness-open' | 'explicit-continuation';
 
 export type TranscriptOlderPaginationLoadOptions = Readonly<{
     trigger: TranscriptOlderPaginationLoadTrigger;
@@ -53,6 +53,8 @@ export type UseTranscriptOlderPaginationInput = Readonly<{
     spinnerDelayMs: number;
     isFillDone: () => boolean;
     isTransactionOpen: () => boolean;
+    /** Current source evidence can reopen a pager exhausted before a new gap existed. */
+    readHasMoreAfterExhaustion?: () => boolean | null;
 }>;
 
 export type UseTranscriptOlderPaginationResult = Readonly<{
@@ -62,6 +64,10 @@ export type UseTranscriptOlderPaginationResult = Readonly<{
     isLoadingOlder: boolean;
     hasMore: boolean;
     getSnapshot: () => TranscriptOlderPaginationSnapshot;
+    /** Feed completed reads from initial fill or navigation into the same availability owner. */
+    observeLoadResult: (result: TranscriptOlderPaginationLoadResult | null) => void;
+    /** Read one retained older page without requiring a scrollable viewport. */
+    continueOlderLoad: () => void;
     reset: () => void;
 }>;
 
@@ -164,6 +170,26 @@ export function useTranscriptOlderPagination(input: UseTranscriptOlderPagination
     }, [clearSpinnerTimeout]);
     useCommittedTranscriptRef(settleSpinnerRef, settleSpinner);
 
+    const reset = React.useCallback(() => {
+        operationGenerationRef.current += 1;
+        clearCooldownTimeout();
+        clearSpinnerTimeout();
+        dispatch({ type: 'reset' });
+        if (mountedRef.current) setIsLoadingOlder(false);
+    }, [clearCooldownTimeout, clearSpinnerTimeout, dispatch]);
+
+    const reconcileExhaustedSource = React.useCallback(() => {
+        if (!stateRef.current.hasMore && inputRef.current.readHasMoreAfterExhaustion?.() === true) {
+            // Reuse the pager's lifecycle reset; a new interval is not a retry of
+            // the exhausted one. Loading still requires a live edge observation.
+            reset();
+        }
+    }, [reset]);
+
+    React.useEffect(() => {
+        reconcileExhaustedSource();
+    });
+
     const syncDerivedSuspensions = React.useCallback(() => {
         const fillDone = inputRef.current.isFillDone() === true;
         const transactionOpen = inputRef.current.isTransactionOpen() === true;
@@ -224,6 +250,7 @@ export function useTranscriptOlderPagination(input: UseTranscriptOlderPagination
 
     const onScrollObservation = React.useCallback((metrics: TranscriptOlderPaginationScrollMetrics) => {
         if (inputRef.current.enabled !== true) return;
+        reconcileExhaustedSource();
         dispatch({
             type: 'scrollObserved',
             offsetY: metrics.offsetY,
@@ -234,7 +261,7 @@ export function useTranscriptOlderPagination(input: UseTranscriptOlderPagination
             thresholdItems: inputRef.current.thresholdItems ?? null,
         });
         maybeStartLoad('threshold-enter');
-    }, [dispatch, maybeStartLoad]);
+    }, [dispatch, maybeStartLoad, reconcileExhaustedSource]);
 
     const isNearOlderEdge = React.useCallback((metrics: TranscriptOlderPaginationScrollMetrics): boolean => {
         return isOlderPaginationObservationInsideThreshold({
@@ -263,13 +290,20 @@ export function useTranscriptOlderPagination(input: UseTranscriptOlderPagination
         };
     }, []);
 
-    const reset = React.useCallback(() => {
-        operationGenerationRef.current += 1;
+    const observeLoadResult = React.useCallback((result: TranscriptOlderPaginationLoadResult | null) => {
+        if (!mountedRef.current) return;
+        const finished = mapLoadResultToFinishedEvent(result);
+        if (finished.error || finished.hasMore) return;
         clearCooldownTimeout();
-        clearSpinnerTimeout();
-        dispatch({ type: 'reset' });
-        if (mountedRef.current) setIsLoadingOlder(false);
-    }, [clearCooldownTimeout, clearSpinnerTimeout, dispatch]);
+        dispatch({ type: 'sourceExhausted' });
+    }, [clearCooldownTimeout, dispatch]);
+
+    const continueOlderLoad = React.useCallback(() => {
+        reconcileExhaustedSource();
+        clearCooldownTimeout();
+        dispatch({ type: 'continuationRequested' });
+        maybeStartLoadRef.current('explicit-continuation');
+    }, [clearCooldownTimeout, dispatch, reconcileExhaustedSource]);
 
     React.useEffect(() => {
         mountedRef.current = true;
@@ -281,5 +315,5 @@ export function useTranscriptOlderPagination(input: UseTranscriptOlderPagination
         };
     }, [clearCooldownTimeout, clearSpinnerTimeout]);
 
-    return { onScrollObservation, isReadyForLoad, isNearOlderEdge, isLoadingOlder, hasMore, getSnapshot, reset };
+    return { onScrollObservation, isReadyForLoad, isNearOlderEdge, isLoadingOlder, hasMore, getSnapshot, observeLoadResult, continueOlderLoad, reset };
 }

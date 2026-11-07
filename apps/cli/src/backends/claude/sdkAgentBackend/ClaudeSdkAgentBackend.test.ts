@@ -849,12 +849,7 @@ describe('ClaudeSdkAgentBackend', () => {
           (error: unknown) => `rejected:${error instanceof Error ? error.message : String(error)}`,
         );
 
-        await new Promise((resolve) => setTimeout(resolve, 30));
-
-        const firstSettled = await Promise.race([
-          firstCompletion,
-          new Promise<string>((resolve) => setTimeout(() => resolve('timeout'), 300)),
-        ]);
+        const firstSettled = await firstCompletion;
 
         expect(firstSettled).toBe('resolved');
 

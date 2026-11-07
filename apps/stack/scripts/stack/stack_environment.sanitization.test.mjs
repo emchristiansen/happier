@@ -123,9 +123,11 @@ test('withStackEnv preserves explicit local stack runtime override env vars from
   await withTempStackEnvFixture(async ({ stackName }) => {
     const previousCliBuild = process.env.HAPPIER_STACK_CLI_BUILD;
     const previousSkipRefreshDeps = process.env.HAPPIER_STACK_SKIP_REFRESH_DEPS;
+    const previousExpoExportMaxWorkers = process.env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS;
 
     process.env.HAPPIER_STACK_CLI_BUILD = '0';
     process.env.HAPPIER_STACK_SKIP_REFRESH_DEPS = '1';
+    process.env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS = '2';
 
     try {
       await withStackEnv({
@@ -133,6 +135,7 @@ test('withStackEnv preserves explicit local stack runtime override env vars from
         fn: async ({ env }) => {
           assert.equal(env.HAPPIER_STACK_CLI_BUILD, '0');
           assert.equal(env.HAPPIER_STACK_SKIP_REFRESH_DEPS, '1');
+          assert.equal(env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS, '2');
         },
       });
     } finally {
@@ -140,6 +143,8 @@ test('withStackEnv preserves explicit local stack runtime override env vars from
       else process.env.HAPPIER_STACK_CLI_BUILD = previousCliBuild;
       if (typeof previousSkipRefreshDeps === 'undefined') delete process.env.HAPPIER_STACK_SKIP_REFRESH_DEPS;
       else process.env.HAPPIER_STACK_SKIP_REFRESH_DEPS = previousSkipRefreshDeps;
+      if (typeof previousExpoExportMaxWorkers === 'undefined') delete process.env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS;
+      else process.env.HAPPIER_STACK_EXPO_EXPORT_MAX_WORKERS = previousExpoExportMaxWorkers;
     }
   });
 });

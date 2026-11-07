@@ -23,7 +23,7 @@ function toDataUrl(source) {
   return `data:text/javascript,${encodeURIComponent(source)}`;
 }
 
-test('startDaemonPostAuth passes webapp URL to daemon env (never internal API URL)', async () => {
+async function verifyPostAuthWebappUrl(scenario) {
   const scriptsDir = dirname(fileURLToPath(import.meta.url));
   const rootDir = dirname(scriptsDir);
 
@@ -53,8 +53,30 @@ test('startDaemonPostAuth passes webapp URL to daemon env (never internal API UR
 
     const stubBySpecifier = {
       '../../daemon.mjs': toDataUrl(`
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { assertStackServerProfileReconciled } from ${JSON.stringify(pathToFileURL(join(scriptsDir, 'utils', 'stack', 'server_profile_reconciliation.mjs')).href)};
 export async function startLocalDaemonWithAuth(input) {
+  // The daemon process boundary is stubbed; its deciding reconciliation predicate is real.
+  // These endpoint spellings model commandUtilities.normalizeUrlOrThrow before the CLI writer.
+  const normalize = (value) => new URL(value).toString().replace(/\\/+$/, '');
+  const serverId = 'stack_main__id_default';
+  mkdirSync(input.cliHomeDir, { recursive: true });
+  writeFileSync(join(input.cliHomeDir, 'settings.json'), JSON.stringify({
+    schemaVersion: 6,
+    activeServerId: serverId,
+    servers: { [serverId]: {
+      id: serverId,
+      serverUrl: normalize(input.internalServerUrl),
+      webappUrl: normalize(input.publicServerUrl),
+    } },
+  }));
+  assertStackServerProfileReconciled({
+    homeDir: input.cliHomeDir,
+    serverId,
+    internalServerUrl: input.internalServerUrl,
+    publicServerUrl: input.publicServerUrl,
+  });
   const marker = process.env.HSTACK_AUTH_FLOW_DAEMON_MARKER;
   if (marker) writeFileSync(marker, JSON.stringify(input), 'utf-8');
 }
@@ -93,6 +115,7 @@ await startDaemonPostAuth({
   stackName: 'main',
   env: process.env,
   forceRestart: true,
+  webappUrl: ${JSON.stringify(scenario.webappUrl)},
 });
 
 `,
@@ -115,12 +138,19 @@ await startDaemonPostAuth({
     const markerRaw = await readFile(markerPath, 'utf-8');
     const marker = JSON.parse(markerRaw);
     assert.equal(marker.internalServerUrl, 'http://127.0.0.1:4102');
-    assert.equal(marker.publicServerUrl, 'http://localhost:3010');
+    assert.equal(marker.publicServerUrl, scenario.expectedWebappUrl);
     assert.notEqual(marker.publicServerUrl, marker.internalServerUrl);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
-});
+}
+
+for (const scenario of [
+  { title: 'passes webapp URL to daemon env (never internal API URL)', webappUrl: '', expectedWebappUrl: 'http://localhost:3010' },
+  { title: 'accepts an explicit webapp URL after CLI endpoint serialization', webappUrl: 'https://EXAMPLE.com:443/', expectedWebappUrl: 'https://EXAMPLE.com:443/' },
+]) {
+  test(`startDaemonPostAuth ${scenario.title}`, () => verifyPostAuthWebappUrl(scenario));
+}
 
 test('startDaemonPostAuth delegates to a live lifecycle owner without creating a daemon', async () => {
   const scriptsDir = dirname(fileURLToPath(import.meta.url));

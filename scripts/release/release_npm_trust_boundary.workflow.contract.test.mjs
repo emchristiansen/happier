@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -51,19 +51,18 @@ test('npm candidate packing is permission-minimized and secret-free', async () =
   assert.match(JSON.stringify(candidate), /trusted-control\/scripts\/pipeline\/npm\/release-packages\.mjs/);
 });
 
-test('an authorized npm candidate is checked out by exact SHA and rechecked against its canonical branch before packing', async () => {
+test('an authorized npm candidate is verified against its admitted promotion source before packing', async () => {
   const workflow = await loadWorkflow();
   const candidate = workflow.jobs?.release;
   assert.equal(workflow.on?.workflow_call?.inputs?.authorized_sha?.default, '');
   const steps = candidate.steps ?? [];
   const checkoutIndex = steps.findIndex((step) => step.name === 'Checkout source ref');
-  const verificationIndex = steps.findIndex((step) => step.name === 'Verify authorized source remains canonical');
+  const verificationIndex = steps.findIndex((step) => step.name === 'Verify admitted publication source');
   assert.ok(checkoutIndex >= 0);
   assert.ok(verificationIndex > checkoutIndex, 'canonical branch recheck must run after exact-SHA checkout');
-  const verification = String(steps[verificationIndex]?.run ?? '');
-  assert.match(verification, /git rev-parse HEAD/);
-  assert.match(verification, /git ls-remote origin "refs\/heads\/\$CANONICAL_REF"/);
-  assert.match(verification, /no longer resolves to authorized_sha/);
+  assert.equal(steps[verificationIndex].env.PROMOTION_SOURCE_REF, '${{ inputs.promotion_source_ref }}');
+  const packIndex = steps.findIndex((step) => step.name === 'npm pack (pipeline)');
+  assert.ok(packIndex > verificationIndex, 'admitted source verification precedes packing');
 });
 
 test('every npm credential-bearing job executes workflow-SHA control and only publishes opaque tarballs', async () => {
@@ -80,6 +79,8 @@ test('every npm credential-bearing job executes workflow-SHA control and only pu
     assert.equal(job.environment, 'release-shared', `${jobName} environment`);
     assert.equal(job.permissions?.['id-token'], 'write', `${jobName} provenance permission`);
     assertTrustedControlCheckout(job, jobName);
+    const setupNode = job.steps.find((step) => step.name === 'Setup Node (npm publish)');
+    assert.equal(setupNode?.with?.['registry-url'], 'https://registry.npmjs.org', `${jobName} registry configuration`);
 
     const source = JSON.stringify(job);
     assert.match(source, /scripts\/pipeline\/npm\/publish-tarball\.mjs/);

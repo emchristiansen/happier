@@ -69,7 +69,7 @@ export function buildOauthRecordFromProxyPayload(params: Readonly<{
       tokenType: params.payload.tokenType,
       providerAccountId: params.payload.providerAccountId,
       providerEmail: params.payload.providerEmail,
-      raw: normalizeConnectedServiceOauthCredentialRawMetadata(params.payload.raw),
+      raw: normalizeConnectedServiceOauthCredentialRawMetadata(params.payload.raw, params.serviceId),
     },
   });
   if (record.kind !== 'oauth') {

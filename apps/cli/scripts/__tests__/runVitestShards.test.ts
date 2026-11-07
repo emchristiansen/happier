@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -68,17 +68,18 @@ describe('runVitestShards', () => {
   it('runs reset-heavy suites in bounded fresh processes', () => {
     const plan = resolveVitestIsolationPlan('vitest.config.ts');
     const resetHeavyFiles = [
+      'src/cli/commands/daemon.startSyncOwnership.test.ts',
+      'src/ui/auth.nonInteractiveBoth.test.ts',
       'src/api/session/sessionClient.durableMutationOutbox.test.ts',
+      'src/agent/executionRuns/runtime/runEphemeralExecutionRunTextPrompt.test.ts',
     ];
 
     expect(plan.shardExcludes).toEqual(expect.arrayContaining(resetHeavyFiles));
     expect(new Set(plan.shardExcludes).size).toBe(plan.shardExcludes.length);
     expect(new Set(plan.runs.map((run) => run.file))).toEqual(new Set(plan.shardExcludes));
-    expect(plan.shardExcludes.filter((file) => !existsSync(new URL(`../../${file}`, import.meta.url)))).toEqual([]);
     for (const file of resetHeavyFiles) {
       expect(plan.runs).toContainEqual({ file, testNamePattern: '.*' });
     }
-    expect(plan.shardExcludes).not.toContain('src/agent/executionRuns/runEphemeralExecutionRunTextPrompt.test.ts');
 
     // These exceptionally large suites intentionally remain split into several
     // fresh processes rather than one whole-file process.
@@ -90,10 +91,55 @@ describe('runVitestShards', () => {
     });
   });
 
+  it('selects existing files for each isolated unit run', () => {
+    const files = [...new Set(resolveVitestIsolationPlan('vitest.config.ts').runs.map(run => run.file))];
+    expect(files.filter(file => !existsSync(fileURLToPath(new URL(`../../${file}`, import.meta.url))))).toEqual([]);
+  });
+
   it('parses --config path from argv', () => {
     expect(resolveVitestConfigPath(['node', 'run', '--config', 'vitest.integration.config.ts'])).toBe(
       'vitest.integration.config.ts',
     );
+  });
+
+  it.each([
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand renders background service start and stop as timed steps'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand starts a stopped linux service that runs another CLI as it is instead of switching it to the managed CLI'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand preserves a running Windows service across install and retry'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand runs nothing when starting the healthy darwin service that already owns the running daemon'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand lets the installed definition outrank the inherited autostart env, and the flag outrank both'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand after "Keep my own" reports a service that runs the managed CLI as a switch to the kept CLI, never as drift (R13)'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand allows an existing named case'],
+    ['src/daemon/service/cli.test.ts', 'runDaemonServiceCliCommand rejects an existing named case'],
+    ['src/daemon/service/cli.test.ts', 'a newly named suite selects a newly named case\nwith another line'],
+    ['src/api/machine/rpcHandlers.sessionHandoff.test.ts', 'rpcHandlers (session handoff) aborts an existing named case'],
+    ['src/api/machine/rpcHandlers.sessionHandoff.test.ts', 'rpcHandlers (session handoff) waits for an existing named case'],
+    ['src/api/machine/rpcHandlers.sessionHandoff.test.ts', 'a newly named suite selects a future handoff case'],
+  ])('selects exactly one isolated run for %s: %s', (file, name) => {
+    const runs = resolveVitestIsolationPlan('vitest.config.ts').runs.filter((run) => run.file === file);
+    expect(runs.filter((run) => new RegExp(run.testNamePattern).test(name))).toHaveLength(1);
+  });
+
+  it.each([2, 3, 32])('distributes every isolated run exactly once across %i CI parts', (parts) => {
+    const fullPlan = resolveVitestIsolationPlan('vitest.config.ts');
+    const plans = Array.from({ length: parts }, (_, index) => resolveVitestIsolationPlan(
+      'vitest.config.ts',
+      resolveVitestShardRange({
+        HAPPIER_CLI_VITEST_PART: String(index + 1),
+        HAPPIER_CLI_VITEST_PARTS: String(parts),
+      }, 64),
+    ));
+
+    for (const plan of plans) {
+      expect(plan.shardExcludes).toEqual(fullPlan.shardExcludes);
+    }
+    const assignedRuns = plans.flatMap((plan) => plan.runs);
+    expect(assignedRuns).toHaveLength(fullPlan.runs.length);
+    expect(assignedRuns.map((run) => JSON.stringify(run)).sort()).toEqual(
+      fullPlan.runs.map((run) => JSON.stringify(run)).sort(),
+    );
+    const runCounts = plans.map((plan) => plan.runs.length);
+    expect(Math.max(...runCounts) - Math.min(...runCounts)).toBeLessThanOrEqual(1);
   });
 
   it('returns null when --config is missing', () => {

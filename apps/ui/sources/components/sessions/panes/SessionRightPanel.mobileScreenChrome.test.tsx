@@ -54,7 +54,7 @@ vi.mock('@/hooks/server/useFeatureEnabled', () => ({
 }));
 
 vi.mock('@/utils/platform/responsive', () => ({
-    useDeviceType: () => 'phone',
+    useDeviceType: () => 'tablet',
 }));
 
 vi.mock('@/components/appShell/panes/hooks/useAppPaneScope', () => ({
@@ -90,6 +90,8 @@ function findParentContaining(
     return root.findAll((node) => node.children.includes(child)).at(0) ?? null;
 }
 
+const { SessionRightPanel } = await import('./SessionRightPanel');
+
 describe('SessionRightPanel (mobile screen chrome)', () => {
     beforeEach(() => {
         scopeState = {
@@ -101,8 +103,18 @@ describe('SessionRightPanel (mobile screen chrome)', () => {
         vi.clearAllMocks();
     });
 
+    it('omits redundant header controls when the pane has an external action rail', async () => {
+        const { PaneActionRailContext } = await import('@/components/appShell/panes/PaneActionRailContext');
+        const screen = await renderScreen(
+            <PaneActionRailContext.Provider value={{ visible: true, contentWidthPx: 1000 }}>
+                <SessionRightPanel sessionId="s1" scopeId="session:s1" />
+            </PaneActionRailContext.Provider>,
+        );
+        expect(screen.findByTestId('session-rightpanel-close')).toBeNull();
+        expect(screen.findByTestId('session-rightpanel-tab:git')).toBeNull();
+    });
+
     it('renders the screen close affordance as a leading back button on native', async () => {
-        const { SessionRightPanel } = await import('./SessionRightPanel');
         const screen = await renderScreen(
             <SessionRightPanel sessionId="s1" scopeId="session:s1" presentation="screen" />,
         );
@@ -119,5 +131,28 @@ describe('SessionRightPanel (mobile screen chrome)', () => {
             throw new Error('Expected close button to be inside the header');
         }
         expect(header.children[0]).toBe(closeButton);
+    });
+
+    it('uses a 48dp close target on Android screens', async () => {
+        const { Platform } = await import('react-native');
+        const previousPlatform = Platform.OS;
+        Platform.OS = 'android';
+        try {
+            const screen = await renderScreen(
+                <SessionRightPanel sessionId="s1" scopeId="session:s1" presentation="screen" />,
+            );
+            const closeButton = screen.findByTestId('session-rightpanel-close');
+            if (!closeButton) throw new Error('Expected close button');
+            const resolvedStyle = typeof closeButton.props.style === 'function'
+                ? closeButton.props.style({ pressed: false, hovered: false })
+                : closeButton.props.style;
+            const flattenStyle = (value: unknown): Record<string, unknown> => Array.isArray(value)
+                ? value.reduce<Record<string, unknown>>((merged, entry) => ({ ...merged, ...flattenStyle(entry) }), {})
+                : Boolean(value) && typeof value === 'object' ? value as Record<string, unknown> : {};
+            const style = flattenStyle(resolvedStyle);
+            expect(style).toMatchObject({ width: 48, height: 48 });
+        } finally {
+            Platform.OS = previousPlatform;
+        }
     });
 });

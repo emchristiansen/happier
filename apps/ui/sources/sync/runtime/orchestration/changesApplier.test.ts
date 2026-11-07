@@ -9,6 +9,7 @@ const credentials: AuthCredentials = { token: 't', secret: 's' };
 function buildPlanned(partial: {
     changes?: ApiChangeEntry[];
     sessionIdsToCatchUp?: string[];
+    reconcileSessionList?: boolean;
     sessionTranscriptRepairs?: PlannedChangeActions['sessionTranscriptRepairs'];
     unsupportedChanges?: PlannedChangeActions['unsupportedChanges'];
     invalidate?: Partial<PlannedChangeActions['invalidate']>;
@@ -18,6 +19,7 @@ function buildPlanned(partial: {
     return {
         changes: partial.changes ?? [],
         sessionIdsToCatchUp: partial.sessionIdsToCatchUp ?? [],
+        reconcileSessionList: partial.reconcileSessionList,
         sessionTranscriptRepairs: partial.sessionTranscriptRepairs ?? [],
         unsupportedChanges: partial.unsupportedChanges ?? [],
         invalidate: {
@@ -358,9 +360,31 @@ describe('changesApplier', () => {
         expect(invalidateSessions).toHaveBeenCalledWith({
             requiredHydrationSessionIds: ['loaded', 'unloaded'],
             prioritizeSessionIds: ['loaded', 'unloaded'],
+            reconcileList: false,
         });
         expect(invalidateMessagesForSession).toHaveBeenCalledTimes(1);
         expect(invalidateMessagesForSession).toHaveBeenCalledWith('loaded');
+    });
+
+    it.each(['share', 'pins'] as const)('reconciles list membership for %s changes even alongside targeted rows', async (kind) => {
+        const contexts: unknown[] = [];
+        const result = await applyPlannedChangeActions({
+            planned: buildPlanned({
+                changes: [buildChange({ cursor: 1, kind: kind === 'share' ? 'share' : 'account', hint: kind === 'pins' ? { sessionOrganization: true, scope: 'pins' } : null })],
+                sessionIdsToCatchUp: ['changed-row'],
+                invalidate: { sessions: true },
+                reconcileSessionList: true,
+            }),
+            credentials,
+            isSessionMessagesLoaded: () => false,
+            invalidate: { sessions: async (context) => { contexts.push(context); } },
+            invalidateMessagesForSession: async () => {},
+            invalidateScmStatusForSession: () => {},
+            applyTodoSocketUpdates: async () => {},
+            kvBulkGet: async () => ({ values: [] }),
+        });
+        expect(result.status).toBe('complete');
+        expect(contexts).toEqual([{ requiredHydrationSessionIds: ['changed-row'], prioritizeSessionIds: ['changed-row'], reconcileList: true }]);
     });
 
     it('does not checkpoint an unloaded-transcript session change when its session-shell refresh fails', async () => {
@@ -494,6 +518,7 @@ describe('changesApplier', () => {
             }),
             credentials,
             isSessionMessagesLoaded: () => true,
+            isSessionMessagesDeferred: () => true,
             invalidate: {
                 sessions: invalidateSessions,
             },
@@ -760,6 +785,7 @@ describe('changesApplier', () => {
             }),
             credentials,
             isSessionMessagesLoaded: () => true,
+            isSessionMessagesDeferred: () => true,
             invalidate: {},
             invalidateMessagesForSession,
             invalidateScmStatusForSession: () => {},
@@ -799,6 +825,29 @@ describe('changesApplier', () => {
             blockedCursor: '1',
             blockedReason: 'partial-materialization',
         });
+    });
+
+    it('checkpoints a hydrated session when its history reader deliberately defers newer content', async () => {
+        let deferred = false;
+        const result = await applyPlannedChangeActions({
+            planned: buildPlanned({
+                changes: [buildChange({ cursor: 1, kind: 'session', entityId: 's1', hint: { lastMessageSeq: 900 } })],
+                sessionIdsToCatchUp: ['s1'],
+                invalidate: { sessions: true },
+            }),
+            credentials,
+            isSessionMessagesLoaded: () => true,
+            shouldCatchUpSessionMessages: () => true,
+            getSessionMaterializedMaxSeq: () => 100,
+            isSessionMessagesDeferred: () => deferred,
+            invalidate: { sessions: async () => {} },
+            invalidateMessagesForSession: async () => { deferred = true; },
+            invalidateScmStatusForSession: () => {},
+            applyTodoSocketUpdates: async () => {},
+            kvBulkGet: async () => ({ values: [] }),
+        });
+
+        expect(result).toMatchObject({ status: 'complete', safeAdvanceCursor: '1', blockedChanges: 0 });
     });
 
     it('advances after session-shell hydration without catching up a hidden loaded transcript', async () => {
@@ -945,6 +994,7 @@ describe('changesApplier', () => {
             }),
             credentials,
             isSessionMessagesLoaded: () => true,
+            isSessionMessagesDeferred: () => true,
             getSessionMaterializedMaxSeq: () => 15,
             invalidate: {},
             invalidateMessagesForSession: async () => {},

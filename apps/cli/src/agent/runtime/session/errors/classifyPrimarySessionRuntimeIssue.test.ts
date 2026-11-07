@@ -1,8 +1,25 @@
 import { describe, expect, it } from 'vitest';
 
 import { classifyPrimarySessionRuntimeIssue } from './classifyPrimarySessionRuntimeIssue';
+import { requireProviderCliCommand } from '@/runtime/managedTools/requireProviderCliCommand';
+import { requireProviderCliLaunchSpec } from '@/runtime/managedTools/requireProviderCliLaunchSpec';
 
 describe('classifyPrimarySessionRuntimeIssue', () => {
+  it.each([requireProviderCliCommand, requireProviderCliLaunchSpec])('preserves CLI resolution failures as actionable dependency errors', (requireCli) => {
+    let error: unknown;
+    try {
+      requireCli('pi', { processEnv: { HOME: '/missing-pi-home', HAPPIER_HOME_DIR: '/missing-happier-home', PATH: '' } });
+    } catch (failure) {
+      error = failure;
+    }
+    expect(error).toBeInstanceOf(ReferenceError);
+    expect(classifyPrimarySessionRuntimeIssue({ provider: 'pi', cause: 'session_error', error })).toMatchObject({
+      source: 'dependency_failure',
+      code: 'provider_cli_not_found',
+      sanitizedPreview: expect.stringContaining('Install'),
+    });
+  });
+
   it('preserves a Pi-owned provider failure code and sanitized preview', () => {
     const error = Object.assign(new Error('Pi provider reported provider failure after prompt acceptance'), {
       piProviderFailure: {
@@ -355,6 +372,28 @@ describe('classifyPrimarySessionRuntimeIssue', () => {
         materializationRoot: '/tmp/happier/connected-services/pi',
         effectiveStateMode: 'isolated',
       },
+    });
+  });
+
+  it('keeps incidental 401 identifiers out of auth issue classification', () => {
+    expect(classifyPrimarySessionRuntimeIssue({
+      cause: 'status_error',
+      error: new Error('[agy-acp] WARN: failed to decode gen_metadata 401: cant skip wire type 6'),
+      occurredAt: 1_000,
+    })).toMatchObject({
+      source: 'provider_status_error',
+      code: 'provider_status_error',
+    });
+  });
+
+  it('classifies contextual HTTP 401 failures as auth issues', () => {
+    expect(classifyPrimarySessionRuntimeIssue({
+      cause: 'status_error',
+      error: new Error('Request failed with status code 401'),
+      occurredAt: 1_000,
+    })).toMatchObject({
+      source: 'auth_error',
+      code: 'auth_error',
     });
   });
 });

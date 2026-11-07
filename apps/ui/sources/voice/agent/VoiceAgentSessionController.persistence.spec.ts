@@ -314,8 +314,8 @@ describe('VoiceAgentSessionController (persistence)', () => {
     const controller = createVoiceAgentSessionController();
 
     await expect(controller.sendTurn('s1', 'hello')).rejects.toMatchObject({
-      message: expect.stringContaining('Experimental Features > Voice Agent'),
       code: 'VOICE_AGENT_RUNTIME_UNAVAILABLE',
+      localVoiceErrorCode: 'voice_agent_feature_disabled',
       featureDecision: expect.objectContaining({
         featureId: 'voice.agent',
         blockedBy: 'local_policy',
@@ -801,6 +801,103 @@ describe('VoiceAgentSessionController (persistence)', () => {
     expect(sendTurn).toHaveBeenCalledTimes(1);
   });
 
+  describe('immediate welcome bookkeeping belongs to the call that requested it', () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    }
+
+    async function loadWelcomeController() {
+      state.settings.voice.adapters.local_conversation.agent.welcome = { enabled: true, mode: 'immediate', templateId: null };
+      const { VOICE_AGENT_GLOBAL_SESSION_ID, createVoiceAgentSessionController } = await loadVoiceAgentPersistenceHarness();
+      return { sessionId: VOICE_AGENT_GLOBAL_SESSION_ID, controller: createVoiceAgentSessionController() };
+    }
+
+    it('welcomes once per call for the same transcript epoch', async () => {
+      welcome.mockResolvedValue({ assistantText: 'Welcome!' });
+      const { sessionId, controller } = await loadWelcomeController();
+
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId)).resolves.toBe('Welcome!');
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId)).resolves.toBeNull();
+      expect(welcome).toHaveBeenCalledTimes(1);
+
+      await controller.stop(sessionId);
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId)).resolves.toBe('Welcome!');
+      expect(welcome).toHaveBeenCalledTimes(2);
+    });
+
+    it('an ended call\'s welcome completing after a reconnect does not mark the new call as welcomed', async () => {
+      const ended = deferred<{ assistantText: string }>();
+      const current = deferred<{ assistantText: string }>();
+      welcome.mockImplementationOnce(() => ended.promise).mockImplementationOnce(() => current.promise);
+      welcome.mockResolvedValue({ assistantText: 'Retried welcome' });
+      const { sessionId, controller } = await loadWelcomeController();
+
+      const endedWelcome = controller.ensureRunningAndMaybeWelcome(sessionId);
+      await vi.waitFor(() => expect(welcome).toHaveBeenCalledTimes(1));
+      await controller.stop(sessionId);
+      const currentWelcome = controller.ensureRunningAndMaybeWelcome(sessionId);
+      await vi.waitFor(() => expect(welcome).toHaveBeenCalledTimes(2));
+
+      ended.resolve({ assistantText: 'Ended call welcome' });
+      await endedWelcome;
+      // The current call's own welcome produced nothing to say, so it has not been welcomed yet.
+      current.resolve({ assistantText: '' });
+      await expect(currentWelcome).resolves.toBeNull();
+
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId)).resolves.toBe('Retried welcome');
+      expect(welcome).toHaveBeenCalledTimes(3);
+    });
+
+    it('an ended call\'s welcome failing after a reconnect keeps the new call\'s agent', async () => {
+      const ended = deferred<{ assistantText: string }>();
+      welcome.mockImplementationOnce(() => ended.promise);
+      welcome.mockResolvedValue({ assistantText: 'New call welcome' });
+      const { sessionId, controller } = await loadWelcomeController();
+
+      const endedWelcome = controller.ensureRunningAndMaybeWelcome(sessionId);
+      await vi.waitFor(() => expect(welcome).toHaveBeenCalledTimes(1));
+      await controller.stop(sessionId);
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId)).resolves.toBe('New call welcome');
+      expect(start).toHaveBeenCalledTimes(2);
+
+      ended.reject(new Error('Voice agent not found'));
+      await expect(endedWelcome).resolves.toBeNull();
+
+      expect(controller.isActive(sessionId)).toBe(true);
+      await controller.sendTurn(sessionId, 'hello');
+      expect(start).toHaveBeenCalledTimes(2);
+      // The new call's own welcome still counts.
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId)).resolves.toBeNull();
+      expect(welcome).toHaveBeenCalledTimes(2);
+    });
+
+    it('a welcome its caller revoked does not mark the still-running agent as welcomed', async () => {
+      const revoked = deferred<{ assistantText: string }>();
+      welcome.mockImplementationOnce(() => revoked.promise);
+      welcome.mockResolvedValue({ assistantText: 'Current welcome' });
+      const { sessionId, controller } = await loadWelcomeController();
+
+      const revokedAttempt = new AbortController();
+      const revokedWelcome = controller.ensureRunningAndMaybeWelcome(sessionId, { signal: revokedAttempt.signal });
+      await vi.waitFor(() => expect(welcome).toHaveBeenCalledTimes(1));
+      revokedAttempt.abort();
+      revoked.resolve({ assistantText: 'Revoked welcome' });
+      await revokedWelcome;
+      expect(controller.isActive(sessionId)).toBe(true);
+
+      const currentAttempt = new AbortController();
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId, { signal: currentAttempt.signal })).resolves.toBe('Current welcome');
+      expect(welcome).toHaveBeenCalledTimes(2);
+      // The welcome that was still current when it completed does count.
+      await expect(controller.ensureRunningAndMaybeWelcome(sessionId, { signal: new AbortController().signal })).resolves.toBeNull();
+      expect(welcome).toHaveBeenCalledTimes(2);
+      expect(start).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('treats the hidden global voice conversation session as resumable and retries it with resumeHandle when the persisted run is not resumable anymore', async () => {
     state.settings.voice.adapters.local_conversation.agent.resumabilityMode = 'provider_resume';
     state.sessions.sys_voice.metadata.voiceAgentRunV1 = {
@@ -1050,13 +1147,13 @@ describe('VoiceAgentSessionController (persistence)', () => {
   });
 
   it('fails fast when a global hidden voice binding points at a target flavor without local control support', async () => {
-    state.sessions.s_kimi = {
-      id: 's_kimi',
+    state.sessions.s_gemini = {
+      id: 's_gemini',
       updatedAt: 1,
       active: true,
       presence: 'online',
       modelMode: 'default',
-      metadata: { flavor: 'kimi' },
+      metadata: { flavor: 'gemini' },
     };
 
     const { VOICE_AGENT_GLOBAL_SESSION_ID, createVoiceAgentSessionController, voiceSessionBindingStore } =
@@ -1066,7 +1163,7 @@ describe('VoiceAgentSessionController (persistence)', () => {
       controlSessionId: VOICE_AGENT_GLOBAL_SESSION_ID,
       conversationSessionId: 'sys_voice',
       transcriptMode: 'native_session',
-      targetSessionId: 's_kimi',
+      targetSessionId: 's_gemini',
       updatedAt: 1,
     });
     const controller = createVoiceAgentSessionController();

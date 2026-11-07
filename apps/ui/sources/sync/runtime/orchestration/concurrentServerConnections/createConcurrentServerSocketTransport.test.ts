@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ConnectedServiceIdSchema } from '@happier-dev/protocol';
 
 type SocketHandler = (...args: any[]) => void;
 
@@ -76,6 +77,7 @@ describe('createConcurrentServerSocketTransport', () => {
             expect.objectContaining({
                 path: '/v1/updates/',
                 auth: expect.objectContaining({
+                    connectedServiceIds: ConnectedServiceIdSchema.options,
                     token: 'token-a',
                     clientType: 'user-scoped',
                     clientPurpose: 'concurrent-server-cache',

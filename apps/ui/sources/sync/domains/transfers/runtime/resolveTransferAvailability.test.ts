@@ -368,4 +368,41 @@ describe('resolveTransferAvailability', () => {
             errorMessage: 'Machine transfer is disabled on the selected server',
         });
     });
+
+    it('does not select direct peer when the caller only permits server-routed transfer', async () => {
+        const { resolveMachineTransferAvailability } = await import('./resolveTransferAvailability');
+
+        expect(resolveMachineTransferAvailability({
+            serverFeatures: {
+                features: {
+                    features: {
+                        sessions: {
+                            enabled: true,
+                            handoff: {
+                                enabled: true,
+                            },
+                        },
+                        machines: {
+                            enabled: true,
+                            transfer: {
+                                enabled: true,
+                                directPeer: {
+                                    enabled: true,
+                                },
+                                serverRouted: {
+                                    enabled: false,
+                                },
+                            },
+                        },
+                    },
+                    capabilities: {},
+                },
+            },
+            preferredTransportStrategies: ['server_routed_stream'],
+        })).toEqual({
+            ok: false,
+            errorCode: 'transfer_disabled',
+            errorMessage: 'Machine transfer is disabled on the selected server',
+        });
+    });
 });

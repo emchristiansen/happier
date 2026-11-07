@@ -423,7 +423,7 @@ describe('Claude SDK utils - getDefaultClaudeCodePathForAgentSdk', () => {
 });
 
 describe('Claude SDK utils - streamToStdin', () => {
-  it('surfaces EPIPE from Claude stdin as an ambiguous attempted handoff', async () => {
+  it('surfaces EPIPE from Claude stdin', async () => {
     class BrokenPipeWritable extends EventEmitter {
       destroyed = false;
       writableEnded = false;

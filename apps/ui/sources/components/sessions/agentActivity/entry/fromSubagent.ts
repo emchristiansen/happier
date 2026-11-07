@@ -62,12 +62,13 @@ export function resolveAgentActivityEntryFromSubagent(
     const { subagent } = params;
     const timestamps = subagent.timestamps;
     const status = resolveSubagentEntryStatus(params);
-    const inProgress = isInProgressAgentActivityStatus(status);
+    const inProgress = subagent.isActive !== false && isInProgressAgentActivityStatus(status);
     const endedAtMs = timestamps.finishedAtMs ?? null;
 
     return {
         id: subagent.id,
         status,
+        ...(subagent.isActive !== undefined ? { isActive: subagent.isActive } : {}),
         title: resolveSessionSubagentPrimaryTitle(subagent),
         // The live line when there is one, otherwise the agent's identity. Never both: the row has
         // one meta line, and "what it is doing" outranks "what it is" whenever it is doing

@@ -7,6 +7,8 @@ import {
   buildSpawnSessionOptionsFromRespawnDescriptorV1,
 } from './processSupervision/sessionRunnerRespawnDescriptor';
 import { abandonSpawnedSessionUntilCompleted } from '@/session/services/awaitSpawnedSessionId';
+import { createDaemonSpawnAttemptRegistry } from './spawn/daemonSpawnAttemptRegistry';
+import { logger } from '@/ui/logger';
 
 describe('daemon control server: /spawn-session', () => {
   afterEach(() => {
@@ -313,6 +315,9 @@ describe('daemon control server: /spawn-session', () => {
   });
 
   it('resolves spawn nonce to a canonical session id when the tracked session is ready', async () => {
+    const registry = createDaemonSpawnAttemptRegistry({ ttlMs: 60_000 });
+    registry.rememberAccepted({ spawnNonce: 'nonce-1', result: { type: 'success', sessionId: 'sess-ready' } });
+    registry.settle('nonce-1', { type: 'success', sessionId: 'sess-ready' });
     const app = createDaemonControlApp({
       getChildren: () => [
         {
@@ -325,6 +330,7 @@ describe('daemon control server: /spawn-session', () => {
       machineId: 'machine_local',
       stopSession: async () => ({ status: 'not_found' as const }),
       spawnSession: async () => ({ type: 'success', sessionId: 'unused' }),
+      resolveSpawnSessionByNonce: registry.resolve,
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
       controlToken: 'test-token',
@@ -348,6 +354,32 @@ describe('daemon control server: /spawn-session', () => {
     } finally {
       await app.close();
     }
+  });
+
+  it.each(['missing', 'unavailable', 'unconfigured', 'unsupported'] as const)('does not infer nonce readiness from a seeded child when its authority is %s', async (authority) => {
+    const warning = vi.spyOn(logger, 'warn');
+    const registry = createDaemonSpawnAttemptRegistry({ ttlMs: 60_000 });
+    const app = createDaemonControlApp({
+      getChildren: () => [{ startedBy: 'daemon', pid: 123, happySessionId: 'sess-seeded',
+        spawnOptions: { directory: '/tmp', spawnNonce: 'nonce-seeded' } }],
+      machineId: 'machine_local', stopSession: async () => ({ status: 'not_found' }),
+      spawnSession: async () => ({ type: 'success', sessionId: 'unused' }),
+      ...(authority === 'unsupported' ? { resolveSpawnSessionByNonce: async () => ({ status: 'unsupported' as const }) }
+        : authority === 'missing' ? { resolveSpawnSessionByNonce: registry.resolve }
+        : authority === 'unavailable' ? { resolveSpawnSessionByNonce: async () => {
+          throw Object.assign(new Error('Fixture owner storage unavailable'), { code: 'EACCES' });
+        } } : {}),
+      requestShutdown: () => {}, onHappySessionWebhook: () => {}, controlToken: 'test-token',
+    });
+    try {
+      const response = await app.inject({ method: 'POST', url: '/spawn-session/resolve',
+        headers: { 'x-happier-daemon-token': 'test-token' }, payload: { spawnNonce: 'nonce-seeded' } });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ success: true, status: authority === 'missing' ? 'not_found' : 'pending' });
+      if (authority === 'unsupported') {
+        expect(warning).toHaveBeenCalledWith(expect.any(String), { spawnNonce: 'nonce-seeded', reason: 'unsupported' });
+      }
+    } finally { await app.close(); }
   });
 
   it('returns the canonical terminal child-exit result even when no tracked child remains', async () => {
@@ -389,6 +421,8 @@ describe('daemon control server: /spawn-session', () => {
   });
 
   it('resolves and positively abandons a spawn from reattached persisted nonce custody after daemon restart', async () => {
+    const registry = createDaemonSpawnAttemptRegistry({ ttlMs: 60_000 });
+    registry.rememberAccepted({ spawnNonce: 'nonce-after-restart', result: { type: 'success', sessionIdStatus: 'pending' } });
     const descriptor = buildSessionRunnerRespawnDescriptorV1FromSpawnOptions({
       directory: '/tmp',
       backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
@@ -413,6 +447,7 @@ describe('daemon control server: /spawn-session', () => {
       machineId: 'machine_local',
       stopSession: async () => ({ status: 'not_found' as const }),
       spawnSession,
+      resolveSpawnSessionByNonce: registry.resolve,
       requestShutdown: () => {},
       onHappySessionWebhook: () => {},
       controlToken: 'test-token',
@@ -430,6 +465,7 @@ describe('daemon control server: /spawn-session', () => {
       expect(pendingResolve.json()).toEqual({ success: true, status: 'pending' });
 
       reattachedChild.happySessionId = 'sess-after-restart';
+      registry.settle('nonce-after-restart', { type: 'success', sessionId: 'sess-after-restart' });
       await expect(abandonSpawnedSessionUntilCompleted({
         spawnNonce: 'nonce-after-restart',
         resolveSpawnSessionByNonce: async (spawnNonce) => {

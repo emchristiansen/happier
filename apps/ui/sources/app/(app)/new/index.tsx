@@ -4,7 +4,8 @@ import { StyleSheet } from 'react-native-unistyles';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 
 import { AppHeaderCloseButton } from '@/components/navigation/AppHeaderCloseButton';
-import { SessionGettingStartedGuidance, useShouldBlockNewSessionWithGettingStartedGuidance } from '@/components/sessions/guidance/SessionGettingStartedGuidance';
+import { useShouldBlockNewSessionWithGettingStartedGuidance } from '@/components/sessions/guidance/useShouldBlockNewSessionWithGettingStartedGuidance';
+import { NewSessionBlockingGuidance } from '@/components/sessions/new/components/NewSessionBlockingGuidance';
 import { NewSessionSimplePanel } from '@/components/sessions/new/components/NewSessionSimplePanel';
 import { NewSessionWizard } from '@/components/sessions/new/components/NewSessionWizard';
 import { useNewSessionScreenModel } from '@/components/sessions/new/hooks/useNewSessionScreenModel';
@@ -25,12 +26,15 @@ import { ComposerAuxiliaryFrame } from '@/components/sessions/shell/view/Compose
 import type { AgentInputStatusBadge } from '@/components/sessions/agentInput/agentInputContracts';
 import {
     deleteSessionDraft,
+    getSessionDraftSnapshot,
     setOrdinaryEntryDraftId,
 } from '@/sync/ops/sessionDrafts/sessionDraftRepository';
 import { useNewSessionDraftHostSnapshot } from '@/components/sessions/drafts/useNewSessionDraftProjection';
-import { useAllActionOperations } from '@/sync/domains/actionOperations/useActionOperations';
+import { readAllActionOperations, useAllActionOperations } from '@/sync/domains/actionOperations/useActionOperations';
 import { resolvePersistedNewSessionOperationIdentity } from '@/sync/domains/actionOperations/actionOperationReentry';
 import { NewSessionDraftComposerActions } from '@/components/sessions/drafts/NewSessionDraftComposerActions';
+import { deleteNewSessionDraftAfterConfirmation } from '@/components/sessions/drafts/deleteNewSessionDraftAfterConfirmation';
+import { buildSessionDraftSyncStatusBadge } from '@/components/sessions/drafts/sessionDraftStatusPresentation';
 import { Modal } from '@/modal';
 import { t } from '@/text';
 
@@ -54,10 +58,11 @@ function NewSessionWebCloseFallback() {
 function NewSessionScreenInner(props: Readonly<{
     composerTopContent?: React.ReactNode;
     draftId: string;
+    onDraftRemoved: () => void;
     statusBadges?: ReadonlyArray<AgentInputStatusBadge>;
-    statusTrailingActions?: React.ReactNode;
+    renderStatusTrailingActions?: (state: Readonly<{ isCreating: boolean }>) => React.ReactNode;
 }>) {
-    const model = useNewSessionScreenModel({ draftId: props.draftId });
+    const model = useNewSessionScreenModel({ draftId: props.draftId, onDraftRemoved: props.onDraftRemoved });
 
     if (model.variant === 'simple') {
         return (
@@ -65,7 +70,7 @@ function NewSessionScreenInner(props: Readonly<{
                 {...model.simpleProps}
                 composerTopContent={props.composerTopContent}
                 statusBadges={props.statusBadges}
-                statusTrailingActions={props.statusTrailingActions}
+                statusTrailingActions={props.renderStatusTrailingActions?.({ isCreating: model.simpleProps.isCreating })}
             />
         );
     }
@@ -83,7 +88,7 @@ function NewSessionScreenInner(props: Readonly<{
             footer={footer}
             composerTopContent={props.composerTopContent}
             statusBadges={props.statusBadges}
-            statusTrailingActions={props.statusTrailingActions}
+            statusTrailingActions={props.renderStatusTrailingActions?.({ isCreating: footer?.isCreating ?? false })}
         />
     );
 }
@@ -92,8 +97,9 @@ function NewSessionContent(props: Readonly<{
     allowBlockingGuidance: boolean;
     composerTopContent?: React.ReactNode;
     draftId: string;
+    onDraftRemoved: () => void;
     statusBadges?: ReadonlyArray<AgentInputStatusBadge>;
-    statusTrailingActions?: React.ReactNode;
+    renderStatusTrailingActions?: (state: Readonly<{ isCreating: boolean }>) => React.ReactNode;
 }>) {
     const shouldBlock = useShouldBlockNewSessionWithGettingStartedGuidance();
 
@@ -101,7 +107,7 @@ function NewSessionContent(props: Readonly<{
         return (
             <>
                 <NewSessionWebCloseFallback />
-                <SessionGettingStartedGuidance variant="newSessionBlocking" />
+                <NewSessionBlockingGuidance />
             </>
         );
     }
@@ -140,7 +146,11 @@ function NewSessionScreenForDraft(props: Readonly<{ draftId: string }>) {
             operations: actionOperations,
         })
     )), [actionOperations, draftScope, draftSnapshot]);
+    const startedAnotherRef = React.useRef(false);
     const startAnother = React.useCallback(() => {
+        // Local deletion notifies the editor before its confirmation promise settles.
+        if (startedAnotherRef.current) return;
+        startedAnotherRef.current = true;
         const next = resolveOrdinaryEntryRoute({ forceFresh: true });
         router.replace({
             pathname: '/new',
@@ -149,23 +159,31 @@ function NewSessionScreenForDraft(props: Readonly<{ draftId: string }>) {
     }, [resolveOrdinaryEntryRoute, router]);
     const deleteDraft = React.useCallback(async () => {
         if (!draftScope || hasUnresolvedLaunch) return;
-        const confirmed = await Modal.confirm(
-            t('sessionDrafts.delete.confirmTitle'),
-            t('sessionDrafts.delete.confirmDescription'),
-            {
-                confirmText: t('common.delete'),
-                cancelText: t('common.cancel'),
-                destructive: true,
+        const deleted = await deleteNewSessionDraftAfterConfirmation({
+            confirm: () => Modal.confirm(
+                t('sessionDrafts.delete.confirmTitle'),
+                t('sessionDrafts.delete.confirmDescription'),
+                {
+                    confirmText: t('common.delete'),
+                    cancelText: t('common.cancel'),
+                    destructive: true,
+                },
+            ),
+            readCurrentDraftDeletionDisposition: () => {
+                const currentDraft = getSessionDraftSnapshot(draftScope, draftAddress);
+                if (!currentDraft) return 'missing';
+                return resolvePersistedNewSessionOperationIdentity({
+                    draftScope,
+                    draftId: props.draftId,
+                    draft: currentDraft.localSupplement,
+                    operations: readAllActionOperations(draftScope.accountId),
+                }) !== null ? 'launch-custody' : 'deletable';
             },
-        );
-        if (!confirmed) return;
-        await deleteSessionDraft({ scope: draftScope, address: draftAddress });
-        const next = resolveOrdinaryEntryRoute({ forceFresh: true });
-        router.replace({
-            pathname: '/new',
-            params: { draftId: next.draftId, draftOrigin: next.draftOrigin },
+            deleteDraft: () => deleteSessionDraft({ scope: draftScope, address: draftAddress }),
         });
-    }, [draftAddress, draftScope, hasUnresolvedLaunch, resolveOrdinaryEntryRoute, router]);
+        if (!deleted) return;
+        startAnother();
+    }, [draftAddress, draftScope, hasUnresolvedLaunch, props.draftId, startAnother]);
 
     const tempData = React.useMemo(() => {
         return typeof dataId === 'string' ? peekTempData<NewSessionData>(dataId) : null;
@@ -192,6 +210,10 @@ function NewSessionScreenForDraft(props: Readonly<{ draftId: string }>) {
     }, [machineId, directory, tempData]);
 
     const draftConflictBanner = useSessionDraftConflictComposerBanner(draftSnapshot?.conflict ?? null);
+    const draftSyncStatusBadge = React.useMemo(
+        () => buildSessionDraftSyncStatusBadge(draftSnapshot?.status ?? 'clean'),
+        [draftSnapshot?.status],
+    );
     const composerTopContent = draftScope && draftSnapshot?.materialized && draftSnapshot.conflict && !draftConflictBanner.collapsed ? (
         <ComposerAuxiliaryFrame>
             <SessionDraftConflictResolution
@@ -201,21 +223,28 @@ function NewSessionScreenForDraft(props: Readonly<{ draftId: string }>) {
             />
         </ComposerAuxiliaryFrame>
     ) : null;
-    const statusBadges = draftConflictBanner.statusBadge ? [draftConflictBanner.statusBadge] : undefined;
-    const statusTrailingActions = draftScope && draftSnapshot?.materialized ? (
-        <NewSessionDraftComposerActions
-            deleteDisabled={hasUnresolvedLaunch}
-            onStartAnother={startAnother}
-            onDelete={deleteDraft}
-        />
-    ) : null;
+    const statusBadges = React.useMemo(() => [
+        ...(draftSyncStatusBadge ? [draftSyncStatusBadge] : []),
+        ...(draftConflictBanner.statusBadge ? [draftConflictBanner.statusBadge] : []),
+    ], [draftConflictBanner.statusBadge, draftSyncStatusBadge]);
+    const showDraftActions = Boolean(draftScope && draftSnapshot?.materialized);
+    const renderStatusTrailingActions = React.useCallback((state: Readonly<{ isCreating: boolean }>) => (
+        showDraftActions ? (
+            <NewSessionDraftComposerActions
+                deleteDisabled={hasUnresolvedLaunch || state.isCreating}
+                onStartAnother={startAnother}
+                onDelete={deleteDraft}
+            />
+        ) : null
+    ), [deleteDraft, hasUnresolvedLaunch, showDraftActions, startAnother]);
     return (
         <NewSessionContent
             allowBlockingGuidance={!hasSeededDraftIntent && !hasSeededRouteIntent}
             draftId={props.draftId}
+            onDraftRemoved={startAnother}
             composerTopContent={composerTopContent}
             statusBadges={statusBadges}
-            statusTrailingActions={statusTrailingActions}
+            renderStatusTrailingActions={renderStatusTrailingActions}
         />
     );
 }

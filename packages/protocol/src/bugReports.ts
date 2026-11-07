@@ -42,3 +42,5 @@ export {
   type BugReportMachineRuntimeLike,
   type BugReportMachineStackContextLike,
 } from './bugReports/machineDiagnostics.js';
+export { buildBugReportExportBundle, serializeBugReportExportBundle, type BugReportExportArtifact, type BugReportExportBundle } from './bugReports/export.js';
+export { BugReportLogSelectionSchema, BugReportSessionDiagnosticsSchema, resolveBugReportLogSelection, BUG_REPORT_LOG_SOURCE_KINDS, type BugReportLogSelection, type BugReportSessionDiagnostics } from './bugReports/logSelection.js';

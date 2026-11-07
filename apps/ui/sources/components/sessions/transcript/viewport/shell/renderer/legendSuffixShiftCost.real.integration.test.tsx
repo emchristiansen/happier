@@ -1,15 +1,26 @@
 // @vitest-environment jsdom
 
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { dirname, resolve as resolvePath } from 'node:path';
-
 import * as React from 'react';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as legendReactNative from '@legendapp/list/react-native';
 import { LegendList, type LegendListRef } from '@legendapp/list/react-native';
+
+import { getVitestNodeBuiltin } from '@/dev/vitestNodeBuiltins';
+
+const { readFileSync } = getVitestNodeBuiltin<{
+    readFileSync: (path: string, encoding: 'utf8') => string;
+}>('node:fs');
+const { createRequire } = getVitestNodeBuiltin<{
+    createRequire: (filename: string | URL) => {
+        resolve: (id: string) => string;
+    };
+}>('node:module');
+const { dirname, resolve: resolvePath } = getVitestNodeBuiltin<{
+    dirname: (path: string) => string;
+    resolve: (...paths: string[]) => string;
+}>('node:path');
 
 vi.mock('react-native', async () => vi.importActual('react-native-web'));
 

@@ -118,3 +118,57 @@ Happier is built with AI agents and we have no issue with AI-assisted contributi
 A contribution where we can see your thinking, even if the code was mostly AI-generated, is far more useful than one where we're guessing at intent. Think of it less as a PR and more as a "here's the problem, here's how I reasoned about it, here's what an agent produced."
 
 Thank you for taking the time to contribute, we deeply appreciate it!
+
+## Development setup
+
+### Nightly and preview builds
+
+Preview and nightly dev builds are user-facing, not contributor-only: see
+[Release channels and nightly builds](README.md#release-channels-and-nightly-builds)
+in the README. Contributors working on the dev lane usually run from source
+instead (below).
+
+### Running from source
+
+```bash
+npm i -g yarn
+git clone https://github.com/happier-dev/happier.git
+cd happier
+yarn
+yarn build
+yarn cli:activate
+yarn tui
+```
+
+From the monorepo root, the `yarn` scripts run in **repo-local mode** (stackless + isolated per checkout).
+These scripts wrap `hstack` with repo-local defaults so you can run from source safely.
+
+Most-used commands:
+
+- `yarn dev`: local dev stack (server + UI + daemon)
+- `yarn tui`, `yarn tui:with-mobile`: dev stack in the integrated TUI (logs + controls)
+- `yarn tui --rescue`: macOS/Linux recovery mode that prioritizes stack controls during severe system load
+- `yarn build`, `yarn start`, `yarn stop`: prod-like build/start/stop flows
+- `yarn auth login`, `yarn daemon`, `yarn happier`: auth + daemon + CLI flows
+- `yarn env list|set|unset`: manage persisted env vars for your repo-local stack
+- `yarn logs`, `yarn logs:all|server|expo|ui|daemon|service`: stream/select logs
+- `yarn service:*`: install/manage OS service
+- `yarn tailscale:*`: configure/query Tailscale Serve URL
+- `yarn mobile`, `yarn mobile:install`, `yarn mobile-dev-client`: mobile workflows
+- `yarn providers`, `yarn eas`, `yarn setup`, `yarn remote`, `yarn self-host`, `yarn menubar`: advanced workflows
+
+[Run from a monorepo clone docs](./apps/docs/content/docs/self-hosting/repo-local.mdx)
+
+Arguments:
+
+- Forward extra flags/args with `--` (Yarn v1), for example:
+  - `yarn logs -- --component=daemon --lines 200 --no-follow`
+  - `yarn auth login -- --method=mobile --no-open`
+  - `yarn service:enable -- --auth-now -- --method=web --webapp=hosted`
+
+`hstack` and `npx`:
+
+- To run `hstack`/`happier` from any terminal using this clone, run `yarn cli:activate`.
+- You can run published `hstack` via `npx` (for example `npx --yes -p @happier-dev/stack@latest hstack <command>`), but that is **not** the same as repo-local wrappers from this checkout.
+
+More dev docs: [hstack docs index](./apps/docs/content/docs/hstack/index.mdx), [development docs](./apps/docs/content/docs/development/index.mdx).

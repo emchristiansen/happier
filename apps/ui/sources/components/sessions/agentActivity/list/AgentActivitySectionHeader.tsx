@@ -26,6 +26,7 @@ import type { AgentActivitySectionId } from './agentActivitySectionModel';
 
 const SECTION_TITLE_KEYS = {
     working: 'session.agentActivity.section.working',
+    idle: 'diagnosis.machineRuns.idle',
     finished: 'session.agentActivity.section.finished',
 } as const satisfies Record<AgentActivitySectionId, string>;
 

@@ -8,6 +8,7 @@ import { checkSessionAccess, requireAccessLevel } from "@/app/share/accessContro
 import { db } from "@/storage/db";
 import { inTx, type Tx } from "@/storage/inTx";
 import { isPrismaErrorCode } from "@/storage/prisma";
+import { error as logError } from "@/utils/logging/log";
 import {
     isStoredContentKindAllowedForSessionByStoragePolicy,
     SessionSystemRecordKindSchema,
@@ -23,6 +24,31 @@ import {
 const SESSION_SYSTEM_RECORD_CURSOR_PREFIX = "v1";
 const SESSION_SYSTEM_RECORD_MAX_LIMIT = 500;
 const SESSION_SYSTEM_RECORD_DEFAULT_LIMIT = 100;
+
+function reportSystemRecordFailure(
+    operation: "upsert" | "list" | "get" | "latest",
+    error: unknown,
+    reason: "exception" | "invalid-stored-record" = "exception",
+): void {
+    // Prisma messages, stacks and metadata can contain SQL, content or credentials. Only
+    // publish fixed exception categories and the documented Prisma code shape.
+    const knownErrorNames = [
+        "Error", "TypeError", "RangeError", "SyntaxError",
+        "PrismaClientKnownRequestError", "PrismaClientUnknownRequestError",
+        "PrismaClientInitializationError", "PrismaClientValidationError", "PrismaClientRustPanicError",
+        "TransactionAcquisitionUnavailableError", "TransactionDeadlineExceededError",
+    ];
+    const code = error && typeof error === "object" && "code" in error ? error.code : null;
+    logError({
+        module: "session-system-record-service",
+        operation,
+        reason,
+        prismaCode: typeof code === "string" && /^P\d{4}$/.test(code) ? code : null,
+        errorType: error === undefined ? null : error instanceof Error
+            ? (knownErrorNames.includes(error.name) ? error.name : "Error")
+            : typeof error,
+    }, "Session system-record operation failed");
+}
 
 export type SessionSystemRecordNamespace = z.infer<typeof SessionSystemRecordNamespaceSchema>;
 export type SessionSystemRecordKind = z.infer<typeof SessionSystemRecordKindSchema>;
@@ -295,7 +321,7 @@ async function upsertSessionSystemRecordWithRetry(
         const fast = await readSessionSystemRecordUpsertState(db, params).catch(() => null);
         if (fast?.kind === "unchanged") return fast.result;
 
-        return await inTx(async (tx) => {
+        const result = await inTx<UpsertSessionSystemRecordResult>(async (tx) => {
             const state = await readSessionSystemRecordUpsertState(tx, params);
             switch (state.kind) {
                 case "unchanged":
@@ -329,10 +355,15 @@ async function upsertSessionSystemRecordWithRetry(
                 }
             }
         });
+        if (!result.ok && result.error === "internal") {
+            reportSystemRecordFailure("upsert", undefined, "invalid-stored-record");
+        }
+        return result;
     } catch (error) {
         if (retryUniqueRace && isPrismaErrorCode(error, "P2002")) {
             return await upsertSessionSystemRecordWithRetry(params, false);
         }
+        reportSystemRecordFailure("upsert", error);
         return { ok: false, error: "internal" };
     }
 }
@@ -418,7 +449,7 @@ export async function listSessionSystemRecords(
     const cursor = decodeCursor(params.cursor);
 
     try {
-        return await inTx(async (tx) => {
+        const result = await inTx<ListSessionSystemRecordsResult>(async (tx) => {
             const session = await tx.session.findUnique({
                 where: { id: params.sessionId },
                 select: { accountId: true, encryptionMode: true },
@@ -460,7 +491,12 @@ export async function listSessionSystemRecords(
                 nextCursor: rows.length > limit && last ? encodeCursor(last) : null,
             };
         });
-    } catch {
+        if (!result.ok && result.error === "internal") {
+            reportSystemRecordFailure("list", undefined, "invalid-stored-record");
+        }
+        return result;
+    } catch (error) {
+        reportSystemRecordFailure("list", error);
         return { ok: false, error: "internal" };
     }
 }
@@ -476,7 +512,7 @@ export async function getSessionSystemRecord(
     if (!access.ok) return access;
 
     try {
-        return await inTx(async (tx) => {
+        const result = await inTx<GetSessionSystemRecordResult>(async (tx) => {
             const session = await tx.session.findUnique({
                 where: { id: params.sessionId },
                 select: { accountId: true, encryptionMode: true },
@@ -504,7 +540,12 @@ export async function getSessionSystemRecord(
             if (!record) return { ok: false, error: "internal" };
             return { ok: true, record };
         });
-    } catch {
+        if (!result.ok && result.error === "internal") {
+            reportSystemRecordFailure("get", undefined, "invalid-stored-record");
+        }
+        return result;
+    } catch (error) {
+        reportSystemRecordFailure("get", error);
         return { ok: false, error: "internal" };
     }
 }
@@ -520,7 +561,7 @@ export async function getLatestSessionSystemRecord(
     if (!access.ok) return access;
 
     try {
-        return await inTx(async (tx) => {
+        const result = await inTx<GetLatestSessionSystemRecordResult>(async (tx) => {
             const session = await tx.session.findUnique({
                 where: { id: params.sessionId },
                 select: { accountId: true, encryptionMode: true },
@@ -547,7 +588,12 @@ export async function getLatestSessionSystemRecord(
             if (!record) return { ok: false, error: "internal" };
             return { ok: true, record };
         });
-    } catch {
+        if (!result.ok && result.error === "internal") {
+            reportSystemRecordFailure("latest", undefined, "invalid-stored-record");
+        }
+        return result;
+    } catch (error) {
+        reportSystemRecordFailure("latest", error);
         return { ok: false, error: "internal" };
     }
 }

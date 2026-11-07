@@ -310,10 +310,38 @@ export function resolveExpoTmpDir({ env = process.env, defaultTmpDir, kind, proj
   return join(base, 'tmp', k, key);
 }
 
-export async function ensureExpoIsolationEnv({ env, stateDir, expoHomeDir, tmpDir }) {
+async function removeStaleTsxSockets(tmpDir, isPidAliveImpl) {
+  if (process.platform === 'win32') return;
+  const tsxDir = join(tmpDir, `tsx-${typeof process.geteuid === 'function' ? process.geteuid() : process.env.USER}`);
+  let entries;
+  try {
+    entries = await readdir(tsxDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  await Promise.all(entries.map(async (entry) => {
+    const match = /^(\d+)\.pipe$/.exec(entry.name);
+    if (!match || isPidAliveImpl(Number(match[1]))) return;
+    try {
+      await unlink(join(tsxDir, entry.name));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }));
+}
+
+export async function ensureExpoIsolationEnv({
+  env,
+  stateDir,
+  expoHomeDir,
+  tmpDir,
+  isPidAliveImpl = isPidAlive,
+}) {
   await mkdir(stateDir, { recursive: true });
   await mkdir(expoHomeDir, { recursive: true });
   await mkdir(tmpDir, { recursive: true });
+  await removeStaleTsxSockets(tmpDir, isPidAliveImpl);
 
   // Expo CLI uses this to override ~/.expo.
   // Always override: stack/worktree isolation must not fall back to the user's global ~/.expo.

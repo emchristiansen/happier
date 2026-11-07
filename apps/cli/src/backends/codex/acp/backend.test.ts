@@ -163,7 +163,7 @@ describe('createCodexAcpBackend', () => {
 
     await withEnv({
       HAPPIER_VARIANT: 'stable',
-      HAPPIER_CODEX_ACP_BIN: '/bin/echo',
+      HAPPIER_CODEX_ACP_BIN: process.execPath,
       OPENAI_API_KEY: undefined,
       CODEX_API_KEY: undefined,
     }, async () => {

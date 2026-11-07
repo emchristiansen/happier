@@ -1,6 +1,6 @@
-import type { DirectSessionsSource, DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import type { DirectSessionsSource, DirectTranscriptRawMessageV1, DirectTranscriptTruncationReason } from '@happier-dev/protocol';
 
-import { createOpenCodeDirectClient } from './createOpenCodeDirectClient';
+import { withOpenCodeDirectClient } from './createOpenCodeDirectClient';
 import { mapOpenCodeMessageToDirectItem } from './mapOpenCodeMessageToDirectItem';
 import { encodeOpenCodeDirectAfterCursor } from './openCodeDirectAfterCursor';
 import { measureDirectTranscriptItemBytes } from './measureDirectTranscriptItemBytes';
@@ -36,14 +36,13 @@ export async function pageOpenCodeTranscript(params: Readonly<{
   cursor?: string;
   maxBytes: number;
   maxItems: number;
-}>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; tailCursor: string | null; hasMore: boolean; truncated?: boolean }>> {
+}>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; tailCursor: string | null; hasMore: boolean; truncated?: boolean; truncationReason?: DirectTranscriptTruncationReason }>> {
   if (params.direction !== 'older') {
     return { items: [], nextCursor: null, tailCursor: null, hasMore: false };
   }
 
-  const client = await createOpenCodeDirectClient(params.source);
+  return await withOpenCodeDirectClient(params.source, async (client) => {
 
-  try {
     const rawMessages = await client.sessionMessagesList({ sessionId: params.remoteSessionId });
     const maxBytes = Math.max(1, Math.trunc(params.maxBytes));
     const maxItems = Math.max(1, Math.trunc(params.maxItems));
@@ -82,8 +81,12 @@ export async function pageOpenCodeTranscript(params: Readonly<{
     const nextEndIndex = firstReturnedIndex ?? startIndex;
     const hasMore = nextEndIndex > 0;
     const nextCursor = hasMore ? encodeBackwardCursor({ v: 1, kind: 'opencodeBackward', endIndex: nextEndIndex }) : null;
-    return { items, nextCursor, tailCursor, hasMore, ...(truncated ? { truncated } : {}) };
-  } finally {
-    await client.dispose().catch(() => {});
-  }
+    return {
+      items,
+      nextCursor,
+      tailCursor,
+      hasMore,
+      ...(truncated ? { truncated, truncationReason: 'page_limit' as const } : {}),
+    };
+  });
 }

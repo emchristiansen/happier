@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import { SessionStatusResultSchema } from '@happier-dev/protocol';
 
 import type { Credentials } from '@/persistence';
 import { wantsJson, printJsonEnvelope, writeJsonStdout } from '@/cli/output/jsonEnvelope';
@@ -6,6 +7,7 @@ import { hasFlag, readCommandPositionals } from '@/cli/commands/shared/argvFlags
 import { createCliActionExecutorFromCredentials } from '@/session/actions/createCliActionExecutorFromCredentials';
 import { normalizeActionExecuteResult } from './shared/normalizeActionExecuteResult';
 import { tryHandleApprovalRequestCreated } from './shared/tryHandleApprovalRequestCreated';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 export async function cmdSessionStatus(
   argv: string[],
@@ -24,7 +26,7 @@ export async function cmdSessionStatus(
       await printJsonEnvelope({ ok: false, kind: 'session_status', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 
@@ -55,16 +57,17 @@ export async function cmdSessionStatus(
   if (await tryHandleApprovalRequestCreated({ envelopeKind: 'session_status', json, result })) {
     return;
   }
+  const usageLimitRecovery = SessionStatusResultSchema.shape.usageLimitRecovery.parse(result.usageLimitRecovery);
 
   if (json) {
     await printJsonEnvelope({
       ok: true,
       kind: 'session_status',
-      data: { session: result.session, ...(result.agentState ? { agentState: result.agentState } : {}) },
+      data: { session: result.session, ...(result.agentState ? { agentState: result.agentState } : {}), usageLimitRecovery },
     });
     return;
   }
 
   console.log(chalk.green('✓'), 'status fetched');
-  await writeJsonStdout({ session: result.session, agentState: result.agentState }, { pretty: true });
+  await writeJsonStdout({ session: result.session, agentState: result.agentState, usageLimitRecovery }, { pretty: true });
 }

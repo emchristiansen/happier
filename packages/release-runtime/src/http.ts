@@ -6,7 +6,25 @@ const MAX_REDIRECTS = 5;
 
 type HeaderMap = Readonly<Record<string, string>>;
 
+export type DownloadProgress = Readonly<{ receivedBytes: number; totalBytes?: number }>;
+type RequestOptions = Readonly<{
+  url: string;
+  headers?: HeaderMap;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  onProgress?: (progress: DownloadProgress) => void;
+}>;
+
 const CROSS_ORIGIN_SENSITIVE_HEADERS = new Set(['authorization', 'proxy-authorization']);
+
+class HttpResponseError extends Error {
+  readonly code: string;
+  constructor(url: string, readonly status: number) {
+    super(`[http] request failed: ${url} (${status})`);
+    this.name = 'HttpResponseError';
+    this.code = `HTTP_${status}`;
+  }
+}
 
 function decodeDataUrl(url: string): Buffer {
   const match = /^data:([^,]*?),(.*)$/s.exec(url);
@@ -55,11 +73,8 @@ function resolveRedirectHeaders(params: Readonly<{
   return dropCrossOriginSensitiveHeaders(params.headers);
 }
 
-async function requestBufferWithNode(params: Readonly<{
-  url: string;
-  headers?: HeaderMap;
+async function requestBufferWithNode(params: RequestOptions & Readonly<{
   redirectCount?: number;
-  timeoutMs?: number;
 }>): Promise<Buffer> {
   const redirectCount = params.redirectCount ?? 0;
   if (redirectCount > MAX_REDIRECTS) {
@@ -74,6 +89,7 @@ async function requestBufferWithNode(params: Readonly<{
       {
         method: 'GET',
         headers: params.headers,
+        signal: params.signal,
       },
       (res) => {
         const statusCode = res.statusCode ?? 0;
@@ -92,19 +108,29 @@ async function requestBufferWithNode(params: Readonly<{
             headers: nextHeaders,
             redirectCount: redirectCount + 1,
             timeoutMs: params.timeoutMs,
+            signal: params.signal,
+            onProgress: params.onProgress,
           }).then(resolve, reject);
           return;
         }
 
         if (statusCode < 200 || statusCode >= 300) {
           res.resume();
-          reject(new Error(`[http] request failed: ${params.url} (${statusCode})`));
+          reject(new HttpResponseError(params.url, statusCode));
           return;
         }
 
         const chunks: Buffer[] = [];
+        let receivedBytes = 0;
+        const contentLength = Number(res.headers['content-length']);
+        const total = Number.isSafeInteger(contentLength) && contentLength > 0
+          ? { totalBytes: contentLength }
+          : {};
         res.on('data', (chunk) => {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          chunks.push(bytes);
+          receivedBytes += bytes.length;
+          params.onProgress?.({ receivedBytes, ...total });
         });
         res.on('end', () => resolve(Buffer.concat(chunks)));
         res.on('error', reject);
@@ -112,43 +138,38 @@ async function requestBufferWithNode(params: Readonly<{
     );
 
     req.setTimeout(params.timeoutMs ?? DEFAULT_TIMEOUT_MS, () => {
-      req.destroy(new Error(`[http] request timed out: ${params.url}`));
+      const error = new Error(`[http] request timed out: ${params.url}`);
+      Object.assign(error, { code: 'ETIMEDOUT' });
+      req.destroy(error);
     });
     req.on('error', reject);
     req.end();
   });
 }
 
-export async function requestBytes(params: Readonly<{
-  url: string;
-  headers?: HeaderMap;
-  timeoutMs?: number;
-}>): Promise<Buffer> {
+export async function requestBytes(params: RequestOptions): Promise<Buffer> {
+  params.signal?.throwIfAborted();
   const url = String(params.url ?? '').trim();
   if (!url) throw new Error('[http] url is required');
   if (url.startsWith('data:')) {
-    return decodeDataUrl(url);
+    const bytes = decodeDataUrl(url);
+    params.onProgress?.({ receivedBytes: bytes.length, ...(bytes.length > 0 ? { totalBytes: bytes.length } : {}) });
+    return bytes;
   }
   return await requestBufferWithNode({
     url,
     headers: params.headers,
     timeoutMs: params.timeoutMs,
+    signal: params.signal,
+    onProgress: params.onProgress,
   });
 }
 
-export async function requestText(params: Readonly<{
-  url: string;
-  headers?: HeaderMap;
-  timeoutMs?: number;
-}>): Promise<string> {
+export async function requestText(params: RequestOptions): Promise<string> {
   const bytes = await requestBytes(params);
   return bytes.toString('utf8');
 }
 
-export async function requestJson<T>(params: Readonly<{
-  url: string;
-  headers?: HeaderMap;
-  timeoutMs?: number;
-}>): Promise<T> {
+export async function requestJson<T>(params: RequestOptions): Promise<T> {
   return JSON.parse(await requestText(params)) as T;
 }

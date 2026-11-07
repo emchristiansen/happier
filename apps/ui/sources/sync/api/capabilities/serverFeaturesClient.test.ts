@@ -61,6 +61,25 @@ function createResponse(status: number, payload: unknown) {
     } as Response;
 }
 
+function createValidFeaturesPayload() {
+    return {
+        features: {
+            sharing: { session: { enabled: true }, public: { enabled: true }, contentKeys: { enabled: true }, pendingQueueV2: { enabled: true } },
+            voice: { enabled: false, configured: false, provider: null },
+            social: { friends: { enabled: true, allowUsername: false, requiredIdentityProviderId: 'github' } },
+            oauth: { providers: {} },
+            auth: {
+                signup: { methods: [] },
+                login: { requiredProviders: [] },
+                recovery: { providerReset: { enabled: false, providers: [] } },
+                ui: { autoRedirect: { enabled: false, providerId: null }, recoveryKeyReminder: { enabled: true } },
+                providers: {},
+                misconfig: [],
+            },
+        },
+    };
+}
+
 function useFrozenServerFeaturesClock(now = frozenServerFeaturesTime): void {
     vi.useFakeTimers();
     vi.setSystemTime(now);
@@ -148,6 +167,88 @@ describe('serverFeaturesClient', () => {
 
         expect(a.status).toBe('ready');
         expect(b.status).toBe('ready');
+    });
+
+    it('keeps caller wait budgets independent from the shared feature request', async () => {
+        useFrozenServerFeaturesClock();
+        let resolveFetch!: (response: Response) => void;
+        featuresFetchMock.mockImplementation(() => new Promise<Response>((resolve) => {
+            resolveFetch = resolve;
+        }));
+
+        const { getServerFeaturesSnapshot, resetServerFeaturesClientForTests } = await import('./serverFeaturesClient');
+        resetServerFeaturesClientForTests();
+
+        const impatient = getServerFeaturesSnapshot({ force: true, timeoutMs: 10 });
+        const patient = getServerFeaturesSnapshot({ force: true, timeoutMs: 100 });
+        await vi.advanceTimersByTimeAsync(10);
+        await expect(impatient).resolves.toEqual({ status: 'error', reason: 'timeout' });
+
+        resolveFetch(createResponse(200, createValidFeaturesPayload()));
+        await expect(patient).resolves.toMatchObject({ status: 'ready' });
+        expect(featuresFetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the last ready snapshot when a forced refresh has a transient network failure', async () => {
+        featuresFetchMock
+            .mockResolvedValueOnce(createResponse(200, createValidFeaturesPayload()))
+            .mockRejectedValueOnce(new TypeError('network unavailable'));
+
+        const {
+            getCachedServerFeaturesSnapshot,
+            getServerFeaturesSnapshot,
+            getServerFeaturesSnapshotRetryDelayMs,
+            resetServerFeaturesClientForTests,
+        } = await import('./serverFeaturesClient');
+        resetServerFeaturesClientForTests();
+
+        await expect(getServerFeaturesSnapshot({ force: true, timeoutMs: 100 })).resolves.toMatchObject({ status: 'ready' });
+        await expect(getServerFeaturesSnapshot({ force: true, timeoutMs: 100 })).resolves.toMatchObject({ status: 'ready' });
+        const cached = getCachedServerFeaturesSnapshot();
+        expect(cached).toMatchObject({ status: 'ready' });
+        const retryDelayMs = getServerFeaturesSnapshotRetryDelayMs({ snapshot: cached! });
+        expect(retryDelayMs).not.toBeNull();
+        expect(retryDelayMs!).toBeGreaterThan(0);
+        expect(retryDelayMs!).toBeLessThanOrEqual(5_000);
+    });
+
+    it('keeps the last ready snapshot when a forced refresh receives a transient response status', async () => {
+        featuresFetchMock
+            .mockResolvedValueOnce(createResponse(200, createValidFeaturesPayload()))
+            .mockResolvedValueOnce(createResponse(503, {}));
+
+        const {
+            getCachedServerFeaturesSnapshot,
+            getServerFeaturesSnapshot,
+            getServerFeaturesSnapshotRetryDelayMs,
+            resetServerFeaturesClientForTests,
+        } = await import('./serverFeaturesClient');
+        resetServerFeaturesClientForTests();
+
+        await expect(getServerFeaturesSnapshot({ force: true, timeoutMs: 100 })).resolves.toMatchObject({ status: 'ready' });
+        await expect(getServerFeaturesSnapshot({ force: true, timeoutMs: 100 })).resolves.toMatchObject({ status: 'ready' });
+        const cached = getCachedServerFeaturesSnapshot();
+        expect(cached).toMatchObject({ status: 'ready' });
+        const retryDelayMs = getServerFeaturesSnapshotRetryDelayMs({ snapshot: cached! });
+        expect(retryDelayMs).not.toBeNull();
+        expect(retryDelayMs!).toBeGreaterThan(0);
+        expect(retryDelayMs!).toBeLessThanOrEqual(30_000);
+    });
+
+    it('does not preserve a ready snapshot across a non-retryable response status', async () => {
+        featuresFetchMock
+            .mockResolvedValueOnce(createResponse(200, createValidFeaturesPayload()))
+            .mockResolvedValueOnce(createResponse(403, {}));
+
+        const { getServerFeaturesSnapshot, resetServerFeaturesClientForTests } = await import('./serverFeaturesClient');
+        resetServerFeaturesClientForTests();
+
+        await expect(getServerFeaturesSnapshot({ force: true, timeoutMs: 100 })).resolves.toMatchObject({ status: 'ready' });
+        await expect(getServerFeaturesSnapshot({ force: true, timeoutMs: 100 })).resolves.toEqual({
+            status: 'error',
+            reason: 'response_status',
+            httpStatus: 403,
+        });
     });
 
     it('probes active-server features without waiting behind reachability supervision', async () => {

@@ -11,14 +11,19 @@ import {
 import { probeAuthenticatedServerAuthPingEndpoint } from '@/sync/api/capabilities/probeAuthenticatedServerAuthPingEndpoint';
 import { canonicalizeServerUrl } from '@/sync/domains/server/url/serverUrlCanonical';
 import { runtimeFetch } from '@/utils/system/runtimeFetch';
+import { HappyError } from '@/utils/errors/errors';
+import { t } from '@/text';
 
 import { createNotAuthenticatedError } from './authErrors';
+import { classifyEndpointResponse } from './endpointSupervision';
 import { buildRetryLaterProbeResultFromResponse } from './retryLaterProbeResult';
 import { readServerReachabilityBackgroundRetryMs, readServerReachabilityProbeTimeoutMs } from './serverReachabilityTuning';
 
-export class ServerReachabilityWaitTimeoutError extends Error {
+export class ServerReachabilityWaitTimeoutError extends HappyError {
     constructor() {
-        super('Timed out waiting for server reachability');
+        super(t('errors.connectionTimeout'), true, { kind: 'network' });
+        // HappyError installs its own prototype; retain timeout-specific catches and subclasses.
+        Object.setPrototypeOf(this, new.target.prototype);
         this.name = 'ServerReachabilityWaitTimeoutError';
     }
 }
@@ -399,10 +404,8 @@ export async function waitForServerReachable(params: Readonly<{
     const tokenChanged = entry.token !== params.token;
     entry.token = params.token;
 
-    // IMPORTANT: `createManagedConnectionSupervisor.start()` will immediately create/connect a transport when the
-    // supervisor is already started but currently offline/auth_failed. For reachability supervision we must not
-    // bypass the existing probe/backoff schedule (otherwise each caller waiting for reachability can reset the
-    // offline state and cause request storms).
+    // `start()` preserves an offline reconnect schedule, but this phase gate also makes the
+    // reachability pool's activation intent explicit and keeps auth recovery tied to token change.
     //
     // Only start when the supervisor has never been started (idle) or when it was explicitly stopped (shutting_down).
     // If we are stuck in auth_failed and the auth token changed, restart from a fresh initial probe.
@@ -498,23 +501,22 @@ export function reportServerRestarting(serverUrl: string, retryAfterMs?: number)
     const entry = entriesByServerUrl.get(canonicalizeServerUrl(serverUrl));
     if (!entry) return;
     if (typeof entry.supervisor.reportProbeResult !== 'function') return;
+    const probeReportScope = entry.supervisor.captureProbeReportScope?.();
     entry.supervisor.reportProbeResult({
         status: 'retry_later',
         retryAfterMs: normalizeServerRestartingRetryAfterMs(retryAfterMs),
         reason: 'server_restarting',
         errorMessage: 'Server restart in progress',
-    });
+    }, probeReportScope);
 }
 
-export function reportServerAuthFailed(serverUrl: string, statusCode: 401 | 403): void {
+export function createServerReachabilityResponseReporter(serverUrl: string, hadAuth: boolean): (response: Response) => void {
     const entry = entriesByServerUrl.get(canonicalizeServerUrl(serverUrl));
-    if (!entry) return;
-    if (typeof entry.supervisor.reportProbeResult !== 'function') return;
-    entry.supervisor.reportProbeResult({
-        status: 'auth_failed',
-        statusCode,
-        errorMessage: `HTTP ${statusCode}`,
-    });
+    const scope = entry?.supervisor.captureProbeReportScope?.();
+    return (response) => {
+        const probe = classifyEndpointResponse(response, hadAuth);
+        if (probe && scope) entry?.supervisor.reportProbeResult?.(probe, scope);
+    };
 }
 
 export function assertServerReachabilityAuthenticated(serverUrl: string): void {

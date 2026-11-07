@@ -76,7 +76,7 @@ describe('buildSessionListReachabilityModels', () => {
                     metadata: { host: 'same-host.local', displayName: 'Live Machine' },
                 } as any,
             },
-            workspaceLabelsV1: {},
+            workspaceLabelsByLabelKey: {},
         });
 
         expect(models.reachableSessionDisplayByKey.get('server-a:session-1')).toMatchObject({
@@ -127,7 +127,7 @@ describe('buildSessionListReachabilityModels', () => {
                 metadata: { host: 'a.local', displayName: 'Machine A' },
             } as any,
         };
-        const workspaceLabelsV1 = {};
+        const workspaceLabelsByLabelKey = {};
         const cache = createSessionListReachabilityModelsCache();
         const first = buildSessionListReachabilityModels({
             cache,
@@ -136,7 +136,7 @@ describe('buildSessionListReachabilityModels', () => {
                 { type: 'session', serverId: 'server-a', session: refreshed } as any,
             ],
             machinesById,
-            workspaceLabelsV1,
+            workspaceLabelsByLabelKey,
         });
         const unchangedDisplay = first.reachableSessionDisplayByKey.get('server-a:unchanged-session');
         const second = buildSessionListReachabilityModels({
@@ -150,7 +150,7 @@ describe('buildSessionListReachabilityModels', () => {
                 } as any,
             ],
             machinesById,
-            workspaceLabelsV1,
+            workspaceLabelsByLabelKey,
         });
 
         expect(second).not.toBe(first);
@@ -159,6 +159,54 @@ describe('buildSessionListReachabilityModels', () => {
             machineId: 'machine-a',
             workspaceSubtitle: 'refreshed',
         });
+    });
+
+    it('reuses retained reachability models across a list remount', async () => {
+        const {
+            buildSessionListReachabilityModels,
+            createSessionListReachabilityModelsCache,
+        } = await import('./sessionListReachabilityModels');
+
+        mockStorageState = {
+            sessions: {},
+            machines: {},
+            getProjectForSession: () => null,
+        };
+        const items = [{
+            type: 'session',
+            serverId: 'server-a',
+            session: {
+                id: 'retained-session',
+                metadata: {
+                    machineId: 'machine-a',
+                    path: '/Users/test/workspace/retained',
+                    homeDir: '/Users/test',
+                    host: 'a.local',
+                },
+            },
+        }] as any;
+        const machinesById = {
+            'machine-a': {
+                id: 'machine-a',
+                title: 'Machine A',
+                subtitle: 'a.local',
+                metadata: { host: 'a.local', displayName: 'Machine A' },
+            } as any,
+        };
+        const first = buildSessionListReachabilityModels({
+            cache: createSessionListReachabilityModelsCache(),
+            items,
+            machinesById,
+            workspaceLabelsByLabelKey: {},
+        });
+        const second = buildSessionListReachabilityModels({
+            cache: createSessionListReachabilityModelsCache(),
+            items,
+            machinesById,
+            workspaceLabelsByLabelKey: {},
+        });
+
+        expect(second).toBe(first);
     });
 
     it('keeps reachability display scoped when two visible servers share a session id', async () => {
@@ -211,7 +259,7 @@ describe('buildSessionListReachabilityModels', () => {
                     metadata: { host: 'b.local', displayName: 'Machine B' },
                 } as any,
             },
-            workspaceLabelsV1: {},
+            workspaceLabelsByLabelKey: {},
         });
 
         expect(models.reachableSessionDisplayByKey.get('server-a:shared-session')).toMatchObject({

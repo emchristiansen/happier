@@ -5,10 +5,13 @@ const fsSync = require('node:fs');
 const { spawn } = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
+const { killProcessTree } = require('./process_tree.cjs');
+const { reportNativeProcessExited } = require('./native_process_exit.cjs');
 
 const terminalSignalNames = ['SIGINT', 'SIGQUIT'];
 const stderrTailMaxChars = 64 * 1024;
 const claudeMcpConfigFilePrefix = 'happier-claude-mcp-config';
+const claudeSystemPromptDirectoryPrefix = 'happier-claude-system-prompt-';
 
 function isPlainObject(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -34,28 +37,58 @@ function readOptionalBoolean(value, name) {
     return value;
 }
 
-function isSafeClaudeMcpConfigCleanupPath(filePath) {
+function isSafeClaudeArtifactCleanupPath(filePath) {
     if (typeof filePath !== 'string' || filePath.length === 0) return false;
     const tmpRoot = path.resolve(os.tmpdir());
     const resolved = path.resolve(filePath);
     const relative = path.relative(tmpRoot, resolved);
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return false;
     const name = path.basename(resolved);
-    return name.startsWith(`${claudeMcpConfigFilePrefix}.`) && name.endsWith('.json');
+    const isMcpConfig = name.startsWith(`${claudeMcpConfigFilePrefix}.`) && name.endsWith('.json');
+    const isSystemPrompt = name === 'text-artifact.txt'
+        && path.dirname(path.dirname(resolved)) === tmpRoot
+        && path.basename(path.dirname(resolved)).startsWith(claudeSystemPromptDirectoryPrefix);
+    return isMcpConfig || isSystemPrompt;
 }
 
-async function cleanupLaunchSpecPaths(paths) {
-    await Promise.allSettled(
+function reportArtifactCleanupFailure(diagnostics, phase) {
+    const message = `Terminal launch artifact cleanup incomplete (terminal_launch_artifact_cleanup_incomplete:${phase})`;
+    if (diagnostics) {
+        try {
+            fsSync.mkdirSync(diagnostics.logsDir, { recursive: true });
+            fsSync.appendFileSync(path.join(diagnostics.logsDir, 'terminal-launch-cleanup.log'), `${message}\n`, { mode: 0o600 });
+            return;
+        } catch {
+            // A missing diagnostic sink must not hide incomplete private cleanup.
+        }
+    }
+    console.error(message);
+}
+
+async function cleanupLaunchSpecPaths(paths, diagnostics) {
+    let incomplete = false;
+    const remove = async (operation) => {
+        try { await operation(); }
+        catch (error) {
+            if (error && error.code === 'ENOENT') return;
+            incomplete = true;
+        }
+    };
+    await Promise.all(
         paths
-            .filter(isSafeClaudeMcpConfigCleanupPath)
+            .filter(isSafeClaudeArtifactCleanupPath)
             .map(async (filePath) => {
-                await fs.unlink(filePath).catch(() => undefined);
+                await remove(() => fs.unlink(filePath));
                 const directory = path.dirname(filePath);
-                if (path.basename(directory).startsWith(`${claudeMcpConfigFilePrefix}-`)) {
-                    await fs.rmdir(directory).catch(() => undefined);
+                if (path.basename(directory).startsWith(`${claudeMcpConfigFilePrefix}-`)
+                    || path.basename(directory).startsWith(claudeSystemPromptDirectoryPrefix)) {
+                    await remove(() => fs.rmdir(directory));
                 }
             }),
     );
+    // Artifact retirement is non-fatal after the native outcome; report it without
+    // replacing success or the original provider/startup failure.
+    if (incomplete) reportArtifactCleanupFailure(diagnostics, 'native_artifacts');
 }
 
 function readEnv(value) {
@@ -80,6 +113,10 @@ function readOptionalDiagnostics(value) {
     const sessionId = value.sessionId;
     const logsDir = value.logsDir;
     const sessionExitDir = value.sessionExitDir;
+    const spawnResultPath = value.spawnResultPath;
+    if (spawnResultPath !== undefined && (typeof spawnResultPath !== 'string' || spawnResultPath.length === 0)) {
+        throw new Error('Invalid terminal launch spec: diagnostics.spawnResultPath must be a non-empty string');
+    }
     if (sessionId !== undefined && typeof sessionId !== 'string') {
         throw new Error('Invalid terminal launch spec: diagnostics.sessionId must be a string');
     }
@@ -93,6 +130,7 @@ function readOptionalDiagnostics(value) {
         sessionId: typeof sessionId === 'string' && sessionId.trim().length > 0 ? sessionId.trim() : null,
         logsDir,
         sessionExitDir,
+        ...(spawnResultPath === undefined ? {} : { spawnResultPath }),
     };
 }
 
@@ -112,12 +150,40 @@ async function readLaunchSpecFile(specPath) {
         throw new Error('Invalid terminal launch spec path');
     }
     const raw = await fs.readFile(specPath, 'utf8');
-    await fs.unlink(specPath).catch(() => {});
+    let parsed;
+    let parseError;
+    try { parsed = JSON.parse(raw); } catch (error) { parseError = error; }
+    let diagnostics = null;
+    try { diagnostics = readOptionalDiagnostics(parsed?.diagnostics); } catch {
+        // Validation below retains the original invalid-spec error.
+    }
+    let cleanupIncomplete = false;
+    try { await fs.unlink(specPath); } catch (error) {
+        if (error?.code !== 'ENOENT') cleanupIncomplete = true;
+    }
     const specDir = path.dirname(specPath);
     if (path.basename(specDir).startsWith('happier-terminal-launch-')) {
-        await fs.rmdir(specDir).catch(() => {});
+        try { await fs.rmdir(specDir); } catch (error) {
+            if (error?.code !== 'ENOENT') {
+                let onlyOwnedReceipt = false;
+                if (error?.code === 'ENOTEMPTY'
+                    && diagnostics?.spawnResultPath
+                    && path.resolve(diagnostics.spawnResultPath) === path.resolve(specDir, 'native-startup.json')) {
+                    try {
+                        const entries = await fs.readdir(specDir);
+                        onlyOwnedReceipt = entries.length === 1 && entries[0] === 'native-startup.json';
+                    } catch (inspectionError) {
+                        onlyOwnedReceipt = inspectionError?.code === 'ENOENT';
+                    }
+                }
+                // The startup observer still owns its exact receipt. Other retained
+                // entries are not permission to recursively remove the directory.
+                if (!onlyOwnedReceipt) cleanupIncomplete = true;
+            }
+        }
     }
-    const parsed = JSON.parse(raw);
+    if (cleanupIncomplete) reportArtifactCleanupFailure(diagnostics, 'launch_handoff');
+    if (parseError) throw parseError;
     if (!isPlainObject(parsed)) {
         throw new Error('Invalid terminal launch spec: root must be an object');
     }
@@ -131,10 +197,12 @@ async function readLaunchSpecFile(specPath) {
         parsed.windowsVerbatimArguments,
         'windowsVerbatimArguments',
     );
+    const inheritStderr = readOptionalBoolean(parsed.inheritStderr, 'inheritStderr');
     return {
         command: parsed.command,
         args: readStringArray(parsed.args, 'args'),
         ...(windowsVerbatimArguments === undefined ? {} : { windowsVerbatimArguments }),
+        ...(inheritStderr === undefined ? {} : { inheritStderr }),
         cwd: parsed.cwd,
         env: buildChildEnv(readEnv(parsed.env), readOptionalStringArray(parsed.envPassthroughKeys, 'envPassthroughKeys')),
         cleanupPaths: readOptionalStringArray(parsed.cleanupPaths, 'cleanupPaths'),
@@ -252,20 +320,60 @@ function installTerminalSignalGuards() {
     };
 }
 
-function runLaunchSpec(spec) {
+function installTerminationSignalForwarding(child) {
+    const signals = process.platform === 'win32' ? ['SIGTERM'] : ['SIGTERM', 'SIGHUP'];
+    const installed = [];
+    let requestedSignal = null;
+    for (const signal of signals) {
+        const listener = () => {
+            requestedSignal ??= signal;
+            if (child.exitCode === null && child.signalCode === null) {
+                try { child.kill(signal); } catch {}
+            }
+        };
+        process.on(signal, listener);
+        installed.push([signal, listener]);
+    }
+    return () => {
+        for (const [signal, listener] of installed) process.off(signal, listener);
+        if (requestedSignal) {
+            try { process.kill(process.pid, requestedSignal); } catch {}
+        }
+    };
+}
+
+function runLaunchSpec(spec, controllerSignal, options = {}) {
     return new Promise((resolve, reject) => {
+        if (controllerSignal?.aborted) {
+            cleanupLaunchSpecPaths(spec.cleanupPaths ?? [], spec.diagnostics).then(() => resolve(1), reject);
+            return;
+        }
         let child;
+        let nativeSpawnReported = false;
+        const reportNativeSpawnResult = (status) => {
+            if (!spec.diagnostics?.spawnResultPath) return;
+            // Startup is an observed event, not the eventual process outcome.
+            // Node can emit an operation error after a successful executable spawn.
+            if (nativeSpawnReported) return;
+            nativeSpawnReported = true;
+            try {
+                fsSync.writeFileSync(spec.diagnostics.spawnResultPath, JSON.stringify({ status }), { mode: 0o600 });
+            } catch {
+                console.error('Native terminal startup receipt could not be written (terminal_native_startup_unknown)');
+            }
+        };
         try {
             child = spawn(spec.command, spec.args, {
                 cwd: spec.cwd,
                 env: spec.env,
                 shell: false,
-                stdio: ['inherit', 'inherit', 'pipe'],
+                stdio: ['inherit', 'inherit', spec.inheritStderr ? 'inherit' : 'pipe'],
                 windowsHide: true,
                 ...(spec.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
             });
         } catch (error) {
-            void cleanupLaunchSpecPaths(spec.cleanupPaths ?? []).then(() => reject(error));
+            reportNativeSpawnResult('failed');
+            void cleanupLaunchSpecPaths(spec.cleanupPaths ?? [], spec.diagnostics).then(() => reject(error));
             return;
         }
         const stderrDiagnostics = createChildStderrDiagnostics(spec.diagnostics, child.pid);
@@ -274,19 +382,107 @@ function runLaunchSpec(spec) {
             process.stderr.write(chunk);
         });
         const removeSignalGuards = installTerminalSignalGuards();
+        const controllerChannel = controllerSignal && require.main === module && typeof process.send === 'function';
+        const reportSignalFailure = () => {
+            console.error('Native terminal signal could not be delivered (terminal_native_signal_failed)');
+            if (controllerChannel && process.connected) process.send({ type: 'terminal-native-signal-failed' }, () => {});
+        };
+        const onNativeSignal = (message) => {
+            if (!message || message.type !== 'terminal-native-signal') return;
+            if (message.signal !== 'SIGINT' && message.signal !== 'SIGKILL') return;
+            if (message.signal === 'SIGKILL') {
+                onControllerClosed();
+                return;
+            }
+            try {
+                child.kill(message.signal);
+            } catch {
+                reportSignalFailure();
+            }
+        };
+        let nativeSpawned = false;
+        child.once('spawn', () => {
+            nativeSpawned = true;
+            reportNativeSpawnResult('spawned');
+            if (controllerChannel && process.connected) process.send({ type: 'terminal-native-spawned' }, (error) => {
+                if (error) onControllerClosed();
+            });
+        });
+        if (controllerChannel) {
+            process.on('message', onNativeSignal);
+        }
+        let controllerCleanup = null;
+        const onControllerClosed = () => {
+            // Independent/recoverable hosts have no IPC channel. The launcher must survive
+            // controller death for this event-driven owned-tree cleanup to complete.
+            controllerCleanup ??= killProcessTree(child).catch(() => {
+                console.error('Owned terminal process cleanup could not be verified (terminal_controller_cleanup_incomplete)');
+            });
+        };
+        controllerSignal?.addEventListener('abort', onControllerClosed, { once: true });
+        const finishTerminationSignalForwarding = installTerminationSignalForwarding(child);
         let settled = false;
+        // Native lifetime ends only when the observed child settles below. A post-spawn
+        // operation error is reported before then, without settling this ownership.
+        let retireNativeLifetime;
+        const nativeLifetime = new Promise((resolveLifetime) => { retireNativeLifetime = resolveLifetime; });
+        let operationErrorReported = false;
         const settle = async (fn) => {
             if (settled) return;
             settled = true;
-            removeSignalGuards();
-            await stderrDiagnostics?.close();
-            await cleanupLaunchSpecPaths(spec.cleanupPaths ?? []);
-            await fn();
+            controllerSignal?.removeEventListener('abort', onControllerClosed);
+            if (controllerChannel) process.off('message', onNativeSignal);
+            try {
+                // Keep terminal guards and SIGTERM/SIGHUP forwarding installed until the
+                // retained child has settled and its private launch artifacts are removed.
+                await controllerCleanup;
+                await stderrDiagnostics?.close();
+                await cleanupLaunchSpecPaths(spec.cleanupPaths ?? [], spec.diagnostics);
+                const code = await fn();
+                removeSignalGuards();
+                finishTerminationSignalForwarding();
+                resolve(code);
+            } catch (error) {
+                removeSignalGuards();
+                finishTerminationSignalForwarding();
+                reject(error);
+            } finally {
+                retireNativeLifetime();
+            }
         };
+        // The Windows invocation owner sets verbatim arguments when it inserts ComSpec.
+        // That shell's exit cannot prove provider shutdown or await inherited provider pipes.
+        const providerIsChild = spec.windowsVerbatimArguments !== true;
+        let spawnError = null;
         child.on('error', (error) => {
-            settle(() => reject(error));
+            reportNativeSpawnResult('failed');
+            spawnError = error;
+            // A post-spawn operation error is a launcher outcome, not a native exit. Report it
+            // now, but the provider may still be running: controller cancellation, signal
+            // forwarding, exit observation and its launch artifacts stay owned until the
+            // native close below settles them.
+            if (nativeSpawned) {
+                if (!settled && !operationErrorReported) {
+                    operationErrorReported = true;
+                    console.error('Native terminal operation failed after startup; native ownership retained until exit (terminal_native_operation_failed)');
+                    options.onNativeLifetimeRetained?.(nativeLifetime);
+                    reject(error);
+                }
+                return;
+            }
+            // A failed spawn has no process; the Windows 'exit' path below never fires for it,
+            // so settle that case here instead of hanging.
+            if (!providerIsChild && child.pid === undefined) {
+                void settle(() => { throw error; });
+            }
         });
-        child.on('close', (code, signal) => {
+        child.on(providerIsChild ? 'close' : 'exit', async (code, signal) => {
+            if (!providerIsChild) child.stderr?.destroy();
+            if (controllerChannel && providerIsChild) await reportNativeProcessExited(process, code, signal);
+            if (spawnError) {
+                void settle(() => { throw spawnError; });
+                return;
+            }
             if (typeof code === 'number') {
                 settle(async () => {
                     if (code !== 0) {
@@ -298,7 +494,7 @@ function runLaunchSpec(spec) {
                             stderrDiagnostics,
                         });
                     }
-                    resolve(code);
+                    return code;
                 });
                 return;
             }
@@ -311,7 +507,7 @@ function runLaunchSpec(spec) {
                         signal,
                         stderrDiagnostics,
                     });
-                    resolve(1);
+                    return 1;
                 });
                 return;
             }
@@ -323,14 +519,37 @@ function runLaunchSpec(spec) {
                     signal: null,
                     stderrDiagnostics,
                 });
-                resolve(1);
+                return 1;
             });
         });
     });
 }
 
 async function runLaunchSpecFile(specPath) {
-    return await runLaunchSpec(await readLaunchSpecFile(specPath));
+    // Install before reading the launch spec, so controller loss during startup cannot
+    // accidentally launch an unowned provider. No channel means the existing detached mode.
+    const lifetime = require.main === module && typeof process.send === 'function' ? new AbortController() : null;
+    const onControllerClosed = () => lifetime.abort();
+    if (lifetime) {
+        process.once('disconnect', onControllerClosed);
+        if (!process.connected) lifetime.abort();
+    }
+    let retainedNativeLifetime = null;
+    try {
+        return await runLaunchSpec(await readLaunchSpecFile(specPath), lifetime?.signal, {
+            onNativeLifetimeRetained: (nativeLifetime) => { retainedNativeLifetime = nativeLifetime; },
+        });
+    } catch (error) {
+        // A reported post-spawn operation error leaves a live native child. Keep the
+        // controller channel, its loss detection and this process until that child exits.
+        await retainedNativeLifetime;
+        throw error;
+    } finally {
+        if (lifetime) {
+            process.off('disconnect', onControllerClosed);
+            if (process.connected) process.disconnect();
+        }
+    }
 }
 
 async function main(argv) {

@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { RpcHandlerManager } from './RpcHandlerManager';
+import { logger } from '@/ui/logger';
 import { RPC_ERROR_CODES, RPC_ERROR_MESSAGES } from '@happier-dev/protocol/rpc';
+import { PublicRpcHandlerError, RpcError, isSocketRpcTargetFailureV1 } from '@happier-dev/protocol/rpcErrors';
 import { decodeBase64, encodeBase64, encrypt, decrypt } from '@/api/encryption';
 import { SOCKET_RPC_EVENTS } from '@happier-dev/protocol/socketRpc';
 import type { Socket } from 'socket.io-client';
@@ -200,6 +202,37 @@ describe('RpcHandlerManager.invokeLocal', () => {
   });
 });
 
+describe('RpcHandlerManager.handleRequest error responses', () => {
+  it.each(['plain', 'e2ee'] as const)('preserves only the public typed error fields over %s transport', async (encryptionMode) => {
+    const encryptionKey = new Uint8Array(32).fill(7);
+    const rpc = new RpcHandlerManager({
+      scopePrefix: 'machine-1', encryptionKey, encryptionVariant: 'dataKey', encryptionMode, logger: () => {},
+    });
+    const request = { method: 'machine-1:handoff', params: encryptionMode === 'plain'
+      ? {} : encodeBase64(encrypt(encryptionKey, 'dataKey', {})) };
+    const readResponse = async () => {
+      const response: unknown = await rpc.handleRequest(request);
+      if (encryptionMode === 'plain') return response;
+      expect(typeof response).toBe('string');
+      return decrypt(encryptionKey, 'dataKey', decodeBase64(response as string));
+    };
+    rpc.registerHandler('handoff', async () => {
+      throw Object.assign(new RpcError('Authentication is required', 'not_authenticated'), {
+        privateCredential: 'must-not-cross-transport', cause: new Error('private cause'),
+      });
+    });
+    expect(await readResponse()).toEqual({ error: 'Authentication is required', errorCode: 'not_authenticated' });
+
+    rpc.registerHandler('handoff', async () => {
+      throw Object.assign(new Error('Untyped handler failure'), { code: 'PRIVATE_OS_CODE' });
+    });
+    expect(await readResponse()).toEqual({ error: 'Untyped handler failure' });
+
+    rpc.registerHandler('handoff', async () => { throw 'untyped non-Error failure'; });
+    expect(await readResponse()).toEqual({ error: 'Unknown error' });
+  });
+});
+
 describe('RpcHandlerManager.handleRequest (plaintext)', () => {
   it('passes plaintext params through and returns plaintext results', async () => {
     const rpc = new RpcHandlerManager({
@@ -230,9 +263,101 @@ describe('RpcHandlerManager.handleRequest (plaintext)', () => {
     const res = await rpc.handleRequest({ method: 'sess_1:missing.method', params: {} });
     expect(res).toEqual({ error: RPC_ERROR_MESSAGES.METHOD_NOT_FOUND, errorCode: RPC_ERROR_CODES.METHOD_NOT_FOUND });
   });
+
+  it('aborts the exact active handler when the relay cancels its transport request', async () => {
+    const rpc = new RpcHandlerManager({
+      scopePrefix: 'sess_1',
+      encryptionKey: new Uint8Array(32),
+      encryptionVariant: 'dataKey',
+      encryptionMode: 'plain',
+      logger: () => {},
+    });
+    let observedSignal: AbortSignal | null = null;
+    rpc.registerHandler('demo.wait', async (...args: unknown[]) => {
+      observedSignal = (args[2] as { signal?: AbortSignal } | undefined)?.signal ?? null;
+      if (!observedSignal) return { error: 'missing transport cancellation signal' };
+      return await new Promise<never>((_resolve, reject) => {
+        observedSignal!.addEventListener('abort', () => reject(observedSignal!.reason), { once: true });
+      });
+    });
+    const boundary = createSocketEventBoundary();
+    rpc.onSocketConnect(boundary.socket);
+
+    const response = rpc.handleRequest({
+      method: 'sess_1:demo.wait',
+      params: {},
+      requestId: 'target-request-1',
+    });
+    await vi.waitFor(() => expect(observedSignal).not.toBeNull());
+
+    boundary.trigger(SOCKET_RPC_EVENTS.CANCEL, { requestId: 'target-request-1' });
+
+    await expect(response).resolves.toEqual({ error: 'RPC request cancelled by caller' });
+    expect(rpc.getInFlightRequestCount()).toBe(0);
+  });
 });
 
 describe('RpcHandlerManager.handleRequest (encrypted)', () => {
+  it('projects public handler refusals through the safe encrypted failure envelope', async () => {
+    const encryptionKey = new Uint8Array(32).fill(5);
+    const privateMessage = 'Private structured answer details';
+    const rpc = new RpcHandlerManager({
+      scopePrefix: 'machine-1', encryptionKey, encryptionVariant: 'dataKey', logger: () => {},
+    });
+    rpc.registerHandler('question-answer', async () => {
+      throw new PublicRpcHandlerError('STRUCTURED_QUESTION_INVALID', privateMessage);
+    });
+
+    const response = await rpc.handleRequest({
+      method: 'machine-1:question-answer',
+      params: encodeBase64(encrypt(encryptionKey, 'dataKey', {})),
+    });
+    const failure = decrypt(encryptionKey, 'dataKey', decodeBase64(response));
+
+    expect(isSocketRpcTargetFailureV1(failure)).toBe(true);
+    expect(failure).toMatchObject({ type: 'socket-rpc-target-failure-v1', errorCode: 'STRUCTURED_QUESTION_INVALID' });
+    expect(JSON.stringify(failure)).not.toContain(privateMessage);
+  });
+
+  it.each(['legacy', 'dataKey'] as const)('records a %s key mismatch without logging key material or running the handler', async (encryptionVariant) => {
+    const encryptionKey = new Uint8Array(32).fill(3);
+    const callerKey = new Uint8Array(32).fill(7);
+    const params = { privateValue: 'must-not-be-logged' };
+    const encryptedParams = encodeBase64(encrypt(callerKey, encryptionVariant, params));
+    const infoFile = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    try {
+      const rpc = new RpcHandlerManager({
+        scopePrefix: 'machine-1',
+        encryptionKey,
+        encryptionVariant,
+        logger: () => {},
+      });
+      let handlerRan = false;
+      rpc.registerHandler('demo.method', async () => {
+        handlerRan = true;
+        return { ok: true };
+      });
+
+      const response = await rpc.handleRequest({ method: 'machine-1:demo.method', params: encryptedParams });
+
+      expect(handlerRan).toBe(false);
+      expect(decrypt(encryptionKey, encryptionVariant, decodeBase64(response))).toEqual({ error: 'Invalid RPC params' });
+      expect(infoFile).toHaveBeenCalledWith(expect.any(String), {
+        reason: 'rpc_params_decryption_failed',
+        method: 'demo.method',
+        encryptionVariant,
+      });
+      const logged = JSON.stringify(infoFile.mock.calls);
+      expect(logged).not.toContain('machine-1');
+      expect(logged).not.toContain(params.privateValue);
+      expect(logged).not.toContain(encryptedParams);
+      expect(logged).not.toContain(encodeBase64(encryptionKey));
+      expect(logged).not.toContain(encodeBase64(callerKey));
+    } finally {
+      infoFile.mockRestore();
+    }
+  });
+
   it('keeps the encrypted result opaque while exposing requested transport acknowledgement metadata', async () => {
     const encryptionKey = new Uint8Array(32).fill(3);
     const rpc = new RpcHandlerManager({

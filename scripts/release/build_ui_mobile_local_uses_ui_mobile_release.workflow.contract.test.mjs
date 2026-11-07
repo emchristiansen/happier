@@ -6,9 +6,29 @@ import YAML from 'yaml';
 
 const repoRoot = path.resolve(import.meta.dirname, '..', '..');
 
+test('iOS submission uses trusted control while retaining candidate build bytes and asynchronous recovery', () => {
+  const workflow = YAML.parse(fs.readFileSync(path.join(repoRoot, '.github/workflows/build-ui-mobile-local.yml'), 'utf8'));
+  const job = workflow.jobs.build_ios;
+  const control = job.steps.find((step) => step.with?.path === '.testflight-control');
+  assert.equal(control?.with?.ref, '${{ job.workflow_sha }}');
+  const build = job.steps.find((step) => step.run?.includes('ui-mobile-release'));
+  assert.match(build.run, /node \.testflight-control\/scripts\/pipeline\/run\.mjs/);
+  assert.equal(build.env.HAPPIER_PIPELINE_REPO_ROOT, '${{ github.workspace }}');
+  assert.match(build.run, /--testflight-distribution-mode deferred/);
+  assert.notEqual(build['continue-on-error'], true);
+  const dispatch = job.steps.find((step) => step.run?.includes('dispatch-testflight-reconciliation.mjs'));
+  assert.ok(dispatch);
+  assert.match(dispatch.if, /inputs\.action == 'build_and_submit'/);
+  assert.doesNotMatch(dispatch.if, /always\(|failure\(/);
+  assert.ok(job.steps.indexOf(dispatch) > job.steps.indexOf(build));
+  assert.equal(dispatch.env.GH_TOKEN, '${{ github.token }}');
+  assert.equal(job.permissions.actions, 'write');
+  assert.match(dispatch.run, /--source-sha "\$\(git rev-parse HEAD\)"/);
+});
+
 test('build-ui-mobile-local workflow delegates selectable cloud or local builds to ui-mobile-release pipeline command', () => {
   const src = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'build-ui-mobile-local.yml'), 'utf8');
-  assert.match(src, /node scripts\/pipeline\/run\.mjs ui-mobile-release/);
+  assert.match(src, /node \.mobile-control\/scripts\/pipeline\/run\.mjs ui-mobile-release/);
   assert.match(src, /native_build_mode:/);
   assert.match(src, /description: "EAS build runner"/);
   assert.match(src, /default: local/);
@@ -53,7 +73,9 @@ test('build-ui-mobile-local exposes immutable APK retry recovery as a workflow i
 test('build-ui-mobile-local passes approved release notes and projects exact retry-candidate notes', () => {
   const src = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'build-ui-mobile-local.yml'), 'utf8');
   assert.match(src, /release_message:/);
-  assert.match(src, /--release-message\s+"\$\{\{\s*inputs\.release_message\s*\}\}"/);
+  assert.match(src, /RELEASE_MESSAGE: \$\{\{\s*inputs\.release_message\s*\}\}/);
+  assert.match(src, /--release-message(?:=|\s+)"\$RELEASE_MESSAGE"/);
+  assert.doesNotMatch(src, /--release-message(?:=|\s+)"\$\{\{/);
   assert.match(src, /Project approved release notes from exact immutable candidate/);
   assert.match(src, /release-notes\.md/);
   assert.match(src, /ref: \$\{\{ steps\.source\.outputs\.authorized_sha \}\}[\s\S]*?path: candidate/);
@@ -96,8 +118,19 @@ test('APK build stays on candidate bytes while trusted workflow control owns sig
   assert.match(publishStep?.run ?? '', /scripts\/pipeline\/expo\/publish-apk-release\.mjs/);
   assert.match(publishStep?.run ?? '', /--version "\$APP_VERSION"/);
   assert.match(publishStep?.run ?? '', /--target-sha "\$AUTHORIZED_SHA"/);
-  assert.match(publishStep?.run ?? '', /--release-message "\$RELEASE_MESSAGE"/);
+  assert.match(publishStep?.run ?? '', /--release-message(?:=|\s+)"\$RELEASE_MESSAGE"/);
 
-  const publishSource = JSON.stringify(publish);
-  assert.doesNotMatch(publishSource, /install-yarn-dependencies|enable-corepack-yarn/);
+  const install = publish.steps.find((step) => step.uses === './.github/actions/install-yarn-dependencies');
+  assert.equal(install?.env?.HAPPIER_INSTALL_SCOPE, 'release-runtime');
+  assert.ok(publish.steps.find((step) => step.uses === './.github/actions/enable-corepack-yarn'));
+});
+
+test('immutable APK recovery installs the release verifier runtime before promotion', () => {
+  const workflow = YAML.parse(fs.readFileSync(path.join(repoRoot, '.github/workflows/build-ui-mobile-local.yml'), 'utf8'));
+  const publish = workflow.jobs.promote_existing_apk;
+  const install = publish.steps.find((step) => step.uses === './.github/actions/install-yarn-dependencies');
+  assert.equal(install?.env?.HAPPIER_INSTALL_SCOPE, 'release-runtime');
+  assert.ok(publish.steps.find((step) => step.uses === './.github/actions/enable-corepack-yarn'));
+  assert.ok(publish.steps.findIndex((step) => step.uses === './.github/actions/install-yarn-dependencies')
+    < publish.steps.findIndex((step) => step.name === 'Recover rolling APK projection from immutable bytes'));
 });

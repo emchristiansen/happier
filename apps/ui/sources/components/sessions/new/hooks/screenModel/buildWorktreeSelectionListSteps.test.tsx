@@ -1033,6 +1033,52 @@ describe('buildWorktreeSelectionListSteps', () => {
         expect(remoteSection.showSkeletonsOnFirstLoad).toBe(true);
     });
 
+    it('puts the main-worktree branch first, then the current branch, while preserving the remaining order', async () => {
+        const { buildWorktreeSelectionListSteps } = await import('./buildWorktreeSelectionListSteps');
+        const repoScmBranchServiceModule = await import('@/scm/repository/repoScmBranchService');
+        (repoScmBranchServiceModule.repoScmBranchService.fetchBranchesForMachinePath as ReturnType<typeof vi.fn>)
+            .mockResolvedValue([
+                { name: 'codex/a', type: 'local', isCurrent: false, upstream: null },
+                { name: 'codex/b', type: 'local', isCurrent: false, upstream: null },
+                { name: 'dev', type: 'local', isCurrent: false, upstream: 'origin/dev' },
+                { name: 'scratch', type: 'local', isCurrent: true, upstream: null },
+                { name: 'release', type: 'local', isCurrent: false, upstream: null },
+            ]);
+
+        const rootStep = buildWorktreeSelectionListSteps({
+            snapshot: makeSnapshot({
+                worktrees: [
+                    { path: '/repo', branch: 'dev', isCurrent: false, isMain: true },
+                    { path: '/tmp/scratch', branch: 'scratch', isCurrent: true, isMain: false },
+                ],
+            }),
+            currentDirPath: '/repo',
+            rowIconColor: TEST_ROW_ICON_COLOR,
+            machineId: 'machine-1',
+            machinePath: '/repo',
+            nowMs: 1_700_000_000_000,
+            onSelectCurrentDir: vi.fn(),
+            onSelectExistingWorktree: vi.fn(),
+            worktreeNameSuggestion: WORKTREE_NAME_SUGGESTION,
+            onCreateWorktreeWithName: vi.fn(),
+            onReuseExistingWorktreeForBranch: vi.fn(),
+        });
+
+        const localSection = requireDynamicSection(
+            requireCreateWorktreeStep(rootStep),
+            'worktree:branches:local',
+        );
+        const result = await localSection.resolve('', new AbortController().signal);
+
+        expect(result.options.map((option) => option.label)).toEqual([
+            'dev',
+            'scratch',
+            'codex/a',
+            'codex/b',
+            'release',
+        ]);
+    });
+
     // ---- RV-10 / F5: origin fallback when snapshot has no remotes listed ----
 
     it("RV-10/F5: defaults to 'origin' when snapshot has empty remotes", async () => {

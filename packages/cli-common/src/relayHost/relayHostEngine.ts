@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawnBackgroundSync } from '../process/index.js';
 import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
@@ -14,6 +14,7 @@ import {
   buildReadWindowsScheduledTaskStatusPowerShellCommand,
   buildServiceDefinition,
   parseWindowsScheduledTaskStatusPowerShellJson,
+  parsePowerShellQuotedString,
   planServiceAction,
   resolveServiceBackend,
   type ServiceBackend,
@@ -539,10 +540,8 @@ function parseLaunchdPlistWorkingDirectory(plistText: string): string | null {
 }
 
 function parseWindowsWrapperWorkingDirectory(wrapperText: string): string | null {
-  const match = String(wrapperText ?? '').match(/Set-Location\s+-LiteralPath\s+"((?:`.|[^"])*)"/iu);
-  const raw = match?.[1]?.trim();
-  if (!raw) return null;
-  return raw.replace(/`(["`])/gu, '$1') || null;
+  const match = String(wrapperText ?? '').match(/Set-Location\s+-LiteralPath\s+(.+)/iu);
+  return match ? parsePowerShellQuotedString(match[1])?.trim() || null : null;
 }
 
 function parseServiceDefinitionWorkingDirectory(params: Readonly<{
@@ -772,7 +771,7 @@ export function createRelayHostEngine(deps: RelayHostEngineDeps): RelayHostEngin
   const now = deps.now ?? (() => Date.now());
 
   const runLocalText = (cmd: string, args: readonly string[]) => {
-    const res = spawnSync(cmd, [...args], {
+    const res = spawnBackgroundSync(cmd, args, {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       env: buildServiceCommandEnv({ cmd, args, env: process.env }),

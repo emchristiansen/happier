@@ -4,6 +4,7 @@ import { View } from 'react-native';
 import { useUnistyles } from 'react-native-unistyles';
 
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+import { useSessionCockpitBottomChromeHeight } from '@/components/workspaceCockpit/session/SessionCockpitChromeRegistry';
 import { SessionInvalidLinkFallback } from '@/components/sessions/shell/SessionInvalidLinkFallback';
 import { useAppPaneScope } from '@/components/appShell/panes/hooks/useAppPaneScope';
 import { createSessionTranscriptDetailsTab } from '@/components/sessions/panes/details/sessionDetailsTabBuilders';
@@ -38,6 +39,7 @@ function readParam(value: string | string[] | undefined): string {
 
 export default function SessionAgentTranscriptScreen() {
     const { theme } = useUnistyles();
+    const bottomChromeHeight = useSessionCockpitBottomChromeHeight();
     const router = useRouter();
     const params = useLocalSearchParams<{ id: string; serverId?: string; sidechainId?: string; title?: string }>();
     const routeScope = useSessionRouteServerScope(params as Record<string, unknown>);
@@ -89,7 +91,7 @@ export default function SessionAgentTranscriptScreen() {
     return (
         <View
             testID="session-agent-transcript-screen"
-            style={{ flex: 1, backgroundColor: theme.colors.background?.canvas ?? theme.colors.surface.base }}
+            style={{ flex: 1, paddingBottom: bottomChromeHeight, backgroundColor: theme.colors.background?.canvas ?? theme.colors.surface.base }}
         >
             <Stack.Screen options={screenOptions} />
             {!sessionId || !sidechainId || sessionMissingAfterHydration ? (

@@ -1,7 +1,7 @@
 import { io, type Socket } from 'socket.io-client';
 
 import type { ManagedConnectionTransport } from '@happier-dev/connection-supervisor';
-import { buildMachineScopedSocketAuth } from '@happier-dev/protocol';
+import { buildMachineScopedSocketAuth, ConnectedServiceIdSchema, CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD } from '@happier-dev/protocol';
 import type { MachineInstallationProofV1 } from '@happier-dev/protocol';
 
 import type { DaemonToServerEvents, ServerToDaemonEvents } from '@/api/machine/socketTypes';
@@ -31,6 +31,7 @@ export function createMachineSocketTransport(params: Readonly<{
   const socket = io(params.serverUrl, {
     ...(params.transports ? { transports: params.transports } : null),
     auth: {
+      [CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD]: ConnectedServiceIdSchema.options,
       ...buildMachineScopedSocketAuth(params),
     },
     path: '/v1/updates',

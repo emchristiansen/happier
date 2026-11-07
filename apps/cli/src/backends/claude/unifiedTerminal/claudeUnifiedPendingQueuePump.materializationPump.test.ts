@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { Session } from '../session';
+import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
+import type { SessionClientPort } from '@/api/session/sessionClientPort';
+import type { EnhancedMode } from '../loop';
+import { Session } from '../session';
 
 const mocks = vi.hoisted(() => ({
   runClaudeUnifiedTerminalSession: vi.fn(),
@@ -14,12 +17,15 @@ import { createSessionProviderInputConsumer } from '@/agent/runtime/sessionInput
 import { claudeUnifiedTerminalLauncher } from './claudeUnifiedTerminalLauncher';
 import { createClaudeUnifiedPendingQueuePump } from './createClaudeUnifiedPendingQueuePump';
 
+const createdSessions: Session[] = [];
+
 function createSession(): Session {
-  return {
+  const fixture = {
     path: '/workspace/project',
     client: {
       waitForProviderInputAdmission: async (signal: AbortSignal) => !signal.aborted,
       sessionId: 'happy-session-id',
+      keepAlive: vi.fn(),
       sendSessionEvent: vi.fn(),
       getMetadataSnapshot: vi.fn(() => ({})),
       recordClaudeJsonlMessageConsumed: vi.fn(),
@@ -50,7 +56,6 @@ function createSession(): Session {
     },
     pushSender: null,
     accountSettings: null,
-    sessionId: 'claude-session-id',
     lastPermissionMode: 'default',
     lastPermissionModeUpdatedAt: 0,
     adoptLastPermissionModeFromMetadata: vi.fn(() => true),
@@ -72,16 +77,29 @@ function createSession(): Session {
     getOrCreateHappierMcpBridge: vi.fn(async () => ({ mcpConfigJson: '{}' })),
     addClaudeSessionHookCallback: vi.fn(),
     removeClaudeSessionHookCallback: vi.fn(),
-    onSessionFound: vi.fn(),
     onThinkingChange: vi.fn(),
     setThinkingWithoutTaskLifecycle: vi.fn(),
     noteUserAbortRequested: vi.fn(),
     abortCurrentTaskTurn: vi.fn(),
-  } as unknown as Session;
+  };
+  const session = new Session({
+    client: fixture.client as unknown as SessionClientPort,
+    path: fixture.path,
+    logPath: '/tmp/claude-unified-materialization-pump.log',
+    sessionId: 'claude-session-id',
+    messageQueue: new MessageQueue2<EnhancedMode>(() => 'mode'),
+    onModeChange: () => {},
+    hookSettingsPath: '/tmp/hooks.json',
+  });
+  // Keep the pump's existing runtime fixture while Session owns identity and resumability.
+  Object.assign(session, fixture);
+  createdSessions.push(session);
+  return session;
 }
 
 describe('Claude unified pending queue materialization pump', () => {
   afterEach(() => {
+    for (const session of createdSessions.splice(0)) session.cleanup();
     vi.useRealTimers();
     mocks.runClaudeUnifiedTerminalSession.mockReset();
   });

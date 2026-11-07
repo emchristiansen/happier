@@ -187,7 +187,7 @@ test('production immutable APK publication disables generated notes when approve
     { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 },
   );
 
-  assert.match(out, /--release-message\s+"Approved exact candidate notes"/);
+  assert.ok(out.includes(JSON.stringify('--release-message=Approved exact candidate notes')));
   assert.match(out, /--generate-notes\s+false/);
   assert.doesNotMatch(out, /--tag ui-mobile-v[^\n]*--generate-notes\s+true/);
 });
@@ -220,7 +220,7 @@ test('trusted publication binds a built APK to its explicit candidate version in
   assert.match(out, /--source-tag\s+ui-mobile-v9\.8\.7\b/);
 });
 
-test('preview APK publication retains the build filename and the website compatibility alias', async () => {
+test('preview APK publication retains the canonical channel filename', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'happier-apk-preview-alias-'));
   const apkPath = join(dir, 'happier-preview-android.apk');
   writeFileSync(apkPath, 'fake-apk');
@@ -237,7 +237,6 @@ test('preview APK publication retains the build filename and the website compati
   );
 
   assert.match(out, /happier-preview-android\.apk/);
-  assert.match(out, /happier-preview\.apk/);
 });
 
 test('APK publication accepts release notes from a file without multiline GitHub outputs', async () => {
@@ -259,5 +258,5 @@ test('APK publication accepts release notes from a file without multiline GitHub
     { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 },
   );
 
-  assert.match(out, /--release-message\s+"First line\\n\\n- second line"/);
+  assert.ok(out.includes(JSON.stringify('--release-message=First line\n\n- second line')));
 });

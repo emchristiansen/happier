@@ -3,6 +3,7 @@ import { serverFetch } from '@/sync/http/client';
 import { HappyError } from '@/utils/errors/errors';
 import { backoff } from '@/utils/timing/time';
 import { createConnectedServiceApiError } from './connectedServiceApiError';
+import { assertConnectedServiceOperationSupported } from './connectedServiceOperationSupport';
 import { z } from 'zod';
 
 import {
@@ -19,6 +20,7 @@ const ConnectedServiceCredentialMetadataResponseSchema = z.object({
   kind: z.enum(['oauth', 'token']),
   providerEmail: z.string().nullable().optional(),
   providerAccountId: z.string().nullable().optional(),
+  providerOrganizationId: z.string().nullable().optional(),
   expiresAt: z.number().finite().nullable().optional(),
 });
 
@@ -31,6 +33,7 @@ type ConnectedServiceCredentialMetadataInput = Readonly<{
   kind: 'oauth' | 'token';
   providerEmail?: string | null;
   providerAccountId?: string | null;
+    providerOrganizationId?: string | null;
   expiresAt?: number | null;
 }>;
 
@@ -51,6 +54,7 @@ export async function registerConnectedServiceCredentialSealed(
     expectedCredentialRevision: ConnectedServiceCredentialRevisionV1 | null;
   }>,
 ): Promise<ConnectedServiceCredentialRevisionBoundaryV1> {
+    await assertConnectedServiceOperationSupported(params.serviceId);
     const response = await serverFetch(
       `/v2/connect/${encodeURIComponent(params.serviceId)}/profiles/${encodeURIComponent(params.profileId)}/credential`,
       {
@@ -196,45 +200,45 @@ export async function exchangeConnectedServiceOauthViaProxy(
     state?: string | null;
   }>,
 ): Promise<Readonly<{ bundle: string }>> {
-  return await backoff(async () => {
-    const response = await serverFetch(
-      `/v2/connect/${encodeURIComponent(params.serviceId)}/oauth/exchange`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${credentials.token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          publicKey: params.publicKey,
-          code: params.code,
-          verifier: params.verifier,
-          redirectUri: params.redirectUri,
-          ...(params.state ? { state: params.state } : {}),
-        }),
+  await assertConnectedServiceOperationSupported(params.serviceId);
+  // A one-use code may already have been consumed after an inconclusive failure.
+  const response = await serverFetch(
+    `/v2/connect/${encodeURIComponent(params.serviceId)}/oauth/exchange`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${credentials.token}`,
+        'Content-Type': 'application/json',
       },
-      { includeAuth: false },
-    );
+      body: JSON.stringify({
+        publicKey: params.publicKey,
+        code: params.code,
+        verifier: params.verifier,
+        redirectUri: params.redirectUri,
+        ...(params.state ? { state: params.state } : {}),
+      }),
+    },
+    { includeAuth: false, retry: 'none' },
+  );
 
-    if (!response.ok) {
-      if (response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429) {
-        const json = await response.json().catch(() => null);
-        throw createConnectedServiceApiError(json, {
-          status: response.status,
-          fallbackCode: 'connect_oauth_exchange_failed',
-        });
-      }
-      throw new Error(`Failed to exchange ${params.serviceId}: ${response.status}`);
+  if (!response.ok) {
+    if (response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429) {
+      const json = await response.json().catch(() => null);
+      throw createConnectedServiceApiError(json, {
+        status: response.status,
+        fallbackCode: 'connect_oauth_exchange_failed',
+      });
     }
+    throw new Error(`Failed to exchange ${params.serviceId}: ${response.status}`);
+  }
 
-    const json = await response.json().catch(() => null);
-    const bundle = json && typeof (json as any).bundle === 'string' ? String((json as any).bundle) : '';
-    if (!bundle) {
-      throw new HappyError('invalid response', false, { status: response.status, kind: 'server' });
-    }
+  const json = await response.json().catch(() => null);
+  const bundle = json && typeof (json as any).bundle === 'string' ? String((json as any).bundle) : '';
+  if (!bundle) {
+    throw new HappyError('invalid response', false, { status: response.status, kind: 'server' });
+  }
 
-    return { bundle };
-  });
+  return { bundle };
 }
 
 type OpenAiCodexDeviceAuthStartCommon = Readonly<{

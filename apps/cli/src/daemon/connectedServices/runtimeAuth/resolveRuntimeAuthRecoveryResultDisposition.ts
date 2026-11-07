@@ -1,4 +1,5 @@
 import { isTerminalProviderOutcomeProof } from '../recovery/providerOutcomeProof';
+import { DEFAULT_USAGE_LIMIT_RECOVERY_BACKOFF_MS } from '@/session/usageLimitRecoveryControls/createBackoffSessionUsageLimitRecoveryControlAdapter';
 import {
   readRuntimeAuthRecoverySwitchResult,
   resolveRuntimeAuthRecoveryProof,
@@ -35,7 +36,7 @@ export type RuntimeAuthRecoveryResultDisposition =
   | Readonly<{
       kind: 'durable_wait';
       nextRetryAtMs: number;
-      reason: 'no_eligible_member' | 'switch_limit_reached' | 'awaiting_limit_reset';
+      reason: 'no_eligible_member' | 'quota_proof_unavailable' | 'switch_limit_reached' | 'awaiting_limit_reset';
     }>
   | Readonly<{
       kind: 'terminal';
@@ -75,13 +76,18 @@ function resolveActionRequiredWaitCandidateMs(input: Readonly<{
   if (!actionReason || !WAITABLE_FAILURE_REASONS.has(actionReason)) return null;
   const futureReset = resolveEarliestFutureWaitCandidateMs([input.classificationResetsAtMs], input.nowMs);
   if (futureReset !== null) return futureReset;
-  // An expired reset is permission to try the provider again, not evidence that
-  // the account is still limited. Fresh failures retain a backoff-separated wait.
-  return action?.groupId === null
-    && (actionReason === 'usage_limit' || actionReason === 'rate_limit')
-    && readNonNegativeNumber(input.classificationResetsAtMs) !== null
-    ? input.nowMs + input.retryBackoffMs
-    : null;
+  if (readNonNegativeNumber(input.classificationResetsAtMs) !== null) {
+    // An expired reset is permission to try the provider again, not evidence that
+    // the account is still limited. Fresh failures retain a backoff-separated wait.
+    // A grouped action-required result keeps its own disposition.
+    if (action?.groupId !== null) return null;
+    if (actionReason === 'usage_limit') {
+      return input.nowMs + Math.max(input.retryBackoffMs, DEFAULT_USAGE_LIMIT_RECOVERY_BACKOFF_MS);
+    }
+    return actionReason === 'rate_limit' ? input.nowMs + input.retryBackoffMs : null;
+  }
+  // Daemon-owned usage-limit waits without a reset time wake on the shared usage-limit backoff.
+  return actionReason === 'usage_limit' ? input.nowMs + DEFAULT_USAGE_LIMIT_RECOVERY_BACKOFF_MS : null;
 }
 
 /**
@@ -92,6 +98,7 @@ function resolveActionRequiredWaitCandidateMs(input: Readonly<{
 export function resolveRuntimeAuthRecoveryResultDisposition(input: Readonly<{
   result: unknown;
   classificationResetsAtMs: number | null;
+  classificationProfileId?: string | null;
   classificationFailureKind?: string | null;
   additionalWaitCandidatesMs?: ReadonlyArray<number | null>;
   unknownNoEligibleMemberBackoffMs?: number | null;
@@ -100,6 +107,17 @@ export function resolveRuntimeAuthRecoveryResultDisposition(input: Readonly<{
   const switchResult = readRuntimeAuthRecoverySwitchResult(input.result);
   if (!switchResult) return null;
   const additionalCandidates = input.additionalWaitCandidatesMs ?? [];
+  const unknownQuotaRetryAtMs = input.nowMs + Math.max(
+    GROUP_EXHAUSTED_WAIT_FLOOR_MS,
+    readNonNegativeNumber(input.unknownNoEligibleMemberBackoffMs) ?? 0,
+  );
+
+  if (switchResult.status === 'quota_proof_unavailable') {
+    return {
+      kind: 'durable_wait', reason: 'quota_proof_unavailable',
+      nextRetryAtMs: Math.max(unknownQuotaRetryAtMs, readNonNegativeNumber(switchResult.retryAtMs) ?? 0),
+    };
+  }
 
   if (switchResult.status === 'no_eligible_member' && switchResult.groupExhausted === true) {
     const transientAlternative = Array.isArray(switchResult.excluded)
@@ -110,22 +128,19 @@ export function resolveRuntimeAuthRecoveryResultDisposition(input: Readonly<{
       ...readExcludedMemberRetryAtMsCandidates(switchResult),
       // A retryable alternative must not inherit the exhausted member's weekly reset.
       // Reuse the scheduler's bounded backoff, not a second retry owner or timer.
-      transientAlternative ? input.nowMs + Math.max(
-        GROUP_EXHAUSTED_WAIT_FLOOR_MS,
-        readNonNegativeNumber(input.unknownNoEligibleMemberBackoffMs) ?? 0,
-      ) : null,
+      transientAlternative ? unknownQuotaRetryAtMs : null,
     ], input.nowMs);
+    const classificationResetApplies = !('activeProfileId' in switchResult)
+      || (readString(switchResult.activeProfileId) !== null
+        && readString(switchResult.activeProfileId) === readString(input.classificationProfileId));
     const fallbackCandidate = resolveEarliestFutureWaitCandidateMs([
-      input.classificationResetsAtMs,
-      ...additionalCandidates,
+      // Current-member observation must not borrow another member's reset or prior wait.
+      ...(classificationResetApplies ? [input.classificationResetsAtMs, ...additionalCandidates] : []),
     ], input.nowMs);
     return {
       kind: 'durable_wait',
       reason: 'no_eligible_member',
-      nextRetryAtMs: switchEvidenceCandidate ?? fallbackCandidate ?? input.nowMs + Math.max(
-        GROUP_EXHAUSTED_WAIT_FLOOR_MS,
-        readNonNegativeNumber(input.unknownNoEligibleMemberBackoffMs) ?? 0,
-      ),
+      nextRetryAtMs: switchEvidenceCandidate ?? fallbackCandidate ?? unknownQuotaRetryAtMs,
     };
   }
 
@@ -162,11 +177,15 @@ export function resolveRuntimeAuthRecoveryResultDisposition(input: Readonly<{
     const resetAtMs = resolveEarliestFutureWaitCandidateMs([
       input.classificationResetsAtMs,
     ], input.nowMs);
-    if (resetAtMs !== null) {
+    const nextRetryAtMs = resetAtMs
+      ?? (input.classificationFailureKind === 'usage_limit'
+        ? input.nowMs + DEFAULT_USAGE_LIMIT_RECOVERY_BACKOFF_MS
+        : null);
+    if (nextRetryAtMs !== null) {
       return {
         kind: 'durable_wait',
         reason: 'awaiting_limit_reset',
-        nextRetryAtMs: resetAtMs,
+        nextRetryAtMs,
       };
     }
   }

@@ -46,7 +46,7 @@ export const piDirectSessionProviderOps: DirectSessionProviderOps = {
 
   readAfterTranscript: async ({ source, remoteSessionId, cursor, maxBytes, maxItems }) => {
     const res = await readAfterPiTranscript({ source, remoteSessionId, cursor, maxBytes, maxItems, env: process.env });
-    return { items: res.items, nextCursor: res.nextCursor ?? null, truncated: res.truncated === true };
+    return { ...res, nextCursor: res.nextCursor ?? null, truncated: res.truncated === true };
   },
 
   acquireFollowLease: async ({ source, remoteSessionId }) =>

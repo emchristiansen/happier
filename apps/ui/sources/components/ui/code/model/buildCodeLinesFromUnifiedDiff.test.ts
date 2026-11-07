@@ -45,14 +45,14 @@ describe('buildCodeLinesFromUnifiedDiff', () => {
         expect(hunk.sourceIndex).toBe(4);
     });
 
-    it('assigns old/new line numbers for add/remove/context lines', () => {
+    it.each([['const a = 1;', 'const a = 2;'], ['-- old heading', '++ new heading']])('assigns old/new line numbers for add/remove/context lines: %s', (oldText, newText) => {
         const diff = [
             'diff --git a/src/a.ts b/src/a.ts',
             '--- a/src/a.ts',
             '+++ b/src/a.ts',
             '@@ -1,2 +1,2 @@',
-            '-const a = 1;',
-            '+const a = 2;',
+            `-${oldText}`,
+            `+${newText}`,
             ' const b = 3;',
         ].join('\n');
 
@@ -64,7 +64,7 @@ describe('buildCodeLinesFromUnifiedDiff', () => {
             oldLine: 1,
             newLine: null,
             renderPrefixText: '-',
-            renderCodeText: 'const a = 1;',
+            renderCodeText: oldText,
         });
 
         expect(body[1]).toMatchObject({
@@ -72,7 +72,7 @@ describe('buildCodeLinesFromUnifiedDiff', () => {
             oldLine: null,
             newLine: 1,
             renderPrefixText: '+',
-            renderCodeText: 'const a = 2;',
+            renderCodeText: newText,
         });
 
         expect(body[2]).toMatchObject({

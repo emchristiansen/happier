@@ -23,12 +23,6 @@ vi.mock('@expo/vector-icons', () => ({
     Octicons: 'Octicons',
 }));
 
-vi.mock('@/constants/Typography', () => ({
-    Typography: {
-        default: () => ({}),
-    },
-}));
-
 vi.mock('@/components/ui/text/Text', () => ({
     Text: (props: any) => React.createElement('Text', props, props.children),
     TextInput: 'TextInput',
@@ -165,13 +159,13 @@ function createWaitingStatus(): SessionStatus {
 function createMetadataPendingRowModel(id: string): SessionListRowModel {
     const session = createMetadataPendingSession(id);
     return {
+        appearanceColor: null,
         rowKey: `server_a:${id}`,
         sessionId: id,
         serverId: 'server_a',
         serverName: 'Server A',
         treeRowId: `session:server_a:${id}`,
         testID: `session-list-item-${id}`,
-        dataIndex: 0,
         session,
         status: createWaitingStatus(),
         statusSignature: 'waiting|0|0||0|',
@@ -212,6 +206,7 @@ function createMetadataPendingRowModel(id: string): SessionListRowModel {
         isSelected: false,
         isPinned: false,
         isAttentionStanding: false,
+        reminder: null,
         attentionStandingEnabled: false,
         isArchived: false,
         isActive: false,

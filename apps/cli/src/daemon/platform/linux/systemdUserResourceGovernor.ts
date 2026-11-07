@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { getPriority } from 'node:os';
 
 import { sessionLaunchScopeUnitName, type SessionLaunchId } from './sessionLaunchId';
 
@@ -222,9 +223,11 @@ export function buildSystemdUserScopedLaunchSpec(params: Readonly<{
   launchSpec: SystemdUserScopedLaunchSpec;
   launchId: SessionLaunchId;
 }>): SystemdUserScopedLaunchSpec {
+  // Raising an inherited nice value requires privileges that agent runners may not have.
+  const niceValue = Math.max(10, getPriority());
   return buildSystemdUserScopedLaunchSpecForSlice(params, HAPPIER_JOBS_SLICE_NAME, [
     `--unit=${sessionLaunchScopeUnitName(params.launchId)}`,
-    '--nice=10',
+    `--nice=${niceValue}`,
   ]);
 }
 

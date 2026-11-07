@@ -7,11 +7,12 @@ import { bootstrapAccountSettingsContext } from '@/settings/accountSettings/boot
 import { readCredentials } from '@/persistence';
 import { readProfilesFromAccountSettings } from '@/settings/profiles/readProfilesFromAccountSettings';
 import { mapProfileToListItem, type ProfilesListItem } from '@/settings/profiles/profileListProjection';
+import { ACCENT_HEX } from '@happier-dev/cli-common/output';
 
 function printProfilesHuman(profiles: ReadonlyArray<ProfilesListItem>, authenticated: boolean): void {
   console.log(chalk.bold(`Backend profiles (${profiles.length})`));
   for (const profile of profiles) {
-    const suffix = profile.isBuiltIn ? chalk.gray('built-in') : chalk.cyan('custom');
+    const suffix = profile.isBuiltIn ? chalk.gray('built-in') : chalk.hex(ACCENT_HEX)('custom');
     console.log(`- ${chalk.bold(profile.id)} (${profile.name}) ${chalk.gray(`[${suffix}]`)}`);
     if (profile.description) console.log(`  ${profile.description}`);
     if (profile.supportedAgentIds.length > 0) {

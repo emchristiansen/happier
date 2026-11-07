@@ -134,6 +134,28 @@ describe('Item disclosure a11y pass-through', () => {
         expect(row?.props['aria-expanded']).toBeUndefined();
     });
 
+    it('forwards native custom actions to the same Pressable that owns row activation', async () => {
+        platformRef.os = 'ios';
+        const { Item } = await import('./Item');
+        const onPress = vi.fn();
+        const onAccessibilityAction = vi.fn();
+        const actions = [{ name: 'markRead', label: 'Mark as read' }] as const;
+        const screen = await renderScreen(
+            <Item
+                testID="action-row"
+                title="Unread session"
+                onPress={onPress}
+                accessibilityActions={actions}
+                onAccessibilityAction={onAccessibilityAction}
+            />,
+        );
+
+        const row = screen.findByTestId('action-row');
+        expect(row?.props.onPress).toEqual(expect.any(Function));
+        expect(row?.props.accessibilityActions).toBe(actions);
+        expect(row?.props.onAccessibilityAction).toBe(onAccessibilityAction);
+    });
+
     it('emits no aria-expanded attribute when accessibilityState is unset (back-compat)', async () => {
         platformRef.os = 'web';
         const { Item } = await import('./Item');

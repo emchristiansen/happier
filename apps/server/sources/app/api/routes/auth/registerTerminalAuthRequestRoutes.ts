@@ -5,7 +5,7 @@ import { db } from "@/storage/db";
 import { auth } from "@/app/auth/auth";
 import { debug } from "@/utils/logging/log";
 import { type Fastify } from "../../types";
-import { type TerminalAuthRequestPolicy } from "./terminalAuthRequestPolicy";
+import { terminalAuthRequestExpiresAt, type TerminalAuthRequestPolicy } from "./terminalAuthRequestPolicy";
 import { getOrCreateServerIdentityId } from "@/app/serverIdentity/serverIdentity";
 
 const BASE64_URL_REGEX = /^[A-Za-z0-9_-]+$/;
@@ -45,11 +45,12 @@ export function registerTerminalAuthRequestRoutes(
             body: z.object({
                 publicKey: z.string(),
                 supportsV2: z.boolean().nullish(),
+                supportsTokenOnly: z.boolean().optional(),
                 claimSecretHash: z.string().length(43).regex(BASE64_URL_REGEX).nullish(),
             }),
             response: {
                 200: z.union([
-                    z.object({ state: z.literal('requested') }).strict(),
+                    z.object({ state: z.literal('requested'), expiresAt: z.number().int() }).strict(),
                     z.object({
                         state: z.literal('authorized'),
                         token: z.string(),
@@ -104,6 +105,9 @@ export function registerTerminalAuthRequestRoutes(
             ? await db.terminalAuthRequest.update({
                 where: { id: existing.id },
                 data: {
+                    ...(typeof request.body.supportsTokenOnly === "boolean" && existing.supportsTokenOnly !== request.body.supportsTokenOnly
+                        ? { supportsTokenOnly: request.body.supportsTokenOnly }
+                        : {}),
                     ...(typeof request.body.supportsV2 === "boolean" && existing.supportsV2 !== request.body.supportsV2
                         ? { supportsV2: request.body.supportsV2 }
                         : {}),
@@ -113,6 +117,7 @@ export function registerTerminalAuthRequestRoutes(
                 data: {
                     publicKey: publicKeyHex,
                     supportsV2: request.body.supportsV2 ?? false,
+                    supportsTokenOnly: request.body.supportsTokenOnly ?? false,
                     ...(claimSecretHash ? { claimSecretHash } : {}),
                 },
             });
@@ -129,7 +134,7 @@ export function registerTerminalAuthRequestRoutes(
             }));
         }
 
-        return reply.send({ state: 'requested' });
+        return reply.send({ state: 'requested', expiresAt: terminalAuthRequestExpiresAt(answer.createdAt, terminalAuthPolicy) });
     });
 
     // Get auth request status
@@ -141,24 +146,25 @@ export function registerTerminalAuthRequestRoutes(
             response: {
                 200: z.object({
                     status: z.enum(['not_found', 'pending', 'authorized']),
-                    supportsV2: z.boolean()
+                    supportsV2: z.boolean(),
+                    supportsTokenOnly: z.boolean(),
                 })
             }
         }
     }, async (request, reply) => {
         const tweetnacl = (await import("tweetnacl")).default;
         if (String(request.query.publicKey).length > 512) {
-            return reply.send({ status: 'not_found', supportsV2: false });
+            return reply.send({ status: 'not_found', supportsV2: false, supportsTokenOnly: false });
         }
         let publicKey: ReturnType<typeof privacyKit.decodeBase64>;
         try {
             publicKey = privacyKit.decodeBase64(request.query.publicKey);
         } catch {
-            return reply.send({ status: 'not_found', supportsV2: false });
+            return reply.send({ status: 'not_found', supportsV2: false, supportsTokenOnly: false });
         }
         const isValid = tweetnacl.box.publicKeyLength === publicKey.length;
         if (!isValid) {
-            return reply.send({ status: 'not_found', supportsV2: false });
+            return reply.send({ status: 'not_found', supportsV2: false, supportsTokenOnly: false });
         }
 
         const publicKeyHex = privacyKit.encodeHex(publicKey);
@@ -167,19 +173,19 @@ export function registerTerminalAuthRequestRoutes(
         });
 
         if (!authRequest) {
-            return reply.send({ status: 'not_found', supportsV2: false });
+            return reply.send({ status: 'not_found', supportsV2: false, supportsTokenOnly: false });
         }
 
         if (isTerminalAuthExpired(authRequest.createdAt)) {
             await db.terminalAuthRequest.delete({ where: { id: authRequest.id } }).catch(() => {});
-            return reply.send({ status: "not_found", supportsV2: false });
+            return reply.send({ status: "not_found", supportsV2: false, supportsTokenOnly: false });
         }
 
         if (authRequest.response && authRequest.responseAccountId) {
-            return reply.send({ status: 'authorized', supportsV2: authRequest.supportsV2 });
+            return reply.send({ status: 'authorized', supportsV2: authRequest.supportsV2, supportsTokenOnly: authRequest.supportsTokenOnly });
         }
 
-        return reply.send({ status: 'pending', supportsV2: authRequest.supportsV2 });
+        return reply.send({ status: 'pending', supportsV2: authRequest.supportsV2, supportsTokenOnly: authRequest.supportsTokenOnly });
     });
 
     app.post("/v1/auth/request/claim", {

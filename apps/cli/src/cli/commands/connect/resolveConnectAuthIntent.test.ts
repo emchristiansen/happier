@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import { resolveConnectAuthIntent } from './resolveConnectAuthIntent';
+import { parseConnectArgs } from './parseConnectArgs';
 
 describe('resolveConnectAuthIntent', () => {
+  it('connects Antigravity personal OAuth separately from Gemini and rejects API keys', () => {
+    expect(resolveConnectAuthIntent({ targetId: 'agy', options: parseConnectArgs(['agy']).options }))
+      .toEqual({ kind: 'oauth', serviceId: 'antigravity' });
+    expect(() => resolveConnectAuthIntent({ targetId: 'agy', options: parseConnectArgs(['agy', '--api-key']).options }))
+      .toThrow(/provider OAuth flow/);
+  });
   it('defaults Claude to setup-token', () => {
     const res = resolveConnectAuthIntent({
       targetId: 'claude',

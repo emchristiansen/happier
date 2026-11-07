@@ -1,36 +1,61 @@
 import { createUserScopedSocket } from '@/api/session/sockets';
 import { fetchAccountMachineReplacements } from '@/api/machine/fetchAccountMachineReplacements';
-import { resolveMachineEncryptionContext } from '@/api/client/encryptionKey';
+import { MachineRpcEncryptionError, resolveMachineRpcEncryption } from '@/api/machine/resolveMachineRpcEncryption';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import type { Credentials } from '@/persistence';
 import { waitForSocketConnect } from '@/session/transport/socket/waitForSocketConnect';
 import { resolveSessionControlSocketConnectTimeoutMs } from '@/session/transport/shared/sessionTimeouts';
 import { SOCKET_RPC_EVENTS } from '@happier-dev/protocol/socketRpc';
-import { createRpcCallError, isRpcMethodNotAvailableError } from '@happier-dev/protocol/rpcErrors';
+import { isRpcMethodNotAvailableError } from '@happier-dev/protocol/rpcErrors';
 import { resolveCanonicalMachineId } from '@happier-dev/protocol';
 import type { SocketRpcAuthorizationContext } from '@happier-dev/protocol/rpc';
+import { randomUUID } from 'node:crypto';
+import {
+  createSocketRpcDisconnectGuard,
+  SocketRpcDisconnectBeforeAcknowledgementError,
+} from './socketRpcDisconnectGuard';
+import { createRpcAcknowledgementError, markRpcRequestDisposition, readRpcRequestDisposition } from './rpcRequestDisposition';
 
 /**
  * Calls exactly one account-scoped machine RPC against exactly the machine id it
  * is given. The caller owns retry policy; this boundary has no timeout redrive.
  */
-async function callExactMachineRpc(params: Readonly<{
+export async function callExactMachineRpc(params: Readonly<{
   credentials: Credentials;
   machineId: string;
   method: string;
   request: unknown;
   authorization?: SocketRpcAuthorizationContext;
-  timeoutMs?: number;
+  /** null delegates acknowledgement expiry to the relay's finite forwarding deadline. */
+  timeoutMs?: number | null;
 }>): Promise<unknown> {
   const machineId = params.machineId.trim();
   if (!machineId) throw new Error('Machine id is required');
 
   const socket = createUserScopedSocket({ token: params.credentials.token });
-  const timeoutMs = typeof params.timeoutMs === 'number' && params.timeoutMs > 0 ? params.timeoutMs : 20_000;
+  const timeoutMs = params.timeoutMs === null
+    ? null
+    : typeof params.timeoutMs === 'number' && params.timeoutMs > 0 ? params.timeoutMs : 20_000;
   const connectTimeoutMs = typeof params.timeoutMs === 'number' && params.timeoutMs > 0
-    ? timeoutMs
+    ? params.timeoutMs
     : resolveSessionControlSocketConnectTimeoutMs();
-  const machineEncryption = resolveMachineEncryptionContext(params.credentials);
+  const requestId = randomUUID();
+  let requestEmitted = false;
+  let responseTimer: ReturnType<typeof setTimeout> | null = null;
+  const cancelRequest = () => {
+    if (!requestEmitted) return;
+    try {
+      socket.emit(SOCKET_RPC_EVENTS.CANCEL, { requestId });
+    } catch {
+      // The caller outcome remains the disconnect/timeout; server-side
+      // caller-disconnect cleanup is the cancellation backstop.
+    }
+  };
+  const disconnectGuard = createSocketRpcDisconnectGuard({
+    socket: socket as unknown as import('socket.io-client').Socket,
+    createError: () => new SocketRpcDisconnectBeforeAcknowledgementError(),
+    onDisconnect: cancelRequest,
+  });
   let cleanedUp = false;
   const cleanup = () => {
     if (cleanedUp) return;
@@ -40,56 +65,74 @@ async function callExactMachineRpc(params: Readonly<{
   };
 
   try {
+    const machineEncryption = await resolveMachineRpcEncryption({ credentials: params.credentials, machineId, timeoutMs: connectTimeoutMs });
     const connectPromise = waitForSocketConnect(socket as unknown as import('socket.io-client').Socket, connectTimeoutMs);
+    const connectedOrDisconnected = Promise.race([connectPromise, disconnectGuard.disconnected]);
     socket.connect();
-    await connectPromise;
+    await connectedOrDisconnected;
+    disconnectGuard.throwIfDisconnected();
 
-    const encryptedRequest = encodeBase64(encrypt(
+    const encodedRequest = machineEncryption.encryptionVariant === 'plain' ? params.request : encodeBase64(encrypt(
       machineEncryption.encryptionKey,
       machineEncryption.encryptionVariant,
       params.request,
     ));
-    const response = await new Promise<{ ok: boolean; result?: unknown; error?: string; errorCode?: string }>((resolve, reject) => {
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout>;
-      const finish = (callback: () => void) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        callback();
-      };
-      timer = setTimeout(() => finish(() => reject(Object.assign(new Error('Machine RPC call timeout'), {
-        code: 'MACHINE_RPC_TIMEOUT',
-      }))), timeoutMs);
+    const responsePromise = new Promise<{ ok: boolean; result?: unknown; error?: string; errorCode?: string }>((resolve, reject) => {
+      if (timeoutMs !== null) {
+        responseTimer = setTimeout(() => {
+          cancelRequest();
+          reject(Object.assign(new Error('Machine RPC call timeout'), {
+            code: 'MACHINE_RPC_TIMEOUT',
+          }));
+        }, timeoutMs);
+      }
       try {
+        requestEmitted = true;
         socket.emit(
           SOCKET_RPC_EVENTS.CALL,
           {
             method: `${machineId}:${params.method}`,
-            params: encryptedRequest,
+            params: encodedRequest,
+            requestId,
+            ...(timeoutMs !== null ? { timeoutMs } : {}),
             ...(params.authorization ? { authorization: params.authorization } : {}),
           },
-          (payload: { ok: boolean; result?: unknown; error?: string; errorCode?: string }) => finish(() => resolve(payload)),
+          (payload: { ok: boolean; result?: unknown; error?: string; errorCode?: string }) => resolve(payload),
         );
       } catch (error) {
-        finish(() => reject(error));
+        reject(error);
       }
     });
+    const response = await Promise.race([responsePromise, disconnectGuard.disconnected]);
 
     if (!response.ok) {
-      throw createRpcCallError({
+      throw createRpcAcknowledgementError({
         error: response.error || 'Machine RPC call failed',
         errorCode: response.errorCode,
       });
     }
-    const encryptedResult = typeof response.result === 'string' ? response.result.trim() : '';
-    if (!encryptedResult) return null;
-    return decrypt(
-      machineEncryption.encryptionKey,
-      machineEncryption.encryptionVariant,
-      decodeBase64(encryptedResult, 'base64'),
-    );
+    if (machineEncryption.encryptionVariant === 'plain') return response.result;
+    try {
+      if (typeof response.result !== 'string' || !response.result.trim()) {
+        throw new MachineRpcEncryptionError('response_invalid');
+      }
+      const result: unknown = decrypt(
+        machineEncryption.encryptionKey,
+        machineEncryption.encryptionVariant,
+        decodeBase64(response.result, 'base64'),
+      );
+      if (result === null) throw new MachineRpcEncryptionError('response_invalid');
+      return result;
+    } catch {
+      throw new MachineRpcEncryptionError('response_invalid');
+    }
+  } catch (error) {
+    throw readRpcRequestDisposition(error) === null
+      ? markRpcRequestDisposition(error, requestEmitted ? 'outcomeUnknown' : 'notSent')
+      : error;
   } finally {
+    if (responseTimer) clearTimeout(responseTimer);
+    disconnectGuard.dispose();
     cleanup();
   }
 }
@@ -143,7 +186,8 @@ export async function callMachineRpc(params: Readonly<{
   method: string;
   request: unknown;
   authorization?: SocketRpcAuthorizationContext;
-  timeoutMs?: number;
+  /** null delegates acknowledgement expiry to the relay's finite forwarding deadline. */
+  timeoutMs?: number | null;
 }>): Promise<unknown> {
   try {
     return await callExactMachineRpc(params);

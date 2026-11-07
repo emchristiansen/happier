@@ -272,7 +272,7 @@ function resolveContainingItemElement(
  * offset comparable at all. Anything else is a different element, and the CONSTANT distance
  * between the two is spent on the reader as a phantom scroll correction: a tool group rendered
  * as per-unit items carries `transcript-anchor-tool-group-<id>` in its `…#header` item and
- * `transcript-anchor-tool-call-<id>` in its `…#tool:<id>` item, both naming the same message
+ * `transcript-anchor-tool-call-<id>` in its `msg:<id>` item, both naming the same message
  * id, so an identity rebuilt from `kind` + `messageId` alone cannot say which was measured.
  * Rebuilding the tool-CALL anchor for every `toolGroup` anchor was the measured web
  * scroll-back (11/11 captured writes carried a `#header` anchor whose stored offset equalled

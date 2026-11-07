@@ -14,6 +14,8 @@ import { renderScreen } from '@/dev/testkit';
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const capturedSelectionLists: SelectionListProps[] = [];
+const machineRpc = vi.hoisted(() => vi.fn());
+vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc', () => ({ machineRpcWithServerScope: machineRpc }));
 
 vi.mock('react-native', () => createReactNativeWebMock({
     View: createPassThroughComponent('View'),
@@ -57,6 +59,29 @@ vi.mock('@/components/ui/selectionList', async (importOriginal) => {
 });
 
 describe('NewSessionConnectedServicesSelectionContent', () => {
+    it.each([
+        { result: { ok: false, error: { code: 'unsupported-method' } }, disabled: true },
+        { result: { ok: true, result: { supportedServiceIds: [null, 'antigravity'] } }, disabled: true },
+        { result: { ok: true, result: { supportedServiceIds: ['antigravity'] } }, disabled: false },
+    ])('admits connected choices only with valid actual daemon launch support ($disabled)', async ({ result, disabled }) => {
+        machineRpc.mockResolvedValue(result);
+        const { NewSessionConnectedServicesSelectionContent } = await import('./NewSessionConnectedServicesSelectionContent');
+        capturedSelectionLists.length = 0;
+        await renderScreen(<NewSessionConnectedServicesSelectionContent
+            supportedServiceIds={['antigravity']}
+            profileOptionsByServiceId={{ antigravity: [{ profileId: 'work', status: 'connected', kind: 'oauth' }] }}
+            bindingsByServiceId={{}}
+            setBindingForService={() => {}}
+            onOpenSettings={() => {}}
+            maxHeight={420}
+            launchTarget={{ machineId: 'old-daemon', serverId: 'server-a', agentId: 'agy' }}
+        />);
+        const section = capturedSelectionLists.at(-1)?.rootStep.sections[0];
+        if (!section || section.kind !== 'static') throw new Error('Expected connected account choices');
+        expect(section.options.find((option) => option.id.includes(':profile:'))?.disabled === true).toBe(disabled);
+        expect(section.options.find((option) => option.id.endsWith(':native'))?.disabled).not.toBe(true);
+    });
+
     it('uses measured native height for connected-services auth content under the computed popover cap', async () => {
         const { NewSessionConnectedServicesSelectionContent } = await import('./NewSessionConnectedServicesSelectionContent');
 

@@ -4,6 +4,12 @@ import { classifyOpenCodeUsageLimitError } from './classifyOpenCodeUsageLimitErr
 import { createOpenCodeConnectedServiceRuntimeAuthAdapter } from './createOpenCodeConnectedServiceRuntimeAuthAdapter';
 
 describe('classifyOpenCodeUsageLimitError', () => {
+  it.each(['GoUsageLimitError', 'FreeUsageLimitError'])('leaves allowance identity unknown when %s names no limit', (name) => {
+    expect(classifyOpenCodeUsageLimitError({
+      providerErrorPath: true,
+      error: { name },
+    })?.providerLimitId).toBeNull();
+  });
   it('parses retry-after-ms usage-limit payloads', () => {
     expect(classifyOpenCodeUsageLimitError({
       providerErrorPath: true,
@@ -16,7 +22,7 @@ describe('classifyOpenCodeUsageLimitError', () => {
       limitCategory: 'usage_limit',
       retryAfterMs: 2500,
       quotaScope: 'account',
-      providerLimitId: 'free_tier_limit',
+      providerLimitId: null,
     });
   });
 

@@ -47,7 +47,8 @@ export type ListSessionFoldersResult =
 
 const SESSION_ORGANIZATION_DISPLAY_KIND = 'session_organization_display';
 
-function accountScopedMaterial(credentials: Credentials): AccountScopedCryptoMaterial {
+function accountScopedMaterial(credentials: Credentials): AccountScopedCryptoMaterial | null {
+  if (credentials.encryption === null) return null;
   return credentials.encryption.type === 'legacy'
     ? { type: 'legacy', secret: credentials.encryption.secret }
     : { type: 'dataKey', machineKey: credentials.encryption.machineKey };
@@ -63,11 +64,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * the same key and scheme the CLI already uses to open account settings.
  */
 function openDisplayValue(
-  material: AccountScopedCryptoMaterial,
+  material: AccountScopedCryptoMaterial | null,
   display: SessionOrganizationContentEnvelope | null,
 ): Readonly<{ ok: true; value: unknown }> | Readonly<{ ok: false; reason: 'no_display' | 'display_not_decryptable' }> {
   if (display === null) return { ok: false, reason: 'no_display' };
   if (display.t === 'plain') return { ok: true, value: display.v };
+  if (material === null) return { ok: false, reason: 'display_not_decryptable' };
   const opened = openAccountScopedBlobCiphertext({
     kind: SESSION_ORGANIZATION_DISPLAY_KIND,
     material,
@@ -91,7 +93,7 @@ function readWorkspace(value: unknown): SessionFolderWorkspace | null {
   return { serverId, machineId, rootPath };
 }
 
-function describeFolder(material: AccountScopedCryptoMaterial, folder: SessionOrganizationFolder): ListedSessionFolder {
+function describeFolder(material: AccountScopedCryptoMaterial | null, folder: SessionOrganizationFolder): ListedSessionFolder {
   const base = {
     folderId: folder.folderId,
     parentFolderId: folder.parentFolderId,

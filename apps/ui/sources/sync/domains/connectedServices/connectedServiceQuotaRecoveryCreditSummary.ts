@@ -9,7 +9,7 @@ export type ConnectedServiceQuotaRecoveryCreditSummary = Readonly<{
     providerCreditId: string | null;
 }>;
 
-function isAvailableRecoveryCredit(
+export function isAvailableRecoveryCredit(
     credit: ConnectedServiceQuotaRecoveryCreditV1,
     nowMs: number | null | undefined,
 ): boolean {

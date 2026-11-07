@@ -27,6 +27,7 @@ const BROKER_SCOPED_TOKEN = deriveConnectedServiceBrokerRefreshToken('token');
 import { buildRuntimeAuthRecoveryKey } from './connectedServices/runtimeAuth/recoveryKey/runtimeAuthRecoveryKey';
 import {
   RuntimeAuthRecoveryScheduler,
+  buildRuntimeAuthRecoveryAttemptId,
   type RuntimeAuthRecoveryDiagnostic,
 } from './connectedServices/runtimeAuth/RuntimeAuthRecoveryScheduler';
 import {
@@ -38,6 +39,7 @@ import type { ConnectedServiceRuntimeFailureClassification } from './connectedSe
 import { authorizeConnectedServiceRuntimeAuthFailureSource } from './connectedServices/runtimeAuth/handleConnectedServiceRuntimeAuthFailureForSession';
 import { resolveCurrentCodexRuntimeAuthFailureSource } from './connectedServices/runtimeAuth/resolveCurrentCodexRuntimeAuthFailureSource';
 import { ConnectedServiceCredentialRefreshError } from './connectedServices/refresh/ConnectedServiceRefreshCoordinator';
+import { DEFAULT_USAGE_LIMIT_RECOVERY_BACKOFF_MS } from '@/session/usageLimitRecoveryControls/createBackoffSessionUsageLimitRecoveryControlAdapter';
 
 function createDeferred<T>(): Readonly<{
   promise: Promise<T>;
@@ -203,7 +205,7 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
     }
   });
 
-  it('accepts and retires an exact old-target report after the registered runtime adopted a newer generation', async () => {
+  it('retires a mismatched report when the registered runtime cannot prove a newer adopted generation', async () => {
     resetConnectedServiceRuntimeAuthFailureReportDedupeForTests();
     const outboxDir = await createTempDir('happier-runtime-auth-post-apply-superseded-');
     const beginClassifiedFailure = vi.fn();
@@ -247,7 +249,7 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
               serviceId: 'openai-codex',
               groupId: 'main',
               profileId: 'batiplus',
-              generation: 1225,
+              generation: 1224,
               credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
             },
           }),
@@ -257,17 +259,6 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
               readRuntimeIdentity,
               resolveCurrentCredential: async () => null,
             }),
-          runtimeAuthApply: {
-            directLiveHotAuth: {
-              supportsInTurnApply: true,
-              requiresExactRuntimeIdentity: true,
-              refreshSelectionResync: 'required',
-              authMode: {
-                kind: 'external_token_injection',
-                surface: 'test-codex-runtime',
-              },
-            },
-          },
         }),
       handleConnectedServiceRuntimeAuthFailure,
       runtimeAuthRecoveryScheduler: {
@@ -321,7 +312,7 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
       expect(beginClassifiedFailure).not.toHaveBeenCalled();
       expect(handleConnectedServiceRuntimeAuthFailure).toHaveBeenCalledWith(expect.objectContaining({
         sessionId: tracked.happySessionId,
-        interruptedOriginId: 'runtime-auth-report:post-apply-superseded',
+        interruptedOriginId: buildRuntimeAuthRecoveryAttemptId('runtime-auth-report:post-apply-superseded'),
         sourceAuthorization: expect.objectContaining({
           status: 'recovery_superseded',
           reason: 'source_tuple_mismatch',
@@ -1837,6 +1828,66 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
     }
   });
 
+  it.each([null, 500])('settles a non-group usage limit with reset %s to a finite recurring wake', async (resetsAtMs) => {
+    let nowMs = 1_000;
+    const result = { status: 'not_group_selection' as const };
+    const runtimeAuthRecoveryScheduler = new RuntimeAuthRecoveryScheduler({
+      nowMs: () => nowMs,
+      maxAttempts: 1,
+      jitterMs: () => 0,
+      recover: async () => result,
+    });
+    const app = createDaemonControlApp({
+      getChildren: () => [],
+      machineId: 'machine',
+      stopSession: async () => ({ status: 'not_found' as const }),
+      spawnSession: async () => ({
+        type: 'error',
+        errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+        errorMessage: 'unused',
+      }),
+      requestShutdown: () => {},
+      onHappySessionWebhook: () => {},
+      controlToken: 'token',
+      handleConnectedServiceRuntimeAuthFailure: async () => result,
+      runtimeAuthRecoveryScheduler,
+    });
+    const recoveryKey = buildRuntimeAuthRecoveryKey({
+      sessionId: 'unknown-reset', serviceId: 'openai-codex', profileId: 'primary', groupId: null,
+    });
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/connected-service-runtime-auth/failure',
+        headers: { 'x-happier-daemon-token': 'token' },
+        payload: {
+          sessionId: 'unknown-reset', switchesThisTurn: 0,
+          classification: {
+            kind: 'usage_limit', serviceId: 'openai-codex', profileId: 'primary', groupId: null,
+            resetsAtMs, planType: null, rateLimits: null, source: 'structured_provider_error',
+          },
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(runtimeAuthRecoveryScheduler.readByKey(recoveryKey)).toMatchObject({
+        status: 'waiting', nextRetryAtMs: nowMs + DEFAULT_USAGE_LIMIT_RECOVERY_BACKOFF_MS,
+        lastError: 'awaiting_limit_reset', terminalReason: null,
+      });
+
+      nowMs += DEFAULT_USAGE_LIMIT_RECOVERY_BACKOFF_MS;
+      await expect(runtimeAuthRecoveryScheduler.wakeByKey({ recoveryKey, reason: 'timer' }))
+        .resolves.toEqual({ status: 'waiting' });
+      expect(runtimeAuthRecoveryScheduler.readByKey(recoveryKey)).toMatchObject({
+        status: 'waiting', nextRetryAtMs: nowMs + DEFAULT_USAGE_LIMIT_RECOVERY_BACKOFF_MS,
+        terminalReason: null,
+      });
+    } finally {
+      runtimeAuthRecoveryScheduler.dispose();
+      await app.close();
+    }
+  });
+
   it('re-arms a durable wait instead of terminalizing a timing-less group-exhausted no_eligible_member (F0)', async () => {
     const diagnostics: RuntimeAuthRecoveryDiagnostic[] = [];
     const runtimeAuthRecoveryScheduler = new RuntimeAuthRecoveryScheduler({
@@ -2502,7 +2553,7 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
   });
 
   it('preserves generation apply failure results when recovery scheduling fails', async () => {
-    const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const handleConnectedServiceRuntimeAuthFailure = vi.fn(async () => ({
       status: 'switch_attempted',
       result: {
@@ -2566,12 +2617,12 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
         },
       });
       expect(enqueueApplyFailure).toHaveBeenCalled();
-      expect(debugSpy).toHaveBeenCalledWith(
+      expect(warnSpy).toHaveBeenCalledWith(
         '[CONTROL SERVER] Connected-service runtime auth recovery scheduling failed after apply failure',
         expect.objectContaining({ sessionId: 'sess_1' }),
       );
     } finally {
-      debugSpy.mockRestore();
+      warnSpy.mockRestore();
       await app.close();
     }
   });
@@ -3079,7 +3130,6 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
 
   it('returns typed handler failures when handler recovery scheduling also fails', async () => {
     const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
-    const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
     const handleConnectedServiceRuntimeAuthFailure = vi.fn(async () => {
       throw new Error('switch coordinator crashed');
     });
@@ -3132,12 +3182,11 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
         },
       });
       expect(enqueueHandlerFailure).toHaveBeenCalled();
-      expect(debugSpy).toHaveBeenCalledWith(
+      expect(warnSpy).toHaveBeenCalledWith(
         '[CONTROL SERVER] Connected-service runtime auth recovery scheduling failed after handler failure',
         expect.objectContaining({ sessionId: 'sess_1' }),
       );
     } finally {
-      debugSpy.mockRestore();
       warnSpy.mockRestore();
       await app.close();
     }
@@ -3579,6 +3628,19 @@ describe('createDaemonControlApp connected-service runtime auth handling', () =>
         event: 'prompt_or_steer',
         requestedAction: { v: 1, kind: 'steer_if_active' },
         activeTurnId: 'session-turn:exact-1',
+      });
+      const providerIdentity = {
+        serviceId: 'claude-subscription', groupId: 'pool', providerOrganizationId: 'org-live',
+        sourceSessionId: 'claude-session', observedAtMs: 200,
+      };
+      const observation = await app.inject({
+        method: 'POST', url: '/connected-service-turn-lifecycle',
+        headers: { 'x-happier-daemon-token': 'token' },
+        payload: { sessionId: 'sess_1', event: 'provider_identity_observed', providerIdentity },
+      });
+      expect(observation.statusCode).toBe(200);
+      expect(handleConnectedServiceTurnLifecycle).toHaveBeenLastCalledWith({
+        sessionId: 'sess_1', event: 'provider_identity_observed', providerIdentity,
       });
     } finally {
       await app.close();
@@ -4388,7 +4450,7 @@ describe('startDaemonControlServer connected-service runtime wiring', () => {
         },
       });
       expect(handleConnectedServiceRuntimeAuthFailure).toHaveBeenCalledWith({
-        interruptedOriginId: 'runtime-auth-report:continuation-origin',
+        interruptedOriginId: buildRuntimeAuthRecoveryAttemptId('runtime-auth-report:continuation-origin'),
         sessionId: 'sess_1',
         switchesThisTurn: 0,
         classification: expect.objectContaining({

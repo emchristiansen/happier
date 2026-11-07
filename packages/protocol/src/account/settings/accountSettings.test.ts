@@ -443,12 +443,12 @@ describe('accountSettings', () => {
     });
   });
 
-  it('defaults coding prompt behavior to current agent-managed behavior', () => {
+  it('defaults coding prompt title updates to session start', () => {
     const parsed = accountSettingsParse({});
 
     expect(parsed.codingPromptBehaviorV1).toEqual({
       v: 1,
-      sessionTitleUpdates: 'ongoing',
+      sessionTitleUpdates: 'initial',
       responseOptions: 'agent',
     });
   });
@@ -850,5 +850,14 @@ describe('isExpoPushNotificationChannelEnabled', () => {
         { v: 1, id: 'secondary', kind: 'expo_push', enabled: true },
       ],
     })).toBe(true);
+  });
+});
+
+
+describe('focused computer notification preference', () => {
+  it('keeps suppression off for legacy/malformed settings and preserves explicit opt-in', () => {
+    expect(accountSettingsParse({}).notificationsSettingsV1.mutePhoneWhenComputerFocused).not.toBe(true);
+    expect(accountSettingsParse({ notificationsSettingsV1: { mutePhoneWhenComputerFocused: 'true' } }).notificationsSettingsV1.mutePhoneWhenComputerFocused).not.toBe(true);
+    expect(accountSettingsParse({ notificationsSettingsV1: { mutePhoneWhenComputerFocused: true } }).notificationsSettingsV1.mutePhoneWhenComputerFocused).toBe(true);
   });
 });

@@ -91,6 +91,6 @@ describe('runCursor', () => {
     await runCursor({ credentials });
 
     const config = runStandardAcpProviderMock.mock.calls[0]?.[1] as StandardAcpProviderConfig | undefined;
-    expect(config?.failClosedOnResumeFailure).toBe(true);
+    expect(config?.declaredSessionLoadSupport).toBe(true);
   });
 });

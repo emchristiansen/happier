@@ -145,7 +145,8 @@ describe('TranscriptNavigationEntryList press outcomes', () => {
         });
 
         await screen.pressByTestIdAsync('nav-entry:turn-1');
-        expect(screen.findByTestId('nav-entry-pending:turn-1')).toBeTruthy();
+        const pending = screen.findByTestId('nav-entry-pending:turn-1');
+        expect(pending).toBeTruthy();
 
         await act(async () => {
             unloadedJump.resolve({ status: 'window-rendered' });

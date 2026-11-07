@@ -1,7 +1,16 @@
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
+import { normalizeOpenCodeCliGeneration } from '@happier-dev/agents';
+
 import { isOpenCodeBrokerMarker } from '@/backends/opencode/brokerPlugin/openCodeBrokerPluginEnv';
+
+import { resolveOpenCodeManagedServerCredentialChildEnv } from './openCodeManagedServerCredential';
+import {
+  OPEN_CODE_SERVER_LEGACY_PASSWORD_ENV,
+  OPEN_CODE_SERVER_PASSWORD_ENV,
+  type OpenCodeServerAuthCredential,
+} from './openCodeServerAuth';
 
 /**
  * Env var carrying the STABLE connected-service selection identity for the managed server launch
@@ -18,6 +27,11 @@ export const OPENCODE_CONNECTED_SERVICE_SELECTION_IDENTITY_ENV = 'HAPPIER_OPENCO
  * binary override) so changing the binary path yields a new fingerprint.
  */
 export const OPENCODE_BINARY_IDENTITY_ENV = 'HAPPIER_OPENCODE_BINARY_IDENTITY';
+
+/** The existing launch identity is a SHA-256 hex digest, never a filesystem path. */
+export function isOpenCodeManagedServerLaunchFingerprint(value: string): boolean {
+  return /^[a-f0-9]{64}$/.test(value);
+}
 
 function hashEnvSecret(value: unknown): string {
   const raw = typeof value === 'string' ? value : '';
@@ -73,11 +87,21 @@ export function resolveOpenCodeManagedServerChildEnv(params: Readonly<{
   baseEnv: NodeJS.ProcessEnv;
   xdgRootDir: string | null;
   isolateConfig: boolean;
+  /**
+   * Credential the managed server must protect itself with. Supplied only by the spawn path: the
+   * launch fingerprint intentionally computes the child env WITHOUT it, because the Happier-minted
+   * password is machine-stable and folding it in would re-key every managed server once, for no
+   * reuse-relevant difference. Operator-configured passwords are folded in from `baseEnv` instead.
+   */
+  authCredential?: OpenCodeServerAuthCredential | null;
 }>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...params.baseEnv,
     // Ensure the subprocess has a stable, explicit config envelope.
     OPENCODE_CONFIG_CONTENT: params.baseEnv.OPENCODE_CONFIG_CONTENT ?? '{}',
+    ...(params.authCredential
+      ? resolveOpenCodeManagedServerCredentialChildEnv(params.authCredential)
+      : {}),
   };
 
   const xdgRootDir = typeof params.xdgRootDir === 'string' ? params.xdgRootDir.trim() : '';
@@ -109,6 +133,8 @@ export function resolveOpenCodeManagedServerChildEnv(params: Readonly<{
  *   and never collides with connected sessions.
  * - `openCodeBinaryIdentity` (or `OPENCODE_BINARY_IDENTITY_ENV`, else `HAPPIER_OPENCODE_PATH`):
  *   changing the opencode binary yields a new fingerprint.
+ * - `HAPPIER_OPENCODE_CLI_GENERATION`: Stable and V2 are distinct process contracts even when
+ *   both resolve to the released `opencode` executable name.
  *
  * NOTE: the runtime "generation key" (see `openCodeManagedServerIdentity.ts`, which changes on every
  * process start) is intentionally NOT part of this fingerprint — that would defeat server reuse.
@@ -150,6 +176,7 @@ export function resolveOpenCodeManagedServerLaunchFingerprint(params: Readonly<{
     ?? env[OPENCODE_BINARY_IDENTITY_ENV]
     ?? env.HAPPIER_OPENCODE_PATH,
   );
+  const requestedCliGeneration = normalizeOpenCodeCliGeneration(env.HAPPIER_OPENCODE_CLI_GENERATION);
 
   const relevant = {
     HOME: typeof env.HOME === 'string' ? env.HOME : '',
@@ -163,10 +190,19 @@ export function resolveOpenCodeManagedServerLaunchFingerprint(params: Readonly<{
     authIdentityClass,
     directKeyAuthHash,
     openCodeBinaryIdentity,
+    ...(requestedCliGeneration === 'auto' ? {} : { openCodeApiGeneration: requestedCliGeneration }),
     OPENAI_API_KEY: typeof env.OPENAI_API_KEY === 'string' ? env.OPENAI_API_KEY : '',
     ANTHROPIC_API_KEY: typeof env.ANTHROPIC_API_KEY === 'string' ? env.ANTHROPIC_API_KEY : '',
     OPENCODE_SERVER_USERNAME: typeof env.OPENCODE_SERVER_USERNAME === 'string' ? env.OPENCODE_SERVER_USERNAME : '',
-    OPENCODE_SERVER_PASSWORD: typeof env.OPENCODE_SERVER_PASSWORD === 'string' ? env.OPENCODE_SERVER_PASSWORD : '',
+    // Operator-configured server credentials are a reuse identity: a server protected by one password
+    // cannot serve a session that authenticates with another. Both released names are folded (hashed
+    // together with the rest of the envelope), canonical first.
+    [OPEN_CODE_SERVER_PASSWORD_ENV]: typeof env[OPEN_CODE_SERVER_PASSWORD_ENV] === 'string'
+      ? env[OPEN_CODE_SERVER_PASSWORD_ENV]
+      : '',
+    [OPEN_CODE_SERVER_LEGACY_PASSWORD_ENV]: typeof env[OPEN_CODE_SERVER_LEGACY_PASSWORD_ENV] === 'string'
+      ? env[OPEN_CODE_SERVER_LEGACY_PASSWORD_ENV]
+      : '',
   };
 
   return createHash('sha256').update(JSON.stringify(relevant)).digest('hex');

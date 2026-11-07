@@ -1,7 +1,8 @@
+import { useThemeProfilesMutable } from '@/sync/domains/state/storage';
+import { resolveThemeProfileNavigationId } from '@/sync/domains/settings/themeProfiles';
 import * as React from 'react';
-import { File, Paths } from 'expo-file-system';
-import * as Sharing from 'expo-sharing';
-import { Platform, View } from 'react-native';
+import { downloadThemeJson } from './themeProfileFileExport';
+import { View } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
 import { useUnistyles } from 'react-native-unistyles';
 import { StyleSheet } from 'react-native-unistyles';
@@ -13,7 +14,6 @@ import { CopiedPill } from '@/components/ui/copy/CopiedPill';
 import { SettingsActionFooter } from '@/components/ui/settingsSurface/SettingsActionFooter';
 import { TextInput } from '@/components/ui/text/Text';
 import { useTemporaryCopyFeedback } from '@/components/ui/copy/useTemporaryCopyFeedback';
-import { useLocalSettingMutable } from '@/sync/domains/state/storage';
 import { t } from '@/text';
 import { setClipboardStringSafe } from '@/utils/ui/clipboard';
 import { exportThemeProfileToJson } from '@/theme/profiles/themeProfileImportExport';
@@ -37,38 +37,15 @@ const resolveExportMode = (profile: ThemeProfileV1): ThemeProfileMode => {
     return resolveThemePresetSourcePreferredMode(profile);
 };
 
-async function downloadThemeJson(fileName: string, json: string): Promise<void> {
-    if (
-        Platform.OS === 'web'
-        && typeof document !== 'undefined'
-        && typeof Blob !== 'undefined'
-        && typeof URL !== 'undefined'
-        && typeof URL.createObjectURL === 'function'
-    ) {
-        const href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
-        const anchor = document.createElement('a');
-        anchor.href = href;
-        anchor.download = fileName;
-        anchor.click();
-        setTimeout(() => URL.revokeObjectURL(href), 1000);
-        return;
-    }
-
-    const file = new File(Paths.cache, fileName);
-    file.write(json);
-    await Sharing.shareAsync(file.uri, {
-        mimeType: 'application/json',
-        dialogTitle: t('settingsAppearance.themeProfiles.exportProfile'),
-    });
-}
 
 export const ThemeProfileExportScreen = React.memo(function ThemeProfileExportScreen() {
     const { theme } = useUnistyles();
     const styles = stylesheet;
     const copyFeedback = useTemporaryCopyFeedback();
     const params = useLocalSearchParams();
-    const [themeProfiles] = useLocalSettingMutable('themeProfiles');
-    const profileId = getProfileIdParam(params.profileId);
+    const [themeProfiles, , themeProfileView] = useThemeProfilesMutable();
+    const profileId = resolveThemeProfileNavigationId(themeProfileView,
+        getProfileIdParam(params.profileId), getProfileIdParam(params.themeProfileIdentity));
     const builtInProfile = BUILT_IN_THEME_PROFILES.find((definition) => definition.profile.id === profileId)?.profile ?? null;
     const profile = themeProfiles.profiles.find((entry) => entry.id === profileId) ?? builtInProfile;
     const json = React.useMemo(() => (profile ? exportThemeProfileToJson(profile, { mode: resolveExportMode(profile), includeResolvedValues: true }) : ''), [profile]);

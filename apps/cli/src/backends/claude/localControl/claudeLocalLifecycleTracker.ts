@@ -6,6 +6,8 @@ import type { RawJSONLines } from '@/backends/claude/types';
 import type { SessionHookData } from '../utils/startHookServer';
 import {
   isSidechainSessionHook,
+  isClaudeSidechainRuntimeEvidence,
+  isLivePrimaryClaudeProviderHook,
   readSessionHookEventName,
 } from '../utils/sessionHookAttribution';
 export { isClaudeTaskNotificationUserPromptHook } from '../utils/sessionHookTaskNotification';
@@ -19,9 +21,9 @@ import {
 import { readClaudeTranscriptTurnSignal } from './readClaudeTranscriptTurnSignal';
 import {
   isClaudeTranscriptTaskNotification,
-  readClaudeTranscriptProviderActivity,
 } from './readClaudeTranscriptProviderActivity';
 import type { createClaudeProviderRuntimeActivityAdapter } from '../providerActivity/createClaudeProviderRuntimeActivityAdapter';
+import { isReplaySdkMessage } from '../remote/runtimeActivityEvidence';
 
 function readNonEmptyString(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -75,6 +77,8 @@ export function createClaudeLocalLifecycleTracker(opts: Readonly<{
   lifecycle: LocalTurnLifecycleController;
   runtimeActivityAdapter?: ReturnType<typeof createClaudeProviderRuntimeActivityAdapter> | null;
   providerActivityLedger?: ReturnType<typeof createClaudeProviderActivityLedger>;
+  onProviderEvent?: () => void;
+  readProviderSessionId?: () => string | null;
 }>) {
   const providerActivityLedger = opts.providerActivityLedger ?? createClaudeProviderActivityLedger();
   let pendingTaskNotificationReaction: {
@@ -94,10 +98,12 @@ export function createClaudeLocalLifecycleTracker(opts: Readonly<{
     }
   };
 
-  const handleClaudeRuntimeActivityLoss = (reason: string): void => {
+  const handleClaudeRuntimeActivityLoss = (reason: string, options?: Readonly<{ providerStopped: true }>): void => {
     const runtimeActivityAdapter = opts.runtimeActivityAdapter;
     if (!runtimeActivityAdapter) return;
-    runRuntimeActivityEffect('runtime-loss-target', () => runtimeActivityAdapter.handleRuntimeLoss(reason));
+    runRuntimeActivityEffect('runtime-loss-target', () => (options
+      ? runtimeActivityAdapter.handleRuntimeLoss(reason, options)
+      : runtimeActivityAdapter.handleRuntimeLoss(reason)));
   };
 
   const observeLifecycle = (event: LocalTurnLifecycleEvent | null): void => {
@@ -117,26 +123,18 @@ export function createClaudeLocalLifecycleTracker(opts: Readonly<{
   };
 
   const observeProviderActivity = (message: unknown, expectedSessionId: string): void => {
-    const row = message as Record<string, unknown>;
-    if (row.isReplay === true || row.is_replay === true) return;
-    const activity = readClaudeProviderTaskActivity(message);
+    if (isReplaySdkMessage(message)) return;
+    if (readFirstNonEmptyString(message, 'session_id', 'sessionId') === expectedSessionId
+      && !isClaudeSidechainRuntimeEvidence(message)) {
+      opts.onProviderEvent?.();
+    }
+    const activity = readClaudeProviderTaskActivity(message, expectedSessionId);
     if (activity) {
       if (activity.sessionId !== expectedSessionId) return;
       observeProviderActivityFact(activity);
       return;
     }
 
-    const transcriptActivity = readClaudeTranscriptProviderActivity(message as RawJSONLines);
-    if (
-      transcriptActivity?.type !== 'task_notification'
-      || !transcriptActivity.terminal
-      || !transcriptActivity.taskId
-    ) return;
-    observeProviderActivityFact({
-      type: 'terminal',
-      sessionId: expectedSessionId,
-      taskId: transcriptActivity.taskId,
-    });
   };
 
   const observe = (event: LocalTurnLifecycleEvent | null): void => {
@@ -171,6 +169,7 @@ export function createClaudeLocalLifecycleTracker(opts: Readonly<{
       if (isSidechainSessionHook(data)) {
         return;
       }
+      if (isLivePrimaryClaudeProviderHook(data, opts.readProviderSessionId?.())) opts.onProviderEvent?.();
       const hookEventName = readSessionHookEventName(data);
       if (hookEventName === 'UserPromptSubmit') {
         if (isClaudeTaskNotificationUserPromptHook(data)) {
@@ -236,9 +235,10 @@ export function createClaudeLocalLifecycleTracker(opts: Readonly<{
     handleProviderActivityObservationLoss(reason: string): void {
       handleClaudeRuntimeActivityLoss(reason);
     },
-    observeProcessExit(): void {
+    observeProcessExit(options?: Readonly<{ providerStopped?: boolean }>): void {
       clearPendingTaskNotificationReaction();
-      handleClaudeRuntimeActivityLoss('claude_process_exit');
+      handleClaudeRuntimeActivityLoss('claude_process_exit', options?.providerStopped === true
+        ? { providerStopped: true } : undefined);
       const snapshot = opts.lifecycle.snapshot();
       if (!snapshot.active || snapshot.terminal) return;
       opts.lifecycle.observe({

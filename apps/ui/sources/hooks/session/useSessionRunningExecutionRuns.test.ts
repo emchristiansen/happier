@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { flushHookEffects, renderHook, standardCleanup } from '@/dev/testkit';
+import { createSessionFixture, createToolCallMessageFixture, flushHookEffects, renderHook, standardCleanup } from '@/dev/testkit';
 
 const sessionExecutionRunListSpy = vi.fn();
 
@@ -45,6 +45,34 @@ describe('useSessionRunningExecutionRuns', () => {
     afterEach(() => {
         standardCleanup();
         vi.useRealTimers();
+        vi.unstubAllGlobals();
+    });
+
+    it('updates the warm roster when only turn activity or run class changes and preserves idle recipients', async () => {
+        const { stubServerFeaturesFetch } = await import('../server/serverFeaturesTestUtils');
+        stubServerFeaturesFetch();
+        const { useSessionSubagents } = await import('./useSessionSubagents');
+        sessionExecutionRunListSpy
+            .mockResolvedValueOnce({ runs: [{ runId: 'run_1', status: 'running', runClass: 'long_lived', turnInFlight: true }] })
+            .mockResolvedValueOnce({ runs: [{ runId: 'run_1', status: 'running', runClass: 'long_lived', turnInFlight: false }] })
+            .mockResolvedValueOnce({ runs: [{ runId: 'run_1', status: 'running', runClass: 'bounded', turnInFlight: false }] });
+        const session = createSessionFixture({ id: 'warm-execution-activity' });
+        const messages = [createToolCallMessageFixture({ tool: {
+            id: 'tool-run', name: 'SubAgentRun', state: 'running',
+            input: { runId: 'run_1', runClass: 'long_lived', intent: 'delegate' },
+            createdAt: 1, startedAt: 1, completedAt: null, description: null,
+        } })];
+        const hook = await renderHook(() => useSessionSubagents({
+            sessionId: session.id, session, messages,
+            directSessionRuntime: { directSessionLink: null, status: null, refreshNow: async () => null },
+        }));
+        expect(hook.getCurrent().subagents[0]?.isActive).toBe(true);
+        await flushHookEffects({ cycles: 1, turns: 1, advanceTimersMs: 5_000 });
+        expect(hook.getCurrent().subagents[0]).toMatchObject({ status: 'running', isActive: false, capabilities: { canSend: true } });
+        expect(hook.getCurrent().participantTargets).toHaveLength(1);
+        await flushHookEffects({ cycles: 1, turns: 1, advanceTimersMs: 5_000 });
+        expect(hook.getCurrent().subagents[0]?.isActive).toBe(true);
+        await hook.unmount();
     });
 
     it('polls while a run is running and stops after it is confirmed finished', async () => {

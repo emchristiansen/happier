@@ -3,9 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { requestClaudeExplicitRunnerStop } from './claudeExplicitRunnerStop';
 
 describe('requestClaudeExplicitRunnerStop', () => {
-  it('destroys the exact Unified host before requesting runner termination', async () => {
+  it('stops the exact Unified terminal before requesting runner termination', async () => {
     const order: string[] = [];
-    const destroyOwnedHostForExplicitStop = vi.fn(async () => {
+    const stopTerminalHostForExplicitStop = vi.fn(async () => {
       order.push('host_disposed');
     });
     const requestTermination = vi.fn(() => {
@@ -14,7 +14,7 @@ describe('requestClaudeExplicitRunnerStop', () => {
 
     await requestClaudeExplicitRunnerStop({
       unifiedTerminalEnabled: true,
-      destroyOwnedHostForExplicitStop,
+      stopTerminalHostForExplicitStop,
       requestTermination,
       whenTerminated: Promise.resolve(),
     });
@@ -28,7 +28,7 @@ describe('requestClaudeExplicitRunnerStop', () => {
 
     await expect(requestClaudeExplicitRunnerStop({
       unifiedTerminalEnabled: true,
-      destroyOwnedHostForExplicitStop: async () => {
+      stopTerminalHostForExplicitStop: async () => {
         throw disposalError;
       },
       requestTermination,
@@ -43,25 +43,25 @@ describe('requestClaudeExplicitRunnerStop', () => {
 
     await expect(requestClaudeExplicitRunnerStop({
       unifiedTerminalEnabled: true,
-      destroyOwnedHostForExplicitStop: null,
+      stopTerminalHostForExplicitStop: null,
       requestTermination,
       whenTerminated: Promise.resolve(),
-    })).rejects.toThrow('exact terminal-host disposal is unavailable');
+    })).rejects.toThrow('exact terminal-host stop is unavailable');
 
     expect(requestTermination).not.toHaveBeenCalled();
   });
 
   it('uses the supplied local exit event after exact host disposal for an archived runner', async () => {
     const requestTermination = vi.fn();
-    const destroyOwnedHostForExplicitStop = vi.fn(async () => {});
+    const stopTerminalHostForExplicitStop = vi.fn(async () => {});
     await requestClaudeExplicitRunnerStop({
       unifiedTerminalEnabled: true,
-      destroyOwnedHostForExplicitStop,
+      stopTerminalHostForExplicitStop,
       requestTermination,
       whenTerminated: Promise.resolve(),
       terminationEvent: { kind: 'exit', code: 0 },
     });
-    expect(destroyOwnedHostForExplicitStop).toHaveBeenCalledOnce();
+    expect(stopTerminalHostForExplicitStop).toHaveBeenCalledOnce();
     expect(requestTermination).toHaveBeenCalledWith({ kind: 'exit', code: 0 });
   });
 
@@ -70,7 +70,7 @@ describe('requestClaudeExplicitRunnerStop', () => {
 
     await requestClaudeExplicitRunnerStop({
       unifiedTerminalEnabled: false,
-      destroyOwnedHostForExplicitStop: null,
+      stopTerminalHostForExplicitStop: null,
       requestTermination,
       whenTerminated: Promise.resolve(),
     });

@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { accessSync, closeSync, constants as fsConstants, existsSync, openSync, readSync, readdirSync } from 'node:fs';
-import { delimiter, isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
 import {
   getProviderCliBinaryNames,
@@ -13,7 +13,7 @@ import {
 import { buildBackendTargetKey } from '@happier-dev/protocol';
 
 import { expandHomeDirPath, resolveHomeDirFromEnvironment } from '../path/expandHomeDirPath.js';
-import { resolveWindowsCommandOnPath, resolveWindowsCommandPath } from '../process/index.js';
+import { resolveExecutableCommand, resolveExecutableCommandsOnPath, resolveWindowsCommandOnPath, resolveWindowsCommandPath } from '../process/index.js';
 import { resolveJavaScriptRuntimeCommand } from './managedJavaScriptRuntime.js';
 import { resolveHappyHomeDirFromEnvironment } from './resolveHappyHomeDir.js';
 
@@ -138,30 +138,6 @@ export function resolveProviderCliManagedCommandPath(
   return join(installRoot, 'current', commandRelativePath);
 }
 
-function resolveCommandOnPath(command: string, processEnv: NodeJS.ProcessEnv): string | null {
-  if (process.platform === 'win32') {
-    return resolveWindowsCommandOnPath(command, processEnv) ?? null;
-  }
-
-  const pathDirs = String(processEnv.PATH ?? '')
-    .split(delimiter)
-    .map((value) => value.trim())
-    .filter(Boolean);
-  for (const dir of pathDirs) {
-    const candidate = join(dir, command);
-    if (!existsSync(candidate)) continue;
-    // On Unix, verify the file is executable
-    try {
-      accessSync(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch {
-      // File exists but is not executable; continue searching
-      continue;
-    }
-  }
-  return null;
-}
-
 function readFileHeader(candidatePath: string): string | null {
   let fd: number | null = null;
   try {
@@ -268,9 +244,18 @@ function basenameForKnownCandidatePath(path: string): string {
 function resolveKnownCommandCandidate(agentId: AgentId, candidate: ProviderCliKnownCommandCandidate, processEnv: NodeJS.ProcessEnv): ResolvedProviderCliSystemCommand | null {
   const homeDir = resolveHomeDirFromEnvironment(processEnv);
   switch (candidate.kind) {
+    case 'envBinDir':
     case 'homeBinDir': {
+      const root = candidate.kind === 'envBinDir'
+        ? expandHomeDirPath(processEnv[candidate.envVar]?.trim() ?? '', processEnv)
+        : homeDir;
+      if (!root) return null;
       for (const binaryName of getProviderCliBinaryNames(agentId, processEnv)) {
-        const commandPath = join(homeDir, candidate.relativeDir, binaryName);
+        const candidatePath = join(root, candidate.relativeDir, binaryName);
+        const commandPath = process.platform === 'win32'
+          ? resolveWindowsCommandPath(candidatePath, processEnv)
+          : candidatePath;
+        if (!commandPath) continue;
         if (providerCliCandidatePathExists(agentId, commandPath)) return { command: commandPath, binaryName };
       }
       return null;
@@ -336,7 +321,7 @@ function commandMatchesAlternativeIdentityProbe(
 
 function resolveProviderCliSystemCommand(agentId: AgentId, processEnv: NodeJS.ProcessEnv): string | null {
   for (const binaryName of getProviderCliBinaryNames(agentId, processEnv)) {
-    const command = resolveCommandOnPath(binaryName, processEnv);
+    const command = resolveExecutableCommand(binaryName, { env: processEnv });
     if (command) {
       const resolved = { command, binaryName };
       if (commandMatchesAlternativeIdentityProbe(agentId, resolved, processEnv)) return command;
@@ -345,6 +330,27 @@ function resolveProviderCliSystemCommand(agentId: AgentId, processEnv: NodeJS.Pr
   const knownCommand = resolveCommandInKnownLocations(agentId, processEnv);
   if (!knownCommand) return null;
   return commandMatchesAlternativeIdentityProbe(agentId, knownCommand, processEnv) ? knownCommand.command : null;
+}
+
+function resolveProviderCliSystemCommands(agentId: AgentId, processEnv: NodeJS.ProcessEnv): string[] {
+  const resolved: string[] = [];
+  const seen = new Set<string>();
+  const add = (candidate: ResolvedProviderCliSystemCommand | null): void => {
+    if (!candidate || seen.has(candidate.command)) return;
+    if (!commandMatchesAlternativeIdentityProbe(agentId, candidate, processEnv)) return;
+    seen.add(candidate.command);
+    resolved.push(candidate.command);
+  };
+
+  for (const binaryName of getProviderCliBinaryNames(agentId, processEnv)) {
+    for (const command of resolveExecutableCommandsOnPath(binaryName, { env: processEnv })) {
+      add({ command, binaryName });
+    }
+  }
+  for (const candidate of getProviderCliRuntimeSpec(agentId).knownCommandCandidates ?? []) {
+    add(resolveKnownCommandCandidate(agentId, candidate, processEnv));
+  }
+  return resolved;
 }
 
 function resolveProviderCliManagedCommand(agentId: AgentId, processEnv: NodeJS.ProcessEnv): string | null {
@@ -410,4 +416,40 @@ export function resolveProviderCliCommand(
     return { source: 'managed', command: managedCommand };
   }
   return null;
+}
+
+/**
+ * Enumerates every concrete runnable candidate in canonical source order.
+ * An explicit override is intentionally exclusive: callers must classify that
+ * exact executable instead of silently falling back to another installation.
+ */
+export function resolveProviderCliCommandCandidates(
+  agentId: AgentId,
+  opts: Readonly<{ processEnv?: NodeJS.ProcessEnv } & RuntimeResolutionOptions> = {},
+): ProviderCliCommandResolution[] {
+  const processEnv = opts.processEnv ?? process.env;
+  const rawOverride = readProviderCliOverride(agentId, processEnv);
+  if (rawOverride) {
+    const override = resolveProviderCliOverride(agentId, processEnv);
+    return override && isProviderCliPathRunnable(override, processEnv, opts)
+      ? [{ source: 'override', command: override }]
+      : [];
+  }
+
+  const system = resolveProviderCliSystemCommands(agentId, processEnv)
+    .filter((command) => isProviderCliPathRunnable(command, processEnv, opts))
+    .map((command) => ({ source: 'system' as const, command }));
+  const managedCommand = resolveProviderCliManagedCommand(agentId, processEnv);
+  const managed = managedCommand && isProviderCliPathRunnable(managedCommand, processEnv, opts)
+    ? [{ source: 'managed' as const, command: managedCommand }]
+    : [];
+  const ordered = readBackendCliSourcePreference(agentId, processEnv) === 'managed-first'
+    ? [...managed, ...system]
+    : [...system, ...managed];
+  const seen = new Set<string>();
+  return ordered.filter(({ command }) => {
+    if (seen.has(command)) return false;
+    seen.add(command);
+    return true;
+  });
 }

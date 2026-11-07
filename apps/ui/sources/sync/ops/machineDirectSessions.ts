@@ -1,24 +1,30 @@
 import {
     DirectSessionLinkEnsureRequestSchema,
     DirectSessionLinkEnsureResponseSchema,
+    DirectSessionCandidateDeleteRequestSchema,
+    DirectSessionCandidateDeleteResponseSchema,
     DirectSessionStatusGetRequestSchema,
     DirectSessionStatusGetResponseSchema,
+    DirectSessionTakeoverPersistStartResponseSchema,
     DirectSessionTakeoverPersistRequestSchema,
-    DirectSessionTakeoverPersistResponseSchema,
     DirectSessionTakeoverRequestSchema,
     DirectSessionTakeoverResponseSchema,
     DirectSessionsCandidatesListRequestSchema,
     DirectSessionsCandidatesListResponseSchema,
+    DirectSessionsAcpSessionListCapabilityRequestSchema,
+    DirectSessionsAcpSessionListCapabilityResponseSchema,
     DirectTranscriptPageRequestSchema,
     DirectTranscriptPageResponseSchema,
     DirectTranscriptReadAfterRequestSchema,
     DirectTranscriptReadAfterResponseSchema,
     type DirectSessionLinkEnsureRequest,
     type DirectSessionLinkEnsureResponse,
+    type DirectSessionCandidateDeleteRequest,
+    type DirectSessionCandidateDeleteResponse,
     type DirectSessionStatusGetRequest,
     type DirectSessionStatusGetResponse,
+    type DirectSessionTakeoverPersistStartResponse,
     type DirectSessionTakeoverPersistRequest,
-    type DirectSessionTakeoverPersistResponse,
     type DirectSessionTakeoverRequest,
     type DirectSessionTakeoverResponse,
     type DirectSessionsCandidatesListRequest,
@@ -32,6 +38,9 @@ import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 import type { ZodType } from 'zod';
 
 import { machineRpcWithServerScope } from '@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc';
+import { isRpcMethodNotAvailableError, isRpcMethodNotFoundError } from '@/sync/runtime/rpcErrors';
+import { storage } from '@/sync/domains/state/storage';
+import { resolveTerminalSpawnOptions } from '@/sync/domains/settings/terminalSettings';
 import { readReplacementAwareMachineRpcTarget } from './machineRpcTarget';
 
 type MachineDirectSessionsOpts = Readonly<{
@@ -74,12 +83,47 @@ export async function machineDirectSessionsCandidatesList(
     input: DirectSessionsCandidatesListRequest,
     opts?: MachineDirectSessionsOpts,
 ): Promise<DirectSessionsCandidatesListResponse> {
+    if (input.source.kind === 'acpSessionList') {
+        try {
+            await callDirectSessionMachineRpc({
+                machineId: input.machineId,
+                method: RPC_METHODS.DAEMON_DIRECT_SESSIONS_ACP_SESSION_LIST_CAPABILITY_GET,
+                input: {},
+                requestSchema: DirectSessionsAcpSessionListCapabilityRequestSchema,
+                responseSchema: DirectSessionsAcpSessionListCapabilityResponseSchema,
+                opts,
+            });
+        } catch (error) {
+            if (!isRpcMethodNotAvailableError(error) && !isRpcMethodNotFoundError(error)) {
+                throw error;
+            }
+            return {
+                ok: false,
+                errorCode: 'provider_unavailable',
+                error: 'acp_session_list_requires_daemon_upgrade',
+            };
+        }
+    }
     return callDirectSessionMachineRpc({
         machineId: input.machineId,
         method: RPC_METHODS.DAEMON_DIRECT_SESSIONS_CANDIDATES_LIST,
         input,
         requestSchema: DirectSessionsCandidatesListRequestSchema,
         responseSchema: DirectSessionsCandidatesListResponseSchema,
+        opts,
+    });
+}
+
+export async function machineDirectSessionCandidateDelete(
+    input: DirectSessionCandidateDeleteRequest,
+    opts?: MachineDirectSessionsOpts,
+): Promise<DirectSessionCandidateDeleteResponse> {
+    return callDirectSessionMachineRpc({
+        machineId: input.machineId,
+        method: RPC_METHODS.DAEMON_DIRECT_SESSION_CANDIDATE_DELETE,
+        input,
+        requestSchema: DirectSessionCandidateDeleteRequestSchema,
+        responseSchema: DirectSessionCandidateDeleteResponseSchema,
         opts,
     });
 }
@@ -140,6 +184,14 @@ export async function machineDirectSessionTranscriptReadAfter(
     });
 }
 
+function withTakeoverTerminalSettings(input: DirectSessionTakeoverRequest): DirectSessionTakeoverRequest {
+    const terminal = input.terminal ?? resolveTerminalSpawnOptions({
+        settings: storage.getState().settings,
+        machineId: readReplacementAwareMachineRpcTarget(input.machineId)?.machineId ?? input.machineId,
+    });
+    return terminal ? { ...input, terminal } : input;
+}
+
 export async function machineDirectSessionTakeover(
     input: DirectSessionTakeoverRequest,
     opts?: MachineDirectSessionsOpts,
@@ -147,23 +199,28 @@ export async function machineDirectSessionTakeover(
     return callDirectSessionMachineRpc({
         machineId: input.machineId,
         method: RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER,
-        input,
+        input: withTakeoverTerminalSettings(input),
         requestSchema: DirectSessionTakeoverRequestSchema,
         responseSchema: DirectSessionTakeoverResponseSchema,
         opts,
     });
 }
 
-export async function machineDirectSessionTakeoverPersist(
+export async function machineDirectSessionTakeoverPersistStart(
     input: DirectSessionTakeoverPersistRequest,
     opts?: MachineDirectSessionsOpts,
-): Promise<DirectSessionTakeoverPersistResponse> {
-    return callDirectSessionMachineRpc({
-        machineId: input.machineId,
-        method: RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST,
-        input,
-        requestSchema: DirectSessionTakeoverPersistRequestSchema,
-        responseSchema: DirectSessionTakeoverPersistResponseSchema,
-        opts,
-    });
+): Promise<DirectSessionTakeoverPersistStartResponse> {
+    try {
+        return await callDirectSessionMachineRpc({
+            machineId: input.machineId,
+            method: RPC_METHODS.DAEMON_DIRECT_SESSION_TAKEOVER_PERSIST_START,
+            input: withTakeoverTerminalSettings(input),
+            requestSchema: DirectSessionTakeoverPersistRequestSchema,
+            responseSchema: DirectSessionTakeoverPersistStartResponseSchema,
+            opts,
+        });
+    } catch (error) {
+        if (!isRpcMethodNotAvailableError(error) && !isRpcMethodNotFoundError(error)) throw error;
+        return { ok: false, errorCode: 'provider_unavailable', error: 'direct_session_import_requires_daemon_upgrade' };
+    }
 }

@@ -11,7 +11,10 @@ import {
   type ApiSessionSocketStub,
   createApiSessionSocketStub,
 } from '@/testkit/backends/apiSessionSocketHarness';
-import type { SessionMutationOutbox } from '@/api/session/mutations/createSessionMutationOutbox';
+import type {
+  CreateSessionMutationOutboxParams,
+  SessionMutationOutbox,
+} from '@/api/session/mutations/createSessionMutationOutbox';
 import {
   HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY,
   HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY,
@@ -119,8 +122,12 @@ vi.mock('@/api/session/connection/createSessionSocketTransport', () => ({
 }));
 
 vi.mock('@/api/session/mutations/createSessionMutationOutbox', () => ({
-  createSessionMutationOutbox: (): SessionMutationOutbox => ({
-    enqueueSessionTurn: async () => {},
+  createSessionMutationOutbox: (params: CreateSessionMutationOutboxParams): SessionMutationOutbox => ({
+    enqueueAgentStateRequestSettlement: async () => ({ persisted: true, delivered: true }),
+    // A delivered turn mutation publishes its turn, which accepted primary-turn Pending awaits.
+    enqueueSessionTurn: async (mutation) => {
+      queueMicrotask(() => params.onSessionTurnDelivered?.(mutation));
+    },
     enqueueTranscriptMessage: async () => ({ persisted: true, delivered: true }),
     enqueueRuntimeActivitySnapshot: async () => ({ persisted: true, delivered: true }),
     setSessionSyncPendingInputServerContract: async () => {},
@@ -612,14 +619,17 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
     const client = await createCodexSessionClient();
     const { root, endActiveTurn, echoUserMessage } = await startScriptedCodexAppServer();
     const { runtime, activeTurn } = await startCodexRuntimeOnSession(client, root);
+    const steered = vi.fn();
     client.onUserMessage(async (message) => {
       await runtime.steerPrompt(message.content.text, { localId: message.localId });
+      steered();
     });
     materializeNextMock.mockResolvedValueOnce(providerDeliveryMaterializeResult(localId, 'steer-without-echo'));
 
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
       .resolves.toMatchObject({ type: 'materialized', localId });
     await waitUntil(() => client.hasCanonicalPendingProviderInputDelivery(localId));
+    await waitUntil(() => steered.mock.calls.length === 1);
     await endActiveTurn();
     await activeTurn;
     await waitUntil(() => blockReasonsFor(localId).length > 0);
@@ -640,12 +650,15 @@ describe('Codex app-server provider-input outcomes reach Queue custody', () => {
     const client = await createCodexSessionClient();
     const fake = await startScriptedCodexAppServer();
     const composed = await startCodexRuntimeOnSession(client, fake.root);
+    const steered = vi.fn();
     client.onUserMessage(async (message) => {
       await composed.runtime.steerPrompt(message.content.text, { localId: message.localId });
+      steered();
     });
     materializeNextMock.mockResolvedValueOnce(providerDeliveryMaterializeResult(localId, 'steer-without-echo'));
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
       .resolves.toMatchObject({ type: 'materialized', localId });
+    await waitUntil(() => steered.mock.calls.length === 1);
     await fake.endTurn('turn-1');
     await composed.activeTurn;
     await waitUntil(() => blockReasonsFor(localId).length > 0);

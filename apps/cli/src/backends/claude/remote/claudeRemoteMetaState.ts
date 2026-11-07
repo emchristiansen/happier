@@ -1,15 +1,24 @@
+import { normalizeClaudeSettingSourcesV2 } from '@/backends/claude/utils/resolveClaudeSettingSources';
 import {
     CLAUDE_UNIFIED_TERMINAL_HOSTS,
+    CLAUDE_REMOTE_PROVIDER_FIELDS,
+    CLAUDE_REMOTE_PROVIDER_SETTINGS_DEFAULTS,
     CLAUDE_UNIFIED_TERMINAL_RESUME_CHOICES,
     type ClaudeUnifiedTerminalHost,
     type ClaudeUnifiedTerminalResumeChoice,
+    type ClaudeUnifiedTerminalResponseLocation,
+    CLAUDE_UNIFIED_TERMINAL_RESPONSE_LOCATIONS,
 } from '@happier-dev/agents';
 
 export type ClaudeRemoteMetaState = Readonly<{
     claudeRemoteAgentSdkEnabled: boolean;
+    claudeRemoteIdleReclaimEnabled: boolean;
+    claudeRemoteIdleReclaimTimeoutMinutes: number;
     claudeUnifiedTerminalEnabled: boolean;
     claudeUnifiedTerminalHost: ClaudeUnifiedTerminalHost;
     claudeUnifiedTerminalResumeChoice: ClaudeUnifiedTerminalResumeChoice;
+    claudeUnifiedTerminalQuestionResponseLocation: ClaudeUnifiedTerminalResponseLocation | null;
+    claudeUnifiedTerminalPermissionResponseLocation: ClaudeUnifiedTerminalResponseLocation | null;
     /**
      * v2 multi-select representation of Claude Code setting sources.
      *
@@ -23,6 +32,7 @@ export type ClaudeRemoteMetaState = Readonly<{
      * Kept for back-compat with older clients. New code should prefer `claudeRemoteSettingSourcesV2`.
      */
     claudeRemoteSettingSources: 'project' | 'user_project' | 'none';
+    claudeCodeIncludeInNativeHistory: boolean;
     claudeCodeExperimentalAgentTeamsEnabled: boolean;
     claudeLocalPermissionBridgeEnabled: boolean;
     claudeLocalPermissionBridgeWaitIndefinitely: boolean;
@@ -37,7 +47,6 @@ export type ClaudeRemoteMetaState = Readonly<{
     claudeRemoteAdvancedOptionsJson: string;
 }>;
 
-const SETTING_SOURCES_V2_ORDER = ['user', 'project', 'local'] as const;
 const DEBUG_CATEGORIES_ORDER = ['api', 'mcp', 'hooks', 'file', '1p'] as const;
 
 function isClaudeUnifiedTerminalHost(value: string): value is ClaudeUnifiedTerminalHost {
@@ -46,20 +55,6 @@ function isClaudeUnifiedTerminalHost(value: string): value is ClaudeUnifiedTermi
 
 function isClaudeUnifiedTerminalResumeChoice(value: string): value is ClaudeUnifiedTerminalResumeChoice {
     return (CLAUDE_UNIFIED_TERMINAL_RESUME_CHOICES as readonly string[]).includes(value);
-}
-
-function normalizeSettingSourcesV2(raw: unknown): ('user' | 'project' | 'local')[] | null {
-    if (!Array.isArray(raw)) return null;
-    const set = new Set<string>();
-    for (const value of raw) {
-        if (typeof value !== 'string') continue;
-        set.add(value);
-    }
-    const out: ('user' | 'project' | 'local')[] = [];
-    for (const key of SETTING_SOURCES_V2_ORDER) {
-        if (set.has(key)) out.push(key);
-    }
-    return out;
 }
 
 function normalizeDebugCategories(raw: unknown): Array<'api' | 'mcp' | 'hooks' | 'file' | '1p'> | null {
@@ -78,13 +73,19 @@ function normalizeDebugCategories(raw: unknown): Array<'api' | 'mcp' | 'hooks' |
 
 export const DEFAULT_CLAUDE_REMOTE_META_STATE: ClaudeRemoteMetaState = Object.freeze({
     claudeRemoteAgentSdkEnabled: true,
+    claudeRemoteIdleReclaimEnabled: CLAUDE_REMOTE_PROVIDER_SETTINGS_DEFAULTS.claudeRemoteIdleReclaimEnabled,
+    claudeRemoteIdleReclaimTimeoutMinutes: CLAUDE_REMOTE_PROVIDER_SETTINGS_DEFAULTS.claudeRemoteIdleReclaimTimeoutMinutes,
     claudeUnifiedTerminalEnabled: false,
     claudeUnifiedTerminalHost: 'auto',
     claudeUnifiedTerminalResumeChoice: 'ask_every_time',
+    // Preserve absence until the shared resolver can see an older explicit bridge opt-out.
+    claudeUnifiedTerminalQuestionResponseLocation: null,
+    claudeUnifiedTerminalPermissionResponseLocation: null,
     claudeRemoteSettingSourcesV2: ['user', 'project', 'local'] as const,
     // Default to loading BOTH user + project settings so Claude Code can see the user's
     // globally configured MCP servers (and other preferences) when launched by Happier.
     claudeRemoteSettingSources: 'user_project',
+    claudeCodeIncludeInNativeHistory: false,
     claudeCodeExperimentalAgentTeamsEnabled: false,
     claudeLocalPermissionBridgeEnabled: true,
     claudeLocalPermissionBridgeWaitIndefinitely: true,
@@ -111,9 +112,25 @@ export function applyClaudeRemoteMetaState(prev: ClaudeRemoteMetaState, meta: un
     };
 
     const record = meta as Record<string, unknown>;
+    for (const key of ['claudeUnifiedTerminalQuestionResponseLocation', 'claudeUnifiedTerminalPermissionResponseLocation'] as const) {
+        const value = record[key];
+        if (typeof value === 'string' && (CLAUDE_UNIFIED_TERMINAL_RESPONSE_LOCATIONS as readonly string[]).includes(value)) {
+            next[key] = value as ClaudeUnifiedTerminalResponseLocation;
+        }
+    }
 
     if (typeof record.claudeRemoteAgentSdkEnabled === 'boolean') {
         next.claudeRemoteAgentSdkEnabled = record.claudeRemoteAgentSdkEnabled;
+    }
+
+    if (typeof record.claudeRemoteIdleReclaimEnabled === 'boolean') {
+        next.claudeRemoteIdleReclaimEnabled = record.claudeRemoteIdleReclaimEnabled;
+    }
+    const idleTimeout = CLAUDE_REMOTE_PROVIDER_FIELDS.claudeRemoteIdleReclaimTimeoutMinutes.schema.safeParse(
+        record.claudeRemoteIdleReclaimTimeoutMinutes,
+    );
+    if (idleTimeout.success) {
+        next.claudeRemoteIdleReclaimTimeoutMinutes = idleTimeout.data;
     }
 
     if (typeof record.claudeUnifiedTerminalEnabled === 'boolean') {
@@ -134,7 +151,7 @@ export function applyClaudeRemoteMetaState(prev: ClaudeRemoteMetaState, meta: un
         }
     }
 
-    const normalizedV2 = normalizeSettingSourcesV2(record.claudeRemoteSettingSourcesV2);
+    const normalizedV2 = normalizeClaudeSettingSourcesV2(record.claudeRemoteSettingSourcesV2);
     if (normalizedV2 !== null) {
         next.claudeRemoteSettingSourcesV2 = normalizedV2;
     }
@@ -144,6 +161,10 @@ export function applyClaudeRemoteMetaState(prev: ClaudeRemoteMetaState, meta: un
         if (value === 'project' || value === 'user_project' || value === 'none') {
             next.claudeRemoteSettingSources = value;
         }
+    }
+
+    if (typeof record.claudeCodeIncludeInNativeHistory === 'boolean') {
+        next.claudeCodeIncludeInNativeHistory = record.claudeCodeIncludeInNativeHistory;
     }
 
     if (typeof record.claudeCodeExperimentalAgentTeamsEnabled === 'boolean') {

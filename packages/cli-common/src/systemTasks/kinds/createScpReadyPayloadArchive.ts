@@ -1,12 +1,9 @@
-import { execFile } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { promisify } from 'node:util';
+import { runCommandStreaming } from '../../process/index.js';
 
 import { createScpReadyPayloadCopy } from './createScpReadyPayloadCopy.js';
-
-const execFileAsync = promisify(execFile);
 
 export async function createScpReadyPayloadArchive(payloadRoot: string): Promise<Readonly<{
   archiveStageRoot: string;
@@ -20,13 +17,13 @@ export async function createScpReadyPayloadArchive(payloadRoot: string): Promise
   const archiveFileName = `${extractedPayloadDirName}.tar`;
 
   try {
-    await execFileAsync('tar', [
+    await runCommandStreaming({ cmd: 'tar', args: [
       '-cf',
       join(archiveStageRoot, archiveFileName),
       '-C',
       join(scpReadyPayload.payloadRoot, '..'),
       extractedPayloadDirName,
-    ]);
+    ] });
     return {
       archiveStageRoot,
       archiveFileName,

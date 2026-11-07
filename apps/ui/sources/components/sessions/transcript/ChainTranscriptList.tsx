@@ -61,6 +61,7 @@ import {
     resolveTranscriptListRendererSelection,
 } from '@/components/sessions/transcript/viewport/shell/renderer/resolveTranscriptListRenderer';
 import { resolveSidechainTranscriptListShellFrame } from '@/components/sessions/transcript/viewport/shell/transcriptListShellCapabilities';
+import { resolveTranscriptListShellEdgeSlots } from '@/components/sessions/transcript/viewport/shell/transcriptListShellEdgeSlots';
 import {
     applySidechainInitialBottomPinRequest,
 } from '@/components/sessions/transcript/viewport/shell/sidechainInitialBottomPin';
@@ -1023,6 +1024,7 @@ export const ChainTranscriptList = React.memo(function ChainTranscriptList(props
         if (item.kind === 'tool-group-footer') {
             return (
                 <ToolCallsGroupUnitFooterRowWithSessionCommon
+                    hasVisibleTools={item.hasVisibleTools}
                     sessionId={props.sessionId}
                     groupId={item.groupId}
                     metadata={props.metadata}
@@ -1104,6 +1106,21 @@ export const ChainTranscriptList = React.memo(function ChainTranscriptList(props
         thinkingExpandedByMessageId,
     }), [thinkingExpandedByMessageId, transcriptMessageSelection.selectionVersion]);
 
+    const edgeSlots = resolveTranscriptListShellEdgeSlots<React.ReactNode>({
+        frame: shellFrame,
+        visualTopNode: props.header ? <View>{props.header}</View> : null,
+        visualBottomNode: (
+            <>
+                {items.length === 0 && props.isInitialLoadInFlight !== false ? (
+                    <View testID="chain-transcript-loading-footer" style={{ paddingVertical: 12 }}>
+                        <ActivitySpinner size="small" />
+                    </View>
+                ) : null}
+                {props.footer ? <View>{props.footer}</View> : null}
+            </>
+        ),
+    });
+
     return (
         <TranscriptMotionProvider sessionKey={datasetKey} config={motionConfig}>
             <TranscriptRowLayoutMutationProvider value={prepareRowLayoutMutation}>
@@ -1152,21 +1169,8 @@ export const ChainTranscriptList = React.memo(function ChainTranscriptList(props
                     onStartReached={observeRenderedOlderStartEdge}
                     onEndReachedThreshold={startReachedThreshold}
                     onEndReached={observeRenderedOlderEndEdge}
-                    header={
-                        props.header ? (
-                            <View>{props.header}</View>
-                        ) : null
-                    }
-                    footer={
-                        <>
-                            {items.length === 0 && props.isInitialLoadInFlight !== false ? (
-                                <View testID="chain-transcript-loading-footer" style={{ paddingVertical: 12 }}>
-                                    <ActivitySpinner size="small" />
-                                </View>
-                            ) : null}
-                            {props.footer ? <View>{props.footer}</View> : null}
-                        </>
-                    }
+                    header={edgeSlots.listHeaderNode}
+                    footer={edgeSlots.listFooterNode}
                     olderLoadOverlay={olderPagination.isLoadingOlder ? <OlderLoadProgressOverlay /> : null}
                     catchUpOverlay={(
                         <CatchUpProgressOverlay

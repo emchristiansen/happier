@@ -25,29 +25,46 @@ describe('createExecutionRunPermissionHandler', () => {
     });
   });
 
-  it('routes write-like tools in the admitted default mode through the session permission owner', async () => {
-    const interactiveHandler = {
-      handleToolCall: vi.fn(async () => ({ decision: 'approved' as const })),
-      cancelPendingRequest: vi.fn(() => true),
-    };
-    const handler = createExecutionRunPermissionHandler({
-      backendId: 'codex',
-      permissionMode: 'default',
-      interactiveHandler,
-    });
+  it.each(['default', 'not-a-mode'])(
+    'routes write-like tools in admitted %s mode through the available permission response route',
+    async (permissionMode) => {
+      const interactiveHandler = {
+        handleToolCall: vi.fn(async () => ({ decision: 'approved' as const })),
+        cancelPendingRequest: vi.fn(() => true),
+      };
+      const handler = createExecutionRunPermissionHandler({
+        backendId: 'codex',
+        permissionMode,
+        interactiveHandler,
+      });
 
-    await expect(handler.handleToolCall('tool-default', 'bash', { command: 'echo write' })).resolves.toEqual({
-      decision: 'approved',
-    });
-    expect(interactiveHandler.handleToolCall).toHaveBeenCalledWith(
-      'tool-default',
-      'bash',
-      { command: 'echo write' },
-      { permissionMode: 'default' },
-    );
-    expect(handler.cancelPendingRequest?.('tool-default', 'run cancelled')).toBe(true);
-    expect(interactiveHandler.cancelPendingRequest).toHaveBeenCalledWith('tool-default', 'run cancelled');
-  });
+      await expect(handler.handleToolCall('tool-default', 'bash', { command: 'echo write' })).resolves.toEqual({
+        decision: 'approved',
+      });
+      expect(interactiveHandler.handleToolCall).toHaveBeenCalledWith(
+        'tool-default',
+        'bash',
+        { command: 'echo write' },
+        { permissionMode: 'default' },
+      );
+      expect(handler.cancelPendingRequest?.('tool-default', 'run cancelled')).toBe(true);
+      expect(interactiveHandler.cancelPendingRequest).toHaveBeenCalledWith('tool-default', 'run cancelled');
+    },
+  );
+
+  it.each(['default', 'not-a-mode'])(
+    'fails with a typed interaction-unavailable error when %s mode needs approval but no response route exists',
+    async (permissionMode) => {
+      const handler = createExecutionRunPermissionHandler({
+        backendId: 'codex',
+        permissionMode,
+      });
+
+      await expect(handler.handleToolCall('tool-unavailable', 'bash', { command: 'echo write' })).rejects.toMatchObject({
+        executionRunErrorCode: 'execution_run_interaction_unavailable',
+      });
+    },
+  );
 
   it('auto-approves read-like ACP tools for read-only execution runs', async () => {
     const handler = createExecutionRunPermissionHandler({

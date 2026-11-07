@@ -8,7 +8,6 @@ import {
     UNRELEASED_TREE_ENV_VAR,
     UPCOMING_LABEL,
     UPCOMING_RELEASE,
-    isShippedAgentId,
 } from './availability';
 import { readUnreleasedAgentIds, resolveUnreleasedTreeRoot } from './unreleasedTree';
 import { GRID_FEATURES, PRIMARY_FEATURES } from './features';
@@ -30,10 +29,10 @@ import { AgentsIndex } from '../pages/AgentsIndex';
  *   2. The FAQ named two voice modes from a dev-only lab in this repository.
  *      The released build offers four different ones.
  *
- * Note the ONE reading of the unreleased registry below. It is deliberate and
- * it is the only legitimate use of it on this site: the unreleased set MINUS
- * the shipped set is exactly the definition of UPCOMING. It is never used to
- * decide what the site may claim.
+ * The unreleased registry validates curated upcoming claims. Every advertised
+ * upcoming agent must exist there and be absent from the shipped set, but the
+ * site need not announce every development entry. Development membership
+ * never establishes shipped availability.
  *
  * It is read off disk rather than imported, for the same reason the released
  * tree is — see unreleasedTree.ts. A static import assumed this site sits in
@@ -41,9 +40,14 @@ import { AgentsIndex } from '../pages/AgentsIndex';
  */
 
 const unreleasedAgentIds = readUnreleasedAgentIds();
-const unreleasedOnly = (unreleasedAgentIds ?? []).filter((id) => !isShippedAgentId(id));
+// The registry renamed this existing integration between the two trees.
+const agentIdentity = (id: string) => id === 'custom-acp' ? 'customAcp' : id;
+const shippedIdentities = new Set(SHIPPED_AGENT_IDS.map(agentIdentity));
+const unreleasedOnly = new Set(
+    (unreleasedAgentIds ?? []).map(agentIdentity).filter((id) => !shippedIdentities.has(id)),
+);
 
-describe('the upcoming set is computed, not asserted', () => {
+describe('curated upcoming claims are checked against both registries', () => {
     /**
      * The guard's own guard, matching agents.test.ts: a cross-tree check that
      * cannot find the other tree is a check that did not happen.
@@ -51,27 +55,29 @@ describe('the upcoming set is computed, not asserted', () => {
     it('can see the unreleased tree', () => {
         expect(
             resolveUnreleasedTreeRoot(),
-            `The unreleased checkout was not found. UPCOMING is defined as the unreleased ` +
-                `registry minus the shipped one, so without it this file cannot tell an ` +
+            `The unreleased checkout was not found. Upcoming claims must exist in the unreleased ` +
+                `registry and be absent from the shipped one, so this file cannot distinguish an ` +
                 `unreleased agent from a shipped one and every assertion below is empty. ` +
                 `Point ${UNRELEASED_TREE_ENV_VAR} at the unreleased checkout.`,
         ).not.toBeNull();
     });
 
-    it('derives upcoming from the unreleased registry minus the shipped one', () => {
+    it('only advertises upcoming agents present in development and absent from the release', () => {
         if (!unreleasedAgentIds) return; // reported by the test above
-        expect(
-            UPCOMING_AGENTS.map((a) => a.id).sort(),
-            'UPCOMING_AGENTS is out of step with the registries. Everything in the unreleased ' +
-                'tree and not in the release belongs here, labelled; nothing else does.',
-        ).toEqual([...unreleasedOnly].sort());
+        for (const agent of UPCOMING_AGENTS) {
+            expect(
+                unreleasedOnly.has(agentIdentity(agent.id)),
+                `UPCOMING_AGENTS names '${agent.id}', which must exist in development and be ` +
+                    'absent from the release. Unannounced development entries may remain omitted.',
+            ).toBe(true);
+        }
     });
 
     it('never lets an unreleased agent into a shipped-facing collection', () => {
         if (!unreleasedAgentIds) return; // reported by the test above
         const shippedFacing = new Map<string, string>([
-            ...AGENTS.map((a) => [a.id, `AGENTS (/agents/${a.slug})`] as const),
-            ...Object.keys(UNLISTED_AGENTS).map((id) => [id, 'UNLISTED_AGENTS'] as const),
+            ...AGENTS.map((a) => [agentIdentity(a.id), `AGENTS (/agents/${a.slug})`] as const),
+            ...Object.keys(UNLISTED_AGENTS).map((id) => [agentIdentity(id), 'UNLISTED_AGENTS'] as const),
         ]);
 
         for (const id of unreleasedOnly) {
@@ -95,10 +101,10 @@ describe('the upcoming set is computed, not asserted', () => {
         }
     });
 
-    it('keeps every id in exactly one state', () => {
+    it('keeps shipped identities out of the upcoming collection', () => {
         for (const id of SHIPPED_AGENT_IDS) {
             expect(
-                UPCOMING_AGENTS.some((a) => a.id === id),
+                UPCOMING_AGENTS.some((a) => agentIdentity(a.id) === agentIdentity(id)),
                 `'${id}' ships and is also listed as upcoming`,
             ).toBe(false);
         }

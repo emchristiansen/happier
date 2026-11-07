@@ -12,6 +12,10 @@ import {
     selectSessionListRowStateSnapshot,
 } from './sessionListRowStateSnapshot';
 import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
+import { createSessionFixture } from '@/dev/testkit';
+import { buildSessionListRenderableMetadata } from '@/sync/domains/session/listing/sessionListRenderable';
+import { resolveSessionWorkspacePresentation } from '@/sync/domains/session/listing/sessionWorkspacePresentation';
+import { buildSessionOrganizationLabelKey } from '@/sync/domains/session/organization/keys';
 
 const serverProfileMockState = vi.hoisted(() => ({
     profiles: [] as ServerProfile[],
@@ -98,6 +102,52 @@ const pending = {
 } satisfies SessionPending;
 
 describe('selectSessionListRowStateSnapshot', () => {
+    it.each(['renderable', 'session'] as const)('keeps foreign workspace appearance metadata scoped when the active Home shares its session id (%s)', (source) => {
+        const activeMetadata = { path: '/active/repo', machineId: 'machine', host: 'active' };
+        const activeSession = createSessionFixture({ id: 'shared', metadata: activeMetadata });
+        const foreignSession = createSessionFixture({ id: 'shared', metadata: { path: '/foreign/repo', machineId: 'machine', host: 'foreign' } });
+        const activeScope = { sessionId: 'shared', serverId: 'server-a', metadata: activeSession.metadata };
+        const foreignScope = { sessionId: 'shared', serverId: 'server-b', metadata: foreignSession.metadata };
+        const activeColor = { kind: 'custom', hex: '#123456' } as const;
+        const foreignColor = { kind: 'custom', hex: '#ABCDEF' } as const;
+        const labels = [
+            { serverId: 'server-a', metadata: activeSession.metadata, color: activeColor },
+            { serverId: 'server-b', metadata: activeSession.metadata, color: activeColor },
+            { serverId: 'server-b', metadata: foreignSession.metadata, color: foreignColor },
+        ].map(({ serverId, metadata, color }) => {
+            const scopeKey = resolveSessionWorkspacePresentation({ metadata, machines: {} }).workspaceKey;
+            return [buildSessionOrganizationLabelKey({ serverId, labelKind: 'workspace', scopeKey }), {
+                labelKind: 'workspace' as const, scopeKey, display: { t: 'plain' as const, v: { color } },
+                archivedAt: null, createdAt: 1, updatedAt: 1,
+            }] as const;
+        });
+        const state = {
+            sessions: { shared: activeSession },
+            sessionListRenderables: source === 'renderable' ? { shared: {
+                ...createRenderable('shared'), metadata: buildSessionListRenderableMetadata(activeSession.metadata),
+            } } : {},
+            sessionMessages: { shared: messages },
+            sessionPending: { shared: pending },
+            sessionOrganizationLabelsByLabelKey: Object.fromEntries(labels),
+        };
+        const selector = createSessionListRowStoreStateSelector([activeScope, foreignScope], 'server-a');
+        const selected = selector(state);
+        const active = selectSessionListRowStateSnapshot(selected, activeScope);
+        const foreign = selectSessionListRowStateSnapshot(selected, foreignScope);
+        expect(active.appearanceColor).toEqual(activeColor);
+        expect(active.renderable ?? active.session).toBe(state.sessionListRenderables.shared ?? activeSession);
+        expect(foreign).toEqual({ session: undefined, renderable: undefined, messages: undefined, pending: undefined, appearanceColor: foreignColor });
+
+        const foreignOnly = createSessionListRowStoreStateSelector([foreignScope], 'server-a');
+        const before = foreignOnly(state);
+        const changedActiveSession = { ...activeSession, metadata: { ...activeMetadata, path: '/active/changed' } };
+        expect(foreignOnly({ ...state, sessions: { shared: changedActiveSession },
+            sessionListRenderables: source === 'renderable' ? { shared: {
+                ...createRenderable('shared'), metadata: buildSessionListRenderableMetadata(changedActiveSession.metadata),
+            } } : {},
+        })).toBe(before);
+    });
+
     afterEach(() => {
         serverProfileMockState.profiles = [];
         runtimeClockMockState.nowServerMs = null;
@@ -421,6 +471,49 @@ describe('selectSessionListRowStateSnapshot', () => {
 
         expect(second).not.toBe(first);
         expect(second.sessionListRenderables?.s1).toBe(unreadRenderable);
+    });
+
+    it('reuses unchanged runtime-priority inputs across unrelated updates until their freshness boundary', () => {
+        runtimeClockMockState.nowServerMs = 1_000_000;
+        let runtimeReads = 0;
+        const working = {
+            ...createRenderable('s1'),
+            active: true,
+            activeAt: 990_000,
+            get latestTurnStatus() {
+                runtimeReads += 1;
+                return 'in_progress' as const;
+            },
+            latestTurnStatusObservedAt: 995_000,
+        } satisfies SessionListRenderableSession;
+        const scope = { sessionId: 's1', serverId: 'server-a' };
+        const selector = createSessionListRuntimePriorityRowScopeSelector([scope], 'server-a');
+        const renderables = { s1: working, other: createRenderable('other') };
+        const first = selector({ sessionListRenderables: renderables });
+        const initialReads = runtimeReads;
+        expect(first).toEqual([scope]);
+        expect(initialReads).toBeGreaterThan(0);
+
+        runtimeClockMockState.nowServerMs = 1_001_000;
+        expect(selector({ sessionListRenderables: renderables, sessionMessages: { other: messages } })).toBe(first);
+        expect(selector({
+            sessionListRenderables: { ...renderables, other: { ...renderables.other, updatedAt: 1234 } },
+        })).toBe(first);
+        expect(runtimeReads).toBe(initialReads);
+
+        runtimeClockMockState.nowServerMs = 1_115_000;
+        expect(selector({ sessionListRenderables: renderables })).toEqual([]);
+        expect(runtimeReads).toBeGreaterThan(initialReads);
+
+        // A correction of the server clock can make the same input fresh again.
+        runtimeClockMockState.nowServerMs = 1_000_000;
+        expect(selector({ sessionListRenderables: renderables })).toEqual([scope]);
+        expect(selector({
+            sessionListRenderables: {
+                ...renderables,
+                s1: { ...working, latestTurnStatus: 'completed' },
+            },
+        })).toEqual([]);
     });
 
     it('tracks runtime-priority scopes without changing for non-priority row overlay updates', () => {

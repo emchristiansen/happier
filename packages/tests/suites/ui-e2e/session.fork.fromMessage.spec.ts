@@ -11,7 +11,11 @@ import {
   reloadCreatedSessionFromNewSessionComposer,
 } from '../../src/testkit/uiE2e/createSessionFromNewSessionComposer';
 import { selectSessionForkStrategy } from '../../src/testkit/uiE2e/selectSessionForkStrategy';
-import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import {
+  fakeClaudeEchoResponseText,
+  fakeClaudeEchoResponseTextFromSha256,
+  fakeClaudeFixturePath,
+} from '../../src/testkit/fakeClaude';
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
 import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
 import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
@@ -76,7 +80,7 @@ test.describe('ui e2e: session fork from message', () => {
   });
 
   test('forks from an assistant message and does not show replay seed as a transcript message', async ({ page }) => {
-    test.setTimeout(540_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -101,6 +105,7 @@ test.describe('ui e2e: session fork from message', () => {
         HOME: cliHomeDir,
         HAPPIER_CLAUDE_PATH: fakeClaudePath,
         HAPPIER_E2E_FAKE_CLAUDE_LOG: fakeClaudeLogPath,
+        HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: 'echo-user-text',
         HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
         HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
       },
@@ -108,6 +113,7 @@ test.describe('ui e2e: session fork from message', () => {
 
     const machineId = await waitForDaemonMachineIdFromCliSettings({ cliHomeDir, timeoutMs: 120_000 });
     const parentPrompt = `fork-parent-1 ${run.runId}`;
+    const parentResponse = fakeClaudeEchoResponseText(parentPrompt);
     const parentSession = await createSessionFromNewSessionComposer({
       page,
       uiBaseUrl,
@@ -118,16 +124,16 @@ test.describe('ui e2e: session fork from message', () => {
     const { sessionId: parentSessionId } = parentSession;
 
     await reloadCreatedSessionFromNewSessionComposer({ page, session: parentSession });
-    await expect(page.getByText('FAKE_CLAUDE_OK_1')).toHaveCount(1, { timeout: 180_000 });
+    await expect(page.getByText(parentResponse)).toHaveCount(1, { timeout: 180_000 });
 
     const parentPrompt2 = `fork-parent-2 ${run.runId}`;
     await page.locator('textarea[data-testid="session-composer-input"]:visible').fill(parentPrompt2);
     await page.locator('textarea[data-testid="session-composer-input"]:visible').press('Enter');
-    await expect(page.getByText('FAKE_CLAUDE_OK_2')).toHaveCount(1, { timeout: 180_000 });
+    await expect(page.getByText(fakeClaudeEchoResponseText(parentPrompt2))).toHaveCount(1, { timeout: 180_000 });
 
     // Ensure replay-fork is enabled (server sync can overwrite early settings changes).
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const targetWrapper = page.locator('[data-testid^="transcript-message-"]').filter({ hasText: 'FAKE_CLAUDE_OK_1' }).first();
+      const targetWrapper = page.locator('[data-testid^="transcript-message-"]').filter({ hasText: parentResponse }).first();
       await expect(targetWrapper).toHaveCount(1, { timeout: 60_000 });
       await targetWrapper.hover();
       const wrapperTestId = await targetWrapper.getAttribute('data-testid');
@@ -140,7 +146,7 @@ test.describe('ui e2e: session fork from message', () => {
       await reloadCreatedSessionFromNewSessionComposer({ page, session: parentSession });
     }
 
-    const targetWrapper = page.locator('[data-testid^="transcript-message-"]').filter({ hasText: 'FAKE_CLAUDE_OK_1' }).first();
+    const targetWrapper = page.locator('[data-testid^="transcript-message-"]').filter({ hasText: parentResponse }).first();
     await expect(targetWrapper).toHaveCount(1, { timeout: 60_000 });
     await targetWrapper.hover();
     const wrapperTestId = await targetWrapper.getAttribute('data-testid');
@@ -251,26 +257,14 @@ test.describe('ui e2e: session fork from message', () => {
     }
     expect(childPromptEntry).toBeTruthy();
     expect(String(childPromptEntry?.userTextPreview ?? '')).toContain(parentPrompt);
-    expect(String(childPromptEntry?.userTextPreview ?? '')).toContain('FAKE_CLAUDE_OK_1');
+    expect(String(childPromptEntry?.userTextPreview ?? '')).toContain(parentResponse);
     expect(String(childPromptEntry?.userTextPreview ?? '')).not.toContain(parentPrompt2);
 
-    // Child session is expected to generate a new FAKE_CLAUDE_OK_1 response (new vendor session),
-    // while also showing the read-only ancestor FAKE_CLAUDE_OK_1 message from the parent.
-    await page.waitForFunction(
-      ({ okText }) => {
-        const wrappers = Array.from(document.querySelectorAll('[data-testid^="transcript-message-"]')).filter((n) => {
-          const tid = n.getAttribute('data-testid') ?? '';
-          // Only consider committed message wrappers, not fork/copy action buttons.
-          if (!tid.startsWith('transcript-message-')) return false;
-          if (tid.includes(':')) return false;
-          return String(n.textContent ?? '').includes(String(okText));
-        });
-        const unique = new Set(wrappers.map((n) => n.getAttribute('data-testid') ?? ''));
-        return unique.size >= 2;
-      },
-      { okText: 'FAKE_CLAUDE_OK_1' },
-      { timeout: 180_000 },
-    );
+    // The child response is prompt-correlated while the read-only ancestor response remains visible.
+    const childPromptSha256 = String(childPromptEntry?.userTextSha256 ?? '');
+    expect(childPromptSha256).toMatch(/^[a-f0-9]{64}$/);
+    await expect(page.getByText(fakeClaudeEchoResponseTextFromSha256(childPromptSha256)).first()).toBeVisible({ timeout: 180_000 });
+    await expect(page.getByText(parentResponse).first()).toBeVisible({ timeout: 180_000 });
 
     await expect(
       page.getByText('This session is continuing from a previous Happy session that could not be vendor-resumed.'),

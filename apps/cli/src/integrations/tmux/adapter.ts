@@ -13,6 +13,7 @@ import type {
 } from '../terminalHost/_types';
 import { delay } from '@/utils/time';
 import { logger } from '@/ui/logger';
+import { TerminalHostCreationError } from '@/integrations/terminalHost/errors';
 
 import { createTmuxTerminalControlPort } from './control';
 import { resolveTmuxPromptSubmitDelayMs } from './env';
@@ -25,6 +26,7 @@ import {
 } from '../terminalHost/promptSubmitVerification';
 import { resolveTerminalPromptWriteTimeoutMs } from '@/agent/runtime/terminal/injection/promptWriteTimeout';
 import { createTmuxTerminalHostHandle } from './hostHandle';
+import { formatTmuxSessionIdentifier } from './identifiers';
 
 /**
  * Stability sampling delay between the two full-pane captures used to detect that the user is
@@ -33,7 +35,11 @@ import { createTmuxTerminalHostHandle } from './hostHandle';
 const INPUT_STABILITY_DELAY_MS = 50;
 
 function targetFromHandle(handle: TerminalHostHandle): string {
-  return handle.paneId ? `${handle.sessionName}:${handle.paneId}` : handle.sessionName;
+  // Window IDs are reused after a server restart. Keep the exact owning session.
+  return formatTmuxSessionIdentifier({
+    session: handle.sessionName,
+    window: handle.paneId?.trim(),
+  }, { exactSession: true });
 }
 
 export function resolveTmuxCommandEnvironmentForHostHandle(
@@ -86,11 +92,12 @@ export function createTmuxTerminalHostAdapter(params?: Readonly<{
 }>): TerminalHostAdapter {
   const tmux = params?.tmux ?? new TmuxUtilities();
   const promptSubmitVerification = params?.promptSubmitVerification;
-  const tmuxForHandle = (handle: TerminalHostHandle): TmuxUtilities => {
+  const tmuxForEnvironment = (environment: Record<string, string> | undefined): TmuxUtilities => {
     if (params?.tmux) return params.tmux;
-    const environment = resolveTmuxCommandEnvironmentForHostHandle(handle);
     return environment ? new TmuxUtilities(undefined, environment) : tmux;
   };
+  const tmuxForHandle = (handle: TerminalHostHandle): TmuxUtilities =>
+    tmuxForEnvironment(resolveTmuxCommandEnvironmentForHostHandle(handle));
 
   async function evaluateLiveness(handle: TerminalHostHandle) {
     const handleTmux = tmuxForHandle(handle);
@@ -148,20 +155,24 @@ export function createTmuxTerminalHostAdapter(params?: Readonly<{
   }
 
   const createOrAttachHost: TerminalHostAdapter['createOrAttachHost'] = async (opts) => {
-    const result = await tmux.spawnInTmux([...opts.spawnArgv], {
+    // The socket root selects the tmux client/server as well as the child environment.
+    const commandEnv = opts.spawnEnv.TMUX_TMPDIR ? { TMUX_TMPDIR: opts.spawnEnv.TMUX_TMPDIR } : undefined;
+    const result = await tmuxForEnvironment(commandEnv).spawnInTmux([...opts.spawnArgv], {
       sessionName: opts.sessionName,
-      windowName: opts.sessionName,
+      windowName: opts.topology === 'shared' ? opts.label ?? opts.sessionName : opts.sessionName,
       cwd: opts.workingDirectory,
-      requireNewSession: true,
+      requireNewSession: opts.topology !== 'shared',
     }, { ...opts.spawnEnv });
     if (!result.success) {
-      throw new Error(result.error ?? 'Failed to create tmux terminal host');
+      const error = new Error(result.error ?? 'Failed to create tmux terminal host');
+      throw new TerminalHostCreationError([error], result, error.message);
     }
     return createTmuxTerminalHostHandle({
       attachmentId: randomUUID() as TerminalAttachmentId,
       sessionName: result.sessionName ?? opts.sessionName,
-      windowName: result.windowName,
-      topology: 'exclusive',
+      windowId: result.windowId ?? '',
+      topology: opts.topology ?? 'exclusive',
+      ...(opts.spawnEnv.TMUX_TMPDIR ? { tmuxTmpDir: opts.spawnEnv.TMUX_TMPDIR } : {}),
     });
   };
 
@@ -223,9 +234,11 @@ export function createTmuxTerminalHostAdapter(params?: Readonly<{
       const result = await pasteTextViaTmuxBuffer({
         target: targetFromHandle(handle),
         text: input.text,
+        signal: input.signal,
+        resolveDeliveryState: input.resolveDeliveryState,
         bufferName: createTmuxPromptBufferName(),
         submitDelayMs: resolveTmuxPromptSubmitDelayMs(),
-        submitRetryDelayMs: resolveTmuxPromptSubmitDelayMs(),
+        postSubmitSettleMs: resolveTmuxPromptSubmitDelayMs(),
         timeoutMs: input.scheduling.timeoutMs ?? resolveTerminalPromptWriteTimeoutMs(input.text),
         ...(writeBoundary
           ? {
@@ -303,7 +316,7 @@ export function createTmuxTerminalHostAdapter(params?: Readonly<{
     async dispose(handle: TerminalHostHandle) {
       const handleTmux = tmuxForHandle(handle);
       if (handle.attachMetadata.topology === 'exclusive') {
-        const result = await handleTmux.executeTmuxCommand(['kill-session'], handle.sessionName);
+        const result = await handleTmux.executeTmuxCommand(['kill-session'], targetFromHandle({ ...handle, paneId: undefined }));
         if (!result || result.returncode !== 0) {
           throw new Error(`Failed to destroy owned tmux session ${handle.sessionName}`);
         }

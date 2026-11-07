@@ -1,7 +1,11 @@
 import fs from 'node:fs';
 
+import { parseDarwinPlistBoolean } from './discoverInstalledDaemonServiceEntries';
+
 /**
- * Semantic equivalence check for darwin launchd plist service definitions.
+ * Equivalence check for installed daemon service definitions.
+ * Systemd units compare strictly except for the inherited PATH value; launchd
+ * plists use the semantic signature below.
  *
  * Background: the previous raw-file-equality check (`installed.trim() ===
  * expected.trim()`) reported spurious drift because the expected content is
@@ -35,10 +39,35 @@ export function doesInstalledDaemonServiceDefinitionMatchExpected(params: Readon
   // services where nothing has drifted yet.
   if (installedRaw.trim() === params.expectedContents.trim()) return true;
 
+  const installedSystemd = normalizeSystemdServicePath(installedRaw);
+  const expectedSystemd = normalizeSystemdServicePath(params.expectedContents);
+  if (installedSystemd !== null && expectedSystemd !== null) {
+    return installedSystemd === expectedSystemd;
+  }
+
   const installed = extractPlistSignature(installedRaw);
   const expected = extractPlistSignature(params.expectedContents);
   if (!installed || !expected) return false;
   return compareServiceSignatures(installed, expected);
+}
+
+function normalizeSystemdServicePath(contents: string): string | null {
+  let section = '';
+  let hasServiceSection = false;
+  const lines = contents.trim().split('\n').map((line) => {
+    if (/^\[[^\]]+\]$/.test(line)) {
+      section = line;
+      if (section === '[Service]') hasServiceSection = true;
+    }
+    // Match only the standalone assignment emitted by renderSystemdServiceUnit,
+    // including its escaped quoted form. Do not hide other assignments or a
+    // missing PATH, and keep every other directive byte-for-byte comparable.
+    if (section === '[Service]' && /^Environment=PATH=(?:"(?:[^"\\]|\\.)*"|[A-Za-z0-9_./:@%+-]+)$/.test(line)) {
+      return 'Environment=PATH=';
+    }
+    return line;
+  });
+  return hasServiceSection ? lines.join('\n') : null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -52,6 +81,9 @@ type PlistSignature = Readonly<{
   workingDirectory: string;
   stdoutPath: string;
   stderrPath: string;
+  runAtLoad: boolean | null;
+  keepAlive: boolean | null;
+  keepAliveConditions: Readonly<Record<string, string>>;
 }>;
 
 function compareServiceSignatures(a: PlistSignature, b: PlistSignature): boolean {
@@ -59,6 +91,8 @@ function compareServiceSignatures(a: PlistSignature, b: PlistSignature): boolean
   if (a.workingDirectory !== b.workingDirectory) return false;
   if (a.stdoutPath !== b.stdoutPath) return false;
   if (a.stderrPath !== b.stderrPath) return false;
+  if (a.runAtLoad !== b.runAtLoad || a.keepAlive !== b.keepAlive) return false;
+  if (!shallowEqualStringMap(a.keepAliveConditions, b.keepAliveConditions)) return false;
   if (!compareProgramArgumentsSemantically(a.programArguments, b.programArguments)) return false;
   // Drop PATH from both sides — it is populated from the caller's environment
   // and drifts per invocation (fnm shells, cwd node_modules/.bin cascades).
@@ -139,6 +173,9 @@ function extractPlistSignature(plistXml: string): PlistSignature | null {
     workingDirectory: extractPlistStringValue(plistXml, 'WorkingDirectory') ?? '',
     stdoutPath: extractPlistStringValue(plistXml, 'StandardOutPath') ?? '',
     stderrPath: extractPlistStringValue(plistXml, 'StandardErrorPath') ?? '',
+    runAtLoad: parseDarwinPlistBoolean(plistXml, 'RunAtLoad'),
+    keepAlive: parseDarwinPlistBoolean(plistXml, 'KeepAlive'),
+    keepAliveConditions: extractPlistDictStrings(plistXml, 'KeepAlive'),
   };
 }
 

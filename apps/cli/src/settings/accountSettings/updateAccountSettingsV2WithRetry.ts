@@ -1,11 +1,11 @@
 import { randomBytes as nodeRandomBytes } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 
-import type { Credentials } from '@/persistence';
+import { requireEncryptionCredentials, type Credentials } from '@/persistence';
 
 import axios from 'axios';
 
-import { configuration } from '@/configuration';
+import { getAccountEncryptionMode } from '@/api/connectedServices/connectedServiceCredentialApi';
 import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
 import { logger } from '@/ui/logger';
 import { decryptAccountSettingsCiphertext } from '@/settings/accountSettingsClient';
@@ -27,8 +27,10 @@ import {
   type AccountSettingsCache,
 } from './accountSettingsCache';
 import { resolveAccountSettingsHttpBaseUrl } from './resolveAccountSettingsHttpBaseUrl';
+import { assertAccountEncryptionModeAllowedByEffectiveClientRequirement } from './resolveEffectiveClientEncryptionRequirement';
 
 function resolveMaterial(credentials: Credentials): { type: 'legacy'; secret: Uint8Array } | { type: 'dataKey'; machineKey: Uint8Array } {
+  requireEncryptionCredentials(credentials);
   return credentials.encryption.type === 'legacy'
     ? { type: 'legacy', secret: credentials.encryption.secret }
     : { type: 'dataKey', machineKey: credentials.encryption.machineKey };
@@ -93,7 +95,12 @@ async function parseSettingsFromContent(params: Readonly<{
   credentials: Credentials;
 }>): Promise<{ raw: AccountSettingsPersistedObject; envelopeKind: 'plain' | 'encrypted' }> {
   if (!params.content) {
-    return { raw: {}, envelopeKind: 'encrypted' };
+    // No stored envelope exists yet; key custody does not authorize a storage mode.
+    const mode = await getAccountEncryptionMode({ token: params.credentials.token });
+    if (mode === 'unknown') {
+      throw new Error('Cannot determine account encryption mode for initial settings');
+    }
+    return { raw: {}, envelopeKind: mode === 'plain' ? 'plain' : 'encrypted' };
   }
 
   if (params.content.t === 'plain') {
@@ -202,10 +209,22 @@ export async function updateAccountSettingsV2WithRetry(_params: Readonly<{
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const parsed = await parseSettingsFromContent({ content, credentials: params.credentials });
+    if (parsed.envelopeKind === 'plain') {
+      assertAccountEncryptionModeAllowedByEffectiveClientRequirement(
+        'plain',
+        accountSettingsParse(parsed.raw),
+      );
+    }
     const nextRaw = mergeMutationResultWithRawBase({
       rawBase: parsed.raw,
       mutatedRaw: parsePersistedAccountSettingsObject(params.mutate(parsed.raw)),
     });
+    if (parsed.envelopeKind === 'plain') {
+      assertAccountEncryptionModeAllowedByEffectiveClientRequirement(
+        'plain',
+        accountSettingsParse(nextRaw),
+      );
+    }
 
     if (isDeepStrictEqual(nextRaw, parsed.raw)) {
       await writeCacheSnapshot(content, version);

@@ -4,6 +4,7 @@ import { RPC_ERROR_CODES } from '@happier-dev/protocol/rpc';
 import { INACTIVE_SESSION_RPC_UNAVAILABLE_ERROR } from '@/sync/runtime/sessionMachineRpcFallback';
 import {
     resolveAppSessionTransferAvailability,
+    resolveMachineTransferRoute,
     SERVER_TRANSFER_POLICY_UNAVAILABLE_ERROR as TRANSFERS_SERVER_TRANSFER_POLICY_UNAVAILABLE_ERROR,
     SESSION_ROUTED_FILE_TRANSFER_TOO_LARGE_ERROR,
 } from '@happier-dev/transfers';
@@ -204,53 +205,22 @@ export function resolveMachineTransferAvailability(input: Readonly<{
         };
     }
 
-    const transferEnabled = readServerEnabledBit(features, 'machines.transfer') === true;
-    if (!transferEnabled) {
+    const route = resolveMachineTransferRoute({
+        serverFeatures: features,
+        preferredStrategies: input.preferredTransportStrategies,
+        directPeerAvailable: true,
+    });
+    if (route.kind === 'unavailable') {
         return {
             ok: false,
             errorCode: 'transfer_disabled',
             errorMessage: 'Machine transfer is disabled on the selected server',
-        };
-    }
-
-    const directPeerEnabled = readServerEnabledBit(features, 'machines.transfer.directPeer') === true;
-    const serverRoutedEnabled = readServerEnabledBit(features, 'machines.transfer.serverRouted') === true;
-    if (!directPeerEnabled && !serverRoutedEnabled) {
-        return {
-            ok: false,
-            errorCode: 'transfer_disabled',
-            errorMessage: 'Machine transfer is disabled on the selected server',
-        };
-    }
-
-    for (const strategy of input.preferredTransportStrategies) {
-        if (strategy === 'direct_peer' && directPeerEnabled) {
-            return {
-                ok: true,
-                negotiatedTransportStrategy: 'direct_peer',
-                allowServerRoutedFallback: serverRoutedEnabled,
-            };
-        }
-        if (strategy === 'server_routed_stream' && serverRoutedEnabled) {
-            return {
-                ok: true,
-                negotiatedTransportStrategy: 'server_routed_stream',
-                allowServerRoutedFallback: true,
-            };
-        }
-    }
-
-    if (serverRoutedEnabled) {
-        return {
-            ok: true,
-            negotiatedTransportStrategy: 'server_routed_stream',
-            allowServerRoutedFallback: true,
         };
     }
 
     return {
         ok: true,
-        negotiatedTransportStrategy: 'direct_peer',
-        allowServerRoutedFallback: false,
+        negotiatedTransportStrategy: route.strategy,
+        allowServerRoutedFallback: route.allowServerRoutedFallback,
     };
 }

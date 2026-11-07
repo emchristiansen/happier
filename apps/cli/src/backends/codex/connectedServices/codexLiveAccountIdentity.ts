@@ -34,8 +34,10 @@ export function readCodexLiveAccountIdentity(value: unknown): CodexLiveAccountId
   const account = readRecord(response?.account);
   const auth = readRecord(response?.auth);
   const profile = readRecord(response?.profile);
+  const workspaceRouting = readRecord(response?.workspaceRouting);
   return {
     activeAccountId: firstString(
+      workspaceRouting?.chatgptAccountId,
       response?.chatgptAccountId,
       response?.chatgpt_account_id,
       response?.accountId,

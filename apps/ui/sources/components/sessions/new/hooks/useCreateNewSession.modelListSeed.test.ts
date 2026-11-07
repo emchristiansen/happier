@@ -348,7 +348,7 @@ describe('useCreateNewSession model list seeding', () => {
         const harness = await setupUseCreateNewSessionHarness();
 
         await runCreateSession(harness, {
-            agentType: 'qwen',
+            agentType: 'kiro',
             preflightModels: PI_PREFLIGHT_MODELS,
         });
 

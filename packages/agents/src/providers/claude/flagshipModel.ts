@@ -9,4 +9,4 @@
  * Invariant: this must be an id present in `CLAUDE_STATIC_MODELS` (guarded by a catalog test),
  * so the constant can never drift to a model that is not actually selectable.
  */
-export const CURRENT_FLAGSHIP_CLAUDE_MODEL_ID = 'claude-opus-5';
+export const CURRENT_FLAGSHIP_CLAUDE_MODEL_ID = 'claude-opus-5-5';

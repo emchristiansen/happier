@@ -1,6 +1,7 @@
 import * as React from 'react';
 import renderer from 'react-test-renderer';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { renderScreen } from '@/dev/testkit';
 import { installSessionDetailsPanelCommonModuleMocks } from './sessionDetailsPanelTestHelpers';
 
@@ -135,7 +136,7 @@ describe('SessionDetailsPanel (Claude subagent launcher resource)', () => {
         tree = (await renderScreen(<SessionDetailsPanel sessionId="s1" scopeId="session:s1" />)).tree;
 
         expect(tree).toBeTruthy();
-        expect(tree!.findAllByType('ActivityIndicator')).toHaveLength(0);
+        expect(tree!.findAllByType(ActivitySpinner)).toHaveLength(0);
         expect(launcherViewSpy).toHaveBeenCalledTimes(1);
     });
 });

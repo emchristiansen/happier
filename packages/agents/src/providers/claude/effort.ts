@@ -3,7 +3,9 @@ export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as
 export type ClaudeEffortLevel = (typeof CLAUDE_EFFORT_LEVELS)[number];
 
 const CLAUDE_EFFORT_LEVELS_BY_MODEL_ID: ReadonlyMap<string, readonly ClaudeEffortLevel[]> = new Map([
+  ['claude-fable-5-1', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['claude-opus-5-5', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['claude-sonnet-5-5', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['claude-opus-5', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['claude-sonnet-5', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['claude-fable-5', ['low', 'medium', 'high', 'xhigh', 'max']],

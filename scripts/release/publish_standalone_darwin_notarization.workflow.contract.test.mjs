@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
@@ -10,6 +13,52 @@ async function loadWorkflow(name) {
   const raw = await readFile(new URL(`../../.github/workflows/${name}`, import.meta.url), 'utf8');
   return { raw, workflow: YAML.parse(raw) };
 }
+
+test('CLI candidate build installs the complete cross-target optional native package set', async () => {
+  const { workflow } = await loadWorkflow('publish-cli-binaries.yml');
+  const install = workflow.jobs.build_candidate.steps.find(
+    (step) => step.uses === './.github/actions/install-yarn-dependencies',
+  );
+
+  assert.match(String(install?.with?.args ?? ''), /(?:^|\s)--ignore-platform(?:\s|$)/);
+});
+
+test('CLI cross-target builds consume the ARM64 PTY addon from the same candidate on a native runner', async () => {
+  const { workflow } = await loadWorkflow('publish-cli-binaries.yml');
+  const native = workflow.jobs.build_linux_arm64_pty;
+  assert.ok(native, 'Linux ARM64 needs its own source-built node-pty addon');
+  assert.equal(native['runs-on'], 'ubuntu-24.04-arm');
+  assert.equal(native.steps.find((step) => step.run?.includes('require("node-pty")'))?.['working-directory'], 'apps/cli');
+  assert.ok(workflow.jobs.build_candidate.needs.includes('build_linux_arm64_pty'));
+  const upload = native.steps.find((step) => step.uses?.startsWith('actions/upload-artifact@'));
+  const download = workflow.jobs.build_candidate.steps.find((step) =>
+    step.uses?.startsWith('actions/download-artifact@') && step.with?.name === upload?.with?.name);
+  assert.ok(upload?.with?.name.includes('${{ needs.prepare.outputs.source_sha }}'));
+  assert.equal(upload.with.path, 'dist/native/node-pty/linux-arm64/pty.node');
+  assert.equal(download?.with?.path, 'dist/native/node-pty/linux-arm64');
+});
+
+test('CLI and hstack publishers keep launcher artifacts distinct within one release run', async () => {
+  const artifactNames = new Set();
+  const launcherDirectory = 'packages/cli-common/native/windows/bin/windows-x64';
+  for (const workflowName of ['publish-cli-binaries.yml', 'publish-hstack-binaries.yml']) {
+    const { workflow } = await loadWorkflow(workflowName);
+    const upload = workflow.jobs.build_windows_service_launcher.steps.find(
+      (step) => step.uses?.startsWith('actions/upload-artifact@')
+        && step.with?.path === `${launcherDirectory}/happier-service-launcher.exe`,
+    );
+    const download = workflow.jobs.build_candidate.steps.find(
+      (step) => step.uses?.startsWith('actions/download-artifact@')
+        && step.with?.path === launcherDirectory,
+    );
+    assert.ok(upload, `${workflowName} must upload its built launcher`);
+    assert.ok(download, `${workflowName} must consume its launcher artifact`);
+    assert.equal(download.with.name, upload.with.name);
+    assert.ok(upload.with.name.includes('${{ needs.prepare.outputs.source_sha }}'));
+    assert.equal(artifactNames.has(upload.with.name), false, 'co-running publishers must not upload the same artifact name');
+    artifactNames.add(upload.with.name);
+  }
+});
 
 test('fresh Darwin finalizers explicitly build the trusted archive runtime before extraction', async () => {
   for (const workflowName of [
@@ -98,7 +147,12 @@ for (const product of [
     assert.match(source, /APPLE_API_PRIVATE_KEY/);
     assert.match(source, /notarize-standalone-binary\.mjs/);
     assert.match(source, /--archive/);
-    assert.match(source, new RegExp(`${product.archiveProduct}-v`));
+    if (product.id === 'cli') {
+      assert.match(source, /for PRODUCT in happier happier-memory-runtime happier-difftastic/);
+      assert.match(source, /\$\{PRODUCT\}-v\$\{VERSION\}-\$\{TARGET\}/);
+    } else {
+      assert.match(source, new RegExp(`${product.archiveProduct}-v`));
+    }
     assert.match(source, /--expected-payload/);
     assert.match(source, /--identity/);
     assert.match(source, /--out/);
@@ -107,7 +161,12 @@ for (const product of [
     } else {
       assert.doesNotMatch(source, /--refresh-cli-runtime-asset-manifest/);
     }
-    assert.match(source, new RegExp(`matrix\\.platform_key.*?${product.evidenceSuffix}\\.json`, 's'));
+    if (product.id === 'cli') {
+      assert.match(source, /SUFFIX=cli/);
+      assert.match(source, /\$\{PLATFORM_KEY\}\.\$\{SUFFIX\}\.json/);
+    } else {
+      assert.match(source, new RegExp(`matrix\\.platform_key.*?${product.evidenceSuffix}\\.json`, 's'));
+    }
     assert.match(source, /--verify-evidence/);
     assert.match(source, /actions\/upload-artifact/);
 
@@ -115,8 +174,14 @@ for (const product of [
     const publishSource = JSON.stringify(publish);
     assert.match(publishSource, /actions\/download-artifact/);
     assert.match(publishSource, /--prepared-artifacts/);
-    assert.match(publishSource, new RegExp(`darwin-arm64\\.${product.evidenceSuffix}\\.json`));
-    assert.match(publishSource, new RegExp(`darwin-x64\\.${product.evidenceSuffix}\\.json`));
+    if (product.id === 'cli') {
+      assert.match(publishSource, /for PRODUCT in happier happier-memory-runtime happier-difftastic/);
+      assert.match(publishSource, /for TARGET in darwin-arm64 darwin-x64/);
+      assert.match(publishSource, /\$\{TARGET\}\.\$\{SUFFIX\}\.json/);
+    } else {
+      assert.match(publishSource, new RegExp(`darwin-arm64\\.${product.evidenceSuffix}\\.json`));
+      assert.match(publishSource, new RegExp(`darwin-x64\\.${product.evidenceSuffix}\\.json`));
+    }
     assert.doesNotMatch(
       publishSource,
       /--finalized-artifacts/,
@@ -130,6 +195,56 @@ for (const product of [
   { id: 'cli', workflow: 'publish-cli-binaries.yml', sourceArtifactPrefix: 'cli-source-' },
   { id: 'hstack', workflow: 'publish-hstack-binaries.yml', sourceArtifactPrefix: 'hstack-source-' },
 ]) {
+  test(`${product.id} finalizer resolves the candidate version when its base differs from trusted control`, async () => {
+    const { workflow } = await loadWorkflow(product.workflow);
+    const controlManifest = JSON.parse(await readFile(join(repoRoot, `apps/${product.id === 'cli' ? 'cli' : 'stack'}/package.json`), 'utf8'));
+    const [major, minor, patch] = controlManifest.version.split('.').map(Number);
+    const candidateBase = `${major}.${minor}.${patch + 1}`;
+    const directory = await mkdtemp(join(tmpdir(), 'publish-candidate-base-'));
+    try {
+      const context = {
+        'inputs.channel': 'preview',
+        'inputs.allow_stable': 'false',
+        'inputs.release_message': '',
+        'steps.candidate_base.outputs.base_version': candidateBase,
+        'github.repository': 'happier-dev/happier',
+      };
+      const resolveValue = (value) => context[String(value).replace(/^\$\{\{\s*|\s*\}\}$/g, '')] ?? '';
+      const stepEnv = (step) => Object.fromEntries(Object.entries(step.env ?? {}).map(([key, value]) => [key, resolveValue(value)]));
+      const allocation = workflow.jobs.prepare.steps.find((step) => step.id === 'version');
+      const allocationOutput = join(directory, 'allocation');
+      const boundaryEnv = {
+        ...process.env,
+        GH_TOKEN: '',
+        GITHUB_TOKEN: '',
+        MINISIGN_SECRET_KEY: '',
+        MINISIGN_PASSPHRASE: '',
+        HAPPIER_RELEASE_PUBLISHED_VERSIONS_JSON: JSON.stringify({ github: {}, npm: {} }),
+      };
+      execFileSync('bash', ['-c', allocation.run], {
+        cwd: repoRoot,
+        env: { ...boundaryEnv, ...stepEnv(allocation), GITHUB_OUTPUT: allocationOutput },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const version = (await readFile(allocationOutput, 'utf8')).trim().split('=')[1];
+      assert.equal(version, `${candidateBase}-preview.1`);
+      context['needs.prepare.outputs.version'] = version;
+      context['needs.prepare.outputs.base_version'] = resolveValue(workflow.jobs.prepare.outputs.base_version);
+      context['needs.prepare.outputs.source_sha'] = '0123456789abcdef0123456789abcdef01234567';
+      const finalizer = workflow.jobs.finalize_publish.steps.find((step) => step.run?.includes(`release/publish-${product.id === 'cli' ? 'cli' : 'hstack'}-binaries.mjs`));
+      const finalOutput = join(directory, 'final');
+      // Stop at the real publisher's version resolution before any artifact or publication effects.
+      execFileSync('bash', ['-c', `${finalizer.run.trimEnd()} \\\n  --resolve-version-only --github-output "$GITHUB_OUTPUT" --dry-run`], {
+        cwd: repoRoot,
+        env: { ...boundaryEnv, ...stepEnv(finalizer), PUBLISH_PHASE: 'publish-immutable', GITHUB_OUTPUT: finalOutput },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      assert.equal((await readFile(finalOutput, 'utf8')).trim(), `version=${version}`);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test(`${product.id} fresh publisher keeps candidate source inert until a permissionless builder`, async () => {
     const { workflow } = await loadWorkflow(product.workflow);
     const prepare = workflow.jobs.prepare;
@@ -183,7 +298,7 @@ test('standalone publishers pass all workflow and malicious free-form payloads t
     assert.ok(releaseMessageSteps.length > 0);
     for (const step of releaseMessageSteps) {
       assert.equal(step.env?.RELEASE_MESSAGE, '${{ inputs.release_message }}');
-      assert.match(String(step.run), /--release-message \"\$RELEASE_MESSAGE\"/);
+      assert.match(String(step.run), /--release-message(?:=|\s+)"\$RELEASE_MESSAGE"/);
     }
     assert.ok(sourceRefSteps.some((step) => step.env?.SOURCE_REF), `${workflowName} must bind source_ref through env`);
   }
@@ -237,12 +352,26 @@ test('Apple certificate import and identity resolution have one reusable workflo
   assert.ok(repoRoot.endsWith('/'));
 });
 
-test('the exact re-extracted finalized CLI executes on its native signing runner', async () => {
+test('every exact re-extracted finalized CLI product executes through the canonical smoke on its native signing runner', async () => {
   const { workflow } = await loadWorkflow('publish-cli-binaries.yml');
   const finalize = workflow.jobs?.finalize_darwin;
+  const buildStep = finalize?.steps?.find((step) => step.name === 'Build trusted release archive runtime');
   const signingStep = finalize?.steps?.find((step) => String(step.name ?? '').includes('Sign, notarize'));
+  assert.match(
+    String(buildStep?.run ?? ''),
+    /ensureWorkspacePackagesBuiltCli\.mjs @happier-dev\/cli-common/,
+    'the clean finalizer must build the canonical smoke verifier dependency before importing it',
+  );
   assert.ok(signingStep, 'missing CLI Darwin finalization step');
-  assert.match(String(signingStep.run ?? ''), /VERIFY_DIR/);
-  assert.match(String(signingStep.run ?? ''), /CLI_BIN/);
-  assert.match(String(signingStep.run ?? ''), /"\$CLI_BIN" --version/);
+  const source = String(signingStep.run ?? '');
+  const verifyEvidenceIndex = source.indexOf('--verify-evidence');
+  const smokeIndex = source.indexOf('smokeTestArchive');
+
+  assert.match(source, /for PRODUCT in happier happier-memory-runtime happier-difftastic/);
+  assert.match(source, /import \{ smokeTestArchive \} from ['"]\.\/scripts\/pipeline\/release\/verify-artifacts\.mjs['"]/);
+  assert.match(source, /smokeTestArchive\(\{ archivePath: process\.argv\[1\] \}\)/);
+  assert.doesNotMatch(source, /execute:\s*false|--skip-smoke/);
+  assert.ok(verifyEvidenceIndex >= 0, 'the finalized archive must retain notarization evidence verification');
+  assert.ok(smokeIndex > verifyEvidenceIndex, 'native execution must happen after signing and notarization verification');
+  assert.doesNotMatch(source, /"\$CLI_BIN" --version/, 'the release lane must not retain a CLI-only smoke bypass');
 });

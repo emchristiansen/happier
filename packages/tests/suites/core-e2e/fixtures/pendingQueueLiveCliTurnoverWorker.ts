@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import axios from 'axios';
 import { ApiSessionClient } from '@/api/session/sessionClient';
+import { configuration } from '@/configuration';
 import { encrypt, encodeBase64 } from '@/api/encryption';
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { createSessionProviderInputConsumer } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
@@ -24,6 +25,8 @@ const run = { runDir: process.argv[4]! };
 const custodyTimeoutMs = 987_654_321;
 
 async function main() {
+    // The real Socket.IO client must use the same private relay as the fixture HTTP helpers.
+    assert.equal(configuration.apiServerUrl, server.baseUrl, 'turnover client and fixture HTTP relay must match');
     const auth = await createTestAuth(server.baseUrl);
     const key = new Uint8Array(randomBytes(32));
     const metadata = {

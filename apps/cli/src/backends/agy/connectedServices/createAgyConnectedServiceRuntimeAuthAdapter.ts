@@ -1,0 +1,29 @@
+import { ConnectedServiceCredentialRecordV1Schema } from '@happier-dev/protocol';
+import type { ConnectedServiceProviderRuntimeAuthAdapter } from '@/daemon/connectedServices/runtimeAuth/types';
+import { logger } from '@/ui/logger';
+import { classifyAgyRuntimeQuotaFailure } from './classifyAgyRuntimeQuotaFailure';
+import { createAgyQuotaFetcher } from './quotaFetcher';
+
+export function createAgyConnectedServiceRuntimeAuthAdapter(): ConnectedServiceProviderRuntimeAuthAdapter {
+  const fetcher = createAgyQuotaFetcher();
+  return {
+    classifyRuntimeAuthFailure: classifyAgyRuntimeQuotaFailure,
+    async materializeActiveProfile() { return { supported: true }; },
+    canHotApply() { return { supported: false, recovery: 'restart_rematerialize' }; },
+    async hotApply() { return { applied: false, reason: 'hot_apply_unsupported' }; },
+    async recoverAfterRuntimeAuthSwitch() { return { recovered: false, recovery: 'restart_rematerialize', reason: 'agy_provider_outcome_pending' }; },
+    async verifyActiveAccount() { return { status: 'unavailable', retryable: true, reason: 'agy_provider_outcome_pending' }; },
+    async probeQuota(input) {
+      const selection = input.selection && typeof input.selection === 'object' && !Array.isArray(input.selection) ? input.selection as Record<string, unknown> : null;
+      const parsed = ConnectedServiceCredentialRecordV1Schema.safeParse(selection?.record);
+      if (!parsed.success || parsed.data.serviceId !== 'antigravity') return { status: 'unsupported', reason: 'missing_antigravity_oauth_record' };
+      try {
+        return { status: 'available', quotaSnapshot: await fetcher.fetch({ record: parsed.data, now: Date.now(), signal: new AbortController().signal }) };
+      } catch {
+        logger.warn('[connected-services] Antigravity selected-account quota request failed');
+        return { status: 'error', reason: 'antigravity_quota_request_failed' };
+      }
+    },
+    async refreshActiveProfile() { return { status: 'unsupported' }; },
+  };
+}

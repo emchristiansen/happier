@@ -64,7 +64,7 @@ describe('createOpenCodeSharedLocalControl', () => {
       getSession: () => harness.session as any,
       getSessionId: () => 'opencode-session-1',
       getDirectory: () => '/tmp/workspace',
-      getServerBaseUrl: () => 'http://127.0.0.1:4096',
+      getServerTarget: () => ({ baseUrl: 'http://127.0.0.1:4096' }),
       supervisor,
       mountRemoteUi,
       unmountRemoteUi,
@@ -92,7 +92,7 @@ describe('createOpenCodeSharedLocalControl', () => {
       getSession: () => harness.session as any,
       getSessionId: () => 'opencode-session-1',
       getDirectory: () => '/tmp/workspace',
-      getServerBaseUrl: () => 'http://127.0.0.1:4096',
+      getServerTarget: () => ({ baseUrl: 'http://127.0.0.1:4096' }),
       supervisor,
     });
 
@@ -126,7 +126,7 @@ describe('createOpenCodeSharedLocalControl', () => {
       getSession: () => harness.session as any,
       getSessionId: () => 'opencode-session-1',
       getDirectory: () => '/tmp/workspace',
-      getServerBaseUrl: () => 'http://127.0.0.1:4096',
+      getServerTarget: () => ({ baseUrl: 'http://127.0.0.1:4096' }),
       supervisor,
     });
 
@@ -158,7 +158,7 @@ describe('createOpenCodeSharedLocalControl', () => {
       getSession: () => currentSession,
       getSessionId: () => currentProviderSessionId,
       getDirectory: () => '/tmp/workspace',
-      getServerBaseUrl: () => 'http://127.0.0.1:4096',
+      getServerTarget: () => ({ baseUrl: 'http://127.0.0.1:4096' }),
       supervisor,
     });
 
@@ -198,7 +198,7 @@ describe('createOpenCodeSharedLocalControl', () => {
       getSession: () => harness.session as any,
       getSessionId: () => 'opencode-session-1',
       getDirectory: () => '/tmp/workspace',
-      getServerBaseUrl: () => 'http://127.0.0.1:4096',
+      getServerTarget: () => ({ baseUrl: 'http://127.0.0.1:4096' }),
       supervisor,
       mountRemoteUi,
     });

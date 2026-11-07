@@ -3,11 +3,57 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync, unlinkSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 import { bundleWorkspaceDeps } from './bundleWorkspaceDeps.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+test('bundleWorkspaceDeps refreshes package-root imports targets through the real workspace copier', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'stack-import-target-refresh-'));
+  try {
+    const stackDir = resolve(root, 'apps/stack');
+    const commonDir = resolve(root, 'packages/cli-common');
+    const sourceDir = resolve(root, 'packages/fixture');
+    const destinationDir = resolve(stackDir, 'node_modules/@happier-dev/fixture');
+    mkdirSync(stackDir, { recursive: true });
+    mkdirSync(resolve(commonDir, 'dist/workspaces'), { recursive: true });
+    mkdirSync(resolve(sourceDir, 'dist'), { recursive: true });
+    mkdirSync(resolve(sourceDir, 'runtime'), { recursive: true });
+    writeJson(resolve(root, 'package.json'), { name: 'fixture-root', private: true });
+    writeFileSync(resolve(root, 'yarn.lock'), '');
+    writeJson(resolve(stackDir, 'package.json'), { bundledDependencies: ['@happier-dev/fixture'] });
+    writeJson(resolve(commonDir, 'package.json'), { name: '@happier-dev/cli-common', type: 'module' });
+    // Exercise the real current source owner, not the older internal copier stub.
+    writeFileSync(resolve(commonDir, 'dist/workspaces/index.js'), `export * from ${JSON.stringify(new URL('../../../packages/cli-common/src/workspaces/index.ts', import.meta.url).href)};\n`);
+    writeJson(resolve(sourceDir, 'package.json'), {
+      name: '@happier-dev/fixture', version: '0.0.0', type: 'module',
+      exports: { '.': './dist/connect.js' },
+      imports: { '#http': { node: './runtime/node.js', default: './dist/fetch.js' }, '#fs': 'fs', '#disabled': null },
+    });
+    writeFileSync(resolve(sourceDir, 'dist/connect.js'), 'export { transport } from "#http";\n');
+    writeFileSync(resolve(sourceDir, 'dist/fetch.js'), 'export const transport = "fetch";\n');
+    const target = resolve(sourceDir, 'runtime/node.js');
+    writeFileSync(target, 'export const transport = "first";\n');
+    writeFileSync(resolve(sourceDir, 'fs'), 'not an imports file target\n');
+    // Compiler execution is an OS boundary; these fixture outputs are already
+    // present and forward to real source, so no compiler or repository publisher runs.
+    const options = { repoRoot: root, stackDir, ensureWorkspacePackagesBuiltByName: async () => {} };
+    await bundleWorkspaceDeps(options);
+    const manifest = JSON.parse(readFileSync(resolve(stackDir, 'node_modules/@happier-dev/.workspace-bundle-manifest.json'), 'utf8'));
+    assert.deepEqual(manifest.bundles[0].expectedRootFiles.map(({ relativePath }) => relativePath), ['runtime/node.js']);
+    writeFileSync(target, 'export const transport = "updated";\n');
+    await bundleWorkspaceDeps(options);
+    assert.equal(readFileSync(resolve(destinationDir, 'runtime/node.js'), 'utf8'), 'export const transport = "updated";\n');
+    const result = execFileSync(process.execPath, ['--input-type=module', '-e',
+      `console.log((await import(${JSON.stringify(pathToFileURL(resolve(destinationDir, 'dist/connect.js')).href)})).transport);`,
+    ], { encoding: 'utf8' }).trim();
+    assert.equal(result, 'updated');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
@@ -55,10 +101,15 @@ export function resolveWorkspaceBundlesFromPackageJson({ repoRoot, hostPackageDi
   for (const name of bundled) {
     if (typeof name !== 'string' || !name.startsWith('@happier-dev/')) continue;
     const short = name.slice('@happier-dev/'.length);
+    const srcDir = resolve(repoRoot, 'packages', short);
+    const workspacePackageJson = readJson(resolve(srcDir, 'package.json'));
     bundles.push({
       packageName: name,
-      srcDir: resolve(repoRoot, 'packages', short),
+      srcDir,
       destDir: resolve(hostPackageDir, 'node_modules', '@happier-dev', short),
+      includeFiles: Array.isArray(workspacePackageJson.happierWorkspaceBundleFiles)
+        ? workspacePackageJson.happierWorkspaceBundleFiles
+        : [],
     });
   }
   return bundles;
@@ -81,6 +132,13 @@ export function bundleWorkspacePackages({ bundles }) {
     for (const relativePath of collectPackageJsonRelativeFileTargets(pkgJson.exports)) {
       const sourcePath = resolve(b.srcDir, relativePath);
       if (existsSync(sourcePath) && !relativePath.startsWith('dist/')) {
+        cpSync(sourcePath, resolve(b.destDir, relativePath));
+      }
+    }
+    for (const relativePath of b.includeFiles ?? []) {
+      const sourcePath = resolve(b.srcDir, relativePath);
+      if (existsSync(sourcePath)) {
+        mkdirSync(dirname(resolve(b.destDir, relativePath)), { recursive: true });
         cpSync(sourcePath, resolve(b.destDir, relativePath));
       }
     }
@@ -289,8 +347,11 @@ test('bundleWorkspaceDeps copies dist + writes a sanitized package.json without 
       types: './dist/index.d.ts',
       exports: { '.': { default: './dist/index.js', types: './dist/index.d.ts' } },
       scripts: { postinstall: 'echo should-not-run' },
+      happierWorkspaceBundleFiles: ['native/windows/bin/windows-x64/happier-service-launcher.exe'],
     });
     writeFileSync(resolve(cliCommonDir, 'dist', 'index.js'), 'export const z = 3;\n', 'utf8');
+    mkdirSync(resolve(cliCommonDir, 'native', 'windows', 'bin', 'windows-x64'), { recursive: true });
+    writeFileSync(resolve(cliCommonDir, 'native', 'windows', 'bin', 'windows-x64', 'happier-service-launcher.exe'), 'synthetic launcher bytes');
 
     await bundleWorkspaceDeps({ repoRoot, stackDir });
 
@@ -303,6 +364,17 @@ test('bundleWorkspaceDeps copies dist + writes a sanitized package.json without 
 
     const bundledDistPath = resolve(stackDir, 'node_modules', '@happier-dev', 'cli-common', 'dist', 'index.js');
     assert.ok(existsSync(bundledDistPath), 'dist/index.js should be copied to bundled location');
+    assert.ok(existsSync(resolve(
+      stackDir,
+      'node_modules',
+      '@happier-dev',
+      'cli-common',
+      'native',
+      'windows',
+      'bin',
+      'windows-x64',
+      'happier-service-launcher.exe',
+    )), 'Windows service launcher should be copied to bundled location');
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
@@ -484,6 +556,40 @@ test('bundleWorkspaceDeps vendors external runtime dependency trees for bundled 
         ),
       ).name,
       'dep-b',
+    );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('bundleWorkspaceDeps stays fresh while a declared bundle file is not built, and refreshes once it is', async () => {
+  const { repoRoot, stackDir, cliCommonDir } = createBundleFixture('happy-stack-bundle-workspace-deps-optional-include-');
+  try {
+    const launcherRelativePath = 'native/windows/bin/windows-x64/happier-service-launcher.exe';
+    writeJson(resolve(cliCommonDir, 'package.json'), {
+      name: '@happier-dev/cli-common',
+      version: '0.0.0',
+      type: 'module',
+      main: './dist/index.js',
+      exports: { '.': { default: './dist/index.js' } },
+      happierWorkspaceBundleFiles: [launcherRelativePath],
+    });
+    writeFileSync(resolve(cliCommonDir, 'dist', 'index.js'), 'export const z = 3;\n', 'utf8');
+
+    await bundleWorkspaceDeps({ repoRoot, stackDir });
+    const manifestPath = resolve(stackDir, 'node_modules', '@happier-dev', '.workspace-bundle-manifest.json');
+    const firstMtimeMs = statSync(manifestPath).mtimeMs;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+
+    await bundleWorkspaceDeps({ repoRoot, stackDir });
+    assert.equal(statSync(manifestPath).mtimeMs, firstMtimeMs, 'an unbuilt optional bundle file must not force a rebundle');
+
+    mkdirSync(resolve(cliCommonDir, 'native', 'windows', 'bin', 'windows-x64'), { recursive: true });
+    writeFileSync(resolve(cliCommonDir, launcherRelativePath), 'built launcher');
+    await bundleWorkspaceDeps({ repoRoot, stackDir });
+    assert.equal(
+      readFileSync(resolve(stackDir, 'node_modules', '@happier-dev', 'cli-common', launcherRelativePath), 'utf8'),
+      'built launcher',
     );
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });

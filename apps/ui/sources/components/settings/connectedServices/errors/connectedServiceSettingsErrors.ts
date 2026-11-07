@@ -59,6 +59,8 @@ export function resolveConnectedServiceSettingsErrorMessage(error: unknown): str
   if (fields) {
     const reset = formatResetTime(fields.resetAtMs);
     switch (fields.code) {
+      case 'connect_service_unsupported':
+        return t('connectedServices.detail.errors.serviceUnsupportedServer');
       case 'connect_credential_referenced_by_group':
         return t('connectedServices.detail.errors.credentialReferencedByGroup');
       case 'connect_credential_not_found':

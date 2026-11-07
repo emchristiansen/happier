@@ -86,6 +86,15 @@ export const ITEM_ICON_BOX_SIZE: Record<ResolvedItemDensity, number> = {
     tight: selectValue({ ios: 18, default: 18 }),
 };
 
+/**
+ * Where a row's title starts, from the row's own leading edge: padding + icon box + gap. Content
+ * that belongs to a row list but is not a row (a collapsed "2 others up to date" line, a progress
+ * hairline) aligns to this, so it sits exactly on the titles' left edge.
+ */
+export function resolveItemTextColumnInset(density: ResolvedItemDensity, iconBoxSize: number = ITEM_ICON_BOX_SIZE[density]): number {
+    return ITEM_ROW_PADDING_HORIZONTAL[density] + iconBoxSize + ITEM_ICON_MARGIN_RIGHT[density];
+}
+
 
 /**
  * The glyph size for an item row and for every menu row that shares this scale.

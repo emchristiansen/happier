@@ -46,6 +46,7 @@ import {
   type PermissionEscalationDecision,
 } from './permissionPrivilege.js';
 import type { ActionsSettingsV1 } from './actionSettings.js';
+import { readPendingLocalId } from '../sessionMessages/pendingLocalId.js';
 import type { ReviewStartInput } from '../reviews/reviewStart.js';
 import type { AcpConfigOptionOverridesV1 } from '../sessionMetadata/metadataOverridesV1.js';
 import type { ConnectedServiceBindingsV1 } from '../connect/connectedServiceBindings.js';
@@ -60,6 +61,8 @@ import {
   type SpawnConfigOptionValue,
 } from './sessionSpawnConfigOptions.js';
 import { EXECUTION_RUN_ACTION_PERMISSION_MODES } from './executionRunActionPermissionMode.js';
+import { isRpcError, readRpcErrorCode } from '../rpcErrors.js';
+import { lazySchema } from '../lazySchema.js';
 
 /**
  * Resolve the canonical run-start model + config-option selection from an agent-facing action
@@ -227,6 +230,7 @@ export type ActionExecutorDeps = Readonly<{
     targetPath?: string;
     requestId?: string;
     targetSessionStorageMode?: 'direct' | 'persisted';
+    stateTransfer?: 'transfer' | 'existing';
     workspaceTransfer?: SessionHandoffWorkspaceTransfer;
     serverId?: string | null;
     signal?: AbortSignal;
@@ -272,6 +276,9 @@ export type ActionExecutorDeps = Readonly<{
   sessionSendMessage: (args: Readonly<{
     sessionId: string;
     message: string;
+    kind?: 'user' | 'notice';
+    from?: string;
+    localId?: string;
     requestedAction: PendingRequestedActionV1;
     permissionModeOverride?: string;
     modelOverride?: string | null;
@@ -291,6 +298,7 @@ export type ActionExecutorDeps = Readonly<{
     callerPermissionMode?: string | null;
   }>) => Promise<unknown>;
   sessionModelSet?: (args: Readonly<{ sessionId: string; modelId: string; serverId?: string | null }>) => Promise<unknown>;
+  sessionConfigOptionSet?: (args: Readonly<{ sessionId: string; configId: string; valueId: string; serverId?: string | null }>) => Promise<unknown>;
   sessionArchiveSet?: (args: Readonly<{ sessionId: string; archived: boolean; serverId?: string | null }>) => Promise<unknown>;
   sessionStatusGet?: (args: Readonly<{ sessionId: string; live?: boolean; serverId?: string | null }>) => Promise<unknown>;
   sessionWorkStateGet?: (args: Readonly<{ sessionId: string; serverId?: string | null }>) => Promise<unknown>;
@@ -618,7 +626,7 @@ function hasOwn(input: any, key: string): boolean {
   return Boolean(input && Object.prototype.hasOwnProperty.call(input, key));
 }
 
-const ActionSurfaceKeySchema = ActionSurfaceSchema.keyof();
+const ActionSurfaceKeySchema = lazySchema(() => ActionSurfaceSchema.keyof());
 
 function parseActionSurfaceKey(value: unknown): keyof ActionSurfaces | null {
   const parsed = ActionSurfaceKeySchema.safeParse(value);
@@ -773,15 +781,15 @@ function resolveServerIdForSession(deps: ActionExecutorDeps, ctx: ActionExecutor
   return deps.resolveServerIdForSessionId ? deps.resolveServerIdForSessionId(sessionId) : null;
 }
 
-function normalizeResolvedOptions(value: unknown): readonly Readonly<{ value: string; label: string; description?: string; disabled?: boolean }>[] {
-  const items = Array.isArray((value as any)?.items)
-    ? ((value as any).items as readonly Record<string, unknown>[])
-    : Array.isArray(value)
-      ? (value as readonly Record<string, unknown>[])
-      : [];
+function normalizeResolvedOptions(value: unknown, options: Readonly<{ allowEmptyValue?: boolean }> = {}): readonly Readonly<{ value: string; label: string; description?: string; disabled?: boolean }>[] {
+  const inventory = typeof value === 'object' && value !== null && 'items' in value ? value.items : value;
+  const items: readonly unknown[] = Array.isArray(inventory) ? inventory : [];
 
   return items
-    .map((item) => {
+    .map((rawItem) => {
+      if (typeof rawItem !== 'object' || rawItem === null) return null;
+      // Action-service inventories are untyped transport input.
+      const item = rawItem as Record<string, unknown>;
       const valueCandidate =
         typeof item?.targetKey === 'string'
           ? item.targetKey
@@ -794,7 +802,7 @@ function normalizeResolvedOptions(value: unknown): readonly Readonly<{ value: st
                 : typeof item?.engineId === 'string'
                   ? item.engineId
                   : null;
-      if (!valueCandidate) return null;
+      if (valueCandidate === null || (valueCandidate === '' && options.allowEmptyValue !== true)) return null;
       const labelCandidate =
         typeof item?.label === 'string'
           ? item.label
@@ -811,7 +819,7 @@ function normalizeResolvedOptions(value: unknown): readonly Readonly<{ value: st
         ...(disabledCandidate ? { disabled: true as const } : {}),
       };
     })
-    .filter(Boolean) as readonly Readonly<{ value: string; label: string; description?: string; disabled?: boolean }>[];
+    .filter((option) => option !== null);
 }
 
 function normalizeExecutionBackendOptionValue(value: string): string {
@@ -996,7 +1004,7 @@ async function resolveDynamicActionOptions(params: Readonly<{
     const sessionId = resolveSessionIdFromInput(input, ctx);
     if (!sessionId) return { ok: false, errorCode: 'session_not_selected', error: 'session_not_selected' };
     const result = await deps.sessionModesList({ sessionId });
-    return { ok: true, result: normalizeResolvedOptions(result) };
+    return { ok: true, result: normalizeResolvedOptions(result, { allowEmptyValue: true }) };
   }
 
   if (route.kind === 'agentInventory') {
@@ -1239,6 +1247,15 @@ function normalizeActionExecutorThrownError(error: unknown): Readonly<{ errorCod
         : typeof anyErr?.message === 'string'
           ? String(anyErr.message)
         : '';
+
+  const rpcErrorCode = isRpcError(error) ? readRpcErrorCode(error)?.trim() : undefined;
+  if (rpcErrorCode) {
+    return {
+      errorCode: rpcErrorCode,
+      error: message || rpcErrorCode,
+      ...(details !== undefined ? { details } : {}),
+    };
+  }
 
   if (rawCode && SessionControlErrorCodeSchema.safeParse(rawCode).success) {
     return {
@@ -1708,7 +1725,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             : {};
         const connectedServicesByTarget = new Map<
           string,
-          Readonly<{ bindings: ConnectedServiceBindingsV1 | undefined; defaultServiceIds: readonly string[] }>
+          Readonly<{ bindings: ConnectedServiceBindingsV1 | null | undefined; defaultServiceIds: readonly string[] }>
         >();
         for (const backendTargetKey of backendTargetKeys) {
           const rawSelection = Object.prototype.hasOwnProperty.call(connectedServicesByBackendTargetKey, backendTargetKey)
@@ -1758,7 +1775,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
                 runClass: (parsed.data as any).runClass ?? 'bounded',
                 ioMode: (parsed.data as any).ioMode ?? 'request_response',
                 launchOrigin: resolveExecutionRunLaunchOrigin(ctx),
-                ...(connectedServices ? { connectedServices } : {}),
+                ...(connectedServices !== undefined ? { connectedServices } : {}),
                 ...(connectedServicesDefaultServiceIds.length > 0
                   ? { connectedServicesDefaultServiceIds }
                   : {}),
@@ -1937,7 +1954,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             if (!normalized.ok) {
               return { ok: false, errorCode: 'invalid_parameters', error: normalized.error };
             }
-            if (normalized.bindings) {
+            if (normalized.bindings !== undefined) {
               request.connectedServices = normalized.bindings;
             } else {
               delete request.connectedServices;
@@ -2035,7 +2052,6 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
           const res = await deps.executionRunWait(sessionId, {
             runId: (parsed.data as any).runId,
             ...(typeof (parsed.data as any).timeoutSeconds === 'number' ? { timeoutSeconds: (parsed.data as any).timeoutSeconds } : {}),
-            ...(typeof (parsed.data as any).pollIntervalMs === 'number' ? { pollIntervalMs: (parsed.data as any).pollIntervalMs } : {}),
           }, opts);
           return { ok: true, result: res };
         }
@@ -2097,6 +2113,7 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
               ? (parsed.data as any).targetSessionStorageMode
               : undefined;
           const targetPath = normalizeId((parsed.data as any).targetPath);
+          const stateTransfer = parsed.data.stateTransfer === 'existing' ? 'existing' : undefined;
           const workspaceTransferParsed = SessionHandoffWorkspaceTransferSchema.safeParse((parsed.data as any).workspaceTransfer);
           const workspaceTransfer = workspaceTransferParsed.success ? workspaceTransferParsed.data : undefined;
           const requestId = normalizeId(ctx.actionRequestId);
@@ -2106,10 +2123,18 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             ...(targetPath ? { targetPath } : {}),
             ...(requestId ? { requestId } : {}),
             ...(targetSessionStorageMode ? { targetSessionStorageMode } : {}),
+            ...(stateTransfer ? { stateTransfer } : {}),
             ...(workspaceTransfer ? { workspaceTransfer } : {}),
             ...(serverId ? { serverId } : {}),
             ...(ctx.signal ? { signal: ctx.signal } : {}),
           });
+          if (res && typeof res === 'object' && 'ok' in res && res.ok === false) {
+            const errorCode = 'errorCode' in res && typeof res.errorCode === 'string' ? res.errorCode : 'handoff_failed';
+            const error = 'errorMessage' in res && typeof res.errorMessage === 'string' && res.errorMessage.trim()
+              ? res.errorMessage
+              : 'error' in res && typeof res.error === 'string' && res.error.trim() ? res.error : 'Session handoff failed';
+            return { ok: false, errorCode, error };
+          }
           return { ok: true, result: res };
         }
 
@@ -2235,19 +2260,30 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
         }
 
         if (actionId === 'session.message.send') {
+          const messageKind = parsed.data.kind === 'notice' ? 'notice' : parsed.data.kind === 'user' ? 'user' : undefined;
+          const from = typeof parsed.data.from === 'string' ? parsed.data.from : undefined;
+          // Only the CLI surface exposes display-only notice authoring in 0.2.
+          // Other surfaces must not silently reinterpret it as a prompt.
+          if ((messageKind === 'notice' || from !== undefined) && ctx.surface !== 'cli') {
+            return { ok: false, errorCode: 'unsupported_action', error: 'Notices are currently CLI-only' };
+          }
           const sessionId = resolveSessionIdFromInput(parsed.data, ctx);
           if (!sessionId) return { ok: false, errorCode: 'session_not_selected', error: 'session_not_selected' };
+          const localIdRaw = (parsed.data as Record<string, unknown>).localId;
+          const localId = readPendingLocalId(localIdRaw);
+          if (localIdRaw !== undefined && (
+            ctx.surface !== 'cli'
+            || localId === null
+          )) {
+            return { ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' };
+          }
           const serverId = resolveServerIdForSession(deps, ctx, sessionId);
           const modelOverrideRaw = Object.prototype.hasOwnProperty.call(parsed.data, 'modelOverride')
             ? (parsed.data as any).modelOverride
             : undefined;
           const permissionOverrideRaw = (parsed.data as any).permissionModeOverride;
-          const permissionModeForAgent = isSessionAgentCaller(ctx)
-            && !(typeof permissionOverrideRaw === 'string' && permissionOverrideRaw.trim().length > 0)
-              ? ctx.callerPermissionMode ?? 'default'
-              : permissionOverrideRaw;
-          const permissionDecision = typeof permissionModeForAgent === 'string' && permissionModeForAgent.trim().length > 0
-            ? assertSessionAgentPermission(ctx, permissionModeForAgent)
+          const permissionDecision = typeof permissionOverrideRaw === 'string' && permissionOverrideRaw.trim().length > 0
+            ? assertSessionAgentPermission(ctx, permissionOverrideRaw)
             : null;
           if (permissionDecision?.ok === false) {
             return createPermissionPolicyResult(ctx, permissionDecision);
@@ -2255,6 +2291,9 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
           const res = await deps.sessionSendMessage({
             sessionId,
             message: (parsed.data as any).message,
+            ...(messageKind ? { kind: messageKind } : {}),
+            ...(from !== undefined ? { from } : {}),
+            ...(localId !== null ? { localId } : {}),
             requestedAction: PendingRequestedActionV1Schema.parse(
               parsed.data.requestedAction ?? { v: 1, kind: 'steer_if_active' },
             ),
@@ -2354,6 +2393,21 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
           if (!modelId) return { ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' };
           const serverId = resolveServerIdForSession(deps, ctx, sessionId);
           const res = await deps.sessionModelSet({ sessionId, modelId, ...(serverId ? { serverId } : {}) });
+          return { ok: true, result: res };
+        }
+
+        if (actionId === 'session.config_option.set') {
+          const sessionId = resolveSessionIdFromInput(parsed.data, ctx);
+          if (!sessionId) return { ok: false, errorCode: 'session_not_selected', error: 'session_not_selected' };
+          if (!deps.sessionConfigOptionSet) {
+            return { ok: false, errorCode: 'unsupported_action', error: 'unsupported_action:session.config_option.set' };
+          }
+          const data = parsed.data as Record<string, unknown>;
+          const configId = readOpaqueIdentifier(data.configId);
+          const valueId = readOpaqueIdentifier(data.valueId);
+          if (!configId || !valueId) return { ok: false, errorCode: 'invalid_parameters', error: 'invalid_parameters' };
+          const serverId = resolveServerIdForSession(deps, ctx, sessionId);
+          const res = await deps.sessionConfigOptionSet({ sessionId, configId, valueId, ...(serverId ? { serverId } : {}) });
           return { ok: true, result: res };
         }
 

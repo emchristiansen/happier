@@ -9,6 +9,8 @@ import {
 } from '@/dev/testkit';
 import { installSessionRouteCommonModuleMocks } from '../sessionRouteTestHelpers';
 import type { Session } from '@/sync/domains/state/storageTypes';
+import { measureScreenContentBottom, PublishBottomChromeHeight } from '../testUtils/bottomChromeViewport';
+import { SessionCockpitChromeRegistryProvider } from '@/components/workspaceCockpit/session/SessionCockpitChromeRegistry';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -291,6 +293,23 @@ describe('Session Run Details Screen', () => {
         await flushHookEffects();
         return screen;
     }
+
+    it('keeps the run details viewport above changing bottom chrome', async () => {
+        routeHydrationState = 'loading';
+        const render = (height: number) => (
+            <SessionCockpitChromeRegistryProvider>
+                <PublishBottomChromeHeight height={height} />
+                <SessionRunDetailsScreen />
+            </SessionCockpitChromeRegistryProvider>
+        );
+        const screen = await renderScreen(render(94));
+        for (const height of [94, 121, 0]) {
+            await screen.update(render(height));
+            const frame = screen.findAllByType('View')[0];
+            expect(frame).toBeTruthy();
+            expect(measureScreenContentBottom(frame.props.style, 700)).toBe(700 - height);
+        }
+    });
 
     it('configures the run details header and constrains the content width', async () => {
         const screen = await renderRunDetailsScreen();

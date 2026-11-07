@@ -21,7 +21,7 @@ export function parseTmuxSessionIdentifier(identifier: string): TmuxSessionIdent
   }
 
   const result: TmuxSessionIdentifier = {
-    session: parts[0].trim(),
+    session: parts[0].trim().replace(/^=/, ''),
   };
 
   // Validate session name for our identifier format.
@@ -37,7 +37,7 @@ export function parseTmuxSessionIdentifier(identifier: string): TmuxSessionIdent
     const windowAndPane = parts[1].split('.');
     result.window = windowAndPane[0]?.trim();
 
-    if (result.window && !/^[a-zA-Z0-9._ -]+$/.test(result.window)) {
+    if (result.window && !/^(?:[a-zA-Z0-9._ -]+|@\d+)$/.test(result.window)) {
       throw new TmuxSessionIdentifierError(
         `Invalid window name: "${result.window}". Only alphanumeric characters, spaces, dots, hyphens, and underscores are allowed.`,
       );
@@ -57,12 +57,15 @@ export function parseTmuxSessionIdentifier(identifier: string): TmuxSessionIdent
 }
 
 // Helper to format tmux session identifier to string
-export function formatTmuxSessionIdentifier(identifier: TmuxSessionIdentifier): string {
+export function formatTmuxSessionIdentifier(
+  identifier: TmuxSessionIdentifier,
+  options?: Readonly<{ exactSession?: boolean }>,
+): string {
   if (!identifier.session) {
     throw new TmuxSessionIdentifierError('Session identifier must have a session name');
   }
 
-  let result = identifier.session;
+  let result = options?.exactSession ? `=${identifier.session}` : identifier.session;
   if (identifier.window) {
     result += `:${identifier.window}`;
     if (identifier.pane) {
@@ -132,7 +135,7 @@ export function buildTmuxSessionIdentifier(params: {
       throw new TmuxSessionIdentifierError(`Invalid session name: "${params.session}"`);
     }
 
-    if (params.window && !/^[a-zA-Z0-9._ -]+$/.test(params.window)) {
+    if (params.window && !/^(?:[a-zA-Z0-9._ -]+|@\d+)$/.test(params.window)) {
       throw new TmuxSessionIdentifierError(`Invalid window name: "${params.window}"`);
     }
 

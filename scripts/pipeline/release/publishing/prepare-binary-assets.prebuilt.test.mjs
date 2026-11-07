@@ -10,7 +10,9 @@ import {
   prepareBinaryReleaseAssets,
 } from './prepare-binary-assets.mjs';
 import { parsePublishBinaryReleaseArgs } from './publish-binary-release.mjs';
-import { getBinaryPublishProductSpec } from './product-specs.mjs';
+import { getBinaryPublishProductSpec as getCompleteBinaryPublishProductSpec } from './product-specs.mjs';
+import { writeChecksumsFile } from '../lib/release-files.mjs';
+import { inspectImmutableReleaseCandidate } from '../lib/immutable-release-candidate.mjs';
 
 const CLI_TARGETS = [
   ['linux', 'x64'],
@@ -19,6 +21,74 @@ const CLI_TARGETS = [
   ['darwin', 'arm64'],
   ['windows', 'x64'],
 ];
+
+// Existing generic envelope cases use only the base product; the complete CLI matrix is exercised below.
+function getBinaryPublishProductSpec(product) {
+  return { ...getCompleteBinaryPublishProductSpec(product), optionalComponentProducts: [] };
+}
+
+test('CLI publication requires complete optional matrices and seals each beneath the CLI envelope', async () => {
+  const artifactsDir = await mkdtemp(join(tmpdir(), 'happier-optional-publication-'));
+  const version = '1.2.3-preview.4';
+  const products = ['happier-memory-runtime', 'happier-difftastic'];
+  const writes = [];
+  const finalize = (extra = {}) => finalizePreparedBinaryArtifacts({
+    artifactsDir, version, channel: 'preview', productSpec: getCompleteBinaryPublishProductSpec('cli'),
+    writeChecksums: async (input) => {
+      writes.push(input);
+      return writeChecksumsFile(input);
+    },
+    signFile: async ({ path }) => {
+      await writeFile(`${path}.minisig`, 'signature');
+      return `${path}.minisig`;
+    },
+    ...extra,
+  });
+  try {
+    await writeCliArchives(artifactsDir, version);
+    await writeCliEvidence(artifactsDir);
+    for (const product of products) {
+      for (const [os, arch] of CLI_TARGETS) {
+        await writeFile(join(artifactsDir, `${product}-v${version}-${os}-${arch}.tar.gz`), 'component');
+      }
+      await writeProductEvidence(artifactsDir, product);
+    }
+    const missing = join(artifactsDir, `happier-difftastic-v${version}-windows-x64.tar.gz`);
+    await rm(missing);
+    await assert.rejects(finalize(), /missing prepared artifact.*happier-difftastic/);
+    assert.equal(writes.length, 0);
+    await writeFile(missing, 'component');
+    const missingEvidence = join(artifactsDir, 'darwin-arm64.happier-memory-runtime.json');
+    await rm(missingEvidence);
+    await assert.rejects(finalize(), /missing prepared Darwin notarization evidence.*happier-memory-runtime/);
+    await writeFile(missingEvidence, '{}');
+    const result = await finalize();
+    assert.deepEqual(writes.map(({ product }) => product), [...products, 'happier']);
+    for (const product of products) {
+      const component = writes.find((entry) => entry.product === product);
+      assert.equal(component.artifacts.length, 7);
+      for (const suffix of ['', '.minisig']) {
+        assert.ok(result.artifacts.some(({ name }) => name === `checksums-${product}-v${version}.txt${suffix}`));
+      }
+    }
+    assert.equal(result.artifacts.length, 25);
+    const candidate = await inspectImmutableReleaseCandidate({ directory: artifactsDir, sourceTag: `cli-v${version}` });
+    assert.equal(candidate.assetNames.length, 25);
+
+    const manifestsRoot = join(artifactsDir, 'manifests');
+    const manifestsDir = join(manifestsRoot, 'v1', 'happier', 'preview');
+    await mkdir(manifestsDir, { recursive: true });
+    for (const name of [...CLI_TARGETS.map(([os, arch]) => `${os}-${arch}.json`), 'latest.json']) {
+      await writeFile(join(manifestsDir, name), '{}');
+    }
+    const withManifests = await finalize({ manifestsRoot, manifestsDir });
+    assert.equal(withManifests.artifacts.length, 31);
+    const finalized = await inspectImmutableReleaseCandidate({ directory: artifactsDir, sourceTag: `cli-v${version}` });
+    assert.equal(finalized.assetNames.length, 31);
+  } finally {
+    await rm(artifactsDir, { recursive: true, force: true });
+  }
+});
 
 async function writeCliArchives(artifactsDir, version, targets = CLI_TARGETS) {
   for (const [os, arch] of targets) {

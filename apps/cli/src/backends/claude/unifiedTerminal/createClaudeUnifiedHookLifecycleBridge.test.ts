@@ -8,8 +8,57 @@ import { createClaudeProviderRuntimeActivityAdapter } from '../providerActivity/
 import type { ClaudeWorkflowTaskReference } from '../workflows/claudeWorkflowTaskReference';
 import type { SessionHookData } from '../utils/startHookServer';
 import { createClaudeUnifiedHookLifecycleBridge } from './createClaudeUnifiedHookLifecycleBridge';
+import { TERMINAL_INPUT_QUIET_PERIOD_MS } from '@/agent/runtime/terminal/injection/arbiter';
+import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
+import type { TurnStallNotice } from '@/agent/runtime/session/turn/stallWatch';
+import { createClaudeUnifiedInputArbiter } from './createClaudeUnifiedInputArbiter';
+import type { ClaudeUnifiedSessionHookSubscription } from './createClaudeUnifiedHookLifecycleBridge';
 
 describe('createClaudeUnifiedHookLifecycleBridge', () => {
+  it('counts fresh main hooks for turn silence while startup replay and sidechain hooks stay inert', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const notices: TurnStallNotice[] = [];
+    const turn = createSessionTurnLifecycle({
+      sessionId: 'happier-session', enqueueSessionTurn: async () => {},
+      turnStallWarnMs: 100, onTurnStallNotice: notice => notices.push(notice),
+    });
+    // Hook delivery and terminal injection are external boundaries; both lifecycle owners stay real.
+    let hook: Parameters<ClaudeUnifiedSessionHookSubscription>[0] | undefined;
+    const arbiter = createClaudeUnifiedInputArbiter({
+      injectPrompt: async batch => ({ status: 'injected', at: Date.now(), bytesWritten: batch.message.length }),
+    });
+    const bridge = createClaudeUnifiedHookLifecycleBridge({
+      subscribeClaudeSessionHooks: callback => { hook = callback; return () => { hook = undefined; }; },
+      arbiter, completionQuiescenceMs: 0,
+      onProviderEvent: () => turn.observeProviderTurnEvent(),
+      readProviderSessionId: () => 'native-main',
+    });
+    try {
+      await turn.beginTurn({ provider: 'claude' });
+      bridge.start({ abortSignal: new AbortController().signal });
+      await vi.advanceTimersByTimeAsync(75);
+      hook?.({ hook_event_name: 'PostToolUse', session_id: 'native-main' });
+      await vi.advanceTimersByTimeAsync(75);
+      hook?.({ hook_event_name: 'PostToolUse', session_id: 'native-main' }, { startupReplay: true, observedAt: 0 });
+      hook?.({ hook_event_name: 'PostToolUse', session_id: 'native-main', agent_id: 'child' });
+      hook?.({ hook_event_name: 'PermissionRequestCompleted', session_id: 'native-main' });
+      hook?.({ hook_event_name: 'PostToolUse', session_id: 'stale-native-session' });
+      await vi.advanceTimersByTimeAsync(24);
+      expect(notices).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(notices).toMatchObject([{ lastEventAgeMs: 100 }]);
+      hook?.({ hook_event_name: 'SessionStart', source: 'compact', session_id: 'native-next' });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(notices).toHaveLength(2);
+    } finally {
+      bridge.dispose();
+      await arbiter.dispose();
+      await turn.completeTurn({ provider: 'claude' });
+      vi.useRealTimers();
+    }
+  });
+
   it('emits no target Activity truth when the unified bridge is disposed', async () => {
     const handle = {
       report: vi.fn(async () => {}),
@@ -58,12 +107,18 @@ describe('createClaudeUnifiedHookLifecycleBridge', () => {
       onReady,
     });
 
-    await bridge.settleAttemptLocalCommandCompleted();
+    try {
+      await bridge.settleAttemptLocalCommandCompleted();
 
-    expect(onThinkingChange).toHaveBeenCalledWith(false);
-    expect(onReady).toHaveBeenCalledTimes(1);
-    expect(observeLifecycle).toHaveBeenCalledWith({ type: 'turn_state', state: 'idle' });
-    expect(observeLifecycle).toHaveBeenCalledWith({ type: 'output' });
+      expect(onThinkingChange).toHaveBeenCalledWith(false);
+      expect(onReady).toHaveBeenCalledTimes(1);
+      expect(observeLifecycle).toHaveBeenCalledWith({ type: 'turn_state', state: 'idle' });
+      expect(observeLifecycle).toHaveBeenCalledWith({ type: 'output' });
+      expect(drainWhenSafe).toHaveBeenCalledTimes(1);
+    } finally {
+      bridge.dispose();
+    }
+    await new Promise((resolve) => setTimeout(resolve, TERMINAL_INPUT_QUIET_PERIOD_MS + 20));
     expect(drainWhenSafe).toHaveBeenCalledTimes(1);
   });
 
@@ -193,6 +248,62 @@ describe('createClaudeUnifiedHookLifecycleBridge', () => {
       expect(confirmPromptAcceptedByProvider).not.toHaveBeenCalled();
       expect(onThinkingChange).not.toHaveBeenCalledWith(true);
       expect(observeLifecycle).not.toHaveBeenCalledWith({ type: 'turn_state', state: 'running' });
+    } finally {
+      bridge.dispose();
+    }
+  });
+
+  it('correlates a UserPromptSubmit that echoes the injected prompt wrapped in paste markers', async () => {
+    // Claude Code 2.1.259 records a bracketed-paste prompt wrapped in its own paste markers, so
+    // the hook echo is not byte-identical to the injected text. Without unwrapping, acceptance for
+    // every multi-line Pending prompt never correlates and the row stays "delivering" forever
+    // (live incident 2026-09-18, session cmtyf86rp1a1ttm237czmr4ts).
+    let subscribedHook: ((data: SessionHookData) => void) | undefined;
+    const injectedMessage = 'first line\n\nsecond line\nthird line';
+    const submittedBatch = {
+      message: injectedMessage,
+      origin: { kind: 'ui_pending' as const },
+      userMessageLocalIds: ['pasted-local'],
+    };
+    const matchedBatches: unknown[] = [];
+    const confirmPromptAcceptedByProviderIf = vi.fn(
+      async (matcher: (batch: typeof submittedBatch) => boolean) => {
+        if (!matcher(submittedBatch)) return false;
+        matchedBatches.push(submittedBatch);
+        return true;
+      },
+    );
+    const bridge = createClaudeUnifiedHookLifecycleBridge({
+      subscribeClaudeSessionHooks: (callback) => {
+        subscribedHook = callback;
+        return () => {
+          subscribedHook = undefined;
+        };
+      },
+      arbiter: {
+        observeLifecycle: vi.fn(),
+        confirmPromptAcceptedByProvider: vi.fn().mockResolvedValue(true),
+        confirmPromptAcceptedByProviderIf,
+        drainWhenSafe: vi.fn().mockResolvedValue(undefined),
+      } as unknown as Parameters<typeof createClaudeUnifiedHookLifecycleBridge>[0]['arbiter'],
+      completionQuiescenceMs: 0,
+    });
+
+    try {
+      bridge.start({ abortSignal: new AbortController().signal });
+      const hook = subscribedHook;
+      if (typeof hook !== 'function') throw new Error('Claude session hook subscription was not registered');
+
+      hook({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'claude-session-id',
+        prompt_id: 'pasted-prompt',
+        prompt: `\n\n<pasted_content id="9b65">\n${injectedMessage}\n</pasted_content id="9b65">\n`,
+      });
+
+      await vi.waitFor(() => {
+        expect(matchedBatches).toEqual([submittedBatch]);
+      });
     } finally {
       bridge.dispose();
     }
@@ -585,6 +696,35 @@ describe('createClaudeUnifiedHookLifecycleBridge', () => {
     }
   });
 
+  it('does not let sidechain compact boundary transcript rows complete the parent compaction lifecycle', () => {
+    const observeLifecycle = vi.fn();
+    const drainWhenSafe = vi.fn().mockResolvedValue(undefined);
+    const bridge = createClaudeUnifiedHookLifecycleBridge({
+      subscribeClaudeSessionHooks: () => null,
+      arbiter: {
+        observeLifecycle,
+        confirmPromptAcceptedByProvider: vi.fn().mockResolvedValue(false),
+        drainWhenSafe,
+      },
+      completionQuiescenceMs: 0,
+    });
+
+    try {
+      bridge.observeTranscript({
+        type: 'system',
+        uuid: 'sidechain-compact-boundary',
+        subtype: 'compact_boundary',
+        session_id: 'claude-sidechain-session-id',
+        isSidechain: true,
+      } as any);
+
+      expect(observeLifecycle).not.toHaveBeenCalled();
+      expect(drainWhenSafe).not.toHaveBeenCalled();
+    } finally {
+      bridge.dispose();
+    }
+  });
+
   it('waits for async ready completion before redraining after a completed turn', async () => {
     let subscribedHook: ((data: SessionHookData) => void) | undefined;
     let resolveReady: (() => void) | undefined;
@@ -678,9 +818,9 @@ describe('createClaudeUnifiedHookLifecycleBridge', () => {
       await vi.waitFor(() => {
         expect(onUsageLimitDetails).toHaveBeenCalledWith(expect.objectContaining({
           v: 1,
-          providerLimitId: 'rate_limit',
           recoverability: 'wait',
         }));
+        expect(onUsageLimitDetails.mock.calls[0]?.[0]).not.toHaveProperty('providerLimitId');
       });
     } finally {
       bridge.dispose();
@@ -1337,5 +1477,91 @@ describe('createClaudeUnifiedHookLifecycleBridge', () => {
     }
   });
 
+  function startBridgeWithTurnStallProbe(params: Readonly<{
+    onStalled: () => 'resolved' | 'pending';
+    onStarvation: () => void;
+  }>) {
+    let subscribedHook: ((data: SessionHookData) => void) | undefined;
+    const bridge = createClaudeUnifiedHookLifecycleBridge({
+      subscribeClaudeSessionHooks: (callback) => {
+        subscribedHook = callback;
+        return () => {
+          subscribedHook = undefined;
+        };
+      },
+      arbiter: {
+        observeLifecycle: vi.fn(),
+        confirmPromptAcceptedByProvider: vi.fn().mockResolvedValue(false),
+        drainWhenSafe: vi.fn().mockResolvedValue(undefined),
+      },
+      completionQuiescenceMs: 0,
+      turnStallScreenProbe: {
+        quietMs: 5,
+        maxAttempts: 2,
+        onStalled: params.onStalled,
+        onStarvation: params.onStarvation,
+      },
+    });
+    bridge.start({ abortSignal: new AbortController().signal });
+    const hook = subscribedHook;
+    if (typeof hook !== 'function') throw new Error('Claude session hook subscription was not registered');
+    hook({ hook_event_name: 'UserPromptSubmit', session_id: 'claude-session-id' });
+    return bridge;
+  }
 
+  it('stops mid-turn stall probing without escalating when the budget exhausts on a clear screen', async () => {
+    const onStalled = vi.fn(() => 'resolved' as const);
+    const onStarvation = vi.fn();
+    const bridge = startBridgeWithTurnStallProbe({ onStalled, onStarvation });
+
+    try {
+      await vi.waitFor(() => {
+        expect(onStalled).toHaveBeenCalledTimes(2);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(onStalled).toHaveBeenCalledTimes(2);
+      expect(onStarvation).not.toHaveBeenCalled();
+    } finally {
+      bridge.dispose();
+    }
+  });
+
+  it.each([
+    { first: 'resolved', last: 'pending', escalations: 1 },
+    { first: 'pending', last: 'resolved', escalations: 0 },
+  ] as const)('uses the last mid-turn stall probe outcome ($first then $last)', async ({ first, last, escalations }) => {
+    const onStalled = vi.fn<() => 'resolved' | 'pending'>()
+      .mockReturnValueOnce(first)
+      .mockReturnValue(last);
+    const onStarvation = vi.fn();
+    const bridge = startBridgeWithTurnStallProbe({ onStalled, onStarvation });
+
+    try {
+      await vi.waitFor(() => {
+        expect(onStalled).toHaveBeenCalledTimes(2);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(onStalled).toHaveBeenCalledTimes(2);
+      expect(onStarvation).toHaveBeenCalledTimes(escalations);
+    } finally {
+      bridge.dispose();
+    }
+  });
+
+  it('escalates once when the mid-turn stall budget exhausts with the screen still unresolved', async () => {
+    const onStalled = vi.fn(() => 'pending' as const);
+    const onStarvation = vi.fn();
+    const bridge = startBridgeWithTurnStallProbe({ onStalled, onStarvation });
+
+    try {
+      await vi.waitFor(() => {
+        expect(onStarvation).toHaveBeenCalledTimes(1);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(onStalled).toHaveBeenCalledTimes(2);
+      expect(onStarvation).toHaveBeenCalledTimes(1);
+    } finally {
+      bridge.dispose();
+    }
+  });
 });

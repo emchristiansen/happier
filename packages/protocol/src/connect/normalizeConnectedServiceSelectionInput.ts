@@ -13,7 +13,8 @@ import {
  * forms an agent naturally reaches for into a canonical {@link ConnectedServiceBindingsV1}.
  *
  * Accepted input (any of):
- *  - `undefined` / `null` → no explicit selection; the run/session uses the account default.
+ *  - `undefined` → no explicit selection; the run/session uses the account default.
+ *  - `"native"` / `null` → explicitly suppress all connected-service inheritance for this run.
  *  - a string token, or an array of string tokens, each one of:
  *      - `"<serviceId>"`                     → the NAMED service's account default. This is an
  *                                              explicit per-service intent: it is REPRESENTED in
@@ -28,7 +29,7 @@ import {
  *      - `"<serviceId>:group:<groupId>"`     → bind to that account pool/group (auto-rotates when the
  *                                              pool has autoSwitch enabled). Group ids are strict and
  *                                              never contain `:`.
- *      - `"<serviceId>:native"`              → opt out; use the runner's inherited account.
+ *      - `"<serviceId>:native"`              → opt out for that service; use its native auth.
  *  - a full `{ v: 1, bindingsByServiceId: { ... } }` object (the canonical power form).
  *
  * Malformed input is rejected with a typed error naming the valid forms — never silently dropped.
@@ -40,18 +41,18 @@ import {
 export type NormalizeConnectedServiceSelectionResult =
     | Readonly<{
         ok: true;
-        bindings: ConnectedServiceBindingsV1 | undefined;
+        bindings: ConnectedServiceBindingsV1 | null | undefined;
         /** Services whose bare token requested their stored account default (explicit per-service intent). */
         defaultServiceIds: readonly ConnectedServiceId[];
     }>
     | Readonly<{ ok: false; error: string }>;
 
 export type NormalizeConnectedServiceSelectionForRunStartResult =
-    | Readonly<{ ok: true; bindings: ConnectedServiceBindingsV1 | undefined }>
+    | Readonly<{ ok: true; bindings: ConnectedServiceBindingsV1 | null | undefined }>
     | Readonly<{ ok: false; error: string }>;
 
 const VALID_FORMS_MESSAGE =
-    'Valid forms: "<serviceId>" (account default), "<serviceId>:<profileId>", '
+    'Valid forms: "native" (use no connected services), "<serviceId>" (account default), "<serviceId>:<profileId>", '
     + '"<serviceId>:profile:<profileId>", "<serviceId>:group:<groupId>", "<serviceId>:native", '
     + 'an array of those, or a full { v: 1, bindingsByServiceId: {...} } object. '
     + 'serviceId is e.g. "openai-codex".';
@@ -164,11 +165,18 @@ function normalizeTokens(tokens: readonly string[]): NormalizeConnectedServiceSe
 export function normalizeConnectedServiceSelectionInput(
     input: unknown,
 ): NormalizeConnectedServiceSelectionResult {
-    if (input === undefined || input === null) {
+    if (input === undefined) {
         return { ok: true, bindings: undefined, defaultServiceIds: [] };
     }
 
+    if (input === null) {
+        return { ok: true, bindings: null, defaultServiceIds: [] };
+    }
+
     if (typeof input === 'string') {
+        if (input.trim() === 'native') {
+            return { ok: true, bindings: null, defaultServiceIds: [] };
+        }
         return normalizeTokens([input]);
     }
 

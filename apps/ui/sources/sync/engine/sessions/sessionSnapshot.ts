@@ -1,4 +1,9 @@
-import { V2SessionListResponseSchema, type V2SessionListResponse } from '@happier-dev/protocol';
+import {
+    V2SessionListResponseSchema,
+    isSessionEncryptionModeAllowedByClientRequirement,
+    type ClientEncryptionRequirement,
+    type V2SessionListResponse,
+} from '@happier-dev/protocol';
 
 import type { AuthCredentials } from '@/auth/storage/tokenStorage';
 import { serverFetch } from '@/sync/http/client';
@@ -15,6 +20,7 @@ import {
     type SessionListRenderableMetadata,
 } from '@/sync/domains/session/listing/sessionListRenderable';
 import { resolveSessionRuntimePresenceFields } from '@/sync/domains/session/attention/deriveSessionRuntimePresentationState';
+import { resolveSessionPresence } from '@/sync/domains/session/sessionLifecycleProjection';
 import type { SessionListCacheEntryV1 } from '@/sync/domains/state/warmCachePersistence';
 import { isSessionListCacheEntryMetadataUsable } from '@/sync/domains/state/warmCacheAdapters';
 import {
@@ -23,6 +29,7 @@ import {
     type SessionDataKeyHydrationEncryption,
 } from '@/sync/encryption/sessionDataKeyHydration';
 import type { EncryptionScopeInput } from '@/sync/encryption/encryption';
+import { nextRollbackEligibilityObservation } from '@/sync/domains/sessionRollback/rollbackEligibilityObservation';
 
 import { parsePlainSessionAgentState, parsePlainSessionMetadata } from './parsePlainSessionPayload';
 import { fetchSessionListPageCompat } from './sessionHttpCompat';
@@ -107,16 +114,18 @@ function normalizeSessionListAbortKey(params: Readonly<{
     sessionListPageSize?: number;
     sessionListMaxPages?: number;
     includeActiveSessionRows?: boolean;
+    sessionListScope?: 'account' | 'required';
 }>): string {
     const serverId = String(params.serverId ?? '').trim() || NO_SERVER_ID_ABORT_KEY;
     const sessionListPath = String(params.sessionListPath ?? '').trim() || DEFAULT_SESSION_LIST_PATH;
-    return `${serverId}\u0000${sessionListPath}`;
+    return `${serverId}\u0000${sessionListPath}\u0000${params.sessionListScope ?? 'account'}`;
 }
 
 function createSessionListDataKeyHydrationAbortController(params: Readonly<{
     encryption: SessionDataKeyHydrationEncryption;
     serverId?: string | null;
     sessionListPath?: string;
+    sessionListScope?: 'account' | 'required';
 }>): AbortController {
     let controllers = activeSessionListDataKeyHydrationControllers.get(params.encryption);
     if (!controllers) {
@@ -175,7 +184,12 @@ function buildHydratedSessionFromDecryptedRow(
     encryptionMode: 'e2ee' | 'plain',
     decryptedState: Readonly<{ metadata: any; agentState: any }>,
     serverId?: string | null,
+    rollbackEligibilityObservedAt?: number,
 ): HydratedSession {
+    const rawRollbackEligibleTurnStarts = (row as Record<string, unknown>).rollbackEligibleTurnStarts;
+    const rollbackEligibleTurnStarts = rawRollbackEligibleTurnStarts === undefined
+        ? undefined
+        : readRollbackEligibleTurnStarts(rawRollbackEligibleTurnStarts);
     const runtimeActivityProjection = resolveSessionRuntimeActivityProjectionFields({}, row);
     const latestTurnStatus = row.latestTurnStatus ?? null;
     const latestTurnStatusObservedAt = row.latestTurnStatusObservedAt ?? null;
@@ -203,10 +217,13 @@ function buildHydratedSessionFromDecryptedRow(
         latestTurnStatus,
         latestTurnStatusObservedAt,
         ...runtimeActivityProjection,
-        rollbackEligibleTurnStarts: (row as Record<string, unknown>).rollbackEligibleTurnStarts === undefined
-            ? null
-            : readRollbackEligibleTurnStarts((row as Record<string, unknown>).rollbackEligibleTurnStarts),
-        presence: row.active ? 'online' : row.activeAt,
+        // Multi-session reads do not carry rollback eligibility (only the exact read, the turns
+        // projection and turn-mutation updates do). Absent stays `undefined` so the store keeps
+        // the value it already knows instead of erasing it. Starts a row does carry are ordered by
+        // the start of the list request that returned them.
+        rollbackEligibleTurnStarts,
+        rollbackEligibilityObservedAt: rollbackEligibleTurnStarts === undefined ? undefined : rollbackEligibilityObservedAt,
+        presence: resolveSessionPresence(row),
     };
 }
 
@@ -249,12 +266,11 @@ function buildRenderableFromRowAndCache(
             hiddenSystemSession: cachedEntry.hiddenSystemSession === true,
         }
         : null;
-    const useMatchingCacheMetadata = metadataMatches && metadataFromCache != null;
-    const useExistingSessionMetadata = !useMatchingCacheMetadata && existingMetadataMatches;
-    const useCurrentRenderableMetadata =
-        !useMatchingCacheMetadata && !useExistingSessionMetadata && currentMetadataMatches;
+    // A compact cache may predate canonical identity projection even at the same
+    // metadata version. Prefer full metadata, which retains the runtime evidence.
+    const useExistingSessionMetadata = existingMetadataMatches;
     const staleCacheMetadataVersion = cachedEntry?.metadataVersion ?? row.metadataVersion;
-    const plainHydratedSession = !useMatchingCacheMetadata && !useExistingSessionMetadata && !useCurrentRenderableMetadata
+    const plainHydratedSession = !useExistingSessionMetadata
         ? buildPlainHydratedSessionFromRow(row)
         : null;
     const plainRenderable = plainHydratedSession?.metadata != null
@@ -264,10 +280,16 @@ function buildRenderableFromRowAndCache(
         return plainRenderable;
     }
     const usePlainRenderableMetadata =
-        !useMatchingCacheMetadata
-        && !useExistingSessionMetadata
-        && !useCurrentRenderableMetadata
+        !useExistingSessionMetadata
         && plainRenderable?.metadata != null;
+    const useCurrentRenderableMetadata =
+        !useExistingSessionMetadata && !usePlainRenderableMetadata && currentMetadataMatches;
+    const useMatchingCacheMetadata =
+        !useExistingSessionMetadata
+        && !usePlainRenderableMetadata
+        && !useCurrentRenderableMetadata
+        && metadataMatches
+        && metadataFromCache != null;
     const useStaleCacheMetadata =
         !useMatchingCacheMetadata
         && !useExistingSessionMetadata
@@ -369,7 +391,7 @@ function buildRenderableFromRowAndCache(
         metadata: renderableMetadata,
         thinking: runtimePresence.thinking,
         thinkingAt: runtimePresence.thinkingAt,
-        presence: row.active ? 'online' : row.activeAt,
+        presence: resolveSessionPresence(row),
         latestTurnId: row.latestTurnId ?? null,
         rollbackEligibleTurnStarts: rowRecord.rollbackEligibleTurnStarts === undefined
             ? null
@@ -472,6 +494,47 @@ function needsWarmHydration(params: {
     return !isCurrentRenderableCompleteForWarmHydration(row, params.currentRenderable);
 }
 
+/**
+ * Rollback eligibility for rows this snapshot does not hydrate (already warm, or beyond the
+ * background cap). Skipping a row saves its decrypt; it must not also hide the snapshot from the
+ * store's eligibility rule (`mergeRollbackEligibility`). That matters because an earlier-turn
+ * mutation changes eligibility without touching any field warm hydration compares.
+ *
+ * Each patch is the session exactly as stored when the snapshot is applied, with only the row's
+ * eligibility in place of the stored value. An absent value leaves known starts stale until an
+ * exact read confirms them; carried starts are new evidence, ordered by the start of the list
+ * request (`rollbackEligibilityObservedAt`), so a confirming row cannot erase the order that keeps
+ * an older in-flight read from restoring revoked starts, and a row requested before a newer update
+ * is dropped. Sessions with nothing to merge (no known starts and none in the row) get no patch.
+ * The stored turns projection rides along unchanged with its own observation; starts newer than
+ * it decide alone, so an explicit empty array revokes and a renewed start is offered
+ * (`resolveTranscriptRollbackActions`).
+ */
+function buildUnhydratedRowRollbackEligibilityPatches(params: Readonly<{
+    sessions: readonly SessionListRow[];
+    hydratingSessionIds: ReadonlySet<string>;
+    getExistingSession?: (sessionId: string) => Session | null | undefined;
+    rollbackEligibilityObservedAt: number;
+}>): HydratedSession[] {
+    const patches: HydratedSession[] = [];
+    for (const row of params.sessions) {
+        if (params.hydratingSessionIds.has(row.id)) continue;
+        const existingSession = params.getExistingSession?.(row.id);
+        if (!existingSession) continue;
+        const rawStarts = (row as Record<string, unknown>).rollbackEligibleTurnStarts;
+        const rowStarts = rawStarts === undefined ? undefined : readRollbackEligibleTurnStarts(rawStarts);
+        if (rowStarts === undefined && existingSession.rollbackEligibleTurnStarts === undefined) continue;
+        patches.push({
+            ...existingSession,
+            rollbackEligibleTurnStarts: rowStarts,
+            rollbackEligibilityObservedAt: rowStarts === undefined
+                ? existingSession.rollbackEligibilityObservedAt
+                : params.rollbackEligibilityObservedAt,
+        });
+    }
+    return patches;
+}
+
 function buildMissingEncryptedDataKeySessionIdSet(
     dataKeyHydrationPlan: ReturnType<typeof createSessionDataKeyHydrationPlan>,
 ): ReadonlySet<string> {
@@ -486,9 +549,11 @@ function buildMissingEncryptedDataKeySessionIdSet(
 
 function canHydrateSessionRow(params: {
     row: SessionListRow;
+    existingSession?: Session | null;
     missingEncryptedDataKeySessionIds: ReadonlySet<string>;
     encryption: SessionListEncryption;
 }): boolean {
+    if (canReuseDecryptedSessionPayload(params.row, params.existingSession)) return true;
     if (!params.missingEncryptedDataKeySessionIds.has(params.row.id)) return true;
     return params.encryption.getSessionEncryption(params.row.id) != null;
 }
@@ -544,6 +609,7 @@ function buildHydrationCandidateAttribution(params: Readonly<{
         }
         if (!canHydrateSessionRow({
             row,
+            existingSession: params.getExistingSession?.(row.id),
             missingEncryptedDataKeySessionIds: params.missingEncryptedDataKeySessionIds,
             encryption: params.encryption,
         })) {
@@ -808,11 +874,13 @@ function buildStaleHydratedSessionRenderablePatch(
     const shouldPatchPendingFlags =
         currentRenderable.agentStateVersion <= hydratedRenderable.agentStateVersion
         && (
-            typeof currentRenderable.hasPendingPermissionRequests !== 'boolean'
+            currentRenderable.agentStateVersion < hydratedRenderable.agentStateVersion
+            || typeof currentRenderable.hasPendingPermissionRequests !== 'boolean'
             || typeof currentRenderable.hasPendingUserActionRequests !== 'boolean'
         );
     if (shouldPatchPendingFlags) {
         patch.agentStateVersion = hydratedRenderable.agentStateVersion;
+        patch.pendingRequestObservedAt = hydratedRenderable.pendingRequestObservedAt ?? null;
         if (typeof hydratedRenderable.hasPendingPermissionRequests === 'boolean') {
             patch.hasPendingPermissionRequests = hydratedRenderable.hasPendingPermissionRequests;
         }
@@ -940,7 +1008,8 @@ function reportStaleHydratedSessionsSkipped(params: Readonly<{
 function reuseHydratedSessionForRow(
     row: SessionListRow,
     existingSession: Session | null | undefined,
-    serverId?: string | null,
+    serverId: string | null | undefined,
+    rollbackEligibilityObservedAt: number,
 ): HydratedSession | null {
     if (!canReuseDecryptedSessionPayload(row, existingSession)) return null;
     const encryptionMode: 'e2ee' | 'plain' = row.encryptionMode === 'plain' ? 'plain' : 'e2ee';
@@ -949,6 +1018,7 @@ function reuseHydratedSessionForRow(
         encryptionMode,
         { metadata: existingSession.metadata, agentState: existingSession.agentState },
         serverId,
+        rollbackEligibilityObservedAt,
     );
     syncPerformanceTelemetry.count('sync.sessions.snapshot.decryptRow.reusedPayload', {
         sessions: 1,
@@ -961,7 +1031,8 @@ function reuseHydratedSessionForRow(
 async function decryptSessionRow(
     row: SessionListRow,
     encryption: SessionListEncryption,
-    serverId?: string | null,
+    serverId: string | null | undefined,
+    rollbackEligibilityObservedAt: number,
 ): Promise<HydratedSession | null> {
     return syncPerformanceTelemetry.measureAsync(
         'sync.sessions.snapshot.decryptRow',
@@ -1000,7 +1071,7 @@ async function decryptSessionRow(
                             return { metadata, agentState };
                         })();
 
-                return buildHydratedSessionFromDecryptedRow(row, encryptionMode, decryptedState, serverId);
+                return buildHydratedSessionFromDecryptedRow(row, encryptionMode, decryptedState, serverId, rollbackEligibilityObservedAt);
             } catch (error) {
                 console.error(`[sessionsSnapshot] Failed to decrypt session ${row.id}`, error);
                 return null;
@@ -1248,6 +1319,9 @@ function scheduleReadStateRepair(params: {
 
 export async function fetchAndApplySessions(params: {
     sessionListPath?: string;
+    serverUrl?: string;
+    sessionListScope?: 'account' | 'required';
+    requiredSessionIds?: readonly string[];
     sessionListCursor?: string | null;
     sessionListPageSize?: number;
     sessionListMaxPages?: number;
@@ -1262,7 +1336,10 @@ export async function fetchAndApplySessions(params: {
     request?: (path: string, init: RequestInit) => Promise<Response>;
     applySessions: (sessions: HydratedSession[]) => void;
     onSnapshotFetched?: (sessionIds: string[]) => void;
-    applySessionListRenderables?: (sessions: SessionListRenderableSession[], options?: { replace?: boolean }) => void;
+    applySessionListRenderables?: (
+        sessions: SessionListRenderableSession[],
+        options?: { replace?: boolean; coversWholeList?: boolean },
+    ) => void;
     cachedSessionListEntries?: Record<string, SessionListCacheEntryV1>;
     getCurrentSessionListRenderable?: CurrentSessionListRenderableLookup;
     applySessionListRenderablePatches?: (patches: readonly SessionListRenderablePatch[]) => void;
@@ -1284,8 +1361,11 @@ export async function fetchAndApplySessions(params: {
     shouldContinue?: () => boolean;
     repairInvalidReadStateV1: (params: { sessionId: string; sessionSeqUpperBound: number }) => Promise<void>;
     log: { log: (message: string) => void };
+    clientEncryptionRequirement?: ClientEncryptionRequirement;
 }): Promise<SessionListFetchResult> {
     const { credentials, encryption, sessionDataKeys, applySessions, repairInvalidReadStateV1 } = params;
+    const requiredOnly = params.sessionListScope === 'required';
+    const awaitSessionListHydration = requiredOnly || params.awaitSessionListHydration === true;
     const snapshotStartedAtMs = nowMs();
     const request =
         params.request
@@ -1310,6 +1390,7 @@ export async function fetchAndApplySessions(params: {
         encryption,
         serverId: params.serverId,
         sessionListPath: params.sessionListPath,
+        sessionListScope: params.sessionListScope,
     });
     const rawShouldContinue = params.shouldContinue ?? (() => true);
     const shouldContinue = () => {
@@ -1321,11 +1402,17 @@ export async function fetchAndApplySessions(params: {
         return canContinue;
     };
 
-    let cursor: string | null = params.sessionListCursor ?? null;
+    let cursor: string | null = requiredOnly ? null : params.sessionListCursor ?? null;
+    const startedFromListHead = cursor === null;
     const seenCursors = new Set<string>();
     let fetchedPages = 0;
     let nextCursorForMore: string | null = cursor;
     let hasNextForMore = false;
+    // Whether the server explicitly reported the end of the last fetched page. Missing or
+    // malformed pagination metadata proves no coverage. Whole-list coverage also requires starting at the list
+    // head and a v2 source: the `/v1/sessions` fallback is capped server-side yet reports no
+    // further page. Anything unproven fails closed and retains omitted rows.
+    let serverReportedListEnd = false;
     let source: 'v2' | 'v1' = 'v2';
     const buildFetchResult = (): SessionListFetchResult => ({
         sessionIds: sessions.map((session) => session.id),
@@ -1344,12 +1431,16 @@ export async function fetchAndApplySessions(params: {
     // The initial page asks the server to merge the active-session rows into the response it already
     // builds. That removes an entire ~1 MB round trip on every foreground, and — because both
     // requests contend for the same server DB connection — the serialization edge behind it.
-    const wantsInitialActiveRows = params.includeActiveSessionRows === true && !cursor && !params.sessionListPath;
+    const wantsInitialActiveRows = !requiredOnly && params.includeActiveSessionRows === true && !cursor && !params.sessionListPath;
     let servedActiveRowsWithInitialPage = false;
+    // Rollback starts carried by any row of this snapshot describe the server no earlier than now.
+    // One observation, taken before the first request, orders them against socket updates and
+    // exact reads (`mergeRollbackEligibility`); later pages are only ever treated as older.
+    const rollbackEligibilityObservedAt = nextRollbackEligibilityObservation();
     const initialSessionListPath = !cursor && !params.sessionListPath
         ? buildSessionListInitialPath({
             includeActiveRows: wantsInitialActiveRows,
-            includeAttentionRows: params.includeSessionListAttentionRows === true,
+            includeAttentionRows: !requiredOnly && params.includeSessionListAttentionRows === true,
         })
         : undefined;
     while (fetchedPages < sessionListMaxPages) {
@@ -1367,10 +1458,13 @@ export async function fetchAndApplySessions(params: {
             async () => fetchSessionListPageCompat({
                 request,
                 token: credentials.token,
+                serverUrl: params.serverUrl,
                 sessionListPath: params.sessionListPath ?? initialSessionListPath,
                 cursor,
                 limit: pageLimit,
                 telemetryFields: fetchPageFields,
+                requiredSessionIds: fetchedPages === 0 && !cursor ? params.requiredSessionIds : undefined,
+                requiredOnly,
             }),
         );
 
@@ -1397,6 +1491,7 @@ export async function fetchAndApplySessions(params: {
                 nextCursor = page.nextCursor;
                 nextCursorForMore = page.nextCursor;
                 hasNextForMore = page.hasNext === true && typeof page.nextCursor === 'string' && page.source === 'v2';
+                serverReportedListEnd = page.hasNext === false;
             },
         );
 
@@ -1421,6 +1516,7 @@ export async function fetchAndApplySessions(params: {
             async () => fetchSessionListPageCompat({
                 request,
                 token: credentials.token,
+                serverUrl: params.serverUrl,
                 sessionListPath: '/v2/sessions/active',
                 cursor: null,
                 limit: 500,
@@ -1437,6 +1533,18 @@ export async function fetchAndApplySessions(params: {
         appendRows(pageRows);
     }
 
+    if (params.clientEncryptionRequirement === 'require_e2ee') {
+        for (let index = sessions.length - 1; index >= 0; index -= 1) {
+            const session = sessions[index];
+            if (session && !isSessionEncryptionModeAllowedByClientRequirement(
+                params.clientEncryptionRequirement,
+                session.encryptionMode === 'plain' ? 'plain' : 'e2ee',
+            )) {
+                sessions.splice(index, 1);
+            }
+        }
+    }
+
     const sessionsNeedingEncryption = sessions.filter((session) => session.encryptionMode !== 'plain');
     const sessionDataKeyEnvelopes = params.sessionDataKeyEnvelopes;
     if (!shouldContinue()) {
@@ -1450,18 +1558,26 @@ export async function fetchAndApplySessions(params: {
     }
 
     const cachedSessionListEntries = params.cachedSessionListEntries ?? {};
-    const requestedRequiredHydrationSessionIds = normalizeSessionListHydrationSessionIds(params.requiredHydrationSessionIds);
+    const requestedRequiredHydrationSessionIds = normalizeSessionListHydrationSessionIds([
+        ...(params.requiredHydrationSessionIds ?? []),
+        ...(requiredOnly ? params.requiredSessionIds ?? [] : []),
+    ]);
     const nonAwaitedRequiredHydrationLimit = params.sessionListBackgroundHydrationMaxRows === undefined
         ? Number.POSITIVE_INFINITY
         : Math.max(0, Math.trunc(params.sessionListBackgroundHydrationMaxRows));
     const requiredHydrationSessionIds = new Set(
-        params.awaitSessionListHydration === true
+        awaitSessionListHydration
             ? requestedRequiredHydrationSessionIds
             : requestedRequiredHydrationSessionIds.slice(0, nonAwaitedRequiredHydrationLimit),
     );
     const shouldApplyRenderables = typeof params.applySessionListRenderables === 'function';
     let appliedRenderableCount = 0;
     const requiredSnapshotRows = countRowsWithIds(sessions, requiredHydrationSessionIds);
+    const assertRequiredRowHydrated = (row: SessionListRow, session: HydratedSession | null): void => {
+        if (!awaitSessionListHydration || !requiredHydrationSessionIds.has(row.id)) return;
+        if (session && session.metadataUnavailable !== true) return;
+        throw new Error(`Required session shell hydration failed for ${row.id}`);
+    };
     const backgroundSnapshotRows = countBackgroundRows(sessions.length, requiredSnapshotRows);
     const encryptionScope: EncryptionScopeInput = typeof params.serverId === 'string' && params.serverId.trim().length > 0
         ? { serverId: params.serverId.trim() }
@@ -1501,7 +1617,10 @@ export async function fetchAndApplySessions(params: {
                 requiredRows: requiredSnapshotRows,
                 backgroundRows: countBackgroundRows(renderables.length, requiredSnapshotRows),
             },
-            () => params.applySessionListRenderables!(renderables, { replace: true }),
+            () => params.applySessionListRenderables!(renderables, {
+                replace: !requiredOnly,
+                coversWholeList: !requiredOnly && startedFromListHead && source === 'v2' && serverReportedListEnd,
+            }),
         );
         recordFirstUsableListTelemetry({
             snapshotStartedAtMs,
@@ -1560,6 +1679,11 @@ export async function fetchAndApplySessions(params: {
         syncPerformanceTelemetry.count('sync.sessions.snapshot.missingEncryptedDataKeys', {
             sessions: missingEncryptedDataKeySessionIds.size,
         });
+        for (const row of sessions) {
+            if (!canHydrateSessionRow({ row, existingSession: params.getExistingSession?.(row.id), missingEncryptedDataKeySessionIds, encryption })) {
+                assertRequiredRowHydrated(row, null);
+            }
+        }
     }
 
     if (shouldApplyRenderables) {
@@ -1594,6 +1718,15 @@ export async function fetchAndApplySessions(params: {
         });
         const rowsNeedingHydration = hydrationPriority.rows;
         const skippedBackgroundHydrationRows = hydrationPriority.counts.skippedBackground;
+        const rollbackEligibilityPatches = buildUnhydratedRowRollbackEligibilityPatches({
+            sessions,
+            hydratingSessionIds: new Set(rowsNeedingHydration.map((row) => row.id)),
+            getExistingSession: params.getExistingSession,
+            rollbackEligibilityObservedAt,
+        });
+        if (rollbackEligibilityPatches.length > 0 && shouldContinue()) {
+            applySessions(rollbackEligibilityPatches);
+        }
         syncPerformanceTelemetry.count(
             'sync.sessions.snapshot.hydrationPriority',
             hydrationPriority.counts,
@@ -1649,7 +1782,7 @@ export async function fetchAndApplySessions(params: {
                 shouldContinue,
                 batchSize: backgroundHydrationApplyBatchSize,
                 flushDelayMs: backgroundHydrationApplyFlushDelayMs,
-                coalesceRequiredRows: params.awaitSessionListHydration === true,
+                coalesceRequiredRows: awaitSessionListHydration,
             });
             const hydrationAttribution = createBackgroundHydrationAttribution();
             const hydrationPromise = syncPerformanceTelemetry.measureAsync(
@@ -1754,7 +1887,8 @@ export async function fetchAndApplySessions(params: {
                                             row,
                                             params.getExistingSession?.(row.id),
                                             params.serverId,
-                                        ) ?? await decryptSessionRow(row, encryption, params.serverId);
+                                            rollbackEligibilityObservedAt,
+                                        ) ?? await decryptSessionRow(row, encryption, params.serverId, rollbackEligibilityObservedAt);
                                         addBackgroundHydrationDuration(
                                             hydrationAttribution,
                                             'decryptRowMs',
@@ -1775,9 +1909,11 @@ export async function fetchAndApplySessions(params: {
                                             if (unavailablePatch && params.applySessionListRenderablePatches) {
                                                 params.applySessionListRenderablePatches([unavailablePatch]);
                                             }
+                                            assertRequiredRowHydrated(row, null);
                                             markRequiredHydrationResult(row, null);
                                             return null;
                                         }
+                                        assertRequiredRowHydrated(row, decryptedSession);
                                         if (!isHydratedSessionCurrentForListState(
                                             decryptedSession,
                                             params.getCurrentSessionListRenderable,
@@ -1812,7 +1948,7 @@ export async function fetchAndApplySessions(params: {
                                         markRequiredHydrationResult(row, decryptedSession);
                                         if (
                                             isRequiredHydrationRow
-                                            && params.awaitSessionListHydration === true
+                                            && awaitSessionListHydration
                                             && pendingRequiredHydrationIds.size === 0
                                         ) {
                                             hydratedSessionBatcher.flush('required');
@@ -1841,7 +1977,7 @@ export async function fetchAndApplySessions(params: {
                     );
                     const finalFlushStartedAtMs = nowMs();
                     if (
-                        params.awaitSessionListHydration !== true
+                        !awaitSessionListHydration
                         && backgroundHydrationApplyFlushDelayMs > 0
                     ) {
                         await yieldToSessionListBackgroundHydration(backgroundHydrationApplyFlushDelayMs);
@@ -1884,17 +2020,11 @@ export async function fetchAndApplySessions(params: {
                 console.error('[sessionsSnapshot] Background hydration failed', error);
             };
 
-            if (params.awaitSessionListHydration === true) {
+            if (awaitSessionListHydration) {
                 void hydrationPromise.catch(logBackgroundHydrationError);
-                // The gate's contract is "every required row reached a terminal state", which
-                // `requiredHydrationPromise` already enforces: it resolves only once
-                // `pendingRequiredHydrationIds` is empty, and a genuine hydration error rejects it
-                // through `rejectRequiredHydration`. A required row that decrypted to nothing or was
-                // superseded by newer list state has a terminal disposition that was already applied
-                // (unavailable / stale renderable patches), so the refresh completed. Treating those
-                // as a failed refresh made the caller's `refreshedByCatchUp.sessions` stay false and
-                // the resume tail repeat the entire session-list refresh — the second foreground
-                // catch-up wave measured on device.
+                // A changes checkpoint requires usable required rows. Decrypt/key failures reject
+                // this wait, while cancellation and rows superseded by newer state keep their
+                // existing terminal disposition without publishing stale data.
                 await syncPerformanceTelemetry.measureAsync(
                     'sync.sessions.snapshot.requiredHydration.wait',
                     {
@@ -1921,6 +2051,7 @@ export async function fetchAndApplySessions(params: {
             sessions
                 .filter((row) => canHydrateSessionRow({
                     row,
+                    existingSession: params.getExistingSession?.(row.id),
                     missingEncryptedDataKeySessionIds,
                     encryption,
                 }))
@@ -1928,11 +2059,18 @@ export async function fetchAndApplySessions(params: {
                     row,
                     params.getExistingSession?.(row.id),
                     params.serverId,
-                ) ?? decryptSessionRow(row, encryption, params.serverId)),
+                    rollbackEligibilityObservedAt,
+                ) ?? decryptSessionRow(row, encryption, params.serverId, rollbackEligibilityObservedAt)),
             concurrencyLimit,
         ),
     );
     const decryptedSessions = decryptedResults.filter((session): session is NonNullable<typeof session> => Boolean(session));
+    if (shouldContinue()) {
+        const decryptedSessionsById = new Map(decryptedSessions.map((session) => [session.id, session]));
+        for (const row of sessions) {
+            assertRequiredRowHydrated(row, decryptedSessionsById.get(row.id) ?? null);
+        }
+    }
 
     const appliedSessions = applyHydratedSessions({
         sessions: decryptedSessions,

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
-import { bold, muted, statusGlyph, subLineArrow, success, warning } from './styles';
+import { cmd, fail, info, ok, warn } from '@happier-dev/cli-common/output';
+
+import { bold, code, glyph, muted, statusGlyph, subLineArrow, success, warning } from './styles';
 
 describe('styles palette', () => {
   it('muted wraps text', () => {
@@ -27,5 +29,13 @@ describe('styles palette', () => {
 
   it('sub-line arrow contains ↳', () => {
     expect(subLineArrow()).toContain('↳');
+  });
+
+  it('uses the same status glyphs and command style as the rest of the CLI', () => {
+    expect(glyph.error()).toBe(fail());
+    expect(glyph.action()).toBe(warn());
+    expect(glyph.success()).toBe(ok());
+    expect(glyph.info()).toBe(info());
+    expect(code('happier doctor repair')).toBe(cmd('happier doctor repair'));
   });
 });

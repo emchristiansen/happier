@@ -20,6 +20,8 @@ import type { AgentActivityEntryKind, AgentActivityLocalEntry } from '../types';
 export type SessionSubagentActivityProjection = Readonly<{
     id: string;
     status: AgentActivityStatusV1;
+    /** False means an available retained handle has no current work. */
+    isActive?: boolean;
     title: string;
     metaDetail?: string | null;
     startedAtMs?: number | null;
@@ -66,10 +68,11 @@ export function toLocalAgentActivityEntry(params: Readonly<{
         kind: resolveSessionSubagentActivityKind(subagent),
         handle: resolveSessionSubagentActivityHandle(subagent),
         status: projection.status,
+        ...(projection.isActive !== undefined ? { isActive: projection.isActive } : {}),
         title: projection.title,
         metaDetail: projection.metaDetail ?? null,
         startedAtMs: projection.startedAtMs ?? null,
-        updatedAtMs: projection.updatedAtMs ?? null,
+        updatedAtMs: projection.updatedAtMs ?? subagent.timestamps.updatedAtMs ?? null,
         endedAtMs: projection.endedAtMs ?? null,
         runId: subagent.runRef?.runId ?? null,
         sidechainId: subagent.transcript.sidechainId ?? null,

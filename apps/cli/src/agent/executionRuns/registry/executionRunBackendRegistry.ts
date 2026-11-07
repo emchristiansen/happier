@@ -4,10 +4,11 @@ import { executionRunBackendFactory as gemini } from '@/backends/gemini/executio
 import { executionRunBackendFactory as opencode } from '@/backends/opencode/executionRuns/executionRunBackendFactory';
 import { executionRunBackendFactory as auggie } from '@/backends/auggie/executionRuns/executionRunBackendFactory';
 import { executionRunBackendFactory as qwen } from '@/backends/qwen/executionRuns/executionRunBackendFactory';
-import { executionRunBackendFactory as kimi } from '@/backends/kimi/executionRuns/executionRunBackendFactory';
 import { executionRunBackendFactory as kilo } from '@/backends/kilo/executionRuns/executionRunBackendFactory';
 import { executionRunBackendFactory as copilot } from '@/backends/copilot/executionRuns/executionRunBackendFactory';
 import { executionRunBackendFactory as pi } from '@/backends/pi/executionRuns/executionRunBackendFactory';
+import { executionRunBackendFactory as devin } from '@/backends/devin/executionRuns/executionRunBackendFactory';
+import { createCatalogDefinedExecutionRunBackendFactory } from '@/agent/acp/catalog/createCatalogDefinedExecutionRunBackendFactory';
 
 import { listNativeReviewEngineIds, resolveNativeReviewExecutionRunBackendFactory } from '@/agent/reviews/engines/nativeReviewEngines';
 import type { BackendIsolationBundle, BackendIsolationRequest } from '@/runtime/isolation/types';
@@ -25,10 +26,15 @@ const REGISTRY: Record<string, ExecutionRunBackendDescriptor> = {
   opencode: { factory: opencode },
   auggie: { factory: auggie },
   qwen: { factory: qwen },
-  kimi: { factory: kimi },
+  kimi: { factory: createCatalogDefinedExecutionRunBackendFactory('kimi') },
   kilo: { factory: kilo },
   copilot: { factory: copilot },
   pi: { factory: pi },
+  devin: { factory: devin },
+  agy: { factory: createCatalogDefinedExecutionRunBackendFactory('agy') },
+  fx: { factory: createCatalogDefinedExecutionRunBackendFactory('fx') },
+  droid: { factory: createCatalogDefinedExecutionRunBackendFactory('droid') },
+  codebuddy: { factory: createCatalogDefinedExecutionRunBackendFactory('codebuddy') },
 };
 
 // Aliases: UI/agents may reference provider IDs that are distinct from the execution-run backend ID.

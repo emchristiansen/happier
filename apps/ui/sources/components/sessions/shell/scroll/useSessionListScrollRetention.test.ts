@@ -25,6 +25,36 @@ function scrollEvent(offsetY: number, viewportHeight: number, contentHeight = 12
 }
 
 describe('useSessionListScrollRetention', () => {
+    it('keeps subscribed scroll callbacks stable and reads the current surface activity', async () => {
+        const scrollToOffset = vi.fn();
+        const hook = await renderHook(
+            (props: { surfaceActive: boolean }) => useSessionListScrollRetention({
+                retentionKey: 'stable-surface-lifecycle',
+                scrollToOffset,
+                surfaceActive: props.surfaceActive,
+            }),
+            { initialProps: { surfaceActive: true } },
+        );
+        const handlers = hook.getCurrent();
+        await act(async () => {
+            handlers.handleLayout(layoutEvent(416));
+            handlers.handleScroll(scrollEvent(280, 416));
+        });
+        await hook.rerender({ surfaceActive: false });
+        expect(hook.getCurrent()).toBe(handlers);
+        await act(async () => {
+            // Native may already hold this callback when the surface deactivates.
+            handlers.handleScroll(scrollEvent(0, 416));
+            handlers.handleLayout(layoutEvent(0));
+        });
+        await hook.rerender({ surfaceActive: true });
+        await act(async () => {
+            handlers.handleLayout(layoutEvent(416));
+        });
+        expect(scrollToOffset).toHaveBeenLastCalledWith({ offset: 280, animated: false });
+        await hook.unmount();
+    });
+
     it('restores the last visible scroll offset when a zero-height retained list becomes visible again', async () => {
         const scrollToOffset = vi.fn();
         const hook = await renderHook(() => useSessionListScrollRetention({

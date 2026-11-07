@@ -24,7 +24,11 @@ import { getComponentDir, getRootDir, resolveStackEnvPath } from './utils/paths/
 import { parseEnvToObject } from './utils/env/dotenv.mjs';
 import { ensureEnvFileUpdated } from './utils/env/env_file.mjs';
 import { getCliHomeDirFromEnvOrDefault } from './utils/stack/dirs.mjs';
-import { buildStackServerProfileSetArgs } from './utils/stack/server_profile_reconciliation.mjs';
+import {
+  assertStackServerProfileReconciled,
+  buildStackServerProfileSetArgs,
+  shouldVerifyStackServerProfileReconciliation,
+} from './utils/stack/server_profile_reconciliation.mjs';
 import {
   isCliDirectExecutableCommand,
   probeCliDistRuntimeImport,
@@ -1786,6 +1790,7 @@ export async function startLocalDaemonWithAuth({
   if (canReconcileProfileWithAdmittedCli && existsSync(join(cliHomeDir, 'settings.json'))) {
     const serverId = String(daemonEnv.HAPPIER_ACTIVE_SERVER_ID ?? '').trim();
     if (serverId) {
+      const verifyPersistedProfile = shouldVerifyStackServerProfileReconciliation(cliHomeDir);
       const profileCommand = resolveDaemonCommandSpec({
         cliBin,
         cliEntrypoint:
@@ -1810,6 +1815,14 @@ export async function startLocalDaemonWithAuth({
           captureFailureDiagnostic: { env: daemonEnv },
         },
       );
+      if (verifyPersistedProfile) {
+        assertStackServerProfileReconciled({
+          homeDir: cliHomeDir,
+          serverId,
+          internalServerUrl,
+          publicServerUrl,
+        });
+      }
     }
   }
 

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { renderPrismaCompatibleSqliteDatabaseUrl } from "@happier-dev/cli-common/firstPartyRuntime";
 
 import {
     prefixSqliteReadPoolPrometheusMetrics,
@@ -36,6 +37,36 @@ describe("renderSqliteReadPoolDatabaseUrl", () => {
             .toBe("file:/data/a b.sqlite?socket_timeout=7&connection_limit=2");
         expect(renderSqliteReadPoolDatabaseUrl("file:C:\\Users\\me\\data\\x.sqlite?connection_limit=1&socket_timeout=30", 4))
             .toBe("file:C:\\Users\\me\\data\\x.sqlite?connection_limit=4&socket_timeout=30");
+    });
+});
+
+describe("native SQLite path and query composition", () => {
+    it.each([
+        "/data/hash#here/db.sqlite",
+        "/data/literal%23#hash/db.sqlite",
+        "C:\\Users\\hash#here\\db.sqlite",
+    ])("validates and renders the canonical writer URL for %s", (dbPath) => {
+        const writerUrl = renderPrismaCompatibleSqliteDatabaseUrl({
+            dbPath, platform: process.platform, sqlite: { busyTimeoutMs: 30_000, connectionLimit: 1 },
+        });
+        expect(writerUrl).toBe(`file:${dbPath}?socket_timeout=30&connection_limit=1`);
+        expect(() => requireSingleSqliteWriteConnection(writerUrl)).not.toThrow();
+        expect(renderSqliteReadPoolDatabaseUrl(writerUrl, 2)).toBe(`file:${dbPath}?socket_timeout=30&connection_limit=2`);
+    });
+
+    it("preserves the literal hash path when replacing the read connection limit", () => {
+        expect(renderSqliteReadPoolDatabaseUrl("file:/data/hash#here/db.sqlite?socket_timeout=30&connection_limit=1", 2))
+            .toBe("file:/data/hash#here/db.sqlite?socket_timeout=30&connection_limit=2");
+    });
+
+    it.each([
+        "file:/data/hash#here/db.sqlite?socket_timeout=30",
+        "file:/data/hash#here/db.sqlite?connection_limit=2",
+        "file:/data/hash#here/db.sqlite?connection_limit=1&connection_limit=1",
+        "file:/data/hash#here/db.sqlite?connection_limit=1&connection_limit=4",
+        "file:/data/hash#here/db.sqlite?connection_limit=4&connection_limit=1",
+    ])("retains exactly-one writer enforcement for %s", (url) => {
+        expect(() => requireSingleSqliteWriteConnection(url)).toThrow(/connection_limit=1/);
     });
 });
 

@@ -6,6 +6,16 @@ import type { Metadata } from '@/api/types';
 import { createTerminalAttachPlan } from './terminalAttachPlan';
 
 describe('createTerminalAttachPlan', () => {
+  it('uses Herdr stable terminal identity for foreground attachment', () => {
+    expect(createTerminalAttachPlan({
+      terminal: {
+        mode: 'herdr',
+        herdr: { sessionName: 'default', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' },
+      },
+      insideTmux: false,
+    })).toEqual({ type: 'herdr', sessionName: 'default', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' });
+  });
+
   it('returns not-attachable when terminal mode is plain', () => {
     const terminal: NonNullable<Metadata['terminal']> = { mode: 'plain' };
     const plan = createTerminalAttachPlan({ terminal, insideTmux: false });
@@ -125,12 +135,26 @@ describe('createTerminalAttachPlan', () => {
     expect(plan).toEqual({
       type: 'tmux',
       sessionName: 'happy',
-      target: 'happy:window-1',
+      target: '=happy:window-1',
       shouldAttach: true,
       shouldUnsetTmuxEnv: false,
       tmuxCommandEnv: {},
-      selectWindowArgs: ['select-window', '-t', 'happy:window-1'],
-      attachSessionArgs: ['attach-session', '-t', 'happy'],
+      selectWindowArgs: ['select-window', '-t', '=happy:window-1'],
+      attachSessionArgs: ['attach-session', '-t', '=happy'],
+    });
+  });
+
+  it('keeps the exact owning session when attaching an immutable tmux window id', () => {
+    const terminal: NonNullable<Metadata['terminal']> = {
+      mode: 'tmux',
+      tmux: { target: 'happy:@7' },
+    };
+
+    expect(createTerminalAttachPlan({ terminal, insideTmux: false })).toMatchObject({
+      type: 'tmux',
+      sessionName: 'happy',
+      target: '=happy:@7',
+      selectWindowArgs: ['select-window', '-t', '=happy:@7'],
     });
   });
 

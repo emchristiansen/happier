@@ -116,6 +116,8 @@ export interface CanUseToolRequest extends ControlRequest {
     input: unknown
     /** Canonical provider key for this tool call; preserve it unchanged for permission ownership. */
     tool_use_id?: string
+    agent_id?: string
+    agentId?: string
 }
 
 export interface CanUseToolControlRequest {
@@ -173,7 +175,7 @@ export interface CanCallToolCallback {
     (
         toolName: string,
         input: unknown,
-        options: { signal: AbortSignal; toolUseId?: string | null },
+        options: { signal: AbortSignal; toolUseId?: string | null; agentId?: string | null },
     ): Promise<PermissionResult>
 }
 
@@ -236,4 +238,21 @@ export class AbortError extends Error {
         super(message)
         this.name = 'AbortError'
     }
+}
+
+export class ClaudeNativeProviderExitUnverifiedError extends Error {
+    readonly code = 'claude_native_provider_exit_unverified'
+
+    constructor() {
+        super('Claude launcher exited without verified native provider termination')
+        this.name = 'ClaudeNativeProviderExitUnverifiedError'
+    }
+}
+
+export function hasUnverifiedProviderTermination(error: unknown): boolean {
+    if (error instanceof ClaudeNativeProviderExitUnverifiedError) return true;
+    if (error && typeof error === 'object' && 'code' in error
+        && error.code === 'process_tree_termination_incomplete') return true;
+    return error instanceof AggregateError
+        && error.errors.some(hasUnverifiedProviderTermination);
 }

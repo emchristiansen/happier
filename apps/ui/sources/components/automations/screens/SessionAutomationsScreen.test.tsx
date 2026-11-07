@@ -1,7 +1,7 @@
 import React from 'react';
 import { act } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { findTestInstanceByTypeContainingText, pressTestInstance, renderScreen } from '@/dev/testkit';
+import { createDeferred, findTestInstanceByTypeContainingText, flushHookEffects, pressTestInstance, renderScreen } from '@/dev/testkit';
 import { installAutomationScreensCommonModuleMocks } from './automationScreensTestHelpers';
 import type { StorageState } from '@/sync/store/types';
 
@@ -226,6 +226,36 @@ describe('SessionAutomationsScreen', () => {
         const json = JSON.stringify(screen.tree.toJSON());
         expect(json).toContain('Linked');
         expect(json).not.toContain('Other session');
+    });
+
+    it('keeps linked hydrated automations visible while the mount refresh is pending', async () => {
+        const refresh = createDeferred<void>();
+        syncSpies.refreshAutomations.mockImplementationOnce(() => refresh.promise);
+        automationsState.list = [{
+            id: 'a1',
+            name: 'Linked',
+            description: null,
+            enabled: true,
+            schedule: { kind: 'interval', everyMs: 60_000, scheduleExpr: null },
+            nextRunAt: null,
+            targetType: 'existing_session',
+            templateCiphertext: JSON.stringify({
+                kind: 'happier_automation_template_encrypted_v1',
+                payloadCiphertext: 'cipher',
+                existingSessionId: 's1',
+            }),
+        }];
+        const { SessionAutomationsScreen } = await import('./SessionAutomationsScreen');
+
+        const screen = await renderScreen(React.createElement(SessionAutomationsScreen, { sessionId: 's1' }));
+        await flushHookEffects();
+
+        expect(findTestInstanceByTypeContainingText(screen.tree, 'Pressable', 'Linked')).toBeTruthy();
+
+        await act(async () => {
+            refresh.resolve();
+            await refresh.promise;
+        });
     });
 
     it('navigates to add automation for the session when the reachable target comes from project state', async () => {

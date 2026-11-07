@@ -6,6 +6,7 @@ import { wantsJson, printJsonEnvelope } from '@/cli/output/jsonEnvelope';
 import { createCliActionExecutorFromCredentials } from '@/session/actions/createCliActionExecutorFromCredentials';
 import { normalizeActionExecuteResult } from './shared/normalizeActionExecuteResult';
 import { tryHandleApprovalRequestCreated } from './shared/tryHandleApprovalRequestCreated';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 function normalizeModelIdOrThrow(raw: string): string {
   const trimmed = raw.trim();
@@ -35,7 +36,7 @@ export async function cmdSessionSetModel(
       await printJsonEnvelope({ ok: false, kind: 'session_set_model', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 

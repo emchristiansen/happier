@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { EnhancedMode } from '@/backends/claude/loop';
+import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 
 import { hashClaudeEnhancedModeForQueue } from './modeHash';
 import { pinClaudeRemoteModeToActiveRuntime } from './normalizeClaudeRemoteMode';
@@ -12,6 +13,24 @@ function makeMode(overrides?: Partial<EnhancedMode>): EnhancedMode {
 }
 
 describe('hashClaudeEnhancedModeForQueue', () => {
+    it.each([true, false])('keeps differing reclamation policies in separate input batches (SDK=%s)', async (claudeRemoteAgentSdkEnabled) => {
+        const queue = new MessageQueue2<EnhancedMode>(hashClaudeEnhancedModeForQueue);
+        const mode = makeMode({ claudeRemoteAgentSdkEnabled, claudeUnifiedTerminalEnabled: false, claudeRemoteIdleReclaimEnabled: true, claudeRemoteIdleReclaimTimeoutMinutes: 30 });
+        queue.push('first', mode);
+        queue.push('disable', { ...mode, claudeRemoteIdleReclaimEnabled: false });
+        queue.push('timeout', { ...mode, claudeRemoteIdleReclaimTimeoutMinutes: 60 });
+        expect((await queue.waitForMessagesAndGetAsString())?.message).toBe('first');
+        expect((await queue.waitForMessagesAndGetAsString())?.mode.claudeRemoteIdleReclaimEnabled).toBe(false);
+        expect((await queue.waitForMessagesAndGetAsString())?.mode.claudeRemoteIdleReclaimTimeoutMinutes).toBe(60);
+    });
+    it.each([{}, { claudeRemoteAgentSdkEnabled: false }, { claudeUnifiedTerminalEnabled: true }])('restarts for an entrypoint change in runtime %j', (runtime) => {
+        const base = makeMode(runtime);
+        const enabled = { ...base, claudeCodeIncludeInNativeHistory: true };
+        const disabled = { ...base, claudeCodeIncludeInNativeHistory: false };
+        expect(hashClaudeEnhancedModeForQueue(enabled)).not.toBe(hashClaudeEnhancedModeForQueue(base));
+        expect(hashClaudeEnhancedModeForQueue(disabled)).toBe(hashClaudeEnhancedModeForQueue(base));
+    });
+
     it('keeps runtime-selector changes out of the active runtime hash', () => {
         const agentSdkMode = makeMode({
             claudeRemoteAgentSdkEnabled: true,
@@ -277,7 +296,7 @@ describe('hashClaudeEnhancedModeForQueue', () => {
         expect(next).not.toBe(base);
     });
 
-    it('does not change when reasoning effort is set to high (provider default; Agent SDK enabled)', () => {
+    it('distinguishes explicit default effort from inheriting native saved effort', () => {
         const base = hashClaudeEnhancedModeForQueue(makeMode({
             claudeRemoteAgentSdkEnabled: true,
             claudeRemoteSettingSourcesV2: ['project'],
@@ -291,7 +310,7 @@ describe('hashClaudeEnhancedModeForQueue', () => {
             reasoningEffort: 'high',
         }));
 
-        expect(next).toBe(base);
+        expect(next).not.toBe(base);
     });
 
     it('changes when claudeRemoteDisableTodos changes (Agent SDK disabled)', () => {

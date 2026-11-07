@@ -9,7 +9,7 @@ import { renderScreen } from '@/dev/testkit';
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const friendRequestsState = vi.hoisted(() => ({
-    items: [] as Array<{ id: string }>,
+    count: 0,
 }));
 
 const inboxState = vi.hoisted(() => ({
@@ -36,7 +36,7 @@ installNavigationCommonModuleMocks({
         const actual = await importOriginal<typeof import('@/sync/domains/state/storage')>();
         return {
             ...actual,
-            useFriendRequests: (() => friendRequestsState.items) as typeof import('@/sync/domains/state/storage').useFriendRequests,
+            useFriendRequestCount: (() => friendRequestsState.count) as typeof import('@/sync/domains/state/storage').useFriendRequestCount,
             useSetting: ((key: string) => {
                 if (key === 'tabBarFriendsBadgeEnabled') return badgeSettingsState.friends;
                 if (key === 'tabBarInboxBadgeEnabled') return badgeSettingsState.inbox;
@@ -109,7 +109,7 @@ function styleObjects(style: unknown): Record<string, unknown>[] {
 describe('TabBar', () => {
     beforeEach(() => {
         vi.resetModules();
-        friendRequestsState.items = [];
+        friendRequestsState.count = 0;
         inboxState.hasContent = false;
         badgeSettingsState.friends = true;
         badgeSettingsState.inbox = true;
@@ -150,7 +150,7 @@ describe('TabBar', () => {
     });
 
     it('hides tab badges when disabled in settings', async () => {
-        friendRequestsState.items = [{ id: 'fr-1' }, { id: 'fr-2' }];
+        friendRequestsState.count = 2;
         inboxState.hasContent = true;
         badgeSettingsState.friends = false;
         badgeSettingsState.inbox = false;
@@ -165,7 +165,7 @@ describe('TabBar', () => {
     });
 
     it('shows friend request counts on the friends tab and a dot for inbox content', async () => {
-        friendRequestsState.items = [{ id: 'fr-1' }, { id: 'fr-2' }];
+        friendRequestsState.count = 2;
         inboxState.hasContent = true;
         const { TabBar } = await import('./TabBar');
 

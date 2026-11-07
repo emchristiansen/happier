@@ -5,6 +5,8 @@ import {
   V2SessionByIdNotFoundSchema,
   V2SessionByIdResponseSchema,
   V2SessionListResponseSchema,
+  CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY,
+  readConnectedServiceReaderSupport,
 } from "@happier-dev/protocol";
 import { resolveApiHotEndpointRateLimit } from "@/app/api/utils/apiRateLimitCatalog";
 import { PROFILE_SELECT, toShareUserProfile } from "@/app/share/types";
@@ -17,6 +19,7 @@ import {
     omitSessionListProjectionFallbackColumns,
     parseStoredSessionLatestTurnStatus,
     parseStoredSessionRuntimeIssue,
+    projectSessionRowsForReader,
 } from "./v2SessionListRows";
 import { mapPendingActivationAuthorization } from "@/app/session/pending/pendingActivationAuthorization";
 import {
@@ -37,6 +40,7 @@ import { createV2SessionListInitialPage } from "./v2SessionListInitialPage";
 import { createV2SessionListServerTiming } from "./v2SessionListServerTiming";
 
 const V2_ACTIVE_SESSION_LIST_QUERYSTRING_SCHEMA = z.object({
+    [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional(),
     limit: z.coerce.number().int().min(1)
         .max(V2_ACTIVE_SESSION_LIST_ROW_LIMIT)
         .default(V2_ACTIVE_SESSION_LIST_ROW_LIMIT),
@@ -48,7 +52,17 @@ const OPTIONAL_BOOLEAN_QUERY_PARAM_SCHEMA = z.preprocess((value) => {
     return value;
 }, z.boolean()).optional();
 
+const OPTIONAL_SESSION_IDS_QUERY_PARAM_SCHEMA = z.preprocess((value) => {
+    if (typeof value !== "string") return value;
+    try {
+        return JSON.parse(value) as unknown;
+    } catch {
+        return value;
+    }
+}, z.array(z.string().min(1))).optional();
+
 const V2_PAGED_SESSION_LIST_QUERYSTRING_SCHEMA = z.object({
+    [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional(),
     cursor: z.string().optional(),
     limit: z.coerce.number().int().min(1).max(200).default(50),
     includeAttention: OPTIONAL_BOOLEAN_QUERY_PARAM_SCHEMA,
@@ -59,6 +73,8 @@ const V2_PAGED_SESSION_LIST_QUERYSTRING_SCHEMA = z.object({
      * the capability.
      */
     includeActive: OPTIONAL_BOOLEAN_QUERY_PARAM_SCHEMA,
+    requiredSessionIds: OPTIONAL_SESSION_IDS_QUERY_PARAM_SCHEMA,
+    requiredOnly: OPTIONAL_BOOLEAN_QUERY_PARAM_SCHEMA,
 }).optional();
 
 function parseInitialIncludeFlag(value: unknown): boolean {
@@ -165,6 +181,9 @@ async function findV1SessionListRowsWithSelect(params: Readonly<{
 export function registerSessionListingRoutes(app: Fastify) {
     app.get('/v1/sessions', {
         preHandler: app.authenticate,
+        schema: {
+            querystring: z.object({ [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional() }).optional(),
+        },
         config: {
             rateLimit: resolveApiHotEndpointRateLimit(process.env, "sessions.list"),
         },
@@ -248,7 +267,8 @@ export function registerSessionListingRoutes(app: Fastify) {
             .sort((a, b) => b.updatedAt - a.updatedAt)
             .slice(0, 150);
 
-        return reply.send({ sessions });
+        return reply.send({ sessions: projectSessionRowsForReader(sessions,
+            readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY])) });
     });
 
     app.get('/v2/sessions/active', {
@@ -272,7 +292,8 @@ export function registerSessionListingRoutes(app: Fastify) {
         }));
 
         const payload = timing.measure("page", () => ({
-            sessions: mapV2SessionListRows({ rows: sessions, userId }),
+            sessions: projectSessionRowsForReader(mapV2SessionListRows({ rows: sessions, userId }),
+                readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY])),
         }));
         timing.apply(reply);
         return reply.send(payload);
@@ -298,15 +319,18 @@ export function registerSessionListingRoutes(app: Fastify) {
             limit = 50,
             includeAttention = false,
             includeActive = false,
+            requiredSessionIds = [],
+            requiredOnly = false,
         } = request.query || {};
-        const initialPinnedSessionIds = !cursor
+        const onlyRequiredRows = parseInitialIncludeFlag(requiredOnly);
+        const initialPinnedSessionIds = !cursor && !onlyRequiredRows
             ? await timing.measureAsync("cursor", async () => fetchSessionOrganizationPinnedSessionIds(userId))
             : [];
-        const includeInitialAttention = !cursor && parseInitialIncludeFlag(includeAttention);
-        const includeInitialActive = !cursor && parseInitialIncludeFlag(includeActive);
+        const includeInitialAttention = !cursor && !onlyRequiredRows && parseInitialIncludeFlag(includeAttention);
+        const includeInitialActive = !cursor && !onlyRequiredRows && parseInitialIncludeFlag(includeActive);
 
         let decodedCursor: { sessionId: string; meaningfulActivityAt: number } | undefined;
-        if (cursor) {
+        if (cursor && !onlyRequiredRows) {
             const decoded = await timing.measureAsync("cursor", async () => resolveV2SessionListCursorForVisibleRows({
                 cursor,
                 userId,
@@ -327,7 +351,7 @@ export function registerSessionListingRoutes(app: Fastify) {
         // read and for every family read the initial page issues, and resolving them per read cost a
         // `SessionShare` statement each.
         const visibilityArms = createV2SessionListVisibilityArmsReader(userId);
-        const sessions = await timing.measureAsync("query", async () => findV2SessionListRows({
+        const sessions = onlyRequiredRows ? [] : await timing.measureAsync("query", async () => findV2SessionListRows({
             userId,
             where,
             orderBy: V2_SESSION_LIST_ORDER_BY,
@@ -336,7 +360,7 @@ export function registerSessionListingRoutes(app: Fastify) {
         }));
 
         let payload;
-        if (!cursor && (initialPinnedSessionIds.length > 0 || includeInitialAttention || includeInitialActive)) {
+        if (onlyRequiredRows || (!cursor && (initialPinnedSessionIds.length > 0 || includeInitialAttention || includeInitialActive || requiredSessionIds.length > 0))) {
             payload = await createV2SessionListInitialPage({
                 userId,
                 pageRows: sessions,
@@ -344,14 +368,17 @@ export function registerSessionListingRoutes(app: Fastify) {
                 pinnedSessionIds: initialPinnedSessionIds,
                 includeAttentionRows: includeInitialAttention,
                 includeActiveRows: includeInitialActive,
+                requiredSessionIds,
                 visibilityArms,
                 timing: timing.initialPageTiming(),
             });
         } else {
-            payload = timing.measure("page", () => createV2SessionListPage({ rows: sessions, userId, limit }));
+            payload = timing.measure("page", () => createV2SessionListPage({ rows: sessions, userId, limit,
+                supportedConnectedServiceIds: readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]) }));
         }
         timing.apply(reply);
-        return reply.send(payload);
+        return reply.send({ ...payload, sessions: projectSessionRowsForReader(payload.sessions,
+            readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY])) });
     });
 
     app.get('/v2/sessions/archived', {
@@ -393,9 +420,11 @@ export function registerSessionListingRoutes(app: Fastify) {
             take: limit + 1,
         }));
 
-        const payload = timing.measure("page", () => createV2SessionListPage({ rows: sessions, userId, limit }));
+        const payload = timing.measure("page", () => createV2SessionListPage({ rows: sessions, userId, limit,
+            supportedConnectedServiceIds: readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]) }));
         timing.apply(reply);
-        return reply.send(payload);
+        return reply.send({ ...payload, sessions: projectSessionRowsForReader(payload.sessions,
+            readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY])) });
     });
 
     app.get('/v2/sessions/:sessionId', {
@@ -404,6 +433,7 @@ export function registerSessionListingRoutes(app: Fastify) {
             rateLimit: resolveApiHotEndpointRateLimit(process.env, "session.detail"),
         },
         schema: {
+            querystring: z.object({ [CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]: z.unknown().optional() }).optional(),
             params: z.object({
                 sessionId: z.string(),
             }),
@@ -423,7 +453,8 @@ export function registerSessionListingRoutes(app: Fastify) {
         }
 
         return reply.send({
-            session: mapV2SessionListRows({ rows: [session], userId })[0],
+            session: projectSessionRowsForReader(mapV2SessionListRows({ rows: [session], userId }),
+                readConnectedServiceReaderSupport(request.query?.[CONNECTED_SERVICE_READER_SUPPORT_QUERY_KEY]))[0],
         });
     });
 }

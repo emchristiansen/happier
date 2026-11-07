@@ -1,13 +1,15 @@
-import { rm } from 'node:fs/promises';
-
 import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import type { CatalogAgentId } from '@/backends/types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '../../credentials/lifecycleTypes';
+import type { ConnectedServiceRuntimeRegistry } from '../../runtimeRegistry/registry';
+import { normalizeMaterializationKeyForPath } from '../normalizeMaterializationKeyForPath';
 import {
   listMaterializedAttemptTargets,
   listMaterializedHomeTargets,
   type ConnectedServiceMaterializedCleanupTarget,
 } from './connectedServiceMaterializedHomeTargets';
+import { runSerializedPromotion } from '../materializeConnectedServicesForSpawn';
+import { settleRetiredConnectedServiceHomes } from './retiredConnectedServiceHomeCustody';
 import {
   createPendingPathCleanupQueue,
   type PendingPathCleanupRetryExhaustedEvent,
@@ -69,9 +71,9 @@ export class ConnectedServiceMaterializedHomeCleanupScheduler {
     rootTtlMs?: number;
     attemptsTtlMs?: number;
     maxCleanupRetries?: number;
-    removePath?: typeof rm;
     resolveCredentialLifecycleDescriptor?: ResolveCredentialLifecycleDescriptor;
     onCleanupRetryExhausted?: (event: PendingPathCleanupRetryExhaustedEvent<PendingMaterializedCleanupTarget>) => void;
+    runtimeRegistry?: ConnectedServiceRuntimeRegistry;
     hasLiveTarget(input: Readonly<{
       kind: 'home' | 'attempt';
       materializationIdentityId: string;
@@ -86,7 +88,8 @@ export class ConnectedServiceMaterializedHomeCleanupScheduler {
       ?? resolveConnectedServiceCredentialLifecycleDescriptor;
     this.cleanupQueue = createPendingPathCleanupQueue<PendingMaterializedCleanupTarget>({
       maxCleanupRetries: deps.maxCleanupRetries,
-      removePath: deps.removePath,
+      // The queued operation revokes credentials; age never authorizes transcript deletion.
+      removePath: async () => {},
       beforeRemove: async (target) => {
         await this.deleteTargetCredentialStorage(target);
       },
@@ -103,6 +106,14 @@ export class ConnectedServiceMaterializedHomeCleanupScheduler {
   }
 
   private hasLiveTarget(target: ConnectedServiceMaterializedCleanupTarget): boolean {
+    // Execution runs use a distinct Run-key registry alongside their runner Session. Reuse that
+    // live registration here; a persisted marker's running status is not process liveness.
+    if (this.deps.runtimeRegistry?.listTargets().some((runtimeTarget) => {
+      if (runtimeTarget.agentId !== target.agentId) return false;
+      const identityId = runtimeTarget.connectedServiceMaterializationIdentityV1?.id
+        ?? (runtimeTarget.materializationKey ? normalizeMaterializationKeyForPath(runtimeTarget.materializationKey) : null);
+      return identityId === target.materializationIdentityId;
+    })) return true;
     return this.deps.hasLiveTarget({
       kind: target.kind,
       materializationIdentityId: target.materializationIdentityId,
@@ -132,6 +143,15 @@ export class ConnectedServiceMaterializedHomeCleanupScheduler {
   }
 
   async reconcileMaterializedHomes(): Promise<ReadonlyArray<ConnectedServiceMaterializedHomeCleanupResult>> {
+    // Retired homes are never launched; their credentials are revoked regardless of age or liveness.
+    const retiredFailures = await settleRetiredConnectedServiceHomes({
+      baseDir: this.deps.baseDir,
+      serialize: runSerializedPromotion,
+      revoke: async ({ rootDir, agentId }) => {
+        const descriptor = await this.resolveCredentialLifecycleDescriptor(agentId);
+        await descriptor.credentialStorageCleanup?.deleteCredentialStorageForHomeRoot({ rootDir, kind: 'retired_home' });
+      },
+    });
     const nowMs = this.deps.nowMs();
     const retainedIdentityIds = normalizeRetainedIdentityIds(await this.deps.listRetainedIdentityIds?.());
     const results: ConnectedServiceMaterializedHomeCleanupResult[] = [];
@@ -149,6 +169,9 @@ export class ConnectedServiceMaterializedHomeCleanupScheduler {
       if (result.cleaned) results.push(result);
     }
 
+    if (retiredFailures.length > 0) {
+      throw new AggregateError(retiredFailures, 'Retired connected-service home credential revocation failed; custody was retained');
+    }
     return results;
   }
 

@@ -7,7 +7,7 @@ describe('installable dep capabilities', () => {
     const { installableDepCapabilities } = await import('./installableDeps');
 
     const ids = installableDepCapabilities.map((capability) => capability.descriptor.id);
-    expect(ids).toEqual([GH_DEP_ID]);
+    expect(ids).toEqual([GH_DEP_ID, 'dep.local-embeddings', 'dep.difftastic']);
     expect(ids).not.toContain(CODEX_ACP_DEP_ID);
   });
 });

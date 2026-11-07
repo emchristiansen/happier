@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import YAML from 'yaml';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..', '..');
@@ -33,8 +34,22 @@ test('tests workflow exposes thin release-validation continuity/update jobs thro
     /cli-update-continuity:[\s\S]*?CLI_UPDATE_TO_SOURCE:[\s\S]*?inputs\.cli_update_to_source[\s\S]*?CLI_UPDATE_TO_REF:[\s\S]*?inputs\.cli_update_to_ref[\s\S]*?--to-source "\$\{CLI_UPDATE_TO_SOURCE\}" \\\n[\s\S]*?--to-ref "\$\{CLI_UPDATE_TO_REF\}"/,
     'tests workflow should run cli-update continuity through the unified release-validation runner',
   );
+  const cliUpdateJob = raw.match(/cli-update-continuity:[\s\S]*?(?=\n  [a-z0-9-]+:|\n$)/)?.[0] ?? '';
+  assert.match(
+    cliUpdateJob,
+    /Run unified CLI update continuity validation[\s\S]*?env:[\s\S]*?GH_TOKEN:\s+\$\{\{\s*github\.token\s*\}\}[\s\S]*?run:/,
+    'published release downloads should use the workflow read token instead of the shared-runner anonymous API quota',
+  );
+  const upload = YAML.parse(raw).jobs['cli-update-continuity'].steps.find((step) =>
+    step.uses?.startsWith('actions/upload-artifact@') && step.with.name.endsWith('cli-update-continuity-artifacts'),
+  );
+  assert.ok(upload, 'CLI update failures should retain their scenario logs');
+  const artifactPaths = upload.with.path.trim().split(/\s+/);
+  assert.ok(artifactPaths.includes('.project/logs/e2e/*core*/cli-update-*/*.log'));
+  assert.ok(artifactPaths.every((path) => /\.(?:log|json|jsonl|ndjson)$/.test(path)),
+    'CLI update failure artifacts must retain diagnostic files without extracted release installs and dependency trees');
   assert.doesNotMatch(
-    raw.match(/cli-update-continuity:[\s\S]*?(?=\n  [a-z0-9-]+:|\n$)/)?.[0] ?? '',
+    cliUpdateJob,
     /Install Sapling|Verify Sapling CLI/,
     'cli-update continuity should stay a thin release-validation lane and must not depend on Sapling bootstrap',
   );

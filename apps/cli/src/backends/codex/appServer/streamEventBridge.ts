@@ -1,3 +1,4 @@
+import { readCodexReasoningText } from '../utils/readCodexReasoningText';
 import { extractMcpToolCallResultOutput } from '../runtime/sessionTurnLifecycle';
 import { readCodexMessageContentText } from '../utils/readCodexMessageContentText';
 import { canonicalizeCodexMcpToolName } from '../utils/canonicalizeCodexMcpToolName';
@@ -6,7 +7,7 @@ import type { SessionMediaSource } from '@/agent/core/AgentMessage';
 
 type RecordLike = Record<string, unknown>;
 
-type ToolKind = 'command' | 'mcp' | 'file-change';
+type ToolKind = 'command' | 'mcp' | 'file-change' | 'web-search' | 'image-view' | 'sleep';
 type PermissionRequestToolName = 'request_permissions';
 
 type NotificationEnvelope = Readonly<{
@@ -26,8 +27,10 @@ type ToolContext = Readonly<{
 }>;
 
 export type CodexAppServerStreamUpdate =
+    | Readonly<{ type: 'provider-user-text'; itemId: string; clientId: string | null; text: string }>
     | Readonly<{ type: 'assistant-text-delta'; itemId: string; text: string }>
     | Readonly<{ type: 'assistant-text-final'; itemId: string; text: string }>
+    | Readonly<{ type: 'async-user-input-request'; itemId: string; text: string; questions: unknown[] }>
     | Readonly<{ type: 'assistant-raw-final'; itemId: string | null; text: string }>
     | Readonly<{ type: 'session-media'; itemId: string; media: SessionMediaSource[] }>
     | Readonly<{ type: 'reasoning-delta'; itemId: string; text: string }>
@@ -144,7 +147,7 @@ function readToolContextFromItem(item: RecordLike): ToolContext | null {
         return {
             toolKind: 'command',
             name: 'CodexBash',
-            input: omitKeys(item, ['id', 'itemId', 'type', 'itemType', 'stderr', 'stdout', 'exitCode', 'exit_code', 'status', 'success', 'error']),
+            input: omitKeys(item, ['id', 'itemId', 'type', 'itemType', 'stderr', 'stdout', 'aggregatedOutput', 'aggregated_output', 'exitCode', 'exit_code', 'durationMs', 'status', 'success', 'error']),
         };
     }
 
@@ -154,6 +157,31 @@ function readToolContextFromItem(item: RecordLike): ToolContext | null {
             toolKind: 'file-change',
             name: 'CodexPatch',
             input: omitKeys(item, ['id', 'itemId', 'type', 'itemType', 'stderr', 'stdout', 'exitCode', 'exit_code', 'status', 'success', 'error']),
+        };
+    }
+
+    if (itemType === 'websearch') {
+        return {
+            toolKind: 'web-search',
+            name: 'WebSearch',
+            input: omitKeys(item, ['id', 'itemId', 'type', 'itemType', 'results']),
+        };
+    }
+
+    // Rollouts record image views and sleeps as the `view_image` and `sleep` tools.
+    if (itemType === 'imageview') {
+        return {
+            toolKind: 'image-view',
+            name: 'view_image',
+            input: omitKeys(item, ['id', 'itemId', 'type', 'itemType']),
+        };
+    }
+
+    if (itemType === 'sleep') {
+        return {
+            toolKind: 'sleep',
+            name: 'sleep',
+            input: omitKeys(item, ['id', 'itemId', 'type', 'itemType']),
         };
     }
 
@@ -176,18 +204,10 @@ function readToolResultOutput(item: RecordLike, itemType: string | null, input?:
         ? Object.keys(input as RecordLike)
         : [];
     const output = omitKeys(item, ['id', 'itemId', 'type', 'itemType', ...inputKeys]);
+    if (itemType === 'commandexecution' && typeof output.aggregatedOutput === 'string') {
+        return { ...omitKeys(output, ['aggregatedOutput']), stdout: output.stdout ?? output.aggregatedOutput };
+    }
     return itemType === 'mcptoolcall' && 'result' in item ? extractMcpToolCallResultOutput(item.result) : output;
-}
-
-function readFinalReasoningText(item: RecordLike): string | null {
-    const content = Array.isArray(item.content)
-        ? item.content.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
-        : [];
-    if (content.length > 0) return content.join('\n\n');
-    const summary = Array.isArray(item.summary)
-        ? item.summary.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
-        : [];
-    return summary.length > 0 ? summary.join('\n\n') : null;
 }
 
 export function createCodexAppServerStreamEventBridge(): Readonly<{
@@ -247,12 +267,26 @@ export function createCodexAppServerStreamEventBridge(): Readonly<{
             if (notification.method === 'item/started') {
                 const item = readItem(params);
                 if (item) {
+                    if (readItemType(item) === 'usermessage') {
+                        const itemId = readItemId(item);
+                        const text = readCodexMessageContentText(item.content);
+                        if (itemId && text) {
+                            return [{
+                                type: 'provider-user-text',
+                                itemId,
+                                clientId: readString(item.clientId) ?? readString(item.client_id),
+                                text,
+                            }];
+                        }
+                    }
                     const reviewModeUpdate = readReviewModeUpdate(item, 'started');
                     if (reviewModeUpdate) return [reviewModeUpdate];
 
                     const itemId = readContextCompactionItemId(item);
                     if (itemId) return [{ type: 'context-compaction', phase: 'started', itemId }];
                 }
+                // A started web search has no query yet; its completed item emits the call and result together.
+                if (item && readItemType(item) === 'websearch') return [];
                 const resolved = resolveToolContext(params);
                 if (!resolved) return [];
                 return [{
@@ -296,11 +330,15 @@ export function createCodexAppServerStreamEventBridge(): Readonly<{
 
             if (itemType === 'agentmessage' || itemType === 'plan') {
                 const text = readText(item, ['text', 'message']) ?? readCodexMessageContentText(item.content);
+                const questions = readQuestions(item);
+                if (itemType === 'agentmessage' && item.delivery === 'async' && questions && questions.length > 0) {
+                    return text ? [{ type: 'async-user-input-request', itemId, text, questions }] : [];
+                }
                 return text ? [{ type: 'assistant-text-final', itemId, text }] : [];
             }
 
             if (itemType === 'reasoning') {
-                const text = readFinalReasoningText(item);
+                const text = readCodexReasoningText(item);
                 return text ? [{ type: 'reasoning-final', itemId, text }] : [];
             }
 

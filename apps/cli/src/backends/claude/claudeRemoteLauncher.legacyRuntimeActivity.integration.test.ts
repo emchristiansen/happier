@@ -1,18 +1,62 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import * as fs from 'node:fs';
+import { ChildProcess, spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { Readable } from 'node:stream';
+import psList from 'ps-list';
 
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import type { RpcHandler } from '@/api/rpc/types';
 import type { SessionClientPort } from '@/api/session/sessionClientPort';
-import type { ACPMessageData } from '@/api/session/sessionMessageTypes';
 import type { AgentState, Metadata } from '@/api/types';
+import { createSessionRuntimeActivity } from '@/session/runtimeActivity/createSessionRuntimeActivity';
+import type { SessionRuntimeActivityContributionHandle } from '@/session/runtimeActivity/types';
+import type { SessionRuntimeActivitySnapshot } from '@happier-dev/protocol';
+import { AccountSettingsSchema } from '@happier-dev/protocol';
 
 import type { EnhancedMode } from './loop';
+import { claudeRemoteLauncher } from './claudeRemoteLauncher';
 import { hashClaudeEnhancedModeForQueue } from './remote/modeHash';
 import { Session } from './session';
+import { logger } from '@/ui/logger';
+import { reloadConfiguration } from '@/configuration';
+import { completedNativeChildTranscript } from './workflows/claudeWorkflowActivitySource.testkit';
+import type { SessionWorkflowRunSnapshotV1 } from '@happier-dev/protocol';
+import type { Query } from '@anthropic-ai/claude-agent-sdk';
+import type { SessionHookData } from './utils/startHookServer';
+import { createClaudeGoalWorkStateSource } from './workState/claudeGoalSource';
+import { createClaudeRemoteIdleProcessFixture } from './remote/claudeRemoteIdleProcess.testkit';
+import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
+import type { SessionTurnMutationV1 } from '@/api/session/mutations/sessionMutationTypes';
+import { waitForProcessExit } from '@/testkit/process/spawn';
+import type { ACPMessageData, ACPProvider } from '@/api/session/sessionMessageTypes';
 
 const mockQuery = vi.hoisted(() => vi.fn());
+const mockClaudeRemote = vi.hoisted(() => vi.fn());
 const mockClaudeRemoteAgentSdk = vi.hoisted(() => vi.fn());
 const mockRunClaudeUnifiedTerminalSession = vi.hoisted(() => vi.fn());
+const notifyDaemonSessionStarted = vi.hoisted(() => vi.fn(async () => ({})));
+
+// Process enumeration is an OS boundary. All tests retain the real implementation unless explicitly denied.
+vi.mock('ps-list', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('ps-list')>();
+  return { default: vi.fn(actual.default) };
+});
+
+// Replace only the OS filesystem operation; keep Session identity and launcher recovery real.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, statSync: vi.fn(actual.statSync) };
+});
+
+// Daemon HTTP boundary; keep capability reporting and launcher selection real.
+vi.mock('@/daemon/controlClient', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/daemon/controlClient')>(),
+  notifyDaemonSessionStarted,
+}));
 
 vi.mock('@/backends/claude/sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/backends/claude/sdk')>();
@@ -22,6 +66,11 @@ vi.mock('@/backends/claude/sdk', async (importOriginal) => {
 vi.mock('./remote/claudeRemoteAgentSdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./remote/claudeRemoteAgentSdk')>();
   return { ...actual, claudeRemoteAgentSdk: mockClaudeRemoteAgentSdk };
+});
+
+vi.mock('./claudeRemote', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./claudeRemote')>();
+  return { ...actual, claudeRemote: mockClaudeRemote };
 });
 
 vi.mock('./unifiedTerminal/runClaudeUnifiedTerminalSession', async (importOriginal) => {
@@ -37,6 +86,9 @@ vi.mock('./utils/resolveClaudeCliPath', () => ({
   resolveClaudeCliPath: vi.fn(() => '/resolved/claude-cli.js'),
 }));
 
+const actualClaudeRemote = await vi.importActual<typeof import('./claudeRemote')>('./claudeRemote');
+const actualClaudeRemoteAgentSdk = await vi.importActual<typeof import('./remote/claudeRemoteAgentSdk')>('./remote/claudeRemoteAgentSdk');
+
 const createdSessions: Session[] = [];
 
 function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -50,7 +102,7 @@ function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void
   };
 }
 
-function createHarness(): Readonly<{
+function createHarness(providerTasks?: SessionRuntimeActivityContributionHandle, opts?: Readonly<{ providerSessionId: string | null }>): Readonly<{
   session: Session;
   switchHandlerReady: Promise<RpcHandler>;
 }> {
@@ -72,25 +124,16 @@ function createHarness(): Readonly<{
     sendAgentMessageCommitted: vi.fn(async () => {}),
     recordClaudeJsonlMessageConsumed: vi.fn(),
     keepAlive: vi.fn(),
-    sessionTurnLifecycle: {
-      beginTurn: vi.fn(async () => ({ turnId: 'turn-1' })),
-      attachProviderTurnId: vi.fn(async () => {}),
-      appendTranscriptAnchors: vi.fn(async () => {}),
-      completeTurn: vi.fn(async () => {}),
-      failTurn: vi.fn(async () => {}),
-      cancelTurn: vi.fn(async () => {}),
-      endSession: vi.fn(async () => {}),
-      markRollbackEligible: vi.fn(async () => {}),
-      markRolledBack: vi.fn(async () => {}),
-      touchActiveTurn: vi.fn(async () => {}),
-      hasActiveTurn: vi.fn(() => false),
-      observeAcpLifecycleMarker: vi.fn((input: { body: ACPMessageData }) => ({ body: input.body, pendingWrite: null })),
-    },
+    sessionTurnLifecycle: createSessionTurnLifecycle({
+      sessionId: 'happier-session-1',
+      enqueueSessionTurn: vi.fn(async () => {}),
+    }),
     updateMetadata: vi.fn((updater: (current: Metadata) => Metadata) => {
       metadata = updater(metadata);
       hasMetadata = true;
     }),
-    updateAgentState: vi.fn((updater: (current: AgentState) => AgentState) => {
+    updateAgentStateRequestSettlement: vi.fn(async () => {}),
+      updateAgentState: vi.fn((updater: (current: AgentState) => AgentState) => {
       agentState = updater(agentState);
     }),
     getAgentStateSnapshot: vi.fn(() => agentState),
@@ -124,14 +167,14 @@ function createHarness(): Readonly<{
     client,
     path: '/tmp',
     logPath: '/tmp/claude-remote.log',
-    sessionId: 'claude-current',
+    sessionId: opts ? opts.providerSessionId : 'claude-current',
     messageQueue: new MessageQueue2<EnhancedMode>(hashClaudeEnhancedModeForQueue),
     onModeChange: () => {},
     hookSettingsPath: '/tmp/claude-hooks.json',
     hookPluginDir: '/tmp/claude-hook-plugin',
     precomputedMcpBridge: { mcpServers: {}, stop: vi.fn() },
     runtimeActivityContributions: {
-      providerTasks: {
+      providerTasks: providerTasks ?? {
         report: vi.fn(async () => {}),
         markUnknown: vi.fn(async () => {}),
         dispose: vi.fn(async () => {}),
@@ -153,9 +196,846 @@ describe.sequential('claudeRemoteLauncher legacy Runtime Activity subscriber', (
   beforeEach(() => {
     vi.clearAllMocks();
     mockQuery.mockReset();
+    mockClaudeRemote.mockReset();
     mockClaudeRemoteAgentSdk.mockReset();
     mockRunClaudeUnifiedTerminalSession.mockReset();
     process.env.HAPPIER_CLAUDE_REMOTE_INTERRUPT_THEN_TEARDOWN_GRACE_MS = '0';
+  });
+
+  it('records a pre-spawn resume failure in the normal file log while preserving the conversation', async () => {
+    const { session } = createHarness();
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-missing-resume-'));
+    session.transcriptPath = join(transcriptDir, 'claude-current.jsonl');
+    // Execute the real SDK runner and its filesystem resume check, stopping before
+    // any external provider launch because the requested transcript is absent.
+    mockClaudeRemoteAgentSdk.mockImplementation(actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk);
+    const infoFile = vi.spyOn(logger, 'infoFile');
+    session.queue.push('continue the conversation', {
+      permissionMode: 'default',
+      claudeRemoteAgentSdkEnabled: true,
+      claudeUnifiedTerminalEnabled: false,
+    }, { userMessageLocalId: 'missing-resume-input' });
+
+    try {
+      await expect(claudeRemoteLauncher(session)).resolves.toBe('exit');
+      expect(session.sessionId).toBe('claude-current');
+      expect(session.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'message',
+        message: expect.stringContaining('transcript is unavailable'),
+      }));
+      expect(infoFile).toHaveBeenCalledWith('[remote]: launch error', expect.objectContaining({
+        error: expect.stringContaining('ClaudeResumeSessionUnavailableError'),
+        disposition: 'preserve-resume-and-exit',
+      }));
+    } finally {
+      infoFile.mockRestore();
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['before launch', 'during launch'] as const)('exits once without consuming input when transcript inspection is denied for an identity observed %s', async observation => {
+    const { session } = createHarness(undefined, { providerSessionId: null });
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-denied-resume-'));
+    const transcriptPath = join(transcriptDir, 'claude-observed.jsonl');
+    const observeIdentity = async () => {
+      session.onSessionFound('claude-observed', { transcript_path: transcriptPath });
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+    };
+    const echoSeedStarted = createDeferred<void>();
+    const finishEchoSeed = createDeferred<void>();
+    if (observation === 'before launch') {
+      await observeIdentity();
+    } else {
+      Object.assign(session.client, {
+        fetchRecentTranscriptTextItemsForAcpImport: vi.fn(async () => {
+          // This transport read runs after launch-start identity capture, before the resume decision.
+          echoSeedStarted.resolve(undefined);
+          await finishEchoSeed.promise;
+          return [];
+        }),
+      });
+    }
+    const denied = Object.assign(new Error('Transcript access denied'), { code: 'EACCES' });
+    const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const stat = vi.mocked(fs.statSync).mockImplementation((...args) => {
+      if (args[0] === transcriptPath) throw denied;
+      return Reflect.apply(actualFs.statSync, actualFs, args);
+    });
+    const termination = new AbortController();
+    let launchErrors = 0;
+    const originalInfoFile = logger.infoFile.bind(logger);
+    const infoFile = vi.spyOn(logger, 'infoFile').mockImplementation((...args) => {
+      originalInfoFile(...args);
+      if (args[0] === '[remote]: launch error' && ++launchErrors > 1) {
+        // Bound a regressed busy loop without replacing its recovery decision or adding a timer.
+        termination.abort('repeated-transcript-inspection-failure');
+      }
+    });
+    session.queue.push('continue the observed conversation', {
+      permissionMode: 'default', claudeRemoteAgentSdkEnabled: true, claudeUnifiedTerminalEnabled: false,
+    }, { userMessageLocalId: 'denied-resume-input' });
+
+    try {
+      const launcher = claudeRemoteLauncher(session, { signal: termination.signal });
+      if (observation === 'during launch') {
+        await echoSeedStarted.promise;
+        await observeIdentity();
+        finishEchoSeed.resolve(undefined);
+      }
+      await expect(launcher).resolves.toBe('exit');
+      expect(launchErrors).toBe(1);
+      expect(termination.signal.aborted).toBe(false);
+      expect(session.sessionId).toBe('claude-observed');
+      expect(session.transcriptPath).toBe(transcriptPath);
+      expect(session.queue.size()).toBe(1);
+      expect(mockClaudeRemoteAgentSdk).not.toHaveBeenCalled();
+      expect(infoFile).toHaveBeenCalledWith('[remote]: launch error', expect.objectContaining({
+        error: expect.stringContaining('ClaudeResumeSessionUnavailableError'),
+        disposition: 'preserve-resume-and-exit',
+      }));
+      expect(session.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'message', message: expect.stringContaining('transcript is unavailable'),
+      }));
+    } finally {
+      finishEchoSeed.resolve(undefined);
+      stat.mockImplementation(actualFs.statSync);
+      infoFile.mockRestore();
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps SDK presentation-only model annotations out of Running metadata', async () => {
+    const { session, switchHandlerReady } = createHarness(undefined, { providerSessionId: null });
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async () => {},
+    });
+    const finishQuery = createDeferred<void>();
+    let queryIdle = false;
+    const createQuery: NonNullable<Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]['createQuery']> = () => ({
+      // Only the external SDK query is replaced. The launcher, stream projection,
+      // effective-model owner and Session metadata remain real.
+      async *[Symbol.asyncIterator]() {
+        yield { type: 'system', subtype: 'init', model: 'claude-requested', session_id: 'model-proof-session' };
+        yield { type: 'result', subtype: 'success', is_error: false, result: 'Result-only response' };
+        queryIdle = true;
+        await finishQuery.promise;
+      },
+      close: () => finishQuery.resolve(undefined),
+      setPermissionMode: async () => {}, setModel: async () => {}, setMaxThinkingTokens: async () => {},
+      supportedCommands: async () => [], supportedModels: async () => [],
+    } as unknown as Query);
+    mockClaudeRemoteAgentSdk.mockImplementation((opts: Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]) => (
+      actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk({ ...opts, claudeExecutablePath: '/tmp/claude', createQuery })
+    ));
+    session.queue.push('hello', {
+      permissionMode: 'default', model: 'sonnet', reasoningEffort: 'low',
+      claudeRemoteAgentSdkEnabled: true, claudeUnifiedTerminalEnabled: false,
+    }, { userMessageLocalId: 'model-proof-input' });
+    const launcher = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await vi.waitFor(() => expect(queryIdle).toBe(true));
+      expect(session.client.getMetadataSnapshot()?.sessionAppliedModelV1).toBeUndefined();
+    } finally {
+      finishQuery.resolve(undefined);
+      await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+    }
+  });
+
+  it('starts a fresh Claude session for the first remote message when the observed terminal id never materialized', async () => {
+    const { session, switchHandlerReady } = createHarness(undefined, { providerSessionId: null });
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async () => {},
+    });
+    const finishQuery = createDeferred<void>();
+    let queryIdle = false;
+    let receivedPrompt: unknown;
+    const createQuery: NonNullable<Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]['createQuery']> = ({ prompt, options }) => ({
+      // Only the external SDK query is replaced. The launcher, start-plan resolution and
+      // Session identity owner run for real, so a ghost resume id would fail before this
+      // query ever starts.
+      async *[Symbol.asyncIterator]() {
+        expect(options?.resume).toBeUndefined();
+        if (typeof prompt === 'string') {
+          receivedPrompt = prompt;
+        } else {
+          const first = await prompt[Symbol.asyncIterator]().next();
+          if (first.done) throw new Error('Expected the first queued remote prompt');
+          receivedPrompt = first.value.message.content;
+        }
+        yield { type: 'system', subtype: 'init', model: 'claude-requested', session_id: 'claude-fresh-start' };
+        yield { type: 'result', subtype: 'success', is_error: false, result: 'First remote message handled' };
+        queryIdle = true;
+        await finishQuery.promise;
+      },
+      close: () => finishQuery.resolve(undefined),
+      setPermissionMode: async () => {}, setModel: async () => {}, setMaxThinkingTokens: async () => {},
+      supportedCommands: async () => [], supportedModels: async () => [],
+    } as unknown as Query);
+    mockClaudeRemoteAgentSdk.mockImplementation((opts: Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]) => (
+      actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk({ ...opts, claudeExecutablePath: '/tmp/claude', createQuery })
+    ));
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-zero-turn-takeover-'));
+    const infoFile = vi.spyOn(logger, 'infoFile');
+    try {
+      // Zero-turn terminal birth: the SessionStart hook observed an id whose transcript
+      // never materialized (no turn ran locally before the App took over).
+      session.onSessionFound('claude-ghost', {
+        transcript_path: join(transcriptDir, 'claude-ghost.jsonl'),
+      } as SessionHookData);
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+      session.queue.push('first message from the app', {
+        permissionMode: 'default',
+        claudeRemoteAgentSdkEnabled: true, claudeUnifiedTerminalEnabled: false,
+      }, { userMessageLocalId: 'zero-turn-input' });
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(queryIdle).toBe(true));
+        expect(JSON.stringify(receivedPrompt)).toContain('first message from the app');
+        expect(infoFile).not.toHaveBeenCalledWith('[remote]: launch error', expect.objectContaining({
+          error: expect.stringContaining('ClaudeResumeSessionUnavailableError'),
+        }));
+        expect(session.client.sendSessionEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+          type: 'message',
+          message: expect.stringContaining('transcript is unavailable'),
+        }));
+      } finally {
+        finishQuery.resolve(undefined);
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    } finally {
+      infoFile.mockRestore();
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it('applies SDK permission metadata during startup and while idle without another prompt', async () => {
+    const { session, switchHandlerReady } = createHarness();
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-live-permission-mode-'));
+    session.transcriptPath = join(transcriptDir, 'claude-current.jsonl');
+    await writeFile(session.transcriptPath, '{"type":"summary"}\n');
+    session.client.updateMetadata(metadata => ({ ...metadata, flavor: 'claude', claudeSessionId: 'claude-current' }));
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async () => {},
+    });
+    let metadataWake = createDeferred<boolean>();
+    Object.assign(session.client, {
+      waitForMetadataUpdate: (signal?: AbortSignal) => {
+        const pending = metadataWake;
+        if (signal?.aborted) return Promise.resolve(false);
+        signal?.addEventListener('abort', () => pending.resolve(false), { once: true });
+        return pending.promise;
+      },
+    });
+    const updatePermission = (permissionMode: 'yolo' | 'default', permissionModeUpdatedAt: number) => {
+      session.client.updateMetadata(current => ({ ...current, permissionMode, permissionModeUpdatedAt }));
+      const pending = metadataWake;
+      metadataWake = createDeferred<boolean>();
+      pending.resolve(true);
+    };
+    const finishQuery = createDeferred<void>();
+    let queryIdle = false;
+    const appliedModes: string[] = [];
+    const createQuery: NonNullable<Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]['createQuery']> = () => {
+      // Query creation and its controls are the external SDK boundary. The real launcher,
+      // metadata consumer, mode arbitration and SDK runtime remain under test.
+      updatePermission('yolo', Date.now() + 1);
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield { type: 'result' };
+          queryIdle = true;
+          await finishQuery.promise;
+        },
+        close: () => finishQuery.resolve(undefined),
+        setPermissionMode: async (permissionMode: string) => { appliedModes.push(permissionMode); },
+        setModel: async () => {}, setMaxThinkingTokens: async () => {},
+        supportedCommands: async () => [], supportedModels: async () => [],
+      } as unknown as Query;
+    };
+    mockClaudeRemoteAgentSdk.mockImplementation((opts: Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]) => (
+      actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk({ ...opts, claudeExecutablePath: '/tmp/claude', createQuery })
+    ));
+    session.queue.push('hello', { permissionMode: 'default', claudeRemoteAgentSdkEnabled: true, claudeUnifiedTerminalEnabled: false },
+      { userMessageLocalId: 'live-permission-mode' });
+    const launcher = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await vi.waitFor(() => expect(queryIdle).toBe(true));
+      await vi.waitFor(() => expect(appliedModes).toEqual(['bypassPermissions']));
+      updatePermission('default', Date.now() + 2);
+      await vi.waitFor(() => expect(appliedModes).toEqual(['bypassPermissions', 'default']));
+      expect(session.queue.size()).toBe(0);
+      expect(mockClaudeRemoteAgentSdk).toHaveBeenCalledTimes(1);
+    } finally {
+      finishQuery.resolve(undefined);
+      await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+    updatePermission('yolo', Date.now() + 3);
+    expect(appliedModes).toEqual(['bypassPermissions', 'default']);
+  });
+
+  it('ends an idle Agent SDK launch and its provider dispatch when runner termination aborts the launcher', async () => {
+    const { session } = createHarness(undefined, { providerSessionId: null });
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async () => {},
+    });
+    let queryIdle = false;
+    let providerAbortObserved = false;
+    const createQuery: NonNullable<Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]['createQuery']> = (params) => {
+      // The SDK query is the external child-process boundary: it ends its stream only when its
+      // abort controller kills the Claude child. Everything above it stays real.
+      const abortController = params.options?.abortController;
+      if (!(abortController instanceof AbortController)) throw new Error('SDK query requires an abortController');
+      const abortSignal = abortController.signal;
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield { type: 'result' };
+          queryIdle = true;
+          await new Promise<void>((resolve) => {
+            if (abortSignal.aborted) return resolve();
+            abortSignal.addEventListener('abort', () => resolve(), { once: true });
+          });
+          providerAbortObserved = true;
+        },
+        close: () => {},
+        setPermissionMode: async () => {}, setModel: async () => {}, setMaxThinkingTokens: async () => {},
+        supportedCommands: async () => [], supportedModels: async () => [],
+      } as unknown as Query;
+    };
+    mockClaudeRemoteAgentSdk.mockImplementation((opts: Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]) => (
+      actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk({ ...opts, claudeExecutablePath: '/tmp/claude', createQuery })
+    ));
+    session.queue.push('hello', { permissionMode: 'default', claudeRemoteAgentSdkEnabled: true, claudeUnifiedTerminalEnabled: false },
+      { userMessageLocalId: 'termination-idle' });
+    const termination = new AbortController();
+    const launcher = claudeRemoteLauncher(session, { signal: termination.signal });
+    await vi.waitFor(() => expect(queryIdle).toBe(true));
+
+    termination.abort('claude-runner-termination');
+
+    const settled = await Promise.race([
+      launcher.then((reason) => ({ reason })),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 2_000)),
+    ]);
+    expect(settled).toEqual({ reason: 'exit' });
+    expect(providerAbortObserved).toBe(true);
+    await expect(session.closeProviderInputAdmissionAndWaitForDispatches()).resolves.toBeUndefined();
+  });
+
+  it.each([false, true])('surfaces idle process cleanup failure and exits without replacement when issue publication fails: %s', async (publicationFails) => {
+    const { session } = createHarness();
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-cleanup-health-'));
+    session.transcriptPath = join(transcriptDir, 'claude-current.jsonl');
+    await writeFile(session.transcriptPath, JSON.stringify({ type: 'user', uuid: 'previous-prompt', sessionId: 'claude-current',
+      message: { role: 'user', content: 'previous prompt' } }) + '\n');
+    const mutations: SessionTurnMutationV1[] = [];
+    const lifecycle = createSessionTurnLifecycle({
+      sessionId: session.client.sessionId,
+      // The durable session mutation transport is the boundary; classification and lifecycle stay real.
+      enqueueSessionTurn: async (mutation) => {
+        mutations.push(mutation);
+        if (publicationFails && mutation.action === 'fail') throw new Error('Session mutation transport unavailable');
+      },
+    });
+    const markerWrites: Promise<void>[] = [];
+    Object.assign(session.client, { sessionTurnLifecycle: lifecycle,
+      // Mirror SessionClient's transport boundary by forwarding markers to the real lifecycle owner.
+      sendAgentMessage: (provider: ACPProvider, body: ACPMessageData) => {
+        const marker = lifecycle.observeAcpLifecycleMarker({ provider, body });
+        if (marker.pendingWrite) markerWrites.push(marker.pendingWrite);
+      },
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }), upsertSessionSystemRecord: async () => {} });
+    const queryIdle = createDeferred<void>();
+    const finishQuery = createDeferred<void>();
+    const children: ChildProcess[] = [];
+    const infoFile = vi.spyOn(logger, 'infoFile');
+    let queryStarts = 0;
+    const createQuery: NonNullable<Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]['createQuery']> = ({ prompt, options }) => {
+      queryStarts += 1;
+      const spawnProcess = options?.spawnClaudeCodeProcess;
+      if (typeof spawnProcess !== 'function') throw new Error('Expected SDK owned-process boundary');
+      const owned: unknown = spawnProcess({ command: process.execPath, args: [], env: process.env });
+      if (!owned || typeof owned !== 'object' || !('stdout' in owned) || !(owned.stdout instanceof Readable)) {
+        throw new Error('Expected SDK process transport stdout');
+      }
+      const childReady = once(owned.stdout, 'data');
+      return {
+        async *[Symbol.asyncIterator]() {
+          await childReady;
+          if (typeof prompt === 'string') throw new Error('Expected SDK prompt stream');
+          const first = await prompt[Symbol.asyncIterator]().next();
+          if (first.done) throw new Error('Expected first queued prompt');
+          yield { ...first.value, session_id: 'claude-current' };
+          yield { type: 'result', subtype: 'success', is_error: false, result: 'Turn completed', session_id: 'claude-current' };
+          queryIdle.resolve(undefined);
+          await finishQuery.promise;
+        },
+        // SDK close can finish before its owned child exits. Canonical cleanup must still run.
+        close: () => {},
+        setPermissionMode: async () => {}, setModel: async () => {}, setMaxThinkingTokens: async () => {},
+        supportedCommands: async () => [], supportedModels: async () => [],
+      } as unknown as Query;
+    };
+    mockClaudeRemoteAgentSdk.mockImplementation((opts: Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]) => (
+      actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk({ ...opts, claudeExecutablePath: '/tmp/claude', createQuery,
+        spawnClaudeCodeProcess: () => {
+          const child = spawn(process.execPath, ['-e', "console.log('ready'); setInterval(() => {}, 1000)"], { stdio: 'pipe' });
+          children.push(child);
+          return child;
+        },
+      })
+    ));
+    const mode = { permissionMode: 'default', claudeRemoteAgentSdkEnabled: true, claudeUnifiedTerminalEnabled: false } as const;
+    session.queue.push('complete before cleanup', mode, { userMessageLocalId: 'cleanup-health-input' });
+    let restoreEnumeration = () => {};
+    const launcher = claudeRemoteLauncher(session);
+    try {
+      await queryIdle.promise;
+      await Promise.all(markerWrites);
+      expect(lifecycle.hasActiveTurn()).toBe(false);
+      const originalEnumeration = vi.mocked(psList).getMockImplementation();
+      if (!originalEnumeration) throw new Error('Expected real process enumeration default');
+      vi.mocked(psList).mockRejectedValue(new Error('Private process-list failure'));
+      restoreEnumeration = () => { vi.mocked(psList).mockImplementation(originalEnumeration); };
+      finishQuery.resolve(undefined);
+      await expect(launcher).resolves.toBe('exit');
+      expect(infoFile).toHaveBeenCalledWith('[process-tree] Owned process cleanup could not be verified', {
+        code: 'process_tree_termination_incomplete', discoveryFailed: true, probeFailed: false, signallingFailed: false,
+      });
+      expect(mutations.find(mutation => mutation.action === 'fail')).toMatchObject({
+        provider: 'claude', issue: { scope: 'primary_session', status: 'failed', source: 'provider_session_error' },
+      });
+      expect(session.sessionId).toBe('claude-current');
+      expect(queryStarts).toBe(1);
+      expect(session.client.discardPendingMessageQueueV2All).not.toHaveBeenCalled();
+      expect(session.client.blockPendingMessageDelivery).not.toHaveBeenCalled();
+      if (publicationFails) {
+        expect(infoFile).toHaveBeenCalledWith('[remote]: failed to record unverified provider termination runtime issue', expect.any(Object));
+      }
+    } finally {
+      restoreEnumeration();
+      finishQuery.resolve(undefined);
+      for (const owned of children) {
+        owned.kill('SIGKILL');
+        if (owned.pid) await waitForProcessExit(owned.pid);
+      }
+      await session.cleanup();
+      await launcher;
+      infoFile.mockRestore();
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it('projects authenticated legacy hooks into the real workflow source while the child runs', async () => {
+    const { session, switchHandlerReady } = createHarness();
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-legacy-workflow-hook-'));
+    session.transcriptPath = join(transcriptDir, 'claude-current.jsonl');
+    await writeFile(session.transcriptPath, JSON.stringify({ type: 'user', uuid: 'previous-prompt', sessionId: 'claude-current',
+      message: { role: 'user', content: 'previous prompt' } }) + '\n');
+    await session.client.updateMetadata(metadata => ({ ...metadata, flavor: 'claude', claudeSessionId: 'claude-current' }));
+    const snapshots: SessionWorkflowRunSnapshotV1[] = [];
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async (record: { content: { t: string; v?: SessionWorkflowRunSnapshotV1 } }) => {
+        if (record.content.t === 'plain' && record.content.v?.agents) snapshots.push(record.content.v);
+      },
+    });
+    mockClaudeRemote.mockImplementation(actualClaudeRemote.claudeRemote);
+    const queryStarted = createDeferred<void>();
+    let queryDone = false;
+    let queryError: unknown;
+    mockQuery.mockImplementation((params: { onMessageReceived?: (row: unknown) => void }) => ({
+      async *[Symbol.asyncIterator]() {
+        queryStarted.resolve(undefined);
+        try {
+          for (const row of completedNativeChildTranscript('claude-current')) {
+            params.onMessageReceived?.(row);
+            yield row;
+          }
+          await vi.waitFor(() => expect(snapshots.at(-1)?.status).toBe('complete'));
+          session.onClaudeSessionHook({ hook_event_name: 'SubagentStart', agent_id: 'native-a', session_id: 'claude-current' });
+          await vi.waitFor(() => expect(snapshots.some(snapshot => snapshot.status === 'active'
+            && snapshot.agents.find(agent => agent.id === 'a')?.status === 'active'
+            && snapshot.agents.find(agent => agent.id === 'b')?.status === 'complete')).toBe(true));
+        } catch (error) { queryError = error; }
+        finally { queryDone = true; }
+      },
+    }));
+    session.queue.push('hello', { permissionMode: 'default', claudeRemoteAgentSdkEnabled: false, claudeUnifiedTerminalEnabled: false },
+      { userMessageLocalId: 'legacy-workflow-hook' });
+    const launcher = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await queryStarted.promise;
+      await vi.waitFor(() => expect(queryDone).toBe(true), { timeout: 3000 });
+      if (queryError) throw queryError;
+    } finally {
+      await switchHandler({ to: 'local' });
+      await launcher;
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])('preserves workflow uncertainty unless provider exit is verified (verified=%s)', async (verified) => {
+    const { session } = createHarness();
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-workflow-exit-proof-'));
+    session.transcriptPath = join(transcriptDir, 'claude-current.jsonl');
+    await writeFile(session.transcriptPath, JSON.stringify({ type: 'user', uuid: 'previous-prompt', sessionId: 'claude-current',
+      message: { role: 'user', content: 'previous prompt' } }) + '\n');
+    await session.client.updateMetadata(metadata => ({ ...metadata, flavor: 'claude', claudeSessionId: 'claude-current' }));
+    const snapshots: SessionWorkflowRunSnapshotV1[] = [];
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async (record: { content: { t: string; v?: SessionWorkflowRunSnapshotV1 } }) => {
+        if (record.content.t === 'plain' && record.content.v?.agents) snapshots.push(record.content.v);
+      },
+    });
+    mockClaudeRemote.mockImplementation(actualClaudeRemote.claudeRemote);
+    mockQuery.mockImplementation((params: {
+      onMessageReceived?: (row: unknown) => void;
+      onProcessExited?: (event: { signal: null; nativeExited: boolean; processTreeStopped: boolean }) => Promise<void>;
+    }) => ({
+      async *[Symbol.asyncIterator]() {
+        // Only the SDK process boundary is replaced. The remote owner, launch disposition,
+        // workflow tracker, durable record projection and shutdown finalizer are real.
+        for (const row of completedNativeChildTranscript('claude-current')) {
+          params.onMessageReceived?.(row);
+          yield row;
+        }
+        await vi.waitFor(() => expect(snapshots.at(-1)?.status).toBe('complete'));
+        session.onClaudeSessionHook({ hook_event_name: 'SubagentStart', agent_id: 'native-a', session_id: 'claude-current' });
+        await vi.waitFor(() => expect(snapshots.at(-1)?.agents.find(agent => agent.id === 'a')?.status).toBe('active'));
+        session.queue.close();
+        await params.onProcessExited?.({ signal: null, nativeExited: verified, processTreeStopped: false });
+      },
+    }));
+    session.queue.push('hello', { permissionMode: 'default', claudeRemoteAgentSdkEnabled: false, claudeUnifiedTerminalEnabled: false },
+      { userMessageLocalId: 'workflow-exit-proof' });
+    try {
+      await expect(claudeRemoteLauncher(session)).resolves.toBe('exit');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(snapshots.at(-1)?.status).toBe(verified ? 'stopped' : 'active');
+      expect(snapshots.at(-1)?.agents.find(agent => agent.id === 'a')?.status).toBe(verified ? 'cancelled' : 'active');
+      if (!verified) {
+        expect(session.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'message', message: expect.stringContaining('without verified native provider termination'),
+        }));
+      }
+    } finally {
+      await session.cleanup();
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['matching cache', 'cached predecessor'] as const)('rebuilds cold SDK workflow aliases beyond the history tail before admitting an authenticated resume (%s)', async (identity) => {
+    const activity = createSessionRuntimeActivity('supported');
+    let published: SessionRuntimeActivitySnapshot = { state: 'unknown', activeCount: 0 };
+    await activity.bindPublisher({ publish: async snapshot => { published = snapshot; }, close: async () => {} });
+    const providerTasks = activity.agentRuntimeContributionHandle;
+    if (!providerTasks) throw new Error('Expected provider contribution');
+    const { session, switchHandlerReady } = createHarness(providerTasks, { providerSessionId: identity === 'cached predecessor' ? null : 'claude-current' });
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-cold-sdk-history-'));
+    session.transcriptPath = join(transcriptDir, 'claude-current.jsonl');
+    const history = [
+      ...completedNativeChildTranscript('claude-current'),
+      ...Array.from({ length: 1100 }, (_, index) => ({
+        type: 'assistant', uuid: `later-history-${index}`, sessionId: 'claude-current',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(1024) }] },
+      })),
+    ].map(row => JSON.stringify(row)).join('\n') + '\n';
+    expect(Buffer.byteLength(history)).toBeGreaterThan(1_000_000);
+    await writeFile(session.transcriptPath, history);
+    if (identity === 'cached predecessor') {
+      session.claudeArgs = ['--resume', 'claude-current'];
+    }
+    await session.client.updateMetadata(metadata => ({ ...metadata, flavor: 'claude', claudeSessionId: identity === 'cached predecessor' ? 'claude-predecessor' : 'claude-current' }));
+    const snapshots: SessionWorkflowRunSnapshotV1[] = [];
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async (record: { content: { t: string; v?: SessionWorkflowRunSnapshotV1 } }) => {
+        if (record.content.t === 'plain' && record.content.v?.agents) snapshots.push(record.content.v);
+      },
+    });
+    const hookObserved = createDeferred<void>();
+    const finishQuery = createDeferred<void>();
+    const sdkAttemptFinished = createDeferred<Readonly<{ error?: unknown }>>();
+    type ObservationHooks = Record<string, Array<{ hooks: Array<(data: SessionHookData) => Promise<unknown>> }>>;
+    const createQuery: NonNullable<Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]['createQuery']> = params => {
+      // This fixture implements the consumed external SDK query/hook boundary only.
+      const hooks = params.options?.hooks as ObservationHooks;
+      return {
+        async *[Symbol.asyncIterator]() {
+          await hooks.SubagentStart[0].hooks[0]({ hook_event_name: 'SubagentStart', session_id: 'claude-current', agent_id: 'native-a' });
+          hookObserved.resolve(undefined);
+          await finishQuery.promise;
+          yield { type: 'result' };
+        },
+        close: () => { finishQuery.resolve(undefined); },
+        setPermissionMode: async () => {}, setModel: async () => {}, setMaxThinkingTokens: async () => {},
+        supportedCommands: async () => [], supportedModels: async () => [],
+      } as unknown as Query;
+    };
+    mockClaudeRemoteAgentSdk.mockImplementation(async (opts: Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0]) => {
+      try {
+        await actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk({ ...opts, claudeExecutablePath: '/tmp/claude', createQuery });
+        sdkAttemptFinished.resolve({});
+      } catch (error) {
+        sdkAttemptFinished.resolve({ error });
+        throw error;
+      }
+    });
+    session.queue.push('continue', { permissionMode: 'default', claudeRemoteAgentSdkEnabled: true, claudeUnifiedTerminalEnabled: false },
+      { userMessageLocalId: 'cold-sdk-workflow-resume' });
+    const launcher = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await Promise.race([
+        hookObserved.promise,
+        sdkAttemptFinished.promise.then(({ error }) => {
+          throw error ?? new Error('Agent SDK attempt finished before observing the authenticated resume hook');
+        }),
+      ]);
+      const ledger = session.getProviderTaskActivityLedger();
+      if (!ledger) throw new Error('Expected actual session ledger');
+      await vi.waitFor(() => expect({
+        runtime: published,
+        nativeTasks: ledger.getActiveProviderTaskBlockers().map(task => task.taskId),
+        agents: snapshots.at(-1)?.agents.map(agent => [agent.id, agent.status]),
+      }).toEqual({
+        runtime: { state: 'active', activeCount: 1 }, nativeTasks: ['native-a'],
+        agents: [['a', 'active'], ['b', 'complete']],
+      }), { timeout: 3000 });
+    } finally {
+      finishQuery.resolve(undefined);
+      await switchHandler({ to: 'local' });
+      await launcher;
+      await activity.dispose();
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it('surfaces incomplete cold SDK startup history and keeps actual runtime activity unknown', async () => {
+    const activity = createSessionRuntimeActivity('supported');
+    let published: SessionRuntimeActivitySnapshot = { state: 'unknown', activeCount: 0 };
+    await activity.bindPublisher({ publish: async snapshot => { published = snapshot; }, close: async () => {} });
+    const providerTasks = activity.agentRuntimeContributionHandle;
+    if (!providerTasks) throw new Error('Expected provider contribution');
+    const { session, switchHandlerReady } = createHarness(providerTasks);
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-cold-sdk-incomplete-'));
+    session.transcriptPath = join(transcriptDir, 'claude-current.jsonl');
+    await writeFile(session.transcriptPath, '{"type":"attachment"');
+    await session.client.updateMetadata(metadata => ({ ...metadata, flavor: 'claude', claudeSessionId: 'claude-current' }));
+    Object.assign(session.client, {
+      getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
+      upsertSessionSystemRecord: async () => {},
+    });
+    session.queue.push('continue', { permissionMode: 'default', claudeRemoteAgentSdkEnabled: true, claudeUnifiedTerminalEnabled: false },
+      { userMessageLocalId: 'cold-sdk-incomplete' });
+    const launcher = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await vi.waitFor(() => expect(session.client.sendSessionEvent).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'message', message: expect.stringMatching(/startup transcript history is incomplete/),
+      })));
+      expect(published).toEqual({ state: 'unknown', activeCount: 0 });
+      expect(mockClaudeRemoteAgentSdk).not.toHaveBeenCalled();
+    } finally {
+      await switchHandler({ to: 'local' });
+      await launcher;
+      await activity.dispose();
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['claude-current', null])('keeps daemon registration under the Happier identity (provider ID: %s)', async (providerSessionId) => {
+    const { session, switchHandlerReady } = createHarness();
+    session.sessionId = providerSessionId;
+    const transcriptDir = await mkdtemp(join(tmpdir(), 'claude-daemon-identity-'));
+    session.transcriptPath = join(transcriptDir, 'claude-current.jsonl');
+    await writeFile(session.transcriptPath, `${JSON.stringify({
+      type: 'user', uuid: 'previous-prompt', sessionId: providerSessionId,
+      message: { role: 'user', content: 'previous prompt' },
+    })}\n`);
+    await session.client.updateMetadata((metadata) => ({ ...metadata, flavor: 'claude' }));
+    const providerEntered = createDeferred<void>();
+    const finishProvider = createDeferred<void>();
+    mockClaudeRemote.mockImplementation(actualClaudeRemote.claudeRemote);
+    mockQuery.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {
+        providerEntered.resolve(undefined);
+        await finishProvider.promise;
+      },
+    }));
+    session.queue.push('hello', {
+      permissionMode: 'default',
+      claudeRemoteAgentSdkEnabled: false,
+      claudeUnifiedTerminalEnabled: false,
+    }, { userMessageLocalId: 'local-daemon-identity' });
+
+    const launcher = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await providerEntered.promise;
+      expect(notifyDaemonSessionStarted).toHaveBeenCalledWith(
+        'happier-session-1',
+        expect.objectContaining({
+          claudeSubscriptionAccessTokenRefreshV1: { v: 1, mode: 'unavailable' },
+        }),
+        expect.anything(),
+      );
+    } finally {
+      const switching = Promise.resolve(switchHandler({ to: 'local' }));
+      finishProvider.resolve(undefined);
+      await Promise.all([switching, session.cleanup(), launcher]);
+      await rm(transcriptDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([true, false])('offers known prelaunch activity before reading durable Pending input (Agent SDK: %s)', async (agentSdkEnabled) => {
+    const activity = createSessionRuntimeActivity('supported');
+    let published: SessionRuntimeActivitySnapshot = { state: 'unknown', activeCount: 0 };
+    await activity.bindPublisher({
+      publish: async (snapshot) => { published = snapshot; },
+      close: async () => {},
+    });
+    const providerTasks = activity.agentRuntimeContributionHandle;
+    if (!providerTasks) throw new Error('Expected supported provider contribution');
+    const { session, switchHandlerReady } = createHarness(providerTasks);
+    session.accountSettings = AccountSettingsSchema.parse({ sessionPendingQueueDeliveryTiming: 'after_runtime_idle' });
+    const materializationStates: SessionRuntimeActivitySnapshot[] = [];
+    // This is the server boundary. Capture the state that authorizes the first durable
+    // row without preloading the local queue or invoking any mocked provider runner.
+    session.client.materializeNextPendingMessageSafely = async () => {
+      materializationStates.push(published);
+      return { type: 'deferred', reason: 'runtime_activity_unknown' };
+    };
+
+    const launcherPromise = claudeRemoteLauncher(session, {
+      initialMode: {
+        permissionMode: 'default',
+        claudeRemoteAgentSdkEnabled: agentSdkEnabled,
+        claudeUnifiedTerminalEnabled: false,
+      },
+    });
+    const switchHandler = await switchHandlerReady;
+    try {
+      await vi.waitFor(() => expect(materializationStates.length).toBeGreaterThan(0));
+      expect(materializationStates[0]).toEqual({ state: 'idle', activeCount: 0 });
+      expect(mockClaudeRemote).not.toHaveBeenCalled();
+      expect(mockClaudeRemoteAgentSdk).not.toHaveBeenCalled();
+    } finally {
+      await Promise.all([
+        Promise.resolve(switchHandler({ to: 'local' })),
+        session.cleanup(),
+        launcherPromise,
+      ]);
+      await activity.dispose();
+    }
+  });
+
+  it('offers idle before reading Pending input after a local provider stops and remote SDK takes over', async () => {
+    const activity = createSessionRuntimeActivity('supported');
+    let published: SessionRuntimeActivitySnapshot = { state: 'unknown', activeCount: 0 };
+    await activity.bindPublisher({
+      publish: async (snapshot) => { published = snapshot; },
+      close: async () => {},
+    });
+    const providerTasks = activity.agentRuntimeContributionHandle;
+    if (!providerTasks) throw new Error('Expected supported provider contribution');
+    const { session, switchHandlerReady } = createHarness(providerTasks);
+    session.accountSettings = AccountSettingsSchema.parse({ sessionPendingQueueDeliveryTiming: 'after_runtime_idle' });
+    const adapter = session.getProviderTaskRuntimeActivityAdapter();
+    if (!adapter) throw new Error('Expected Claude provider activity adapter');
+    await adapter.activateObservation('local-observer-installed');
+    await adapter.handleRuntimeLoss('claude_process_exit');
+    expect(published).toEqual({ state: 'unknown', activeCount: 0 });
+
+    const materializationStates: SessionRuntimeActivitySnapshot[] = [];
+    session.client.materializeNextPendingMessageSafely = async () => {
+      materializationStates.push(published);
+      return { type: 'deferred', reason: 'runtime_activity_unknown' };
+    };
+    const launcherPromise = claudeRemoteLauncher(session, {
+      initialMode: {
+        permissionMode: 'default',
+        claudeRemoteAgentSdkEnabled: true,
+        claudeUnifiedTerminalEnabled: false,
+      },
+    });
+    const switchHandler = await switchHandlerReady;
+    try {
+      await vi.waitFor(() => expect(materializationStates.length).toBeGreaterThan(0));
+      expect(materializationStates[0]).toEqual({ state: 'idle', activeCount: 0 });
+      expect(mockClaudeRemoteAgentSdk).not.toHaveBeenCalled();
+    } finally {
+      await Promise.all([
+        Promise.resolve(switchHandler({ to: 'local' })),
+        session.cleanup(),
+        launcherPromise,
+      ]);
+      await activity.dispose();
+    }
+  });
+
+  it('publishes Agent SDK steer support and clears it when authentication falls back to legacy', async () => {
+    const { session, switchHandlerReady } = createHarness();
+    const agentSdkState = createDeferred<AgentState>();
+    const legacyState = createDeferred<AgentState>();
+    const finishLegacy = createDeferred<void>();
+
+    mockClaudeRemoteAgentSdk.mockImplementationOnce(async () => {
+      agentSdkState.resolve(session.client.getAgentStateSnapshot?.() ?? {});
+      throw new Error('API Error: 401 OAuth access token has expired');
+    });
+    mockClaudeRemote.mockImplementationOnce(async () => {
+      legacyState.resolve(session.client.getAgentStateSnapshot?.() ?? {});
+      await finishLegacy.promise;
+    });
+
+    session.queue.push(
+      'initial prompt',
+      {
+        permissionMode: 'default',
+        claudeRemoteAgentSdkEnabled: true,
+        claudeUnifiedTerminalEnabled: false,
+      },
+      { userMessageLocalId: 'local-initial' },
+    );
+
+    const { claudeRemoteLauncher } = await import('./claudeRemoteLauncher');
+    const launcherPromise = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await expect(agentSdkState.promise).resolves.toMatchObject({
+        capabilities: {
+          inFlightSteer: true,
+          inFlightSteerSupported: true,
+          inFlightSteerAvailable: false,
+          inFlightSteerUnavailableReason: 'unsafe_window',
+        },
+      });
+      await expect(legacyState.promise).resolves.toMatchObject({
+        capabilities: {
+          inFlightSteer: false,
+          inFlightSteerSupported: false,
+          inFlightSteerAvailable: false,
+          inFlightSteerUnavailableReason: 'backend_unsupported',
+        },
+      });
+    } finally {
+      finishLegacy.resolve(undefined);
+      await Promise.all([
+        Promise.resolve(switchHandler({ to: 'local' })),
+        session.cleanup(),
+        launcherPromise,
+      ]);
+    }
   });
 
   afterEach(() => {
@@ -164,7 +1044,10 @@ describe.sequential('claudeRemoteLauncher legacy Runtime Activity subscriber', (
     } else {
       process.env.HAPPIER_CLAUDE_REMOTE_INTERRUPT_THEN_TEARDOWN_GRACE_MS = previousGraceMs;
     }
-    for (const session of createdSessions.splice(0)) session.cleanup();
+    for (const session of createdSessions.splice(0)) {
+      session.client.sessionTurnLifecycle?.dispose();
+      session.cleanup();
+    }
   });
 
   it('releases the previous Agent SDK input wait before a provider relaunch', async () => {
@@ -365,4 +1248,345 @@ describe.sequential('claudeRemoteLauncher legacy Runtime Activity subscriber', (
       ]));
     }
   }, 60_000);
+
+  describe('idle provider exit', () => {
+    const previousIdleExitMs = process.env.HAPPIER_CLAUDE_REMOTE_IDLE_EXIT_MS;
+    const idleExitMs = 50;
+    const ownedFixtures: Awaited<ReturnType<typeof createClaudeRemoteIdleProcessFixture>>[] = [];
+
+    beforeEach(() => {
+      process.env.HAPPIER_CLAUDE_REMOTE_IDLE_EXIT_MS = String(idleExitMs);
+      reloadConfiguration();
+    });
+
+    afterEach(async () => {
+      for (const fixture of ownedFixtures.splice(0)) await fixture.cleanup();
+      if (previousIdleExitMs === undefined) delete process.env.HAPPIER_CLAUDE_REMOTE_IDLE_EXIT_MS;
+      else process.env.HAPPIER_CLAUDE_REMOTE_IDLE_EXIT_MS = previousIdleExitMs;
+      reloadConfiguration();
+    });
+
+    const agentSdkMode = {
+      permissionMode: 'default',
+      claudeRemoteAgentSdkEnabled: true,
+      claudeUnifiedTerminalEnabled: false,
+      claudeRemoteIdleReclaimEnabled: true,
+      claudeRemoteIdleReclaimTimeoutMinutes: 30,
+    } as const;
+
+    type LaunchRecord = { sessionId: unknown; firstMessage: string | null; ready: boolean; inputEnded: boolean; inputEndedAtMs: number | null; idleNext: 'pending' | 'ended' | 'message' };
+
+    // Keep launcher, dispatcher, SDK runner and SDK transport real; only the native executable
+    // is a wire-compatible fixture with a real owned MCP descendant.
+    function recordLaunches(fixtureOptions: Parameters<typeof createClaudeRemoteIdleProcessFixture>[1] = {}): LaunchRecord[] {
+      const launches: LaunchRecord[] = [];
+      type SdkOptions = Parameters<typeof actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk>[0];
+      const recordRun = async (
+        opts: Pick<SdkOptions, 'sessionId' | 'nextMessage' | 'onPromptAcceptedByProvider' | 'onReady'>,
+        run: (
+          fixture: Awaited<ReturnType<typeof createClaudeRemoteIdleProcessFixture>>,
+          nextMessage: SdkOptions['nextMessage'],
+          onPromptAcceptedByProvider: NonNullable<SdkOptions['onPromptAcceptedByProvider']>,
+          onReady: SdkOptions['onReady'],
+        ) => Promise<void>,
+      ) => {
+        const launch: LaunchRecord = { sessionId: opts.sessionId, firstMessage: null, ready: false, inputEnded: false, inputEndedAtMs: null, idleNext: 'pending' };
+        launches.push(launch);
+        if (!opts.sessionId) throw new Error('Expected native resume identity');
+        const fixture = await createClaudeRemoteIdleProcessFixture(opts.sessionId, fixtureOptions);
+        ownedFixtures.push(fixture);
+        let readFirst = false;
+        let firstMessage: string | null = null;
+        let processesStopped = false;
+        try {
+          await run(fixture, async () => {
+            const next = await opts.nextMessage();
+            if (!readFirst) {
+              readFirst = true;
+              firstMessage = next?.message ?? null;
+            } else {
+              if (next) launch.idleNext = 'message';
+              else {
+                launch.inputEnded = true;
+                launch.inputEndedAtMs = Date.now();
+              }
+            }
+            return next;
+          }, (accepted) => {
+            launch.firstMessage ??= firstMessage;
+            return opts.onPromptAcceptedByProvider?.(accepted);
+          }, async () => {
+            await fixture.assertRunning();
+            await opts.onReady();
+            launch.ready = true;
+          });
+          await fixture.assertStopped();
+          processesStopped = true;
+          if (launch.inputEnded) launch.idleNext = 'ended';
+        } finally {
+          // Native transcripts belong to the conversation and must survive child retirement.
+          // Remove their files only after the whole test, while stopping processes each launch.
+          if (!processesStopped) await fixture.stop();
+        }
+      };
+      mockClaudeRemoteAgentSdk.mockImplementation((opts: SdkOptions) => recordRun(opts, (fixture, nextMessage, onPromptAcceptedByProvider, onReady) =>
+        actualClaudeRemoteAgentSdk.claudeRemoteAgentSdk({
+          ...opts,
+          path: fixture.directory,
+          transcriptPath: fixture.transcriptPath,
+          claudeExecutablePath: fixture.executablePath,
+          spawnClaudeCodeProcess: fixture.spawnClaudeCodeProcess,
+          nextMessage,
+          onPromptAcceptedByProvider,
+          onReady,
+        })));
+      mockClaudeRemote.mockImplementation((opts: Parameters<typeof actualClaudeRemote.claudeRemote>[0]) => recordRun(opts, async (fixture, nextMessage, onPromptAcceptedByProvider, onReady) => {
+        const sdk = await vi.importActual<typeof import('@/backends/claude/sdk')>('@/backends/claude/sdk');
+        // The real legacy query still owns its OS child; replace only the executable at that boundary.
+        mockQuery.mockImplementation((config: Parameters<typeof sdk.query>[0]) => sdk.query({
+          ...config,
+          options: { ...config.options, executable: process.execPath, pathToClaudeCodeExecutable: fixture.executablePath },
+        }));
+        await actualClaudeRemote.claudeRemote({
+          ...opts,
+          path: fixture.directory,
+          transcriptPath: fixture.transcriptPath,
+          nextMessage,
+          onPromptAcceptedByProvider,
+          onReady,
+        });
+      }));
+      return launches;
+    }
+
+    // The harness client omits the optional turn query; the production SessionClient implements it,
+    // and idle exit treats a missing answer as busy.
+    function markCanonicalTurnIdle(session: Session): void {
+      Object.assign(session.client, { hasActiveCanonicalTurn: () => false });
+    }
+
+    it.each([
+      { enabled: undefined, overrideMs: idleExitMs },
+      { enabled: false, overrideMs: idleExitMs },
+      { enabled: true, overrideMs: 0 },
+    ])('keeps reclamation disabled without opt-in or with an explicit environment disable (%j)', async ({ enabled, overrideMs }) => {
+      process.env.HAPPIER_CLAUDE_REMOTE_IDLE_EXIT_MS = String(overrideMs);
+      reloadConfiguration();
+      const { session, switchHandlerReady } = createHarness();
+      markCanonicalTurnIdle(session);
+      const launches = recordLaunches();
+      session.queue.push('keep running', { ...agentSdkMode, claudeRemoteIdleReclaimEnabled: enabled }, { userMessageLocalId: 'opt-in-first' });
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.ready).toBe(true));
+        await new Promise<void>((resolve) => setTimeout(resolve, idleExitMs * 4));
+        expect(launches).toHaveLength(1);
+        expect(launches[0]?.inputEnded).toBe(false);
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+
+    it('applies a later opt-out without relaunching the provider or losing the prompt', async () => {
+      process.env.HAPPIER_CLAUDE_REMOTE_IDLE_EXIT_MS = '500';
+      reloadConfiguration();
+      const { session, switchHandlerReady } = createHarness();
+      markCanonicalTurnIdle(session);
+      const launches = recordLaunches();
+      session.queue.push('first prompt', agentSdkMode, { userMessageLocalId: 'policy-first' });
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.ready).toBe(true));
+        session.queue.push('keep this process', { ...agentSdkMode, claudeRemoteIdleReclaimEnabled: false }, { userMessageLocalId: 'policy-second' });
+        await vi.waitFor(() => expect(launches[0]?.idleNext).toBe('message'));
+        await new Promise<void>((resolve) => setTimeout(resolve, 750));
+        expect(launches).toHaveLength(1);
+        expect(launches[0]?.inputEnded).toBe(false);
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+
+    it.each([true, undefined])('keeps a child when canonical turn activity is busy or unknown (%s)', async (active) => {
+      const { session, switchHandlerReady } = createHarness();
+      if (active !== undefined) Object.assign(session.client, { hasActiveCanonicalTurn: () => active });
+      const launches = recordLaunches();
+      session.queue.push('continue', agentSdkMode, { userMessageLocalId: 'canonical-first' });
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.ready).toBe(true));
+        await new Promise<void>((resolve) => setTimeout(resolve, idleExitMs * 4));
+        expect(launches[0]?.inputEnded).toBe(false);
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+
+    it.each(['permission', 'user_action'] as const)('keeps a child awaiting %s attention', async (kind) => {
+      const { session, switchHandlerReady } = createHarness();
+      markCanonicalTurnIdle(session);
+      await session.client.updateAgentState((state) => ({ ...state, requests: {
+        pending: { tool: kind === 'permission' ? 'Bash' : 'AskUserQuestion', kind, arguments: {}, createdAt: Date.now() },
+      } }));
+      const launches = recordLaunches();
+      session.queue.push('await attention', agentSdkMode, { userMessageLocalId: 'attention-first' });
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.ready).toBe(true));
+        await new Promise<void>((resolve) => setTimeout(resolve, idleExitMs * 4));
+        expect(launches[0]?.inputEnded).toBe(false);
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+
+    it('keeps a child with an active native goal restored from canonical work state', async () => {
+      const { session, switchHandlerReady } = createHarness();
+      markCanonicalTurnIdle(session);
+      const source = createClaudeGoalWorkStateSource({
+        backendId: 'claude',
+        getCurrentClaudeSessionId: () => 'claude-current',
+        publishWorkStateSnapshot: (snapshot) => {
+          void session.client.updateMetadata((metadata) => ({ ...metadata, sessionWorkStateV1: snapshot }));
+        },
+      });
+      source.observeTranscriptMessage({
+        type: 'attachment', uuid: 'active-goal', sessionId: 'claude-current',
+        timestamp: new Date().toISOString(), attachment: { type: 'goal_status', met: false, condition: 'continue until complete' },
+      });
+      const launches = recordLaunches();
+      session.queue.push('continue goal', agentSdkMode, { userMessageLocalId: 'goal-first' });
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.ready).toBe(true));
+        await new Promise<void>((resolve) => setTimeout(resolve, idleExitMs * 4));
+        expect(launches[0]?.inputEnded).toBe(false);
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+
+    it.each([true, false])('stops an idle provider child and resumes the same Claude session on the next prompt (SDK=%s)', async (claudeRemoteAgentSdkEnabled) => {
+      const { session, switchHandlerReady } = createHarness();
+      markCanonicalTurnIdle(session);
+      const launches = recordLaunches();
+      const runtimeMode = { ...agentSdkMode, claudeRemoteAgentSdkEnabled };
+      session.queue.push('first prompt', runtimeMode, { userMessageLocalId: 'idle-first' });
+
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.idleNext).toBe('ended'), { timeout: 30_000 });
+        // No child is spawned again until a prompt arrives.
+        await new Promise<void>((resolve) => setTimeout(resolve, idleExitMs * 4));
+        expect(launches).toHaveLength(1);
+
+        session.queue.push('after idle', runtimeMode, { userMessageLocalId: 'idle-second' });
+
+        await vi.waitFor(() => expect(launches[1]?.firstMessage).toBe('after idle'), { timeout: 30_000 });
+        expect(launches[0]).toMatchObject({ sessionId: 'claude-current', firstMessage: 'first prompt' });
+        expect(launches[1]?.sessionId).toBe('claude-current');
+        expect(session.client.sendSessionDeath).not.toHaveBeenCalled();
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+
+    it('keeps the provider child alive while a background task is still running', async () => {
+      const { session, switchHandlerReady } = createHarness();
+      markCanonicalTurnIdle(session);
+      const launches = recordLaunches({ backgroundTask: true });
+      session.queue.push('start background work', agentSdkMode, { userMessageLocalId: 'busy-first' });
+
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.ready).toBe(true));
+        expect(session.getProviderTaskActivityLedger()?.hasActiveProviderTasks()).toBe(true);
+        await new Promise<void>((resolve) => setTimeout(resolve, idleExitMs * 6));
+        expect(launches).toHaveLength(1);
+        expect(launches[0]?.inputEnded).toBe(false);
+
+        session.queue.push('check on it', agentSdkMode, { userMessageLocalId: 'busy-second' });
+        await vi.waitFor(() => expect(launches[0]?.idleNext).toBe('message'));
+        expect(launches).toHaveLength(1);
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+
+    it('measures idle time from the end of a real provider turn', async () => {
+      const turnIdleExitMs = 300;
+      process.env.HAPPIER_CLAUDE_REMOTE_IDLE_EXIT_MS = String(turnIdleExitMs);
+      reloadConfiguration();
+      const { session, switchHandlerReady } = createHarness();
+      markCanonicalTurnIdle(session);
+      const launches = recordLaunches({ turnDurationMs: turnIdleExitMs * 0.8 });
+      session.queue.push('long turn', agentSdkMode, { userMessageLocalId: 'turn-first' });
+
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.firstMessage).toBe('long turn'));
+        expect(session.thinking).toBe(true);
+        expect(launches[0]?.inputEnded).toBe(false);
+        await vi.waitFor(() => expect(launches[0]?.ready).toBe(true));
+        const turnEndedAt = session.thinkingChangedAtMs;
+        await new Promise<void>((resolve) => setTimeout(resolve, turnIdleExitMs / 2));
+        expect(launches[0]?.inputEnded).toBe(false);
+        await vi.waitFor(() => expect(launches[0]?.inputEnded).toBe(true));
+        expect((launches[0]?.inputEndedAtMs ?? 0) - turnEndedAt).toBeGreaterThanOrEqual(turnIdleExitMs - 20);
+        await vi.waitFor(() => expect(launches[0]?.idleNext).toBe('ended'), { timeout: 5_000 });
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+
+    it('keeps the provider child alive while file checkpoints exist only in that runner', async () => {
+      const { session, switchHandlerReady } = createHarness();
+      markCanonicalTurnIdle(session);
+      const launches = recordLaunches();
+      session.queue.push('edit with checkpoints', { ...agentSdkMode, claudeRemoteEnableFileCheckpointing: true },
+        { userMessageLocalId: 'checkpoint-first' });
+
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.ready).toBe(true));
+        await new Promise<void>((resolve) => setTimeout(resolve, idleExitMs * 6));
+        expect(launches).toHaveLength(1);
+        expect(launches[0]?.inputEnded).toBe(false);
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+
+    it.each([
+      ['CronCreate', true],
+      ['ScheduleWakeup', true],
+      ['TeamCreate', true],
+      ['TeamCreate', false],
+    ] as const)('keeps the provider child alive after %s creates resident work (SDK=%s)', async (toolName, claudeRemoteAgentSdkEnabled) => {
+      const { session, switchHandlerReady } = createHarness();
+      markCanonicalTurnIdle(session);
+      const launches = recordLaunches({ residentWorkTool: toolName });
+      session.queue.push('start resident work', { ...agentSdkMode, claudeRemoteAgentSdkEnabled }, { userMessageLocalId: 'resident-first' });
+
+      const launcher = claudeRemoteLauncher(session);
+      const switchHandler = await switchHandlerReady;
+      try {
+        await vi.waitFor(() => expect(launches[0]?.ready).toBe(true));
+        await new Promise<void>((resolve) => setTimeout(resolve, idleExitMs * 6));
+        expect(launches[0]?.inputEnded).toBe(false);
+        expect(launches).toHaveLength(1);
+      } finally {
+        await Promise.all([Promise.resolve(switchHandler({ to: 'local' })), session.cleanup(), launcher]);
+      }
+    }, 30_000);
+  });
 });

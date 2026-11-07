@@ -25,6 +25,9 @@ test('one trusted reusable workflow resolves prior release candidates by exact r
   assert.ok(parsed.on.workflow_call.inputs.expected_channel);
   for (const output of [
     'source_sha',
+    'desktop_run_number',
+    'desktop_artifacts',
+    'desktop_finalized_artifacts',
     'cli_version',
     'stack_version',
     'server_version',
@@ -40,6 +43,10 @@ test('one trusted reusable workflow resolves prior release candidates by exact r
     'docker_requested',
     'npm_requested',
     'deploy_ui_complete',
+    'ui_ota_complete',
+    'ui_native_ios_complete',
+    'ui_native_android_complete',
+    'ui_apk_complete',
     'deploy_server_complete',
     'deploy_website_complete',
     'deploy_docs_complete',
@@ -54,10 +61,47 @@ test('one trusted reusable workflow resolves prior release candidates by exact r
   assert.equal(resolveJob.permissions.contents, 'read');
   const source = resolveJob.steps.map((step) => step.run ?? '').join('\n');
   assert.match(source, /resolve-release-resume\.mjs[\s\S]*--mode inspect/);
-  assert.match(source, /actions\/artifacts\/\$\{STATUS_ARTIFACT_ID\}\/zip/);
-  assert.match(source, /sha256sum/);
-  assert.match(source, /test "sha256:\$\{actual_digest\}" = "\$\{EXPECTED_DIGEST\}"/);
+  assert.match(source, /resolve-release-resume\.mjs[\s\S]*--mode download/);
+  assert.match(source, /--artifact-id "\$STATUS_ARTIFACT_ID"/);
+  assert.match(source, /--artifact-digest "\$EXPECTED_DIGEST"/);
   assert.match(source, /resolve-release-resume\.mjs[\s\S]*--mode resolve/);
+  assert.equal((source.match(/\/jobs\?filter=latest&per_page=100/g) ?? []).length, 1, 'one canonical origin retrieval owns nested completion evidence');
+  assert.match(source, /--jobs-json "\$RUNNER_TEMP\/resume-jobs.json"/);
+
+  const ui = workflow('promote-ui.yml');
+  const mobile = workflow('build-ui-mobile-local.yml');
+  for (const input of ['ui_ota_complete', 'ui_native_ios_complete', 'ui_native_android_complete', 'ui_apk_complete']) {
+    assert.equal(ui.on.workflow_call.inputs[input]?.type, 'boolean');
+    assert.equal(ui.on.workflow_call.inputs[input]?.default, false);
+  }
+  const evaluate = (expression, inputs) => Function('inputs', 'needs', `return ${expression.replace(/^\$\{\{\s*|\s*\}\}$/g, '')};`)(
+    inputs, { promote: { result: 'success' } },
+  );
+  const fresh = { expo_action: 'full', ui_ota_complete: false, ui_native_ios_complete: false, ui_native_android_complete: false, ui_apk_complete: false };
+  const complete = { ...fresh, ui_ota_complete: true, ui_native_ios_complete: true, ui_native_android_complete: true, ui_apk_complete: true };
+  assert.equal(evaluate(ui.jobs.mobile_native.if, fresh), true);
+  assert.equal(evaluate(ui.jobs.mobile_native.if, complete), false);
+  assert.equal(evaluate(ui.jobs.mobile_apk_release.if, fresh), true);
+  assert.equal(evaluate(ui.jobs.mobile_apk_release.if, complete), false);
+  assert.equal(evaluate(ui.jobs.mobile_native.with.platform, fresh), 'all');
+  assert.equal(evaluate(ui.jobs.mobile_native.with.platform, { ...fresh, ui_native_ios_complete: true }), 'android');
+  assert.equal(evaluate(ui.jobs.mobile_native.with.platform, { ...fresh, ui_native_android_complete: true }), 'ios');
+  assert.equal(ui.jobs.mobile_native.name, 'Mobile native (local runner)');
+  assert.equal(ui.jobs.mobile_apk_release.name, 'Mobile APK release (local runner)');
+  assert.equal(mobile.jobs.build_ios.name, 'Build (ios)');
+  assert.equal(mobile.jobs.build_android.name, 'Build (android)');
+  assert.equal(mobile.jobs.publish_android_apk.name, 'Sign and publish Android APK');
+  for (const [job, names] of [
+    [ui.jobs.validate_candidate, ['Prepare Android OTA artifact without credentials', 'Prepare iOS OTA artifact without credentials', 'Upload prepared OTA artifacts']],
+    [ui.jobs.promote, ['Enable Corepack', 'Install trusted OTA publisher dependencies', 'Download prepared OTA artifacts', 'Publish Android OTA from validated bytes', 'Publish iOS OTA from validated bytes']],
+  ]) {
+    for (const name of names) {
+      const steps = job.steps.filter((step) => step.name === name);
+      assert.equal(steps.length, 1);
+      assert.equal(evaluate(steps[0].if, fresh), true);
+      assert.equal(evaluate(steps[0].if, complete), false, 'satisfied OTA does not export or republish');
+    }
+  }
 });
 
 for (const [name, buildJobs] of [
@@ -84,9 +128,10 @@ for (const [name, buildJobs] of [
 
 test('nightly resume pins the prior source, reuses completed immutable candidates, and records future resume identities', () => {
   const parsed = workflow('nightly-dev.yml');
-  assert.ok(parsed.on.workflow_dispatch.inputs.resume_run_id);
+  assert.ok(workflow('release.yml').on.workflow_dispatch.inputs.resume_run_id);
   assert.equal(parsed.jobs.resolve_resume.uses, './.github/workflows/resolve-release-resume.yml');
   assert.equal(parsed.jobs.resolve_resume.with.expected_workflow, '.github/workflows/nightly-dev.yml');
+  assert.equal(parsed.jobs.ui_desktop.with.resume_run_id, '${{ inputs.resume_run_id }}');
   assert.ok(needs(parsed.jobs.prepare_release_candidate).includes('resolve_resume'));
   const checkout = parsed.jobs.prepare_release_candidate.steps.find((step) => String(step.name).includes('Checkout requested nightly source'));
   assert.match(checkout.with.ref, /needs\.resolve_resume\.outputs\.source_sha/);
@@ -106,15 +151,14 @@ test('nightly resume pins the prior source, reuses completed immutable candidate
   assert.equal(statusProjection.env.CLI_RESUME_VERIFIED, '${{ needs.verify_resume_candidates.outputs.cli_verified }}');
   assert.equal(statusProjection.env.IMMUTABLE_VERIFICATION_RESULT, '${{ needs.release_verify.result }}');
   assert.equal(statusProjection.env.SOURCE_SHA, "${{ needs.prepare_release_candidate.outputs.source_sha || 'unavailable' }}");
+  assert.equal(statusProjection.env.DESKTOP_ORIGIN_RUN_ID, '${{ inputs.resume_run_id || github.run_id }}');
 });
 
 test('full release resume binds the prior run to the same operation and authorized source', () => {
-  const parsed = workflow('release.yml');
-  assert.ok(parsed.on.workflow_dispatch.inputs.resume_run_id);
+  const parsed = workflow('release-channel.yml');
+  assert.ok(workflow('release.yml').on.workflow_dispatch.inputs.resume_run_id);
   assert.equal(parsed.jobs.resolve_resume.uses, './.github/workflows/resolve-release-resume.yml');
   assert.equal(parsed.on.workflow_call.inputs.combined_preview_production.default, false);
-  assert.match(parsed.jobs.resolve_resume.with.expected_workflow, /combined_preview_production/);
-  assert.match(parsed.jobs.resolve_resume.with.expected_workflow, /release-preview-and-production\.yml/);
   assert.match(parsed.jobs.resolve_resume.with.expected_workflow, /release\.yml/);
   assert.equal(parsed.jobs.resolve_resume.with.expected_source_sha, '${{ inputs.authorized_promotion_source_sha }}');
   assert.equal(parsed.jobs.resolve_resume.with.expected_operation_id, '${{ inputs.hmaint_operation_id }}');
@@ -143,9 +187,11 @@ test('full release resume binds the prior run to the same operation and authoriz
   const statusProjection = parsed.jobs.release_status.steps.find((step) => String(step.name).includes('Project release status'));
   assert.match(statusProjection.run, /project-release-status\.mjs/);
   assert.equal(statusProjection.env.CLI_VERSION, '${{ needs.publish_cli_binaries.outputs.version }}');
-  assert.equal(statusProjection.env.CLI_RESUME_VERIFIED, '${{ needs.verify_resume_candidates.outputs.cli_verified }}');
+  assert.equal(statusProjection.env.CLI_RESUME_VERIFIED, "${{ needs.verify_cli_candidate.result == 'success' }}");
   assert.equal(statusProjection.env.IMMUTABLE_VERIFICATION_RESULT, '${{ needs.verify_release_candidates.result }}');
   assert.match(String(parsed.jobs.plan.outputs.publish_docker_needed), /needs\.resolve_resume\.outputs\.docker_requested == 'true'/);
+  assert.match(String(parsed.jobs.plan.outputs.publish_docker_relay_needed), /docker_requested == 'true' && needs\.resolve_resume\.outputs\.server_requested == 'true'/);
+  assert.match(String(parsed.jobs.plan.outputs.publish_docker_dev_box_needed), /docker_requested == 'true' && needs\.resolve_resume\.outputs\.cli_requested == 'true'/);
   assert.match(String(parsed.jobs.publish_docker.if), /needs\.plan\.outputs\.publish_docker_needed == 'true'/);
   assert.match(String(parsed.jobs.publish_docker.if), /needs\.resolve_resume\.outputs\.docker_complete != 'true'/);
   assert.match(String(parsed.jobs.publish_docker.with.build_relay), /needs\.plan\.outputs\.publish_docker_relay_needed == 'true'/);
@@ -170,6 +216,21 @@ test('full release resume binds the prior run to the same operation and authoriz
   assert.match(String(parsed.jobs.deploy_plan.outputs.deploy_ui_resume_complete), /needs\.resolve_resume\.outputs\.deploy_ui_expo_action == inputs\.ui_expo_action/);
   assert.match(String(parsed.jobs.deploy_plan.outputs.deploy_ui_resume_complete), /needs\.resolve_resume\.outputs\.deploy_ui_desktop_mode == inputs\.desktop_mode/);
   assert.match(String(parsed.jobs.deploy_ui.with.desktop_mode), /needs\.deploy_plan\.outputs\.deploy_ui_desktop_mode/);
+  const uiPromotion = workflow('promote-ui.yml');
+  for (const [input, output] of [
+    ['resume_desktop_artifacts', 'desktop_artifacts'],
+    ['resume_desktop_finalized_artifacts', 'desktop_finalized_artifacts'],
+    ['resume_desktop_run_number', 'desktop_run_number'],
+    ['resume_source_sha', 'source_sha'],
+  ]) {
+    assert.equal(parsed.jobs.deploy_ui.with[input], `\${{ needs.resolve_resume.outputs.${output} }}`);
+    assert.equal(uiPromotion.on.workflow_call.inputs[input]?.type, 'string');
+    assert.equal(uiPromotion.jobs.desktop.with[input], `\${{ inputs.${input} }}`);
+  }
+  for (const output of ['ui_ota_complete', 'ui_native_ios_complete', 'ui_native_android_complete', 'ui_apk_complete']) {
+    assert.match(String(parsed.jobs.deploy_ui.with[output]), new RegExp(`needs\\.resolve_resume\\.outputs\\.${output} == 'true'`));
+    assert.match(String(parsed.jobs.deploy_ui.with[output]), /needs\.resolve_resume\.outputs\.deploy_ui_expo_action == inputs\.ui_expo_action/);
+  }
   assert.match(String(statusProjection.env.REQUEST_DEPLOY_UI), /needs\.resolve_resume\.outputs\.deploy_ui_requested == 'true'/);
   assert.match(String(statusProjection.env.REQUEST_DEPLOY_UI), /needs\.deploy_plan\.outputs\.deploy_ui_requested == 'true'/);
   for (const [jobName, outputName, requestEnv] of [
@@ -197,7 +258,7 @@ test('full release resume binds the prior run to the same operation and authoriz
   assert.match(String(statusProjection.env.DEPLOY_UI_RESUME_COMPLETE), /needs\.deploy_plan\.outputs\.deploy_ui_resume_complete/);
 });
 
-test('failed grouped verification independently certifies each successful immutable sibling for resume', () => {
+test('nightly grouped verification independently certifies each successful immutable sibling for resume', () => {
   const verifier = workflow('verify-release-resume-candidates.yml');
   for (const output of ['cli_verified', 'stack_verified', 'server_verified', 'ui_web_verified']) {
     assert.ok(verifier.on.workflow_call.outputs[output], `missing per-product output ${output}`);
@@ -239,7 +300,6 @@ test('failed grouped verification independently certifies each successful immuta
 
   for (const [name, groupedJob, candidates] of [
     ['nightly-dev.yml', 'release_verify', ['cli', 'hstack', 'server_runtime', 'ui_web']],
-    ['release.yml', 'verify_release_candidates', ['publish_cli_binaries', 'publish_hstack_binaries', 'publish_server_runtime', 'publish_ui_web']],
   ]) {
     const parsed = workflow(name);
     const independent = parsed.jobs.verify_resume_candidates;
@@ -263,10 +323,10 @@ test('nightly-dev replaces its singleton status artifact safely on a GitHub reru
 });
 
 test('release.yml defaults its replaceable status artifact to the canonical name', () => {
-  const parsed = workflow('release.yml');
+  const parsed = workflow('release-channel.yml');
   assert.equal(parsed.on.workflow_call.inputs.combined_preview_production.default, false);
   const upload = parsed.jobs.release_status.steps.find(
-    (step) => String(step.with?.name).includes('happier-release-status-preview'),
+    (step) => String(step.with?.name).includes('happier-release-status-{0}'),
   );
   assert.ok(upload, 'release.yml must upload the selected release status artifact');
   assert.equal(upload.with.overwrite, true);

@@ -21,13 +21,17 @@ vi.mock('@happier-dev/cli-common/processInstance', async (importOriginal) => ({
 }));
 
 describe('markerless recovery home ownership', () => {
-  const envScope = createEnvKeyScope(['HAPPIER_HOME_DIR', 'HAPPIER_DAEMON_MARKERLESS_REATTACH_ENABLED']);
+  const envScope = createEnvKeyScope(['HAPPIER_HOME_DIR', 'HAPPIER_DAEMON_MARKERLESS_REATTACH_ENABLED', 'HAPPIER_ACTIVE_SERVER_ID', 'HAPPIER_SERVER_URL', 'HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID']);
   let happyHomeDir: string;
   let runtimeRoot: string;
 
   beforeEach(async () => {
     happyHomeDir = await mkdtemp(join(tmpdir(), 'happier-markerless-home-'));
-    envScope.patch({ HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_DAEMON_MARKERLESS_REATTACH_ENABLED: '1' });
+    envScope.patch({
+      HAPPIER_HOME_DIR: happyHomeDir, HAPPIER_DAEMON_MARKERLESS_REATTACH_ENABLED: '1',
+      HAPPIER_ACTIVE_SERVER_ID: 'fixture-relay', HAPPIER_SERVER_URL: 'https://relay.example.test',
+      HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: undefined,
+    });
     vi.resetModules();
     discovery.processes = [];
     runtimeRoot = (await import('@/projectPath')).projectPath();
@@ -49,7 +53,9 @@ describe('markerless recovery home ownership', () => {
       command: `node ${root}/dist/index.mjs claude --happy-starting-mode remote --started-by daemon --existing-session session-${pid}`,
       type: 'daemon-spawned-session',
       cwd: happyHomeDir,
-      ...(homeDir === undefined ? {} : { daemonOwnershipEnvironmentVariables: { HAPPIER_HOME_DIR: homeDir } }),
+      ...(homeDir === undefined ? {} : { daemonOwnershipEnvironmentVariables: {
+        HAPPIER_HOME_DIR: homeDir, HAPPIER_ACTIVE_SERVER_ID: 'fixture-relay', HAPPIER_SERVER_URL: 'https://relay.example.test',
+      } }),
     };
   }
 

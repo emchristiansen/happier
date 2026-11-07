@@ -10,7 +10,6 @@ import { startCliAuthLoginForTerminalConnect, type StartedCliTerminalConnect } f
 import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
 import { acknowledgeTerminalConnectSuccessIfPresent } from '../../src/testkit/uiE2e/acknowledgeTerminalConnectSuccessIfPresent';
-import { clickScopedButtonByTestIdOrRole } from '../../src/testkit/uiE2e/clickScopedButtonByTestIdOrRole';
 import { createGitRepoForBranchPublishAndStashFixture, execGit } from '../../src/testkit/uiE2e/gitRepoFixtures';
 import { spawnSessionFromDaemon } from '../../src/testkit/uiE2e/spawnSessionFromDaemon';
 import { toTestIdSafeValue } from '../../src/testkit/uiE2e/testIdSafeValue';
@@ -72,9 +71,6 @@ test.describe('ui e2e: SCM branch publish + switch-with-changes + stash restore'
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_SHARED_DEPS_BUILD: '1',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_GENERATE: '1',
         HAPPIER_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT: '1',
@@ -95,7 +91,7 @@ test.describe('ui e2e: SCM branch publish + switch-with-changes + stash restore'
   });
 
   test('creates + publishes branch, stashes on switch, restores stash, and brings changes to target branch', async ({ page }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     const browserDiagnostics = collectBrowserDiagnostics({ page });
@@ -174,13 +170,7 @@ test.describe('ui e2e: SCM branch publish + switch-with-changes + stash restore'
       await expect(rightPaneLocator(page)).toHaveCount(1, { timeout: 60_000 });
       let rightPane = rightPaneLocator(page);
 
-      // Ensure right pane is on Source control.
-      await clickScopedButtonByTestIdOrRole({
-        scope: rightPane,
-        testId: 'session-rightpanel-tab:git',
-        roleName: 'Source control',
-        timeoutMs: 180_000,
-      });
+      await expect(rightPane.getByTestId('session-rightpanel-surface-git')).toBeVisible({ timeout: 180_000 });
 
       // Create + checkout a new branch via the branch dropdown search/create affordance.
       await expect(rightPane.getByTestId('scm-branch-menu-trigger')).toHaveCount(1, { timeout: 120_000 });

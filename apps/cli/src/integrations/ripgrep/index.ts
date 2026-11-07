@@ -50,7 +50,7 @@ export function run(args: string[], options?: RipgrepOptions): Promise<RipgrepRe
 
             child.on('close', (code) => {
                 resolve({
-                    exitCode: code || 0,
+                    exitCode: typeof code === 'number' ? code : -1,
                     stdout,
                     stderr
                 });

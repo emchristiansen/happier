@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -20,6 +20,7 @@ import type { Credentials } from '@/persistence';
 import { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } from './nativeAuth/claudeCodeCredentialScopes';
 import { materializeClaudeConnectedServiceRuntimeAuthSelection } from './materializeClaudeConnectedServiceRuntimeAuthSelection';
 import { resolveClaudeConnectedServiceStableConfigDir } from './resolveClaudeConnectedServiceStableAuthDir';
+import { CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS } from './claudeTranscriptRetentionSettings';
 
 // Server HTTP boundary mock: the persisted-metadata continuity fallback fetches the session
 // snapshot from the server; unit tests must never hit the network.
@@ -281,7 +282,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
         hasCompletedProjectOnboarding: true,
       },
     });
-    await expect(readFile(join(groupClaudeConfigDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"ambient"}\n');
+    expect(JSON.parse(await readFile(join(groupClaudeConfigDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'ambient', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
   });
 
   it('returns shared group hot-apply metadata without rewriting the live Claude config dir first', async () => {
@@ -1024,7 +1025,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
     })).resolves.toMatchObject({ ok: true });
   });
 
-  it('isolates runtime rematerialization from stale target temp-file collisions by staging before replacement', async () => {
+  it('isolates native credential writes from stale target temp-file collisions without replacing the home', async () => {
     const fixedUuid = 'runtime-write-failure';
     vi.resetModules();
     vi.doMock('node:crypto', async (importOriginal) => {
@@ -1068,6 +1069,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
         })}\n`,
       );
       await mkdir(join(targetClaudeConfigDir, `.credentials.${fixedUuid}.tmp`), { recursive: true });
+      await writeFile(join(targetClaudeConfigDir, 'private-state'), 'preserve through runtime refresh');
       const record = buildConnectedServiceCredentialRecord({
         now: 1_000,
         serviceId: 'claude-subscription',
@@ -1176,6 +1178,8 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
       const replacedCredential = JSON.parse(await readFile(join(targetClaudeConfigDir, '.credentials.json'), 'utf8'));
       expect(replacedCredential.claudeAiOauth.accessToken).toBe('replacement-access-placeholder');
       expect(replacedCredential.claudeAiOauth).not.toHaveProperty('refreshToken');
+      await expect(readFile(join(targetClaudeConfigDir, 'private-state'), 'utf8')).resolves.toBe('preserve through runtime refresh');
+      expect((await lstat(join(targetClaudeConfigDir, `.credentials.${fixedUuid}.tmp`))).isDirectory()).toBe(true);
     } finally {
       vi.doUnmock('node:crypto');
       vi.resetModules();

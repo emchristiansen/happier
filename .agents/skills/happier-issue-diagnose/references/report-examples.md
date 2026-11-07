@@ -12,7 +12,7 @@ These examples demonstrate stance and information selection. They are not templa
 >
 > Keep the issue open through a native Windows regression and a named corrected artifact. The unrun Windows process gate is the material remaining risk.
 >
-> cc: @<local-gh-login>
+> _Posted on behalf of @<local-gh-login>._
 
 This works because the opening answers validity, cause, owner, correction, rejected workaround, unchanged behavior, closure, and risk once, in one causal narrative.
 
@@ -24,7 +24,7 @@ This works because the opening answers validity, cause, owner, correction, rejec
 >
 > Do not broaden the parser or treat unknown objects as success. First request the loaded UI, daemon, and server identities plus the response's non-sensitive top-level type, keys, status, and reason. That one vector will decide whether the correction belongs in transport unwrapping, a provenance-backed compatibility adapter, or update guidance.
 >
-> cc: @<local-gh-login>
+> _Posted on behalf of @<local-gh-login>._
 
 There is no invented “after the fix” behavior and no implementation approval request. The missing discriminator is the recommendation.
 
@@ -34,7 +34,7 @@ There is no invented “after the fix” behavior and no implementation approval
 >
 > #268 is a separate decision. Release lag is visible, but the installed iOS build, loaded update, connected CLI/provider, and missing model are unknown. Collect that provenance before changing the model catalog or authorizing a mobile release.
 >
-> cc: @<local-gh-login>
+> _Posted on behalf of @<local-gh-login>._
 
 Shared release work is explained once. The issue with a different evidence need is not forced into the same brief merely because all three involve publication.
 
@@ -48,7 +48,7 @@ Shared release work is explained once. The issue with a different evidence need 
 >
 > This is integrated and verified on `dev`, so it is currently `stage:source` and will reach preview on the next preview release. The issue should remain open through `stage:preview`. Once it reaches that channel, please retry the original tag sequence on preview; if it still fails, send the app version from Settings, platform, and exact selection/clearing sequence because that would contradict the corrected path.
 >
-> cc: @<local-gh-login>
+> _Posted on behalf of @<local-gh-login>._
 
 This response appreciates the concrete effort that helped the investigation, then gives a developer enough mechanism, ownership, design, validation, availability, and conditional follow-up to challenge the conclusion. It does not use a canned support opener, ask a preview user to validate dev, or narrate private evidence collection.
 

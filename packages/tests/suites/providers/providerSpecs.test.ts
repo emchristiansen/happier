@@ -18,6 +18,8 @@ describe('providers: cli provider specs', () => {
     expect(ids).toContain('auggie');
     expect(ids).toContain('cursor');
     expect(ids).toContain('grok');
+    expect(ids).toContain('agy');
+    expect(ids).toContain('devin');
 
     for (const spec of specs) {
       expect(typeof spec.enableEnvVar).toBe('string');

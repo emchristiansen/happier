@@ -10,7 +10,7 @@ import { installAgentInputCommonModuleMocks } from './agentInputTestHelpers';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-const storageSettings: Settings = {
+const storageSettings: { -readonly [K in keyof Settings]: Settings[K] } = {
     ...settingsDefaults,
     profiles: [],
     agentInputEnterToSend: true,
@@ -144,7 +144,7 @@ vi.mock('@/agents/catalog/catalog', () => ({
     }),
     getAgentBehavior: (agentId: string) => ({
         sessionUsage: {
-            supportsExactContextUsageBadge: agentId !== 'codex' && agentId !== 'gemini',
+            contextUsageBadge: agentId === 'gemini' ? 'hidden' : agentId === 'codex' ? 'reportedOnly' : 'derived',
         },
     }),
 }));
@@ -332,132 +332,14 @@ describe('AgentInput (context usage badge)', () => {
 
     beforeEach(() => {
         captured.last = null;
+        storageSettings.sessionUsageGaugeLabels = false;
         windowDimensionsState.width = 800;
         windowDimensionsState.height = 600;
     });
 
-    it('does not render a context usage badge for codex sessions even when telemetry is present', async () => {
+    it.each([false, true])('renders provider-reported context and honors the global label preference (%s)', async (showLabels) => {
         captured.last = null;
-        const { AgentInput } = await import('./AgentInput');
-
-        const screen = await renderScreen(
-            <AgentInput
-                value=""
-                placeholder="Type"
-                onChangeText={() => {}}
-                onSend={() => {}}
-                autocompleteKinds={[]}
-                autocompleteSuggestions={async () => []}
-                agentType={"codex" as any}
-                onAgentClick={() => {}}
-                usageData={{
-                    inputTokens: 0,
-                    outputTokens: 0,
-                    cacheCreation: 0,
-                    cacheRead: 0,
-                    contextSize: 16_000,
-                }}
-                alwaysShowContextSize={true}
-                connectionStatus={{
-                    text: 'Connected',
-                    color: '#00aa00',
-                    dotColor: '#00aa00',
-                }}
-                metadata={{
-                    sessionModelsV1: {
-                        v: 1,
-                        provider: 'codex',
-                        updatedAt: 1,
-                        currentModelId: 'gpt-5.4',
-                        availableModels: [
-                            {
-                                id: 'gpt-5.4',
-                                name: 'GPT 5.4',
-                                contextWindowTokens: 258_000,
-                            },
-                        ],
-                    },
-                } as any}
-            />,
-        );
-
-        expect(screen.findByTestId('agent-input-status-trailing')).toBeTruthy();
-        expect(screen.findByTestId('agent-input-context-usage-badge')).toBeNull();
-
-        act(() => screen.tree.unmount());
-    });
-
-    it('does not render a zero-state context usage badge for codex when always-show is enabled', async () => {
-        captured.last = null;
-        const { AgentInput } = await import('./AgentInput');
-
-        const screen = await renderScreen(
-            <AgentInput
-                value=""
-                placeholder="Type"
-                onChangeText={() => {}}
-                onSend={() => {}}
-                autocompleteKinds={[]}
-                autocompleteSuggestions={async () => []}
-                agentType={"codex" as any}
-                onAgentClick={() => {}}
-                alwaysShowContextSize={true}
-                metadata={{
-                    sessionModelsV1: {
-                        v: 1,
-                        provider: 'codex',
-                        updatedAt: 1,
-                        currentModelId: 'gpt-5.4',
-                        availableModels: [
-                            {
-                                id: 'gpt-5.4',
-                                name: 'GPT 5.4',
-                                contextWindowTokens: 258_000,
-                            },
-                        ],
-                    },
-                } as any}
-            />,
-        );
-
-        expect(screen.findByTestId('agent-input-context-usage-badge')).toBeNull();
-
-        act(() => screen.tree.unmount());
-    });
-
-    it('does not render a codex context usage badge from live telemetry when metadata is missing', async () => {
-        captured.last = null;
-        const { AgentInput } = await import('./AgentInput');
-
-        const screen = await renderScreen(
-            <AgentInput
-                value=""
-                placeholder="Type"
-                onChangeText={() => {}}
-                onSend={() => {}}
-                autocompleteKinds={[]}
-                autocompleteSuggestions={async () => []}
-                agentType={"codex" as any}
-                onAgentClick={() => {}}
-                usageData={{
-                    inputTokens: 700,
-                    outputTokens: 250,
-                    cacheCreation: 0,
-                    cacheRead: 200,
-                    contextSize: 1_200,
-                    contextWindowTokens: 258_400,
-                } as any}
-                alwaysShowContextSize={true}
-            />,
-        );
-
-        expect(screen.findByTestId('agent-input-context-usage-badge')).toBeNull();
-
-        act(() => screen.tree.unmount());
-    });
-
-    it('still renders the context usage badge for providers that support exact context telemetry', async () => {
-        captured.last = null;
+        storageSettings.sessionUsageGaugeLabels = showLabels;
         const { AgentInput } = await import('./AgentInput');
 
         const screen = await renderScreen(
@@ -476,6 +358,7 @@ describe('AgentInput (context usage badge)', () => {
                     cacheCreation: 0,
                     cacheRead: 0,
                     contextSize: 38_691,
+                    contextSizeIsReported: true,
                     contextWindowTokens: 200_000,
                 }}
                 alwaysShowContextSize={true}
@@ -487,6 +370,66 @@ describe('AgentInput (context usage badge)', () => {
         expect(screen.findByTestId('agent-input-context-usage-ring')).toBeTruthy();
         expect(screen.findByTestId('agent-input-context-usage-value')?.props.children).toBe('19');
         expect(String(badge?.props.accessibilityLabel ?? '')).toContain('38.7k/200k');
+        expect(Boolean(screen.findByTestId('agent-input-context-usage-label'))).toBe(showLabels);
+
+        act(() => screen.tree.unmount());
+    });
+
+    it('renders the context badge derived from per-message usage when the provider does not report context explicitly', async () => {
+        captured.last = null;
+        const { AgentInput } = await import('./AgentInput');
+
+        const screen = await renderScreen(
+            <AgentInput
+                value=""
+                placeholder="Type"
+                onChangeText={() => {}}
+                onSend={() => {}}
+                autocompleteKinds={[]}
+                autocompleteSuggestions={async () => []}
+                agentType={"claude" as any}
+                onAgentClick={() => {}}
+                usageData={{
+                    inputTokens: 2_000,
+                    outputTokens: 1_200,
+                    cacheCreation: 8_000,
+                    cacheRead: 170_000,
+                    contextSize: 180_000,
+                    contextSizeIsReported: false,
+                    contextWindowTokens: 200_000,
+                }}
+                alwaysShowContextSize={false}
+            />,
+        );
+
+        const badge = screen.findByTestId('agent-input-context-usage-badge');
+        expect(badge).toBeTruthy();
+        expect(screen.findByTestId('agent-input-context-usage-value')?.props.children).toBe('90');
+        expect(String(badge?.props.accessibilityLabel ?? '')).toContain('180k/200k');
+
+        act(() => screen.tree.unmount());
+    });
+
+    it('honors alwaysShowContextSize before the first usage record arrives', async () => {
+        captured.last = null;
+        const { AgentInput } = await import('./AgentInput');
+
+        const screen = await renderScreen(
+            <AgentInput
+                value=""
+                placeholder="Type"
+                onChangeText={() => {}}
+                onSend={() => {}}
+                autocompleteKinds={[]}
+                autocompleteSuggestions={async () => []}
+                agentType={"claude" as any}
+                onAgentClick={() => {}}
+                alwaysShowContextSize={true}
+            />,
+        );
+
+        expect(screen.findByTestId('agent-input-context-usage-badge')).toBeTruthy();
+        expect(screen.findByTestId('agent-input-context-usage-value')?.props.children).toBe('0');
 
         act(() => screen.tree.unmount());
     });
@@ -525,6 +468,7 @@ describe('AgentInput (context usage badge)', () => {
                     cacheCreation: 0,
                     cacheRead: 0,
                     contextSize: 38_691,
+                    contextSizeIsReported: true,
                 }}
                 alwaysShowContextSize={true}
             />,
@@ -579,6 +523,7 @@ describe('AgentInput (context usage badge)', () => {
                 status: 'ok',
                 details: {},
             },
+            usageRings: [],
             allMeterRows: [
                 {
                     meterId: 'weekly',
@@ -611,6 +556,7 @@ describe('AgentInput (context usage badge)', () => {
                     cacheCreation: 0,
                     cacheRead: 0,
                     contextSize: 38_691,
+                    contextSizeIsReported: true,
                 }}
                 alwaysShowContextSize={true}
                 {...{ providerUsageGauge }}
@@ -629,8 +575,11 @@ describe('AgentInput (context usage badge)', () => {
 
         expect(screen.findByTestId('agent-input-provider-usage-popover')).toBeTruthy();
         expect(screen.findByTestId('agent-input-provider-usage-meter:weekly')).toBeTruthy();
-        const providerUsageOverlay = screen.findByType('FloatingOverlay');
-        expect(providerUsageOverlay?.props.scrollEnabled).toBe(false);
+        // Plain quota detail rows use the shared scroll owner; match their overlay by content.
+        const providerUsageOverlays = screen.findAll((node) => String(node.type) === 'FloatingOverlay'
+            && node.findAll((child) => child.props.testID === 'agent-input-provider-usage-meter:weekly').length > 0);
+        expect(providerUsageOverlays).toHaveLength(1);
+        expect(providerUsageOverlays[0]?.props.scrollEnabled).toBe(true);
         expect(screen.getTextContent()).toContain('Claude usage');
         expect(screen.getTextContent()).toContain('Work account');
         expect(screen.getTextContent()).toContain('18% left · resets in 2h');
@@ -678,6 +627,7 @@ describe('AgentInput (context usage badge)', () => {
                 status: 'ok',
                 details: {},
             },
+            usageRings: [],
             allMeterRows: [
                 {
                     meterId: 'weekly',
@@ -709,6 +659,7 @@ describe('AgentInput (context usage badge)', () => {
                     cacheCreation: 0,
                     cacheRead: 0,
                     contextSize: 38_691,
+                    contextSizeIsReported: true,
                 }}
                 alwaysShowContextSize={true}
                 {...{ providerUsageGauge }}
@@ -726,6 +677,37 @@ describe('AgentInput (context usage badge)', () => {
 
         expect(screen.findByTestId('agent-input-hidden-usage-overflow-popover')).toBeTruthy();
         expect(screen.getTextContent()).toContain('38.7k/200k context used');
+
+        act(() => screen.tree.unmount());
+    });
+
+    it('hides the context badge for a reported-only provider until it reports active context', async () => {
+        captured.last = null;
+        const { AgentInput } = await import('./AgentInput');
+
+        const screen = await renderScreen(
+            <AgentInput
+                value=""
+                placeholder="Type"
+                onChangeText={() => {}}
+                onSend={() => {}}
+                autocompleteKinds={[]}
+                autocompleteSuggestions={async () => []}
+                agentType={"codex" as any}
+                onAgentClick={() => {}}
+                usageData={{
+                    inputTokens: 12_000,
+                    outputTokens: 800,
+                    cacheCreation: 0,
+                    cacheRead: 0,
+                    contextSize: 0,
+                    contextWindowTokens: 258_400,
+                }}
+                alwaysShowContextSize={true}
+            />,
+        );
+
+        expect(screen.findByTestId('agent-input-context-usage-badge')).toBeNull();
 
         act(() => screen.tree.unmount());
     });

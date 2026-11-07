@@ -1,7 +1,7 @@
 import { buildBackendTargetKey, type AcpCatalogSettingsV1, type BackendTargetRefV1 } from '@happier-dev/protocol';
 
-import { getAgentCore } from '@/agents/catalog/catalog';
-import { getResolvedBackendCatalogEntries, resolveBuiltInAgentIdForBackendTarget } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
+import { isAgentId } from '@/agents/catalog/catalog';
+import { getResolvedBackendCatalogEntries, resolveBuiltInAgentIdForBackendTarget, resolveBuiltInAgentTitle } from '@/agents/backendCatalog/getResolvedBackendCatalogEntries';
 import { buildAvailableReviewEngineOptions, type ExecutionRunsBackendSnapshotEntry } from '@/sync/domains/reviews/reviewEngineCatalog';
 import { resolveExecutionRunAvailableBackends } from '@/sync/domains/executionRuns/resolveExecutionRunAvailableBackends';
 
@@ -12,15 +12,6 @@ export type ExecutionRunLauncherBackendChoice = Readonly<{
     title: string;
     disabled: boolean;
 }>;
-
-function isResolvableBuiltInCatalogAgent(id: string): boolean {
-    try {
-        getAgentCore(id as any);
-        return true;
-    } catch {
-        return false;
-    }
-}
 
 export function resolveExecutionRunLauncherBackendChoices(params: Readonly<{
     enabledAgentIds: readonly string[];
@@ -33,7 +24,7 @@ export function resolveExecutionRunLauncherBackendChoices(params: Readonly<{
             ...params.enabledAgentIds,
             ...Object.keys(params.executionRunsBackends ?? {}),
         ]),
-    ).filter((id) => isResolvableBuiltInCatalogAgent(id));
+    ).filter(isAgentId);
     const availableBuiltInBackendIds = new Set(
         resolveExecutionRunAvailableBackends(params.executionRunsBackends, params.intent),
     );
@@ -42,21 +33,21 @@ export function resolveExecutionRunLauncherBackendChoices(params: Readonly<{
         return buildAvailableReviewEngineOptions({
             enabledAgentIds: [...params.enabledAgentIds],
             executionRunsBackends: params.executionRunsBackends,
-            resolveAgentLabel: (id) => id,
+            resolveAgentLabel: (id) => resolveBuiltInAgentTitle(id) ?? id,
         }).map((option) => {
             const target: BackendTargetRefV1 = { kind: 'builtInAgent', agentId: option.id };
             return {
                 target,
                 targetKey: buildBackendTargetKey(target),
                 builtInAgentId: option.id,
-                title: option.id,
+                title: option.label || option.id,
                 disabled: option.disabled === true,
             };
         });
     }
 
     return getResolvedBackendCatalogEntries({
-        enabledAgentIds: catalogAgentIds as any,
+        enabledAgentIds: catalogAgentIds,
         acpCatalogSettingsV1: params.acpCatalogSettingsV1,
     }).map((entry) => {
         const builtInAgentId = resolveBuiltInAgentIdForBackendTarget(entry.target);
@@ -64,7 +55,7 @@ export function resolveExecutionRunLauncherBackendChoices(params: Readonly<{
             target: entry.target,
             targetKey: entry.targetKey,
             builtInAgentId,
-            title: entry.family === 'configuredAcpBackend' ? entry.title : builtInAgentId,
+            title: entry.title,
             disabled: !availableBuiltInBackendIds.has(builtInAgentId),
         };
     });

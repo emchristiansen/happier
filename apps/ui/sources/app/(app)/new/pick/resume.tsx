@@ -43,6 +43,11 @@ export default function ResumePickerScreen() {
         const fromTemp = typeof tempSessionData?.machineId === 'string' ? tempSessionData.machineId.trim() : '';
         return fromTemp || null;
     }, [params.machineId, tempSessionData?.machineId]);
+    const effectiveDirectory = React.useMemo(() => {
+        const directory = typeof tempSessionData?.directory === 'string' ? tempSessionData.directory.trim() : '';
+        const path = typeof tempSessionData?.path === 'string' ? tempSessionData.path.trim() : '';
+        return directory || path || null;
+    }, [tempSessionData?.directory, tempSessionData?.path]);
     const effectiveServerId = React.useMemo(() => {
         const directParam = typeof params.spawnServerId === 'string' ? params.spawnServerId.trim() : '';
         return directParam || null;
@@ -110,6 +115,7 @@ export default function ResumePickerScreen() {
                             agentOptionState,
                             profile: accountProfile,
                             settings,
+                            directory: effectiveDirectory,
                         });
                         if (!source) return null;
                         return openDirectSessionsResumeIdPickerModal({

@@ -5,7 +5,7 @@ description: The coding agents Happier can run for you, what they have in common
 
 Happier does not replace your coding agent. It runs the one you already use — on your own machine, in your own checkout — and gives you a way to watch it, steer it, approve its work and reply to it from anywhere.
 
-Fourteen agents are wired up today. Whichever you pick, the parts that belong to Happier work the same way: the transcript, the pending queue, permissions and approvals, session settings, notifications, and the tools an agent can call. What differs is what each agent's own CLI exposes — which models it offers, whether it can resume a session, whether it accepts images.
+Eighteen agents are wired up today. Whichever you pick, the parts that belong to Happier work the same way: the transcript, the pending queue, permissions and approvals, session settings, notifications, and the tools an agent can call. What differs is what each agent's own CLI exposes — which models it offers, whether it can resume a session, whether it accepts images.
 
 Those differences are real and worth checking before you commit to a workflow. They live in one generated place:
 
@@ -17,10 +17,13 @@ Those differences are real and worth checking before you commit to a workflow. T
 
 Each agent's page covers the same three things: installing its CLI, authenticating it, and the limits that will actually affect you. The shape is deliberately identical so you can move between them.
 
-Two things are true for all of them:
+Three things are true for all of them:
 
-- **You install the agent's CLI yourself.** Happier detects what is already on the machine; it does not bundle any agent. Some agents have a managed install Happier can run for you, and the capability tables say which.
+- **You need the agent's CLI on the machine.** Happier detects what is already there and does not bundle an agent. Some agents have a managed install Happier can run for you, and the capability tables say which.
+- **The upcoming 0.2 setup flow can guide installation.** When no agent is available, choose a catalog-backed agent or **Skip for now**. Skipping is valid, but a machine with no installed agent is connected rather than coding-ready.
 - **Authentication belongs to the agent.** Happier reads its login state and, for some agents, can hold the credentials for you through [Connected Services](/accounts/connected-services) so you do not have to sign in separately on every machine.
+
+Installing an agent and authenticating it are separate steps. After a managed install, follow that agent's page to complete its own sign-in before starting a session.
 
 ## Built-in agents
 
@@ -38,6 +41,11 @@ Two things are true for all of them:
   <Card title="Kilo" href="/agents/kilo" />
   <Card title="Kiro" href="/agents/kiro" />
   <Card title="Pi" href="/agents/pi" />
+  <Card title="Antigravity" href="/agents/agy" />
+  <Card title="Devin" href="/agents/devin" />
+  <Card title="FX" href="/agents/fx" />
+  <Card title="Factory Droid" href="/agents/droid" />
+  <Card title="CodeBuddy" href="/agents/codebuddy" />
 </Cards>
 
 ## Anything else that speaks ACP

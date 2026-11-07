@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { View } from 'react-native';
 import { useUnistyles } from 'react-native-unistyles';
 
 import { useCodeSyntaxHighlighting } from '@/components/ui/code/highlighting/useCodeSyntaxHighlighting';
@@ -36,25 +37,42 @@ export const CodeBlockView = React.memo<CodeBlockViewProps>(({
         && Boolean(syntax.language)
         && budget.withinBudget;
 
-    const content = shouldHighlight ? (
-        <SimpleSyntaxHighlighter
-            code={code}
-            language={syntax.language}
-            selectable={selectable}
-        />
-    ) : (
-        <Text
-            selectable={selectable}
-            style={{
-                fontFamily: Typography.mono().fontFamily,
-                fontSize: 14,
-                lineHeight: 20,
-                color: theme.colors.text.primary,
-                flexShrink: 0,
-            }}
-        >
-            {code}
-        </Text>
+    const lines = React.useMemo(
+        () => budget.lines ?? budget.normalizedCode.split('\n'),
+        [budget],
+    );
+
+    // A single native Text spanning a wide, long block can measure correctly but
+    // paint completely blank on iOS. Keep each line on its own text surface;
+    // the frame still owns scrolling and copying the complete original code.
+    const content = (
+        <View style={{ flexShrink: 0 }}>
+            {lines.map((line, index) => (
+                <View key={index} style={{ minHeight: 20 }}>
+                    {shouldHighlight ? (
+                        <SimpleSyntaxHighlighter
+                            wrap={wrap}
+                            code={line}
+                            language={syntax.language}
+                            selectable={selectable}
+                        />
+                    ) : (
+                        <Text
+                            selectable={selectable}
+                            style={{
+                                fontFamily: Typography.mono().fontFamily,
+                                fontSize: 14,
+                                lineHeight: 20,
+                                color: theme.colors.text.primary,
+                                flexShrink: 0,
+                            }}
+                        >
+                            {line}
+                        </Text>
+                    )}
+                </View>
+            ))}
+        </View>
     );
 
     return (

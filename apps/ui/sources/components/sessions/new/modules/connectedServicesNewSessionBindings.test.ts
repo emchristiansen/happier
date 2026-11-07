@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
 import { AGENTS_CORE } from '@happier-dev/agents';
+import { AccountProfileSchema } from '@happier-dev/protocol';
 import {
     buildConnectedServiceAccountGroupOptionsByServiceId,
     buildConnectedServiceProfileOptionsByServiceId,
     buildConnectedServicesBindingsPayload,
+    resolveNewSessionConnectedServicesBindingsForAgent,
     type ConnectedServicesProfileOptionsByServiceId,
 } from './connectedServicesNewSessionBindings';
 
@@ -14,6 +16,30 @@ const profileOptionsByServiceId: ConnectedServicesProfileOptionsByServiceId = {
         { profileId: 'backup', status: 'connected', providerEmail: 'backup@example.com' },
     ],
 };
+
+describe('Antigravity saved default selection', () => {
+    it('uses the additive exact account default and preserves explicit native choice', () => {
+        const params = {
+            agentId: 'agy', agentCore: AGENTS_CORE.agy,
+            accountProfileConnectedServicesV2: AccountProfileSchema.shape.connectedServicesV2.parse([{ serviceId: 'antigravity',
+                profiles: [{ profileId: 'work', status: 'connected', kind: 'oauth' }] }]),
+            settings: {
+                connectedServicesProfileLabelByKey: {}, connectedServicesDefaultProfileByServiceId: {},
+                connectedServicesAdditionalDefaultAuthByAgentIdV1: { v: 1, bindingsByAgentId: {
+                    agy: { v: 1, bindingsByServiceId: { antigravity: { source: 'connected', profileId: 'work' } } },
+                } },
+            },
+            connectedServicesFeatureEnabled: true, accountGroupsFeatureEnabled: true,
+        };
+        const saved = resolveNewSessionConnectedServicesBindingsForAgent({ ...params, agentOptionState: null });
+        expect(saved.connectedServicesBindingsPayload?.bindingsByServiceId.antigravity)
+            .toMatchObject({ source: 'connected', selection: 'profile', profileId: 'work' });
+        const native = resolveNewSessionConnectedServicesBindingsForAgent({ ...params, agentOptionState: {
+            connectedServicesBindingsByServiceId: { antigravity: { source: 'native' } },
+        } });
+        expect(native.connectedServicesBindingsPayload?.bindingsByServiceId.antigravity).toEqual({ source: 'native' });
+    });
+});
 
 describe('buildConnectedServicesBindingsPayload', () => {
     it('emits a group binding without using the stored fallback profile id', () => {

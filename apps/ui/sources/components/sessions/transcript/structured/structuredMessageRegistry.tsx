@@ -5,6 +5,7 @@ import { ReviewCommentsV1Schema } from '@/sync/domains/input/reviewComments/revi
 import { ReviewCommentsMessageCard } from '@/components/sessions/reviews/messages/ReviewCommentsMessageCard';
 import {
     DelegateOutputV1Schema,
+    ExecutionRunCompletionV1Schema,
     PlanOutputV1Schema,
     ParticipantMessageV1Schema,
     ReviewFindingsV1Schema,
@@ -27,6 +28,7 @@ import { ParticipantMessageCard } from '@/components/sessions/participants/messa
 import { SubagentLaunchMessageCard } from '@/components/sessions/subagents/messages/SubagentLaunchMessageCard';
 import { SubagentCommandMessageCard } from '@/components/sessions/subagents/messages/SubagentCommandMessageCard';
 import type { TranscriptInteraction } from '@/utils/sessions/deriveTranscriptInteraction';
+import { ExecutionRunCompletionMessageCard } from '@/components/sessions/runs/messages/ExecutionRunCompletionMessageCard';
 
 export type StructuredMessageKind =
     | 'participant_message.v1'
@@ -38,6 +40,7 @@ export type StructuredMessageKind =
     | 'review_follow_up.v1'
     | 'plan_output.v1'
     | 'delegate_output.v1'
+    | 'execution_run_completion.v1'
     | 'voice_agent_turn.v1'
     | 'session_synopsis.v1'
     | 'session_summary_shard.v1';
@@ -64,7 +67,7 @@ export type StructuredMessageRegistryEntry<T> = Readonly<{
 }>;
 
 // A structured card that quotes the message body only exists when the message carries one
-// (a `subagent_launch.v1` envelope can ride a tool call, which has no user text). Callers read
+// (a `subagent_launch.v1` envelope can ride a tool call, which has no user text). Text-message callers read
 // `renderStructuredMessage(...) != null` to decide whether the structured card *replaces* the
 // surrounding chrome, so that emptiness has to be decided here, before an element exists — a
 // card that returns null from its own body still yields a non-null element and would suppress
@@ -151,6 +154,11 @@ const structuredMessageRegistryEntries: readonly StructuredMessageRegistryEntry<
         render: (payload) => (
             <DelegateOutputMessageCard payload={payload} />
         ),
+    },
+    {
+        kind: 'execution_run_completion.v1',
+        schema: ExecutionRunCompletionV1Schema,
+        render: (payload) => <ExecutionRunCompletionMessageCard payload={payload} />,
     },
     {
         kind: 'voice_agent_turn.v1',

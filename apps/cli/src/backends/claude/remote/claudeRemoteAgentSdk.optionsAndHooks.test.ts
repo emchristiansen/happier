@@ -10,7 +10,12 @@ import {
 } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import { claudeRemoteAgentSdk } from './claudeRemoteAgentSdk';
 import { makeMode } from './claudeRemoteAgentSdk.testkit';
+import type { EnhancedMode } from '../loop';
+import type { Query } from '@anthropic-ai/claude-agent-sdk';
 import { resolveClaudeProjectId } from '../utils/path';
+import type { SessionWorkflowRunSnapshotV1 } from '@happier-dev/protocol';
+import { createClaudeWorkflowActivitySource } from '../workflows/claudeWorkflowActivitySource';
+import { completedNativeChildTranscript } from '../workflows/claudeWorkflowActivitySource.testkit';
 
 const ORIGINAL_CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
 
@@ -55,6 +60,47 @@ afterEach(() => {
 });
 
 describe('claudeRemoteAgentSdk options and hooks', () => {
+    it('projects an authenticated SDK SubagentStart into the exact completed workflow child', async () => {
+        let latest: SessionWorkflowRunSnapshotV1 | undefined;
+        const source = createClaudeWorkflowActivitySource({
+            backendId: 'claude', getCurrentClaudeSessionId: () => 'claude-session-1',
+            commitRecord: async (snapshot) => { latest = snapshot; }, writeHeadlines: () => {},
+        });
+        for (const row of completedNativeChildTranscript()) source.observeTranscriptMessage(row);
+        await source.flush();
+        expect(latest?.status).toBe('complete');
+        // The query is the external Agent SDK boundary; normalization, tracker and publisher stay real.
+        const createQuery = vi.fn((_params: any) => ({
+            async *[Symbol.asyncIterator]() {
+                await _params.options.hooks.SubagentStart[0].hooks[0]({
+                    hook_event_name: 'SubagentStart', agent_id: 'native-a', session_id: 'claude-session-1',
+                });
+                yield { type: 'result' };
+            },
+            close: vi.fn(), setPermissionMode: vi.fn(), setModel: vi.fn(), setMaxThinkingTokens: vi.fn(),
+            supportedCommands: vi.fn(async () => []), supportedModels: vi.fn(async () => []),
+        } as any));
+        let sent = false;
+        const onMessage = vi.fn();
+        try {
+            await claudeRemoteAgentSdk({
+                sessionId: null, transcriptPath: null, path: '/tmp', claudeArgs: [], claudeExecutablePath: '/tmp/claude',
+                canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }), isAborted: () => false,
+                nextMessage: async () => {
+                    if (sent) return null;
+                    sent = true;
+                    return { message: 'hello', mode: makeMode({ permissionMode: 'default' }) };
+                },
+                onReady: () => {}, onSessionFound: () => {}, onMessage,
+                onSessionHook: (data: unknown) => source.observeTranscriptMessage(data, { historicalReplay: false, authenticatedHook: true }),
+                createQuery,
+            });
+            await source.flush();
+            expect(latest?.agents.map(agent => [agent.id, agent.status])).toEqual([['a', 'active'], ['b', 'complete']]);
+            expect(latest?.status).toBe('active');
+            expect(onMessage.mock.calls.flat()).not.toContainEqual(expect.objectContaining({ hook_event_name: 'SubagentStart' }));
+        } finally { source.dispose(); }
+    });
     afterEach(() => {
         ensureJavaScriptRuntimeExecutableMock.mockReset();
         ensureJavaScriptRuntimeExecutableMock.mockResolvedValue('/managed/js-runtime');
@@ -268,13 +314,24 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         });
     });
 
-    it('passes effort when the mode specifies a reasoningEffort', async () => {
+    it.each([
+        { requestedModel: 'sonnet', runtimeModel: 'claude-sonnet-4-6', effort: 'low' },
+        { requestedModel: 'claude-opus-4-6', runtimeModel: 'claude-opus-4-6', effort: 'max' },
+    ])('passes effort when the mode specifies a reasoningEffort ($requestedModel/$effort)', async ({ requestedModel, runtimeModel, effort }) => {
         let capturedOptions: any = null;
+        const onEffectiveModel = vi.fn();
 
         const createQuery = vi.fn((_params: any) => {
             capturedOptions = _params.options;
             return {
                 async *[Symbol.asyncIterator]() {
+                    expect(onEffectiveModel).not.toHaveBeenCalled();
+                    yield { type: 'system', subtype: 'init', model: runtimeModel, session_id: 'effort-init' } as any;
+                    expect(onEffectiveModel).not.toHaveBeenCalled();
+                    yield { type: 'assistant', message: { role: 'assistant', model: runtimeModel,
+                        content: [{ type: 'text', text: 'Response' }] } };
+                    yield { type: 'assistant', message: { role: 'assistant', model: 'claude-next',
+                        content: [{ type: 'text', text: 'Next response' }] } };
                     yield { type: 'result' } as any;
                 },
                 close: vi.fn(),
@@ -292,7 +349,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             didSendFirst = true;
             return {
                 message: 'hello',
-                mode: makeMode({ permissionMode: 'default', model: 'claude-opus-4-6', reasoningEffort: 'max' } as any),
+                mode: makeMode({ permissionMode: 'default', model: requestedModel, reasoningEffort: effort }),
             };
         });
 
@@ -308,12 +365,15 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             onReady: () => {},
             onSessionFound: () => {},
             onMessage: () => {},
+            onEffectiveModel,
             createQuery,
         } as any);
 
         expect(capturedOptions).toBeTruthy();
-        expect(capturedOptions.model).toBe('claude-opus-4-6');
-        expect(capturedOptions.effort).toBe('max');
+        expect(capturedOptions.model).toBe(requestedModel);
+        expect(capturedOptions.effort).toBe(effort);
+        expect(onEffectiveModel).toHaveBeenCalledWith({ modelId: runtimeModel, reasoningEffort: effort });
+        expect(onEffectiveModel).toHaveBeenLastCalledWith({ modelId: 'claude-next' });
     });
 
     it('passes ultracode through the --settings extraArg for xhigh-capable models', async () => {
@@ -459,6 +519,68 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         expect(capturedOptions).toBeTruthy();
         expect(capturedOptions.model).toBe('claude-sonnet-4-6[1m]');
         expect(capturedOptions.effort).toBe('low');
+    });
+
+    it('suppresses the requested interrupt error while the replacement prompt awaits its own result', async () => {
+        type CreateQuery = NonNullable<Parameters<typeof claudeRemoteAgentSdk>[0]['createQuery']>;
+        let finishInput!: () => void;
+        const inputFinished = new Promise<void>((resolve) => { finishInput = resolve; });
+        let releaseReplacementResult!: () => void;
+        const replacementResultReady = new Promise<void>((resolve) => { releaseReplacementResult = resolve; });
+        let reachedInterruptedResult = false;
+        const interrupt = vi.fn(async () => {});
+        // The SDK control response can acknowledge interrupt before its separate result frame.
+        // Keep the real runner, prompt settlement and input iterable beneath that SDK boundary.
+        const createQuery = (({ prompt }: Parameters<CreateQuery>[0]) => ({
+            async *[Symbol.asyncIterator]() {
+                const input = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+                const first = await input.next();
+                if (first.done) throw new Error('Expected initial prompt');
+                yield { type: 'system', subtype: 'init', session_id: 'interrupted-session' };
+                const replacement = await input.next();
+                if (replacement.done) throw new Error('Expected replacement prompt');
+                // This older result's queue snapshot predates the replacement's submission.
+                yield { type: 'result', subtype: 'error_during_execution', session_id: 'interrupted-session',
+                    errors: ['Interrupted by user'], user_message_uuid: first.value.uuid, queued_turn_count: 0 };
+                reachedInterruptedResult = true;
+                await replacementResultReady;
+                yield { type: 'result', subtype: 'success', session_id: 'interrupted-session',
+                    result: 'Replacement answered', user_message_uuid: replacement.value.uuid, queued_turn_count: 0 };
+                await inputFinished;
+            },
+            interrupt,
+            close() { finishInput(); },
+        })) as unknown as CreateQuery;
+        const onReady = vi.fn();
+        const onCompletionEvent = vi.fn();
+        const prompts = [
+            { message: 'first', mode: makeMode(), userMessageLocalIds: ['first'] },
+            { message: 'replacement', mode: makeMode(), userMessageLocalIds: ['replacement'], pendingProviderAction: 'interrupt_and_send' as const },
+        ];
+        const runner = claudeRemoteAgentSdk({
+            sessionId: null, transcriptPath: null, path: '/tmp', claudeArgs: [], claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }), isAborted: () => false,
+            nextMessage: async () => {
+                const prompt = prompts.shift();
+                if (prompt) return prompt;
+                await inputFinished;
+                return null;
+            },
+            onReady, onCompletionEvent, onSessionFound: () => {}, onMessage: () => {}, createQuery,
+        });
+        void runner.catch(() => {});
+        try {
+            await vi.waitFor(() => { expect(reachedInterruptedResult).toBe(true); });
+            expect(interrupt).toHaveBeenCalledOnce();
+            expect(onReady).not.toHaveBeenCalled();
+            expect(onCompletionEvent.mock.calls.flat()).not.toContainEqual(expect.stringContaining('error_during_execution'));
+            releaseReplacementResult();
+            await vi.waitFor(() => { expect(onReady).toHaveBeenCalledOnce(); });
+        } finally {
+            releaseReplacementResult();
+            finishInput();
+            await runner;
+        }
     });
 
     it('exposes a turn interrupt handler that stops the active task via query.stopTask()', async () => {
@@ -1175,7 +1297,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         expect(updatedTranscript).toContain('"tool_use_id":"toolu_1"');
     });
 
-    it('omits effort when the mode specifies reasoningEffort=high (provider default)', async () => {
+    it('forwards explicit effort even when it equals the catalog default', async () => {
         let capturedOptions: any = null;
 
         const createQuery = vi.fn((_params: any) => {
@@ -1220,7 +1342,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
 
         expect(capturedOptions).toBeTruthy();
         expect(capturedOptions.model).toBe('claude-opus-4-6');
-        expect('effort' in capturedOptions ? capturedOptions.effort : undefined).toBeUndefined();
+        expect(capturedOptions.effort).toBe('high');
     });
 
     it('uses the resolved JavaScript runtime path instead of a raw node default', async () => {
@@ -1309,9 +1431,9 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
 
         expect(capturedOptions).toBeTruthy();
         expect(capturedOptions.settingSources).toEqual(['user', 'project', 'local']);
-        // When Happier resolves to 'default', we omit permissionMode from the Agent SDK options
-        // so the SDK honors the user's `permissions.defaultMode` from .claude/settings.json.
-        expect(capturedOptions).not.toHaveProperty('permissionMode');
+        // Agent SDK 0.2.123 converts an absent value to `--permission-mode default`, which
+        // overrides the user's settings. A runtime null is the SDK boundary's omit sentinel.
+        expect(capturedOptions.permissionMode).toBeNull();
     });
 
     it('forwards settingSources when explicitly set on the mode', async () => {
@@ -2175,6 +2297,131 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         }
     });
 
+    it('applies permission control while waiting for a prompt and unregisters it on teardown', async () => {
+        let finishQuery: () => void = () => {};
+        const queryFinished = new Promise<void>(resolve => { finishQuery = resolve; });
+        let releaseNextPrompt: () => void = () => {};
+        const nextPrompt = new Promise<null>(resolve => { releaseNextPrompt = () => resolve(null); });
+        type PermissionModeApplier = (permissionMode: EnhancedMode['permissionMode']) => Promise<void>;
+        let applyPermissionMode: PermissionModeApplier | null = null;
+        const getApplier = (): PermissionModeApplier | null => applyPermissionMode;
+        let finishFirstControl: () => void = () => {};
+        const firstControl = new Promise<void>(resolve => { finishFirstControl = resolve; });
+        const setPermissionMode = vi.fn(async () => {}).mockImplementationOnce(() => firstControl);
+        const createQuery: NonNullable<Parameters<typeof claudeRemoteAgentSdk>[0]['createQuery']> = () => ({
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'result' };
+                await queryFinished;
+            },
+            close: finishQuery,
+            setPermissionMode,
+            setModel: async () => {}, setMaxThinkingTokens: async () => {},
+            supportedCommands: async () => [], supportedModels: async () => [],
+        } as unknown as Query); // Only the consumed external SDK query boundary is replaced.
+        let sentInitial = false;
+        const opts = {
+            sessionId: null, transcriptPath: null, path: '/tmp', claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow' as const, updatedInput: {} }), isAborted: () => false,
+            nextMessage: async () => {
+                if (sentInitial) return nextPrompt;
+                sentInitial = true;
+                return { message: 'hello', mode: makeMode() };
+            },
+            onReady: () => {}, onSessionFound: () => {}, onMessage: () => {}, createQuery,
+            setPermissionModeApplier: (apply: typeof applyPermissionMode) => { applyPermissionMode = apply; },
+        };
+        const runner = claudeRemoteAgentSdk(opts);
+        try {
+            await vi.waitFor(() => expect(applyPermissionMode).toBeTypeOf('function'));
+            const apply = getApplier();
+            if (!apply) throw new Error('Expected registered permission mode control');
+            const bypass = apply('yolo');
+            const restore = apply('default');
+            await vi.waitFor(() => expect(setPermissionMode).toHaveBeenCalledWith('bypassPermissions'));
+            finishFirstControl();
+            await Promise.all([bypass, restore]);
+            expect(setPermissionMode).toHaveBeenCalledWith('bypassPermissions');
+            expect(setPermissionMode).toHaveBeenLastCalledWith('default');
+        } finally {
+            finishFirstControl();
+            releaseNextPrompt();
+            finishQuery();
+            await runner;
+        }
+        expect(applyPermissionMode).toBeNull();
+    });
+
+    it('holds a refused model prompt without metadata retries and permits a later model change', async () => {
+        type PermissionApplier = (permissionMode: EnhancedMode['permissionMode']) => Promise<void>;
+        let applyPermission: PermissionApplier | null = null;
+        const delivered: string[] = [];
+        const controls: string[] = [];
+        let controlsAfterMetadata: string[] = [];
+        const onAccepted = vi.fn();
+        const onFailure = vi.fn();
+        const onCompletionEvent = vi.fn();
+        const warn = vi.spyOn(logger, 'warnFile');
+        const createQuery: NonNullable<Parameters<typeof claudeRemoteAgentSdk>[0]['createQuery']> = ({ prompt }) => ({
+            async *[Symbol.asyncIterator]() {
+                if (typeof prompt === 'string') throw new Error('Expected streaming input');
+                for await (const message of prompt) {
+                    delivered.push(JSON.stringify(message.message.content));
+                    yield message;
+                    yield { type: 'result' };
+                }
+            },
+            close() {},
+            async setPermissionMode() {},
+            async setModel(model: string) {
+                controls.push(model);
+                if (model === 'rejected-model') throw new Error('Model validation timed out');
+            },
+            async setMaxThinkingTokens() {},
+            async supportedCommands() { return []; },
+            async supportedModels() { return []; },
+        } as unknown as Query); // The external SDK boundary consumes and acknowledges real runner input.
+        let promptIndex = 0;
+        try {
+            await claudeRemoteAgentSdk({
+                sessionId: null, transcriptPath: null, path: '/tmp', claudeExecutablePath: '/tmp/claude',
+                canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }), isAborted: () => false,
+                nextMessage: async () => {
+                    promptIndex += 1;
+                    if (promptIndex === 1) return {
+                        message: 'initial prompt', mode: makeMode({ model: 'original-model' }), userMessageLocalIds: ['initial'],
+                    };
+                    if (promptIndex === 2) return {
+                        message: 'must remain pending', mode: makeMode({ model: 'rejected-model' }), userMessageLocalIds: ['rejected'],
+                    };
+                    if (promptIndex === 3) {
+                        // Metadata wakes must apply permissions without retrying the refused model.
+                        await applyPermission?.('acceptEdits');
+                        await applyPermission?.('acceptEdits');
+                        controlsAfterMetadata = [...controls];
+                        return {
+                            message: 'recovered prompt', mode: makeMode({ model: 'working-model' }), userMessageLocalIds: ['recovered'],
+                        };
+                    }
+                    return null;
+                },
+                setPermissionModeApplier: (apply) => { applyPermission = apply; },
+                onReady: () => {}, onSessionFound: () => {}, onMessage: () => {}, createQuery,
+                onPromptAcceptedByProvider: onAccepted, onPromptTransportFailure: onFailure, onCompletionEvent,
+            });
+            expect(controlsAfterMetadata).toEqual(['rejected-model']);
+            expect(delivered).toHaveLength(2);
+            expect(delivered.join(' ')).not.toContain('must remain pending');
+            expect(onAccepted.mock.calls.map(([outcome]) => outcome.userMessageLocalIds)).toEqual([['initial'], ['recovered']]);
+            expect(onFailure).toHaveBeenCalledWith(expect.objectContaining({ kind: 'rejected_before_effect', userMessageLocalIds: ['rejected'] }));
+            expect(controls).toEqual(['rejected-model', 'working-model']);
+            expect(onCompletionEvent.mock.calls.flat().join(' ')).toContain('Model validation timed out');
+            expect(onCompletionEvent.mock.calls.flat().join(' ')).toContain('original-model');
+            expect(warn).toHaveBeenCalled();
+        } finally {
+            warn.mockRestore();
+        }
+    });
+
     it('applies live setModel, setPermissionMode, and setMaxThinkingTokens before the next queued message', async () => {
         const transcriptPath = await createMaterializedClaudeTranscript('session-runtime-settings');
         let response: any = null;
@@ -2298,7 +2545,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         }
     });
 
-    it('injects isolated XDG dirs so Claude Code does not contend with global version locks', async () => {
+    it('leaves unset XDG directories unset so Claude Code uses its native user caches', async () => {
         const transcriptPath = await createMaterializedClaudeTranscript('sess_1');
         const originals = {
             XDG_DATA_HOME: process.env.XDG_DATA_HOME,
@@ -2351,12 +2598,9 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             } as any);
 
             expect(capturedOptions?.env).toBeTruthy();
-            expect(typeof capturedOptions.env.XDG_DATA_HOME).toBe('string');
-            expect(typeof capturedOptions.env.XDG_CACHE_HOME).toBe('string');
-            expect(typeof capturedOptions.env.XDG_STATE_HOME).toBe('string');
-            expect(capturedOptions.env.XDG_DATA_HOME).toContain(join(configuration.activeServerDir, 'isolation'));
-            expect(capturedOptions.env.XDG_CACHE_HOME).toContain(join(configuration.activeServerDir, 'isolation'));
-            expect(capturedOptions.env.XDG_STATE_HOME).toContain(join(configuration.activeServerDir, 'isolation'));
+            expect(capturedOptions.env.XDG_DATA_HOME).toBeUndefined();
+            expect(capturedOptions.env.XDG_CACHE_HOME).toBeUndefined();
+            expect(capturedOptions.env.XDG_STATE_HOME).toBeUndefined();
         } finally {
             if (originals.XDG_DATA_HOME === undefined) delete process.env.XDG_DATA_HOME;
             else process.env.XDG_DATA_HOME = originals.XDG_DATA_HOME;
@@ -2423,32 +2667,49 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         }
     });
 
-    it('always sets allowDangerouslySkipPermissions so permission mode can escalate to bypassPermissions at runtime', async () => {
-        let capturedOptions: any = null;
+    it.each([
+        { uid: 1000, sandbox: undefined, bubblewrap: undefined, allowed: true },
+        { uid: 0, sandbox: undefined, bubblewrap: undefined, allowed: false },
+        { uid: 0, sandbox: '0', bubblewrap: 'true', allowed: false },
+        { uid: 0, sandbox: '1', bubblewrap: undefined, allowed: true },
+        { uid: 0, sandbox: undefined, bubblewrap: '1', allowed: true },
+    ])('pre-enables bypass only where Claude permits it ($uid/$sandbox/$bubblewrap)', async ({ uid, sandbox, bubblewrap, allowed }) => {
+        const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+        Object.defineProperty(process, 'platform', { ...platformDescriptor, value: 'linux' });
+        const uidDescriptor = Object.getOwnPropertyDescriptor(process, 'getuid');
+        const previousSandbox = process.env.IS_SANDBOX;
+        const previousBubblewrap = process.env.CLAUDE_CODE_BUBBLEWRAP;
+        Object.defineProperty(process, 'getuid', { configurable: true, value: () => uid });
+        if (sandbox === undefined) delete process.env.IS_SANDBOX;
+        else process.env.IS_SANDBOX = sandbox;
+        if (bubblewrap === undefined) delete process.env.CLAUDE_CODE_BUBBLEWRAP;
+        else process.env.CLAUDE_CODE_BUBBLEWRAP = bubblewrap;
+        try {
+            let capturedOptions: any = null;
 
-        const createQuery = vi.fn((_params: any) => {
-            capturedOptions = _params.options;
-            return {
-                async *[Symbol.asyncIterator]() {
-                    yield { type: 'result' } as any;
-                },
-                close: vi.fn(),
-                setPermissionMode: vi.fn(),
-                setModel: vi.fn(),
-                setMaxThinkingTokens: vi.fn(),
-                supportedCommands: vi.fn(async () => []),
-                supportedModels: vi.fn(async () => []),
-            } as any;
-        });
-
-        const runOnce = async (modeOverrides: any) => {
-            capturedOptions = null;
-            let didSendFirst = false;
-            const nextMessage = vi.fn(async () => {
-                if (didSendFirst) return null;
-                didSendFirst = true;
-                return { message: 'hello', mode: makeMode(modeOverrides) };
+            const createQuery = vi.fn((_params: any) => {
+                capturedOptions = _params.options;
+                return {
+                    async *[Symbol.asyncIterator]() {
+                        yield { type: 'result' } as any;
+                    },
+                    close: vi.fn(),
+                    setPermissionMode: vi.fn(),
+                    setModel: vi.fn(),
+                    setMaxThinkingTokens: vi.fn(),
+                    supportedCommands: vi.fn(async () => []),
+                    supportedModels: vi.fn(async () => []),
+                } as any;
             });
+
+            const runOnce = async (modeOverrides: any) => {
+                capturedOptions = null;
+                let didSendFirst = false;
+                const nextMessage = vi.fn(async () => {
+                    if (didSendFirst) return null;
+                    didSendFirst = true;
+                    return { message: 'hello', mode: makeMode(modeOverrides) };
+                });
 
                 await claudeRemoteAgentSdk({
                     sessionId: null,
@@ -2458,22 +2719,34 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
                     claudeExecutablePath: '/tmp/claude',
                     canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
                     isAborted: () => false,
-                nextMessage,
-                onReady: () => {},
-                onSessionFound: () => {},
-                onMessage: () => {},
-                createQuery,
-            } as any);
+                    nextMessage,
+                    onReady: () => {},
+                    onSessionFound: () => {},
+                    onMessage: () => {},
+                    createQuery,
+                } as any);
 
-            return capturedOptions;
-        };
+                return capturedOptions;
+            };
 
-        expect((await runOnce({ permissionMode: 'default' }))?.allowDangerouslySkipPermissions).toBe(true);
-        expect((await runOnce({ permissionMode: 'bypassPermissions' }))?.allowDangerouslySkipPermissions).toBe(true);
-        expect((await runOnce({ permissionMode: 'default', agentModeId: 'plan' }))?.allowDangerouslySkipPermissions).toBe(true);
+            for (const permissionMode of ['default', 'safe-yolo', 'acceptEdits', 'bypassPermissions'] as const) {
+                const options = await runOnce({ permissionMode });
+                expect(options?.allowDangerouslySkipPermissions).toBe(allowed);
+                expect(options?.permissionMode).toBe(permissionMode === 'default' ? null : permissionMode === 'safe-yolo' ? 'auto' : permissionMode);
+            }
+            expect((await runOnce({ permissionMode: 'default', agentModeId: 'plan' }))?.allowDangerouslySkipPermissions).toBe(allowed);
+        } finally {
+            Object.defineProperty(process, 'platform', platformDescriptor);
+            if (uidDescriptor) Object.defineProperty(process, 'getuid', uidDescriptor);
+            else Reflect.deleteProperty(process, 'getuid');
+            if (previousSandbox === undefined) delete process.env.IS_SANDBOX;
+            else process.env.IS_SANDBOX = previousSandbox;
+            if (previousBubblewrap === undefined) delete process.env.CLAUDE_CODE_BUBBLEWRAP;
+            else process.env.CLAUDE_CODE_BUBBLEWRAP = previousBubblewrap;
+        }
     });
 
-    it('omits permissionMode when Happier resolves to default, but passes it for non-default modes', async () => {
+    it('uses the Agent SDK omit sentinel when Happier resolves to default, but passes non-default modes', async () => {
         let capturedOptions: any = null;
 
         const createQuery = vi.fn((_params: any) => {
@@ -2516,13 +2789,20 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             return capturedOptions;
         };
 
-        // Default → no permissionMode key → SDK reads settings.json defaultMode
-        expect(await runOnce({ permissionMode: 'default' })).not.toHaveProperty('permissionMode');
+        // Default → null sentinel → no CLI flag → Claude reads settings.json defaultMode
+        expect((await runOnce({ permissionMode: 'default' }))?.permissionMode).toBeNull();
         // agentModeId === 'plan' still resolves to 'plan' (non-default), so it IS passed
         expect((await runOnce({ permissionMode: 'default', agentModeId: 'plan' }))?.permissionMode).toBe('plan');
         // Non-default explicit modes still forwarded
-        expect((await runOnce({ permissionMode: 'bypassPermissions' }))?.permissionMode).toBe('bypassPermissions');
-        expect((await runOnce({ permissionMode: 'acceptEdits' }))?.permissionMode).toBe('acceptEdits');
+        const bypass = await runOnce({ permissionMode: 'bypassPermissions' });
+        expect(bypass?.permissionMode).toBe('bypassPermissions');
+        expect(bypass?.extraArgs).toMatchObject({ 'dangerously-skip-permissions': null });
+        const planOverride = await runOnce({ permissionMode: 'bypassPermissions', agentModeId: 'plan' });
+        expect(planOverride?.permissionMode).toBe('plan');
+        expect(planOverride?.extraArgs?.['dangerously-skip-permissions']).toBeUndefined();
+        const acceptEdits = await runOnce({ permissionMode: 'acceptEdits' });
+        expect(acceptEdits?.permissionMode).toBe('acceptEdits');
+        expect(acceptEdits?.extraArgs?.['dangerously-skip-permissions']).toBeUndefined();
     });
 
     it('prefers CLI model overrides over mode.model', async () => {
@@ -3133,7 +3413,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
                 setPermissionMode: vi.fn(),
                 setModel: vi.fn(),
                 setMaxThinkingTokens: vi.fn(),
-                supportedCommands: vi.fn(async () => [{ command: '/compact', description: 'Compact context' }]),
+                supportedCommands: vi.fn(async () => [{ name: 'compact', description: 'Compact context', argumentHint: '' }]),
                 supportedModels: vi.fn(async () => [{ id: 'm1', displayName: 'Model 1' }]),
             } as any;
         });
@@ -3158,8 +3438,8 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
 
         expect(onCapabilities).toHaveBeenCalledWith(
             expect.objectContaining({
-                slashCommands: ['/compact'],
-                slashCommandDetails: [{ command: '/compact', description: 'Compact context' }],
+                slashCommands: ['compact'],
+                slashCommandDetails: [{ command: 'compact', description: 'Compact context' }],
             }),
         );
     });
@@ -3199,6 +3479,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
                         claudeRemoteAdvancedOptionsJson: JSON.stringify({
                             plugins: [{ type: 'local', path: '/tmp/plugin' }],
                             hooks: { SessionStart: [] },
+                            pathToClaudeCodeExecutable: null,
                         }),
                     }),
                 }),
@@ -3209,6 +3490,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             } as any);
 
             expect(capturedOptions?.plugins).toEqual([{ type: 'local', path: '/tmp/plugin' }]);
+            expect(capturedOptions?.pathToClaudeCodeExecutable).toBe('/tmp/claude');
             expect(capturedOptions?.hooks?.SessionStart?.[0]?.hooks?.length).toBe(1);
             expect(typeof capturedOptions?.debugFile).toBe('string');
             expect(capturedOptions?.debugFile).toMatch(/^\/tmp\/happier-claude-debug-artifacts\//);
@@ -3346,7 +3628,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             suppressOutput: true,
             hookSpecificOutput: {
                 hookEventName: 'PermissionRequest',
-                decision: { behavior: 'allow', updatedInput, updatedPermissions },
+                decision: { behavior: 'allow', updatedPermissions },
             },
         });
     });

@@ -10,7 +10,9 @@ export type AgentAuthProbeParser =
   | 'piEnvOnly'
   | 'copilotGhAuth'
   | 'kiroWhoamiJson'
-  | 'cursorAboutJson';
+  | 'cursorAboutJson'
+  | 'credentialSourceJson'
+  | 'devinAuthStatus';
 
 export type AgentAuthProbeBackgroundChecks = 'safe' | 'manual_only';
 
@@ -22,6 +24,18 @@ export type AgentAuthProbeConfig = Readonly<{
   backgroundChecks: AgentAuthProbeBackgroundChecks;
   envVars?: ReadonlyArray<string>;
   credentialPaths?: ReadonlyArray<string>;
+  jsonStatus?: Readonly<{
+    discriminator: Readonly<{ field: string; value: string }>;
+    sourceField: string;
+    requiredBooleanFields: ReadonlyArray<string>;
+    expiredField: string;
+    missingSource: string;
+    unconfiguredSource: string;
+    methods: ReadonlyArray<Readonly<{
+      source: string | RegExp;
+      method: 'api_key_env' | 'auth_token_env' | 'oauth_cli' | 'config_file' | 'unknown';
+    }>>;
+  }>;
 }>;
 
 export const AGENT_AUTH_PROBE_CONFIG: Readonly<Record<AgentId, AgentAuthProbeConfig>> = Object.freeze({
@@ -101,6 +115,14 @@ export const AGENT_AUTH_PROBE_CONFIG: Readonly<Record<AgentId, AgentAuthProbeCon
     parser: 'kiroWhoamiJson',
     backgroundChecks: 'manual_only',
   },
+  devin: {
+    agentId: 'devin',
+    binaryNames: [getProviderCliRuntimeSpec('devin').binaryName],
+    statusCommand: ['auth', 'status'],
+    parser: 'devinAuthStatus',
+    // The current CLI writes its log on startup, so do not invoke it as an ambient background probe.
+    backgroundChecks: 'manual_only',
+  },
   customAcp: {
     agentId: 'customAcp',
     binaryNames: [getProviderCliRuntimeSpec('customAcp').binaryName],
@@ -139,6 +161,57 @@ export const AGENT_AUTH_PROBE_CONFIG: Readonly<Record<AgentId, AgentAuthProbeCon
     parser: 'unknown',
     backgroundChecks: 'safe',
     envVars: ['XAI_API_KEY'],
+  },
+  agy: {
+    agentId: 'agy',
+    binaryNames: [getProviderCliRuntimeSpec('agy').binaryName],
+    statusCommand: null,
+    parser: 'unknown',
+    // Interactive `agy` auth is local-login backed; never probe it ambiently.
+    // The managed ACP server surface stays separate from this CLI identity.
+    backgroundChecks: 'manual_only',
+  },
+  fx: {
+    agentId: 'fx',
+    binaryNames: [getProviderCliRuntimeSpec('fx').binaryName],
+    statusCommand: ['status', '--json'],
+    parser: 'credentialSourceJson',
+    backgroundChecks: 'manual_only',
+    envVars: ['VERCEL_OIDC_TOKEN', 'AI_GATEWAY_API_KEY'],
+    // FX 0.0.14 / 1a070af32cdf: output_contracts.zig StatusSnapshot.
+    jsonStatus: {
+      discriminator: { field: 'kind', value: 'status' },
+      sourceField: 'auth',
+      requiredBooleanFields: ['auth_refreshable'],
+      expiredField: 'auth_expired',
+      missingSource: 'missing',
+      unconfiguredSource: 'host managed',
+      methods: [
+        { source: 'AI_GATEWAY_API_KEY', method: 'api_key_env' },
+        { source: 'VERCEL_OIDC_TOKEN', method: 'auth_token_env' },
+        { source: 'fx login', method: 'oauth_cli' },
+        { source: 'Codex subscription', method: 'oauth_cli' },
+        { source: 'Grok subscription', method: 'oauth_cli' },
+        { source: /^stored API key \([^\r\n]+\)$/u, method: 'unknown' },
+        { source: 'configured provider', method: 'config_file' },
+      ],
+    },
+  },
+  droid: {
+    agentId: 'droid',
+    binaryNames: [getProviderCliRuntimeSpec('droid').binaryName],
+    statusCommand: null,
+    parser: 'unknown',
+    backgroundChecks: 'manual_only',
+    envVars: ['FACTORY_API_KEY'],
+  },
+  codebuddy: {
+    agentId: 'codebuddy',
+    binaryNames: [getProviderCliRuntimeSpec('codebuddy').binaryName],
+    statusCommand: null,
+    parser: 'unknown',
+    backgroundChecks: 'manual_only',
+    envVars: ['CODEBUDDY_API_KEY'],
   },
 });
 

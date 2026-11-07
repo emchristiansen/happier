@@ -6,7 +6,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
-import { ensureTauriSigningKeyFile } from './ensure-signing-key-file.mjs';
+import { createTauriSignerFileEnv, ensureTauriSigningKeyFile } from './ensure-signing-key-file.mjs';
 import { extractTauriUpdaterSignature } from './notarize-macos-artifacts.mjs';
 import { resolveTauriSigningPrivateKeyPassword } from './resolve-signing-key-password.mjs';
 import { resolveYarnInvocation } from './resolve-yarn-invocation.mjs';
@@ -30,10 +30,9 @@ function listSignatureFiles(dir) {
 export function signUpdaterArtifacts(options, deps = {}) {
   const signingKeyValue = String(options.env.TAURI_SIGNING_PRIVATE_KEY ?? '').trim();
   if (!signingKeyValue) throw new Error('TAURI_SIGNING_PRIVATE_KEY is required');
-  const materializeSigningKey = deps.ensureSigningKeyFile ?? ensureTauriSigningKeyFile;
   const resolveYarn = deps.resolveYarnInvocation ?? resolveYarnInvocation;
   const runSigner = deps.runSigner ?? execFileSyncPortable;
-  const signingKeyPath = materializeSigningKey({ tmpRoot: options.tmpRoot, keyValue: signingKeyValue, dryRun: false });
+  const signingKeyPath = ensureTauriSigningKeyFile({ tmpRoot: options.tmpRoot, keyValue: signingKeyValue, dryRun: false });
   const password = resolveTauriSigningPrivateKeyPassword(options.env);
   const signatures = listSignatureFiles(options.searchDir);
   if (signatures.length === 0) throw new Error(`expected updater signatures under ${options.searchDir}`);
@@ -49,7 +48,7 @@ export function signUpdaterArtifacts(options, deps = {}) {
     const args = [...yarn.prefixArgs, '--silent', 'tauri', 'signer', 'sign', '--private-key-path', signingKeyPath];
     if (password) args.push('--password', password);
     args.push(artifactPath);
-    const stdout = runSigner(yarn.cmd, args, { cwd: options.uiDir, env: { ...options.env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], timeout: 10 * 60_000 });
+    const stdout = runSigner(yarn.cmd, args, { cwd: options.uiDir, env: createTauriSignerFileEnv(options.env), encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], timeout: 10 * 60_000 });
     const signature = extractTauriUpdaterSignature(stdout);
     if (!signature || !/^[A-Za-z0-9+/=]+$/u.test(signature)) throw new Error(`invalid updater signature for ${artifactPath}`);
     fs.writeFileSync(signaturePath, `${signature}\n`, 'utf8');

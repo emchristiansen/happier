@@ -344,6 +344,28 @@ describe('NewSessionSimplePanel keyboard scaffold integration', () => {
         }
     });
 
+    it('rests the floating composer above the Android navigation bar inset', async () => {
+        testState.platformOs = 'android';
+        const { NewSessionSimplePanel } = await import('./NewSessionSimplePanel');
+        let screen: Awaited<ReturnType<typeof renderScreen>> | undefined;
+
+        try {
+            // Edge-to-edge Android draws under the navigation bar, and three-button navigation is
+            // an opaque touch strip rather than an indicator the card may overlap.
+            screen = await renderScreen(
+                <NewSessionSimplePanel {...createFloatingPanelProps()} safeAreaBottom={48} />,
+            );
+
+            // 48 + 8 - 12: the card floats the floating tab bar's gap above the whole inset, less
+            // the 12 the composer wrapper already pads below the card. The side-margin rule would
+            // hand the scaffold 4 and seat the card inside the navigation bar.
+            const scaffoldRender = testState.scaffoldHarness?.getLastRender();
+            expect(scaffoldRender?.props.safeAreaBottom).toBe(44);
+        } finally {
+            act(() => { screen?.tree.unmount(); });
+        }
+    });
+
     it('keeps the platform bottom inset when the composer is not the floating presentation', async () => {
         testState.platformOs = 'web';
         const { NewSessionSimplePanel } = await import('./NewSessionSimplePanel');

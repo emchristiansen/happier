@@ -1,5 +1,6 @@
+import { getServerFetchUrl } from '@/dev/testkit/mocks/serverFetch';
 import React from 'react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react-test-renderer';
 import { renderSettingsView } from '@/dev/testkit';
 import { storage } from '@/sync/domains/state/storageStore';
@@ -17,7 +18,28 @@ import {
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-vi.mock('react-native-reanimated', () => ({}));
+vi.mock('react-native-reanimated', async () => {
+    const { createReanimatedModuleMock } = await import('@/dev/testkit/mocks/reanimated');
+    return createReanimatedModuleMock();
+});
+
+const settingMutableMock = vi.hoisted(() => ({
+    values: {} as Record<string, unknown>,
+    set: vi.fn((key: string, value: unknown) => {
+        settingMutableMock.values[key] = value;
+    }),
+}));
+
+vi.mock('@/sync/domains/state/storage', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/sync/domains/state/storage')>();
+    return {
+        ...actual,
+        useSettingMutable: (key: string) => [
+            settingMutableMock.values[key],
+            (value: unknown) => settingMutableMock.set(key, value),
+        ],
+    };
+});
 
 installAccountSettingsRouteModuleMocks();
 
@@ -61,6 +83,10 @@ function findEncryptionModeSwitches(screen: Awaited<ReturnType<typeof renderSett
     return screen.findAllByTestId('settings-account-encryption-mode-switch');
 }
 
+function findClientEncryptionRequirementSwitch(screen: Awaited<ReturnType<typeof renderSettingsView>>) {
+    return screen.findByTestId('settings-account-client-encryption-requirement-switch');
+}
+
 function createReachabilityProbeResponse(): { ok: true; status: 200; json: () => Promise<{ ok: true }> } {
     return {
         ok: true,
@@ -70,6 +96,16 @@ function createReachabilityProbeResponse(): { ok: true; status: 200; json: () =>
 }
 
 describe('Settings → Account (encryption mode toggle)', () => {
+    beforeEach(() => {
+        settingMutableMock.values = {
+            analyticsOptOut: false,
+            crashReportsOptOut: false,
+            clientEncryptionRequirementV1: 'follow_account',
+            clientEncryptionRequirementLocalV1: 'follow_account',
+        };
+        settingMutableMock.set.mockClear();
+    });
+
     afterEach(() => {
         vi.restoreAllMocks();
         vi.unstubAllGlobals();
@@ -86,7 +122,7 @@ describe('Settings → Account (encryption mode toggle)', () => {
         storage.getState().applyProfile({ ...profileDefaults, linkedProviders: [], username: null });
 
         const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = getRequestUrl(input);
+            const url = getServerFetchUrl(input).pathname;
             const method = (init?.method ?? 'GET').toUpperCase();
             if (url.endsWith('/health') && method === 'GET') {
                 return createReachabilityProbeResponse();
@@ -118,7 +154,7 @@ describe('Settings → Account (encryption mode toggle)', () => {
     });
 
     it('fetches + updates account encryption mode when enabled', async () => {
-        useFeatureEnabledMock.mockReturnValue(true);
+        useFeatureEnabledMock.mockImplementation((featureId: string) => featureId === 'encryption.accountOptOut');
         useAuthMock.mockReturnValue({
             isAuthenticated: true,
             credentials: { token: 't', secret: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
@@ -129,7 +165,7 @@ describe('Settings → Account (encryption mode toggle)', () => {
         storage.getState().replaceSettings({ analyticsOptOut: false } as any, 7);
 
         const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = getRequestUrl(input);
+            const url = getServerFetchUrl(input).pathname;
             const method = (init?.method ?? 'GET').toUpperCase();
             if (url.endsWith('/health') && method === 'GET') {
                 return createReachabilityProbeResponse();
@@ -193,8 +229,55 @@ describe('Settings → Account (encryption mode toggle)', () => {
         }
     });
 
+    it('stores both the synced preference and trusted local pin when E2EE is required', async () => {
+        useFeatureEnabledMock.mockImplementation((featureId: string) => featureId === 'encryption.accountOptOut');
+        useAuthMock.mockReturnValue({
+            isAuthenticated: true,
+            credentials: { token: 't', secret: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
+            logout: vi.fn(),
+            login: vi.fn(),
+        });
+        storage.getState().applyProfile({ ...profileDefaults, linkedProviders: [], username: null });
+        storage.getState().replaceSettings({
+            analyticsOptOut: false,
+            clientEncryptionRequirementV1: 'follow_account',
+            clientEncryptionRequirementLocalV1: 'follow_account',
+        } as any, 7);
+
+        const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = getServerFetchUrl(input).pathname;
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (url.endsWith('/health') || url.endsWith('/v1/auth/ping')) return createReachabilityProbeResponse();
+            if (isFeaturesRequest(url)) {
+                return { ok: true, json: async () => createAccountFeaturesResponse({ encryptionAccountOptOutEnabled: true }) };
+            }
+            if (url.endsWith('/v1/account/encryption') && method === 'GET') {
+                return { ok: true, json: async () => ({ mode: 'e2ee', updatedAt: 1 }) };
+            }
+            throw new Error(`Unexpected fetch: ${url} (${method})`);
+        });
+        vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+        const { default: AccountScreen } = await import('@/app/(app)/settings/account');
+        let screen: Awaited<ReturnType<typeof renderSettingsView>> | undefined;
+        try {
+            screen = await renderSettingsView(<AccountScreen />);
+            await act(async () => {});
+            const requirementSwitch = findClientEncryptionRequirementSwitch(screen);
+            if (!requirementSwitch) throw new Error('Expected client encryption requirement switch');
+            await act(async () => requirementSwitch.props.onValueChange(true));
+
+            expect(settingMutableMock.set.mock.calls).toEqual(expect.arrayContaining([
+                ['clientEncryptionRequirementLocalV1', 'require_e2ee'],
+                ['clientEncryptionRequirementV1', 'require_e2ee'],
+            ]));
+        } finally {
+            await screen?.unmount();
+        }
+    });
+
     it('shows an error alert when updating account encryption mode fails', async () => {
-        useFeatureEnabledMock.mockReturnValue(true);
+        useFeatureEnabledMock.mockImplementation((featureId: string) => featureId === 'encryption.accountOptOut');
         useAuthMock.mockReturnValue({
             isAuthenticated: true,
             credentials: { token: 't', secret: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
@@ -205,7 +288,7 @@ describe('Settings → Account (encryption mode toggle)', () => {
         storage.getState().replaceSettings({ analyticsOptOut: false } as any, 7);
 
         const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = getRequestUrl(input);
+            const url = getServerFetchUrl(input).pathname;
             const method = (init?.method ?? 'GET').toUpperCase();
             if (url.endsWith('/health') && method === 'GET') {
                 return createReachabilityProbeResponse();
@@ -263,7 +346,7 @@ describe('Settings → Account (encryption mode toggle)', () => {
     });
 
     it('enables e2ee on keyless credentials by generating a secret and migrating', async () => {
-        useFeatureEnabledMock.mockReturnValue(true);
+        useFeatureEnabledMock.mockImplementation((featureId: string) => featureId === 'encryption.accountOptOut');
         const loginSpy = vi.fn(async () => {});
         useAuthMock.mockReturnValue({
             isAuthenticated: true,
@@ -278,7 +361,7 @@ describe('Settings → Account (encryption mode toggle)', () => {
         const alertSpy = vi.spyOn(Modal, 'alertAsync').mockResolvedValue();
 
         const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = getRequestUrl(input);
+            const url = getServerFetchUrl(input).pathname;
             const method = (init?.method ?? 'GET').toUpperCase();
             if (url.endsWith('/health') && method === 'GET') {
                 return createReachabilityProbeResponse();
@@ -342,7 +425,7 @@ describe('Settings → Account (encryption mode toggle)', () => {
     });
 
     it('shows a restore-required message when enabling e2ee fails with invalid params on keyless credentials', async () => {
-        useFeatureEnabledMock.mockReturnValue(true);
+        useFeatureEnabledMock.mockImplementation((featureId: string) => featureId === 'encryption.accountOptOut');
         const loginSpy = vi.fn(async () => {});
         useAuthMock.mockReturnValue({
             isAuthenticated: true,
@@ -357,7 +440,7 @@ describe('Settings → Account (encryption mode toggle)', () => {
         const alertSpy = vi.spyOn(Modal, 'alertAsync').mockResolvedValue();
 
         const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = getRequestUrl(input);
+            const url = getServerFetchUrl(input).pathname;
             const method = (init?.method ?? 'GET').toUpperCase();
             if (url.endsWith('/health') && method === 'GET') {
                 return createReachabilityProbeResponse();

@@ -3,12 +3,60 @@ import { mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { spawnTestProcess } from '@/testkit/process/spawn';
+import { withTempDir } from '@/testkit/fs/tempDir';
+import { projectPath } from '@/projectPath';
+import { pathToFileURL } from 'node:url';
 
 import { describe, expect, it, vi } from 'vitest';
 
 const require = createRequire(import.meta.url);
 
 describe('terminal_launch_spec_runner.cjs', () => {
+  it('reports controller-loss cleanup failure with a fixed diagnostic, without native launch values', async () => {
+    const mod = require('./terminal_launch_spec_runner.cjs') as {
+      runLaunchSpec: (spec: { command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv }, signal: AbortSignal) => Promise<number>;
+    };
+    const controller = new AbortController();
+    const previousPath = process.env.PATH;
+    let ownedPid: number | undefined;
+    let stderr = '';
+    const consoleError = vi.spyOn(console, 'error').mockImplementation((...values: unknown[]) => {
+      stderr += values.map(String).join(' ') + '\n';
+    });
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      const text = String(chunk);
+      stderr += text;
+      const ready = text.match(/guardian-ready:(\d+)/);
+      if (ready) {
+        ownedPid = Number(ready[1]);
+        // Genuine OS discovery failure in the surviving launcher, after native startup.
+        process.env.PATH = '';
+        controller.abort();
+      }
+      return true;
+    });
+    try {
+      await mod.runLaunchSpec({
+        command: process.execPath,
+        args: ['-e', 'process.stderr.write("guardian-ready:" + process.pid + "\\n"); setInterval(() => {}, 1000)', 'private-native-value'],
+        cwd: tmpdir(),
+        env: { ...process.env, PRIVATE_NATIVE_VALUE: 'private-native-value' },
+      }, controller.signal);
+      expect(ownedPid).toBeGreaterThan(0);
+      expect(stderr).toContain('terminal_controller_cleanup_incomplete');
+      expect(stderr).not.toContain('private-native-value');
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      stderrWrite.mockRestore();
+      consoleError.mockRestore();
+      if (ownedPid) {
+        try { process.kill(ownedPid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  });
+
   it('reads Windows verbatim argument handling and rejects malformed values', async () => {
     const mod = require('./terminal_launch_spec_runner.cjs') as {
       readLaunchSpecFile: (specPath: string) => Promise<{ windowsVerbatimArguments?: boolean }>;
@@ -46,6 +94,122 @@ describe('terminal_launch_spec_runner.cjs', () => {
       await rm(workDir, { recursive: true, force: true });
     }
   });
+
+  it('keeps a full prompt file readable by the child and removes it after termination', async () => {
+    const mod = require('./terminal_launch_spec_runner.cjs') as {
+      runLaunchSpecFile: (path: string) => Promise<number>;
+    };
+    const specDir = await mkdtemp(join(tmpdir(), 'happier-terminal-launch-spec-test-'));
+    const promptDir = await mkdtemp(join(tmpdir(), 'happier-claude-system-prompt-'));
+    const promptPath = join(promptDir, 'text-artifact.txt');
+    const workDir = await mkdtemp(join(tmpdir(), 'happier-prompt-observation-'));
+    const outputPath = join(workDir, 'observed.txt');
+    const specPath = join(specDir, 'launch.json');
+    const prompt = `  ${'λ'.repeat(80_000)}\n`;
+    await writeFile(promptPath, prompt, { mode: 0o600 });
+    await writeFile(specPath, JSON.stringify({
+      command: process.execPath,
+      args: ['-e', 'const fs = require("node:fs"); fs.writeFileSync(process.argv[2], fs.readFileSync(process.argv[1]));', promptPath, outputPath],
+      cwd: tmpdir(), env: {}, cleanupPaths: [promptPath],
+    }), { mode: 0o600 });
+    try {
+      await expect(mod.runLaunchSpecFile(specPath)).resolves.toBe(0);
+      await expect(readFile(outputPath, 'utf8')).resolves.toBe(prompt);
+      expect(existsSync(promptPath)).toBe(false);
+      expect(existsSync(promptDir)).toBe(false);
+    } finally {
+      await rm(promptDir, { recursive: true, force: true });
+      await rm(workDir, { recursive: true, force: true });
+      await rm(specDir, { recursive: true, force: true });
+    }
+  });
+
+  it('retains the handed-off prompt when its preparing wrapper exits before the runner starts', async () => {
+    await withTempDir('happier-terminal-handoff-', async (directory) => {
+      const specPath = join(directory, 'launch.json');
+      const outputPath = join(directory, 'observed.txt');
+      const prompt = '  retained wrapper handoff prompt\n';
+      const helperUrl = pathToFileURL(join(projectPath(), 'src/backends/claude/utils/materializeClaudeSystemPromptArgsForSpawn.ts')).href;
+      const wrapper = spawnTestProcess(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', `
+        import { writeFileSync } from 'node:fs';
+        import { materializeClaudeSystemPromptArgsForSpawn } from ${JSON.stringify(helperUrl)};
+        const prepared = await materializeClaudeSystemPromptArgsForSpawn(['--append-system-prompt', ${JSON.stringify(prompt)}]);
+        writeFileSync(${JSON.stringify(specPath)}, JSON.stringify({
+          command: process.execPath,
+          args: ['-e', 'const fs = require("node:fs"); fs.writeFileSync(process.argv[2], fs.readFileSync(process.argv[1]));', prepared.cleanupPaths[0], ${JSON.stringify(outputPath)}],
+          cwd: ${JSON.stringify(directory)}, env: {}, cleanupPaths: prepared.cleanupPaths,
+        }));
+        process.exit(0);
+      `], { cwd: projectPath() });
+      await new Promise<void>((resolve) => { wrapper.once('close', () => resolve()); });
+      expect(wrapper.exitCode).toBe(0);
+      const spec = JSON.parse(await readFile(specPath, 'utf8')) as { cleanupPaths: string[] };
+      const promptPath = spec.cleanupPaths[0]!;
+      try {
+        await expect(readFile(promptPath, 'utf8')).resolves.toBe(prompt);
+        const runner = spawnTestProcess(process.execPath, [require.resolve('./terminal_launch_spec_runner.cjs'), specPath]);
+        await new Promise<void>((resolve) => { runner.once('close', () => resolve()); });
+        expect(runner.exitCode).toBe(0);
+        await expect(readFile(outputPath, 'utf8')).resolves.toBe(prompt);
+        expect(existsSync(dirname(promptPath))).toBe(false);
+      } finally {
+        await rm(dirname(promptPath), { recursive: true, force: true });
+      }
+    });
+  });
+
+  it.skipIf(process.platform === 'win32').each(['SIGTERM', 'SIGHUP'] as const)(
+    'forwards %s and removes the prompt only after the retained child terminates',
+    async (signal) => {
+      await withTempDir('happier-terminal-signal-', async (directory) => {
+        const promptDirectory = await mkdtemp(join(tmpdir(), 'happier-claude-system-prompt-'));
+        const promptPath = join(promptDirectory, 'text-artifact.txt');
+        const readyPath = join(directory, 'ready.json');
+        const observedPath = join(directory, 'observed.txt');
+        const releasePath = join(directory, 'release');
+        const prompt = '  terminal runner signal prompt\n';
+        await writeFile(promptPath, prompt, { mode: 0o600 });
+        const source = `
+          const fs = require('node:fs');
+          for (const signal of ['SIGTERM', 'SIGHUP']) process.on(signal, () => {
+            fs.writeFileSync(${JSON.stringify(observedPath)}, fs.readFileSync(${JSON.stringify(promptPath)}));
+          });
+          fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ pid: process.pid }));
+          setInterval(() => {
+            if (fs.existsSync(${JSON.stringify(releasePath)})) process.exit(0);
+          }, 10);
+        `;
+        const specPath = join(directory, 'launch.json');
+        await writeFile(specPath, JSON.stringify({
+          command: process.execPath, args: ['-e', source], cwd: directory,
+          env: {}, cleanupPaths: [promptPath],
+        }));
+        const runner = spawnTestProcess(process.execPath, [require.resolve('./terminal_launch_spec_runner.cjs'), specPath]);
+        const closed = new Promise<void>((resolve) => { runner.once('close', () => resolve()); });
+        let childPid: number | undefined;
+        try {
+          await expect.poll(async () => {
+            try { childPid = JSON.parse(await readFile(readyPath, 'utf8')).pid; return true; } catch { return false; }
+          }).toBe(true);
+          runner.kill(signal);
+          await expect.poll(async () => {
+            try { return await readFile(observedPath, 'utf8'); } catch { return ''; }
+          }).toBe(prompt);
+          expect(runner.signalCode).toBe(null);
+          await expect(readFile(promptPath, 'utf8')).resolves.toBe(prompt);
+          await writeFile(releasePath, '');
+          await closed;
+          expect(runner.signalCode).toBe(signal);
+          expect(existsSync(promptDirectory)).toBe(false);
+        } finally {
+          if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch {} }
+          if (runner.exitCode === null && runner.signalCode === null) runner.kill('SIGKILL');
+          await closed;
+          await rm(promptDirectory, { recursive: true, force: true });
+        }
+      });
+    },
+  );
 
   it('runs a launch spec, forwards cwd/env/args, and removes the spec directory after reading', async () => {
     const mod = require('./terminal_launch_spec_runner.cjs') as {

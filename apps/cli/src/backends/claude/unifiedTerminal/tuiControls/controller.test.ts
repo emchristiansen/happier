@@ -38,7 +38,7 @@ const IDLE = ['╭─────╮', '│ >   │', '╰─────╯', '
 const ACCEPT = ['╭─────╮', '│ >   │', '╰─────╯', '  ⏵⏵ accept edits on (shift+tab to cycle)'].join('\n');
 const MODEL_OK = ['Set model to Sonnet 4.6 and saved as your default', '╭─────╮', '│ >   │', '╰─────╯'].join('\n');
 const EFFORT_OK = ['Set reasoning effort to high', '╭─────╮', '│ >   │', '╰─────╯'].join('\n');
-const GENERATING = ['● working', '✶ Forging… (10s · esc to interrupt)'].join('\n');
+const GENERATING = ['● working', '✶ Forging… (10s · esc to interrupt)', '  ⏸ manual'].join('\n');
 
 describe('createClaudeUnifiedTuiControlController — ordering and aggregation', () => {
   it('applies model → effort → permission mode in order and lets the prompt proceed', async () => {
@@ -88,6 +88,17 @@ describe('createClaudeUnifiedTuiControlController — ordering and aggregation',
 
 describe('createClaudeUnifiedTuiControlController — ultracode (session-only setting)', () => {
   const ULTRACODE_OK = ['Set effort level to ultracode', '╭─────╮', '│ >   │', '╰─────╯'].join('\n');
+
+  it('does not reuse effort verification across an Ultracode control', async () => {
+    const port = createFakeControlPort({ captures: [IDLE, IDLE, ULTRACODE_OK, IDLE, IDLE, EFFORT_OK] });
+    const controller = await controllerFor(port);
+    controller.reconcileFromStatusline({ model: 'claude-opus-4-7', reasoningEffort: 'high' });
+
+    await controller.applyDesiredRuntimeConfig({ desired: { ultracode: true } });
+    expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('ultracode');
+    await controller.applyDesiredRuntimeConfig({ desired: { reasoningEffort: 'high' } });
+    expect(port.sentLiteral).toContain('/effort high');
+  });
 
   it('applies ultracode via /effort ultracode under the launchOption change key', async () => {
     const port = createFakeControlPort({ captures: [IDLE, IDLE, ULTRACODE_OK] });
@@ -195,6 +206,22 @@ describe('createClaudeUnifiedTuiControlController — ultracode (session-only se
 });
 
 describe('createClaudeUnifiedTuiControlController — prompt gating', () => {
+  it('keeps mode-dependent prompts gated while the footer is clipped and retries the pending control when visible', async () => {
+    const cropped = ['────────────────────', '❯ ', '────────────────────', '  Opus 5.5'].join('\n');
+    const port = createFakeControlPort({ captures: [cropped, ACCEPT] });
+    const controller = await controllerFor(port);
+
+    const blocked = await controller.applyDesiredRuntimeConfig({ desired: { permissionMode: 'acceptEdits' }, reason: 'before_prompt' });
+    expect(blocked.promptMayProceed).toBe(false);
+    expect(blocked.changes[0]).toMatchObject({ reason: 'permission_mode_not_visible', timing: 'queued_until_safe_window' });
+    expect(port.sentKeys).toEqual([]);
+
+    const retry = await controller.applyDesiredRuntimeConfig({ desired: {}, reason: 'before_prompt' });
+    expect(retry.promptMayProceed).toBe(true);
+    expect(retry.changes[0]).toMatchObject({ key: 'permissionMode', status: 'applied', effective: 'acceptEdits' });
+    expect(port.sentKeys).toEqual([]);
+  });
+
   it('blocks the prompt when a required control fails (B7, C7)', async () => {
     // The command never leaves the slash picker (genuinely not delivered). A clean composer with a
     // missing confirmation is no longer a definitive failure (L2: delivered-but-unverified).
@@ -568,14 +595,44 @@ describe('createClaudeUnifiedTuiControlController — reconcileFromStatusline (l
     expect(port.captureCount()).toBe(0);
   });
 
-  it('ignores absent fields (haiku omits effort) and a fully-empty update is a no-op', async () => {
+  it.each(['statusline', 'prompt_metadata', 'native_control'] as const)(
+    'verifies effort again after a model change from %s',
+    async (source) => {
+      const port = createFakeControlPort({
+        captures: [
+          ...(source === 'native_control' ? [IDLE, IDLE, MODEL_OK] : []),
+          IDLE, IDLE, EFFORT_OK,
+        ],
+      });
+      const controller = await controllerFor(port);
+      controller.reconcileFromStatusline({ model: 'claude-opus-4-7', reasoningEffort: 'high' });
+
+      if (source === 'statusline') {
+        controller.reconcileFromStatusline({ model: 'sonnet' });
+      } else if (source === 'prompt_metadata') {
+        controller.reconcileAfterProviderPromptSubmit({ model: 'sonnet' });
+      } else {
+        const changed = await controller.applyDesiredRuntimeConfig({ desired: { model: 'sonnet' } });
+        expect(changed.status).toBe('applied');
+      }
+
+      expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBeNull();
+      const outcome = await controller.applyDesiredRuntimeConfig({ desired: { reasoningEffort: 'high' } });
+      expect(outcome.status).toBe('applied');
+      expect(outcome.changes[0]?.timing).not.toBe('skipped_already_effective');
+      expect(port.sentLiteral).toContain('/effort high');
+    },
+  );
+
+  it('preserves effort on same-model updates and a fully-empty update is a no-op', async () => {
     const port = createFakeControlPort({ captures: [IDLE] });
     const controller = await controllerFor(port);
-    controller.reconcileAfterProviderPromptSubmit({ reasoningEffort: 'high', permissionMode: 'acceptEdits' });
+    controller.reconcileFromStatusline({ model: 'claude-sonnet-4-6', reasoningEffort: 'high' });
+    controller.reconcileAfterProviderPromptSubmit({ permissionMode: 'acceptEdits' });
 
-    controller.reconcileFromStatusline({ model: 'claude-haiku-4-5' });
+    controller.reconcileFromStatusline({ model: 'claude-sonnet-4-6' });
     expect(controller.getLastVerifiedRuntimeConfig()).toMatchObject({
-      model: 'claude-haiku-4-5',
+      model: 'claude-sonnet-4-6',
       reasoningEffort: 'high',
       modeMarker: 'acceptEdits',
     });

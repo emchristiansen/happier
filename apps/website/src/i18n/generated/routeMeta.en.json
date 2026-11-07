@@ -145,5 +145,12 @@
     "ogTitle": "Self-host the Happier relay behind your own SSO",
     "ogDescription": "A relay you host, locked to your GitHub org or OIDC groups, with client certificates, offboarding re-checks and a storage policy you choose. MIT-licensed, all of it.",
     "ogImageAlt": "The Happier wordmark over the words: One client for every AI coding agent."
+  },
+  "/download": {
+    "title": "Download Happier — desktop, mobile and the CLI",
+    "description": "Get Happier for macOS on Apple Silicon or Intel, Windows and Linux, the iOS and Android apps, the APK, or the one-line CLI installer — in one place.",
+    "ogTitle": "Download Happier for every device",
+    "ogDescription": "The desktop app for macOS, Windows and Linux, the mobile apps for iOS and Android, and the CLI that runs the agents on your own computer. One page, every build.",
+    "ogImageAlt": "The Happier wordmark over the words: One client for every AI coding agent."
   }
 }

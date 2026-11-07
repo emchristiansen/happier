@@ -32,6 +32,23 @@ async function scrollConnectedTestIdIntoView(
   throw new Error(`missing connected ${testId}`);
 }
 
+async function revealSessionReorderHandle(page: Page, sourceTestId: string): Promise<void> {
+  const sourceContainer = page.getByTestId(sourceTestId);
+  await sourceContainer.getByTestId('session-item-right-area').hover();
+  await sourceContainer.getByTestId('session-item-reorder-handle').waitFor({ state: 'visible' });
+}
+
+async function resolveDragActivationPoint(
+  page: Page,
+  source: Readonly<{ x: number; y: number }>,
+  distance: number,
+): Promise<Readonly<{ x: number; y: number }>> {
+  const height = page.viewportSize()?.height ?? await page.evaluate(() => window.innerHeight);
+  // Lift toward the viewport interior so a source just above the floating
+  // footer does not move onto that overlay before its pan gesture activates.
+  return { x: source.x + 2, y: source.y + (source.y < height / 2 ? distance : -distance) };
+}
+
 async function dispatchSessionTreePointerDrag(page: Page, params: Readonly<{
   sourceTestId: string;
   sourceChildTestId?: string;
@@ -39,11 +56,14 @@ async function dispatchSessionTreePointerDrag(page: Page, params: Readonly<{
   targetEdge: 'top' | 'middle' | 'bottom';
   scrollDuringDrag?: 'target-into-view' | 'autoscroll-bottom';
 }>): Promise<DragDispatchResult> {
-  await scrollConnectedTestIdIntoView(page, params.sourceTestId);
-  await page.getByTestId(params.sourceTestId).hover().catch(() => undefined);
-
   if (!params.scrollDuringDrag) {
     await scrollConnectedTestIdIntoView(page, params.targetTestId);
+  }
+  await scrollConnectedTestIdIntoView(page, params.sourceTestId);
+  if (params.sourceChildTestId === 'session-item-reorder-handle') {
+    await revealSessionReorderHandle(page, params.sourceTestId);
+  } else {
+    await page.getByTestId(params.sourceTestId).hover();
   }
 
   const scrollMetricsBefore = await page.evaluate((sourceTestId) => {
@@ -135,13 +155,16 @@ async function dispatchSessionTreePointerDrag(page: Page, params: Readonly<{
   };
 
   const sourcePoint = pointForBox(sourceBox, 'middle');
+  const activationPoint = await resolveDragActivationPoint(page, sourcePoint, 10);
   await page.mouse.move(sourcePoint.x, sourcePoint.y);
   await page.mouse.down({ button: 'left' });
   await page.waitForTimeout(35);
-  await page.mouse.move(sourcePoint.x + 2, sourcePoint.y + 10);
+  await page.mouse.move(activationPoint.x, activationPoint.y);
   await page.waitForTimeout(35);
 
-  if (params.scrollDuringDrag === 'target-into-view') {
+  // Revealing/hovering the source can scroll a previously visible target out
+  // of the list. Reveal it with the pointer held before sampling drop geometry.
+  if (params.scrollDuringDrag !== 'autoscroll-bottom') {
     await scrollConnectedTestIdIntoView(page, params.targetTestId);
     await page.waitForTimeout(80);
   } else if (params.scrollDuringDrag === 'autoscroll-bottom' && scrollMetricsBefore.rect) {
@@ -307,11 +330,11 @@ export async function dragSessionWithGeometryProbe(page: Page, params: Readonly<
 }>): Promise<DragGeometryProbe> {
   const sourceTestId = `session-list-item-${params.sessionId}`;
   await scrollConnectedTestIdIntoView(page, sourceTestId);
-  await page.getByTestId(sourceTestId).hover();
+  await revealSessionReorderHandle(page, sourceTestId);
   if (params.preScroll === 'target-into-view') {
     await scrollConnectedTestIdIntoView(page, params.targetTestId);
     await scrollConnectedTestIdIntoView(page, sourceTestId);
-    await page.getByTestId(sourceTestId).hover();
+    await revealSessionReorderHandle(page, sourceTestId);
   }
 
   const scrollTopBefore = await page.evaluate((sourceTestId) => {
@@ -399,10 +422,11 @@ export async function dragSessionWithGeometryProbe(page: Page, params: Readonly<
   };
 
   const sourcePoint = pointForBox(sourceBox, 'middle');
+  const activationPoint = await resolveDragActivationPoint(page, sourcePoint, 12);
   await page.mouse.move(sourcePoint.x, sourcePoint.y);
   await page.mouse.down({ button: 'left' });
   await page.waitForTimeout(40);
-  await page.mouse.move(sourcePoint.x + 2, sourcePoint.y + 12);
+  await page.mouse.move(activationPoint.x, activationPoint.y);
   await page.waitForTimeout(40);
 
   // Scroll the target into view AFTER the drag lifts so the probe matches the
@@ -661,7 +685,7 @@ export async function beginSteppedSessionDrag(page: Page, params: Readonly<{
 }>): Promise<SteppedSessionDrag> {
   const sourceTestId = `session-list-item-${params.sessionId}`;
   await scrollConnectedTestIdIntoView(page, sourceTestId);
-  await page.getByTestId(sourceTestId).hover();
+  await revealSessionReorderHandle(page, sourceTestId);
 
   const sourceHandle = page
     .getByTestId(sourceTestId)
@@ -682,16 +706,17 @@ export async function beginSteppedSessionDrag(page: Page, params: Readonly<{
   });
 
   const sourcePoint = pointForBox(sourceBox, 'middle');
+  const activationPoint = await resolveDragActivationPoint(page, sourcePoint, 12);
   await page.mouse.move(sourcePoint.x, sourcePoint.y);
   await page.mouse.down({ button: 'left' });
   await page.waitForTimeout(40);
   // Move past the activation threshold so the drag lifts and the snapshot
   // freezes.
-  await page.mouse.move(sourcePoint.x + 2, sourcePoint.y + 12);
+  await page.mouse.move(activationPoint.x, activationPoint.y);
   await page.waitForTimeout(60);
   await page.waitForTimeout(80);
 
-  let currentPoint = { x: sourcePoint.x + 2, y: sourcePoint.y + 12 };
+  let currentPoint = activationPoint;
 
   return {
     moveOverTarget: async (targetTestId, edge) => {

@@ -1,3 +1,4 @@
+import { matchServerFetchUrl } from '@/dev/testkit/mocks/serverFetch';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { AuthCredentials } from '@/auth/storage/tokenStorage';
@@ -43,7 +44,7 @@ describe('apiConnectedServicesQuotasV2', () => {
         status: 200,
         json: async () => ({
           sealed: { format: 'account_scoped_v1', ciphertext: 'cipher' },
-          metadata: { fetchedAt: 1, staleAfterMs: 2, status: 'ok' },
+          metadata: { fetchedAt: 1, staleAfterMs: 2, status: 'error', refreshRequestedAt: 9, refreshErrorAt: 8 },
         }),
       };
     });
@@ -52,8 +53,9 @@ describe('apiConnectedServicesQuotasV2', () => {
     const { getConnectedServiceQuotaSnapshotSealed } = await import('./apiConnectedServicesQuotasV2');
     const res = await getConnectedServiceQuotaSnapshotSealed(credentials, { serviceId: 'openai-codex', profileId: 'work' });
     expect(res?.sealed?.ciphertext).toBe('cipher');
+    expect(res?.metadata).toMatchObject({ fetchedAt: 1, status: 'error', refreshRequestedAt: 9, refreshErrorAt: 8 });
     expect(fetchMock).toHaveBeenCalledWith(
-      'https://api.example.test/v2/connect/openai-codex/profiles/work/quotas',
+      matchServerFetchUrl('https://api.example.test/v2/connect/openai-codex/profiles/work/quotas'),
       expect.objectContaining({ method: 'GET', headers: expect.any(Headers) }),
     );
   });
@@ -66,7 +68,7 @@ describe('apiConnectedServicesQuotasV2', () => {
       if (url === 'https://api.example.test/health' || url === 'https://api.example.test/v1/auth/ping') {
         return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true }) });
       }
-      if (url === 'https://api.example.test/v2/connect/openai-codex/profiles/work/quotas') {
+      if (matchServerFetchUrl('https://api.example.test/v2/connect/openai-codex/profiles/work/quotas').asymmetricMatch(url)) {
         requestSignal = init?.signal ?? undefined;
         return new Promise<Response>(() => {});
       }
@@ -129,7 +131,7 @@ describe('apiConnectedServicesQuotasV2', () => {
     const ok = await requestConnectedServiceQuotaSnapshotRefresh(credentials, { serviceId: 'openai-codex', profileId: 'work' });
     expect(ok).toBe(true);
     expect(fetchMock).toHaveBeenCalledWith(
-      'https://api.example.test/v2/connect/openai-codex/profiles/work/quotas/refresh',
+      matchServerFetchUrl('https://api.example.test/v2/connect/openai-codex/profiles/work/quotas/refresh'),
       expect.objectContaining({ method: 'POST', headers: expect.any(Headers) }),
     );
   });

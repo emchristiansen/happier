@@ -9,12 +9,10 @@ import {
     subscribeSessionDraft,
     type ExistingSessionDraftProjection,
 } from '@/sync/ops/sessionDrafts/sessionDraftRepository';
-import type { SessionListViewItem } from '@/sync/domains/session/listing/sessionListViewData';
 import {
     createSessionListRowStoreStateSelector,
     selectSessionListRowStateSnapshot,
 } from '@/sync/store/sessionListRowStateSnapshot';
-import type { DropdownMenuItem } from '@/components/ui/forms/dropdown/DropdownMenu';
 import type { TreeDropOverlaySharedValues } from '@/components/ui/treeDragDrop';
 import type {
     RegisterSessionListTreeRowBounds,
@@ -22,7 +20,7 @@ import type {
 } from '../SessionListHeaderFrame';
 import type {
     UseSessionInlineDragCancelEvent,
-    UseSessionInlineDragDropResultEvent,
+    UseSessionInlineDragParams,
     UseSessionInlineDragResolveDropResultEvent,
     UseSessionInlineDragResolvedDrop,
 } from '../useSessionInlineDrag';
@@ -34,7 +32,7 @@ import {
 import {
     buildCachedSessionListRowModel,
     createSessionListRowModelsCache,
-    resolveSessionListRowModelAdjacency,
+    type SessionListRowModelAdjacency,
 } from './buildSessionListRowModels';
 import { SessionListRow } from './SessionListRow';
 import type {
@@ -44,42 +42,41 @@ import type {
 } from './sessionListRowModelTypes';
 import type { SessionListRowStoreSubscriptionMode } from './sessionListVisibleRowStoreScopes';
 import type { SessionItemProps } from '../SessionItem';
+import type { SessionWorkspacePresentationMetadata } from '@/sync/domains/session/listing/sessionWorkspacePresentation';
 
 const EMPTY_SESSION_LIST_ROW_STORE_STATE: SessionListRowStoreState = Object.freeze({});
-const EMPTY_FOLDER_MOVE_MENU_ITEMS: readonly DropdownMenuItem[] = Object.freeze([]);
 
 type SessionListRowMoveActionHandlers = Readonly<{
     onMoveDown?: () => void;
     onMoveToFolder?: () => void;
     onMoveToWorkspaceRoot?: () => void;
     onMoveUp?: () => void;
-    onSelectFolderMoveMenuItem?: (itemId: string) => void;
 }>;
 
 export type SessionListRowModelBoundaryProps = Readonly<{
     activeServerId?: string | null;
+    adjacency: SessionListRowModelAdjacency;
     dataActive: boolean;
     dataIndex: number;
     dragEnabled: boolean;
     draggingSessionKey: string | null;
-    folderMoveMenuItems?: readonly DropdownMenuItem[];
     folderViewEnabled: boolean;
+    folderActionsEnabled: boolean;
     forkActionContext?: SessionItemProps['forkActionContext'];
     getRowMoveActionHandlers: (input: Readonly<{
-        item: SessionListRowSessionItem;
         sourceLabel: string;
         sourceRowId: string;
     }>) => SessionListRowMoveActionHandlers;
     getRowNativeContextMenuOpenChangeHandler: (sessionKey: string) => (next: boolean) => void;
     getRowSetTagsHandler: (sessionKey: string) => (newTags: string[]) => void;
     getRowTogglePinnedHandler: (sessionKey: string) => () => void;
+    onSetSessionAppearance?: SessionItemProps['onSetSessionAppearance'];
     groupKey: string;
     item: SessionListRowSessionItem;
-    items: ReadonlyArray<SessionListViewItem>;
     nativeContextMenuSessionKey: string | null;
     onDragCancel: (event: UseSessionInlineDragCancelEvent) => void;
     onDragStart: (sessionKey: string) => void;
-    onDropResult: (event: UseSessionInlineDragDropResultEvent) => void;
+    onDropResult: UseSessionInlineDragParams['onDropResult'];
     onRegisterTreeRowBounds: RegisterSessionListTreeRowBounds;
     onUnregisterTreeRowBounds: UnregisterSessionListTreeRowBounds;
     overlayShared: TreeDropOverlaySharedValues;
@@ -132,9 +129,10 @@ function readSessionListRowStoreStateOnce(input: Readonly<{
     activeServerId?: string | null;
     serverId?: string | null;
     sessionId: string;
+    metadata?: SessionWorkspacePresentationMetadata;
 }>): SessionListRowStoreState {
     const selector = createSessionListRowStoreStateSelector(
-        [{ sessionId: input.sessionId, serverId: input.serverId ?? null }],
+        [{ sessionId: input.sessionId, serverId: input.serverId ?? null, metadata: input.metadata }],
         input.activeServerId,
     );
     return selector(storage.getState());
@@ -153,16 +151,17 @@ function useSessionListRowStoreState(input: Readonly<{
     enabled: boolean;
     serverId?: string | null;
     sessionId: string;
+    metadata?: SessionWorkspacePresentationMetadata;
 }>): SessionListRowStoreState {
-    const { activeServerId, enabled, serverId, sessionId } = input;
+    const { activeServerId, enabled, serverId, sessionId, metadata } = input;
     const readRowStoreState = React.useMemo(() => {
         if (!enabled) return readEmptyRowStoreState;
         const selector = createSessionListRowStoreStateSelector(
-            [{ sessionId, serverId: serverId ?? null }],
+            [{ sessionId, serverId: serverId ?? null, metadata }],
             activeServerId,
         );
         return () => selector(storage.getState());
-    }, [activeServerId, enabled, serverId, sessionId]);
+    }, [activeServerId, enabled, serverId, sessionId, metadata]);
 
     return React.useSyncExternalStore(
         enabled ? storage.subscribe : subscribeToNoRowStoreUpdates,
@@ -183,6 +182,7 @@ export const SessionListRowModelBoundary = React.memo(function SessionListRowMod
         enabled: props.rowStoreSubscriptionEnabled,
         serverId: props.item.serverId,
         sessionId: props.item.session.id,
+        metadata: props.item.session.metadata,
     });
     const liveDraftProjection = useExistingSessionDraftProjection({
         enabled: props.rowStoreSubscriptionEnabled,
@@ -208,6 +208,7 @@ export const SessionListRowModelBoundary = React.memo(function SessionListRowMod
             activeServerId: props.activeServerId,
             serverId: props.item.serverId,
             sessionId: props.item.session.id,
+            metadata: props.item.session.metadata,
         });
         frozenDraftProjectionRef.current = draftScope
             ? getExistingSessionDraftProjection(draftScope, props.item.session.id)
@@ -263,18 +264,13 @@ const SessionListRowModelBoundaryContent = React.memo(function SessionListRowMod
             ? { preview: props.draftProjection.preview }
             : null,
     }), [props.draftProjection, storeSnapshot]);
-    const adjacency = React.useMemo(
-        () => resolveSessionListRowModelAdjacency(props.items, props.dataIndex),
-        [props.dataIndex, props.items],
-    );
     const rowModel = React.useMemo(() => buildCachedSessionListRowModel({
         item: props.item,
         snapshot,
-        dataIndex: props.dataIndex,
-        adjacency,
+        adjacency: props.adjacency,
         settings,
         cache: rowModelsCacheRef.current,
-    }), [adjacency, props.dataIndex, props.item, settings, snapshot]);
+    }), [props.adjacency, props.item, settings, snapshot]);
 
     useSessionListRuntimeWake(rowModel.nextRuntimeFreshnessAtMs, props.dataActive);
 
@@ -292,22 +288,24 @@ const SessionListRowModelBoundaryContent = React.memo(function SessionListRowMod
         ? props.getRowSetTagsHandler(sessionKey)
         : null;
     const isIos = Platform.OS === 'ios';
-    const nativeContextMenuOpen = isIos && sessionKey != null && props.nativeContextMenuSessionKey === sessionKey;
-    const handleNativeContextMenuOpenChange = isIos && sessionKey
+    const isNativeMobile = isIos || Platform.OS === 'android';
+    const nativeContextMenuOpen = isNativeMobile && sessionKey != null && props.nativeContextMenuSessionKey === sessionKey;
+    const handleNativeContextMenuOpenChange = isNativeMobile && sessionKey
         ? props.getRowNativeContextMenuOpenChangeHandler(sessionKey)
         : null;
     const moveActionHandlers = props.getRowMoveActionHandlers({
         sourceRowId: rowModel.treeRowId,
         sourceLabel: props.item.session.id,
-        item: props.item,
     });
     const onDeleteDraft = React.useMemo(() => {
         const scope = props.draftScope;
         if (!scope || !props.draftProjection) return null;
-        return () => deleteSessionDraft({
-            scope,
-            address: { kind: 'session', sessionId: props.item.session.id },
-        });
+        return async () => {
+            await deleteSessionDraft({
+                scope,
+                address: { kind: 'session', sessionId: props.item.session.id },
+            });
+        };
     }, [props.draftProjection, props.draftScope, props.item.session.id]);
 
     return (
@@ -341,6 +339,7 @@ const SessionListRowModelBoundaryContent = React.memo(function SessionListRowMod
             allKnownTags={rowModel.allKnownTags}
             onSetTags={onSetTags}
             tagsEnabled={rowModel.tagsEnabled}
+            onSetSessionAppearance={props.onSetSessionAppearance}
             selected={rowModel.isSelected}
             isFirst={rowModel.adjacency.isFirst}
             isLast={rowModel.adjacency.isLast}
@@ -348,13 +347,11 @@ const SessionListRowModelBoundaryContent = React.memo(function SessionListRowMod
             variant={rowModel.variant ?? undefined}
             activityTimeMode={rowModel.activity.mode === 'updatedAt' ? 'updatedAt' : undefined}
             folderDepth={rowModel.folder.depth}
-            folderMoveMenuItems={props.folderViewEnabled ? props.folderMoveMenuItems ?? EMPTY_FOLDER_MOVE_MENU_ITEMS : EMPTY_FOLDER_MOVE_MENU_ITEMS}
             forkActionContext={props.forkActionContext}
-            onMoveToFolder={props.folderViewEnabled ? moveActionHandlers.onMoveToFolder : undefined}
-            onMoveToWorkspaceRoot={props.folderViewEnabled ? moveActionHandlers.onMoveToWorkspaceRoot : undefined}
+            onMoveToFolder={props.folderActionsEnabled ? moveActionHandlers.onMoveToFolder : undefined}
+            onMoveToWorkspaceRoot={props.folderActionsEnabled ? moveActionHandlers.onMoveToWorkspaceRoot : undefined}
             onMoveUp={props.folderViewEnabled ? moveActionHandlers.onMoveUp : undefined}
             onMoveDown={props.folderViewEnabled ? moveActionHandlers.onMoveDown : undefined}
-            onSelectFolderMoveMenuItem={moveActionHandlers.onSelectFolderMoveMenuItem}
             secondaryLineMode={rowModel.secondaryLineMode}
             compact={rowModel.compact}
             compactMinimal={rowModel.compactMinimal}
@@ -364,7 +361,7 @@ const SessionListRowModelBoundaryContent = React.memo(function SessionListRowMod
                     nativeInlineDragEnabled: true,
                 }
                 : null)}
-            {...(isIos && sessionKey != null
+            {...(isNativeMobile && sessionKey != null
                 ? {
                     nativeContextMenuOpen,
                     onNativeContextMenuOpenChange: handleNativeContextMenuOpenChange ?? undefined,

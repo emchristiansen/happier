@@ -53,6 +53,10 @@ describe('feature catalog', () => {
       'connectedServices.accountGroups',
       'sessions.usageLimitRecovery',
     ]);
+    expect(FEATURE_CATALOG['connectedServices.poolQuotaLimitSelection']?.dependencies).toEqual([
+      'connectedServices.accountFallback',
+      'connectedServices.quotas',
+    ]);
   });
 
   it('includes sessions usage-limit recovery feature id', () => {

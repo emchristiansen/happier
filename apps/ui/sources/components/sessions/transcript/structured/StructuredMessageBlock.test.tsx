@@ -198,4 +198,44 @@ describe('StructuredMessageBlock', () => {
         expect(serialized).toContain('alpha');
         expect(serialized).toContain('Shut alpha down');
     });
+
+    it('renders execution-run completion input as a structured card instead of raw fallback text', async () => {
+        const screen = await renderScreen(<StructuredMessageBlock
+            message={{
+                kind: 'user-text',
+                id: 'm_completion',
+                localId: null,
+                createdAt: 42,
+                text: [
+                    '<happier_execution_run_notification>',
+                    'This is an automated background-run notification from Happier, not a user message.',
+                    'Run ID: run_1',
+                    'Status: succeeded',
+                    '',
+                    'Final result:',
+                    'Done',
+                    '</happier_execution_run_notification>',
+                ].join('\n'),
+                meta: {
+                    happierStructuredInputV1: {
+                        v: 1,
+                        executionRunCompletion: {
+                            v: 1,
+                            runId: 'run_1',
+                            status: 'succeeded',
+                            finishedAtMs: 42,
+                            canInspect: true,
+                            summary: 'Done',
+                        },
+                    },
+                },
+            } as any}
+            sessionId="s1"
+        />);
+
+        expect(screen.findByTestId('execution-run-completion:run_1')).toBeTruthy();
+        expect(screen.getTextContent()).toContain('run_1');
+        expect(screen.getTextContent()).toContain('Done');
+        expect(screen.getTextContent()).not.toContain('<happier_execution_run_notification>');
+    });
 });

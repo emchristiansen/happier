@@ -52,6 +52,10 @@ export type ReadinessProbeResult =
   | Readonly<{ status: 'auth_failed'; statusCode?: number; errorMessage?: string }>
   | Readonly<{ status: 'retry_later'; retryAfterMs?: number; errorMessage?: string; reason?: ReadinessRetryLaterReason }>;
 
+export type ManagedProbeReportScope = Readonly<{
+  generation: number;
+}>;
+
 export type ManagedConnectionContext = Readonly<{
   state: ManagedConnectionState;
 }>;
@@ -101,6 +105,12 @@ export interface ManagedConnectionSupervisorConfig extends ManagedConnectionTimi
 export interface ManagedConnectionSupervisor {
   start(): Promise<void>;
   stop(): Promise<void>;
-  reportProbeResult?(probe: Exclude<ReadinessProbeResult, Readonly<{ status: 'ready' }>>): void;
+  /** Reset retry escalation after the consuming transport has actually connected. */
+  resetRetryBackoff?(): void;
+  captureProbeReportScope?(): ManagedProbeReportScope;
+  reportProbeResult?(
+    probe: Exclude<ReadinessProbeResult, Readonly<{ status: 'ready' }>>,
+    scope?: ManagedProbeReportScope,
+  ): void;
   getState(): ManagedConnectionState;
 }

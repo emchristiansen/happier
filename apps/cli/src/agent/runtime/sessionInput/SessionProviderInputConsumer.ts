@@ -50,6 +50,7 @@ export interface SessionProviderInputConsumerSession {
     reason: 'unknown';
   }>) => Promise<boolean>) | undefined;
   waitForPendingEligibilityUpdate: (abortSignal?: AbortSignal) => Promise<boolean>;
+  waitForMetadataUpdate?: ((abortSignal?: AbortSignal) => Promise<boolean>) | undefined;
   readRuntimeActivitySnapshotTail?: (() => RuntimeActivitySnapshotTail) | undefined;
   waitForRuntimeActivitySnapshotTailChange?: ((sequence: number, signal?: AbortSignal) => Promise<boolean>) | undefined;
 }
@@ -192,7 +193,7 @@ function logInputConsumerMaterializationDecision(opts: {
   activeTurnSteerability: PendingForegroundSteerability | undefined;
   result: PendingMaterializationResult;
 }): void {
-  logger.debug('[pendingQueue] input consumer materialization decision', {
+  logger.infoFile('[pendingQueue] input consumer materialization decision', {
     source: opts.source,
     reconcileWhenEmpty: opts.reconcileWhenEmpty,
     activeTurnSteerability: opts.activeTurnSteerability ?? 'unsteerable',
@@ -339,6 +340,7 @@ export function createSessionProviderInputConsumer<Mode, Message>(
   let activeProviderInputDispatches = 0;
   let activePendingMaterializationRequests = 0;
   let providerInputBatchReserved = false;
+  let retainedBatch: MessageBatch<Mode, Message> | null = null;
   const activeProviderInputAdmissionWorkDrainWaiters = new Set<() => void>();
 
   const notifyProviderInputAdmissionWorkDrained = (): void => {
@@ -405,6 +407,9 @@ export function createSessionProviderInputConsumer<Mode, Message>(
       }
     },
     waitForPendingEligibilityUpdate: (abortSignal) => opts.session.waitForPendingEligibilityUpdate(abortSignal),
+    ...(opts.session.waitForMetadataUpdate
+      ? { waitForMetadataUpdate: (abortSignal?: AbortSignal) => opts.session.waitForMetadataUpdate!(abortSignal) }
+      : {}),
     ...(opts.session.readRuntimeActivitySnapshotTail
       ? { readRuntimeActivitySnapshotTail: () => opts.session.readRuntimeActivitySnapshotTail!() }
       : {}),
@@ -465,7 +470,8 @@ export function createSessionProviderInputConsumer<Mode, Message>(
   const drainPending = async (drainOpts?: DrainPendingOptions): Promise<DrainPendingResult> => {
     const abortSignal = drainOpts?.abortSignal ?? new AbortController().signal;
     const result = await runMaterializationPass(abortSignal, async () => {
-      if (opts.messageQueue.size() > 0) {
+      // A retained dequeued batch still owns delivery order; Pending must not overtake it.
+      if (retainedBatch !== null || opts.messageQueue.size() > 0) {
         return { materialized: 0, stoppedReason: 'drain_disallowed' } as const;
       }
       // Keep the exact localId reservation authoritative before any later claim.
@@ -528,8 +534,9 @@ export function createSessionProviderInputConsumer<Mode, Message>(
         // returned batch has left the dequeue-to-invocation gap. This is the completion signal
         // for long-lived provider dispatches that consume multiple batches within one dispatch.
         providerInputBatchReserved = false;
-        const batch = await waitForNextInput({
+        const batch = retainedBatch ?? await waitForNextInput({
           ...opts,
+          onMetadataUpdate: waitOpts.onMetadataUpdate === undefined ? opts.onMetadataUpdate : waitOpts.onMetadataUpdate,
           session: admissionTrackedSession,
           abortSignal: waitOpts.abortSignal,
           isProviderInputAdmissionOpen: () => providerInputAdmissionOpen,
@@ -542,14 +549,25 @@ export function createSessionProviderInputConsumer<Mode, Message>(
             (result) => (result?.kind === 'retry' ? result : null),
           ),
         });
+        if (!batch) return null;
+        // Metadata reconciliation can outlive this provider activation. Keep the complete batch
+        // in the session-owned consumer until a live waiter receives it; requeueing would lose
+        // isolation and can let a later control prompt replace its Pending delivery attribution.
+        retainedBatch = batch;
         if (
-          batch?.pendingProviderAction !== undefined
+          batch.pendingProviderAction !== undefined
           && batch.userMessageLocalIds?.length === 1
         ) {
           // The queue no longer exposes this batch, but the provider has not accepted it yet.
           // Reserve local custody across the dequeue-to-dispatch gap.
           providerInputBatchReserved = true;
         }
+        await callMetadataUpdate(
+          waitOpts.onMetadataUpdate === undefined ? opts.onMetadataUpdate : waitOpts.onMetadataUpdate,
+          waitOpts.abortSignal,
+        );
+        if (waitOpts.abortSignal.aborted || !providerInputAdmissionOpen) return null;
+        retainedBatch = null;
         return batch;
       } finally {
         releaseTurn();
@@ -690,6 +708,8 @@ async function waitForNextInput<Mode, Message>(
     const wakePromise = waitForWakeSignal({
       messageQueue: opts.messageQueue,
       waitForPendingEligibilityUpdate: opts.session.waitForPendingEligibilityUpdate,
+      waitForMetadataUpdate: opts.session.waitForMetadataUpdate,
+      onMetadataUpdate: opts.onMetadataUpdate,
       controller,
       metadataWaitRetryBackoffMs,
     }).then((winner) => {
@@ -712,13 +732,13 @@ async function waitForNextInput<Mode, Message>(
       if (!batch) {
         const outcome = await opts.materialize(() => materializePendingMessage(opts));
         if (outcome?.kind === 'recheck') recheckAfterMs = outcome.afterMs;
+        if (!opts.isProviderInputAdmissionOpen()) return null;
         batch = await collectQueuedBatch(opts.messageQueue, opts.abortSignal);
       }
+      // A dequeued batch is no longer visible in the queue. Hand it to the session-owned
+      // consumer, which retains it across metadata reconciliation and activation cancellation.
+      if (batch) return batch;
       if (opts.abortSignal.aborted || !opts.isProviderInputAdmissionOpen()) return null;
-      if (batch) {
-        await callMetadataUpdate(opts.onMetadataUpdate, opts.abortSignal);
-        return opts.abortSignal.aborted ? null : batch;
-      }
       if (passDirty) {
         if (!await applyWake(await wakePromise)) return null;
         continue;
@@ -1034,23 +1054,47 @@ function logTerminalAuthDrainStop(opts: DrainPendingOptions, status: 401 | 403 |
 async function waitForWakeSignal<Mode, Message>(opts: {
   messageQueue?: MessageQueue2<Mode, Message>;
   waitForPendingEligibilityUpdate: (abortSignal?: AbortSignal) => Promise<boolean>;
+  waitForMetadataUpdate?: ((abortSignal?: AbortSignal) => Promise<boolean>) | undefined;
+  onMetadataUpdate?: ((abortSignal: AbortSignal) => void | Promise<void>) | null | undefined;
   controller: AbortController;
   metadataWaitRetryBackoffMs: number;
 }): Promise<WakeWinner> {
   const queueWait = opts.messageQueue
     ?.waitForMessagesSignal(opts.controller.signal)
     .then((hasMessages) => ({ kind: 'queue' as const, hasMessages }));
+  const waitForControls = () => opts.onMetadataUpdate && opts.waitForMetadataUpdate
+    ? opts.waitForMetadataUpdate(opts.controller.signal).then(
+      (ok) => ({ kind: 'controls' as const, ok }),
+      () => ({ kind: 'controls' as const, ok: false }),
+    )
+    : undefined;
+  let controlsWait = waitForControls();
   try {
     while (true) {
       if (opts.controller.signal.aborted) {
         return { kind: 'meta', ok: false };
       }
 
-      const metaWait = opts.waitForPendingEligibilityUpdate(opts.controller.signal).then(
+      const pendingWait = opts.waitForPendingEligibilityUpdate(opts.controller.signal).then(
         (ok) => ({ kind: 'meta' as const, ok }),
         () => ({ kind: 'meta' as const, ok: false }),
       );
-      const winner = await Promise.race([...(queueWait ? [queueWait] : []), metaWait]);
+      let winner: WakeWinner;
+      while (true) {
+        if (opts.controller.signal.aborted) return { kind: 'meta', ok: false };
+        const next = await Promise.race([
+          ...(queueWait ? [queueWait] : []), pendingWait,
+          ...(controlsWait ? [controlsWait] : []),
+        ]);
+        if (next.kind !== 'controls') {
+          winner = next;
+          break;
+        }
+        // Keep observing before the callback awaits provider I/O. Metadata controls never
+        // settle the Pending wake or authorize another materialization pass.
+        controlsWait = next.ok ? waitForControls() : undefined;
+        if (next.ok) await callMetadataUpdate(opts.onMetadataUpdate, opts.controller.signal);
+      }
       if (winner.kind !== 'meta' || winner.ok || opts.controller.signal.aborted) {
         return winner;
       }

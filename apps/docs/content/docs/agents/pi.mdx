@@ -34,6 +34,34 @@ pi --version
 happier pi
 ```
 
+## Extension-started runs
+
+In development builds, text submitted by Pi extensions appears in the Happier
+conversation, and runs started by extensions show the session as working.
+Repeated submissions remain separate messages, even when their text is identical.
+
+A recorded input may still be transformed or handled by another extension, or
+cancelled while queued. Its appearance in the conversation does not by itself
+confirm that the model received it. This support covers text inputs; it does not
+add extension-input image attachments.
+
+## Permissions
+
+Use the shared permission vocabulary when starting Pi:
+
+```bash
+happier pi --permission-mode read_only
+happier pi --permission-mode auto
+```
+
+Read-only limits Pi to Happier's read-tool allowlist. Auto, Default, and YOLO do
+not pass Pi's `--tools` option, so Pi keeps its full native catalog, including
+the platform shell and installed extension/custom tools such as subagents. Auto
+is not a workspace-confinement guarantee. Older spellings such as `safe-yolo`
+and `workspace_write` remain accepted for compatibility.
+
+For the cross-provider vocabulary and aliases, see [Permissions](/sessions/permissions).
+
 ## Local authentication in Happier
 
 Pi does not currently expose a native interactive login flow through Happier provider settings.
@@ -70,6 +98,17 @@ If Pi is not detected:
 1. Verify `pi --version` works.
 2. Restart Happier.
 3. Set `HAPPIER_PI_PATH` if your binary is not in `PATH`.
+
+Pi's vendor-managed installer can put its launcher at `~/.pi/agent/bin/pi`, or
+under `PI_CODING_AGENT_DIR/bin/pi` when that directory is configured. An already
+running daemon may retain a `PATH` from before installation. Point
+`HAPPIER_PI_PATH` at the launcher and restart the daemon if terminal launches
+work but daemon launches fail.
+
+Current development builds also discover these locations when `PATH` has no Pi
+executable. If launch resolution still fails, they report `provider_cli_not_found`
+with installation or override guidance. An invalid `HAPPIER_PI_PATH` must be
+corrected or unset; it does not fall back to another installation.
 
 ## Related
 

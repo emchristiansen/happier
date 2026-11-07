@@ -1,4 +1,8 @@
 import { Server } from "socket.io";
+import { RELEASED_CONNECTED_SERVICE_IDS, readConnectedServiceReaderSupport } from "@happier-dev/protocol";
+import { CURRENT_CONNECTED_SERVICE_READER_ROOM, RELEASED_CONNECTED_SERVICE_READER_ROOM } from "../api/socketRooms";
+import { projectConnectedServiceUpdateForReader } from "./projectConnectedServiceUpdateForReader";
+import { type HappierSocketData } from "../api/socket/socketData";
 import {
     socketEmissionPayloadBytesHistogram,
     socketEmissionsCounter,
@@ -67,6 +71,29 @@ class EventRouter {
 
     getConnections(userId: string): Set<ClientConnection> | undefined {
         return this.userConnections.get(userId);
+    }
+
+    /** Query the account's live socket owner, including other Redis-adapter workers. */
+    async hasFocusedComputerUi(userId: string): Promise<boolean> {
+        const isFocused = (data: HappierSocketData) => data.clientType === 'user-scoped'
+            && data.clientPurpose === 'sync'
+            && data.uiFocus?.computer === true
+            && data.uiFocus.focused === true;
+        if (this.io) {
+            try {
+                const sockets = await this.io.in(`user-scoped:${userId}`).fetchSockets();
+                return sockets.some((socket) => isFocused(socket.data as HappierSocketData));
+            } catch (error) {
+                // Unknown focus must preserve phone delivery rather than silently mute it.
+                log({ module: 'ui-focus', error }, 'Unable to query focused computer UI; preserving push delivery');
+                return false;
+            }
+        }
+        return [...(this.userConnections.get(userId) ?? [])].some((connection) => (
+            connection.connectionType === 'user-scoped'
+            && connection.socket.connected === true
+            && isFocused(connection.socket.data as HappierSocketData)
+        ));
     }
 
     // === SOCKET.IO ADAPTER (ROOM-BASED FANOUT) ===
@@ -178,6 +205,20 @@ class EventRouter {
         if (this.io) {
             const skipSocketId = params.skipSenderConnection?.socket?.id;
             const emitter = this.getEmitterForFilter(params.userId, params.recipientFilter);
+            if (params.eventName === "update") {
+                const legacyPayload = projectConnectedServiceUpdateForReader(params.payload, RELEASED_CONNECTED_SERVICE_IDS);
+                if (legacyPayload !== params.payload) {
+                    // Intersect the existing recipient rooms with reader support
+                    // through exclusion, retaining distributed adapter fanout.
+                    const emitToReaders = (excludedRoom: string, payload: UpdatePayload) => {
+                        const readerEmitter = emitter.except(excludedRoom);
+                        (skipSocketId ? readerEmitter.except(skipSocketId) : readerEmitter).emit(params.eventName, payload);
+                    };
+                    emitToReaders(CURRENT_CONNECTED_SERVICE_READER_ROOM, legacyPayload);
+                    emitToReaders(RELEASED_CONNECTED_SERVICE_READER_ROOM, params.payload);
+                    return;
+                }
+            }
             if (skipSocketId && typeof (emitter as any).except === "function") {
                 (emitter as any).except(skipSocketId).emit(params.eventName, params.payload);
             } else {
@@ -211,7 +252,10 @@ class EventRouter {
                 continue;
             }
 
-            connection.socket.emit(params.eventName, params.payload);
+            const payload = params.eventName === "update"
+                ? projectConnectedServiceUpdateForReader(params.payload, readConnectedServiceReaderSupport((connection.socket.data as HappierSocketData).connectedServiceIds))
+                : params.payload;
+            connection.socket.emit(params.eventName, payload);
         }
     }
 

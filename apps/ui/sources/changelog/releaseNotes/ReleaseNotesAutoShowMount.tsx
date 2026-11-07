@@ -11,8 +11,9 @@ import { revalidateRemoteManifest } from './remoteManifest';
 import { useReleaseNotesLauncher } from './useReleaseNotesLauncher';
 
 function hasActiveSetupIntent(): boolean {
-    const intent = getPendingSetupIntent();
-    return Boolean(intent && intent.phase !== 'dismissed');
+    // A discarded intent is cleared rather than kept in a dismissed state, so any intent that is
+    // still here is one the person is in the middle of.
+    return getPendingSetupIntent() !== null;
 }
 
 /**

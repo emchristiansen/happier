@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { Platform, View } from 'react-native';
+import { Text } from '@/components/ui/text/Text';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 
 import { OAuthView, OAuthViewUnsupported, type OAuthViewConfig } from '@/components/ui/navigation/OAuthView';
@@ -7,8 +8,9 @@ import { Modal } from '@/modal';
 import { useAuth } from '@/auth/context/AuthContext';
 import { t } from '@/text';
 import { getConnectedServiceRegistryEntry } from '@/sync/domains/connectedServices/connectedServiceRegistry';
-import { ConnectedServiceCredentialRecordV1Schema, ConnectedServiceIdSchema, type ConnectedServiceCredentialRecordV1, type ConnectedServiceId } from '@happier-dev/protocol';
+import { ConnectedServiceCredentialRecordV1Schema, ConnectedServiceIdSchema, supportsConnectedServiceOperation, type ConnectedServiceCredentialRecordV1, type ConnectedServiceId } from '@happier-dev/protocol';
 import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
+import { useServerFeaturesRuntimeSnapshot } from '@/sync/domains/features/featureDecisionRuntime';
 import { fireAndForget } from '@/utils/system/fireAndForget';
 
 import { getConnectedServiceOauthAdapter } from '@/sync/domains/connectedServices/oauth/connectedServiceOauthAdapters';
@@ -35,6 +37,12 @@ export const ConnectedServiceOauthView = React.memo(function ConnectedServiceOau
   const rawServiceId = asStringParam(params.serviceId).trim();
   const parsedServiceId = ConnectedServiceIdSchema.safeParse(rawServiceId);
   const serviceId: ConnectedServiceId | null = parsedServiceId.success ? parsedServiceId.data : null;
+  const serverFeatures = useServerFeaturesRuntimeSnapshot({
+    enabled: connectedServicesEnabled && serviceId !== null && !supportsConnectedServiceOperation(null, serviceId),
+  });
+  const operationSupported = serviceId !== null && supportsConnectedServiceOperation(
+    serverFeatures.status === 'ready' ? serverFeatures.features : null, serviceId,
+  );
   const profileId = asStringParam(params.profileId).trim();
   const method = asStringParam(params.method).trim().toLowerCase();
 
@@ -65,6 +73,10 @@ export const ConnectedServiceOauthView = React.memo(function ConnectedServiceOau
         <OAuthViewUnsupported name={serviceLabel} command={entry.connectCommand} />
       </View>
     );
+  }
+
+  if (!operationSupported) {
+    return <View style={{ flex: 1, padding: 16 }}><Text>{t('connectedServices.detail.errors.serviceUnsupportedServer')}</Text></View>;
   }
 
   const mode = resolveConnectedServiceOauthMode({

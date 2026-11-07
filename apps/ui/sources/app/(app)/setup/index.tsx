@@ -7,15 +7,16 @@ import { useAuth } from '@/auth/context/AuthContext';
 import { UnauthenticatedSplitShell } from '@/components/onboarding/unauthShell';
 import { DesktopOnlySetupNotice } from '@/components/settings/machines/DesktopOnlySetupNotice';
 import { MachineSetupFlowScreen } from '@/components/settings/machines/MachineSetupFlowScreen';
-import { RelayDriftActionCard } from '@/components/settings/server/RelayDriftActionCard';
-import { useRelayDriftBanner } from '@/components/settings/server/useRelayDriftBanner';
 import { motionTokens } from '@/components/ui/motion/motionTokens';
 import { Item } from '@/components/ui/lists/Item';
 import { ItemGroup } from '@/components/ui/lists/ItemGroup';
 import { ItemList } from '@/components/ui/lists/ItemList';
 import { MachineSetupTextField } from '@/components/settings/machines/shared/MachineSetupTextField';
-import { getActiveServerSnapshot, setActiveServer, subscribeActiveServer } from '@/sync/domains/server/serverRuntime';
-import { clearPendingSetupIntent, getPendingSetupIntent, setPendingSetupIntent } from '@/sync/domains/pending/pendingSetupIntent';
+import { getActiveServerSnapshot, subscribeActiveServer } from '@/sync/domains/server/serverRuntime';
+import { useSettingMutable } from '@/sync/domains/state/storage';
+import { selectRelayDirectly } from '@/setup/directRelaySelectionIntent';
+import { clearPendingSetupIntent, setPendingSetupIntent } from '@/sync/domains/pending/pendingSetupIntent';
+import { usePendingSetupIntent } from '@/components/onboarding/state/usePendingSetupIntent';
 import {
     listServerProfiles,
     resolveServerProfileScopeId,
@@ -26,6 +27,7 @@ import { t } from '@/text';
 import { toServerUrlDisplay } from '@/sync/domains/server/url/serverUrlDisplay';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 import { Icon } from '@/components/ui/icons/Icon';
+import { fireAndForget } from '@/utils/system/fireAndForget';
 
 const ignoreBrandHeroGetStarted = () => undefined;
 
@@ -161,6 +163,22 @@ function PreAuthSetupRoute() {
     const [customRelayName, setCustomRelayName] = React.useState('');
     const [customRelayError, setCustomRelayError] = React.useState<string | null>(null);
     const relayFormOpacity = React.useRef(new Animated.Value(0)).current;
+    const [, setServerSelectionActiveTargetKind] = useSettingMutable('serverSelectionActiveTargetKind');
+    const [, setServerSelectionActiveTargetId] = useSettingMutable('serverSelectionActiveTargetId');
+    /**
+     * R8/INV7 — a relay picked or added here is the person choosing it for this device, so it goes
+     * through the one direct-selection operation: after sign-in the desktop setup gate may then
+     * offer to move this computer's background service there. `refreshAuth` is null because the
+     * auth provider already refreshes on every active-server change, and onboarding reaches sign-in
+     * through its own Continue path.
+     */
+    const selectRelay = React.useCallback(async (serverId: string) => {
+        await selectRelayDirectly({
+            serverId,
+            selectionTarget: { setServerSelectionActiveTargetKind, setServerSelectionActiveTargetId },
+            refreshAuth: null,
+        });
+    }, [setServerSelectionActiveTargetId, setServerSelectionActiveTargetKind]);
     const continueToAuthForRelay = React.useCallback((nextRelayUrl: string | null) => {
         setPendingSetupIntent({
             branch: 'thisComputer',
@@ -175,15 +193,13 @@ function PreAuthSetupRoute() {
     }, [continueToAuthForRelay, relayUrl]);
 
     const handleDiscard = React.useCallback(() => {
-        setPendingSetupIntent({
-            branch: 'thisComputer',
-            phase: 'dismissed',
-            relayUrl,
-        });
+        // Discarding means there is no intent, not an intent in a "dismissed" state: no reader
+        // ever told the two apart, and the marker only kept a record alive for a day for nothing.
+        clearPendingSetupIntent();
         router.replace('/');
-    }, [relayUrl]);
+    }, []);
 
-    const handleAddRelay = React.useCallback(() => {
+    const handleAddRelay = React.useCallback(async () => {
         const nextRelayUrl = normalizeRelayUrl(customRelayUrl);
         const validation = validateServerUrl(nextRelayUrl ?? customRelayUrl);
         if (!nextRelayUrl || !validation.valid) {
@@ -197,13 +213,13 @@ function PreAuthSetupRoute() {
             source: 'manual',
             replaceEquivalentStoredUrl: true,
         });
-        setActiveServer({ serverId: resolveServerProfileScopeId(profile), scope: 'device' });
+        await selectRelay(resolveServerProfileScopeId(profile));
         setCustomRelayUrl('');
         setCustomRelayName('');
         setCustomRelayError(null);
         setShowInlineRelayForm(false);
         continueToAuthForRelay(nextRelayUrl);
-    }, [continueToAuthForRelay, customRelayName, customRelayUrl]);
+    }, [continueToAuthForRelay, customRelayName, customRelayUrl, selectRelay]);
 
     React.useEffect(() => {
         if (shouldOpenCustomRelayForm) {
@@ -259,7 +275,7 @@ function PreAuthSetupRoute() {
                                     selected={resolveServerProfileScopeId(profile) === snapshot.serverId}
                                     showChevron={false}
                                     onPress={() => {
-                                        setActiveServer({ serverId: resolveServerProfileScopeId(profile), scope: 'device' });
+                                        fireAndForget(selectRelay(resolveServerProfileScopeId(profile)), { tag: 'setup.selectSavedRelay' });
                                     }}
                                 />
                             ))}
@@ -313,7 +329,7 @@ function PreAuthSetupRoute() {
                                     testID="setup.addRelay"
                                     title={t('setupOnboarding.addAndUseRelay')}
                                     disabled={!customRelayUrl.trim()}
-                                    onPress={handleAddRelay}
+                                    onPress={() => fireAndForget(handleAddRelay(), { tag: 'setup.addRelay' })}
                                 />
                             </>
                         ) : null}
@@ -334,111 +350,89 @@ function PreAuthSetupRoute() {
 }
 
 function PostAuthSetupRoute() {
-    const pending = getPendingSetupIntent();
+    const pending = usePendingSetupIntent();
     const desktop = isTauriDesktop();
+    const livePending = pending?.phase === 'awaiting_auth' || pending?.phase === 'post_auth' ? pending : null;
+    const remoteMachineContinuation = livePending?.branch === 'remoteMachine' ? livePending : null;
+    /**
+     * R9/INV1: after authentication exactly one owner performs "make this computer ready" — the
+     * `DesktopLocalSetupRuntime` the authenticated desktop shell mounts, driven by
+     * `desktopSetupCoordinator` and presented on the Home. This route must never be a second one,
+     * so a desktop visit whose only business is local setup goes to the Home instead of rendering
+     * another setup surface. The remote-machine
+     * branch keeps its post-auth job here: resuming provider follow-up after a relay adoption
+     * (`MachineSetupFlowScreen`'s switch-to-remote-relay action).
+     */
+    const shouldDeferToSetupGate = desktop && remoteMachineContinuation === null;
     const effectivePending = React.useMemo(() => {
-        if (pending?.phase !== 'awaiting_auth') {
-            return pending;
+        if (livePending?.phase !== 'awaiting_auth') {
+            return livePending;
         }
         return {
-            ...pending,
+            ...livePending,
             phase: 'post_auth',
         } as const;
-    }, [pending]);
-    const snapshot = React.useSyncExternalStore(subscribeActiveServer, getActiveServerSnapshot, getActiveServerSnapshot);
-    const relayDriftBanner = useRelayDriftBanner();
-    const relayUrl = normalizeRelayUrl(snapshot.serverUrl ?? effectivePending?.relayUrl ?? null) ?? t('status.unknown');
-    const thisComputerSummary = relayDriftBanner?.title
-        ?? (effectivePending?.branch === 'remoteMachine'
-            ? t('settings.machineSetupSshMachineSubtitle')
-            : effectivePending?.phase === 'post_auth'
-                ? t('settings.machineSetupCurrentMachineSubtitle')
-                : t('setupOnboarding.thisComputerReady'));
-    const nextActionSummary = relayDriftBanner?.actionLabel
-        ?? (effectivePending?.branch === 'remoteMachine'
-            ? t('settingsProviders.setup.startTitle')
-            : effectivePending?.phase === 'post_auth'
-                ? t('settings.machineSetupStageConnect')
-                : t('setupOnboarding.nextActionReady'));
+    }, [livePending]);
 
     React.useEffect(() => {
-        if (pending?.phase !== 'awaiting_auth') {
+        if (!shouldDeferToSetupGate) {
+            return;
+        }
+        router.replace('/');
+    }, [shouldDeferToSetupGate]);
+
+    React.useEffect(() => {
+        if (shouldDeferToSetupGate || pending?.phase !== 'awaiting_auth') {
             return;
         }
         setPendingSetupIntent({
             ...pending,
             phase: 'post_auth',
         });
-    }, []);
+    }, [pending, shouldDeferToSetupGate]);
 
     const handleDiscard = React.useCallback(() => {
         clearPendingSetupIntent();
         router.replace('/');
     }, []);
 
+    if (shouldDeferToSetupGate) {
+        return null;
+    }
+
     return (
         <ItemList>
-            <ItemGroup title={t('setupOnboarding.postAuthTitle')}>
-                <Item
-                    testID="setup.postAuth"
-                    title={t('setupOnboarding.postAuthBody')}
-                    showChevron={false}
-                    mode="info"
-                />
-                <Item
-                    testID="setup.postAuthDiscard"
-                    title={t('common.discard')}
-                    onPress={handleDiscard}
-                />
-            </ItemGroup>
-            <ItemGroup title={t('setupOnboarding.controlPanelTitle')}>
-                <Item
-                    testID="setup.summary.activeRelay"
-                    title={t('setupOnboarding.activeRelaySummaryTitle')}
-                    subtitle={relayUrl}
-                    showChevron={false}
-                    mode="info"
-                />
-                <Item
-                    testID="setup.summary.thisComputer"
-                    title={t('setupOnboarding.thisComputerSummaryTitle')}
-                    subtitle={thisComputerSummary}
-                    showChevron={false}
-                    mode="info"
-                />
-                <Item
-                    testID="setup.summary.nextAction"
-                    title={t('setupOnboarding.nextActionSummaryTitle')}
-                    subtitle={nextActionSummary}
-                    showChevron={false}
-                    mode="info"
-                />
-            </ItemGroup>
-            {relayDriftBanner ? (
-                !desktop ? (
-                    <ItemGroup title={relayDriftBanner.title}>
-                        <Item
-                            testID="setup.webRelayDriftNotice"
-                            title={relayDriftBanner.title}
-                            subtitle={relayDriftBanner.description}
-                            showChevron={false}
-                            mode="info"
-                        />
-                    </ItemGroup>
-                ) : (
-                    <RelayDriftActionCard banner={relayDriftBanner} />
-                )
+            {effectivePending ? (
+                <ItemGroup title={t('setupOnboarding.postAuthTitle')}>
+                    <Item
+                        testID="setup.postAuth"
+                        title={t('setupOnboarding.postAuthBody')}
+                        showChevron={false}
+                        mode="info"
+                    />
+                    <Item
+                        testID="setup.postAuthDiscard"
+                        title={t('common.discard')}
+                        onPress={handleDiscard}
+                    />
+                </ItemGroup>
             ) : null}
-            {desktop ? (
+            {desktop && remoteMachineContinuation ? (
                 <MachineSetupFlowScreen
-                    autoStartLocalTask={effectivePending?.branch === 'thisComputer'}
                     embedded
-                    initialProviderMachineId={effectivePending?.branch === 'remoteMachine' ? effectivePending.machineId : null}
+                    initialProviderMachineId={remoteMachineContinuation.machineId}
                     onLocalSetupSucceeded={() => {
                         clearPendingSetupIntent();
                     }}
                 />
-            ) : null}
+            ) : (
+                <DesktopOnlySetupNotice
+                    testID="setup.desktopOnlyNotice"
+                    groupTitle={t('setupOnboarding.controlPanelTitle')}
+                    title={t('setupOnboarding.webDesktopOnlyTitle')}
+                    subtitle={t('setupOnboarding.webDesktopOnlyBody')}
+                />
+            )}
         </ItemList>
     );
 }

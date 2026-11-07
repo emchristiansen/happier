@@ -2,13 +2,14 @@ import * as React from 'react';
 import renderer from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 
-import { ChangedFilesReviewDiffBlock } from './ChangedFilesReviewDiffBlock';
 import { renderScreen } from '@/dev/testkit';
 import { createThemeFixture } from '@/dev/testkit/fixtures/themeFixtures';
 import { installFilesContentCommonModuleMocks } from '../filesContentTestHelpers';
 
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+vi.mock('expo-image', () => ({ Image: 'ExpoImage' }));
 
 installFilesContentCommonModuleMocks({
     reactNative: async () => {
@@ -69,24 +70,16 @@ vi.mock('@/components/ui/code/diff/reviewComments/DiffReviewCommentsViewer', () 
     DiffReviewCommentsViewer: (props: any) => React.createElement('DiffReviewCommentsViewer', props),
 }));
 
-vi.mock('react-native-svg', () => ({
-    SvgXml: (props: any) => React.createElement('SvgXml', props),
-    SvgAst: (props: any) => React.createElement('SvgAst', props),
-    parse: (_xml: string, middleware?: (root: {
-        tag: string;
-        props: Record<string, unknown>;
-        children: [];
-        parent: null;
-        Tag: () => null;
-    }) => unknown) => {
-        const root = { tag: 'svg', props: {}, children: [] as [], parent: null, Tag: () => null };
-        middleware?.(root);
-        return root;
-    },
+vi.mock('react-native-svg', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('react-native-svg')>()),
+    SvgXml: (props: Record<string, unknown>) => React.createElement('SvgXml', props),
+    SvgAst: (props: Record<string, unknown>) => React.createElement('SvgAst', props),
 }));
 
 describe('ChangedFilesReviewDiffBlock (svg previews)', () => {
     it('renders a validated SvgAst preview for svg images on native when no diff is available', async () => {
+        const { ChangedFilesReviewDiffBlock } = await import('./ChangedFilesReviewDiffBlock');
+        const { AttachmentImagePreviewModal } = await import('@/components/sessions/attachments/preview/AttachmentImagePreviewModal');
         const loadedState = { status: 'loaded', diff: '', error: null } as const;
         const diffStateSource = {
             getDiffState: () => loadedState,
@@ -96,7 +89,7 @@ describe('ChangedFilesReviewDiffBlock (svg previews)', () => {
         const theme = createThemeFixture();
 
         let tree!: renderer.ReactTestRenderer;
-        tree = (await renderScreen(<ChangedFilesReviewDiffBlock
+        const screen = await renderScreen(<ChangedFilesReviewDiffBlock
                     theme={theme}
                     sessionId="s1"
                     snapshotSignature="sig"
@@ -105,9 +98,18 @@ describe('ChangedFilesReviewDiffBlock (svg previews)', () => {
                     diffStateSource={diffStateSource}
                     reviewCommentsEnabled={false}
                     reviewCommentDrafts={[]}
-                />)).tree;
+                />);
+        tree = screen.tree;
 
         expect(tree.findAllByType('SvgAst' as any).length).toBe(1);
         expect(tree.findAllByType('SvgXml' as any).length).toBe(0);
+        await screen.pressByTestIdAsync('scm-review-image-preview');
+        const { Modal } = await import('@/modal');
+        expect(Modal.show).toHaveBeenCalledWith(expect.objectContaining({
+            component: AttachmentImagePreviewModal,
+            props: {
+                images: [{ kind: 'session-image', sessionId: 's1', filePath: 'src/icon.svg', title: 'src/icon.svg', cacheKey: 'sig' }],
+            },
+        }));
     });
 });

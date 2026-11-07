@@ -1,3 +1,4 @@
+import { matchServerFetchUrl } from '@/dev/testkit/mocks/serverFetch';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { AuthCredentials } from '@/auth/storage/tokenStorage';
@@ -77,24 +78,45 @@ function createGroupResponse() {
 }
 
 describe('apiConnectedServiceAuthGroupsV3', () => {
-    it('negotiates quota-reset policy visibility for both reads and mutations', async () => {
+    it('negotiates response policy fields without adding custom CORS request headers', async () => {
         mockServerConfig();
-        vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: RequestInit) => {
+        const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
             const group = createGroupResponse().group;
-            const policy = new Headers(init?.headers).get('accept') === 'application/json; happier-connected-service-auto-quota-reset=1'
-                ? { ...group.policy, autoUseQuotaResetsWhenExhausted: true }
-                : group.policy;
+            const url = new URL(String(input));
+            const headers = new Headers(init?.headers);
+            const policy = {
+                ...group.policy,
+                ...(headers.get('accept') === 'application/json; happier-connected-service-auto-quota-reset=1'
+                    ? { autoUseQuotaResetsWhenExhausted: true }
+                    : {}),
+                ...(url.searchParams.get('happierAutoDisablePlanInvalidAccounts') === '1'
+                    ? { autoDisablePlanInvalidAccounts: true }
+                    : {}),
+                ...(url.searchParams.get('happierPoolQuotaLimitSelection') === '1'
+                    ? { quotaLimitSelection: { mode: 'all' as const, providerLimitIds: [] } }
+                    : {}),
+            };
             return { ok: true, status: 200, json: async () => init?.method === 'PATCH'
                 ? { group: { ...group, policy } }
                 : { groups: [{ ...group, policy }] } };
-        }));
+        });
+        vi.stubGlobal('fetch', fetchMock);
         const api = await import('./apiConnectedServiceAuthGroupsV3');
         const groups = await api.listConnectedServiceAuthGroupsV3(credentials, { serviceId: 'openai-codex' });
         expect(groups[0]?.policy.autoUseQuotaResetsWhenExhausted).toBe(true);
+        expect(groups[0]?.policy.autoDisablePlanInvalidAccounts).toBe(true);
+        expect(groups[0]?.policy.quotaLimitSelection).toEqual({ mode: 'all', providerLimitIds: [] });
         const updated = await api.patchConnectedServiceAuthGroupV3(credentials, {
             serviceId: 'openai-codex', groupId: 'primary', patch: { displayName: 'Renamed' },
         });
         expect(updated.policy.autoUseQuotaResetsWhenExhausted).toBe(true);
+        expect(updated.policy.autoDisablePlanInvalidAccounts).toBe(true);
+        expect(updated.policy.quotaLimitSelection).toEqual({ mode: 'all', providerLimitIds: [] });
+        for (const [, init] of fetchMock.mock.calls) {
+            const headers = new Headers(init?.headers);
+            expect(headers.get('x-happier-connected-service-auto-disable-plan-invalid')).toBeNull();
+            expect(headers.get('x-happier-connected-service-pool-quota-limit-selection')).toBeNull();
+        }
     });
 
     it('lists connected-service auth groups through the v3 route', async () => {
@@ -116,7 +138,7 @@ describe('apiConnectedServiceAuthGroupsV3', () => {
         expect(groups).toHaveLength(1);
         expect(groups[0]?.groupId).toBe('primary');
         expect(fetchMock).toHaveBeenCalledWith(
-            'https://api.example.test/v3/connect/openai-codex/groups',
+            matchServerFetchUrl('https://api.example.test/v3/connect/openai-codex/groups?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
             expect.objectContaining({
                 method: 'GET',
                 headers: expect.any(Headers),
@@ -147,7 +169,7 @@ describe('apiConnectedServiceAuthGroupsV3', () => {
 
         expect(group.groupId).toBe('primary');
         expect(fetchMock).toHaveBeenCalledWith(
-            'https://api.example.test/v3/connect/openai-codex/groups',
+            matchServerFetchUrl('https://api.example.test/v3/connect/openai-codex/groups?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
             expect.objectContaining({
                 method: 'POST',
                 headers: expect.any(Headers),
@@ -208,7 +230,7 @@ describe('apiConnectedServiceAuthGroupsV3', () => {
         });
 
         expect(fetchMock).toHaveBeenCalledWith(
-            'https://api.example.test/v3/connect/openai-codex/groups/primary/members',
+            matchServerFetchUrl('https://api.example.test/v3/connect/openai-codex/groups/primary/members?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
             expect.objectContaining({
                 method: 'POST',
                 body: JSON.stringify({
@@ -220,15 +242,15 @@ describe('apiConnectedServiceAuthGroupsV3', () => {
             }),
         );
         expect(fetchMock).toHaveBeenCalledWith(
-            'https://api.example.test/v3/connect/openai-codex/groups/primary/members/backup',
+            matchServerFetchUrl('https://api.example.test/v3/connect/openai-codex/groups/primary/members/backup?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
             expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ enabled: false, expectedGeneration: 3 }) }),
         );
         expect(fetchMock).toHaveBeenCalledWith(
-            'https://api.example.test/v3/connect/openai-codex/groups/primary/active-profile',
+            matchServerFetchUrl('https://api.example.test/v3/connect/openai-codex/groups/primary/active-profile?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
             expect.objectContaining({ method: 'POST', body: JSON.stringify({ profileId: 'work', expectedGeneration: 2 }) }),
         );
         expect(fetchMock).toHaveBeenCalledWith(
-            'https://api.example.test/v3/connect/openai-codex/groups/primary/members/backup?expectedGeneration=4',
+            matchServerFetchUrl('https://api.example.test/v3/connect/openai-codex/groups/primary/members/backup?expectedGeneration=4&happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
             expect.objectContaining({ method: 'DELETE' }),
         );
     });
@@ -242,7 +264,7 @@ describe('apiConnectedServiceAuthGroupsV3', () => {
             if (url === 'https://api.example.test/health' || url === 'https://api.example.test/v1/auth/ping') {
                 return { ok: true, status: 200, json: async () => ({ ok: true }) };
             }
-            if (url === 'https://api.example.test/v3/connect/openai-codex/groups/primary/active-profile') {
+            if (matchServerFetchUrl('https://api.example.test/v3/connect/openai-codex/groups/primary/active-profile?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1').asymmetricMatch(url)) {
                 activeProfileRequestCount += 1;
             }
             if (activeProfileRequestCount === 1) {
@@ -282,7 +304,7 @@ describe('apiConnectedServiceAuthGroupsV3', () => {
         })).resolves.toEqual(expect.objectContaining({ groupId: 'primary' }));
 
         expect(fetchMock).toHaveBeenCalledWith(
-            'https://api.example.test/v3/connect/openai-codex/groups/primary/active-profile',
+            matchServerFetchUrl('https://api.example.test/v3/connect/openai-codex/groups/primary/active-profile?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
             expect.objectContaining({
                 method: 'POST',
                 body: JSON.stringify({

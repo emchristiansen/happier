@@ -97,3 +97,17 @@ That depends on how your Happier server is configured.
 - On enterprise or special deployments, the server may advertise **optional** or **plaintext-only** storage behavior.
 
 If you operate the server yourself, see [Server → Encryption & plaintext storage](/self-hosting/encryption).
+
+## Require E2EE on the client
+
+On a server that offers optional plaintext storage, **Settings → Account → Require end-to-end encryption** adds a client-side requirement. Happier then refuses plaintext Account settings, new plaintext sessions, and plaintext session content instead of relying only on the mode advertised by the server. The control appears when the server offers the Account encryption-mode setting.
+
+The app stores both a synced preference and a trusted device-local pin. The local pin means a later server response cannot silently weaken a requirement already selected on that device. Enable Account E2EE before turning the requirement on; turn the requirement off before intentionally switching the Account to plaintext storage.
+
+For unattended CLI/daemon hosts, set:
+
+```bash
+HAPPIER_ENCRYPTION_REQUIREMENT=require_e2ee
+```
+
+The environment override only strengthens policy and wins over Account settings. `follow_account` (or an unset variable) keeps the normal Account-selected behavior. An invalid non-empty value stops CLI/daemon startup, and changing the environment requires restarting the daemon. When the daemon is managed by a service manager, configure the variable in that service's environment.

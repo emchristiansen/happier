@@ -1,6 +1,7 @@
 import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { createToolCallMessageFixture, renderScreen } from '@/dev/testkit';
 import { installToolCallsGroupViewCommonModuleMocks } from '@/components/sessions/transcript/turns/toolCalls/toolCallsGroupViewTestHelpers';
 import { createTranscriptSessionCommonPropsFixture, flattenStyleProp } from './toolCallsGroupUnitsTestFixtures';
@@ -79,7 +80,7 @@ describe('ToolCallsGroupUnitHeaderRow', () => {
             ],
         });
 
-        expect(screen.findAllByType('ActivityIndicator' as any).length).toBeGreaterThan(0);
+        expect(screen.findAllByType(ActivitySpinner).length).toBeGreaterThan(0);
         expect(screen.findByTestId('icon:check-circle')).toBeNull();
     });
 
@@ -159,20 +160,23 @@ describe('ToolCallsGroupUnitHeaderRow', () => {
         // resolveInactiveSessionToolCallFailure cancels the pending permission, and the
         // canceled permission resolves to 'permission_blocked' — not running, not error —
         // exactly as ToolCallsGroupRow derives the grouped status today.
-        expect(screen.findAllByType('ActivityIndicator' as any)).toHaveLength(0);
+        expect(screen.findAllByType(ActivitySpinner)).toHaveLength(0);
         expect(screen.findByTestId('icon:check-circle')).not.toBeNull();
     });
 
-    it('keeps the header non-pressable while collapsed and collapses via setExpanded(false) when expanded', async () => {
+    it('expands from the header with previews off and collapses from the expanded header', async () => {
         const setExpanded = vi.fn();
         const collapsed = await renderHeaderRow({
             toolMessages: [createToolCallMessageFixture({ id: 'm1', createdAt: 1 })],
             expanded: false,
             setExpanded,
+            ...createTranscriptSessionCommonPropsFixture({
+                toolChromeCommon: { transcriptToolCallsCollapsedPreviewCount: 0 },
+            }),
         });
 
-        const collapsedHeader = collapsed.findByTestId('transcript-tool-calls-header') as any;
-        expect(collapsedHeader?.props.onPress).toBeUndefined();
+        await collapsed.pressByTestIdAsync('transcript-tool-calls-header');
+        expect(setExpanded).toHaveBeenCalledWith(true);
 
         const expanded = await renderHeaderRow({
             toolMessages: [createToolCallMessageFixture({ id: 'm1', createdAt: 1 })],

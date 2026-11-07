@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { buildUsageLimitIssueFingerprint, type SessionRuntimeIssueV1 } from '@happier-dev/protocol';
 
 import { CONNECTED_SERVICE_BROKER_BRIDGE_FETCH_TIMEOUT_MS } from '../broker/brokerBridgeCallSource';
 
@@ -6,6 +7,7 @@ import {
   CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS,
   reportConnectedServiceRuntimeAuthFailureToDaemon,
   resetConnectedServiceRuntimeAuthFailureReportDedupeForTests,
+  recordRuntimeAuthProviderCompletion,
 } from './reportConnectedServiceRuntimeAuthFailureToDaemon';
 import {
   enqueueRuntimeAuthFailureReportOutboxItem,
@@ -25,6 +27,71 @@ const classifiedFailure = {
 } as const;
 
 describe('reportConnectedServiceRuntimeAuthFailureToDaemon', () => {
+  it.each([false, true])('leaves retry ownership with the calling run instead of the session outbox (transport failure: %s)', async (transportFails) => {
+    const outboxDir = await createTempDir('happier-run-owned-report-');
+    const scheduleOutboxDrain = vi.fn();
+    const response = { ok: true, result: { status: 'switch_attempted', result: { status: 'switched', activeProfileId: 'backup' } } };
+    try {
+      const result = await reportConnectedServiceRuntimeAuthFailureToDaemon({
+        sessionId: `execution_run:caller-owned-${transportFails}`,
+        classification: classifiedFailure,
+        delivery: 'caller_owned',
+        reportOutboxDir: outboxDir,
+        scheduleOutboxDrain,
+        notify: async () => {
+          if (transportFails) throw new Error('daemon unavailable');
+          return response;
+        },
+      });
+      expect(result.report).toEqual(transportFails ? null : response);
+      expect(await readRuntimeAuthFailureReportOutboxItems({ outboxDir })).toEqual([]);
+      expect(scheduleOutboxDrain).not.toHaveBeenCalled();
+    } finally { await removeTempDir(outboxDir); }
+  });
+  it.each(['usage_limit', 'auth_expired', 'refresh_failed', 'account_changed', 'account_disabled', 'permission_denied'] as const)('delivers unattributed %s failures for daemon-owned session binding authorization', async (kind) => {
+    const outboxDir = await createTempDir('happier-native-quota-report-');
+    const notify = vi.fn(async () => ({ ok: true, result: { status: 'not_applicable', reason: 'no_connected_service_binding' } }));
+    try {
+      const result = await reportConnectedServiceRuntimeAuthFailureToDaemon({ sessionId: 'native-quota-session',
+        classification: { ...classifiedFailure, kind, profileId: null, groupId: null },
+        notify, reportOutboxDir: outboxDir });
+      expect(result.report).not.toBeNull();
+      expect(notify).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        classification: expect.objectContaining({ profileId: null, groupId: null }),
+      }), expect.anything());
+      expect(await readRuntimeAuthFailureReportOutboxItems({ outboxDir })).toEqual([]);
+    } finally { await removeTempDir(outboxDir); }
+  });
+  it('reports each accepted failure occurrence while coalescing duplicate observers of that occurrence', async () => {
+    resetConnectedServiceRuntimeAuthFailureReportDedupeForTests();
+    const outboxDir = await createTempDir('happier-runtime-auth-failed-turns-');
+    const calls: string[] = [];
+    const notify = async (body: Readonly<{ reportId: string }>) => {
+      calls.push(body.reportId);
+      return { ok: true, result: { status: 'switch_reason_disabled' }, recoveryReceipt: {
+        reportId: body.reportId, attemptId: `attempt:${calls.length}`, transition: 'terminal', eventLocalId: `event:${calls.length}`,
+      } };
+    };
+    const issue: SessionRuntimeIssueV1 = { v: 1, scope: 'primary_session', status: 'failed', code: 'usage_limit', source: 'usage_limit', provider: 'claude', occurredAt: 1_000 };
+    const classification = { ...classifiedFailure, kind: 'usage_limit' as const };
+    try {
+      for (const occurredAt of [1_000, 1_000, 2_000]) {
+        await reportConnectedServiceRuntimeAuthFailureToDaemon({
+          sessionId: 'same-session-fresh-turns', classification: {
+            ...classification,
+            runtimeIssueFingerprint: buildUsageLimitIssueFingerprint({ ...issue, occurredAt }),
+          }, notify, reportOutboxDir: outboxDir, nowMs: () => occurredAt,
+        });
+      }
+      expect(new Set(calls).size).toBe(2);
+      expect(calls).toHaveLength(2);
+      expect(await readRuntimeAuthFailureReportOutboxItems({ outboxDir })).toEqual([]);
+    } finally {
+      resetConnectedServiceRuntimeAuthFailureReportDedupeForTests();
+      await removeTempDir(outboxDir);
+    }
+  });
+
   it('keeps the local recovery report lifecycle-owned instead of imposing a wall-clock deadline', () => {
     expect(CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS).toBeNull();
     expect(CONNECTED_SERVICE_BROKER_BRIDGE_FETCH_TIMEOUT_MS).toBeGreaterThan(0);
@@ -142,6 +209,33 @@ describe('reportConnectedServiceRuntimeAuthFailureToDaemon', () => {
   // Incident Jun-11 H-C / FIX-2: one failed turn is observed by THREE independent triggers
   // (StopFailure hook, SDK inbound loop, bridge observeTranscript), each calling this report
   // path. Dedupe lives HERE — inside the single shared owner — keyed on stable identity only
+  it('reports successive credential revisions to the daemon within the existing dedupe window', async () => {
+    const outboxDir = await createTempDir('runtime-auth-revision-report-');
+    try {
+      const revisions = ['csr_aaaaaaaaaaaaaaaaaaaaaa', 'csr_bbbbbbbbbbbbbbbbbbbbbb'];
+      type NotifyBody = Parameters<NonNullable<Parameters<typeof reportConnectedServiceRuntimeAuthFailureToDaemon>[0]['notify']>>[0];
+      const notify = vi.fn(async (body: NotifyBody) => {
+        const observed = body.classification as Readonly<{ credentialRevision?: string }>;
+        return { ok: true, result: observed.credentialRevision === revisions[0]
+          ? { status: 'recovery_superseded', reason: 'source_tuple_mismatch' }
+          : { status: 'session_not_found' } };
+      });
+      const reports = [];
+      for (const credentialRevision of revisions) {
+        reports.push(await reportConnectedServiceRuntimeAuthFailureToDaemon({
+          sessionId: 'revision-guarded-session',
+          classification: { ...classifiedFailure, groupGeneration: 7, credentialRevision },
+          notify, reportOutboxDir: outboxDir, nowMs: () => 1_000,
+        }));
+      }
+      expect(notify.mock.calls.map(([body]) => body.classification)).toEqual(revisions.map(credentialRevision =>
+        expect.objectContaining({ credentialRevision, groupGeneration: 7 })));
+      expect(reports[0]!.report).toMatchObject({ result: { status: 'recovery_superseded' } });
+      expect(reports[1]!.report).toMatchObject({ result: { status: 'session_not_found' } });
+      expect(await readRuntimeAuthFailureReportOutboxItems({ outboxDir })).toEqual([]);
+    } finally { await removeTempDir(outboxDir); }
+  });
+
   // (no Date.now-derived retryAfterMs), so all triggers are covered without per-call-site dedupers.
   describe('stable report dedupe', () => {
     const limitClassification = {
@@ -154,6 +248,26 @@ describe('reportConnectedServiceRuntimeAuthFailureToDaemon', () => {
       rateLimits: null,
       source: 'provider_runtime_marker',
     } as const;
+
+    it('separates a new refusal after useful completion without clearing another session', async () => {
+      const outboxDir = await createTempDir('happier-runtime-auth-completion-');
+      const notify = vi.fn(async (body: Readonly<{ reportId: string }>) => ({ ok: true,
+        recoveryReceipt: { reportId: body.reportId, attemptId: 'accepted', transition: 'armed', eventLocalId: 'event' } }));
+      const report = (sessionId: string) => reportConnectedServiceRuntimeAuthFailureToDaemon({
+        sessionId, classification: limitClassification, notify, reportOutboxDir: outboxDir,
+        scheduleOutboxDrain: () => {}, nowMs: () => 1_000,
+      });
+      try {
+        await report('completed-session');
+        await report('other-session');
+        await report('completed-session');
+        expect(notify).toHaveBeenCalledTimes(2);
+        recordRuntimeAuthProviderCompletion('completed-session');
+        await report('completed-session');
+        await report('other-session');
+        expect(notify).toHaveBeenCalledTimes(3);
+      } finally { await removeTempDir(outboxDir); }
+    });
 
     it('suppresses duplicate identical reports within the dedupe window and reuses the first daemon result', async () => {
       const notify = vi.fn(async () => ({ ok: true, result: { status: 'noop' } }));
@@ -251,6 +365,18 @@ describe('reportConnectedServiceRuntimeAuthFailureToDaemon', () => {
         nowMs: () => 1_100,
       });
 
+      expect(notify).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps reports from different organizations distinct for the same provider user', async () => {
+      const notify = vi.fn(async () => ({ ok: true, result: { status: 'noop' } }));
+      for (const sourceProviderOrganizationId of ['org-one', 'org-two']) {
+        await reportConnectedServiceRuntimeAuthFailureToDaemon({
+          sessionId: 'sess_dedupe_source_organization', switchesThisTurn: 0,
+          classification: { ...limitClassification, sourceProviderAccountId: 'same-user', sourceProviderOrganizationId },
+          notify, nowMs: () => 1000,
+        });
+      }
       expect(notify).toHaveBeenCalledTimes(2);
     });
 

@@ -52,7 +52,7 @@ function shouldRetryForPublishedSessionDataEncryptionKey(params: Readonly<{
     credentials: Credentials;
     rawSession: RawSessionRecord;
 }>): boolean {
-    if (params.credentials.encryption.type !== 'dataKey') {
+    if (params.credentials.encryption?.type !== 'dataKey') {
         return false;
     }
 
@@ -144,7 +144,7 @@ export async function resolveSessionTransportContext(
         rawSession: resolved.rawSession,
     });
     const mode = resolveSessionStoredContentEncryptionMode(rawSession);
-    if (params.requireOpenSessionDataKey && mode === 'e2ee' && params.credentials.encryption.type === 'dataKey') {
+    if (params.requireOpenSessionDataKey && mode === 'e2ee' && params.credentials.encryption?.type === 'dataKey') {
         const publishedDataKey = typeof rawSession.dataEncryptionKey === 'string'
             ? rawSession.dataEncryptionKey.trim()
             : '';

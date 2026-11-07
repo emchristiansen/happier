@@ -23,6 +23,7 @@ export {
   buildPiBrokerExtensionSource,
 } from './piBrokerExtensionSource';
 export {
+  resolvePiBrokerExtensionArgs,
   resolvePiBrokerExtensionDir,
   resolvePiBrokerExtensionPath,
   ensurePiBrokerExtensionAsset,

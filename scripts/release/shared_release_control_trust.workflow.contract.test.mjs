@@ -62,8 +62,8 @@ test('release shell steps receive GitHub inputs and outputs only through environ
   }
 });
 
-test('top-level release planning keeps dispatch data out of shell source and uses read-only permissions', () => {
-  const release = workflow('release.yml');
+test('channel release planning keeps dispatch data out of shell source and uses read-only permissions', () => {
+  const release = workflow('release-channel.yml');
   assert.deepEqual(release.jobs?.release_actor_guard?.needs, ['trusted_ref_guard', 'release_preflight']);
   assert.doesNotMatch(JSON.stringify(release.jobs?.trusted_ref_guard), /secrets\.|environment/);
   assert.match(JSON.stringify(release.jobs?.trusted_ref_guard), /job\.workflow_ref/);
@@ -76,7 +76,7 @@ test('top-level release planning keeps dispatch data out of shell source and use
     assert.doesNotMatch(
       candidate.run,
       /\$\{\{\s*(?:inputs\.|steps\.[^.]+\.outputs\.)/,
-      `release.yml plan/${candidate.name} must transport dispatch and step-output data through env`,
+      `release-channel.yml plan/${candidate.name} must transport dispatch and step-output data through env`,
     );
   }
 });
@@ -241,6 +241,7 @@ test('malicious branch and release inputs remain opaque publisher arguments', ()
       INPUT_TARGET: 'main',
       INPUT_MODE: 'fast_forward',
       INPUT_ALLOW_RESET: 'false',
+      INPUT_PRESERVE_TARGET_DESCENDANT: 'false',
       INPUT_CONFIRM: 'promote main from safe',
       INPUT_DRY_RUN: 'true',
       GITHUB_STEP_SUMMARY: join(tmpdir(), 'unused-release-summary'),

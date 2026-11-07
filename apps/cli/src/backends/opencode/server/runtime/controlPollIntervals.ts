@@ -25,7 +25,7 @@ export function resolveOpenCodeServerControlPollIntervals(
   );
   const turnActivePollSleepMs = readBoundedPollIntervalMs(
     readEnvString(env, 'HAPPIER_OPENCODE_SERVER_ACTIVE_CONTROL_POLL_INTERVAL_MS'),
-    Math.min(pollSleepMs, 250),
+    pollSleepMs,
   );
 
   return { pollSleepMs, turnActivePollSleepMs };

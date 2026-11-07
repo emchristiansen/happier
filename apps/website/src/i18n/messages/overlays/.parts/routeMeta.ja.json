@@ -145,5 +145,12 @@
     "ogTitle": "自社の SSO の背後で Happier のリレーをセルフホスト",
     "ogDescription": "自分でホストするリレーを、自社の GitHub 組織や OIDC グループに限定し、クライアント証明書、オフボーディングの再確認、選べるストレージポリシーを添えて。すべて MIT ライセンスです。",
     "ogImageAlt": "Happier のワードマークと、その下の言葉：あらゆる AI コーディングエージェントに、1 つのクライアント。"
+  },
+  "/download": {
+    "title": "Happier をダウンロード — デスクトップ、モバイル、CLI",
+    "description": "macOS、Windows、Linux、iOS、Android 版の Happier、またはエージェントを動かすコンピューター向け CLI をダウンロードできます。",
+    "ogTitle": "すべてのデバイスに Happier をダウンロード",
+    "ogDescription": "デスクトップアプリ、モバイルアプリ、直接 APK、そして自分のコンピューターでエージェントを動かす CLI。全ビルドを 1 ページにまとめました。",
+    "ogImageAlt": "Happier のワードマークと、その下の言葉：あらゆる AI コーディングエージェントに、1 つのクライアント。"
   }
 }

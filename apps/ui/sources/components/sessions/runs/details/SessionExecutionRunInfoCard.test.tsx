@@ -24,6 +24,9 @@ installSessionExecutionRunDetailsCommonModuleMocks({
         return createTextModuleMock({
             translate: (key, values) => {
                 if (key === 'session.subagents.intent.review') return 'Review';
+                // The card names the backend the way the rest of the app does, so the catalog
+                // display name is what reaches the Backend fact — never the raw `codex` id.
+                if (key === 'agentInput.agent.codex') return 'Codex';
                 if (key === 'executionRuns.details.labels.backend' && values?.value) return `Backend: ${String(values.value)}`;
                 if (key === 'executionRuns.details.labels.permissions' && values?.value) {
                     return `Permissions: ${String(values.value)}`;
@@ -97,7 +100,7 @@ describe('SessionExecutionRunInfoCard', () => {
         const text = JSON.stringify(tree!.toJSON());
         expect(text).toContain('Review Subagent');
         expect(text).toContain('Run ID: run_1');
-        expect(text).toContain('Backend: codex');
+        expect(text).toContain('Backend: Codex');
         expect(text).toContain('Permissions: safe_yolo');
         expect(text).toContain('Mode: bounded · streaming');
         expect(text).toContain('Status: running');

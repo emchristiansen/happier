@@ -1,11 +1,10 @@
 import type { SessionUserMessageAdmissionBody } from '@/session/services/admitSessionUserMessage';
+import type { SessionEncryptionContext } from '@/session/transport/encryption/sessionEncryptionContext';
 import { randomUUID } from 'node:crypto';
+import { buildSessionEventContent } from '@/api/session/sessionEventContent';
 
 import {
-  parsePermissionIntentAlias,
   resolveMetadataStringOverrideV1,
-  resolvePermissionIntentFromSessionMetadata,
-  type PermissionIntent,
 } from '@happier-dev/agents';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { isRpcMethodNotAvailableError, isRpcMethodNotFoundError } from '@happier-dev/protocol/rpcErrors';
@@ -28,11 +27,12 @@ import {
   isSessionUserMessage,
   type SessionTurnActivity,
 } from '@/session/query/detectSessionTurnInFlight';
-import { fetchSessionById } from '@/session/transport/http/sessionsHttp';
+import { commitSessionStoredMessage, fetchSessionById, type RawSessionRecord } from '@/session/transport/http/sessionsHttp';
 import { callSessionRpc } from '@/session/transport/rpc/sessionRpc';
 import { waitForIdleViaSocket } from '@/session/transport/socket/sessionSocketAgentState';
 import {
   decryptSessionPayload,
+  encryptSessionPayload,
   tryDecryptSessionMetadata,
 } from '@/session/transport/encryption/sessionEncryptionContext';
 import {
@@ -43,6 +43,8 @@ import {
 import { resolveSessionTransportContext } from './resolveSessionTransportContext';
 import { requestInactiveSessionResume } from './requestInactiveSessionResume';
 import { probeSessionPendingQueueWakeCapabilityV1 } from '@/daemon/sessions/pendingQueueWake';
+import { resolveSessionMessagePermissionIntent } from './resolveSessionMessagePermissionIntent';
+import { resolveSessionUserMessageRequestedAction } from './resolveSessionUserMessageRequestedAction';
 
 export type SendSessionMessageResult =
   | Readonly<{ ok: true; sessionId: string; localId: string; waited: boolean; suppressed?: true }>
@@ -54,34 +56,13 @@ export type SendSessionMessageResult =
        * from `unsupported`, which claims this Session or daemon cannot do it at
        * all — see `InactiveSessionResumeResult`.
        */
-      code: 'session_not_found' | 'session_id_ambiguous' | 'session_lookup_timeout' | 'session_data_key_unopenable' | 'session_archived' | 'unsupported' | 'resume_failed' | 'timeout' | 'wait_failed';
+      code: 'invalid_arguments' | 'session_not_found' | 'session_id_ambiguous' | 'session_lookup_timeout' | 'session_data_key_unopenable' | 'session_archived' | 'permission_escalation_denied' | 'unsupported' | 'resume_failed' | 'timeout' | 'wait_failed';
       candidates?: string[];
       message?: string;
     }> & (
       | Readonly<{ pendingCustody: 'confirmed'; sessionId: string; localId: string }>
       | Readonly<{ pendingCustody?: never; sessionId?: never; localId?: never }>
     );
-
-function parsePermissionIntentOrThrow(raw: string): PermissionIntent {
-  const parsed = parsePermissionIntentAlias(raw);
-  if (!parsed) {
-    const err = new Error(`Invalid permission mode: ${raw}`);
-    (err as any).code = 'invalid_arguments';
-    throw err;
-  }
-  return parsed;
-}
-
-function resolvePermissionIntent(params: Readonly<{
-  permissionModeOverride?: string;
-  decryptedMetadata: unknown;
-}>): PermissionIntent {
-  if (params.permissionModeOverride) {
-    return parsePermissionIntentOrThrow(params.permissionModeOverride);
-  }
-  const resolved = resolvePermissionIntentFromSessionMetadata(params.decryptedMetadata);
-  return resolved?.intent ?? 'default';
-}
 
 function resolveModelId(params: Readonly<{
   modelOverride?: string | null;
@@ -108,10 +89,7 @@ function sleep(ms: number): Promise<void> {
 
 function decryptTranscriptRowContent(params: Readonly<{
   content: { t: 'encrypted'; c: string } | { t: 'plain'; v: unknown };
-  ctx: Readonly<{
-    encryptionKey: Uint8Array;
-    encryptionVariant: 'legacy' | 'dataKey';
-  }>;
+  ctx: SessionEncryptionContext;
 }>): unknown | null {
   if (params.content.t === 'plain') {
     return params.content.v;
@@ -226,10 +204,7 @@ async function resolveCurrentTurnAfterSeqExclusive(params: Readonly<{
   sessionId: string;
   localId: string;
   materializedSeq: number;
-  ctx: Readonly<{
-    encryptionKey: Uint8Array;
-    encryptionVariant: 'legacy' | 'dataKey';
-  }>;
+  ctx: SessionEncryptionContext;
 }>): Promise<number> {
   const materializedSeq = Math.max(0, Math.trunc(params.materializedSeq));
   const fallbackAfterSeqExclusive = Math.max(0, materializedSeq - 1);
@@ -357,10 +332,7 @@ async function readAssistantTurnOutcomeAfterCurrentUserTurn(params: Readonly<{
   sessionId: string;
   localId: string;
   materializedSeq: number;
-  ctx: Readonly<{
-    encryptionKey: Uint8Array;
-    encryptionVariant: 'legacy' | 'dataKey';
-  }>;
+  ctx: SessionEncryptionContext;
 }>): Promise<AssistantTurnOutcome> {
   const afterSeq = Math.max(0, Math.trunc(params.materializedSeq) - 1);
   const rows = await fetchEncryptedTranscriptPageAfterSeq({
@@ -398,10 +370,7 @@ async function waitForAssistantOutcomeAfterCurrentUserTurn(params: Readonly<{
   sessionId: string;
   localId: string;
   materializedSeq: number;
-  ctx: Readonly<{
-    encryptionKey: Uint8Array;
-    encryptionVariant: 'legacy' | 'dataKey';
-  }>;
+  ctx: SessionEncryptionContext;
   maxWaitMs: number;
 }>): Promise<AssistantTurnOutcome> {
   const deadlineMs = Date.now() + Math.max(1, Math.trunc(params.maxWaitMs));
@@ -436,17 +405,26 @@ export async function sendSessionMessage(params: Readonly<{
   credentials: Credentials;
   idOrPrefix: string;
   message: string;
+  kind?: 'user' | 'notice';
+  from?: string;
   wait: boolean;
   timeoutMs: number;
   localId?: string;
   resumeInactiveSession?: boolean;
   permissionModeOverride?: string;
+  permissionModeCeiling?: string;
   modelOverride?: string | null;
   requestedAction?: PendingRequestedActionV1;
   pendingAdmissionMode?: 'continuation_if_no_queued_user_input';
   assertCanAdmit?: () => void;
   preserveAdmission?: (body: SessionUserMessageAdmissionBody) => Promise<SessionUserMessageAdmissionBody>;
+  /** Recheck a synthetic input's authority after transport lookup, before Pending custody. */
+  canAdmit?: (context: Readonly<{ rawSession: RawSessionRecord; metadata: Record<string, unknown> | null }>) => boolean | Promise<boolean>;
 }>): Promise<SendSessionMessageResult> {
+  if ((params.from !== undefined && (params.kind !== 'notice' || !params.from.trim()))
+    || (params.kind === 'notice' && (params.wait || params.permissionModeOverride !== undefined || params.modelOverride !== undefined))) {
+    return { ok: false, code: 'invalid_arguments', message: 'Notices accept a sender label but cannot wait for an agent or override its model or permissions' };
+  }
   const sessionTarget = await resolveSessionTransportContext({
     credentials: params.credentials,
     idOrPrefix: params.idOrPrefix,
@@ -475,20 +453,49 @@ export async function sendSessionMessage(params: Readonly<{
     throw new Error('Pending localId must not be blank');
   }
   const localId = readPendingLocalId(params.localId) ?? randomUUID();
+  if (params.kind === 'notice') {
+    const record = buildSessionEventContent({
+      type: 'message',
+      message: `${params.from?.trim() ?? 'Notice'}: ${params.message}`,
+    }, localId);
+    await commitSessionStoredMessage({
+      token: params.credentials.token,
+      sessionId,
+      localId,
+      messageRole: 'event',
+      content: sessionTarget.mode === 'plain'
+        ? { t: 'plain', v: record }
+        : { t: 'encrypted', c: encryptSessionPayload({
+            ctx: sessionTarget.ctx,
+            payload: record,
+            idempotencyKey: `session-notice:v1:${sessionId}:${localId}`,
+          }) },
+    });
+    return { ok: true, sessionId, localId, waited: false };
+  }
   const decryptedMetadata = tryDecryptSessionMetadata({
     credentials: params.credentials,
     rawSession: sessionTarget.rawSession,
   });
-  const permissionIntent = resolvePermissionIntent({
+  const permissionResolution = resolveSessionMessagePermissionIntent({
     permissionModeOverride: params.permissionModeOverride,
+    permissionModeCeiling: params.permissionModeCeiling,
     decryptedMetadata,
   });
+  if (!permissionResolution.ok) {
+    return permissionResolution;
+  }
+  const permissionIntent = permissionResolution.permissionIntent;
   const modelId = resolveModelId({
     modelOverride: params.modelOverride,
     decryptedMetadata,
   });
 
   const shouldUseRuntimeRpc = sessionTarget.rawSession.active === true;
+  const shouldResumeInactiveSession = !shouldUseRuntimeRpc && params.resumeInactiveSession !== false;
+  if (params.canAdmit && !(await params.canAdmit({ rawSession: sessionTarget.rawSession, metadata: asRecord(decryptedMetadata) }))) {
+    return { ok: true, sessionId, localId, waited: false, suppressed: true };
+  }
   const admission = await admitSessionUserMessageToPendingQueue({
     credentials: params.credentials,
     sessionId,
@@ -500,7 +507,10 @@ export async function sendSessionMessage(params: Readonly<{
     modelId,
     ...(params.preserveAdmission ? { preserveAdmission: params.preserveAdmission } : {}),
     ...(params.assertCanAdmit ? { assertCanAdmit: params.assertCanAdmit } : {}),
-    ...(params.requestedAction ? { requestedAction: params.requestedAction } : {}),
+    requestedAction: resolveSessionUserMessageRequestedAction({
+      deliveryIntent: shouldResumeInactiveSession ? 'runtime_bootstrap' : 'ordinary',
+      ...(params.requestedAction ? { requestedAction: params.requestedAction } : {}),
+    }),
     ...(params.pendingAdmissionMode ? { pendingAdmissionMode: params.pendingAdmissionMode } : {}),
   });
 
@@ -522,7 +532,7 @@ export async function sendSessionMessage(params: Readonly<{
     return { ok: true, sessionId, localId, waited: false };
   }
 
-  if (!shouldUseRuntimeRpc && params.resumeInactiveSession !== false) {
+  if (shouldResumeInactiveSession) {
     const resumeResult = await requestInactiveSessionResume({
       credentials: params.credentials,
       sessionId,

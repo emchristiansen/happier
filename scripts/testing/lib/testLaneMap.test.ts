@@ -79,3 +79,9 @@ test('exposes the WSREPL Lima UI lane as a root script', () => {
   assert.equal(LANE_ROOT_SCRIPTS['test:e2e:ui:wsrepl:lima'], 'yarn test:e2e:ui:wsrepl:lima');
   assert.equal(LANE_ROOT_SCRIPTS['test:e2e:ui:wsrepl:lima:self'], 'yarn test:e2e:ui:wsrepl:lima:self');
 });
+
+test('exposes CLI slow and shared-package workspaces through root-owned lanes', () => {
+  assert.equal(LANE_ROOT_SCRIPTS['cli:test:slow'], 'yarn test:cli:slow');
+  assert.equal(LANE_ROOT_SCRIPTS['website:test'], 'yarn test');
+  assert.equal(LANE_ROOT_SCRIPTS['release-runtime:test'], 'yarn test');
+});

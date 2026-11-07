@@ -1,12 +1,16 @@
 import type { AgentId } from '@/agents/catalog/catalog';
+import type { DaemonTerminalLaunchIntent } from '@happier-dev/protocol';
 
 export type ProviderLocalAuthSupport = 'login_terminal' | 'status_only' | 'manual_only' | 'unsupported';
 
-export type ProviderLocalAuthLaunch = Readonly<{
+type ProviderLocalAuthLaunchBase = Readonly<{
     kind: 'primary' | 'device_code';
-    initialCommand: string;
     initialInput?: string | null;
 }>;
+
+export type ProviderLocalAuthLaunch =
+    | (ProviderLocalAuthLaunchBase & Readonly<{ initialCommand: string; launch?: never }>)
+    | (ProviderLocalAuthLaunchBase & Readonly<{ launch: DaemonTerminalLaunchIntent; initialCommand?: never }>);
 
 export type ProviderLocalAuthPlugin = Readonly<{
     providerId: AgentId;

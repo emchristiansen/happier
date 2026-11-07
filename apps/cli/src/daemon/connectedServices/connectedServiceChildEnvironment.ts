@@ -180,6 +180,35 @@ export function readConnectedServiceMaterializedEnvKeysFromEnv(
     .filter(Boolean)));
 }
 
+/**
+ * Removes Connected Service authority inherited from a parent runtime before
+ * composing a distinct child runtime. The materialized-key marker is the
+ * canonical provider-agnostic inventory of credential/config environment
+ * owned by that parent selection; the control markers are removed with it so
+ * a child cannot reinterpret the parent's selection as its own.
+ *
+ * A child with an explicit Connected Service selection receives its freshly
+ * materialized overlay later. Native children keep unrelated ambient values,
+ * including their genuine native credentials.
+ */
+export function stripInheritedConnectedServiceEnvironment(
+  env: Pick<NodeJS.ProcessEnv, string>,
+): Record<string, string> {
+  const inheritedKeys = new Set<string>([
+    ...readConnectedServiceMaterializedEnvKeysFromEnv(env),
+    HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY,
+    HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY,
+    HAPPIER_CONNECTED_SERVICE_TARGET_MATERIALIZED_ROOT_ENV_KEY,
+  ]);
+  const sanitized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === 'string' && !inheritedKeys.has(key)) {
+      sanitized[key] = value;
+    }
+  }
+  return sanitized;
+}
+
 export function findConnectedServiceChildSelection(
   env: Pick<NodeJS.ProcessEnv, string>,
   serviceId: ConnectedServiceId,

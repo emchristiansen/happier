@@ -9,10 +9,26 @@ import {
   getAgentSessionModesKind,
 } from './sessionModes.js';
 import { getAgentAdvancedModeCapabilities } from './advancedModes.js';
+import { BUILT_IN_ACP_CONFIG } from './acp.js';
+import { resolveAgentNativeSpawnDefinitiveRejection } from './nativeLaunchSelection.js';
 
 const cursorAgentId = 'cursor' as AgentId;
 
 describe('sessionModes', () => {
+  it('admits an advertised Antigravity mode as an initial launch selection', () => {
+    expect(resolveAgentNativeSpawnDefinitiveRejection({
+      agentId: 'agy',
+      selection: { acpSessionModeId: 'auto_edit' },
+    })).toEqual({ ok: true });
+  });
+
+  it('does not suppress negotiated modes for built-in ACP transports that allow them', () => {
+    for (const config of Object.values(BUILT_IN_ACP_CONFIG)) {
+      if (config.supportsModes === 'no') continue;
+      expect(getAgentSessionModeDescriptor(config.agentId).source, config.agentId).toBe('acp');
+      expect(getAgentSessionModesKind(config.agentId), config.agentId).not.toBe('none');
+    }
+  });
   it('exposes structured session mode descriptors for representative agents', () => {
     expect(getAgentSessionModeDescriptor('claude')).toEqual({
       source: 'provider-native',
@@ -37,13 +53,21 @@ describe('sessionModes', () => {
       semantics: 'none',
       runtimeSwitch: 'none',
     });
+
+    expect(getAgentSessionModeDescriptor('qwen')).toEqual({
+      source: 'acp',
+      semantics: 'agent-modes',
+      runtimeSwitch: 'acp-setSessionMode',
+    });
   });
 
   it('keeps flat compatibility shims aligned with the structured descriptor', () => {
+    expect(getAgentSessionModesKind('kimi')).toBe('none');
     expect(getAgentSessionModesKind('claude')).toBe('staticAgentModes');
     expect(getAgentSessionModesKind('opencode')).toBe('acpAgentModes');
     expect(getAgentSessionModesKind('codex')).toBe('acpPolicyPresets');
     expect(getAgentSessionModesKind('gemini')).toBe('none');
+    expect(getAgentSessionModesKind('qwen')).toBe('acpAgentModes');
   });
 
   it('drives advanced mode runtime-switch capabilities from the shared descriptor', () => {
@@ -51,6 +75,7 @@ describe('sessionModes', () => {
     expect(getAgentAdvancedModeCapabilities('opencode').supportsRuntimeModeSwitch).toBe('acp-setSessionMode');
     expect(getAgentAdvancedModeCapabilities('codex').supportsRuntimeModeSwitch).toBe('metadata-gating');
     expect(getAgentAdvancedModeCapabilities('gemini').supportsRuntimeModeSwitch).toBe('none');
+    expect(getAgentAdvancedModeCapabilities('qwen').supportsRuntimeModeSwitch).toBe('acp-setSessionMode');
   });
 
   it('declares Cursor as an ACP agent-mode provider', () => {

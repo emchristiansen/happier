@@ -1,8 +1,28 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import 'fake-indexeddb/auto';
+import { forceCloseDatabase } from 'fake-indexeddb';
 import { clearBrowserRecords, deleteBrowserRecord, listBrowserRecords, readBrowserRecord, updateBrowserRecord, writeBrowserRecord } from './browserRecordStorage';
 
 describe('browser large-record transactions', () => {
+    it('reopens an unexpectedly closed connection before clearing durable records', async () => {
+        const opening = vi.spyOn(indexedDB, 'open');
+        await writeBrowserRecord('closed:draft', 'private draft');
+        const opened = opening.mock.results[0];
+        opening.mockRestore();
+        if (opened.type !== 'return') throw new Error('Expected a database open request');
+        const database = opened.value.result;
+        const closed = new Promise<void>((resolve) => database.addEventListener('close', () => resolve(), { once: true }));
+        // @ts-expect-error fake-indexeddb declares a constructor here, but its API takes an instance.
+        forceCloseDatabase(database);
+        await closed;
+
+        expect(await readBrowserRecord('closed:draft')).toBe('private draft');
+        await clearBrowserRecords();
+        expect(await listBrowserRecords('')).toEqual(new Map());
+        await writeBrowserRecord('closed:next-account', 'new draft');
+        expect(await readBrowserRecord('closed:next-account')).toBe('new draft');
+    });
+
     it('completes an explicit local-data clear before reporting success', async () => {
         await writeBrowserRecord('clear:draft', 'draft');
         await writeBrowserRecord('clear:outbox', 'message');

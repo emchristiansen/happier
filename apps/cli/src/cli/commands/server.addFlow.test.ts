@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,13 +20,16 @@ const { resolveInstalledDaemonServiceInventoryForCurrentRelayMock } = vi.hoisted
 }));
 
 vi.mock('node:readline', () => ({
-  createInterface: () => ({
-    question: (prompt: string, cb: (answer: string) => void) => {
-      promptQuestions.push(prompt);
-      cb(promptAnswers.shift() ?? '');
-    },
-    close: () => {},
-  }),
+  createInterface: () => {
+    const rl = new EventEmitter();
+    return Object.assign(rl, {
+      question: (prompt: string, cb: (answer: string) => void) => {
+        promptQuestions.push(prompt);
+        cb(promptAnswers.shift() ?? '');
+      },
+      close: () => { rl.emit('close'); },
+    });
+  },
 }));
 
 const spawnHappyCLIMock = vi.fn();
@@ -361,7 +365,7 @@ describe('happier server add guided flow', () => {
 
       const settings = await readSettings();
       expect(settings.servers?.CloudCopy?.serverUrl).toBe('https://api.happier.dev');
-      expect(settings.servers?.CloudCopy?.webappUrl).toBe('https://app.happier.dev');
+      expect(settings.servers?.CloudCopy?.webappUrl).toBe('https://cloud.happier.dev');
     } finally {
       restoreTty();
       if (prevHome === undefined) delete process.env.HAPPIER_HOME_DIR;

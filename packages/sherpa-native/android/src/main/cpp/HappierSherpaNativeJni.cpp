@@ -3,15 +3,18 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <android/log.h>
 
 #include "sherpa-onnx/c-api/c-api.h"
+#include "HappierSherpaOnlineAsr.h"
 
 namespace {
 
@@ -32,6 +35,16 @@ int32_t ProgressCallback(const float * /*samples*/, int32_t /*n*/, float /*p*/, 
   return parg->state->cancelled.load() ? 0 : 1;
 }
 
+// Accepted synthesis jobs by id, from acceptance (still queued on the TTS executor) until the job ends. Cancel
+// flags a queued or running job; ids it does not know (finished, never accepted, ASR jobs) are ignored, so the
+// map never outgrows the jobs actually in flight.
+std::mutex g_jobsMutex;
+std::unordered_map<std::string, std::shared_ptr<JobState>> g_jobs;
+
+constexpr jint kSynthesisFailed = 0;
+constexpr jint kSynthesisOk = 1;
+constexpr jint kSynthesisCancelled = 2;
+
 struct Engine {
   const SherpaOnnxOfflineTts *tts = nullptr;
   std::string assetsDir;
@@ -39,9 +52,6 @@ struct Engine {
   std::string voicesPath;
   std::string tokensPath;
   std::string dataDirPath;
-
-  std::mutex mutex;
-  std::unordered_map<std::string, std::unique_ptr<JobState>> jobs;
 
   ~Engine() {
     if (tts) {
@@ -67,14 +77,55 @@ struct AsrEngine {
   }
 };
 
-struct AsrStreamState {
-  AsrEngine *engine = nullptr;
-  SherpaOnnxOnlineStream *stream = nullptr;
+struct AsrStreamDeleter {
+  void operator()(const SherpaOnnxOnlineStream *stream) const {
+    if (stream) SherpaOnnxDestroyOnlineStream(stream);
+  }
 };
 
+using AsrStream = std::unique_ptr<const SherpaOnnxOnlineStream, AsrStreamDeleter>;
+
+// Streams share their engine. Member destruction releases the stream before its engine; moves transfer
+// both together, and assignment cannot accidentally release an old engine before its old stream.
+struct AsrStreamState {
+  std::shared_ptr<AsrEngine> engine;
+  AsrStream stream;
+  int32_t inputSampleRate = 16000;
+  // Text of segments already closed by an endpoint. The stream is reset at each endpoint (otherwise the
+  // utterance-length rule keeps reporting an endpoint on every frame), and callers receive the whole
+  // transcript so far rather than only the open segment.
+  std::string committedText;
+
+  AsrStreamState(std::shared_ptr<AsrEngine> engine, AsrStream stream)
+      : engine(std::move(engine)), stream(std::move(stream)) {}
+  AsrStreamState(const AsrStreamState &) = delete;
+  AsrStreamState &operator=(const AsrStreamState &) = delete;
+  AsrStreamState(AsrStreamState &&) = default;
+  AsrStreamState &operator=(AsrStreamState &&) = delete;
+};
+
+// One private owner per Android module, used only on that module's ASR executor. Teardown is its final
+// queued operation, so neither another module nor a reused external job id can retire these streams.
+struct AsrOwner {
+  std::unordered_map<std::string, AsrStreamState> streams;
+};
+
+std::string JoinTranscript(const std::string &committed, const std::string &segment) {
+  if (committed.empty()) return segment;
+  if (segment.empty()) return committed;
+  return committed + " " + segment;
+}
+
+std::string ReadStreamText(const SherpaOnnxOnlineRecognizer *recognizer, const SherpaOnnxOnlineStream *stream) {
+  const SherpaOnnxOnlineRecognizerResult *result = SherpaOnnxGetOnlineStreamResult(recognizer, stream);
+  std::string text;
+  if (result && result->text) text = std::string(result->text);
+  if (result) SherpaOnnxDestroyOnlineRecognizerResult(result);
+  return text;
+}
+
 std::mutex g_asrMutex;
-std::unordered_map<std::string, std::unique_ptr<AsrEngine>> g_asrEnginesByAssetsDir;
-std::unordered_map<std::string, AsrStreamState> g_asrStreamsByJobId;
+std::unordered_map<std::string, std::shared_ptr<AsrEngine>> g_asrEnginesByAssetsDir;
 
 Engine *CreateEngine(const std::string &assetsDir) {
   auto engine = std::make_unique<Engine>();
@@ -118,14 +169,14 @@ Engine *CreateEngine(const std::string &assetsDir) {
   return engine.release();
 }
 
-AsrEngine *GetOrCreateAsrEngine(const std::string &assetsDir) {
+std::shared_ptr<AsrEngine> GetOrCreateAsrEngine(const std::string &assetsDir) {
   std::lock_guard<std::mutex> lock(g_asrMutex);
   auto it = g_asrEnginesByAssetsDir.find(assetsDir);
   if (it != g_asrEnginesByAssetsDir.end()) {
-    return it->second.get();
+    return it->second;
   }
 
-  auto engine = std::make_unique<AsrEngine>();
+  auto engine = std::make_shared<AsrEngine>();
   engine->assetsDir = assetsDir;
   engine->tokensPath = assetsDir + "/tokens.txt";
   engine->encoderPath = assetsDir + "/encoder.onnx";
@@ -160,24 +211,18 @@ AsrEngine *GetOrCreateAsrEngine(const std::string &assetsDir) {
   config.model_config.transducer.decoder = engine->decoderPath.c_str();
   config.model_config.transducer.joiner = engine->joinerPath.c_str();
 
-  config.decoder_config.decoding_method = "greedy_search";
-  config.decoder_config.num_active_paths = 4;
-  config.decoder_config.enable_endpoint = 1;
-  config.decoder_config.hotwords_file = nullptr;
-  config.decoder_config.hotwords_score = 0.0f;
-  config.decoder_config.rule_fsts = nullptr;
-  config.decoder_config.rule_fsts_score = 0.0f;
-  config.decoder_config.blank_penalty = 0.0f;
+  // Mirrors ios/HappierSherpaOnlineAsrEngine.mm. Unset (zero) fields take sherpa-onnx defaults.
+  config.decoding_method = "greedy_search";
+  config.max_active_paths = 4;
+  config.enable_endpoint = 1;
 
-  config.endpoint_config.rule1.must_contain_nonsilence = 1;
-  config.endpoint_config.rule1.min_trailing_silence = 1.2f;
-  config.endpoint_config.rule1.min_utterance_length = 0.0f;
-  config.endpoint_config.rule2.must_contain_nonsilence = 1;
-  config.endpoint_config.rule2.min_trailing_silence = 0.6f;
-  config.endpoint_config.rule2.min_utterance_length = 2.0f;
-  config.endpoint_config.rule3.must_contain_nonsilence = 0;
-  config.endpoint_config.rule3.min_trailing_silence = 0.0f;
-  config.endpoint_config.rule3.min_utterance_length = 15.0f;
+  // Default endpointing tuned for streaming turn-taking. Units are seconds.
+  config.rule1_min_trailing_silence = 1.2f;
+  config.rule2_min_trailing_silence = 0.6f;
+  // Rule 3 fires on utterance length alone, i.e. mid-speech. The stream resets on every endpoint and
+  // the UI ends the hands-free turn on it, so only the trailing-silence rules may report one. Zero
+  // would select the sherpa-onnx default (20 s), so disable it with an unreachable length.
+  config.rule3_min_utterance_length = std::numeric_limits<float>::max();
 
   const SherpaOnnxOnlineRecognizer *recognizer = SherpaOnnxCreateOnlineRecognizer(&config);
   if (!recognizer) {
@@ -186,9 +231,8 @@ AsrEngine *GetOrCreateAsrEngine(const std::string &assetsDir) {
   }
 
   engine->recognizer = recognizer;
-  AsrEngine *out = engine.get();
-  g_asrEnginesByAssetsDir[assetsDir] = std::move(engine);
-  return out;
+  g_asrEnginesByAssetsDir[assetsDir] = engine;
+  return engine;
 }
 
 std::string JStringToUtf8(JNIEnv *env, jstring str) {
@@ -286,21 +330,26 @@ Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeSynthesizeToWavFile(
     jstring outWavPath,
     jstring jobId) {
   auto *engine = reinterpret_cast<Engine *>(handle);
-  if (!engine || !engine->tts) return 0;
+  if (!engine || !engine->tts) return kSynthesisFailed;
 
   const std::string jobKey = JStringToUtf8(env, jobId);
   const std::string outPath = JStringToUtf8(env, outWavPath);
   const std::string inputText = JStringToUtf8(env, text);
-  if (jobKey.empty() || outPath.empty() || inputText.empty()) return 0;
+  if (jobKey.empty() || outPath.empty() || inputText.empty()) return kSynthesisFailed;
 
-  auto state = std::make_unique<JobState>();
-  JobState *statePtr = state.get();
+  std::shared_ptr<JobState> state;
   {
-    std::lock_guard<std::mutex> lock(engine->mutex);
-    engine->jobs[jobKey] = std::move(state);
+    std::lock_guard<std::mutex> lock(g_jobsMutex);
+    auto &entry = g_jobs[jobKey];
+    if (!entry) entry = std::make_shared<JobState>();
+    if (entry->cancelled.load()) {
+      g_jobs.erase(jobKey);
+      return kSynthesisCancelled;
+    }
+    state = entry;
   }
 
-  ProgressArg arg{statePtr};
+  ProgressArg arg{state.get()};
 
   SherpaOnnxGenerationConfig genCfg;
   memset(&genCfg, 0, sizeof(genCfg));
@@ -313,82 +362,109 @@ Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeSynthesizeToWavFile(
       engine->tts, inputText.c_str(), &genCfg, ProgressCallback, &arg);
 
   {
-    std::lock_guard<std::mutex> lock(engine->mutex);
-    engine->jobs.erase(jobKey);
+    std::lock_guard<std::mutex> lock(g_jobsMutex);
+    g_jobs.erase(jobKey);
   }
 
-  if (!audio) {
-    return 0;
+  // A cancelled generation stops early and may still return the partial audio; never publish it.
+  if (state->cancelled.load()) {
+    if (audio) SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
+    return kSynthesisCancelled;
   }
+  if (!audio) return kSynthesisFailed;
 
   const int32_t ok = SherpaOnnxWriteWave(audio->samples, audio->n, audio->sample_rate, outPath.c_str());
   SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
-  return ok ? 1 : 0;
+  return ok ? kSynthesisOk : kSynthesisFailed;
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeCancel(JNIEnv *env, jclass /*clazz*/, jlong handle, jstring jobId) {
-  auto *engine = reinterpret_cast<Engine *>(handle);
-  if (!engine) return;
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeCancel(JNIEnv *env, jclass /*clazz*/, jstring jobId) {
   const std::string jobKey = JStringToUtf8(env, jobId);
   if (jobKey.empty()) return;
-  std::lock_guard<std::mutex> lock(engine->mutex);
-  auto it = engine->jobs.find(jobKey);
-  if (it == engine->jobs.end()) return;
+  std::lock_guard<std::mutex> lock(g_jobsMutex);
+  auto it = g_jobs.find(jobKey);
+  if (it == g_jobs.end()) return;
   it->second->cancelled.store(true);
 }
 
+// Registers a synthesis job when it is accepted, before it waits on the TTS executor, so a cancel that arrives
+// while it is queued is not lost.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeAcceptSynthesis(JNIEnv *env, jclass /*clazz*/, jstring jobId) {
+  const std::string jobKey = JStringToUtf8(env, jobId);
+  if (jobKey.empty()) return;
+  std::lock_guard<std::mutex> lock(g_jobsMutex);
+  g_jobs[jobKey] = std::make_shared<JobState>();
+}
+
+// Drops an accepted job that ended without running (failed before synthesis or could not be scheduled).
+extern "C" JNIEXPORT void JNICALL
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeForgetSynthesis(JNIEnv *env, jclass /*clazz*/, jstring jobId) {
+  const std::string jobKey = JStringToUtf8(env, jobId);
+  if (jobKey.empty()) return;
+  std::lock_guard<std::mutex> lock(g_jobsMutex);
+  g_jobs.erase(jobKey);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeCreateAsrOwner(JNIEnv * /*env*/, jclass /*clazz*/) {
+  return reinterpret_cast<jlong>(new AsrOwner());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeDestroyAsrOwner(
+    JNIEnv * /*env*/, jclass /*clazz*/, jlong ownerHandle) {
+  delete reinterpret_cast<AsrOwner *>(ownerHandle);
+}
+
 extern "C" JNIEXPORT jint JNICALL
-Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeCreateStreamingRecognizer(
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeCreateOwnedStreamingRecognizer(
     JNIEnv *env,
     jclass /*clazz*/,
+    jlong ownerHandle,
     jstring jobId,
     jstring assetsDir,
     jint /*sampleRate*/,
     jint /*channels*/,
     jstring /*language*/) {
+  auto *owner = reinterpret_cast<AsrOwner *>(ownerHandle);
+  if (!owner) return 0;
   const std::string jobKey = JStringToUtf8(env, jobId);
   const std::string dir = JStringToUtf8(env, assetsDir);
   if (jobKey.empty() || dir.empty()) return 0;
 
-  AsrEngine *engine = GetOrCreateAsrEngine(dir);
+  std::shared_ptr<AsrEngine> engine = GetOrCreateAsrEngine(dir);
   if (!engine || !engine->recognizer) return 0;
 
-  std::lock_guard<std::mutex> lock(g_asrMutex);
-  auto it = g_asrStreamsByJobId.find(jobKey);
-  if (it != g_asrStreamsByJobId.end()) {
-    if (it->second.stream) {
-      SherpaOnnxDestroyOnlineStream(it->second.stream);
-    }
-    g_asrStreamsByJobId.erase(it);
-  }
+  owner->streams.erase(jobKey);
 
-  SherpaOnnxOnlineStream *stream = SherpaOnnxCreateOnlineStream(engine->recognizer);
+  AsrStream stream(SherpaOnnxCreateOnlineStream(engine->recognizer));
   if (!stream) return 0;
-  g_asrStreamsByJobId[jobKey] = AsrStreamState{engine, stream};
+  owner->streams.try_emplace(jobKey, std::move(engine), std::move(stream));
   return 1;
 }
 
 extern "C" JNIEXPORT jobject JNICALL
-Java_dev_happier_sherpa_HappierSherpaNativeJni_nativePushAudioFrame(
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativePushOwnedAudioFrame(
     JNIEnv *env,
     jclass /*clazz*/,
+    jlong ownerHandle,
     jstring jobId,
     jbyteArray pcm16le,
     jint sampleRate,
     jint channels) {
+  auto *owner = reinterpret_cast<AsrOwner *>(ownerHandle);
+  if (!owner) return MakePushFrameResult(env, "", false);
   const std::string jobKey = JStringToUtf8(env, jobId);
   if (jobKey.empty() || !pcm16le) return MakePushFrameResult(env, "", false);
 
-  AsrStreamState state;
-  {
-    std::lock_guard<std::mutex> lock(g_asrMutex);
-    auto it = g_asrStreamsByJobId.find(jobKey);
-    if (it == g_asrStreamsByJobId.end() || !it->second.engine || !it->second.stream) {
-      return MakePushFrameResult(env, "", false);
-    }
-    state = it->second;
+  // This owner's executor serializes frames, finish, cancel and terminal owner disposal.
+  auto it = owner->streams.find(jobKey);
+  if (it == owner->streams.end() || !it->second.engine || !it->second.stream) {
+    return MakePushFrameResult(env, "", false);
   }
+  AsrStreamState *state = &it->second;
 
   const jsize len = env->GetArrayLength(pcm16le);
   if (len <= 0) return MakePushFrameResult(env, "", false);
@@ -398,63 +474,71 @@ Java_dev_happier_sherpa_HappierSherpaNativeJni_nativePushAudioFrame(
                           reinterpret_cast<jbyte *>(samples16.data()));
 
   const auto mono = Pcm16LeToMonoFloats(samples16.data(), samples16.size(), channels);
+  const SherpaOnnxOnlineRecognizer *recognizer = state->engine->recognizer;
   if (!mono.empty()) {
-    SherpaOnnxOnlineStreamAcceptWaveform(state.stream, sampleRate > 0 ? sampleRate : 16000, mono.data(),
+    state->inputSampleRate = sampleRate > 0 ? sampleRate : 16000;
+    SherpaOnnxOnlineStreamAcceptWaveform(state->stream.get(), state->inputSampleRate, mono.data(),
                                          static_cast<int32_t>(mono.size()));
   }
 
-  while (SherpaOnnxIsOnlineStreamReady(state.engine->recognizer, state.stream)) {
-    SherpaOnnxDecodeOnlineStream(state.engine->recognizer, state.stream);
+  while (SherpaOnnxIsOnlineStreamReady(recognizer, state->stream.get())) {
+    SherpaOnnxDecodeOnlineStream(recognizer, state->stream.get());
   }
 
-  const SherpaOnnxOnlineRecognizerResult *result = SherpaOnnxGetOnlineStreamResult(state.engine->recognizer, state.stream);
-  std::string text;
-  if (result && result->text) text = std::string(result->text);
-  if (result) SherpaOnnxDestroyOnlineRecognizerResult(result);
-
-  const bool endpoint = SherpaOnnxOnlineStreamIsEndpoint(state.engine->recognizer, state.stream) != 0;
-  return MakePushFrameResult(env, text, endpoint);
+  const std::string segment = ReadStreamText(recognizer, state->stream.get());
+  const bool endpoint = SherpaOnnxOnlineStreamIsEndpoint(recognizer, state->stream.get()) != 0;
+  const std::string transcript = JoinTranscript(state->committedText, segment);
+  if (endpoint) {
+    state->committedText = transcript;
+    SherpaOnnxOnlineStreamReset(recognizer, state->stream.get());
+  }
+  return MakePushFrameResult(env, transcript, endpoint);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeFinishStreaming(JNIEnv *env, jclass /*clazz*/, jstring jobId) {
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeFinishOwnedStreaming(
+    JNIEnv *env, jclass /*clazz*/, jlong ownerHandle, jstring jobId) {
+  auto *owner = reinterpret_cast<AsrOwner *>(ownerHandle);
+  if (!owner) return env->NewStringUTF("");
   const std::string jobKey = JStringToUtf8(env, jobId);
   if (jobKey.empty()) return env->NewStringUTF("");
 
-  AsrStreamState state;
-  {
-    std::lock_guard<std::mutex> lock(g_asrMutex);
-    auto it = g_asrStreamsByJobId.find(jobKey);
-    if (it == g_asrStreamsByJobId.end()) return env->NewStringUTF("");
-    state = it->second;
-    g_asrStreamsByJobId.erase(it);
-  }
+  auto it = owner->streams.find(jobKey);
+  if (it == owner->streams.end()) return env->NewStringUTF("");
+  AsrStreamState state(std::move(it->second));
+  owner->streams.erase(it);
 
   if (!state.engine || !state.stream) return env->NewStringUTF("");
 
-  SherpaOnnxOnlineStreamInputFinished(state.stream);
-  while (SherpaOnnxIsOnlineStreamReady(state.engine->recognizer, state.stream)) {
-    SherpaOnnxDecodeOnlineStream(state.engine->recognizer, state.stream);
-  }
+  happier_sherpa::FinishOnlineTransducer(state.engine->recognizer, state.stream.get(), state.inputSampleRate);
 
-  const SherpaOnnxOnlineRecognizerResult *result = SherpaOnnxGetOnlineStreamResult(state.engine->recognizer, state.stream);
-  std::string text;
-  if (result && result->text) text = std::string(result->text);
-  if (result) SherpaOnnxDestroyOnlineRecognizerResult(result);
+  const std::string text = JoinTranscript(state.committedText, ReadStreamText(state.engine->recognizer, state.stream.get()));
 
-  SherpaOnnxDestroyOnlineStream(state.stream);
   return env->NewStringUTF(text.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeCancelStreaming(JNIEnv *env, jclass /*clazz*/, jstring jobId) {
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeCancelOwnedStreaming(
+    JNIEnv *env, jclass /*clazz*/, jlong ownerHandle, jstring jobId) {
+  auto *owner = reinterpret_cast<AsrOwner *>(ownerHandle);
+  if (!owner) return;
   const std::string jobKey = JStringToUtf8(env, jobId);
   if (jobKey.empty()) return;
-  std::lock_guard<std::mutex> lock(g_asrMutex);
-  auto it = g_asrStreamsByJobId.find(jobKey);
-  if (it == g_asrStreamsByJobId.end()) return;
-  if (it->second.stream) {
-    SherpaOnnxDestroyOnlineStream(it->second.stream);
+  owner->streams.erase(jobKey);
+}
+
+// Drops the cached ASR engine for an assets dir so the next stream loads the pack's current files. Streams
+// already running keep their engine alive until they finish.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_happier_sherpa_HappierSherpaNativeJni_nativeReleaseAsrEngine(JNIEnv *env, jclass /*clazz*/, jstring assetsDir) {
+  const std::string dir = JStringToUtf8(env, assetsDir);
+  if (dir.empty()) return;
+  std::shared_ptr<AsrEngine> released;
+  {
+    std::lock_guard<std::mutex> lock(g_asrMutex);
+    auto it = g_asrEnginesByAssetsDir.find(dir);
+    if (it == g_asrEnginesByAssetsDir.end()) return;
+    released = std::move(it->second);
+    g_asrEnginesByAssetsDir.erase(it);
   }
-  g_asrStreamsByJobId.erase(it);
 }

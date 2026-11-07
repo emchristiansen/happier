@@ -3,15 +3,12 @@ import type { AcpPermissionHandler } from '@/agent/acp/AcpBackend';
 import type { PermissionMode } from '@/api/types';
 import type { PiBridgeSessionConfig } from '@/backends/pi/bridgeExtension';
 import {
-  PI_BROKER_PROVIDERS,
-  PI_BROKER_SELECTIONS_ENV,
-  parsePiBrokerSelections,
-  resolvePiBrokerExtensionPath,
+  resolvePiBrokerExtensionArgs,
 } from '@/backends/pi/brokerExtension';
 import { PiRpcBackend } from '@/backends/pi/rpc/PiRpcBackend';
 import { readConnectedServiceChildSelectionsFromEnv } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import { requireProviderCliLaunchSpec } from '@/runtime/managedTools/requireProviderCliLaunchSpec';
-import { providers } from '@happier-dev/agents';
+import { parsePermissionIntentAlias, providers } from '@happier-dev/agents';
 
 export interface PiBackendOptions extends AgentFactoryOptions {
   mcpServers?: Record<string, McpServerConfig>;
@@ -41,26 +38,21 @@ export interface PiBackendOptions extends AgentFactoryOptions {
 
 // `null` means Happier must not override Pi's native tool catalog. Passing
 // `--tools` would also filter extension and custom tools in current Pi releases.
-export function buildPiToolsForPermissionMode(permissionMode?: PermissionMode): string[] | null {
+export function buildPiToolsForPermissionMode(permissionMode?: string): string[] | null {
   const rawMode = typeof permissionMode === 'string' ? permissionMode : 'default';
-
-  // Normalize legacy aliases into canonical permission intents.
-  const mode = rawMode === 'acceptEdits'
-    ? 'safe-yolo'
-    : rawMode === 'bypassPermissions'
-      ? 'yolo'
-      : rawMode;
+  const mode = parsePermissionIntentAlias(rawMode);
 
   if (mode === 'plan' || mode === 'read-only') {
     return ['read', 'grep', 'find', 'ls'];
   }
-  if (mode === 'safe-yolo') {
-    return ['read', 'edit', 'write', 'grep', 'find', 'ls'];
-  }
-  if (mode === 'default' || mode === 'yolo') {
+  if (mode === 'default' || mode === 'safe-yolo' || mode === 'yolo') {
     return null;
   }
-  return ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'];
+  // The catalog factory is an erased runtime boundary (`opts: unknown`), so an
+  // unrecognized value can reach this launch-time allowlist despite the narrower
+  // types used by normal callers. Pi has no mid-session permission interception;
+  // fail closed rather than granting its shell and write tools.
+  return ['read', 'grep', 'find', 'ls'];
 }
 
 export function buildPiRpcArgs(opts?: Readonly<{
@@ -110,16 +102,6 @@ function resolvePiLaunchSelectionFromConnectedServiceSelection(
   return null;
 }
 
-function resolvePiBrokerExtensionArgs(env: Readonly<Record<string, string>>): string[] {
-  const agentDir = env.PI_CODING_AGENT_DIR?.trim();
-  if (!agentDir) return [];
-
-  const selections = parsePiBrokerSelections(env[PI_BROKER_SELECTIONS_ENV]);
-  const hasBrokeredProvider = PI_BROKER_PROVIDERS.some((provider) => selections[provider]);
-  if (!hasBrokeredProvider) return [];
-
-  return ['--extension', resolvePiBrokerExtensionPath(agentDir)];
-}
 
 /**
  * Tools-bridge extension arguments. Both-or-neither with the Happier session binding:

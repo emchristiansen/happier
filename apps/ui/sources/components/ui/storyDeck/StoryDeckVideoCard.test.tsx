@@ -2,6 +2,7 @@ import * as React from 'react';
 import { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { renderScreen } from '@/dev/testkit';
 import type { StoryDeckVideoCard as VideoCardData } from '@/changelog/releaseNotes/types';
 
@@ -119,7 +120,7 @@ describe('StoryDeckVideoCard', () => {
         expect(shared.useVideoPlayer).not.toHaveBeenCalled();
         expect(screen.findByTestId('story-video-media-poster')).toBeTruthy();
         expect(screen.findAllByType('VideoView')).toHaveLength(0);
-        expect(screen.findAllByType('ActivityIndicator')).toHaveLength(0);
+        expect(screen.findAllByType(ActivitySpinner)).toHaveLength(0);
     });
 
     it('falls back to poster without console warnings or infinite spinner when video loading fails', async () => {
@@ -142,7 +143,7 @@ describe('StoryDeckVideoCard', () => {
 
             expect(warnSpy).not.toHaveBeenCalled();
             expect(screen.findByTestId('story-video-media-poster')).toBeTruthy();
-            expect(screen.findAllByType('ActivityIndicator')).toHaveLength(0);
+            expect(screen.findAllByType(ActivitySpinner)).toHaveLength(0);
         } finally {
             warnSpy.mockRestore();
         }
@@ -171,7 +172,7 @@ describe('StoryDeckVideoCard', () => {
             });
 
             expect(screen.findByTestId('story-video-media-poster')).toBeTruthy();
-            expect(screen.findAllByType('ActivityIndicator')).toHaveLength(0);
+            expect(screen.findAllByType(ActivitySpinner)).toHaveLength(0);
         } finally {
             vi.useRealTimers();
         }

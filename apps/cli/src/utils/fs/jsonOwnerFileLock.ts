@@ -8,6 +8,8 @@ type JsonOwnerFileLockOptions = Readonly<{
   staleAfterMs: number;
   errorCode: string;
   pollIntervalMs?: number;
+  signal?: AbortSignal;
+  onWait?: (info: Readonly<{ pid: number | null; heldForMs: number | null; waitedForMs: number }>) => void;
   readQuarantinedRaw?: (path: string) => Promise<string>;
 }>;
 
@@ -543,13 +545,16 @@ export async function withJsonOwnerFileLock<TResult>(
   options: JsonOwnerFileLockOptions,
   effect: () => Promise<TResult>,
 ): Promise<TResult> {
+  options.signal?.throwIfAborted();
   const startedAtMs = Date.now();
   const pollIntervalMs = Math.max(1, Math.trunc(options.pollIntervalMs ?? 10));
   const readQuarantinedRaw = options.readQuarantinedRaw ?? (async (path) => await readFile(path, 'utf8'));
   await mkdir(dirname(options.lockPath), { recursive: true });
 
   let ownRaw: string | null = null;
+  let didNotifyWait = false;
   for (;;) {
+    options.signal?.throwIfAborted();
     if (Date.now() - startedAtMs >= options.timeoutMs) throw new Error(options.errorCode);
     if (await inspectAndScavengeLockArtifacts(options.lockPath, options.staleAfterMs)) {
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
@@ -611,6 +616,20 @@ export async function withJsonOwnerFileLock<TResult>(
       if (observed && await shouldReclaimCurrent(observed, options.staleAfterMs)) {
         const reclaim = await reclaimJsonOwnerFileLockSnapshot(options.lockPath, observed.raw, readQuarantinedRaw);
         if (reclaim === 'ownership_unknown') throw new Error(`${options.errorCode}_compromised`);
+      } else if (!didNotifyWait && options.onWait) {
+        options.signal?.throwIfAborted();
+        didNotifyWait = true;
+        const owner = observed ? parseCurrentOwner(observed.raw) : null;
+        const nowMs = Date.now();
+        try {
+          options.onWait({
+            pid: owner?.pid ?? null,
+            heldForMs: owner ? Math.max(0, nowMs - owner.createdAtMs) : null,
+            waitedForMs: Math.max(0, nowMs - startedAtMs),
+          });
+        } catch {
+          // Diagnostic failures must not change lock acquisition or ownership.
+        }
       }
       if (Date.now() - startedAtMs >= options.timeoutMs) throw new Error(options.errorCode);
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
@@ -618,6 +637,7 @@ export async function withJsonOwnerFileLock<TResult>(
   }
 
   try {
+    options.signal?.throwIfAborted();
     return await effect();
   } finally {
     if (ownRaw !== null) {

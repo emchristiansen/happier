@@ -85,8 +85,8 @@ export type ListSessionSystemRecordsResult = Readonly<{
 
 /**
  * List session system records for a `(namespace, kind)` pair (or `localId` lookup), through the
- * canonical authenticated request path. Returns an empty page on transport/parse failure so callers
- * fail soft and render a loading/minimal shell rather than throwing.
+ * canonical authenticated request path. Failures remain failures so a caller can preserve its
+ * last-known inventory rather than treating unreachable records as removed.
  */
 export async function listSessionSystemRecords(params: Readonly<{
     sessionId: string;
@@ -97,32 +97,27 @@ export async function listSessionSystemRecords(params: Readonly<{
     cursor?: string | null;
     serverId?: string | null;
 }>): Promise<ListSessionSystemRecordsResult> {
-    const empty: ListSessionSystemRecordsResult = { records: [], nextCursor: null, hasNext: false };
-    try {
-        const path = appendQuery(buildSystemRecordsBasePath(params.sessionId), {
-            namespace: params.namespace,
-            kind: params.kind,
-            localId: params.localId,
-            limit: params.limit,
-            cursor: params.cursor ?? undefined,
-        });
-        const response = await requestSessionSystemRecordRoute({
-            sessionId: params.sessionId,
-            path,
-            serverId: params.serverId ?? null,
-        });
-        if (!response.ok) return empty;
-        const json = await response.json().catch(() => null);
-        const parsed = SessionSystemRecordPageResponseSchema.safeParse(json);
-        if (!parsed.success) return empty;
-        return {
-            records: parsed.data.records,
-            nextCursor: parsed.data.nextCursor,
-            hasNext: parsed.data.hasNext,
-        };
-    } catch {
-        return empty;
-    }
+    const path = appendQuery(buildSystemRecordsBasePath(params.sessionId), {
+        namespace: params.namespace,
+        kind: params.kind,
+        localId: params.localId,
+        limit: params.limit,
+        cursor: params.cursor ?? undefined,
+    });
+    const response = await requestSessionSystemRecordRoute({
+        sessionId: params.sessionId,
+        path,
+        serverId: params.serverId ?? null,
+    });
+    if (!response.ok) throw new Error(`Session system record inventory unavailable (${response.status})`);
+    const json: unknown = await response.json();
+    const parsed = SessionSystemRecordPageResponseSchema.safeParse(json);
+    if (!parsed.success) throw new Error('Session system record inventory response is invalid');
+    return {
+        records: parsed.data.records,
+        nextCursor: parsed.data.nextCursor,
+        hasNext: parsed.data.hasNext,
+    };
 }
 
 /**

@@ -6,13 +6,13 @@ import type {
 
 import type { InFlightConfigApplyOutcome } from '@/agent/runtime/permission/bindPermissionModeQueue';
 import {
-  resolveClaudeEffectiveEffortForModel,
+  resolveClaudeEffortForModel,
   resolveClaudeUltracodeForModel,
   resolveModeEffortLevelsForModel,
 } from '@/backends/claude/utils/claudeEffort';
 
 import type { EnhancedMode } from '../loop';
-import { controlResultToChangeOutcome } from './tuiControls/outcome';
+import { controlResultToChangeOutcome, isRuntimeConfigChangePromptBlocking } from './tuiControls/outcome';
 import type {
   ClaudeDesiredRuntimeConfig,
   ClaudePromptSubmitMetadata,
@@ -172,7 +172,7 @@ export function mapEnhancedModeToDesiredRuntimeConfig(mode: EnhancedMode): Claud
   } = {};
   const model = normalizeNonEmptyString(mode.model);
   if (model !== undefined) desired.model = model;
-  const reasoningEffort = resolveClaudeEffectiveEffortForModel({
+  const reasoningEffort = resolveClaudeEffortForModel({
     modelId: mode.model,
     effort: mode.reasoningEffort,
     supportedLevels: resolveModeEffortLevelsForModel(mode, mode.model),
@@ -206,6 +206,7 @@ function sameAgentModeId(a: string | null | undefined, b: string | null | undefi
 function computeDesiredDelta(
   desired: ClaudeDesiredRuntimeConfig,
   baseline: ClaudeDesiredRuntimeConfig,
+  pending: ClaudeDesiredRuntimeConfig = {},
 ): ClaudeDesiredRuntimeConfig {
   const delta: {
     model?: string;
@@ -215,21 +216,30 @@ function computeDesiredDelta(
     maxThinkingTokens?: number;
     ultracode?: boolean;
   } = {};
-  if (desired.model !== baseline.model && desired.model !== undefined) delta.model = desired.model;
-  if (desired.reasoningEffort !== baseline.reasoningEffort && desired.reasoningEffort !== undefined) {
-    delta.reasoningEffort = desired.reasoningEffort;
-  }
-  if (desired.ultracode !== baseline.ultracode && desired.ultracode !== undefined) {
+  if ((desired.model !== baseline.model || pending.model !== undefined) && desired.model !== undefined) delta.model = desired.model;
+  if ((desired.ultracode !== baseline.ultracode || delta.model !== undefined || pending.ultracode !== undefined || pending.model !== undefined)
+    && desired.ultracode !== undefined) {
     delta.ultracode = desired.ultracode;
   }
+  // Model changes can reset effort. Turning ultracode off also selects an effort level, so carry
+  // the current selection even when it has not changed instead of falling back to native history.
+  if ((desired.reasoningEffort !== baseline.reasoningEffort || delta.model !== undefined
+    || delta.ultracode === false || pending.reasoningEffort !== undefined || pending.model !== undefined)
+    && desired.reasoningEffort !== undefined) {
+    delta.reasoningEffort = desired.reasoningEffort;
+  }
+  // Selecting a regular effort replaces ultracode; restore it in the same ordered control batch.
+  if (delta.reasoningEffort !== undefined && desired.ultracode === true) delta.ultracode = true;
   const modeChanged =
     desired.permissionMode !== baseline.permissionMode
-    || !sameAgentModeId(desired.agentModeId, baseline.agentModeId);
+    || !sameAgentModeId(desired.agentModeId, baseline.agentModeId)
+    || pending.permissionMode !== undefined || pending.agentModeId !== undefined;
   if (modeChanged) {
     if (desired.permissionMode !== undefined) delta.permissionMode = desired.permissionMode;
     if (desired.agentModeId !== undefined) delta.agentModeId = desired.agentModeId;
   }
-  if (desired.maxThinkingTokens !== baseline.maxThinkingTokens && desired.maxThinkingTokens !== undefined) {
+  if ((desired.maxThinkingTokens !== baseline.maxThinkingTokens || pending.maxThinkingTokens !== undefined)
+    && desired.maxThinkingTokens !== undefined) {
     delta.maxThinkingTokens = desired.maxThinkingTokens;
   }
   return delta;
@@ -472,6 +482,10 @@ export function createClaudeUnifiedRuntimeControlBridge(
   let committed: ClaudeDesiredRuntimeConfig = params.startupMode
     ? mapEnhancedModeToDesiredRuntimeConfig(params.startupMode)
     : {};
+  // A launch flag is a claim until native evidence confirms it. In particular, resumes can retain
+  // a saved effort that differs from the selected catalog default. The controller verifies this
+  // first apply and skips typing when statusline/prompt metadata already confirms the selection.
+  committed = { ...committed, reasoningEffort: undefined };
   // F5 (qa/QA-B.md, live session cmqakh8mb): a NON-DEFAULT launch-claimed permission/plan mode is a
   // CLAIM, not a fact — `--permission-mode auto` is silently ignored by claude when `auto` is
   // model/account-gated, so blindly committing the claim made every later request for that mode a
@@ -553,13 +567,7 @@ export function createClaudeUnifiedRuntimeControlBridge(
 
   function resolveBlockedApplyReason(outcome: RuntimeConfigApplyOutcome): string | undefined {
     if (outcome.promptMayProceed) return undefined;
-    const blockedChange = outcome.changes.find((change) =>
-      change.status === 'failed'
-      || change.status === 'requires_interactive_control'
-      || change.timing === 'scheduled_for_next_prompt'
-      || change.timing === 'queued_until_safe_window'
-      || change.timing === 'next_idle'
-    );
+    const blockedChange = outcome.changes.find(isRuntimeConfigChangePromptBlocking);
     const reason = blockedChange?.reason;
     if (typeof reason !== 'string') return undefined;
     const trimmed = reason.trim();
@@ -572,7 +580,9 @@ export function createClaudeUnifiedRuntimeControlBridge(
     reason: 'before_prompt' | 'out_of_band',
   ): Promise<ClaudeUnifiedRuntimeControlApplyResult> {
     const desired = mapEnhancedModeToDesiredRuntimeConfig(mode);
-    const delta = computeDesiredDelta(desired, committed);
+    // Before a prompt, current intent supersedes a previously submitted but unverified control.
+    const delta = computeDesiredDelta(desired, committed,
+      reason === 'before_prompt' ? controller.getPendingRuntimeConfig() : undefined);
     if (isEmptyDesired(delta)) {
       return { promptMayProceed: true, attempted: false };
     }

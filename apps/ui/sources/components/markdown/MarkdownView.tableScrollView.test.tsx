@@ -1,6 +1,6 @@
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { renderScreen } from '@/dev/testkit';
+import { pressTestInstanceAsync, renderScreen } from '@/dev/testkit';
 import { findNearestHostParent, flattenTestStyle } from '@/dev/testkit/harness/popoverHarness';
 import { installMarkdownCommonModuleMocks } from './markdownTestHelpers';
 
@@ -12,9 +12,18 @@ declare global {
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
-installMarkdownCommonModuleMocks();
+installMarkdownCommonModuleMocks({
+    storage: () => vi.importActual('@/sync/domains/state/storage'),
+});
 
-function mockPlatform(os: 'android' | 'web') {
+const setStringAsyncSpy = vi.fn<(text: string) => Promise<boolean>>(async (_text) => true);
+
+// expo-clipboard is a native module boundary; the spy records what reaches the system clipboard.
+vi.mock('expo-clipboard', () => ({
+    setStringAsync: (text: string) => setStringAsyncSpy(text),
+}));
+
+function mockPlatform(os: 'android' | 'ios' | 'web') {
     vi.doMock('react-native', async () => {
         const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
         return createReactNativeWebMock({
@@ -30,7 +39,7 @@ describe('MarkdownView (tables)', () => {
         vi.resetModules();
     });
 
-    it('renders tables inside a gesture-handler ScrollView so horizontal scrolling works reliably on Android', async () => {
+    it('renders tables inside the platform ScrollView on Android so horizontal drags share native nested scrolling with the transcript list', async () => {
         mockPlatform('android');
         const { MarkdownView } = await import('./MarkdownView');
 
@@ -42,11 +51,11 @@ describe('MarkdownView (tables)', () => {
 
         const screen = await renderScreen(<MarkdownView markdown={markdown} />);
 
-        const scrollViews = screen.findAllByType('GestureHandlerScrollView' as any);
+        expect(screen.findAllByType('GestureHandlerScrollView' as any)).toHaveLength(0);
+        const scrollViews = screen.findAllByType('ScrollView' as any);
         expect(scrollViews).toHaveLength(1);
         expect(scrollViews[0]!.props.horizontal).toBe(true);
         expect(scrollViews[0]!.props.nestedScrollEnabled).toBe(true);
-        expect(scrollViews[0]!.props.disallowInterruption).toBe(true);
     }, 60_000);
 
     it('uses a visible horizontal scrollbar on web and does not clip the scroll shell', async () => {
@@ -73,23 +82,52 @@ describe('MarkdownView (tables)', () => {
         expect(shellStyle.maxWidth).toBe('100%');
     }, 60_000);
 
-    it('renders table header/cell text as selectable so users can copy values from transcripts', async () => {
-        mockPlatform('android');
-        const { MarkdownView } = await import('./MarkdownView');
-
+    it('keeps table text selectable on iOS but not inside the Android horizontal scroller, where selection fights the scroll gesture', async () => {
         const markdown = [
             '| A | B |',
             '|---|---|',
             '| 1 | 2 |',
         ].join('\n');
 
+        for (const [os, expected] of [['ios', true], ['android', false]] as const) {
+            vi.resetModules();
+            mockPlatform(os);
+            const { MarkdownView } = await import('./MarkdownView');
+
+            const screen = await renderScreen(<MarkdownView markdown={markdown} />);
+
+            const findTextNode = (text: string) =>
+                screen.findAllByType('Text' as any).find((n) => n.props?.children === text)!;
+
+            expect(findTextNode('A').props.selectable, os).toBe(expected);
+            expect(findTextNode('1').props.selectable, os).toBe(expected);
+        }
+    }, 60_000);
+
+    it('copies the table as markdown from its copy button, preserving alignment, escaped pipes and the rendered column count', async () => {
+        mockPlatform('android');
+        setStringAsyncSpy.mockClear();
+        const { MarkdownView } = await import('./MarkdownView');
+
+        const markdown = [
+            '| Left | Center | Right | Plain |',
+            '| :--- | :---: | ---: | --- |',
+            '| **a** | b \\| c | d |  |',
+            '| short |',
+            '| 1 | 2 | 3 | 4 | ignored |',
+        ].join('\n');
+
         const screen = await renderScreen(<MarkdownView markdown={markdown} />);
 
-        const findTextNode = (text: string) =>
-            screen.findAllByType('Text' as any).find((n) => n.props?.children === text)!;
+        await pressTestInstanceAsync(screen.findByTestId('markdown-table-copy'), 'table copy');
 
-        expect(findTextNode('A').props.selectable).toBe(true);
-        expect(findTextNode('1').props.selectable).toBe(true);
+        expect(setStringAsyncSpy).toHaveBeenCalledWith([
+            '| Left | Center | Right | Plain |',
+            '| :--- | :---: | ---: | --- |',
+            '| **a** | b \\| c | d |  |',
+            '| short |  |  |  |',
+            '| 1 | 2 | 3 | 4 |',
+        ].join('\n'));
     }, 60_000);
 
     it('renders math table cells through the enriched renderer without losing horizontal scrolling', async () => {
@@ -106,7 +144,8 @@ describe('MarkdownView (tables)', () => {
             <MarkdownView markdown={markdown} selectable profile="transcript" agentTexMath />,
         );
 
-        expect(screen.findAllByType('GestureHandlerScrollView' as any)).toHaveLength(1);
+        expect(screen.findAllByType('ScrollView' as any)).toHaveLength(1);
+        expect(screen.findAllByType('EnrichedMarkdownText').map((node) => node.props.selectable)).toEqual([false, false]);
         expect(screen.findAllByType('EnrichedMarkdownText').map((node) => node.props.markdown)).toEqual([
             '\\(x_i\\)',
             '$y_i$',

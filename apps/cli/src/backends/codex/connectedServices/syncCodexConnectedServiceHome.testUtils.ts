@@ -2,8 +2,6 @@ import { lstat, mkdir, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { vi } from 'vitest';
-
 export async function loadSyncCodexConnectedServiceHome() {
   const module = await import('./syncCodexConnectedServiceHome');
   return module.syncCodexConnectedServiceHome;
@@ -58,38 +56,4 @@ export function settings(configMode: 'linked' | 'copied' | 'isolated', stateMode
       acknowledgedRisksByAgentId: {},
     },
   };
-}
-
-export function mockSymlinkFailureForTempLink(destinationPathFragment: string): void {
-  vi.resetModules();
-  vi.doMock('node:fs/promises', async () => {
-    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-    return {
-      ...actual,
-      symlink: vi.fn(async (...args: Parameters<typeof actual.symlink>) => {
-        const [, destinationPath] = args;
-        if (String(destinationPath).includes(destinationPathFragment)) {
-          const error = new Error('file symlink unavailable') as NodeJS.ErrnoException;
-          error.code = 'EPERM';
-          throw error;
-        }
-        return actual.symlink(...args);
-      }),
-    };
-  });
-}
-
-export function mockAllSymlinksFail(): void {
-  vi.resetModules();
-  vi.doMock('node:fs/promises', async () => {
-    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-    return {
-      ...actual,
-      symlink: vi.fn(async () => {
-        const error = new Error('symlink unavailable') as NodeJS.ErrnoException;
-        error.code = 'EPERM';
-        throw error;
-      }),
-    };
-  });
 }

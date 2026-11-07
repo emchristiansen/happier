@@ -28,6 +28,7 @@ export type OpenCodeRuntimeDescriptorProviderExtraRuntimeHandle = Readonly<{
   vendorSessionId: string | null;
   serverBaseUrl: string | null;
   serverBaseUrlExplicit: boolean;
+  managedServerLaunchFingerprint: string | null;
 }>;
 
 export type OpenCodeRuntimeDescriptorProviderExtra = Readonly<{
@@ -37,6 +38,7 @@ export type OpenCodeRuntimeDescriptorProviderExtra = Readonly<{
     vendorSessionId?: string;
     serverBaseUrl?: string;
     serverBaseUrlExplicit?: true;
+    managedServerLaunchFingerprint?: string;
   }>;
 }>;
 
@@ -46,12 +48,15 @@ export function buildOpenCodeRuntimeDescriptorProviderExtra(
     vendorSessionId?: string | null;
     serverBaseUrl?: string | null;
     serverBaseUrlExplicit?: boolean;
+    managedServerLaunchFingerprint?: string | null;
   }>,
 ): OpenCodeRuntimeDescriptorProviderExtra {
   const backendMode = normalizeOpenCodeBackendMode(params.backendMode);
   const vendorSessionId = normalizeTrimmedString(params.vendorSessionId);
   const serverBaseUrlExplicit = normalizeOpenCodeServerBaseUrlExplicit(params.serverBaseUrlExplicit);
   const serverBaseUrl = serverBaseUrlExplicit ? normalizeOpenCodeServerBaseUrl(params.serverBaseUrl) : null;
+  const managedServerLaunchFingerprint = backendMode === 'server' && !serverBaseUrlExplicit
+    ? normalizeTrimmedString(params.managedServerLaunchFingerprint) : null;
 
   return {
     v: 1,
@@ -60,6 +65,7 @@ export function buildOpenCodeRuntimeDescriptorProviderExtra(
       ...(vendorSessionId ? { vendorSessionId } : {}),
       ...(serverBaseUrl ? { serverBaseUrl } : {}),
       ...(serverBaseUrl && serverBaseUrlExplicit ? { serverBaseUrlExplicit: true } : {}),
+      ...(managedServerLaunchFingerprint ? { managedServerLaunchFingerprint } : {}),
     },
   };
 }
@@ -78,12 +84,17 @@ export function readOpenCodeRuntimeDescriptorProviderExtra(
     vendorSessionId: normalizeTrimmedString(runtimeHandle.vendorSessionId),
     serverBaseUrl: normalizeOpenCodeServerBaseUrl(runtimeHandle.serverBaseUrl),
     serverBaseUrlExplicit: normalizeOpenCodeServerBaseUrlExplicit(runtimeHandle.serverBaseUrlExplicit),
+    // Preserve present malformed affinity as invalid (empty), not absent. The state owner
+    // validates the fingerprint before filesystem lookup; invalid intent must not use ambient state.
+    managedServerLaunchFingerprint: runtimeHandle.managedServerLaunchFingerprint == null ? null
+      : typeof runtimeHandle.managedServerLaunchFingerprint === 'string' ? runtimeHandle.managedServerLaunchFingerprint.trim() : '',
   } satisfies OpenCodeRuntimeDescriptorProviderExtraRuntimeHandle;
 
   if (
     !normalizedRuntimeHandle.backendMode &&
     !normalizedRuntimeHandle.vendorSessionId &&
-    !normalizedRuntimeHandle.serverBaseUrl
+    !normalizedRuntimeHandle.serverBaseUrl &&
+    normalizedRuntimeHandle.managedServerLaunchFingerprint === null
   ) {
     return null;
   }

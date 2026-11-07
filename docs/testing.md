@@ -9,6 +9,8 @@ Canonical lanes:
 - `yarn test` — fast unit lane across apps.
 - `yarn test:import-cycles` — CLI runtime import-cycle guard, also enforced by the CLI unit lane.
 - `yarn test:integration` — orchestration-heavy app integration lane.
+- `yarn test:shared-packages:local` — all-settled shared-package checks, also run by the Shared Package Unit Tests CI job.
+- `yarn test:cli:slow` — CLI slow tests, also enforced by CLI CI part 1.
 - `yarn test:e2e:core:fast` — default local core e2e loop.
 - `yarn test:e2e:core:slow` — long orchestration core e2e.
 - `yarn test:e2e:ui` — Playwright UI/browser e2e exercising real UI + server + CLI/daemon flows.
@@ -16,6 +18,27 @@ Canonical lanes:
 - `yarn test:db-contract:docker` — server DB contract via Docker.
 
 Use the smallest relevant subset during RED/GREEN loops. Before handoff, run the touched package typecheck/build-enforcing lane and at least one broader relevant lane when shared contracts are touched.
+
+## Choose checks by the changed contract
+
+| Change | Focused loop | Integration boundary |
+| --- | --- | --- |
+| Package behavior | Existing owner test through real internal logic | Package typecheck and the affected unit/integration lane |
+| Shared schema, catalog, or testkit | Shared owner tests plus an affected consumer | Relevant consumer lanes; producer-only green is insufficient |
+| UI flow, layout mode, or selector | Relevant component test | Existing Playwright scenario with explicit viewport, mode, and permissions |
+| Process, port, daemon, or session lifecycle | Existing process/testkit test | Owning integration lane; ephemeral ports and observed readiness, not fixed sleeps |
+| CI selection, sharding, or root commands | Workflow/runner contracts and selected-file inventory | Prove complete, non-overlapping coverage and a failing final result when any required check fails |
+| Installer, packaging, or release control | Canonical source contracts | Candidate-dependent smoke/update and publication checks after the actual artifact exists |
+
+Use shared boundary fixtures and real internal owners. A changed internal export is not a reason to expand a local mock; inventory its callers and update the owning fixture once. Assert stable outcomes rather than old implementation spelling. Remove redundant or obsolete assertions only after identifying the behavior they formerly protected.
+
+Root unit and integration commands collect failures across independent workspaces instead of stopping at the first red package. Package preparation remains a prerequisite; aggregate failure collection cannot expose behavior behind an unavailable build, database, or candidate. Do not call an unexecuted lane successful.
+
+For broad local collection, inspect `node scripts/pipeline/run.mjs checks --profile fast --dry-run` first. For a focused rerun, use a workspace command or `checks --profile custom --custom-checks integration,typecheck --install-deps false`. Custom selection is exact, not an implicit full baseline. The checks owner collects independent failures and returns nonzero; install failure still stops dependent checks.
+
+Local and hosted profiles share selection policy ownership in `scripts/pipeline/checks/lib/checks-profile.mjs`, but are not interchangeable matrices: local profiles preserve local toolchain coverage; hosted profiles include platform/runner jobs. Read the current command help or workflow inputs instead of assuming a local `fast` result certifies hosted `release` coverage. In 0.3, route these commands through `hstack-exec`; its public test scripts already do so.
+
+Collect one complete reachable failure set, fix deterministic clusters locally, then rerun affected lanes. Use one final required hosted profile for the coherent source, not a full graph per test edit. Reuse successful evidence when source, dependencies, configuration, command, and environment remain applicable. New source or a previously unreachable candidate boundary can legitimately expose another failure.
 
 ## TypeScript toolchain
 
@@ -43,6 +66,30 @@ When introducing or moving a lane/pattern, update all relevant places in the sam
 1. package-level scripts/config,
 2. root `package.json` lane scripts,
 3. CI workflow wiring.
+
+## UI native Sentry regression
+
+The Android replay regression runs against the installed Sentry Gradle project and its production dependency graph. It wedges only the OS `MediaCodec` boundary, then verifies that the real replay cache can close without waiting for the encoder and cannot persist new segment metadata after closing.
+
+From `apps/ui/android`, run through the checkout's `hstack-exec` with a configured Android SDK and JDK:
+
+```sh
+./gradlew -I ../tools/sentry/native-contract.init.gradle :sentry_react-native:testDebugUnitTest --tests io.sentry.android.replay.ReplayEncoderContractTest
+```
+
+Use `gradlew.bat` on Windows. This extends the vendor project's existing native unit-test task; it does not install an app or replace SDK dependencies for the test. The Sentry vendor patch keeps Android dependencies coherent and includes the official profiler executor supplier adaptation needed by the updated native SDK. Its replay close contract comes from [Sentry's encoder shutdown fix](https://github.com/getsentry/sentry-java/pull/5842).
+
+## UI native Markdown regression
+
+The Android Markdown contract runs against the installed enriched-markdown Gradle project with Robolectric native graphics. It checks paragraph span ordering, selection and buffer ownership, nested checkbox drawing and reflow, and table measurement. Its dense-text probe reports render, view adoption, layout construction, width scanning, and measurement-store timings; timing values have no uncalibrated pass/fail threshold.
+
+From `apps/ui/android`, run through the checkout's `hstack-exec` with a configured Android SDK and JDK:
+
+```sh
+./gradlew -I ../tools/markdown/native-contract.init.gradle :react-native-enriched-markdown:testDebugUnitTest --tests com.swmansion.enriched.markdown.MarkdownLayoutContractTest
+```
+
+Use `gradlew.bat` on Windows. The vendor patch preserves the renderer's span index through measurement and view adoption, adapting [upstream's ordered no-copy buffer change](https://github.com/software-mansion/enriched-markdown/commit/7bcab4e4ac63bac876802b1603b058e0d625d765) to the 0.5.0 measurement and table consumers. This unit lane compiles the native module without installing an app; device validation still requires a client attributed to the current source.
 
 ## UI e2e authoring
 

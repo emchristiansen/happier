@@ -1,11 +1,8 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { ActionsSettingsV1Schema } from '@happier-dev/protocol';
-
-import { createEnvKeyScope } from '@/testkit/env/envScope';
+import { describe, expect, it } from 'vitest';
 
 import {
+  isSafeFirstPartyHappierActionToolCall,
   resolveHappierActionForMcpToolName,
-  shouldSuppressProviderPermissionForHappierApproval,
 } from './resolveHappierActionForMcpToolName';
 
 describe('resolveHappierActionForMcpToolName', () => {
@@ -31,62 +28,23 @@ describe('resolveHappierActionForMcpToolName', () => {
       input: {},
     })).toBeNull();
   });
-});
 
-describe('shouldSuppressProviderPermissionForHappierApproval', () => {
-  const envScope = createEnvKeyScope(['HAPPIER_ACTIONS_SETTINGS_V1']);
-
-  afterEach(() => {
-    envScope.restore();
-  });
-
-  it('suppresses provider prompts only when first-party Happier action approval is required', () => {
-    process.env.HAPPIER_ACTIONS_SETTINGS_V1 = JSON.stringify({
-      v: 1,
-      actions: {
-        'session.list': {
-          disabledSurfaces: [],
-          approvalRequiredSurfaces: ['session_agent'],
-        },
-      },
-    });
-
-    expect(shouldSuppressProviderPermissionForHappierApproval({
-      toolName: 'mcp__happier__session_list',
-      input: {},
-      surface: 'session_agent',
-    })).toEqual({ suppress: true, actionId: 'session.list' });
-
-    expect(shouldSuppressProviderPermissionForHappierApproval({
-      toolName: 'mcp__happier__session_status_get',
-      input: {},
-      surface: 'session_agent',
-    })).toEqual({ suppress: false, actionId: 'session.status.get' });
-
-    expect(shouldSuppressProviderPermissionForHappierApproval({
-      toolName: 'mcp__custom__session_list',
-      input: {},
-      surface: 'session_agent',
-    })).toEqual({ suppress: false, actionId: null });
-  });
-
-  it('does not suppress provider prompts for approval actions even when settings require approval', () => {
-    const rawActionsSettings: unknown = {
-      v: 1,
-      actions: {
-        'approval.request.create': {
-          approvalRequiredSurfaces: ['session_agent'],
-        },
-      },
-    };
-
-    expect(shouldSuppressProviderPermissionForHappierApproval({
+  it('recognizes only safe first-party Action transport calls', () => {
+    expect(isSafeFirstPartyHappierActionToolCall({
       toolName: 'mcp__happier__action_execute',
-      input: { actionId: 'approval.request.create' },
-      surface: 'session_agent',
-      accountSettings: {
-        actionsSettingsV1: ActionsSettingsV1Schema.parse(rawActionsSettings),
-      },
-    })).toEqual({ suppress: false, actionId: 'approval.request.create' });
+      input: { actionId: 'execution.run.start' },
+    })).toBe(true);
+    expect(isSafeFirstPartyHappierActionToolCall({
+      toolName: 'mcp__happier__action_execute',
+      input: { actionId: 'prompt_asset.export' },
+    })).toBe(false);
+    expect(isSafeFirstPartyHappierActionToolCall({
+      toolName: 'mcp__happier__action_execute',
+      input: { actionId: 'not.a.known.action' },
+    })).toBe(false);
+    expect(isSafeFirstPartyHappierActionToolCall({
+      toolName: 'mcp__custom__execution_run_start',
+      input: {},
+    })).toBe(false);
   });
 });

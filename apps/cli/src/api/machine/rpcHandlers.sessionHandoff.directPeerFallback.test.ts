@@ -23,7 +23,8 @@ describe('rpcHandlers (session handoff direct-peer fallback)', () => {
         await vi.waitFor(async () => {
             result = await resultGet!({ handoffId });
             expect(result).toEqual(expected);
-        });
+        // The prepare runs real transfer crypto/IO; the 1 s default budget is too tight on loaded hosts.
+        }, { timeout: 20_000, interval: 50 });
         return result;
     }
 
@@ -289,7 +290,7 @@ describe('rpcHandlers (session handoff direct-peer fallback)', () => {
             expiresAt: Date.now() - 1,
         });
 
-        await prepare!({
+        await expect(prepare!({
             handoffId: 'handoff_direct_peer_expired_candidates_no_fallback',
             sourceMachineId: 'machine_source',
             targetMachineId: 'machine_target',
@@ -305,11 +306,14 @@ describe('rpcHandlers (session handoff direct-peer fallback)', () => {
                     endpointCandidates: [expiredCandidate],
                 },
             },
-        });
-        await waitForPrepareResult(registered, 'handoff_direct_peer_expired_candidates_no_fallback', {
+        })).resolves.toEqual({
             ok: false,
             errorCode: 'direct_peer_transfer_unavailable',
             error: 'Direct peer transfer is unavailable and server-routed fallback is disabled',
+        });
+        await waitForPrepareResult(registered, 'handoff_direct_peer_expired_candidates_no_fallback', {
+            ok: false,
+            errorCode: 'not_found',
         });
 
         expect(requestPayloadFile).not.toHaveBeenCalled();
@@ -346,7 +350,7 @@ describe('rpcHandlers (session handoff direct-peer fallback)', () => {
             expiresAt: Date.now() + 30_000,
         });
 
-        await prepare!({
+        await expect(prepare!({
             handoffId: 'handoff_direct_peer_legacy_only_adapter',
             sourceMachineId: 'machine_source',
             targetMachineId: 'machine_target',
@@ -362,11 +366,14 @@ describe('rpcHandlers (session handoff direct-peer fallback)', () => {
                     endpointCandidates: [endpointCandidate],
                 },
             },
-        });
-        await waitForPrepareResult(registered, 'handoff_direct_peer_legacy_only_adapter', {
+        })).resolves.toEqual({
             ok: false,
             errorCode: 'direct_peer_transfer_unavailable',
             error: 'Direct peer transfer is unavailable and server-routed fallback is disabled',
+        });
+        await waitForPrepareResult(registered, 'handoff_direct_peer_legacy_only_adapter', {
+            ok: false,
+            errorCode: 'not_found',
         });
 
         expect(legacyRequestPayload).not.toHaveBeenCalled();

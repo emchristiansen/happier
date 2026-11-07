@@ -181,6 +181,43 @@ describe('buildSessionViewShellSessionSignature', () => {
         );
     });
 
+    it('changes when the stored starts become newer than the turns projection, and only then', () => {
+        const projection = {
+            v: 1 as const,
+            sessionId: 's1',
+            latestTurnId: 'turn-1',
+            updatedAt: 2,
+            turns: [],
+        };
+        const sameRead = createSession({
+            rollbackEligibleTurnStarts: [1],
+            sessionTurns: projection,
+            sessionTurnsObservedAt: 3,
+            rollbackEligibilityObservedAt: 3,
+        });
+        const renewed = createSession({
+            rollbackEligibleTurnStarts: [1],
+            sessionTurns: projection,
+            sessionTurnsObservedAt: 3,
+            rollbackEligibilityObservedAt: 5,
+        });
+        const renewedAgain = createSession({
+            rollbackEligibleTurnStarts: [1],
+            sessionTurns: projection,
+            sessionTurnsObservedAt: 3,
+            rollbackEligibilityObservedAt: 9,
+        });
+
+        // The resolver lets newer starts decide alone, so the shell must re-render on that flip ...
+        expect(buildSessionViewShellSessionSignature(renewed)).not.toBe(
+            buildSessionViewShellSessionSignature(sameRead),
+        );
+        // ... but a later observation that keeps the same order must not churn the shell.
+        expect(buildSessionViewShellSessionSignature(renewedAgain)).toBe(
+            buildSessionViewShellSessionSignature(renewed),
+        );
+    });
+
     it('changes when pending request details hydrate at the same agent state version', () => {
         const projectedOnly = createSession({
             agentState: null,

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ApiMessage } from '@/sync/api/types/apiTypes';
 import { fetchAndApplyMessages } from './syncSessions';
+import { SessionMessagePageDecryptionError } from './sessionMessagesPagePipeline';
 
 function buildEncryptedApiMessage(id: string, seq: number): ApiMessage {
     return {
@@ -76,7 +77,7 @@ describe('fetchAndApplyMessages (encrypted decrypt retry)', () => {
         const markMessagesLoaded = vi.fn();
         const sessionReceivedMessages = new Map<string, Map<string, number>>();
 
-        await fetchAndApplyMessages({
+        await expect(fetchAndApplyMessages({
             sessionId: 's1',
             getSessionEncryption: () => ({ decryptMessages }),
             request,
@@ -84,10 +85,11 @@ describe('fetchAndApplyMessages (encrypted decrypt retry)', () => {
             applyMessages,
             markMessagesLoaded,
             log: { log: () => {} },
-        });
+        })).rejects.toBeInstanceOf(SessionMessagePageDecryptionError);
 
         expect(decryptMessages.mock.calls[0]?.[0]).toHaveLength(1);
-        expect(applyMessages.mock.calls[0]?.[1]).toHaveLength(0);
+        expect(applyMessages).not.toHaveBeenCalled();
+        expect(markMessagesLoaded).not.toHaveBeenCalled();
 
         canDecrypt = true;
 
@@ -102,6 +104,6 @@ describe('fetchAndApplyMessages (encrypted decrypt retry)', () => {
         });
 
         expect(decryptMessages.mock.calls[1]?.[0]).toHaveLength(1);
-        expect(applyMessages.mock.calls[1]?.[1]?.[0]?.id).toBe('m1');
+        expect(applyMessages.mock.calls[0]?.[1]?.[0]?.id).toBe('m1');
     });
 });

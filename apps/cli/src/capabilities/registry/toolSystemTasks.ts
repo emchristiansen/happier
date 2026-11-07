@@ -3,6 +3,9 @@ import {
 } from '@happier-dev/protocol';
 
 import { type Capability } from '../service';
+import { readCliUpdateFactsForThisCli } from '@/cli/runtime/update/cliUpdateFacts';
+
+import { CLI_UPDATE_SYSTEM_TASK_KIND } from '../systemTasks/kinds/cliUpdateRemote';
 import { getLiveSystemTasksRunnerAdapter } from '../systemTasks/liveSystemTasksRunner';
 
 export const SYSTEM_TASK_KIND_IDS = [
@@ -12,6 +15,16 @@ export const SYSTEM_TASK_KIND_IDS = [
   'relay.runtime.status.v1',
   'relay.runtime.stop.v1',
 ] as const;
+
+/**
+ * The kinds this daemon advertises. The list is the capability negotiation: an app offers an
+ * action only for a listed kind, so `cli.update.v1` (plan R13 K5) is listed only when this machine
+ * can actually run its CLI update remotely (a managed install on a service manager that lets the
+ * updater outlive the restart). Older daemons never list it.
+ */
+export function listAdvertisedSystemTaskKinds(params: Readonly<{ canUpdateCliRemotely: boolean }>): string[] {
+  return [...SYSTEM_TASK_KIND_IDS, ...(params.canUpdateCliRemotely ? [CLI_UPDATE_SYSTEM_TASK_KIND] : [])];
+}
 
 type SystemTasksRunnerAdapter = Readonly<{
   start: (params: Record<string, unknown>) => Promise<unknown>;
@@ -70,7 +83,11 @@ export function createProtocolSystemTasksRunnerAdapter(
   };
 }
 
-export function createSystemTasksCapability(runner: SystemTasksRunnerAdapter = createUnsupportedRunner()): Capability {
+export function createSystemTasksCapability(
+  runner: SystemTasksRunnerAdapter = createUnsupportedRunner(),
+  params: Readonly<{ listKinds?: () => string[] }> = {},
+): Capability {
+  const listKinds = params.listKinds ?? (() => [...SYSTEM_TASK_KIND_IDS]);
   return {
     descriptor: {
       id: 'tool.systemTasks',
@@ -84,7 +101,7 @@ export function createSystemTasksCapability(runner: SystemTasksRunnerAdapter = c
     },
     detect: async () => ({
       available: true,
-      kinds: [...SYSTEM_TASK_KIND_IDS],
+      kinds: listKinds(),
       methods: ['start', 'poll', 'respond'],
     }),
     invoke: async ({ method, params }) => {
@@ -131,4 +148,6 @@ export function createSystemTasksCapability(runner: SystemTasksRunnerAdapter = c
   };
 }
 
-export const systemTasksCapability: Capability = createSystemTasksCapability(getLiveSystemTasksRunnerAdapter());
+export const systemTasksCapability: Capability = createSystemTasksCapability(getLiveSystemTasksRunnerAdapter(), {
+  listKinds: () => listAdvertisedSystemTaskKinds({ canUpdateCliRemotely: readCliUpdateFactsForThisCli().canUpdateRemotely }),
+});

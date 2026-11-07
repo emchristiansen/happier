@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -44,9 +46,18 @@ test('install.ps1 accepts an exact CLI version request through parameter or envi
 
   assert.match(raw, /\[string\]\s+\$Version\s*=\s*\$\(if\s*\(\$env:HAPPIER_INSTALL_VERSION\)/i);
   assert.match(raw, /Resolve-InstallerRequestedVersionPattern/i);
-  assert.match(raw, /\$assetPattern\s*=\s*Resolve-InstallerRequestedVersionPattern[\s\S]*happier-v[\s\S]*windows-x64/i);
+  assert.match(raw, /\$assetPattern\s*=\s*if[\s\S]*happier-v\$\{resolvedVersionPattern\}-windows-x64/i);
   assert.match(raw, /\$checksumsPattern\s*=\s*Resolve-InstallerRequestedVersionPattern[\s\S]*checksums-happier-v[\s\S]*\.txt/i);
   assert.doesNotMatch(raw, /\$asset\s*=\s*Resolve-InstallerAsset\s+-Release\s+\$release\s+-Pattern\s+'[\^]happier-v\.\*-windows-x64/i);
+});
+
+test('install.ps1 resolves rolling payload aliases while binding exact versions to immutable releases', async () => {
+  const path = join(repoRoot, 'scripts', 'release', 'installers', 'install.ps1');
+  const raw = await readFile(path, 'utf8');
+
+  assert.match(raw, /\$tag\s*=\s*if\s*\(\$Version\)\s*\{\s*"cli-v\$Version"/i);
+  assert.match(raw, /\^happier-windows-x64\\\.tar\\\.gz\$/i);
+  assert.match(raw, /\$checksumAssetName\s*=\s*"happier-v\$resolvedVersion-windows-x64\.tar\.gz"/i);
 });
 
 test('install.ps1 semver-sorts rolling release assets instead of relying on provider enumeration order', async () => {
@@ -79,3 +90,64 @@ test('install.ps1 exposes installer-side rollback without invoking the current h
     'expected rollback to run before any installed CLI fast path can invoke the current happier command',
   );
 });
+
+
+for (const [older, newer] of [
+  ['1.0.0-preview.alpha', '1.0.0-preview.alpha.1'],
+  ['1.0.0-preview.alpha', '1.0.0-preview.alpha.beta'],
+  ['1.0.0-preview.9', '1.0.0-preview.10'],
+  ['1.0.0-preview.1', '1.0.0-preview.alpha'],
+  ['1.0.0-preview.alpha.1', '1.0.0'],
+]) {
+  test(`install.ps1 real remote/local selector orders ${older} before ${newer}`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-powershell-asset-order-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const command = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+    // Parse the actual installer with PowerShell's own parser; execute only its four selection owners.
+    const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:HAPPIER_TEST_INSTALLER, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors | Out-String) }
+$names = @('Get-InstallerAssetVersionSortKey', 'Select-NewestInstallerAsset', 'Get-AssetByPattern', 'Get-LocalAssetByPattern')
+$functions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $node.Name }, $true))
+if ($functions.Count -ne 4) { throw 'Expected exactly the four canonical selection owners' }
+foreach ($function in $functions) { . ([scriptblock]::Create($function.Extent.Text)) }
+$ReleaseAssetsDir = Join-Path $env:HAPPIER_TEST_ROOT 'assets'
+New-Item -Path $ReleaseAssetsDir -ItemType Directory | Out-Null
+$oldName = 'checksums-happier-v' + $env:HAPPIER_TEST_OLDER + '.txt'
+$newName = 'checksums-happier-v' + $env:HAPPIER_TEST_NEWER + '.txt'
+foreach ($name in @($oldName, $newName)) { New-Item -Path (Join-Path $ReleaseAssetsDir $name) -ItemType File | Out-Null }
+$forward = Get-AssetByPattern -Release ([pscustomobject]@{ assets = @([pscustomobject]@{ name = $oldName }, [pscustomobject]@{ name = $newName }) }) -Pattern '^checksums-happier-v.*\.txt$'
+$reverse = Get-AssetByPattern -Release ([pscustomobject]@{ assets = @([pscustomobject]@{ name = $newName }, [pscustomobject]@{ name = $oldName }) }) -Pattern '^checksums-happier-v.*\.txt$'
+$local = Get-LocalAssetByPattern -Pattern '^checksums-happier-v.*\.txt$'
+$exact = Get-LocalAssetByPattern -Pattern ('^' + [Regex]::Escape($oldName) + '$')
+@{ forward = $forward.name; reverse = $reverse.name; local = $local.Name; exact = $exact.Name; runtime = $PSVersionTable.PSVersion.ToString() } | ConvertTo-Json -Compress
+`;
+    const run = spawnSync(command, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: root,
+        USERPROFILE: root,
+        XDG_CONFIG_HOME: root,
+        XDG_CACHE_HOME: root,
+        POWERSHELL_TELEMETRY_OPTOUT: '1',
+        HAPPIER_TEST_INSTALLER: join(repoRoot, 'scripts', 'release', 'installers', 'install.ps1'),
+        HAPPIER_TEST_ROOT: root,
+        HAPPIER_TEST_OLDER: older,
+        HAPPIER_TEST_NEWER: newer,
+      },
+    });
+    if (run.error?.code === 'ENOENT' && process.platform !== 'win32') {
+      t.skip('PowerShell runtime is unavailable; no Windows selector behavior exercised');
+      return;
+    }
+    assert.equal(run.status, 0, `PowerShell selector failed: ${run.error ?? ''}\n${run.stdout}\n${run.stderr}`);
+    const actual = JSON.parse(run.stdout.replace(/^\uFEFF/, '').trim());
+    const expected = `checksums-happier-v${newer}.txt`;
+    assert.deepEqual([actual.forward, actual.reverse, actual.local], [expected, expected, expected]);
+    assert.equal(actual.exact, `checksums-happier-v${older}.txt`, 'exact-version filtering remains authoritative');
+  });
+}

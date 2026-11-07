@@ -210,6 +210,6 @@ describe('createConnectedServiceQuotaFetchers', () => {
     const claudeHeaders = fetchMock.mock.calls.find((call) => String(call[0]).includes('/api/oauth/usage'))
       ?.[1] as { headers?: Record<string, string> } | undefined;
     expect(codexHeaders?.headers?.['User-Agent']).toBe('codex-specific-agent/1.0');
-    expect(claudeHeaders?.headers?.['User-Agent']).toMatch(/^claude-code\//u);
+    expect(claudeHeaders?.headers?.['User-Agent']).toMatch(/^claude-cli\/[0-9][a-zA-Z0-9._+-]* \(external, cli\)$/u);
   });
 });

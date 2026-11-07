@@ -146,7 +146,7 @@ describe('buildClaudeSessionModelsMetadataWithCurrentModelId', () => {
 
     expect(update?.sessionModelsV1).toEqual(update?.acpSessionModelsV1);
     expect(update?.sessionModelsV1).toMatchObject({
-      updatedAt: 30,
+      updatedAt: 20,
       currentModelId: 'claude-next',
       availableModels: [{ id: 'claude-new', name: 'Claude New' }],
     });

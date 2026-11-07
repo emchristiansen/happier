@@ -1,6 +1,7 @@
 import { AGENTS_CORE, type AgentId } from '@happier-dev/agents';
 import {
-  ConnectedServicesDefaultAuthByAgentIdV1Schema,
+  readConnectedServicesDefaultAuthSettings,
+  type ConnectedServicesDefaultAuthSettings,
   ConnectedServiceBindingsV1Schema,
   type ConnectedServiceBindingSelectionV1,
   type ConnectedServiceBindingsV1,
@@ -63,22 +64,19 @@ export function resolveSpawnConnectedServicesDefaultDisposition(params: Readonly
   if (targetServiceIds.length === 0) return { kind: 'native' };
 
   const settingsRecord = params.accountSettings && typeof params.accountSettings === 'object' && !Array.isArray(params.accountSettings)
-    ? params.accountSettings as { connectedServicesDefaultAuthByAgentIdV1?: unknown }
+    ? params.accountSettings as ConnectedServicesDefaultAuthSettings
     : {};
-  if (!Object.prototype.hasOwnProperty.call(settingsRecord, 'connectedServicesDefaultAuthByAgentIdV1')) {
-    return { kind: 'native' };
-  }
-  const parsedDefaults = ConnectedServicesDefaultAuthByAgentIdV1Schema.safeParse(
-    settingsRecord.connectedServicesDefaultAuthByAgentIdV1,
-  );
-  if (!parsedDefaults.success) {
+  let defaults;
+  try {
+    defaults = readConnectedServicesDefaultAuthSettings(settingsRecord);
+  } catch {
     return {
       kind: 'unavailable',
       reason: 'connected_services_default_settings_invalid',
     };
   }
 
-  const configuredBindings = parsedDefaults.data.bindingsByAgentId[params.agentId]?.bindingsByServiceId ?? {};
+  const configuredBindings = defaults.bindingsByAgentId[params.agentId]?.bindingsByServiceId ?? {};
   const bindingsByServiceId: Record<string, ConnectedServiceBindingSelectionV1> = {};
   let hasConnectedBinding = false;
 

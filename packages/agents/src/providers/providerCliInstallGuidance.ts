@@ -10,7 +10,7 @@ function formatProviderCliInstallCommand(command: ProviderCliInstallCommand): st
     return command.args[1];
   }
   if (
-    command.cmd === 'powershell'
+    command.cmd === 'powershell.exe'
     && command.args[0] === '-NoProfile'
     && command.args[1] === '-ExecutionPolicy'
     && command.args[2] === 'Bypass'

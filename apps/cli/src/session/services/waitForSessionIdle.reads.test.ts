@@ -20,7 +20,7 @@ function session(overrides: Partial<RawSessionRecord> = {}): RawSessionRecord {
     id: sessionId, seq: 1, createdAt: 0, updatedAt: 0, active: true, activeAt: 0,
     encryptionMode: 'plain', metadata: '{}', metadataVersion: 0,
     agentState: JSON.stringify({ requests: {} }), agentStateVersion: 0, dataEncryptionKey: null,
-    latestTurnStatus: 'in_progress', pendingPermissionRequestCount: 0, pendingUserActionRequestCount: 0, ...overrides,
+    latestTurnStatus: 'in_progress', pendingCount: 0, pendingPermissionRequestCount: 0, pendingUserActionRequestCount: 0, ...overrides,
   };
 }
 
@@ -40,7 +40,7 @@ async function harness(params: {
   const sessionReads: number[] = [];
   const transcriptReads: number[] = [];
   httpGet.mockImplementation(async (url: string) => {
-    if (String(url).endsWith(`/v2/sessions/${sessionId}`)) {
+    if (new URL(String(url)).pathname === `/v2/sessions/${sessionId}`) {
       sessionReads.push(Date.now());
       if (params.serviceMs) await new Promise((resolve) => setTimeout(resolve, params.serviceMs));
       return { status: 200, data: { session: await (params.readSession?.(sessionReads.length) ?? session({ latestTurnStatus: socketCompleted ? 'completed' : 'in_progress' })) } };
@@ -58,7 +58,7 @@ async function harness(params: {
     update: () => {
       socketCompleted = true;
       return handlers.get('update')?.({ id: 'u1', seq: 1, createdAt: Date.now(), body: {
-      t: 'update-session', id: sessionId, latestTurnStatus: 'completed', pendingPermissionRequestCount: 0, pendingUserActionRequestCount: 0,
+      t: 'update-session', id: sessionId, latestTurnStatus: 'completed', pendingCount: 0, pendingPermissionRequestCount: 0, pendingUserActionRequestCount: 0,
     } });
     },
   };
@@ -109,8 +109,9 @@ describe('waitForSessionIdle request scheduling', () => {
     const h = await harness(); const result = h.wait();
     await vi.advanceTimersByTimeAsync(8_000); h.update();
     await expect(result).resolves.toMatchObject({ ok: true, idle: true, observedAt: 8_000 });
-    expect(h.sessionReads).toEqual([0, 250, 750, 1750, 3750, 7750, 8000]);
-    await vi.advanceTimersByTimeAsync(10_000); expect(h.sessionReads).toHaveLength(7);
+    // A complete socket projection settles a projection-preferred wait without another read.
+    expect(h.sessionReads).toEqual([0, 250, 750, 1750, 3750, 7750]);
+    await vi.advanceTimersByTimeAsync(10_000); expect(h.sessionReads).toHaveLength(6);
   });
 
   it('retains post-idle fresh AgentState proof and rejects local user control', async () => {
@@ -162,6 +163,7 @@ describe('waitForSessionIdle request scheduling', () => {
     });
     const result = h.wait(1_000); await vi.advanceTimersByTimeAsync(1_000);
     await expect(result).resolves.toEqual({ ok: false, code: 'timeout' });
-    expect(h.sessionReads).toEqual([0]); expect(h.transcriptReads).toEqual([0, 250, 500, 750]);
+    // Each recheck reads the Session first so queued input (pendingCount) stays visible.
+    expect(h.sessionReads).toEqual([0, 250, 500, 750]); expect(h.transcriptReads).toEqual([0, 250, 500, 750]);
   });
 });

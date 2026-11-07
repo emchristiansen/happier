@@ -19,6 +19,7 @@ import {
   readConnectedServiceChildSelectionsFromEnv,
   serializeConnectedServiceChildSelections,
   serializeConnectedServiceMaterializedEnvKeys,
+  stripInheritedConnectedServiceEnvironment,
 } from './connectedServiceChildEnvironment';
 
 describe('connectedServiceChildEnvironment runtime auth context', () => {
@@ -123,5 +124,24 @@ describe('connectedServiceChildEnvironment runtime auth context', () => {
     expect(readConnectedServiceMaterializedEnvKeysFromEnv({
       [HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY]: serialized ?? undefined,
     })).toEqual(['CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR']);
+  });
+
+  it('removes only inherited connected-service authority before composing a child runtime', () => {
+    const inheritedSelections = JSON.stringify([{ serviceId: 'openai-codex', source: 'connected' }]);
+    const stripped = stripInheritedConnectedServiceEnvironment({
+      OPENAI_API_KEY: 'connected-secret',
+      CODEX_HOME: '/tmp/connected-codex',
+      NATIVE_RUNTIME_TOKEN: 'native-secret',
+      [HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY]: inheritedSelections,
+      [HAPPIER_CONNECTED_SERVICE_MATERIALIZED_ENV_KEYS_ENV_KEY]: JSON.stringify([
+        'OPENAI_API_KEY',
+        'CODEX_HOME',
+      ]),
+      HAPPIER_CONNECTED_SERVICE_TARGET_MATERIALIZED_ROOT: '/tmp/connected-root',
+    });
+
+    expect(stripped).toEqual({
+      NATIVE_RUNTIME_TOKEN: 'native-secret',
+    });
   });
 });

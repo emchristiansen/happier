@@ -3,6 +3,7 @@ import { View } from 'react-native';
 
 import { CodeEditor } from '@/components/ui/code/editor/CodeEditor';
 import type { CodeEditorHandle } from '@/components/ui/code/editor/codeEditorTypes';
+import { usePublishCodeEditorHandle } from '@/components/ui/code/editor/usePublishCodeEditorHandle';
 import { Typography } from '@/constants/Typography';
 import { Text } from '@/components/ui/text/Text';
 import { t } from '@/text';
@@ -20,10 +21,11 @@ function FileEditorPanelImpl(props: Readonly<{
     changeDebounceMs?: number;
     bridgeMaxChunkBytes?: number;
 }>) {
+    const publishEditorHandle = usePublishCodeEditorHandle(props.editorRef);
     return (
         <View style={{ flex: 1, paddingHorizontal: 16, paddingVertical: 12 }}>
             <CodeEditor
-                ref={props.editorRef}
+                ref={publishEditorHandle}
                 resetKey={props.resetKey}
                 value={props.value}
                 language={props.language}

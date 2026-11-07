@@ -55,6 +55,7 @@ Current native-MCP providers include:
 - OpenCode
 - Gemini
 - Kiro
+- Devin
 - Custom ACP providers that expose native MCP support
 
 ### Shell bridge
@@ -143,6 +144,8 @@ In the app, this lives under **Settings → Actions**.
 
 When an action is approval-gated, callers do not execute it immediately. Instead, Happier creates an approval request and surfaces it in **Inbox** for review and execution.
 
+In development source, **Archive session** and **Unarchive session** also expose an app control under **Settings → Actions**. Set **Contextual UI → Allowed** to skip confirmation, or **Ask first** to show a confirmation dialog. This applies to session rows, the header menu, session info, the archived list, and bulk selection. Archiving an active session still asks before stopping it; delete and stop confirmations remain in place. Archive and unarchive confirmations use normal styling.
+
 Eligible tool-backed action surfaces also have a **tool exposure** setting:
 
 - **Use default** follows Happier’s default for that action and surface.
@@ -185,6 +188,14 @@ For an action invoked by an agent inside a session, `sessionId` is optional. Omi
 Before starting a run, inspect its current action spec, then resolve selectable fields through the action-options flow. The spec and option resolver are the source of truth for current Agent targets, models, configuration, accounts, connected services, and accepted input shapes. This avoids depending on recipes or option-source names that may no longer match the installed build.
 
 Waiting is only observation. If a bounded wait times out, the run may still be active; the timeout does not stop it or turn it into a failed run. Retry only when the returned provider evidence classifies the failure as retryable, such as a typed transient rate limit. Do not treat every backend failure as transient or silently switch to another backend.
+
+## Recovering a native session goal
+
+In development source, a session agent can inspect, update, and clear its native goal through Happier tools. Omit `sessionId` to target the invoking session; external callers without a bound session must supply it. The installed action spec remains the source of truth for the accepted fields and current availability.
+
+To replace a blocked goal, read it, clear it, confirm that the goal snapshot is empty, then set the replacement objective. These controls use the existing native goal path and require an Agent runtime that supports goal controls.
+
+Goal recovery is autonomous by default. You can require approval for clearing through the existing action approval settings. When required, the clear tool waits for approval and returns the execution result; rejection leaves the goal intact. Disabled actions and discoverable-only preferences still apply.
 
 ## Hot-path actions
 

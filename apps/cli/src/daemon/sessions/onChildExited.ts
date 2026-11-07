@@ -7,6 +7,7 @@ import { removeSessionMarker, updateSessionMarkerActiveTurn } from '../sessionRe
 import { cleanupPidSessionResources } from './cleanupPidSessionResources';
 import { isPidPlaceholderSessionId } from './pidPlaceholderSessionId';
 import { stageObservedExit } from './stageObservedExit';
+import { classifyTrackedSessionRunnerPresence } from './isSessionRunnerActive';
 
 export type ChildExit = { reason: string; code: number | null; signal: string | null };
 
@@ -21,6 +22,10 @@ function isPidAlive(pid: number): boolean {
 
 function normalizeSessionId(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function isServerBackedSessionId(sessionId: string): boolean {
+  return !/^PID-\d+$/.test(sessionId);
 }
 
 function isTrackedSessionAlive(tracked: TrackedSession): boolean {
@@ -87,7 +92,7 @@ export function createOnChildExited(params: Readonly<{
   onUnexpectedExit?: (trackedSession: TrackedSession, exit: ChildExit) => void;
   isExitUnexpectedOverride?: (trackedSession: TrackedSession, exit: ChildExit) => boolean | null | undefined;
   onPidPromoted?: (input: Readonly<{ fromPid: number; toPid: number; trackedSession: TrackedSession }>) => void;
-  shouldPreserveSessionMarkerOnExit?: (input: Readonly<{ pid: number; trackedSession: TrackedSession; exit: ChildExit }>) => boolean;
+  shouldPreserveSessionMarkerOnExit?: (input: Readonly<{ pid: number; trackedSession: TrackedSession; exit: ChildExit }>) => boolean | Promise<boolean>;
   onFinalTrackedSessionExitStaged?: (input: Readonly<{
     pid: number;
     trackedSession: TrackedSession;
@@ -116,9 +121,30 @@ export function createOnChildExited(params: Readonly<{
   return async (pid: number, exit: ChildExit) => {
     logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
     const tracked = pidToTrackedSession.get(pid);
+    if (tracked?.startupCustody && exit.reason === 'process-missing') {
+      const presence = await classifyTrackedSessionRunnerPresence({ tracked });
+      // Presence reads may overlap promotion, reports, or explicit cancellation.
+      if (pidToTrackedSession.get(pid) !== tracked || tracked.reportMarkerCustody?.retiring) return;
+      if (tracked.startupCustody && tracked.stopRequestedAtMs === undefined
+        && presence !== 'absent' && (presence !== 'present' || !tracked.sessionRunnerPid)) {
+        logger.infoFile('[DAEMON RUN] Retaining pending startup after an unproven runner exit', { pid, presence });
+        return;
+      }
+    }
     const runnerPid = tracked?.sessionRunnerPid;
     const override = tracked && isExitUnexpectedOverride ? isExitUnexpectedOverride(tracked, exit) : null;
-    if (tracked && typeof runnerPid === 'number' && runnerPid !== pid && isPidAlive(runnerPid)) {
+    let canPromoteRunner = Boolean(tracked && typeof runnerPid === 'number' && runnerPid !== pid && isPidAlive(runnerPid));
+    if (tracked && canPromoteRunner && tracked.processInstanceFingerprint) {
+      const presence = await classifyTrackedSessionRunnerPresence({ tracked });
+      if (pidToTrackedSession.get(pid) !== tracked || tracked.sessionRunnerPid !== runnerPid
+        || tracked.reportMarkerCustody?.retiring) return;
+      if (presence === 'unknown' || presence === 'recoverable_stopped') {
+        logger.infoFile('[DAEMON RUN] Retaining wrapper custody until runner identity is resolved', { pid, runnerPid, presence });
+        return;
+      }
+      canPromoteRunner = presence === 'present';
+    }
+    if (tracked && typeof runnerPid === 'number' && canPromoteRunner) {
       logger.debug(`[DAEMON RUN] Wrapper PID ${pid} exited; promoting tracked session to runner PID ${runnerPid}`);
       const spawnCleanup = spawnResourceCleanupByPid.get(pid);
       if (spawnCleanup) {
@@ -138,12 +164,28 @@ export function createOnChildExited(params: Readonly<{
         childProcess: undefined,
       };
       pidToTrackedSession.set(runnerPid, promoted);
+      tracked.startupCustody?.promotePid?.(runnerPid);
       onPidPromoted?.({ fromPid: pid, toPid: runnerPid, trackedSession: promoted });
-      void removeSessionMarkerFn(pid).catch((error) => {
-        logger.debug('[DAEMON RUN] Failed to remove wrapper marker after promoting tracked session to runner PID', error);
-      });
+      void Promise.all([tracked.reportMarkerCustody?.pending, tracked.startupCustody?.finalization])
+        .then(() => removeSessionMarkerFn(pid)).catch(() => {
+          logger.infoFile('[DAEMON RUN] Warning: failed to remove promoted wrapper marker', { pid });
+        });
       return;
     }
+
+    // Promotion is not a runner exit. Every actual exit source must settle startup
+    // immediately, then let its existing marker/binding finalizer finish before retirement.
+    const startup = tracked?.startupCustody;
+    startup?.observeExit(exit);
+    const markerCustody = tracked?.reportMarkerCustody;
+    // Close the same write owner synchronously even when no report has arrived:
+    // a first report during startup retirement must not open new marker work.
+    if (tracked) {
+      tracked.reportMarkerCustody ??= { pending: Promise.resolve(), retiring: true };
+      tracked.reportMarkerCustody.retiring = true;
+    }
+    if (markerCustody) await markerCustody.pending;
+    if (startup) await startup.finalization;
 
     if (tracked) {
       const liveReplacement = findLiveReplacementForSameSession(pidToTrackedSession, pid, tracked);
@@ -164,7 +206,11 @@ export function createOnChildExited(params: Readonly<{
         });
       }
 
-      const preserveExitedMarker = shouldPreserveSessionMarkerOnExit?.({ pid, trackedSession: tracked, exit }) === true;
+      const finalSessionId = normalizeSessionId(tracked.happySessionId);
+      const hasServerBackedSession = Boolean(finalSessionId) && isServerBackedSessionId(finalSessionId);
+      const actionableUnexpectedExit = shouldReportSessionEnd && isUnexpected && hasServerBackedSession;
+      const preserveExitedMarker = hasServerBackedSession
+        && await shouldPreserveSessionMarkerOnExit?.({ pid, trackedSession: tracked, exit }) === true;
       const apiMachineForSessions = getApiMachineForSessions();
       const observedAt = Date.now();
       try {
@@ -195,6 +241,13 @@ export function createOnChildExited(params: Readonly<{
             }));
           },
         });
+        if (typeof tracked.stopRequestedAtMs === 'number') {
+          logger.infoFile('[DAEMON STOP] Runner exit durable staging completed', {
+            sessionId: tracked.happySessionId,
+            pid,
+            elapsedMs: Date.now() - observedAt,
+          });
+        }
       } catch (error) {
         logger.warn('[DAEMON RUN] Failed to durably stage observed runner exit; retaining marker evidence', {
           sessionId: tracked.happySessionId,
@@ -203,7 +256,13 @@ export function createOnChildExited(params: Readonly<{
         });
         throw error;
       }
-      if (shouldReportSessionEnd && onFinalTrackedSessionExitStaged) {
+      if (
+        shouldReportSessionEnd
+        && hasServerBackedSession
+        && exit.reason !== 'startup-cancelled-before-ack'
+        && onFinalTrackedSessionExitStaged
+      ) {
+        const recoveryStartedAtMs = Date.now();
         try {
           await onFinalTrackedSessionExitStaged({
             pid,
@@ -211,6 +270,13 @@ export function createOnChildExited(params: Readonly<{
             exit,
             observedAt,
           });
+          if (typeof tracked.stopRequestedAtMs === 'number') {
+            logger.infoFile('[DAEMON STOP] Runner exit terminal recovery completed', {
+              sessionId: tracked.happySessionId,
+              pid,
+              elapsedMs: Date.now() - recoveryStartedAtMs,
+            });
+          }
         } catch (error) {
           // The runner exit is already durably staged above; this step only
           // registers the disconnected terminal host as a RECOVERY candidate.
@@ -241,7 +307,7 @@ export function createOnChildExited(params: Readonly<{
           publisherIncarnationId: exitedPublisherIncarnationId,
         }, pid);
       }
-      if (shouldReportSessionEnd && isUnexpected && typeof tracked.happySessionId === 'string' && tracked.happySessionId.trim().length > 0) {
+      if (actionableUnexpectedExit) {
         try {
           onUnexpectedExit?.(tracked, exit);
         } catch (e) {
@@ -260,11 +326,19 @@ export function createOnChildExited(params: Readonly<{
         },
       }).catch((e) => logger.debug('[DAEMON RUN] Failed to write session exit report', e));
     }
+    const resourceCleanupStartedAtMs = Date.now();
     await cleanupPidSessionResources({
       pid,
       spawnResourceCleanupByPid,
       sessionAttachCleanupByPid,
     });
     pidToTrackedSession.delete(pid);
+    if (typeof tracked?.stopRequestedAtMs === 'number') {
+      logger.infoFile('[DAEMON STOP] Runner exit resources completed', {
+        sessionId: tracked.happySessionId,
+        pid,
+        elapsedMs: Date.now() - resourceCleanupStartedAtMs,
+      });
+    }
   };
 }

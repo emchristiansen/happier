@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
-import { ensureTauriSigningKeyFile } from './ensure-signing-key-file.mjs';
+import { createTauriSignerFileEnv, ensureTauriSigningKeyFile } from './ensure-signing-key-file.mjs';
 import { resolveTauriSigningPrivateKeyPassword } from './resolve-signing-key-password.mjs';
 import { resolveYarnInvocation } from './resolve-yarn-invocation.mjs';
 
@@ -65,7 +65,7 @@ export function extractTauriUpdaterSignature(stdout) {
  * @param {{ dryRun: boolean }} opts
  * @param {string} cmd
  * @param {string[]} args
- * @param {{ cwd: string; env?: Record<string, string>; stdio?: import('node:child_process').StdioOptions; timeoutMs?: number }} extra
+ * @param {{ cwd: string; env?: NodeJS.ProcessEnv; stdio?: import('node:child_process').StdioOptions; timeoutMs?: number }} extra
  * @returns {string}
  */
 function run(opts, cmd, args, extra) {
@@ -372,6 +372,7 @@ function main() {
 
   const sigRaw = run(opts, yarn.cmd, signArgs, {
     cwd: absUiDir,
+    env: signingKeyPath ? createTauriSignerFileEnv(process.env) : undefined,
     stdio: ['ignore', 'pipe', 'inherit'],
     timeoutMs: 10 * 60_000,
   });

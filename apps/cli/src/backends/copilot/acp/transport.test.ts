@@ -97,4 +97,11 @@ describe('CopilotTransport handleStderr', () => {
       },
     });
   });
+
+  it('does not treat an incidental 401 identifier as authentication failure', () => {
+    expect(copilotTransport.handleStderr(
+      '[agy-acp] WARN: failed to decode gen_metadata 401: cant skip wire type 6',
+      DEFAULT_STDERR_CONTEXT,
+    )).toEqual({ message: null });
+  });
 });

@@ -26,8 +26,9 @@ export type ClaudeUnifiedTuiRuntimeControlFeatureId =
   typeof CLAUDE_UNIFIED_TUI_RUNTIME_CONTROL_FEATURE_ID;
 
 /**
- * Probe-verified Claude TUI permission/plan mode cycle members. `default` is detected by the ABSENCE
- * of a status-bar marker. `auto`/`bypassPermissions` are model/account-gated and may be unreachable;
+ * Probe-verified Claude TUI permission/plan mode cycle members. A hidden footer is unknown;
+ * default requires its legacy shortcuts footer or explicit manual marker.
+ * `auto`/`bypassPermissions` are model/account-gated and may be unreachable;
  * the controller must verify the marker after each cycle press rather than counting presses.
  */
 export type ClaudeTuiModeMarker = 'default' | 'acceptEdits' | 'plan' | 'auto' | 'bypassPermissions';
@@ -139,7 +140,7 @@ export type ClaudePromptSubmitMetadata = Readonly<{
  * Statusline-reported EFFECTIVE runtime facts (lane Y). The statusline is faster than
  * `UserPromptSubmit` and is the only live source of reasoning effort, so it acts as a second
  * effective-truth feed into `lastVerified`. Fields are optional because the payload shape is
- * Claude-owned (haiku omits effort); absent fields must be ignored, never reset.
+ * Claude-owned (haiku omits effort); absent effort is retained only for the same model.
  */
 export type ClaudeStatuslineRuntimeMetadata = Readonly<{
   model?: string | undefined;
@@ -163,6 +164,7 @@ export interface ClaudeUnifiedTuiControlController {
    */
   reconcileFromStatusline(metadata: ClaudeStatuslineRuntimeMetadata): void;
   getLastVerifiedRuntimeConfig(): ClaudeUnifiedVerifiedRuntimeConfig;
+  getPendingRuntimeConfig(): ClaudeDesiredRuntimeConfig;
   /** True while a control op holds the terminal lock; Lane E must not inject prompts while held. */
   isControlInFlight(): boolean;
   /** True only while a Happier-initiated slash control owns this registered follow-up dialog. */

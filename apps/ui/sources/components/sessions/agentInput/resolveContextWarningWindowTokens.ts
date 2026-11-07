@@ -1,6 +1,6 @@
 import type { AgentId } from '@/agents/catalog/catalog';
 import type { Metadata } from '@/sync/domains/state/storageTypes';
-import { readSessionModelsState } from '@/sync/domains/sessionControl/readSessionControlMetadata';
+import { matchesSessionControlProvider, readSessionModelsState } from '@/sync/domains/sessionControl/readSessionControlMetadata';
 import { getAgentStaticModels, providers as agentProviders } from '@happier-dev/agents';
 
 export const DEFAULT_CONTEXT_WINDOW_TOKENS = agentProviders.claude.CLAUDE_DEFAULT_CONTEXT_WINDOW_TOKENS;
@@ -49,7 +49,7 @@ function resolveAssumedContextWindowTokens(params: Readonly<{
 
     const overrideModelId = normalizeModelId(params.metadata?.modelOverrideV1?.modelId);
     const sessionModelsState = readSessionModelsState(params.metadata);
-    if (sessionModelsState && sessionModelsState.provider === params.agentId) {
+    if (sessionModelsState && matchesSessionControlProvider({ ...params, provider: sessionModelsState.provider })) {
         const activeModelId = overrideModelId || normalizeModelId(sessionModelsState.currentModelId);
         const matchingModel = Array.isArray(sessionModelsState.availableModels)
             ? sessionModelsState.availableModels.find((model) => normalizeModelId(model.id) === activeModelId)

@@ -3,11 +3,14 @@ import type { TracedMessage } from '../reducerTracer';
 import type { ReducerMessage, ReducerState } from '../reducer';
 import { getSidechainThinkingMergeCursor, setSidechainThinkingMergeCursor } from '../helpers/mergeCursors';
 import { applyToolResultUpdateToReducerMessage } from '../helpers/applyToolResultUpdateToReducerMessage';
+import { selectToolResultSessionMediaMeta } from '@/sync/domains/sessionMedia/sessionMediaMessageMeta';
 import { normalizeThinkingChunk, unwrapThinkingText } from '../helpers/thinkingText';
 import { readStreamSegmentMetaV1 } from '../helpers/streamSegmentMeta';
 import { upsertStreamSegmentSnapshotMessage } from '../helpers/upsertStreamSegmentSnapshotMessage';
 import { restoreSubagentToolFromSyntheticInterruption } from '../helpers/subagentSyntheticInterruption';
 import { normalizeTranscriptSeq } from '../../domains/messages/transcriptOrdering';
+import { drainAndApplyOrphanToolResultsToMessage } from '../helpers/drainAndApplyOrphanToolResultsToMessage';
+import { resolveSidechainToolMessage, resolveSidechainPermissionMirror } from './toolResults';
 
 export function runSidechainsPhase(params: Readonly<{
     state: ReducerState;
@@ -125,6 +128,7 @@ export function runSidechainsPhase(params: Readonly<{
                             createdAt: msg.createdAt,
                             text: c.text,
                             isThinking: false,
+                            ...(c.peer ? { peer: c.peer } : {}),
                             tool: null,
                             event: null,
                             meta: msg.meta,
@@ -215,7 +219,7 @@ export function runSidechainsPhase(params: Readonly<{
                 } else if (c.type === 'tool-call') {
                     setSidechainThinkingMergeCursor(state, sidechainId, null, 'sidechain-tool-call');
                     // Check if there's already a permission message for this tool
-                    const existingPermissionMessageId = state.toolIdToMessageId.get(c.id);
+                    const existingPermissionMessageId = resolveSidechainPermissionMirror(state, c.id);
 
                     const mid = allocateId();
                     const toolCall: ToolCall = {
@@ -263,6 +267,7 @@ export function runSidechainsPhase(params: Readonly<{
                     // Map sidechain tool separately to avoid overwriting permission mapping
                     state.sidechainToolIdToMessageId.set(c.id, mid);
                 } else if (c.type === 'tool-result') {
+                    const resultMeta = selectToolResultSessionMediaMeta(msg, c.tool_use_id);
                     // Process tool result in sidechain - update BOTH messages
                     const toolResult = {
                         tool_use_id: c.tool_use_id,
@@ -272,7 +277,7 @@ export function runSidechainsPhase(params: Readonly<{
                     };
 
                     // Update the sidechain tool message
-                    const sidechainMessageId = state.sidechainToolIdToMessageId.get(c.tool_use_id);
+                    const sidechainMessageId = resolveSidechainToolMessage(state, c.tool_use_id, sidechainId)?.messageId;
                     if (sidechainMessageId != null) {
                         const sidechainMessage = state.messages.get(sidechainMessageId);
                         if (sidechainMessage && sidechainMessage.tool) {
@@ -281,23 +286,23 @@ export function runSidechainsPhase(params: Readonly<{
                                 messageId: sidechainMessageId,
                                 toolResult,
                                 resultCreatedAt: msg.createdAt,
-                                meta: msg.meta,
+                                meta: resultMeta,
                                 changed,
                             });
                         }
                     }
 
                     // Also update the main permission message if it exists
-                    const permissionMessageId = state.toolIdToMessageId.get(c.tool_use_id);
+                    const permissionMessageId = resolveSidechainPermissionMirror(state, c.tool_use_id);
                     if (permissionMessageId != null) {
                         const permissionMessage = state.messages.get(permissionMessageId);
-                        if (permissionMessage && permissionMessage.tool) {
+                        if (permissionMessage?.tool?.permission) {
                             applyToolResultUpdateToReducerMessage({
                                 message: permissionMessage,
                                 messageId: permissionMessageId,
                                 toolResult,
                                 resultCreatedAt: msg.createdAt,
-                                meta: msg.meta,
+                                meta: resultMeta,
                                 changed,
                             });
                         }
@@ -320,5 +325,16 @@ export function runSidechainsPhase(params: Readonly<{
         }
     }
 
+    // Register every child in the batch before consuming unscoped outcomes, so colliding siblings
+    // cannot make the first registered child look like the sole owner.
+    for (const toolUseId of state.orphanToolResults.keys()) {
+        if (state.toolIdToMessageId.has(toolUseId)) continue;
+        const sidechain = resolveSidechainToolMessage(state, toolUseId);
+        if (!sidechain) continue;
+        drainAndApplyOrphanToolResultsToMessage({ state, toolUseId, messageId: sidechain.messageId, changed });
+        const parentId = state.toolIdToMessageId.get(sidechain.sidechainId);
+        if (parentId) changed.add(parentId);
+        stateChanged = true;
+    }
     return stateChanged;
 }

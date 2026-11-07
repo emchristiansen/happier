@@ -21,6 +21,7 @@ function sanitizeBundledPackageJsonFallback(raw) {
     module,
     types,
     exports,
+    imports,
     dependencies,
     peerDependencies,
     optionalDependencies,
@@ -37,6 +38,7 @@ function sanitizeBundledPackageJsonFallback(raw) {
     module,
     types,
     exports,
+    ...(imports === undefined ? {} : { imports }),
     dependencies: stripInternalBundledWorkspaceDependenciesFallback(dependencies),
     peerDependencies,
     optionalDependencies: stripInternalBundledWorkspaceDependenciesFallback(optionalDependencies),
@@ -277,6 +279,7 @@ function syncBundledWorkspaceReferencedFiles({ srcPackageDir, destPackageDir, pa
   collectPackageJsonRelativeFileTargets(packageJsonRaw?.module, relativeTargets);
   collectPackageJsonRelativeFileTargets(packageJsonRaw?.types, relativeTargets);
   collectPackageJsonRelativeFileTargets(packageJsonRaw?.exports, relativeTargets);
+  collectPackageJsonRelativeFileTargets(packageJsonRaw?.imports, relativeTargets);
 
   for (const relPath of relativeTargets) {
     // `dist/**` is synced separately with extra staging/atomicity; skip it here.

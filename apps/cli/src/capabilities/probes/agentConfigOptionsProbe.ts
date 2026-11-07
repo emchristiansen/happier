@@ -5,6 +5,7 @@ import type { Credentials } from '@/persistence';
 import { buildAgentProbeCacheKey } from './buildAgentProbeCacheKey';
 import { resolveAgentProbeVariant } from './resolveAgentProbeVariant';
 import { z } from 'zod';
+import { lazySchema } from '@happier-dev/protocol';
 
 export type ProbedAgentConfigOptionValue = string | number | boolean | null;
 
@@ -36,22 +37,22 @@ const agentConfigOptionsProbeCache = new AsyncTtlCache<ProbedAgentConfigOptionsR
   successTtlMs: PROBE_CONFIG_OPTIONS_SUCCESS_TTL_MS,
   errorTtlMs: PROBE_CONFIG_OPTIONS_FAILURE_TTL_MS,
 });
-const ProbeNonEmptyStringSchema = z.string().trim().min(1);
-const ProbeDescriptionSchema = z.string();
-const ProbeOptionValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
-const ProbeConfigChoiceInputSchema = z.object({
+const ProbeNonEmptyStringSchema = lazySchema(() => z.string().trim().min(1));
+const ProbeDescriptionSchema = lazySchema(() => z.string());
+const ProbeOptionValueSchema = lazySchema(() => z.union([z.string(), z.number(), z.boolean(), z.null()]));
+const ProbeConfigChoiceInputSchema = lazySchema(() => z.object({
   value: z.unknown().optional(),
   name: ProbeNonEmptyStringSchema,
   description: ProbeDescriptionSchema.optional(),
-});
-const ProbeConfigOptionInputSchema = z.object({
+}));
+const ProbeConfigOptionInputSchema = lazySchema(() => z.object({
   id: ProbeNonEmptyStringSchema,
   name: ProbeNonEmptyStringSchema,
   description: ProbeDescriptionSchema.optional(),
   type: ProbeNonEmptyStringSchema,
   currentValue: z.unknown().optional(),
   options: z.array(z.unknown()).optional(),
-});
+}));
 
 function buildStatic(agentId: CatalogAgentId): ProbedAgentConfigOptionsResult {
   return { provider: agentId, configOptions: [], source: 'static' };
@@ -112,6 +113,9 @@ export async function probeAgentConfigOptionsBestEffort(params: {
   connectedServices?: ConnectedServiceBindingsV1 | null;
   processEnv?: NodeJS.ProcessEnv;
   connectedServiceSelectionCacheKey?: string | null;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  onNativeCleanup?: import('./catalogProbeLifecycle').RegisterNativeCatalogCleanup;
 }): Promise<ProbedAgentConfigOptionsResult> {
   const nowMs = Date.now();
   const cwd = typeof params.cwd === 'string' && params.cwd.trim().length > 0 ? params.cwd.trim() : process.cwd();
@@ -138,7 +142,8 @@ export async function probeAgentConfigOptionsBestEffort(params: {
   const cached = agentConfigOptionsProbeCache.get(cacheKey);
   if (cached?.kind === 'success' && agentConfigOptionsProbeCache.isFresh(cached, nowMs)) return cached.value;
 
-  return await agentConfigOptionsProbeCache.runDedupe(cacheKey, async () => {
+  const runProbe = async () => {
+    params.signal?.throwIfAborted();
     const cached2 = agentConfigOptionsProbeCache.get(cacheKey);
     const nowMs2 = Date.now();
     if (cached2?.kind === 'success' && agentConfigOptionsProbeCache.isFresh(cached2, nowMs2)) return cached2.value;
@@ -157,6 +162,9 @@ export async function probeAgentConfigOptionsBestEffort(params: {
           backendTarget: params.backendTarget,
           cwd,
           timeoutMs,
+          deadlineAt: params.deadlineAt,
+          signal: params.signal,
+          onNativeCleanup: params.onNativeCleanup,
           profileId,
           accountSettings: params.accountSettings ?? null,
           credentials: params.credentials ?? null,
@@ -195,5 +203,6 @@ export async function probeAgentConfigOptionsBestEffort(params: {
 
     agentConfigOptionsProbeCache.setSuccess(cacheKey, fallback, { nowMs: nowMs2, ttlMs: PROBE_CONFIG_OPTIONS_SUCCESS_TTL_MS });
     return fallback;
-  });
+  };
+  return params.signal ? await runProbe() : await agentConfigOptionsProbeCache.runDedupe(cacheKey, runProbe);
 }

@@ -48,6 +48,74 @@ describe('applyConnectedServiceStateSharingDescriptor destination races', () => 
     vi.resetModules();
   });
 
+  it('blocks continuity when required state symlinks are unavailable without replacing private state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-state-link-unavailable-'));
+    const sourceRoot = join(root, 'source');
+    const targetRoot = join(root, 'target');
+    try {
+      await mkdir(join(sourceRoot, 'projects'), { recursive: true });
+      await writeFile(join(sourceRoot, 'projects', 'source.jsonl'), '{"id":"source"}\n');
+      await mkdir(join(targetRoot, 'projects'), { recursive: true });
+      await writeFile(join(targetRoot, 'projects', 'private.jsonl'), '{"id":"private"}\n');
+      vi.doMock('node:fs/promises', async () => {
+        const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+        return {
+          ...actual,
+          symlink: async () => {
+            const error = new Error('symlink unavailable') as NodeJS.ErrnoException;
+            error.code = 'EPERM';
+            throw error;
+          },
+        };
+      });
+
+      await expect(applyDescriptor({ root, sourceRoot, targetRoot })).rejects.toMatchObject({
+        code: 'state_symlink_unavailable',
+      });
+      await expect(readFile(join(targetRoot, 'projects', 'private.jsonl'), 'utf8')).resolves.toBe('{"id":"private"}\n');
+      await expect(readFile(join(sourceRoot, 'projects', 'source.jsonl'), 'utf8')).resolves.toBe('{"id":"source"}\n');
+      expect((await readdir(targetRoot)).some((name) => name.includes('.happier-link-'))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refreshes owned linked-config fallback copies without accumulating private backups', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-config-fallback-repeat-'));
+    const sourceRoot = join(root, 'source');
+    const targetRoot = join(root, 'target');
+    try {
+      await mkdir(sourceRoot, { recursive: true });
+      await mkdir(targetRoot, { recursive: true });
+      await writeFile(join(sourceRoot, 'settings.json'), 'source-one');
+      await writeFile(join(targetRoot, 'settings.json'), 'private-original');
+      vi.doMock('node:fs/promises', async () => {
+        const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+        return { ...actual, symlink: async () => { throw createRenameError('EPERM'); } };
+      });
+      const { applyConnectedServiceStateSharingDescriptor: apply } = await import('./applyConnectedServiceStateSharingDescriptor');
+      const input = {
+        descriptor: { ...descriptor, config: { ...descriptor.config, entries: [{ path: 'settings.json', mode: 'linked' as const }] } },
+        nativeSourceContext: { sourceRoot, sourceEnv: {} },
+        target: { targetMaterializedRoot: targetRoot, targetMaterializedEnv: {} },
+        configMode: 'linked', requestedStateMode: 'isolated', effectiveStateMode: 'isolated', cwd: root,
+      } as const;
+      const first = await apply(input);
+      const privateBackups = (await readdir(targetRoot)).filter(name => name.startsWith('settings.json.local-'));
+      expect(privateBackups).toHaveLength(1);
+      const before = await lstat(join(targetRoot, 'settings.json'));
+      await apply({ ...input, existingManifest: first.manifest });
+      expect((await lstat(join(targetRoot, 'settings.json'))).ino).toBe(before.ino);
+      await writeFile(join(sourceRoot, 'settings.json'), 'source-two');
+      await apply({ ...input, existingManifest: first.manifest });
+      expect((await readdir(targetRoot)).filter(name => name.startsWith('settings.json.local-'))).toEqual(privateBackups);
+      await expect(readFile(join(targetRoot, privateBackups[0]!), 'utf8')).resolves.toBe('private-original');
+      await expect(readFile(join(targetRoot, 'settings.json'), 'utf8')).resolves.toBe('source-two');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(['EISDIR', 'ENOTEMPTY', 'EEXIST', 'EPERM'] as const)(
     'preserves provider-created content and retries the same prepared link after %s',
     async (raceCode) => {

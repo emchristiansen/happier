@@ -4,6 +4,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /**
+ * Standalone `tauri signer sign --private-key-path` conflicts with the raw-key
+ * environment input. Undefined masks inherited values even when a command
+ * wrapper merges this copy over process.env; Node omits them from the child.
+ * The Tauri build API has a different key contract and must not use this adapter.
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function createTauriSignerFileEnv(env) {
+  const signerEnv = { ...env };
+  for (const name of Object.keys(signerEnv)) {
+    if (['TAURI_SIGNING_PRIVATE_KEY', 'TAURI_PRIVATE_KEY'].includes(name.toUpperCase())) {
+      signerEnv[name] = undefined;
+    }
+  }
+  return signerEnv;
+}
+
+/**
  * @param {{ tmpRoot: string; keyValue: string; dryRun: boolean }} opts
  * @returns {string}
  */

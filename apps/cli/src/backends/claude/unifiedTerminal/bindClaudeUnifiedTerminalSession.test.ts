@@ -253,6 +253,29 @@ describe('bindClaudeUnifiedTerminalSession', () => {
     }
   });
 
+  it('cancels a provisional native resume barrier when startup is blocked before SessionStart', async () => {
+    const { binding, sessionTurnLifecycle } = createBinding();
+
+    await binding.recordProviderResumeStarted({ kind: 'resume_native', providerSessionId: 'claude-session-resume-1' });
+
+    await expect(binding.recordProviderStartupBlocked()).resolves.toBe(true);
+    expect(sessionTurnLifecycle.cancelTurn).toHaveBeenCalledTimes(1);
+    expect(sessionTurnLifecycle.completeTurn).not.toHaveBeenCalled();
+
+    await binding.sessionOptions.onProviderPromptStarted?.();
+    expect(sessionTurnLifecycle.beginTurn).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not cancel a resume barrier after SessionStart confirms provider ownership', async () => {
+    const { binding, sessionTurnLifecycle } = createBinding();
+
+    await binding.recordProviderResumeStarted({ kind: 'resume_native', providerSessionId: 'claude-session-resume-1' });
+    binding.recordProviderResumeSessionStarted();
+
+    await expect(binding.recordProviderStartupBlocked()).resolves.toBe(false);
+    expect(sessionTurnLifecycle.cancelTurn).not.toHaveBeenCalled();
+  });
+
   it('retains a confirmed native resume barrier until the exact prompt terminal path settles it', async () => {
     vi.useFakeTimers();
     const { binding, sessionTurnLifecycle } = createBinding({ providerResumeIdleReleaseDelayMs: 800 });

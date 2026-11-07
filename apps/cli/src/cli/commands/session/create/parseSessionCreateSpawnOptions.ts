@@ -2,8 +2,8 @@ import {
   AcpConfigOptionOverridesV1Schema,
   AgentRuntimeDescriptorV1Schema,
   ConnectedServiceBindingsV1Schema,
-  SESSION_PERMISSION_MODES,
-  SessionMcpSelectionV1Schema,
+  SESSION_PERMISSION_INTENT_INPUTS,
+  SessionMcpSelectionV1InputSchema,
   parseSessionPermissionModeAlias,
   type SpawnConfigOptionValue,
 } from '@happier-dev/protocol';
@@ -36,14 +36,17 @@ export const SESSION_CREATE_USAGE = [
   '  [--path <path>] [--backend <backend-target>]',
   '  [--title <title>] [--tag <tag>]',
   '  [--prompt <text>|--message <text>]',
-  `  [--model <model-id>] [--permission-mode <${SESSION_PERMISSION_MODES.join('|')}>]`,
-  '    Aliases include read_only, ro, safe, full-access, accept-edits, and bypass-permissions.',
+  `  [--model <model-id>] [--permission-mode <${SESSION_PERMISSION_INTENT_INPUTS.join('|')}>]`,
+  '    Compatible aliases include read-only, workspace_write, safe-yolo, accept-edits, and bypass-permissions.',
   '  [--mode <agent-mode-id>] [--config-option <id=value>]',
   '  [--reasoning-effort <value>] [--ultracode]',
   '  [--config-overrides-json <json>] [--launch-profile <profile-id>]',
   '  [--env <KEY=VALUE>]',
   '  [--auth <default|native|cs:<id>>|--connected-services <selector>|--auth-json <json>]',
   '  [--mcp-selection-json <json>] [--transcript-storage <persisted|direct>]',
+  '    MCP JSON: {"v":1,"managedServersEnabled":true,"happierToolsEnabled":true,',
+  '      "forceIncludeServerIds":[],"forceExcludeServerIds":[]}. All fields are optional; unknown fields are rejected.',
+  '    Set happierToolsEnabled:false to omit built-in Happier tools; managedServersEnabled:false disables saved defaults.',
   '  [--terminal-json <json>] [--codex-backend-mode <mcp|acp|appServer>]',
   '  [--runtime-descriptor-json <json>|--agent-runtime-descriptor-json <json>]',
   '  [--host <host>] [--machine-id <machineId>]',
@@ -199,7 +202,7 @@ export function parseSessionCreateSpawnOptions(argv: readonly string[]): ParsedS
   const permissionMode = permissionModeRaw ? parseSessionPermissionModeAlias(permissionModeRaw) : null;
   if (permissionModeRaw && !permissionMode) {
     throw new Error(
-      `Invalid --permission-mode "${permissionModeRaw}". Expected one of: ${SESSION_PERMISSION_MODES.join(', ')}.`,
+      `Invalid --permission-mode "${permissionModeRaw}". Expected one of: ${SESSION_PERMISSION_INTENT_INPUTS.join(', ')}.`,
     );
   }
   const agentModeId = readOpaqueFlagValue(argv, '--mode') ?? '';
@@ -255,7 +258,7 @@ export function parseSessionCreateSpawnOptions(argv: readonly string[]): ParsedS
   const mcpSelection = readParsedJsonFlag(
     argv,
     '--mcp-selection-json',
-    (value) => SessionMcpSelectionV1Schema.parse(value),
+    (value) => SessionMcpSelectionV1InputSchema.parse(value),
   );
   const terminalRaw = readFlagValue(argv, '--terminal-json');
   const terminal = terminalRaw ? parseObjectJsonFlagValue(terminalRaw, '--terminal-json') : null;

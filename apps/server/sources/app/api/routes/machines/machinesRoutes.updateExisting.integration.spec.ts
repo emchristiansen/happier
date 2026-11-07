@@ -75,7 +75,7 @@ describe("machinesRoutes (update existing machine)", () => {
         }));
     });
 
-    it("updates dataEncryptionKey when machine already exists for the authenticated account", async () => {
+    it("retains the incumbent dataEncryptionKey with its metadata when registration presents a different envelope", async () => {
         const { machinesRoutes } = await import("./machinesRoutes");
         const route = createRouteTestBuilder({
             method: "POST",
@@ -99,18 +99,8 @@ describe("machinesRoutes (update existing machine)", () => {
             },
         );
 
-        expect(markAccountChanged).toHaveBeenCalledWith(
-            expect.anything(),
-            expect.objectContaining({ accountId: "u1", kind: "machine", entityId: "m1" }),
-        );
-
-        expect(txDbMocks.db.machine.update).toHaveBeenCalledWith(expect.objectContaining({
-            where: { accountId_id: { accountId: "u1", id: "m1" } },
-            data: expect.objectContaining({
-                // Ensure the update writes the new key instead of leaving stale state.
-                dataEncryptionKey: expect.any(Uint8Array),
-            }),
-        }));
+        expect(markAccountChanged).not.toHaveBeenCalled();
+        expect(txDbMocks.db.machine.update).not.toHaveBeenCalled();
 
         expect(reply.send).toHaveBeenCalled();
         expect(response).toEqual(
@@ -118,9 +108,47 @@ describe("machinesRoutes (update existing machine)", () => {
                 machine: expect.objectContaining({
                     id: "m1",
                     metadata: "meta-old",
-                    dataEncryptionKey: "AAECAw==",
+                    dataEncryptionKey: "AAkJCQ==",
                 }),
             }),
         );
+    });
+
+    it("preserves existing metadata when daemon registration refreshes daemon state", async () => {
+        const { machinesRoutes } = await import("./machinesRoutes");
+        const route = createRouteTestBuilder({
+            method: "POST",
+            path: "/v1/machines",
+            registerRoutes(app) {
+                machinesRoutes(app as any);
+            },
+        });
+
+        const { response } = await route.invoke(
+            {
+                userId: "u1",
+                body: {
+                    id: "m1",
+                    metadata: "daemon-bootstrap-meta",
+                    daemonState: "daemon-state-new",
+                    dataEncryptionKey: 'AAkJCQ==',
+                },
+            },
+        );
+
+        expect(txDbMocks.db.machine.update).toHaveBeenCalledWith(expect.objectContaining({
+            where: { accountId_id: { accountId: "u1", id: "m1" } },
+            data: {
+                daemonState: "daemon-state-new",
+                daemonStateVersion: { increment: 1 },
+            },
+        }));
+        expect(response).toEqual(expect.objectContaining({
+            machine: expect.objectContaining({
+                metadata: "meta-old",
+                metadataVersion: 1,
+                daemonState: "daemon-state-new",
+            }),
+        }));
     });
 });

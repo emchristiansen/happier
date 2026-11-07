@@ -123,4 +123,55 @@ describe('runCatalogDefinedAcpAgent', () => {
       },
     }));
   });
+
+  it('lets the Devin catalog entry attach its model config projection without a shared provider branch', async () => {
+    let capturedConfig: null | Readonly<{ createRuntime: (args: any) => unknown }> = null;
+    runStandardAcpProviderMock.mockImplementation(async (_opts: unknown, config: unknown) => {
+      capturedConfig = config as Readonly<{ createRuntime: (args: any) => unknown }>;
+    });
+    createCatalogProviderAcpRuntimeMock.mockReturnValue({ kind: 'runtime' });
+
+    await runCatalogDefinedAcpAgent('devin', {
+      credentials: { token: 'token' } as any,
+    });
+    if (!capturedConfig) throw new Error('Expected ACP runtime config to be captured');
+    (capturedConfig as Readonly<{ createRuntime: (args: any) => unknown }>).createRuntime({
+      directory: '/repo',
+      machineId: 'machine-123',
+      session: {},
+      messageBuffer: {},
+      mcpServers: {},
+      permissionHandler: { handleToolCall: vi.fn() },
+      setThinking: vi.fn(),
+      getPermissionMode: () => 'default',
+      memoryRecallGuidanceEnabled: false,
+    });
+
+    expect(createCatalogProviderAcpRuntimeMock).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'devin',
+      deriveSessionModelsFromConfigOptions: expect.any(Function),
+      resolveSessionModelConfigUpdate: expect.any(Function),
+      resolveSessionConfigOptionUpdate: expect.any(Function),
+    }));
+  });
+
+  /**
+   * Every built-in ACP agent declares `session/load`. Without forwarding that declaration the
+   * shared runner keeps its new-session fallback, so a failed `session/load` would silently
+   * create a fresh vendor session for Devin, Agy, FX, Droid, Kimi, Kiro, and Custom ACP.
+   */
+  it.each(['kiro', 'devin', 'agy', 'fx', 'droid', 'kimi', 'customAcp'] as const)(
+    'forwards the built-in ACP session-load declaration for %s so explicit resume fails closed',
+    async (agentId) => {
+      let capturedConfig: null | Readonly<{ declaredSessionLoadSupport?: boolean }> = null;
+      runStandardAcpProviderMock.mockImplementation(async (_opts: unknown, config: unknown) => {
+        capturedConfig = config as Readonly<{ declaredSessionLoadSupport?: boolean }>;
+      });
+      createCatalogProviderAcpRuntimeMock.mockReturnValue({ kind: 'runtime' });
+
+      await runCatalogDefinedAcpAgent(agentId, { credentials: { token: 'token' } as any });
+
+      expect(capturedConfig).toMatchObject({ declaredSessionLoadSupport: true });
+    },
+  );
 });

@@ -3,10 +3,10 @@ import { cp, mkdir, mkdtemp, readdir, rename, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 
-import { CLI_BINARY_TARGETS, resolveCurrentBinaryTarget, resolveExecutableName, type BinaryTarget } from './targets.js';
+import { CLI_BINARY_TARGETS, resolveCliToolsPlatformDir, resolveCurrentBinaryTarget, resolveExecutableName, type BinaryTarget } from './targets.js';
+import { WINDOWS_SERVICE_LAUNCHER_FILE_NAME } from '../service/windowsLauncher.js';
 import { commandExists, compileBunBinary, ensureFileExists, execOrThrow, resolveBunCommand, resolveYarnCommand, type RunCommand } from './commands.js';
 import {
-  bundleInstalledPackageWithRuntimeDependencies,
   bundleWorkspacePackageWithRuntimeDependencies,
   resolveWorkspaceBundlesFromPackageJson,
   vendorBundledPackageRuntimeDependencies,
@@ -18,12 +18,17 @@ import type {
 import { withCliDistBuildLock } from './withCliDistBuildLock.js';
 import { ensureBundledWorkspacePackagesBuilt } from './ensureBundledWorkspacePackagesBuilt.js';
 import { finalizeRuntimeArtifactPayload } from './finalizeRuntimeArtifactPayload.js';
-import { recordCliBinaryArtifactRuntimeAssetBuildManifest } from './refreshCliBinaryArtifactRuntimeAssetBuildManifest.js';
+import { resolveSharpRuntimeSidecarEntries } from './sharpRuntimeSidecars.js';
+import {
+  recordCliBinaryArtifactRuntimeAssetBuildManifest,
+  refreshCliBinaryArtifactClosureBuildManifest,
+} from './refreshCliBinaryArtifactRuntimeAssetBuildManifest.js';
 import { shouldReuseCliDistSnapshot } from './shouldReuseCliDistSnapshot.js';
 
 const CLI_RUNTIME_SIDECAR_ENTRIES = [
   ['childProcessOptions.cjs'],
   ['claude_launcher_runtime.cjs'],
+  ['native_process_exit.cjs'],
   ['claude_local_launcher.cjs'],
   ['claude_remote_launcher.cjs'],
   ['session_hook_forwarder.cjs'],
@@ -31,35 +36,24 @@ const CLI_RUNTIME_SIDECAR_ENTRIES = [
   ['ripgrep_launcher.cjs'],
   ['statusline_forwarder.cjs'],
   ['terminal_launch_spec_runner.cjs'],
+  ['process_tree.cjs'],
   ['node_pty_relay.cjs'],
   ['runtime'],
   ['shims'],
 ] as const;
 
-const CLI_RUNTIME_EXTERNAL_PACKAGES = [
-  '@huggingface/transformers',
+const CLI_RUNTIME_BUNDLED_PACKAGES = [
   'node-pty',
   '@homebridge/node-pty-prebuilt-multiarch',
 ] as const;
 
-type CliToolUnpackModule = {
-  unpackTools?: (options: Readonly<{ platformDir: string; toolsDir: string }>) => Promise<unknown> | unknown;
-};
+// The local-embeddings consumer acquires this exact-version component on first use.
+// Keep it external to Bun while omitting only the CLI's direct disk dependency.
+const CLI_OPTIONAL_RUNTIME_PACKAGES = ['@huggingface/transformers'] as const;
 
-function resolveCliToolsPlatformDir(target: BinaryTarget): string {
-  const targetKey = `${target.arch}-${target.os}`;
-  switch (targetKey) {
-    case 'arm64-darwin':
-    case 'x64-darwin':
-    case 'arm64-linux':
-    case 'x64-linux':
-      return targetKey;
-    case 'x64-windows':
-      return 'x64-win32';
-    default:
-      throw new Error(`[component-artifacts] unsupported CLI tools binary target: ${targetKey}`);
-  }
-}
+type CliToolUnpackModule = {
+  unpackTools?: (options: Readonly<{ platformDir: string; toolsDir: string; tools: readonly string[] }>) => Promise<unknown> | unknown;
+};
 
 async function copyCliRuntimeSidecars(repoRoot: string, payloadDir: string): Promise<void> {
   for (const segments of CLI_RUNTIME_SIDECAR_ENTRIES) {
@@ -67,15 +61,6 @@ async function copyCliRuntimeSidecars(repoRoot: string, payloadDir: string): Pro
     const targetPath = join(payloadDir, 'scripts', ...segments);
     await mkdir(join(targetPath, '..'), { recursive: true });
     await cp(sourcePath, targetPath, { recursive: true });
-  }
-
-  const resolveFromPackageJsonPath = join(repoRoot, 'package.json');
-  for (const packageName of CLI_RUNTIME_EXTERNAL_PACKAGES) {
-    bundleInstalledPackageWithRuntimeDependencies({
-      packageName,
-      resolveFromPackageJsonPath,
-      destNodeModulesDir: join(payloadDir, 'node_modules'),
-    });
   }
 }
 
@@ -97,6 +82,7 @@ async function copyCliRuntimeTools(repoRoot: string, payloadDir: string, target:
   await unpackToolsModule.unpackTools({
     platformDir: resolveCliToolsPlatformDir(target),
     toolsDir: targetToolsDir,
+    tools: target.os === 'windows' ? ['ripgrep'] : ['ripgrep', 'zellij'],
   });
   await rm(targetArchivesDir, { recursive: true, force: true });
 }
@@ -106,10 +92,7 @@ async function copyCliNodeRuntimePayload(
   payloadDir: string,
   distDir: string,
   workspaceBundles: readonly BundledWorkspacePackage[],
-  params: Readonly<{
-    yarn: Readonly<{ cmd: string; args: string[] }>;
-    runCommand: RunCommand;
-  }>,
+  target: BinaryTarget,
 ): Promise<void> {
   const cliDir = join(repoRoot, 'apps', 'cli');
 
@@ -117,12 +100,30 @@ async function copyCliNodeRuntimePayload(
   vendorBundledPackageRuntimeDependencies({
     srcPackageJsonPath: join(cliDir, 'package.json'),
     destPackageDir: payloadDir,
+    excludeRootDependencies: [...CLI_OPTIONAL_RUNTIME_PACKAGES, 'sharp'],
   });
-  for (const { packageName, srcDir } of workspaceBundles) {
+  // node-pty 1.1.0 ships no Linux prebuilds. Cross-target archives consume the
+  // addon produced on the matching release runner instead of the build host's.
+  if (target.os === 'linux' && (process.platform !== 'linux' || process.arch !== target.arch)) {
+    const binding = join(repoRoot, 'dist', 'native', 'node-pty', `linux-${target.arch}`, 'pty.node');
+    await ensureFileExists(binding);
+    const releaseDir = join(payloadDir, 'node_modules', 'node-pty', 'build', 'Release');
+    await mkdir(releaseDir, { recursive: true });
+    await cp(binding, join(releaseDir, 'pty.node'));
+  }
+  for (const entry of await resolveSharpRuntimeSidecarEntries({ resolveFromPackageJsonPath: join(cliDir, 'package.json'), target })) {
+    const destination = join(payloadDir, entry.targetPath);
+    await mkdir(join(destination, '..'), { recursive: true });
+    await cp(entry.sourcePath, destination, { recursive: true });
+  }
+  // The node-hosted package-dist resolves package assets (such as the Windows service launcher)
+  // from these bundled copies, so they carry the same declared files as the npm bundle.
+  for (const { packageName, srcDir, includeFiles } of workspaceBundles) {
     bundleWorkspacePackageWithRuntimeDependencies({
       packageName,
       srcDir,
       destDir: join(payloadDir, 'node_modules', ...packageName.split('/')),
+      includeFiles,
     });
   }
 }
@@ -209,7 +210,7 @@ export async function buildCliBinaryArtifactPayload({
     hostPackageDir: cliDir,
   });
   const executableName = resolveExecutableName({ baseName: 'happier', target });
-  const mergedExternals = [...new Set([...CLI_RUNTIME_EXTERNAL_PACKAGES, ...externals.map((value) => String(value ?? '').trim()).filter(Boolean)])];
+  const mergedExternals = [...new Set([...CLI_RUNTIME_BUNDLED_PACKAGES, ...CLI_OPTIONAL_RUNTIME_PACKAGES, ...externals.map((value) => String(value ?? '').trim()).filter(Boolean)])];
 
   await withCliDistBuildLock(async ({ heldLockValue }) => {
     const runCommandWithHeldDistLock: RunCommand = (cmd, args, options = {}) => runCommand(cmd, args, {
@@ -280,10 +281,30 @@ export async function buildCliBinaryArtifactPayload({
         cwd: repoRoot,
         externals: mergedExternals,
         bunCommand,
+        // The standalone CLI must not inherit project-local dotenv or bunfig files from
+        // the directory where the user invokes it. Configuration is loaded by
+        // the host runtime, and Bun's compiled-executable autoloader can abort
+        // startup before the CLI installs its error reporting.
+        autoloadDotenv: false,
+        buildRunnerEntrypoint: join(repoRoot, 'packages', 'cli-common', 'scripts', 'buildBunBinary.mjs'),
         runCommand,
       });
       await rm(join(payloadDir, 'node_modules'), { recursive: true, force: true });
-      await copyCliNodeRuntimePayload(repoRoot, payloadDir, snapshotDistDir, workspaceBundles, { yarn, runCommand });
+      await copyCliNodeRuntimePayload(repoRoot, payloadDir, snapshotDistDir, workspaceBundles, target);
+      if (target.os === 'windows' && target.arch === 'x64') {
+        const launcherSource = join(
+          repoRoot,
+          'packages',
+          'cli-common',
+          'native',
+          'windows',
+          'bin',
+          'windows-x64',
+          WINDOWS_SERVICE_LAUNCHER_FILE_NAME,
+        );
+        await ensureFileExists(launcherSource);
+        await cp(launcherSource, join(payloadDir, WINDOWS_SERVICE_LAUNCHER_FILE_NAME));
+      }
     } finally {
       if (snapshotDistDir) {
         await rm(snapshotDistDir, { recursive: true, force: true }).catch(() => {});
@@ -293,11 +314,18 @@ export async function buildCliBinaryArtifactPayload({
 
   await copyCliRuntimeSidecars(repoRoot, payloadDir);
   await copyCliRuntimeTools(repoRoot, payloadDir, target);
-  await finalizeRuntimeArtifactPayload(payloadDir);
+  await finalizeRuntimeArtifactPayload(payloadDir, target);
+  refreshCliBinaryArtifactClosureBuildManifest({ payloadDir });
   recordCliBinaryArtifactRuntimeAssetBuildManifest({
     payloadDir,
     relativePath: executableName,
   });
+  if (target.os === 'windows' && target.arch === 'x64') {
+    recordCliBinaryArtifactRuntimeAssetBuildManifest({
+      payloadDir,
+      relativePath: WINDOWS_SERVICE_LAUNCHER_FILE_NAME,
+    });
+  }
 
   return {
     executableName,

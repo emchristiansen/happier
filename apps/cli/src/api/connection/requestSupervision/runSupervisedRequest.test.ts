@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ManagedConnectionSupervisor, ManagedConnectionState, ReadinessProbeResult } from '@happier-dev/connection-supervisor';
+import {
+  createManagedConnectionSupervisor,
+  DEFAULT_MANAGED_CONNECTION_POLICY,
+  type ManagedConnectionSupervisor,
+  type ManagedConnectionState,
+  type ManagedConnectionTransport,
+  type ReadinessProbeResult,
+} from '@happier-dev/connection-supervisor';
 
 import { HttpStatusError, readHttpStatus } from '@/api/client/httpStatusError';
 
@@ -30,6 +37,51 @@ function createSupervisor(state: ManagedConnectionState = createState()): Manage
   };
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function createTransportHarness() {
+  const onConnectedListeners = new Set<() => void>();
+  const onDisconnectedListeners = new Set<(event: { intentional?: boolean; reason?: string | null; error?: unknown }) => void>();
+  let connected = false;
+  const transport: ManagedConnectionTransport = {
+    connect: vi.fn(async () => {
+      connected = true;
+      for (const listener of onConnectedListeners) listener();
+    }),
+    disconnect: vi.fn(async () => {
+      connected = false;
+    }),
+    destroy: vi.fn(async () => {
+      connected = false;
+    }),
+    isConnected: () => connected,
+    onConnected: (listener) => {
+      onConnectedListeners.add(listener);
+      return () => onConnectedListeners.delete(listener);
+    },
+    onDisconnected: (listener) => {
+      onDisconnectedListeners.add(listener);
+      return () => onDisconnectedListeners.delete(listener);
+    },
+    onError: () => () => {},
+  };
+  return {
+    transport,
+    emitDisconnect() {
+      connected = false;
+      for (const listener of onDisconnectedListeners) listener({ reason: 'transport closed' });
+    },
+  };
+}
+
 async function expectRejectedHttpStatus(promise: Promise<unknown>, status: number): Promise<void> {
   try {
     await promise;
@@ -42,6 +94,53 @@ async function expectRejectedHttpStatus(promise: Promise<unknown>, status: numbe
 }
 
 describe('request supervision', () => {
+  it('does not let a deferred authentication failure from an older connection replace a healthy reconnect', async () => {
+    vi.useFakeTimers();
+    try {
+      const firstTransport = createTransportHarness();
+      const secondTransport = createTransportHarness();
+      const transports = [firstTransport, secondTransport];
+      const supervisor = createManagedConnectionSupervisor({
+        ...DEFAULT_MANAGED_CONNECTION_POLICY,
+        createTransport: () => {
+          const next = transports.shift();
+          if (!next) throw new Error('missing transport');
+          return next.transport;
+        },
+        probeReadiness: async () => ({ status: 'ready' }),
+        initialFastRetryDelayMs: 1,
+        backoffMinMs: 5,
+        backoffMaxMs: 5,
+        jitterRatio: 0,
+      });
+      await supervisor.start();
+
+      const request = createDeferred<string>();
+      const pending = runSupervisedRequest({
+        supervisor,
+        requireAuth: true,
+        request: () => request.promise,
+      });
+
+      firstTransport.emitDisconnect();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(supervisor.getState()).toEqual(expect.objectContaining({ phase: 'online', attempt: 1 }));
+
+      request.reject(new HttpStatusError(401, 'expired token from older connection'));
+      await expect(pending).rejects.toThrow(/older connection/i);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(supervisor.getState()).toEqual(expect.objectContaining({
+        phase: 'online',
+        attempt: 1,
+        lastErrorMessage: null,
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('fails fast when the managed connection is already auth_failed', async () => {
     const supervisor = createSupervisor(createState({ phase: 'auth_failed', reason: 'auth_invalid' }));
 
@@ -275,18 +374,21 @@ describe('request supervision', () => {
       statusCode: 503,
       error: new HttpStatusError(503, 'busy'),
       hadAuth: true,
+      probeReportScope: undefined,
     });
 
     reportRequestOutcomeToSupervisor({
       supervisor,
       error: connectionError,
       hadAuth: true,
+      probeReportScope: undefined,
     });
 
     reportRequestOutcomeToSupervisor({
       supervisor,
       error: new Error('domain validation failed'),
       hadAuth: true,
+      probeReportScope: undefined,
     });
 
     expect(supervisor.reportProbeResult).toHaveBeenNthCalledWith(1, {

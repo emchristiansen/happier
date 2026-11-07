@@ -7,7 +7,9 @@ import { Text } from '@/components/ui/text/Text';
 import { TokenUsageRing, type TokenUsageTone } from '@/components/sessions/usage';
 import { Typography } from '@/constants/Typography';
 import { t } from '@/text';
-import type { ConnectedServiceQuotaGaugeViewModel } from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
+import type {
+    ConnectedServiceQuotaGaugeViewModel,
+} from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
 
 import { AgentInputContentPopover } from './AgentInputContentPopover';
 
@@ -19,6 +21,7 @@ type WebHoverablePressableState = Readonly<{
 type AgentInputProviderUsageBadgeProps = Readonly<{
     viewModel: ConnectedServiceQuotaGaugeViewModel;
     marginLeft?: number;
+    showLabels?: boolean;
     onRecoveryCreditPress?: () => void;
     recoveryCreditActionPending?: boolean;
 }>;
@@ -49,6 +52,24 @@ function areProviderUsageMeterRowsEqual(
         }
     }
     return true;
+}
+
+function areProviderUsageWindowRingsEqual(
+    left: ConnectedServiceQuotaGaugeViewModel['usageRings'],
+    right: ConnectedServiceQuotaGaugeViewModel['usageRings'],
+): boolean {
+    if (left === right) return true;
+    if (left.length !== right.length) return false;
+    return left.every((ring, index) => {
+        const other = right[index];
+        return !!other
+            && ring.label === other.label
+            && ring.meterId === other.meterId
+            && ring.usedPct === other.usedPct
+            && ring.ringValueLabel === other.ringValueLabel
+            && ring.valueLabel === other.valueLabel
+            && ring.tone === other.tone;
+    });
 }
 
 function areProviderUsageRecoveryCreditsEqual(
@@ -93,14 +114,16 @@ function areProviderUsageViewModelsEqual(
         && left.tone === right.tone
         && left.isStale === right.isStale
         && areProviderUsageRecoveryCreditsEqual(left.recoveryCreditSummary, right.recoveryCreditSummary)
-        && areProviderUsageMeterRowsEqual(left.allMeterRows, right.allMeterRows);
+        && areProviderUsageMeterRowsEqual(left.allMeterRows, right.allMeterRows)
+        && areProviderUsageWindowRingsEqual(left.usageRings, right.usageRings);
 }
 
 function areProviderUsageBadgePropsEqual(
     left: AgentInputProviderUsageBadgeProps,
     right: AgentInputProviderUsageBadgeProps,
 ): boolean {
-    return left.marginLeft === right.marginLeft
+    return left.showLabels === right.showLabels
+        && left.marginLeft === right.marginLeft
         && left.onRecoveryCreditPress === right.onRecoveryCreditPress
         && left.recoveryCreditActionPending === right.recoveryCreditActionPending
         && areProviderUsageViewModelsEqual(left.viewModel, right.viewModel);
@@ -126,8 +149,17 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
     const [isPinnedOpen, setIsPinnedOpen] = React.useState(false);
     const [isHovered, setIsHovered] = React.useState(false);
     const open = isPinnedOpen || isHovered;
+    const rings = props.viewModel.usageRings.length > 0
+        ? props.viewModel.usageRings
+        : [{ meterId: props.viewModel.effectiveMeter.meterId, label: props.viewModel.effectiveMeter.label,
+            usedPct: props.viewModel.usedPct, ringValueLabel: props.viewModel.ringValueLabel,
+            valueLabel: props.viewModel.valueLabel, tone: props.viewModel.tone }];
+    // Remaining-first, like the ring numbers. Extra rings are named so each one can be told apart.
+    const ringAccessibilityValues = rings.length === 1
+        ? [props.viewModel.badgeLabel]
+        : rings.map((ring) => `${ring.label} ${ring.valueLabel}`);
     const accessibilityLabel = t('agentInput.providerUsage.accessibilityLabel', {
-        value: props.viewModel.badgeLabel,
+        value: ringAccessibilityValues.join(', '),
     });
     const title = props.viewModel.providerDisplayName
         ? t('agentInput.providerUsage.titleForProvider', { provider: props.viewModel.providerDisplayName })
@@ -136,7 +168,7 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
 
     return (
         <>
-            <View testID="agent-input-provider-quota-badge">
+            <View testID="agent-input-provider-quota-badge" style={styles.badgeContainer}>
             <Pressable
                 ref={anchorRef}
                 testID="agent-input-provider-usage-badge"
@@ -157,15 +189,31 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
                     ];
                 }}
             >
-                <TokenUsageRing
-                    used={props.viewModel.usedPct}
-                    limit={100}
-                    label={accessibilityLabel}
-                    value={props.viewModel.ringValueLabel}
-                    tone={mapQuotaToneToTokenTone(props.viewModel.tone)}
-                    ringTestID="agent-input-provider-usage-ring"
-                    valueTestID="agent-input-provider-usage-value"
-                />
+                {rings.map((ring, index) => {
+                    const testIdSuffix = index === 0 ? '' : `:${ring.meterId}`;
+                    return (
+                        <View key={ring.meterId} style={styles.windowRing}>
+                            {props.showLabels === true || rings.length > 1 ? (
+                                <Text
+                                    testID={`agent-input-provider-usage-meter-label${testIdSuffix}`}
+                                    style={styles.windowLabel}
+                                    numberOfLines={1}
+                                >
+                                    {ring.label}
+                                </Text>
+                            ) : null}
+                            <TokenUsageRing
+                                used={ring.usedPct}
+                                limit={100}
+                                label={rings.length === 1 ? accessibilityLabel : ringAccessibilityValues[index]}
+                                value={ring.ringValueLabel}
+                                tone={mapQuotaToneToTokenTone(ring.tone)}
+                                ringTestID={`agent-input-provider-usage-ring${testIdSuffix}`}
+                                valueTestID={`agent-input-provider-usage-value${testIdSuffix}`}
+                            />
+                        </View>
+                    );
+                })}
             </Pressable>
             </View>
 
@@ -178,7 +226,6 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
                 }}
                 maxWidthCap={360}
                 testID="agent-input-provider-usage-popover"
-                scrollEnabled={false}
                 content={(
                     <View style={styles.popoverContent}>
                         <Text style={styles.popoverTitle}>
@@ -244,7 +291,7 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
                                         {row.detailRightLabel}
                                     </Text>
                                 </View>
-                                <MeterBar
+                                {row.remainingPct !== null ? <MeterBar
                                     testID={`agent-input-provider-usage-meter-bar:${row.meterId}`}
                                     tone={mapGaugeToneToMeterTone(row.tone)}
                                     // Remaining-first fill: the adjacent label says "% left" and the
@@ -252,7 +299,7 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
                                     // (battery model; user decision 2026-07-10, reverting 5ad4d06be).
                                     fillFraction={row.remainingPct / 100}
                                     height={5}
-                                />
+                                /> : null}
                                 {row.usedLimitLabel ? (
                                     <Text style={styles.meterUsage}>
                                         {row.usedLimitLabel}
@@ -304,10 +351,15 @@ export const AgentInputProviderUsageBadge = React.memo(function AgentInputProvid
 }, areProviderUsageBadgePropsEqual);
 
 const stylesheet = StyleSheet.create((theme) => ({
+    badgeContainer: { flexShrink: 1, maxWidth: '100%' },
     badge: {
         position: 'relative',
-        width: 20,
-        height: 20,
+        flexDirection: 'row',
+        minWidth: 20,
+        minHeight: 20,
+        maxWidth: '100%',
+        flexWrap: 'wrap',
+        gap: 8,
         borderRadius: 999,
         justifyContent: 'center',
         alignItems: 'center',
@@ -315,6 +367,19 @@ const stylesheet = StyleSheet.create((theme) => ({
     badgePressed: {
         opacity: 0.9,
         transform: [{ scale: 0.96 }],
+    },
+    windowRing: {
+        maxWidth: '100%',
+        flexShrink: 1,
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 4,
+    },
+    windowLabel: {
+        minWidth: 0,
+        flexShrink: 1,
+        ...Typography.pillLabel(),
+        color: theme.colors.text.secondary,
     },
     popoverContent: {
         paddingHorizontal: 18,

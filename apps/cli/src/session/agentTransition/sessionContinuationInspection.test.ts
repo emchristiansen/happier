@@ -19,6 +19,7 @@ vi.mock('@/session/transport/encryption/sessionEncryptionContext', () => ({
 const {
   evaluateSessionContinuationTargetSupport,
   inspectSessionContinuation,
+  inspectSessionContinuations,
 } = await import('./sessionContinuationInspection');
 
 const credentials = { token: 'token-1' } as never;
@@ -34,6 +35,20 @@ function rawSession(metadata: Record<string, unknown>, overrides: Record<string,
 }
 
 describe('evaluateSessionContinuationTargetSupport', () => {
+  it('distinguishes two configured targets sharing one executable', () => {
+    const settings = { acpCatalogSettingsV1: { v: 2, backends: ['a', 'b'].map((id) => ({
+      id, name: id, title: id, command: 'harmless-acp', args: ['--configuration', id], env: {}, createdAt: 1, updatedAt: 1,
+    })) } };
+    const selection = { v: 1, agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'b' } } as const;
+    expect(evaluateSessionContinuationTargetSupport({ selection, sourceAgentId: 'customAcp',
+      sourceBackendTarget: { kind: 'configuredAcpBackend', backendId: 'a' }, accountSettings: settings,
+    })).toMatchObject({ type: 'supported', targetAgentId: 'customAcp' });
+    expect(evaluateSessionContinuationTargetSupport({ selection, sourceAgentId: 'customAcp',
+      sourceBackendTarget: selection.backendTarget, accountSettings: settings,
+    })).toEqual({ type: 'unsupported', code: 'same_target' });
+    expect(evaluateSessionContinuationTargetSupport({ selection, sourceAgentId: 'claude', accountSettings: {} }))
+      .toEqual({ type: 'unsupported', code: 'target_unavailable' });
+  });
   it('accepts another catalog Agent', () => {
     expect(evaluateSessionContinuationTargetSupport({
       selection: { v: 1, agentId: 'codex' },
@@ -63,7 +78,6 @@ describe('evaluateSessionContinuationTargetSupport', () => {
   });
 
   it.each([
-    ['a static-only native model outside its catalog', { v: 1, agentId: 'qwen', modelId: 'not-a-qwen' }],
     ['a mode for an Agent with no mode surface', { v: 1, agentId: 'gemini', acpSessionModeId: 'plan' }],
     ['a malformed config-option override shape', { v: 1, agentId: 'codex', sessionConfigOptionOverrides: { v: 0 } }],
   ] as const)('rejects %s before a transition can stop its source', (_label, selection) => {
@@ -78,6 +92,13 @@ describe('evaluateSessionContinuationTargetSupport', () => {
       selection: { v: 1, agentId: 'codex', modelId: 'future-model' },
       sourceAgentId: 'claude',
     })).toEqual({ type: 'supported', targetAgentId: 'codex' });
+  });
+
+  it('defers an unknown Qwen ACP model to the ordinary launch owner', () => {
+    expect(evaluateSessionContinuationTargetSupport({
+      selection: { v: 1, agentId: 'qwen', modelId: 'runtime-advertised-model' },
+      sourceAgentId: 'claude',
+    })).toEqual({ type: 'supported', targetAgentId: 'qwen' });
   });
 
   it('reports the current Agent as same_target', () => {
@@ -108,6 +129,31 @@ describe('inspectSessionContinuation', () => {
       protocolVersion: 1,
       sameSessionTransition: true,
     });
+  });
+
+  it('loads and decrypts the source Session once for every target in a batch', async () => {
+    mocks.fetchSessionByIdCompat.mockResolvedValue(rawSession({ path: '/work/repo', flavor: 'claude' }));
+
+    await expect(inspectSessionContinuations({
+      credentials,
+      request: {
+        v: 1,
+        sourceSessionId: 'session-1',
+        selections: [
+          { v: 1, agentId: 'codex' },
+          { v: 1, agentId: 'claude' },
+          { v: 1, agentId: 'not-an-agent' },
+        ],
+      },
+    })).resolves.toEqual({
+      v: 1,
+      inspections: [
+        { type: 'available', protocolVersion: 1, sameSessionTransition: true },
+        { type: 'available', protocolVersion: 1, sameSessionTransition: false },
+        { type: 'unavailable', reason: 'target_unavailable' },
+      ],
+    });
+    expect(mocks.fetchSessionByIdCompat).toHaveBeenCalledTimes(1);
   });
 
   it('reports a direct-transcript Session as an unsupported session', async () => {

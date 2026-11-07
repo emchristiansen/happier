@@ -93,6 +93,74 @@ vi.mock('@/sync/domains/server/serverProfiles', async () => {
     };
 });
 
+// The signed-in account for the active relay: the executor's explicit target needs it (R3).
+vi.mock('@/sync/domains/scope/activeServerAccountScope', () => ({
+    getActiveServerAccountScope: () => ({ serverId: activeServerSnapshot.serverId, accountId: 'acct_app' }),
+}));
+
+/**
+ * The readiness proof's two boundaries: the app-wide runner the coordinator reads this computer
+ * through, and INV10's read-only machine RPC. Task success is never readiness (INV8), so a screen
+ * that shows provider setup has to have proven it here first.
+ */
+const ambientRunnerRef = vi.hoisted(() => ({ current: null as unknown }));
+const machineRpcSpy = vi.hoisted(() => vi.fn(async (_params: unknown) => ({ ok: true }) as unknown));
+
+vi.mock('@/components/systemTasks/systemTasksRuntime', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/components/systemTasks/systemTasksRuntime')>();
+    return {
+        ...actual,
+        getSystemTasksRunner: () => ambientRunnerRef.current ?? actual.getSystemTasksRunner(),
+    };
+});
+
+vi.mock('@/sync/domains/server/serverRuntime', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/sync/domains/server/serverRuntime')>();
+    return {
+        ...actual,
+        getActiveServerSnapshot: () => activeServerSnapshot,
+    };
+});
+
+vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc', () => ({
+    machineRpcWithServerScope: (params: unknown) => machineRpcSpy(params),
+}));
+
+/** A converged ambient read for the relay and account this screen is on. */
+function convergedAmbientResult(taskId: string) {
+    return {
+        protocolVersion: 1,
+        taskId,
+        ok: true as const,
+        data: {
+            serviceInstalled: true,
+            daemonRunning: true,
+            needsAuth: false,
+            machineId: 'machine-local-1',
+            acquisition: { command: '/home/user/.happier/cli/current/happier', provenance: 'managed' },
+            server: {
+                serverUrl: 'https://relay.example.test',
+                publicServerUrl: 'https://relay.example.test',
+                localServerUrl: null,
+                comparableKey: 'https://relay.example.test',
+            },
+            auth: {
+                credentialState: 'valid',
+                validatedAccountId: 'acct_app',
+                accountId: 'acct_app',
+                machineId: 'machine-local-1',
+            },
+            service: { installed: true, running: true },
+            runtimeConvergence: {
+                controlReachable: true,
+                serviceOwnsRunningDaemon: true,
+                machineIdMatches: true,
+                cliVersionMatches: true,
+            },
+        },
+    };
+}
+
 vi.mock('@/components/settings/server/localControl/buildLocalTailscaleSecureAccessSystemTaskSpec', () => ({
     buildLocalTailscaleSecureAccessSystemTaskSpec: vi.fn(() => ({
         protocolVersion: 1,
@@ -102,7 +170,25 @@ vi.mock('@/components/settings/server/localControl/buildLocalTailscaleSecureAcce
 }));
 
 describe('MachineSetupFlowScreen local control follow-up', () => {
-    beforeEach(() => {
+    beforeEach(async () => {
+        const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
+        ambientRunnerRef.current = createSystemTaskRunner({
+            bridge: {
+                async start() {
+                    return 'ambient:daemon.service.status.v1';
+                },
+                async subscribe(taskId, listenerSet) {
+                    queueMicrotask(() => {
+                        listenerSet.onResult(convergedAmbientResult(taskId) as never);
+                    });
+                    return () => {};
+                },
+                async cancel() {},
+                async respond() {},
+            },
+        });
+        machineRpcSpy.mockReset();
+        machineRpcSpy.mockImplementation(async () => ({ ok: true }));
         (globalThis as any).__TAURI_INTERNALS__ = { invoke: () => undefined };
         activeServerSnapshot.serverId = 'relay-example';
         activeServerSnapshot.serverUrl = 'https://relay.example.test';
@@ -284,8 +370,12 @@ describe('MachineSetupFlowScreen local control follow-up', () => {
             });
         });
 
+        // Task success only opens the proof; the coordinator's re-read and the machine RPC decide.
+        await renderer.act(async () => {});
+
         expect(screen.findByTestId('settings.localRelayRuntime.status')).toBeTruthy();
         expect(screen.findByTestId('settings.localTailscale.status')).toBeTruthy();
+        expect(machineRpcSpy).toHaveBeenCalledTimes(1);
         expect(screen.findAllByType('ProviderSetupFlow' as any)).toHaveLength(1);
     });
 });

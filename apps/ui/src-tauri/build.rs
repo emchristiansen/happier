@@ -5,44 +5,13 @@ use std::path::PathBuf;
 #[path = "build_support.rs"]
 mod build_support;
 
-use build_support::{resolve_sidecar_update_action, SidecarSnapshot, SidecarUpdateAction};
+use build_support::{
+    resolve_sidecar_update_action, SidecarSnapshot, SidecarUpdateAction, APP_TAURI_COMMANDS,
+};
 use flate2;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tauri_build::{AppManifest, Attributes};
-
-const APP_TAURI_COMMANDS: &[&str] = &[
-    "desktop_fetch_update",
-    "desktop_install_update",
-    "desktop_pick_ssh_identity_file",
-    "desktop_get_autostart_enabled",
-    "desktop_set_autostart_enabled",
-    "desktop_set_tray_state",
-    "sync_desktop_pet_overlay_state",
-    "desktop_pet_overlay_read_window_state",
-    "desktop_pet_overlay_set_input_locked",
-    "desktop_pet_overlay_sync_element_metrics",
-    "desktop_pet_overlay_start_drag_session",
-    "desktop_pet_overlay_apply_drag_delta",
-    "desktop_pet_overlay_release_drag_velocity",
-    "desktop_pet_overlay_apply_momentum_delta",
-    "desktop_pet_overlay_end_drag_session",
-    "desktop_pet_overlay_reset_position",
-    "emit_desktop_pet_overlay_interaction_result",
-    "desktop_pet_overlay_show_main_window",
-    "start_system_task",
-    "cancel_system_task",
-    "get_system_task_snapshot",
-    "system_tasks_open_log_path",
-    "respond_system_task_prompt",
-    "desktop_get_window_chrome_policy",
-    "desktop_get_window_state",
-    "desktop_minimize_window",
-    "desktop_toggle_window_maximize",
-    "desktop_close_window",
-    "desktop_show_main_window",
-    "desktop_start_window_dragging",
-];
 
 fn is_truthy_env(name: &str) -> bool {
     env::var(name)
@@ -55,6 +24,7 @@ fn is_truthy_env(name: &str) -> bool {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_support.rs");
     println!("cargo:rerun-if-env-changed=TARGET");
     println!("cargo:rerun-if-env-changed=HAPPIER_HSETUP_SIDECAR_SOURCE");
     println!("cargo:rerun-if-env-changed=HAPPIER_SKIP_HSETUP_SIDECAR_BUILD");
@@ -145,7 +115,6 @@ fn build_hsetup_sidecar() -> Result<(), String> {
 
     fs::create_dir_all(&binaries_dir).map_err(|error| error.to_string())?;
     println!("cargo:rerun-if-changed={}", source_path.display());
-    println!("cargo:rerun-if-changed=build_support.rs");
 
     if !source_path.is_file() {
         return Err(format!(

@@ -35,6 +35,44 @@ describe('waitForSessionWebhook', () => {
     expect(pidToSpawnWebhookTimeout.has(42)).toBe(false);
   });
 
+  it('does not acknowledge the webhook until async startup finalization completes', async () => {
+    const pidToAwaiter = new Map<number, (session: any) => void>();
+    const pidToSpawnResultResolver = new Map<number, (result: any) => void>();
+    const pidToSpawnWebhookTimeout = new Map<number, NodeJS.Timeout>();
+    let finishFinalization!: () => void;
+    const finalization = new Promise<void>((resolve) => {
+      finishFinalization = resolve;
+    });
+
+    const promise = waitForSessionWebhook({
+      pid: 43,
+      pidToAwaiter,
+      pidToSpawnResultResolver,
+      pidToSpawnWebhookTimeout,
+      timeoutErrorMessage: 'timeout',
+      onSuccess: async () => {
+        await finalization;
+      },
+    });
+
+    const resolver = pidToAwaiter.get(43);
+    expect(typeof resolver).toBe('function');
+    resolver?.({ happySessionId: 'session-2' });
+    let settled = false;
+    void promise.then(() => {
+      settled = true;
+    });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    finishFinalization();
+    await expect(promise).resolves.toEqual({
+      type: 'success',
+      sessionId: 'session-2',
+    });
+  });
+
   it('resolves timeout error and cleans maps when webhook does not arrive', async () => {
     vi.useFakeTimers();
 

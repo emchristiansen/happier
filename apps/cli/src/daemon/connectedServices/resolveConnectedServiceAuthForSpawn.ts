@@ -47,10 +47,7 @@ import {
   buildConnectedServiceAuthGroupSwitchStateFromAccountUsage,
   type AccountUsageStoreForAuthGroupSwitchState,
 } from './accountGroups/switching/buildConnectedServiceAuthGroupSwitchStateFromAccountUsage';
-import {
-  ConnectedServiceAuthGroupQuotaProbeIncompleteError,
-  type ConnectedServiceAuthGroupSwitchState,
-} from './accountGroups/switching/ConnectedServiceAuthGroupSwitchCoordinator';
+import type { ConnectedServiceAuthGroupSwitchState } from './accountGroups/switching/ConnectedServiceAuthGroupSwitchCoordinator';
 import { evaluatePredictiveSoftSwitchPolicy } from './accountGroups/switching/predictiveSoftSwitchPolicy';
 import type { ConnectedServiceRefreshFailureCategory } from './credentials/lifecycleTypes';
 import { persistCredentialHealthForMaterializationFailure } from './refresh/refreshDiagnostics';
@@ -157,7 +154,7 @@ function readAuthoritativeSpawnSwitchResult(
 }
 
 export class ConnectedServiceSpawnAuthGroupAuthorityError extends Error {
-  readonly kind: 'resolution_unavailable' | 'resolution_failed' | 'group_missing';
+  readonly kind: 'resolution_unavailable' | 'resolution_failed' | 'group_missing' | 'quota_proof_unavailable';
   readonly serviceId: ConnectedServiceId;
   readonly groupId: string;
 
@@ -568,7 +565,16 @@ async function resolveAuthoritativeGroupAfterSpawnSwitchResult(params: Readonly<
   groupId: string;
   api: ConnectedServiceAuthGroupApi;
   result: ConnectedServiceAuthGroupPreTurnSwitchResult;
+  switchReason: string;
 }>): Promise<ConnectedServiceAuthGroupResponse | null> {
+  if (params.result.status === 'quota_proof_unavailable') {
+    if (params.switchReason === 'soft_threshold') return params.group;
+    // A new spawn has no interrupted-turn recovery to schedule. Preserve its retryable launch
+    // rejection; existing sessions consume this same switch result through the durable scheduler.
+    throw new ConnectedServiceSpawnAuthGroupAuthorityError({
+      kind: 'quota_proof_unavailable', serviceId: params.serviceId, groupId: params.groupId,
+    });
+  }
   const authoritative = readAuthoritativeSpawnSwitchResult(params.result);
   if (authoritative.kind === 'none') return null;
   if (authoritative.kind === 'authoritative') {
@@ -659,28 +665,21 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
       allowCurrentProfileRetry: true,
     }).length > 0
   ) {
-    let switched: Awaited<ReturnType<ConnectedServiceAuthGroupPreTurnSwitchCoordinator['switchBeforeTurn']>>;
-    try {
-      switched = await params.authGroupSwitchCoordinator.switchBeforeTurn({
-        ...(params.sessionId ? { sessionId: params.sessionId } : {}),
-        serviceId: params.serviceId,
-        groupId: params.groupId,
-        reason: switchReason,
-        observedProfileId: state.activeProfileId,
-        ...(params.quotaProbeDeadlineAtMs === undefined ? {} : { deadlineAtMs: params.quotaProbeDeadlineAtMs }),
-      });
-    } catch (error) {
-      if (error instanceof ConnectedServiceAuthGroupQuotaProbeIncompleteError && switchReason === 'soft_threshold') {
-        return params.group;
-      }
-      throw error;
-    }
+    const switched = await params.authGroupSwitchCoordinator.switchBeforeTurn({
+      ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+      serviceId: params.serviceId,
+      groupId: params.groupId,
+      reason: switchReason,
+      observedProfileId: state.activeProfileId,
+      ...(params.quotaProbeDeadlineAtMs === undefined ? {} : { deadlineAtMs: params.quotaProbeDeadlineAtMs }),
+    });
     const authoritative = await resolveAuthoritativeGroupAfterSpawnSwitchResult({
       group: params.group,
       serviceId: params.serviceId,
       groupId: params.groupId,
       api: params.api,
       result: switched,
+      switchReason,
     });
     if (authoritative) return authoritative;
     if (switched.status === 'no_eligible_member') {
@@ -690,6 +689,8 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
   }
 
   const selected = selectConnectedServiceAuthGroupCandidate({
+    lastSwitchReason: state.lastSwitchReason,
+    lastSwitchAt: state.lastSwitchAt,
     nowMs: params.nowMs,
     quotaFreshnessMs: params.quotaFreshnessMs,
     activeProfileId: state.activeProfileId,
@@ -701,28 +702,21 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
   const selectedProfileId = selected.selected?.profileId ?? null;
   if (!selectedProfileId || selectedProfileId === readProfileId(state.activeProfileId)) return params.group;
 
-  let switched: Awaited<ReturnType<ConnectedServiceAuthGroupPreTurnSwitchCoordinator['switchBeforeTurn']>>;
-  try {
-    switched = await params.authGroupSwitchCoordinator.switchBeforeTurn({
-      ...(params.sessionId ? { sessionId: params.sessionId } : {}),
-      serviceId: params.serviceId,
-      groupId: params.groupId,
-      reason: switchReason,
-      observedProfileId: state.activeProfileId,
-      ...(params.quotaProbeDeadlineAtMs === undefined ? {} : { deadlineAtMs: params.quotaProbeDeadlineAtMs }),
-    });
-  } catch (error) {
-    if (error instanceof ConnectedServiceAuthGroupQuotaProbeIncompleteError && switchReason === 'soft_threshold') {
-      return params.group;
-    }
-    throw error;
-  }
+  const switched = await params.authGroupSwitchCoordinator.switchBeforeTurn({
+    ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+    serviceId: params.serviceId,
+    groupId: params.groupId,
+    reason: switchReason,
+    observedProfileId: state.activeProfileId,
+    ...(params.quotaProbeDeadlineAtMs === undefined ? {} : { deadlineAtMs: params.quotaProbeDeadlineAtMs }),
+  });
   const authoritative = await resolveAuthoritativeGroupAfterSpawnSwitchResult({
     group: params.group,
     serviceId: params.serviceId,
     groupId: params.groupId,
     api: params.api,
     result: switched,
+    switchReason,
   });
   if (authoritative) return authoritative;
   if (switched.status === 'no_eligible_member') {
@@ -869,6 +863,8 @@ function isAuthoritativeGroupActiveProfileEligible(params: Readonly<{
   const activeMembers = state.members.filter((member) => member.profileId === params.activeProfileId);
   if (activeMembers.length === 0) return false;
   const selected = selectConnectedServiceAuthGroupCandidate({
+    lastSwitchReason: state.lastSwitchReason,
+    lastSwitchAt: state.lastSwitchAt,
     nowMs: params.nowMs,
     quotaFreshnessMs: params.quotaFreshnessMs,
     activeProfileId: params.activeProfileId,
@@ -940,6 +936,7 @@ async function applyCanonicalSpawnFailureSwitch(params: Readonly<{
     groupId: group.groupId,
     api: params.api,
     result,
+    switchReason: 'refresh_failed',
   });
   const activeProfileId = readProfileId(authoritative?.activeProfileId);
   if (!activeProfileId || activeProfileId === params.observedProfileId) return false;
@@ -1154,6 +1151,7 @@ function resolveMaxSpawnMaterializationAttempts(
 
 async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly<{
   agentId: CatalogAgentId;
+  materializationPurpose?: 'probe';
   materializationKey: string;
   connectedServiceMaterializationIdentityV1: ConnectedServiceMaterializationIdentityV1 | null;
   activeServerDir: string;
@@ -1164,6 +1162,8 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   selectionsByServiceId: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedSelection>;
   accountSettings: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv: NodeJS.ProcessEnv;
+  previousMaterializedRoot?: string | null;
+  existingSessionMetadata?: unknown;
   refreshService: ConnectedServiceSpawnCredentialRefreshService | null;
   forceOauthRefresh: boolean;
   /** Read at each credential decision in the materialization-time refresh. */
@@ -1173,12 +1173,16 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   resumeReachabilityRequired: boolean;
   candidatePersistedSessionFile: string | null;
   validateGroupMutationCurrentness: ReturnType<typeof createConnectedServiceGroupMutationCurrentnessValidator>;
+  sessionStateMode?: 'existing';
+  signal?: AbortSignal;
+  onCleanup?: (cleanup: () => Promise<void>) => void;
 }>): Promise<(ConnectedServicesMaterializeResult & Readonly<{
   materializationRoot: string;
-  cleanupMaterializationRoot: () => void;
+  cleanupMaterializationRoot: () => Promise<void>;
 }>) | null> {
   const materialized = await materializeConnectedServicesForSpawn({
     agentId: params.agentId,
+    materializationPurpose: params.materializationPurpose,
     materializationKey: params.materializationKey,
     connectedServiceMaterializationIdentityV1: params.connectedServiceMaterializationIdentityV1,
     activeServerDir: params.activeServerDir,
@@ -1214,9 +1218,14 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
       : null,
     accountSettings: params.accountSettings,
     processEnv: params.processEnv,
+    previousMaterializedRoot: params.previousMaterializedRoot,
+    existingSessionMetadata: params.existingSessionMetadata,
     vendorResumeId: params.vendorResumeId,
     candidatePersistedSessionFile: params.candidatePersistedSessionFile,
+    sessionStateMode: params.sessionStateMode,
     validateGroupMutationCurrentness: params.validateGroupMutationCurrentness,
+    signal: params.signal,
+    onCleanup: params.onCleanup,
     validatePromotedMaterialization: async ({ env, diagnostics }) => {
       assertNoBlockingMaterializationDiagnostics({
         agentId: params.agentId,
@@ -1227,7 +1236,9 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
         materializedEnv: env,
         vendorResumeId: params.vendorResumeId,
         cwd: params.sessionDirectory,
-        resumeReachabilityRequired: params.resumeReachabilityRequired,
+        // Existing-state handoff verifies the final composed launch environment for both native
+        // and connected sessions at resolveSpawnChildEnvironment; never run a repairing probe here.
+        resumeReachabilityRequired: params.sessionStateMode === 'existing' ? false : params.resumeReachabilityRequired,
         candidatePersistedSessionFile: params.candidatePersistedSessionFile,
       });
     },
@@ -1238,6 +1249,7 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
 
 export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
   agentId: CatalogAgentId;
+  materializationPurpose?: 'probe';
   sessionDirectory?: string | null;
   connectedServicesBindingsRaw: unknown;
   materializationKey: string;
@@ -1255,6 +1267,8 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
   quotaProbeDeadlineAtMs?: number;
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv?: NodeJS.ProcessEnv;
+  previousMaterializedRoot?: string | null;
+  existingSessionMetadata?: unknown;
   credentialRefreshService?: ConnectedServiceSpawnCredentialRefreshService | null;
   /**
    * The vendor `--resume` reference the spawned process will resume from. Required for the §2
@@ -1274,16 +1288,20 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
    * hard-fail.
    */
   candidatePersistedSessionFile?: string | null;
+  sessionStateMode?: 'existing';
+  signal?: AbortSignal;
+  onCleanup?: (cleanup: () => Promise<void>) => void;
 }>): Promise<Readonly<{
   env: Record<string, string>;
   materializationRoot?: string | null;
-  cleanupMaterializationRoot?: (() => void) | null;
+  cleanupMaterializationRoot?: (() => Promise<void>) | null;
   cleanupOnFailure: (() => void) | null;
   cleanupOnExit: (() => void) | null;
   connectedServicesBindings: ConnectedServicesBindingsV1;
   runtimeAccountIdentitySelections: ReadonlyArray<RuntimeAccountIdentitySelectionInput>;
   diagnostics?: readonly ConnectedServicesMaterializationDiagnostic[];
 }> | null> {
+  params.signal?.throwIfAborted();
   const selections = parseConnectedServiceBindingSelections(params.connectedServicesBindingsRaw);
   if (selections.length === 0) return null;
   const clock = params.nowMs ?? (() => Date.now());
@@ -1304,12 +1322,14 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
     predictiveSoftSwitchMode: credentialLifecycleDescriptor.predictiveSoftSwitch.mode,
     quotaProbeDeadlineAtMs: params.quotaProbeDeadlineAtMs,
   });
+  params.signal?.throwIfAborted();
 
   const resolvedCredentials = await resolveConnectedServiceCredentialsWithRevisions({
       credentials: params.credentials,
       api: params.api,
       bindings: resolvedBindings.credentialBindings,
     });
+  params.signal?.throwIfAborted();
   const recordsByServiceId = new Map(Array.from(
     resolvedCredentials,
     ([serviceId, resolved]) => [serviceId, resolved.record],
@@ -1336,6 +1356,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
         api: params.api,
         credentialBindings,
       });
+      params.signal?.throwIfAborted();
       await applySpawnPreflightRefresh({
         recordsByServiceId,
         credentialRevisionsByServiceId,
@@ -1378,6 +1399,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
     try {
       const materialized = await materializeAndVerifyConnectedServiceAuthForSpawn({
         agentId: params.agentId,
+        materializationPurpose: params.materializationPurpose,
         materializationKey: params.materializationKey,
         connectedServiceMaterializationIdentityV1: params.connectedServiceMaterializationIdentityV1 ?? null,
         activeServerDir: params.activeServerDir,
@@ -1388,6 +1410,8 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
         selectionsByServiceId,
         accountSettings: params.accountSettings ?? null,
         processEnv: params.processEnv ?? process.env,
+        previousMaterializedRoot: params.previousMaterializedRoot,
+        existingSessionMetadata: params.existingSessionMetadata,
         refreshService: params.credentialRefreshService ?? null,
         forceOauthRefresh: forceSpawnPreflightOauthRefresh,
         clock,
@@ -1395,12 +1419,20 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
         vendorResumeId: params.vendorResumeId ?? null,
         resumeReachabilityRequired: params.resumeReachabilityRequired ?? false,
         candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
+        sessionStateMode: params.sessionStateMode,
+        signal: params.signal,
+        onCleanup: params.onCleanup,
         validateGroupMutationCurrentness: createConnectedServiceGroupMutationCurrentnessValidator({
           api: params.api,
           credentials: params.credentials,
         }),
       });
-      if (materialized === null) return null;
+      if (materialized === null) {
+        if (params.sessionStateMode === 'existing') {
+          throw new Error('connected_service_existing_state_materialization_unavailable');
+        }
+        return null;
+      }
       return {
         ...materialized,
         connectedServicesBindings,

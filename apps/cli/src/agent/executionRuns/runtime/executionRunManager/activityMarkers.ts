@@ -4,6 +4,7 @@ import type { ExecutionRunState } from '@/agent/executionRuns/runtime/executionR
 import { areExecutionRunBackendTargetsEqual } from '@/agent/executionRuns/runtime/backendTargets';
 import { writeExecutionRunMarker } from '@/daemon/executionRunRegistry';
 import { buildExecutionRunConnectedServicesLaunchV1 } from '@/daemon/connectedServices/runsBridge/contract';
+import { projectExecutionRunRequestedConfiguration } from '@happier-dev/protocol';
 
 export function enqueueExecutionRunMarkerWrite(args: Readonly<{
   markerWriteChains: Map<string, Promise<void>>;
@@ -29,7 +30,7 @@ export function enqueueExecutionRunMarkerWrite(args: Readonly<{
 export async function writeExecutionRunActivityMarker(args: Readonly<{
   runId: string;
   nowMs: number;
-  opts?: Readonly<{ force?: boolean }>;
+  opts?: Readonly<{ force?: boolean; resumed?: boolean }>;
   runs: Map<string, ExecutionRunState>;
   controllers: Map<string, ExecutionRunController>;
   enqueueMarkerWrite: (runId: string, write: () => Promise<void>) => Promise<void>;
@@ -44,6 +45,10 @@ export async function writeExecutionRunActivityMarker(args: Readonly<{
   const throttleMs = 1_000;
   if (args.opts?.force !== true && args.nowMs - ctrl.lastMarkerWriteAtMs < throttleMs) return;
   ctrl.lastMarkerWriteAtMs = args.nowMs;
+  const requestedConfiguration = projectExecutionRunRequestedConfiguration({
+    modelId: run.launch?.modelId,
+    sessionConfigOptionOverrides: run.launch?.sessionConfigOptionOverrides,
+  });
 
   const markerPayload = {
     pid: process.pid,
@@ -57,6 +62,7 @@ export async function writeExecutionRunActivityMarker(args: Readonly<{
     backendTarget: run.backendTarget,
     ...(run.display ? { display: run.display } : {}),
     ...(run.launch?.launchOrigin ? { launchOrigin: run.launch.launchOrigin } : {}),
+    ...(requestedConfiguration ? { requestedConfiguration } : {}),
     permissionMode: run.permissionMode,
     runClass: run.runClass,
     ioMode: run.ioMode,
@@ -84,5 +90,10 @@ export async function writeExecutionRunActivityMarker(args: Readonly<{
         : null;
     })(),
   } as const;
-  await args.enqueueMarkerWrite(args.runId, () => writeExecutionRunMarker(markerPayload)).catch(() => {});
+  await args.enqueueMarkerWrite(args.runId, async () => {
+    // Resume admission is valid only for the exact still-running occurrence when its
+    // serialized write executes. Delayed ordinary writes never resurrect a terminal run.
+    if (args.runs.get(args.runId) !== run || args.controllers.get(args.runId) !== ctrl || run.status !== 'running') return;
+    await writeExecutionRunMarker(markerPayload, { allowTerminalToRunning: args.opts?.resumed === true });
+  }).catch(() => {});
 }

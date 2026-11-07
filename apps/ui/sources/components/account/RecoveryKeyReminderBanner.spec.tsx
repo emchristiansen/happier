@@ -126,6 +126,7 @@ vi.mock('@/components/ui/lists/Item', () => ({
     Item: (props: {
         onPress?: () => void;
         rightElement?: React.ReactNode;
+        rightElementOutsidePressable?: boolean;
         testID?: string;
     }) => {
         const dismissElement = React.isValidElement<{
@@ -146,16 +147,16 @@ vi.mock('@/components/ui/lists/Item', () => ({
                   });
               })()
             : props.rightElement;
-        return (
-            <>
-                {React.createElement('Pressable', {
+        const row = React.createElement(
+            'Pressable',
+            {
                     accessibilityLabel: 'recovery-key-item',
                     testID: 'recovery-key-item',
                     onPress: props.onPress,
-                })}
-                {dismissElement}
-            </>
+            },
+            props.rightElementOutsidePressable ? null : dismissElement,
         );
+        return props.rightElementOutsidePressable ? <>{row}{dismissElement}</> : row;
     },
 }));
 
@@ -215,6 +216,12 @@ describe('RecoveryKeyReminderBanner', () => {
         await screen.pressByTestIdAsync('recovery-key-dismiss');
 
         expect(setRecoveryKeyReminderDismissed).toHaveBeenCalledWith(true);
+
+        const rowPressTarget = screen.findHostByTestId('recovery-key-item');
+        const dismissPressTarget = screen.findHostByTestId('recovery-key-dismiss');
+        let ancestor = dismissPressTarget?.parent ?? null;
+        while (ancestor && ancestor !== rowPressTarget) ancestor = ancestor.parent;
+        expect(ancestor).toBeNull();
     });
 
     it('does not render when server features cannot be fetched', async () => {

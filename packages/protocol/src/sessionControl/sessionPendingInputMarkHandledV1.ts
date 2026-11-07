@@ -1,18 +1,19 @@
 import { z } from 'zod';
 
+import { lazySchema } from '../lazySchema.js';
 import { PendingDeliveryBlockedReasonSchema } from '../sessionMessages/pendingDeliveryBlockedReason.js';
 import { PendingLocalIdSchema } from '../sessionMessages/pendingLocalId.js';
 
 /** Queued delivery states from which the server's handled route may resolve a pending row. */
-export const SessionPendingInputMarkHandledExpectedDeliveryStateV1Schema = z.enum([
+export const SessionPendingInputMarkHandledExpectedDeliveryStateV1Schema = lazySchema(() => z.enum([
   'delivering',
   'external_handoff',
   'blocked',
-]);
+]));
 export type SessionPendingInputMarkHandledExpectedDeliveryStateV1 =
   z.infer<typeof SessionPendingInputMarkHandledExpectedDeliveryStateV1Schema>;
 
-export const SessionPendingInputMarkHandledRequestV1Schema = z
+export const SessionPendingInputMarkHandledRequestV1Schema = lazySchema(() => z
   .object({
     sessionId: z.string().trim().min(1),
     localId: PendingLocalIdSchema,
@@ -28,14 +29,14 @@ export const SessionPendingInputMarkHandledRequestV1Schema = z
         message: 'expectedBlockedReason requires expectedDeliveryState "blocked"',
       });
     }
-  });
+  }));
 export type SessionPendingInputMarkHandledRequestV1 =
   z.infer<typeof SessionPendingInputMarkHandledRequestV1Schema>;
 
-const NonNegativeIntegerSchema = z.number().int().nonnegative();
+const NonNegativeIntegerSchema = lazySchema(() => z.number().int().nonnegative());
 
 /** One pending row exactly as the server's pending list reported it. */
-export const SessionPendingInputRowSnapshotV1Schema = z
+export const SessionPendingInputRowSnapshotV1Schema = lazySchema(() => z
   .object({
     localId: PendingLocalIdSchema,
     status: z.enum(['queued', 'discarded']),
@@ -43,7 +44,7 @@ export const SessionPendingInputRowSnapshotV1Schema = z
     deliveryBlockedReason: z.string().min(1).nullable(),
     position: z.number().int(),
   })
-  .strict();
+  .strict());
 export type SessionPendingInputRowSnapshotV1 = z.infer<typeof SessionPendingInputRowSnapshotV1Schema>;
 
 /** An HTTP read or write that produced no usable answer. */
@@ -52,26 +53,30 @@ const SessionPendingInputHttpFailureV1Shape = {
   errorCode: z.string().min(1).nullable(),
 } as const;
 
-const SessionPendingInputMarkHandledExpectationV1Schema = z
+const SessionPendingInputMarkHandledExpectationV1Schema = lazySchema(() => z
   .object({
     deliveryState: SessionPendingInputMarkHandledExpectedDeliveryStateV1Schema,
     blockedReason: PendingDeliveryBlockedReasonSchema.nullable(),
   })
-  .strict();
+  .strict());
 
-const SessionPendingInputMarkHandledRefusalV1Schema = z.discriminatedUnion('reason', [
+const SessionPendingInputMarkHandledRefusalV1Schema = lazySchema(() => z.discriminatedUnion('reason', [
   z.object({ reason: z.literal('not_authenticated') }).strict(),
   z.object({ reason: z.literal('pre_read_failed'), ...SessionPendingInputHttpFailureV1Shape }).strict(),
   z.object({ reason: z.literal('row_missing') }).strict(),
   z.object({ reason: z.literal('state_mismatch'), row: SessionPendingInputRowSnapshotV1Schema }).strict(),
-]);
+]));
 
-/** Queue counters a response or readback may omit; each is null when it was not reported. */
-const SessionPendingQueueCountsV1Shape = {
+/**
+ * Queue counters a response or readback may omit; each is null when it was not reported.
+ * A function rather than a constant shape so that `.nullable()` does not build the lazy
+ * counter schema at import time.
+ */
+const sessionPendingQueueCountsV1Shape = () => ({
   pendingCount: NonNegativeIntegerSchema.nullable(),
   pendingBlockedCount: NonNegativeIntegerSchema.nullable(),
   pendingVersion: NonNegativeIntegerSchema.nullable(),
-} as const;
+} as const);
 
 /**
  * Queue counters of a not-resolved receipt. A handled response without a transcript message counts
@@ -83,7 +88,7 @@ const SessionPendingQueueCompleteCountsV1Shape = {
   pendingVersion: NonNegativeIntegerSchema,
 } as const;
 
-const SessionPendingInputMarkHandledReadbackV1Schema = z
+const SessionPendingInputMarkHandledReadbackV1Schema = lazySchema(() => z
   .object({
     pendingRows: z.discriminatedUnion('status', [
       z.object({
@@ -94,22 +99,22 @@ const SessionPendingInputMarkHandledReadbackV1Schema = z
       z.object({ status: z.literal('failed'), ...SessionPendingInputHttpFailureV1Shape }).strict(),
     ]),
     sessionCounts: z.discriminatedUnion('status', [
-      z.object({ status: z.literal('read'), ...SessionPendingQueueCountsV1Shape }).strict(),
+      z.object({ status: z.literal('read'), ...sessionPendingQueueCountsV1Shape() }).strict(),
       z.object({ status: z.literal('failed'), ...SessionPendingInputHttpFailureV1Shape }).strict(),
     ]),
   })
-  .strict();
+  .strict());
 export type SessionPendingInputMarkHandledReadbackV1 = z.infer<typeof SessionPendingInputMarkHandledReadbackV1Schema>;
 
 /** Definite server refusals: the route answered and did not resolve the row. */
-export const SessionPendingInputMarkHandledRejectionKindV1Schema = z.enum([
+export const SessionPendingInputMarkHandledRejectionKindV1Schema = lazySchema(() => z.enum([
   'transcript_conflict',
   'invalid_params',
   'unauthenticated',
   'forbidden',
   'session_not_found',
   'other_client_error',
-]);
+]));
 export type SessionPendingInputMarkHandledRejectionKindV1 =
   z.infer<typeof SessionPendingInputMarkHandledRejectionKindV1Schema>;
 
@@ -118,11 +123,11 @@ export type SessionPendingInputMarkHandledRejectionKindV1 =
  * status that is not a final client rejection (5xx, timeouts, rate limits), or a success body
  * this client could not read.
  */
-export const SessionPendingInputMarkHandledUncertaintyKindV1Schema = z.enum([
+export const SessionPendingInputMarkHandledUncertaintyKindV1Schema = lazySchema(() => z.enum([
   'transport_failure',
   'non_final_status',
   'malformed_response',
-]);
+]));
 export type SessionPendingInputMarkHandledUncertaintyKindV1 =
   z.infer<typeof SessionPendingInputMarkHandledUncertaintyKindV1Schema>;
 
@@ -143,7 +148,7 @@ const SessionPendingInputMarkHandledPostedReceiptV1Shape = {
   readback: SessionPendingInputMarkHandledReadbackV1Schema,
 } as const;
 
-export const SessionPendingInputMarkHandledResultV1Schema = z.discriminatedUnion('outcome', [
+export const SessionPendingInputMarkHandledResultV1Schema = lazySchema(() => z.discriminatedUnion('outcome', [
   z.object({
     ...SessionPendingInputMarkHandledReceiptBaseV1Shape,
     outcome: z.literal('refused'),
@@ -153,7 +158,7 @@ export const SessionPendingInputMarkHandledResultV1Schema = z.discriminatedUnion
     ...SessionPendingInputMarkHandledPostedReceiptV1Shape,
     outcome: z.literal('resolved'),
     post: z.object({
-      ...SessionPendingQueueCountsV1Shape,
+      ...sessionPendingQueueCountsV1Shape(),
       transcriptMessage: z.object({
         id: z.string().min(1),
         seq: NonNegativeIntegerSchema,
@@ -184,6 +189,6 @@ export const SessionPendingInputMarkHandledResultV1Schema = z.discriminatedUnion
       ...SessionPendingInputHttpFailureV1Shape,
     }).strict(),
   }).strict(),
-]);
+]));
 export type SessionPendingInputMarkHandledResultV1 =
   z.infer<typeof SessionPendingInputMarkHandledResultV1Schema>;

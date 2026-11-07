@@ -6,6 +6,7 @@ const ARTIFACT_HEADS_RETENTION_MAX_COUNT = loadSyncTuning().artifactHeadsRetenti
 
 export type ArtifactsDomain = {
   artifacts: Record<string, DecryptedArtifact>;
+  artifactsLoaded: boolean;
   applyArtifacts: (artifacts: DecryptedArtifact[]) => void;
   addArtifact: (artifact: DecryptedArtifact) => void;
   updateArtifact: (artifact: DecryptedArtifact) => void;
@@ -39,6 +40,7 @@ export function createArtifactsDomain<S extends ArtifactsDomain>({
 }): ArtifactsDomain {
   return {
     artifacts: {},
+    artifactsLoaded: false,
     applyArtifacts: (artifacts) =>
       set((state) => {
         const mergedArtifacts = { ...state.artifacts };
@@ -49,6 +51,7 @@ export function createArtifactsDomain<S extends ArtifactsDomain>({
         return {
           ...state,
           artifacts: retainArtifactHeads(mergedArtifacts),
+          artifactsLoaded: true,
         };
       }),
     addArtifact: (artifact) =>

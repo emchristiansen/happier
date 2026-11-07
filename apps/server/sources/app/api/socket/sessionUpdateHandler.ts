@@ -110,7 +110,7 @@ function scheduleSessionParticipantBadgeRefresh(params: Parameters<typeof refres
 
 type TrustedTranscriptObservationPublisher = Readonly<{
     presence: Pick<ReturnType<typeof createSessionPublisherPresence>, "resolveCurrentPublisher">
-        & Partial<Pick<ReturnType<typeof createSessionPublisherPresence>, "runAsCurrentPublisher" | "runAsCurrentPublisherInTx">>;
+        & Partial<Pick<ReturnType<typeof createSessionPublisherPresence>, "runAsCurrentPublisher" | "runAsCurrentPublisherInTx" | "awaitRegistration">>;
     binding: Readonly<{ accountId: string; machineId: string; sessionId: string }>;
 }>;
 
@@ -187,6 +187,73 @@ function warnPendingPublisherAuthorityRefused(params: Readonly<{
     );
 }
 
+/** This socket's publisher status for `sessionId`, or null when it may not publish there at all. */
+async function resolveAuthorizedTranscriptPublisher(params: Readonly<{
+    socket: Socket;
+    connection: ClientConnection;
+    userId: string;
+    sessionId: string;
+    trusted?: TrustedTranscriptObservationPublisher;
+}>): Promise<CurrentPublisherResult | null> {
+    const trusted = params.trusted;
+    if (!trusted || trusted.binding.sessionId !== params.sessionId) return null;
+    if (!await authorizeSessionRelayPublish({
+        socket: params.socket,
+        connection: params.connection,
+        userId: params.userId,
+        sessionId: params.sessionId,
+    })) return null;
+    return await trusted.presence.resolveCurrentPublisher({
+        socket: params.socket,
+        binding: trusted.binding,
+    });
+}
+
+async function resolveAuthorizedCurrentTranscriptPublisher(
+    params: Parameters<typeof resolveAuthorizedTranscriptPublisher>[0],
+): Promise<Extract<CurrentPublisherResult, { status: "current" }> | null> {
+    const publisher = await resolveAuthorizedTranscriptPublisher(params);
+    return publisher?.status === "current" ? publisher : null;
+}
+
+/**
+ * Bounded wait for a freshly connected machine-bound socket to register itself before its first
+ * released `message` write. Released runners (0.2.x) emit agent output as soon as the socket
+ * connects and register on their first heartbeat / Runtime Activity snapshot; an in-memory
+ * registration does not survive a relay restart or reconnect. The budget runs from the message's
+ * receipt, so time queued behind earlier messages on the same socket is part of it and every
+ * answer stays below the released client's 10s socket ACK timeout.
+ */
+const UNREGISTERED_PUBLISHER_MESSAGE_GRACE_MS = 5_000;
+
+async function resolveMessageTranscriptPublisher(params: Readonly<{
+    socket: Socket;
+    connection: ClientConnection;
+    userId: string;
+    sessionId: string;
+    trusted: TrustedTranscriptObservationPublisher;
+    registrationDeadlineAtMs: number;
+}>): Promise<
+    | Readonly<{ ok: true; publisher: Extract<CurrentPublisherResult, { status: "current" }> }>
+    | Readonly<{ ok: false; error: "forbidden" | "transaction-unavailable" }>
+> {
+    let publisher = await resolveAuthorizedTranscriptPublisher(params);
+    const awaitRegistration = params.trusted.presence.awaitRegistration;
+    if (publisher?.status === "unregistered" && awaitRegistration) {
+        // Waiting grants nothing: only this socket's own canonical registration can make it current,
+        // and the whole authorization is re-resolved afterwards.
+        const registered = await awaitRegistration({
+            socket: params.socket,
+            deadlineAtMs: params.registrationDeadlineAtMs,
+        });
+        if (registered) publisher = await resolveAuthorizedTranscriptPublisher(params);
+    }
+    if (publisher?.status === "current") return { ok: true, publisher };
+    // Still unregistered: a typed retryable refusal (released runners retry the same intent).
+    // Unauthorized, superseded and rejected sockets keep the permanent `forbidden`.
+    return { ok: false, error: publisher?.status === "unregistered" ? "transaction-unavailable" : "forbidden" };
+}
+
 export function sessionUpdateHandler(
     userId: string,
     socket: Socket,
@@ -205,18 +272,18 @@ export function sessionUpdateHandler(
             callback?.({ ok: false, error: "invalid_session" });
             return;
         }
-        const authorized = await authorizeSessionRelayPublish({ socket, connection, userId, sessionId });
-        if (!authorized || !trustedTranscriptObservationPublisher || trustedTranscriptObservationPublisher.binding.sessionId !== sessionId) {
+        const publisher = await resolveAuthorizedCurrentTranscriptPublisher({
+            socket,
+            connection,
+            userId,
+            sessionId,
+            trusted: trustedTranscriptObservationPublisher,
+        });
+        if (!publisher) {
             callback?.({ ok: false, error: "forbidden" });
             return;
         }
-        const publisher = await trustedTranscriptObservationPublisher.presence.resolveCurrentPublisher({
-            socket,
-            binding: trustedTranscriptObservationPublisher.binding,
-        });
-        callback?.(publisher.status === "current"
-            ? { ok: true, capability: SESSION_TRANSCRIPT_OBSERVATION_CAPABILITY_V1 }
-            : { ok: false, error: "forbidden" });
+        callback?.({ ok: true, capability: SESSION_TRANSCRIPT_OBSERVATION_CAPABILITY_V1 });
         } catch (error) {
             log({ module: "websocket", level: "warn" }, `Transcript observation capability negotiation failed: ${error}`);
             callback?.({ ok: false, error: "internal" });
@@ -244,28 +311,14 @@ export function sessionUpdateHandler(
             callback?.({ ok: false, error: "forbidden" });
             return;
         }
-        const authorized = await authorizeSessionRelayPublish({
+        const publisher = await resolveAuthorizedCurrentTranscriptPublisher({
             socket,
             connection,
             userId,
             sessionId: observation.sessionId,
+            trusted: trustedTranscriptObservationPublisher,
         });
-        if (!authorized) {
-            callback?.({ ok: false, error: "forbidden" });
-            return;
-        }
-        if (
-            !trustedTranscriptObservationPublisher
-            || trustedTranscriptObservationPublisher.binding.sessionId !== observation.sessionId
-        ) {
-            callback?.({ ok: false, error: "forbidden" });
-            return;
-        }
-        const publisher = await trustedTranscriptObservationPublisher.presence.resolveCurrentPublisher({
-            socket,
-            binding: trustedTranscriptObservationPublisher.binding,
-        });
-        if (publisher.status !== "current") {
+        if (!publisher) {
             callback?.({ ok: false, error: "forbidden" });
             return;
         }
@@ -279,7 +332,7 @@ export function sessionUpdateHandler(
                 sidechainId: observation.sidechainId,
                 messageRole: observation.messageRole,
                 trustedPublisherFence: {
-                    ...trustedTranscriptObservationPublisher.binding,
+                    ...trustedTranscriptObservationPublisher!.binding,
                     committedFence: publisher.committedFence,
                 },
                 trustedSourceTimestamps: { createdAt: observation.createdAt, updatedAt: observation.updatedAt },
@@ -299,7 +352,7 @@ export function sessionUpdateHandler(
                 sidechainId: observation.sidechainId,
                 messageRole: observation.messageRole,
                 trustedPublisherFence: {
-                    ...trustedTranscriptObservationPublisher.binding,
+                    ...trustedTranscriptObservationPublisher!.binding,
                     committedFence: publisher.committedFence,
                 },
                 trustedSourceTimestamps: { createdAt: observation.createdAt, updatedAt: observation.updatedAt },
@@ -797,6 +850,7 @@ export function sessionUpdateHandler(
 
     const receiveMessageLock = new AsyncLock();
     socket.on('message', async (data: any, callback?: (response: any) => void) => {
+        const registrationDeadlineAtMs = Date.now() + UNREGISTERED_PUBLISHER_MESSAGE_GRACE_MS;
         await receiveMessageLock.inLock(async () => {
             const respond = (response: any) => {
                 if (typeof callback === 'function') {
@@ -830,6 +884,27 @@ export function sessionUpdateHandler(
                     respond({ ok: false, error: 'forbidden' });
                     return;
                 }
+
+                // Machine-bound session sockets are accepted as transcript publishers only
+                // while they remain the current runtime owner. The released `message` event
+                // is still supported for older servers, but a current server must not let a
+                // superseded provider socket keep writing transcript rows.
+                const messagePublisher = trustedTranscriptObservationPublisher
+                    ? await resolveMessageTranscriptPublisher({
+                        socket,
+                        connection,
+                        userId,
+                        sessionId: sid,
+                        trusted: trustedTranscriptObservationPublisher,
+                        registrationDeadlineAtMs,
+                    })
+                    : null;
+                if (messagePublisher && !messagePublisher.ok) {
+                    socketMessageAckCounter.inc({ result: 'error', error: messagePublisher.error });
+                    respond({ ok: false, error: messagePublisher.error });
+                    return;
+                }
+                const currentTranscriptPublisher = messagePublisher?.ok ? messagePublisher.publisher : null;
 
                 // Immutable old UIs wrote user prompts directly to the transcript. The Pending
                 // Queue is now the only user-input ingress, so reject this exact release-proven shape
@@ -873,6 +948,14 @@ export function sessionUpdateHandler(
                     localId,
                     sidechainId,
                     messageRole,
+                    ...(currentTranscriptPublisher
+                        ? {
+                            trustedPublisherFence: {
+                                ...trustedTranscriptObservationPublisher!.binding,
+                                committedFence: currentTranscriptPublisher.committedFence,
+                            },
+                        }
+                        : {}),
                     ...(trustedSessionEventType ? { trustedSessionEventType } : {}),
                 });
 

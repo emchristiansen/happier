@@ -1,11 +1,18 @@
 import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { getPriority, tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { SessionLaunchId } from './sessionLaunchId';
+
+// Scheduling priority is an OS boundary; keep the real launch policy underneath it.
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return { ...actual, getPriority: vi.fn(() => 0) };
+});
+
 import {
   buildSystemdUserCriticalScopedLaunchSpec,
   buildSystemdUserScopedLaunchSpec,
@@ -16,6 +23,10 @@ import {
 const FIXED_LAUNCH_ID = '0b7c8f2e-4d1a-4c3b-9e8f-7a6b5c4d3e2f' as SessionLaunchId;
 
 describe('systemd user resource governor', () => {
+  beforeEach(() => {
+    vi.mocked(getPriority).mockReturnValue(0);
+  });
+
   it.each([
     ['linux background service', 'linux', 'background-service', true],
     ['linux self-restart', 'linux', 'self-restart', true],
@@ -62,6 +73,18 @@ describe('systemd user resource governor', () => {
       env: { HAPPIER_TEST_ADMITTED_CLOSURE: 'immutable' },
     });
     expect(spec.args.join(' ')).not.toMatch(/CPUQuota|MemoryMax|MemoryHigh|TasksMax/u);
+  });
+
+  it('preserves an inherited lower scheduling priority instead of requiring permission to raise it', () => {
+    vi.mocked(getPriority).mockReturnValue(19);
+
+    const spec = buildSystemdUserScopedLaunchSpec({
+      launchId: FIXED_LAUNCH_ID,
+      launchSpec: { filePath: '/opt/happier/runtime/bin/happier-js-runtime', args: ['claude'] },
+    });
+
+    expect(spec.args).toContain('--nice=19');
+    expect(spec.args).not.toContain('--nice=10');
   });
 
   it('only enables the Linux wrapper when the provisioned jobs slice has its expected shares and finite soft memory boundary', async () => {

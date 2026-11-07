@@ -1,4 +1,5 @@
 import { ICON_SIZE } from '@/components/ui/icons/Icon';
+import { Platform } from 'react-native';
 
 /**
  * One size for the session header's icon actions.
@@ -13,3 +14,8 @@ import { ICON_SIZE } from '@/components/ui/icons/Icon';
  * place that can reasonably know about a glyph's ink.
  */
 export const SESSION_HEADER_ICON_SIZE_PX = ICON_SIZE.md;
+
+/** Native touch boxes follow the stricter platform minimum; pointer and iOS layouts remain 44pt. */
+export function resolveSessionHeaderActionTargetPx(platformOS: typeof Platform.OS = Platform.OS): number {
+    return platformOS === 'android' ? 48 : 44;
+}

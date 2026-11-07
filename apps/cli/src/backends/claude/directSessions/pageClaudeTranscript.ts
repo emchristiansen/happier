@@ -4,7 +4,7 @@ import type { DirectSessionsSource, DirectTranscriptRawMessageV1 } from '@happie
 
 import { readJsonlFileBackwardPage } from '@/api/directSessions/filePaging/jsonlBackwardPager';
 
-import { encodeClaudeDirectForwardCursor } from './claudeDirectForwardCursor';
+import { encodeClaudeDirectTailCursor, readClaudeDirectTailCursor } from './claudeDirectForwardCursor';
 import { mapClaudeJsonlLineToDirectMessages } from './mapClaudeJsonlLineToDirectMessages';
 import { resolveClaudeDirectSessionFile } from './resolveClaudeDirectSessionFile';
 
@@ -65,12 +65,6 @@ export async function pageClaudeTranscript(params: Readonly<{
 
   const fileStat = await stat(resolved.filePath).catch(() => null);
   const fileSize = fileStat ? fileStat.size : 0;
-  const tailCursor = encodeClaudeDirectForwardCursor({
-    v: 1,
-    kind: 'claudeForward',
-    fileRelPath: resolved.fileRelPath,
-    offsetBytes: fileSize,
-  });
 
   let truncated = false;
   let endOffsetBytes: number | null = null;
@@ -85,6 +79,9 @@ export async function pageClaudeTranscript(params: Readonly<{
 
   const resolvedEnd = endOffsetBytes === null ? fileSize : Math.min(fileSize, Math.max(0, Math.trunc(endOffsetBytes)));
   if (resolvedEnd <= 0) {
+    const tailCursor = fileSize === 0
+      ? encodeClaudeDirectTailCursor({ fileRelPath: resolved.fileRelPath, offsetBytes: 0 })
+      : await readClaudeDirectTailCursor({ ...resolved, maxBytes, endOffsetBytes: fileSize });
     return { items: [], nextCursor: null, tailCursor, hasMore: false, ...(truncated ? { truncated } : {}) };
   }
 
@@ -94,6 +91,9 @@ export async function pageClaudeTranscript(params: Readonly<{
     maxBytes,
     maxItems,
   });
+  const tailCursor = resolvedEnd === fileSize
+    ? encodeClaudeDirectTailCursor({ fileRelPath: resolved.fileRelPath, offsetBytes: page.tailOffsetBytes })
+    : await readClaudeDirectTailCursor({ ...resolved, maxBytes, endOffsetBytes: fileSize });
 
   const items: DirectTranscriptRawMessageV1[] = [];
   for (const line of page.items) {

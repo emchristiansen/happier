@@ -26,6 +26,8 @@ export type BackgroundServiceRepairAction =
       kind: 'install-default-following-service';
       releaseChannel: PublicReleaseRingId;
       mode: DaemonServiceMode;
+      /** The definition replaced by this target; retain its settings if repair removes it first. */
+      preserveFrom?: string;
     }>;
 
 export type BackgroundServiceRepairApplyRuntime = Readonly<{

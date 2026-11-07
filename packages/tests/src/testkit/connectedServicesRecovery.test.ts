@@ -1,11 +1,15 @@
 import { createServer } from 'node:http';
 import { connect, type Socket } from 'node:net';
 import { once } from 'node:events';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 import { withTimeoutMs } from './timing/withTimeout';
+import { withTempDir } from './fs/tempDir';
 import {
+  countFakeClaudeUserTextOccurrences,
   isRuntimeAuthRecoveryAwaitingProviderOutcomeProof,
   startConnectedServiceRecoveryProxy,
 } from './connectedServicesRecovery';
@@ -109,5 +113,35 @@ describe('connected-services recovery proof-wait matchers', () => {
       status: 'waiting',
       lastError: 'recovery_unproven_awaiting_provider_outcome',
     })).toBe(false);
+  });
+});
+
+
+describe('connected-services recovery replay observations', () => {
+  it.each(['missing', 'empty', 'unparseable'] as const)('rejects %s observations instead of proving zero replay', async (kind) => {
+    await withTempDir({ prefix: 'recovery-replay-' }, async ({ path: dir }) => {
+      const logPath = join(dir, 'provider.jsonl');
+      if (kind !== 'missing') await writeFile(logPath, kind === 'empty' ? '' : 'invalid-json\n');
+      await expect(countFakeClaudeUserTextOccurrences({ logPath, text: 'original prompt', sinceMs: 200 })).rejects.toThrow();
+    });
+  });
+
+  it('counts matching SDK and local deliveries only after a witnessed cutoff', async () => {
+    await withTempDir({ prefix: 'recovery-replay-' }, async ({ path: dir }) => {
+      const logPath = join(dir, 'provider.jsonl');
+      const invocation = { type: 'invocation', ts: 100 };
+      const oldInput = { type: 'sdk_stdin', ts: 150, hasUserText: true, userTextPreview: 'original prompt' };
+      await writeFile(logPath, [invocation, oldInput].map((event) => JSON.stringify(event)).join('\n') + '\n');
+      await expect(countFakeClaudeUserTextOccurrences({ logPath, text: 'original prompt', sinceMs: 200 })).resolves.toBe(0);
+      await writeFile(logPath, [
+        invocation,
+        oldInput,
+        { type: 'sdk_stdin', ts: 201, hasUserText: true, userTextPreview: 'original prompt' },
+        { type: 'local_stdin_turn_completed', ts: 202, userTextPreview: 'original prompt' },
+        { type: 'sdk_stdin', ts: 203, hasUserText: false, userTextPreview: 'original prompt' },
+        { type: 'local_stdin_turn_completed', ts: 204, userTextPreview: 'different prompt' },
+      ].map((event) => JSON.stringify(event)).join('\n') + '\n');
+      await expect(countFakeClaudeUserTextOccurrences({ logPath, text: 'original prompt', sinceMs: 200 })).resolves.toBe(2);
+    });
   });
 });

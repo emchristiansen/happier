@@ -6,6 +6,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { TerminalHostAdapter, TerminalHostHandle } from '@/integrations/terminalHost/_types';
 import type { TerminalControlPort } from '@/integrations/terminalHost/controlTypes';
+import { createSessionRuntimeActivity } from '@/session/runtimeActivity/createSessionRuntimeActivity';
+import type { SessionRuntimeActivitySnapshotPublisher } from '@/session/runtimeActivity/types';
 import type { RawJSONLines } from '../types';
 import { SessionArchiveInputAdmission } from '@/api/session/sessionArchiveInputAdmission';
 import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
@@ -102,7 +104,100 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     }
   });
 
-  it('fails closed before prompt injection when Claude starts a different session than the explicit resume', async () => {
+  it.each(['absorbed_mid_turn', 'cleared_on_cancel'] as const)(
+    'joins queued attachment and later removal through the live transcript importer: %s', async (reason) => {
+      const dir = await mkdtemp(join(tmpdir(), 'happier-claude-native-queue-order-'));
+      tempDirs.push(dir);
+      const workspaceDir = join(dir, 'workspace');
+      await mkdir(workspaceDir, { recursive: true });
+      const sessionId = '12121212-1212-4212-8212-121212121212';
+      const configDir = join(dir, 'claude-config');
+      const projectDir = getProjectPath(workspaceDir, configDir);
+      await mkdir(projectDir, { recursive: true });
+      const transcriptPath = join(projectDir, `${sessionId}.jsonl`);
+      await writeFile(transcriptPath, '');
+      const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+      const abort = new AbortController();
+      const prompt = 'queued native attachment ordering';
+      const accepted: string[] = [];
+      const observed: unknown[] = [];
+      let hook: ((data: SessionHookData) => void) | undefined;
+      let pulled = false;
+      let injected = false;
+      const handle: TerminalHostHandle = { kind: 'tmux', sessionName: 'native-queue-order', paneId: '%1',
+        attachMetadata: { attachStrategy: 'terminal_host', topology: 'shared', locality: 'same_machine', liveProbe: 'required' } };
+      // Only the terminal host/OS boundary is replaced. The arbiter, discovery,
+      // hook lifecycle and filesystem transcript follower remain real.
+      const adapter: TerminalHostAdapter = {
+        kind: 'tmux',
+        createOrAttachHost: async () => {
+          if (!hook) throw new Error('Missing hook subscription before host launch');
+          hook({ hook_event_name: 'SessionStart', session_id: sessionId, transcript_path: transcriptPath, source: 'startup' });
+          hook({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: 'previous running prompt' });
+          return handle;
+        },
+        injectUserPrompt: async (_handle, input) => {
+          if (!hook) throw new Error('Missing hook subscription before terminal injection');
+          hook({ hook_event_name: 'UserPromptSubmit', session_id: sessionId, prompt: input.text });
+          return { status: 'injected', at: Date.now(), bytesWritten: input.text.length };
+        },
+        evaluateLiveness: async () => ({ paneAlive: true, observedAt: Date.now() }),
+        captureInputState: async () => ({ stable: true, currentInput: composerScreen('', true), observedAt: Date.now() }),
+        interruptTurn: async () => {}, dispose: async () => {},
+      };
+      const run = runClaudeUnifiedTerminalSession({
+        path: workspaceDir, sessionId, transcriptPath, hookPluginDir: join(dir, 'owned-hooks'), signal: abort.signal,
+        waitForProviderInputAdmission: async (signal) => !signal.aborted,
+        nextMessage: async () => {
+          if (pulled) return await new Promise(() => undefined);
+          pulled = true;
+          return { message: prompt, mode: { permissionMode: 'default', claudeUnifiedTerminalHost: 'tmux' },
+            pendingProviderAction: 'steer', userMessageLocalIds: ['queued-live-input'] };
+        },
+        onTerminalPromptInjected: () => { injected = true; },
+        onPromptAcceptedByProvider: ({ userMessageLocalIds }) => { accepted.push(...userMessageLocalIds); },
+        onRawTranscriptValue: (value) => { observed.push(value); },
+        resolveHostAdapter: async () => ({ status: 'resolved', adapter, reason: 'test' }),
+        buildSpawn: async () => ({ spawnArgv: ['/bin/claude'], spawnEnv: {} }),
+        createSessionName: () => 'native-queue-order',
+        subscribeClaudeSessionHooks: (callback) => { hook = callback; return () => { hook = undefined; }; },
+        lifecycleCompletionQuiescenceMs: 0, dialogTurnEndScreenProbeDelaysMs: [],
+      });
+      try {
+        await waitUntil(() => injected);
+        expect(accepted).toEqual([]);
+        const timestamp = new Date().toISOString();
+        const operation = { type: 'queue-operation', sessionId, content: prompt, timestamp };
+        await appendFile(transcriptPath, `${JSON.stringify({ ...operation, operation: 'enqueue' })}\n`);
+        await appendFile(transcriptPath, `${JSON.stringify({ type: 'attachment', uuid: 'live-queued-attachment',
+          parentUuid: 'previous-tool-result', isSidechain: false, sessionId, timestamp,
+          attachment: { type: 'queued_command', prompt, commandMode: 'prompt', origin: { kind: 'human' },
+            source_uuid: 'native-live-command', delivery_id: 'native-live-delivery', timestamp } })}\n`);
+        await waitUntil(() => observed.some((value) => typeof value === 'object' && value !== null
+          && 'uuid' in value && value.uuid === 'live-queued-attachment'));
+        expect(accepted).toEqual([]);
+        await appendFile(transcriptPath, `${JSON.stringify({ ...operation, operation: 'remove', reason,
+          commandUuid: 'native-live-command', deliveryId: 'native-live-delivery' })}\n`);
+        if (reason === 'absorbed_mid_turn') {
+          await waitUntil(() => accepted.length === 1);
+          expect(accepted).toEqual(['queued-live-input']);
+        } else {
+          await waitUntil(() => observed.some((value) => typeof value === 'object' && value !== null
+            && 'operation' in value && value.operation === 'remove'));
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(accepted).toEqual([]);
+        }
+      } finally {
+        abort.abort();
+        await run;
+        if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+      }
+    },
+  );
+
+  it.each([false, true])('fails closed before prompt injection when Claude starts a different session than the explicit resume (native broker: %s)', async (withNativeBroker) => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-claude-resume-identity-mismatch-'));
     tempDirs.push(dir);
     const workspaceDir = join(dir, 'workspace');
@@ -117,6 +212,9 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
     const abortController = new AbortController();
+    const broker = withNativeBroker
+      ? new ClaudeUnifiedDialogChoiceBroker(createPermissionHandlerSessionStub('resume-mismatch-broker').session)
+      : undefined;
     const onSessionFound = vi.fn(() => abortController.abort());
     let subscribedHook: ((data: SessionHookData) => void) | undefined;
     let pendingPulled = false;
@@ -170,6 +268,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
         hookPluginDir: join(dir, 'owned-happier-hook-plugin'),
         signal: abortController.signal,
         waitForProviderInputAdmission: async (signal) => !signal.aborted,
+        dialogChoiceBroker: broker,
         nextMessage: async () => {
           if (pendingPulled) return await new Promise(() => undefined);
           pendingPulled = true;
@@ -202,6 +301,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       expect(injectUserPrompt).not.toHaveBeenCalled();
     } finally {
       abortController.abort();
+      await broker?.dispose();
       if (previousClaudeConfigDir === undefined) {
         delete process.env.CLAUDE_CONFIG_DIR;
       } else {
@@ -911,7 +1011,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     }
   });
 
-  it('keeps a known resumed session alive when owned UserPromptSubmit precedes exact transcript acceptance', async () => {
+  it.each([true, false])('settles exact resumed prompt custody before enforcing hook activation (hooks active: %s)', async (hooksActive) => {
     const dir = await mkdtemp(join(tmpdir(), 'happier-claude-unified-resumed-hook-activation-'));
     tempDirs.push(dir);
     const workspaceDir = join(dir, 'workspace');
@@ -929,8 +1029,18 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     const assistantText = 'RESUMED_HOOK_ACTIVATION_OK';
     const abortController = new AbortController();
     const onMessage = vi.fn<(message: RawJSONLines) => void>();
+    let resolveTranscriptObserved!: () => void;
+    const transcriptObserved = new Promise<void>((resolve) => { resolveTranscriptObserved = resolve; });
+    let transcriptObservedDuringInjection = false;
     const onTranscriptMessageSuppressed = vi.fn<(message: RawJSONLines) => void>();
+    const onRawTranscriptValue = (message: unknown) => {
+      if (!message || typeof message !== 'object' || !('uuid' in message)
+        || message.uuid !== 'resumed-hook-accepted-user-row') return;
+      transcriptObservedDuringInjection ||= !injected;
+      resolveTranscriptObserved();
+    };
     const onPromptAcceptedByProvider = vi.fn();
+    const returnUnconsumedMessage = vi.fn();
     let resolveReady!: () => void;
     const ready = new Promise<void>((resolve) => {
       resolveReady = resolve;
@@ -942,14 +1052,14 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     let runtimeOfferedBeforeInjection = false;
     let workflowArmedBeforeInjection = false;
     const onWorkflowActivityObserverReady = vi.fn();
-    const runtimeActivityReport = vi.fn(async () => {});
+    const runtimeActivity = createSessionRuntimeActivity('supported');
+    const runtimeActivityPublish = vi.fn<SessionRuntimeActivitySnapshotPublisher['publish']>(async () => {});
+    await runtimeActivity.bindPublisher({ publish: runtimeActivityPublish, close: async () => {} });
+    const contributionHandle = runtimeActivity.agentRuntimeContributionHandle;
+    if (!contributionHandle) throw new Error('Expected supported runtime Activity handle');
     const runtimeActivityAdapter = createClaudeProviderRuntimeActivityAdapter({
       providerActivityLedger: createClaudeProviderActivityLedger(),
-      contributionHandle: {
-        report: runtimeActivityReport,
-        markUnknown: vi.fn(async () => {}),
-        dispose: vi.fn(async () => {}),
-      },
+      contributionHandle,
     });
 
     const handle: TerminalHostHandle = {
@@ -967,14 +1077,14 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       kind: 'tmux',
       createOrAttachHost: vi.fn(async () => handle),
       injectUserPrompt: vi.fn(async (_handle, input) => {
-        runtimeOfferedBeforeInjection = runtimeActivityReport.mock.calls.length > 0;
+        runtimeOfferedBeforeInjection = runtimeActivityPublish.mock.calls.some(([snapshot]) => snapshot.state === 'idle');
         workflowArmedBeforeInjection = onWorkflowActivityObserverReady.mock.calls.length > 0;
         // The live failure happened long after the known-resume follower was established. Keep this
         // test on that same boundary instead of racing controller startup.
         await new Promise((resolve) => setTimeout(resolve, 100));
         const hook = subscribedHook;
         if (!hook) throw new Error('Claude session hook subscription was not registered before injection');
-        hook({
+        if (hooksActive) hook({
           hook_event_name: 'UserPromptSubmit',
           session_id: claudeSessionId,
           transcript_path: transcriptPath,
@@ -991,6 +1101,12 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
           isSidechain: false,
           message: { role: 'user', content: input.text },
         })}\n`);
+        // Hold the OS injection boundary open while the real follower reads acceptance.
+        if (!hooksActive) {
+          await transcriptObserved;
+          // Let the real follower's queued acceptance confirmation drain before the OS write returns.
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
         injected = true;
         return { status: 'injected', at: Date.now(), bytesWritten: input.text.length } as const;
       }),
@@ -1024,7 +1140,9 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       },
       onMessage,
       onTranscriptMessageSuppressed,
+      onRawTranscriptValue,
       onPromptAcceptedByProvider,
+      returnUnconsumedMessage,
       onReady,
       resolveHostAdapter: async () => ({ status: 'resolved', adapter, reason: 'test' }),
       buildSpawn: async () => ({ spawnArgv: ['/bin/claude'], spawnEnv: {} }),
@@ -1051,11 +1169,20 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
       expect(runtimeOfferedBeforeInjection).toBe(true);
       expect(workflowArmedBeforeInjection).toBe(true);
       expect(onWorkflowActivityObserverReady).toHaveBeenCalledTimes(1);
-      expect(runtimeActivityReport).toHaveBeenCalledWith(
+      expect(runtimeActivityPublish).toHaveBeenCalledWith(
         { state: 'idle', activeCount: 0 },
-        'claude-unified-provider-observer-installed',
       );
       await waitUntil(() => onPromptAcceptedByProvider.mock.calls.length === 1 || sessionOutcome !== 'pending');
+      if (!hooksActive) {
+        expect(transcriptObservedDuringInjection).toBe(true);
+        await sessionPromise;
+        expect(sessionError).toMatchObject({ code: 'claude_unified_terminal_hook_activation_missing' });
+        expect(onPromptAcceptedByProvider).toHaveBeenCalledExactlyOnceWith({
+          message: prompt, maxUserMessageSeq: 2039, userMessageLocalIds: ['resumed-hook-local-id'],
+        });
+        expect(returnUnconsumedMessage).not.toHaveBeenCalled();
+        return;
+      }
       expect(sessionOutcome, `session stopped before assistant delivery: ${String(sessionError)}`).toBe('pending');
       expect(onPromptAcceptedByProvider).toHaveBeenCalledTimes(1);
 
@@ -1101,6 +1228,7 @@ describe('runClaudeUnifiedTerminalSession resumed hook activation', () => {
     } finally {
       abortController.abort();
       await sessionPromise;
+      await runtimeActivity.dispose();
       if (previousClaudeConfigDir === undefined) {
         delete process.env.CLAUDE_CONFIG_DIR;
       } else {

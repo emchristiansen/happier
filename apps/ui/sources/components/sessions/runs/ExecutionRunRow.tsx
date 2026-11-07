@@ -2,7 +2,7 @@ import * as React from 'react';
 import { Pressable, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
-import type { ExecutionRunPublicState } from '@happier-dev/protocol';
+import { isExecutionRunActive, type ExecutionRunPublicState } from '@happier-dev/protocol';
 import { ExecutionRunStatusPill } from './ExecutionRunStatusPill';
 import { Text } from '@/components/ui/text/Text';
 import { resolveExecutionRunBackendLabel } from '@/components/sessions/runs/resolveExecutionRunBackendLabel';
@@ -10,7 +10,7 @@ import { resolveExecutionRunBackendLabel } from '@/components/sessions/runs/reso
 
 export type ExecutionRunRowRun =
     Pick<ExecutionRunPublicState, 'runId' | 'intent' | 'backendTarget' | 'status' | 'display'>
-    & Partial<Pick<ExecutionRunPublicState, 'startedAtMs' | 'finishedAtMs'>>;
+    & Partial<Pick<ExecutionRunPublicState, 'startedAtMs' | 'finishedAtMs' | 'runClass' | 'turnInFlight'>>;
 
 export const ExecutionRunRow = React.memo((props: Readonly<{
     run: ExecutionRunRowRun;
@@ -48,7 +48,7 @@ export const ExecutionRunRow = React.memo((props: Readonly<{
                     {title}
                 </Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                    <ExecutionRunStatusPill status={run.status} />
+                    <ExecutionRunStatusPill status={run.status} isActive={isExecutionRunActive(run)} />
                     {props.rightAccessory ?? null}
                 </View>
             </View>

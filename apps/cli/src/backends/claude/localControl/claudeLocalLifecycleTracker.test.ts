@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { createLocalTurnLifecycleController, type LocalTurnLifecycleSnapshot } from '@/agent/localControl/turnLifecycle';
+import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
+import type { TurnStallNotice } from '@/agent/runtime/session/turn/stallWatch';
 import { GENERIC_CONTINUATION_RESUME_PROMPT } from '@/daemon/connectedServices/continuation/continuationResumePrompt';
 import type {
   SessionRuntimeActivityContribution,
@@ -13,6 +15,68 @@ import type { RawJSONLines } from '../types';
 import { createClaudeLocalLifecycleTracker } from './claudeLocalLifecycleTracker';
 
 describe('createClaudeLocalLifecycleTracker', () => {
+  it('uses live raw rows and main hooks for silence without counting presentation replay or foreign rows', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const notices: TurnStallNotice[] = [];
+    const turn = createSessionTurnLifecycle({
+      sessionId: 'happier-session', enqueueSessionTurn: async () => {},
+      turnStallWarnMs: 100, onTurnStallNotice: notice => notices.push(notice),
+    });
+    const lifecycle = createLocalTurnLifecycleController({ completionQuiescenceMs: 0 });
+    const tracker = createClaudeLocalLifecycleTracker({
+      lifecycle, onProviderEvent: () => turn.observeProviderTurnEvent(),
+      readProviderSessionId: () => 'native-main',
+    });
+    try {
+      await turn.beginTurn({ provider: 'claude' });
+      await vi.advanceTimersByTimeAsync(75);
+      tracker.observeLiveProviderActivityRow({ type: 'attachment', sessionId: 'native-main' }, 'native-main');
+      await vi.advanceTimersByTimeAsync(75);
+      tracker.observeHook({ hook_event_name: 'PostToolUse', session_id: 'native-main', tool_name: 'Bash' });
+      await vi.advanceTimersByTimeAsync(75);
+      tracker.observeTranscript({ type: 'assistant', uuid: 'old', sessionId: 'native-main', message: { content: [] } });
+      tracker.observeLiveProviderActivityRow({ type: 'attachment', sessionId: 'foreign' }, 'native-main');
+      tracker.observeLiveProviderActivityRow({ type: 'attachment', sessionId: 'native-main', isReplay: true }, 'native-main');
+      tracker.observeLiveProviderActivityRow({ type: 'attachment', sessionId: 'native-main', isSidechain: true }, 'native-main');
+      tracker.observeLiveProviderActivityRow({ type: 'attachment', sessionId: 'native-main', parent_tool_use_id: 'child' }, 'native-main');
+      tracker.observeHook({ hook_event_name: 'PostToolUse', session_id: 'native-main', agent_id: 'child', tool_name: 'Bash' });
+      tracker.observeHook({ hook_event_name: 'PermissionRequestCompleted', session_id: 'native-main' });
+      tracker.observeHook({ hook_event_name: 'PostToolUse', session_id: 'stale-native-session' });
+      await vi.advanceTimersByTimeAsync(24);
+      expect(notices).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(notices).toMatchObject([{ lastEventAgeMs: 100 }]);
+      tracker.observeHook({ hook_event_name: 'SessionStart', source: 'compact', session_id: 'native-next' });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(notices).toHaveLength(2);
+    } finally {
+      await turn.completeTurn({ provider: 'claude' });
+      lifecycle.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains task custody when only the local wrapper exit was observed', async () => {
+    const lifecycle = createLocalTurnLifecycleController({ completionQuiescenceMs: 0 });
+    const ledger = createClaudeProviderActivityLedger();
+    const reports: SessionRuntimeActivityContribution[] = [];
+    const adapter = createClaudeProviderRuntimeActivityAdapter({ providerActivityLedger: ledger,
+      contributionHandle: { report: async value => { reports.push(value); },
+        markUnknown: async () => { reports.push({ state: 'unknown', activeCount: 0 }); }, dispose: async () => {} } });
+    await adapter.activateObservation('local-observer');
+    const tracker = createClaudeLocalLifecycleTracker({ lifecycle, providerActivityLedger: ledger, runtimeActivityAdapter: adapter });
+    tracker.observeHook({ hook_event_name: 'PostToolUse', session_id: 'local-session', tool_name: 'Agent',
+      tool_response: { status: 'async_launched', agentId: 'owned-task' } });
+    await vi.waitFor(() => expect(reports.at(-1)).toEqual({ state: 'active', activeCount: 1 }));
+    tracker.observeProcessExit();
+    await vi.waitFor(() => expect(reports.at(-1)).toEqual({ state: 'unknown', activeCount: 0 }));
+    expect(ledger.hasActiveProviderTasks()).toBe(true);
+    tracker.observeProcessExit({ providerStopped: true });
+    await vi.waitFor(() => expect(reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 }));
+    expect(ledger.hasActiveProviderTasks()).toBe(false);
+    lifecycle.dispose();
+  });
   it('keeps presentation replay inert and uses only exact-session live JSONL for provider Activity', async () => {
     const lifecycle = createLocalTurnLifecycleController({ completionQuiescenceMs: 0 });
     const reports: SessionRuntimeActivityContribution[] = [];
@@ -64,26 +128,64 @@ describe('createClaudeLocalLifecycleTracker', () => {
     expect(handle.markUnknown).not.toHaveBeenCalled();
 
     tracker.observeLiveProviderActivityRow({
-      type: 'queue-operation',
-      operation: 'enqueue',
+      type: 'user',
+      origin: { kind: 'task-notification' },
       sessionId: 'provider-session',
-      content: [
+      message: { content: [
         '<task-notification>',
         '<task-id>agent_target</task-id>',
         '<status>completed</status>',
         '</task-notification>',
-      ].join(''),
+      ].join('') },
     } as unknown as RawJSONLines, 'provider-session');
     await vi.waitFor(() => expect(reports).toHaveLength(2));
     expect(reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
     expect(handle.markUnknown).not.toHaveBeenCalled();
     expect(providerActivityLedger.hasActiveProviderTasks()).toBe(false);
 
-    tracker.observeProcessExit();
+    tracker.observeProcessExit({ providerStopped: true });
     await Promise.resolve();
     expect(providerActivityLedger.hasActiveProviderTasks()).toBe(false);
     expect(reports).toHaveLength(2);
-    expect(handle.markUnknown).toHaveBeenCalledTimes(1);
+    expect(handle.markUnknown).not.toHaveBeenCalled();
+    expect(reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
+    lifecycle.dispose();
+  });
+
+  it('keeps provider tasks through transcript observation loss and abandons them when the process exits', async () => {
+    const lifecycle = createLocalTurnLifecycleController({ completionQuiescenceMs: 0 });
+    const handle = {
+      report: vi.fn(async () => {}),
+      markUnknown: vi.fn(async () => {}),
+      dispose: vi.fn(async () => {}),
+    } satisfies SessionRuntimeActivityContributionHandle;
+    const providerActivityLedger = createClaudeProviderActivityLedger();
+    const runtimeActivityAdapter = createClaudeProviderRuntimeActivityAdapter({
+      contributionHandle: handle,
+      providerActivityLedger,
+    });
+    await runtimeActivityAdapter.activateObservation('test-observer-installed');
+    const tracker = createClaudeLocalLifecycleTracker({
+      lifecycle,
+      runtimeActivityAdapter,
+      providerActivityLedger,
+    });
+    tracker.observeLiveProviderActivityRow({
+      type: 'system',
+      subtype: 'task_started',
+      session_id: 'provider-session',
+      task_id: 'background-task',
+      task_type: 'local_bash',
+    } as unknown as RawJSONLines, 'provider-session');
+    await vi.waitFor(() => expect(providerActivityLedger.hasActiveProviderTasks()).toBe(true));
+
+    // Losing the transcript feed does not stop the Claude process, so its task may still run.
+    tracker.handleProviderActivityObservationLoss('jsonl_observation_lost');
+    await vi.waitFor(() => expect(handle.markUnknown).toHaveBeenCalledOnce());
+    expect(providerActivityLedger.hasActiveProviderTasks()).toBe(true);
+
+    tracker.observeProcessExit({ providerStopped: true });
+    await vi.waitFor(() => expect(providerActivityLedger.hasActiveProviderTasks()).toBe(false));
     lifecycle.dispose();
   });
 
@@ -133,6 +235,12 @@ describe('createClaudeLocalLifecycleTracker', () => {
       session_id: 'provider-session',
       agent_id: 'agent-1',
     });
+    await Promise.resolve();
+    expect(reports.at(-1)).toEqual({ state: 'active', activeCount: 1 });
+    tracker.observeLiveProviderActivityRow({
+      type: 'user', origin: { kind: 'task-notification' }, sessionId: 'provider-session',
+      message: { content: '<task-notification><task-id>agent-1</task-id><status>completed</status></task-notification>' },
+    } as unknown as RawJSONLines, 'provider-session');
     await vi.waitFor(() => expect(reports.at(-1)).toEqual({ state: 'idle', activeCount: 0 }));
     lifecycle.dispose();
   });

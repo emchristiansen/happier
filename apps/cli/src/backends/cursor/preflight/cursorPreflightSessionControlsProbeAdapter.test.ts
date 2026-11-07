@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
+import { writeExecutableShimSync } from '@/testkit/fs/executableShim';
 import {
   createProbeTempDir,
   resolveAcpSdkEntryFromCwd,
@@ -154,6 +157,35 @@ await connection.closed;
 }
 
 describe('cursorPreflightSessionControlsProbeAdapter', () => {
+  it('owns the CLI fallback when ACP startup fails, preserving configured launch settings', async () => {
+    const fixture = await createProbeTempDir('happier-cursor-preflight-failed-acp');
+    const invocations = join(fixture.dir, 'invocations');
+    const script = join(fixture.dir, 'cursor.cjs');
+    try {
+      await writeFile(script, `
+const { appendFileSync } = require('node:fs');
+if (process.argv.includes('acp')) { appendFileSync(${JSON.stringify(invocations)}, 'acp\\n'); process.exit(1); }
+if (process.argv.includes('models')) {
+  appendFileSync(${JSON.stringify(invocations)}, 'models\\n');
+  console.log('gpt-5.5 - GPT-5.5');
+} else process.exit(1);
+`);
+      const command = writeExecutableShimSync({
+        dir: fixture.dir, fileName: process.platform === 'win32' ? 'cursor.cmd' : 'cursor',
+        contents: process.platform === 'win32'
+          ? `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`
+          : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`,
+      });
+      const result = await cursorPreflightSessionControlsProbeAdapter.probeModelsRaw?.({
+        cwd: fixture.dir, timeoutMs: 5_000,
+        accountSettings: { cursorBinaryPath: command, cursorAgentFallbackEnabled: false },
+        processEnv: { ...process.env, HAPPIER_CURSOR_PATH: '/unused/account-setting-wins' },
+      });
+      expect(result).toEqual([{ id: 'gpt-5.5', name: 'GPT-5.5' }]);
+      expect((await readFile(invocations, 'utf8')).trim().split('\n')).toEqual(['acp', 'models']);
+    } finally { await fixture.cleanup(); }
+  });
+
   it('merges cheap Cursor CLI model variants with the active ACP model config surface', async () => {
     const fixture = await createProbeTempDir('happier-cursor-preflight-models');
     try {

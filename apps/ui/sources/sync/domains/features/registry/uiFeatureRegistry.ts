@@ -26,7 +26,7 @@ export const UI_FEATURE_REGISTRY = {
     automations: {
         settingsToggle: {
             showInSettings: true,
-            isExperimental: true,
+            isExperimental: false,
             defaultEnabled: true,
             titleKey: 'settingsFeatures.expAutomations',
             subtitleKey: 'settingsFeatures.expAutomationsSubtitle',
@@ -36,8 +36,8 @@ export const UI_FEATURE_REGISTRY = {
     'execution.runs': {
         settingsToggle: {
             showInSettings: true,
-            isExperimental: true,
-            defaultEnabled: false,
+            isExperimental: false,
+            defaultEnabled: true,
             titleKey: 'settingsFeatures.expExecutionRuns',
             subtitleKey: 'settingsFeatures.expExecutionRunsSubtitle',
             icon: { ioniconName: 'code-slash-outline', color: '#AF52DE' },
@@ -58,6 +58,9 @@ export const UI_FEATURE_REGISTRY = {
         settingsToggle: undefined,
     },
     'encryption.plaintextStorage': {
+        settingsToggle: undefined,
+    },
+    'encryption.plaintextMachine': {
         settingsToggle: undefined,
     },
     'encryption.accountOptOut': {
@@ -89,8 +92,8 @@ export const UI_FEATURE_REGISTRY = {
     connectedServices: {
         settingsToggle: {
             showInSettings: true,
-            isExperimental: true,
-            defaultEnabled: false,
+            isExperimental: false,
+            defaultEnabled: true,
             titleKey: 'settingsFeatures.expConnectedServices',
             subtitleKey: 'settingsFeatures.expConnectedServicesSubtitle',
             icon: { ioniconName: 'link-outline', color: '#007AFF' },
@@ -99,8 +102,8 @@ export const UI_FEATURE_REGISTRY = {
     'connectedServices.quotas': {
         settingsToggle: {
             showInSettings: true,
-            isExperimental: true,
-            defaultEnabled: false,
+            isExperimental: false,
+            defaultEnabled: true,
             titleKey: 'settingsFeatures.expConnectedServicesQuotas',
             subtitleKey: 'settingsFeatures.expConnectedServicesQuotasSubtitle',
             icon: { ioniconName: 'analytics-outline', color: '#34C759' },
@@ -110,7 +113,11 @@ export const UI_FEATURE_REGISTRY = {
         settingsToggle: undefined,
     },
     'connectedServices.subscription': { settingsToggle: undefined },
+    'connectedServices.quotaRecoveryCreditDetails': { settingsToggle: undefined },
     'connectedServices.autoQuotaReset': { settingsToggle: undefined },
+    'connectedServices.autoDisablePlanInvalid': { settingsToggle: undefined },
+    'connectedServices.poolQuotaLimitSelection': { settingsToggle: undefined },
+    'connectedServices.poolExpiryFirst': { settingsToggle: undefined },
     'connectedServices.accountFallback': {
         settingsToggle: undefined,
     },
@@ -288,8 +295,8 @@ export const UI_FEATURE_REGISTRY = {
     'attachments.uploads': {
         settingsToggle: {
             showInSettings: true,
-            isExperimental: true,
-            defaultEnabled: false,
+            isExperimental: false,
+            defaultEnabled: true,
             titleKey: 'settingsFeatures.expAttachmentsUploads',
             subtitleKey: 'settingsFeatures.expAttachmentsUploadsSubtitle',
             icon: { ioniconName: 'attach-outline', color: '#007AFF' },
@@ -351,8 +358,8 @@ export const UI_FEATURE_REGISTRY = {
     'terminal.embeddedPty': {
         settingsToggle: {
             showInSettings: true,
-            isExperimental: true,
-            defaultEnabled: false,
+            isExperimental: false,
+            defaultEnabled: true,
             titleKey: 'settingsFeatures.expEmbeddedTerminal',
             subtitleKey: 'settingsFeatures.expEmbeddedTerminalSubtitle',
             icon: { ioniconName: 'terminal-outline', color: '#AF52DE' },

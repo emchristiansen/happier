@@ -1,4 +1,3 @@
-import chalk from 'chalk';
 
 import type { CommandContext } from '@/cli/commandRegistry';
 import { wantsJson, printJsonEnvelope } from '@/cli/output/jsonEnvelope';
@@ -6,6 +5,7 @@ import { mapUnknownErrorToControlError } from '@/cli/control/controlErrorMapping
 
 import { showRelayHelp } from './relay/help';
 import { runRelaySubcommand } from './relay/subcommands';
+import { fail } from '@happier-dev/cli-common/output';
 
 /**
  * Decide whether a failure is an argument-parsing error (where showing the
@@ -86,7 +86,7 @@ export async function handleRelayCliCommand(context: CommandContext): Promise<vo
       );
       return;
     }
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (isArgumentUsageError(error)) {
       // Only surface the usage block when the error is about how the command
       // was invoked. Runtime failures (daemon didn't converge, port busy,

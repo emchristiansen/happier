@@ -52,12 +52,15 @@ vi.mock('@/sync/ops/machineDirectSessions', () => ({
 }));
 
 const appStateAddListener = vi.hoisted(() => vi.fn(() => ({ remove: vi.fn() })));
+const platformOS = vi.hoisted(() => ({ current: 'web' as 'web' | 'ios' }));
 vi.mock('react-native', async () => {
     const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
     return createReactNativeWebMock(
         {
                                             Platform: {
-                                                OS: 'web',
+                                                get OS() {
+                                                    return platformOS.current;
+                                                },
                                             },
                                             AppState: {
                                                 currentState: 'active',
@@ -102,8 +105,9 @@ vi.mock('@/voice/context/voiceHooks', () => ({
 }));
 
 import { sync } from './sync';
+import { Encryption } from './encryption/encryption';
 import { storage } from './domains/state/storage';
-import type { Machine } from './domains/state/storageTypes';
+import type { Machine, Session } from './domains/state/storageTypes';
 import type { NormalizedMessage } from './typesRaw';
 import { loadChangesCursor, loadDirectSessionTailCursor, saveProfile } from './domains/state/persistence';
 import { profileDefaults } from './domains/profiles/profile';
@@ -170,6 +174,9 @@ function stubSnapshotRefreshFetch(): ReturnType<typeof vi.fn> {
     if (url.includes('/v2/session-organization')) {
       return emptySessionOrganizationSnapshotResponse();
     }
+    if (url.includes('/v1/account/encryption')) return Response.json({ mode: 'e2ee', updatedAt: 0 });
+    if (url.includes('/v2/account/settings')) return Response.json({ content: null, version: 0 });
+    if (url.includes('/v1/kv')) return Response.json({ items: [] });
     if (url.includes('/v2/sessions')) {
       return new Response(
         JSON.stringify({ sessions: [], nextCursor: null, hasNext: false }),
@@ -220,7 +227,7 @@ function expectApiSocketMessageRequest(params: {
     throw new Error(`Expected apiSocket request for ${requestPath}`);
   }
   const [path, init] = call;
-  expect(init).toEqual({ method: 'GET' });
+  expect(init).toMatchObject({ method: 'GET' });
 
   const [, query = ''] = String(path).split('?');
   const searchParams = new URLSearchParams(query);
@@ -231,10 +238,34 @@ function expectApiSocketMessageRequest(params: {
   expect(searchParams.has('sidechainId')).toBe(false);
 }
 
+function expectApiSocketInitialMessageRequest(params: {
+  sessionId: string;
+  limit: string;
+}): void {
+  const requestPath = `/v1/sessions/${encodeURIComponent(params.sessionId)}/messages`;
+  const calls = apiSocketRequestMock.mock.calls as Array<[string, RequestInit | undefined]>;
+  const call = calls.find(([path]) => String(path).startsWith(`${requestPath}?`));
+  expect(call).toBeDefined();
+  if (!call) {
+    throw new Error(`Expected apiSocket request for ${requestPath}`);
+  }
+  const [path, init] = call;
+  expect(init).toMatchObject({ method: 'GET' });
+
+  const [, query = ''] = String(path).split('?');
+  const searchParams = new URLSearchParams(query);
+  expect(searchParams.get('scope')).toBe('main');
+  expect(searchParams.get('limit')).toBe(params.limit);
+  expect(searchParams.has('afterSeq')).toBe(false);
+  expect(searchParams.has('beforeSeq')).toBe(false);
+  expect(searchParams.has('sidechainId')).toBe(false);
+}
+
 describe('sync socket offline tracking', () => {
   const initialStorageState = storage.getState();
 
   beforeEach(() => {
+    platformOS.current = 'web';
     storage.setState(initialStorageState, true);
     clearActiveViewingSessionsForServerScopeReset();
     clearMountedSessionRealtimeScmConsumerScopes();
@@ -246,8 +277,9 @@ describe('sync socket offline tracking', () => {
     (sync as any).webSyncClientIdentityHeartbeatTimer = null;
     (sync as any).webSyncClientIdentity = null;
     (sync as any).syncTuning = loadSyncTuning();
-    (sync as any).changesCursor = null;
-    (sync as any).directSessionTailCursorBySessionId.clear();
+    // These reconnect fixtures have an incremental basis. Missing-cursor repair is explicit below.
+    (sync as any).changesCursor = '0';
+    (sync as any).directSessionTailStateBySessionId.clear();
     (sync as any).directSessionOlderCursorBySessionId.clear();
     (sync as any).directSessionHasMoreOlderBySessionId.clear();
     (sync as any).safeCursorLagState = null;
@@ -281,6 +313,167 @@ describe('sync socket offline tracking', () => {
     ));
     appStateAddListener.mockClear();
     vi.unstubAllGlobals();
+  });
+
+  it.each(['metadata', 'archive', 'new', 'share'] as const)('materializes %s changes before checkpointing and reconciles only membership changes', async (change) => {
+    const profile = upsertAndActivateServer({ serverUrl: 'http://localhost:53288', scope: 'tab' });
+    const session = (id: string): Session => ({
+      id, serverId: profile.id, seq: 1, createdAt: 1, updatedAt: 1,
+      active: false, activeAt: 1, archivedAt: null, encryptionMode: 'plain',
+      metadata: { path: '/workspace', host: 'localhost', name: id }, metadataVersion: 1,
+      agentState: null, agentStateVersion: 0, thinking: false, thinkingAt: 0, presence: 1,
+    });
+    storage.getState().applySessions([
+      ...(change === 'new' ? [] : [session('changed-row')]),
+      session('unchanged-neighbor'),
+    ]);
+    const requestedLists: URL[] = [];
+    let releaseRow!: () => void;
+    const rowReady = new Promise<void>((resolve) => { releaseRow = resolve; });
+    const updated = {
+      ...session('changed-row'), seq: 5, updatedAt: 5,
+      archivedAt: change === 'archive' ? 5 : null,
+      metadata: JSON.stringify({ path: '/workspace', host: 'localhost', name: 'Updated title' }),
+      metadataVersion: 2, dataEncryptionKey: null, share: null,
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost:53288');
+      if (url.pathname === '/v2/sessions') {
+        requestedLists.push(url);
+        await rowReady;
+        const requiredOnly = url.searchParams.get('requiredOnly') === 'true';
+        return Response.json({
+          sessions: requiredOnly ? [updated] : [
+            updated,
+            { ...session('unchanged-neighbor'), metadata: JSON.stringify(session('unchanged-neighbor').metadata), dataEncryptionKey: null, share: null },
+          ],
+          nextCursor: requiredOnly ? null : 'account-next', hasNext: !requiredOnly, includedActive: !requiredOnly,
+        });
+      }
+      if (url.pathname === '/v2/session-organization') return emptySessionOrganizationSnapshotResponse();
+      return Response.json({});
+    }));
+    fetchChangesMock.mockResolvedValueOnce({
+      status: 'ok', changes: [{ cursor: 11, kind: change === 'share' ? 'share' : 'session', entityId: 'changed-row', changedAt: 5, hint: null }], nextCursor: '11',
+    });
+    // The real orchestrator and row hydrator run; only the HTTP/credential boundary is supplied.
+    const runtime = sync as unknown as {
+      credentials: { token: string; secret: string };
+      encryption: Encryption;
+      serverID: string; changesCursor: string | null; sessionListNextCursor: string | null; sessionListHasMore: boolean;
+      resumeViaChanges: (options: { accountId: string }) => Promise<unknown>;
+    };
+    runtime.credentials = { token: 'hdr.eyJzdWIiOiJ0ZXN0In0.sig', secret: 'secret' };
+    runtime.encryption = Encryption.createWithoutKeyMaterial();
+    runtime.serverID = 'test-account';
+    runtime.changesCursor = '10';
+    runtime.sessionListNextCursor = 'account-page-cursor';
+    runtime.sessionListHasMore = true;
+
+    const resumed = runtime.resumeViaChanges({ accountId: 'test-account' });
+    await expect.poll(() => requestedLists.length).toBe(1);
+    expect(runtime.changesCursor).toBe('10');
+    expect(storage.getState().sessions['changed-row']?.seq).toBe(change === 'new' ? undefined : 1);
+    releaseRow();
+    await resumed;
+
+    expect(requestedLists).toHaveLength(change === 'new' || change === 'archive' ? 2 : 1);
+    expect(requestedLists[0]?.searchParams.get('requiredOnly')).toBe(change === 'share' ? null : 'true');
+    expect(storage.getState().sessions['changed-row']).toMatchObject({ seq: 5, metadata: { name: 'Updated title' } });
+    expect(storage.getState().sessionListRenderables['unchanged-neighbor']).toBeDefined();
+    expect(runtime.sessionListNextCursor).toBe(change === 'metadata' ? 'account-page-cursor' : 'account-next');
+    expect(runtime.sessionListHasMore).toBe(true);
+    expect(runtime.changesCursor).toBe('11');
+    expect(apiSocketRequestMock).not.toHaveBeenCalled();
+  });
+
+  it.each([403, 500, 'html-404', 'empty-404', 'unavailable-metadata'] as const)('does not checkpoint or delete a required row on exact-read %s', async (failure) => {
+    const profile = upsertAndActivateServer({ serverUrl: 'http://localhost:53288', scope: 'tab' });
+    const original: Session = {
+      id: 'required-row', serverId: profile.id, seq: 1, createdAt: 1, updatedAt: 1,
+      active: false, activeAt: 1, archivedAt: null, encryptionMode: 'plain',
+      metadata: { path: '/workspace', host: 'localhost' }, metadataVersion: 1,
+      agentState: null, agentStateVersion: 0, thinking: false, thinkingAt: 0, presence: 1,
+    };
+    storage.getState().applySessions([original]);
+    stubSnapshotRefreshFetch();
+    apiSocketRequestMock.mockImplementation(async () => failure === 'unavailable-metadata'
+      ? Response.json({ session: { ...original, seq: 5, metadataVersion: 2, metadata: 'invalid-json', dataEncryptionKey: null, share: null } })
+      : failure === 'html-404' || failure === 'empty-404'
+      ? new Response(failure === 'html-404' ? '<html>Not Found</html>' : null, { status: 404 })
+      : Response.json({ error: 'Exact read failed' }, { status: failure }));
+    fetchChangesMock.mockResolvedValueOnce({
+      status: 'ok', changes: [{ cursor: 11, kind: 'session', entityId: original.id, changedAt: 5 }], nextCursor: '11',
+    });
+    const runtime = sync as unknown as {
+      credentials: { token: string; secret: string };
+      encryption: Encryption;
+      serverID: string; changesCursor: string | null;
+      resumeViaChanges: (options: { accountId: string }) => Promise<unknown>;
+    };
+    runtime.credentials = { token: 'hdr.eyJzdWIiOiJ0ZXN0In0.sig', secret: 'secret' };
+    runtime.encryption = Encryption.createWithoutKeyMaterial();
+    runtime.serverID = 'test-account';
+    runtime.changesCursor = '10';
+    await runtime.resumeViaChanges({ accountId: 'test-account' });
+    expect(runtime.changesCursor).toBe('10');
+    expect(storage.getState().sessions[original.id]).toBeDefined();
+    expect(storage.getState().sessionListRenderables[original.id]).toBeDefined();
+  });
+
+  it('paints the warm list before organization settles but completes only after newly required rows materialize', async () => {
+    const profile = upsertAndActivateServer({ serverUrl: 'http://localhost:53288', scope: 'device' });
+    expect(getActiveServerSnapshot().serverId).toBe(profile.id);
+    const organization = {
+      schemaVersion: 1 as const, version: 1, pins: [], folders: [], folderAssignments: [], tags: [], tagAssignments: [], orderEntries: [], labels: [],
+    };
+    storage.getState().applySessionOrganizationSnapshot(profile.id, organization);
+    expect(storage.getState().sessionOrganizationSnapshotVersionByServerId[profile.id]).toBe(1);
+    const row = {
+      id: 'warm-row', seq: 1, createdAt: 1, updatedAt: 1, active: false, activeAt: 1,
+      archivedAt: null, encryptionMode: 'plain', metadata: JSON.stringify({ path: '/workspace', host: 'localhost' }),
+      metadataVersion: 1, agentState: null, agentStateVersion: 0, dataEncryptionKey: null, share: null,
+    };
+    let releaseOrganization!: () => void;
+    const organizationReady = new Promise<void>((resolve) => { releaseOrganization = resolve; });
+    const requestedPaths: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      requestedPaths.push(url.pathname);
+      if (url.pathname === '/v2/session-organization') {
+        await organizationReady;
+        return Response.json({ snapshot: { ...organization, version: 2, pins: [{ sessionId: 'fresh-pin', sortKey: 'a', pinnedAt: 1 }] } });
+      }
+      if (url.pathname === '/v2/sessions') {
+        return Response.json({ sessions: [row], nextCursor: null, hasNext: false, includedActive: true });
+      }
+      return Response.json({});
+    }));
+    // An older list implementation may omit a row newly required by the overlapping snapshot.
+    apiSocketRequestMock.mockResolvedValue(Response.json({ session: { ...row, id: 'fresh-pin' } }));
+    const runtime = sync as unknown as {
+      credentials: { token: string; secret: string };
+      encryption: Encryption;
+      fetchSessions: (options: { awaitSessionListHydration: boolean }) => Promise<void>;
+    };
+    runtime.credentials = { token: 'hdr.eyJzdWIiOiJ0ZXN0In0.sig', secret: 'secret' };
+    runtime.encryption = Encryption.createWithoutKeyMaterial();
+    let completed = false;
+    const pending = runtime.fetchSessions({ awaitSessionListHydration: true }).then(() => { completed = true; });
+    try {
+      await expect.poll(() => ({ requestedPaths, painted: Boolean(storage.getState().sessionListRenderables['warm-row']) })).toMatchObject({ painted: true });
+    } catch (error) {
+      releaseOrganization();
+      await pending;
+      throw new Error(`Warm list fixture did not paint: ${JSON.stringify({ requestedPaths, activeServerId: getActiveServerSnapshot().serverId, seededServerId: profile.id })}`, { cause: error });
+    }
+    const completedBeforeOrganization = completed;
+    releaseOrganization();
+    await pending;
+
+    expect(completedBeforeOrganization).toBe(false);
+    expect(storage.getState().sessions['fresh-pin']?.metadata).toMatchObject({ path: '/workspace' });
+    expect(apiSocketRequestMock).toHaveBeenCalledWith('/v2/sessions/fresh-pin', expect.objectContaining({ method: 'GET' }));
   });
 
   it('clears lastSocketDisconnectedAtMs when socket becomes connected again', async () => {
@@ -366,6 +559,48 @@ describe('sync socket offline tracking', () => {
     await (sync as any).fetchMessages('s_tuned_page_size');
 
     expectApiSocketMessageRequest({ sessionId: 's_tuned_page_size', afterSeq: '20', limit: '42' });
+  }, 60_000);
+
+  it('uses the native transcript page size for the first viewport without shrinking catch-up pages', async () => {
+    platformOS.current = 'ios';
+    (sync as any).syncTuning = {
+      ...loadSyncTuning(),
+      sessionMessagesPageSize: 42,
+      transcriptNativeOlderMessagesPageSize: 37,
+    };
+
+    storage.setState((state) => ({
+      ...state,
+      sessions: {
+        ...state.sessions,
+        s_native_initial_page: {
+          id: 's_native_initial_page',
+          seq: 20,
+          encryptionMode: 'plain',
+          metadata: {},
+          agentState: null,
+        } as any,
+        s_native_catchup_page: {
+          id: 's_native_catchup_page',
+          seq: 21,
+          encryptionMode: 'plain',
+          metadata: {},
+          agentState: null,
+        } as any,
+      },
+    }), true);
+
+    seedMaterializedMessage('s_native_catchup_page', 20);
+    storage.getState().applyMessagesLoaded('s_native_catchup_page');
+    (sync as any).sessionMaterializedMaxSeqById = { s_native_catchup_page: 20 };
+    (sync as any).isForeground = true;
+    markSessionVisible('s_native_catchup_page');
+
+    await (sync as any).fetchMessages('s_native_initial_page');
+    await (sync as any).fetchMessages('s_native_catchup_page');
+
+    expectApiSocketInitialMessageRequest({ sessionId: 's_native_initial_page', limit: '37' });
+    expectApiSocketMessageRequest({ sessionId: 's_native_catchup_page', afterSeq: '20', limit: '42' });
   }, 60_000);
 
   it('uses deferred durable transcript seq for visible catch-up when the stored session seq is stale', async () => {
@@ -1266,43 +1501,16 @@ describe('sync socket offline tracking', () => {
     ).toBe(true);
   }, 60_000);
 
-  it('captures a fresh snapshot-base cursor before cursor-gone snapshot repair', async () => {
+  it.each(['cursor-gone', 'missing'] as const)('captures a fresh snapshot-base cursor before %s snapshot repair', async (basis) => {
     upsertAndActivateServer({ serverUrl: 'http://localhost:53288', scope: 'tab' });
-    fetchChangesMock
-      .mockResolvedValueOnce({ status: 'cursor-gone' as const, currentCursor: '9' })
-      .mockResolvedValueOnce({ status: 'ok' as const, changes: [], nextCursor: '12' });
+    if (basis === 'missing') (sync as any).changesCursor = null;
+    if (basis === 'cursor-gone') {
+      fetchChangesMock.mockResolvedValueOnce({ status: 'cursor-gone' as const, currentCursor: '9' });
+    }
+    fetchChangesMock.mockResolvedValue({ status: 'ok' as const, changes: [], nextCursor: '12' });
     fetchCurrentChangesCursorMock.mockResolvedValue({ status: 'ok' as const, cursor: '12' });
 
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const url: string =
-        typeof input === 'string'
-          ? input
-          : input instanceof Request
-            ? input.url
-            : 'url' in input
-              ? String(input.url)
-              : input.toString();
-      if (url.includes('/v2/sessions')) {
-        return new Response(
-          JSON.stringify({ sessions: [], nextCursor: null, hasNext: false }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
-        );
-      }
-      if (url.includes('/v1/machines')) {
-        return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      if (url.includes('/v1/artifacts')) {
-        return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      if (url.includes('/v1/feed')) {
-        return new Response(JSON.stringify({ items: [], hasMore: false }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      if (url.includes('/v1/account/profile')) {
-        return new Response(JSON.stringify({ ...profileDefaults, id: 'test-account' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    });
-    vi.stubGlobal('fetch', fetchMock);
+    stubSnapshotRefreshFetch();
 
     storage.setState((state) => ({ ...state, profile: { ...(state.profile ?? {}), id: 'stale-profile-account' } as any }), true);
     saveProfile({ ...profileDefaults, id: 'test-account' });
@@ -1415,36 +1623,7 @@ describe('sync socket offline tracking', () => {
       .mockResolvedValueOnce({ status: 'ok' as const, changes: [], nextCursor: '12' });
     fetchCurrentChangesCursorMock.mockResolvedValue({ status: 'ok' as const, cursor: '12' });
 
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const url: string =
-        typeof input === 'string'
-          ? input
-          : input instanceof Request
-            ? input.url
-            : 'url' in input
-              ? String(input.url)
-              : input.toString();
-      if (url.includes('/v2/sessions')) {
-        return new Response(
-          JSON.stringify({ sessions: [], nextCursor: null, hasNext: false }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
-        );
-      }
-      if (url.includes('/v1/machines')) {
-        return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      if (url.includes('/v1/artifacts')) {
-        return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      if (url.includes('/v1/feed')) {
-        return new Response(JSON.stringify({ items: [], hasMore: false }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      if (url.includes('/v1/account/profile')) {
-        return new Response(JSON.stringify({ ...profileDefaults, id: 'test-account' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    });
-    vi.stubGlobal('fetch', fetchMock);
+    stubSnapshotRefreshFetch();
 
     storage.setState((state) => ({ ...state, profile: { ...(state.profile ?? {}), id: 'test-account' } as any }), true);
     saveProfile({ ...profileDefaults, id: 'test-account' });
@@ -1580,7 +1759,7 @@ describe('sync socket offline tracking', () => {
     expect((sync as any).changesCursor).toBeNull();
   }, 60_000);
 
-  it('catches up loaded direct sessions on resume even when the account changes feed is empty', async () => {
+  it('catches up visible loaded direct sessions on resume even when the account changes feed is empty', async () => {
     upsertAndActivateServer({ serverUrl: 'http://localhost:53288', scope: 'tab' });
     fetchChangesMock.mockResolvedValue({
       status: 'ok' as const,
@@ -1642,7 +1821,7 @@ describe('sync socket offline tracking', () => {
       },
     }), true);
     saveProfile({ ...profileDefaults, id: 'test-account' });
-    storage.getState().applyMessagesLoaded('s1');
+    markSessionVisible('s1');
     (sync as any).credentials = { token: 'hdr.eyJzdWIiOiJ0ZXN0In0.sig', secret: 'secret' };
     (sync as any).serverID = 'test';
     (sync as any).encryption = {
@@ -1654,12 +1833,28 @@ describe('sync socket offline tracking', () => {
     (sync as any).isForeground = true;
     (sync as any).lastSocketDisconnectedAtMs = Date.now() - 1000;
 
+    // A loaded direct transcript includes its accepted source and cursor. Seed it
+    // through the real reader so resume exercises incremental catch-up, not an initial snapshot.
+    machineDirectSessionTranscriptPageMock.mockResolvedValueOnce({
+      ok: true,
+      items: [{
+        id: 'direct-msg-initial',
+        createdAtMs: 0,
+        raw: { role: 'user', content: { type: 'text', text: 'already loaded direct' } },
+      }],
+      nextCursor: null,
+      tailCursor: 'tail-0',
+      hasMore: false,
+    });
+    await sync.refreshSessionMessages('s1');
+    expect(storage.getState().sessionMessages.s1?.isLoaded).toBe(true);
+
     await (sync as any).resumeSync('socket-reconnect');
 
     expect(machineDirectSessionTranscriptReadAfterMock).toHaveBeenCalledWith(expect.objectContaining({
       machineId: 'm1',
       remoteSessionId: 'remote-1',
-      cursor: 'tail',
+      cursor: 'tail-0',
     }), expect.anything());
     const sessionMessages = storage.getState().sessionMessages.s1;
     const texts = (sessionMessages?.messageIdsOldestFirst ?? [])
@@ -1667,7 +1862,7 @@ describe('sync socket offline tracking', () => {
       .filter((message): message is NonNullable<typeof message> => Boolean(message))
       .filter((message) => message.kind === 'user-text')
       .map((message) => message.text);
-    expect(texts).toEqual(['caught up direct']);
+    expect(texts).toEqual(['already loaded direct', 'caught up direct']);
     const directReadServerId = String(machineDirectSessionTranscriptReadAfterMock.mock.calls[0]?.[1]?.serverId ?? '').trim();
     expect(loadDirectSessionTailCursor('s1', { serverScope: directReadServerId, accountId: 'test' })).toBe('tail-1');
   }, 60_000);

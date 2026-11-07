@@ -54,9 +54,6 @@ test.describe('ui e2e: direct sessions browse/open/tail', () => {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
         HAPPIER_FEATURE_ENCRYPTION__STORAGE_POLICY: 'plaintext_only',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_SHARED_DEPS_BUILD: '1',
       },
     });
@@ -87,7 +84,7 @@ test.describe('ui e2e: direct sessions browse/open/tail', () => {
   });
 
   test('links a provider-backed direct session and follows appended provider log lines', async ({ page }) => {
-    test.setTimeout(540_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     const testDir = resolve(join(suiteDir, 't1-direct-browse-open-tail'));
@@ -176,7 +173,7 @@ test.describe('ui e2e: direct sessions browse/open/tail', () => {
   });
 
   test('takes over + persists a linked direct session from the send intercept and moves it to the persisted tab', async ({ page }) => {
-    test.setTimeout(540_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     const testDir = resolve(join(suiteDir, 't2-direct-browse-takeover-persist'));

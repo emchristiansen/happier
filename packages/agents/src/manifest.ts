@@ -20,6 +20,7 @@ export const AGENTS_CORE = {
         cloudConnect: { vendorKey: 'anthropic', status: 'wired' },
         connectedServices: {
             supportedServiceIds: ['claude-subscription', 'anthropic'],
+            quotaResetServiceIds: ['claude-subscription'],
             sessionAuthSwitch: {
                 continuityMode: 'restart_same_home',
                 supportedTransitions: ['same_connected_group'],
@@ -59,7 +60,7 @@ export const AGENTS_CORE = {
             sessionRollback: { conversation: 'unsupported' },
             usageLimitRecovery: { checkNow: 'supported' },
         },
-        handoff: { vendorStateTransfer: 'supported' },
+        handoff: { vendorStateTransfer: 'supported', existingState: true },
         localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
         runtimeInput: {
             inFlightSteerSupported: true,
@@ -138,13 +139,19 @@ export const AGENTS_CORE = {
                             sessionRollback: { conversation: 'unsupported' },
                             usageLimitRecovery: { checkNow: 'unsupported' },
                         },
+                        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
                         media: { nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION },
                     },
                 },
-                appServer: { kind: 'appServer' },
+                appServer: {
+                    kind: 'appServer',
+                    overrides: {
+                        localControl: { supported: true, topology: 'shared', attachStrategy: 'provider_attach' },
+                    },
+                },
             },
         },
-        handoff: { vendorStateTransfer: 'experimental', requiresExplicitSessionId: true },
+        handoff: { vendorStateTransfer: 'experimental', requiresExplicitSessionId: true, existingState: true },
         localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
         tools: { delivery: 'native_mcp', support: 'supported' },
         media: {
@@ -179,6 +186,8 @@ export const AGENTS_CORE = {
         sessionStorage: { direct: true, persisted: true },
         sessionCapabilities: {
             sessionListing: 'supported',
+            // Both retained V1 and released V2 expose native latest/message forks;
+            // the server client adapts the exclusive message boundary per dialect.
             sessionFork: { conversation: 'supported', fromMessage: 'supported' },
             sessionRollback: { conversation: 'unsupported' },
             usageLimitRecovery: { checkNow: 'supported' },
@@ -192,7 +201,7 @@ export const AGENTS_CORE = {
                     overrides: {
                         sessionStorage: { direct: false },
                         sessionCapabilities: {
-                            sessionFork: { fromMessage: 'unsupported' },
+                            sessionFork: { conversation: 'supported', fromMessage: 'unsupported' },
                             usageLimitRecovery: { checkNow: 'unsupported' },
                         },
                         localControl: null,
@@ -219,7 +228,7 @@ export const AGENTS_CORE = {
             supportedServiceIds: ['gemini'],
             sessionAuthSwitch: {
                 continuityMode: 'restart_same_home',
-                supportedTransitions: ['native_to_connected', 'connected_to_connected'],
+                supportedTransitions: ['native_to_connected', 'connected_to_connected', 'same_connected_group'],
             },
             supportedKindsByServiceId: {
                 gemini: ['oauth'],
@@ -251,12 +260,13 @@ export const AGENTS_CORE = {
         resume: { vendorResume: 'supported', vendorResumeIdField: 'auggieSessionId' },
         sessionStorage: { direct: false, persisted: true },
         sessionCapabilities: {
-            sessionListing: 'unsupported',
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
             sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
             sessionRollback: { conversation: 'unsupported' },
         },
         handoff: { vendorStateTransfer: 'unsupported' },
-        tools: { delivery: 'shell_bridge', support: 'experimental' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
         media: {
             acceptsImageInput: 'experimental',
             emitsSessionMedia: EXPERIMENTAL_SESSION_MEDIA_OUTPUT,
@@ -273,12 +283,13 @@ export const AGENTS_CORE = {
         resume: { vendorResume: 'supported', vendorResumeIdField: 'qwenSessionId' },
         sessionStorage: { direct: false, persisted: true },
         sessionCapabilities: {
-            sessionListing: 'unsupported',
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
             sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
             sessionRollback: { conversation: 'unsupported' },
         },
         handoff: { vendorStateTransfer: 'unsupported' },
-        tools: { delivery: 'shell_bridge', support: 'experimental' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
         media: {
             acceptsImageInput: 'experimental',
             emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
@@ -295,12 +306,17 @@ export const AGENTS_CORE = {
         resume: { vendorResume: 'supported', vendorResumeIdField: 'kimiSessionId' },
         sessionStorage: { direct: false, persisted: true },
         sessionCapabilities: {
-            sessionListing: 'unsupported',
-            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'supported', fromMessage: 'unsupported' },
             sessionRollback: { conversation: 'unsupported' },
         },
         handoff: { vendorStateTransfer: 'unsupported' },
-        tools: { delivery: 'shell_bridge', support: 'experimental' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        // Kimi Code's ACP initialize advertises `mcpCapabilities.http`/`.sse` (see the
+        // runtime fingerprint in the CLI's Kimi discovery owner), and the built-in ACP
+        // config passes Happier's MCP descriptors on session/new and session/load.
+        tools: { delivery: 'native_mcp', support: 'experimental' },
         media: {
             acceptsImageInput: 'experimental',
             emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
@@ -317,12 +333,13 @@ export const AGENTS_CORE = {
         resume: { vendorResume: 'supported', vendorResumeIdField: 'kiloSessionId' },
         sessionStorage: { direct: false, persisted: true },
         sessionCapabilities: {
-            sessionListing: 'unsupported',
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
             sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
             sessionRollback: { conversation: 'unsupported' },
         },
         handoff: { vendorStateTransfer: 'unsupported' },
-        tools: { delivery: 'shell_bridge', support: 'experimental' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
         media: {
             acceptsImageInput: 'experimental',
             emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
@@ -345,6 +362,35 @@ export const AGENTS_CORE = {
         },
         handoff: { vendorStateTransfer: 'unsupported' },
         localControl: { supported: true, topology: 'exclusive', attachStrategy: 'unsupported' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    devin: {
+        id: 'devin',
+        cliSubcommand: 'devin',
+        detectKey: providerDetectKey('devin'),
+        flavorAliases: ['devin-cli'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'devinSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        runtimeInput: {
+            inFlightSteerSupported: false,
+            terminalPromptInjectionSupported: false,
+        },
+        // Devin loads session MCP servers through its provider-owned process config adapter.
         tools: { delivery: 'native_mcp', support: 'supported' },
         media: {
             acceptsImageInput: 'experimental',
@@ -438,12 +484,13 @@ export const AGENTS_CORE = {
         resume: { vendorResume: 'supported', vendorResumeIdField: 'copilotSessionId' },
         sessionStorage: { direct: false, persisted: true },
         sessionCapabilities: {
-            sessionListing: 'unsupported',
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
             sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
             sessionRollback: { conversation: 'unsupported' },
         },
         handoff: { vendorStateTransfer: 'unsupported' },
-        tools: { delivery: 'shell_bridge', support: 'experimental' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
         media: {
             acceptsImageInput: 'experimental',
             emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
@@ -470,7 +517,7 @@ export const AGENTS_CORE = {
         },
         handoff: { vendorStateTransfer: 'unsupported' },
         localControl: { supported: true, topology: 'exclusive', attachStrategy: 'unsupported' },
-        tools: { delivery: 'shell_bridge', support: 'experimental' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
         media: {
             acceptsImageInput: 'unsupported',
             emitsSessionMedia: 'supported',
@@ -505,6 +552,129 @@ export const AGENTS_CORE = {
         media: {
             acceptsImageInput: 'unsupported',
             emitsSessionMedia: 'unsupported',
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    agy: {
+        id: 'agy',
+        cliSubcommand: 'agy',
+        detectKey: providerDetectKey('agy'),
+        flavorAliases: [],
+        cloudConnect: { vendorKey: 'antigravity', status: 'wired' },
+        connectedServices: {
+            supportedServiceIds: ['antigravity'],
+            sessionAuthSwitch: {
+                continuityMode: 'restart_shared_state_required',
+                supportedTransitions: ['same_connected_group'],
+                providerStateSharingRequired: {
+                    supportedTransitions: ['native_to_connected', 'connected_to_native', 'connected_to_connected'],
+                },
+            },
+            providerStateSharing: {
+                config: {
+                    supported: true,
+                    modes: ['linked', 'copied', 'isolated'],
+                },
+                state: {
+                    supported: true,
+                    modes: ['isolated', 'shared'],
+                    sharedStatePrivacyRiskAcknowledgementRequired: true,
+                },
+            },
+            supportedKindsByServiceId: {
+                antigravity: ['oauth'],
+            },
+        },
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'agySessionId' },
+        // The managed ACP server owns an opaque provider session id, but Happier does not
+        // read an Agy-native transcript store directly.
+        sessionStorage: { direct: false, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+            usageLimitRecovery: { checkNow: 'supported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        // Interactive `agy` stays the system-first terminal/local-control surface.
+        // The managed `agy_acp_server` ACP transport never shares session identity with it
+        // until a real create → list/load round trip proves equivalence.
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    fx: {
+        id: 'fx',
+        cliSubcommand: 'fx',
+        detectKey: providerDetectKey('fx'),
+        flavorAliases: [],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'fxSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'supported',
+            sessionListingSource: 'acp',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'supported',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    droid: {
+        id: 'droid',
+        cliSubcommand: 'droid',
+        detectKey: providerDetectKey('droid'),
+        flavorAliases: ['factory-droid'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'droidSessionId' },
+        sessionStorage: { direct: true, persisted: true },
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        tools: { delivery: 'native_mcp', support: 'supported' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
+            nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
+        },
+    },
+    codebuddy: {
+        id: 'codebuddy',
+        cliSubcommand: 'codebuddy',
+        detectKey: providerDetectKey('codebuddy'),
+        flavorAliases: ['codebuddy-code'],
+        cloudConnect: null,
+        connectedServices: null,
+        resume: { vendorResume: 'supported', vendorResumeIdField: 'codebuddySessionId' },
+        sessionStorage: { direct: false, persisted: true },
+        // CodeBuddy Code 2.162.0 advertises `loadSession` but not ACP `sessionCapabilities.list`.
+        sessionCapabilities: {
+            sessionListing: 'unsupported',
+            sessionFork: { conversation: 'unsupported', fromMessage: 'unsupported' },
+            sessionRollback: { conversation: 'unsupported' },
+        },
+        handoff: { vendorStateTransfer: 'unsupported' },
+        localControl: { supported: true, topology: 'exclusive', attachStrategy: 'tmux' },
+        tools: { delivery: 'native_mcp', support: 'experimental' },
+        media: {
+            acceptsImageInput: 'experimental',
+            emitsSessionMedia: GENERIC_SESSION_MEDIA_OUTPUT,
             nativeImageGeneration: NO_NATIVE_IMAGE_GENERATION,
         },
     },

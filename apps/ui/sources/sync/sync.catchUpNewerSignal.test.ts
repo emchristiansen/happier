@@ -249,8 +249,8 @@ describe('§13 catch-up-newer signal brackets the on-open catch-up', () => {
  *
  * The sibling incremental path already gates the same signal on `isCatchUpWork`
  * (`decision.kind !== 'do_nothing'`); these two cases pin the direct-session equivalent, so the
- * fix cannot be "stop bracketing" — a truncated tail must still surface, because it drops the
- * transcript and refetches it.
+ * fix cannot be "stop bracketing" — a truncated tail must still surface while its replacement
+ * transcript is fetched.
  */
 describe('§13 catch-up-newer signal and the direct-session tail poll', () => {
     beforeEach(() => {
@@ -280,13 +280,32 @@ describe('§13 catch-up-newer signal and the direct-session tail poll', () => {
                 },
             } as unknown as Session['metadata'],
         }]);
-        storage.getState().applyMessagesLoaded(SESSION_ID);
         t.encryption = { getSessionEncryption: () => null };
         t.activeServerSessionIds = new Set<string>([SESSION_ID]);
         t.hasFetchedSessionsSnapshotForActiveServer = true;
         t.isForeground = true;
         t.sessionMaterializedMaxSeqById[SESSION_ID] = 20;
         markSessionVisible(SESSION_ID);
+        // A warm direct transcript includes an accepted source and cursor, not
+        // merely a loaded flag. Establish that state through the real reader.
+        directTranscriptPageMock.mockResolvedValueOnce({
+            ok: true,
+            items: [{
+                id: 'accepted-direct',
+                createdAtMs: 1,
+                raw: { role: 'user', content: { type: 'text', text: 'accepted direct transcript' } },
+            }],
+            nextCursor: null,
+            tailCursor: 'c-1',
+            hasMore: false,
+        });
+        await sync.refreshSessionMessages(SESSION_ID);
+        const transcript = storage.getState().sessionMessages[SESSION_ID];
+        expect(transcript?.isLoaded).toBe(true);
+        expect(Object.values(transcript?.messagesById ?? {}).some(
+            (message) => message.kind === 'user-text' && message.text === 'accepted direct transcript',
+        )).toBe(true);
+        directTranscriptPageMock.mockClear();
     }
 
     /** A promise whose settlement this test controls, so the in-flight window is observable. */
@@ -335,7 +354,7 @@ describe('§13 catch-up-newer signal and the direct-session tail poll', () => {
         expect(catchUpInFlight()).toBe(0);
     });
 
-    it('DOES raise the signal while a truncated tail drops and refetches the transcript', async () => {
+    it('DOES raise the signal while a truncated tail stages a replacement transcript', async () => {
         await seedLoadedDirectSession();
         const { sync } = await import('./sync');
 
@@ -346,8 +365,7 @@ describe('§13 catch-up-newer signal and the direct-session tail poll', () => {
         const refresh = sync.refreshSessionMessages(SESSION_ID);
         await waitFor(() => directTranscriptPageMock.mock.calls.length > 0);
 
-        // A truncated tail is genuine catch-up: the transcript was reset and is being refetched,
-        // which is exactly the window the overlay exists to cover.
+        // A truncated tail is genuine catch-up while the replacement is staged.
         expect(catchUpInFlight()).toBeGreaterThan(0);
 
         page.resolve({ ok: true, items: [], nextCursor: null, hasMore: false });

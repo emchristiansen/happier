@@ -5,6 +5,7 @@ const { pathToFileURL } = require('url');
 
 const { expandHomeDirPath } = require('@happier-dev/cli-common/expandHomeDirPath');
 const { withWindowsHide } = require('./childProcessOptions.cjs');
+const { reportNativeProcessExited, reportProviderInLauncher } = require('./native_process_exit.cjs');
 
 function resolvePathSafe(filePath) {
     if (!fs.existsSync(filePath)) return null;
@@ -80,11 +81,12 @@ function buildClaudeBinarySpawnInvocation(params) {
             return {
                 command: comspec,
                 args: ['/d', '/s', '/c', cliPath, ...args],
+                providerIsChild: false,
             };
         }
     }
 
-    return { command: cliPath, args };
+    return { command: cliPath, args, providerIsChild: true };
 }
 
 function attachChildSignalForwarding(child, proc = process) {
@@ -113,8 +115,8 @@ function runClaudeCli(cliPath) {
 
     if (isJsFile) {
         const importUrl = pathToFileURL(cliPath).href;
-        import(importUrl);
-        return;
+        // The importer owns this provider process; flush that fact before provider code can exit.
+        return reportProviderInLauncher(process).then(() => import(importUrl));
     }
 
     const args = process.argv.slice(2);
@@ -125,7 +127,8 @@ function runClaudeCli(cliPath) {
     }));
 
     attachChildSignalForwarding(child);
-    child.on('exit', (code) => {
+    child.on('exit', async (code, signal) => {
+        if (invocation.providerIsChild) await reportNativeProcessExited(process, code, signal);
         process.exit(code || 0);
     });
 }

@@ -22,7 +22,7 @@ export type AuthSignalsForProfile = Readonly<{
   /** True if a machine id has been confirmed for this profile. */
   machineRegistered: boolean;
   /** Whether credential presence came from the active store or historical profile metadata. */
-  credentialEvidence: 'active-store' | 'historical-record';
+  credentialEvidence: 'inspected-store' | 'historical-record';
   /** True if this profile is the currently active one. */
   isActive: boolean;
   /**
@@ -69,7 +69,7 @@ export function classifyAuth(params: Readonly<{
 
   const active = params.signals.find((s) => s.isActive) ?? null;
 
-  if (active?.credentialEvidence === 'active-store') {
+  if (active?.credentialEvidence === 'inspected-store') {
     if (!active.hasCredentials) {
       const finding: AuthMissingForProfile = {
         kind: 'auth_missing_for_profile',

@@ -9,18 +9,23 @@ import {
 } from '@/sync/domains/session/listing/sessionListRenderable';
 import {
     deriveSessionRuntimePresentationState,
+    resolveNextSessionRuntimePresentationFreshnessAtMs,
     SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS,
 } from '@/sync/domains/session/attention/deriveSessionRuntimePresentationState';
 import { nowServerMs } from '@/sync/runtime/time';
 import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
 import { formatShortRelativeTimeAt } from '@/utils/time/formatShortRelativeTime';
+import { selectEffectiveSessionAppearanceColor, type SessionAppearanceSelectorState } from './selectors/sessionAppearance';
+import { areSessionAppearanceColorsEqual, type SessionAppearanceColor } from '@/sync/domains/session/organization/appearanceColor';
+import type { SessionWorkspacePresentationMetadata } from '@/sync/domains/session/listing/sessionWorkspacePresentation';
 
 type SessionListRowStateSnapshotScope = Readonly<{
     sessionId: string;
     serverId?: string | null;
+    metadata?: SessionWorkspacePresentationMetadata;
 }>;
 
-type SessionListRowStoreStateSelectorInput = Readonly<{
+type SessionListRowStoreStateSelectorInput = SessionAppearanceSelectorState & Readonly<{
     sessions?: SessionListRowStoreState['sessions'];
     sessionListRenderables?: SessionListRowStoreState['sessionListRenderables'];
     sessionMessages?: SessionListRowStoreState['sessionMessages'];
@@ -70,12 +75,15 @@ export function selectSessionListRowStateSnapshot(
 ): SessionListRowStateSnapshot {
     const normalizedScope = normalizeScope(scope);
     const sessionId = normalizedScope.sessionId;
+    const key = `${normalizedScope.serverId ?? state.activeServerId ?? ''}:${sessionId}`;
+    const appearanceColor = state.appearanceColorsBySessionKey?.[key] ?? null;
     if (!shouldReadActiveServerOverlay(state, normalizedScope.serverId)) {
         return {
             session: undefined,
             renderable: undefined,
             messages: undefined,
             pending: undefined,
+            appearanceColor,
         };
     }
 
@@ -84,6 +92,7 @@ export function selectSessionListRowStateSnapshot(
         renderable: state.sessionListRenderables?.[sessionId],
         messages: state.sessionMessages?.[sessionId],
         pending: state.sessionPending?.[sessionId],
+        appearanceColor,
     };
 }
 
@@ -221,14 +230,41 @@ export function createSessionListRuntimePriorityRowScopeSelector(
     const normalizedScopes = scopes.map(normalizeScope);
     const overlayState: SessionListRowStoreState = { activeServerId };
     let previousOutput: readonly SessionListRowStateSnapshotScope[] | null = null;
+    // Store notifications often replace the outer record while only one row
+    // changes. Keep the existing priority projection with its scoped input,
+    // and expire it at the runtime owner's boundary, including clock rewinds.
+    const priorityByScope: Array<Readonly<{
+        renderable: SessionListRenderableSession | undefined;
+        evaluatedAtMs: number;
+        validUntilMs: number | null;
+        isPriority: boolean;
+    }> | undefined> = [];
 
     return (state) => {
         const nowMs = nowServerMs();
         let nextOutput: SessionListRowStateSnapshotScope[] | null = null;
-        for (const scope of normalizedScopes) {
+        for (let index = 0; index < normalizedScopes.length; index += 1) {
+            const scope = normalizedScopes[index];
             if (!shouldReadActiveServerOverlay(overlayState, scope.serverId)) continue;
             const renderable = state.sessionListRenderables?.[scope.sessionId];
-            if (!isRuntimePriorityRenderable(renderable, nowMs)) continue;
+            let priority = priorityByScope[index];
+            if (
+                !priority
+                || priority.renderable !== renderable
+                || nowMs < priority.evaluatedAtMs
+                || (priority.validUntilMs !== null && nowMs >= priority.validUntilMs)
+            ) {
+                priority = {
+                    renderable,
+                    evaluatedAtMs: nowMs,
+                    validUntilMs: renderable
+                        ? resolveNextSessionRuntimePresentationFreshnessAtMs(renderable, nowMs)
+                        : null,
+                    isPriority: isRuntimePriorityRenderable(renderable, nowMs),
+                };
+                priorityByScope[index] = priority;
+            }
+            if (!priority.isPriority) continue;
             if (nextOutput === null) nextOutput = [];
             nextOutput.push(scope);
         }
@@ -248,10 +284,12 @@ export function createSessionListRowStoreStateSelector(
     activeServerId: string | null | undefined,
 ): (state: SessionListRowStoreStateSelectorInput) => SessionListRowStoreState {
     const normalizedScopes = scopes.map(normalizeScope);
+    const overlayState: SessionListRowStoreState = { activeServerId };
     let previousSessions: readonly unknown[] | null = null;
     let previousRenderables: readonly unknown[] | null = null;
     let previousMessages: readonly unknown[] | null = null;
     let previousPending: readonly unknown[] | null = null;
+    let previousAppearances: readonly (SessionAppearanceColor | null)[] | null = null;
     let previousOutput: SessionListRowStoreState | null = null;
 
     return (state) => {
@@ -259,6 +297,8 @@ export function createSessionListRowStoreStateSelector(
         const nextRenderables: unknown[] = [];
         const nextMessages: unknown[] = [];
         const nextPending: unknown[] = [];
+        const nextAppearances: (SessionAppearanceColor | null)[] = [];
+        const appearanceColorsBySessionKey: Record<string, SessionAppearanceColor | null> = {};
         const sessions: MutableSessionListRowStoreState['sessions'] = {};
         const sessionListRenderables: MutableSessionListRowStoreState['sessionListRenderables'] = {};
         const sessionMessages: MutableSessionListRowStoreState['sessionMessages'] = {};
@@ -272,7 +312,8 @@ export function createSessionListRowStoreStateSelector(
         for (let index = 0; index < normalizedScopes.length; index += 1) {
             const scope = normalizedScopes[index];
             const sessionId = scope.sessionId;
-            const rawRenderable = state.sessionListRenderables?.[sessionId];
+            const readActiveOverlay = shouldReadActiveServerOverlay(overlayState, scope.serverId);
+            const rawRenderable = readActiveOverlay ? state.sessionListRenderables?.[sessionId] : undefined;
             const previousRenderable = previousRenderables?.[index] as SessionListRenderableSession | undefined;
             const renderable = shouldReusePreviousProgressRenderable({
                 previous: previousRenderable,
@@ -284,17 +325,28 @@ export function createSessionListRowStoreStateSelector(
             if (renderable === previousRenderable && rawRenderable !== previousRenderable && rawRenderable !== undefined) {
                 suppressedProgressRenderableUpdates += 1;
             }
-            const session = renderable ? undefined : state.sessions?.[sessionId];
-            const messages = renderable ? undefined : state.sessionMessages?.[sessionId];
-            const pending = state.sessionPending?.[sessionId];
+            const session = readActiveOverlay && !renderable ? state.sessions?.[sessionId] : undefined;
+            const messages = readActiveOverlay && !renderable ? state.sessionMessages?.[sessionId] : undefined;
+            const pending = readActiveOverlay ? state.sessionPending?.[sessionId] : undefined;
             nextSessions.push(session);
             nextRenderables.push(renderable);
             nextMessages.push(messages);
             nextPending.push(pending);
-            sessions[sessionId] = session;
-            sessionListRenderables[sessionId] = renderable;
-            sessionMessages[sessionId] = messages;
-            sessionPending[sessionId] = pending;
+            if (readActiveOverlay) {
+                sessions[sessionId] = session;
+                sessionListRenderables[sessionId] = renderable;
+                sessionMessages[sessionId] = messages;
+                sessionPending[sessionId] = pending;
+            }
+            const serverId = scope.serverId ?? activeServerId ?? '';
+            const color = selectEffectiveSessionAppearanceColor(state, { serverId, sessionId, activeServerId,
+                metadata: renderable?.metadata ?? session?.metadata ?? scope.metadata,
+                active: renderable?.active ?? session?.active,
+            });
+            const previousColor = previousAppearances?.[index];
+            const stableColor = areSessionAppearanceColorsEqual(previousColor, color) ? previousColor ?? null : color;
+            nextAppearances.push(stableColor);
+            appearanceColorsBySessionKey[`${serverId}:${sessionId}`] = stableColor;
         }
 
         if (suppressedProgressRenderableUpdates > 0) {
@@ -310,6 +362,7 @@ export function createSessionListRowStoreStateSelector(
             && refsEqual(previousRenderables, nextRenderables)
             && refsEqual(previousMessages, nextMessages)
             && refsEqual(previousPending, nextPending)
+            && refsEqual(previousAppearances, nextAppearances)
         ) {
             return previousOutput;
         }
@@ -327,12 +380,14 @@ export function createSessionListRowStoreStateSelector(
         previousRenderables = nextRenderables;
         previousMessages = nextMessages;
         previousPending = nextPending;
+        previousAppearances = nextAppearances;
         previousOutput = {
             activeServerId,
             sessions,
             sessionListRenderables,
             sessionMessages,
             sessionPending,
+            appearanceColorsBySessionKey,
         };
         return previousOutput;
     };

@@ -1,12 +1,12 @@
-import { stat } from 'node:fs/promises';
-
 import type { DirectSessionsSource, DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
 
 import { readJsonlFileForward } from '@/api/directSessions/filePaging/jsonlForwardReader';
 
-import { decodeClaudeDirectForwardCursor, encodeClaudeDirectForwardCursor } from './claudeDirectForwardCursor';
+import { decodeClaudeDirectForwardCursor, encodeClaudeDirectForwardCursor, readClaudeDirectTailCursor } from './claudeDirectForwardCursor';
 import { mapClaudeJsonlLineToDirectMessages } from './mapClaudeJsonlLineToDirectMessages';
 import { resolveClaudeDirectSessionFile } from './resolveClaudeDirectSessionFile';
+
+import type { DirectSessionTranscriptReadAfter } from '@/backends/directSessions/providerOps';
 
 export async function readAfterClaudeTranscript(params: Readonly<{
   source: DirectSessionsSource;
@@ -15,7 +15,7 @@ export async function readAfterClaudeTranscript(params: Readonly<{
   cursor: string;
   maxBytes: number;
   maxItems: number;
-}>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; truncated: boolean }>> {
+}>): Promise<DirectSessionTranscriptReadAfter> {
   const env = params.env ?? process.env;
   const resolved = await resolveClaudeDirectSessionFile({
     source: params.source,
@@ -30,25 +30,24 @@ export async function readAfterClaudeTranscript(params: Readonly<{
   const maxItems = Math.max(1, Math.trunc(params.maxItems));
 
   if (params.cursor === 'tail') {
-    const fileSize = await stat(resolved.filePath).then((s) => s.size).catch(() => 0);
     return {
       items: [],
-      nextCursor: encodeClaudeDirectForwardCursor({ v: 1, kind: 'claudeForward', fileRelPath: resolved.fileRelPath, offsetBytes: fileSize }),
+      nextCursor: await readClaudeDirectTailCursor({ ...resolved, maxBytes }),
       truncated: false,
     };
   }
 
   const decoded = decodeClaudeDirectForwardCursor(params.cursor);
   if (!decoded) {
-    return { items: [], nextCursor: null, truncated: true };
+    return { items: [], nextCursor: null, truncated: true, truncationReason: 'source_discontinuity' };
   }
 
   if (decoded.fileRelPath !== resolved.fileRelPath) {
-    const fileSize = await stat(resolved.filePath).then((s) => s.size).catch(() => 0);
     return {
       items: [],
-      nextCursor: encodeClaudeDirectForwardCursor({ v: 1, kind: 'claudeForward', fileRelPath: resolved.fileRelPath, offsetBytes: fileSize }),
+      nextCursor: await readClaudeDirectTailCursor({ ...resolved, maxBytes }),
       truncated: true,
+      truncationReason: 'source_discontinuity',
     };
   }
 
@@ -61,11 +60,11 @@ export async function readAfterClaudeTranscript(params: Readonly<{
   });
 
   if (read.truncated) {
-    const fileSize = await stat(resolved.filePath).then((s) => s.size).catch(() => 0);
     return {
       items: [],
-      nextCursor: encodeClaudeDirectForwardCursor({ v: 1, kind: 'claudeForward', fileRelPath: resolved.fileRelPath, offsetBytes: fileSize }),
+      nextCursor: await readClaudeDirectTailCursor({ ...resolved, maxBytes }),
       truncated: true,
+      truncationReason: 'source_discontinuity',
     };
   }
 
@@ -87,5 +86,6 @@ export async function readAfterClaudeTranscript(params: Readonly<{
     items,
     nextCursor: encodeClaudeDirectForwardCursor({ v: 1, kind: 'claudeForward', fileRelPath: resolved.fileRelPath, offsetBytes: read.nextOffsetBytes }),
     truncated: false,
+    ...(read.hitPageLimit ? { truncationReason: 'page_limit' as const } : {}),
   };
 }

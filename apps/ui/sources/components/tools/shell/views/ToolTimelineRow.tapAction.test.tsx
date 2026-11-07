@@ -12,15 +12,6 @@ const ensureSidechainMessagesLoadedMock = vi.fn(async () => 'loaded');
 const pushSpy = vi.fn();
 const navigateWithBlurOnWebSpy = vi.hoisted(() => vi.fn((action: () => void) => action()));
 
-function flattenStyle(style: unknown): Record<string, unknown> {
-    if (Array.isArray(style)) {
-        return Object.assign({}, ...style.map((entry) => flattenStyle(entry)));
-    }
-    if (style && typeof style === 'object') {
-        return style as Record<string, unknown>;
-    }
-    return {};
-}
 
 vi.mock('@/sync/sync', () => ({
     sync: {
@@ -543,8 +534,12 @@ describe('ToolTimelineRow (tap action)', () => {
             messageId: 'm1',
         });
 
-        const spinner = screen.findByTestId('tool-timeline-row-running');
-        const spinnerStyle = flattenStyle(spinner?.props?.style);
-        expect(spinner?.props?.color ?? spinnerStyle.borderColor).toBe('#555555');
+        // The row owns which color its spinner gets; how the spinner draws it depends on the
+        // user's loading indicator style, so assert the color handed to the spinner.
+        const spinnerColors = screen
+            .findAllByTestId('tool-timeline-row-running')
+            .map((node) => node.props?.color)
+            .filter((color) => color != null);
+        expect(spinnerColors).toContain('#555555');
     });
 });

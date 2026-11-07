@@ -14,9 +14,12 @@ import { logger } from '@/ui/logger';
 import { expandHomeDirPath } from '@happier-dev/cli-common/providers';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
 import { resolveCodexCliInvocation } from './utils/resolveCodexCliInvocation';
+import { appendCodexCliConfigOverridesArgs } from './utils/appendCodexCliConfigOverridesArgs';
 import { delay } from '@/utils/time';
 import { resolveConfiguredCodexHome } from './utils/resolveConfiguredCodexHome';
 import { configuration } from '@/configuration';
+import { findConnectedServiceChildSelection } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
+import { bootstrapCodexTuiHome } from './appServer/bootstrapCodexTuiHome';
 
 import { CodexRolloutMirror } from './localControl/codexRolloutMirror';
 import { discoverCodexRolloutFileOnce } from './localControl/rolloutDiscovery';
@@ -71,9 +74,13 @@ async function resolveCodexTuiInvocation(opts: {
   resumeId?: string | null;
   permissionMode: PermissionMode;
   codexArgs?: readonly string[];
+  configOverrides?: readonly string[];
 }): Promise<{ command: string; args: string[] }> {
   return await resolveCodexCliInvocation({
-    args: buildCodexTuiArgs(opts),
+    args: appendCodexCliConfigOverridesArgs(
+      { command: 'codex', args: buildCodexTuiArgs(opts) },
+      opts.configOverrides ?? [],
+    ).args,
     cwd: opts.cwd,
     processEnv: process.env,
     overrideEnvVarKeys: ['HAPPIER_CODEX_TUI_BIN', 'HAPPY_CODEX_TUI_BIN'],
@@ -164,6 +171,7 @@ export async function codexLocalLauncher<TMode>(opts: {
   permissionMode?: PermissionMode;
   resumeId?: string | null;
   codexArgs?: readonly string[];
+  configOverrides?: readonly string[];
   debugMirroring?: boolean;
   rolloutDiscovery?: Partial<CodexRolloutDiscoveryConfig>;
 }): Promise<CodexLauncherResult> {
@@ -380,6 +388,7 @@ export async function codexLocalLauncher<TMode>(opts: {
       resumeId: opts.resumeId,
       permissionMode: opts.permissionMode ?? 'default',
       codexArgs: opts.codexArgs ?? [],
+      configOverrides: opts.configOverrides,
     });
 
     const invocation = resolveWindowsCommandInvocation({
@@ -389,6 +398,19 @@ export async function codexLocalLauncher<TMode>(opts: {
     });
 
     const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
+    const childEnv = buildCodexTuiChildEnv();
+    if (findConnectedServiceChildSelection(childEnv, 'openai-codex')) {
+      // Unlike shared control, this native TUI owns a separate disk-auth
+      // process. Initialize its home before exposing cold SQLite/skill state.
+      await bootstrapCodexTuiHome({
+        cwd: opts.path,
+        processEnv: childEnv,
+        codexArgs: appendCodexCliConfigOverridesArgs(
+          { command: 'codex', args: [...(opts.codexArgs ?? [])] },
+          opts.configOverrides ?? [],
+        ).args,
+      });
+    }
     let bufferedStderr = '';
     const maxBufferedStderrChars = 16_000;
     if (!await opts.session.waitForProviderInputAdmission(new AbortController().signal)) {
@@ -396,7 +418,7 @@ export async function codexLocalLauncher<TMode>(opts: {
     }
     child = spawn(invocation.command, invocation.args, {
       cwd: opts.path,
-      env: buildCodexTuiChildEnv(),
+      env: childEnv,
       stdio: interactive ? 'inherit' : 'pipe',
       windowsHide: true,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,

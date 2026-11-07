@@ -42,7 +42,7 @@ describe('startDaemon provider-account usage startup composition', () => {
     });
     const startLoop = vi.fn(() => {
       order.push('start-loop');
-      return { stop: vi.fn(async () => {}), pause: vi.fn(), resume: vi.fn() };
+      return { stop: vi.fn(async () => {}), pause: vi.fn(), resume: vi.fn(), wake: vi.fn() };
     });
 
     const activation = activateConnectedServiceQuotaAutomationAfterProviderAccountUsageHydration({

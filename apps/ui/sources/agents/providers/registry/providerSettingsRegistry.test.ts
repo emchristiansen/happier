@@ -151,6 +151,10 @@ describe('getProviderSettingsPlugin', () => {
         }
     });
 
+    it('has a plugin entry for Agy', () => {
+        expect(getProviderSettingsPlugin('agy')).toMatchObject({ providerId: 'agy' });
+    });
+
     it('has a plugin entry for every registered backend', () => {
         for (const agentId of AGENT_IDS) {
             expect(getProviderSettingsPlugin(agentId)).not.toBeNull();
@@ -166,22 +170,23 @@ describe('getProviderSettingsPlugin', () => {
         expect(visibleFieldKeys.has('cursorApiEndpoint')).toBe(true);
     });
 
-    it('exposes Kimi ACP Python selector in provider settings UI sections', () => {
+    it('omits the Kimi ACP Python selector from provider settings UI sections', () => {
         const kimiPlugin = getProviderSettingsPlugin('kimi');
         const visibleFieldKeys = new Set(
             kimiPlugin?.uiSections.flatMap((section) => section.fields.map((field) => field.key)) ?? [],
         );
 
-        expect(PROVIDER_SETTINGS_DEFAULTS.kimiAcpPythonSelector).toBe('auto');
-        expect(visibleFieldKeys.has('kimiAcpPythonSelector')).toBe(true);
+        expect('kimiAcpPythonSelector' in PROVIDER_SETTINGS_DEFAULTS).toBe(false);
+        expect(visibleFieldKeys.has('kimiAcpPythonSelector')).toBe(false);
     });
 
-    it('exposes Claude unified terminal provider settings in UI sections', () => {
+    it('exposes Claude model discovery and unified terminal provider settings in UI sections', () => {
         const claudePlugin = getProviderSettingsPlugin('claude');
         const visibleFields = claudePlugin?.uiSections.flatMap((section) => section.fields) ?? [];
         const visibleFieldKeys = new Set(visibleFields.map((field) => field.key));
         const resumeChoiceField = visibleFields.find((field) => field.key === 'claudeUnifiedTerminalResumeChoice');
 
+        expect(visibleFieldKeys.has('claudeDynamicModelProbeEnabled')).toBe(true);
         expect(visibleFieldKeys.has('claudeUnifiedTerminalEnabled')).toBe(true);
         expect(visibleFieldKeys.has('claudeUnifiedTerminalHost')).toBe(true);
         expect(visibleFieldKeys.has('claudeUnifiedTerminalResumeChoice')).toBe(true);

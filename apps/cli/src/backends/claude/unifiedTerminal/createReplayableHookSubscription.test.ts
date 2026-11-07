@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { SessionHookData } from '../utils/startHookServer';
 import { createReplayableHookSubscription } from './createReplayableHookSubscription';
+import { createClaudeProviderActivityLedger, readClaudeSessionHookProviderTaskActivity } from '../providerActivity/createClaudeProviderActivityLedger';
 
 function createHarness(): Readonly<{
   emit: (data: SessionHookData) => void;
@@ -25,6 +26,25 @@ function createHarness(): Readonly<{
 }
 
 describe('createReplayableHookSubscription', () => {
+  it('delegates deferred startup SubagentStart admission to the workflow owner, but admits a fresh start', () => {
+    const { emit, subscription } = createHarness();
+    const start: SessionHookData = { hook_event_name: 'SubagentStart', session_id: 'sess', agent_id: 'native-a' };
+    emit(start);
+    const ledger = createClaudeProviderActivityLedger();
+    ledger.apply({ type: 'started', taskId: 'native-a', sessionId: 'sess', source: 'hook-agent-launch' });
+    ledger.apply({ type: 'terminal', taskId: 'native-a', sessionId: 'sess', terminalStatus: 'completed' });
+    subscription.subscribe?.((data, observation) => {
+      if (observation?.startupReplay && data.hook_event_name === 'SubagentStart') return;
+      const activity = readClaudeSessionHookProviderTaskActivity(data);
+      if (activity) ledger.apply(activity);
+    });
+    expect(ledger.getActiveProviderTaskCount()).toBe(0);
+    subscription.finishStartup();
+    expect(ledger.getActiveProviderTaskCount()).toBe(0);
+    emit(start);
+    expect(ledger.getActiveProviderTaskCount()).toBe(1);
+    subscription.dispose();
+  });
   it('replays an early SessionStart to the first late startup subscriber', () => {
     const { emit, subscription } = createHarness();
     const earlySessionStart: SessionHookData = {

@@ -12,20 +12,16 @@
  * - when disabled, invalid servers are skipped and surfaced as warnings.
  */
 
-import { tmpdir } from 'node:os';
-import { basename, join, resolve as resolvePath } from 'node:path';
-import { realpathSync } from 'node:fs';
-
 import type { McpServerConfig } from '@/agent';
 import { resolveNodeBackedMcpServerCommand } from '@/mcp/runtime/resolveNodeBackedMcpServerCommand';
-import { writeSecureMcpRuntimeConfigFile } from '@/mcp/runtime/writeSecureMcpRuntimeConfigFile';
+import { removeWrittenMcpRuntimeConfigFile, writeSecureMcpRuntimeConfigFile } from '@/mcp/runtime/writeSecureMcpRuntimeConfigFile';
 import {
   type McpServerCatalogEntryV1,
   type ResolveEffectiveServersV1Result,
   type SecretStringV1,
 } from '@happier-dev/protocol';
 
-import { normalizePackageRunnerInvocation } from './normalizePackageRunnerInvocation';
+import { isPackageRunnerCommand, normalizePackageRunnerInvocation } from './normalizePackageRunnerInvocation';
 import { resolveMcpValueRefPlaintext } from './resolveMcpValueRefPlaintext';
 
 export type MaterializeMcpServerConfigRecordWarning = Readonly<{
@@ -37,6 +33,7 @@ export type MaterializeMcpServerConfigRecordWarning = Readonly<{
 export type MaterializeMcpServerConfigRecordResult = Readonly<{
   mcpServers: Record<string, McpServerConfig>;
   warnings: ReadonlyArray<MaterializeMcpServerConfigRecordWarning>;
+  cleanup: () => void;
 }>;
 
 type Deps = Readonly<{
@@ -58,28 +55,6 @@ async function resolveDefaultStdioLauncherCommand(): Promise<Readonly<{ command:
   });
 }
 
-function isPackageRunnerCommand(command: string): boolean {
-  const normalized = basename(command).toLowerCase();
-  return new Set(['npx', 'npx.cmd', 'npm', 'npm.cmd', 'pnpm', 'pnpm.cmd', 'yarn', 'yarn.cmd', 'yarnpkg', 'yarnpkg.cmd', 'bunx', 'bunx.cmd'])
-    .has(normalized);
-}
-
-function resolveNeutralLaunchCwd(processEnv: NodeJS.ProcessEnv): string {
-  const home = typeof processEnv.HOME === 'string' && processEnv.HOME.length > 0 ? processEnv.HOME : null;
-  const userProfile =
-    typeof processEnv.USERPROFILE === 'string' && processEnv.USERPROFILE.length > 0 ? processEnv.USERPROFILE : null;
-  const homeDrive = typeof processEnv.HOMEDRIVE === 'string' ? processEnv.HOMEDRIVE : '';
-  const homePath = typeof processEnv.HOMEPATH === 'string' ? processEnv.HOMEPATH : '';
-
-  const raw = home ?? userProfile ?? (homeDrive && homePath ? `${homeDrive}${homePath}` : tmpdir());
-  const resolved = resolvePath(raw);
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
 async function materializeStdioServer(params: Readonly<{
   server: McpServerCatalogEntryV1;
   directory: string;
@@ -87,6 +62,7 @@ async function materializeStdioServer(params: Readonly<{
   processEnv: NodeJS.ProcessEnv;
   tmpDir: string | null;
   deps: Deps;
+  writtenPaths: string[];
 }>): Promise<
   | null
   | Readonly<{ ok: true; config: McpServerConfig }>
@@ -98,12 +74,13 @@ async function materializeStdioServer(params: Readonly<{
     const normalizedInvocation = await normalizePackageRunnerInvocation({
       command: params.server.stdio.command,
       args: params.server.stdio.args,
-      processEnv: params.processEnv,
+      processEnv: { ...params.processEnv, ...params.resolvedEnv },
+      cwd: params.directory,
     });
     if (!normalizedInvocation) {
       return {
         ok: false,
-        detail: 'managed pnpm unavailable for package-runner command',
+        detail: `Configured MCP command ${params.server.stdio.command} was not found or is not executable. Install it on this machine or update the server command and PATH.`,
       };
     }
     const launcherCommand = await (params.deps.resolveStdioLauncherCommand?.() ?? resolveDefaultStdioLauncherCommand());
@@ -114,9 +91,10 @@ async function materializeStdioServer(params: Readonly<{
         command: normalizedInvocation.command,
         args: normalizedInvocation.args,
         env: params.resolvedEnv,
-        cwd: normalizedInvocation.cwdPolicy === 'workspace' ? params.directory : resolveNeutralLaunchCwd(params.processEnv),
+        cwd: params.directory,
       },
     });
+    params.writtenPaths.push(configPath);
 
     return {
       ok: true,
@@ -148,6 +126,7 @@ async function materializeRemoteServer(params: Readonly<{
   resolvedHeaders: Record<string, string>;
   tmpDir: string | null;
   deps: Deps;
+  writtenPaths: string[];
 }>): Promise<McpServerConfig | null> {
   if (params.server.transport === 'stdio' || !params.server.remote) return null;
 
@@ -162,6 +141,7 @@ async function materializeRemoteServer(params: Readonly<{
       headers: params.resolvedHeaders,
     },
   });
+  params.writtenPaths.push(configPath);
 
   const env = {
     ...(bridgeCommand.env ?? {}),
@@ -192,126 +172,145 @@ export async function materializeMcpServerConfigRecord(params: Readonly<{
 
   const mcpServers: Record<string, McpServerConfig> = {};
   const warnings: MaterializeMcpServerConfigRecordWarning[] = [];
-
-  for (const [serverName, item] of Object.entries(params.resolved.serversByName)) {
-    if (item.enabled !== true) continue;
-    const server = item.config;
-
-    const resolvedEnv: Record<string, string> = {};
-    let missingDetail: string | null = null;
-
-    for (const [envKey, valueRef] of Object.entries(server.env)) {
-      const resolved = resolveMcpValueRefPlaintext({
-        valueRef,
-        savedSecretsById: params.savedSecretsById,
-        settingsSecretsKey: params.settingsSecretsKey,
-        settingsSecretsReadKeys: params.settingsSecretsReadKeys,
-        processEnv,
-      });
-      if (resolved === null) {
-        missingDetail = `env:${envKey}`;
-        break;
+  const writtenPaths: string[] = [];
+  const cleanup = () => {
+    let firstError: unknown = null;
+    for (const path of writtenPaths.splice(0)) {
+      try {
+        removeWrittenMcpRuntimeConfigFile(path, params.tmpDir === null);
+      } catch (error) {
+        firstError ??= error;
       }
-      resolvedEnv[envKey] = resolved;
     }
+    if (firstError) throw firstError;
+  };
 
-    if (missingDetail) {
-      const warning: MaterializeMcpServerConfigRecordWarning = {
-        serverName,
-        code: 'missing_value_ref',
-        detail: missingDetail,
-      };
-      if (strictMode) {
-        throw new Error(`Failed to materialize MCP server ${serverName}: missing ${missingDetail}`);
+  try {
+    for (const [serverName, item] of Object.entries(params.resolved.serversByName)) {
+      if (item.enabled !== true) continue;
+      const server = item.config;
+
+      const resolvedEnv: Record<string, string> = {};
+      let missingDetail: string | null = null;
+
+      for (const [envKey, valueRef] of Object.entries(server.env)) {
+        const resolved = resolveMcpValueRefPlaintext({
+          valueRef,
+          savedSecretsById: params.savedSecretsById,
+          settingsSecretsKey: params.settingsSecretsKey,
+          settingsSecretsReadKeys: params.settingsSecretsReadKeys,
+          processEnv,
+        });
+        if (resolved === null) {
+          missingDetail = `env:${envKey}`;
+          break;
+        }
+        resolvedEnv[envKey] = resolved;
       }
-      warnings.push(warning);
-      continue;
-    }
 
-    if (server.transport === 'stdio') {
-      const cfg = await materializeStdioServer({
-        server,
-        directory: params.resolved.directory,
-        resolvedEnv,
-        processEnv,
-        tmpDir: params.tmpDir,
-        deps,
-      });
-      if (!cfg || cfg.ok !== true) {
+      if (missingDetail) {
+        const warning: MaterializeMcpServerConfigRecordWarning = {
+          serverName,
+          code: 'missing_value_ref',
+          detail: missingDetail,
+        };
+        if (strictMode) {
+          throw new Error(`Failed to materialize MCP server ${serverName}: missing ${missingDetail}`);
+        }
+        warnings.push(warning);
+        continue;
+      }
+
+      if (server.transport === 'stdio') {
+        const cfg = await materializeStdioServer({
+          server,
+          directory: params.resolved.directory,
+          resolvedEnv,
+          processEnv,
+          tmpDir: params.tmpDir,
+          deps,
+          writtenPaths,
+        });
+        if (!cfg || cfg.ok !== true) {
+          const warning: MaterializeMcpServerConfigRecordWarning = {
+            serverName,
+            code: 'invalid_server',
+            detail: cfg?.detail ?? 'missing stdio config',
+          };
+          if (strictMode) throw new Error(`Failed to materialize MCP server ${serverName}: ${warning.detail}`);
+          warnings.push(warning);
+          continue;
+        }
+        mcpServers[serverName] = cfg.config;
+        continue;
+      }
+
+      if (!server.remote) {
         const warning: MaterializeMcpServerConfigRecordWarning = {
           serverName,
           code: 'invalid_server',
-          detail: cfg?.detail ?? 'missing stdio config',
+          detail: 'missing remote config',
         };
         if (strictMode) throw new Error(`Failed to materialize MCP server ${serverName}: ${warning.detail}`);
         warnings.push(warning);
         continue;
       }
-      mcpServers[serverName] = cfg.config;
-      continue;
-    }
 
-    if (!server.remote) {
-      const warning: MaterializeMcpServerConfigRecordWarning = {
-        serverName,
-        code: 'invalid_server',
-        detail: 'missing remote config',
-      };
-      if (strictMode) throw new Error(`Failed to materialize MCP server ${serverName}: ${warning.detail}`);
-      warnings.push(warning);
-      continue;
-    }
+      const resolvedHeaders: Record<string, string> = {};
+      for (const [headerKey, valueRef] of Object.entries(server.remote.headers)) {
+        const resolved = resolveMcpValueRefPlaintext({
+          valueRef,
+          savedSecretsById: params.savedSecretsById,
+          settingsSecretsKey: params.settingsSecretsKey,
+          settingsSecretsReadKeys: params.settingsSecretsReadKeys,
+          processEnv,
+        });
+        if (resolved === null) {
+          missingDetail = `header:${headerKey}`;
+          break;
+        }
+        resolvedHeaders[headerKey] = resolved;
+      }
 
-    const resolvedHeaders: Record<string, string> = {};
-    for (const [headerKey, valueRef] of Object.entries(server.remote.headers)) {
-      const resolved = resolveMcpValueRefPlaintext({
-        valueRef,
-        savedSecretsById: params.savedSecretsById,
-        settingsSecretsKey: params.settingsSecretsKey,
-        settingsSecretsReadKeys: params.settingsSecretsReadKeys,
-        processEnv,
+      if (missingDetail) {
+        const warning: MaterializeMcpServerConfigRecordWarning = {
+          serverName,
+          code: 'missing_value_ref',
+          detail: missingDetail,
+        };
+        if (strictMode) {
+          throw new Error(`Failed to materialize MCP server ${serverName}: missing ${missingDetail}`);
+        }
+        warnings.push(warning);
+        continue;
+      }
+
+      const remoteCfg = await materializeRemoteServer({
+        server,
+        resolvedEnv,
+        resolvedHeaders,
+        tmpDir: params.tmpDir,
+        deps,
+        writtenPaths,
       });
-      if (resolved === null) {
-        missingDetail = `header:${headerKey}`;
-        break;
+
+      if (!remoteCfg) {
+        const warning: MaterializeMcpServerConfigRecordWarning = {
+          serverName,
+          code: 'invalid_server',
+          detail: 'remote bridge unavailable',
+        };
+        if (strictMode) throw new Error(`Failed to materialize MCP server ${serverName}: ${warning.detail}`);
+        warnings.push(warning);
+        continue;
       }
-      resolvedHeaders[headerKey] = resolved;
+
+      mcpServers[serverName] = remoteCfg;
     }
 
-    if (missingDetail) {
-      const warning: MaterializeMcpServerConfigRecordWarning = {
-        serverName,
-        code: 'missing_value_ref',
-        detail: missingDetail,
-      };
-      if (strictMode) {
-        throw new Error(`Failed to materialize MCP server ${serverName}: missing ${missingDetail}`);
-      }
-      warnings.push(warning);
-      continue;
-    }
-
-    const remoteCfg = await materializeRemoteServer({
-      server,
-      resolvedEnv,
-      resolvedHeaders,
-      tmpDir: params.tmpDir,
-      deps,
-    });
-
-    if (!remoteCfg) {
-      const warning: MaterializeMcpServerConfigRecordWarning = {
-        serverName,
-        code: 'invalid_server',
-        detail: 'remote bridge unavailable',
-      };
-      if (strictMode) throw new Error(`Failed to materialize MCP server ${serverName}: ${warning.detail}`);
-      warnings.push(warning);
-      continue;
-    }
-
-    mcpServers[serverName] = remoteCfg;
+    return { mcpServers, warnings, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
   }
-
-  return { mcpServers, warnings };
 }

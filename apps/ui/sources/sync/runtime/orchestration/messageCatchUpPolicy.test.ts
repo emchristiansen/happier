@@ -44,6 +44,19 @@ describe('decideMessageCatchUpPolicy', () => {
         })).toEqual({ kind: 'do_nothing' });
     });
 
+    it.each([true, false])('honors known deferred backlog with an equal hint and pinned=%s', (isPinned) => {
+        expect(decideMessageCatchUpPolicy({
+            isForeground: true,
+            isSessionVisible: true,
+            isPinned,
+            materializedMaxSeq: 20,
+            sessionSeqHint: 20,
+            offlineForMs: 0,
+            hasDeferredNewer: true,
+            thresholds,
+        })).toEqual({ kind: isPinned ? 'tail_reset_latest_page' : 'defer_forward_loading' });
+    });
+
     it('forces one bounded tail probe when a loaded session becomes visible even if its cached hint did not advance', () => {
         expect(decideMessageCatchUpPolicy({
             isForeground: true,

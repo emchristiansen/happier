@@ -16,59 +16,15 @@ function findAncestor(instance: any, predicate: (node: any) => boolean) {
     return null;
 }
 
-installMessageViewCommonModuleMocks({
-    storage: async (importOriginal) => {
-        const { createStorageModuleMock } = await import('@/dev/testkit/mocks/storage');
-        return createStorageModuleMock({
-            importOriginal,
-            overrides: {
-                useSetting: (key: string) => key === 'transcriptMessageSelectionEnabled' ? true : null,
-                useSession: () => null,
-            },
-        });
-    },
-});
-
-vi.mock('@/components/markdown/MarkdownView', () => ({
-    MarkdownView: (props: any) => React.createElement('MarkdownView', props),
-}));
-
-vi.mock('@/components/tools/shell/views/ToolView', () => ({
-    ToolView: (props: any) => React.createElement('ToolView', props),
-}));
-
-vi.mock('@/components/tools/shell/views/ToolTimelineRow', () => ({
-    ToolTimelineRow: (props: any) => React.createElement('ToolTimelineRow', props),
-}));
-
-vi.mock('@/components/ui/text/Text', () => ({
-    Text: (props: any) => React.createElement('Text', props, props.children),
-    TextInput: (props: any) => React.createElement('TextInput', props, props.children),
-}));
-
-vi.mock('@/components/sessions/linkedFiles/extractWorkspaceFileMentions', () => ({
-    extractWorkspaceFileMentions: () => [],
-}));
-
-vi.mock('@/components/sessions/transcript/references/StructuredReferencesRow', () => ({
-    StructuredReferencesRow: () => null,
-}));
-
-vi.mock('@/utils/sessions/discardedCommittedMessages', () => ({
-    isCommittedMessageDiscarded: () => false,
-}));
+installMessageViewCommonModuleMocks({ storage: async (importOriginal) => importOriginal() });
 
 vi.mock('expo-clipboard', () => ({
-    setStringAsync: vi.fn(),
+    setStringAsync: vi.fn(async () => true),
 }));
 
 vi.mock('@expo/vector-icons', () => ({
     Ionicons: 'Ionicons',
     Octicons: 'Octicons',
-}));
-
-vi.mock('@/sync/sync', () => ({
-    sync: { submitMessage: vi.fn(), sendMessage: vi.fn() },
 }));
 
 describe('MessageView (copy button hitSlop, web)', () => {
@@ -77,6 +33,8 @@ describe('MessageView (copy button hitSlop, web)', () => {
     });
 
     it('keeps selectable message actions visible across rows while selection mode is active on web', async () => {
+        const { storage } = await import('@/sync/domains/state/storage');
+        storage.setState((state) => ({ settings: { ...state.settings, transcriptMessageSelectionEnabled: true } }));
         const { MessageView } = await import('./MessageView');
         const { TranscriptMessageSelectionProvider } = await import('./messageSelection/TranscriptMessageSelectionContext');
 
@@ -103,11 +61,11 @@ describe('MessageView (copy button hitSlop, web)', () => {
         const firstActions = screen.findByTestId('transcript-message-actions:m1');
         const firstHoverableRow = findAncestor(
             firstActions,
-            (node: any) => node.type === 'Pressable' && typeof node.props.onHoverIn === 'function',
+            (node: any) => node.type === 'View' && typeof node.props.onPointerEnter === 'function',
         );
         expect(firstHoverableRow).not.toBeNull();
         await act(async () => {
-            firstHoverableRow!.props.onHoverIn();
+            firstHoverableRow!.props.onPointerEnter();
         });
         await act(async () => {
             screen.findByTestId('transcript-message-select:m1')!.props.onPress();
@@ -125,6 +83,8 @@ describe('MessageView (copy button hitSlop, web)', () => {
     });
 
     it('does not use hitSlop on web (avoids overlapping hit targets for sibling actions)', async () => {
+        const { storage } = await import('@/sync/domains/state/storage');
+        storage.setState((state) => ({ settings: { ...state.settings, transcriptMessageSelectionEnabled: true } }));
         const { MessageView } = await import('./MessageView');
         const { TranscriptMessageSelectionProvider } = await import('./messageSelection/TranscriptMessageSelectionContext');
 

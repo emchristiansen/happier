@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { renderScreen } from '@/dev/testkit';
 import { lightTheme } from '@/theme';
+import { ConnectedServiceQuotaMeterRow } from './ConnectedServiceQuotaMeterRow';
 
 vi.mock('react-native', async () => {
     const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
@@ -29,7 +30,6 @@ vi.mock('@/text', async () => {
 
 describe('ConnectedServiceQuotaMeterRow', () => {
     it('renders remaining quota text and a remaining-filled bar state', async () => {
-        const { ConnectedServiceQuotaMeterRow } = await import('./ConnectedServiceQuotaMeterRow');
 
         const nowMs = 1_000_000;
         const screen = await renderScreen(
@@ -62,8 +62,18 @@ describe('ConnectedServiceQuotaMeterRow', () => {
         expect(style.backgroundColor).toBe(lightTheme.colors.state.warning.foreground);
     });
 
+    it('renders unavailable reported numbers without usage counts or critical capacity', async () => {
+        const screen = await renderScreen(<ConnectedServiceQuotaMeterRow meter={{
+            meterId: 'disabled', label: 'Disabled', used: 100, limit: 100, unit: 'count',
+            utilizationPct: 100, remainingPct: 0, resetsAt: null, status: 'unavailable', details: {},
+        }} nowMs={1_000_000} pinned onTogglePin={() => {}} />);
+        expect(screen.getTextContent()).toContain('—');
+        expect(screen.getTextContent()).not.toContain('100/100 used');
+        const bar = screen.findByTestId('connected-service-quota-meter-row:remaining-bar:fill');
+        expect(flattenStyle(bar?.props?.style).backgroundColor).toBe(lightTheme.colors.state.neutral.foreground);
+    });
+
     it('renders unknown remaining quota as an unavailable dash without a remaining suffix', async () => {
-        const { ConnectedServiceQuotaMeterRow } = await import('./ConnectedServiceQuotaMeterRow');
 
         const screen = await renderScreen(
             <ConnectedServiceQuotaMeterRow

@@ -4,11 +4,12 @@ import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 
 import { resolveChecksProfilePlan } from './lib/checks-profile.mjs';
+import { runCommandSuite } from '../../testing/lib/runCommandSuite.ts';
 import { resolveYarnInvocation } from '../tauri/resolve-yarn-invocation.mjs';
 
+/** @param {string} message @returns {never} */
 function fail(message) {
-  console.error(message);
-  process.exit(1);
+  throw new Error(message);
 }
 
 /**
@@ -73,7 +74,7 @@ function resolveAutoBool(value, name, autoValue) {
  * @param {{ dryRun: boolean }} opts
  * @param {string} cmd
  * @param {string[]} args
- * @param {{ env?: Record<string, string> }} [extra]
+ * @param {{ env?: NodeJS.ProcessEnv }} [extra]
  */
 function run(opts, cmd, args, extra) {
   const printable = `${cmd} ${args.map((a) => (a.includes(' ') ? JSON.stringify(a) : a)).join(' ')}`;
@@ -102,7 +103,7 @@ function run(opts, cmd, args, extra) {
 /**
  * @param {{ dryRun: boolean }} opts
  * @param {string[]} args
- * @param {{ env?: Record<string, string> }} [extra]
+ * @param {{ env?: NodeJS.ProcessEnv }} [extra]
  */
 function runReleaseValidate(opts, args, extra) {
   const commandArgs = ['scripts/pipeline/run.mjs', 'release-validate', ...args];
@@ -126,13 +127,13 @@ function runReleaseValidate(opts, args, extra) {
  * @param {{ dryRun: boolean }} opts
  * @param {{ cmd: string; prefixArgs: string[] }} yarnInvocation
  * @param {string[]} args
- * @param {{ env?: Record<string, string> }} [extra]
+ * @param {{ env?: NodeJS.ProcessEnv }} [extra]
  */
 function runYarn(opts, yarnInvocation, args, extra) {
   run(opts, yarnInvocation.cmd, [...yarnInvocation.prefixArgs, ...args], extra);
 }
 
-function main() {
+async function main() {
   const { values } = parseArgs({
     options: {
       profile: { type: 'string' },
@@ -148,14 +149,12 @@ function main() {
   const customChecks = String(values['custom-checks'] ?? '').trim();
 
   const plan = resolveChecksProfilePlan({
-    // @ts-expect-error runtime validation happens in resolveChecksProfilePlan
     profile,
     customChecks,
   });
 
   const dryRun = values['dry-run'] === true;
   const installDeps = resolveAutoBool(values['install-deps'], '--install-deps', process.env.GITHUB_ACTIONS === 'true');
-  const yarnInvocation = resolveYarnInvocation();
 
   console.log(`[pipeline] checks: profile=${profile}`);
   console.log('[pipeline] checks: plan');
@@ -168,6 +167,7 @@ function main() {
     return;
   }
 
+  const yarnInvocation = resolveYarnInvocation();
   if (installDeps) {
     if (commandExists('corepack')) {
       run({ dryRun }, 'corepack', ['enable']);
@@ -181,27 +181,28 @@ function main() {
     );
   }
 
-  // Baseline checks (mirrors release workflow intent).
-  runYarn({ dryRun }, yarnInvocation, ['test']);
-  runYarn({ dryRun }, yarnInvocation, ['test:integration']);
-  runYarn({ dryRun }, yarnInvocation, ['typecheck']);
+  /** @type {Array<{ id: string; args: string[]; execute: () => void }>} */
+  const commands = [];
+  /** @param {string} id @param {() => void} execute */
+  const check = (id, execute) => commands.push({ id, args: [], execute });
 
-  // UI E2E (Playwright) is now part of the default preflight plan for full/fast.
-  if (plan.runUiE2e) runYarn({ dryRun }, yarnInvocation, ['test:e2e:ui']);
+  if (plan.runUnit) check('unit', () => runYarn({ dryRun }, yarnInvocation, ['test']));
+  if (plan.runIntegration) check('integration', () => runYarn({ dryRun }, yarnInvocation, ['test:integration']));
+  if (plan.runTypecheck) check('typecheck', () => runYarn({ dryRun }, yarnInvocation, ['typecheck']));
+  if (plan.runUiE2e) check('ui_e2e', () => runYarn({ dryRun }, yarnInvocation, ['test:e2e:ui']));
+  if (plan.runReleaseContracts) {
+    check('release_contracts', () => runYarn({ dryRun }, yarnInvocation, ['-s', 'test:release:contracts'], { env: { HAPPIER_FEATURE_POLICY_ENV: '' } }));
+    check('release_sync_installers', () => run({ dryRun }, process.execPath, ['scripts/pipeline/run.mjs', 'release-sync-installers', '--check']));
+  }
+  if (plan.runE2eCore) check('e2e_core', () => runYarn({ dryRun }, yarnInvocation, ['test:e2e:core:fast']));
+  if (plan.runE2eCoreSlow) check('e2e_core_slow', () => runYarn({ dryRun }, yarnInvocation, ['test:e2e:core:slow']));
+  if (plan.runServerDbContract) check('server_db_contract', () => runYarn({ dryRun }, yarnInvocation, ['test:db-contract:docker']));
+  if (plan.runStress) check('stress', () => runYarn({ dryRun }, yarnInvocation, ['test:stress']));
+  if (plan.runBuildWebsite) check('build_website', () => runYarn({ dryRun }, yarnInvocation, ['website:build']));
+  if (plan.runBuildDocs) check('build_docs', () => runYarn({ dryRun }, yarnInvocation, ['docs:build']));
+  if (plan.runCliSmokeLinux) check('cli_smoke_linux', () => run({ dryRun }, process.execPath, ['scripts/pipeline/run.mjs', 'smoke-cli']));
 
-  // Release contracts are part of release checks.
-  runYarn({ dryRun }, yarnInvocation, ['-s', 'test:release:contracts'], { env: { HAPPIER_FEATURE_POLICY_ENV: '' } });
-  run({ dryRun }, process.execPath, ['scripts/pipeline/run.mjs', 'release-sync-installers', '--check']);
-
-  if (plan.runE2eCore) runYarn({ dryRun }, yarnInvocation, ['test:e2e:core:fast']);
-  if (plan.runE2eCoreSlow) runYarn({ dryRun }, yarnInvocation, ['test:e2e:core:slow']);
-  if (plan.runServerDbContract) runYarn({ dryRun }, yarnInvocation, ['test:db-contract:docker']);
-  if (plan.runStress) runYarn({ dryRun }, yarnInvocation, ['test:stress']);
-  if (plan.runBuildWebsite) runYarn({ dryRun }, yarnInvocation, ['website:build']);
-  if (plan.runBuildDocs) runYarn({ dryRun }, yarnInvocation, ['docs:build']);
-  if (plan.runCliSmokeLinux) run({ dryRun }, process.execPath, ['scripts/pipeline/run.mjs', 'smoke-cli']);
-
-  if (plan.runReleaseAssetsE2e) {
+  if (plan.runReleaseAssetsE2e) check('release_assets_e2e', () => {
     const modeRaw = String(process.env.HAPPIER_RELEASE_ASSETS_E2E_MODE ?? '').trim().toLowerCase();
     const mode = modeRaw === 'npm' || modeRaw === 'local' ? modeRaw : modeRaw ? null : 'local';
     if (!mode) {
@@ -241,9 +242,9 @@ function main() {
       ],
       {},
     );
-  }
+  });
 
-  if (plan.runSelfHostSystemd) {
+  if (plan.runSelfHostSystemd) check('self_host_systemd', () => {
     if (!dryRun) {
       if (process.platform !== 'linux') fail(`self_host_systemd is linux-only (current: ${process.platform})`);
       if (process.arch !== 'x64') fail(`self_host_systemd requires linux-x64 (current: ${process.platform}-${process.arch})`);
@@ -254,25 +255,25 @@ function main() {
       }
     }
     run({ dryRun }, process.execPath, ['--test', 'apps/stack/scripts/self_host_systemd.real.integration.test.mjs']);
-  }
+  });
 
-  if (plan.runSelfHostLaunchd) {
+  if (plan.runSelfHostLaunchd) check('self_host_launchd', () => {
     if (!dryRun) {
       if (process.platform !== 'darwin') fail(`self_host_launchd is macOS-only (current: ${process.platform})`);
       if (!commandExists('launchctl')) fail('self_host_launchd requires launchctl');
       if (!commandExists('bun')) fail('self_host_launchd requires bun (needed to build compiled binaries)');
     }
     run({ dryRun }, process.execPath, ['--test', 'apps/stack/scripts/self_host_launchd.real.integration.test.mjs']);
-  }
+  });
 
-  if (plan.runSelfHostSchtasks) {
+  if (plan.runSelfHostSchtasks) check('self_host_schtasks', () => {
     if (!dryRun) {
       if (process.platform !== 'win32') fail(`self_host_schtasks is Windows-only (current: ${process.platform})`);
     }
     run({ dryRun }, process.execPath, ['--test', 'apps/stack/scripts/self_host_schtasks.real.integration.test.mjs']);
-  }
+  });
 
-  if (plan.runSelfHostDaemon) {
+  if (plan.runSelfHostDaemon) check('self_host_daemon', () => {
     if (!dryRun) {
       if (process.platform !== 'linux' && process.platform !== 'darwin') {
         fail(`self_host_daemon supports linux and macOS only (current: ${process.platform})`);
@@ -286,7 +287,15 @@ function main() {
       }
     }
     run({ dryRun }, process.execPath, ['--test', 'apps/stack/scripts/self_host_daemon.real.integration.test.mjs']);
-  }
+  });
+  await runCommandSuite({
+    commands,
+    runCommand: async (command) => command.execute(),
+    suiteName: 'Local checks',
+  });
 }
 
-main();
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+});

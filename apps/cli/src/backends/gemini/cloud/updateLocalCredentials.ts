@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { resolveGeminiConfigPaths } from '../utils/resolveGeminiConfigPaths';
+import { warn } from '@happier-dev/cli-common/output';
 
 type GeminiOAuthTokens = Readonly<{
   access_token: string;
@@ -44,6 +45,6 @@ export function updateLocalGeminiCredentials(oauth: unknown): void {
     writeFileSync(credentialsPath, JSON.stringify(credentials, null, 2), 'utf-8');
     console.log(chalk.gray(`  Updated local credentials: ${credentialsPath}`));
   } catch (error) {
-    console.log(chalk.yellow(`  ⚠️ Could not update local credentials: ${error}`));
+    console.log(`  ${warn(`Could not update local credentials: ${error}`)}`);
   }
 }

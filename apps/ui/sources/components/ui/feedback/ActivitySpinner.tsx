@@ -8,9 +8,33 @@ import {
 } from 'react-native';
 import { useUnistyles } from 'react-native-unistyles';
 
+import { useIsHostVisible } from '@/hooks/ui/useIsHostVisible';
+import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreference';
+import {
+    normalizeLoadingIndicatorStyleId,
+    normalizeLoadingIndicatorTiming,
+    type LoadingIndicatorStyleId,
+} from '@/sync/domains/settings/registry/local/loadingIndicatorStyleSetting';
+import { useLocalSetting } from '@/sync/store/hooks';
+import { t } from '@/text';
+import { DotSpinnerNative } from './activitySpinner/DotSpinnerNative';
+import { DotSpinnerWeb } from './activitySpinner/DotSpinnerWeb';
+import type { DotSpinnerInk } from './activitySpinner/dotSpinnerFrames';
+import { DOT_SPINNER_STYLES } from './activitySpinner/dotSpinnerStyles';
+import { resolveSpinnerMotion } from './activitySpinner/dotSpinnerMotion';
+
 const DEFAULT_SMALL_SPINNER_SIZE = 20;
 const DEFAULT_LARGE_SPINNER_SIZE = 36;
 const DEFAULT_NUMERIC_SPINNER_SIZE = 20;
+
+/**
+ * The spinner that stands alone on an otherwise empty screen or pane: a session opening cold, the
+ * session list before its first load. Inline and status spinners keep `small`.
+ *
+ * 54 keeps the dot styles on whole pixels: a dot is a sixth of the size (9 px) on a pitch of a third
+ * (18 px), so the mark is the small one scaled up, not a softer redraw of it.
+ */
+export const HERO_SPINNER_SIZE = 54;
 const STEPPED_WEB_SPINNER_MAX_SIZE = DEFAULT_SMALL_SPINNER_SIZE;
 const STEPPED_WEB_SPINNER_TIMING_FUNCTION = 'steps(6, end)';
 const SPINNER_ANIMATION_NAME = 'happierActivitySpinnerSpin';
@@ -30,12 +54,17 @@ export type ActivitySpinnerProps = Omit<ActivityIndicatorProps, 'size'> & {
      * Keep the spinner visible but stop it turning.
      *
      * Used wherever ambient motion must pause without the mark disappearing: a mounted offscreen
-     * list row, an entry that has stopped reporting. Honoured on every platform — web drops the CSS
-     * animation, native stops the `ActivityIndicator` while overriding `hidesWhenStopped` so the
-     * ring stays on screen. A paused spinner still says "this is the running state"; a missing one
-     * says the work ended.
+     * list row, an entry that has stopped reporting. Honoured on every platform and style — dot
+     * styles hold the full chosen mark still (web drops the CSS animation, native stops its frame clock), and
+     * the classic ring stops turning while keeping a still mark on screen. A
+     * paused spinner still says "this is the running state"; a missing one says the work ended.
      */
     animationEnabled?: boolean;
+    /**
+     * Draw this style instead of the one chosen in Settings → Appearance. Only for surfaces that
+     * show the styles themselves, such as that picker's previews.
+     */
+    variant?: LoadingIndicatorStyleId;
 };
 
 function resolveSpinnerSize(size: ActivityIndicatorProps['size']): number {
@@ -70,20 +99,94 @@ export function iconMatchedSpinnerSize(iconSize: number): number {
     return Math.round(iconSize * ICON_CIRCLE_INK_RATIO);
 }
 
+/**
+ * Every loading spinner in the app. Draws the style chosen in Settings → Appearance: one of the dot
+ * styles (the Happier mark or H with light moving through it) or the classic ring, at the speed and pause
+ * between loops chosen there.
+ */
 export function ActivitySpinner(props: ActivitySpinnerProps) {
+    // Native hidden spinners retain their layout host; that placeholder must not announce work.
+    const normalizedProps = {
+        ...props,
+        accessibilityLabel: props.accessibilityLabel ?? t('common.loading'),
+        ...(Platform.OS !== 'web' && props.animating === false && props.hidesWhenStopped !== false ? {
+            accessible: false,
+            accessibilityElementsHidden: true,
+            importantForAccessibility: 'no-hide-descendants' as const,
+        } : null),
+    };
     const { theme } = useUnistyles();
-    const resolvedColor = props.color ?? theme.colors.text.secondary;
+    const storedStyle = useLocalSetting('loadingIndicatorStyle');
+    const storedSpeed = useLocalSetting('loadingIndicatorSpeed');
+    const storedPause = useLocalSetting('loadingIndicatorPause');
+    const reduceMotion = useReducedMotionPreference();
+    // A window nobody can see (a hidden tab, a backgrounded app) gets a still spinner: every
+    // animation loop declares its stop condition (`apps/ui/AGENTS.md`).
+    const hostVisible = useIsHostVisible();
+    const {
+        animating = true,
+        animationEnabled = true,
+        color,
+        hidesWhenStopped,
+        size,
+        variant,
+        ...viewProps
+    } = normalizedProps;
+    const styleId = variant ?? normalizeLoadingIndicatorStyleId(storedStyle);
+    // Previews (`variant`) play at the chosen speed and pause too, so they show the real spinner.
+    const { speed, pause } = normalizeLoadingIndicatorTiming(storedSpeed, storedPause);
+    const timing = React.useMemo(() => ({ speed, pause }), [pause, speed]);
+    const resolvedColor = color ?? theme.colors.text.secondary;
+    const inkColor = typeof resolvedColor === 'string' ? resolvedColor : theme.colors.text.secondary;
+    const { indigo, purple, orange } = theme.colors.accent;
+    // Aurora uses the theme accents, but only when the caller left the color to us: an explicit
+    // color usually means a tinted surface (a filled button) where accent colors would not read.
+    const useAurora = styleId !== 'classicRing' && DOT_SPINNER_STYLES[styleId].ink === 'aurora' && color == null;
+    const ink = React.useMemo<DotSpinnerInk>(
+        () => (useAurora ? { aurora: [indigo, purple, orange] } : { color: inkColor }),
+        [indigo, inkColor, orange, purple, useAurora],
+    );
+
+    if (styleId === 'classicRing') {
+        return <ClassicRingSpinner {...normalizedProps} color={resolvedColor} reduceMotion={reduceMotion} hostVisible={hostVisible} />;
+    }
+
+    const hidden = !animating && hidesWhenStopped !== false;
+    const motion = resolveSpinnerMotion({ paused: !animating || !animationEnabled || !hostVisible, reduceMotion });
+    const resolvedSize = resolveSpinnerSize(size ?? DEFAULT_NUMERIC_SPINNER_SIZE);
+    const accessibleViewProps = { ...viewProps, accessibilityRole: normalizedProps.accessibilityRole ?? 'progressbar' as const };
 
     if (Platform.OS !== 'web') {
-        const { animationEnabled: nativeAnimationEnabled = true, ...nativeProps } = props;
+        return (
+            <DotSpinnerNative
+                styleId={styleId}
+                timing={timing}
+                size={resolvedSize}
+                ink={ink}
+                motion={motion}
+                hidden={hidden}
+                viewProps={accessibleViewProps}
+            />
+        );
+    }
+    if (hidden) return null;
+    return <DotSpinnerWeb styleId={styleId} timing={timing} size={resolvedSize} ink={ink} motion={motion} viewProps={accessibleViewProps} />;
+}
+
+function ClassicRingSpinner(props: ActivitySpinnerProps & { reduceMotion: boolean; hostVisible: boolean }) {
+    // The platform ring stops with its window on its own, so only the web ring reads `hostVisible`.
+    const { reduceMotion, hostVisible, variant: _variant, ...spinnerProps } = props;
+    const resolvedColor = spinnerProps.color;
+
+    if (Platform.OS !== 'web' && Platform.OS !== 'android') {
+        const { animationEnabled: nativeAnimationEnabled = true, ...nativeProps } = spinnerProps;
+        const pauseForMotion = nativeProps.animating !== false && (!nativeAnimationEnabled || reduceMotion);
         return (
             <NativeActivityIndicator
                 {...nativeProps}
                 color={resolvedColor}
-                // Only when the caller asked for a pause. A caller that set `animating={false}`
-                // itself keeps the default `hidesWhenStopped`, because hiding a stopped spinner is
-                // a legitimate thing to want and is not this flag's business.
-                {...(nativeAnimationEnabled ? null : { animating: false, hidesWhenStopped: false })}
+                // Explicit stops retain the caller's hiding choice; motion pauses stay visible.
+                {...(pauseForMotion ? { animating: false, hidesWhenStopped: false } : null)}
             />
         );
     }
@@ -91,14 +194,14 @@ export function ActivitySpinner(props: ActivitySpinnerProps) {
     const {
         animating = true,
         animationEnabled = true,
-        color,
         hidesWhenStopped = true,
         size,
         style,
+        color: _color,
         ...viewProps
-    } = props;
+    } = spinnerProps;
 
-    if (!animating && hidesWhenStopped) {
+    if (Platform.OS === 'web' && !animating && hidesWhenStopped) {
         return null;
     }
 
@@ -109,9 +212,11 @@ export function ActivitySpinner(props: ActivitySpinnerProps) {
         alignSelf: 'center',
         borderRadius: resolvedSize / 2,
         borderWidth: resolveSpinnerBorderWidth(resolvedSize),
-        borderColor: typeof resolvedColor === 'string' ? resolvedColor : 'currentColor',
+        borderColor: Platform.OS === 'web'
+            ? (typeof resolvedColor === 'string' ? resolvedColor : 'currentColor')
+            : resolvedColor,
         borderTopColor: 'transparent',
-        ...(animationEnabled ? {
+        ...(Platform.OS === 'web' && animating && animationEnabled && !reduceMotion && hostVisible ? {
             animationDuration: '850ms',
             animationIterationCount: 'infinite',
             animationName: SPINNER_ANIMATION_NAME,
@@ -120,13 +225,41 @@ export function ActivitySpinner(props: ActivitySpinnerProps) {
                 : 'linear',
             willChange: 'transform',
         } : null),
-        opacity: animating ? 1 : 0,
+        opacity: 1,
     };
+
+    if (Platform.OS === 'android') {
+        const nativeAnimating = animating && animationEnabled && !reduceMotion;
+        const showStillRing = !nativeAnimating && (animating || !hidesWhenStopped);
+        // Android hides its stopped widget regardless of hidesWhenStopped. Keep both layers
+        // mounted so motion pauses preserve the native instance and its intrinsic layout box.
+        return (
+            <View
+                {...viewProps}
+                accessibilityRole={spinnerProps.accessibilityRole ?? 'progressbar'}
+                style={[{ alignItems: 'center', justifyContent: 'center' }, style]}
+            >
+                <NativeActivityIndicator
+                    animating={nativeAnimating}
+                    color={resolvedColor}
+                    size={size}
+                    accessible={false}
+                    importantForAccessibility="no-hide-descendants"
+                />
+                <View
+                    pointerEvents="none"
+                    accessible={false}
+                    importantForAccessibility="no-hide-descendants"
+                    style={[spinnerStyle, { position: 'absolute', opacity: showStillRing ? 1 : 0 }]}
+                />
+            </View>
+        );
+    }
 
     return (
         <View
             {...viewProps}
-            accessibilityRole={props.accessibilityRole ?? 'progressbar'}
+            accessibilityRole={spinnerProps.accessibilityRole ?? 'progressbar'}
             style={[spinnerStyle, style]}
         />
     );

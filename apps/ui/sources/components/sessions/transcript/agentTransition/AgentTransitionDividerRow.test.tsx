@@ -98,6 +98,18 @@ describe('Agent transition divider', () => {
         return t('session.agentContinuation.dividerTitle', { from, to });
     }
 
+    it('names two configured targets separately instead of collapsing both to custom ACP', async () => {
+        const screen = await renderScreen(
+            <TranscriptEventRow localId={DIVIDER_LOCAL_ID} event={dividerEvent({
+                v: 1, fromAgentId: 'customAcp', toAgentId: 'customAcp', sourceCutoffSeqInclusive: 12,
+                fromBackendTarget: { kind: 'configuredAcpBackend', backendId: 'backend-a' },
+                toBackendTarget: { kind: 'configuredAcpBackend', backendId: 'backend-b' },
+            })} />,
+        );
+        expect(titleRun(screen.findByTestId('transcript-agent-transition-divider-title')).filter((token) => !token.startsWith('mark:')).join(' '))
+            .toBe(sentence('backend-a', 'backend-b'));
+    });
+
     it('renders the boundary as a separator naming both Agents, not as an informational row', async () => {
         const screen = await renderScreen(
             <TranscriptEventRow localId={DIVIDER_LOCAL_ID} event={dividerEvent({ v: 1, fromAgentId: 'claude', toAgentId: 'codex', sourceCutoffSeqInclusive: 29_979 })} />,

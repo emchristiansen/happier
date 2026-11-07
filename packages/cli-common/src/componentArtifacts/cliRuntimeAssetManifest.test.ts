@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import cliDistBuildManifest from '../../cliDistBuildManifest.cjs';
 import {
   recordCliBinaryArtifactRuntimeAssetBuildManifest,
+  refreshCliBinaryArtifactClosureBuildManifest,
   refreshCliBinaryArtifactRuntimeAssetBuildManifest,
 } from './refreshCliBinaryArtifactRuntimeAssetBuildManifest.js';
 
@@ -184,5 +185,38 @@ describe('CLI runtime asset build manifest', () => {
       runtimeRoot: runtime.runtimeRoot,
       relativePath: runtime.relativePath,
     })).toMatchObject({ ok: true, reason: 'runtime_asset_manifest' });
+  });
+
+  it('refreshes the packaged closure after target pruning without dropping build provenance', async () => {
+    const runtime = await createRuntimeRoot({ executableName: 'happier' });
+    const prunedPath = join(runtime.runtimeRoot, 'package-dist', 'unused.cjs');
+    await writeFile(prunedPath, 'module.exports = true;\n');
+    const inputFingerprint = 'a'.repeat(64);
+    cliDistBuildManifest.writeCliDistBuildManifest(runtime.entrypoint, {
+      buildVersion: '0.2.13',
+      inputFingerprint,
+      builtAt: '2026-09-23T00:00:00.000Z',
+    });
+
+    await rm(prunedPath);
+    expect(cliDistBuildManifest.readCliDistBuildManifest(runtime.entrypoint))
+      .toMatchObject({ ok: false, reason: 'build_manifest_file_count_mismatch' });
+
+    refreshCliBinaryArtifactClosureBuildManifest({ payloadDir: runtime.runtimeRoot });
+    recordCliBinaryArtifactRuntimeAssetBuildManifest({
+      payloadDir: runtime.runtimeRoot,
+      relativePath: runtime.relativePath,
+    });
+
+    expect(cliDistBuildManifest.readCliDistBuildManifest(runtime.entrypoint))
+      .toMatchObject({
+        ok: true,
+        manifest: {
+          buildVersion: '0.2.13',
+          inputFingerprint,
+          builtAt: '2026-09-23T00:00:00.000Z',
+          runtimeAsset: { relativePath: runtime.relativePath },
+        },
+      });
   });
 });

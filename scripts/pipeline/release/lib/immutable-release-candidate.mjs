@@ -4,6 +4,7 @@ import { appendFile, lstat, readFile, readdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
+import { CLI_OPTIONAL_COMPONENT_PRODUCTS } from '../publishing/product-specs.mjs';
 
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
 
@@ -94,8 +95,14 @@ export async function inspectImmutableReleaseCandidate(params) {
   if (!names.includes(checksumsName) || !names.includes(signatureName)) {
     fail(`immutable ${tagSpec.product} ${version} candidate is missing ${checksumsName} or its Minisign signature.`);
   }
+  const admittedComponentEnvelopes = new Set(tagSpec.product === 'cli'
+    ? CLI_OPTIONAL_COMPONENT_PRODUCTS.flatMap((product) => [
+        `checksums-${product}-v${version}.txt`,
+        `checksums-${product}-v${version}.txt.minisig`,
+      ])
+    : []);
   const competingChecksums = names.filter((name) => /^checksums-.+\.txt(?:\.minisig)?$/u.test(name)
-    && name !== checksumsName && name !== signatureName);
+    && name !== checksumsName && name !== signatureName && !admittedComponentEnvelopes.has(name));
   if (competingChecksums.length > 0) {
     fail(`immutable candidate contains competing checksum envelopes: ${competingChecksums.join(', ')}`);
   }

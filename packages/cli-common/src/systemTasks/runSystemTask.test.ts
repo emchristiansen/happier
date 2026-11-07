@@ -8,6 +8,33 @@ import {
 } from './index.js';
 
 describe('executeSystemTask', () => {
+  it('publishes callback progress while a handler is still awaiting work', async () => {
+    const events: unknown[] = [];
+    let finish: (() => void) | undefined;
+    const pending = new Promise<void>((resolve) => { finish = resolve; });
+    const run = executeSystemTask({
+      spec: { protocolVersion: SYSTEM_TASK_PROTOCOL_VERSION, kind: 'system.acquisition.v1', params: {} },
+      taskId: 'acquisition',
+      registry: createSystemTaskRegistry([{
+        kind: 'system.acquisition.v1',
+        handler: async function* (_params, context) {
+          if ('emit' in context && typeof context.emit === 'function') {
+            context.emit({ type: 'progress', stepId: 'downloading', data: { receivedBytes: 12 } });
+          }
+          await pending;
+          return { ready: true };
+        },
+      }]),
+      emitEvent: (event) => events.push(event),
+    });
+    try {
+      expect(events).toEqual([expect.objectContaining({ stepId: 'downloading', data: { receivedBytes: 12 } })]);
+    } finally {
+      finish?.();
+      await run;
+    }
+  });
+
   it('rejects specs with the wrong protocol version', async () => {
     const events: unknown[] = [];
 

@@ -2,12 +2,12 @@ import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react-test-renderer';
 import type { PermissionMode, ModelMode } from '@/sync/domains/permissions/permissionTypes';
-import type { Settings } from '@/sync/domains/settings/settings';
+import { settingsDefaults, type Settings } from '@/sync/domains/settings/settings';
 import { localSettingsDefaults } from '@/sync/domains/settings/localSettings';
 import { purchasesDefaults } from '@/sync/domains/purchases/purchases';
 import { profileDefaults } from '@/sync/domains/profiles/profile';
 import type { UseMachineEnvPresenceResult } from '@/hooks/machine/useMachineEnvPresence';
-import { renderScreen } from '@/dev/testkit';
+import { createMachineFixture, createSessionFixture, renderScreen } from '@/dev/testkit';
 import { installNewSessionScreenModelCommonModuleMocks } from './newSessionScreenModelTestHelpers';
 import { createNewSessionPromptStore } from '@/components/sessions/new/hooks/screenModel/newSessionPromptStore';
 
@@ -15,28 +15,32 @@ import { createNewSessionPromptStore } from '@/components/sessions/new/hooks/scr
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 type StorageState = {
-  settings: Record<string, unknown>;
-  machines: Record<string, { id: string }>;
+  settings: Settings;
+  machines: Record<string, ReturnType<typeof createMachineFixture>>;
+  sessions: Record<string, ReturnType<typeof createSessionFixture>>;
   updateSessionPermissionMode: ReturnType<typeof vi.fn>;
   updateSessionModelMode: ReturnType<typeof vi.fn>;
   updateSessionDraft: ReturnType<typeof vi.fn>;
+  markSessionOptimisticThinking: ReturnType<typeof vi.fn>;
+  upsertPendingMessage: ReturnType<typeof vi.fn>;
 } & Record<string, unknown>;
 
 let storageState: StorageState = {
-  settings: {},
-  machines: { m1: { id: 'm1' } },
+  settings: settingsDefaults,
+  machines: { m1: createMachineFixture({ id: 'm1' }) },
+  sessions: {},
   updateSessionPermissionMode: vi.fn(),
   updateSessionModelMode: vi.fn(),
   updateSessionDraft: vi.fn(),
+  markSessionOptimisticThinking: vi.fn(),
+  upsertPendingMessage: vi.fn(),
 };
 
 installNewSessionScreenModelCommonModuleMocks({
   storage: async () => {
-    const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
+    const { createStorageModuleStub, createStorageStoreStub } = await import('@/dev/testkit/mocks/storage');
     return createStorageModuleStub({
-      storage: {
-        getState: () => storageState,
-      },
+      storage: createStorageStoreStub(() => storageState),
     });
   },
 });
@@ -66,11 +70,14 @@ async function setupHarness(options?: Readonly<{
     await sendMessageSpy(params.sessionId, params.initialMessageText);
   });
   storageState = {
-    settings: {},
-    machines: { m1: { id: 'm1' } },
+    settings: settingsDefaults,
+    machines: { m1: createMachineFixture({ id: 'm1' }) },
+    sessions: {},
     updateSessionPermissionMode: vi.fn(),
     updateSessionModelMode: vi.fn(),
     updateSessionDraft: vi.fn(),
+    markSessionOptimisticThinking: vi.fn(),
+    upsertPendingMessage: vi.fn(),
     ...(options?.storageState ?? {}),
   };
   vi.doMock('@/sync/sync', () => ({
@@ -80,6 +87,9 @@ async function setupHarness(options?: Readonly<{
       decryptSecretValue: vi.fn(),
       refreshAutomations: vi.fn(async () => {}),
       refreshSessions: vi.fn(async () => {}),
+      ensureSessionVisibleForMessageRoute: vi.fn(async (sessionId: string) => {
+        storageState.sessions[sessionId] = createSessionFixture({ id: sessionId });
+      }),
       refreshMachines: vi.fn(async () => {}),
       sendMessage: sendMessageSpy,
       acquireUserRequestLease: () => () => {},
@@ -89,11 +99,6 @@ async function setupHarness(options?: Readonly<{
   }));
   vi.doMock('@/sync/store/settingsWriters', () => ({
     useApplySettings: () => vi.fn(),
-  }));
-  vi.doMock('@/sync/domains/state/storage', () => ({
-    storage: {
-      getState: () => storageState,
-    },
   }));
   vi.doMock('@/sync/domains/state/persistence', async (importOriginal) =>
     (await import('@/dev/testkit/mocks/persistence')).createPersistenceModuleMock({
@@ -191,7 +196,8 @@ async function setupHarness(options?: Readonly<{
     completeMachineSpawnAttemptCustody: vi.fn(async () => true),
     resetMachineSpawnAttemptCustody: vi.fn(async () => true),
   }));
-  vi.doMock('@/sync/runtime/orchestration/serverScopedRpc/followUpSpawnedSession', () => ({
+  vi.doMock('@/sync/runtime/orchestration/serverScopedRpc/followUpSpawnedSession', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/sync/runtime/orchestration/serverScopedRpc/followUpSpawnedSession')>()),
     followUpSpawnedSessionWithServerScope: followUpSpawnedSessionWithServerScopeSpy,
   }));
   vi.doMock('@/utils/sessions/tempDataStore', () => ({

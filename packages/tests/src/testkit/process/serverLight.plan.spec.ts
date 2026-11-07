@@ -1,9 +1,10 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   hasServerSharedDepsOutputs,
   hasServerGeneratedProviderOutputs,
@@ -20,6 +21,32 @@ import {
   type TestDbProvider,
 } from "./serverLight";
 import { resolveServerAppWorkspaceName } from "./serverWorkspaceName";
+
+
+const lockBoundary = vi.hoisted(() => ({ onCreate: null as null | ((path: string) => void), calls: 0 }));
+vi.mock('node:fs', async (original) => {
+  const actual = await original<typeof import('node:fs')>();
+  // Node overloads are interposed only at this genuine filesystem boundary.
+  return { ...actual,
+    openSync: (...args: Parameters<typeof actual.openSync>) => {
+      const fd = actual.openSync(...args);
+      if (args[1] === 'wx') lockBoundary.onCreate?.(String(args[0]));
+      return fd;
+    },
+    linkSync: (...args: Parameters<typeof actual.linkSync>) => {
+      actual.linkSync(...args); lockBoundary.onCreate?.(String(args[1]));
+    },
+    readFileSync: (...args: Parameters<typeof actual.readFileSync>) => {
+      if (/^\/proc\/\d+\/stat$/.test(String(args[0]))) return `1 (fixture) S ${Array(18).fill('0').join(' ')} 100`;
+      return actual.readFileSync(...args);
+    },
+  };
+});
+vi.mock('node:child_process', async (original) => {
+  const actual = await original<typeof import('node:child_process')>();
+  const refuse = () => { lockBoundary.calls++; throw new Error('child process forbidden'); };
+  return { ...actual, spawn: refuse, spawnSync: refuse, exec: refuse, execSync: refuse, execFile: refuse, execFileSync: refuse, fork: refuse };
+});
 
 const normalizeForPathAssertions = (value: string): string => value.replace(/\\/g, "/");
 
@@ -317,5 +344,74 @@ describe("startServerLight planning helpers", () => {
     const tsconfigPath = launch.env?.TSX_TSCONFIG_PATH;
     expect(tsconfigPath).toBeDefined();
     expect(normalizeForPathAssertions(tsconfigPath ?? "")).toContain("/apps/server/tsconfig.json");
+  });
+});
+
+describe('J079 server lock ownership', () => {
+  let root: string;
+  let restoreNativeBoundaries: (() => void) | undefined;
+  beforeEach(async () => {
+    // Also bind actual builtin exports: linked .mjs dependencies may be externalized by Vite.
+    const require = createRequire(import.meta.url);
+    const nativeFs: typeof import('node:fs') = require('node:fs');
+    const nativeCp: typeof import('node:child_process') = require('node:child_process');
+    const savedRead = nativeFs.readFileSync;
+    const savedSpawn = nativeCp.spawnSync;
+    nativeFs.readFileSync = ((...args: Parameters<typeof savedRead>) => {
+      if (/^\/proc\/\d+\/stat$/.test(String(args[0]))) return `1 (fixture) S ${Array(18).fill('0').join(' ')} 100`;
+      return savedRead(...args);
+    }) as typeof savedRead; // Genuine overloaded builtin boundary.
+    nativeCp.spawnSync = (() => { throw new Error('J079 external probe forbidden'); }) as typeof savedSpawn;
+    syncBuiltinESMExports();
+    expect(require('node:fs').readFileSync).toBe(nativeFs.readFileSync);
+    expect(require('node:child_process').spawnSync).toBe(nativeCp.spawnSync);
+    restoreNativeBoundaries = () => { nativeFs.readFileSync = savedRead; nativeCp.spawnSync = savedSpawn; syncBuiltinESMExports(); };
+
+    root = mkdtempSync(join(tmpdir(), 'j079-server-'));
+    const fs = await import('node:fs');
+    const cp = await import('node:child_process');
+    expect(fs.openSync.toString()).toContain('lockBoundary');
+    expect(cp.spawnSync.toString()).toContain('forbidden');
+    vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      expect(signal).toBe(0);
+      if (pid === process.pid) return true;
+      throw Object.assign(new Error('fixture absent'), { code: 'ESRCH' });
+    });
+    vi.stubGlobal('fetch', () => { lockBoundary.calls++; throw new Error('fetch forbidden'); });
+  });
+  afterEach(() => {
+    lockBoundary.onCreate = null;
+    expect(lockBoundary.calls).toBe(0);
+    restoreNativeBoundaries?.();
+    vi.restoreAllMocks(); vi.unstubAllGlobals(); rmSync(root, { recursive: true, force: true });
+  });
+  it('preserves an empty legacy record and refuses callback', async () => {
+    const lockPath = join(root, 'lock'); writeFileSync(lockPath, '');
+    await expect(withServerSharedDepsBuildLock(async () => { throw new Error('empty entered'); }, {
+      lockPath, timeoutMs: 15, pollIntervalMs: 1,
+    })).rejects.toThrow(/Timed out/);
+    expect(readFileSync(lockPath, 'utf8')).toBe('');
+  });
+  it('recovers a positively absent recorded owner', async () => {
+    const lockPath = join(root, 'lock'); writeFileSync(lockPath, JSON.stringify({ pid: 999999999, token: 'fixture-dead', createdAtMs: 1 }));
+    await expect(withServerSharedDepsBuildLock(async () => 'owned', { lockPath, timeoutMs: 100, pollIntervalMs: 1 })).resolves.toBe('owned');
+    expect(existsSync(lockPath)).toBe(false);
+  });
+  it('preserves a replacement record on release', async () => {
+    const lockPath = join(root, 'lock'); const replacement = JSON.stringify({ pid: process.pid, token: 'new-owner', createdAtMs: Date.now() });
+    await withServerSharedDepsBuildLock(async () => { unlinkSync(lockPath); writeFileSync(lockPath, replacement); }, { lockPath });
+    expect(readFileSync(lockPath, 'utf8')).toBe(replacement);
+  });
+  it('serializes a contender at canonical publication', async () => {
+    const lockPath = join(root, 'lock'); const events: string[] = []; let second: Promise<void> | undefined;
+    lockBoundary.onCreate = (path) => {
+      if (path !== lockPath || second) return;
+      lockBoundary.onCreate = null;
+      second = withServerSharedDepsBuildLock(async () => { events.push('second'); }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
+    };
+    try {
+      await withServerSharedDepsBuildLock(async () => { events.push('first'); }, { lockPath, timeoutMs: 500, pollIntervalMs: 1 });
+      await second; expect(events).toEqual(['first', 'second']);
+    } finally { lockBoundary.onCreate = null; await second; }
   });
 });

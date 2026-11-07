@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 let spawnStdoutText = '';
+let spawnedChild: (EventEmitter & { exitCode: number | null; signalCode: NodeJS.Signals | null }) | null = null;
 
 vi.mock('./spawnProcess', () => ({
     spawnLoggedProcess: (params: { stdoutPath: string; stderrPath: string }) => {
@@ -19,6 +20,7 @@ vi.mock('./spawnProcess', () => ({
         };
         child.exitCode = null;
         child.signalCode = null;
+        spawnedChild = child;
         return {
             child,
             stdoutPath: params.stdoutPath,
@@ -43,6 +45,7 @@ afterEach(() => {
 });
 
 beforeEach(() => {
+    spawnedChild = null;
     spawnStdoutText = 'http://127.0.0.1:19077\n';
     vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
         const url = String(input);
@@ -77,6 +80,34 @@ function readProcessStartTime(pid: number): string {
 }
 
 describe('startUiWebMetro', () => {
+    it.each(['status', 'script'])('reports Expo death during %s readiness instead of a readiness timeout', async (phase) => {
+        const testDir = await mkdtemp(join(tmpdir(), 'happier-ui-web-metro-exit-'));
+        const readyFetch = globalThis.fetch;
+        vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+            const url = String(input);
+            if (url.endsWith(phase === 'status' ? '/status' : '/index.js')) {
+                if (!spawnedChild) throw new Error('Expo child was not started');
+                spawnedChild.signalCode = 'SIGABRT';
+                spawnedChild.emit('exit', null, 'SIGABRT');
+                throw new TypeError('fetch failed');
+            }
+            return readyFetch(input as string);
+        }));
+
+        try {
+            await expect(startUiWebMetro({
+                testDir,
+                env: {
+                    HAPPIER_E2E_UI_WEB_METRO_STATUS_TIMEOUT_MS: '100',
+                    HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS: '100',
+                },
+                port: 19077,
+            })).rejects.toThrow(/exited before ready \(signal=SIGABRT\)/);
+        } finally {
+            await rm(testDir, { recursive: true, force: true });
+        }
+    });
+
     it('fails setup when the Expo entry page never publishes an application script', async () => {
         const testDir = await mkdtemp(join(tmpdir(), 'happier-ui-web-metro-missing-script-'));
 

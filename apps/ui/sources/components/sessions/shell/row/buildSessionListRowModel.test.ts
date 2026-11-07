@@ -1,6 +1,9 @@
+import { buildSessionListRenderableMetadata } from '@/sync/domains/session/listing/sessionListRenderable';
 import { describe, expect, it } from 'vitest';
+import { t } from '@/text';
 
 import type { Message } from '@/sync/domains/messages/messageTypes';
+import { buildTranscriptRenderableAggregate } from '@/sync/domains/messages/transcriptRenderableAggregate';
 import type { SessionListViewItem } from '@/sync/domains/session/listing/sessionListViewData';
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
 import {
@@ -167,6 +170,55 @@ function createSettings(
 }
 
 describe('buildSessionListRowModel', () => {
+    it('uses the maintained unread watermark in a row without a store renderable', () => {
+        let historicalVisits = 0;
+        const message: Message = {
+            ...createMessage('historical', NOW_MS - 1_000, 10),
+            get transcriptObservationProvenance() {
+                historicalVisits += 1;
+                return undefined;
+            },
+        };
+        const messages = createMessages([message]);
+        messages.renderableAggregate = buildTranscriptRenderableAggregate({ messages: [message], completedRequests: null });
+        historicalVisits = 0;
+
+        const model = buildSessionListRowModel({
+            item: createSessionItem(createRenderable('s_aggregate', { lastViewedSessionSeq: 10 })),
+            state: { messages },
+            isFirst: true,
+            isLast: true,
+            isSingle: true,
+            settings: createSettings(),
+        });
+
+        expect(model.hasUnreadMessages).toBe(false);
+        expect(historicalVisits).toBe(0);
+    });
+
+    it('keeps the useful subtitle and exposes a canonical scheduled reminder presentation', () => {
+        const model = buildSessionListRowModel({
+            item: createSessionItem(createRenderable('reminded-session')),
+            state: {},
+            isFirst: true,
+            isLast: true,
+            isSingle: true,
+            settings: createSettings({
+                attentionStandingEnabled: true,
+                attentionStandingPolicy: {
+                    defaultStanding: false,
+                    overridesBySessionKey: {
+                        'server-a:reminded-session': { standing: true, remindAt: NOW_MS + 60_000, updatedAt: 1 },
+                    },
+                },
+            }),
+        });
+
+        expect(model.subtitle).toBe('~/reminded-session');
+        expect(model.reminder).toEqual({ state: 'scheduled', remindAt: NOW_MS + 60_000 });
+        expect(model.nextRuntimeFreshnessAtMs).toBe(NOW_MS + 60_000);
+    });
+
     it('carries the canonical safe existing-session draft projection without changing row placement', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(createRenderable('drafted-session')),
@@ -175,7 +227,6 @@ describe('buildSessionListRowModel', () => {
                     preview: 'Fix the flaky release test',
                 },
             },
-            dataIndex: 4,
             isFirst: false,
             isLast: true,
             isSingle: false,
@@ -183,7 +234,6 @@ describe('buildSessionListRowModel', () => {
         });
 
         expect(model.draft).toEqual({ preview: 'Fix the flaky release test' });
-        expect(model.dataIndex).toBe(4);
         expect(model.groupKey).toBe('group-a');
         expect(model.adjacency).toEqual({ isFirst: false, isLast: true, isSingle: false });
     });
@@ -193,7 +243,6 @@ describe('buildSessionListRowModel', () => {
         const modelA = buildSessionListRowModel({
             item: createSessionItem(session, { serverId: 'server-a' }),
             state: {},
-            dataIndex: 2,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -202,7 +251,6 @@ describe('buildSessionListRowModel', () => {
         const modelB = buildSessionListRowModel({
             item: createSessionItem(session, { serverId: 'server-b' }),
             state: {},
-            dataIndex: 3,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -216,7 +264,7 @@ describe('buildSessionListRowModel', () => {
         expect(modelA.testID).toBe('session-list-item-shared-id');
     });
 
-    it('merges the store renderable overlay while preserving row-only pending flags and newer activity', () => {
+    it('merges the store renderable overlay while honoring cleared pending flags and preserving newer activity', () => {
         const rowSession = createRenderable('s1', {
             metadata: {
                 name: 'Row Name',
@@ -245,7 +293,6 @@ describe('buildSessionListRowModel', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(rowSession),
             state: { renderable: storeRenderable },
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -253,8 +300,70 @@ describe('buildSessionListRowModel', () => {
         });
 
         expect(model.session.metadata?.name).toBe('Store Name');
-        expect((model.session as SessionListRenderableSession).hasPendingPermissionRequests).toBe(true);
+        expect((model.session as SessionListRenderableSession).hasPendingPermissionRequests).toBe(false);
         expect((model.session as SessionListRenderableSession).meaningfulActivityAt).toBe(900);
+    });
+
+    it.each(['foreground', 'background'] as const)('clears stale row attention when the store clears requests while %s work continues', (workKind) => {
+        const rowSession = createRenderable('s1', {
+            active: true,
+            activeAt: NOW_MS - 10,
+            latestTurnStatus: workKind === 'foreground' ? 'in_progress' : 'completed',
+            latestTurnStatusObservedAt: NOW_MS - 10,
+            runtimeActivityState: 'active',
+            runtimeActivityActiveCount: 1,
+            runtimeActivityObservedAt: NOW_MS - 10,
+            runtimeActivityRevision: 1,
+            hasPendingPermissionRequests: true,
+            hasPendingUserActionRequests: true,
+            pendingRequestObservedAt: NOW_MS - 10,
+            // Read: isolate request clearing from the independent unread signal.
+            lastViewedSessionSeq: 10,
+        });
+        const item = createSessionItem(rowSession);
+        const build = (renderable: SessionListRenderableSession) => buildSessionListRowModel({
+            item,
+            state: { renderable },
+            isFirst: true,
+            isLast: true,
+            isSingle: true,
+            settings: createSettings(),
+        });
+
+        expect(build(rowSession).attention.listState).toBe('action_required');
+
+        const cleared = build({
+            ...rowSession,
+            agentStateVersion: rowSession.agentStateVersion + 1,
+            hasPendingPermissionRequests: false,
+            hasPendingUserActionRequests: false,
+            pendingRequestObservedAt: null,
+        });
+
+        expect(cleared.session).toMatchObject({
+            hasPendingPermissionRequests: false,
+            hasPendingUserActionRequests: false,
+        });
+        expect(cleared.attention.listState).not.toBe('action_required');
+        expect(cleared.status.state).toBe(workKind === 'foreground' ? 'thinking' : 'background_active');
+        expect(cleared.presentation.attentionIndicator).toBe('working');
+    });
+
+    it('preserves row pending flags when the store overlay has no pending projection', () => {
+        const model = buildSessionListRowModel({
+            item: createSessionItem(createRenderable('s1', {
+                hasPendingPermissionRequests: true,
+                hasPendingUserActionRequests: true,
+            })),
+            state: { renderable: createRenderable('s1') },
+            isFirst: true,
+            isLast: true,
+            isSingle: true,
+            settings: createSettings(),
+        });
+
+        expect((model.session as SessionListRenderableSession).hasPendingPermissionRequests).toBe(true);
+        expect((model.session as SessionListRenderableSession).hasPendingUserActionRequests).toBe(true);
     });
 
     it('preserves row-only blocked pending state when merging the store renderable overlay', () => {
@@ -269,7 +378,6 @@ describe('buildSessionListRowModel', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(rowSession),
             state: { renderable: storeRenderable },
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -294,7 +402,6 @@ describe('buildSessionListRowModel', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(rowSession),
             state: { renderable: storeRenderable },
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -318,7 +425,6 @@ describe('buildSessionListRowModel', () => {
                 messages: createMessages([createMessage('m1', NOW_MS - 120_000)]),
                 pending: createPending([NOW_MS - 60_000]),
             },
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -339,7 +445,6 @@ describe('buildSessionListRowModel', () => {
                 latestTurnStatusObservedAt: NOW_MS - 10,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -352,6 +457,25 @@ describe('buildSessionListRowModel', () => {
         expect(model.status.state).toBe('thinking');
     });
 
+    it('preserves shared archive progress when live runtime fields overlay the list row', () => {
+        const rowSession = createRenderable('s1', { active: true, activeAt: NOW_MS - 10 });
+        const model = buildSessionListRowModel({
+            item: createSessionItem({ ...rowSession, archiving: true }, { groupKind: 'date', workingPlacementReason: 'working-retained' }),
+            state: { renderable: rowSession },
+            isFirst: true,
+            isLast: true,
+            isSingle: true,
+            settings: createSettings({ runtimeNowMs: NOW_MS }),
+        });
+
+        expect(model.status.state).toBe('archiving');
+        expect(model.status.shouldShowStatus).toBe(true);
+        expect(model.presentation.secondaryLine).toBe('status');
+        expect(model.presentation.attentionIndicator).toBe('working');
+        expect(model.presentation.statusTextKey).toBeUndefined();
+        expect(model.workingIndicatorPaused).toBe(false);
+    });
+
     it('presents retained working placement as a paused working row', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(createRenderable('s1', {
@@ -361,7 +485,6 @@ describe('buildSessionListRowModel', () => {
                 latestTurnStatusObservedAt: NOW_MS - SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS - 1_000,
             }), { groupKind: 'working', workingPlacementReason: 'working-retained' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -389,7 +512,6 @@ describe('buildSessionListRowModel', () => {
                 latestTurnStatusObservedAt: NOW_MS - 10,
             }), { groupKind: 'working', workingPlacementReason: 'working' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -418,7 +540,6 @@ describe('buildSessionListRowModel', () => {
                 } as any,
             }), { groupKind: 'working', workingPlacementReason: 'working-retained' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -436,7 +557,6 @@ describe('buildSessionListRowModel', () => {
                 attentionPromotionReason: 'standing',
             }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -453,6 +573,49 @@ describe('buildSessionListRowModel', () => {
         expect(model.presentation.titleTone).toBe('quiet');
     });
 
+    it('says a quiet pinned session is offline, because the pinned band has no Active/Inactive header', () => {
+        const buildPinned = (overrides: Partial<SessionListRenderableSession>) => buildSessionListRowModel({
+            item: createSessionItem(createRenderable('s1', { lastViewedSessionSeq: 10, ...overrides }), {
+                groupKind: 'pinned',
+            }),
+            state: {},
+            isFirst: true,
+            isLast: true,
+            isSingle: true,
+            settings: createSettings({ runtimeNowMs: NOW_MS }),
+        });
+
+        const stopped = buildPinned({ active: false, presence: 0 });
+        expect(stopped.attention.rowState).toBe('quiet');
+        expect(stopped.status.state).toBe('disconnected');
+        expect(stopped.presentation.secondaryLine).toBe('status');
+        expect(stopped.presentation.statusTextKey).toBeUndefined();
+
+        // A live session keeps the quiet row: "online" on every pinned row is the noise the
+        // list deliberately avoids, so an empty status line is what reads as live.
+        const live = buildPinned({ active: true, activeAt: NOW_MS, presence: 'online' });
+        expect(live.attention.rowState).toBe('quiet');
+        expect(live.status.isConnected).toBe(true);
+        expect(live.presentation.secondaryLine).toBe('none');
+    });
+
+    it('keeps quiet offline rows silent where the band already says they are inactive', () => {
+        const model = buildSessionListRowModel({
+            item: createSessionItem(createRenderable('s1', { lastViewedSessionSeq: 10, active: false, presence: 0 }), {
+                section: 'inactive',
+                groupKind: 'project',
+            }),
+            state: {},
+            isFirst: true,
+            isLast: true,
+            isSingle: true,
+            settings: createSettings({ runtimeNowMs: NOW_MS }),
+        });
+
+        expect(model.status.state).toBe('disconnected');
+        expect(model.presentation.secondaryLine).toBe('none');
+    });
+
     it('does not present standing for a row promoted for any other reason', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(createRenderable('s1'), {
@@ -460,7 +623,6 @@ describe('buildSessionListRowModel', () => {
                 attentionPromotionReason: 'unread',
             }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -471,7 +633,34 @@ describe('buildSessionListRowModel', () => {
         expect(model.presentation.statusTextKey).toBeUndefined();
     });
 
-    it('presents background activity with the normal working indicator and precise neutral secondary copy', () => {
+    it.each(['keepWorking', 'keepWorkingUnread', 'showUnread'] as const)('preserves unread and background work with %s attention policy', (backgroundWorkAttentionMode) => {
+        const session = createRenderable('background-unread', {
+                active: true, activeAt: NOW_MS, hasUnreadMessages: true, lastViewedSessionSeq: 9,
+                latestTurnStatus: 'completed', latestTurnStatusObservedAt: NOW_MS,
+                runtimeActivityState: 'active', runtimeActivityActiveCount: 1,
+                runtimeActivityObservedAt: NOW_MS, runtimeActivityRevision: 1,
+        });
+        const model = buildSessionListRowModel({
+            item: createSessionItem(session),
+            isFirst: true, isLast: true, isSingle: true,
+            settings: createSettings({ backgroundWorkAttentionMode }),
+        });
+        expect(model.attention.rowState).toBe(backgroundWorkAttentionMode === 'keepWorking' ? 'working' : 'unread');
+        expect(model.hasUnreadMessages).toBe(true);
+        expect(model.presentation.attentionIndicator).toBe(backgroundWorkAttentionMode === 'keepWorking' ? 'working' : 'unread');
+        expect(model.presentation.statusTextKey).toBeUndefined();
+        expect(model.status.state).toBe('background_active');
+        const readModel = buildSessionListRowModel({
+            item: createSessionItem({ ...session, hasUnreadMessages: false, lastViewedSessionSeq: 10 }),
+            isFirst: true, isLast: true, isSingle: true,
+            settings: createSettings({ backgroundWorkAttentionMode }),
+        });
+        expect(readModel.hasUnreadMessages).toBe(false);
+        expect(readModel.attention.rowState).toBe('working');
+        expect(readModel.presentation.attentionIndicator).toBe('working');
+    });
+
+    it('keeps queued messages and unread independent of background work with neutral secondary copy', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(createRenderable('s1', {
                 active: true,
@@ -489,7 +678,6 @@ describe('buildSessionListRowModel', () => {
                 runtimeActivityRevision: 1,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -499,8 +687,8 @@ describe('buildSessionListRowModel', () => {
         expect(model.status.state).toBe('background_active');
         expect(model.status.statusColor).toBe('default-token');
         expect(model.status.statusDotColor).toBe('default-token');
-        expect(model.attention.listState).toBe('pending');
-        expect(model.attention.rowState).toBe('pending');
+        expect(model.attention.listState).toBe('thinking');
+        expect(model.attention.rowState).toBe('working');
         expect(model.hasUnreadMessages).toBe(true);
         expect(model.pendingCount).toBe(2);
         expect(model.presentation.attentionIndicator).toBe('working');
@@ -525,7 +713,6 @@ describe('buildSessionListRowModel', () => {
                 runtimeActivityRevision: 1,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -550,7 +737,6 @@ describe('buildSessionListRowModel', () => {
                 runtimeActivityRevision: 9,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -581,7 +767,6 @@ describe('buildSessionListRowModel', () => {
                 runtimeActivityRevision: 4,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -591,7 +776,7 @@ describe('buildSessionListRowModel', () => {
         expect(model.nextRuntimeFreshnessAtMs).toBe(NOW_MS - 1_000 + 120_000);
     });
 
-    it('does not schedule a clock refresh once nothing witnesses the detached activity', () => {
+    it('keeps delayed background work paused in Working while awaiting a fresh observation', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(createRenderable('s1', {
                 active: true,
@@ -602,7 +787,6 @@ describe('buildSessionListRowModel', () => {
                 runtimeActivityRevision: 4,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -610,6 +794,10 @@ describe('buildSessionListRowModel', () => {
         });
 
         expect(model.nextRuntimeFreshnessAtMs).toBeNull();
+        expect(model.attention.rowState).toBe('working');
+        expect(model.status.state).toBe('background_active');
+        expect(model.status.statusText).toBe(t('status.workingRetained'));
+        expect(model.workingIndicatorPaused).toBe(true);
     });
 
     it('keeps foreground working presentation when detached runtime activity overlaps an active turn', () => {
@@ -627,7 +815,6 @@ describe('buildSessionListRowModel', () => {
                 runtimeActivityRevision: 1,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -655,7 +842,6 @@ describe('buildSessionListRowModel', () => {
                 runtimeActivityRevision: 1,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -679,7 +865,6 @@ describe('buildSessionListRowModel', () => {
                 meaningfulActivityAt: NOW_MS - SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS - 30_000,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -703,7 +888,6 @@ describe('buildSessionListRowModel', () => {
                 meaningfulActivityAt: NOW_MS - SESSION_RUNTIME_STATUS_STALE_SIGNAL_MS - 30_000,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -724,7 +908,6 @@ describe('buildSessionListRowModel', () => {
                 meaningfulActivityAt: NOW_MS - 10,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -746,7 +929,6 @@ describe('buildSessionListRowModel', () => {
                 latestTurnStatusObservedAt: NOW_MS - 100,
             }), { groupKind: 'date' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -761,7 +943,6 @@ describe('buildSessionListRowModel', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(createRenderable('s1')),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -793,7 +974,6 @@ describe('buildSessionListRowModel', () => {
         const modelA = buildSessionListRowModel({
             item: createSessionItem(session, { serverId: 'server-a' }),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -802,7 +982,6 @@ describe('buildSessionListRowModel', () => {
         const modelB = buildSessionListRowModel({
             item: createSessionItem(session, { serverId: 'server-b' }),
             state: {},
-            dataIndex: 1,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -830,7 +1009,6 @@ describe('buildSessionListRowModel', () => {
                 selected: true,
             } as Partial<Extract<SessionListViewItem, { type: 'session' }> & { selected: true }>),
             state: { pending: createPending([NOW_MS - 50_000, NOW_MS - 40_000]) },
-            dataIndex: 5,
             isFirst: false,
             isLast: true,
             isSingle: false,
@@ -860,7 +1038,6 @@ describe('buildSessionListRowModel', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(session),
             state: {},
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -879,7 +1056,6 @@ describe('buildSessionListRowModel', () => {
         const model = buildSessionListRowModel({
             item: createSessionItem(session),
             state: { pending: createBlockedPending(NOW_MS - 50_000) },
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -898,7 +1074,6 @@ describe('buildSessionListRowModel', () => {
         const blockedModel = buildSessionListRowModel({
             item: createSessionItem(blockedAggregateSession),
             state: { pending: createPending([NOW_MS - 50_000]) },
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -915,7 +1090,6 @@ describe('buildSessionListRowModel', () => {
         const unblockedModel = buildSessionListRowModel({
             item: createSessionItem(unblockedAggregateSession),
             state: { pending: createBlockedPending(NOW_MS - 50_000) },
-            dataIndex: 0,
             isFirst: true,
             isLast: true,
             isSingle: true,
@@ -946,7 +1120,6 @@ describe('buildSessionListRowModel', () => {
         function buildWithSetting(enabled: boolean, counts: Partial<AgentActivityCounts>) {
             return buildSessionListRowModel({
                 item: createSessionItem(renderableWithCounts(counts)),
-                dataIndex: 0,
                 isFirst: true,
                 isLast: true,
                 isSingle: true,
@@ -977,10 +1150,24 @@ describe('buildSessionListRowModel', () => {
                 .toBe('1 workflow, 5 agents');
         });
 
+        it('retires a metadata-only live claim after loss without requiring transcript hydration', () => {
+            const session = createRenderable('s-agents', {
+                active: false, activeAt: NOW_MS - 300_000, presence: NOW_MS - 300_000,
+                metadata: buildSessionListRenderableMetadata({ path: '', host: '', sessionAgentActivityHeadlineV1: {
+                    v: 1, backendId: 'claude', updatedAt: NOW_MS - 400_000,
+                    activeEntries: [{ entryId: 'workflow_agent:run_1:alpha', kind: 'workflow_agent', title: 'Audit', status: 'running', updatedAt: NOW_MS - 400_000 }],
+                } }),
+            });
+            expect(session.metadata?.agentActivityCounts?.live).toBe(1);
+            expect(buildSessionListRowModel({
+                item: createSessionItem(session), isFirst: true, isLast: true, isSingle: true,
+                settings: createSettings({ agentActivityCountEnabled: true }),
+            }).agentActivityLabel).toBeNull();
+        });
+
         it('says nothing for a session with no published activity', () => {
             expect(buildSessionListRowModel({
                 item: createSessionItem(createRenderable('s-quiet')),
-                dataIndex: 0,
                 isFirst: true,
                 isLast: true,
                 isSingle: true,

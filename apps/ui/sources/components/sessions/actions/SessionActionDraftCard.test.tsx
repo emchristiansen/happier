@@ -82,7 +82,8 @@ vi.mock('@/agents/hooks/useEnabledAgentIds', () => ({
   useEnabledAgentIds: () => ['claude'],
 }));
 
-vi.mock('@/agents/catalog/catalog', () => ({
+vi.mock('@/agents/catalog/catalog', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/agents/catalog/catalog')>()),
   AGENT_IDS: ['claude'],
   getAgentCore: () => ({ displayNameKey: 'agent.claude' }),
 }));

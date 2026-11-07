@@ -1,3 +1,4 @@
+import { removeConnectedServiceCredentialFiles } from '@/daemon/connectedServices/credentials/removeConnectedServiceCredentialFiles';
 import { AGENTS_CORE } from '@happier-dev/agents';
 
 import { PI_BROKER_SELECTIONS_ENV, parsePiBrokerSelections } from '@/backends/pi/brokerExtension';
@@ -12,9 +13,15 @@ import { resolvePiConnectedServiceSwitchContinuity } from '@/backends/pi/connect
 import type { AgentCatalogEntry } from '../types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 import { piDaemonSpawnHooks } from '@/backends/pi/daemon/spawnHooks';
+import { reportPiTurnFailure } from './connectedServices/reportPiTurnFailure';
 
 const piConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCredentialLifecycleDescriptor = {
   providerId: 'pi',
+  credentialStorageCleanup: {
+    async deleteCredentialStorageForHomeRoot({ rootDir }) {
+      await removeConnectedServiceCredentialFiles(rootDir, piConnectedServiceStateSharingDescriptor.authIsolation.secretEntries.map((entry) => `pi-agent-dir/${entry}`));
+    },
+  },
   serviceIds: AGENTS_CORE.pi.connectedServices.supportedServiceIds,
   spawnPreflightOauthRefresh: { mode: 'expiry_window' },
   refreshedCredentialApplication: {
@@ -70,6 +77,7 @@ export const agent = {
   vendorResumeSupport: AGENTS_CORE.pi.resume.vendorResume,
   getPreflightSessionControlsProbeAdapter: async () =>
     (await import('@/backends/pi/preflight/piPreflightModelsProbeAdapter')).piPreflightModelsProbeAdapter,
+  getAcpRuntimeTurnHooks: async () => ({ onTurnFailure: reportPiTurnFailure }),
   getAcpBackendFactory: async () => {
     const { createPiBackend } = await import('@/backends/pi/acp/backend');
     return (opts) => ({ backend: createPiBackend(opts as any) });

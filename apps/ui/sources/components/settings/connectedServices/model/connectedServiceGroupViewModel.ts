@@ -7,6 +7,7 @@ import {
 } from './resolveConnectedServiceIdentityDisplay';
 import {
     ConnectedServiceAuthGroupPolicyV1Schema,
+    ConnectedServiceAuthGroupStrategyV1Schema,
     type ConnectedServiceCredentialHealthStatusV1,
     type ConnectedServiceAuthGroupPolicyV1,
     type ConnectedServiceAuthGroupV1,
@@ -27,6 +28,8 @@ export type ConnectedServiceGroupMemberViewModel = Readonly<{
     validationBlockedUntilMs: number | null;
     lastObservedAtMs: number | null;
     lastFailureKind: string | null;
+    lastFailureCode: string | null;
+    autoDisabledReason: 'model_not_entitled' | null;
     readiness: ConnectedServiceGroupMemberReadiness;
     blocker: ConnectedServiceGroupMemberBlocker | null;
 }>;
@@ -76,6 +79,8 @@ const connectedServiceAuthGroupPolicyKeys = [
     'strategy',
     'autoSwitch',
     'autoUseQuotaResetsWhenExhausted',
+    'autoDisablePlanInvalidAccounts',
+    'quotaLimitSelection',
     'switchOn',
     'cooldownMs',
     'honorProviderResetsAt',
@@ -129,9 +134,16 @@ export function normalizeConnectedServiceGroupPolicy(
     const rawStrategy = readConnectedServiceGroupString(raw.strategy);
     return {
         ...CONNECTED_SERVICE_GROUP_DEFAULT_POLICY,
-        strategy: rawStrategy === 'least_limited' || rawStrategy === 'manual' ? rawStrategy : 'priority',
+        strategy: ConnectedServiceAuthGroupStrategyV1Schema.safeParse(rawStrategy).data ?? CONNECTED_SERVICE_GROUP_DEFAULT_POLICY.strategy,
         autoSwitch: readBoolean(raw.autoSwitch, CONNECTED_SERVICE_GROUP_DEFAULT_POLICY.autoSwitch),
     };
+}
+
+export function resolveConnectedServiceGroupStrategyLabel(strategy: ConnectedServiceAuthGroupPolicyV1['strategy']): string {
+    if (strategy === 'expiry_first') return t('connectedServices.detail.groups.strategyExpiryFirst');
+    if (strategy === 'manual') return t('connectedServices.detail.groups.strategyManual');
+    if (strategy === 'least_limited') return t('connectedServices.detail.groups.strategyLeastLimited');
+    return t('connectedServices.detail.groups.strategyPriority');
 }
 
 export function normalizeConnectedServiceGroupMember(value: unknown): ConnectedServiceGroupMemberViewModel | null {
@@ -173,6 +185,8 @@ export function normalizeConnectedServiceGroupMember(value: unknown): ConnectedS
         validationBlockedUntilMs,
         lastObservedAtMs: readNumber(state.lastObservedAtMs),
         lastFailureKind: readConnectedServiceGroupString(state.lastFailureKind) || null,
+        lastFailureCode: readConnectedServiceGroupString(state.lastFailureCode) || null,
+        autoDisabledReason: state.autoDisabledReason === 'model_not_entitled' ? 'model_not_entitled' : null,
         readiness: !enabled ? 'disabled' : blocker?.kind ?? 'ready',
         blocker,
     };
@@ -348,11 +362,7 @@ export function formatConnectedServiceGroupSubtitle(
         group.policy.autoSwitch
             ? t('connectedServices.detail.groups.autoFallbackEnabled')
             : t('connectedServices.detail.groups.autoFallbackDisabled'),
-        group.policy.strategy === 'manual'
-            ? t('connectedServices.detail.groups.strategyManual')
-            : group.policy.strategy === 'least_limited'
-                ? t('connectedServices.detail.groups.strategyLeastLimited')
-                : t('connectedServices.detail.groups.strategyPriority'),
+        resolveConnectedServiceGroupStrategyLabel(group.policy.strategy),
         prioritySummary
             ? t('connectedServices.detail.groups.priority', { priority: prioritySummary })
             : null,
@@ -389,7 +399,9 @@ export function formatConnectedServiceGroupMemberSubtitle(
         member.enabled ? t('connectedServices.detail.groups.memberEnabled') : t('connectedServices.detail.groups.memberDisabled'),
         t('connectedServices.detail.groups.memberPriority', { priority: member.priority }),
         formatConnectedServiceGroupMemberBlocker(member.blocker),
-        member.lastFailureKind
+        member.autoDisabledReason === 'model_not_entitled'
+            ? t('connectedServices.detail.groups.memberAutoDisabledModelNotEntitled')
+            : member.lastFailureKind
             ? t('connectedServices.detail.groups.memberLastFailure', { reason: member.lastFailureKind })
             : null,
     ];

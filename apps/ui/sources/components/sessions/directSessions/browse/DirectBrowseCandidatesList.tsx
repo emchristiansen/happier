@@ -16,6 +16,7 @@ import {
     buildDirectBrowseCandidateSubtitle,
 } from './buildDirectBrowseCandidatePresentation';
 import type { DirectBrowseCandidate } from './useDirectBrowseCandidates';
+import { DirectBrowseCandidateActions } from './DirectBrowseCandidateActions';
 
 type AppTheme = Theme;
 
@@ -53,6 +54,11 @@ const stylesheet = StyleSheet.create((theme: AppTheme) => ({
         alignItems: 'center',
         justifyContent: 'center',
     },
+    candidateAccessory: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+    },
 }));
 
 export const DirectBrowseCandidatesList = React.memo(function DirectBrowseCandidatesList(props: Readonly<{
@@ -63,9 +69,13 @@ export const DirectBrowseCandidatesList = React.memo(function DirectBrowseCandid
     loadingMore: boolean;
     searchAugmenting: boolean;
     linkingSessionId: string | null;
+    deletingSessionId: string | null;
+    canDeleteCandidates: boolean;
+    providerLabel: string;
     searchQuery: string;
     onSearchQueryChange: (value: string) => void;
     onSelectCandidate: (candidate: DirectBrowseCandidate) => void;
+    onDeleteCandidate: (candidate: DirectBrowseCandidate) => void;
     onLoadMore: () => void;
 }>) {
     const { theme } = useUnistyles() as { theme: AppTheme };
@@ -115,9 +125,22 @@ export const DirectBrowseCandidatesList = React.memo(function DirectBrowseCandid
                             testID={`direct-session-candidate:${candidate.remoteSessionId}`}
                             title={buildDirectBrowseCandidateDisplayTitle(candidate)}
                             subtitle={buildDirectBrowseCandidateSubtitle(candidate, theme, itemDensity)}
-                            rightElement={buildDirectBrowseCandidateRightElement(candidate, theme, itemDensity)}
+                            rightElement={props.canDeleteCandidates ? (
+                                <View style={styles.candidateAccessory}>
+                                    {buildDirectBrowseCandidateRightElement(candidate, theme, itemDensity)}
+                                    <DirectBrowseCandidateActions
+                                        candidateTitle={buildDirectBrowseCandidateDisplayTitle(candidate)}
+                                        candidateId={candidate.remoteSessionId}
+                                        providerLabel={props.providerLabel}
+                                        deleting={props.deletingSessionId !== null}
+                                        onDelete={() => props.onDeleteCandidate(candidate)}
+                                    />
+                                </View>
+                            ) : buildDirectBrowseCandidateRightElement(candidate, theme, itemDensity)}
+                            rightElementOutsidePressable={props.canDeleteCandidates}
                             onPress={() => props.onSelectCandidate(candidate)}
-                            loading={props.linkingSessionId === candidate.remoteSessionId}
+                            loading={props.linkingSessionId === candidate.remoteSessionId || props.deletingSessionId === candidate.remoteSessionId}
+                            disabled={props.deletingSessionId === candidate.remoteSessionId}
                         />
                     ))}
                     {props.nextCursor ? (

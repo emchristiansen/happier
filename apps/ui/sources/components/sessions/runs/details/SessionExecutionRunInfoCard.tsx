@@ -1,4 +1,4 @@
-import type { ExecutionRunPublicState } from '@happier-dev/protocol';
+import { isExecutionRunActive, type ExecutionRunPublicState } from '@happier-dev/protocol';
 import * as React from 'react';
 import { View } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
@@ -144,7 +144,8 @@ export const SessionExecutionRunInfoCard = React.memo((props: Readonly<{
                 </View>
                 <View style={styles.statusPill}>
                     <Text style={styles.statusText}>
-                        {t('executionRuns.details.labels.statusValue', { value: String((props.run as any).status ?? 'unknown') })}
+                        {t('executionRuns.details.labels.statusValue', { value: props.run.status === 'running' && !isExecutionRunActive(props.run)
+                            ? t('diagnosis.machineRuns.idle') : props.run.status })}
                     </Text>
                 </View>
             </View>

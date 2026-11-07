@@ -5,7 +5,7 @@ import type { CapabilitiesDetectRequest, CapabilitiesInvokeRequest } from '@/syn
 import { settingsParse } from '@/sync/domains/settings/settings';
 import type { MachineCapabilitiesInvokeResult } from '@/sync/ops';
 
-import { buildInstallablesBackgroundActionKey, ensureAgentInstallablesBackground } from './ensureAgentInstallablesBackground';
+import { buildInstallablesBackgroundActionKey, ensureAgentInstallablesBackground, ensureMachineUpdateFactsBackground } from './ensureAgentInstallablesBackground';
 
 function buildMissingCodexAcpResults() {
     return {
@@ -340,6 +340,54 @@ describe('ensureAgentInstallablesBackground', () => {
             await firstCall;
 
             expect(machineCapabilitiesInvoke).toHaveBeenCalledTimes(2);
+        });
+    });
+
+    describe('agent CLI latest version (K6, R13 (e): the Updates pill learns of agent updates here)', () => {
+        const settings = settingsParse({} as any);
+        const agentResult = (data: Record<string, unknown>, checkedAt: number) => ({
+            'cli.claude': { ok: true as const, checkedAt, data: { available: true, version: '2.1.3', ...data } },
+        });
+        const run = async (results: MachineCapabilitiesSnapshot['response']['results']) => {
+            const prefetchMachineCapabilities = vi.fn(async (_params: { request: CapabilitiesDetectRequest }) => {});
+            await ensureAgentInstallablesBackground(
+                { agentId: 'claude', machineId: 'm1', serverId: 's1', settings, resumeSessionId: '' },
+                {
+                    prefetchMachineCapabilities,
+                    getMachineCapabilitiesSnapshot: () => ({ response: { protocolVersion: 1 as const, results } }),
+                    machineCapabilitiesInvoke: vi.fn(async (): Promise<MachineCapabilitiesInvokeResult> => ({ supported: true, response: { ok: true, result: null } })),
+                },
+            );
+            return prefetchMachineCapabilities.mock.calls
+                .flatMap(([params]) => params.request.requests ?? [])
+                .filter((request) => request.id === 'cli.claude');
+        };
+
+        it('asks a K6 daemon for the latest version when it has none, on the shared cadence', async () => {
+            const now = Date.now();
+            expect(await run(agentResult({ updateSupported: true, installSource: 'managed' }, now)))
+                .toEqual([{ id: 'cli.claude', params: { includeLatestVersion: true } }]);
+            // Fresh answer: nothing to ask.
+            expect(await run(agentResult({ updateSupported: true, latestVersion: '2.1.4' }, now))).toEqual([]);
+            // Older than the freshness window: ask again.
+            expect(await run(agentResult({ updateSupported: true, latestVersion: '2.1.4' }, now - 25 * 60 * 60 * 1000))).toHaveLength(1);
+        });
+
+        it('never asks a daemon that predates K6 (it would ignore the request)', async () => {
+            expect(await run(agentResult({}, Date.now()))).toEqual([]);
+        });
+    });
+
+    describe('update facts for every installed agent and helper (R13 (e) summary coverage)', () => {
+        it('asks each machine once, on the shared freshness policy, for every agent CLI with its latest version and every helper', async () => {
+            const prefetchMachineCapabilitiesIfStale = vi.fn(async (_params: { machineId: string; staleMs: number; request: CapabilitiesDetectRequest }) => {});
+            await ensureMachineUpdateFactsBackground({ machineIds: ['m1', 'm2'] }, { prefetchMachineCapabilitiesIfStale });
+            expect(prefetchMachineCapabilitiesIfStale).toHaveBeenCalledTimes(2);
+            const [first] = prefetchMachineCapabilitiesIfStale.mock.calls[0]!;
+            expect(first.staleMs).toBe(24 * 60 * 60 * 1000);
+            const ids = (first.request.requests ?? []).map((request) => request.id);
+            expect(ids).toEqual(expect.arrayContaining(['cli.claude', 'cli.codex', 'dep.gh', 'tool.systemTasks']));
+            expect((first.request.requests ?? []).find((request) => request.id === 'cli.claude')?.params).toEqual({ includeLatestVersion: true });
         });
     });
 });

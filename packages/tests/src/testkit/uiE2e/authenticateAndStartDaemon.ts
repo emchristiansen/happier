@@ -1,12 +1,74 @@
 import { type Page } from '@playwright/test';
 
-import { startTestDaemon, type StartedDaemon } from '../daemon/daemon';
+import {
+  resolveTestDaemonCliLaunchSpec,
+  startTestDaemon,
+  type PreparedTestDaemonCliLaunchSpec,
+  type StartedDaemon,
+} from '../daemon/daemon';
 import { approveTerminalConnect } from './approveTerminalConnect';
-import { startCliAuthLoginForTerminalConnect } from './cliTerminalConnect';
+import {
+  resolveCliTerminalConnectLaunchSpec,
+  startCliAuthLoginForTerminalConnect,
+  type PreparedCliTerminalConnectLaunchSpec,
+} from './cliTerminalConnect';
 import { acknowledgeTerminalConnectSuccessIfPresent } from './acknowledgeTerminalConnectSuccessIfPresent';
 import { gotoCommittedWithRetries, gotoDomContentLoadedWithPathFallback } from './pageNavigation';
 import { ensureAccountReadyForConnect } from './ensureAccountReadyForConnect';
 import { waitForInitialAppUi } from './waitForInitialAppUi';
+
+type AuthenticateAndStartDaemonLaunchParams = Readonly<{
+  testDir: string;
+  cliHomeDir: string;
+  serverUrl: string;
+  cliServerUrl?: string;
+  uiBaseUrl: string;
+  extraEnv?: NodeJS.ProcessEnv;
+}>;
+
+function buildCliLoginEnv(params: AuthenticateAndStartDaemonLaunchParams): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ...(params.extraEnv ?? {}),
+    CI: '1',
+    HAPPIER_DISABLE_CAFFEINATE: '1',
+    HAPPIER_VARIANT: 'dev',
+    HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+  };
+}
+
+function buildDaemonEnv(params: AuthenticateAndStartDaemonLaunchParams): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ...(params.extraEnv ?? {}),
+    CI: '1',
+    HAPPIER_HOME_DIR: params.cliHomeDir,
+    HAPPIER_SERVER_URL: params.cliServerUrl ?? params.serverUrl,
+    HAPPIER_WEBAPP_URL: params.uiBaseUrl,
+    HAPPIER_DISABLE_CAFFEINATE: '1',
+    HAPPIER_VARIANT: 'dev',
+    HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+  };
+}
+
+export type PreparedAuthenticateAndStartDaemonLaunchSpecs = Readonly<{
+  cliLogin: PreparedCliTerminalConnectLaunchSpec;
+  daemon: PreparedTestDaemonCliLaunchSpec;
+}>;
+
+/**
+ * Resolves exactly the CLI-login and daemon launch specs `authenticateAndStartDaemon` would resolve
+ * for the same testDir, URLs and extraEnv, in the same order, for a caller that prepares them once
+ * outside a test budget and lends them through `preparedLaunchSpecs` (the daemon spec is also reused
+ * by the returned daemon's restart()).
+ */
+export async function resolveAuthenticateAndStartDaemonLaunchSpecs(
+  params: AuthenticateAndStartDaemonLaunchParams,
+): Promise<PreparedAuthenticateAndStartDaemonLaunchSpecs> {
+  const cliLogin = await resolveCliTerminalConnectLaunchSpec({ testDir: params.testDir, env: buildCliLoginEnv(params) });
+  const daemon = await resolveTestDaemonCliLaunchSpec({ testDir: params.testDir, env: buildDaemonEnv(params) });
+  return Object.freeze({ cliLogin, daemon });
+}
 
 export async function authenticateAndStartDaemon(params: Readonly<{
   page: Page;
@@ -15,6 +77,8 @@ export async function authenticateAndStartDaemon(params: Readonly<{
   serverUrl: string;
   cliServerUrl?: string;
   uiBaseUrl: string;
+  /** Borrowed specs from resolveAuthenticateAndStartDaemonLaunchSpecs; nothing is resolved when given. */
+  preparedLaunchSpecs?: PreparedAuthenticateAndStartDaemonLaunchSpecs;
   createAccount?: boolean;
   accountReadyTimeoutMs?: number;
   allowStoredCredentialsWithoutReady?: boolean;
@@ -66,14 +130,8 @@ export async function authenticateAndStartDaemon(params: Readonly<{
     serverUrl: cliServerUrl,
     webappUrl: params.uiBaseUrl,
     connectUrlTimeoutMs: params.terminalConnectUrlTimeoutMs,
-    env: {
-      ...process.env,
-      ...(params.extraEnv ?? {}),
-      CI: '1',
-      HAPPIER_DISABLE_CAFFEINATE: '1',
-      HAPPIER_VARIANT: 'dev',
-      HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
-    },
+    env: buildCliLoginEnv(params),
+    ...(params.preparedLaunchSpecs ? { preparedCliLaunchSpec: params.preparedLaunchSpecs.cliLogin } : {}),
   });
 
   try {
@@ -89,16 +147,7 @@ export async function authenticateAndStartDaemon(params: Readonly<{
     testDir: params.testDir,
     happyHomeDir: params.cliHomeDir,
     startupTimeoutMs: params.daemonStartupTimeoutMs,
-    env: {
-      ...process.env,
-      ...(params.extraEnv ?? {}),
-      CI: '1',
-      HAPPIER_HOME_DIR: params.cliHomeDir,
-      HAPPIER_SERVER_URL: cliServerUrl,
-      HAPPIER_WEBAPP_URL: params.uiBaseUrl,
-      HAPPIER_DISABLE_CAFFEINATE: '1',
-      HAPPIER_VARIANT: 'dev',
-      HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
-    },
+    env: buildDaemonEnv(params),
+    ...(params.preparedLaunchSpecs ? { preparedCliLaunchSpec: params.preparedLaunchSpecs.daemon } : {}),
   });
 }

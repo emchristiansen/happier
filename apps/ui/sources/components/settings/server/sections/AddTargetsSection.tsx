@@ -20,6 +20,7 @@ type AddTargetsSectionProps = Readonly<{
     inputName: string;
     error: string | null;
     isValidating: boolean;
+    canResetServer: boolean;
     onChangeUrl: (value: string) => void;
     onChangeName: (value: string) => void;
     onResetServer: () => Promise<void> | void;
@@ -76,13 +77,18 @@ const stylesheet = StyleSheet.create((theme) => ({
         color: theme.colors.status.connecting,
         marginBottom: 12,
     },
+    // Buttons share the row while their labels fit and stack once a label would truncate
+    // (narrow phones, larger text, longer translations).
     buttonRow: {
         flexDirection: 'row',
+        flexWrap: 'wrap',
         gap: 12,
         marginBottom: 12,
     },
     buttonWrapper: {
-        flex: 1,
+        flexGrow: 1,
+        flexShrink: 0,
+        flexBasis: 'auto',
     },
     statusText: {
         ...Typography.default(),
@@ -254,6 +260,7 @@ export function AddTargetsSection(props: AddTargetsSectionProps) {
                                 title={t('server.resetToDefault')}
                                 size="normal"
                                 display="inverted"
+                                disabled={!props.canResetServer}
                                 onPress={props.onResetServer}
                             />
                         </View>

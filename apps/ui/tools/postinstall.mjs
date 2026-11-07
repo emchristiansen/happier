@@ -5,6 +5,7 @@ import url from 'node:url';
 import { resolveUiPostinstallTasks } from './resolveUiPostinstallTasks.mjs';
 import { ensureNohoistPeerLinks } from './ensureNohoistPeerLinks.mjs';
 import { createFilteredPatchDir } from './postinstall/filteredPatchDirectory.mjs';
+import { prepareKokoroWebRuntime } from './postinstall/kokoroWebStreams.mjs';
 import { runCommandBestEffort, runCommandOrExit } from './postinstall/runCommand.mjs';
 import { verifyNativePatchCompilation } from './postinstall/verifyNativePatchCompilation.mjs';
 import {
@@ -99,7 +100,7 @@ if (wants('patch-package')) {
             try {
                 runCommandOrExit({
                     command: process.execPath,
-                    args: [patchPackageCliPath, '--patch-dir', path.relative(repoRootDir, filteredPatchDir)],
+                    args: [patchPackageCliPath, '--error-on-fail', '--patch-dir', path.relative(repoRootDir, filteredPatchDir)],
                     options: { cwd: repoRootDir },
                 });
             } finally {
@@ -116,7 +117,7 @@ if (wants('patch-package')) {
             try {
                 runCommandOrExit({
                     command: process.execPath,
-                    args: [patchPackageCliPath, '--patch-dir', path.relative(expoAppDir, filteredPatchDir)],
+                    args: [patchPackageCliPath, '--error-on-fail', '--patch-dir', path.relative(expoAppDir, filteredPatchDir)],
                     options: { cwd: expoAppDir },
                 });
             } finally {
@@ -395,7 +396,7 @@ if (wants('vendor-kokoro-web')) {
             const dst = path.resolve(expoAppDir, 'public', 'vendor', 'kokoro', 'kokoro.web.js');
             if (fs.existsSync(src)) {
                 fs.mkdirSync(path.dirname(dst), { recursive: true });
-                fs.cpSync(src, dst, { force: true });
+                fs.writeFileSync(dst, prepareKokoroWebRuntime(fs.readFileSync(src, 'utf8')), 'utf8');
             }
         }
 
@@ -422,7 +423,8 @@ if (wants('vendor-kokoro-web')) {
             }
         }
     } catch (e) {
-        // Best-effort: Kokoro GS is optional and should not break installs.
+        // Kokoro is optional, but a failed vendor step must remain visible.
+        console.warn('[postinstall] Failed to vendor Kokoro web runtime:', e);
     }
 }
 

@@ -1,4 +1,7 @@
 import {
+  AGY_OAUTH_CLIENT_ID,
+  AGY_OAUTH_CLIENT_SECRET,
+  AGY_OAUTH_TOKEN_URL,
   CLAUDE_OAUTH_CLIENT_ID,
   CLAUDE_OAUTH_TOKEN_URL,
   GEMINI_CLI_OAUTH_CLIENT_ID,
@@ -7,6 +10,18 @@ import {
   OPENAI_CODEX_OAUTH_CLIENT_ID,
   OPENAI_CODEX_OAUTH_TOKEN_URL,
 } from "@happier-dev/agents";
+
+export function resolveAgyOauthClientId(): string {
+  return AGY_OAUTH_CLIENT_ID;
+}
+
+export function resolveAgyOauthClientSecret(): string {
+  return AGY_OAUTH_CLIENT_SECRET;
+}
+
+export function resolveAgyOauthTokenUrl(): string {
+  return AGY_OAUTH_TOKEN_URL;
+}
 
 function resolveNonEmptyEnv(raw: string | undefined, fallback: string): string {
   if (typeof raw !== "string") return fallback;

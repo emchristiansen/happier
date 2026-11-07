@@ -2,6 +2,7 @@ import { machineRpcWithServerScope } from '@/sync/runtime/orchestration/serverSc
 import type { ConnectedServiceBindingsV1, ConnectedServiceId, ConnectedServiceUxDiagnosticV1 } from '@happier-dev/protocol';
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { prepareAccountSettingsForDaemonSpawnIfNeeded } from '@/sync/ops/accountSettingsDaemonSpawnPreparation';
+import { machineSupportsConnectedServiceAuthSelection } from '../connectedServiceAuthSupport';
 
 export const SESSION_CONNECTED_SERVICE_AUTH_SWITCH_MACHINE_RPC_METHOD =
     RPC_METHODS.DAEMON_SESSION_CONNECTED_SERVICE_AUTH_SWITCH;
@@ -29,6 +30,7 @@ export type SessionConnectedServiceAuthSwitchErrorCode =
     | 'provider_state_sharing_required'
     | 'provider_state_sharing_unavailable'
     | 'metadata_update_failed'
+    | 'restart_disallowed_by_execution_policy'
     | 'restart_failed'
     | 'hot_apply_failed'
     | 'bindings_rollback_failed'
@@ -90,6 +92,14 @@ export async function setSessionConnectedServiceAuthBinding(params: Readonly<{
     expectedGroupGenerationByServiceId?: Readonly<Record<string, number>>;
     accountSettingsVersionHint?: number;
 }>): Promise<SessionConnectedServiceAuthSwitchResult> {
+    if (!await machineSupportsConnectedServiceAuthSelection({
+        machineId: params.machineId,
+        serverId: params.serverId,
+        backendTarget: { kind: 'builtInAgent', agentId: params.agentId },
+        connectedServices: params.bindings,
+    })) {
+        return { ok: false, errorCode: 'unsupported_service' };
+    }
     const accountSettingsPreparation = await prepareAccountSettingsForDaemonSpawnIfNeeded(params.accountSettingsVersionHint);
     const accountSettingsVersionHint = typeof params.accountSettingsVersionHint === 'number'
         ? params.accountSettingsVersionHint

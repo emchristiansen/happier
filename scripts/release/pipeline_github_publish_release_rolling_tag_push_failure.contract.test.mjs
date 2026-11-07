@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -13,8 +13,10 @@ function makeExecutable(filePath, content) {
   fs.writeFileSync(filePath, content, { encoding: 'utf8', mode: 0o755 });
 }
 
-test('pipeline GitHub rolling release still uploads assets when git tag push fails', async () => {
+for (const tagUpdateSucceeds of [true, false]) {
+test(`rolling publication requires tag binding before existing release mutation (tag update succeeds: ${tagUpdateSucceeds})`, (t) => {
   const tmp = fs.mkdtempSync(resolve(os.tmpdir(), 'happier-publish-release-'));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
   const binDir = resolve(tmp, 'bin');
   fs.mkdirSync(binDir, { recursive: true });
 
@@ -68,11 +70,28 @@ set -eu
 echo "gh $*" >> "${ghLog}"
 
 if [ "$1" = "release" ] && [ "$2" = "view" ]; then
-  exit 1
+  exit ${tagUpdateSucceeds ? 1 : 0}
 fi
 
 if [ "$1" = "api" ]; then
-  # Return empty assets list for prune.
+  if echo "$*" | grep -q "repos/test/test/git/ref/tags/dev-test"; then
+    echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    exit 0
+  fi
+  if echo "$*" | grep -q "repos/test/test/git/refs/tags/dev-test"; then
+    exit ${tagUpdateSucceeds ? 0 : 1}
+  fi
+  if echo "$*" | grep -q "repos/test/test/releases/tags/dev-test --jq .id"; then
+    echo "123"
+    exit 0
+  fi
+  if echo "$*" | grep -q "repos/test/test/releases/123 --jq .target_commitish"; then
+    echo "0123456789abcdef0123456789abcdef01234567"
+    exit 0
+  fi
+  if echo "$*" | grep -q -- "--jq .assets\[\].id"; then
+    echo "321"
+  fi
   exit 0
 fi
 
@@ -88,7 +107,7 @@ exit 0
     PATH: `${binDir}:${process.env.PATH ?? ''}`,
   };
 
-  execFileSync(
+  const result = spawnSync(
     process.execPath,
     [
       resolve(repoRoot, 'scripts', 'pipeline', 'github', 'publish-release.mjs'),
@@ -121,6 +140,14 @@ exit 0
   );
 
   const log = fs.readFileSync(ghLog, 'utf8');
-  assert.match(log, /gh release upload dev-test /);
+  assert.ifError(result.error);
+  assert.match(log, /git\/refs\/tags\/dev-test/);
+  if (tagUpdateSucceeds) {
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(log, /gh release upload dev-test /);
+  } else {
+    assert.notEqual(result.status, 0, 'failed tag binding must fail publication');
+    assert.doesNotMatch(log, /gh release (?:create|edit|upload)|gh api -X (?:DELETE|PATCH) repos\/test\/test\/releases\//);
+  }
 });
-
+}

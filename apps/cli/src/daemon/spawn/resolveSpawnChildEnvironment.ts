@@ -1,10 +1,15 @@
+import type { Credentials } from '@/persistence';
+import { readProfilesFromAccountSettings } from '@/settings/profiles/readProfilesFromAccountSettings';
+import { resolveProfileForBackendTarget } from '@/settings/profiles/resolveProfileForAgent';
+import { buildProfileEnvOverlay } from '@/settings/profiles/buildProfileEnvOverlay';
 import { SPAWN_SESSION_ERROR_CODES } from '@/rpc/handlers/registerSessionHandlers';
 import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers';
 import type { SpawnSessionErrorCode } from '@/rpc/handlers/registerSessionHandlers';
 import { resolveCanonicalCodexBackendMode } from '@/rpc/handlers/codexBackendMode';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import { sanitizeEnvVarRecord } from '@/terminal/runtime/envVarSanitization';
-import type { DaemonSpawnHooks } from '../spawnHooks';
+import { validateDaemonSpawn, type DaemonSpawnHooks } from '../spawnHooks';
+import { readBuiltInCatalogAgentIdFromBackendTarget } from '../sessions/resolveTrackedSessionCatalogAgentId';
 import { buildAuthEnvUnexpandedErrorMessage, findUnexpandedAuthEnvironmentReferences } from './authEnvValidation';
 import { resolveCodexBackendModeForRun } from '@/backends/codex/utils/resolveCodexBackendModeForRun';
 import { SESSION_REQUESTED_DIRECTORY_ENV } from '@/agent/runtime/resolveRequestedSessionDirectory';
@@ -18,33 +23,15 @@ import {
   serializeSessionConnectedServiceMaterializationIdentityForEnv,
 } from '@/agent/runtime/sessionConnectedServiceMaterializationIdentityEnv';
 import { HAPPIER_SPAWN_EXPLICIT_ENV_KEYS_JSON_ENV_VAR } from './spawnExplicitEnvKeysMarker';
+import { stripDaemonOwnedChildEnvOverrides } from './stripDaemonOwnedChildEnvOverrides';
 import type { ConnectedServicesMaterializationDiagnostic } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
+import { resolveExistingSessionHandoffStateThroughCatalog } from '@/backends/catalog';
+import { ExistingSessionStateUnavailableError } from '@/session/handoff/sessionHandoffErrors';
 
 function sanitizeCodexAcpFallbackDetail(detail: string): string {
   const normalized = detail.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (normalized.length <= 160) return normalized;
   return `${normalized.slice(0, 157)}...`;
-}
-
-const DAEMON_OWNED_CHILD_ENV_KEYS = new Set<string>([
-  'HAPPIER_HOME_DIR',
-  'HAPPIER_ACTIVE_SERVER_ID',
-  'HAPPIER_SERVER_URL',
-  'HAPPIER_WEBAPP_URL',
-  'HAPPIER_PUBLIC_SERVER_URL',
-  'HAPPIER_LOCAL_SERVER_URL',
-  'HAPPIER_DAEMON_SERVICE_INSTANCE_ID',
-  'HAPPIER_DAEMON_SERVICE_SERVER_URL',
-  SESSION_MACHINE_WORKSPACE_PATH_ENV,
-]);
-
-function stripDaemonOwnedChildEnvOverrides(input: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = Object.create(null);
-  for (const [key, value] of Object.entries(input)) {
-    if (DAEMON_OWNED_CHILD_ENV_KEYS.has(key)) continue;
-    out[key] = value;
-  }
-  return out;
 }
 
 type ResolveSpawnChildEnvironmentSuccess = {
@@ -83,13 +70,15 @@ export async function resolveSpawnChildEnvironment(params: {
     cleanupOnExit: (() => void) | null;
     diagnostics?: readonly ConnectedServicesMaterializationDiagnostic[];
   } | null;
+  existingSessionMetadata?: unknown;
+  accountSettings?: Readonly<Record<string, unknown>> | null;
+  credentials?: Credentials;
 }): Promise<ResolveSpawnChildEnvironmentResult> {
   const connectedCleanupOnFailure = params.connectedServiceAuth?.cleanupOnFailure ?? null;
   const connectedCleanupOnExit = params.connectedServiceAuth?.cleanupOnExit ?? null;
   const materializationDiagnostics = params.connectedServiceAuth?.diagnostics;
 
-  const agentId =
-    params.options.backendTarget?.kind === 'builtInAgent' ? params.options.backendTarget.agentId : null;
+  const agentId = readBuiltInCatalogAgentIdFromBackendTarget(params.options.backendTarget);
   const explicitResumeId = typeof params.options.resume === 'string' && params.options.resume.trim().length > 0
     ? params.options.resume.trim()
     : null;
@@ -123,11 +112,45 @@ export async function resolveSpawnChildEnvironment(params: {
   }
   const sanitizedAuthEnv = sanitizeEnvVarRecord(authEnv);
 
+  let resolvedProfileEnvironment = params.profileEnvironmentVariables;
+  if (params.options.existingSessionId && params.options.profileId) {
+    try {
+      if (!params.accountSettings || !params.credentials || !params.options.backendTarget) {
+        throw new Error('Account settings and credentials are required to restore the session profile.');
+      }
+      const profile = resolveProfileForBackendTarget({
+        backendTarget: params.options.backendTarget,
+        query: params.options.profileId,
+        customProfiles: readProfilesFromAccountSettings(params.accountSettings).customProfiles,
+      });
+      if (profile.id !== params.options.profileId) throw new Error('The saved session profile is unavailable.');
+      const overlay = await buildProfileEnvOverlay({
+        backendTarget: params.options.backendTarget,
+        profile,
+        accountSettings: params.accountSettings,
+        credentials: params.credentials,
+        processEnv: params.processEnv,
+        environmentVariables: params.profileEnvironmentVariables,
+        promptSecretFn: null,
+        startedBy: 'daemon',
+      });
+      resolvedProfileEnvironment = overlay.envOverlayExpanded;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Session profile restoration failed.';
+      params.logWarn(`[DAEMON RUN] ${errorMessage}`);
+      return {
+        ok: false, errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED, errorMessage,
+        cleanupOnFailure, cleanupOnExit,
+        ...(materializationDiagnostics ? { materializationDiagnostics } : {}),
+      };
+    }
+  }
+
   let profileEnv: Record<string, string> = {};
-  if (Object.keys(params.profileEnvironmentVariables).length > 0) {
-    profileEnv = stripDaemonOwnedChildEnvOverrides(sanitizeEnvVarRecord(params.profileEnvironmentVariables));
-    params.logInfo(`[DAEMON RUN] Using GUI-provided profile environment variables (${Object.keys(profileEnv).length} vars)`);
-    params.logDebug(`[DAEMON RUN] GUI profile env var keys: ${Object.keys(profileEnv).join(', ')}`);
+  if (Object.keys(resolvedProfileEnvironment).length > 0) {
+    profileEnv = stripDaemonOwnedChildEnvOverrides(sanitizeEnvVarRecord(resolvedProfileEnvironment));
+    params.logInfo(`[DAEMON RUN] Using resolved profile environment variables (${Object.keys(profileEnv).length} vars)`);
+    params.logDebug(`[DAEMON RUN] Profile env var keys: ${Object.keys(profileEnv).join(', ')}`);
   } else {
     params.logDebug('[DAEMON RUN] No profile environment variables provided by caller; skipping profile env injection');
   }
@@ -171,56 +194,62 @@ export async function resolveSpawnChildEnvironment(params: {
     };
   }
 
-  if (params.daemonSpawnHooks?.validateSpawn) {
-    const validationContext = {
-      directory: params.options.directory,
-      environmentVariables: { ...params.processEnv, ...extraEnv },
-    };
-    const validation = await params.daemonSpawnHooks.validateSpawn({
+  const validationContext = {
+    directory: params.options.directory,
+    environmentVariables: { ...params.processEnv, ...extraEnv },
+  };
+  const validation = await validateDaemonSpawn({
+    hooks: params.daemonSpawnHooks,
+    agentId,
+    runtimeSelection: {
       experimentalCodexAcp: effectiveExperimentalCodexAcp,
       codexBackendMode: effectiveCodexBackendMode,
       ...validationContext,
-    });
-    if (!validation.ok) {
-      const shouldFallbackToMcp =
-        agentId === 'codex' &&
-        effectiveCodexBackendMode === 'acp' &&
-        explicitResumeId === null &&
-        validation.reasonCode === 'codex_acp_unavailable';
+    },
+  });
+  if (!validation.ok) {
+    const shouldFallbackToMcp =
+      agentId === 'codex' &&
+      effectiveCodexBackendMode === 'acp' &&
+      explicitResumeId === null &&
+      validation.reasonCode === 'codex_acp_unavailable';
 
-      if (!shouldFallbackToMcp) {
-        return {
-          ok: false,
-          errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
-          errorMessage: validation.errorMessage,
-          cleanupOnFailure,
-          cleanupOnExit,
-          ...(materializationDiagnostics ? { materializationDiagnostics } : {}),
-        };
-      }
+    if (!shouldFallbackToMcp) {
+      return {
+        ok: false,
+        errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+        errorMessage: validation.errorMessage,
+        cleanupOnFailure,
+        cleanupOnExit,
+        ...(materializationDiagnostics ? { materializationDiagnostics } : {}),
+      };
+    }
 
-      // New sessions only: fall back to MCP when Codex ACP cannot run.
-      // Explicit resume must fail closed (resuming via MCP is not supported).
-      effectiveExperimentalCodexAcp = undefined;
-      effectiveCodexBackendMode = 'mcp';
-      codexAcpFallbackMessage = `Codex ACP could not start (${sanitizeCodexAcpFallbackDetail(validation.errorMessage)}). Falling back to MCP for this new session.`;
-      params.logWarn(`[DAEMON RUN] ${codexAcpFallbackMessage}`);
+    // New sessions only: fall back to MCP when Codex ACP cannot run.
+    // Explicit resume must fail closed (resuming via MCP is not supported).
+    effectiveExperimentalCodexAcp = undefined;
+    effectiveCodexBackendMode = 'mcp';
+    codexAcpFallbackMessage = `Codex ACP could not start (${sanitizeCodexAcpFallbackDetail(validation.errorMessage)}). Falling back to MCP for this new session.`;
+    params.logWarn(`[DAEMON RUN] ${codexAcpFallbackMessage}`);
 
-      const validationAfterFallback = await params.daemonSpawnHooks.validateSpawn({
+    const validationAfterFallback = await validateDaemonSpawn({
+      hooks: params.daemonSpawnHooks,
+      agentId,
+      runtimeSelection: {
         experimentalCodexAcp: effectiveExperimentalCodexAcp,
         codexBackendMode: effectiveCodexBackendMode,
         ...validationContext,
-      });
-      if (!validationAfterFallback.ok) {
-        return {
-          ok: false,
-          errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
-          errorMessage: validationAfterFallback.errorMessage,
-          cleanupOnFailure,
-          cleanupOnExit,
-          ...(materializationDiagnostics ? { materializationDiagnostics } : {}),
-        };
-      }
+      },
+    });
+    if (!validationAfterFallback.ok) {
+      return {
+        ok: false,
+        errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+        errorMessage: validationAfterFallback.errorMessage,
+        cleanupOnFailure,
+        cleanupOnExit,
+        ...(materializationDiagnostics ? { materializationDiagnostics } : {}),
+      };
     }
   }
 
@@ -275,6 +304,33 @@ export async function resolveSpawnChildEnvironment(params: {
   }
   if (codexAcpFallbackMessage) {
     extraEnvForChild.HAPPIER_CODEX_ACP_FALLBACK_TO_MCP_MESSAGE = codexAcpFallbackMessage;
+  }
+
+  if (params.options.handoffStateTransfer === 'existing') {
+    try {
+      const existing = await resolveExistingSessionHandoffStateThroughCatalog({
+        metadata: params.existingSessionMetadata,
+        targetPath: params.options.directory,
+        env: { ...params.processEnv, ...extraEnvForChild },
+        sessionStorageMode: params.options.transcriptStorage,
+      });
+      if (!explicitResumeId || existing.remoteSessionId !== explicitResumeId) {
+        throw new Error('Existing-state handoff resume id does not match the provider session');
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Existing provider session state is unavailable';
+      params.logWarn(`[DAEMON RUN] Existing-state handoff resume validation failed: ${errorMessage}`);
+      return {
+        ok: false,
+        errorCode: error instanceof ExistingSessionStateUnavailableError
+          ? SPAWN_SESSION_ERROR_CODES.EXISTING_SESSION_STATE_UNAVAILABLE
+          : SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+        errorMessage,
+        cleanupOnFailure,
+        cleanupOnExit,
+        ...(materializationDiagnostics ? { materializationDiagnostics } : {}),
+      };
+    }
   }
 
   return {

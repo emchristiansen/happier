@@ -45,13 +45,15 @@ function readToolResultError(result: unknown): string | null {
 
 function buildCompletedRequestPlaceholderResult(completed: unknown): unknown {
     const completedRecord = asRecord(completed);
-    const answerRecord = asRecord(completedRecord?.answers);
+    const answerRecord = asRecord(completedRecord?.structuredAnswersV1) ?? asRecord(completedRecord?.answers);
     if (!answerRecord) return 'Approved';
 
     const answers: Record<string, string> = {};
     for (const [question, answer] of Object.entries(answerRecord)) {
         if (typeof answer === 'string') {
             answers[question] = answer;
+        } else if (Array.isArray(answer) && answer.every((entry) => typeof entry === 'string')) {
+            answers[question] = answer.join(', ');
         }
     }
     return Object.keys(answers).length > 0 ? { answers } : 'Approved';
@@ -96,6 +98,9 @@ export function runAgentStatePermissionsPhase(params: Readonly<{
     state: ReducerState;
     agentState?: AgentState | null;
     incomingToolIds: Set<string>;
+    incomingToolResultIds?: ReadonlySet<string>;
+    completedRequestHistoryStartAt?: number | null;
+    mainHistoryStartLoaded?: boolean;
     changed: Set<string>;
     allocateId: () => string;
     enableLogging: boolean;
@@ -453,6 +458,22 @@ export function runAgentStatePermissionsPhase(params: Readonly<{
                     if (agentState.requests && agentState.requests[permId]) {
                         continue;
                     }
+
+                    // Completed history must not bridge the unloaded gap before the current
+                    // transcript page. Pending requests and already displayed requests above
+                    // still update immediately. A loaded result can also own a placeholder
+                    // when its tool-call row is absent.
+                    const historyStartAt = params.completedRequestHistoryStartAt;
+                    const isInLoadedHistory = typeof historyStartAt === 'number'
+                        && typeof completed.createdAt === 'number'
+                        && Number.isFinite(completed.createdAt)
+                        && completed.createdAt >= historyStartAt;
+                    if (
+                        !isInLoadedHistory
+                        && params.mainHistoryStartLoaded !== true
+                        && !params.incomingToolResultIds?.has(permId)
+                        && !state.orphanToolResults.has(permId)
+                    ) continue;
 
                     // Create a new message for completed permission without tool
                     let mid = allocateId();

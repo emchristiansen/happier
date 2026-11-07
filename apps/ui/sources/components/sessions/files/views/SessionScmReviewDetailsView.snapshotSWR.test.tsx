@@ -1,6 +1,7 @@
 import * as React from 'react';
 import renderer, { act } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { createPartialStorageModuleMock, renderScreen } from '@/dev/testkit';
 import type { Session } from '@/sync/domains/state/storageTypes';
 import { installSessionFilesViewCommonModuleMocks } from './sessionFilesViewsTestHelpers';
@@ -212,7 +213,7 @@ describe('SessionScmReviewDetailsView (snapshot SWR)', () => {
         });
 
         expect(tree.findAllByType('ChangedFilesReview' as any)).toHaveLength(1);
-        expect(tree.findAllByType('ActivityIndicator')).toHaveLength(0);
+        expect(tree.findAllByType(ActivitySpinner)).toHaveLength(0);
     });
 
     it('uses the auto-refresh lease for the initial review snapshot warm-up', async () => {

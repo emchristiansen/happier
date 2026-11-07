@@ -298,7 +298,7 @@ describe('MessageView (fork button)', () => {
     const screen = await renderScreen(<MessageView message={message} metadata={null} sessionId="s1" />);
 
     const actionContainer = getActionContainer(screen, 'm2');
-    const rowContainer = findAncestor(actionContainer, (node: any) => typeof node.props?.onHoverIn === 'function');
+    const rowContainer = findAncestor(actionContainer, (node: any) => typeof node.props?.onPointerEnter === 'function' && typeof node.props?.onPointerLeave === 'function');
     expect(rowContainer).toBeTruthy();
     expect(rowContainer?.props.pointerEvents).toBeUndefined();
   });
@@ -553,6 +553,29 @@ describe('MessageView (fork button)', () => {
     expect(routerPushSpy).toHaveBeenCalledWith('/session/child-1?serverId=server-a');
   });
 
+  it('opens a fork child with the canonical native session history policy', async () => {
+    const { Platform } = await import('react-native');
+    const { default: AsyncStorage } = await import('@react-native-async-storage/async-storage');
+    const credentialRead = vi.spyOn(AsyncStorage, 'getItem').mockResolvedValue(null);
+    const previousPlatform = Platform.OS;
+    Platform.OS = 'ios';
+    try {
+      const { MessageView } = await import('./MessageView');
+      const message = { kind: 'user-text' as const, id: 'm1', localId: null, createdAt: 1, text: 'hi', seq: 5 };
+      const screen = await renderScreen(<MessageView message={message} metadata={null} sessionId="s1" />);
+      await screen.pressByTestIdAsync('transcript-message-fork:m1');
+      const flow = openSessionForkStrategyFlowSpy.mock.calls[0]?.[0] as Parameters<typeof import('@/components/sessions/fork/openSessionForkStrategyFlow').openSessionForkStrategyFlow>[0];
+      await act(async () => { await flow.navigateToSession('child-native'); });
+      expect(routerNavigateSpy).toHaveBeenCalledWith('/session/child-native?serverId=server-a', expect.any(Object));
+      expect(routerNavigateSpy.mock.calls[0]?.[1]?.dangerouslySingular()).toBe('session');
+      expect(routerPushSpy).not.toHaveBeenCalled();
+      await flushHookEffects();
+    } finally {
+      Platform.OS = previousPlatform;
+      credentialRead.mockRestore();
+    }
+  });
+
   it('carries the replay seed settings the account resolves', async () => {
     const { MessageView } = await import('./MessageView');
     const message: any = { kind: 'agent-text', id: 'm1', createdAt: 1, text: 'hi', isThinking: false, seq: 5 };
@@ -565,7 +588,7 @@ describe('MessageView (fork button)', () => {
     expect(flowArgs.settings).toEqual(expect.objectContaining({ sessionReplayEnabled: true }));
   });
 
-  it('renders fork button when replay is disabled but provider supports native fork-at-message', async () => {
+  it('renders native OpenCode server fork-from-message when replay is disabled', async () => {
     replayEnabled = false;
     sessionMetadata = { machineId: 'm1', flavor: 'opencode', opencodeBackendMode: 'server' };
 
@@ -575,7 +598,6 @@ describe('MessageView (fork button)', () => {
     const screen = await renderScreen(<MessageView message={message} metadata={null} sessionId="s1" />);
 
     expect(screen.findByTestId('transcript-message-fork:m1')).toBeTruthy();
-    expect(screen.findByTestId('transcript-message-fork:m1')?.props.accessibilityLabel).toBe('session.forking.forkFromMessageA11y');
   });
 
   it('still opens the strategy modal when session metadata machineId is missing', async () => {

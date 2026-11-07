@@ -110,6 +110,123 @@ describe('useTranscriptOlderPagination', () => {
         standardCleanup();
     });
 
+    it('holds explicit underfilled continuation until fill and viewport ownership are ready', async () => {
+        let fillDone = false;
+        let transactionOpen = true;
+        const { input, loadOlder, pendingLoads } = createHarness({
+            isFillDone: () => fillDone,
+            isTransactionOpen: () => transactionOpen,
+        });
+        const hook = await renderHook(() => useTranscriptOlderPagination(input));
+        await observe(hook, { offsetY: 0, scrollable: false });
+        await act(async () => hook.getCurrent().continueOlderLoad());
+        expect(loadOlder).not.toHaveBeenCalled();
+
+        fillDone = true;
+        await hook.rerender();
+        expect(loadOlder).not.toHaveBeenCalled();
+        transactionOpen = false;
+        await hook.rerender();
+        expect(loadOlder).toHaveBeenCalledTimes(1);
+        expect(loadOlder).toHaveBeenLastCalledWith({ trigger: 'readiness-open' });
+        await resolveLoad(pendingLoads, { status: 'no_more', loaded: 0, hasMore: false });
+        await act(async () => hook.getCurrent().continueOlderLoad());
+        expect(loadOlder).toHaveBeenCalledTimes(1);
+        await hook.unmount();
+    });
+
+    it('consumes initial-fill exhaustion before any threshold load and reopens a later gap', async () => {
+        let gapAvailability: boolean | null = null;
+        const { input, loadOlder } = createHarness();
+        const hook = await renderHook(() => useTranscriptOlderPagination({
+            ...input,
+            readHasMoreAfterExhaustion: () => gapAvailability,
+        }));
+        await act(async () => {
+            hook.getCurrent().observeLoadResult({ status: 'no_more', loaded: 0, hasMore: false });
+        });
+        expect(hook.getCurrent().hasMore).toBe(false);
+        await observe(hook, { offsetY: 120 });
+        expect(loadOlder).not.toHaveBeenCalled();
+
+        gapAvailability = true;
+        await hook.rerender();
+        expect(hook.getCurrent().hasMore).toBe(true);
+        expect(loadOlder).not.toHaveBeenCalled();
+        await hook.unmount();
+    });
+
+    it('retains exhaustion from another reader while an admitted pager attempt settles', async () => {
+        const { input, loadOlder, pendingLoads } = createHarness({ spinnerDelayMs: 0 });
+        const hook = await renderHook(() => useTranscriptOlderPagination(input));
+        await observe(hook, { offsetY: 120 });
+        expect(hook.getCurrent().isLoadingOlder).toBe(true);
+        await act(async () => {
+            hook.getCurrent().observeLoadResult({ status: 'loaded', loaded: 5, hasMore: false });
+        });
+        expect(hook.getCurrent().hasMore).toBe(false);
+        expect(hook.getCurrent().isLoadingOlder).toBe(true);
+        await observe(hook, { offsetY: 120, trigger: 'edge-reached' });
+        expect(loadOlder).toHaveBeenCalledTimes(1);
+        await resolveLoad(pendingLoads, { status: 'in_flight', loaded: 0, hasMore: true });
+        expect(hook.getCurrent().isLoadingOlder).toBe(false);
+        expect(hook.getCurrent().hasMore).toBe(false);
+        await hook.unmount();
+    });
+
+    it('reopens exhausted paging only when the current source confirms a fillable gap', async () => {
+        vi.useFakeTimers();
+        let gapAvailability: boolean | null = null;
+        const { input, loadOlder, pendingLoads } = createHarness();
+        const hook = await renderHook(() => useTranscriptOlderPagination({
+            ...input,
+            readHasMoreAfterExhaustion: () => gapAvailability,
+        }));
+        await observe(hook, { offsetY: 120 });
+        await resolveLoad(pendingLoads, { loaded: 0, hasMore: false, status: 'no_more' });
+        expect(hook.getCurrent().hasMore).toBe(false);
+
+        // An unfillable retained gap must not restart network work on render or scroll.
+        gapAvailability = false;
+        await hook.rerender();
+        await observe(hook, { offsetY: 120, trigger: 'edge-reached' });
+        expect(loadOlder).toHaveBeenCalledTimes(1);
+
+        // A later latest-page catch-up creates a new fillable interval in the same session.
+        gapAvailability = true;
+        await hook.rerender();
+        expect(hook.getCurrent().hasMore).toBe(true);
+        expect(loadOlder).toHaveBeenCalledTimes(1);
+        await observe(hook, { offsetY: 120, trigger: 'edge-reached' });
+        expect(loadOlder).toHaveBeenCalledTimes(2);
+        gapAvailability = false;
+        await resolveLoad(pendingLoads, { loaded: 1, hasMore: false, status: 'no_more' });
+        expect(hook.getCurrent().hasMore).toBe(false);
+        await hook.unmount();
+    });
+
+    it('does not let a held exhausted result prevent paging a newly opened gap', async () => {
+        vi.useFakeTimers();
+        let gapAvailability: boolean | null = null;
+        const { input, loadOlder, pendingLoads } = createHarness();
+        const hook = await renderHook(() => useTranscriptOlderPagination({
+            ...input,
+            readHasMoreAfterExhaustion: () => gapAvailability,
+        }));
+        await observe(hook, { offsetY: 120 });
+        gapAvailability = true;
+        await hook.rerender();
+        expect(loadOlder).toHaveBeenCalledTimes(1);
+        await resolveLoad(pendingLoads, { loaded: 0, hasMore: false, status: 'no_more' });
+        expect(hook.getCurrent().hasMore).toBe(true);
+        await observe(hook, { offsetY: 120, trigger: 'edge-reached' });
+        expect(loadOlder).toHaveBeenCalledTimes(2);
+        gapAvailability = null;
+        await resolveLoad(pendingLoads, { loaded: 1, hasMore: false, status: 'no_more' });
+        expect(hook.getCurrent().hasMore).toBe(false);
+        await hook.unmount();
+    });
+
     it('exposes the canonical proximity predicate without mutating or loading the machine', async () => {
         const { input, loadOlder } = createHarness({ thresholdPx: 400, thresholdItems: 12 });
         const hook = await renderHook(() => useTranscriptOlderPagination(input));

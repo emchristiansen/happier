@@ -31,6 +31,25 @@ function readRolloutPath(
     : null;
 }
 
+/** Reads the native resume authority without creating an index or repairing its rows. */
+export async function resolveExistingCodexIndexedRolloutPath(params: Readonly<{
+  env: NodeJS.ProcessEnv;
+  vendorResumeId: string;
+  cwd: string;
+}>): Promise<string | null> {
+  const databasePath = join(resolveConfiguredCodexSqliteHome(params.env, params.cwd), CODEX_STATE_DATABASE_FILE_NAME);
+  let database: SqliteDatabaseSync | null = null;
+  try {
+    database = openSqliteDatabaseSync(databasePath, { readOnly: true });
+    const indexedPath = readRolloutPath(database, params.vendorResumeId);
+    return indexedPath && await isFile(indexedPath) ? indexedPath : null;
+  } catch {
+    return null;
+  } finally {
+    database?.close();
+  }
+}
+
 /**
  * Reconciles the one Codex index field required to resume an already-proven rollout.
  *

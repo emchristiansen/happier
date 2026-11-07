@@ -111,6 +111,8 @@ const ALLOW_SAME_STRING_KEYS_BY_LOCALE: Readonly<Record<string, ReadonlySet<stri
     'common.error': new Set(['es', 'ca']),
     'tools.fullView.error': new Set(['es', 'ca']),
     'status.error': new Set(['es']),
+    // "Terminal" is the correct word in these locales and matches English.
+    'machine.cliPath.title': new Set(['pl', 'es', 'fr', 'pt', 'ca', 'de']),
     // Catalan: common noun matches English.
     'tabs.sessions': new Set(['ca']),
     'memorySearchSettings.embeddings.openAi.dimensionsTitle': new Set(['ca']),
@@ -134,6 +136,16 @@ const ALLOW_SAME_STRING_KEYS_BY_LOCALE: Readonly<Record<string, ReadonlySet<stri
     'connectedServices.detail.segments.pools': new Set(['es', 'pt', 'ca']),
     'connectedServices.pools.title': new Set(['es', 'pt', 'ca']),
     'connectedServices.profile.poolsGroupTitle': new Set(['es', 'pt', 'ca']),
+    // Loading indicator style names: "Radar" and "Aurora" are the same word in these locales,
+    // and French uses "Style" for the picker title.
+    'settingsAppearance.loadingIndicatorOptions.radar': new Set(['pl', 'es', 'fr', 'it', 'pt', 'ca', 'de']),
+    'settingsAppearance.loadingIndicatorOptions.aurora': new Set(['es', 'it', 'pt', 'ca']),
+    'settingsAppearance.loadingIndicatorOptions.hRadar': new Set(['pl', 'es', 'fr', 'it', 'pt', 'ca', 'de']),
+    'settingsAppearance.loadingIndicatorOptions.hAurora': new Set(['es', 'it', 'pt', 'ca']),
+    'settingsAppearance.loadingIndicatorStyle': new Set(['fr']),
+    // "Normal" and "Pause" are the same words in these locales.
+    'settingsAppearance.loadingIndicatorSpeedOptions.normal': new Set(['de', 'es', 'pt', 'ca']),
+    'settingsAppearance.loadingIndicatorPause': new Set(['de', 'fr']),
 };
 
 function isProviderPluginTitleKey(key: string): boolean {

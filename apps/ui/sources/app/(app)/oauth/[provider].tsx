@@ -245,7 +245,7 @@ export default function OAuthProviderReturn() {
 
                 if (params.mode === 'e2ee') {
                     const secretBytes = decodeBase64(secret!, 'base64url');
-                    const supportsSharing = await isSessionSharingSupported({ timeoutMs: 800 });
+                    const supportsSharing = await isSessionSharingSupported();
                     if (supportsSharing) {
                         const binding = await buildContentKeyBinding(secretBytes);
                         payload.contentPublicKey = binding.contentPublicKey;

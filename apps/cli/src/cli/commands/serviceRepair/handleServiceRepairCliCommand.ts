@@ -15,6 +15,7 @@ import { getServerProfile } from '@/server/serverProfiles';
 import { isInteractiveTerminal } from '../server/commandUtilities';
 import { assertRepairPlanSystemUserAvailable, resolveBackgroundServiceRepairSystemUser } from './repairSystemUser';
 import { renderDoctorRepairReport } from './renderDoctorRepairReport';
+import { renderPlannedServiceRemovals } from './sections/renderPlannedServiceRemovals';
 import { runGuidedRepair } from './runGuidedRepair';
 
 function printMigrationBanner(params: Readonly<{ report: DoctorRepairReport }>): void {
@@ -194,6 +195,11 @@ function buildDoctorRepairJsonSnapshot(snapshot: DoctorSnapshot | null): Readonl
   };
 }
 
+function printPlannedServiceRemovals(plan: Parameters<typeof renderPlannedServiceRemovals>[0]): void {
+  const lines = renderPlannedServiceRemovals(plan);
+  if (lines.length > 0) console.log(['', ...lines].join('\n'));
+}
+
 export async function handleServiceRepairCliCommand(params: Readonly<{
   argv: readonly string[];
   commandPath: string;
@@ -286,11 +292,13 @@ export async function handleServiceRepairCliCommand(params: Readonly<{
       // answer prompts know there's a follow-up command to run.
       if (onMigration) printMigrationBanner({ report });
       console.log(renderDoctorRepairReport(report, { includeInteractiveFooter: true }).join('\n'));
+      printPlannedServiceRemovals(plan);
       return;
     }
 
     if (onMigration) printMigrationBanner({ report });
     console.log(renderDoctorRepairReport(report).join('\n'));
+    printPlannedServiceRemovals(plan);
     if (report.findings.length === 0 || !isInteractiveTerminal()) {
       return;
     }
@@ -318,6 +326,7 @@ export async function handleServiceRepairCliCommand(params: Readonly<{
     // Print a banner so the user sees why these service actions are happening.
     printMigrationBanner({ report });
   }
+  if (parsed.execute) printPlannedServiceRemovals(plan);
 
   const result = await applyBackgroundServiceRepairPlan(plan, {
     platform: runtime.platform,

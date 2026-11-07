@@ -2,6 +2,7 @@ import type {
   DirectSessionCandidateV1,
   DirectSessionsSource,
   DirectTranscriptRawMessageV1,
+  DirectTranscriptTruncationReason,
 } from '@happier-dev/protocol';
 
 import type {
@@ -15,6 +16,9 @@ export type DirectSessionCandidatesPage = Readonly<{
   candidates: DirectSessionCandidateV1[];
   nextCursor: string | null;
   searchIncomplete?: boolean;
+  capabilities?: Readonly<{
+    deleteCandidate: boolean;
+  }>;
 }>;
 
 export type DirectSessionActivitySample = Readonly<{
@@ -28,14 +32,32 @@ export type DirectSessionTranscriptPage = Readonly<{
   tailCursor: string | null;
   hasMore: boolean;
   truncated: boolean;
+  truncationReason?: DirectTranscriptTruncationReason;
 }>;
 
 export type DirectSessionTranscriptReadAfter = Readonly<{
   items: DirectTranscriptRawMessageV1[];
   nextCursor: string | null;
   truncated: boolean;
+  truncationReason?: DirectTranscriptTruncationReason;
 }>;
 
+/**
+ * A direct-sessions operation the resolved provider genuinely cannot perform for this source.
+ * Callers map it to `provider_unavailable` so the surface degrades truthfully instead of reporting
+ * an internal error or an empty-but-successful result.
+ */
+export class DirectSessionsProviderUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DirectSessionsProviderUnavailableError';
+  }
+}
+
+/**
+ * Transcript, activity and takeover members are optional: a resume-only source (ACP `session/list`)
+ * can enumerate candidates without owning the provider's transcript store or process lifecycle.
+ */
 export type DirectSessionProviderOps = Readonly<{
   listCandidates: (params: Readonly<{
     source: DirectSessionsSource;
@@ -44,11 +66,15 @@ export type DirectSessionProviderOps = Readonly<{
     searchTerm?: string;
     searchMode?: 'fast' | 'full';
   }>) => Promise<DirectSessionCandidatesPage>;
-  getActivity: (params: Readonly<{
+  deleteCandidate?: (params: Readonly<{
+    source: DirectSessionsSource;
+    remoteSessionId: string;
+  }>) => Promise<void>;
+  getActivity?: (params: Readonly<{
     source: DirectSessionsSource;
     remoteSessionId: string;
   }>) => Promise<DirectSessionActivitySample>;
-  pageTranscript: (params: Readonly<{
+  pageTranscript?: (params: Readonly<{
     source: DirectSessionsSource;
     remoteSessionId: string;
     direction: 'older' | 'newer';
@@ -56,7 +82,7 @@ export type DirectSessionProviderOps = Readonly<{
     maxBytes: number;
     maxItems: number;
   }>) => Promise<DirectSessionTranscriptPage>;
-  readAfterTranscript: (params: Readonly<{
+  readAfterTranscript?: (params: Readonly<{
     source: DirectSessionsSource;
     remoteSessionId: string;
     cursor: string;
@@ -68,9 +94,10 @@ export type DirectSessionProviderOps = Readonly<{
     remoteSessionId: string;
     reason: DirectSessionFollowLeaseReason;
   }>) => Promise<DirectSessionFollowLease | null>;
-  resolveTakeoverSpawnOptions: (params: Readonly<{
+  resolveTakeoverSpawnOptions?: (params: Readonly<{
     linked: LoadedLinkedDirectSession;
     sessionId: string;
+    transcriptStorage: 'direct' | 'persisted';
   }>) => Promise<SpawnSessionOptions | null>;
 }>;
 

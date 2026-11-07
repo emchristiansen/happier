@@ -13,6 +13,18 @@ function buildMetadata(overrides: Partial<Metadata> = {}): Metadata {
 }
 
 describe('describeEffectiveModelMode', () => {
+    it('retains the configured backend applied model separately from the requested model', () => {
+        const metadata = buildMetadata({
+            acpConfiguredBackendV1: { v: 1, backendId: 'custom-one', title: 'Custom', updatedAt: 1 },
+            sessionAppliedModelV1: { v: 1, provider: 'acp:custom-one', modelId: 'applied', updatedAt: 1 },
+        });
+        expect(describeEffectiveModelMode({ agentType: 'customAcp', selectedModelId: 'requested', metadata })).toMatchObject({
+            selectedModelId: 'requested', appliedModelId: 'applied',
+        });
+        metadata.acpConfiguredBackendV1 = { v: 1, backendId: 'custom-two', title: 'Other', updatedAt: 2 };
+        expect(describeEffectiveModelMode({ agentType: 'customAcp', selectedModelId: 'requested', metadata }).appliedModelId).toBeNull();
+    });
+
     it('treats Claude model overrides as next-prompt', () => {
         const out = describeEffectiveModelMode({
             agentType: 'claude',

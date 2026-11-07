@@ -334,7 +334,7 @@ describe('sessionMachineRpcFallback', () => {
         expect(machineRPC).not.toHaveBeenCalled();
         expect(machineRpcWithServerScopeMock).toHaveBeenCalledTimes(methods.length);
         expect(getReadyServerFeaturesMock).toHaveBeenCalledTimes(methods.length);
-        expect(getReadyServerFeaturesMock).toHaveBeenNthCalledWith(1, { timeoutMs: 500, serverId: 'server-owned' });
+        expect(getReadyServerFeaturesMock).toHaveBeenNthCalledWith(1, { serverId: 'server-owned' });
     });
 
     it('fails closed (no machine_rpc_direct) for guarded methods when server features are not available yet', async () => {

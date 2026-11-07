@@ -5,23 +5,36 @@
  * Environment files should be loaded using Node's --env-file flag
  */
 
+import { resolveServerProfileApiUrl } from '@/server/serverProfileApiUrl';
 import { spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join, isAbsolute, resolve as resolvePath } from 'node:path'
 import { deriveServerIdFromUrl, isServerIdFilesystemSafe, sanitizeServerIdForFilesystem } from '@/server/serverId'
 import { isLocalishServerUrl } from '@/server/serverUrlClassification'
-import { normalizeCliArgv } from '@/cli/parseArgs'
+import { readCliProcessArgs } from '@/cli/parseArgs'
+import { applyRuntimeContextPrefixEnv, parseRuntimeContextPrefixArgs } from '@/utils/env/runtimeContextArgv'
 import { expandHomeDirPath } from '@/utils/path/expandHomeDirPath'
 import {
   resolveManagedCliReleaseChannelSync,
 } from '@happier-dev/cli-common/firstPartyRuntime'
 import { CANONICAL_DAEMON_STATE_BASENAME } from '@/daemon/ownership/daemonOwnershipPaths'
-import { createServerUrlComparableKey, HAPPIER_REPLAY_SEED_MAX_CHARS, HAPPIER_REPLAY_SEED_MIN_CHARS } from '@happier-dev/protocol'
+import {
+  createServerUrlComparableKey,
+  HAPPIER_REPLAY_SEED_MAX_CHARS,
+  HAPPIER_REPLAY_SEED_MIN_CHARS,
+  MAX_EXECUTION_RUN_OBSERVATION_TIMEOUT_SECONDS,
+  type ClientEncryptionRequirement,
+} from '@happier-dev/protocol'
 import packageJson from '../package.json'
 import type { PublicReleaseRingId } from '@happier-dev/release-runtime/releaseRings'
 
 export const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS = 100_000_000;
 export const DEFAULT_EXECUTION_RUN_WAIT_MCP_TIMEOUT_GRACE_MS = 60_000;
+// Codex's default inbound MCP tool-call deadline is 300 seconds. Happier run waits
+// legitimately observe work for up to one hour, so leave two minutes for admission and the result
+// to traverse the bridge without making every stalled tool effectively unbounded.
+export const DEFAULT_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS =
+  MAX_EXECUTION_RUN_OBSERVATION_TIMEOUT_SECONDS * 1_000 + 120_000;
 const MAX_SAFE_NODE_TIMEOUT_MS = 2_147_000_000;
 
 export type ShellBridgeContextEnvMode = 'off' | 'home' | 'full';
@@ -34,10 +47,10 @@ export type ShellBridgeContextEnvMode = 'off' | 'home' | 'full';
  * - If `opts.max` is specified, the value is clamped to that upper bound.
  * - Otherwise the `opts.default` value is returned.
  */
-function resolveIntEnvWithBounds(
+function resolveIntEnvWithBounds<Default extends number | null>(
   envVar: string,
-  opts: { min?: number; max?: number; default: number },
-): number {
+  opts: { min?: number; max?: number; default: Default },
+): number | Default {
   const raw = String(process.env[envVar] ?? '').trim()
   const parsed = Number.parseInt(raw, 10)
   const min = opts.min ?? 1
@@ -49,6 +62,15 @@ function resolveShellBridgeContextEnvMode(env: NodeJS.ProcessEnv): ShellBridgeCo
   const raw = String(env.HAPPIER_SHELL_BRIDGE_CONTEXT_ENV ?? '').trim().toLowerCase();
   if (raw === 'home' || raw === 'full') return raw;
   return 'off';
+}
+
+function resolveClientEncryptionRequirementEnv(env: NodeJS.ProcessEnv): ClientEncryptionRequirement {
+  const raw = String(env.HAPPIER_ENCRYPTION_REQUIREMENT ?? '').trim().toLowerCase();
+  if (!raw || raw === 'follow_account') return 'follow_account';
+  if (raw === 'require_e2ee') return 'require_e2ee';
+  throw new Error(
+    'Invalid HAPPIER_ENCRYPTION_REQUIREMENT; expected "follow_account" or "require_e2ee"',
+  );
 }
 
 /**
@@ -73,7 +95,7 @@ export function isDaemonProcessArgv(args: readonly string[]): boolean {
   return args[1] === 'start' || args[1] === 'start-sync'
 }
 
-function resolveCliHappyHomeDir(env: NodeJS.ProcessEnv): string {
+export function resolveCliHappyHomeDir(env: NodeJS.ProcessEnv): string {
   const override = typeof env.HAPPIER_HOME_DIR === 'string' ? env.HAPPIER_HOME_DIR.trim() : ''
   if (!override) {
     const sudoInvokerHomeDir = resolveSudoInvokerHomeDir(env)
@@ -234,6 +256,7 @@ class Configuration {
   // MCP client request timeouts for tool calls proxied by Happier-owned bridges.
   public readonly mcpToolCallTimeoutMs: number
   public readonly mcpExecutionRunWaitTimeoutGraceMs: number
+  public readonly codexHappierMcpToolCallTimeoutMs: number
 
   // Transcript lookup / recovery (fallback path when socket ACK/broadcast is missed).
   public readonly transcriptLookupRequestTimeoutMs: number
@@ -279,6 +302,7 @@ class Configuration {
   // Claude remote launcher: grace window between requesting a turn interrupt and force-aborting
   // the underlying Claude Code subprocess during teardown (switch/exit).
   public readonly claudeRemoteInterruptThenTeardownGraceMs: number
+  public readonly claudeRemoteIdleExitMs: number | null
   public readonly claudeLocalAbortEscalateAfterMs: number
   public readonly claudeLocalAbortKillAfterMs: number
 
@@ -340,10 +364,11 @@ class Configuration {
   public readonly startupOverridesCacheMaxAgeMs: number
   // Shell-bridge command context env policy (default: off).
   public readonly shellBridgeContextEnvMode: ShellBridgeContextEnvMode
+  public readonly clientEncryptionRequirement: ClientEncryptionRequirement
 
   constructor() {
     // Check if we're running as daemon based on process args
-    const args = normalizeCliArgv(process.argv.slice(2))
+    const { args } = parseRuntimeContextPrefixArgs(readCliProcessArgs())
     this.isDaemonProcess = isDaemonProcessArgv(args)
     normalizeDaemonProcessInheritedEnv({
       env: process.env,
@@ -389,6 +414,7 @@ class Configuration {
 
     this.activeServerDir = join(this.serversDir, this.activeServerId)
     this.shellBridgeContextEnvMode = resolveShellBridgeContextEnvMode(process.env)
+    this.clientEncryptionRequirement = resolveClientEncryptionRequirementEnv(process.env)
     this.legacyPrivateKeyFile = join(this.happyHomeDir, 'access.key')
     this.privateKeyFile = join(this.activeServerDir, 'access.key')
     this.installationIdentityFile = join(this.happyHomeDir, 'installation-identity.json')
@@ -608,6 +634,14 @@ class Configuration {
         default: DEFAULT_EXECUTION_RUN_WAIT_MCP_TIMEOUT_GRACE_MS,
       },
     );
+    this.codexHappierMcpToolCallTimeoutMs = resolveIntEnvWithBounds(
+      'HAPPIER_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS',
+      {
+        min: 60_000,
+        max: MAX_SAFE_NODE_TIMEOUT_MS,
+        default: DEFAULT_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS,
+      },
+    );
 
     const parseCsvNumberList = (raw: string, opts: { min: number; max: number }): number[] | null => {
       const value = raw.trim();
@@ -783,6 +817,14 @@ class Configuration {
     this.claudeRemoteInterruptThenTeardownGraceMs = resolveIntEnvWithBounds(
       'HAPPIER_CLAUDE_REMOTE_INTERRUPT_THEN_TEARDOWN_GRACE_MS',
       { min: 0, max: 30_000, default: 5_000 },
+    );
+
+    // Optional timeout override after the user opts in through Claude settings. An absent or invalid
+    // value leaves the app timeout authoritative; 0 disables reclamation even when opted in.
+    // Capped at the longest delay setTimeout supports; Node fires larger delays after 1 ms.
+    this.claudeRemoteIdleExitMs = resolveIntEnvWithBounds(
+      'HAPPIER_CLAUDE_REMOTE_IDLE_EXIT_MS',
+      { min: 0, max: 2 ** 31 - 1, default: null },
     );
 
     // Default: 3000ms. On local mode switching we send SIGINT first, then give Claude Code some time
@@ -1122,7 +1164,7 @@ function resolveServerSelection(params: Readonly<{
   serversDir: string;
 }>): Readonly<{ activeServerId: string; serverUrl: string; apiServerUrl: string; webappUrl: string }> {
   const DEFAULT_SERVER_URL = 'https://api.happier.dev';
-  const DEFAULT_WEBAPP_URL = 'https://app.happier.dev';
+  const DEFAULT_WEBAPP_URL = 'https://cloud.happier.dev';
   const resolveActiveServerId = (fallbackId: string): string =>
     sanitizeServerIdForFilesystem(params.envActiveServerId ?? fallbackId, 'cloud');
 
@@ -1151,7 +1193,7 @@ function resolveServerSelection(params: Readonly<{
       : null;
     if (envActivePersisted && !matchesUrl(envActivePersisted, envCanonicalServerUrl)) {
       const canonical = normalizeServerUrl(envActivePersisted.serverUrl);
-      const apiServerUrl = normalizeServerUrl(envActivePersisted.localServerUrl ?? '') || canonical;
+      const apiServerUrl = normalizeServerUrl(resolveServerProfileApiUrl(envActivePersisted));
       return {
         activeServerId: resolveActiveServerId(envActivePersisted.id),
         serverUrl: canonical,
@@ -1234,7 +1276,7 @@ function resolveServerSelection(params: Readonly<{
     const active = params.persisted.servers[params.persisted.activeServerId];
     if (active) {
       const canonical = normalizeServerUrl(active.serverUrl);
-      const apiServerUrl = normalizeServerUrl(active.localServerUrl ?? '') || canonical;
+      const apiServerUrl = normalizeServerUrl(resolveServerProfileApiUrl(active));
       return {
         activeServerId: resolveActiveServerId(active.id),
         serverUrl: canonical,
@@ -1252,6 +1294,9 @@ function resolveServerSelection(params: Readonly<{
   };
 }
 
+// Apply once, before home/server selection and any configuration filesystem access.
+// Reloads honor later explicit selections rather than replaying the startup context.
+applyRuntimeContextPrefixEnv(readCliProcessArgs(), process.env)
 export let configuration: Configuration = new Configuration()
 
 export function reloadConfiguration(): void {

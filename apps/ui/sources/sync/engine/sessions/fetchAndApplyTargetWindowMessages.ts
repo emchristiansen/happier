@@ -147,6 +147,7 @@ function shouldDropTargetWindowCommit(params: Readonly<{
 
 export async function fetchAndApplyTargetWindowMessages(params: {
     sessionId: string;
+    shouldContinue?: () => boolean;
     windowId: string;
     target: TargetWindowTarget;
     direction: TargetWindowDirection;
@@ -214,6 +215,7 @@ export async function fetchAndApplyTargetWindowMessages(params: {
             afterSeq: page.afterSeq,
         },
         lifecyclePolicy: 'suppress',
+        shouldContinue: params.shouldContinue,
         getSessionEncryption: params.getSessionEncryption,
         isSessionKnown: params.isSessionKnown,
         request: params.request,
@@ -233,9 +235,9 @@ export async function fetchAndApplyTargetWindowMessages(params: {
         beforeSeq,
         afterSeq,
     });
-    if (result.skippedMissingSession) {
+    if (result.skippedMissingSession || result.skippedSuperseded) {
         return {
-            status: 'skipped_missing_session',
+            status: result.skippedSuperseded ? 'stale' : 'skipped_missing_session',
             windowId: params.windowId,
             targetSeq: targetSequence,
             targetPresent: false,
@@ -300,7 +302,7 @@ export async function fetchAndApplyTargetWindowMessages(params: {
 
     const pageResults: TargetWindowPageResult[] = [result];
     if (useInitialMaterialization) {
-        pageResults.push(await loadPage({
+        const newerResult = await loadPage({
             direction: 'newer',
             requestPath: buildSessionMessagesPath({
                 sessionId: params.sessionId,
@@ -310,7 +312,23 @@ export async function fetchAndApplyTargetWindowMessages(params: {
                 afterSeq: targetSequence,
             }),
             afterSeq: targetSequence,
-        }));
+        });
+        if (newerResult.skippedMissingSession || newerResult.skippedSuperseded) {
+            const latestWindowState = params.getWindowState();
+            return {
+                status: newerResult.skippedSuperseded ? 'stale' : 'skipped_missing_session',
+                windowId: params.windowId,
+                targetSeq: targetSequence,
+                targetPresent: false,
+                rawSeqs: result.rawSeqs,
+                appliedSeqs: result.appliedSeqs,
+                olderCursor: latestWindowState.olderCursor,
+                newerCursor: latestWindowState.newerCursor,
+                hasMoreOlder: latestWindowState.hasMoreOlder,
+                hasMoreNewer: latestWindowState.hasMoreNewer,
+            };
+        }
+        pageResults.push(newerResult);
     }
 
     const rawSeqs = pageResults.flatMap((pageResult) => pageResult.rawSeqs);

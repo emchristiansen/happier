@@ -1,4 +1,4 @@
-import { readSpawnConfigOptionOverrideValue } from '@happier-dev/protocol';
+import { readSpawnConfigOptionOverrideValue, resolveCodexReasoningSummaryOverride } from '@happier-dev/protocol';
 
 import { readNonBlankSessionControlIdentifier } from '@/agent/runtime/sessionControlIdentifiers';
 import { createCodexAcpBackend } from '@/backends/codex/acp/backend';
@@ -21,9 +21,12 @@ const CODEX_EXECUTION_RUN_PROCESS_ENV_KEYS = [
   'HAPPIER_CODEX_EXECUTION_RUN_TRANSPORT',
   'HAPPIER_CODEX_APP_SERVER_RPC_TIMEOUT_MS',
   'HAPPIER_CODEX_APP_SERVER_STARTUP_RPC_TIMEOUT_MS',
+  'HAPPIER_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS',
 ] as const;
 
 function buildCodexExecutionRunBaseEnv(isolationEnv: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv | undefined {
+  if (isolationEnv === undefined) return { ...process.env };
+
   const inherited: NodeJS.ProcessEnv = {};
   for (const key of CODEX_EXECUTION_RUN_PROCESS_ENV_KEYS) {
     const value = process.env[key];
@@ -47,6 +50,7 @@ export const executionRunBackendFactory: ExecutionRunBackendFactory = (opts) => 
     'reasoning_effort',
   );
   const reasoningEffort = readNonBlankSessionControlIdentifier(reasoningEffortValue) ?? undefined;
+  const reasoningSummary = resolveCodexReasoningSummaryOverride(opts.accountSettings?.codexReasoningSummaries);
   const baseEnv = buildCodexExecutionRunBaseEnv(opts.isolation?.env);
   const env = buildCodexAcpEnvOverrides({ baseEnv, projectDir: opts.cwd });
   const permissionMode = permissionModeForExecutionRunPolicy(opts.permissionMode);
@@ -72,6 +76,7 @@ export const executionRunBackendFactory: ExecutionRunBackendFactory = (opts) => 
     return withExecutionRunBackendModelOptions(
       createCodexAppServerExecutionRunBackend({
         cwd: opts.cwd,
+        reasoningSummary,
         env,
         permissionHandler: opts.permissionHandler,
         permissionMode,
@@ -98,6 +103,7 @@ export const executionRunBackendFactory: ExecutionRunBackendFactory = (opts) => 
   if (shouldUseMcp) {
     return createCodexMcpExecutionRunBackend({
       cwd: opts.cwd,
+      reasoningSummary,
       env,
       modelId: opts.modelId,
       ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -108,6 +114,7 @@ export const executionRunBackendFactory: ExecutionRunBackendFactory = (opts) => 
   return withExecutionRunBackendModelOptions(
     createCodexAcpBackend({
       cwd: opts.cwd,
+      reasoningSummary,
       env,
       permissionHandler: opts.permissionHandler,
       permissionMode,

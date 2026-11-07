@@ -13,6 +13,7 @@ describe('happier daemon install/uninstall', () => {
       'HAPPIER_DAEMON_SERVICE_USER_HOME_DIR',
       'HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR',
       'HAPPIER_DAEMON_SERVICE_INSTANCE_ID',
+      'HAPPIER_DAEMON_SERVICE_TARGET_MODE',
       'HOME',
       'PATH',
     ]);
@@ -23,6 +24,7 @@ describe('happier daemon install/uninstall', () => {
         HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: tmp,
         HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: join(tmp, '.happier'),
         HAPPIER_DAEMON_SERVICE_INSTANCE_ID: 'cloud',
+        HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
         HOME: tmp,
         PATH: join(tmp, 'bin'),
       });
@@ -51,6 +53,7 @@ describe('happier daemon install/uninstall', () => {
       'HAPPIER_DAEMON_SERVICE_USER_HOME_DIR',
       'HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR',
       'HAPPIER_DAEMON_SERVICE_INSTANCE_ID',
+      'HAPPIER_DAEMON_SERVICE_TARGET_MODE',
       'HOME',
       'PATH',
     ]);
@@ -61,6 +64,7 @@ describe('happier daemon install/uninstall', () => {
         HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: tmp,
         HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: join(tmp, '.happier'),
         HAPPIER_DAEMON_SERVICE_INSTANCE_ID: 'cloud',
+        HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
         HOME: tmp,
         PATH: join(tmp, 'bin'),
       });

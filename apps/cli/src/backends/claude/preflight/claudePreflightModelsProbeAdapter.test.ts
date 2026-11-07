@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ConnectedServiceCredentialRecordV1 } from '@happier-dev/protocol';
 
@@ -131,12 +132,17 @@ function fullEffort(): AnthropicModelEntry['capabilities'] {
 }
 
 async function runProbe() {
-  return claudePreflightModelsProbeAdapter.probeModelsRaw?.({
+  const raw = await claudePreflightModelsProbeAdapter.probeModelsRaw?.({
     cwd: '/tmp',
     timeoutMs: 1_500,
     backendTarget: undefined,
     accountSettings: null,
-  }) as Promise<Array<Record<string, unknown>> | null>;
+  });
+  return z.object({
+    availableModels: z.array(z.record(z.string(), z.unknown())),
+    source: z.enum(['dynamic', 'static']),
+    refreshError: z.boolean().optional(),
+  }).parse(raw);
 }
 
 beforeEach(() => {
@@ -184,7 +190,7 @@ describe('claudePreflightModelsProbeAdapter', () => {
       processEnv,
     });
 
-    expect(raw).toEqual(expect.any(Array));
+    expect(raw).toMatchObject({ source: 'dynamic', availableModels: expect.any(Array), observedAt: expect.any(Number) });
     expect(fetchAnthropicModelsMock).toHaveBeenCalledWith(expect.objectContaining({
       apiKey: 'profile-api-key',
     }));
@@ -210,14 +216,14 @@ describe('claudePreflightModelsProbeAdapter', () => {
 
     expect(fetchAnthropicModelsMock).toHaveBeenCalledWith(expect.objectContaining({ apiKey: 'sk-ant-key' }));
 
-    expect(raw.map((model) => model.id)).toEqual([
+    expect(raw.availableModels.map((model) => model.id)).toEqual([
       'claude-opus-5',
       'claude-opus-4-5-20251101',
       'claude-opus-9',
     ]);
 
     // Matching curated rows keep curated presentation while API capabilities own effort facts.
-    const opus5 = raw.find((m) => m.id === 'claude-opus-5');
+    const opus5 = raw.availableModels.find((m) => m.id === 'claude-opus-5');
     const opus5Effort = (opus5?.modelOptions as Array<Record<string, unknown>> | undefined)
       ?.find((o) => o.id === 'reasoning_effort');
     expect(opus5?.name).toBe('Opus 5');
@@ -227,12 +233,12 @@ describe('claudePreflightModelsProbeAdapter', () => {
     ]));
 
     // Discovered model appears with derived options + context window.
-    const opus9 = raw.find((m) => m.id === 'claude-opus-9');
+    const opus9 = raw.availableModels.find((m) => m.id === 'claude-opus-9');
     expect(opus9?.name).toBe('Opus 9');
     expect(opus9?.contextWindowTokens).toBe(1_000_000);
     expect((opus9?.modelOptions as Array<Record<string, unknown>> | undefined)?.some((o) => o.id === 'reasoning_effort')).toBe(true);
 
-    const dated = raw.find((m) => m.id === 'claude-opus-4-5-20251101');
+    const dated = raw.availableModels.find((m) => m.id === 'claude-opus-4-5-20251101');
     expect(dated).toEqual(expect.objectContaining({
       id: 'claude-opus-4-5-20251101',
       name: 'Opus 4.5',
@@ -252,15 +258,15 @@ describe('claudePreflightModelsProbeAdapter', () => {
     if (!raw) throw new Error('expected model list');
 
     expect(fetchAnthropicModelsMock).toHaveBeenCalledWith(expect.objectContaining({ accessToken: 'sk-ant-oat01-disk' }));
-    expect(raw.some((m) => m.id === 'claude-opus-9')).toBe(true);
+    expect(raw.availableModels.some((m) => m.id === 'claude-opus-9')).toBe(true);
   });
 
-  it('returns null when no credential is available', async () => {
+  it('returns observable static fallback when no credential is available', async () => {
     readClaudeCodeNativeCredentialMock.mockResolvedValue(null);
 
     const raw = await runProbe();
 
-    expect(raw).toBeNull();
+    expect(raw).toMatchObject({ source: 'static', refreshError: true });
     expect(fetchAnthropicModelsMock).not.toHaveBeenCalled();
   });
 
@@ -277,12 +283,12 @@ describe('claudePreflightModelsProbeAdapter', () => {
     const raw = await runProbe();
     if (!raw) throw new Error('expected model list');
 
-    for (const model of raw) {
+    for (const model of raw.availableModels) {
       const optionIds = (model.modelOptions as Array<Record<string, unknown>> | undefined)
         ?.map((option) => option.id) ?? [];
       expect(optionIds).not.toContain('ultracode');
     }
-    const opus9Options = raw.find((model) => model.id === 'claude-opus-9')
+    const opus9Options = raw.availableModels.find((model) => model.id === 'claude-opus-9')
       ?.modelOptions as Array<Record<string, unknown>> | undefined;
     expect(opus9Options?.some((option) => option.id === 'reasoning_effort')).toBe(true);
   });
@@ -310,7 +316,7 @@ describe('claudePreflightModelsProbeAdapter', () => {
 
     const raw = await runProbe();
 
-    expect(raw).toBeNull();
+    expect(raw).toMatchObject({ source: 'static', refreshError: true });
     expect(fetchAnthropicModelsMock).not.toHaveBeenCalled();
   });
 
@@ -343,7 +349,7 @@ describe('claudePreflightModelsProbeAdapter', () => {
     const raw = await runProbe();
     if (!raw) throw new Error('expected authoritative model list');
 
-    expect(raw.map((model) => model.id)).toEqual([
+    expect(raw.availableModels.map((model) => model.id)).toEqual([
       'claude-opus-9',
       'claude-3-5-sonnet-20241022',
       'claude-3-5-sonnet-20240620',
@@ -444,12 +450,12 @@ describe('claudePreflightModelsProbeAdapter', () => {
     }));
   });
 
-  it('returns null when the models fetch fails', async () => {
+  it('returns observable static fallback when the models fetch fails', async () => {
     process.env.ANTHROPIC_API_KEY = 'sk-ant-key';
     fetchAnthropicModelsMock.mockResolvedValue(null);
 
     const raw = await runProbe();
 
-    expect(raw).toBeNull();
+    expect(raw).toMatchObject({ source: 'static', refreshError: true });
   });
 });

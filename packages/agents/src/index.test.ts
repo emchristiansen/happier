@@ -69,8 +69,8 @@ describe('agents package exports', () => {
     expect(getAgentMediaCapabilities('codex').nativeImageGeneration).toBe('supported');
   });
 
-  it('re-exports Kimi provider setting fields from the package root', () => {
-    expect(KIMI_PROVIDER_FIELDS.kimiAcpPythonSelector.default).toBe('auto');
+  it('does not expose legacy Kimi Python compatibility settings', () => {
+    expect(KIMI_PROVIDER_FIELDS).toEqual({});
   });
 
   it('re-exports connected-service session option helpers from the package root', () => {

@@ -67,23 +67,11 @@ vi.mock('@/hooks/ui/useKeyboardHeight', () => ({
     useKeyboardHeight: () => 0,
 }));
 
-vi.mock('@/agents/catalog/catalog', () => ({
+vi.mock('@/agents/catalog/catalog', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/agents/catalog/catalog')>(),
     getAgentIconSvgXml: () => null,
     getAgentIconSource: () => null,
     getAgentIconTintColor: () => undefined,
-    AGENT_IDS: ['codex', 'claude', 'opencode', 'gemini'],
-    DEFAULT_AGENT_ID: 'codex',
-    resolveAgentIdFromFlavor: () => null,
-    getAgentCore: () => ({
-        displayNameKey: 'agents.codex',
-        toolRendering: { hideUnknownToolsByDefault: false },
-        ui: { agentPickerIconName: 'terminal-outline' },
-    }),
-    getAgentBehavior: (agentId: string) => ({
-        sessionUsage: {
-            supportsExactContextUsageBadge: agentId !== 'codex' && agentId !== 'gemini',
-        },
-    }),
 }));
 
 vi.mock('@/sync/domains/models/modelOptions', () => ({
@@ -175,17 +163,15 @@ vi.mock('@/components/sessions/pickers/OptionPickerOverlay', () => ({
     OptionPickerOverlay: () => null,
 }));
 
-vi.mock('@/sync/domains/sessionControl/sessionModeControl', () => ({
-    computeSessionModePickerControl: () => null,
-}));
 
 vi.mock('@/sync/domains/sessionControl/configOptionsControl', () => ({
     computeSessionConfigOptionControls: () => null,
 }));
 
+const { AgentInput } = await import('./AgentInput');
+
 describe('AgentInput (chip ordering)', () => {
     it('keeps the engine controls grouped ahead of permission in wrap layout', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         let tree: renderer.ReactTestRenderer | undefined;
         tree = (await renderScreen(React.createElement(AgentInput, {
@@ -236,7 +222,6 @@ describe('AgentInput (chip ordering)', () => {
     }, 90_000);
 
     it('keeps machine on the secondary wrap row after the send button and before path/resume', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         let tree: renderer.ReactTestRenderer | undefined;
         tree = (await renderScreen(React.createElement(AgentInput, {
@@ -284,7 +269,6 @@ describe('AgentInput (chip ordering)', () => {
     }, 90_000);
 
     it('keeps recipient ahead of delivery in the primary wrap row', async () => {
-        const { AgentInput } = await import('./AgentInput');
 
         let tree: renderer.ReactTestRenderer | undefined;
         tree = (await renderScreen(React.createElement(AgentInput, {
@@ -295,6 +279,7 @@ describe('AgentInput (chip ordering)', () => {
                     autocompleteKinds: [],
                     autocompleteSuggestions: async () => [],
                     onPermissionClick: () => {},
+                    agentType: 'codex',
                     extraActionChips: [
                         {
                             key: 'participants-recipient',
@@ -348,6 +333,39 @@ describe('AgentInput (chip ordering)', () => {
         expect(permissionIndex).toBeGreaterThanOrEqual(0);
         expect(recipientIndex).toBeGreaterThan(permissionIndex);
         expect(deliveryIndex).toBeGreaterThan(recipientIndex);
+    }, 90_000);
+
+    it('does not rebuild the control rows when only the composer text changes', async () => {
+        const renderRecipientChip = vi.fn(() => React.createElement('Pressable', { testID: 'agent-input-recipient-chip' }));
+        const extraActionChips = [{
+            key: 'participants-recipient',
+            controlId: 'recipient' as const,
+            collapsedOptionsPopover: {
+                title: 'session.participants.sendToTitle',
+                options: [{ id: 'lead', label: 'Lead' }],
+                selectedOptionId: 'lead',
+                onSelect: () => {},
+            },
+            render: renderRecipientChip,
+        }];
+        const stableProps = {
+            placeholder: 'placeholder',
+            onChangeText: () => {},
+            onSend: () => {},
+            autocompleteKinds: [],
+            autocompleteSuggestions: async () => [],
+            onPermissionClick: () => {},
+            agentType: 'codex' as const,
+            extraActionChips,
+        };
+        const screen = await renderScreen(React.createElement(AgentInput, { ...stableProps, value: '' }));
+        expect(renderRecipientChip).toHaveBeenCalled();
+        renderRecipientChip.mockClear();
+
+        await screen.update(React.createElement(AgentInput, { ...stableProps, value: 'h' }));
+        await screen.update(React.createElement(AgentInput, { ...stableProps, value: 'he' }));
+
+        expect(renderRecipientChip).not.toHaveBeenCalled();
     }, 90_000);
 
 });

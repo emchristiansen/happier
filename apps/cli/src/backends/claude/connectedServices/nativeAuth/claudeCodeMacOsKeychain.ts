@@ -96,10 +96,13 @@ function assertSecuritySpawnAllowed(): void {
 async function runSecurityCommand(params: Readonly<{
   args: readonly string[];
   timeoutMs?: number | undefined;
+  signal?: AbortSignal;
 }>): Promise<Readonly<{ stdout: string; stderr: string; status: number | null }>> {
+  params.signal?.throwIfAborted();
   assertSecuritySpawnAllowed();
   const child = spawn('security', [...params.args], {
     stdio: ['pipe', 'pipe', 'pipe'],
+    signal: params.signal,
   });
   const stdoutChunks: Buffer[] = [];
   const stderrChunks: Buffer[] = [];
@@ -266,6 +269,7 @@ export async function readClaudeCodeMacOsKeychainCredential(params: Readonly<{
   claudeConfigDir: string;
   homeDir?: string | null | undefined;
   username?: string | null | undefined;
+  signal?: AbortSignal;
 }>): Promise<ClaudeCodeNativeCredentialPayload | null> {
   return (await readClaudeCodeMacOsKeychainCredentialWithMetadata(params))?.payload ?? null;
 }
@@ -274,7 +278,9 @@ export async function readClaudeCodeMacOsKeychainCredentialWithMetadata(params: 
   claudeConfigDir: string;
   homeDir?: string | null | undefined;
   username?: string | null | undefined;
+  signal?: AbortSignal;
 }>): Promise<ClaudeCodeMacOsKeychainCredentialReadResult | null> {
+  params.signal?.throwIfAborted();
   const serviceName = resolveClaudeCodeMacOsKeychainServiceName({
     claudeConfigDir: params.claudeConfigDir,
     homeDir: params.homeDir,
@@ -290,9 +296,10 @@ export async function readClaudeCodeMacOsKeychainCredentialWithMetadata(params: 
   try {
     const args = ['find-generic-password', '-a', username, '-s', serviceName] as const;
     const [raw, metadata] = await Promise.all([
-      runSecurityCommand({ args: [...args, '-w'] }),
-      runSecurityCommand({ args }),
+      runSecurityCommand({ args: [...args, '-w'], signal: params.signal }),
+      runSecurityCommand({ args, signal: params.signal }),
     ]);
+    params.signal?.throwIfAborted();
     if (raw.status !== 0 || metadata.status !== 0) return null;
     const parsed = JSON.parse(raw.stdout.trim()) as unknown;
     const payload = readClaudeCodeNativeCredentialPayload(parsed);
@@ -303,6 +310,7 @@ export async function readClaudeCodeMacOsKeychainCredentialWithMetadata(params: 
         }
       : null;
   } catch {
+    params.signal?.throwIfAborted();
     return null;
   }
 }

@@ -1,16 +1,10 @@
-import type { AcpPermissionHandler } from '@/agent/acp/AcpBackend';
+import type { AcpBackend, AcpPermissionHandler } from '@/agent/acp/AcpBackend';
 import { createAcpRuntime } from '@/agent/acp/runtime/createAcpRuntime';
 import type { McpServerConfig } from '@/agent';
-import type { AgentBackend } from '@/agent/core';
 import type { ApiSessionClient } from '@/api/session/sessionClient';
 import type { PermissionMode } from '@/api/types';
 import type { MessageBuffer } from '@/ui/ink/messageBuffer';
 import { logger } from '@/ui/logger';
-import {
-  sendPermissionRequestPushNotificationForActiveAccount,
-  type PermissionRequestPushSender,
-} from '@/settings/notifications/permissionRequestPush';
-import { getSessionNotificationTitle } from '@/agent/runtime/readyNotificationContext';
 import type { SessionProviderInputConsumer } from '@/agent/runtime/sessionInput/types';
 
 import { createConfiguredAcpBackend } from './createConfiguredAcpBackend';
@@ -21,11 +15,11 @@ type CreateConfiguredAcpRuntimeParams = Readonly<{
   loggerLabel: string;
   directory: string;
   session: ApiSessionClient;
-  pushSender?: PermissionRequestPushSender;
   messageBuffer: MessageBuffer;
   mcpServers: Record<string, McpServerConfig>;
   permissionHandler: AcpPermissionHandler;
   launchEnv: Readonly<Record<string, string>>;
+  processEnv?: NodeJS.ProcessEnv;
   onThinkingChange: (thinking: boolean) => void;
   getPermissionMode?: () => PermissionMode | null | undefined;
   onSessionIdChange?: (nextSessionId: string | null) => void;
@@ -35,42 +29,34 @@ type CreateConfiguredAcpRuntimeParams = Readonly<{
 }>;
 
 export function createConfiguredAcpRuntime(params: CreateConfiguredAcpRuntimeParams) {
-  const sendPermissionPush = (evt: { permissionId: string; toolName: string }): void => {
-    if (!params.pushSender) return;
-    try {
-      sendPermissionRequestPushNotificationForActiveAccount({
-        pushSender: params.pushSender,
-        sessionId: params.session.sessionId,
-        sessionTitle: getSessionNotificationTitle(params.session.getMetadataSnapshot?.bind(params.session)) ?? params.session.sessionId,
-        agentDisplayName: params.backend.title,
-        permissionId: evt.permissionId,
-        toolName: evt.toolName,
-        permissionMode: params.getPermissionMode?.(),
-      });
-    } catch {
-      // best-effort
-    }
-  };
+  let activeBackend: AcpBackend | null = null;
 
   return createAcpRuntime({
     provider: `acp:${params.backend.backendId}`,
     directory: params.directory,
     happierSessionId: params.session.sessionId,
+    processEnv: params.processEnv,
     session: params.session,
     messageBuffer: params.messageBuffer,
     mcpServers: params.mcpServers,
     permissionHandler: params.permissionHandler,
     onThinkingChange: params.onThinkingChange,
-    sessionIdentity: {
-      kind: 'runtime-only',
-      reason: 'vendor-resume-unsupported',
-    },
+    sessionIdentity: params.backend.capabilities.supportsLoadSession
+      ? {
+          kind: 'persist-bound',
+          persistBound: async (event) => {
+            if (activeBackend?.getNegotiatedSessionLoadSupport() !== true) return;
+            await Promise.resolve(params.session.updateMetadata((metadata) => ({
+              ...metadata,
+              customAcpSessionId: event.vendorSessionId,
+            })));
+          },
+        }
+      : {
+          kind: 'runtime-only',
+          reason: 'vendor-resume-unsupported',
+        },
     memoryRecallGuidance: params.memoryRecallGuidance,
-    hooks: {
-      onPermissionRequest: (evt) => {
-        sendPermissionPush(evt);
-      },
-    },
     pendingQueue: {
       drainAfterStartOrLoad: true,
       maxPopPerWake: params.pendingQueueDrainMaxPopPerWake,
@@ -82,21 +68,26 @@ export function createConfiguredAcpRuntime(params: CreateConfiguredAcpRuntimePar
         cwd: params.directory,
         backend: params.backend,
         launchEnv: params.launchEnv,
+        env: params.processEnv,
+        happierSessionId: params.session.sessionId,
         mcpServers: params.mcpServers,
         permissionHandler: params.permissionHandler,
         ...(permissionMode ? { permissionMode } : {}),
       });
+      activeBackend = backend;
       logger.debug(`[${params.loggerLabel}] Backend created`);
-      return backend as unknown as AgentBackend;
+      return backend;
     },
     createReplayBackend: async () => {
       return createConfiguredAcpBackend({
         cwd: params.directory,
         backend: params.backend,
         launchEnv: params.launchEnv,
+        env: params.processEnv,
+        happierSessionId: params.session.sessionId,
         mcpServers: params.mcpServers,
         permissionHandler: params.permissionHandler,
-      }) as unknown as AgentBackend;
+      });
     },
   });
 }

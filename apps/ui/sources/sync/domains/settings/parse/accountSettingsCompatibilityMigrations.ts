@@ -1,5 +1,5 @@
 import { buildBackendTargetKey, normalizeCodexBackendMode } from '@happier-dev/protocol';
-import { parsePermissionIntentAlias } from '@happier-dev/agents';
+import { parsePermissionIntentAlias, resolveClaudeUnifiedTerminalResponseLocations } from '@happier-dev/agents';
 import { z } from 'zod';
 
 import { AGENT_IDS, getAgentCore } from '@/agents/registry/registryCore';
@@ -18,6 +18,11 @@ export function applyAccountSettingsCompatibilityMigrations<TSettings extends Re
 }): TSettings {
     const { input, inputSchemaVersion, supportedSchemaVersion } = params;
     const next = { ...params.settings } as Record<string, unknown>;
+
+    // Resolve before defaults hide whether an older account explicitly disabled the bridge.
+    const claudeResponseLocations = resolveClaudeUnifiedTerminalResponseLocations(input);
+    next.claudeUnifiedTerminalQuestionResponseLocation = claudeResponseLocations.question;
+    next.claudeUnifiedTerminalPermissionResponseLocation = claudeResponseLocations.permission;
 
     if (next.preferredLanguage === 'zh') {
         next.preferredLanguage = 'zh-Hans';
@@ -79,6 +84,21 @@ export function applyAccountSettingsCompatibilityMigrations<TSettings extends Re
     if (!('sessionTmuxByMachineId' in input) && 'terminalTmuxByMachineId' in input) {
         const parsed = z.record(z.string(), SessionTmuxMachineOverrideSchema).safeParse(input.terminalTmuxByMachineId);
         if (parsed.success) next.sessionTmuxByMachineId = parsed.data;
+    }
+    // Development Herdr settings previously nested the host in the released
+    // tmux map. Normalize retained input once; current writers only use the
+    // additive top-level map, which older UI edits preserve.
+    if (!('sessionTerminalHostByMachineId' in input)) {
+        const legacyMap = input.sessionTmuxByMachineId;
+        if (legacyMap && typeof legacyMap === 'object' && !Array.isArray(legacyMap)) {
+            const hosts: Record<string, 'zellij' | 'herdr'> = {};
+            for (const [machineId, value] of Object.entries(legacyMap)) {
+                if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+                const host = (value as Record<string, unknown>).terminalHost;
+                if (host === 'zellij' || host === 'herdr') hosts[machineId] = host;
+            }
+            next.sessionTerminalHostByMachineId = hosts;
+        }
     }
     if (!('sessionMessageSendMode' in input) && 'messageSendMode' in input) {
         const parsed = z.enum(['agent_queue', 'interrupt', 'server_pending'] as const).safeParse(input.messageSendMode);

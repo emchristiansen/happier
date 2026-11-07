@@ -6,6 +6,8 @@ import { AcpBackend, type AcpBackendOptions, type AcpPermissionHandler } from '@
 import type { AgentBackend } from '@/agent/core';
 import { probeAgentModelsBestEffort, probeModelsFromAcpBackend } from './agentModelsProbe';
 import { createApprovedPermissionHandler } from '@/testkit/backends/permissionHandler';
+import { createFx014SessionResponse, writeFx014AcpAgentScript } from '@/agent/acp/testkit/fx014';
+import { withTempDir } from '@/testkit/fs/tempDir';
 import {
   createProbeTempDir,
   resolveAcpSdkEntryFromCwd,
@@ -48,6 +50,61 @@ type ProbeBackendLike = Pick<AgentBackend, 'startSession'> & {
 };
 
 describe('probeModelsFromAcpBackend', () => {
+  it('uses an explicit opaque selector id and recursively grouped choices ahead of a model-labelled decoy', async () => {
+    await withTempDir('happier-acp-explicit-probe-', async (dir) => {
+      const [provider, model, ...controls] = createFx014SessionResponse().configOptions;
+      const selector = { ...model, id: ' vendor/selector ', name: 'Engine selection', options: [
+        { name: 'Outer', options: [{ name: 'Inner', options: model.options }] },
+      ] };
+      const backend = new AcpBackend({
+        agentName: 'test', cwd: dir, command: process.execPath,
+        args: [writeFx014AcpAgentScript({ dir, configOptions: [
+          provider, { ...provider, id: 'model', name: 'Model' }, selector, ...controls,
+        ] })],
+      });
+      try {
+        const models = await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000, modelConfigOptionId: selector.id });
+        expect(models?.map((entry) => entry.id)).toEqual(['default', ...model.options.map((choice) => choice.value)]);
+        expect(models?.find((entry) => entry.id === model.currentValue)?.modelOptions?.map((option) => option.id)).toEqual(['effort', 'fast']);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  });
+
+  it('rejects an ambiguous category-only model projection', async () => {
+    await withTempDir('happier-acp-ambiguous-probe-', async (dir) => {
+      const backend = new AcpBackend({
+        agentName: 'test', cwd: dir, command: process.execPath,
+        args: [writeFx014AcpAgentScript({ dir, configOptions: createFx014SessionResponse().configOptions.filter((option) => option.id !== 'model') })],
+      });
+      try {
+        expect(await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000 })).toBeNull();
+        expect(backend.getSessionConfigOptionsState()?.map((option) => option.id)).toContain('provider');
+      } finally {
+        await backend.dispose();
+      }
+    });
+  });
+
+  it.each([false, true])('selects FX models rather than providers or fast controls (reordered: %s)', async (reordered) => {
+    await withTempDir('happier-fx014-probe-', async (dir) => {
+      const response = createFx014SessionResponse();
+      const backend = new AcpBackend({
+        agentName: 'fx', cwd: dir, command: process.execPath,
+        args: [writeFx014AcpAgentScript({ dir, configOptions: reordered ? [...response.configOptions].reverse() : response.configOptions })],
+      });
+      try {
+        const models = await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000 });
+        expect(models?.map((model) => model.id)).toEqual(['default', ...response.configOptions[1].options.map((choice) => choice.value)]);
+        expect(models?.find((model) => model.id === 'gpt-6.1-sol')?.modelOptions?.map((option) => option.id).sort()).toEqual(['effort', 'fast']);
+        expect(models?.filter((model) => model.id !== 'gpt-6.1-sol').every((model) => !model.modelOptions)).toBe(true);
+      } finally {
+        await backend.dispose();
+      }
+    });
+  });
+
   it('extracts available models from ACP session/new and normalizes Default', async () => {
     const fixture = await createProbeTempDir('happier-acp-model-probe');
     const sdkEntry = resolveAcpSdkEntryFromCwd(process.cwd());
@@ -185,6 +242,42 @@ describe('probeModelsFromAcpBackend', () => {
       ]);
     } finally {
       await backend.dispose().catch(() => {});
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it.each([true, false])('keeps session model options on the observed current model (models payload: %s)', async (withModels) => {
+    const fixture = await createProbeTempDir('happier-acp-model-probe-scoped');
+    const sdkEntry = resolveAcpSdkEntryFromCwd(process.cwd());
+    const effort = {
+      id: 'reasoning_effort', name: 'Reasoning effort', category: 'thought_level',
+      type: 'select', currentValue: 'high',
+      options: [{ value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }],
+    };
+    const payload = {
+      sessionId: 'scoped-probe-session',
+      ...(withModels ? { models: {
+        currentModelId: 'model-a',
+        availableModels: [{ id: 'model-a', name: 'Model A' }, { id: 'model-b', name: 'Model B' }],
+      } } : {}),
+      configOptions: [
+        { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'model-a',
+          options: [{ value: 'model-a', name: 'Model A' }, { value: 'model-b', name: 'Model B' }] },
+        effort,
+        { id: 'approval', name: 'Approval', type: 'select', currentValue: 'ask',
+          options: [{ value: 'ask', name: 'Ask' }] },
+      ],
+    };
+    const agentPath = await writeFakeAcpAgentScript({ dir: fixture.dir, sdkEntry, sessionPayloadSource: JSON.stringify(payload) });
+    const backend = new AcpBackend(createProbeBackendOptions({ cwd: fixture.dir, agentPath }));
+    try {
+      const models = await probeModelsFromAcpBackend({ backend, timeoutMs: 10_000 });
+      const { category: _category, ...expectedEffort } = effort;
+      expect(models?.find((model) => model.id === 'model-a')?.modelOptions).toEqual([expectedEffort]);
+      expect(models?.find((model) => model.id === 'model-b')?.modelOptions).toBeUndefined();
+      expect(models?.find((model) => model.id === 'default')?.modelOptions).toBeUndefined();
+    } finally {
+      await backend.dispose();
       await fixture.cleanup();
     }
   }, 20_000);
@@ -359,8 +452,11 @@ describe('probeAgentModelsBestEffort', () => {
       opencodePath,
       `#!/usr/bin/env node
 const args = process.argv.slice(2);
-if (args[0] === "models") {
-  process.stdout.write("openai/gpt-4.1\\nopenai/gpt-4.1-mini\\n");
+if (args[0] === "models" && args[1] === "--verbose") {
+  process.stdout.write(
+    'openai/gpt-4.1\\n{"id":"gpt-4.1","providerID":"openai","name":"GPT-4.1","capabilities":{"toolcall":true}}\\n' +
+    'openai/gpt-4.1-mini\\n{"id":"gpt-4.1-mini","providerID":"openai","name":"GPT-4.1 Mini","capabilities":{"toolcall":true}}\\n'
+  );
   process.exit(0);
 }
 process.exit(1);
@@ -555,10 +651,14 @@ process.exit(1);
       expect(res.source).toBe('dynamic');
       expect(res.availableModels[0]).toEqual({ id: 'default', name: 'Default' });
       expect(res.availableModels).toEqual(expect.arrayContaining([
-        { id: 'composer-2.5', name: 'Composer 2.5' },
-        { id: 'composer-2.5-fast', name: 'Composer 2.5 Fast' },
+        expect.objectContaining({
+          id: 'composer-2.5',
+          name: 'Composer 2.5',
+          modelOptions: [expect.objectContaining({ id: 'fast' })],
+        }),
         { id: 'gpt-5.5', name: 'GPT-5.5' },
       ]));
+      expect(res.availableModels.some((model) => model.id === 'composer-2.5-fast')).toBe(false);
     } finally {
       process.env.PATH = prevPath;
       if (typeof prevOverride === 'string') {

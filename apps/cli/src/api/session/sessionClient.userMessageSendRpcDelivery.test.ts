@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createMockSession as createMockSessionBase,
   createPlainSessionFixture as createPlainSessionFixtureBase,
+  createSessionRecordFixture,
 } from '@/testkit/backends/sessionFixtures';
 import {
   createApiSessionSocketStub as createApiSessionSocketStubBase,
@@ -13,7 +14,10 @@ import {
 } from '@/testkit/backends/apiSessionSocketHarness';
 import { waitForCondition } from '@/testkit/async/waitFor';
 import { decodeBase64, decrypt } from '../encryption';
-import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
+import { RPC_METHODS, SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
+import { FeaturesResponseSchema } from '@happier-dev/protocol';
+import * as persistence from '@/persistence';
+import * as machineRpc from '@/session/transport/rpc/machineRpc';
 
 let sessionSocketStub: ApiSessionSocketStub | null = null;
 let userSocketStub: ApiSessionSocketStub | null = null;
@@ -132,6 +136,10 @@ vi.mock('./pendingQueueV2Transport', async (importOriginal) => {
 });
 
 import { ApiSessionClient } from './sessionClient';
+import type { SessionClientPort } from './sessionClientPort';
+import { createClaudeReadyHandler } from '@/backends/claude/ready/createClaudeReadyHandler';
+import { DeferredApiSessionClient, type DeferredApiSessionTarget } from '@/agent/runtime/startup/DeferredApiSessionClient';
+import { createClaudeRemoteProviderInputOutcomeBridge } from '@/backends/claude/remote/claudeRemoteProviderInputOutcome';
 
 function createPlainClaudeSessionFixture(id: string) {
   const session = createPlainSessionFixture({ id });
@@ -169,8 +177,9 @@ async function waitForReleasedServerPendingInputContract(client: ApiSessionClien
 describe('ApiSessionClient session.userMessage.send delivery', () => {
   beforeEach(() => {
     vi.useRealTimers();
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(JSON.stringify(FeaturesResponseSchema.parse({
       features: {
+        sessions: { enabled: true, usageLimitRecovery: { enabled: true } },
         sharing: {
           pendingQueueV2: { enabled: true },
           pendingDeliveryState: { enabled: true },
@@ -182,7 +191,7 @@ describe('ApiSessionClient session.userMessage.send delivery', () => {
           pendingInput: { protocolVersion: 1 },
         },
       },
-    }), { status: 200 })));
+    })), { status: 200 })));
     enqueuePendingQueueV2MessageViaHttpMock.mockReset();
     enqueuePendingQueueV2MessageViaHttpMock.mockResolvedValue(undefined);
     materializeNextPendingQueueV2MessageMock.mockReset();
@@ -250,6 +259,99 @@ describe('ApiSessionClient session.userMessage.send delivery', () => {
       },
     });
   });
+
+  it.each(['before', 'after'] as const)('settles a claimed Claude prompt through a deferred client bound %s attach', async (bindingTime) => {
+    sessionSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+    userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+    const client = new ApiSessionClient('tok', createPlainClaudeSessionFixture('deferred-claude'));
+    await waitForCurrentPendingInputContract(client);
+    const deferred = new DeferredApiSessionClient({
+      placeholderSessionId: 'PID-claude',
+      limits: { maxEntries: 10, maxBytes: 10_000 },
+    });
+    if (bindingTime === 'after') await deferred.attach(client as unknown as DeferredApiSessionTarget);
+    const staleBridge = createClaudeRemoteProviderInputOutcomeBridge(deferred);
+    const bridge = createClaudeRemoteProviderInputOutcomeBridge(deferred);
+    if (bindingTime === 'before') await deferred.attach(client as unknown as DeferredApiSessionTarget);
+
+    const receivedLocalIds: Array<string | null | undefined> = [];
+    client.onUserMessage((message) => receivedLocalIds.push(message.localId));
+    await deferred.enqueueSessionUserMessage({ text: 'hello from local to remote', localId: 'deferred-prompt' });
+    expect(receivedLocalIds).toEqual(['deferred-prompt']);
+    expect(client.hasCanonicalPendingProviderInputDelivery('deferred-prompt')).toBe(true);
+    expect(bridge.hasAccepted(['deferred-prompt'])).toBe(false);
+
+    staleBridge.observeAccepted(['deferred-prompt']);
+    expect(client.hasPendingProviderInputAcceptance('deferred-prompt')).toBe(false);
+    bridge.observeAccepted(['deferred-prompt']);
+
+    expect(bridge.hasAccepted(['deferred-prompt'])).toBe(true);
+    await vi.waitFor(() => expect(client.hasCanonicalPendingProviderInputDelivery('deferred-prompt')).toBe(false));
+    expect(resolveAcceptedPendingQueueV2DeliveryMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'deferred-claude', localId: 'deferred-prompt',
+    }));
+  });
+
+  it.each(['provider rejection', 'explicit block', 'termination', 'cancellation'] as const)(
+    'preserves deferred provider delivery custody for %s', async (outcome) => {
+      sessionSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+      userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+      const client = new ApiSessionClient('tok', createPlainClaudeSessionFixture('deferred-custody'));
+      await waitForCurrentPendingInputContract(client);
+      const deferred = new DeferredApiSessionClient({
+        placeholderSessionId: 'PID-claude',
+        limits: { maxEntries: 10, maxBytes: 10_000 },
+      });
+      const bridge = createClaudeRemoteProviderInputOutcomeBridge(deferred);
+      await deferred.attach(client as unknown as DeferredApiSessionTarget);
+      client.onUserMessage(() => {});
+      await deferred.enqueueSessionUserMessage({ text: 'keep custody', localId: 'custody-prompt' });
+      expect(deferred.hasCanonicalPendingProviderInputDelivery('custody-prompt')).toBe(true);
+      expect(deferred.hasCanonicalPendingProviderInputDelivery('unclaimed-prompt')).toBe(false);
+
+      const pushSender = { sendToAllDevices: vi.fn() };
+      const notifyReady = createClaudeReadyHandler({
+        session: deferred,
+        pushSender,
+        waitingForCommandLabel: 'Claude',
+        logPrefix: '[test]',
+        getPending: () => null,
+        getQueueSize: () => 1,
+        hasOnlyBlockedPendingWork: () => (deferred as SessionClientPort).hasOnlyBlockedPendingWork?.() === true,
+      });
+      notifyReady();
+      expect(pushSender.sendToAllDevices).not.toHaveBeenCalled();
+
+      if (outcome === 'provider rejection') {
+        bridge.observeRejectedBeforeEffect({
+          userMessageLocalIds: ['custody-prompt'], reason: 'provider_rejected_before_acceptance',
+        });
+      } else if (outcome === 'explicit block') {
+        expect(await deferred.blockPendingMessageDelivery({
+          localIds: ['custody-prompt'], reason: 'provider_rejected_before_acceptance', providerEffect: 'none',
+        })).toBe(true);
+      } else {
+        if (outcome === 'termination') deferred.beginRuntimeTermination();
+        else deferred.cancel();
+        bridge.observeAccepted(['custody-prompt']);
+      }
+
+      if (outcome === 'provider rejection' || outcome === 'explicit block') {
+        await vi.waitFor(() => expect(blockPendingQueueV2DeliveryMock).toHaveBeenCalledWith(expect.objectContaining({
+          sessionId: 'deferred-custody', localId: 'custody-prompt', reason: 'provider_rejected_before_acceptance',
+        })));
+        await vi.waitFor(() => expect(client.hasOnlyBlockedPendingWork()).toBe(true));
+        notifyReady();
+        expect(pushSender.sendToAllDevices).toHaveBeenCalledWith(expect.any(String), expect.any(String), {
+          sessionId: 'deferred-custody',
+        });
+      } else {
+        expect(blockPendingQueueV2DeliveryMock).not.toHaveBeenCalled();
+      }
+      expect(resolveAcceptedPendingQueueV2DeliveryMock).not.toHaveBeenCalled();
+      expect(client.hasPendingProviderInputAcceptance('custody-prompt')).toBe(false);
+    },
+  );
 
   it('settles typed provider outcomes only for the exact claimed local input', async () => {
     sessionSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
@@ -679,6 +781,86 @@ describe('ApiSessionClient session.userMessage.send delivery', () => {
     expect(received).toHaveLength(1);
   });
 
+  it('keeps active recovery checks with the daemon owner rather than the provider-local recovery loop', async () => {
+    sessionSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+    userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+    const fixture = createPlainSessionFixture({ id: 's1' });
+    const client = new ApiSessionClient('tok', {
+      ...fixture,
+      metadata: {
+        ...fixture.metadata,
+        sessionUsageLimitRecoveryV1: {
+          v: 1,
+          status: 'waiting',
+          issueFingerprint: 'usage-limit:codex:turn-1:1:1000',
+          runtimeAuthRecoveryAttemptId: 'attempt-1',
+          armedAtMs: 1,
+          resetAtMs: 1000,
+          nextCheckAtMs: 1000,
+          attemptCount: 0,
+          maxAttempts: 5,
+          lastProbeError: null,
+          resumePromptMode: 'standard',
+          selectedAuth: { kind: 'profile', serviceId: 'openai-codex', profileId: 'profile-1' },
+        },
+      },
+    });
+    const localControl = vi.fn(async () => ({ ok: true, status: 'resumed' }));
+    client.setSessionRuntimeControls({ checkUsageLimitRecoveryNow: localControl });
+    const credentialRead = vi.spyOn(persistence, 'readCredentials').mockResolvedValue({
+      token: 'tok', encryption: { type: 'legacy', secret: new Uint8Array(32) },
+    });
+    const daemonCheck = vi.spyOn(machineRpc, 'callMachineRpc').mockResolvedValue({ ok: true, status: 'waiting' });
+    const sessionRead = vi.spyOn(axios, 'get').mockImplementation(async () => ({ status: 200, data: {
+      session: createSessionRecordFixture({ id: 's1', active: true, encryptionMode: 'plain',
+        metadata: JSON.stringify(client.getMetadataSnapshot()) }),
+    } }));
+    try {
+      await waitForCurrentPendingInputContract(client);
+      // Use the real registered control through its RPC boundary; no recovery owner is mocked.
+      const result = await client.rpcHandlerManager.invokeLocal(SESSION_RPC_METHODS.SESSION_USAGE_LIMIT_CHECK_NOW, {
+        sessionId: 's1', provider: 'codex', resumePromptMode: 'custom',
+      });
+      expect(result).toMatchObject({ ok: true, status: 'waiting' });
+      expect(daemonCheck).toHaveBeenCalledWith(expect.objectContaining({
+        machineId: 'machine-1',
+        method: RPC_METHODS.DAEMON_SESSION_USAGE_LIMIT_CHECK_NOW,
+        request: { sessionId: 's1', provider: 'codex', resumePromptMode: 'custom' },
+        authorization: { kind: 'session.write', sessionId: 's1' },
+      }));
+      expect(localControl).not.toHaveBeenCalled();
+
+      const received: unknown[] = [];
+      client.onUserMessage((message) => received.push(message));
+      const prompt = await client.rpcHandlerManager.invokeLocal(SESSION_RPC_METHODS.SESSION_USER_MESSAGE_SEND, {
+        text: 'explicit retry', localId: 'owned-retry', meta: { source: 'ui' },
+      });
+      expect(prompt).toMatchObject({ ok: true, providerAcceptancePending: true });
+      expect(enqueuePendingQueueV2MessageViaHttpMock).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 's1', body: expect.objectContaining({ localId: 'owned-retry' }),
+      }));
+      expect(daemonCheck).toHaveBeenCalledTimes(1);
+      expect(received).toHaveLength(1);
+      expect(localControl).not.toHaveBeenCalled();
+
+      daemonCheck.mockRejectedValueOnce(new Error('daemon unavailable'));
+      const unavailable = await client.rpcHandlerManager.invokeLocal(SESSION_RPC_METHODS.SESSION_USAGE_LIMIT_CHECK_NOW, { sessionId: 's1' });
+      expect(unavailable).toMatchObject({ ok: false, errorCode: 'session_usage_limit_recovery_control_remote_unavailable' });
+      expect(localControl).not.toHaveBeenCalled();
+
+      const providerAction = await client.rpcHandlerManager.invokeLocal(SESSION_RPC_METHODS.SESSION_USAGE_LIMIT_CHECK_NOW, {
+        sessionId: 's1', operation: 'switch_account_now',
+      });
+      expect(providerAction).toMatchObject({ ok: true, status: 'resumed' });
+      expect(localControl).toHaveBeenLastCalledWith({ sessionId: 's1', operation: 'switch_account_now' });
+    } finally {
+      credentialRead.mockRestore();
+      daemonCheck.mockRestore();
+      sessionRead.mockRestore();
+      await client.close();
+    }
+  });
+
   it('coalesces exact replays without collapsing whitespace-distinct recovery request ids', async () => {
     sessionSocketStub = createApiSessionSocketStub({
       connected: true,
@@ -890,7 +1072,7 @@ describe('ApiSessionClient session.userMessage.send delivery', () => {
     });
   });
 
-  it('fails closed when persisted blocking recovery has no provider decision control', async () => {
+  it('admits explicit input while generic recovery retains the automatic quota wait', async () => {
     sessionSocketStub = createApiSessionSocketStub({
       connected: true,
       emitWithAckResult: { ok: true, id: 'm1', seq: 1, localId: 'l1' },
@@ -915,6 +1097,7 @@ describe('ApiSessionClient session.userMessage.send delivery', () => {
         },
       },
     }));
+    await waitForCurrentPendingInputContract(client);
     const received: any[] = [];
     client.onUserMessage((message) => received.push(message));
 
@@ -922,14 +1105,9 @@ describe('ApiSessionClient session.userMessage.send delivery', () => {
       text: 'fresh Claude prompt',
       localId: 'request-missing-control',
       meta: { source: 'ui' },
-    })).resolves.toEqual({
-      recoveryBlocked: {
-        status: 'unavailable',
-        errorCode: 'session_user_message_recovery_control_unavailable',
-      },
-    });
+    })).resolves.toEqual({ providerAcceptancePending: true });
 
-    expect(received).toHaveLength(0);
+    expect(received).toHaveLength(1);
   });
 
   it('delivers fresh direct prompts while runtime activity projection is active', async () => {

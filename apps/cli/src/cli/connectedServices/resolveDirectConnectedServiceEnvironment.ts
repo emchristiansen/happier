@@ -112,6 +112,7 @@ export async function resolveDirectConnectedServiceEnvironment(params: Readonly<
           sessionId: params.sessionId,
           accountSettings: params.accountSettings,
           processEnv: process.env,
+          existingSessionMetadata: sessionMetadata,
           ...(params.vendorResumeId ? { vendorResumeId: params.vendorResumeId } : {}),
           resumeReachabilityRequired,
           candidatePersistedSessionFile: resolveConnectedServiceCandidatePersistedSessionFile(

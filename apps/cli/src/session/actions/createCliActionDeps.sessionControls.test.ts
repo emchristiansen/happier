@@ -1,6 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Credentials } from '@/persistence';
+import { configuration } from '@/configuration';
 import {
   ReviewStartInputSchema,
   SessionUsageLimitRecoveryOperationResultV1Schema,
@@ -114,6 +115,10 @@ function parseUsageLimitResult(value: unknown) {
 }
 
 describe('createCliActionDeps session controls', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   beforeEach(() => {
     mocks.axiosPost.mockReset();
     mocks.axiosPost.mockResolvedValue({ data: { didWrite: true } });
@@ -178,6 +183,9 @@ describe('createCliActionDeps session controls', () => {
   });
 
   it('lists models from provider probes instead of stale current-session metadata', async () => {
+    // This case exercises the cold fallback; the catalog's discovered-membership cases
+    // exercise dynamic discovery separately through their HTTP boundary fixtures.
+    vi.stubEnv('HAPPIER_CLAUDE_DYNAMIC_MODEL_PROBE_ENABLED', '0');
     const deps = createCliActionInventoryDeps({
       token: 'token',
       credentials: createCredentials(),
@@ -304,7 +312,11 @@ describe('createCliActionDeps session controls', () => {
     expect(JSON.stringify(configOptions)).not.toMatch(/token|secret|password/i);
   });
 
-  it('lists spawn target paths, machines, and servers from canonical session and daemon owners', async () => {
+  it('lists spawn target paths, account machines, and configured servers through their canonical owners', async () => {
+    mocks.axiosGet.mockResolvedValueOnce({ status: 200, data: [
+      { id: 'machine-cloud', active: true },
+      { id: 'machine-remote', active: false },
+    ] });
     mocks.listSessions.mockResolvedValueOnce({
       sessions: [
         { id: 'sess-a', path: '/repo/a', host: 'host-a', activeAt: 30 },
@@ -390,11 +402,21 @@ describe('createCliActionDeps session controls', () => {
         value: 'machine-cloud',
         label: 'machine-cloud',
         machineId: 'machine-cloud',
-        serverId: 'cloud',
-        serverName: 'Cloud',
+        serverId: configuration.activeServerId,
+        serverName: configuration.serverUrl,
         authenticated: true,
         machineRegistered: true,
         daemonRunning: true,
+      },
+      {
+        value: 'machine-remote',
+        label: 'machine-remote',
+        machineId: 'machine-remote',
+        serverId: configuration.activeServerId,
+        serverName: configuration.serverUrl,
+        authenticated: true,
+        machineRegistered: true,
+        daemonRunning: false,
       },
     ]);
     expect(servers.items).toEqual([
@@ -630,7 +652,7 @@ describe('createCliActionDeps session controls', () => {
             memberProfileIds: ['work'],
             generation: 3,
             enabledMemberCount: 1,
-            autoSwitch: false,
+            autoSwitch: null,
             status: 'ready',
           },
         ],
@@ -883,6 +905,40 @@ describe('createCliActionDeps session controls', () => {
       expect(result).toEqual({ ok: false, errorCode: 'resume_failed', error: 'resume_failed', message: 'Resume rejected',
         details: { pendingCustody: 'confirmed', sessionId: 'sess_1', localId: body.localId } });
     }
+  });
+
+  it('forwards the session-agent permission ceiling without manufacturing a target mode override', async () => {
+    const deps = createCliActionDeps({
+      token: 'token',
+      credentials: createCredentials(),
+      sessionId: 'sess_1',
+      ctx: {
+        encryptionKey: new Uint8Array(32).fill(1),
+        encryptionVariant: 'legacy',
+      },
+      mode: 'plain',
+      rawSession: {
+        metadata: {
+          permissionMode: 'safe-yolo',
+          permissionModeUpdatedAt: 10,
+        },
+      },
+    });
+
+    await deps.sessionSendMessage({
+      sessionId: 'sess_2',
+      message: 'hello',
+      requestedAction: { v: 1, kind: 'steer_if_active' },
+      callerSurface: 'session_agent',
+      callerPermissionMode: 'safe-yolo',
+    });
+
+    expect(mocks.sendSessionMessage).toHaveBeenCalledWith(expect.objectContaining({
+      permissionModeCeiling: 'safe-yolo',
+    }));
+    expect(mocks.sendSessionMessage).toHaveBeenCalledWith(expect.not.objectContaining({
+      permissionModeOverride: expect.anything(),
+    }));
   });
 
   it('preserves exact nonblank opaque model override bytes through the CLI service adapter', async () => {
@@ -1551,14 +1607,16 @@ describe('createCliActionDeps session controls', () => {
       errorCode: 'session_rpc_failed',
       error: 'session_rpc_failed',
     }, true],
-  ])('handles a stale active Codex session when %s', async (_scenario, liveResult, shouldSpawn) => {
-    mocks.callSessionRpc.mockResolvedValueOnce(liveResult);
-    mocks.callMachineRpc.mockResolvedValueOnce({ type: 'success', sessionId: 'sess_stale' });
+  ])('handles a stale active Codex session when %s', async (scenario, liveResult, usesTimedFallback) => {
+    const recoverySessionId = `sess_stale_${scenario.replace(/[^a-z]/g, '_')}`;
+    const response = liveResult.ok ? { ...liveResult, sessionId: recoverySessionId } : liveResult;
+    mocks.callSessionRpc.mockResolvedValueOnce(response);
+    mocks.callMachineRpc.mockResolvedValueOnce({ type: 'success', sessionId: recoverySessionId });
     mocks.resolveSessionTransportContext.mockResolvedValueOnce({
       ok: true as const,
-      sessionId: 'sess_stale',
+      sessionId: recoverySessionId,
       rawSession: {
-        id: 'sess_stale',
+        id: recoverySessionId,
         active: true,
         latestTurnStatus: 'failed',
         path: '/repo',
@@ -1613,41 +1671,15 @@ describe('createCliActionDeps session controls', () => {
       rawSession: { metadata: {} },
     });
 
-    await expect(deps.sessionUsageLimitCheckNow?.({ sessionId: 'sess_stale', provider: 'codex' })).resolves.toEqual({
-      ok: true,
-      status: shouldSpawn ? 'resumed' : 'ready',
-      sessionId: 'sess_stale',
-    });
-
+    const result = await deps.sessionUsageLimitCheckNow?.({ sessionId: recoverySessionId, provider: 'codex' });
+    expect(result).toMatchObject({ ok: true, status: 'ready', sessionId: recoverySessionId });
+    if (usesTimedFallback) expect(result).toMatchObject({ metadata: {
+      sessionUsageLimitRecoveryV1: { status: 'waiting', attemptCount: 0 },
+    } });
     expect(mocks.callSessionRpc).toHaveBeenCalledTimes(1);
-    if (!shouldSpawn) {
-      expect(mocks.callMachineRpc).not.toHaveBeenCalled();
-      return;
-    }
-    expect(mocks.callMachineRpc).toHaveBeenCalledTimes(1);
-    expect(mocks.callMachineRpc).toHaveBeenCalledWith({
-      credentials,
-      machineId: 'machine-local',
-      method: RPC_METHODS.SPAWN_HAPPY_SESSION,
-      request: expect.objectContaining({
-        type: 'resume-session',
-        sessionId: 'sess_stale',
-        directory: '/repo',
-        agentRuntimeDescriptorV1: {
-          v: 1,
-          providerId: 'codex',
-          provider: {
-            backendMode: 'appServer',
-            vendorSessionId: 'codex-thread-persisted',
-          },
-        },
-      }),
-    });
-    const machineCall = mocks.callMachineRpc.mock.calls[0]?.[0] as { request?: unknown } | undefined;
-    const spawnRequest = machineCall?.request;
-    expect(spawnRequest).not.toHaveProperty('message');
-    expect(spawnRequest).not.toHaveProperty('prompt');
-    expect(mocks.getSessionUsageLimitRecoveryControlAdapter).not.toHaveBeenCalled();
+    // Attaching a process cannot claim resumption without a continuation handoff.
+    expect(mocks.callMachineRpc).not.toHaveBeenCalled();
+
   });
 
   it('routes inactive local usage-limit controls without re-entering live session RPC', async () => {
@@ -1657,7 +1689,7 @@ describe('createCliActionDeps session controls', () => {
     mocks.getSessionUsageLimitRecoveryControlAdapter.mockResolvedValue({
       checkNow,
     });
-    mocks.resolveSessionTransportContext.mockResolvedValueOnce({
+    mocks.resolveSessionTransportContext.mockResolvedValue({
       ok: true as const,
       sessionId: 'sess_inactive',
       rawSession: {
@@ -1725,21 +1757,17 @@ describe('createCliActionDeps session controls', () => {
       status: 'cancelled',
       sessionId: 'sess_inactive',
     });
+    mocks.callMachineRpc.mockResolvedValue({ ok: false, errorCode: 'session_usage_limit_recovery_control_inactive' });
     await expect(deps.sessionUsageLimitCheckNow?.({ sessionId: 'sess_inactive' })).resolves.toEqual({
-      ok: true,
-      status: 'ready',
-      sessionId: 'sess_inactive',
+      ok: false, status: 'inactive', sessionId: 'sess_inactive',
+      errorCode: 'session_usage_limit_recovery_control_inactive',
     });
-
     expect(mocks.callSessionRpc).not.toHaveBeenCalled();
-    expect(mocks.getSessionUsageLimitRecoveryControlAdapter).toHaveBeenCalledWith('codex');
+    expect(mocks.getSessionUsageLimitRecoveryControlAdapter).not.toHaveBeenCalled();
     expect(mocks.updateSessionMetadataWithRetry).toHaveBeenCalledTimes(2);
-    expect(checkNow).toHaveBeenCalledWith(expect.objectContaining({
-      sessionId: 'sess_inactive',
-      cwd: '/repo',
-      metadata: expect.objectContaining({ machineId: 'machine-local' }),
-      currentMachineId: 'machine-local',
-    }));
+    // Each action re-resolves the same target; owned checks still use the daemon route.
+    expect(checkNow).not.toHaveBeenCalled();
+
   });
 
   it('passes inactive ready usage-limit recovery through the daemon resume callback', async () => {
@@ -2605,12 +2633,13 @@ describe('createCliActionDeps session controls', () => {
       const pendingLists = [...params.pendingLists];
       mocks.axiosGet.mockImplementation(async (...args: unknown[]) => {
         const url = String(args[0]);
-        if (url.endsWith('/v2/sessions/sess_1/pending')) {
+        const pathname = new URL(url).pathname;
+        if (pathname.endsWith('/v2/sessions/sess_1/pending')) {
           const next = pendingLists.shift();
           if (next instanceof Error || (next && typeof next === 'object' && 'isAxiosError' in next)) throw next;
           return { status: 200, data: next };
         }
-        if (url.endsWith('/v2/sessions/sess_1')) {
+        if (pathname.endsWith('/v2/sessions/sess_1')) {
           if (params.sessionError) throw params.sessionError;
           return { status: 200, data: { session: params.session } };
         }
@@ -3140,4 +3169,37 @@ describe('createCliActionDeps session controls', () => {
       });
     });
   });
+  it.each([
+    { active: true, machineId: 'machine-local', metadataMachineId: 'machine-local' },
+    { active: false, machineId: 'machine-local', metadataMachineId: 'machine-local' },
+    { active: true, machineId: 'machine-remote', metadataMachineId: 'machine-remote' },
+    { active: true, machineId: 'machine-local', metadataMachineId: 'machine-other' },
+  ])('checks daemon ownership before routing an owned CLI check ($active, $machineId, $metadataMachineId)', async ({ active, machineId, metadataMachineId }) => {
+    const recovery = { v: 1, status: 'waiting', issueFingerprint: 'attempt',
+      runtimeAuthRecoveryAttemptId: 'attempt', armedAtMs: 1, resetAtMs: 2, nextCheckAtMs: 2,
+      attemptCount: 0, maxAttempts: 3, lastProbeError: null, resumePromptMode: 'standard',
+      selectedAuth: { kind: 'profile', serviceId: 'claude-subscription', profileId: 'work' } };
+    mocks.resolveSessionTransportContext.mockResolvedValue({ ok: true, sessionId: 'sess_1',
+      rawSession: { active, machineId, metadata: { machineId: metadataMachineId,
+        agentRuntimeDescriptorV1: { v: 1, providerId: 'claude' }, sessionUsageLimitRecoveryV1: recovery } },
+      ctx: { encryptionKey: new Uint8Array(32).fill(3), encryptionVariant: 'legacy' }, mode: 'plain' });
+    mocks.callMachineRpc.mockResolvedValue({ ok: true, status: 'waiting', sessionId: 'sess_1' });
+    const deps = createCliActionDeps({ token: 'token', credentials: createCredentials(), sessionId: 'sess_1',
+      ctx: { encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy' }, mode: 'plain', rawSession: { metadata: {} } });
+    const result = await deps.sessionUsageLimitCheckNow?.({ sessionId: 'sess_1', resumePromptMode: 'custom' });
+    if (metadataMachineId !== machineId) {
+      expect(result).toMatchObject({ ok: false, errorCode: 'session_usage_limit_recovery_control_remote_unavailable' });
+      expect(mocks.callMachineRpc).not.toHaveBeenCalled();
+      expect(mocks.callSessionRpc).not.toHaveBeenCalled();
+      return;
+    }
+    expect(result).toMatchObject({ ok: true, status: 'waiting' });
+    expect(mocks.callMachineRpc).toHaveBeenCalledWith(expect.objectContaining({
+      machineId, method: RPC_METHODS.DAEMON_SESSION_USAGE_LIMIT_CHECK_NOW,
+      request: { sessionId: 'sess_1', resumePromptMode: 'custom' },
+      authorization: { kind: 'session.write', sessionId: 'sess_1' },
+    }));
+    expect(mocks.callSessionRpc).not.toHaveBeenCalled();
+  });
+
 });

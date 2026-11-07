@@ -45,7 +45,7 @@ GITHUB_CLIENT_ID=...
 GITHUB_CLIENT_SECRET=...
 GITHUB_REDIRECT_URL=https://YOUR_SERVER/v1/oauth/github/callback
 
-# OAuth return redirect back to the client (required unless you are using https://app.happier.dev)
+# OAuth return redirect back to the client (required unless you are using https://cloud.happier.dev)
 # - Web: set this to the URL you open in the browser for the Happier web app (self-hosted or local dev).
 # - Mobile: use HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE + HAPPIER_OAUTH_RETURN_ALLOWED_SCHEMES instead.
 HAPPIER_WEBAPP_URL=https://YOUR_WEBAPP
@@ -124,8 +124,8 @@ Required:
 - `GITHUB_REDIRECT_URL` (preferred) or legacy `GITHUB_REDIRECT_URI`
   - Must be: `https://YOUR_SERVER/v1/oauth/github/callback`
 
-Required **unless** you are using the hosted client at `https://app.happier.dev`:
-- `HAPPIER_WEBAPP_URL` (default `https://app.happier.dev`)
+Required **unless** you are using the hosted client at `https://cloud.happier.dev`:
+- `HAPPIER_WEBAPP_URL` (default `https://cloud.happier.dev`)
 
 Optional (typically only needed for mobile deep links / custom schemes):
 - `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE`
@@ -137,14 +137,14 @@ Optional (typically only needed for mobile deep links / custom schemes):
 Notes:
 - `GITHUB_REDIRECT_URL` must be reachable by GitHub (it’s where GitHub redirects the browser after the user approves OAuth).
 - If your server is behind a reverse proxy, `GITHUB_REDIRECT_URL` should be the **public** URL (not an internal container hostname).
-- `HAPPIER_WEBAPP_URL` / `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE` are only “optional” if you are using the hosted client at `https://app.happier.dev`.
+- `HAPPIER_WEBAPP_URL` / `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE` are only “optional” if you are using the hosted client at `https://cloud.happier.dev`.
   - If you are self-hosting the web app, or using a local dev web UI, you must set one of these so the server can redirect back to your client after OAuth.
 
 ## OAuth return URL to the client (advanced)
 
 After the server handles the GitHub callback, it redirects the browser back to the client so the client can finish the flow.
 
-- Default return base: `HAPPIER_WEBAPP_URL` (`https://app.happier.dev`)
+- Default return base: `HAPPIER_WEBAPP_URL` (`https://cloud.happier.dev`)
   - The server redirects to `${HAPPIER_WEBAPP_URL}/oauth/github?...` unless you override it.
 - Override return base (without provider suffix): `HAPPIER_WEBAPP_OAUTH_RETURN_URL_BASE`
   - Example: `https://app.example.com/custom-oauth` → redirects to `https://app.example.com/custom-oauth/github?...`
@@ -153,7 +153,7 @@ After the server handles the GitHub callback, it redirects the browser back to t
   - `http://` is only allowed for loopback hosts like `localhost`, `127.0.0.1`, and `*.localhost`, and is not allowed for non-loopback hosts.
 
 Troubleshooting:
-- If you get redirected to `https://app.happier.dev` even after setting `HAPPIER_WEBAPP_URL`, the server likely rejected your configured return URL as unsafe. For local web dev, use `http://localhost:PORT` or `http://*.localhost:PORT` (or use `https://`).
+- If you get redirected to `https://cloud.happier.dev` even after setting `HAPPIER_WEBAPP_URL`, the server likely rejected your configured return URL as unsafe. For local web dev, use `http://localhost:PORT` or `http://*.localhost:PORT` (or use `https://`).
 
 ## OAuth scopes
 

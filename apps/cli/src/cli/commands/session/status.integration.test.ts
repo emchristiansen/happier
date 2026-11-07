@@ -19,7 +19,8 @@ vi.mock('socket.io-client', () => ({
 }));
 
 describe('happier session status (integration)', () => {
-  const envKeys = ['HAPPIER_SERVER_URL', 'HAPPIER_WEBAPP_URL', 'HAPPIER_HOME_DIR'] as const;
+  const envKeys = ['HAPPIER_SERVER_URL', 'HAPPIER_WEBAPP_URL', 'HAPPIER_HOME_DIR',
+    'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_ACTIVE_SERVER_ID'] as const;
   let envScope = createEnvKeyScope(envKeys);
   let server: Server | null = null;
   let happyHomeDir = '';
@@ -50,6 +51,12 @@ describe('happier session status (integration)', () => {
           flavor: 'claude',
           tag: 'MyTag',
           host: 'host1',
+          sessionUsageLimitRecoveryV1: {
+            v: 1, status: 'waiting', issueFingerprint: 'status-integration-issue', armedAtMs: 123,
+            runtimeAuthRecoveryAttemptId: 'status-integration-attempt', resetAtMs: null,
+            nextCheckAtMs: 456, attemptCount: 1, maxAttempts: 3, lastProbeError: null,
+            selectedAuth: { kind: 'native' },
+          },
         },
         dek,
       ),
@@ -117,12 +124,19 @@ describe('happier session status (integration)', () => {
       throw new Error('Failed to resolve session control integration test server address');
     }
 
-    process.env.HAPPIER_SERVER_URL = `http://127.0.0.1:${address.port}`;
-    process.env.HAPPIER_WEBAPP_URL = 'http://127.0.0.1:3000';
-    process.env.HAPPIER_HOME_DIR = happyHomeDir;
+    const fixtureServerUrl = `http://127.0.0.1:${address.port}`;
+    envScope.patch({
+      HAPPIER_SERVER_URL: fixtureServerUrl,
+      HAPPIER_WEBAPP_URL: 'http://127.0.0.1:3000',
+      HAPPIER_HOME_DIR: happyHomeDir,
+      HAPPIER_PUBLIC_SERVER_URL: undefined,
+      HAPPIER_LOCAL_SERVER_URL: undefined,
+      HAPPIER_ACTIVE_SERVER_ID: undefined,
+    });
 
-    const { reloadConfiguration } = await import('@/configuration');
-    reloadConfiguration();
+    const configurationModule = await import('@/configuration');
+    configurationModule.reloadConfiguration();
+    expect(configurationModule.configuration.apiServerUrl).toBe(fixtureServerUrl);
 
     const socket = createApiSessionSocketStub({
       onConnect(currentSocket) {
@@ -181,11 +195,17 @@ describe('happier session status (integration)', () => {
 
       const parsed = output.json();
       expect(parsed.v).toBe(1);
-      expect(parsed.ok).toBe(true);
+      expect(parsed.error).toBeUndefined();
+      expect(parsed).toMatchObject({ ok: true, kind: 'session_status' });
       expect(parsed.kind).toBe('session_status');
       expect(parsed.data?.session?.id).toBe('sess_integration_status_123');
       expect(parsed.data?.agentState?.pendingRequestsCount).toBe(1);
       expect(parsed.data?.agentState?.controlledByUser).toBe(false);
+      expect(parsed.data?.usageLimitRecovery).toEqual({
+        state: 'present', metadataVersion: 0,
+        recovery: { status: 'waiting', issueFingerprint: 'status-integration-issue', armedAtMs: 123,
+          runtimeAuthRecoveryAttemptId: 'status-integration-attempt' },
+      });
     } finally {
       output.restore();
     }

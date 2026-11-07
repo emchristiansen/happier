@@ -1,6 +1,5 @@
 import { isTauriDesktop } from '@/utils/platform/tauri';
 
-import { buildLocalMachineSetupSystemTaskSpec } from './buildLocalMachineSetupSystemTaskSpec';
 import { createDeterministicSystemTaskBridge } from './createDeterministicSystemTaskBridge';
 import { createSystemTaskRunner } from './createSystemTaskRunner';
 import { createTauriSystemTaskBridge } from './createTauriSystemTaskBridge';
@@ -36,8 +35,4 @@ export function getSystemTasksRunner(): SystemTaskRunner {
             : createUnavailableSystemTaskBridge());
     sharedRunner = createSystemTaskRunner({ bridge, mode });
     return sharedRunner;
-}
-
-export function buildDefaultThisComputerTaskSpec() {
-    return buildLocalMachineSetupSystemTaskSpec();
 }

@@ -619,8 +619,10 @@ describe('SessionWorkStatePopover', () => {
         act(() => tree?.unmount());
     });
 
-    it('shows budget-limited goals precisely and hides pause controls', async () => {
+    it('removes an exhausted budget before resuming a budget-limited goal', async () => {
+        confirm.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
         const anchorRef = { current: null } as React.RefObject<any>;
+        const onSetGoal = vi.fn().mockResolvedValue({ ok: true });
 
         let tree: renderer.ReactTestRenderer | undefined;
         await act(async () => {
@@ -641,23 +643,94 @@ describe('SessionWorkStatePopover', () => {
                             status: 'blocked',
                             statusReason: 'budgetLimited',
                             title: 'Ship goals',
+                            tokenBudget: 1_000,
+                            tokensUsed: 1_000,
                             updatedAt: 10,
                         },
                     ],
                 }}
                 editableGoal
                 onRequestClose={vi.fn()}
-                onSetGoal={vi.fn()}
+                onSetGoal={onSetGoal}
                 onClearGoal={vi.fn()}
             />);
         });
 
         expect(collectText(tree?.toJSON())).toContain('session.workState.goal.statusBudgetLimited:');
         openGoalActionsMenu(tree);
-        expect(() => tree?.root.findByProps({ testID: 'session-goal-pause-resume-button' })).toThrow();
+        const resumeButton = tree?.root.findByProps({ testID: 'session-goal-pause-resume-button' });
+        expect(collectText(tree?.toJSON())).toContain('session.workState.goal.resume:');
         expect(() => tree?.root.findByProps({ testID: 'session-goal-complete-button' })).toThrow();
         expect(tree?.root.findByProps({ testID: 'session-goal-clear-button' })).toBeTruthy();
         expect(tree?.root.findByProps({ testID: 'session-goal-edit-button' })).toBeTruthy();
+
+        await act(async () => {
+            await resumeButton?.props.onPress();
+        });
+
+        expect(onSetGoal).not.toHaveBeenCalled();
+
+        openGoalActionsMenu(tree);
+        await act(async () => {
+            await tree?.root.findByProps({ testID: 'session-goal-pause-resume-button' }).props.onPress();
+        });
+
+        expect(confirm).toHaveBeenLastCalledWith(
+            'session.workState.goal.statusBudgetLimited:',
+            'session.workState.goal.budgetReachedBody:',
+            {
+                cancelText: 'common.cancel:',
+                confirmText: 'session.workState.goal.removeBudgetAndResume:',
+            },
+        );
+        expect(confirm).toHaveBeenCalledTimes(2);
+        expect(onSetGoal).toHaveBeenCalledWith({ status: 'active', tokenBudget: null });
+
+        act(() => tree?.unmount());
+    });
+
+    it.each(['blocked', 'usageLimited'] as const)('resumes a %s goal without changing its budget', async (statusReason) => {
+        const anchorRef = { current: null } as React.RefObject<any>;
+        const onSetGoal = vi.fn().mockResolvedValue({ ok: true });
+
+        let tree: renderer.ReactTestRenderer | undefined;
+        await act(async () => {
+            tree = renderer.create(<SessionWorkStatePopover
+                sessionId="sess_1"
+                open
+                anchorRef={anchorRef}
+                snapshot={{
+                    v: 1,
+                    backendId: 'codex',
+                    updatedAt: 10,
+                    primaryItemId: 'goal:codex',
+                    items: [{
+                        id: 'goal:codex',
+                        kind: 'goal',
+                        origin: 'vendor',
+                        status: 'blocked',
+                        statusReason,
+                        title: 'Ship goals',
+                        updatedAt: 10,
+                    }],
+                }}
+                editableGoal
+                onRequestClose={vi.fn()}
+                onSetGoal={onSetGoal}
+                onClearGoal={vi.fn()}
+            />);
+        });
+
+        openGoalActionsMenu(tree);
+        const resumeButton = tree?.root.findByProps({ testID: 'session-goal-pause-resume-button' });
+        expect(collectText(tree?.toJSON())).toContain('session.workState.goal.resume:');
+
+        await act(async () => {
+            await resumeButton?.props.onPress();
+        });
+
+        expect(confirm).not.toHaveBeenCalled();
+        expect(onSetGoal).toHaveBeenCalledWith({ status: 'active' });
 
         act(() => tree?.unmount());
     });
@@ -1251,7 +1324,8 @@ describe('SessionWorkStatePopover', () => {
             await tree?.root.findByProps({ testID: 'session-goal-complete-button' }).props.onPress();
         });
 
-        expect(tree?.root.findByProps({ testID: 'session-goal-pending' })).toBeTruthy();
+        const pending = tree?.root.findByProps({ testID: 'session-goal-pending' });
+        expect(pending).toBeTruthy();
         expect(onRequestClose).not.toHaveBeenCalled();
 
         // The native work-state now reflects the change → confirmation closes the popover.

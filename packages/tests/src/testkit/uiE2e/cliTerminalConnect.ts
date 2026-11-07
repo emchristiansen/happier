@@ -1,7 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
 
-import { resolveCliTestLaunchSpec } from '../process/cliLaunchSpec';
+import { resolveCliTestLaunchSpec, shouldUseCliSourceEntrypoint, type CliTestLaunchSpec } from '../process/cliLaunchSpec';
+import { sanitizeCliTestEnv } from '../process/cliTestEnv';
 import {
   inspectOwnedProcess,
   registerProcessOwnershipLease,
@@ -53,17 +54,6 @@ function deriveServerIdFromUrl(url: string): string {
     h = Math.imul(h, 16777619);
   }
   return `env_${(h >>> 0).toString(16)}`;
-}
-
-export function sanitizeCliTerminalConnectEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const sanitized = { ...env };
-  // The harness owns the server profile selected below. Ambient stack/daemon selection can
-  // otherwise override HAPPIER_SERVER_URL and store the freshly approved credentials under a
-  // different server than the daemon that this fixture starts afterwards.
-  delete sanitized.HAPPIER_ACTIVE_SERVER_ID;
-  delete sanitized.HAPPIER_DAEMON_SERVICE_INSTANCE_ID;
-  delete sanitized.HAPPIER_DAEMON_SERVICE_SERVER_URL;
-  return sanitized;
 }
 
 async function ensureActiveServerSelection(params: Readonly<{
@@ -148,6 +138,70 @@ export type StartedCliTerminalConnect = {
   stop: () => Promise<void>;
 };
 
+/**
+ * A terminal-connect CLI launch spec resolved ahead of time by `resolveCliTerminalConnectLaunchSpec`
+ * and lent to `startCliAuthLoginForTerminalConnect`, which then launches it without resolving or
+ * preparing anything. It records the testDir and source-entrypoint selection it was resolved for so
+ * a launch with a different testDir or entrypoint mode is rejected instead of guessed.
+ */
+export type PreparedCliTerminalConnectLaunchSpec = Readonly<{
+  kind: 'cli-terminal-connect';
+  testDir: string;
+  cliSourceEntrypointRequested: boolean;
+  spec: CliTestLaunchSpec;
+}>;
+
+function resolveCliTerminalConnectLaunchSpecFresh(testDir: string, sanitizedEnv: NodeJS.ProcessEnv): Promise<CliTestLaunchSpec> {
+  return resolveCliTestLaunchSpec(
+    { testDir, env: sanitizedEnv },
+    { snapshotDir: resolvePath(testDir, 'cli-dist') },
+  );
+}
+
+/**
+ * Resolves exactly the launch spec `startCliAuthLoginForTerminalConnect` would resolve for the same
+ * testDir and env (same sanitization, namespace and mode), for a caller that prepares it once outside
+ * a test budget and lends it through `preparedCliLaunchSpec`.
+ */
+export async function resolveCliTerminalConnectLaunchSpec(params: Readonly<{
+  testDir: string;
+  env: NodeJS.ProcessEnv;
+}>): Promise<PreparedCliTerminalConnectLaunchSpec> {
+  const sanitizedEnv = sanitizeCliTestEnv(params.env);
+  const spec = await resolveCliTerminalConnectLaunchSpecFresh(params.testDir, sanitizedEnv);
+  return Object.freeze({
+    kind: 'cli-terminal-connect' as const,
+    testDir: resolvePath(params.testDir),
+    cliSourceEntrypointRequested: shouldUseCliSourceEntrypoint(sanitizedEnv),
+    spec: Object.freeze({
+      ...spec,
+      args: Object.freeze([...spec.args]) as string[],
+      ...(spec.env ? { env: Object.freeze({ ...spec.env }) } : {}),
+    }),
+  });
+}
+
+function assertBorrowableCliTerminalConnectLaunchSpec(
+  prepared: PreparedCliTerminalConnectLaunchSpec,
+  testDir: string,
+  sanitizedEnv: NodeJS.ProcessEnv,
+): void {
+  if (prepared.kind !== 'cli-terminal-connect') {
+    throw new Error(
+      `startCliAuthLoginForTerminalConnect preparedCliLaunchSpec must come from resolveCliTerminalConnectLaunchSpec (got kind=${String(prepared.kind)})`,
+    );
+  }
+  const resolvedTestDir = resolvePath(testDir);
+  const cliSourceEntrypointRequested = shouldUseCliSourceEntrypoint(sanitizedEnv);
+  if (prepared.testDir !== resolvedTestDir || prepared.cliSourceEntrypointRequested !== cliSourceEntrypointRequested) {
+    throw new Error(
+      `startCliAuthLoginForTerminalConnect preparedCliLaunchSpec was resolved for testDir=${prepared.testDir} `
+        + `cliSourceEntrypoint=${prepared.cliSourceEntrypointRequested} but this launch has testDir=${resolvedTestDir} `
+        + `cliSourceEntrypoint=${cliSourceEntrypointRequested}; resolve it with the same testDir and env`,
+    );
+  }
+}
+
 export async function startCliAuthLoginForTerminalConnect(params: Readonly<{
   testDir: string;
   cliHomeDir: string;
@@ -155,8 +209,13 @@ export async function startCliAuthLoginForTerminalConnect(params: Readonly<{
   webappUrl: string;
   connectUrlTimeoutMs?: number;
   env: NodeJS.ProcessEnv;
+  /** Borrowed launch spec from resolveCliTerminalConnectLaunchSpec; launched as-is, never resolved again. */
+  preparedCliLaunchSpec?: PreparedCliTerminalConnectLaunchSpec;
 }>): Promise<StartedCliTerminalConnect> {
-  const sanitizedEnv = sanitizeCliTerminalConnectEnv(params.env);
+  const sanitizedEnv = sanitizeCliTestEnv(params.env);
+  if (params.preparedCliLaunchSpec !== undefined) {
+    assertBorrowableCliTerminalConnectLaunchSpec(params.preparedCliLaunchSpec, params.testDir, sanitizedEnv);
+  }
   const currentOwnerInspection = inspectOwnedProcess(process.pid);
   if (currentOwnerInspection.ok) {
     await sweepProcessOwnershipLeases({
@@ -168,10 +227,9 @@ export async function startCliAuthLoginForTerminalConnect(params: Readonly<{
     });
   }
 
-  const cliLaunchSpec = await resolveCliTestLaunchSpec(
-    { testDir: params.testDir, env: sanitizedEnv },
-    { snapshotDir: resolvePath(params.testDir, 'cli-dist') },
-  );
+  const cliLaunchSpec = params.preparedCliLaunchSpec !== undefined
+    ? params.preparedCliLaunchSpec.spec
+    : await resolveCliTerminalConnectLaunchSpecFresh(params.testDir, sanitizedEnv);
 
   await ensureActiveServerSelection({
     cliHomeDir: params.cliHomeDir,

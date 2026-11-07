@@ -1,77 +1,68 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Text, useInput, Box } from 'ink';
+import { ACCENT_HEX } from '@happier-dev/cli-common/output';
+import { resolveAuthSelectorInput, type AuthMethod } from './authSelectorInput';
 
-export type AuthMethod = 'mobile' | 'web';
+export type { AuthMethod } from './authSelectorInput';
 
 interface AuthSelectorProps {
     onSelect: (method: AuthMethod) => void;
     onCancel: () => void;
 }
 
+const AUTH_OPTIONS: ReadonlyArray<Readonly<{
+    method: AuthMethod;
+    label: string;
+    description: string;
+}>> = [
+    {
+        method: 'mobile',
+        label: 'Mobile app (recommended)',
+        description: 'Scan a QR code with Happier on your phone.',
+    },
+    {
+        method: 'web',
+        label: 'Web browser',
+        description: 'Open one copyable link in any browser.',
+    },
+];
+
 export const AuthSelector: React.FC<AuthSelectorProps> = ({ onSelect, onCancel }) => {
     const [selectedIndex, setSelectedIndex] = useState(0);
     
-    const options: Array<{ 
-        method: AuthMethod; 
-        label: string; 
-    }> = [
-        {
-            method: 'mobile',
-            label: 'Mobile App (recommended)'
-        },
-        {
-            method: 'web',
-            label: 'Web Browser'
-        }
-    ];
-
     useInput((input, key) => {
-        if (key.upArrow) {
-            setSelectedIndex(prev => Math.max(0, prev - 1));
-        } else if (key.downArrow) {
-            setSelectedIndex(prev => Math.min(options.length - 1, prev + 1));
-        } else if (key.return) {
-            onSelect(options[selectedIndex].method);
-        } else if (key.escape || (key.ctrl && input === 'c')) {
-            onCancel();
-        } else if (input === '1') {
-            setSelectedIndex(0);
-            onSelect('mobile');
-        } else if (input === '2') {
-            setSelectedIndex(1);
-            onSelect('web');
-        }
+        const action = resolveAuthSelectorInput(input, key, selectedIndex);
+        setSelectedIndex(action.selectedIndex);
+        if (action.cancelled) onCancel();
+        else if (action.selectedMethod) onSelect(action.selectedMethod);
     });
 
     return (
         <Box flexDirection="column" paddingY={1}>
             <Box marginBottom={1}>
-                <Text>How would you like to authenticate?</Text>
+                <Text bold>Connect this computer</Text>
             </Box>
             <Box marginBottom={1}>
-                <Text dimColor>Mobile is recommended because account creation and device linking are simpler.</Text>
-            </Box>
-            <Box marginBottom={1}>
-                <Text dimColor>If you already use Happier on another device, sign in with that same account.</Text>
+                <Text>Choose where to finish signing in. Use the same Happier account as your other devices.</Text>
             </Box>
 
             <Box flexDirection="column">
-                {options.map((option, index) => {
+                {AUTH_OPTIONS.map((option, index) => {
                     const isSelected = selectedIndex === index;
                     
                     return (
-                        <Box key={option.method} marginY={0}>
-                            <Text color={isSelected ? "cyan" : "gray"}>
-                                {isSelected ? '› ' : '  '}
-                                {index + 1}. {option.label}
+                        <Box key={option.method} marginBottom={index === AUTH_OPTIONS.length - 1 ? 0 : 1} flexDirection="column">
+                            <Text color={isSelected ? ACCENT_HEX : undefined} bold={isSelected}>
+                                {isSelected ? '› ' : '  '}{index + 1}. {option.label}
                             </Text>
+                            <Text dimColor>     {option.description}</Text>
                         </Box>
                     );
                 })}
             </Box>
 
             <Box marginTop={1}>
-                <Text dimColor>Use arrows or 1-2 to select, Enter to confirm</Text>
+                <Text dimColor>Use ↑/↓ or 1–2, then Enter. Esc cancels.</Text>
             </Box>
         </Box>
     );

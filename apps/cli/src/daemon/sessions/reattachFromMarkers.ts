@@ -1,11 +1,12 @@
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { resolveHappierHomeDirComparableKey } from '../ownership/happierHomeDirComparableKey';
+import { daemonProcessMatchesCurrentScope } from '../ownership/daemonProcessScopeIdentity';
 import type { Credentials } from '@/persistence';
 import { parseOptionalBooleanEnv } from '@happier-dev/protocol';
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import {
-  hasTerminalAttachmentControlDescriptorThroughCatalog,
+  resolveTerminalAttachmentControlDescriptorStatusThroughCatalog,
   resolveCatalogAgentIdForCliSubcommand,
 } from '@/backends/catalog';
 import type { AgentId } from '@/agent/core';
@@ -146,7 +147,7 @@ function buildRecoveredRespawnDescriptor(params: Readonly<{
   const { spawnOptions, parsedRespawnDescriptor, credentials } = params;
   const rebuiltRespawn = spawnOptions
     ? buildSessionRunnerRespawnDescriptorV1FromSpawnOptions(spawnOptions, {
-      encryptionMaterial: credentials?.encryption,
+      encryptionMaterial: credentials?.encryption ?? undefined,
     })
     : null;
   if (!parsedRespawnDescriptor) {
@@ -176,7 +177,7 @@ function restoreSpawnOptionsFromRespawnDescriptor(params: Readonly<{
   }
   try {
     return buildSpawnSessionOptionsFromRespawnDescriptorV1(parsedRespawnDescriptor, {
-      encryptionMaterial: credentials?.encryption,
+      encryptionMaterial: credentials?.encryption ?? undefined,
     });
   } catch {
     return undefined;
@@ -223,6 +224,7 @@ async function recoverMarkerlessDaemonSpawnedSessions(params: Readonly<{
     );
     if (processHomeKey === null || processHomeKey !== currentHomeKey) continue;
     const incompleteMarker = incompleteMarkerByPid.get(processInfo.pid);
+    if (!daemonProcessMatchesCurrentScope(processInfo, { requireScopeIdentity: !incompleteMarker })) continue;
     const isGenericHappySession = processInfo.type === 'user-session' || processInfo.type === 'dev-session';
     const liveExistingSessionId = extractExistingSessionIdFromCommand(processInfo.command);
     const incompleteMarkerSessionId =
@@ -408,10 +410,10 @@ export async function reattachTrackedSessionsFromMarkers(params: Readonly<{
   // Retained as an ignored compatibility input for existing callers/tests. Cold
   // startup never probes or mutates terminal hosts for dead runner markers.
   terminalHostAdapters?: unknown;
-  hasTerminalAttachmentControlDescriptor?: (
+  resolveTerminalAttachmentControlDescriptorStatus?: (
     agentId: AgentId | null | undefined,
     input: Readonly<{ happyHomeDir: string; sessionId: string }>,
-  ) => Promise<boolean>;
+  ) => Promise<import('@/backends/types').TerminalAttachmentControlDescriptorStatus>;
 }>): Promise<ReattachTrackedSessionsFromMarkersResult> {
   const { pidToTrackedSession, credentials } = params;
   const orphanedDeadDaemonSessions: OrphanedDeadDaemonSession[] = [];
@@ -447,15 +449,21 @@ export async function reattachTrackedSessionsFromMarkers(params: Readonly<{
           continue;
         }
         const attachment = attachmentState.status === 'present' ? attachmentState.info : null;
-        const hasExactControlDescriptor = attachment?.version === 2
-          ? await (params.hasTerminalAttachmentControlDescriptor
-              ?? hasTerminalAttachmentControlDescriptorThroughCatalog)(markerAgentId, {
+        const controlDescriptorStatus = attachment?.version === 2
+          ? await (params.resolveTerminalAttachmentControlDescriptorStatus
+              ?? resolveTerminalAttachmentControlDescriptorStatusThroughCatalog)(markerAgentId, {
                 happyHomeDir: marker.happyHomeDir,
                 sessionId,
                 attachmentId: attachment.attachmentId,
               })
-          : false;
+          : 'not_applicable';
         if (attachment?.version === 2) {
+          const spawnOptions = applyRecoveredRuntimeSnapshot({
+            spawnOptions: restoreSpawnOptionsFromRespawnDescriptor({
+              parsedRespawnDescriptor: parseRecoveredRespawnDescriptor(marker.respawn), credentials: params.credentials,
+            }),
+            metadata: marker.metadata,
+          });
           disconnectedTerminalHostCandidates.push({
             sessionId,
             pid: marker.pid,
@@ -463,7 +471,8 @@ export async function reattachTrackedSessionsFromMarkers(params: Readonly<{
             happyHomeDir: marker.happyHomeDir,
             attachmentId: attachment.attachmentId,
             handle: attachment.handle,
-            controlDescriptorAvailable: hasExactControlDescriptor,
+            controlDescriptorStatus,
+            ...(spawnOptions ? { spawnOptions } : {}),
           });
           continue;
         }

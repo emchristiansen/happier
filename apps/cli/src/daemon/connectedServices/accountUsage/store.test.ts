@@ -4,7 +4,7 @@ import {
   type ProviderAccountUsageRecordKeyV1,
   type ProviderAccountUsageSnapshotV1,
 } from '@happier-dev/protocol';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { computeProviderAccountUsageSnapshotFingerprint } from './fingerprint';
 
 type ProviderAccountUsageStore = Readonly<{
@@ -74,6 +74,26 @@ function createSnapshot(overrides: Partial<ProviderAccountUsageSnapshotV1> = {})
 }
 
 describe('provider account usage store', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('applies a later refresh failure without replacing newer meter observations or accepting an older outcome', async () => {
+    const { createProviderAccountUsageStore } = await import('./store');
+    const store = createProviderAccountUsageStore();
+    const current = createSnapshot({ fetchedAtMs: 2_000, observedAtMs: 2_000, planLabel: 'New usage' });
+    store.recordSnapshot(current);
+    const failure = createSnapshot({ fetchedAtMs: 1_000, observedAtMs: 3_000, state: 'error_last_known_good',
+      diagnostics: [{ kind: 'provider_http', status: 429, observedAtMs: 3_000 }] });
+    expect(store.recordSnapshot(failure).snapshotAdvanced).toBe(true);
+    expect(store.resolveRecordId(current.recordId)).toMatchObject({ fetchedAtMs: 2_000, observedAtMs: 3_000,
+      planLabel: 'New usage', state: 'error_last_known_good', diagnostics: failure.diagnostics });
+    store.recordSnapshot({ ...current, observedAtMs: 2_500 });
+    expect(store.resolveRecordId(current.recordId)?.state).toBe('error_last_known_good');
+    store.recordSnapshot({ ...current, observedAtMs: 4_000 });
+    expect(store.resolveRecordId(current.recordId)).toMatchObject({ state: 'loaded_data', observedAtMs: 4_000 });
+  });
+
   it('merges subscription observations independently without re-aging or replacing newer usage', async () => {
     const module = await loadStoreModule();
     const store = module!.createProviderAccountUsageStore();
@@ -294,6 +314,22 @@ describe('provider account usage store', () => {
       sourceLinked: false,
     });
     expect(store.resolveRecordId(initial.recordId)?.planLabel).toBe('Enterprise');
+  });
+
+  it('replaces a retained future-dated usage observation with a current observation', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const module = await loadStoreModule();
+    const store = module!.createProviderAccountUsageStore();
+    const future = createSnapshot({ fetchedAtMs: 100_000, observedAtMs: 100_000, planLabel: 'Poisoned' });
+    const current = createSnapshot({ fetchedAtMs: 10_000, observedAtMs: 10_000, planLabel: 'Recovered' });
+
+    store.recordSnapshot(future);
+    expect(store.recordSnapshot(current).status).toBe('snapshot_advanced');
+    expect(store.resolveRecordId(current.recordId)).toMatchObject({
+      fetchedAtMs: 10_000,
+      planLabel: 'Recovered',
+    });
   });
 
 });

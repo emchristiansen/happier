@@ -2,13 +2,18 @@ import type { Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
 
-import { inferAgentIdFromSessionMetadata, resolveVendorResumeIdFromSessionMetadata } from '@happier-dev/agents';
+import {
+  inferAgentIdFromSessionMetadata,
+  resolveProviderSessionIdForBackendTarget,
+  resolveVendorResumeIdFromSessionMetadata,
+} from '@happier-dev/agents';
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import { execFileSync } from 'node:child_process';
 import { expandHomeDirPath } from '@/utils/path/expandHomeDirPath';
 import { readCredentials } from '@/persistence';
 
 import { findHappyProcessByPid } from '../doctor';
+import { readProcessRunState } from '../processRunState';
 import type { TrackedSession } from '../types';
 import { hashProcessCommand, writeSessionMarker } from '../sessionRegistry';
 import { buildSessionRunnerRespawnDescriptorV1FromSpawnOptions } from '../processSupervision/sessionRunnerRespawnDescriptor';
@@ -18,7 +23,7 @@ import type { SessionStartedRunnerReport } from '../sessionStartedReadiness';
 const DEFAULT_PARENT_PID_LOOKUP_TIMEOUT_MS = 1000;
 const PARENT_PID_LOOKUP_TIMEOUT_ENV_KEY = 'HAPPIER_DAEMON_PARENT_PID_LOOKUP_TIMEOUT_MS';
 
-function adoptReportedHappySessionId(tracked: TrackedSession, reportedSessionId: string): string {
+export function adoptReportedHappySessionId(tracked: TrackedSession, reportedSessionId: string): string {
   const currentSessionId = normalizeNonEmptyString(tracked.happySessionId);
   if (
     tracked.startedBy === 'daemon'
@@ -35,6 +40,16 @@ function adoptReportedHappySessionId(tracked: TrackedSession, reportedSessionId:
   }
   tracked.happySessionId = reportedSessionId;
   return reportedSessionId;
+}
+
+/** Record the runner role without changing launcher custody or webhook readiness. */
+export function adoptReportedSessionRunnerIdentity(
+  tracked: TrackedSession,
+  reportedPid: number,
+  processInstanceFingerprint?: string,
+): void {
+  if (tracked.pid !== reportedPid) tracked.sessionRunnerPid = reportedPid;
+  if (processInstanceFingerprint) tracked.processInstanceFingerprint = processInstanceFingerprint;
 }
 
 function resolveParentPidLookupTimeoutMs(): number {
@@ -101,7 +116,7 @@ function findPendingWindowsTerminalTrackedSession(params: Readonly<{
   pidToTrackedSession: Map<number, TrackedSession>;
   pidToAwaiter: Map<number, (session: TrackedSession) => void>;
   webhookPid: number;
-  metadata: Metadata;
+  metadata: Pick<Metadata, 'startedBy' | 'terminal'>;
 }>): TrackedSession | null {
   if (params.metadata.startedBy !== 'daemon') return null;
 
@@ -125,6 +140,29 @@ function findPendingWindowsTerminalTrackedSession(params: Readonly<{
   return matches.length === 1 ? matches[0] : null;
 }
 
+/** Correlate session identity without publishing webhook readiness or promoting custody. */
+export function correlateTrackedSessionReport(params: Readonly<{
+  pidToTrackedSession: Map<number, TrackedSession>;
+  pidToAwaiter: Map<number, (session: TrackedSession) => void>;
+  pid: number;
+  metadata: Pick<Metadata, 'startedBy' | 'terminal'>;
+  getParentPidFn?: (pid: number) => number | null;
+}>): TrackedSession | null {
+  const { pidToTrackedSession, pidToAwaiter, pid, metadata } = params;
+  const direct = pidToTrackedSession.get(pid);
+  if (direct) return direct;
+  const recordedRunner = findTrackedSessionByRunnerPid(pidToTrackedSession, pid);
+  if (recordedRunner) return recordedRunner;
+  // Only pending daemon launches perform bounded parent or hosted-tab matching.
+  if (pidToAwaiter.size === 0) return null;
+  const ppid = (params.getParentPidFn ?? getParentPid)(pid);
+  const parent = typeof ppid === 'number' ? pidToTrackedSession.get(ppid) : undefined;
+  if (parent?.startedBy === 'daemon' && (pidToAwaiter.has(parent.pid) || parent.childProcess?.pid === parent.pid)) {
+    return parent;
+  }
+  return findPendingWindowsTerminalTrackedSession({ pidToTrackedSession, pidToAwaiter, webhookPid: pid, metadata });
+}
+
 export function createOnHappySessionWebhook(params: Readonly<{
   pidToTrackedSession: Map<number, TrackedSession>;
   pidToAwaiter: Map<number, (session: TrackedSession) => void>;
@@ -145,6 +183,9 @@ export function createOnHappySessionWebhook(params: Readonly<{
     onTrackedSessionReady,
     onTrackedSessionReported,
   } = params;
+
+  const correlateTrackedReport = (pid: number, metadata: Metadata): TrackedSession | null =>
+    correlateTrackedSessionReport({ pidToTrackedSession, pidToAwaiter, pid, metadata, getParentPidFn });
 
   return async (sessionId: string, sessionMetadata: Metadata, report: SessionStartedRunnerReport = {}) => {
     const normalizedPath = expandHomeDirPath(sessionMetadata.path, process.env);
@@ -170,163 +211,61 @@ export function createOnHappySessionWebhook(params: Readonly<{
     logger.debug(`[DAEMON RUN] Current tracked sessions before webhook: ${Array.from(pidToTrackedSession.keys()).join(', ')}`);
 
     // Check if we already have this PID (daemon-spawned)
-    const existingSession = pidToTrackedSession.get(pid);
     const isPlaceholderSessionId = isPidPlaceholderSessionId(sessionId);
-    let trackedForPid: TrackedSession | null = null;
-
-    if (existingSession) {
-      trackedForPid = existingSession;
-
-      // Update tracked session with latest webhook data.
-      adoptReportedHappySessionId(existingSession, sessionId);
-      existingSession.happySessionMetadataFromLocalWebhook = normalizedMetadata;
-      if (existingSession.startedBy === 'daemon') {
-        logger.debug(`[DAEMON RUN] Updated daemon-spawned session ${sessionId} with metadata`);
-
-        // Resolve any awaiter for this PID
-        const awaiter = pidToAwaiter.get(pid);
-        if (awaiter) {
-          if (isPlaceholderSessionId) {
-            logger.debug(
-              `[DAEMON RUN] Deferred awaiter resolution for PID ${pid}; waiting for canonical session id`,
-            );
-          } else {
-            pidToAwaiter.delete(pid);
-            awaiter(existingSession);
-            logger.debug(`[DAEMON RUN] Resolved session awaiter for PID ${pid}`);
-          }
-        }
-      } else if (existingSession.reattachedFromDiskMarker) {
-        existingSession.startedBy = normalizedMetadata.startedBy ?? existingSession.startedBy;
-        logger.debug(`[DAEMON RUN] Refreshed reattached session ${sessionId} metadata`);
-      } else {
-        existingSession.startedBy = 'happy directly - likely by user from terminal';
-        logger.debug(`[DAEMON RUN] Refreshed externally-started session ${sessionId}`);
+    let trackedForPid = correlateTrackedReport(pid, normalizedMetadata);
+    const startReportMarkerWork = (): void => {
+      if (!trackedForPid) return;
+      const backendTarget = trackedForPid.spawnOptions?.backendTarget;
+      const vendorResumeId = backendTarget
+        ? resolveProviderSessionIdForBackendTarget(backendTarget, normalizedMetadata)
+        : resolveVendorResumeIdFromSessionMetadata(inferAgentIdFromSessionMetadata(normalizedMetadata), normalizedMetadata);
+      if (vendorResumeId) trackedForPid.vendorResumeId = vendorResumeId;
+      else if (backendTarget?.kind === 'configuredAcpBackend') delete trackedForPid.vendorResumeId;
+      const custody = trackedForPid.reportMarkerCustody ??= { pending: Promise.resolve(), retiring: false };
+      if (custody.retiring) return;
+      const work = persistReportMarker().catch(() => {
+        logger.infoFile('[DAEMON RUN] Warning: failed to persist reported session marker', { pid });
+      });
+      custody.pending = Promise.all([custody.pending, work]).then(() => undefined);
+    };
+    if (!trackedForPid && normalizedMetadata.startedBy === 'daemon') {
+      const state = await readProcessRunState(pid);
+      // Acceptance/promotion may arrive during the OS read. Its current custody
+      // wins over the earlier absence snapshot (including an obsolete dead sample).
+      trackedForPid = correlateTrackedReport(pid, normalizedMetadata);
+      if (!trackedForPid && (state === 'dead' || state === 'zombie')) {
+        logger.infoFile('[DAEMON RUN] Warning: ignored a positively dead untracked daemon session report', { pid });
+        return;
       }
-    } else if (!existingSession) {
-      // PID not in tracked map. This can happen for:
-      // - externally-started sessions, OR
-      // - wrapper-script scenarios where the daemon spawned a wrapper PID (parent),
-      //   but the webhook reports the actual session binary PID (child).
-      //
-      // First: check if we already associated this runner PID with a tracked daemon session.
-      const trackedByRunnerPid = findTrackedSessionByRunnerPid(pidToTrackedSession, pid);
-      if (trackedByRunnerPid) {
-        trackedForPid = trackedByRunnerPid;
-        adoptReportedHappySessionId(trackedByRunnerPid, sessionId);
-        trackedByRunnerPid.happySessionMetadataFromLocalWebhook = normalizedMetadata;
-        logger.debug(`[DAEMON RUN] Refreshed daemon session via previously recorded runner PID ${pid}`);
-
-        if (trackedByRunnerPid.startedBy === 'daemon') {
-          const wrapperPid = trackedByRunnerPid.pid;
-          const awaiter = pidToAwaiter.get(wrapperPid);
-          if (awaiter) {
-            if (isPlaceholderSessionId) {
-              logger.debug(
-                `[DAEMON RUN] Deferred awaiter resolution for wrapper PID ${wrapperPid}; waiting for canonical session id`,
-              );
-            } else {
-              pidToAwaiter.delete(wrapperPid);
-              awaiter(trackedByRunnerPid);
-              logger.debug(`[DAEMON RUN] Resolved session awaiter via wrapper PID ${wrapperPid}`);
-            }
-          }
-        }
-      } else {
-        // Heuristic: only attempt PPID correlation when at least one daemon spawn is in-flight.
-        // This keeps the webhook path fast for the common case of externally-started sessions.
-        if (pidToAwaiter.size === 0) {
-          const trackedSession: TrackedSession = {
-            startedBy: 'happy directly - likely by user from terminal',
-            happySessionId: sessionId,
-            happySessionMetadataFromLocalWebhook: normalizedMetadata,
-            pid
-          };
-          trackedForPid = trackedSession;
-          pidToTrackedSession.set(pid, trackedSession);
-          logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
-        } else {
-          const ppid = getParentPidFn(pid);
-          const parentSession = typeof ppid === 'number' ? (pidToTrackedSession.get(ppid) ?? null) : null;
-          const hasAwaiter = typeof ppid === 'number' ? pidToAwaiter.has(ppid) : false;
-          const hasChildHandle = typeof ppid === 'number' ? parentSession?.childProcess?.pid === ppid : false;
-          const parentEligible =
-            typeof ppid === 'number' &&
-            parentSession?.startedBy === 'daemon' &&
-            (hasAwaiter || hasChildHandle);
-
-          if (parentEligible && ppid && parentSession) {
-            trackedForPid = parentSession;
-            parentSession.sessionRunnerPid = pid;
-            adoptReportedHappySessionId(parentSession, sessionId);
-            parentSession.happySessionMetadataFromLocalWebhook = normalizedMetadata;
-            logger.debug(`[DAEMON RUN] Matched session webhook PID ${pid} to daemon wrapper PID ${ppid}`);
-
-            // Resolve any awaiter that was waiting on the wrapper PID.
-            const awaiter = pidToAwaiter.get(ppid);
-            if (awaiter) {
-              if (isPlaceholderSessionId) {
-                logger.debug(
-                  `[DAEMON RUN] Deferred awaiter resolution for wrapper PID ${ppid}; waiting for canonical session id`,
-                );
-              } else {
-                pidToAwaiter.delete(ppid);
-                awaiter(parentSession);
-                logger.debug(`[DAEMON RUN] Resolved session awaiter via wrapper PID ${ppid}`);
-              }
-            }
-          } else {
-            const windowsTerminalSession = findPendingWindowsTerminalTrackedSession({
-              pidToTrackedSession,
-              pidToAwaiter,
-              webhookPid: pid,
-              metadata: normalizedMetadata,
-            });
-            if (windowsTerminalSession) {
-              const wrapperPid = windowsTerminalSession.pid;
-              trackedForPid = windowsTerminalSession;
-              windowsTerminalSession.sessionRunnerPid = pid;
-              adoptReportedHappySessionId(windowsTerminalSession, sessionId);
-              windowsTerminalSession.happySessionMetadataFromLocalWebhook = normalizedMetadata;
-              logger.debug(
-                `[DAEMON RUN] Matched Windows Terminal webhook PID ${pid} to daemon launch PID ${wrapperPid}`,
-              );
-
-              const awaiter = pidToAwaiter.get(wrapperPid);
-              if (awaiter) {
-                if (isPlaceholderSessionId) {
-                  logger.debug(
-                    `[DAEMON RUN] Deferred awaiter resolution for Windows Terminal PID ${wrapperPid}; waiting for canonical session id`,
-                  );
-                } else {
-                  pidToAwaiter.delete(wrapperPid);
-                  awaiter(windowsTerminalSession);
-                  logger.debug(`[DAEMON RUN] Resolved session awaiter via Windows Terminal PID ${wrapperPid}`);
-                }
-              }
-          } else {
-            // New session started externally (not by this daemon)
-            const trackedSession: TrackedSession = {
-              startedBy: 'happy directly - likely by user from terminal',
-              happySessionId: sessionId,
-              happySessionMetadataFromLocalWebhook: normalizedMetadata,
-              pid
-            };
-            trackedForPid = trackedSession;
-            pidToTrackedSession.set(pid, trackedSession);
-            logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
-          }
-          }
-        }
+    }
+    if (trackedForPid) {
+      adoptReportedSessionRunnerIdentity(trackedForPid, pid);
+      adoptReportedHappySessionId(trackedForPid, sessionId);
+      trackedForPid.happySessionMetadataFromLocalWebhook = normalizedMetadata;
+      if (trackedForPid.startedBy !== 'daemon' && trackedForPid.reattachedFromDiskMarker) {
+        trackedForPid.startedBy = normalizedMetadata.startedBy ?? trackedForPid.startedBy;
+      } else if (trackedForPid.startedBy !== 'daemon') {
+        trackedForPid.startedBy = 'happy directly - likely by user from terminal';
       }
+    } else {
+      trackedForPid = { startedBy: 'happy directly - likely by user from terminal', happySessionId: sessionId,
+        happySessionMetadataFromLocalWebhook: normalizedMetadata, pid };
+      pidToTrackedSession.set(pid, trackedForPid);
+      logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
     }
 
     if (trackedForPid) {
-      // The reporting process is this tracked session's runner; remember which publisher incarnation it is.
+      // Bind publisher incarnation only after the canonical runner correlation above.
       if (report.publisherIncarnationId) trackedForPid.publisherIncarnationId = report.publisherIncarnationId;
-      const agentId = inferAgentIdFromSessionMetadata(normalizedMetadata);
-      const vendorResumeId = resolveVendorResumeIdFromSessionMetadata(agentId, normalizedMetadata);
-      if (vendorResumeId) trackedForPid.vendorResumeId = vendorResumeId;
+      startReportMarkerWork();
+      if (trackedForPid.startedBy === 'daemon' && !isPlaceholderSessionId) {
+        const waiterPid = trackedForPid.pid;
+        const awaiter = pidToAwaiter.get(waiterPid);
+        if (awaiter) {
+          pidToAwaiter.delete(waiterPid);
+          await awaiter(trackedForPid);
+        }
+      }
       if (!isPlaceholderSessionId) {
         // Best-effort report observers must not wait on strict startup reconciliation:
         // terminal-host serviceability is produced by this exact report and is independently useful.
@@ -346,7 +285,7 @@ export function createOnHappySessionWebhook(params: Readonly<{
 
     // Best-effort: write/update marker so future daemon restarts can reattach.
     // Also capture a process command hash so reattach/stop can be PID-reuse-safe.
-    void (async () => {
+    async function persistReportMarker(): Promise<void> {
       const proc = await findHappyProcessByPidFn(pid);
       const discoveredProcessCommand =
         typeof proc?.command === 'string' && proc.command.trim().length > 0 ? proc.command : undefined;
@@ -376,7 +315,7 @@ export function createOnHappySessionWebhook(params: Readonly<{
         logger.debug(`[DAEMON RUN] Could not determine process command for PID ${pid}; marker will be weaker`);
       }
       if (trackedForPid && processInstanceFingerprint) {
-        trackedForPid.processInstanceFingerprint = processInstanceFingerprint;
+        adoptReportedSessionRunnerIdentity(trackedForPid, pid, processInstanceFingerprint);
       }
 
       const storedCredentials =
@@ -392,7 +331,7 @@ export function createOnHappySessionWebhook(params: Readonly<{
           ? buildSessionRunnerRespawnDescriptorV1FromSpawnOptions(
             trackedForPid.spawnOptions,
             {
-              ...(storedCredentials ? { encryptionMaterial: storedCredentials.encryption } : {}),
+              ...(storedCredentials?.encryption ? { encryptionMaterial: storedCredentials.encryption } : {}),
               ...(trackedVendorResumeId ? { vendorResumeId: trackedVendorResumeId } : {}),
             },
           )
@@ -409,8 +348,6 @@ export function createOnHappySessionWebhook(params: Readonly<{
         ...(respawn ? { respawn } : {}),
         ...(trackedForPid?.activeTurnId ? { activeTurnId: trackedForPid.activeTurnId } : {}),
       });
-    })().catch((e) => {
-      logger.debug('[DAEMON RUN] Failed to write session marker', e);
-    });
+    }
   };
 }

@@ -1,11 +1,35 @@
+import { createClaudeSessionModelsReconciler, reconcileClaudeSessionModelsState } from '../sessionModels/reconcileClaudeSessionModelsState';
 import { describe, expect, it } from 'vitest';
 
 import type { Metadata } from '@/api/types';
+import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
 import { buildClaudeSessionModelsMetadataFromSupportedModels } from '@/backends/claude/remote/buildClaudeSessionModelsMetadataFromSupportedModels';
 
 import { publishClaudeSessionModelsMetadataBestEffort } from './publishClaudeSessionModelsMetadataBestEffort';
 
 describe('publishClaudeSessionModelsMetadataBestEffort', () => {
+  it.each(['sonnet', 'opus', 'fable'])('preserves a supported effort request for the %s alias', async (currentModelId) => {
+    const state: { metadata: Metadata } = {
+      metadata: createTestMetadata({
+        sessionConfigOptionOverridesV1: {
+          v: 1, updatedAt: 1,
+          overrides: { reasoning_effort: { updatedAt: 1, value: 'low' } },
+        },
+      }),
+    };
+    await publishClaudeSessionModelsMetadataBestEffort({
+      cwd: '/', timeoutMs: 250, currentModelId,
+      accountSettings: { claudeDynamicModelProbeEnabled: false },
+      probeInstalledRuntimeCapabilities: async () => ({ supportsEffort: true, supportsUltracode: false }),
+      session: {
+        ensureMetadataSnapshot: async () => state.metadata,
+        updateMetadata: async (updater) => { state.metadata = updater(state.metadata); },
+      },
+    });
+    expect(state.metadata.sessionConfigOptionOverridesV1?.overrides.reasoning_effort)
+      .toEqual({ updatedAt: 1, value: 'low' });
+  });
+
   it('retires effort overrides the runtime can no longer apply', async () => {
     const state: { metadata: Metadata } = {
       metadata: {
@@ -169,7 +193,7 @@ describe('publishClaudeSessionModelsMetadataBestEffort', () => {
       expect.objectContaining({
         v: 1,
         provider: 'claude',
-        updatedAt: 999,
+        updatedAt: 0,
         currentModelId: 'claude-sonnet-4-6',
         availableModels: expect.any(Array),
       }),
@@ -214,8 +238,9 @@ describe('publishClaudeSessionModelsMetadataBestEffort', () => {
   });
 
   it('converges catalog and Agent SDK model publications in either order', async () => {
-    const publishSdkModels = (metadata: Metadata, nowMs: number): Metadata => {
+    const publishSdkModels = (metadata: Metadata, nowMs: number, reconcileModels: typeof reconcileClaudeSessionModelsState): Metadata => {
       const update = buildClaudeSessionModelsMetadataFromSupportedModels({
+        reconcileModels,
         modelsRaw: [
           { value: 'claude-fable-5', displayName: 'Sparse SDK Fable' },
           { value: 'claude-sdk-only', displayName: 'SDK Only' },
@@ -226,9 +251,10 @@ describe('publishClaudeSessionModelsMetadataBestEffort', () => {
       if (!update) throw new Error('expected Agent SDK model metadata');
       return { ...metadata, ...update };
     };
-    const publishCatalogModels = async (metadata: Metadata, nowMs: number): Promise<Metadata> => {
+    const publishCatalogModels = async (metadata: Metadata, nowMs: number, reconcileModels: typeof reconcileClaudeSessionModelsState): Promise<Metadata> => {
       const state: { metadata: Metadata } = { metadata };
       await publishClaudeSessionModelsMetadataBestEffort({
+        reconcileModels,
         cwd: '/',
         timeoutMs: 250,
         currentModelId: 'claude-fable-5',
@@ -244,13 +270,15 @@ describe('publishClaudeSessionModelsMetadataBestEffort', () => {
       return state.metadata;
     };
 
+    const first = createClaudeSessionModelsReconciler();
+    const second = createClaudeSessionModelsReconciler();
     const catalogThenSdk = publishSdkModels(
-      await publishCatalogModels({} as Metadata, 100),
-      200,
+      await publishCatalogModels({} as Metadata, 100, first),
+      200, first,
     );
     const sdkThenCatalog = await publishCatalogModels(
-      publishSdkModels({} as Metadata, 200),
-      100,
+      publishSdkModels({} as Metadata, 200, second),
+      100, second,
     );
 
     expect(catalogThenSdk.sessionModelsV1).toEqual(sdkThenCatalog.sessionModelsV1);

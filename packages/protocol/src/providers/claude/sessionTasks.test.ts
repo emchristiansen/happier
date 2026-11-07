@@ -14,6 +14,12 @@ import {
 } from './sessionTasks.js';
 
 describe('normalizeClaudeActivityStatusSignal (canonical Claude status classifier)', () => {
+    it('reads persisted terminal tool outcomes through the same native status decoder', () => {
+        expect(readClaudeAgentSdkProviderTaskStatus(JSON.stringify({ status: 'stopped', result: 'ended' }))).toBe('stopped');
+        expect(readClaudeAgentSdkProviderTaskStatus({ tool_use_result: JSON.stringify({ status: 'cancelled' }) })).toBe('cancelled');
+        expect(readClaudeAgentSdkProviderTaskStatus({ toolUseResult: { status: 'failed' } })).toBe('failed');
+        expect(readClaudeAgentSdkProviderTaskStatus('ordinary result')).toBeNull();
+    });
     it('maps the full Claude activity vocabulary to neutral 7-value status', () => {
         expect(normalizeClaudeActivityStatusSignal('pending')).toBe('pending');
         expect(normalizeClaudeActivityStatusSignal('running')).toBe('active');

@@ -10,6 +10,7 @@ import {
     stringifyConnectedServiceAuthGroupPolicy,
 } from "../connect/connectedServicesV3/authGroupPolicy";
 import { resolveConnectedServiceCredentialRevision } from "../connect/credentials/credentialRevision";
+import { AccountProfileSchema as ReleasedAccountProfileSchema } from "@happier-dev/protocol/testing/releasedV0215AccountProfile";
 
 describe("Account profile (integration)", () => {
     let harness: LightSqliteHarness;
@@ -31,6 +32,44 @@ describe("Account profile (integration)", () => {
             () => db.repeatKey.deleteMany(),
             () => db.account.deleteMany(),
         ]);
+    });
+
+    it("projects profiles, pools and credential revisions together for the declared HTTP reader", async () => {
+        const account = await db.account.create({ data: { publicKey: "pk-profile-reader-support" }, select: { id: true } });
+        await db.serviceAccountToken.create({
+            data: {
+                accountId: account.id, vendor: "antigravity", profileId: "work", token: Buffer.from("sealed"),
+                metadata: { v: 2, format: "account_scoped_v1", kind: "oauth" },
+            },
+        });
+        await db.connectedServiceAuthGroup.create({
+            data: { accountId: account.id, vendor: "antigravity", groupId: "pool", generation: 1,
+                policyJson: stringifyConnectedServiceAuthGroupPolicy(DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1) },
+        });
+        await db.serviceAccountToken.create({
+            data: {
+                accountId: account.id, vendor: "github", profileId: "personal", token: Buffer.from("sealed"),
+                metadata: { v: 2, format: "account_scoped_v1", kind: "oauth" },
+            },
+        });
+        await withAuthenticatedTestApp((app) => accountRoutes(app), async (app) => {
+            for (const declaration of [undefined, "malformed", JSON.stringify(["antigravity"])]) {
+                const supportsAntigravity = declaration === JSON.stringify(["antigravity"]);
+                const supported = supportsAntigravity ? ["antigravity", "github"] : ["github"];
+                const response = await app.inject({
+                    method: "GET",
+                    url: declaration === undefined ? "/v1/account/profile" : `/v1/account/profile?happierConnectedServices=${encodeURIComponent(declaration)}`,
+                    headers: { "x-test-user-id": account.id },
+                });
+                expect(response.statusCode).toBe(200);
+                const body = response.json();
+                expect(body.connectedServicesV2.map((entry: { serviceId: string }) => entry.serviceId)).toEqual(supported);
+                expect(body.connectedServiceCredentialRevisionsV1.map((entry: { serviceId: string }) => entry.serviceId)).toEqual(supported);
+                if (supportsAntigravity) expect(body.connectedServicesV2[0].groups).toMatchObject([{ groupId: "pool" }]);
+                else expect(ReleasedAccountProfileSchema.safeParse(body).success).toBe(true);
+            }
+            expect(await db.serviceAccountToken.count({ where: { accountId: account.id } })).toBe(2);
+        });
     });
 
     it("GET /v1/account/profile returns linkedProviders derived from AccountIdentity", async () => {

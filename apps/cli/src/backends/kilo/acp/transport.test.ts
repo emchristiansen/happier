@@ -103,6 +103,14 @@ describe('KiloTransport handleStderr', () => {
     expect(asStatusErrorMessage(result.message).detail).toContain('Authentication error');
   });
 
+  it('does not treat an incidental 401 identifier as authentication failure', () => {
+    const transport = new KiloTransport();
+    expect(transport.handleStderr(
+      '[agy-acp] WARN: failed to decode gen_metadata 401: cant skip wire type 6',
+      { activeToolCalls: new Set(), hasActiveInvestigation: false },
+    )).toEqual({ message: null });
+  });
+
   it('emits actionable model-not-found errors', () => {
     const transport = new KiloTransport();
     const result = transport.handleStderr('Model not found', {

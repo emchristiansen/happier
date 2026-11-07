@@ -19,6 +19,22 @@ const classification: ConnectedServiceRuntimeFailureClassification = {
 };
 
 describe('normalizeConnectedServiceRuntimeAuthRecoveryProjection', () => {
+  it('distinguishes terminal policy decisions from explicit recovery cancellation', () => {
+    for (const reason of ['switch_reason_disabled', 'auto_switch_disabled', 'selection_mismatch']) {
+      expect(buildRuntimeAuthRecoveryTerminalResult({
+        classification,
+        recovery: { status: 'cancelled', terminalReason: reason },
+      }).status).toBe('recovery_terminal');
+    }
+    expect(buildRuntimeAuthRecoveryTerminalResult({
+      classification,
+      recovery: { status: 'cancelled', terminalReason: 'usage_limit_recovery_cancelled' },
+    }).status).toBe('recovery_cancelled');
+    expect(buildRuntimeAuthRecoveryTerminalResult({
+      classification,
+      recovery: { status: 'cancelled', terminalReason: null },
+    }).status).toBe('recovery_cancelled');
+  });
   it('keeps valid typed runtime-auth transcript events', () => {
     const result = buildRuntimeAuthRecoveryScheduledResult({
       classification,

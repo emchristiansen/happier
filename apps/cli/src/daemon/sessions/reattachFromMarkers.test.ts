@@ -30,6 +30,15 @@ const emptyAdoptResult = {
   respawnRestoreErrors: [],
 } satisfies ReturnType<typeof adoptSessionsFromMarkers>;
 
+function currentOwnershipEnvironment() {
+  return {
+    HAPPIER_HOME_DIR: configuration.happyHomeDir,
+    HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: process.env.HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID,
+    HAPPIER_ACTIVE_SERVER_ID: configuration.activeServerId,
+    HAPPIER_SERVER_URL: configuration.serverUrl,
+  };
+}
+
 function mockHappyProcessesForDiscovery(processes: ReadonlyArray<HappyProcessInfo>): void {
   // These existing recovery scenarios concern this home's processes. Model the OS
   // ownership field explicitly; the real-owner suite covers absent/foreign identities.
@@ -265,7 +274,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
     const result = await reattachTrackedSessionsFromMarkers({
       pidToTrackedSession,
       terminalHostAdapters: { tmux: adapter },
-      hasTerminalAttachmentControlDescriptor: async () => true,
+      resolveTerminalAttachmentControlDescriptorStatus: async () => 'available',
     });
 
     expect(adapter.evaluateLiveness).not.toHaveBeenCalled();
@@ -324,16 +333,16 @@ describe('reattachTrackedSessionsFromMarkers', () => {
     vi.spyOn(process, 'kill').mockImplementation(() => {
       throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
     });
-    const hasTerminalAttachmentControlDescriptor = vi.fn(async () => false);
+    const resolveTerminalAttachmentControlDescriptorStatus = vi.fn(async () => 'missing' as const);
 
     const result = await reattachTrackedSessionsFromMarkers({
       pidToTrackedSession: new Map<number, TrackedSession>(),
       terminalHostAdapters: {},
-      hasTerminalAttachmentControlDescriptor,
+      resolveTerminalAttachmentControlDescriptorStatus,
     });
 
-    expect(hasTerminalAttachmentControlDescriptor).toHaveBeenCalledOnce();
-    expect(hasTerminalAttachmentControlDescriptor).toHaveBeenCalledWith('claude', {
+    expect(resolveTerminalAttachmentControlDescriptorStatus).toHaveBeenCalledOnce();
+    expect(resolveTerminalAttachmentControlDescriptorStatus).toHaveBeenCalledWith('claude', {
       happyHomeDir: marker.happyHomeDir,
       sessionId: marker.happySessionId,
       attachmentId,
@@ -343,7 +352,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
         sessionId: marker.happySessionId,
         pid: marker.pid,
         attachmentId,
-        controlDescriptorAvailable: false,
+        controlDescriptorStatus: 'missing',
       }),
     ]);
     expect(result.orphanedDeadDaemonSessions).toEqual([]);
@@ -826,6 +835,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
     mockHappyProcessesForDiscovery([
       {
         pid: 12345,
+        daemonOwnershipEnvironmentVariables: currentOwnershipEnvironment(),
         type: 'daemon-spawned-session',
         cwd: '/tmp/project',
         environmentVariables: {
@@ -846,9 +856,9 @@ describe('reattachTrackedSessionsFromMarkers', () => {
         happyProcesses: [
           {
             pid: 12345,
+            daemonOwnershipEnvironmentVariables: currentOwnershipEnvironment(),
             type: 'daemon-spawned-session',
             cwd: '/tmp/project',
-            daemonOwnershipEnvironmentVariables: { HAPPIER_HOME_DIR: configuration.happyHomeDir },
             environmentVariables: {
               CLAUDE_CONFIG_DIR: '/tmp/claude-config',
             },
@@ -1316,10 +1326,10 @@ describe('reattachTrackedSessionsFromMarkers', () => {
   });
 
   it('recovers a generic happy user session only when the live command proves the session identity and preserves encrypted respawn env', async () => {
-    const credentials: Credentials = {
+    const credentials = {
       token: 't',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
-    };
+    } satisfies Credentials;
     vi.mocked(listSessionMarkers).mockResolvedValue([
       {
         pid: 12345,
@@ -1719,6 +1729,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
     } satisfies HappyProcessInfo;
     const markerlessProcess = {
       pid: 99991,
+      daemonOwnershipEnvironmentVariables: currentOwnershipEnvironment(),
       type: 'daemon-spawned-session',
       cwd: '/tmp/other',
       command: 'happier codex --started-by daemon --existing-session session-markerless',
@@ -1793,6 +1804,7 @@ describe('reattachTrackedSessionsFromMarkers', () => {
     mockHappyProcessesForDiscovery([
       {
         pid: 22222,
+        daemonOwnershipEnvironmentVariables: currentOwnershipEnvironment(),
         type: 'daemon-spawned-session',
         cwd: '/tmp/project',
         command:

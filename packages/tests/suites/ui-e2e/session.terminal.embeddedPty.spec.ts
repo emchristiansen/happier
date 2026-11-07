@@ -79,9 +79,6 @@ test.describe('ui e2e: embedded terminal (PTY)', () => {
                 HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys,providers.claude.unifiedTerminal',
                 HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
                 HAPPIER_FEATURE_TERMINAL_EMBEDDED_PTY__ENABLED: '1',
-                HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-                HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-                HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
             },
         });
 
@@ -106,7 +103,7 @@ test.describe('ui e2e: embedded terminal (PTY)', () => {
     });
 
     test('runs a command and shows output', async ({ page }) => {
-        test.setTimeout(420_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
         const browserDiagnostics = collectBrowserDiagnostics({ page });
@@ -143,7 +140,7 @@ test.describe('ui e2e: embedded terminal (PTY)', () => {
 
             await expect(getVisibleSessionComposer(page)).toHaveCount(1, { timeout: 180_000 });
 
-            await page.getByTestId('session-header-terminal-button').click();
+            await page.getByTestId('session-action-rail:terminal').click();
 
             await expect(page.getByTestId('session-bottompanel-surface-terminal')).toHaveCount(1, { timeout: 180_000 });
 

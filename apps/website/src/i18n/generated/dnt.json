@@ -514,7 +514,8 @@
   },
   "faq.FAQ_ITEMS.server.a.1": {
     "dnt": [
-      "`happier relay host install`"
+      "`happier relay host install`",
+      "`localhost`"
     ]
   },
   "faq.FAQ_ITEMS.plan.a.1": {

@@ -7,6 +7,61 @@ import { describe, expect, it } from 'vitest';
 import { createCodexAppServerStreamEventBridge } from './streamEventBridge';
 
 describe('createCodexAppServerStreamEventBridge', () => {
+    it('keeps native completed command output in the tool result when no started event was observed', () => {
+        const updates = createCodexAppServerStreamEventBridge().onNotification({ method: 'item/completed', params: {
+            item: { id: 'native-command', type: 'commandExecution', command: 'pwd', cwd: '/project',
+                status: 'completed', aggregatedOutput: '/project\n', exitCode: 0 },
+        } });
+        expect(updates).toEqual([
+            expect.objectContaining({ type: 'tool-call', input: expect.not.objectContaining({ aggregatedOutput: expect.anything() }) }),
+            expect.objectContaining({ type: 'tool-result', output: expect.objectContaining({ stdout: '/project\n', exitCode: 0 }) }),
+        ]);
+    });
+    it('maps provider-native user messages while preserving Happier correlation', () => {
+        const bridge = createCodexAppServerStreamEventBridge();
+
+        expect(
+            bridge.onNotification({
+                method: 'item/started',
+                params: {
+                    item: {
+                        id: 'native_user_1',
+                        type: 'userMessage',
+                        content: [
+                            { type: 'text', text: 'hello from Codex TUI' },
+                            { type: 'mention', name: 'README.md', path: '/repo/README.md' },
+                            { type: 'text', text: 'second paragraph' },
+                        ],
+                    },
+                },
+            }),
+        ).toEqual([{
+            type: 'provider-user-text',
+            itemId: 'native_user_1',
+            clientId: null,
+            text: 'hello from Codex TUI\nsecond paragraph',
+        }]);
+
+        expect(
+            bridge.onNotification({
+                method: 'item/started',
+                params: {
+                    item: {
+                        id: 'happier_user_1',
+                        type: 'userMessage',
+                        clientId: 'happier-local-1',
+                        content: [{ type: 'text', text: 'hello from Happier' }],
+                    },
+                },
+            }),
+        ).toEqual([{
+            type: 'provider-user-text',
+            itemId: 'happier_user_1',
+            clientId: 'happier-local-1',
+            text: 'hello from Happier',
+        }]);
+    });
+
     it('maps app-server v2 agent message, plan, and reasoning notifications', () => {
         const bridge = createCodexAppServerStreamEventBridge();
 
@@ -42,6 +97,26 @@ describe('createCodexAppServerStreamEventBridge', () => {
                 },
             }),
         ).toEqual([{ type: 'assistant-text-final', itemId: 'msg_1', text: 'Hello world' }]);
+
+        expect(
+            bridge.onNotification({
+                method: 'item/completed',
+                params: {
+                    item: {
+                        id: 'async_question_1',
+                        type: 'agentMessage',
+                        text: 'Choose an environment\n- Staging\n- Production',
+                        delivery: 'async',
+                        questions: [{ title: 'Choose an environment', options: ['Staging', 'Production'] }],
+                    },
+                },
+            }),
+        ).toEqual([{
+            type: 'async-user-input-request',
+            itemId: 'async_question_1',
+            text: 'Choose an environment\n- Staging\n- Production',
+            questions: [{ title: 'Choose an environment', options: ['Staging', 'Production'] }],
+        }]);
 
         expect(
             bridge.onNotification({
@@ -463,6 +538,26 @@ describe('createCodexAppServerStreamEventBridge', () => {
                     exitCode: 1,
                 },
             },
+        ]);
+    });
+
+    it('emits web searches when they complete and image views when they start', () => {
+        const bridge = createCodexAppServerStreamEventBridge();
+        const notify = (method: string, item: Record<string, unknown>) => bridge.onNotification({ method, params: { item } });
+        const action = { type: 'search', query: 'fused kernels', queries: ['fused kernels'] };
+        const results = [{ type: 'text_result', ref_id: 'turn0search0', title: 'Fusion benchmark',
+            url: 'https://example.invalid/bench', domain: 'example.invalid', snippet: 'Fused kernels compared.' }];
+
+        expect(notify('item/started', { id: 'search', type: 'webSearch', query: '', action: null, results: null })).toEqual([]);
+        expect(notify('item/completed', { id: 'search', type: 'webSearch', query: 'fused kernels', action, results })).toEqual([
+            expect.objectContaining({ type: 'tool-call', name: 'WebSearch', input: { query: 'fused kernels', action } }),
+            expect.objectContaining({ type: 'tool-result', output: { results } }),
+        ]);
+        expect(notify('item/started', { id: 'view', type: 'imageView', path: '/repo/plot.png' })).toEqual([
+            expect.objectContaining({ type: 'tool-call', name: 'view_image', input: { path: '/repo/plot.png' } }),
+        ]);
+        expect(notify('item/completed', { id: 'view', type: 'imageView', path: '/repo/plot.png' })).toEqual([
+            expect.objectContaining({ type: 'tool-result', callId: 'view' }),
         ]);
     });
 

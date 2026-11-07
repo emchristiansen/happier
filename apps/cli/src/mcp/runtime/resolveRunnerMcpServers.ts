@@ -41,6 +41,7 @@ export async function resolveRunnerMcpServers(params: Readonly<{
     commandMode: params.commandMode,
     credentials: params.credentials,
     accountSettings,
+    sessionMetadata: params.sessionMetadata ?? params.session.getMetadataSnapshot?.(),
     ...(typeof params.requestedBuiltInMcpPort === 'number'
       ? { requestedPort: params.requestedBuiltInMcpPort }
       : {}),
@@ -77,12 +78,26 @@ export async function resolveRunnerMcpServers(params: Readonly<{
   });
 
   if (materialized.warnings.length > 0) {
-    logger.debug('[mcp] Materialization warnings', {
+    logger.infoFile('[mcp] Materialization warnings', {
       warningCount: materialized.warnings.length,
       warnings: materialized.warnings.map((w) => ({ serverName: w.serverName, code: w.code, detail: w.detail })),
     });
+    for (const warning of materialized.warnings) {
+      params.session.sendSessionEvent?.({
+        type: 'message',
+        message: `MCP server ${warning.serverName} was not started: ${warning.detail}`,
+      });
+    }
   }
 
   const merged = mergeWithBuiltInHappierMcpServer({ builtIn: builtIn.mcpServers, extra: materialized.mcpServers });
-  return { happierMcpServer: builtIn.happierMcpServer, mcpServers: merged };
+  return {
+    happierMcpServer: {
+      ...builtIn.happierMcpServer,
+      stop: () => {
+        try { builtIn.happierMcpServer.stop(); } finally { materialized.cleanup(); }
+      },
+    },
+    mcpServers: merged,
+  };
 }

@@ -31,12 +31,14 @@ import {
     writeProviderAccountUsageRecordAndLinkConnectedServiceUsageSource,
 } from "./index";
 import { writeProviderAccountUsageRecordWithPolicy } from "./routeWritePolicy";
+import { mutateConnectedServiceCredential } from "../credentials/mutation";
 
 async function createProfileBinding(params: Readonly<{
     accountId: string;
     serviceId?: string;
     profileId?: string;
     providerAccountId?: string | null;
+    providerOrganizationId?: string;
 }>): Promise<void> {
     await db.serviceAccountToken.create({
         data: {
@@ -46,6 +48,7 @@ async function createProfileBinding(params: Readonly<{
             token: Buffer.from(`token:${params.serviceId ?? "openai-codex"}:${params.profileId ?? "work"}`, "utf8"),
             metadata: {
                 kind: "oauth",
+                ...(params.providerOrganizationId ? { providerOrganizationId: params.providerOrganizationId } : {}),
                 ...(params.providerAccountId === null
                     ? {}
                     : { providerAccountId: params.providerAccountId ?? "acct_provider_subject" }),
@@ -170,6 +173,65 @@ describe("providerAccountUsage storage", () => {
         await db.account.deleteMany().catch(() => {});
     });
 
+    it("invalidates every alias only for the credential whose organization changes and retains same-context token rotation", async () => {
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        const writeCredential = (profileId: string, organizationId: string) => mutateConnectedServiceCredential({
+            accountId: user.id, serviceId: "claude-subscription", profileId,
+            token: Buffer.from(`token:${organizationId}`), storageMode: "plain", expiresAt: null,
+            metadata: { v: 3, storage: "plain_json_v1", kind: "oauth", providerAccountId: "same-user", providerOrganizationId: organizationId },
+            incomingIdentity: { providerAccountId: "same-user" }, allowProviderIdentityChange: false,
+        });
+        for (const profileId of ["work", "other"]) await writeCredential(profileId, "org-a");
+        const group = await db.connectedServiceAuthGroup.create({ data: {
+            accountId: user.id, vendor: "claude-subscription", groupId: "team", displayName: "Team",
+            policyJson: "{}", activeProfileId: "work", generation: 1,
+        } });
+        await db.connectedServiceAuthGroupMember.create({ data: {
+            groupDbId: group.id, accountId: user.id, vendor: "claude-subscription", groupId: "team",
+            profileId: "work", priority: 1, enabled: true,
+        } });
+        const snapshot = createUsageSnapshot({ fetchedAt: Date.now(), recordKey: createProviderAccountUsageRecordKey({
+            providerId: "claude", accountSubjectId: "same-user", quotaScope: "organization", quotaScopeId: "org-a",
+        }) });
+        await writeProviderAccountUsageRecord({ accountId: user.id, recordId: snapshot.recordId, recordKey: snapshot.recordKey,
+            payloadMode: "plain_json_v1", snapshot, status: "ok", fetchedAt: snapshot.fetchedAtMs, staleAfterMs: snapshot.staleAfterMs });
+        const sources: ConnectedServiceUsageSourceV1[] = [
+            { serviceId: "claude-subscription", profileId: "work", bindingKind: "profile" },
+            { serviceId: "claude-subscription", profileId: "work", bindingKind: "group_member", groupId: "team", groupGeneration: 1 },
+            { serviceId: "claude-subscription", profileId: "other", bindingKind: "profile" },
+        ];
+        for (const source of sources) await linkConnectedServiceUsageSource({ accountId: user.id, providerAccountUsageRecordId: snapshot.recordId, source });
+        await writeCredential("work", "org-a");
+        expect(await db.connectedServiceUsageSource.count({ where: { accountId: user.id } })).toBe(3);
+        await expect(readConnectedServiceQuotaView({ accountId: user.id, serviceId: "claude-subscription", profileId: "work" })).resolves.not.toBeNull();
+        await writeCredential("work", "org-b");
+        await expect(readConnectedServiceQuotaView({ accountId: user.id, serviceId: "claude-subscription", profileId: "work" })).resolves.toBeNull();
+        expect(await db.connectedServiceUsageSource.count({ where: { accountId: user.id, profileId: "work" } })).toBe(0);
+        await expect(readExactConnectedServiceUsageSource({ accountId: user.id, source: sources[2]! })).resolves.not.toBeNull();
+        await expect(linkConnectedServiceUsageSource({ accountId: user.id, providerAccountUsageRecordId: snapshot.recordId, source: sources[0]! })).rejects.toBeInstanceOf(ConnectedServiceUsageSourceOwnershipError);
+    });
+
+    it("requires organization proof for organization usage and rejects a legacy account alias once the credential has organization proof", async () => {
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        await createProfileBinding({ accountId: user.id, serviceId: "claude-subscription", providerAccountId: "same-user" });
+        for (const recordKey of [
+            createProviderAccountUsageRecordKey({ providerId: "claude", accountSubjectId: "same-user", quotaScope: "organization", quotaScopeId: "org-a" }),
+            createProviderAccountUsageRecordKey({ providerId: "claude", accountSubjectId: "same-user" }),
+        ]) {
+            const snapshot = createUsageSnapshot({ fetchedAt: Date.now(), recordKey });
+            await writeProviderAccountUsageRecord({ accountId: user.id, recordId: snapshot.recordId, recordKey,
+                payloadMode: "plain_json_v1", snapshot, status: "ok", fetchedAt: snapshot.fetchedAtMs, staleAfterMs: snapshot.staleAfterMs });
+            const source = { serviceId: "claude-subscription", profileId: "work", bindingKind: "profile" } as const;
+            if (recordKey.quotaScope === "organization") {
+                await expect(linkConnectedServiceUsageSource({ accountId: user.id, providerAccountUsageRecordId: snapshot.recordId, source })).rejects.toBeInstanceOf(ConnectedServiceUsageSourceOwnershipError);
+            } else {
+                await linkConnectedServiceUsageSource({ accountId: user.id, providerAccountUsageRecordId: snapshot.recordId, source });
+                await db.serviceAccountToken.updateMany({ where: { accountId: user.id }, data: { metadata: { kind: "oauth", providerAccountId: "same-user", providerOrganizationId: "org-a" } } });
+                await expect(readConnectedServiceUsageSource({ accountId: user.id, ...source })).resolves.toBeNull();
+            }
+        }
+    });
+
     it("merges sealed subscription observations independently of quota clocks and preserves them for older writers", async () => {
         const user = await db.account.create({ data: { publicKey: "sealed-subscription", encryptionMode: "e2ee" }, select: { id: true } });
         const snapshot = createUsageSnapshot({ fetchedAt: 1000 });
@@ -208,6 +270,85 @@ describe("providerAccountUsage storage", () => {
             snapshot: createUsageSnapshot({ fetchedAt: 3000 }),
         });
         expect((await readProviderAccountUsageRecord({ accountId: user.id, recordId: base.recordId }))?.snapshot?.subscription).toEqual(subscription);
+    });
+
+    it("stores recovery details outside the strict snapshot and keeps them tied to their quota observation", async () => {
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        const base = createUsageSnapshot({ fetchedAt: 1000 });
+        const recoveryCreditDetails = {
+            reset_one: { remainingCount: 2, appliesToProviderLimitIds: ["weekly"], unavailableReason: "paused" as const },
+        };
+        const write = (fetchedAt: number, details?: typeof recoveryCreditDetails) => writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id, recordId: base.recordId, recordKey: base.recordKey,
+            payloadMode: "plain_json_v1", status: "ok", fetchedAt, staleAfterMs: 60000,
+            snapshot: { ...createUsageSnapshot({ fetchedAt }), ...(details ? { recoveryCreditDetails: details } : {}) },
+        });
+        await write(1000, recoveryCreditDetails);
+        const row = await db.providerAccountUsageRecord.findUniqueOrThrow({ where: { accountId_recordId: { accountId: user.id, recordId: base.recordId } } });
+        expect(row.snapshot).not.toHaveProperty("recoveryCreditDetails");
+        expect(row.metadata).toHaveProperty("recoveryCreditDetails", recoveryCreditDetails);
+        expect((await readProviderAccountUsageRecord({ accountId: user.id, recordId: base.recordId }))?.snapshot)
+            .toMatchObject({ recoveryCreditDetails });
+        await expect(write(500)).resolves.toBe("stale");
+        expect((await readProviderAccountUsageRecord({ accountId: user.id, recordId: base.recordId }))?.snapshot)
+            .toMatchObject({ recoveryCreditDetails });
+        await write(3000);
+        const refreshed = await readProviderAccountUsageRecord({ accountId: user.id, recordId: base.recordId });
+        expect(refreshed?.snapshot).toMatchObject({ fetchedAtMs: 3000 });
+        expect(refreshed?.snapshot).not.toHaveProperty("recoveryCreditDetails");
+        await expect(write(1000, recoveryCreditDetails)).resolves.toBe("stale");
+        expect((await readProviderAccountUsageRecord({ accountId: user.id, recordId: base.recordId }))?.snapshot)
+            .not.toHaveProperty("recoveryCreditDetails");
+    });
+
+    it("rejects future-dated writes and lets a current observation replace a previously persisted future clock", async () => {
+        const nowMs = Date.now();
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        const recordKey = createProviderAccountUsageRecordKey();
+        const future = createUsageSnapshot({ fetchedAt: nowMs + 600_000, recordKey, planLabel: "poisoned" });
+        const current = createUsageSnapshot({ fetchedAt: nowMs, recordKey, planLabel: "recovered" });
+
+        await writeProviderAccountUsageRecord({
+            accountId: user.id,
+            recordId: future.recordId,
+            recordKey,
+            payloadMode: "plain_json_v1",
+            snapshot: future,
+            status: "ok",
+            fetchedAt: future.fetchedAtMs,
+            staleAfterMs: future.staleAfterMs,
+        });
+
+        await expect(writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id,
+            recordId: current.recordId,
+            recordKey,
+            payloadMode: "plain_json_v1",
+            snapshot: current,
+            status: "ok",
+            fetchedAt: current.fetchedAtMs,
+            staleAfterMs: current.staleAfterMs,
+        })).resolves.toBe("written");
+        await expect(readProviderAccountUsageRecord({ accountId: user.id, recordId: current.recordId }))
+            .resolves.toEqual(expect.objectContaining({
+                fetchedAt: nowMs,
+                snapshot: expect.objectContaining({ planLabel: "recovered" }),
+            }));
+
+        const futureOnlyKey = createProviderAccountUsageRecordKey({ accountSubjectId: "acct_future_only" });
+        const futureOnly = createUsageSnapshot({ fetchedAt: nowMs + 600_000, recordKey: futureOnlyKey, planLabel: "future-only" });
+        await expect(writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id,
+            recordId: futureOnly.recordId,
+            recordKey: futureOnlyKey,
+            payloadMode: "plain_json_v1",
+            snapshot: futureOnly,
+            status: "ok",
+            fetchedAt: futureOnly.fetchedAtMs,
+            staleAfterMs: futureOnly.staleAfterMs,
+        })).rejects.toThrow(ProviderAccountUsagePayloadInvariantError);
+        await expect(readProviderAccountUsageRecord({ accountId: user.id, recordId: futureOnly.recordId }))
+            .resolves.toBeNull();
     });
 
     it("persists refresh-requested provider usage records without requiring a payload", async () => {
@@ -386,6 +527,39 @@ describe("providerAccountUsage storage", () => {
                 providerId: snapshot.providerId,
             }),
         }));
+    });
+
+    it("preserves organization scope and supplemental facts in the connected-service quota view", async () => {
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        await createProfileBinding({ accountId: user.id, serviceId: "anthropic", providerAccountId: "acct-user", providerOrganizationId: "org-work" });
+        const snapshot = ProviderAccountUsageSnapshotV1Schema.parse({
+            ...createUsageSnapshot({
+                fetchedAt: Date.now(),
+                recordKey: {
+                    providerId: "claude", accountSubjectId: "acct-user", subjectKind: "account",
+                    quotaScope: "organization", quotaScopeId: "org-work",
+                },
+            }),
+            subscription: { status: "none", renewal: "unknown", observedAtMs: 1000, staleAfterMs: 60000 },
+            recoveryCreditDetails: {},
+        });
+        await upsertProviderAccountUsageRecord({
+            accountId: user.id, recordId: snapshot.recordId, recordKey: snapshot.recordKey,
+            payloadMode: "plain_json_v1", snapshot, status: "ok", fetchedAt: snapshot.fetchedAtMs,
+            staleAfterMs: snapshot.staleAfterMs,
+        });
+        await upsertConnectedServiceUsageSource({
+            accountId: user.id, serviceId: "anthropic", profileId: "work",
+            providerAccountUsageRecordId: snapshot.recordId, bindingKind: "profile",
+        });
+        await expect(readConnectedServiceQuotaView({
+            accountId: user.id, serviceId: "anthropic", profileId: "work",
+        })).resolves.toMatchObject({
+            snapshot: {
+                activeAccountId: "acct-user", providerOrganizationId: "org-work",
+                subscription: snapshot.subscription, recoveryCreditDetails: {},
+            },
+        });
     });
 
     it("upserts provider usage records and source links idempotently", async () => {
@@ -1486,6 +1660,89 @@ describe("providerAccountUsage storage", () => {
             snapshot: expect.objectContaining({ planLabel: "newer-winner" }),
             fetchedAt: newerSnapshot.fetchedAtMs,
         }));
+    });
+
+    it.each([undefined, "failure-material"])("settles a first equal-time failure without losing later requests (fingerprint %s)", async (materialFingerprint) => {
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        const base = createUsageSnapshot({ fetchedAt: 1000 });
+        await writeProviderAccountUsageRecord({
+            accountId: user.id, recordId: base.recordId, recordKey: base.recordKey,
+            payloadMode: "plain_json_v1", status: "ok", snapshot: base,
+            fetchedAt: base.fetchedAtMs, staleAfterMs: base.staleAfterMs,
+            refreshRequestedAt: 1000, metadata: { materialFingerprint: "success-material" },
+        });
+        const write = () => writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id, recordId: base.recordId, recordKey: base.recordKey,
+            payloadMode: "plain_json_v1", status: "error", fetchedAt: base.fetchedAtMs, staleAfterMs: base.staleAfterMs,
+            refreshErrorAt: 1000, materialFingerprint,
+            snapshot: { ...base, state: "error_last_known_good", diagnostics: [{ kind: "provider_http", status: 429, observedAtMs: 1000 }] },
+        });
+        expect(await write()).toBe("written");
+        const read = () => readProviderAccountUsageRecord({ accountId: user.id, recordId: base.recordId });
+        expect(await read()).toMatchObject({ fetchedAt: 1000, status: "error", metadata: { refreshErrorAt: 1000 }, snapshot: { state: "error_last_known_good" } });
+        expect(await read()).not.toHaveProperty("refreshRequestedAt");
+        await db.providerAccountUsageRecord.updateMany({ where: { accountId: user.id }, data: { refreshRequestedAt: new Date(1000) } });
+        expect(await write()).toBe("written");
+        expect(await read()).toMatchObject({ metadata: { refreshErrorAt: 1000 }, status: "error" });
+        expect(await read()).not.toHaveProperty("refreshRequestedAt");
+        // Replaying the same failure cannot settle a later request or erase the recorded outcome.
+        await db.providerAccountUsageRecord.updateMany({ where: { accountId: user.id }, data: { refreshRequestedAt: new Date(1001) } });
+        expect(await write()).toBe(materialFingerprint === undefined ? "stale" : "noop");
+        expect(await read()).toMatchObject({ fetchedAt: 1000, metadata: { refreshErrorAt: 1000 }, refreshRequestedAt: 1001 });
+        expect(await writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id, recordId: base.recordId, recordKey: base.recordKey,
+            payloadMode: "plain_json_v1", status: "error", fetchedAt: base.fetchedAtMs, staleAfterMs: base.staleAfterMs,
+            refreshErrorAt: 2000,
+            snapshot: { ...base, state: "error_last_known_good", diagnostics: [{ kind: "provider_http", status: 429, observedAtMs: 2000 }] },
+        })).toBe("written");
+        // A newer successful observation supersedes the earlier failure even at the same millisecond.
+        expect(await writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id, recordId: base.recordId, recordKey: base.recordKey,
+            payloadMode: "plain_json_v1", status: "ok", fetchedAt: 2000, staleAfterMs: base.staleAfterMs,
+            snapshot: { ...base, fetchedAtMs: 2000 },
+        })).toBe("written");
+        expect(await read()).toMatchObject({ fetchedAt: 2000, status: "ok", snapshot: { state: "loaded_data" } });
+        expect((await read())?.metadata ?? {}).not.toHaveProperty("refreshErrorAt");
+        expect(await writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id, recordId: base.recordId, recordKey: base.recordKey,
+            payloadMode: "plain_json_v1", status: "error", fetchedAt: base.fetchedAtMs, staleAfterMs: base.staleAfterMs,
+            refreshErrorAt: 2000,
+            snapshot: { ...base, state: "error_last_known_good", diagnostics: [{ kind: "provider_http", status: 429, observedAtMs: 2000 }] },
+        })).toBe("stale");
+        expect(await read()).toMatchObject({ fetchedAt: 2000, status: "ok", snapshot: { state: "loaded_data" } });
+        expect((await read())?.metadata ?? {}).not.toHaveProperty("refreshErrorAt");
+    });
+
+    it("does not let a lagging equal-observation failure overwrite a newer failure outcome", async () => {
+        const user = await db.account.create({ data: { publicKey: null, encryptionMode: "plain" }, select: { id: true } });
+        const base = createUsageSnapshot({ fetchedAt: 1000 });
+        const write = (refreshErrorAt: number, client?: Parameters<typeof writeProviderAccountUsageRecordWithPolicy>[0]["client"]) => writeProviderAccountUsageRecordWithPolicy({
+            accountId: user.id, recordId: base.recordId, recordKey: base.recordKey,
+            payloadMode: "plain_json_v1", status: "error", fetchedAt: base.fetchedAtMs, staleAfterMs: base.staleAfterMs,
+            refreshErrorAt, snapshot: { ...base, state: "error_last_known_good", diagnostics: [{ kind: "provider_http", status: 429, observedAtMs: refreshErrorAt }] },
+            ...(client ? { client } : {}),
+        });
+        expect(await write(3000)).toBe("written");
+        const laggingRow = await db.providerAccountUsageRecord.findUniqueOrThrow({ where: { accountId_recordId: { accountId: user.id, recordId: base.recordId } } });
+        expect(await write(5000)).toBe("written");
+        let first = true;
+        const client = {
+            account: db.account,
+            providerAccountUsageRecord: {
+                findUnique: async (args: Parameters<typeof db.providerAccountUsageRecord.findUnique>[0]) => {
+                    if (first) { first = false; return laggingRow; }
+                    return await db.providerAccountUsageRecord.findUnique(args);
+                },
+                create: db.providerAccountUsageRecord.create.bind(db.providerAccountUsageRecord),
+                updateMany: db.providerAccountUsageRecord.updateMany.bind(db.providerAccountUsageRecord),
+            },
+            // Real Prisma boundary with one lagging read; all mutations use the isolated SQLite database.
+        } as unknown as Pick<typeof db, "account" | "providerAccountUsageRecord">;
+        expect(await write(4000, client)).toBe("stale");
+        expect(await readProviderAccountUsageRecord({ accountId: user.id, recordId: base.recordId })).toMatchObject({
+            fetchedAt: 1000, status: "error", metadata: { refreshErrorAt: 5000 },
+            snapshot: { diagnostics: [{ observedAtMs: 5000 }] },
+        });
     });
 
     it("refreshes provider usage through the connected-service source relation and returns not_found when no source is linked", async () => {

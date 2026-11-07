@@ -3,13 +3,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { TerminalHostHandle } from '@/integrations/terminalHost/_types';
 
 import {
+  ClaudeUnifiedTerminalProviderRefusedStartError,
   ClaudeUnifiedTerminalReadinessTimeoutError,
   createClaudeUnifiedTerminalReadinessBridge,
+  isClaudeUnifiedTerminalProviderRefusedStartError,
   isClaudeUnifiedTerminalReadinessTimeoutError,
 } from './createClaudeUnifiedTerminalReadinessBridge';
 import { createPermissionHandlerSessionStub } from '../utils/permissionHandler.testkit';
 import { createFakeControlPort } from './tuiControls/fakeControlPort';
 import { createClaudeUnifiedResumeChoiceStartupResolver } from './resumeChoice/claudeUnifiedResumeChoiceStartupResolver';
+import { parseClaudeScreenState } from './tuiControls/screenState';
+import { resolveClaudeUnifiedVisibleDialog } from './tuiControls/dialogRegistry';
 import { ClaudeUnifiedDialogChoiceBroker } from './dialogChoice/claudeUnifiedDialogChoiceBroker';
 
 const handle: TerminalHostHandle = {
@@ -120,6 +124,45 @@ describe('createClaudeUnifiedTerminalReadinessBridge', () => {
     expect(evaluateLiveness).toHaveBeenCalledTimes(1);
     bridge.dispose();
     await started;
+  });
+
+  it('fails fast with the classified refusal when Claude refuses to start', async () => {
+    // Observed 2026-09-19: the provider prints this and exits 1 before any session exists, so
+    // readiness can never arrive. Waiting out the window would report a timeout the launcher then
+    // retries, burning the whole relaunch budget on a verdict Claude already gave.
+    // Deliberately real timers: the refusal must be raised on the first screen, before any poll
+    // or timeout window, so this test needs no clock control and cannot hold a worker open.
+    const arbiter = createArbiter();
+    const evaluateLiveness = vi.fn().mockResolvedValue({ paneAlive: true, observedAt: 10 });
+    const captureInputState = vi.fn().mockResolvedValue({
+      stable: true,
+      currentInput: 'Error: Session 726be323 is running as a background session (726be323). '
+        + 'Run `claude attach 726be323` to open it, or `claude stop 726be323` first to resume it here.',
+      cursor: undefined,
+      observedAt: 10,
+    });
+    const onStartupReady = vi.fn();
+    const bridge = createClaudeUnifiedTerminalReadinessBridge({
+      hostAdapter: { evaluateLiveness, captureInputState },
+      handle,
+      arbiter,
+      pollIntervalMs: 250,
+      timeoutMs: 15_000,
+      nowMs: () => 0,
+      onStartupReady,
+    });
+
+    const error = await Promise.resolve(bridge.start({ abortSignal: new AbortController().signal }))
+      .then(() => null, (thrown: unknown) => thrown);
+    expect(isClaudeUnifiedTerminalProviderRefusedStartError(error)).toBe(true);
+    expect((error as ClaudeUnifiedTerminalProviderRefusedStartError).refusal).toMatchObject({
+      code: 'session_held_by_background',
+      retryable: false,
+    });
+    // The verdict arrives immediately, not after the readiness window.
+    expect(isClaudeUnifiedTerminalReadinessTimeoutError(error)).toBe(false);
+    expect(onStartupReady).not.toHaveBeenCalled();
+    bridge.dispose();
   });
 
   it('retries after a transient liveness probe failure and still reports startup readiness', async () => {
@@ -606,6 +649,74 @@ describe('createClaudeUnifiedTerminalReadinessBridge', () => {
       bridge.dispose();
     }
   });
+
+  it.each(['inconclusive', 'probe_failed', 'capture_failed', 'dead'] as const)(
+    'keeps the human wait through %s observations unless host death is definitive',
+    async (observation) => {
+      vi.useFakeTimers();
+      let nowMs = 0;
+      let interrupted = false;
+      const { session, client } = createPermissionHandlerSessionStub('startup-human-wait');
+      const broker = new ClaudeUnifiedDialogChoiceBroker(session);
+      const screen = ['Do you trust the files in this folder?', '❯ 1. Yes, proceed', '  2. No, exit'].join('\n');
+      const dialog = resolveClaudeUnifiedVisibleDialog(parseClaudeScreenState(screen))!;
+      void broker.requestDialogChoice({ dialog }).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(Object.keys(client.getAgentStateSnapshot().requests)).toHaveLength(1);
+      const resolver = createClaudeUnifiedResumeChoiceStartupResolver({
+        choice: 'ask_every_time', broker,
+        port: createFakeControlPort({ captures: [screen] }),
+        wait: async () => undefined, settleMs: 1,
+      });
+      const abortController = new AbortController();
+      let rejection: unknown;
+      const bridge = createClaudeUnifiedTerminalReadinessBridge({
+        hostAdapter: {
+          async evaluateLiveness() {
+            if (interrupted && observation === 'probe_failed') throw new Error('probe unavailable');
+            return {
+              paneAlive: !interrupted || observation === 'capture_failed',
+              paneDead: interrupted && observation === 'dead' ? true : undefined,
+              probeInconclusive: interrupted && observation === 'inconclusive',
+              observedAt: nowMs,
+            };
+          },
+          async captureInputState() {
+            if (interrupted && observation === 'capture_failed') throw new Error('capture unavailable');
+            return { stable: true, currentInput: screen, observedAt: nowMs };
+          },
+        },
+        handle, arbiter: createArbiter(), resolveStartupDialog: resolver,
+        pollIntervalMs: 10, timeoutMs: 20, extendedTimeoutMs: 20,
+        nowMs: () => nowMs,
+      });
+      const started = Promise.resolve(bridge.start({ abortSignal: abortController.signal }))
+        .catch((error: unknown) => { rejection = error; });
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        interrupted = true;
+        for (let i = 0; i < 6; i += 1) {
+          nowMs += 10;
+          await vi.advanceTimersByTimeAsync(10);
+        }
+        if (observation === 'dead') {
+          expect(isClaudeUnifiedTerminalReadinessTimeoutError(rejection)).toBe(true);
+        } else {
+          expect(rejection).toBeUndefined();
+          interrupted = false;
+          nowMs += 10;
+          await vi.advanceTimersByTimeAsync(10);
+          expect(rejection).toBeUndefined();
+        }
+      } finally {
+        abortController.abort();
+        await vi.advanceTimersByTimeAsync(0);
+        await started;
+        bridge.dispose();
+        await broker.dispose();
+      }
+    },
+  );
 
   it('resumes the readiness timeout after the human-wait dialog disappears without a ready composer', async () => {
     vi.useFakeTimers();

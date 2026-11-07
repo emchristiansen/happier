@@ -206,3 +206,49 @@ test('the INSTALLED package still carries every hunk', (t) => {
     }
     assert.equal(result.status, 'ok', formatVendoredLegendPatchFailure(result));
 });
+
+test('installed runtime builds accept Windows line endings without accepting missing behaviour', (t) => {
+    const installed = verifyVendoredLegendPatchMarkers({ packageDir: INSTALLED_PACKAGE_DIR });
+    if (installed.status === 'skipped') {
+        t.skip(installed.reason);
+        return;
+    }
+    assert.equal(installed.status, 'ok', formatVendoredLegendPatchFailure(installed));
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'legend-patch-line-endings-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const builds = LEGEND_RUNTIME_BUILDS.map((build) => ({
+        build,
+        contents: fs.readFileSync(path.join(INSTALLED_PACKAGE_DIR, build), 'utf8').replace(/\r\n/g, '\n'),
+    }));
+
+    // patch-package can combine the package's LF bytes with CRLF patch additions. Exercise real
+    // installed code, not comments manufactured from the verifier's marker inventory.
+    for (const endings of ['CRLF', 'mixed']) {
+        for (const { build, contents } of builds) {
+            let line = 0;
+            fs.writeFileSync(path.join(dir, build), contents.replace(/\n/g, () => (
+                endings === 'CRLF' || line++ % 2 === 0 ? '\r\n' : '\n'
+            )));
+        }
+        const result = verifyVendoredLegendPatchMarkers({ packageDir: dir });
+        assert.equal(result.status, 'ok', `${endings}: ${formatVendoredLegendPatchFailure(result)}`);
+    }
+
+    // Only newline encoding is equivalent. Removing either real call must still fail in all six
+    // exports, even when the surviving code uses Windows line endings.
+    for (const [id, call] of [
+        ['settled-geometry-tail-maintenance', 'doMaintainScrollAtEnd(ctx);'],
+        ['terminal-bootstrap-retirement', 'clearBootstrapInitialScrollSession(state);'],
+    ]) {
+        for (const { build, contents } of builds) {
+            assert.ok(contents.includes(call), `${build} must exercise ${call}`);
+            fs.writeFileSync(path.join(dir, build), contents.replaceAll(call, '').replace(/\n/g, '\r\n'));
+        }
+        const result = verifyVendoredLegendPatchMarkers({ packageDir: dir });
+        assert.equal(result.status, 'missing');
+        assert.deepEqual(result.missing.map((item) => ({ build: item.build, id: item.id, found: item.found })),
+            LEGEND_RUNTIME_BUILDS.map((build) => ({ build, id, found: 0 })));
+        assert.deepEqual(result.missingBuilds, []);
+    }
+});

@@ -46,6 +46,16 @@ For each old/new direction that can occur, record:
 
 Cover new-reader/old-writer by default. Cover old-reader/new-writer only when independent rollout, coexistence, or rollback makes it reachable. New-client/old-server behavior must negotiate capabilities or degrade safely; old-client/new-server behavior preserves released wire and semantics.
 
+For every new request header reachable from a cross-origin web client, treat browser
+preflight as part of the compatibility seam. Capture the exact
+`Access-Control-Request-Headers`, verify it against the supported predecessor relay's
+`Access-Control-Allow-Headers`, and exercise that predecessor's real `OPTIONS` response.
+Changing only the new server allowlist is insufficient. Prefer CORS-safelisted headers,
+query/URL negotiation, or typed request bodies; emit a necessary custom header only
+after peer capability negotiation unless supported predecessors already allow it.
+Custom response headers additionally require `Access-Control-Expose-Headers` before
+browser code can read them.
+
 Do not expand unaffected roles into a Cartesian product. Broaden only when a shared protocol, persisted shape, installer/service state, or deployment order couples them.
 
 ## 5. Choose the narrowest safe transition

@@ -452,6 +452,12 @@ function isExpoModuleOrigin(originModulePath, suffixes) {
 
 const defaultResolveRequest = config.resolver.resolveRequest;
 config.resolver.resolveRequest = (context, moduleName, platform) => {
+  // Hoisted dependencies can carry nested copies of the app's runtime peers.
+  // Resolve these from the app while preserving Metro's platform/export rules;
+  // otherwise one native bundle can contain multiple complete React renderers.
+  if (/^(react|react-dom|react-native)(?:\/|$)/u.test(moduleName)) {
+    context = { ...context, originModulePath: workspaceEntryPoint };
+  }
   const generatedWorkletResolution = resolveGeneratedWorkletModule(moduleName);
   if (generatedWorkletResolution) return generatedWorkletResolution;
 

@@ -148,6 +148,17 @@ describe('transcriptMeasurementReconciler', () => {
             const reservation = reconciler.resolveReservation(changed);
             expect(reservation === undefined || reservation.kind === 'floor').toBe(true);
         });
+
+        it('drops the exact height when a structural reset keeps the same signature', () => {
+            const reconciler = createTestTranscriptMeasurementReconciler();
+            const signature = stableSignature();
+            reconciler.recordMeasuredHeight({ signature, heightPx: 400 });
+            expect(reconciler.resolveReservation(signature)).toEqual({ kind: 'exact', minHeight: 400 });
+
+            reconciler.resetReservationForStructuralChange({ itemId: signature.itemId, signature, invalidateExact: true });
+
+            expect(reconciler.resolveReservation(signature)).toBeUndefined();
+        });
     });
 
     describe('global layout invalidation is transaction-gated and coalesced per commit (R3)', () => {

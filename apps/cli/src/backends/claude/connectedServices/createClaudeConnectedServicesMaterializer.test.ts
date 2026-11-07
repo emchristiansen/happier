@@ -22,6 +22,7 @@ import {
 import { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } from './nativeAuth/claudeCodeCredentialScopes';
 import { resolveClaudeCodeMacOsKeychainServiceName } from './nativeAuth/claudeCodeMacOsKeychain';
 import { syncClaudeConnectedServiceHome } from './syncClaudeConnectedServiceHome';
+import { CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS } from './claudeTranscriptRetentionSettings';
 
 const { spawnSpy } = vi.hoisted(() => ({
   spawnSpy: vi.fn(),
@@ -184,7 +185,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     expect(credential.claudeAiOauth.scopes).toContain('user:sessions:claude_code');
     expect(credential.claudeAiOauth.expiresAt).toBe(REALISTIC_EXPIRES_AT_MS);
     expect(credential.claudeAiOauth.expiresAt).toBeGreaterThan(1_000_000_000_000);
-    await expect(readFile(join(result!.env.CLAUDE_CONFIG_DIR!, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
+    expect(JSON.parse(await readFile(join(result!.env.CLAUDE_CONFIG_DIR!, 'settings.json'), 'utf8'))).toEqual({ theme: 'source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
   });
 
   it('projects user-accepted Claude workspace trust without copying credentials or per-project approvals', async () => {
@@ -862,10 +863,10 @@ describe('createClaudeConnectedServicesMaterializer', () => {
         hasCompletedProjectOnboarding: true,
       },
     });
-    await expect(readFile(join(existingTargetDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
+    expect(JSON.parse(await readFile(join(existingTargetDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
   });
 
-  it('reuses an existing stable profile home as the authoritative Claude source when Happier-owned provenance matches', async () => {
+  it('refreshes an existing stable profile home from the current native Claude config when provenance matches', async () => {
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-claude-materializer-server-'));
     const rootDir = await mkdtemp(join(tmpdir(), 'happier-claude-materializer-root-'));
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-materializer-home-'));
@@ -951,7 +952,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     });
 
     expect(result).not.toBeNull();
-    await expect(readFile(join(existingTargetDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"target"}\n');
+    expect(JSON.parse(await readFile(join(existingTargetDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
     const targetConfig = JSON.parse(await readFile(join(existingTargetDir, '.claude.json'), 'utf8'));
     expect(targetConfig).not.toHaveProperty('oauthAccount');
     const credential = JSON.parse(await readFile(join(existingTargetDir, '.credentials.json'), 'utf8'));
@@ -1038,7 +1039,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     expect(result).not.toBeNull();
     const targetConfig = JSON.parse(await readFile(join(existingTargetDir, '.claude.json'), 'utf8'));
     expect(targetConfig).not.toHaveProperty('oauthAccount');
-    await expect(readFile(join(existingTargetDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"source"}\n');
+    expect(JSON.parse(await readFile(join(existingTargetDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
   });
 
   it('falls back to the real HOME-based Claude source when the ambient CLAUDE_CONFIG_DIR already points at the managed target home', async () => {
@@ -1118,7 +1119,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     });
 
     expect(result).not.toBeNull();
-    await expect(readFile(join(existingTargetDir, 'settings.json'), 'utf8')).resolves.toBe('{"theme":"home-source"}\n');
+    expect(JSON.parse(await readFile(join(existingTargetDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'home-source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
     const targetConfig = JSON.parse(await readFile(join(existingTargetDir, '.claude.json'), 'utf8'));
     expect(targetConfig).not.toHaveProperty('oauthAccount');
   });

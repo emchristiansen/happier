@@ -5,6 +5,7 @@ import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers
 import { ConnectedServiceSwitchDeferralConflictError, createConnectedServiceSwitchDeferralQueue } from '@/daemon/connectedServices/sessionAuthSwitch/connectedServiceSwitchDeferralQueue';
 import { requestConnectedServiceSessionRestartSignal } from '@/daemon/connectedServices/sessionAuthSwitch/requestConnectedServiceSessionRestartSignal';
 
+import { createRestartCompletionWaiters } from './completionWaiters';
 import { requestPlannedRunnerRestart } from './requestPlannedRunnerRestart';
 
 function trackedSession(overrides: Partial<TrackedSession> = {}): TrackedSession {
@@ -54,7 +55,7 @@ describe('requestPlannedRunnerRestart', () => {
           }),
         },
       },
-      restartRequestedPids, pidToTrackedSession,
+      restartRequestedPids, completionWaiters: createRestartCompletionWaiters({ timeoutMs: 60_000 }), pidToTrackedSession,
       isProcessSafeToSignal: async () => { announceAuthority(); return await authority; },
       requestSignal: async ({ shouldSignal, onSignalFailure, onProcessAlreadyMissing }) =>
         await requestConnectedServiceSessionRestartSignal({
@@ -76,7 +77,7 @@ describe('requestPlannedRunnerRestart', () => {
       resolveAuthority(true);
       const outcome = await settled;
       if (admission === 'idle') {
-        expect(outcome).toEqual({ result: { signaled: false } });
+        expect(outcome).toEqual({ result: { signaled: false, notSignaledReason: 'duplicate_restart' } });
       } else {
         expect(outcome).toEqual({ error: expect.objectContaining({ code: 'daemon_shutdown' }) });
       }
@@ -100,16 +101,15 @@ describe('requestPlannedRunnerRestart', () => {
     const tracked = trackedSession();
     const pidToTrackedSession = new Map([[tracked.pid, tracked]]);
     const restartRequestedPids = new Set<number>();
-    const requestSwitch = vi.fn(async (input: { runSwitch: () => Promise<void> }) => {
-      expect(restartRequestedPids.has(tracked.pid)).toBe(false);
-      await input.runSwitch();
-    });
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess-1', event: 'task_started' });
     const requestSignal = vi.fn(async () => {
       expect(restartRequestedPids.has(tracked.pid)).toBe(true);
       return { status: 'requested' as const };
     });
 
-    const result = await requestPlannedRunnerRestart({
+    const pending = requestPlannedRunnerRestart({
+      completionWaiters: createRestartCompletionWaiters({ timeoutMs: 60_000 }),
       sessionId: 'sess-1',
       tracked,
       reason: 'connected_service_switch',
@@ -118,7 +118,7 @@ describe('requestPlannedRunnerRestart', () => {
         source: 'automatic',
         policy: 'defer_until_turn_boundary',
         target: { serviceId: 'anthropic', profileId: 'work', groupId: 'primary', generation: 2 },
-        turnDeferralQueue: { requestSwitch },
+        turnDeferralQueue: queue,
       },
       restartRequestedPids,
       pidToTrackedSession,
@@ -126,15 +126,55 @@ describe('requestPlannedRunnerRestart', () => {
       logDebug: () => {},
     });
 
-    expect(result).toEqual({ signaled: true });
-    expect(requestSwitch).toHaveBeenCalledWith(expect.objectContaining({
-      sessionId: 'sess-1',
-      source: 'automatic',
-      policy: 'defer_until_turn_boundary',
-      target: { serviceId: 'anthropic', profileId: 'work', groupId: 'primary', generation: 2 },
-    }));
+    expect(restartRequestedPids.has(tracked.pid)).toBe(false);
+    expect(requestSignal).not.toHaveBeenCalled();
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess-1', event: 'assistant_message_end' });
+    await expect(pending).resolves.toEqual({ signaled: true });
     expect(requestSignal).toHaveBeenCalledTimes(1);
     expect(restartRequestedPids.has(tracked.pid)).toBe(true);
+  });
+
+  it('does not signal a deferred restart whose turn boundary arrives after shutdown began', async () => {
+    const tracked = trackedSession();
+    const pidToTrackedSession = new Map([[tracked.pid, tracked]]);
+    const restartRequestedPids = new Set<number>();
+    const completionWaiters = createRestartCompletionWaiters({ timeoutMs: 60_000 });
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess-1', event: 'task_started' });
+    let shuttingDown = false;
+    const requestSignal = vi.fn(async ({ shouldSignal }) => (
+      await shouldSignal()
+        ? { status: 'requested' as const }
+        : { status: 'skipped_stale_owner' as const }
+    ));
+
+    const pending = requestPlannedRunnerRestart({
+      completionWaiters,
+      sessionId: 'sess-1',
+      tracked,
+      reason: 'connected_service_switch',
+      deferral: {
+        kind: 'connected_service_switch',
+        source: 'automatic',
+        policy: 'defer_until_turn_boundary',
+        target: { serviceId: 'anthropic', profileId: 'work', groupId: 'primary', generation: 2 },
+        turnDeferralQueue: queue,
+      },
+      restartRequestedPids,
+      pidToTrackedSession,
+      requestSignal,
+      canSignal: () => true,
+      isShuttingDown: () => shuttingDown,
+      isProcessSafeToSignal: async () => true,
+      logDebug: () => {},
+    });
+
+    shuttingDown = true;
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess-1', event: 'assistant_message_end' });
+
+    await expect(pending).resolves.toEqual({ signaled: false, notSignaledReason: 'shutting_down' });
+    expect(restartRequestedPids.has(tracked.pid)).toBe(false);
+    expect(completionWaiters.hasPending()).toBe(false);
   });
 
   it('clears the reservation and reports no signal when ownership changes before signal', async () => {
@@ -143,6 +183,7 @@ describe('requestPlannedRunnerRestart', () => {
     const restartRequestedPids = new Set<number>();
 
     const result = await requestPlannedRunnerRestart({
+      completionWaiters: createRestartCompletionWaiters({ timeoutMs: 60_000 }),
       sessionId: 'sess-1',
       tracked,
       reason: 'version_runtime_refresh',
@@ -151,7 +192,7 @@ describe('requestPlannedRunnerRestart', () => {
       pidToTrackedSession,
       requestSignal: async ({ shouldSignal }) => {
         pidToTrackedSession.delete(tracked.pid);
-        return shouldSignal() ? { status: 'requested' as const } : { status: 'skipped_stale_owner' as const };
+        return await shouldSignal() ? { status: 'requested' as const } : { status: 'skipped_stale_owner' as const };
       },
       logDebug: () => {},
     });
@@ -172,6 +213,7 @@ describe('requestPlannedRunnerRestart', () => {
     ));
 
     const result = await requestPlannedRunnerRestart({
+      completionWaiters: createRestartCompletionWaiters({ timeoutMs: 60_000 }),
       sessionId: 'sess-1',
       tracked,
       reason: 'version_runtime_refresh',
@@ -204,6 +246,7 @@ describe('requestPlannedRunnerRestart', () => {
     ));
 
     const result = await requestPlannedRunnerRestart({
+      completionWaiters: createRestartCompletionWaiters({ timeoutMs: 60_000 }),
       sessionId: 'sess-1',
       tracked,
       reason: 'version_runtime_refresh',
@@ -234,6 +277,7 @@ describe('requestPlannedRunnerRestart', () => {
     ));
 
     const result = await requestPlannedRunnerRestart({
+      completionWaiters: createRestartCompletionWaiters({ timeoutMs: 60_000 }),
       sessionId: 'sess-1',
       tracked,
       reason: 'version_runtime_refresh',
@@ -262,6 +306,7 @@ describe('requestPlannedRunnerRestart', () => {
     const observeProcessMissing = vi.fn();
 
     const result = await requestPlannedRunnerRestart({
+      completionWaiters: createRestartCompletionWaiters({ timeoutMs: 60_000 }),
       sessionId: 'sess-1',
       tracked,
       reason: 'version_runtime_refresh',
@@ -281,34 +326,26 @@ describe('requestPlannedRunnerRestart', () => {
   it('preserves connected-service cancellation semantics when a deferred request is superseded', async () => {
     const tracked = trackedSession();
     const restartRequestedPids = new Set<number>();
+    const completionWaiters = createRestartCompletionWaiters({ timeoutMs: 60_000 });
+    const queue = createConnectedServiceSwitchDeferralQueue({ timeoutMs: 60_000, disableDeferral: false });
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess-1', event: 'task_started' });
     const requestSignal = vi.fn(async () => ({ status: 'requested' as const }));
-
-    const result = await requestPlannedRunnerRestart({
-      sessionId: 'sess-1',
-      tracked,
-      reason: 'connected_service_switch',
+    const request = (profileId: string) => requestPlannedRunnerRestart({
+      completionWaiters, sessionId: 'sess-1', tracked, reason: 'connected_service_switch',
       deferral: {
-        kind: 'connected_service_switch',
-        source: 'automatic',
-        policy: 'defer_until_turn_boundary',
-        target: { serviceId: 'anthropic', profileId: 'work', groupId: 'primary', generation: 2 },
-        turnDeferralQueue: {
-          requestSwitch: async () => {
-            throw new ConnectedServiceSwitchDeferralConflictError({
-              code: 'switch_cancelled',
-              message: 'superseded',
-            });
-          },
-        },
+        kind: 'connected_service_switch', source: 'automatic', policy: 'defer_until_turn_boundary',
+        target: { serviceId: 'anthropic', profileId, groupId: 'primary', generation: 2 },
+        turnDeferralQueue: queue,
       },
-      restartRequestedPids,
-      pidToTrackedSession: new Map([[tracked.pid, tracked]]),
-      requestSignal,
+      restartRequestedPids, pidToTrackedSession: new Map([[tracked.pid, tracked]]), requestSignal,
       logDebug: () => {},
     });
-
-    expect(result).toEqual({ signaled: false, notSignaledReason: 'superseded' });
+    const superseded = request('work');
+    const selected = request('personal');
+    await expect(superseded).resolves.toEqual({ signaled: false, notSignaledReason: 'superseded' });
     expect(requestSignal).not.toHaveBeenCalled();
     expect(restartRequestedPids.size).toBe(0);
+    queue.recordTurnLifecycleEvent({ sessionId: 'sess-1', event: 'assistant_message_end' });
+    await expect(selected).resolves.toEqual({ signaled: true });
   });
 });

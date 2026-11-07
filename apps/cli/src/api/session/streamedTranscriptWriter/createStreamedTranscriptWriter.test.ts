@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { logger } from '@/ui/logger';
 import type { ACPMessageData, ACPProvider } from '../sessionMessageTypes';
 import { createStreamedTranscriptWriter } from './createStreamedTranscriptWriter';
 import type { StreamedTranscriptEnqueueOptions, StreamedTranscriptWriterSession } from './types';
@@ -192,5 +193,85 @@ describe('createStreamedTranscriptWriter', () => {
     await expect(writer.flushAll({ reason: 'turn-end' })).rejects.toThrow(
       'Exact transcript segment commit failed for rollout-assistant-failed-1: durable ACK unavailable',
     );
+  });
+
+  it('coalesces fast durable failures into the latest segment snapshot and one failure incident', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(0));
+    const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    const sendAgentMessageCommitted = vi.fn()
+      .mockRejectedValueOnce(new Error('Socket not connected'))
+      .mockRejectedValueOnce(new Error('Socket not connected'))
+      .mockResolvedValue(undefined);
+    const writer = createStreamedTranscriptWriter({
+      provider: 'codex',
+      session: { sendAgentMessageCommitted },
+      makeLocalId: () => 'offline-segment-1',
+      initialCheckpointDelayMs: 0,
+      checkpointIntervalMs: 0,
+      checkpointMinChars: 1,
+    });
+
+    writer.appendAssistantDelta('a');
+    await settleCommittedSnapshot();
+    writer.appendAssistantDelta('b');
+    await settleCommittedSnapshot();
+    writer.appendAssistantDelta('c');
+    await settleCommittedSnapshot();
+
+    expect(sendAgentMessageCommitted).toHaveBeenCalledOnce();
+    expect(debugSpy.mock.calls.filter(([message]) =>
+      message === '[StreamedTranscriptWriter] Durable snapshot commit failed (non-fatal)'
+    )).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await settleCommittedSnapshot();
+    expect(sendAgentMessageCommitted).toHaveBeenCalledTimes(2);
+    expect(sendAgentMessageCommitted.mock.calls[1]?.[1]).toEqual({ type: 'message', message: 'abc' });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await settleCommittedSnapshot();
+    expect(sendAgentMessageCommitted).toHaveBeenCalledTimes(3);
+    expect(debugSpy.mock.calls.filter(([message]) =>
+      message === '[StreamedTranscriptWriter] Durable snapshot commit failed (non-fatal)'
+    )).toHaveLength(1);
+    expect(debugSpy).toHaveBeenCalledWith(
+      '[StreamedTranscriptWriter] Durable snapshot commit recovered',
+      expect.objectContaining({ failureCount: 2, suppressedFailureCount: 1 }),
+    );
+  });
+
+  it('does not delay a terminal durable snapshot behind streaming failure backoff', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(0));
+    const sendAgentMessageCommitted = vi.fn()
+      .mockRejectedValueOnce(new Error('Socket not connected'))
+      .mockResolvedValue(undefined);
+    const writer = createStreamedTranscriptWriter({
+      provider: 'codex',
+      session: { sendAgentMessageCommitted },
+      makeLocalId: () => 'terminal-offline-segment-1',
+      initialCheckpointDelayMs: 0,
+      checkpointIntervalMs: 0,
+      checkpointMinChars: 1,
+    });
+
+    writer.appendAssistantDelta('partial');
+    await settleCommittedSnapshot();
+    writer.appendAssistantDelta(' complete');
+
+    await expect(writer.flushAll({ reason: 'turn-end' })).resolves.toMatchObject({
+      assistantRoot: { sawText: true, didDurablyFlush: true },
+    });
+    expect(sendAgentMessageCommitted).toHaveBeenCalledTimes(2);
+    expect(sendAgentMessageCommitted.mock.calls[1]?.[1]).toEqual({
+      type: 'message',
+      message: 'partial complete',
+    });
+    expect(sendAgentMessageCommitted.mock.calls[1]?.[2]).toEqual(expect.objectContaining({
+      meta: expect.objectContaining({
+        happierStreamSegmentV1: expect.objectContaining({ segmentState: 'complete' }),
+      }),
+    }));
   });
 });

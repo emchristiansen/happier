@@ -3,9 +3,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react-test-renderer';
 import type { ActionOperationSnapshotV1 } from '@happier-dev/protocol';
 
-import { renderScreen, standardCleanup } from '@/dev/testkit';
+import { renderHook, renderScreen, standardCleanup } from '@/dev/testkit';
+import { storage } from '@/sync/domains/state/storage';
+import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
 import { actionOperationStore } from '@/sync/domains/actionOperations/actionOperationStore';
 import { actionOperationReentry } from '@/sync/domains/actionOperations/actionOperationReentry';
+import { ActionOperationDetail } from './ActionOperationDetail';
+import { ItemGroupRowPositionProvider } from '@/components/ui/lists/ItemGroupRowPosition';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -71,6 +75,73 @@ function runningOperation(): ActionOperationSnapshotV1 {
 }
 
 describe('ActionOperationLedger', () => {
+    it('keeps a seen failure explicitly dismissible through the shared Activity and Inbox model', async () => {
+        const { useActionOperationActivityModel } = await import('./useActionOperationActivityModel');
+        const previousProfileScope = storage.getState().profileScope;
+        const scope = { serverId: getActiveServerSnapshot().serverId, accountId: 'account-dismissal' };
+        const failed: ActionOperationSnapshotV1 = {
+            ...runningOperation(),
+            operationId: 'seen-failure',
+            scope: { ...runningOperation().scope, accountId: scope.accountId },
+            state: 'failed',
+            settledAt: 1_700_000_120_000,
+        };
+        storage.setState({ profileScope: scope });
+        actionOperationStore.merge(failed);
+        const hook = await renderHook(() => useActionOperationActivityModel());
+        try {
+            await act(async () => { actionOperationStore.markAccountTerminalSeen(scope.accountId); });
+            expect(hook.getCurrent().inboxEntries).toEqual([]);
+            expect(hook.getCurrent().canDismissOperation(failed)).toBe(true);
+            await act(async () => hook.getCurrent().dismissOperation(failed.operationId));
+            expect(hook.getCurrent().operations).toEqual([]);
+            expect(actionOperationStore.getState().operationsById.get(failed.operationId)?.state).toBe('failed');
+        } finally {
+            await hook.unmount();
+            storage.setState({ profileScope: previousProfileScope });
+        }
+    });
+
+    it('retains shared stopping feedback when Activity is reopened and observes the cancellation cutoff', async () => {
+        const snapshot = { ...runningOperation(), actionId: 'session.direct.takeover_persist',
+            progress: { kind: 'phase' as const, phase: 'cancelling', label: 'Stopping import' } };
+        const onCancel = vi.fn();
+        const screen = await renderScreen(<ActionOperationDetail operation={snapshot} observation="available" onClose={() => {}} onCancel={onCancel} />);
+        expect(screen.findByTestId('action-operation-stop')?.props.disabled).toBe(true);
+        await screen.update(<ActionOperationDetail operation={{ ...snapshot, cancellation: 'unsupported', progress: { kind: 'phase', phase: 'starting', label: 'Starting' } }} observation="available" onClose={() => {}} onCancel={onCancel} />);
+        expect(screen.findByTestId('action-operation-stop')).toBeNull();
+    });
+
+    it('distributes a parent ItemGroup row across every rendered operation row', async () => {
+        const { ActionOperationRows } = await import('./ActionOperationLedger');
+        const secondOperation = { ...runningOperation(), operationId: 'operation-2' };
+        const screen = await renderScreen(
+            <ItemGroupRowPositionProvider value={{ isFirst: true, isLast: true }}>
+                <ActionOperationRows
+                    operations={[runningOperation(), secondOperation]}
+                    onOpenOperation={() => {}}
+                    nowMs={1_700_000_120_000}
+                    showDivider={false}
+                />
+            </ItemGroupRowPositionProvider>,
+        );
+
+        const itemDividers = screen.tree.root.findAll((node) => {
+            const props = node.props as Record<string, unknown> | undefined;
+            return props != null
+                && typeof props.testID === 'string'
+                && props.testID.startsWith('action-operation-row-')
+                && 'subtitleLines' in props
+                && 'showDivider' in props;
+        }).map((node) => node.props.showDivider);
+        expect(itemDividers).toEqual([true, false]);
+        expect(screen.tree.root.findAllByType(ItemGroupRowPositionProvider).map((node) => node.props.value)).toEqual([
+            { isFirst: true, isLast: true },
+            { isFirst: true, isLast: false },
+            { isFirst: false, isLast: true },
+        ]);
+    });
+
     it('shows successful custody with failed setup as a needs-attention Activity row', async () => {
         const registration = actionOperationReentry.registerNewSession({
             requestId: 'spawn-setup-attention',
@@ -98,7 +169,7 @@ describe('ActionOperationLedger', () => {
             />,
         );
 
-        expect(screen.getTextContent()).toContain('Needs attention');
+        expect(screen.getTextContent()).toContain('NEEDS ATTENTION');
         expect(screen.getTextContent()).not.toContain('Session created; setup needs attention');
         expect(screen.getTextContent()).not.toContain('Succeeded');
         expect(screen.findByTestId('action-operation-row-operation-setup-attention')?.props.accessibilityLabel)
@@ -178,13 +249,38 @@ describe('ActionOperationLedger', () => {
             />,
         );
 
-        expect(screen.getTextContent()).toContain('Needs attention');
+        expect(screen.getTextContent()).toContain('NEEDS ATTENTION');
         expect(screen.getTextContent()).toContain('leeroy-mbp');
         expect(screen.getTextContent()).not.toContain('Status unavailable');
         expect(screen.findByTestId('action-operation-stop-operation-1')).toBeNull();
         await screen.pressByTestIdAsync('action-operation-dismiss-operation-1');
         expect(onDismissOperation).toHaveBeenCalledWith('operation-1');
         expect(onCancelOperation).not.toHaveBeenCalled();
+    });
+
+    it('offers explicit dismissal of a terminal failure in Activity as well as Inbox', async () => {
+        const onDismissOperation = vi.fn();
+        const failed: ActionOperationSnapshotV1 = {
+            ...runningOperation(),
+            operationId: 'operation-failed-inbox',
+            revision: 3,
+            state: 'failed',
+            settledAt: 1_700_000_120_000,
+            error: { errorCode: 'failed', error: 'Failed' },
+        };
+        const { ActionOperationLedger } = await import('./ActionOperationLedger');
+        const screen = await renderScreen(
+            <ActionOperationLedger
+                operations={[failed]}
+                onOpenOperation={() => {}}
+                canDismissOperation={() => true}
+                onDismissOperation={onDismissOperation}
+                nowMs={1_700_000_120_000}
+            />,
+        );
+
+        await screen.pressByTestIdAsync('action-operation-dismiss-operation-failed-inbox');
+        expect(onDismissOperation).toHaveBeenCalledWith('operation-failed-inbox');
     });
 
     it('does not repeat terminal status as visible row text', async () => {
@@ -210,7 +306,6 @@ describe('ActionOperationLedger', () => {
     });
 
     it('renders a successful handoff cleanup warning and terminal Done affordance', async () => {
-        const { ActionOperationDetail } = await import('./ActionOperationDetail');
         const operation: ActionOperationSnapshotV1 = {
             ...runningOperation(),
             revision: 7,
@@ -240,7 +335,6 @@ describe('ActionOperationLedger', () => {
     });
 
     it('keeps an active detail collapsible and exposes its acknowledged Stop action', async () => {
-        const { ActionOperationDetail } = await import('./ActionOperationDetail');
         const onCancel = vi.fn();
         const screen = await renderScreen(
             <ActionOperationDetail
@@ -273,6 +367,15 @@ describe('ActionOperationLedger', () => {
         await screen.pressByTestIdAsync('action-operation-stop-operation-1');
         expect(onCancelOperation).toHaveBeenCalledWith('operation-1');
         expect(onOpenOperation).not.toHaveBeenCalled();
+
+        const rowPressTarget = screen.findHostByTestId('action-operation-row-operation-1');
+        const stopPressTarget = screen.findHostByTestId('action-operation-stop-operation-1');
+        expect(rowPressTarget).not.toBeNull();
+        expect(stopPressTarget).not.toBeNull();
+
+        let ancestor = stopPressTarget?.parent ?? null;
+        while (ancestor && ancestor !== rowPressTarget) ancestor = ancestor.parent;
+        expect(ancestor).toBeNull();
     });
 
     it('marks the same visible detail seen only when its running operation terminalizes', async () => {
@@ -303,5 +406,12 @@ describe('ActionOperationLedger', () => {
         });
 
         expect(actionOperationStore.getState().terminalSeenAtById.has(operationId)).toBe(true);
+
+        const mountedTerminal = { ...running, operationId: 'operation-mounted-terminal', state: 'failed' as const };
+        actionOperationStore.merge(mountedTerminal);
+        await renderScreen(
+            <ActionOperationDetailModal operationId={mountedTerminal.operationId} onClose={() => {}} refreshDetail={async () => {}} />,
+        );
+        expect(actionOperationStore.getState().terminalSeenAtById.has(mountedTerminal.operationId)).toBe(false);
     });
 });

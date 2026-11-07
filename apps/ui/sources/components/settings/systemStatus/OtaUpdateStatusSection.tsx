@@ -1,12 +1,12 @@
 import * as React from 'react';
-import { Linking, Platform } from 'react-native';
+import { useRouter } from 'expo-router';
 import { useUnistyles } from 'react-native-unistyles';
 
 import { Item } from '@/components/ui/lists/Item';
 import { ItemGroup } from '@/components/ui/lists/ItemGroup';
 import { Text } from '@/components/ui/text/Text';
 import { useUpdates } from '@/hooks/inbox/useUpdates';
-import { useNativeUpdate } from '@/hooks/ui/useNativeUpdate';
+import { UPDATES_ROUTE } from '@/components/updates/updatesRoute';
 import { t } from '@/text';
 import { Icon } from '@/components/ui/icons/Icon';
 
@@ -30,7 +30,6 @@ function formatLastChecked(value: Date | undefined): string {
 
 export const OtaUpdateStatusSection = React.memo(function OtaUpdateStatusSection() {
     const { theme } = useUnistyles();
-    const updateUrl = useNativeUpdate();
     const {
         otaUpdatesEnabled,
         isChecking,
@@ -41,8 +40,6 @@ export const OtaUpdateStatusSection = React.memo(function OtaUpdateStatusSection
         checkError,
         downloadError,
         lastCheckForUpdateTimeSinceRestart,
-        checkForUpdates,
-        reloadApp,
     } = useUpdates();
 
     const progressPercent = typeof downloadProgress === 'number'
@@ -69,21 +66,10 @@ export const OtaUpdateStatusSection = React.memo(function OtaUpdateStatusSection
         ? <Text style={{ color: theme.colors.text.secondary }}>{errorMessage}</Text>
         : undefined;
 
-    const openStoreUpdate = React.useCallback(async () => {
-        if (!updateUrl) return;
-        const supported = await Linking.canOpenURL(updateUrl);
-        if (!supported) return;
-        await Linking.openURL(updateUrl);
-    }, [updateUrl]);
-
-    const runOtaAction = React.useCallback(() => {
-        if (!otaUpdatesEnabled) return;
-        if (isUpdatePending) {
-            void reloadApp();
-            return;
-        }
-        void checkForUpdates();
-    }, [checkForUpdates, isUpdatePending, otaUpdatesEnabled, reloadApp]);
+    const router = useRouter();
+    const openUpdates = React.useCallback(() => {
+        router.push(UPDATES_ROUTE);
+    }, [router]);
 
     return (
         <ItemGroup title={t('systemStatus.sections.updates')}>
@@ -100,26 +86,13 @@ export const OtaUpdateStatusSection = React.memo(function OtaUpdateStatusSection
                 mode="info"
                 icon={<Icon name="clock" size={24} color={theme.colors.accent.orange} />}
             />
-            {updateUrl ? (
-                <Item
-                    title={t('systemStatus.updates.openStore')}
-                    detail={t('systemStatus.updates.available')}
-                    subtitle={Platform.OS === 'ios' ? t('updateBanner.tapToUpdateAppStore') : t('updateBanner.tapToUpdatePlayStore')}
-                    onPress={openStoreUpdate}
-                    icon={<Icon name="download" size={24} color={theme.colors.state.success.foreground} />}
-                />
-            ) : null}
-            {otaUpdatesEnabled ? (
-                <Item
-                    title={isUpdatePending ? t('systemStatus.updates.applyNow') : t('systemStatus.updates.checkNow')}
-                    subtitle={isUpdatePending ? t('updateBanner.pressToApply') : t('systemStatus.updates.checkNowSubtitle')}
-                    onPress={runOtaAction}
-                    loading={isUpdatePending ? isRestarting : (isChecking || isDownloading)}
-                    disabled={isUpdatePending ? isRestarting : (isChecking || isDownloading)}
-                    showChevron={false}
-                    icon={<Icon name={isUpdatePending ? 'arrows-clockwise' : 'arrow-clockwise'} size={24} color={theme.colors.accent.indigo} />}
-                />
-            ) : null}
+            {/* Diagnostics only: the update itself lives in Settings › Updates (one entry, R13 (e)). */}
+            <Item
+                testID="system-status-open-updates"
+                title={t('updates.action.openUpdates')}
+                onPress={openUpdates}
+                icon={<Icon name="hard-drive-download" size={24} color={theme.colors.accent.indigo} />}
+            />
         </ItemGroup>
     );
 });

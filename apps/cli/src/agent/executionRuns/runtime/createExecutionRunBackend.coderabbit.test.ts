@@ -95,7 +95,7 @@ describe('createExecutionRunBackend (coderabbit)', () => {
     }
   }, 20_000);
 
-  it('overlays isolated XDG state/cache/data dirs for ephemeral runs', async () => {
+  it('preserves user XDG state/cache/data directories for ephemeral runs', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-coderabbit-home-'));
     const dir = await mkdtemp(join(tmpdir(), 'happier-coderabbit-isolation-'));
     const scriptPath = join(dir, 'coderabbit-env.mjs');
@@ -167,10 +167,9 @@ describe('createExecutionRunBackend (coderabbit)', () => {
       await backend.sendPrompt(started.sessionId, 'ignored prompt');
 
       const parsed = JSON.parse(fullText);
-      const root = join(configMod.configuration.activeServerDir, 'isolation', 'coderabbit', 'execution_run', 'run_1', 'xdg');
-      expect(parsed.state).toBe(join(root, 'state'));
-      expect(parsed.cache).toBe(join(root, 'cache'));
-      expect(parsed.data).toBe(join(root, 'data'));
+      expect(parsed.state).toBe('/tmp/xdg-state-original');
+      expect(parsed.cache).toBe('/tmp/xdg-cache-original');
+      expect(parsed.data).toBe('/tmp/xdg-data-original');
 
       await backend.dispose();
     } finally {
@@ -198,7 +197,7 @@ describe('createExecutionRunBackend (coderabbit)', () => {
     }
   }, 20_000);
 
-  it('overlays isolated XDG state/cache/data dirs for resumable runs with a stable run id', async () => {
+  it('preserves user XDG state/cache/data directories for resumable runs with a stable run id', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-coderabbit-home-'));
     const dir = await mkdtemp(join(tmpdir(), 'happier-coderabbit-isolation-'));
     const scriptPath = join(dir, 'coderabbit-env.mjs');
@@ -270,10 +269,9 @@ describe('createExecutionRunBackend (coderabbit)', () => {
       await backend.sendPrompt(started.sessionId, 'ignored prompt');
 
       const parsed = JSON.parse(fullText);
-      const root = join(configMod.configuration.activeServerDir, 'isolation', 'coderabbit', 'execution_run', 'run_resumable_1', 'xdg');
-      expect(parsed.state).toBe(join(root, 'state'));
-      expect(parsed.cache).toBe(join(root, 'cache'));
-      expect(parsed.data).toBe(join(root, 'data'));
+      expect(parsed.state).toBe('/tmp/xdg-state-original');
+      expect(parsed.cache).toBe('/tmp/xdg-cache-original');
+      expect(parsed.data).toBe('/tmp/xdg-data-original');
 
       await backend.dispose();
     } finally {

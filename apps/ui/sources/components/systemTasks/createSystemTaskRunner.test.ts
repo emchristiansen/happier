@@ -54,6 +54,64 @@ function createManualBridge() {
 }
 
 describe('createSystemTaskRunner', () => {
+    it('retires the native subscription when snapshot replay completes during registration', async () => {
+        const { createSystemTaskRunner } = await import('./createSystemTaskRunner');
+        const manual = createManualBridge();
+        const subscriptions = new Set<string>();
+        // The OS bridge replays an already-finished native task before returning its disposer.
+        const runner = createSystemTaskRunner({ bridge: {
+            ...manual.bridge,
+            async subscribe(taskId, listeners) {
+                subscriptions.add(taskId);
+                listeners.onResult({ protocolVersion: 1, taskId, ok: true, data: {} });
+                return () => { subscriptions.delete(taskId); };
+            },
+        } });
+        const taskId = await runner.start(createSpec());
+        expect(runner.getSnapshot(taskId)?.result).toMatchObject({ ok: true });
+        expect(subscriptions.size).toBe(0);
+    });
+
+    it('does not replay a prompt when its subscriber synchronously changes task state', async () => {
+        const { createSystemTaskRunner } = await import('./createSystemTaskRunner');
+        const manual = createManualBridge();
+        const runner = createSystemTaskRunner({ bridge: manual.bridge });
+        const taskId = await runner.start(createSpec());
+        const seen: string[] = [];
+        runner.subscribe(taskId, (event) => {
+            seen.push(event.type);
+            if (event.type === 'prompt') void runner.cancel(taskId);
+        }, () => {});
+        manual.emitEvent(taskId, { protocolVersion: 1, taskId, tsMs: 1, type: 'prompt' });
+        expect(seen).toEqual(['prompt']);
+        expect(runner.getSnapshot(taskId)?.status).toBe('canceling');
+    });
+
+    it('retains current download samples, phase changes and prompts for late subscribers', async () => {
+        const { createSystemTaskRunner } = await import('./createSystemTaskRunner');
+        const manual = createManualBridge();
+        const runner = createSystemTaskRunner({ bridge: manual.bridge });
+        const taskId = await runner.start(createSpec());
+        const emit = (tsMs: number, phase: string, receivedBytes?: number) => manual.emitEvent(taskId, {
+            protocolVersion: 1, taskId, tsMs, type: 'cli.acquisition.progress',
+            stepId: 'setup.thisComputer.ensureCli', data: { phase, ...(receivedBytes === undefined ? {} : { receivedBytes }) },
+        });
+        emit(1, 'resolvingRelease');
+        emit(2, 'downloading');
+        for (let index = 2; index <= 1000; index++) emit(index, 'downloading', index);
+        manual.emitEvent(taskId, { protocolVersion: 1, taskId, tsMs: 1001, type: 'prompt', stepId: 'consent' });
+        emit(1002, 'verifying');
+        const events: SystemTaskEvent[] = [];
+        runner.subscribe(taskId, (event) => events.push(event), () => {});
+        expect(events.map((event) => event.data ?? event.type)).toEqual([
+            { phase: 'resolvingRelease' }, { phase: 'downloading' }, { phase: 'downloading', receivedBytes: 1000 }, 'prompt', { phase: 'verifying' },
+        ]);
+        // Replayed older samples must not displace the current value or lose phase boundaries.
+        emit(3, 'downloading', 3);
+        expect(runner.getSnapshot(taskId)?.events).toHaveLength(5);
+        expect(runner.getSnapshot(taskId)?.events[2]?.data).toEqual({ phase: 'downloading', receivedBytes: 1000 });
+    });
+
     it('ignores invalid events and converts an invalid result payload into a stable failure result', async () => {
         const { createSystemTaskRunner } = await import('./createSystemTaskRunner');
         const manual = createManualBridge();

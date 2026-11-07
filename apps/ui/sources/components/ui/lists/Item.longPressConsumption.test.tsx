@@ -92,7 +92,7 @@ vi.mock('@expo/vector-icons', () => ({
 }));
 
 vi.mock('expo-clipboard', () => ({
-    setStringAsync: vi.fn(async () => {}),
+    setStringAsync: vi.fn(async () => true),
 }));
 
 vi.mock('@/constants/Typography', () => ({

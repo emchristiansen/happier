@@ -55,6 +55,7 @@ vi.mock('@/components/ui/text/Text', () => ({
 
 vi.mock('@/components/ui/buttons/RoundButton', () => ({
     RoundButton: (props: any) => React.createElement('RoundButton', props),
+    RoundButtonSizeScope: (props: Readonly<{ children?: React.ReactNode }>) => React.createElement(React.Fragment, null, props.children),
 }));
 
 vi.mock('@/agents/backendCatalog/getResolvedBackendCatalogEntries', () => ({

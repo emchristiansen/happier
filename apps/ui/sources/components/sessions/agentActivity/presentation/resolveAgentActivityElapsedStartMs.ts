@@ -28,6 +28,7 @@ import type { AgentActivityRowEntry } from '../agentActivityRowEntry';
  * fabricated-zero defect belongs to the derivations that invented the timestamps, not here.
  */
 export function resolveAgentActivityElapsedStartMs(entry: AgentActivityRowEntry): number | null {
+    if (entry.isActive === false && entry.status === 'running') return null;
     const startedAtMs = readTimestamp(entry.startedAtMs);
     if (startedAtMs == null) return null;
     if (isInProgressAgentActivityStatus(entry.status)) return startedAtMs;

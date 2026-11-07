@@ -109,7 +109,11 @@ export const CODEX_UI_BEHAVIOR_OVERRIDE: AgentUiBehavior = {
         includeInSessionGettingStartedCliExamples: true,
     },
     sessionUsage: {
-        supportsExactContextUsageBadge: false,
+        // Codex `token_count` rows carry the thread's cumulative totals under a stable usage-report
+        // key (the server keeps them as account usage snapshots), so they are not per-message usage
+        // and the composer must not derive active context from them. The app-server runtime reports
+        // active context explicitly as `used`; rows without it (older CLIs) show no gauge.
+        contextUsageBadge: 'reportedOnly',
     },
     workState: {
         supportsEditableGoals: ({ agentId, session }) => {

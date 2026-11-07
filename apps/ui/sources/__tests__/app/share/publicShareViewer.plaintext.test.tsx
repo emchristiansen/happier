@@ -1,5 +1,7 @@
 import { flushHookEffects } from '@/dev/testkit/hooks/flushHookEffects';
 import { createDeferred, renderScreen } from '@/dev/testkit';
+import { createReactNavigationNativeMock } from '@/dev/testkit/mocks/reactNavigation';
+import { measureNativeLayout } from '@/dev/testkit/render/measureNativeLayout';
 import React from 'react';
 import { act } from 'react-test-renderer';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -65,9 +67,7 @@ vi.mock('@/auth/context/AuthContext', () => ({
     useAuth: () => ({ credentials: { token: 'auth-token' } }),
 }));
 
-vi.mock('@/components/sessions/transcript/ChatHeaderView', () => ({
-    ChatHeaderView: () => null,
-}));
+vi.mock('@react-navigation/native', () => createReactNavigationNativeMock());
 
 vi.mock('@/components/sessions/transcript/TranscriptList', () => ({
     TranscriptList: (props: any) => {
@@ -96,6 +96,52 @@ describe('PublicShareViewerScreen (plaintext)', () => {
         const { resolvePublicShareTokenParam } = await import('@/app/(app)/share/[token]');
 
         expect(resolvePublicShareTokenParam(':token', '/share/web-token-1')).toBe('web-token-1');
+    });
+
+    it.each([
+        { hasMore: false, completedQuestions: 1 },
+        { hasMore: true, completedQuestions: 0 },
+        { hasMore: undefined, completedQuestions: 0 },
+    ])('projects historical completed questions only for explicitly complete public history ($hasMore)', async ({ hasMore, completedQuestions }) => {
+        serverFetchSpy
+            .mockResolvedValueOnce({
+                ok: true, status: 200,
+                json: async () => ({
+                    session: {
+                        id: 's1', seq: 3, encryptionMode: 'plain', createdAt: 1, updatedAt: 3,
+                        active: false, activeAt: 3, metadata: JSON.stringify({ path: '/repo', host: 'devbox' }),
+                        metadataVersion: 1, agentStateVersion: 1,
+                        agentState: JSON.stringify({ completedRequests: {
+                            'old-question': {
+                                tool: 'AskUserQuestion', arguments: { questions: [{ question: 'Choose a mode' }] },
+                                createdAt: 1, completedAt: 2, status: 'approved', answers: { 'Choose a mode': 'Fast' },
+                            },
+                        } }),
+                    },
+                    owner: { id: 'u1', username: 'alice', firstName: null, lastName: null, avatar: null },
+                    accessLevel: 'view', encryptedDataKey: null, isConsentRequired: false,
+                }),
+            })
+            .mockResolvedValueOnce({
+                ok: true, status: 200,
+                json: async () => ({
+                    ...(hasMore === undefined ? {} : { hasMore }),
+                    messages: [{
+                        id: 'm3', seq: 3, localId: null, createdAt: 3, updatedAt: 3,
+                        content: { t: 'plain', v: { role: 'user', content: { type: 'text', text: 'Latest message' } } },
+                    }],
+                }),
+            });
+        const { default: PublicShareViewerScreen } = await import('@/app/(app)/share/[token]');
+        await renderScreen(<PublicShareViewerScreen />);
+        await flushHookEffects({ cycles: 1, turns: 1 });
+        const messages = transcriptListSpy.mock.calls.at(-1)?.[0]?.messages;
+        expect(messages).toEqual(expect.any(Array));
+        const questions = messages.filter((message: { kind: string; tool?: { name: string } }) => (
+            message.kind === 'tool-call' && message.tool?.name === 'AskUserQuestion'
+        ));
+        expect(questions).toHaveLength(completedQuestions);
+        if (completedQuestions) expect(questions[0].tool.result).toEqual({ answers: { 'Choose a mode': 'Fast' } });
     });
 
     it('does not attempt DEK decryption for plaintext sessions', async () => {
@@ -183,7 +229,7 @@ describe('PublicShareViewerScreen (plaintext)', () => {
         expect(last).not.toHaveProperty('interaction');
     });
 
-    it('offsets transcript content below the absolute share header', async () => {
+    it('keeps the transcript below the real share header at enlarged text sizes', async () => {
         transcriptListSpy.mockClear();
         serverFetchSpy.mockReset();
 
@@ -222,15 +268,20 @@ describe('PublicShareViewerScreen (plaintext)', () => {
         const screen = await renderScreen(<PublicShareViewerScreen />);
         await flushHookEffects({ cycles: 1, turns: 1 });
 
-        const headerOffset = 84;
-        const transcriptContainers = screen.findAll((node) => {
-            const style = node.props?.style;
-            if (Array.isArray(style)) {
-                return style.some((entry) => entry?.paddingTop === headerOffset);
-            }
-            return style?.paddingTop === headerOffset;
-        });
-        expect(transcriptContainers).toHaveLength(1);
+        const root = screen.root.findAll((node) => String(node.type) === 'View')[0];
+        const header = screen.root.findAll((node) => String(node.type) === 'View'
+            && Array.isArray(node.props.style)
+            && node.props.style.some((style: Record<string, unknown> | null) => style?.zIndex === 100))[0];
+        const transcript = screen.root.findByType('TranscriptList' as never);
+        const layout = measureNativeLayout(root, 390, 2.5, 844);
+        try {
+            const headerRect = layout.rect(header);
+            const transcriptRect = layout.rect(transcript);
+            expect(headerRect.height).toBeGreaterThan(84);
+            expect(transcriptRect.top).toBeGreaterThanOrEqual(headerRect.top + headerRect.height);
+        } finally {
+            layout.free();
+        }
     });
 
     it('normalizes and reduces messages in deterministic oldest-first order by seq when available', async () => {

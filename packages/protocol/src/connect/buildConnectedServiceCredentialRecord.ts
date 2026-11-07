@@ -3,16 +3,12 @@ import {
   type ConnectedServiceCredentialRecordV1,
   type ConnectedServiceId,
 } from './connectedServiceSchemas.js';
+import { readClaudeOauthCredentialMetadata, readClaudeOauthCredentialOrganizationId, type ClaudeOauthCredentialMetadata } from '../providers/claude/oauthProfile.js';
 
 export type ConnectedServiceOauthCredentialRawMetadata = Readonly<{
-  claudeAiOauth?: Readonly<{
-    subscriptionType?: string;
-    rateLimitTier?: string;
-  }>;
-  'claude.ai_oauth'?: Readonly<{
-    subscriptionType?: string;
-    rateLimitTier?: string;
-  }>;
+  project_id?: string;
+  claudeAiOauth?: ClaudeOauthCredentialMetadata;
+  'claude.ai_oauth'?: ClaudeOauthCredentialMetadata;
 }>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -27,20 +23,16 @@ function readString(value: unknown): string | undefined {
 
 export function normalizeConnectedServiceOauthCredentialRawMetadata(
   raw: unknown,
+  serviceId?: ConnectedServiceId,
 ): ConnectedServiceOauthCredentialRawMetadata | null {
   const root = isRecord(raw) ? raw : {};
-  const claudeAiOauthRaw = isRecord(root.claudeAiOauth)
-    ? root.claudeAiOauth
-    : isRecord(root['claude.ai_oauth'])
-      ? root['claude.ai_oauth']
-      : {};
-  const subscriptionType = readString(claudeAiOauthRaw.subscriptionType);
-  const rateLimitTier = readString(claudeAiOauthRaw.rateLimitTier);
-  const claudeAiOauth = {
-    ...(subscriptionType ? { subscriptionType } : {}),
-    ...(rateLimitTier ? { rateLimitTier } : {}),
+  const projectId = serviceId === 'antigravity' ? readString(root.project_id) : undefined;
+  const claudeAiOauth = readClaudeOauthCredentialMetadata(raw);
+  const normalized = {
+    ...(claudeAiOauth ? { claudeAiOauth } : {}),
+    ...(projectId ? { project_id: projectId } : {}),
   };
-  return Object.keys(claudeAiOauth).length > 0 ? { claudeAiOauth } : null;
+  return Object.keys(normalized).length > 0 ? normalized : null;
 }
 
 export function buildConnectedServiceCredentialRecord(
@@ -96,7 +88,7 @@ export function buildConnectedServiceCredentialRecord(
             tokenType: params.oauth.tokenType,
             providerAccountId: params.oauth.providerAccountId,
             providerEmail: params.oauth.providerEmail,
-            raw: normalizeConnectedServiceOauthCredentialRawMetadata(params.oauth.raw),
+            raw: normalizeConnectedServiceOauthCredentialRawMetadata(params.oauth.raw, params.serviceId),
           },
           token: null,
         }
@@ -113,4 +105,36 @@ export function buildConnectedServiceCredentialRecord(
         };
 
   return ConnectedServiceCredentialRecordV1Schema.parse(record);
+}
+
+/** Provider usage identity requirements shared by credential writers and usage consumers. */
+export function connectedServiceUsageRequiresOrganizationId(serviceId: ConnectedServiceId): boolean {
+  return serviceId === 'claude-subscription';
+}
+
+export function readConnectedServiceCredentialOrganizationId(record: ConnectedServiceCredentialRecordV1): string | null {
+  return connectedServiceUsageRequiresOrganizationId(record.serviceId) && record.kind === 'oauth'
+    ? readClaudeOauthCredentialOrganizationId(record.oauth.raw)
+    : null;
+}
+
+export type ConnectedServiceCredentialMetadata = Readonly<{
+  kind: 'oauth' | 'token';
+  providerEmail: string | null;
+  providerAccountId: string | null;
+  providerOrganizationId?: string | null;
+  expiresAt: number | null;
+}>;
+
+/** Public, non-secret projection of the credential's attested provider identity. */
+export function buildConnectedServiceCredentialMetadata(record: ConnectedServiceCredentialRecordV1): ConnectedServiceCredentialMetadata {
+  const identity = record.kind === 'oauth' ? record.oauth : record.token;
+  const providerOrganizationId = readConnectedServiceCredentialOrganizationId(record);
+  return {
+    kind: record.kind,
+    providerEmail: identity.providerEmail ?? null,
+    providerAccountId: identity.providerAccountId ?? null,
+    ...(providerOrganizationId ? { providerOrganizationId } : {}),
+    expiresAt: record.expiresAt,
+  };
 }

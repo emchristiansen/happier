@@ -28,6 +28,10 @@ export {
 
 export {
   ConnectedServicesDefaultAuthByAgentIdV1Schema,
+  ConnectedServicesAdditionalDefaultAuthByAgentIdV1Schema,
+  readConnectedServicesDefaultAuthSettings,
+  buildConnectedServicesDefaultAuthSettingsPatch,
+  type ConnectedServicesDefaultAuthSettings,
   ConnectedServicesProviderConfigSharingModeV1Schema,
   ConnectedServicesProviderStateSharingModeV1Schema,
   ConnectedServicesProviderStateSharingPolicyV1Schema,

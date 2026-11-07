@@ -1,9 +1,160 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
+import type { SessionTurnMutationV1 } from '@/api/session/mutations/sessionMutationTypes';
+
 import { claudeRemoteAgentSdk } from './claudeRemoteAgentSdk';
 import { makeMode } from './claudeRemoteAgentSdk.testkit';
 
+type CreateQuery = NonNullable<Parameters<typeof claudeRemoteAgentSdk>[0]['createQuery']>;
+
 describe('claudeRemoteAgentSdk post-result streaming', () => {
+    it.each(['user_message_uuid', 'user_message_uuids'] as const)('releases an answered prompt despite session backlog using %s and ignores its late result during the next prompt', async (attributionField) => {
+        let finishInput!: () => void;
+        const inputFinished = new Promise<void>((resolve) => { finishInput = resolve; });
+        let releaseSecondResult!: () => void;
+        const secondResultReady = new Promise<void>((resolve) => { releaseSecondResult = resolve; });
+        let reachedSecondPrompt = false;
+        let reachedPreviousTrailers = false;
+        let allowSecondPrompt!: () => void;
+        const secondPromptAllowed = new Promise<void>((resolve) => { allowSecondPrompt = resolve; });
+        const attribution = (uuid: string | undefined) => attributionField === 'user_message_uuids'
+            ? { user_message_uuids: ['foreign-prompt', uuid] }
+            : { user_message_uuid: uuid };
+        const createQuery = (({ prompt }: Parameters<CreateQuery>[0]) => ({
+            async *[Symbol.asyncIterator]() {
+                const input = (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]();
+                const first = await input.next();
+                if (first.done) throw new Error('Expected initial prompt');
+                yield { type: 'system', subtype: 'init', session_id: 'claude-resumed' };
+                // Consumed during a notification turn; no replay echo was emitted.
+                yield { type: 'result', subtype: 'success', session_id: 'claude-resumed', queued_turn_count: 1,
+                    origin: { kind: 'task-notification' }, result: 'first answered', ...attribution(first.value.uuid) };
+                yield { type: 'result', subtype: 'success', session_id: 'claude-resumed', queued_turn_count: 1,
+                    result: 'late queued result', ...attribution(first.value.uuid) };
+                yield { type: 'result', subtype: 'success', session_id: 'claude-resumed', queued_turn_count: 0,
+                    result: 'late terminal result', ...attribution(first.value.uuid) };
+                reachedPreviousTrailers = true;
+                const second = await Promise.race([input.next(), inputFinished.then(() => null)]);
+                if (!second || second.done) return;
+                expect(second.value.message.content).toEqual([{ type: 'text', text: 'second prompt' }]);
+                // A late result and idle from the previous work must not finish the new prompt.
+                yield { type: 'result', subtype: 'success', session_id: 'claude-resumed', queued_turn_count: 0,
+                    result: 'late first result', ...attribution(first.value.uuid) };
+                yield { type: 'system', subtype: 'session_state_changed', session_id: 'claude-resumed', state: 'idle' };
+                reachedSecondPrompt = true;
+                await secondResultReady;
+                yield { type: 'result', subtype: 'success', session_id: 'claude-resumed', queued_turn_count: 0,
+                    result: 'second answered', ...attribution(second.value.uuid) };
+                await inputFinished;
+            },
+            close() { finishInput(); },
+        })) as unknown as CreateQuery;
+        const onReady = vi.fn();
+        const acceptedLocalIds: Array<readonly string[]> = [];
+        const prompts = ['first', 'second'].map((id) => ({
+            message: `${id} prompt`, mode: makeMode({ claudeRemoteAgentSdkEnabled: true }), userMessageLocalIds: [id],
+        }));
+        const runner = claudeRemoteAgentSdk({
+            sessionId: null, transcriptPath: null, path: '/tmp', claudeArgs: [], claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }), isAborted: () => false,
+            nextMessage: async () => {
+                const prompt = prompts.shift();
+                if (prompt) {
+                    if (prompt.userMessageLocalIds[0] === 'second') await Promise.race([secondPromptAllowed, inputFinished]);
+                    return prompt;
+                }
+                await inputFinished;
+                return null;
+            },
+            onReady, onMessage: () => {}, onSessionFound: () => {}, createQuery,
+            onPromptAcceptedByProvider: ({ userMessageLocalIds }) => { acceptedLocalIds.push(userMessageLocalIds); },
+        });
+        void runner.catch(() => {});
+        try {
+            await vi.waitFor(() => { expect(onReady).toHaveBeenCalledOnce(); });
+            await vi.waitFor(() => { expect(reachedPreviousTrailers).toBe(true); });
+            expect(onReady).toHaveBeenCalledOnce();
+            allowSecondPrompt();
+            await vi.waitFor(() => { expect(reachedSecondPrompt).toBe(true); });
+            expect(onReady).toHaveBeenCalledOnce();
+            expect(acceptedLocalIds).toEqual([['first']]);
+            releaseSecondResult();
+            await vi.waitFor(() => { expect(onReady).toHaveBeenCalledTimes(2); });
+            expect(acceptedLocalIds).toEqual([['first'], ['second']]);
+        } finally {
+            allowSecondPrompt(); releaseSecondResult(); finishInput();
+            await runner;
+        }
+    });
+
+    it.each(['success', 'error_during_execution'] as const)('keeps the submitted turn active when a %s result reports queued user sends', async (subtype) => {
+        let releaseQueuedTurn!: () => void;
+        const queuedTurn = new Promise<void>((resolve) => { releaseQueuedTurn = resolve; });
+        let finishInput!: () => void;
+        const inputFinished = new Promise<void>((resolve) => { finishInput = resolve; });
+        let reachedQueuedContinuation = false;
+        const createQuery = (({ prompt }: Parameters<CreateQuery>[0]) => ({
+            async *[Symbol.asyncIterator]() {
+                const input = await (prompt as AsyncIterable<import('@anthropic-ai/claude-agent-sdk').SDKUserMessage>)[Symbol.asyncIterator]().next();
+                if (input.done) throw new Error('Expected initial prompt');
+                yield { ...input.value, isReplay: true, session_id: 'claude-resumed' };
+                yield { type: 'system', subtype: 'init', session_id: 'claude-resumed' };
+                yield { type: 'result', subtype, session_id: 'claude-resumed', queued_turn_count: 1, result: 'notification finished' };
+                reachedQueuedContinuation = true;
+                await queuedTurn;
+                yield { type: 'result', subtype: 'success', session_id: 'claude-resumed', queued_turn_count: 0, result: 'user turn finished' };
+                await inputFinished;
+            },
+            close() { finishInput(); },
+        })) as unknown as NonNullable<Parameters<typeof claudeRemoteAgentSdk>[0]['createQuery']>;
+        const onReady = vi.fn();
+        const onMessage = vi.fn();
+        const onCompletionEvent = vi.fn();
+        const thinkingEvents: boolean[] = [];
+        const acceptedLocalIds: Array<readonly string[]> = [];
+        let firstInput = true;
+        let laterInput = true;
+        const nextMessage = vi.fn(async () => {
+            if (firstInput) {
+                firstInput = false;
+                return { message: 'continue', mode: makeMode({ claudeRemoteAgentSdkEnabled: true }), userMessageLocalIds: ['requested'] };
+            }
+            if (laterInput) {
+                laterInput = false;
+                return { message: 'later prompt', mode: makeMode({ claudeRemoteAgentSdkEnabled: true }), userMessageLocalIds: ['later'] };
+            }
+            await inputFinished;
+            return null;
+        });
+        const runner = claudeRemoteAgentSdk({
+            sessionId: null, transcriptPath: null, path: '/tmp', claudeArgs: [],
+            claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+            isAborted: () => false, nextMessage, onReady, onMessage, onCompletionEvent,
+            onPromptAcceptedByProvider: ({ userMessageLocalIds }) => { acceptedLocalIds.push(userMessageLocalIds); },
+            onThinkingChange: (thinking) => { thinkingEvents.push(thinking); },
+            onSessionFound: () => {}, createQuery,
+        });
+        void runner.catch(() => {});
+        try {
+            await vi.waitFor(() => { expect(reachedQueuedContinuation).toBe(true); });
+            expect(onReady).not.toHaveBeenCalled();
+            expect(acceptedLocalIds).toEqual([['requested']]);
+            expect(thinkingEvents).toEqual([true]);
+            expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'result', queued_turn_count: 1 }));
+            if (subtype === 'error_during_execution') {
+                expect(onCompletionEvent).toHaveBeenCalledWith(expect.stringContaining(subtype));
+            }
+            releaseQueuedTurn();
+            await vi.waitFor(() => { expect(onReady).toHaveBeenCalledOnce(); });
+            expect(thinkingEvents.slice(0, 2)).toEqual([true, false]);
+        } finally {
+            releaseQueuedTurn(); finishInput();
+            await runner;
+        }
+    });
+
     it('continues consuming post-result assistant output without reopening the foreground turn', async () => {
         let responseNextCalls = 0;
         let resolveDone: (() => void) | null = null;
@@ -207,6 +358,80 @@ describe('claudeRemoteAgentSdk post-result streaming', () => {
         } finally {
             resolveSecond(null);
             await runnerPromise;
+        }
+    });
+
+    it('reopens and completes the canonical turn for a new owned root message after a resume result', async () => {
+        const mutations: SessionTurnMutationV1[] = [];
+        const lifecycle = createSessionTurnLifecycle({
+            sessionId: 'happier-session',
+            enqueueSessionTurn: async (mutation) => { mutations.push(mutation); },
+        });
+        await lifecycle.beginTurn({ provider: 'claude' });
+        let reachedRoot = false;
+        let releaseRoot!: () => void;
+        const rootReady = new Promise<void>((resolve) => { releaseRoot = resolve; });
+        let releaseResult!: () => void;
+        const resultReady = new Promise<void>((resolve) => { releaseResult = resolve; });
+        let finishInput!: () => void;
+        const inputFinished = new Promise<void>((resolve) => { finishInput = resolve; });
+        let firstInput = true;
+        const thinkingEvents: boolean[] = [];
+        const rootStart = {
+            type: 'stream_event', session_id: 'owned-session', parent_tool_use_id: null,
+            event: { type: 'message_start', message: { role: 'assistant', content: [] } },
+        };
+        // Only the SDK query transport is stubbed; unused SDK control methods are omitted.
+        const createQuery = () => ({
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'system', subtype: 'init', session_id: 'owned-session' };
+                yield { type: 'result', session_id: 'owned-session' };
+                yield { ...rootStart, parent_tool_use_id: 'child-task' };
+                yield { ...rootStart, session_id: 'foreign-session' };
+                yield { ...rootStart, isReplay: true };
+                reachedRoot = true;
+                await rootReady;
+                yield rootStart;
+                yield rootStart;
+                await resultReady;
+                yield { type: 'result', session_id: 'owned-session' };
+                await inputFinished;
+            },
+            close() { finishInput(); },
+        }) as unknown as ReturnType<NonNullable<Parameters<typeof claudeRemoteAgentSdk>[0]['createQuery']>>;
+        const runner = claudeRemoteAgentSdk({
+            sessionId: null, transcriptPath: null, path: '/tmp', claudeArgs: [],
+            claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+            isAborted: () => false,
+            nextMessage: async () => {
+                if (firstInput) {
+                    firstInput = false;
+                    return { message: 'continue', mode: makeMode({ claudeRemoteAgentSdkEnabled: true }) };
+                }
+                await inputFinished;
+                return null;
+            },
+            onReady: async () => { await lifecycle.completeTurn({ provider: 'claude' }); },
+            onProviderPromptStarted: async () => { await lifecycle.beginTurn({ provider: 'claude' }); },
+            onThinkingChange: (thinking: boolean) => { thinkingEvents.push(thinking); },
+            onSessionFound: () => {}, onMessage: () => {}, createQuery,
+        });
+        try {
+            await vi.waitFor(() => { expect(mutations.map((m) => m.action)).toEqual(['begin', 'complete']); });
+            await vi.waitFor(() => { expect(reachedRoot).toBe(true); });
+            expect(lifecycle.hasActiveTurn()).toBe(false);
+            expect(thinkingEvents).toEqual([true, false]);
+            releaseRoot();
+            await vi.waitFor(() => { expect(lifecycle.hasActiveTurn()).toBe(true); });
+            expect(thinkingEvents).toEqual([true, false, true]);
+            releaseResult();
+            await vi.waitFor(() => { expect(mutations.map((m) => m.action)).toEqual(['begin', 'complete', 'begin', 'complete']); });
+            expect(lifecycle.hasActiveTurn()).toBe(false);
+            expect(thinkingEvents).toEqual([true, false, true, false]);
+        } finally {
+            releaseRoot(); releaseResult(); finishInput();
+            await runner;
         }
     });
 

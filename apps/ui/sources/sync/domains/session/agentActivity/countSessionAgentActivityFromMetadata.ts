@@ -10,7 +10,8 @@ import {
     deriveAgentActivityCounts,
     type AgentActivityCounts,
 } from './deriveAgentActivityCounts';
-import { deriveAgentActivityEntries, toAgentActivityCountable } from './deriveAgentActivityEntries';
+import type { AgentActivityEntry } from './types';
+import { deriveAgentActivityEntries, reconcileAgentActivityEntryObservation, toAgentActivityCountable } from './deriveAgentActivityEntries';
 
 /**
  * A session's agent activity, counted from its metadata alone.
@@ -30,14 +31,21 @@ import { deriveAgentActivityEntries, toAgentActivityCountable } from './deriveAg
  * launchers are the only ones that compose the publisher) counts zero. That is the §5.2 degrade
  * path, and zero renders nothing rather than something wrong.
  */
-export function countSessionAgentActivityFromMetadata(metadata: unknown): AgentActivityCounts {
+export function readSessionAgentActivityEntriesFromMetadata(metadata: unknown): readonly AgentActivityEntry[] {
     const headline = readSessionAgentActivityHeadlineFromMetadata(metadata);
     // Only when the unified key is absent: both headlines project the same committed run snapshots,
     // so reading both would count every run twice.
     const workflowHeadline = headline ? null : readSessionWorkflowActivityHeadlineFromMetadata(metadata);
-    if (!headline && !workflowHeadline) return EMPTY_AGENT_ACTIVITY_COUNTS;
+    if (!headline && !workflowHeadline) return [];
 
     const merged = deriveAgentActivityEntries({ headline, workflowHeadline, local: [] });
-    if (merged.entries.length === 0) return EMPTY_AGENT_ACTIVITY_COUNTS;
-    return deriveAgentActivityCounts(merged.entries.map(toAgentActivityCountable));
+    return merged.entries;
+}
+
+export function countSessionAgentActivityFromMetadata(metadata: unknown, runtimeLostSinceMs?: number | null): AgentActivityCounts {
+    const entries = readSessionAgentActivityEntriesFromMetadata(metadata);
+    if (entries.length === 0) return EMPTY_AGENT_ACTIVITY_COUNTS;
+    return deriveAgentActivityCounts(entries.map((entry) => toAgentActivityCountable(
+        reconcileAgentActivityEntryObservation(entry, runtimeLostSinceMs),
+    )));
 }

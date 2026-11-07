@@ -16,6 +16,8 @@ import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connected
 import { ConnectedServiceSessionAuthSwitchLockRegistry, createConnectedServiceSessionAuthSwitchCore } from '../runtimeAuth/connectedServiceSessionAuthSwitchCore';
 import { createSessionConnectedServiceAuthHotApply } from './sessionConnectedServiceAuthHotApply';
 import { switchSessionConnectedServiceAuth, type SwitchSessionConnectedServiceAuthInput } from './switchSessionConnectedServiceAuth';
+import { createQuotaRecoveryGuard } from './quotaRecoveryGuard';
+import type { RuntimeAuthRecoveryIntent } from '../runtimeAuth/RuntimeAuthRecoveryScheduler';
 
 const credentialRevision = 'csr_abcdefghijklmnopqrstuv';
 afterEach(() => vi.restoreAllMocks());
@@ -194,6 +196,58 @@ function createContinuationStore() {
 }
 
 describe('switchSessionConnectedServiceAuth', () => {
+  it.each(['before_lock', 'during_profile_read'] as const)(
+    'refuses a changed quota source %s before committing bindings or requesting a restart', async (schedule) => {
+      const tracked = trackedSession({
+        spawnOptionsCustody: 'accepted_live_launch',
+        vendorResumeId: 'same-native', processInstanceFingerprint: 'fixture-instance', publisherIncarnationId: 'fixture-publisher',
+      });
+      let turnInFlight = false;
+      const guard = createQuotaRecoveryGuard({
+        destinationProfileId: 'new-profile',
+        expected: { sessionId: 'sess_1', agentId: 'claude', nativeId: 'same-native', pid: 123,
+          processInstanceFingerprint: 'fixture-instance', serviceId: 'anthropic',
+          profileId: 'old-profile', failureAttemptId: 'current-refusal', failureArmedAtMs: 100,
+          nativePublisherIncarnationId: 'fixture-publisher', nativeObservationSequence: '1', failureObservedAtMs: 150 },
+        getChildren: () => [tracked], isTurnInFlight: () => turnInFlight,
+        readFailureSource: () => ({ kind: 'usage_limit', serviceId: 'anthropic', profileId: 'old-profile',
+          attemptId: 'current-refusal', armedAtMs: 100, observedAtMs: 150,
+          nativeProviderSource: { nativeId: 'same-native', pid: 123, publisherIncarnationId: 'fixture-publisher', sequence: '1' } }),
+        readRecoveryIntents: () => [{
+          v: 2, sessionId: 'sess_1', serviceId: 'anthropic', profileId: 'old-profile',
+          groupId: null, attemptId: 'current-refusal', armedAtMs: 100, status: 'waiting',
+          nextRetryAtMs: null, attemptCount: 0, maxAttempts: 5, switchesThisTurn: 0,
+          failurePhase: 'handler', failureReason: 'usage_limit', lastError: null,
+          lastErrorClassification: null,
+          classification: { kind: 'usage_limit', serviceId: 'anthropic', profileId: 'old-profile',
+            groupId: null, resetsAtMs: null, planType: null, rateLimits: null, source: 'structured_provider_error' },
+        } satisfies RuntimeAuthRecoveryIntent],
+      });
+      expect(() => guard.assertCurrent()).not.toThrow();
+      if (schedule === 'before_lock') turnInFlight = true;
+      const before = structuredClone(tracked.spawnOptions);
+      const restartSession = vi.fn();
+      const persistSessionBindings = vi.fn();
+      const listConnectedServiceProfiles = vi.fn(async () => {
+        turnInFlight = true;
+        return { serviceId: 'anthropic' as const, profiles: [{ profileId: 'new-profile', status: 'connected' as const }] };
+      });
+      await expect(switchSessionConnectedServiceAuth(Object.assign({
+        core: createCore(), getChildren: () => [tracked],
+        postSwitchVerificationMode: { kind: 'disabled_for_test_only' as const, reason: 'negative guard fixture; no provider operation permitted' },
+        api: { listConnectedServiceProfiles, getConnectedServiceAuthGroup: async () => null },
+        resolveContinuity: async () => ({ mode: 'restart_rematerialize' as const }),
+        restartSession, persistSessionBindings, hotApply: async () => ({ ok: true as const }),
+        registerHotApplyTargets: () => {}, emitSessionEvent: () => {},
+        request: { sessionId: 'sess_1', agentId: 'claude', bindings: bindings('new-profile') },
+      }, { quotaRecoveryGuard: guard }))).rejects.toThrow('quota_recovery_current_source_changed');
+      expect(tracked.spawnOptions).toEqual(before);
+      expect(persistSessionBindings).not.toHaveBeenCalled();
+      expect(restartSession).not.toHaveBeenCalled();
+      expect(listConnectedServiceProfiles).toHaveBeenCalledTimes(schedule === 'during_profile_read' ? 1 : 0);
+    },
+  );
+
   it('rejects a missing session without mutating or restarting', async () => {
     const restartSession = vi.fn();
 
@@ -1673,7 +1727,7 @@ describe('switchSessionConnectedServiceAuth', () => {
     expect(continueAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
   });
 
-  it('rejects a revision-only mismatch before unchanged-binding rematerialization side effects', async () => {
+  it('rematerializes an unchanged selected account after a credential refresh', async () => {
     const desiredRevision = 'csr_aaaaaaaaaaaaaaaaaaaaaa';
     const materializedRevision = 'csr_bbbbbbbbbbbbbbbbbbbbbb';
     const tracked = trackedSession({
@@ -1694,7 +1748,6 @@ describe('switchSessionConnectedServiceAuth', () => {
         connectedServiceMaterializationIdentityV1: materializationIdentity,
       },
     });
-    const previousSpawnOptions = tracked.spawnOptions;
     const hotApply = vi.fn(async () => ({ ok: true as const }));
     const persistSessionBindings = vi.fn(async () => {});
     const registerHotApplyTargets = vi.fn();
@@ -1715,7 +1768,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       },
       postSwitchVerificationMode: {
         kind: 'disabled_for_test_only',
-        reason: 'revision fencing aborts before provider adoption verification',
+        reason: 'this test isolates current-credential application',
       },
       getChildren: () => [tracked],
       api: {
@@ -1759,17 +1812,17 @@ describe('switchSessionConnectedServiceAuth', () => {
           },
         },
       },
-    })).rejects.toThrow(
-      'connected_service_auth_generation_apply_failed:credential_revision_superseded',
-    );
+    })).resolves.toMatchObject({ ok: true, action: 'hot_applied' });
 
-    expect(tracked.spawnOptions).toBe(previousSpawnOptions);
-    expect(hotApply).not.toHaveBeenCalled();
-    expect(verifyProviderAccountAdoption).not.toHaveBeenCalled();
-    expect(persistSessionBindings).not.toHaveBeenCalled();
-    expect(registerHotApplyTargets).not.toHaveBeenCalled();
+    expect(hotApply).toHaveBeenCalled();
+    expect(verifyProviderAccountAdoption).toHaveBeenCalled();
     expect(restartSession).not.toHaveBeenCalled();
-    expect(recoverAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
+    expect(recoverAfterRuntimeAuthSwitch).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'hot_applied',
+      runtimeAuthSelectionsByServiceId: new Map([
+        ['anthropic', { credentialRevision: materializedRevision }],
+      ]),
+    }));
     expect(continueAfterRuntimeAuthSwitch).not.toHaveBeenCalled();
   });
 
@@ -5399,7 +5452,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       .toBe(runtimeAuthSelection);
   });
 
-  it('rejects a superseded materialized credential revision before the provider effect', async () => {
+  it('applies a refreshed credential for the selected Codex account', async () => {
     const desiredRevision = 'csr_aaaaaaaaaaaaaaaaaaaaaa';
     const materializedRevision = 'csr_bbbbbbbbbbbbbbbbbbbbbb';
     const tracked = trackedSession({
@@ -5414,7 +5467,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       core: createCore(),
       postSwitchVerificationMode: {
         kind: 'disabled_for_test_only',
-        reason: 'revision fencing aborts before provider adoption verification',
+        reason: 'this test isolates current-credential application',
       },
       getChildren: () => [tracked],
       api: {
@@ -5445,10 +5498,8 @@ describe('switchSessionConnectedServiceAuth', () => {
       expectedCredentialRevisionByServiceId: Readonly<Record<string, string>>;
     }>;
 
-    await expect(switchSessionConnectedServiceAuth(switchInput)).rejects.toThrow(
-      'connected_service_auth_generation_apply_failed:credential_revision_superseded',
-    );
-    expect(hotApply).not.toHaveBeenCalled();
+    await expect(switchSessionConnectedServiceAuth(switchInput)).resolves.toMatchObject({ ok: true, action: 'hot_applied' });
+    expect(hotApply).toHaveBeenCalled();
   });
 
   it('requires direct live Codex apply for usage-limit recovery when the provider declares direct live auth', async () => {

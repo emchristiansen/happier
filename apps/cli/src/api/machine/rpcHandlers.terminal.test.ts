@@ -31,6 +31,63 @@ class FakePtyProvider implements PtyProvider {
 }
 
 describe('registerMachineTerminalRpcHandlers', () => {
+  it('launches a typed Happier CLI intent through the daemon current-runtime resolver', async () => {
+    const suiteDir = await mkdtemp(join(tmpdir(), 'happier-terminal-cli-'));
+    const provider = new FakePtyProvider();
+    const sessionManager = createTerminalPtySessionManager({
+      ptyProvider: provider,
+      env: { SHELL: '/bin/bash' } as any,
+      platform: 'linux',
+      now: () => 0,
+      config: {
+        maxSessions: 10,
+        idleTimeoutMs: 60_000,
+        bufferMaxBytes: 1_000_000,
+        bufferMaxEvents: 1000,
+        urlParseBufferLimit: 32_768,
+        maxWriteChunkBytes: 16_384,
+        defaultCols: 80,
+        defaultRows: 24,
+      },
+    });
+    const registered = new Map<string, (params: any) => Promise<any>>();
+    const rpcHandlerManager = {
+      registerHandler: (method: string, handler: (params: any) => Promise<any>) => registered.set(method, handler),
+    } as unknown as RpcHandlerManager;
+    const buildLaunchSpec = vi.fn(() => ({
+      runtime: 'binary' as const,
+      filePath: '/opt/happier/bin/happier',
+      args: ['agy', 'auth', 'login'],
+      env: { HAPPIER_CLI_TEST: '1' },
+    }));
+
+    registerMachineTerminalRpcHandlers({
+      rpcHandlerManager,
+      deps: {
+        env: { HAPPIER_DAEMON_TERMINAL_ENABLED: '1' },
+        workingDirectory: suiteDir,
+        sessionManager,
+        buildHappyCliSubprocessLaunchSpecFn: buildLaunchSpec,
+      },
+    });
+
+    const ensure = registered.get(RPC_METHODS.DAEMON_TERMINAL_ENSURE)!;
+    const result = await ensure({
+      terminalKey: 'provider-login:machine-1:agy:primary',
+      launch: { kind: 'happier_cli', args: ['agy', 'auth', 'login'] },
+    });
+
+    expect(result).toEqual(expect.objectContaining({ ok: true, reused: false }));
+    expect(buildLaunchSpec).toHaveBeenCalledWith(['agy', 'auth', 'login']);
+    expect(provider.spawned[0]).toEqual(expect.objectContaining({
+      file: '/opt/happier/bin/happier',
+      args: ['agy', 'auth', 'login'],
+      options: expect.objectContaining({
+        env: expect.objectContaining({ HAPPIER_CLI_TEST: '1' }),
+      }),
+    }));
+  });
+
   it('launches typed session attach through the current CLI entrypoint and daemon-owned terminal key', async () => {
     const suiteDir = await mkdtemp(join(tmpdir(), 'happier-terminal-attach-'));
     const provider = new FakePtyProvider();

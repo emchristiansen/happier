@@ -1,4 +1,4 @@
-import { readSettings, updateSettings } from '@/persistence';
+import { readSettings, updateSettings, type Settings } from '@/persistence';
 import { deriveServerIdFromName, deriveServerIdFromUrl, sanitizeServerIdForFilesystem } from '@/server/serverId';
 import { isLocalishServerUrl } from '@/server/serverUrlClassification';
 import { createServerUrlComparableKey } from '@happier-dev/protocol';
@@ -23,7 +23,7 @@ function deriveLegacyEnvServerIdFromUrl(url: string): string {
   return `env_${(h >>> 0).toString(16)}`;
 }
 
-async function maybeCopyAccessKeyFromDerivedUrlId(params: Readonly<{
+async function maybeAdoptDerivedServerProfileState(params: Readonly<{
   targetServerId: string;
   serverUrl: string;
   localServerUrl?: string;
@@ -33,11 +33,8 @@ async function maybeCopyAccessKeyFromDerivedUrlId(params: Readonly<{
   const targetKeyPath = join(targetDir, 'access.key');
   if (existsSync(targetKeyPath)) return;
 
-  const candidates = [
-    params.serverUrl,
-    params.localServerUrl ?? '',
-  ]
-    .map((value) => normalizeServerUrlForEnvId(value))
+  const candidates = [params.serverUrl, params.localServerUrl ?? '']
+    .map(normalizeServerUrlForEnvId)
     .filter(Boolean)
     .flatMap((value) => [deriveServerIdFromUrl(value), deriveLegacyEnvServerIdFromUrl(value)])
     .filter((value) => value !== params.targetServerId);
@@ -45,15 +42,19 @@ async function maybeCopyAccessKeyFromDerivedUrlId(params: Readonly<{
   for (const candidateId of candidates) {
     const sourceKeyPath = join(serversDir, candidateId, 'access.key');
     if (!existsSync(sourceKeyPath)) continue;
-    try {
-      await mkdir(targetDir, { recursive: true, mode: 0o700 });
-      await copyFile(sourceKeyPath, targetKeyPath);
-      await chmod(targetKeyPath, 0o600).catch(() => {});
-      return;
-    } catch {
-      // Best-effort migration; the normal auth/login flow can recreate this.
-      return;
-    }
+    await updateSettings(async (current) => {
+      if (existsSync(targetKeyPath) || hasServerScopedState(current, params.targetServerId)) return current;
+      try {
+        await mkdir(targetDir, { recursive: true, mode: 0o700 });
+        await copyFile(sourceKeyPath, targetKeyPath);
+        await chmod(targetKeyPath, 0o600).catch(() => {});
+      } catch {
+        // Best-effort migration; the normal auth/login flow can recreate this.
+        return current;
+      }
+      return copyMissingServerScopedState(current, candidateId, params.targetServerId);
+    });
+    return;
   }
 }
 
@@ -207,6 +208,37 @@ function copyMissingServerScopedEntry<T>(
   return { ...map, [targetId]: map[sourceId] };
 }
 
+function hasServerScopedState(settings: Settings, serverId: string): boolean {
+  return [settings.machineIdByServerId, settings.machineIdByServerIdByAccountId,
+    settings.machineReplacementCandidatesByServerIdByAccountId, settings.lastTokenSubByServerId,
+    settings.machineIdConfirmedByServerByServerId, settings.lastChangesCursorByServerIdByAccountId]
+    .some((map) => map && serverId in map);
+}
+
+function copyMissingServerScopedState(current: Settings, sourceId: string, targetId: string): Settings {
+  return {
+    ...current,
+    machineIdByServerId: copyMissingServerScopedEntry(current.machineIdByServerId, sourceId, targetId),
+    machineIdByServerIdByAccountId: copyMissingServerScopedEntry(current.machineIdByServerIdByAccountId, sourceId, targetId),
+    machineReplacementCandidatesByServerIdByAccountId: copyMissingServerScopedEntry(
+      current.machineReplacementCandidatesByServerIdByAccountId,
+      sourceId,
+      targetId,
+    ),
+    lastTokenSubByServerId: copyMissingServerScopedEntry(current.lastTokenSubByServerId, sourceId, targetId),
+    machineIdConfirmedByServerByServerId: copyMissingServerScopedEntry(
+      current.machineIdConfirmedByServerByServerId,
+      sourceId,
+      targetId,
+    ),
+    lastChangesCursorByServerIdByAccountId: copyMissingServerScopedEntry(
+      current.lastChangesCursorByServerIdByAccountId,
+      sourceId,
+      targetId,
+    ),
+  };
+}
+
 function findProfileIdByLocalUrlAndWebapp(
   servers: Record<string, any>,
   localServerUrlRaw: string,
@@ -291,7 +323,7 @@ export async function useServerProfile(idRaw: string): Promise<ServerProfile> {
   });
 
   const active = await getActiveServerProfile();
-  await maybeCopyAccessKeyFromDerivedUrlId({
+  await maybeAdoptDerivedServerProfileState({
     targetServerId: active.id,
     serverUrl: active.serverUrl,
     ...(active.localServerUrl ? { localServerUrl: active.localServerUrl } : {}),
@@ -351,7 +383,7 @@ export async function addServerProfile(opts: Readonly<{
   });
 
   if (shouldUse) {
-    await maybeCopyAccessKeyFromDerivedUrlId({
+    await maybeAdoptDerivedServerProfileState({
       targetServerId: id,
       serverUrl,
       ...(localServerUrl ? { localServerUrl } : {}),
@@ -429,7 +461,7 @@ export async function upsertServerProfileByUrl(opts: Readonly<{
   }
 
   if (shouldUse) {
-    await maybeCopyAccessKeyFromDerivedUrlId({
+    await maybeAdoptDerivedServerProfileState({
       targetServerId: resolvedId,
       serverUrl,
       ...(localServerUrl ? { localServerUrl } : {}),
@@ -496,27 +528,7 @@ export async function setServerProfileEndpointsById(opts: Readonly<{
       servers: { ...servers, [id]: next },
     };
     if (!sourceId) return nextSettings;
-    return {
-      ...nextSettings,
-      machineIdByServerId: copyMissingServerScopedEntry(current.machineIdByServerId, sourceId, id),
-      machineIdByServerIdByAccountId: copyMissingServerScopedEntry(current.machineIdByServerIdByAccountId, sourceId, id),
-      machineReplacementCandidatesByServerIdByAccountId: copyMissingServerScopedEntry(
-        current.machineReplacementCandidatesByServerIdByAccountId,
-        sourceId,
-        id,
-      ),
-      lastTokenSubByServerId: copyMissingServerScopedEntry(current.lastTokenSubByServerId, sourceId, id),
-      machineIdConfirmedByServerByServerId: copyMissingServerScopedEntry(
-        current.machineIdConfirmedByServerByServerId,
-        sourceId,
-        id,
-      ),
-      lastChangesCursorByServerIdByAccountId: copyMissingServerScopedEntry(
-        current.lastChangesCursorByServerIdByAccountId,
-        sourceId,
-        id,
-      ),
-    };
+    return copyMissingServerScopedState(nextSettings, sourceId, id);
   });
 
   return shouldUse ? await getActiveServerProfile() : await getServerProfile(id);

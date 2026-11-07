@@ -27,7 +27,7 @@ const IDLE = ['╭─────╮', '│ >   │', '╰─────╯', '
 const ACCEPT = ['╭─────╮', '│ >   │', '╰─────╯', '  ⏵⏵ accept edits on (shift+tab to cycle)'].join('\n');
 const MODEL_OK = ['Set model to Sonnet 4.6 and saved as your default', '╭─────╮', '│ >   │', '╰─────╯'].join('\n');
 const PLAN = ['╭─╮', '│ >│', '╰─╯', '  ⏸ plan mode on (shift+tab to cycle)'].join('\n');
-const GENERATING = ['● working', '✶ Forging… (10s · esc to interrupt)'].join('\n');
+const GENERATING = ['● working', '✶ Forging… (10s · esc to interrupt)', '  ⏸ manual'].join('\n');
 const USER_DRAFT = ['╭─────╮', '│ > unsent terminal draft', '╰─────╯'].join('\n');
 
 async function makeGuard(): Promise<SettingsGuard> {
@@ -268,22 +268,61 @@ describe('createClaudeUnifiedRuntimeControlBridge', () => {
     expect(port.captureCount()).toBe(0);
   });
 
-  it('does not type /effort when the launch-baked startup mode already carries the persisted effort (incident cmq7pyqkj, U2 baseline)', async () => {
-    const port = createFakeControlPort({ captures: [IDLE] });
+  it('verifies startup effort against native truth before trusting a resumed selection', async () => {
+    const confirmed = ['Set effort level to medium', IDLE].join('\n');
+    const port = createFakeControlPort({ captures: [IDLE, IDLE, confirmed] });
     const controller = await makeController(port);
-    const events: ClaudeUnifiedRuntimeConfigOutcomeEvent[] = [];
+    const initial = mode({ model: 'claude-opus-5-5', reasoningEffort: 'medium' });
     const bridge = createClaudeUnifiedRuntimeControlBridge({
       controller,
-      emitRuntimeConfigOutcome: (event) => events.push(event),
-      startupMode: mode({ model: 'sonnet', reasoningEffort: 'medium' }),
+      emitRuntimeConfigOutcome: () => undefined,
+      startupMode: initial,
     });
+    bridge.reconcileFromStatusline({ model: initial.model, reasoningEffort: 'high' });
 
-    const result = await bridge.applyBeforePrompt(mode({ model: 'sonnet', reasoningEffort: 'medium' }));
+    expect(await bridge.applyBeforePrompt(initial)).toMatchObject({ attempted: true, promptMayProceed: true });
+    expect(port.sentLiteral).toEqual(['/effort medium']);
+    expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
+    expect(await bridge.applyBeforePrompt(initial)).toEqual({ attempted: false, promptMayProceed: true });
+  });
 
-    expect(result).toEqual({ promptMayProceed: true, attempted: false });
-    expect(events).toHaveLength(0);
-    expect(port.sentLiteral).toHaveLength(0);
-    expect(port.captureCount()).toBe(0);
+  it('preserves enabled ultracode while verifying the selected startup effort', async () => {
+    const effortConfirmed = ['Set effort level to medium', IDLE].join('\n');
+    const ultracodeConfirmed = ['Set effort level to ultracode', IDLE].join('\n');
+    const port = createFakeControlPort({ captures: [IDLE, IDLE, effortConfirmed, IDLE, IDLE, ultracodeConfirmed] });
+    const controller = await makeController(port);
+    const initial = mode({ model: 'claude-opus-5-5', reasoningEffort: 'medium', ultracode: true });
+    const bridge = createClaudeUnifiedRuntimeControlBridge({
+      controller,
+      emitRuntimeConfigOutcome: () => undefined,
+      startupMode: initial,
+    });
+    bridge.reconcileFromStatusline({ model: initial.model, reasoningEffort: 'ultracode' });
+
+    await bridge.applyBeforePrompt(initial);
+
+    expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('ultracode');
+    expect(await bridge.applyBeforePrompt(initial)).toEqual({ attempted: false, promptMayProceed: true });
+  });
+
+  it('retains the selected effort when turning ultracode off after startup', async () => {
+    const confirmed = ['Set effort level to medium', IDLE].join('\n');
+    const port = createFakeControlPort({ captures: [IDLE, IDLE, confirmed] });
+    const controller = await makeController(port);
+    const initial = mode({ model: 'claude-opus-5-5', reasoningEffort: 'medium' });
+    const bridge = createClaudeUnifiedRuntimeControlBridge({
+      controller,
+      emitRuntimeConfigOutcome: () => undefined,
+      startupMode: initial,
+    });
+    bridge.reconcileFromStatusline({ model: initial.model, reasoningEffort: 'medium' });
+    await bridge.applyBeforePrompt(initial);
+    bridge.reconcileFromStatusline({ model: initial.model, reasoningEffort: 'high' });
+
+    await bridge.applyBeforePrompt({ ...initial, ultracode: false });
+
+    expect(port.sentLiteral).toEqual(['/effort medium']);
+    expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
   });
 
   it('skips a resume re-apply with zero TUI bytes when the screen already shows the persisted effort (incident cmq7pyqkj, U2)', async () => {
@@ -468,6 +507,44 @@ describe('createClaudeUnifiedRuntimeControlBridge', () => {
       changes: [expect.objectContaining({ key: 'reasoningEffort', requested: 'medium', reason: 'delivered_unverified' })],
     });
   });
+
+  it.each(['model', 'reasoningEffort'] as const)(
+    'restores the committed %s after a submitted but unverified change',
+    async (key) => {
+      const effortConfirmed = ['Set reasoning effort to high', '╭─────╮', '│ >   │', '╰─────╯'].join('\n');
+      const captures = [IDLE, IDLE, IDLE];
+      const port = createFakeControlPort({ captures });
+      const controller = await makeController(port);
+      const events: ClaudeUnifiedRuntimeConfigOutcomeEvent[] = [];
+      const initial = mode({ model: 'sonnet', reasoningEffort: 'high' });
+      const bridge = createClaudeUnifiedRuntimeControlBridge({
+        controller,
+        emitRuntimeConfigOutcome: (event) => events.push(event),
+        startupMode: initial,
+      });
+      bridge.reconcileFromStatusline({ model: 'sonnet', reasoningEffort: 'high' });
+
+      await bridge.applyBeforePrompt(mode(key === 'model'
+        ? { model: 'opus', reasoningEffort: 'high' }
+        : { model: 'sonnet', reasoningEffort: 'medium' }));
+      expect(events[0]?.changes).toContainEqual(expect.objectContaining({ reason: 'delivered_unverified' }));
+
+      // Restoration confirmations become available only after the unverified command settles.
+      captures.length = port.captureCount();
+      captures.fill(IDLE);
+      captures.push(
+        ...(key === 'model' ? [IDLE, IDLE, MODEL_OK] : []),
+        IDLE, IDLE, effortConfirmed, IDLE,
+      );
+      const restored = await bridge.applyBeforePrompt(initial);
+      expect(restored).toMatchObject({ attempted: true, promptMayProceed: true });
+      expect(port.sentLiteral).toContain(key === 'model' ? '/model sonnet' : '/effort high');
+      expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('high');
+      expect(controller.getPendingRuntimeConfig().model).toBeUndefined();
+      expect(controller.getPendingRuntimeConfig().reasoningEffort).toBeUndefined();
+      expect(await bridge.applyBeforePrompt(initial)).toMatchObject({ attempted: false });
+    },
+  );
 
   it('reports requires_interactive_control and blocks the prompt when a mode is not cycle-reachable', async () => {
     // default → (acceptEdits) → back to default (already visited) before reaching bypassPermissions → unreachable.

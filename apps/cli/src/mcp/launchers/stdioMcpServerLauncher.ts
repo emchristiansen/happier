@@ -2,17 +2,16 @@ import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 
 import { z } from 'zod';
+import { lazySchema } from '@happier-dev/protocol';
 
-import { removeConsumedMcpRuntimeConfigFile } from '../runtime/isSafeTmpMcpConfigFilePath';
+import { type CommandInvocation, resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
 
-const STDIO_LAUNCHER_CONFIG_PREFIX = 'happier-mcp-stdio-launcher';
-
-const StdioMcpServerLauncherConfigSchema = z.object({
+const StdioMcpServerLauncherConfigSchema = lazySchema(() => z.object({
   command: z.string().min(1),
   args: z.array(z.string()).optional().default([]),
   env: z.record(z.string(), z.string()).optional().default({}),
   cwd: z.string().min(1).optional(),
-});
+}));
 
 type StdioMcpServerLauncherConfig = z.infer<typeof StdioMcpServerLauncherConfigSchema>;
 
@@ -29,10 +28,6 @@ async function readLauncherConfig(configPath: string): Promise<StdioMcpServerLau
   return StdioMcpServerLauncherConfigSchema.parse(JSON.parse(raw));
 }
 
-async function deleteLauncherConfigFile(configPath: string): Promise<void> {
-  await removeConsumedMcpRuntimeConfigFile(configPath, STDIO_LAUNCHER_CONFIG_PREFIX);
-}
-
 export async function runStdioMcpServerLauncher(): Promise<void> {
   const configPath = typeof process.env.HAPPIER_MCP_STDIO_LAUNCHER_CONFIG_FILE === 'string'
     ? process.env.HAPPIER_MCP_STDIO_LAUNCHER_CONFIG_FILE
@@ -46,18 +41,23 @@ export async function runStdioMcpServerLauncher(): Promise<void> {
   try {
     config = await readLauncherConfig(configPath);
   } catch (err) {
-    await deleteLauncherConfigFile(configPath);
     writeStderr(`[happier-mcp-stdio-launcher] Failed to read config: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(2);
   }
 
-  await deleteLauncherConfigFile(configPath);
-
-  const child = spawn(config.command, config.args, {
+  const env = { ...process.env, ...config.env };
+  const invocation: CommandInvocation = process.platform === 'win32'
+    ? resolveWindowsCommandInvocation({ command: config.command, args: config.args, env })
+    : { command: config.command, args: config.args };
+  const child = spawn(invocation.command, invocation.args, {
     cwd: config.cwd,
-    env: { ...process.env, ...config.env },
+    env,
+    ...(invocation.windowsVerbatimArguments !== undefined
+      ? { windowsVerbatimArguments: invocation.windowsVerbatimArguments }
+      : {}),
     stdio: ['pipe', 'pipe', 'pipe'],
     shell: false,
+    windowsHide: true,
   });
 
   const forwardSignal = (signal: NodeJS.Signals) => {

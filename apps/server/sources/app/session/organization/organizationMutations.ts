@@ -3,6 +3,7 @@ import {
     SESSION_ORGANIZATION_MAX_FOLDERS,
     SESSION_ORGANIZATION_MAX_LABELS,
     SESSION_ORGANIZATION_MAX_PINNED_SESSIONS,
+    SESSION_ORGANIZATION_MAX_SESSION_APPEARANCES,
     SESSION_ORGANIZATION_MAX_TAGS,
     type CreateOrUpdateSessionOrganizationFolderRequest,
     type CreateOrUpdateSessionOrganizationTagRequest,
@@ -14,12 +15,15 @@ import {
     type MoveSessionFolderAssignmentsResponse,
     type ReorderSessionOrganizationRequest,
     type SetSessionAttentionStandingRequest,
+    type SetSessionAppearanceRequest,
+    type SetSessionAppearanceResponse,
     type SetSessionPinRequest,
     type SetSessionTagAssignmentsRequest,
     type UpsertSessionOrganizationLabelRequest,
 } from "@happier-dev/protocol";
 
 import { createV2SessionListVisibilityWhere } from "@/app/api/routes/session/v2SessionListRows";
+import { markSessionReadInTx } from "@/app/session/sessionWriteService";
 import { inTx } from "@/storage/inTx";
 import {
     areSessionOrganizationDisplayEnvelopesAllowedForAccount,
@@ -39,6 +43,7 @@ import {
 import { hashSessionOrganizationKey } from "./hashKeys";
 import {
     mapSessionAttentionStanding,
+    mapSessionAppearance,
     mapSessionOrganizationFolder,
     mapSessionOrganizationLabel,
     mapSessionOrganizationPin,
@@ -362,9 +367,9 @@ export async function setSessionPin(params: Readonly<{
 /**
  * Writes the account-scoped attention standing override for one session.
  *
- * `standing: null` clears the override so the account default applies again; that clear path
- * deliberately skips the visibility guard (mirroring pin removal) so an account can always drop
- * state it owns, even for a session that is no longer visible or has been archived.
+ * Standing and reminder are independent mutations on one record. Scheduling snapshots the exact
+ * prior standing override inside the row; removing the reminder restores it (or removes a
+ * reminder-only row), so snoozing never changes the user's durable attention preference.
  */
 export async function setSessionAttentionStandingInTx(tx: SessionOrganizationTx, params: Readonly<{
     accountId: string;
@@ -383,6 +388,46 @@ export async function setSessionAttentionStandingInTx(tx: SessionOrganizationTx,
         return { standing: null };
     }
 
+    if (params.request.remindAt === null) {
+        const existingReminder = await tx.sessionAttentionStanding.findUnique({
+            where: { accountId_sessionId: { accountId: params.accountId, sessionId: params.sessionId } },
+            select: { sessionId: true, standing: true, remindAt: true, standingBeforeReminder: true, updatedAt: true },
+        });
+        if (!existingReminder) {
+            return { standing: null };
+        }
+        if (!existingReminder.remindAt) {
+            return { standing: mapSessionAttentionStanding(existingReminder) };
+        }
+        if (existingReminder.standingBeforeReminder === null) {
+            await tx.sessionAttentionStanding.deleteMany({
+                where: { accountId: params.accountId, sessionId: params.sessionId },
+            });
+            await markSessionOrganizationChanged(tx, {
+                accountId: params.accountId,
+                scope: "attentionStandings",
+                sessionIds: [params.sessionId],
+            });
+            return { standing: null };
+        }
+
+        const restoredStanding = await tx.sessionAttentionStanding.update({
+            where: { accountId_sessionId: { accountId: params.accountId, sessionId: params.sessionId } },
+            data: {
+                standing: existingReminder.standingBeforeReminder,
+                remindAt: null,
+                standingBeforeReminder: null,
+            },
+            select: { sessionId: true, standing: true, remindAt: true, updatedAt: true },
+        });
+        await markSessionOrganizationChanged(tx, {
+            accountId: params.accountId,
+            scope: "attentionStandings",
+            sessionIds: [params.sessionId],
+        });
+        return { standing: mapSessionAttentionStanding(restoredStanding) };
+    }
+
     const visible = await canAccessVisibleUnarchivedSessionForOrganizationInTx(tx, {
         accountId: params.accountId,
         sessionId: params.sessionId,
@@ -397,7 +442,7 @@ export async function setSessionAttentionStandingInTx(tx: SessionOrganizationTx,
     // so a user at the bound can still flip a session they already declared.
     const existingStanding = await tx.sessionAttentionStanding.findUnique({
         where: { accountId_sessionId: { accountId: params.accountId, sessionId: params.sessionId } },
-        select: { sessionId: true },
+        select: { sessionId: true, standing: true, remindAt: true, standingBeforeReminder: true },
     });
     if (!existingStanding) {
         const standingCount = await tx.sessionAttentionStanding.count({
@@ -411,16 +456,45 @@ export async function setSessionAttentionStandingInTx(tx: SessionOrganizationTx,
         }
     }
 
-    const standing = await tx.sessionAttentionStanding.upsert({
-        where: { accountId_sessionId: { accountId: params.accountId, sessionId: params.sessionId } },
-        create: {
-            accountId: params.accountId,
-            sessionId: params.sessionId,
-            standing: params.request.standing,
-        },
-        update: { standing: params.request.standing },
-        select: { sessionId: true, standing: true, updatedAt: true },
-    });
+    if (typeof params.request.remindAt === "number") {
+        const read = await markSessionReadInTx({ tx, actorUserId: params.accountId, sessionId: params.sessionId });
+        if (!read.ok) return { error: "session-not-found" };
+    }
+
+    const standing = typeof params.request.remindAt === "number"
+        ? await tx.sessionAttentionStanding.upsert({
+            where: { accountId_sessionId: { accountId: params.accountId, sessionId: params.sessionId } },
+            create: {
+                accountId: params.accountId,
+                sessionId: params.sessionId,
+                standing: false,
+                remindAt: new Date(params.request.remindAt),
+                standingBeforeReminder: null,
+            },
+            update: {
+                remindAt: new Date(params.request.remindAt),
+                standingBeforeReminder: existingStanding?.remindAt
+                    ? existingStanding.standingBeforeReminder
+                    : existingStanding?.standing ?? null,
+            },
+            select: { sessionId: true, standing: true, remindAt: true, updatedAt: true },
+        })
+        : await tx.sessionAttentionStanding.upsert({
+            where: { accountId_sessionId: { accountId: params.accountId, sessionId: params.sessionId } },
+            create: {
+                accountId: params.accountId,
+                sessionId: params.sessionId,
+                standing: params.request.standing!,
+                remindAt: null,
+                standingBeforeReminder: null,
+            },
+            update: {
+                standing: params.request.standing!,
+                remindAt: null,
+                standingBeforeReminder: null,
+            },
+            select: { sessionId: true, standing: true, remindAt: true, updatedAt: true },
+        });
 
     await markSessionOrganizationChanged(tx, {
         accountId: params.accountId,
@@ -437,6 +511,68 @@ export async function setSessionAttentionStanding(params: Readonly<{
     request: SetSessionAttentionStandingRequest;
 }>): Promise<Readonly<{ standing: ReturnType<typeof mapSessionAttentionStanding> | null }> | { error: "session-not-found" | "session-attention-standing-limit-exceeded" }> {
     return await inTx(async (tx) => await setSessionAttentionStandingInTx(tx, params));
+}
+
+/**
+ * Stores one account's opaque display envelope for a visible session. Clearing deletes the
+ * override, including on archived sessions, and updates at the collection limit remain allowed.
+ */
+export async function setSessionAppearanceInTx(tx: SessionOrganizationTx, params: Readonly<{
+    accountId: string;
+    sessionId: string;
+    request: SetSessionAppearanceRequest;
+}>): Promise<SetSessionAppearanceResponse | { error: "session-not-found" | "invalid-display-envelope" | "session-appearance-limit-exceeded" }> {
+    if (params.request.display === null) {
+        await tx.sessionAppearance.deleteMany({ where: { accountId: params.accountId, sessionId: params.sessionId } });
+        await markSessionOrganizationChanged(tx, {
+            accountId: params.accountId, scope: "sessionAppearances", sessionIds: [params.sessionId],
+        });
+        return { appearance: null };
+    }
+
+    if (!await canAccessVisibleUnarchivedSessionForOrganizationInTx(tx, params)) {
+        return { error: "session-not-found" };
+    }
+    if (!await isSessionOrganizationDisplayEnvelopeAllowedForAccount({
+        tx, accountId: params.accountId, display: params.request.display,
+    })) {
+        return { error: "invalid-display-envelope" };
+    }
+    const existing = await tx.sessionAppearance.findUnique({
+        where: { accountId_sessionId: { accountId: params.accountId, sessionId: params.sessionId } },
+        select: { id: true },
+    });
+    if (!existing) {
+        const count = await tx.sessionAppearance.count({
+            where: {
+                accountId: params.accountId,
+                session: createVisibleUnarchivedOrganizationSessionWhere(params.accountId),
+            },
+        });
+        if (count >= SESSION_ORGANIZATION_MAX_SESSION_APPEARANCES) {
+            return { error: "session-appearance-limit-exceeded" };
+        }
+    }
+
+    const displayDbValue = serializeSessionOrganizationDisplayEnvelope(params.request.display)!;
+    const appearance = await tx.sessionAppearance.upsert({
+        where: { accountId_sessionId: { accountId: params.accountId, sessionId: params.sessionId } },
+        create: { accountId: params.accountId, sessionId: params.sessionId, displayDbValue },
+        update: { displayDbValue },
+        select: { sessionId: true, displayDbValue: true, updatedAt: true },
+    });
+    await markSessionOrganizationChanged(tx, {
+        accountId: params.accountId, scope: "sessionAppearances", sessionIds: [params.sessionId],
+    });
+    return { appearance: mapSessionAppearance(appearance) };
+}
+
+export async function setSessionAppearance(params: Readonly<{
+    accountId: string;
+    sessionId: string;
+    request: SetSessionAppearanceRequest;
+}>): Promise<SetSessionAppearanceResponse | { error: "session-not-found" | "invalid-display-envelope" | "session-appearance-limit-exceeded" }> {
+    return await inTx(async (tx) => await setSessionAppearanceInTx(tx, params));
 }
 
 export async function upsertSessionOrganizationFolderInTx(tx: SessionOrganizationTx, params: Readonly<{

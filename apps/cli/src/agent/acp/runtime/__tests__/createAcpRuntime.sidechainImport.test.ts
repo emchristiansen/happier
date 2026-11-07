@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { writeAcpTestAgentScript } from '@/agent/acp/testkit/subprocessHarness';
+import { withTempDir } from '@/testkit/fs/tempDir';
+import { createEnvKeyScope } from '@/testkit/env/envScope';
 
 import type { AgentMessage, ToolCallMessage, ToolResultMessage } from '@/agent/core/AgentMessage';
 import type { AcpRuntimeBackend } from '../createAcpRuntime';
@@ -8,9 +12,15 @@ import { createDeferred } from '@/testkit/async/deferred';
 import { createFakeAcpRuntimeBackend } from '@/testkit/backends/acpRuntimeBackend';
 import { createApprovedPermissionHandler } from '@/testkit/backends/permissionHandler';
 import { createSessionClientWithMetadata } from '@/testkit/backends/sessionFixtures';
+import { openCodeTransport } from '@/backends/opencode/acp/transport';
 
 describe('createAcpRuntime (sidechain import)', () => {
-  it('imports Task sub-session replay as sidechain messages when tool-result includes sessionId metadata', async () => {
+  it.each([
+    'Task',
+    'task',
+    'Agent',
+    openCodeTransport.determineToolName('change_title', 'task-alias', { _acp: { title: 'task' }, prompt: 'do work' }, { recentPromptHadChangeTitle: false, toolCallCountSincePrompt: 0 }),
+  ])('imports %s sub-session replay as sidechain messages when tool-result includes sessionId metadata', async (toolName) => {
     const mainBackend = createFakeAcpRuntimeBackend();
     const replayBackend = createFakeAcpRuntimeBackend();
     replayBackend.loadSessionWithReplayCapture = async (_id: string) => ({
@@ -22,12 +32,7 @@ describe('createAcpRuntime (sidechain import)', () => {
       ],
     });
 
-    const importedSidechain = createDeferred<void>();
-    const { session, committed } = createSessionClientWithMetadata({
-      onSendAgentMessageCommitted: (body) => {
-        if (body.sidechainId === 'tool_task_1') importedSidechain.resolve(undefined);
-      },
-    });
+    const { session, committed } = createSessionClientWithMetadata();
 
     const runtime = createAcpRuntime({
       provider: 'opencode',
@@ -44,18 +49,17 @@ describe('createAcpRuntime (sidechain import)', () => {
     await runtime.startOrLoad({ resumeId: null });
 
     // Simulate Task tool-call and tool-result coming from the main ACP backend.
-    const taskCall: ToolCallMessage = { type: 'tool-call', toolName: 'Task', args: { prompt: 'do work' }, callId: 'tool_task_1' };
+    const taskCall: ToolCallMessage = { type: 'tool-call', toolName, args: { prompt: 'do work' }, callId: 'tool_task_1' };
     mainBackend.emit(taskCall);
     const taskResult: ToolResultMessage = {
       type: 'tool-result',
-      toolName: 'Task',
+      toolName,
       callId: 'tool_task_1',
       result: { output: 'SUBTASK_OK', metadata: { sessionId: 'ses_123' } },
     };
     mainBackend.emit(taskResult);
 
-    await importedSidechain.promise;
-    expect(committed.some((body) => body.sidechainId === 'tool_task_1')).toBe(true);
+    await expect.poll(() => committed.some((body) => body.type === 'message' && body.sidechainId === 'tool_task_1')).toBe(true);
   });
 
   it('falls back to importing Task output as a sidechain message when replay capture is empty', async () => {
@@ -98,46 +102,66 @@ describe('createAcpRuntime (sidechain import)', () => {
     expect(committed.some((body) => body.sidechainId === 'tool_task_1' && body.type === 'message')).toBe(true);
   });
 
-  it('falls back to importing Task output as a sidechain message when replay capture throws', async () => {
-    const mainBackend = createFakeAcpRuntimeBackend();
-    const replayBackend = createFakeAcpRuntimeBackend();
-    replayBackend.loadSessionWithReplayCapture = async (_id: string) => {
-      throw new Error('Replay not supported');
-    };
-
-    const importedSidechain = createDeferred<void>();
-    const { session, committed } = createSessionClientWithMetadata({
-      onSendAgentMessageCommitted: (body) => {
-        if (body.sidechainId === 'tool_task_1' && body.type === 'message') importedSidechain.resolve(undefined);
-      },
+  it('records replay failure at the default session log level while preserving the fallback', async () => {
+    await withTempDir('happier-acp-replay-failure-', async (dir) => {
+      const env = createEnvKeyScope(['HAPPIER_HOME_DIR', 'HAPPIER_LOG_LEVEL', 'DEBUG', 'DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING']);
+      env.patch({ HAPPIER_HOME_DIR: dir, HAPPIER_LOG_LEVEL: undefined, DEBUG: undefined, DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING: undefined });
+      vi.resetModules();
+      const { createTestAcpRuntime } = await import('@/testkit/backends/acpRuntime');
+      const { logger } = await import('@/ui/logger');
+      const { AcpBackend } = await import('@/agent/acp/AcpBackend');
+      const mainBackend = createFakeAcpRuntimeBackend();
+      const replayBackend = new AcpBackend({
+        agentName: 'test', cwd: dir, command: process.execPath,
+        args: [writeAcpTestAgentScript({ dir, fileName: 'replay-failure.mjs', source: `
+          let buffer = '';
+          process.stdin.on('data', (chunk) => {
+            buffer += chunk.toString();
+            const lines = buffer.split('\\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              const request = JSON.parse(line);
+              const response = request.method === 'initialize'
+                ? { result: { protocolVersion: 1, authMethods: [], agentCapabilities: { loadSession: true } } }
+                : request.method === 'session/load'
+                  ? { error: { code: -32601, message: 'private-provider-payload' } }
+                  : { result: {} };
+              if (request.id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, ...response }) + '\\n');
+            }
+          });
+        ` })],
+        declaredSessionLoadSupport: true,
+      });
+      const fallbackCommitted = createDeferred<void>();
+      const { session, committed } = createSessionClientWithMetadata({
+        onSendAgentMessageCommitted(body) {
+          if (body.sidechainId === 'tool_task_1' && body.type === 'message') fallbackCommitted.resolve(undefined);
+        },
+      });
+      const runtime = createTestAcpRuntime({
+        provider: 'opencode', directory: dir, session, messageBuffer: new MessageBuffer(),
+        mcpServers: {}, permissionHandler: createApprovedPermissionHandler(), onThinkingChange: () => {},
+        ensureBackend: async () => mainBackend, createReplayBackend: async () => replayBackend,
+      });
+      try {
+        await runtime.startOrLoad({ resumeId: null });
+        mainBackend.emit({ type: 'tool-call', toolName: 'Task', args: { prompt: 'do work' }, callId: 'tool_task_1' });
+        mainBackend.emit({ type: 'tool-result', toolName: 'Task', callId: 'tool_task_1', result: { output: 'SUBTASK_OK', metadata: { sessionId: 'ses_123' } } });
+        await fallbackCommitted.promise;
+        expect(committed.some((body) => body.sidechainId === 'tool_task_1' && body.type === 'message')).toBe(true);
+        logger.flushSync();
+        const log = existsSync(logger.getLogPath()) ? readFileSync(logger.getLogPath(), 'utf8') : '';
+        const diagnostics = log.split('\n').filter((line) => line.includes('"phase":"replay"')).map((line) => JSON.parse(line.slice(line.indexOf('{'))));
+        expect(diagnostics).toContainEqual(expect.objectContaining({ phase: 'replay', errorCode: -32601 }));
+        expect(log).not.toContain('private-provider-payload');
+      } finally {
+        await runtime.reset();
+        await replayBackend.dispose({ preserveProviderSession: true });
+        logger.flushSync();
+        env.restore();
+      }
     });
-
-    const runtime = createAcpRuntime({
-      provider: 'opencode',
-      directory: '/tmp',
-      session,
-      messageBuffer: new MessageBuffer(),
-      mcpServers: {},
-      permissionHandler: createApprovedPermissionHandler(),
-      onThinkingChange: () => {},
-      ensureBackend: async () => mainBackend,
-      createReplayBackend: async () => replayBackend,
-    });
-
-    await runtime.startOrLoad({ resumeId: null });
-
-    const taskCall: ToolCallMessage = { type: 'tool-call', toolName: 'Task', args: { prompt: 'do work' }, callId: 'tool_task_1' };
-    mainBackend.emit(taskCall);
-    const taskResult: ToolResultMessage = {
-      type: 'tool-result',
-      toolName: 'Task',
-      callId: 'tool_task_1',
-      result: { output: 'SUBTASK_OK', metadata: { sessionId: 'ses_123' } },
-    };
-    mainBackend.emit(taskResult);
-
-    await importedSidechain.promise;
-    expect(committed.some((body) => body.sidechainId === 'tool_task_1' && body.type === 'message')).toBe(true);
   });
 
   it('evicts tool-call name cache when maxEntries is exceeded', async () => {

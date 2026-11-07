@@ -19,6 +19,9 @@ export type RunCommand = (
   },
 ) => Promise<void> | void;
 
+// Standalone tools must not execute a working directory's bunfig preloads.
+export const DEFAULT_BUN_COMPILE_OPTIONS = Object.freeze({ autoloadBunfig: false });
+
 const DEFAULT_BUN_COMPILE_ATTEMPTS = 3;
 const MAX_BUN_COMPILE_ATTEMPTS = 5;
 
@@ -186,6 +189,9 @@ export async function compileBunBinary({
   runCommand = execOrThrow,
   maxAttempts,
   buildRunnerEntrypoint,
+  autoloadDotenv,
+  autoloadBunfig = DEFAULT_BUN_COMPILE_OPTIONS.autoloadBunfig,
+  defines = {},
 }: {
   entrypoint: string;
   bunTarget: string;
@@ -196,6 +202,9 @@ export async function compileBunBinary({
   runCommand?: RunCommand;
   maxAttempts?: number;
   buildRunnerEntrypoint?: string;
+  autoloadDotenv?: boolean;
+  autoloadBunfig?: boolean;
+  defines?: Readonly<Record<string, string>>;
 }): Promise<void> {
   const resolvedBunCommand = (() => {
     const candidate = String(bunCommand ?? '').trim();
@@ -212,6 +221,15 @@ export async function compileBunBinary({
         `--outfile=${outfile}`,
       ]
     : ['build', '--compile', '--no-cache', `--target=${bunTarget}`, entrypoint, '--outfile', outfile];
+  if (Object.keys(defines).length > 0 && buildRunnerEntrypoint) {
+    throw new Error('[component-artifacts] compile definitions are unsupported by the custom Bun build runner');
+  }
+  for (const [name, value] of Object.entries(defines)) args.push(`--define=${name}=${value}`);
+  const appendCompileAutoloadOption = (name: 'dotenv' | 'bunfig', enabled: boolean | undefined): void => {
+    if (enabled !== undefined) args.push(enabled ? `--compile-autoload-${name}` : `--no-compile-autoload-${name}`);
+  };
+  appendCompileAutoloadOption('dotenv', autoloadDotenv);
+  appendCompileAutoloadOption('bunfig', autoloadBunfig);
   for (const external of externals) {
     const value = String(external ?? '').trim();
     if (!value) continue;

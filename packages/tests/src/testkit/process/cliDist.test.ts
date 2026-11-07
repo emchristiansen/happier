@@ -1,13 +1,21 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll as j078AfterAll, beforeEach as j078BeforeEach } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { existsSync, rmSync, utimesSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { existsSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 
 import { ensureCliDistBuilt, ensureCliDistSnapshotEntrypoint, ensureCliSharedDepsBuilt, withCliDistBuildLock } from './cliDist';
 import { sleep } from '../timing';
 
 const createdDirs: string[] = [];
+const originalSkipBuild = process.env.HAPPIER_CLI_TEST_SKIP_BUILD;
+beforeEach(() => { delete process.env.HAPPIER_CLI_TEST_SKIP_BUILD; });
+afterEach(() => {
+  if (originalSkipBuild === undefined) delete process.env.HAPPIER_CLI_TEST_SKIP_BUILD;
+  else process.env.HAPPIER_CLI_TEST_SKIP_BUILD = originalSkipBuild;
+});
 
 async function createRepoRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'happier-cli-dist-test-'));
@@ -67,6 +75,35 @@ describe('ensureCliDistBuilt', () => {
     for (const dir of createdDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('consumes downloaded CI dist without rebuilding for checkout timestamps', async () => {
+    const repoRoot = await createRepoRoot();
+    utimesSync(join(repoRoot, 'apps/cli/src/index.ts'), new Date('2031-01-01'), new Date('2031-01-01'));
+    const entrypoint = await ensureCliDistBuilt(
+      { testDir: join(repoRoot, '.project'), env: { ...process.env, HAPPIER_CLI_TEST_SKIP_BUILD: '1' } },
+      {
+        repoRoot,
+        waitForAvailabilityMs: 0,
+        // OS command boundary: any compilation would replace the downloaded bytes.
+        runCommand: async () => { throw new Error('unexpected CLI rebuild'); },
+      },
+    );
+    expect(entrypoint).toBe(join(repoRoot, 'apps/cli/dist/index.mjs'));
+    expect(await readFile(entrypoint, 'utf8')).toBe('export const ok = true;\n');
+  });
+
+  it('fails closed when a CI consumer has no downloaded dist', async () => {
+    const repoRoot = await createRepoRoot();
+    rmSync(join(repoRoot, 'apps/cli/dist/index.mjs'));
+    await expect(ensureCliDistBuilt(
+      { testDir: join(repoRoot, '.project'), env: { ...process.env, HAPPIER_CLI_TEST_SKIP_BUILD: '1' } },
+      {
+        repoRoot,
+        waitForAvailabilityMs: 0,
+        runCommand: async () => { throw new Error('unexpected CLI rebuild'); },
+      },
+    )).rejects.toThrow('Missing CLI dist entrypoint');
   });
 
   it('does not rebuild when only src test files are newer than dist', async () => {
@@ -702,7 +739,7 @@ describe('ensureCliDistSnapshotEntrypoint', () => {
     }
   });
 
-  it('repairs missing bundled runtime dependency files even when snapshot dist and ready marker already exist', async () => {
+  it('J078 repairs missing bundled runtime dependency files in a new generation while retaining the old snapshot', async () => {
     const repoRoot = await createRepoRoot();
     const snapshotDir = join(repoRoot, '.project', 'tmp', 'cli-dist-snapshot');
     const snapshotDistDir = join(snapshotDir, 'dist');
@@ -779,9 +816,9 @@ describe('ensureCliDistSnapshotEntrypoint', () => {
       },
     );
 
-    expect(snapshotEntrypoint).toBe(join(snapshotDistDir, 'index.mjs'));
+    expect(snapshotEntrypoint).not.toBe(join(snapshotDistDir, 'index.mjs'));
     const repairedIndexFilePath = join(
-      snapshotDir,
+      snapshotEntrypoint, '..', '..',
       'node_modules',
       '@happier-dev',
       'agents',
@@ -789,7 +826,274 @@ describe('ensureCliDistSnapshotEntrypoint', () => {
       'zod',
       'index.js',
     );
+    expect(existsSync(join(snapshotDir, 'node_modules', '@happier-dev', 'agents', 'node_modules', 'zod', 'index.js'))).toBe(false);
     expect(existsSync(repairedIndexFilePath)).toBe(true);
     await expect(readFile(repairedIndexFilePath, 'utf8')).resolves.toContain('source-zod');
+  });
+});
+
+
+// J078: install genuine system boundaries before the real owners load. Fixture cp remains real.
+const j078Boundary = await vi.hoisted(async () => {
+  const { createRequire, syncBuiltinESMExports } = await import('node:module');
+  const req = createRequire(`${process.cwd()}/package.json`);
+  const fs = req('node:fs');
+  const promises = req('node:fs/promises');
+  const cp = req('node:child_process');
+  const http = req('node:http');
+  const https = req('node:https');
+  const net = req('node:net');
+  const original = { read: fs.readFileSync, cpSync: fs.cpSync, openSync: fs.openSync, cp: promises.cp, rename: promises.rename, kill: process.kill, fetch: globalThis.fetch,
+    child: Object.fromEntries(['spawn','spawnSync','exec','execSync','execFile','execFileSync','fork'].map((key) => [key, cp[key]])),
+    httpRequest: http.request, httpsRequest: https.request, httpServer: http.createServer, netServer: net.createServer };
+  const state = { active: true, attempts: [] as string[], onCopy: null as null | ((src: string, dest: string, run: () => Promise<void>) => Promise<void>) };
+  const refuse = (name: string) => (..._args: unknown[]) => { state.attempts.push(name); throw new Error(`J078 forbidden external boundary: ${name}`); };
+  for (const key of Object.keys(original.child)) cp[key] = (...args: unknown[]) => state.active ? refuse(key)(...args) : original.child[key](...args);
+  http.request = (...args: unknown[]) => state.active ? refuse('http')(...args) : original.httpRequest(...args);
+  https.request = (...args: unknown[]) => state.active ? refuse('https')(...args) : original.httpsRequest(...args);
+  http.createServer = (...args: unknown[]) => state.active ? refuse('server')(...args) : original.httpServer(...args);
+  net.createServer = (...args: unknown[]) => state.active ? refuse('net')(...args) : original.netServer(...args);
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => state.active ? refuse('fetch')(...args) : original.fetch(...args)) as typeof fetch;
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (!state.active) return original.kill(pid, signal);
+    if (signal !== 0) return refuse('signal')(pid, signal);
+    return true; // Fixture liveness only; never send signal 0.
+  }) as typeof process.kill;
+  fs.readFileSync = (...args: unknown[]) => state.active && typeof args[0] === 'string' && /^\/proc\/\d+\/stat$/.test(args[0])
+    ? `1 (fixture) S ${Array(18).fill('0').join(' ')} 100` : original.read(...args);
+  const allowed = (path: unknown) => {
+    const root = process.env.TMPDIR;
+    if (!root || typeof path !== 'string' || !(path === root || path.startsWith(`${root}/`))) {
+      throw new Error(`J078 fixture copy outside owned TMPDIR: ${String(path)}`);
+    }
+  };
+  fs.cpSync = (...args: unknown[]) => { if (state.active) { allowed(args[0]); allowed(args[1]); } return original.cpSync(...args); };
+  // The snapshot copier writes files through openSync (no copy_file_range), so bound its write/create opens to TMPDIR too.
+  // Read-only opens are exempt: readFileSync internals and module loading also route through fs.openSync.
+  const isWriteOpen = (flags: unknown) => typeof flags === 'string'
+    ? /[wa+]/.test(flags)
+    : typeof flags === 'number' && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT
+      | fs.constants.O_TRUNC | fs.constants.O_APPEND)) !== 0;
+  fs.openSync = (...args: unknown[]) => { if (state.active && isWriteOpen(args[1])) allowed(args[0]); return original.openSync(...args); };
+  promises.cp = async (src: string, dest: string, ...args: unknown[]) => {
+    if (state.active) { allowed(src); allowed(dest); }
+    const run = () => original.cp(src, dest, ...args) as Promise<void>;
+    return state.active && state.onCopy ? state.onCopy(src, dest, run) : run();
+  };
+  promises.rename = async (src: string, dest: string) => {
+    if (state.active) { allowed(dest); allowed(src); }
+    return original.rename(src, dest) as Promise<void>;
+  };
+  syncBuiltinESMExports();
+  if ((await import('node:child_process')).spawnSync !== cp.spawnSync
+    || (await import('node:fs')).readFileSync !== fs.readFileSync
+    || (await import('node:fs')).openSync !== fs.openSync
+    || (await import('node:fs/promises')).cp !== promises.cp
+    || (await import('node:fs/promises')).rename !== promises.rename) throw new Error('J078 actual builtin binding mismatch');
+  return { state, restore: () => {
+    fs.readFileSync = original.read; fs.cpSync = original.cpSync; fs.openSync = original.openSync; promises.cp = original.cp; promises.rename = original.rename;
+    for (const key of Object.keys(original.child)) cp[key] = original.child[key];
+    http.request = original.httpRequest; https.request = original.httpsRequest;
+    http.createServer = original.httpServer; net.createServer = original.netServer;
+    process.kill = original.kill; globalThis.fetch = original.fetch; syncBuiltinESMExports();
+  } };
+});
+// Unselected legacy cases retain their own existing boundaries and assertions.
+j078BeforeEach(() => { j078Boundary.state.active = Boolean(expect.getState().currentTestName?.includes('J078')); });
+j078AfterAll(() => {
+  try { expect(j078Boundary.state.attempts).toEqual([]); }
+  finally { j078Boundary.restore(); }
+});
+
+describe('J078 returned dist generation lifetime', () => {
+  afterEach(() => { j078Boundary.state.onCopy = null; });
+  async function fixture() {
+    const root = await createRepoRoot();
+    const snapshotDir = join(root, '.project', 'tmp', 'cli-dist-snapshot');
+    const canonical = join(root, 'apps', 'cli', 'dist', 'index.mjs');
+    await writeFile(canonical, 'export const generation = "A";\n');
+    await writeFile(join(root, 'apps', 'cli', 'dist', 'lazy.mjs'), 'export const lazy = "A";\n');
+    const prepare = () => ensureCliDistSnapshotEntrypoint({ testDir: root, env: { CI: '1', HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE: 'copy' } }, {
+      repoRoot: root, snapshotDir, skipSourceFreshnessCheck: true,
+      runCommand: async () => { throw new Error('J078 unexpected build'); },
+    });
+    const advance = async () => {
+      await writeFile(canonical, 'export const generation = "B";\n');
+      await writeFile(join(root, 'apps', 'cli', 'dist', 'lazy.mjs'), 'export const lazy = "B";\n');
+      utimesSync(canonical, new Date('2035-01-01'), new Date('2035-01-01'));
+    };
+    return { root, snapshotDir, canonical, prepare, advance };
+  }
+  // The fixture CLI additionally declares a dependency only the repository root provides.
+  async function f_withRootPackage() {
+    const f = await fixture();
+    const cliManifest = join(f.root, 'apps', 'cli', 'package.json');
+    await writeFile(cliManifest, JSON.stringify({ name: '@happier-dev/cli', dependencies: { 'j078-root-only': '1' } }));
+    utimesSync(cliManifest, new Date('2026-03-09T00:55:00.000Z'), new Date('2026-03-09T00:55:00.000Z'));
+    await mkdir(join(f.root, 'node_modules', 'j078-root-only'), { recursive: true });
+    await writeFile(join(f.root, 'node_modules', 'j078-root-only', 'package.json'), JSON.stringify({ name: 'j078-root-only', version: '1.0.0' }));
+    return f;
+  }
+  it('J078 retains entrypoint and lazy chunks after the next same-namespace preparation', async () => {
+    const f = await fixture(); const a = await f.prepare(); await f.advance(); const b = await f.prepare();
+    expect(b).not.toBe(a);
+    expect(await readFile(a, 'utf8')).toContain('"A"');
+    expect(await readFile(join(a, '..', 'lazy.mjs'), 'utf8')).toContain('"A"');
+    expect(await readFile(b, 'utf8')).toContain('"B"');
+  });
+  it('J078 keeps an existing consumer readable while a later copy is held', async () => {
+    const f = await fixture(); const a = await f.prepare(); await f.advance();
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>((r) => { entered = r; });
+    const gate = new Promise<void>((r) => { release = r; });
+    j078Boundary.state.onCopy = async (src, _dest, run) => {
+      if (src === join(f.root, 'apps', 'cli', 'dist')) { entered(); await gate; }
+      await run();
+    };
+    const pending = f.prepare();
+    try { await started; expect(await readFile(a, 'utf8')).toContain('"A"'); }
+    finally { release(); await pending; }
+  });
+  it('J078 preserves the returned generation when a subsequent copy rejects', async () => {
+    const f = await fixture(); const a = await f.prepare(); await f.advance();
+    const error = new Error('fixture copy rejected');
+    j078Boundary.state.onCopy = async () => { throw error; };
+    await expect(f.prepare()).rejects.toBe(error);
+    expect(await readFile(a, 'utf8')).toContain('"A"');
+  });
+  it('J078 scopes an ENOENT retry to the unpublished allocation', async () => {
+    const f = await fixture(); const a = await f.prepare(); await f.advance(); let failed = false;
+    j078Boundary.state.onCopy = async (_src, _dest, run) => {
+      if (!failed) { failed = true; throw Object.assign(new Error('fixture copy race'), { code: 'ENOENT' }); }
+      await run();
+    };
+    const b = await f.prepare(); expect(failed).toBe(true); expect(b).not.toBe(a);
+    expect(await readFile(a, 'utf8')).toContain('"A"'); expect(await readFile(b, 'utf8')).toContain('"B"');
+  });
+  it('J078 reconciles dependencies in a new generation without rewriting a ready consumer', async () => {
+    const f = await fixture(); const a = await f.prepare();
+    const relative = ['node_modules', '@happier-dev', 'protocol', 'package.json'];
+    const aPackage = join(a, '..', '..', ...relative); const original = await readFile(aPackage, 'utf8');
+    await writeFile(join(f.root, 'packages', 'protocol', 'package.json'), '{"name":"@happier-dev/protocol","version":"2"}');
+    const b = await f.prepare();
+    expect(await readFile(aPackage, 'utf8')).toBe(original);
+    expect(await readFile(join(b, '..', '..', ...relative), 'utf8')).toContain('"version":"2"');
+  });
+  it('J078 preserves an incomplete pre-existing logical namespace', async () => {
+    const f = await fixture(); await mkdir(f.snapshotDir, { recursive: true });
+    const sentinel = join(f.snapshotDir, 'borrowed.txt'); await writeFile(sentinel, 'preserve');
+    const a = await f.prepare(); expect(await readFile(sentinel, 'utf8')).toBe('preserve');
+    expect(a).not.toBe(join(f.snapshotDir, 'dist', 'index.mjs'));
+  });
+  it('J078 keeps two real resolver calls independent at the default shared namespace', async () => {
+    const f = await fixture(); const { resolveCliTestLaunchSpec } = await import('./cliLaunchSpec');
+    const params = { testDir: f.root, env: { HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE: 'copy' } };
+    const options = { repoRoot: f.root, snapshotDir: f.snapshotDir, skipSourceFreshnessCheck: true,
+      runCommand: async () => { throw new Error('unexpected build'); } };
+    const a = await resolveCliTestLaunchSpec(params, options); await f.advance();
+    const b = await resolveCliTestLaunchSpec(params, options);
+    expect(a.args[1]).not.toBe(b.args[1]);
+    expect(await readFile(a.args[1], 'utf8')).toContain('"A"');
+    expect(await readFile(b.args[1], 'utf8')).toContain('"B"');
+  });
+  it('J078 source fallback cannot reuse a prior returned dist generation', async () => {
+    const f = await fixture(); const a = await f.prepare(); rmSync(join(f.root, 'apps', 'cli', 'dist'), { recursive: true });
+    const { resolveCliTestLaunchSpec } = await import('./cliLaunchSpec');
+    const fallback = await resolveCliTestLaunchSpec({ testDir: f.root, env: { HAPPIER_E2E_PROVIDER_SKIP_CLI_SHARED_DEPS_BUILD: '1' } }, {
+      repoRoot: f.root, snapshotDir: f.snapshotDir, skipSourceFreshnessCheck: true,
+      runCommand: async () => { throw new Error('fixture dist unavailable'); },
+    });
+    expect(fallback.args).toContain('--import');
+    expect(fallback.cwd).not.toBe(join(a, '..', '..'));
+    expect(await readFile(a, 'utf8')).toContain('"A"');
+    expect(await readFile(join(a, '..', 'lazy.mjs'), 'utf8')).toContain('"A"');
+  });
+  it('J078 returns with the preparation lock released without reclaiming its generation', async () => {
+    const f = await fixture(); const a = await f.prepare();
+    expect(existsSync(join(f.root, '.project', 'tmp', 'cli-dist-build.lock'))).toBe(false);
+    expect(await readFile(a, 'utf8')).toContain('"A"');
+  });
+  it('J078 dist entrypoint loads declared root runtime dependencies at source-tree versions after the source is removed', async () => {
+    const f = await fixture(); const modules = join(f.root, 'node_modules');
+    const writePackage = async (dir: string, manifest: Record<string, unknown>, body: string) => {
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, 'package.json'), JSON.stringify({ main: 'index.js', ...manifest }));
+      await writeFile(join(dir, 'index.js'), body);
+    };
+    const cliManifest = join(f.root, 'apps', 'cli', 'package.json');
+    await writeFile(cliManifest, JSON.stringify({ name: '@happier-dev/cli', dependencies: { 'j078-root-direct': '1', 'j078-shadowed': '2' } }));
+    utimesSync(cliManifest, new Date('2026-03-09T00:55:00.000Z'), new Date('2026-03-09T00:55:00.000Z'));
+    await writePackage(join(f.root, 'apps', 'cli', 'node_modules', 'j078-shadowed'), { name: 'j078-shadowed', version: '2.0.0' }, "module.exports = 'shadowed@2';\n");
+    await writePackage(join(modules, 'j078-shadowed'), { name: 'j078-shadowed', version: '1.0.0' }, "module.exports = 'shadowed@1';\n");
+    await writePackage(join(modules, 'j078-root-direct'), { name: 'j078-root-direct', version: '1.0.0', dependencies: { 'j078-shadowed': '1', 'j078-root-transitive': '1' } },
+      "module.exports = { shadowed: require('j078-shadowed'), transitive: require('j078-root-transitive') };\n");
+    await writePackage(join(modules, 'j078-root-transitive'), { name: 'j078-root-transitive', version: '1.0.0' }, "module.exports = 'transitive';\n");
+    await writePackage(join(modules, 'j078-root-unrelated'), { name: 'j078-root-unrelated', version: '1.0.0' }, "module.exports = 'unrelated';\n");
+    const fromSource = createRequire(join(f.root, 'apps', 'cli', 'dist', 'probe.cjs'));
+    const expected = { direct: fromSource('j078-root-direct'), shadowed: fromSource('j078-shadowed') };
+    const outside = await mkdtemp(join(tmpdir(), 'happier-cli-dist-outside-')); createdDirs.push(outside);
+    const entry = await ensureCliDistSnapshotEntrypoint({ testDir: f.root, env: { CI: '1', HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE: 'copy' } }, {
+      repoRoot: f.root, snapshotDir: join(outside, 'cli-dist-snapshot'), skipSourceFreshnessCheck: true,
+      runCommand: async () => { throw new Error('J078 unexpected build'); },
+    });
+    rmSync(f.root, { recursive: true, force: true });
+    const fromGeneration = createRequire(join(dirname(entry), 'probe.cjs'));
+    expect({ direct: fromGeneration('j078-root-direct'), shadowed: fromGeneration('j078-shadowed') }).toEqual(expected);
+    expect(expected).toEqual({ direct: { shadowed: 'shadowed@1', transitive: 'transitive' }, shadowed: 'shadowed@2' });
+    expect(() => fromGeneration.resolve('j078-root-unrelated')).toThrow();
+  });
+  it('J078 dist generation mirrors the repository layout and serves exactly as a prepared snapshot', async () => {
+    const f = await f_withRootPackage();
+    const entry = await f.prepare();
+    const cliDir = dirname(dirname(entry));
+    const generation = dirname(dirname(cliDir));
+    expect([basename(dirname(cliDir)), basename(cliDir)]).toEqual(['apps', 'cli']);
+    expect(readdirSync(generation).sort()).toEqual(['apps', 'node_modules']);
+    expect(readdirSync(join(generation, 'node_modules'))).toEqual(['j078-root-only']);
+    expect(existsSync(join(cliDir, 'dist', 'node_modules'))).toBe(false);
+    expect(JSON.parse(readFileSync(join(cliDir, '.cli-dist-snapshot.ready.json'), 'utf8'))).toMatchObject({ v: 2, layout: 'repo-mirror' });
+    const { resolveCliTestLaunchSpec } = await import('./cliLaunchSpec');
+    const before = readdirSync(dirname(f.snapshotDir)).sort();
+    const prepared = await resolveCliTestLaunchSpec({ testDir: f.root, env: {} }, {
+      repoRoot: f.root, snapshotDir: cliDir, preparedDistSnapshotOnly: true,
+      runCommand: async () => { throw new Error('J078 unexpected build'); },
+    });
+    expect(prepared).toEqual({ command: process.execPath, args: ['--preserve-symlinks', entry] });
+    expect(readdirSync(dirname(f.snapshotDir)).sort()).toEqual(before);
+  });
+  it('J078 prepared snapshot reader refuses other dist generation layouts and the generation root', async () => {
+    const f = await f_withRootPackage();
+    const entry = await f.prepare();
+    const cliDir = dirname(dirname(entry));
+    const { resolveCliTestLaunchSpec } = await import('./cliLaunchSpec');
+    const read = (snapshotDir: string) => resolveCliTestLaunchSpec({ testDir: f.root, env: {} }, {
+      repoRoot: f.root, snapshotDir, preparedDistSnapshotOnly: true,
+      runCommand: async () => { throw new Error('J078 unexpected build'); },
+    });
+    await expect(read(dirname(dirname(cliDir)))).rejects.toThrow('Expected an already-prepared CLI dist snapshot');
+    // The same files presented at a path that is not a mirror's CLI package, and earlier or unknown layout markers.
+    const elsewhere = join(f.root, '.project', 'tmp', 'j078-elsewhere');
+    await mkdir(join(elsewhere, 'dist'), { recursive: true }); await mkdir(join(elsewhere, 'node_modules'), { recursive: true });
+    await writeFile(join(elsewhere, 'dist', 'index.mjs'), 'export {};\n');
+    const marker = join(elsewhere, '.cli-dist-snapshot.ready.json');
+    writeFileSync(marker, JSON.stringify({ v: 2, layout: 'repo-mirror', createdAt: 'x' }));
+    await expect(read(elsewhere)).rejects.toThrow('Expected the CLI package directory of a repo-mirror dist generation');
+    writeFileSync(marker, JSON.stringify({ v: 1, createdAt: 'x' }));
+    await expect(read(elsewhere)).rejects.toThrow('earlier layout');
+    writeFileSync(marker, JSON.stringify({ v: 3, layout: 'other' }));
+    await expect(read(elsewhere)).rejects.toThrow('Unknown CLI dist generation layout');
+    // Markers of other producers (release payloads, extracted packages) name no layout and remain accepted.
+    writeFileSync(marker, JSON.stringify({ v: 1, source: 'cli-update-release-validation', role: 'from' }));
+    await expect(read(elsewhere)).resolves.toEqual({ command: process.execPath, args: ['--preserve-symlinks', join(elsewhere, 'dist', 'index.mjs')] });
+  });
+  it('J078 detaches symlink-selected runtime files before returning', async () => {
+    const f = await fixture(); const dependency = join(f.root, 'apps', 'cli', 'node_modules', 'local-lazy');
+    await mkdir(dependency, { recursive: true }); await writeFile(join(dependency, 'index.js'), 'original');
+    const a = await ensureCliDistSnapshotEntrypoint({ testDir: f.root, env: { CI: '1', HAPPIER_E2E_CLI_SNAPSHOT_NODE_MODULES_MODE: 'symlink' } }, {
+      repoRoot: f.root, snapshotDir: f.snapshotDir, skipSourceFreshnessCheck: true,
+      runCommand: async () => { throw new Error('unexpected build'); },
+    });
+    rmSync(dependency, { recursive: true });
+    expect(await readFile(join(a, '..', '..', 'node_modules', 'local-lazy', 'index.js'), 'utf8')).toBe('original');
   });
 });

@@ -145,5 +145,12 @@
     "ogTitle": "Aloje o relay do Happier você mesmo, atrás do seu próprio SSO",
     "ogDescription": "Um relay que você aloja, restrito à sua organização GitHub ou aos seus grupos OIDC, com certificados de cliente, reverificação de saídas e a política de armazenamento que escolher. Tudo com licença MIT.",
     "ogImageAlt": "A marca nominativa do Happier sobre as palavras: Um cliente para todos os agentes de programação com IA."
+  },
+  "/download": {
+    "title": "Baixar o Happier para desktop, telemóvel e CLI",
+    "description": "Baixe o Happier para macOS, Windows, Linux, iOS ou Android, ou instale a CLI no computador onde os seus agentes são executados.",
+    "ogTitle": "Baixe o Happier para todos os seus dispositivos",
+    "ogDescription": "Aplicações desktop e móveis, APK direto e a CLI que executa os agentes no seu computador. Uma página com todas as versões.",
+    "ogImageAlt": "A marca nominativa do Happier sobre as palavras: Um cliente para todos os agentes de programação com IA."
   }
 }

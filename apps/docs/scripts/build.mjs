@@ -18,6 +18,7 @@ export function resolveNextCliPath() {
 
 export async function runDocsBuild({
   packageRoot = defaultPackageRoot,
+  env = process.env,
   processExecPath = process.execPath,
   execYarnImpl = execYarn,
   resolveNextCliPathImpl = resolveNextCliPath,
@@ -27,6 +28,17 @@ export async function runDocsBuild({
   writeFileImpl = writeFile,
   relocateMdxSourcesImpl = relocateMdxSources,
 } = {}) {
+  // The browser bundle is the only place this public project key can be
+  // injected. Cloudflare receives the already-built out/ directory, so a
+  // Worker variable cannot repair a build that omitted it. An explicitly empty
+  // value remains the deliberate escape hatch for forks and blind builds.
+  if (env.NEXT_PUBLIC_POSTHOG_KEY === undefined) {
+    throw new Error(
+      'NEXT_PUBLIC_POSTHOG_KEY is not set. Set the repository variable passed by PROMOTE — Docs, ' +
+      'or export NEXT_PUBLIC_POSTHOG_KEY="" to build an intentionally blind bundle.',
+    );
+  }
+
   // Before anything expensive: a broken internal link and a renamed UI label
   // both build perfectly green and both mislead every reader who hits them.
   // Failing here is the only place either becomes visible.
@@ -62,7 +74,7 @@ export async function runDocsBuild({
     [resolveNextCliPathImpl(), 'build', '--webpack'],
     {
       cwd: packageRoot,
-      env: process.env,
+      env,
       stdio: 'inherit',
     },
   );

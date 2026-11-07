@@ -10,6 +10,11 @@ import { randomUUID } from 'node:crypto';
 import { createPendingFirstInput } from '@/daemon/spawn/pendingFirstInput';
 
 import { resolveDaemonSpawnSessionByNonce, spawnDaemonSession } from '@/daemon/controlClient';
+import { DEFAULT_SESSION_WEBHOOK_TIMEOUT_MS } from '@/daemon/spawn/waitForSessionWebhook';
+import { callExactMachineRpc } from '@/session/transport/rpc/machineRpc';
+import { readRpcRequestDisposition } from '@/session/transport/rpc/rpcRequestDisposition';
+import { RPC_METHODS } from '@happier-dev/protocol/rpc';
+import { isRpcMethodNotAvailableError, isRpcMethodNotFoundError } from '@happier-dev/protocol/rpcErrors';
 import type { Credentials } from '@/persistence';
 import { SPAWN_SESSION_ERROR_CODES } from '@/rpc/handlers/registerSessionHandlers';
 import { SpawnDaemonSessionRequestSchema, type SpawnDaemonSessionRequest } from '@/rpc/handlers/spawnSessionOptionsContract';
@@ -18,7 +23,7 @@ import { fetchSessionById, getOrCreateSessionByTag } from '@/session/transport/h
 import { tryDecryptSessionMetadata } from '@/session/transport/encryption/sessionEncryptionContext';
 import { summarizeSessionRecord, type SessionSummary } from '@/cli/output/session/sessionSummary';
 import { delay } from '@/utils/time';
-import { abandonSpawnedSessionBestEffort, awaitSpawnedSessionId, type SpawnSessionNonceResolver } from './awaitSpawnedSessionId';
+import { abandonSpawnedSessionBestEffort, awaitSpawnedSessionId, readSpawnSessionNonceResolution, type SpawnSessionNonceResolver } from './awaitSpawnedSessionId';
 import { requestSessionStop } from './requestSessionStop';
 import { archiveSessionByIdBestEffort } from './setSessionArchivedState';
 import {
@@ -30,8 +35,8 @@ import {
  * In-process spawn transport for an ingress that already runs inside the
  * daemon.
  *
- * The default transport is the daemon control client, an HTTP call to the
- * daemon's own control server. The machine-RPC replay ingresses run inside that
+ * Explicit machine targets use account-scoped machine RPC. Untargeted local
+ * creation uses the daemon control client. Machine-RPC replay ingresses run inside that
  * same daemon and hold the in-process `spawnSession` handler, so routing them
  * back through HTTP would be a self-call. They inject their handler here
  * instead, merging their own ingress-specific spawn options inside the adapter.
@@ -159,6 +164,7 @@ const DEFINITE_REPLAY_SEEDED_PRE_ADMISSION_ERROR_CODES = new Set<string>([
   SPAWN_SESSION_ERROR_CODES.RESUME_MISSING_ENCRYPTION_KEY,
   SPAWN_SESSION_ERROR_CODES.DIRECTORY_CREATE_FAILED,
   SPAWN_SESSION_ERROR_CODES.SPAWN_VALIDATION_FAILED,
+  SPAWN_SESSION_ERROR_CODES.BACKEND_DISABLED,
 ]);
 
 function resolvePositiveIntFromEnv(key: string, fallback: number): number {
@@ -476,15 +482,63 @@ export async function createSpawnedSession(
     ? params.spawnNonce.trim()
     : null;
   const spawnNonce = callerOwnedSpawnNonce ?? randomUUID();
+  const exactMachineId = params.machineId?.trim();
+  if (params.machineId !== undefined && !exactMachineId) {
+    throw createCodedError('Machine id is required', SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST);
+  }
+  const callSpawnRpc = async (request: SpawnDaemonSessionRequest): Promise<unknown> => {
+    const call = (method: string) => callExactMachineRpc({
+      credentials: params.credentials,
+      machineId: exactMachineId!,
+      method,
+      request,
+      timeoutMs: DEFAULT_SESSION_WEBHOOK_TIMEOUT_MS,
+    });
+    try {
+      try {
+        return await call(RPC_METHODS.SPAWN_HAPPY_SESSION_PROVIDER_SAFE);
+      } catch (error) {
+        // Released older daemons may carry only the original method. Retry
+        // only this capability refusal, against the SAME selected machine.
+        if (!isRpcMethodNotAvailableError(error) && !isRpcMethodNotFoundError(error)) throw error;
+        return await call(RPC_METHODS.SPAWN_HAPPY_SESSION);
+      }
+    } catch (error) {
+      if (isRpcMethodNotAvailableError(error) || isRpcMethodNotFoundError(error)) {
+        throw createCodedError('The selected machine is unavailable for session creation', SPAWN_SESSION_ERROR_CODES.DAEMON_RPC_UNAVAILABLE);
+      }
+      // A relay forwarding failure can be a plain Error after dispatch too.
+      // Preserve attempt identity whenever transport cannot prove non-delivery.
+      if (error && typeof error === 'object' && readRpcRequestDisposition(error) === 'outcomeUnknown') {
+        (error as { details?: unknown }).details = { spawnNonce };
+      }
+      throw error;
+    }
+  };
   const dispatchSpawnRequest: (request: SpawnDaemonSessionRequest) => Promise<unknown> = params.directTransport
     ? params.directTransport.spawn
-    : spawnDaemonSession;
+    : exactMachineId ? callSpawnRpc : spawnDaemonSession;
   const resolveSpawnSessionByNonce = params.directTransport?.resolveSpawnSessionByNonce
-    ?? resolveDaemonSpawnSessionByNonce;
+    ?? (exactMachineId && !params.directTransport
+      ? async (nonce: string, timeoutMs?: number) => {
+        try {
+          return readSpawnSessionNonceResolution(await callExactMachineRpc({
+            credentials: params.credentials,
+            machineId: exactMachineId,
+            method: RPC_METHODS.DAEMON_SPAWN_SESSION_RESOLVE,
+            request: { spawnNonce: nonce },
+            ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+          }));
+        } catch (error) {
+          if (isRpcMethodNotAvailableError(error) || isRpcMethodNotFoundError(error)) return { status: 'unsupported' as const };
+          throw error;
+        }
+      }
+      : resolveDaemonSpawnSessionByNonce);
   const spawnRequestInput = {
     directory: params.directory,
     spawnNonce,
-    ...(params.machineId ? { machineId: params.machineId } : {}),
+    ...(exactMachineId ? { machineId: exactMachineId } : {}),
     backendTarget: params.backendTarget,
     ...(params.permissionMode ? { permissionMode: params.permissionMode } : {}),
     ...(typeof params.permissionModeUpdatedAt === 'number' && Number.isFinite(params.permissionModeUpdatedAt)
@@ -546,16 +600,18 @@ export async function createSpawnedSession(
     : await dispatchSpawnRequest(spawnRequest);
   throwIfActionOperationAborted(params.signal);
   const spawnResponseRecord = readSpawnResponseRecord(spawnResponse);
-  const acceptedWithoutSessionId = isAcceptedPendingSpawn(spawnResponse) || isTransientSpawnFailure(spawnResponse);
-  const hasDirectSessionId = spawnResponseRecord?.success === true
+  const acceptedWithoutSessionId = isAcceptedPendingSpawn(spawnResponse) || isTransientSpawnFailure(spawnResponse)
+    || (spawnResponseRecord?.type === 'success' && !readNonBlankString(spawnResponseRecord.sessionId));
+  const hasDirectSessionId = (spawnResponseRecord?.success === true || spawnResponseRecord?.type === 'success')
     && typeof spawnResponseRecord.sessionId === 'string'
     && spawnResponseRecord.sessionId.trim().length > 0;
   if (!acceptedWithoutSessionId && !hasDirectSessionId) {
     const error = new Error(
-      readNonBlankExactString(spawnResponseRecord?.error) ?? 'Failed to spawn session',
+      readNonBlankExactString(spawnResponseRecord?.errorMessage)
+        ?? readNonBlankExactString(spawnResponseRecord?.error) ?? 'Failed to spawn session',
     );
     (error as { code?: string }).code =
-      spawnResponseRecord?.requiresUserApproval === true
+      spawnResponseRecord?.requiresUserApproval === true || spawnResponseRecord?.type === 'requestToApproveDirectoryCreation'
         ? 'conflict'
         : readNonBlankExactString(spawnResponseRecord?.errorCode) ?? 'unknown_error';
     (error as { details?: unknown }).details = spawnResponse ?? null;

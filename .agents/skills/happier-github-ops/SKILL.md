@@ -82,7 +82,7 @@ Under a standing grant:
 There are only two pre-authorized exceptions, both repository-owned and documented in `docs/issue-triage.md`:
 
 - release automation may move a pre-release snapshot forward to the verified target `stage:*` after the owning release verifier succeeds, including a higher-channel release that bypasses a lower channel; this permits only the exact label add/remove operation performed by `scripts/pipeline/github/reconcile-issue-stage.mjs`;
-- issue handoff automation may set `needs:maintainer` for opened/reopened issues, move an open `needs:reporter` issue to `needs:maintainer` after an external human response, or execute exact allowlisted saved-reply directives posted by a project-side commenter; this permits only the incremental label operations performed by `scripts/pipeline/github/reconcile-issue-needs.mjs`.
+- issue/PR handoff automation may perform the bounded label transitions in [handoff policy](../../../docs/issue-triage.md#pull-request-handoff-and-disposition): issue opening/reopening and external responses, non-draft PR opening/reopening/readiness/current-head updates, author conversation responses, closed/merged PR label cleanup, and exact allowlisted human project-side saved-reply directives. This permits only incremental label operations through `scripts/pipeline/github/reconcile-issue-needs.mjs`, never closure or semantic review decisions.
 
 Neither exception authorizes comments, closure, assignment, issue edits, arbitrary labels, backward stage transitions, or any other mutation. Interactive agents still require exact or bounded standing authority; they do not gain implicit write authority from saved-reply syntax.
 
@@ -190,9 +190,9 @@ Before proposing an agent-authored public comment on a Happier GitHub issue, res
 gh api user --jq .login
 ```
 
-Use the returned login in a standalone final line of every comment: `cc: @<local-gh-login>`. Resolve this identity with ordinary `gh`, never `yarn ghops`: `ghops` is deliberately authenticated as the bot that transports issue reads and writes, not the local maintainer who should receive notifications. Do not substitute the bot login, repository owner, operating-system username, Git author, a hardcoded handle, or a previously observed account. If ordinary `gh` is unavailable, unauthenticated, or returns no login, stop before posting and ask the user to authenticate with `gh auth login` or explicitly supply the mention target.
+Use the returned login in a standalone final line of every comment: `_Posted on behalf of @<local-gh-login>._` Resolve this identity with ordinary `gh`, never `yarn ghops`: `ghops` is deliberately authenticated as the account that transports issue reads and writes, not the local maintainer who authorized and stands behind the comment. Do not substitute the transport login, repository owner, operating-system username, Git author, a hardcoded handle, or a previously observed account. If ordinary `gh` is unavailable, unauthenticated, or returns no login, stop before posting and ask the user to authenticate with `gh auth login` or explicitly supply the attribution target.
 
-This direct mention keeps the local maintainer participating in the issue conversation. Apply it to initial responses, evidence requests, progress updates, release updates, and closure recommendations. Under exact authorization, include the resolved line in the complete preview and never add it afterward. Under standing authorization, resolve it immediately before each comment and keep it inside the delegated comment payload. Do not omit it based on inferred subscription status, an earlier mention, or prior participation. This rule applies to issue comments, not issue bodies or release automation's label-only mutations. Use a different handle or omit the line only when the applicable exact or standing authorization permits that variation.
+This attribution makes the human authorization behind the transported comment explicit, while its direct mention keeps the local maintainer participating in the issue conversation. Apply it to initial responses, evidence requests, progress updates, release updates, and closure recommendations. Under exact authorization, include the resolved line in the complete preview and never add it afterward. Under standing authorization, resolve it immediately before each comment and keep it inside the delegated comment payload. Do not omit it based on inferred subscription status, an earlier mention, or prior participation. This rule applies to issue comments, not issue bodies or release automation's label-only mutations. Use a different handle or omit the line only when the applicable exact or standing authorization permits that variation.
 
 ### Voice and identity
 
@@ -263,10 +263,12 @@ These labels are intended to keep the public roadmap curated and consistent:
 
 - `roadmap` (triage-owned): include this item on the public roadmap project
 - `priority:p0`, `priority:p1`, `priority:p2`, `priority:p3` (triage-owned)
-- `needs:maintainer`, `needs:reporter` (optional, mutually exclusive conversational ownership; see `docs/issue-triage.md`)
+- `needs:maintainer`, `needs:reporter` (issues), `needs:author` (PRs): optional, mutually exclusive conversational ownership; see `docs/issue-triage.md`
 - `stage:source`, `stage:dev`, `stage:preview`, `stage:stable` (optional, mutually exclusive correction availability; see `docs/issue-triage.md`)
 - `type: bug`, `type: feature`, `type: task` (recommended)
 - `source: bug-report` (applied automatically by the bug-report service)
+
+Before deciding this transition, apply the [source verification and handoff decision](../../../docs/issue-triage.md#source-verification-and-handoff-decision). It defines the deciding correction evidence and the normal paired addition of `stage:source` and removal of `needs:maintainer`, including infrastructure-blocked checks. Keep unrun checks explicit; do not turn the source label into full CI or release certification.
 
 For an open issue with a complete correction integrated and verified on canonical `dev`, the next authorized GitHub mutation must add `stage:source` and remove any conflicting `stage:*` label. Omit this only when the issue is already at the same or a higher verified stage, or the evidence-backed disposition establishes that no correction exists to release; state the reason in the preview or post-action report. Do not apply the label before integration, infer a later stage, or silently omit the pending proposal when mutation authority is absent.
 
@@ -276,11 +278,13 @@ Use a GitHub milestone such as `v0.3` for planned release scope. Do not duplicat
 
 ### Handoff labels and saved replies
 
+For PRs, follow [PR handoff and disposition](../../../docs/issue-triage.md#pull-request-handoff-and-disposition). An explicit author change/evidence/question request selects `needs:author`; substantive project review/decision selects `needs:maintainer`. State the disposition and exact label delta with the public response. A declined approach is not author waiting: explicitly say no further repair is requested, then recommend closure or close under already-granted authority. Review comments record analysis; handoff labels only identify who must act next. Do not invent another PR label policy, infer closure authority from rejection, or create new labels without authorization. Use the existing bootstrap owner when a label must be provisioned.
+
 Use `needs:maintainer` only when a named project-side review, diagnosis, product decision, implementation, or engineering correction is currently required. Use `needs:reporter` only after the project has explicitly asked an external participant for decision-material information, reproduction, logs, versions, or confirmation. If useful diagnosis, review, or implementation remains possible before that answer, keep the issue with the maintainer. If the only prerequisite is normal release progression and the requested reporter evidence remains the next human input, use `needs:reporter`; `stage:*` records the release prerequisite. Clear both handoff labels when only release progression, promotion, publication, release-owned certification, backlog scheduling, or eventual closure remains. Never use `needs:maintainer` as a generic open-issue or release-queue marker.
 
 For agent-authored GitHub updates, keep the exact `needs:*` addition/removal explicit beside the public comment. Under exact authorization, include both in the mutation preview; under standing authorization, apply and report both without hiding the label mutation inside comment text. Manual maintainers may use the exact saved-reply directives documented in `docs/issue-triage.md`; the workflow recognizes only standalone directives and initially allows `needs:*`, `type:*`, and `priority:*`. It rejects `stage:*`, `source:*`, `roadmap`, `ai-triage`, milestones, assignments, disposition labels, contradictory operations, and a result containing both handoff labels.
 
-An external human comment automatically changes `needs:reporter` to `needs:maintainer`, regardless of whether the commenter is the original issue author. Treat this only as a wake-up signal: read and evaluate the response before deciding whether the requested evidence is sufficient. Bots and Apps are ignored, and comments on issues not marked `needs:reporter` do not change handoff state.
+An external human issue comment automatically changes `needs:reporter` to `needs:maintainer`, regardless of whether the commenter is the original issue author. For a PR, only its author's conversation reply wakes `needs:author`; new current-head commits on a non-draft PR also request review. Treat these as wake-up signals: evaluate the new evidence before deciding whether findings are resolved. Bot/App comments are ignored; inline review replies require explicit steward handoff. Closed/merged PRs clear handoff labels without closing their linked issues.
 
 When asked to “create an issue and put it on the roadmap with P0”, do:
 
@@ -318,7 +322,7 @@ Comment on an issue:
 
 ```bash
 local_gh_login="$(gh api user --jq .login)"
-comment_body="$(printf 'Update: ...\n\ncc: @%s' "$local_gh_login")"
+comment_body="$(printf 'Update: ...\n\n_Posted on behalf of @%s._' "$local_gh_login")"
 yarn ghops api repos/happier-dev/happier/issues/123/comments -f "body=$comment_body"
 ```
 

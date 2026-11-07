@@ -6,7 +6,10 @@ import {
   getProviderCliBinaryNames,
   getProviderCliRuntimeSpec,
   PROVIDER_CLI_RUNTIME_SPECS,
+  resolveProviderCliLatestVersionSource,
+  resolveProviderCliNpmPackageName,
 } from './providerCliRuntime.js';
+import { getProviderCliManualInstallSummaryLines } from './providerCliInstallGuidance.js';
 
 const cursorAgentId = 'cursor' as AgentId;
 
@@ -32,7 +35,7 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
         },
         archiveExtractionLimits: {
           maxFileBytes: 384 * 1024 * 1024,
-          maxExpandedBytes: 384 * 1024 * 1024,
+          maxExpandedBytes: 512 * 1024 * 1024,
         },
       },
     });
@@ -44,14 +47,16 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
     expect(archiveExtractionLimits).toBeDefined();
     if (!archiveExtractionLimits) return;
 
-    // Checksum-pinned OpenAI release rust-v0.147.0 contains a 298,668,336-byte
-    // Codex executable and expands to 370,442,135 bytes across the package.
-    expect(archiveExtractionLimits.maxFileBytes).toBeGreaterThan(298_668_336);
-    expect(archiveExtractionLimits.maxExpandedBytes).toBeGreaterThan(370_442_135);
+    // Digest-verified rust-v0.163.0 Windows x64 package: SHA-256
+    // 901028b285614a9974f431f9d9f6534b3e5ed8d62eba4ba64f4762c00f040522.
+    expect(archiveExtractionLimits.maxFileBytes).toBeGreaterThanOrEqual(341_270_320);
+    expect(archiveExtractionLimits.maxExpandedBytes).toBeGreaterThanOrEqual(465_689_987);
   });
 
   it('declares managed package sources for package-backed CLIs', () => {
     expect(getProviderCliRuntimeSpec('opencode')).toMatchObject({
+      binaryName: 'opencode',
+      alternativeBinaryNames: ['opencode2'],
       managedInstall: {
         kind: 'managed_package',
         packageName: 'opencode-ai',
@@ -99,16 +104,72 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
 
   it('keeps upstream manual install hints on the runtime catalog for vendor-recipe providers', () => {
     expect(JSON.stringify(getProviderCliRuntimeSpec('claude'))).toContain('claude.ai/install.sh');
-    expect(JSON.stringify(getProviderCliRuntimeSpec('kimi'))).toContain('code.kimi.com/install.sh');
+    expect(JSON.stringify(getProviderCliRuntimeSpec('kimi'))).toContain('code.kimi.com/kimi-code/install.sh');
   });
 
   it('keeps provider-specific setup guide links on the runtime catalog when they differ from general docs', () => {
     expect(getProviderCliRuntimeSpec('claude').installGuideUrl).toBe('https://code.claude.com/docs/en/setup');
     expect(getProviderCliRuntimeSpec('opencode').installGuideUrl).toBe('https://opencode.ai/docs');
-    expect(getProviderCliRuntimeSpec('kimi').installGuideUrl).toBe('https://kimi.moonshot.cn/docs/cli');
+    expect(getProviderCliRuntimeSpec('kimi').installGuideUrl).toContain('moonshotai.github.io/kimi-code');
     expect(getProviderCliRuntimeSpec('qwen').installGuideUrl).toBe('https://qwenlm.github.io/qwen-code-docs/');
     expect(getProviderCliRuntimeSpec('pi').installGuideUrl).toBe('https://github.com/badlogic/pi-mono');
     expect(getProviderCliRuntimeSpec('codex').installGuideUrl).toBeNull();
+    expect(getProviderCliRuntimeSpec('devin').installGuideUrl).toBe('https://docs.devin.ai/work-with-devin/devin-cli');
+  });
+
+  it('declares Devin as a system-first vendor-installed CLI', () => {
+    expect(getProviderCliRuntimeSpec('devin')).toMatchObject({
+      id: 'devin',
+      title: 'Devin CLI',
+      binaryName: 'devin',
+      knownCommandCandidates: [{ kind: 'homeBinDir', relativeDir: '.local/bin' }],
+      sourcePreferenceDefault: 'system-first',
+      managedInstall: null,
+      manualInstallKind: 'command',
+    });
+  });
+
+  it('declares FX and Droid as system-first vendor-recipe CLIs', () => {
+    expect(getProviderCliRuntimeSpec('fx')).toMatchObject({
+      binaryName: 'fx', managedInstall: null, manualInstallKind: 'vendor_recipe',
+    });
+    expect(JSON.stringify(getProviderCliRuntimeSpec('fx').manualInstallRecipes)).toContain('fx.sh/setup.sh');
+    expect(getProviderCliRuntimeSpec('droid')).toMatchObject({
+      binaryName: 'droid', managedInstall: null, manualInstallKind: 'vendor_recipe',
+    });
+    expect(JSON.stringify(getProviderCliRuntimeSpec('droid').manualInstallRecipes)).toContain('app.factory.ai/cli');
+  });
+
+  it('declares CodeBuddy Code as a system-first CLI Happier can install from its npm package', () => {
+    expect(getProviderCliRuntimeSpec('codebuddy')).toMatchObject({
+      id: 'codebuddy',
+      binaryName: 'codebuddy',
+      sourcePreferenceDefault: 'system-first',
+      managedInstall: { kind: 'managed_package', packageName: '@tencent-ai/codebuddy-code', binaryName: 'codebuddy' },
+      manualInstallKind: 'command',
+    });
+  });
+
+  /**
+   * Factory's published Windows installer (`https://app.factory.ai/cli/windows`, observed
+   * 2026-09-12 at CLI 0.218.1) resolves x64 / x64-baseline / arm64 from one script and copies
+   * `droid.exe` into `%USERPROFILE%\bin`, which it then appends to the user PATH.
+   */
+  it('installs and detects the official Windows Droid CLI binary', () => {
+    const droid = getProviderCliRuntimeSpec('droid');
+    expect(droid.manualInstallRecipes?.win32).toEqual([
+      {
+        cmd: 'powershell.exe',
+        args: [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          'Invoke-RestMethod https://app.factory.ai/cli/windows | Invoke-Expression',
+        ],
+      },
+    ]);
+    expect(droid.knownCommandCandidates).toContainEqual({ kind: 'homePath', relativePath: 'bin/droid.exe' });
   });
 
   it('captures ordered provider CLI fallback candidates on the runtime catalog', () => {
@@ -131,6 +192,7 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
     ]);
     expect(getProviderCliRuntimeSpec('opencode').knownCommandCandidates).toEqual([
       { kind: 'homeBinDir', relativeDir: '.opencode/bin' },
+      { kind: 'homeBinDir', relativeDir: '.local/bin' },
       { kind: 'homePath', relativePath: 'AppData/Roaming/npm/opencode.cmd' },
     ]);
     expect(getProviderCliRuntimeSpec('codex').knownCommandCandidates).toBeNull();
@@ -183,6 +245,24 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
     });
   });
 
+  it('uses directly spawnable Windows PowerShell executables for every vendor recipe', () => {
+    for (const providerId of AGENT_IDS) {
+      for (const command of getProviderCliRuntimeSpec(providerId).manualInstallRecipes?.win32 ?? []) {
+        if (command.args.includes('-Command')) {
+          expect(command.cmd, providerId).toBe('powershell.exe');
+        }
+      }
+    }
+  });
+
+  it('uses the official native Windows Cursor installer and preserves copyable PowerShell guidance', () => {
+    const command = getProviderCliRuntimeSpec(cursorAgentId).manualInstallRecipes?.win32?.[0];
+    expect(command?.args.at(-1)).toBe("irm 'https://cursor.com/install?win32=true' | iex");
+    expect(getProviderCliManualInstallSummaryLines(cursorAgentId)).toContain(
+      "  Windows (PowerShell): irm 'https://cursor.com/install?win32=true' | iex",
+    );
+  });
+
   it('filters Cursor fallback binary aliases when the fallback env var is disabled', () => {
     expect(getProviderCliBinaryNames(cursorAgentId, {
       HAPPIER_CURSOR_AGENT_FALLBACK_ENABLED: '0',
@@ -218,5 +298,27 @@ describe('PROVIDER_CLI_RUNTIME_SPECS', () => {
 
   it('covers every built-in provider', () => {
     expect(Object.keys(PROVIDER_CLI_RUNTIME_SPECS).sort()).toEqual([...AGENT_IDS].sort());
+  });
+
+  it('derives the latest-version source from the managed install owner before the npm package fact', () => {
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('codex'))).toEqual({
+      kind: 'github_release',
+      githubRepo: 'openai/codex',
+    });
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('opencode'))).toEqual({
+      kind: 'npm',
+      packageName: 'opencode-ai',
+    });
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('claude'))).toEqual({
+      kind: 'npm',
+      packageName: '@anthropic-ai/claude-code',
+    });
+    expect(resolveProviderCliLatestVersionSource(getProviderCliRuntimeSpec('kiro'))).toBeNull();
+  });
+
+  it('names the npm package used to prove package-manager installs', () => {
+    expect(resolveProviderCliNpmPackageName(getProviderCliRuntimeSpec('codex'))).toBe('@openai/codex');
+    expect(resolveProviderCliNpmPackageName(getProviderCliRuntimeSpec('gemini'))).toBe('@google/gemini-cli');
+    expect(resolveProviderCliNpmPackageName(getProviderCliRuntimeSpec('cursor'))).toBeNull();
   });
 });

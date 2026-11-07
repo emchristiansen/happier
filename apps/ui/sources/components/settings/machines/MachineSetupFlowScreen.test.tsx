@@ -174,12 +174,41 @@ vi.mock('@/sync/domains/server/serverRuntime', async (importOriginal) => {
     const actual = await importOriginal<typeof import('@/sync/domains/server/serverRuntime')>();
     return {
         ...actual,
+        // The setup coordinator reads the app's relay from here; keep it on the same relay the
+        // rest of this screen's mocks describe so the readiness proof compares like with like.
+        getActiveServerSnapshot: () => activeServerSnapshotState,
         upsertAndActivateServer: upsertAndActivateServerSpy,
     };
 });
 
+/** INV10's read-only reachability call. The only real network boundary in this flow. */
+const machineRpcSpy = vi.hoisted(() => vi.fn(async (_params: unknown) => ({ ok: true }) as unknown));
+
+vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc', () => ({
+    machineRpcWithServerScope: (params: unknown) => machineRpcSpy(params),
+}));
+
 vi.mock('@/sync/runtime/orchestration/connectionManager', () => ({
     switchConnectionToActiveServer: () => switchConnectionToActiveServerSpy(),
+}));
+
+// The signed-in account for the active relay: the executor's explicit target needs it (R3).
+// `LocalDaemonControlSection` and the drift banner read the coordinator's one ambient inspection,
+// which goes through the app-wide runner rather than the runner this screen is handed. Point that
+// at a bridge that always answers so the shared inspection settles instead of leaving a pending
+// promise the executor start would wait on.
+const ambientRunnerRef = vi.hoisted(() => ({ current: null as unknown }));
+
+vi.mock('@/components/systemTasks/systemTasksRuntime', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/components/systemTasks/systemTasksRuntime')>();
+    return {
+        ...actual,
+        getSystemTasksRunner: () => ambientRunnerRef.current ?? actual.getSystemTasksRunner(),
+    };
+});
+
+vi.mock('@/sync/domains/scope/activeServerAccountScope', () => ({
+    getActiveServerAccountScope: () => ({ serverId: activeServerSnapshotState.serverId, accountId: 'acct_app' }),
 }));
 
 function findTextNodeByTestId(scope: renderer.ReactTestInstance, testID: string) {
@@ -192,8 +221,94 @@ function findProgressCardByTitle(scope: RenderScreenResult, title: string) {
     ));
 }
 
+
+/**
+ * A converged ambient `daemon.service.status.v1` reply for the relay and account this screen is
+ * on: the running daemon is this computer's, owned by the installed service, on the app's relay.
+ * It is what the coordinator's one readiness proof reads before it asks the machine anything.
+ */
+function convergedAmbientResult(taskId: string, overrides: Record<string, unknown> = {}) {
+    return {
+        protocolVersion: 1,
+        taskId,
+        ok: true as const,
+        data: {
+            serviceInstalled: true,
+            daemonRunning: true,
+            needsAuth: false,
+            machineId: 'machine-local-1',
+            acquisition: { command: '/home/user/.happier/cli/current/happier', provenance: 'managed' },
+            server: {
+                serverUrl: 'https://relay.example.test',
+                publicServerUrl: 'https://relay.example.test',
+                localServerUrl: null,
+                comparableKey: 'https://relay.example.test',
+            },
+            auth: {
+                credentialState: 'valid',
+                validatedAccountId: 'acct_app',
+                accountId: 'acct_app',
+                machineId: 'machine-local-1',
+            },
+            service: { installed: true, running: true },
+            runtimeConvergence: {
+                controlReachable: true,
+                serviceOwnsRunningDaemon: true,
+                machineIdMatches: true,
+                cliVersionMatches: true,
+            },
+            ...overrides,
+        },
+    };
+}
+
+/** Points the app-wide runner (the coordinator's) at a bridge answering with `result`. */
+async function installAmbientResult(result: (taskId: string) => unknown, onStart?: (kind: string) => void): Promise<void> {
+    const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
+    ambientRunnerRef.current = createSystemTaskRunner({
+        bridge: {
+            async start(spec) {
+                onStart?.(spec.kind);
+                return 'ambient:daemon.service.status.v1';
+            },
+            async subscribe(taskId, listenerSet) {
+                queueMicrotask(() => {
+                    listenerSet.onResult(result(taskId) as never);
+                });
+                return () => {};
+            },
+            async cancel() {},
+            async respond() {},
+        },
+    });
+}
+
 describe('MachineSetupFlowScreen', () => {
-    beforeEach(() => {
+    beforeEach(async () => {
+        // Each case models a new app open. The coordinator intentionally retains unfinished
+        // setup across route mounts, so a previous case's run must not belong to this app.
+        vi.resetModules();
+        const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
+        ambientRunnerRef.current = createSystemTaskRunner({
+            bridge: {
+                async start() {
+                    return 'ambient:daemon.service.status.v1';
+                },
+                async subscribe(taskId, listenerSet) {
+                    queueMicrotask(() => {
+                        listenerSet.onResult({
+                            protocolVersion: 1,
+                            taskId,
+                            ok: false,
+                            error: { code: 'cli_unavailable', message: 'no local cli in this test' },
+                        });
+                    });
+                    return () => {};
+                },
+                async cancel() {},
+                async respond() {},
+            },
+        });
         vi.useRealTimers();
         routerPushSpy.mockReset();
         setClipboardStringSafeSpy.mockReset();
@@ -201,6 +316,8 @@ describe('MachineSetupFlowScreen', () => {
         modalConfirmSpy.mockReset();
         modalConfirmSpy.mockResolvedValue(true);
         setPendingSetupIntentSpy.mockReset();
+        machineRpcSpy.mockReset();
+        machineRpcSpy.mockImplementation(async () => ({ ok: true }));
         activeServerSnapshotState = {
             serverId: 'relay-example',
             serverUrl: 'https://relay.example.test',
@@ -288,6 +405,129 @@ describe('MachineSetupFlowScreen', () => {
         expect(progressCard).toBeTruthy();
         expect(findTextNodeByTestId(progressCard!, 'system-task-message')?.props.children).toBe('Installing runtime');
         expect(findTextNodeByTestId(progressCard!, 'system-task-step-label')?.props.children).toBe('settings.systemTaskStepInstallRuntime');
+    });
+
+    it('answers the local setup task\'s consent and pairing prompts through the shared setup owners (C6)', async () => {
+        const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
+        const {
+            SystemTaskSpecSchema,
+            createSetupPairingPromptData,
+            createSetupServiceConsentPromptData,
+        } = await import('@happier-dev/protocol');
+        const { createServerUrlComparableKey } = await import('@/sync/domains/server/url/serverUrlCanonical');
+        const { desktopSetupCoordinator } = await import('@/setup/desktopSetupCoordinator');
+
+        // A resolved ambient inspection, so this exercises the ordinary desktop state. Install
+        // ownership itself rides the executor's own prompt, not this read (INV2/R13).
+        const ambientRunnerWithoutCli = ambientRunnerRef.current;
+        ambientRunnerRef.current = createSystemTaskRunner({
+            bridge: {
+                async start() {
+                    return 'ambient:daemon.service.status.v1';
+                },
+                async subscribe(taskId, listenerSet) {
+                    queueMicrotask(() => {
+                        listenerSet.onResult({
+                            protocolVersion: 1,
+                            taskId,
+                            ok: true,
+                            data: { acquisition: { command: '/managed/happier', provenance: 'managed' } },
+                        });
+                    });
+                    return () => {};
+                },
+                async cancel() {},
+                async respond() {},
+            },
+        });
+        await desktopSetupCoordinator.inspect({ fresh: true });
+
+        try {
+            const answers: unknown[] = [];
+            let nextTaskId = 1;
+            const taskIdByKind = new Map<string, string>();
+            const listeners = new Map<string, {
+                onEvent: (payload: unknown) => void;
+                onResult: (payload: unknown) => void;
+            }>();
+
+            const runner = createSystemTaskRunner({
+                bridge: {
+                    async start(spec) {
+                        const parsed = SystemTaskSpecSchema.parse(spec);
+                        const taskId = `task_${nextTaskId++}`;
+                        taskIdByKind.set(parsed.kind, taskId);
+                        return taskId;
+                    },
+                    async subscribe(taskId, listenerSet) {
+                        listeners.set(taskId, listenerSet);
+                        return () => {
+                            listeners.delete(taskId);
+                        };
+                    },
+                    async cancel() {},
+                    async respond(_taskId, answer) {
+                        answers.push(answer);
+                    },
+                },
+            });
+
+            const { MachineSetupFlowScreen } = await import('./MachineSetupFlowScreen');
+            const screen = await renderScreen(React.createElement(MachineSetupFlowScreen, { runner }));
+
+            await screen.pressByTestIdAsync('settings.machineSetup.startLocalTask');
+            const setupTaskId = taskIdByKind.get('setup.thisComputer.v1');
+            expect(setupTaskId).toBeTruthy();
+
+            // The executor asks for the service-ownership decision before it mutates anything (UD5).
+            await renderer.act(async () => {
+                listeners.get(setupTaskId!)?.onEvent({
+                    protocolVersion: 1,
+                    taskId: setupTaskId!,
+                    tsMs: 100,
+                    type: 'prompt',
+                    stepId: 'setup.thisComputer.serviceConsent',
+                    message: 'Another service already manages this computer',
+                    data: createSetupServiceConsentPromptData({
+                        takeover: 'com.example.other',
+                        message: 'Another service owns this computer.',
+                        competingServices: ['com.example.other'],
+                        servicesToRemove: [],
+                    }),
+                });
+            });
+            expect(modalConfirmSpy).toHaveBeenCalled();
+            expect(answers).toContainEqual({ approved: true });
+
+            // ...and then for pairing approval. A `v3` requirement is refused by the approval owner
+            // itself, which is what tells "the owner ran and failed closed" apart from "no owner was
+            // wired, so the prompt was declined by name and setup dead-ends".
+            const relayUrl = 'https://relay.example.test';
+            await renderer.act(async () => {
+                listeners.get(setupTaskId!)?.onEvent({
+                    protocolVersion: 1,
+                    taskId: setupTaskId!,
+                    tsMs: 200,
+                    type: 'prompt',
+                    stepId: 'setup.thisComputer.authRequest',
+                    message: 'Approve this computer in Happier to continue',
+                    data: createSetupPairingPromptData({
+                        publicKeyB64Url: 'cHVibGljLWtleQ',
+                        relayUrl,
+                        serverIdentityKey: createServerUrlComparableKey(relayUrl),
+                        accountId: 'acct_app',
+                        pairingRequirement: 'v3',
+                        cliProvenance: 'managed',
+                        cliCommand: '/managed/happier',
+                    }),
+                });
+            });
+            expect(answers).toContainEqual({ approved: false, reason: 'pairing_requirement_v3' });
+            expect(answers).not.toContainEqual({ approved: false, reason: 'approval_unavailable' });
+        } finally {
+            ambientRunnerRef.current = ambientRunnerWithoutCli;
+            await desktopSetupCoordinator.inspect({ fresh: true }).catch(() => {});
+        }
     });
 
     it('treats a not_authenticated local setup result as a guided follow-up instead of a hard failure', async () => {
@@ -383,30 +623,16 @@ describe('MachineSetupFlowScreen', () => {
         expect(screen.findByTestId('settings.machineSetup.startError')?.props.subtitle).toBe('settings.systemTaskBridgeUnavailable');
     });
 
-    it('can adopt an existing local installation by reading daemon status and continuing with provider setup', async () => {
+    it('adopts an existing installation only through the same canonical readiness proof', async () => {
         const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
-        const { SystemTaskSpecSchema } = await import('@happier-dev/protocol');
-
-        let nextTaskId = 1;
-        const taskIdByKind = new Map<string, string>();
-        const listeners = new Map<string, {
-            onEvent: (payload: unknown) => void;
-            onResult: (payload: unknown) => void;
-        }>();
-
+        await installAmbientResult(convergedAmbientResult);
         const runner = createSystemTaskRunner({
             bridge: {
-                async start(spec) {
-                    const parsed = SystemTaskSpecSchema.parse(spec);
-                    const taskId = `task_${nextTaskId++}`;
-                    taskIdByKind.set(parsed.kind, taskId);
-                    return taskId;
+                async start() {
+                    return 'task_unused';
                 },
-                async subscribe(taskId, listenerSet) {
-                    listeners.set(taskId, listenerSet);
-                    return () => {
-                        listeners.delete(taskId);
-                    };
+                async subscribe() {
+                    return () => {};
                 },
                 async cancel() {},
                 async respond() {},
@@ -419,26 +645,48 @@ describe('MachineSetupFlowScreen', () => {
         expect(screen.findAllByType('ProviderSetupFlow' as any)).toHaveLength(0);
 
         await screen.pressByTestIdAsync('settings.machineSetup.adoptExisting');
-        const statusTaskId = taskIdByKind.get('daemon.service.status.v1');
-        expect(statusTaskId).toBeTruthy();
+        await renderer.act(async () => {});
 
-        await renderer.act(async () => {
-            listeners.get(statusTaskId!)?.onResult({
-                protocolVersion: 1,
-                taskId: statusTaskId!,
-                ok: true,
-                data: {
-                    serviceInstalled: true,
-                    daemonRunning: true,
-                    needsAuth: false,
-                    machineId: 'machine-local-1',
-                },
-            });
-        });
-
+        expect(machineRpcSpy).toHaveBeenCalledTimes(1);
         const providerFlows = screen.findAllByType('ProviderSetupFlow' as any);
         expect(providerFlows).toHaveLength(1);
         expect(providerFlows[0]?.props.machineId).toBe('machine-local-1');
+    });
+
+    it('does not adopt a daemon that is running but not this relay\'s, and says so (D1/INV8)', async () => {
+        // Service installed + a live PID + credentials on disk is exactly the state that looked
+        // ready and was not: the running daemon carries a different machine id.
+        const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
+        await installAmbientResult((taskId) => convergedAmbientResult(taskId, {
+            runtimeConvergence: {
+                controlReachable: true,
+                serviceOwnsRunningDaemon: true,
+                machineIdMatches: false,
+                cliVersionMatches: true,
+            },
+        }));
+        const runner = createSystemTaskRunner({
+            bridge: {
+                async start() {
+                    return 'task_unused';
+                },
+                async subscribe() {
+                    return () => {};
+                },
+                async cancel() {},
+                async respond() {},
+            },
+        });
+
+        const { MachineSetupFlowScreen } = await import('./MachineSetupFlowScreen');
+        const screen = await renderScreen(React.createElement(MachineSetupFlowScreen, { runner }));
+
+        await screen.pressByTestIdAsync('settings.machineSetup.adoptExisting');
+        await renderer.act(async () => {});
+
+        expect(machineRpcSpy).not.toHaveBeenCalled();
+        expect(screen.findAllByType('ProviderSetupFlow' as any)).toHaveLength(0);
+        expect(modalAlertSpy).toHaveBeenCalledWith('common.error', 'settings.machineSetupAdoptExistingNotReady');
     });
 
     it('shows a generic start failure when the local setup task fails for an unknown reason', async () => {
@@ -464,6 +712,54 @@ describe('MachineSetupFlowScreen', () => {
 
         expect(screen.findByTestId('settings.machineSetup.startError')).toBeTruthy();
         expect(screen.findByTestId('settings.machineSetup.startError')?.props.subtitle).toBe('settings.systemTaskStartFailed');
+    });
+
+    it('does not present a ready machine on task success alone: the canonical proof decides (INV8/INV10)', async () => {
+        // A service command can succeed while the running daemon carries the wrong identity, or
+        // while the relay cannot reach this computer at all. Reading `machineId` off the task
+        // result was a second readiness definition, and this is the case it got wrong.
+        const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
+        const { SystemTaskSpecSchema } = await import('@happier-dev/protocol');
+        await installAmbientResult(convergedAmbientResult);
+        machineRpcSpy.mockImplementation(async () => {
+            throw new Error('Machine RPC timed out after 30000ms');
+        });
+
+        const taskIdByKind = new Map<string, string>();
+        const listeners = new Map<string, { onEvent: (payload: unknown) => void; onResult: (payload: unknown) => void }>();
+        const runner = createSystemTaskRunner({
+            bridge: {
+                async start(spec) {
+                    const parsed = SystemTaskSpecSchema.parse(spec);
+                    taskIdByKind.set(parsed.kind, 'task_setup_1');
+                    return 'task_setup_1';
+                },
+                async subscribe(taskId, listenerSet) {
+                    listeners.set(taskId, listenerSet);
+                    return () => listeners.delete(taskId);
+                },
+                async cancel() {},
+                async respond() {},
+            },
+        });
+
+        const { MachineSetupFlowScreen } = await import('./MachineSetupFlowScreen');
+        const screen = await renderScreen(React.createElement(MachineSetupFlowScreen, { runner }));
+
+        await screen.pressByTestIdAsync('settings.machineSetup.startLocalTask');
+        await renderer.act(async () => {
+            listeners.get('task_setup_1')?.onResult({
+                protocolVersion: 1,
+                taskId: 'task_setup_1',
+                ok: true,
+                data: { machineId: 'machine-local-1' },
+            });
+        });
+        await renderer.act(async () => {});
+
+        expect(machineRpcSpy).toHaveBeenCalledTimes(1);
+        expect(screen.findAllByType('ProviderSetupFlow' as any)).toHaveLength(0);
+        expect(screen.findByTestId('settings.machineSetup.localReadinessBlocked')).toBeTruthy();
     });
 
     it('shows the canonical provider setup flow after the local setup task succeeds', async () => {
@@ -496,12 +792,15 @@ describe('MachineSetupFlowScreen', () => {
             },
         });
 
+        const inspectionKinds: string[] = [];
+        await installAmbientResult(convergedAmbientResult, (kind) => inspectionKinds.push(kind));
         const { MachineSetupFlowScreen } = await import('./MachineSetupFlowScreen');
         const screen = await renderScreen(React.createElement(MachineSetupFlowScreen, { runner }));
 
         await screen.pressByTestIdAsync('settings.machineSetup.startLocalTask');
         const setupTaskId = taskIdByKind.get('setup.thisComputer.v1');
         expect(setupTaskId).toBeTruthy();
+        const inspectionsBeforeSuccess = inspectionKinds.length;
 
         await renderer.act(async () => {
             listeners.get(setupTaskId!)?.onResult({
@@ -511,13 +810,19 @@ describe('MachineSetupFlowScreen', () => {
                 data: { machineId: 'machine-1' },
             });
         });
+        await renderer.act(async () => {});
 
+        // The machine id comes from the proven runtime, never from the task's own result.
         const providerFlows = screen.findAllByType('ProviderSetupFlow' as any);
         expect(providerFlows).toHaveLength(1);
-        expect(providerFlows[0]?.props.machineId).toBe('machine-1');
+        expect(providerFlows[0]?.props.machineId).toBe('machine-local-1');
+        // Setup owns one fresh read shared by every reader; readiness consumes it, without
+        // starting a second managed-CLI acquisition for the same successful operation.
+        expect(inspectionKinds.slice(inspectionsBeforeSuccess)).toEqual(['daemon.service.status.v1']);
+        expect(machineRpcSpy).toHaveBeenCalledTimes(1);
     });
 
-    it('auto-starts the local setup task when requested by the setup continuation route', async () => {
+    it('starts no local setup task on mount — auto-start belongs to the desktop setup gate alone (R9/INV1)', async () => {
         const { createSystemTaskRunner } = await import('@/components/systemTasks/createSystemTaskRunner');
         const { SystemTaskSpecSchema } = await import('@happier-dev/protocol');
 
@@ -537,16 +842,9 @@ describe('MachineSetupFlowScreen', () => {
         });
 
         const { MachineSetupFlowScreen } = await import('./MachineSetupFlowScreen');
-        await renderScreen(React.createElement(MachineSetupFlowScreen, {
-            runner,
-            autoStartLocalTask: true,
-        }));
+        await renderScreen(React.createElement(MachineSetupFlowScreen, { runner }));
 
-        expect(starts.some((entry) => (entry as { kind?: unknown }).kind === 'setup.thisComputer.v1')).toBe(true);
-        const setupStart = starts.find((entry) => (entry as { kind?: unknown }).kind === 'setup.thisComputer.v1');
-        expect(setupStart).toMatchObject({
-            kind: 'setup.thisComputer.v1',
-        });
+        expect(starts.map((entry) => (entry as { kind?: unknown }).kind)).not.toContain('setup.thisComputer.v1');
     });
 
     it('does not show the provider setup flow when the local setup task succeeds without a machine id', async () => {

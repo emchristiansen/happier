@@ -64,6 +64,7 @@ const connectionHarness = vi.hoisted(() => {
           await connectNextTransport();
         }),
         stop: vi.fn(async () => {}),
+        captureProbeReportScope: vi.fn(() => ({ generation: 1 })),
         reportProbeResult,
         getState: vi.fn(() => ({
           phase: 'online',
@@ -365,6 +366,6 @@ describe('ApiMachineClient connect ordering', () => {
       status: 'auth_failed',
       statusCode: 426,
       errorMessage: 'This Happier daemon must be upgraded before it can sync sessions.',
-    });
+    }, { generation: 1 });
   });
 });

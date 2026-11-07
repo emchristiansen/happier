@@ -21,6 +21,7 @@ import {
 } from '@happier-dev/protocol';
 
 import type { Credentials } from '@/persistence';
+import { readConnectedServiceCredentialOrganizationId } from '../../descriptors/connectedAccountDescriptors';
 import {
   invalidateConnectedServiceAccountMode,
   resolveConnectedServiceAccountMode,
@@ -52,8 +53,6 @@ import {
   type ConnectedServiceUsageSourceRecordRef,
 } from '../../accountGroups/switching/buildConnectedServiceAuthGroupSwitchStateFromAccountUsage';
 import {
-  hasConnectedServiceAuthGroupCandidateEvidenceForSwitchReason,
-  isConnectedServiceAuthGroupSoftSwitchCandidateMeaningfullyBetter,
   resolveConnectedServiceAuthGroupSoftSwitchSourceEvidence,
   selectConnectedServiceAuthGroupCandidate,
   type ConnectedServiceAuthGroupMemberRuntimeState,
@@ -142,6 +141,7 @@ export type QuotaApi = Readonly<{
           staleAfterMs: number;
           status: 'ok' | 'unavailable' | 'estimated' | 'error';
           refreshRequestedAt?: number;
+          refreshErrorAt?: number;
           materialFingerprint?: string;
         }>;
       }>
@@ -155,6 +155,7 @@ export type QuotaApi = Readonly<{
           staleAfterMs: number;
           status: 'ok' | 'unavailable' | 'estimated' | 'error';
           refreshRequestedAt?: number;
+          refreshErrorAt?: number;
           materialFingerprint?: string;
         }>;
       }>
@@ -188,7 +189,7 @@ export type QuotaApi = Readonly<{
     recordKey: ProviderAccountUsageRecordKeyV1;
     source?: ConnectedServiceUsageSourceV1;
     sealed: Readonly<{ format: 'account_scoped_v1'; ciphertext: string }>;
-    metadata: Readonly<{ fetchedAt: number; staleAfterMs: number; status: 'ok' | 'unavailable' | 'estimated' | 'error'; materialFingerprint?: string }>;
+    metadata: Readonly<{ fetchedAt: number; staleAfterMs: number; status: 'ok' | 'unavailable' | 'estimated' | 'error'; materialFingerprint?: string; refreshErrorAt?: number }>;
   }>) => Promise<void>;
   registerProviderAccountUsageSnapshotPlain?: (args: Readonly<{
     recordId: string;
@@ -229,9 +230,17 @@ export type ExistingQuotaSnapshotResponse =
   | Awaited<ReturnType<NonNullable<QuotaApi['getConnectedServiceQuotaSnapshotPlain']>>>;
 
 export type ResolvedQuotaStorageMode = 'e2ee' | 'plain';
+export type ResolvedQuotaCredential = Readonly<{
+  storageMode: ResolvedQuotaStorageMode;
+  record: ConnectedServiceCredentialRecordV1 | null;
+  credentialRevision: ConnectedServiceCredentialRevisionV1 | null;
+}>;
 export type ResolvedExistingQuotaSnapshot = Readonly<{
   storageMode: ResolvedQuotaStorageMode;
   existing: ExistingQuotaSnapshotResponse;
+  credential?: ResolvedQuotaCredential;
+  preopenedSnapshot?: ConnectedServiceQuotaSnapshotV1;
+  verifiedCredentialFingerprint?: string | null;
 }>;
 export type ConnectedServiceInBandQuotaSnapshotRecordResult =
   | Readonly<{ status: 'enqueued'; enqueue: 'accepted' | 'coalesced' }>
@@ -573,6 +582,7 @@ export function activeBindingMatchesRuntimeIdentity(
 
 export function readCredentialAccountIdentity(record: ConnectedServiceCredentialRecordV1): Readonly<{
   providerAccountId: string;
+  providerOrganizationId: string | null;
   accountLabel: string | null;
 }> | null {
   if (record.kind === 'oauth') {
@@ -583,7 +593,7 @@ export function readCredentialAccountIdentity(record: ConnectedServiceCredential
     const accountLabel = typeof record.oauth.providerEmail === 'string' && record.oauth.providerEmail.trim()
       ? record.oauth.providerEmail.trim()
       : null;
-    return { providerAccountId, accountLabel };
+    return { providerAccountId, providerOrganizationId: readConnectedServiceCredentialOrganizationId(record), accountLabel };
   }
   if (record.kind === 'token') {
     const providerAccountId = typeof record.token.providerAccountId === 'string'
@@ -593,7 +603,7 @@ export function readCredentialAccountIdentity(record: ConnectedServiceCredential
     const accountLabel = typeof record.token.providerEmail === 'string' && record.token.providerEmail.trim()
       ? record.token.providerEmail.trim()
       : null;
-    return { providerAccountId, accountLabel };
+    return { providerAccountId, providerOrganizationId: readConnectedServiceCredentialOrganizationId(record), accountLabel };
   }
   return null;
 }
@@ -627,9 +637,10 @@ export function deriveQuotaSnapshotStatus(snapshot: ConnectedServiceQuotaSnapsho
 export type FailureState = Readonly<{
   consecutiveFailures: number;
   nextAllowedAt: number;
+  inconclusiveRefreshProbeCount?: number;
 }>;
 
-export type CredentialRefreshReason = 'near_expiry' | 'auth_failure';
+export type CredentialRefreshReason = 'near_expiry' | 'auth_failure' | 'provider_context';
 export type RefreshConnectedServiceCredentialForQuota = (input: Readonly<{
   serviceId: ConnectedServiceId;
   profileId: string;
@@ -639,10 +650,17 @@ export type RefreshConnectedServiceCredentialForQuota = (input: Readonly<{
 
 export type AccountUsageStoreForQuotaPolicy = Pick<
   ProviderAccountUsageStore,
-  'recordSnapshot' | 'resolveRecordId'
+  'recordSnapshot' | 'resolveRecordId' | 'retainSourcesForProfile'
 > & AccountUsageStoreForAuthGroupSwitchState;
 
 export const QUOTA_AUTH_FAILURE_REAUTH_CONSECUTIVE_FAILURES = 5;
+/**
+ * Keep a credential visibly reconnect-required after repeated auth failures when
+ * the refresh owner cannot classify its probe. This is deliberately bounded so a
+ * dead credential cannot remain retryable forever, while the initial probe window
+ * still gives transient provider failures a chance to recover.
+ */
+export const QUOTA_AUTH_FAILURE_INCONCLUSIVE_PROBE_LIMIT = 10;
 
 export function readFiniteNonNegativeMs(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null;
@@ -736,18 +754,22 @@ export function defaultSleepMs(ms: number): Promise<void> {
 /**
  * X8 — Stale-but-usable quota.
  *
- * Returns a copy of the snapshot with all meters annotated as stale_quota so
- * the UI can show "last known data (refresh failed)" rather than a blank.
- * The meter data (utilizationPct, resetsAt, etc.) is preserved.
+ * Returns a copy of the snapshot with all meters annotated with the given
+ * staleness code so the UI can show "last known data (refresh failed)" rather
+ * than a blank. The meter data (utilizationPct, resetsAt, etc.) is preserved.
+ * `provider_rate_limited` marks a refresh the provider refused with 429.
  */
-export function annotateSnapshotAsStale(snapshot: ConnectedServiceQuotaSnapshotV1): ConnectedServiceQuotaSnapshotV1 {
+export function annotateSnapshotAsStale(
+  snapshot: ConnectedServiceQuotaSnapshotV1,
+  code: 'stale_quota' | 'provider_rate_limited' = 'stale_quota',
+): ConnectedServiceQuotaSnapshotV1 {
   return {
     ...snapshot,
     meters: snapshot.meters.map((meter) => ({
       ...meter,
       details: {
         ...meter.details,
-        code: 'stale_quota',
+        code,
       },
     })),
   };

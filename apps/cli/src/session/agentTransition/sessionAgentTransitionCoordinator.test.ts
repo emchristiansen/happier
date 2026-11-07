@@ -1,10 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import Fastify from 'fastify';
+import { installAxiosFastifyAdapter } from '@/testkit/http/axiosAdapter';
+import { resolveServerHttpBaseUrl } from '@/session/transport/http/serverHttpBaseUrl';
 
 import {
   FeaturesResponseSchema,
   SessionStopOutcomeSchema,
   isSessionStopConfirmed,
   readSessionAgentTransitionDividerV1,
+  readAcpConfiguredBackendV1FromMetadata,
   type SessionStopOutcome,
 } from '@happier-dev/protocol';
 import type { SessionAgentTransitionRequestV1 } from '@happier-dev/protocol';
@@ -15,7 +19,8 @@ import type { SessionAgentTransitionRequestV1 } from '@happier-dev/protocol';
  * What is mocked is exactly the set of process / HTTP / socket / crypto
  * boundaries the coordinator composes: the stop proof, the idle probe, the
  * cutover and session HTTP calls, the Pending enqueue transport, the machine
- * RPC resume, the encryption context, and the Replay context owner. Everything
+ * RPC resume, the transport. Legacy cases stub Replay; the configured sequence uses real
+ * Replay and crypto with the canonical HTTP adapter. Everything
  * the coordinator itself decides — ordering, stop-outcome classification,
  * result-arm mapping, divider identity, and the projected target view — runs
  * for real, because that is the logic under test.
@@ -96,16 +101,7 @@ vi.mock('@/session/handoff/metadata/localAgentNativeResumeRecordStore', () => ({
     writeAgentNativeResumeRecord: mocks.writeAgentNativeResumeRecord,
   }),
 }));
-vi.mock('@/session/transport/encryption/sessionEncryptionContext', () => ({
-  tryDecryptSessionMetadata: (params: { rawSession: { metadata: string } }) =>
-    JSON.parse(params.rawSession.metadata) as Record<string, unknown>,
-  encryptStoredSessionPayload: (params: { payload: unknown }) => JSON.stringify(params.payload),
-  encryptSessionPayload: (params: { payload: unknown }) => JSON.stringify(params.payload),
-  decryptStoredSessionPayload: (params: { mode: string; value: unknown }) =>
-    params.mode === 'plain' && typeof params.value === 'string'
-      ? (JSON.parse(params.value) as unknown)
-      : params.value,
-}));
+
 
 const { runSessionAgentTransition } = await import('./sessionAgentTransitionCoordinator');
 const { resolveCliFeatureDecision } = await import('@/features/featureDecisionService');
@@ -179,6 +175,7 @@ function rawSession(metadata: Record<string, unknown>, overrides: Record<string,
     id: SESSION_ID,
     seq: 100,
     active: false,
+    encryptionMode: 'plain',
     archivedAt: null,
     metadata: JSON.stringify(metadata),
     metadataVersion: 7,
@@ -201,7 +198,7 @@ function request(overrides: Partial<SessionAgentTransitionRequestV1> = {}): Sess
   } as SessionAgentTransitionRequestV1;
 }
 
-const credentials = { token: 'token-1' } as never;
+const credentials = { token: 'token-1', encryption: { type: 'legacy' as const, secret: new Uint8Array(32) } };
 
 function resolveAgentSwitchingDecision(serverSnapshot?: Parameters<typeof resolveCliFeatureDecision>[0]['serverSnapshot']) {
   return resolveCliFeatureDecision({
@@ -264,6 +261,149 @@ function primeHappyPath(
 }
 
 describe('runSessionAgentTransition', () => {
+  it('refuses a configured-source request without its exact expected target', async () => {
+    primeHappyPath(sourceMetadata({
+      flavor: 'acp:b', claudeSessionId: undefined, claudeTranscriptPath: undefined,
+      acpConfiguredBackendV1: { v: 1, backendId: 'b', title: 'B', updatedAt: 1 },
+    }));
+    mocks.findTranscriptEncryptedMessageByLocalIdV2.mockResolvedValue({ type: 'not_found' });
+    const result = await runSessionAgentTransition({
+      credentials,
+      request: request({ expectedCurrentAgentId: 'customAcp',
+        selection: { v: 1, agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'b' } },
+      }),
+      deps: { readAccountSettings: () => ({}) },
+    });
+    expect(result).toEqual({ type: 'rejected', code: 'stale_selection', sourceEffect: 'none' });
+    expect(mocks.requestSessionStop).not.toHaveBeenCalled();
+  });
+
+  it.each(['customAcp', 'claude'] as const)('reports a committed configured target after its Account definition is removed (source %s)', async (expectedCurrentAgentId) => {
+    primeHappyPath(sourceMetadata({
+      flavor: 'acp:b', claudeSessionId: undefined, claudeTranscriptPath: undefined,
+      acpConfiguredBackendV1: { v: 1, backendId: 'b', title: 'B', updatedAt: 1 },
+    }));
+    mocks.findTranscriptEncryptedMessageByLocalIdV2.mockResolvedValue({ type: 'not_found' });
+    const result = await runSessionAgentTransition({
+      credentials,
+      request: request({
+        expectedCurrentAgentId,
+        ...(expectedCurrentAgentId === 'customAcp'
+          ? { expectedCurrentBackendTarget: { kind: 'configuredAcpBackend' as const, backendId: 'a' } }
+          : {}),
+        selection: { v: 1, agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'b' } },
+      }),
+      deps: { readAccountSettings: () => ({}) },
+    });
+    expect(result).toEqual({
+      type: 'partially_applied', localId: LOCAL_ID, applied: 'current_view_committed', code: 'divider_unavailable',
+    });
+    expect(mocks.requestSessionStop).not.toHaveBeenCalled();
+  });
+
+  it('continues A to exact B to a builtin and back to A without borrowing ACP session ids', async () => {
+    let metadata = sourceMetadata({
+      flavor: 'acp:a', claudeSessionId: undefined, claudeTranscriptPath: undefined,
+      customAcpSessionId: 'opaque-a',
+      acpConfiguredBackendV1: { v: 1, backendId: 'a', title: 'A', updatedAt: 1 },
+    });
+    const settings = { acpCatalogSettingsV1: { v: 2, backends: ['a', 'b'].map((id) => ({
+      id, name: id, title: id.toUpperCase(), command: 'harmless-acp',
+      args: ['--configuration', id], env: {}, createdAt: 1, updatedAt: 1,
+    })) } };
+    const selections = [
+      { v: 1, agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'b' } },
+      { v: 1, agentId: 'claude' },
+      { v: 1, agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'a' } },
+    ] as const;
+    const app = Fastify();
+    app.get('/v1/sessions/:id/messages', async () => ({
+      messages: [{ id: 'history-99', seq: 99, createdAt: 1,
+        content: { t: 'plain', v: { role: 'user', content: { type: 'text', text: 'Remember the original conversation' } } },
+      }],
+      hasMore: false, nextBeforeSeq: null, nextAfterSeq: null,
+    }));
+    const restoreHttp = installAxiosFastifyAdapter({ app, origin: resolveServerHttpBaseUrl() });
+    const replay = await vi.importActual<typeof import('@/session/replay/resolveReplaySeedDraft')>('@/session/replay/resolveReplaySeedDraft');
+    try {
+      for (const [index, selection] of selections.entries()) {
+        primeHappyPath(metadata);
+        // This configured journey keeps Replay hydration, framing and crypto real;
+        // only its HTTP transcript source is replaced at the package testkit boundary.
+        mocks.resolveReplaySeedDraft.mockImplementation(replay.resolveReplaySeedDraft);
+        const sourceTarget = readAcpConfiguredBackendV1FromMetadata(metadata);
+        const localId = `${LOCAL_ID}-${index}`;
+        const result = await runSessionAgentTransition({
+          credentials,
+          request: request({
+            expectedCurrentAgentId: sourceTarget ? 'customAcp' : 'claude',
+            ...(sourceTarget ? { expectedCurrentBackendTarget: { kind: 'configuredAcpBackend' as const, backendId: sourceTarget.backendId } } : {}),
+            selection,
+            input: { text: 'keep going', localId, meta: {} },
+          }),
+          deps: { readAccountSettings: () => settings },
+        });
+        expect(result).toEqual({ type: 'accepted', localId });
+        metadata = mocks.requestInactiveSessionResume.mock.calls.at(-1)?.[0].metadata;
+        expect(metadata.customAcpSessionId).toBeUndefined();
+        expect(metadata.replaySeedV1).toMatchObject({
+          seedText: expect.stringContaining('Remember the original conversation'), sourceCutoffSeqInclusive: 100,
+        });
+        if ('backendTarget' in selection) {
+          expect(metadata).toMatchObject({
+            flavor: `acp:${selection.backendTarget.backendId}`,
+            acpConfiguredBackendV1: { backendId: selection.backendTarget.backendId, title: selection.backendTarget.backendId.toUpperCase() },
+          });
+        } else {
+          expect(metadata.flavor).toBe('claude');
+          expect(metadata.acpConfiguredBackendV1).toBeUndefined();
+        }
+      }
+    } finally {
+      restoreHttp();
+      await app.close();
+    }
+  });
+
+  it.each(['missing-definition', 'missing-secret', 'stale-configured-source'] as const)(
+    'keeps the configured source untouched for %s', async (failure) => {
+      primeHappyPath(sourceMetadata({
+        flavor: failure === 'stale-configured-source' ? 'acp:c' : 'acp:a',
+        claudeSessionId: undefined,
+        claudeTranscriptPath: undefined,
+        customAcpSessionId: 'opaque-source',
+        acpConfiguredBackendV1: {
+          v: 1, backendId: failure === 'stale-configured-source' ? 'c' : 'a', title: 'Source', updatedAt: 1,
+        },
+      }));
+      const settings = {
+        acpCatalogSettingsV1: {
+          v: 2,
+          backends: failure === 'missing-definition' ? [] : [{
+            id: 'b', name: 'b', title: 'B', command: 'harmless-acp', args: ['b'],
+            env: failure === 'missing-secret' ? { TOKEN: { t: 'savedSecret', secretId: 'unavailable' } } : {},
+            createdAt: 1, updatedAt: 1,
+          }],
+        },
+      };
+      const result = await runSessionAgentTransition({
+        credentials,
+        request: request({
+          expectedCurrentAgentId: 'customAcp',
+          expectedCurrentBackendTarget: { kind: 'configuredAcpBackend', backendId: 'a' },
+          selection: { v: 1, agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'b' } },
+        }),
+        deps: { readAccountSettings: () => settings },
+      });
+      expect(result).toEqual({
+        type: 'rejected',
+        code: failure === 'stale-configured-source' ? 'stale_selection' : 'target_unavailable',
+        sourceEffect: 'none',
+      });
+      expect(mocks.callOrder).toEqual([]);
+    },
+  );
+
   beforeEach(() => {
     for (const value of Object.values(mocks)) {
       if (typeof value === 'function' && 'mockReset' in value) (value as { mockReset: () => void }).mockReset();
@@ -280,6 +420,18 @@ describe('runSessionAgentTransition', () => {
   });
 
   describe('pre-effect rejections leave the source running', () => {
+    it.each(['unrecognized-permission', '', 42])('rejects invalid authored permission %j before stopping the source', async (permissionMode) => {
+      primeHappyPath();
+
+      const result = await runSessionAgentTransition({
+        credentials,
+        request: request({ input: { text: 'keep going', localId: LOCAL_ID, meta: { permissionMode } } }),
+      });
+
+      expect(result).toEqual({ type: 'rejected', code: 'unsupported_operation', sourceEffect: 'none' });
+      expect(mocks.callOrder).toEqual([]);
+    });
+
     it.each([
       [
         'the server explicitly disables it',
@@ -1080,6 +1232,22 @@ describe('runSessionAgentTransition', () => {
       expect((enqueue.body.content.v as { meta: Record<string, unknown> }).meta.permissionMode).toBe('yolo');
     });
 
+    it('admits the frozen input permission instead of a different committed Session permission', async () => {
+      primeHappyPath(sourceMetadata({ permissionMode: 'yolo' }));
+
+      const result = await runSessionAgentTransition({
+        credentials,
+        request: request({ input: { text: 'keep going', localId: LOCAL_ID, meta: { permissionMode: 'read-only' } } }),
+      });
+
+      expect(result).toEqual({ type: 'accepted', localId: LOCAL_ID });
+      const enqueue = mocks.enqueuePendingQueueV2MessageViaHttp.mock.calls[0]?.[0];
+      expect((enqueue.body.content.v as { meta: Record<string, unknown> }).meta.permissionMode).toBe('read-only');
+      const cutover = mocks.commitSessionAgentTransitionCutover.mock.calls[0]?.[0];
+      const written = JSON.parse(cutover.currentView.metadataCiphertext) as Record<string, unknown>;
+      expect(written.permissionMode).toBe('yolo');
+    });
+
     // With bytes and version taken from one post-stop observation, the CAS can
     // no longer catch a transition that committed during the stop window — it
     // would adopt that operation's version and overwrite its committed target.
@@ -1151,6 +1319,7 @@ describe('runSessionAgentTransition', () => {
       const enqueue = mocks.enqueuePendingQueueV2MessageViaHttp.mock.calls[0]?.[0];
       expect(enqueue.body.localId).toBe(LOCAL_ID);
       expect(enqueue.body.messageRole).toBe('user');
+      expect(enqueue.body.requestedAction).toEqual({ v: 1, kind: 'send_now' });
       const record = JSON.parse(enqueue.body.content.v ? JSON.stringify(enqueue.body.content.v) : '{}') as {
         content: { text: string };
         meta: Record<string, unknown>;

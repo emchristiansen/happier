@@ -1,14 +1,17 @@
+import { connectedServiceUsageRequiresOrganizationId } from '@happier-dev/protocol';
 import {
   buildProviderAccountUsageRecordId,
   ConnectedServiceQuotaConfidenceV1Schema,
   ConnectedServiceQuotaSourceV1Schema,
   type ConnectedServiceQuotaSnapshotV1,
   type ProviderAccountUsageConfidenceV1,
+  type ProviderAccountUsageDiagnosticV1,
   type ProviderAccountUsageRecordKeyV1,
   type ProviderAccountUsageSourceV1,
   type ProviderAccountUsageSnapshotV1,
 } from '@happier-dev/protocol';
 import { ProviderAccountUsageSnapshotV1Schema } from '@happier-dev/protocol';
+import { getConnectedAccountDescriptor } from '../descriptors/connectedAccountDescriptors';
 
 function mapQuotaSourceToUsageSource(source: ConnectedServiceQuotaSnapshotV1['source']): ProviderAccountUsageSourceV1 {
   const normalized = source ? ConnectedServiceQuotaSourceV1Schema.parse(source) : 'unknown';
@@ -40,6 +43,7 @@ export function buildProviderAccountUsageSnapshotFromConnectedServiceQuotaObserv
   snapshot: ConnectedServiceQuotaSnapshotV1;
   observedAtMs?: number;
   sourceProviderAccountId?: string | null;
+  refreshError?: ProviderAccountUsageDiagnosticV1;
 }>): ProviderAccountUsageSnapshotV1 {
   const snapshot = input.snapshot;
   const providerId = (snapshot.providerId ?? snapshot.serviceId).trim();
@@ -47,15 +51,18 @@ export function buildProviderAccountUsageSnapshotFromConnectedServiceQuotaObserv
     ? input.sourceProviderAccountId.trim()
     : '';
   const stableAccountId = (snapshot.activeAccountId ?? sourceProviderAccountId).trim();
-  const hasStableSubject = Boolean(stableAccountId);
-  const accountSubjectId = stableAccountId
-    || `legacy-connected-service:${snapshot.serviceId}:${snapshot.profileId}`;
+  const organizationId = snapshot.providerOrganizationId?.trim() || null;
+  const requiresOrganization = connectedServiceUsageRequiresOrganizationId(snapshot.serviceId);
+  const hasStableSubject = Boolean(stableAccountId) && (!requiresOrganization || Boolean(organizationId));
+  const accountSubjectId = hasStableSubject ? stableAccountId
+    : `legacy-connected-service:${snapshot.serviceId}:${snapshot.profileId}`;
   const fetchedAtMs = snapshot.fetchedAtMs ?? snapshot.fetchedAt;
   const recordKey: ProviderAccountUsageRecordKeyV1 = {
     providerId,
     accountSubjectId,
     subjectKind: hasStableSubject ? 'account' : 'unknown',
-    quotaScope: 'account',
+    quotaScope: hasStableSubject && organizationId ? 'organization' : 'account',
+    ...(hasStableSubject && organizationId ? { quotaScopeId: organizationId } : {}),
   };
 
   return ProviderAccountUsageSnapshotV1Schema.parse({
@@ -71,7 +78,8 @@ export function buildProviderAccountUsageSnapshotFromConnectedServiceQuotaObserv
     staleAfterMs: snapshot.staleAfterMs,
     source: mapQuotaSourceToUsageSource(snapshot.source),
     confidence: mapQuotaConfidenceToUsageConfidence(snapshot.confidence),
-    state: snapshot.confidence === 'stale'
+    ...(input.refreshError ? { diagnostics: [input.refreshError] } : {}),
+    state: input.refreshError ? 'error_last_known_good' : snapshot.confidence === 'stale'
       ? 'stale_data'
       : snapshot.meters.length > 0
         ? 'loaded_data'
@@ -80,6 +88,7 @@ export function buildProviderAccountUsageSnapshotFromConnectedServiceQuotaObserv
     accountLabel: snapshot.accountLabel,
     ...(snapshot.subscription ? { subscription: snapshot.subscription } : {}),
     ...(snapshot.recoveryCredits ? { recoveryCredits: snapshot.recoveryCredits } : {}),
+    ...(snapshot.recoveryCreditDetails ? { recoveryCreditDetails: snapshot.recoveryCreditDetails } : {}),
     meters: snapshot.meters,
   });
 }

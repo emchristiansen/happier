@@ -21,13 +21,14 @@ export {
   resolveCodexSpawnExtrasFromSettings,
 } from './definitions/codex.js';
 
-export type { OpenCodeBackendMode } from './definitions/opencode.js';
+export type { OpenCodeBackendMode, OpenCodeCliGeneration } from './definitions/opencode.js';
 export {
   OPENCODE_PROVIDER_SETTINGS_DEFINITION,
   OPENCODE_PROVIDER_FIELDS,
   OPENCODE_PROVIDER_SETTINGS_DEFAULTS,
   buildOpenCodeProviderSettingsShape,
   normalizeOpenCodeBackendMode,
+  normalizeOpenCodeCliGeneration,
   normalizeOpenCodeServerBaseUrl,
   normalizeOpenCodeServerBaseUrlExplicit,
   readOpenCodeExplicitServerBaseUrl,
@@ -44,30 +45,31 @@ export {
   resolveCursorSpawnExtrasFromSettings,
 } from './definitions/cursor.js';
 
-export type { KimiAcpPythonSelector } from './definitions/kimi.js';
 export {
   KIMI_PROVIDER_SETTINGS_DEFINITION,
   KIMI_PROVIDER_FIELDS,
   KIMI_PROVIDER_SETTINGS_DEFAULTS,
   buildKimiProviderSettingsShape,
-  normalizeKimiAcpPythonSelector,
-  resolveKimiSpawnExtrasFromSettings,
 } from './definitions/kimi.js';
 
 export {
   type ClaudeUnifiedTerminalHost,
   type ClaudeUnifiedTerminalResumeChoice,
+  type ClaudeUnifiedTerminalResponseLocation,
   type ClaudeUnifiedTerminalWorkspaceTrust,
   type ClaudeUnifiedTerminalWorkspaceTrustPolicy,
   CLAUDE_REMOTE_PROVIDER_SETTINGS_DEFINITION,
   CLAUDE_REMOTE_PROVIDER_FIELDS,
+  MAX_CLAUDE_REMOTE_IDLE_RECLAIM_TIMEOUT_MINUTES,
   CLAUDE_REMOTE_PROVIDER_SETTINGS_DEFAULTS,
   CLAUDE_UNIFIED_TERMINAL_HOSTS,
   CLAUDE_UNIFIED_TERMINAL_RESUME_CHOICES,
+  CLAUDE_UNIFIED_TERMINAL_RESPONSE_LOCATIONS,
   CLAUDE_UNIFIED_TERMINAL_WORKSPACE_TRUST_POLICIES,
   MAX_CLAUDE_REMOTE_ADVANCED_OPTIONS_JSON_CHARS,
   buildClaudeRemoteOutgoingMessageMetaExtras,
   buildClaudeRemoteProviderSettingsShape,
   isValidClaudeRemoteAdvancedOptionsJson,
   normalizeClaudeRemoteAdvancedOptionsJson,
+  resolveClaudeUnifiedTerminalResponseLocations,
 } from './definitions/claudeRemote.js';

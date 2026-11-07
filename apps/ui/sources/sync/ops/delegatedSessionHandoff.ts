@@ -64,6 +64,7 @@ export async function delegateSessionHandoffToSourceDaemon(
         sessionId: string;
         sessionStorageMode: SessionHandoffStorageMode;
         targetSessionStorageMode?: SessionHandoffStorageMode;
+        stateTransfer?: 'transfer' | 'existing';
         requestId: string;
         workspaceTransfer?: SessionHandoffWorkspaceTransfer;
         serverId?: string | null;
@@ -104,6 +105,7 @@ export async function delegateSessionHandoffToSourceDaemon(
                     ...(params.targetPath ? { targetPath: params.targetPath } : {}),
                     sessionStorageMode: params.sessionStorageMode,
                     ...(params.targetSessionStorageMode ? { targetSessionStorageMode: params.targetSessionStorageMode } : {}),
+                    ...(params.stateTransfer ? { stateTransfer: params.stateTransfer } : {}),
                     preferredTransportStrategies: ['direct_peer', 'server_routed_stream'],
                     ...(params.workspaceTransfer ? { workspaceTransfer: params.workspaceTransfer } : {}),
                 },

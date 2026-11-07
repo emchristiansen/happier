@@ -255,6 +255,23 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
     });
     expect(stale.edge).toEqual({ phase: 'no_edge' });
 
+    const future = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+      mode: 'live_account_usage_change',
+      group,
+      changedProfileId: 'primary',
+      changedGroupGeneration: group.generation,
+      previousState: { status: 'unblocked' },
+      snapshotsByProfileId: snapshotMap(
+        createUsageSnapshot({ profileId: 'primary', nowMs, remainingPct: 0, fetchedAtMs: nowMs + 900_000 }),
+        backupBlocked,
+      ),
+      activeSessionIds: ['session-1'],
+      nowMs,
+      quotaFreshnessMs: 300_000,
+    });
+    expect(future.edge).toEqual({ phase: 'no_edge' });
+    expect(future.nextState).toEqual({ status: 'unblocked' });
+
     const mismatchedGeneration = evaluateConnectedServiceAuthGroupQuotaLifecycle({
       mode: 'live_account_usage_change',
       group,

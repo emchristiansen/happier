@@ -37,6 +37,7 @@ describe('SessionListHeaderControls', () => {
                 searchQuery=""
                 searchOpen={true}
                 onSelectedTagsChange={vi.fn()}
+                onSearchOpenChange={vi.fn()}
                 onSearchQueryChange={onSearchQueryChange}
                 searchTrailingAccessory={null}
                 viewMenu={null}
@@ -65,6 +66,7 @@ describe('SessionListHeaderControls', () => {
                 searchQuery="memory"
                 searchOpen={true}
                 onSelectedTagsChange={vi.fn()}
+                onSearchOpenChange={vi.fn()}
                 onSearchQueryChange={onSearchQueryChange}
                 searchTrailingAccessory={null}
                 viewMenu={null}
@@ -93,6 +95,7 @@ describe('SessionListHeaderControls', () => {
                 searchQuery="memory"
                 searchOpen={true}
                 onSelectedTagsChange={vi.fn()}
+                onSearchOpenChange={vi.fn()}
                 onSearchQueryChange={vi.fn()}
                 searchTrailingAccessory={null}
                 viewMenu={null}
@@ -113,6 +116,7 @@ describe('SessionListHeaderControls', () => {
                 searchQuery="memory"
                 searchOpen={true}
                 onSelectedTagsChange={vi.fn()}
+                onSearchOpenChange={vi.fn()}
                 onSearchQueryChange={vi.fn()}
                 searchTrailingAccessory={<IoniconsTestNode />}
                 viewMenu={null}
@@ -130,6 +134,7 @@ describe('SessionListHeaderControls', () => {
             selectedTags: [],
             searchQuery: 'vector',
             searchOpen: true,
+            onSearchOpenChange: vi.fn(),
             onSelectedTagsChange: vi.fn(),
             onSearchQueryChange: vi.fn(),
             viewMenu: null,

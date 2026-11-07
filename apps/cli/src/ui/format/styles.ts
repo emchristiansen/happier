@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import { cmd, fail, info, ok, warn } from '@happier-dev/cli-common/output';
 
 /**
  * Shared CLI text style palette for doctor-repair rendering.
@@ -12,8 +13,9 @@ import chalk from 'chalk';
  *
  * Anything else stays in default terminal color. Bold is reserved for
  * structural roles — section headers and finding titles — NOT for emphasis
- * inside body prose. Inline commands/paths/URLs use `code()` (cyan, never
- * bold). See apps/cli/CLAUDE.md for the full rationale.
+ * inside body prose. Status glyphs and inline commands come from the shared
+ * CLI vocabulary (`@happier-dev/cli-common/output`) so repair screens read like
+ * every other command.
  */
 
 // ─── Severity primitives ─────────────────────────────────────────────────────
@@ -26,14 +28,11 @@ export const severity = {
 };
 
 export const glyph = {
-  error: (): string => chalk.red.bold('✗'),
-  action: (): string => chalk.yellow.bold('●'),
-  success: (): string => chalk.green('✓'),
-  // `○` (hollow circle) gives the info/idle row the same visual weight as
-  // `●` without implying a problem. The earlier `·` (middle dot) was too
-  // small to distinguish from table separators at normal terminal sizes.
-  info: (): string => chalk.gray('○'),
-  arrow: (): string => chalk.cyan('→'),
+  error: (): string => fail(),
+  action: (): string => warn(),
+  success: (): string => ok(),
+  info: (): string => info(),
+  arrow: (): string => chalk.gray('→'),
 };
 
 // ─── Structural helpers ──────────────────────────────────────────────────────
@@ -42,9 +41,9 @@ export function sectionHeader(text: string): string {
   return chalk.bold(text);
 }
 
-/** Inline commands, paths, URLs. Cyan, never bold. */
+/** Inline commands, paths, URLs: the shared command style, never bold. */
 export function code(text: string): string {
-  return chalk.cyan(text);
+  return cmd(text);
 }
 
 // ─── Legacy aliases (kept so existing call sites compile unchanged). ──────────

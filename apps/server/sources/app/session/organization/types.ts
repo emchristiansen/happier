@@ -11,6 +11,14 @@ export interface SessionOrganizationPinRecord {
 export interface SessionAttentionStandingRecord {
     readonly sessionId: string;
     readonly standing: boolean;
+    readonly remindAt: Date | null;
+    readonly standingBeforeReminder?: boolean | null;
+    readonly updatedAt: Date;
+}
+
+export interface SessionAppearanceRecord {
+    readonly sessionId: string;
+    readonly displayDbValue: string;
     readonly updatedAt: Date;
 }
 

@@ -8,6 +8,16 @@ export type TerminalControlServiceabilityEvidence = Readonly<{
   reason?: string;
 }>;
 
+export function hasActiveReportedTerminalControlServiceability(params: Readonly<{
+  terminal: Metadata['terminal'] | null | undefined;
+  attachmentId: string;
+}>): boolean {
+  const existing = params.terminal?.controlServiceabilityV1;
+  return existing?.v === 1
+    && existing.retired !== true
+    && existing.attachmentId === params.attachmentId;
+}
+
 export function shouldPublishReportedTerminalControlServiceability(params: Readonly<{
   terminal: Metadata['terminal'] | null | undefined;
   attachmentId: string | null | undefined;
@@ -15,12 +25,7 @@ export function shouldPublishReportedTerminalControlServiceability(params: Reado
 }>): boolean {
   const attachmentId = typeof params.attachmentId === 'string' ? params.attachmentId.trim() : '';
   if (!attachmentId || !params.terminal || params.terminal.mode === 'plain') return false;
-  const existing = params.terminal.controlServiceabilityV1;
-  if (
-    existing?.v === 1
-    && existing.retired !== true
-    && existing.attachmentId === attachmentId
-  ) {
+  if (hasActiveReportedTerminalControlServiceability({ terminal: params.terminal, attachmentId })) {
     return false;
   }
   return params.publishedAttachmentId !== attachmentId;
@@ -89,10 +94,22 @@ export function applyTerminalControlServiceabilityProjection(params: Readonly<{
  * blocks an already-in-flight publisher from resurrecting it while allowing replacement evidence.
  */
 export function clearTerminalControlServiceabilityProjection(params: Readonly<{
+  metadata: Metadata;
+  retiredAttachmentId: string;
+  retiredAt: number;
+  terminalMode?: NonNullable<Metadata['terminal']>['mode'];
+}>): Metadata;
+export function clearTerminalControlServiceabilityProjection(params: Readonly<{
   metadata: Record<string, unknown>;
   retiredAttachmentId: string;
   retiredAt: number;
-  terminalMode?: 'plain' | 'tmux' | 'zellij' | 'windows_terminal' | 'windows_console';
+  terminalMode?: NonNullable<Metadata['terminal']>['mode'];
+}>): Record<string, unknown>;
+export function clearTerminalControlServiceabilityProjection(params: Readonly<{
+  metadata: Record<string, unknown>;
+  retiredAttachmentId: string;
+  retiredAt: number;
+  terminalMode?: NonNullable<Metadata['terminal']>['mode'];
 }>): Record<string, unknown> {
   const terminal = asRecord(params.metadata.terminal) ?? {};
   const existing = asRecord(terminal.controlServiceabilityV1);

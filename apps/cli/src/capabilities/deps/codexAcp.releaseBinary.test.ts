@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+
+import { createEnvKeyScope } from '@/testkit/env/envScope';
 
 vi.mock('@happier-dev/cli-common/providers', async () => {
   const actual = await vi.importActual<typeof import('@happier-dev/cli-common/providers')>('@happier-dev/cli-common/providers');
@@ -25,6 +27,15 @@ const ORIGINAL_PLATFORM_DESCRIPTOR = Object.getOwnPropertyDescriptor(process, 'p
 const ORIGINAL_ARCH_DESCRIPTOR = Object.getOwnPropertyDescriptor(process, 'arch');
 const ORIGINAL_HOME = process.env.HAPPIER_HOME_DIR;
 const ORIGINAL_PATH = process.env.PATH;
+const runtimeEnv = createEnvKeyScope(['HAPPIER_JS_RUNTIME_PATH', 'HAPPIER_MANAGED_NODE_BIN', 'HAPPIER_NODE_PATH']);
+
+beforeEach(() => {
+  runtimeEnv.patch({
+    HAPPIER_JS_RUNTIME_PATH: undefined,
+    HAPPIER_MANAGED_NODE_BIN: undefined,
+    HAPPIER_NODE_PATH: undefined,
+  });
+});
 
 const tempDirs = new Set<string>();
 
@@ -56,6 +67,7 @@ afterEach(async () => {
   else process.env.HAPPIER_HOME_DIR = ORIGINAL_HOME;
   if (ORIGINAL_PATH === undefined) delete process.env.PATH;
   else process.env.PATH = ORIGINAL_PATH;
+  runtimeEnv.restore();
   vi.restoreAllMocks();
   vi.resetModules();
   for (const dir of tempDirs) {

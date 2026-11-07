@@ -157,7 +157,7 @@ describe("rpcHandler", () => {
       await vi.advanceTimersByTimeAsync(30);
       await pending;
 
-      expect(targetTimeout).toHaveBeenCalledWith(30000);
+      expect(targetTimeout).toHaveBeenCalledWith(2_147_483_647);
       expect(targetEmitWithAck).toHaveBeenCalledWith(SOCKET_RPC_EVENTS.REQUEST, {
         method: "sess_1:execution.run.stream.start",
         params: { runId: "run-1" },
@@ -215,7 +215,7 @@ describe("rpcHandler", () => {
       await vi.advanceTimersByTimeAsync(30);
       await pending;
 
-      expect(timeout).toHaveBeenCalledWith(30000);
+      expect(timeout).toHaveBeenCalledWith(2_147_483_647);
       expect(to).toHaveBeenCalledWith(targetSocketId);
       expect(emitWithAck).toHaveBeenCalledWith(SOCKET_RPC_EVENTS.REQUEST, {
         method: "sess_1:execution.run.stream.start",

@@ -50,6 +50,11 @@ export type ProviderCliManagedInstallSpec =
 
 export type ProviderCliKnownCommandCandidate =
   | Readonly<{
+      kind: 'envBinDir';
+      envVar: string;
+      relativeDir: string;
+    }>
+  | Readonly<{
       kind: 'homeBinDir';
       relativeDir: string;
     }>
@@ -72,6 +77,29 @@ export type ProviderCliAlternativeBinaryIdentityProbe = Readonly<{
   stdoutJsonStringField: string;
 }>;
 
+/**
+ * Who owns an installed agent CLI, derived from its resolved path. Only `managed`
+ * and `native` (with a declared vendor updater) can be updated by Happier; the
+ * package-manager sources are surfaced with a copyable command instead.
+ */
+export type ProviderCliInstallSource = 'managed' | 'native' | 'npm' | 'pnpm' | 'bun' | 'brew' | 'other';
+
+/**
+ * The vendor's own updater, verified from vendor documentation or source. It runs
+ * against the resolved executable only when that executable lives under one of
+ * `installPaths` (home-relative, `/`-separated; the resolved path or its real
+ * path must equal or sit under an entry), so Happier never asks a vendor updater
+ * to replace an install that a package manager owns.
+ */
+export type ProviderCliNativeUpdateSpec = Readonly<{
+  args: ReadonlyArray<string>;
+  installPaths: ReadonlyArray<string>;
+}>;
+
+export type ProviderCliLatestVersionSource =
+  | Readonly<{ kind: 'npm'; packageName: string }>
+  | Readonly<{ kind: 'github_release'; githubRepo: string }>;
+
 export type ProviderCliRuntimeSpec = Readonly<{
   id: AgentId;
   title: string;
@@ -87,6 +115,9 @@ export type ProviderCliRuntimeSpec = Readonly<{
   acceptsJavaScriptFileOverride: boolean;
   installGuideUrl?: string | null;
   docsUrl?: string | null;
+  /** The vendor's npm package, when the CLI is also published to npm and it is not already the managed package. */
+  npmPackageName?: string | null;
+  nativeUpdate?: ProviderCliNativeUpdateSpec | null;
 }>;
 
 function bashCurlPipe(url: string): ProviderCliInstallCommand {
@@ -95,7 +126,7 @@ function bashCurlPipe(url: string): ProviderCliInstallCommand {
 
 function powershellInstall(command: string): ProviderCliInstallCommand {
   return {
-    cmd: 'powershell',
+    cmd: 'powershell.exe',
     args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
   };
 }
@@ -130,6 +161,14 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     acceptsJavaScriptFileOverride: true,
     installGuideUrl: 'https://code.claude.com/docs/en/setup',
     docsUrl: 'https://claude.ai',
+    npmPackageName: '@anthropic-ai/claude-code',
+    // https://code.claude.com/docs/en/setup ("Update manually": `claude update`). The native
+    // installer links ~/.local/bin/claude into ~/.local/share/claude/versions/ and, on Windows,
+    // installs %USERPROFILE%\.local\bin\claude.exe beside ~/.local/share/claude.
+    nativeUpdate: {
+      args: ['update'],
+      installPaths: ['.local/share/claude', '.local/bin/claude.exe'],
+    },
   },
   codex: {
     id: 'codex',
@@ -180,13 +219,13 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
           },
         ],
       },
-      // OpenAI Codex rust-v0.147.0's checksum-pinned x64 Windows package
-      // expands to 370,442,135 bytes, including one 298,668,336-byte
-      // executable. A 384 MiB ceiling leaves bounded headroom while retaining
-      // generic archive, entry-count, path, and compression-ratio protections.
+      // Digest-verified rust-v0.163.0 Windows x64 expands to 465,689,987 bytes;
+      // its largest file is 341,270,320 bytes. Reuse the 0.3 Agent manifest's
+      // 512 MiB total budget while retaining the existing per-file budget and
+      // shared archive, entry-count, path and compression-ratio protections.
       archiveExtractionLimits: {
         maxFileBytes: 384 * 1024 * 1024,
-        maxExpandedBytes: 384 * 1024 * 1024,
+        maxExpandedBytes: 512 * 1024 * 1024,
       },
     },
     manualInstallKind: 'command',
@@ -194,13 +233,23 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     acceptsJavaScriptFileOverride: false,
     installGuideUrl: null,
     docsUrl: 'https://github.com/openai/codex',
+    npmPackageName: '@openai/codex',
+    // openai/codex `codex-rs/cli/src/main.rs` declares the `update` subcommand; the standalone
+    // installer (`scripts/install/install.sh`) keeps its payload in $CODEX_HOME/packages/standalone
+    // (default ~/.codex). A custom CODEX_HOME is not attributed and stays a manual update.
+    nativeUpdate: {
+      args: ['update'],
+      installPaths: ['.codex/packages/standalone'],
+    },
   },
   opencode: {
     id: 'opencode',
     title: 'OpenCode CLI',
     binaryName: 'opencode',
+    alternativeBinaryNames: ['opencode2'],
     knownCommandCandidates: [
       { kind: 'homeBinDir', relativeDir: '.opencode/bin' },
+      { kind: 'homeBinDir', relativeDir: '.local/bin' },
       { kind: 'homePath', relativePath: 'AppData/Roaming/npm/opencode.cmd' },
     ],
     sourcePreferenceDefault: 'system-first',
@@ -215,6 +264,12 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     acceptsJavaScriptFileOverride: false,
     installGuideUrl: 'https://opencode.ai/docs',
     docsUrl: 'https://opencode.ai',
+    // https://opencode.ai/docs/cli/ (`opencode upgrade`); the official install script uses
+    // INSTALL_DIR=$HOME/.opencode/bin.
+    nativeUpdate: {
+      args: ['upgrade'],
+      installPaths: ['.opencode/bin'],
+    },
   },
   gemini: {
     id: 'gemini',
@@ -267,20 +322,20 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
   },
   kimi: {
     id: 'kimi',
-    title: 'Kimi CLI',
+    title: 'Kimi Code CLI',
     binaryName: 'kimi',
     knownCommandCandidates: [{ kind: 'homeBinDir', relativeDir: '.local/bin' }],
     sourcePreferenceDefault: 'system-first',
     managedInstall: null,
     manualInstallKind: 'vendor_recipe',
     manualInstallRecipes: {
-      darwin: [bashCurlPipe('https://code.kimi.com/install.sh')],
-      linux: [bashCurlPipe('https://code.kimi.com/install.sh')],
-      win32: [powershellInstall('Invoke-RestMethod https://code.kimi.com/install.ps1 | Invoke-Expression')],
+      darwin: [bashCurlPipe('https://code.kimi.com/kimi-code/install.sh')],
+      linux: [bashCurlPipe('https://code.kimi.com/kimi-code/install.sh')],
+      win32: [powershellInstall('Invoke-RestMethod https://code.kimi.com/kimi-code/install.ps1 | Invoke-Expression')],
     },
     acceptsJavaScriptFileOverride: false,
-    installGuideUrl: 'https://kimi.moonshot.cn/docs/cli',
-    docsUrl: 'https://code.kimi.com',
+    installGuideUrl: 'https://moonshotai.github.io/kimi-code/en/guides/getting-started',
+    docsUrl: 'https://moonshotai.github.io/kimi-code/en/',
   },
   kiro: {
     id: 'kiro',
@@ -293,6 +348,19 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     manualInstallRecipes: null,
     acceptsJavaScriptFileOverride: false,
     docsUrl: 'https://kiro.dev/docs/cli/acp/',
+  },
+  devin: {
+    id: 'devin',
+    title: 'Devin CLI',
+    binaryName: 'devin',
+    knownCommandCandidates: [{ kind: 'homeBinDir', relativeDir: '.local/bin' }],
+    sourcePreferenceDefault: 'system-first',
+    managedInstall: null,
+    manualInstallKind: 'command',
+    manualInstallRecipes: null,
+    acceptsJavaScriptFileOverride: false,
+    installGuideUrl: 'https://docs.devin.ai/work-with-devin/devin-cli',
+    docsUrl: 'https://docs.devin.ai/work-with-devin/devin-cli',
   },
   customAcp: {
     id: 'customAcp',
@@ -326,7 +394,10 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     id: 'pi',
     title: 'Pi Coding Agent CLI',
     binaryName: 'pi',
-    knownCommandCandidates: null,
+    knownCommandCandidates: [
+      { kind: 'envBinDir', envVar: 'PI_CODING_AGENT_DIR', relativeDir: 'bin' },
+      { kind: 'homeBinDir', relativeDir: '.pi/agent/bin' },
+    ],
     sourcePreferenceDefault: 'system-first',
     managedInstall: {
       kind: 'managed_package',
@@ -377,11 +448,17 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     manualInstallRecipes: {
       darwin: [bashCurlPipe('https://cursor.com/install')],
       linux: [bashCurlPipe('https://cursor.com/install')],
-      win32: [powershellInstall('iwr https://cursor.com/install.ps1 -useb | iex')],
+      win32: [powershellInstall("irm 'https://cursor.com/install?win32=true' | iex")],
     },
     acceptsJavaScriptFileOverride: false,
     installGuideUrl: 'https://cursor.com/docs/cli/installation',
     docsUrl: 'https://cursor.com/docs/cli',
+    // https://cursor.com/docs/cli/installation ("agent update"); `agent` and `cursor-agent` are
+    // the same installed executable under ~/.local/share/cursor-agent/versions/.
+    nativeUpdate: {
+      args: ['update'],
+      installPaths: ['.local/share/cursor-agent'],
+    },
   },
   grok: {
     id: 'grok',
@@ -406,10 +483,101 @@ export const PROVIDER_CLI_RUNTIME_SPECS: Readonly<Record<AgentId, ProviderCliRun
     installGuideUrl: 'https://x.ai/cli',
     docsUrl: 'https://x.ai',
   },
+  agy: {
+    id: 'agy',
+    title: 'Antigravity CLI',
+    binaryName: 'agy',
+    knownCommandCandidates: [{ kind: 'homeBinDir', relativeDir: '.local/bin' }],
+    sourcePreferenceDefault: 'system-first',
+    // Interactive `agy` stays system/vendor installed. The managed `agy_acp_server`
+    // ACP transport is owned by the runtime-installables seam, not this CLI spec.
+    managedInstall: null,
+    manualInstallKind: 'vendor_recipe',
+    manualInstallRecipes: {
+      darwin: [bashCurlPipe('https://antigravity.google/cli/install.sh')],
+      linux: [bashCurlPipe('https://antigravity.google/cli/install.sh')],
+      win32: [powershellInstall('irm https://antigravity.google/cli/install.ps1 | iex')],
+    },
+    acceptsJavaScriptFileOverride: false,
+    installGuideUrl: 'https://antigravity.google/docs/cli/install',
+    docsUrl: 'https://antigravity.google/docs/cli/install',
+  },
+  fx: {
+    id: 'fx',
+    title: 'FX CLI',
+    binaryName: 'fx',
+    knownCommandCandidates: [{ kind: 'homeBinDir', relativeDir: '.local/bin' }],
+    sourcePreferenceDefault: 'system-first',
+    managedInstall: null,
+    manualInstallKind: 'vendor_recipe',
+    manualInstallRecipes: {
+      darwin: [bashCurlPipe('https://fx.sh/setup.sh')],
+      linux: [bashCurlPipe('https://fx.sh/setup.sh')],
+    },
+    acceptsJavaScriptFileOverride: false,
+    installGuideUrl: 'https://fx.sh/docs/getting-started/installation',
+    docsUrl: 'https://fx.sh/docs',
+  },
+  droid: {
+    id: 'droid',
+    title: 'Factory Droid CLI',
+    binaryName: 'droid',
+    knownCommandCandidates: [
+      { kind: 'homeBinDir', relativeDir: '.local/bin' },
+      // Factory's Windows installer copies `droid.exe` into `%USERPROFILE%\bin` for every
+      // published architecture (x64, x64-baseline, arm64) and appends that directory to PATH.
+      { kind: 'homePath', relativePath: 'bin/droid.exe' },
+    ],
+    sourcePreferenceDefault: 'system-first',
+    managedInstall: null,
+    manualInstallKind: 'vendor_recipe',
+    manualInstallRecipes: {
+      darwin: [bashCurlPipe('https://app.factory.ai/cli')],
+      linux: [bashCurlPipe('https://app.factory.ai/cli')],
+      win32: [powershellInstall('Invoke-RestMethod https://app.factory.ai/cli/windows | Invoke-Expression')],
+    },
+    acceptsJavaScriptFileOverride: false,
+    installGuideUrl: 'https://docs.factory.ai/cli/getting-started/quickstart',
+    docsUrl: 'https://docs.factory.ai/ide-integrations',
+  },
+  codebuddy: {
+    id: 'codebuddy',
+    title: 'CodeBuddy Code CLI',
+    binaryName: 'codebuddy',
+    knownCommandCandidates: null,
+    sourcePreferenceDefault: 'system-first',
+    managedInstall: {
+      kind: 'managed_package',
+      packageName: '@tencent-ai/codebuddy-code',
+      binaryName: 'codebuddy',
+    },
+    manualInstallKind: 'command',
+    manualInstallRecipes: null,
+    acceptsJavaScriptFileOverride: false,
+    installGuideUrl: 'https://www.codebuddy.ai/docs/cli/quickstart',
+    docsUrl: 'https://www.codebuddy.ai/docs/cli/acp',
+  },
 } as const;
 
 export function getProviderCliRuntimeSpec(id: AgentId): ProviderCliRuntimeSpec {
   return PROVIDER_CLI_RUNTIME_SPECS[id];
+}
+
+export function resolveProviderCliNpmPackageName(spec: ProviderCliRuntimeSpec): string | null {
+  if (spec.managedInstall?.kind === 'managed_package') return spec.managedInstall.packageName;
+  return spec.npmPackageName ?? null;
+}
+
+/**
+ * Where "latest" comes from: the source the managed install owner would install
+ * from, else the vendor's npm package. `null` means no verified latest source.
+ */
+export function resolveProviderCliLatestVersionSource(spec: ProviderCliRuntimeSpec): ProviderCliLatestVersionSource | null {
+  if (spec.managedInstall?.kind === 'github_release_binary') {
+    return { kind: 'github_release', githubRepo: spec.managedInstall.githubRepo };
+  }
+  const packageName = resolveProviderCliNpmPackageName(spec);
+  return packageName ? { kind: 'npm', packageName } : null;
 }
 
 export function getProviderCliBinaryNames(

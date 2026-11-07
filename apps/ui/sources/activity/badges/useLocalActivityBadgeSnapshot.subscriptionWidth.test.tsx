@@ -11,6 +11,7 @@ const SESSION_OPTIONS = {
     showUnread: true,
     showPendingPermissionRequests: true,
     showPendingUserActionRequests: true,
+    showQueuedUserInput: true,
 } as const;
 
 const SESSION_ID = 'badge-session';

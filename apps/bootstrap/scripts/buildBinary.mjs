@@ -22,5 +22,9 @@ await componentArtifacts.compileBunBinary({
   entrypoint: join(repoRoot, 'apps', 'bootstrap', 'src', 'bin', 'hsetup.ts'),
   bunTarget: process.env.HAPPIER_BUN_TARGET ?? target.bunTarget,
   outfile: join(outDir, exeName),
-  cwd: repoRoot,
+  // Bun creates its temporary executable in cwd; keep it with ignored build outputs so
+  // a continuously synchronized source mirror cannot remove it before promotion.
+  cwd: outDir,
+  // Freeze the QA acquisition gate in standalone hsetup; runtime NODE_ENV cannot enable it.
+  defines: { 'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV === 'development' ? 'development' : 'production') },
 });

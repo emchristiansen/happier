@@ -35,6 +35,7 @@ import {
   buildServiceDefinition,
   buildWindowsScheduledTaskPowerShellAction,
   planServiceAction,
+  preflightServiceInstallAssets,
   renderSystemdServiceUnit,
   renderWindowsScheduledTaskWrapperPs1,
   resolveServiceBackend,
@@ -43,7 +44,6 @@ import {
   resolveConfiguredRelayRuntimeBinaryOverride,
   resolveConfiguredRelayRuntimePaths,
 } from '@happier-dev/cli-common/firstPartyRuntime/relayRuntime';
-import { removeRuntimePayloadPath } from '@happier-dev/cli-common/firstPartyRuntime';
 import {
   mergeSelfHostServerEnvText,
   parseEnvText as parseEnvTextShared,
@@ -235,6 +235,7 @@ function assertRoot() {
 
 function runCommand(cmd, args, { cwd, env, allowFail = false, stdio = 'pipe' } = {}) {
   const result = spawnSync(cmd, args, {
+    windowsHide: stdio !== 'inherit',
     cwd,
     env: env ?? process.env,
     encoding: 'utf-8',
@@ -1141,8 +1142,7 @@ async function uninstallAutoUpdateJob({ config }) {
   return { uninstalled: true, backend, label: updaterLabel };
 }
 
-async function restartAndCheckHealth({ config, serviceSpec, port }) {
-  await restartManagedService({ platform: config.platform, mode: config.mode, spec: serviceSpec }).catch(() => {});
+async function waitForHealth({ config, port }) {
   const timeoutMs = resolveSelfHostHealthTimeoutMs();
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -1760,6 +1760,8 @@ export async function runSelfHostRuntimeMutationWithServiceRecovery({
   const previousDefinitionContents = existsSync(previousDefinition.path)
     ? await readFile(previousDefinition.path, 'utf-8').catch(() => previousDefinition.contents)
     : previousDefinition.contents;
+  // Install and recovery both need these assets; reject before stopping the current service.
+  await preflightServiceInstallAssets({ backend });
 
   try {
     return await mutateRuntime({
@@ -1915,7 +1917,7 @@ async function performSelfHostPostPromoteSteps({
     persistent: true,
   });
 
-  const healthy = await restartAndCheckHealth({ config, serviceSpec, port: healthPort });
+  const healthy = await waitForHealth({ config, port: healthPort });
   if (!healthy) {
     throw new Error('[self-host] service failed health checks after install');
   }
@@ -2315,8 +2317,10 @@ async function cmdRollback({ channel, mode, argv, json }) {
     homeDir: homedir(),
     spec: serviceSpec,
     persistent: true,
-  }).catch(() => {});
-  const healthy = await restartAndCheckHealth({ config: configWithPort, serviceSpec });
+  }).catch(async () => {
+    await restartManagedService({ platform: configWithPort.platform, mode: configWithPort.mode, homeDir: homedir(), spec: serviceSpec }).catch(() => {});
+  });
+  const healthy = await waitForHealth({ config: configWithPort });
   if (!healthy) {
     throw new Error('[self-host] rollback completed binary swap but health checks failed');
   }
@@ -2367,16 +2371,16 @@ async function cmdUninstall({ channel, mode, argv, json }) {
     persistent: true,
   });
 
-  await removeRuntimePayloadPath(config.serverBinaryPath, config.platform);
-  await removeRuntimePayloadPath(config.serverPreviousBinaryPath, config.platform);
-  await removeRuntimePayloadPath(join(config.binDir, config.serverBinaryName), config.platform);
-  await removeRuntimePayloadPath(config.statePath, config.platform);
+  await rm(config.serverBinaryPath, { force: true });
+  await rm(config.serverPreviousBinaryPath, { force: true });
+  await rm(join(config.binDir, config.serverBinaryName), { force: true });
+  await rm(config.statePath, { force: true });
 
   if (purgeData) {
-    await removeRuntimePayloadPath(config.installRoot, config.platform);
-    await removeRuntimePayloadPath(config.configDir, config.platform);
-    await removeRuntimePayloadPath(config.dataDir, config.platform);
-    await removeRuntimePayloadPath(config.logDir, config.platform);
+    await rm(config.installRoot, { recursive: true, force: true });
+    await rm(config.configDir, { recursive: true, force: true });
+    await rm(config.dataDir, { recursive: true, force: true });
+    await rm(config.logDir, { recursive: true, force: true });
   }
 
   printResult({
@@ -2635,6 +2639,7 @@ function resolveRelayHostForwardSupport(env = process.env) {
 
   try {
     const probe = spawnSync('happier', ['relay', 'host', '--help'], {
+      windowsHide: true,
       env,
       stdio: 'ignore',
       encoding: 'utf-8',

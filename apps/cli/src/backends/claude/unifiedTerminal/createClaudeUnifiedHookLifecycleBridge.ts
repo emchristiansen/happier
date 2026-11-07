@@ -10,6 +10,7 @@ import {
   createClaudeLocalLifecycleTracker,
   isClaudeTaskNotificationUserPromptHook,
 } from '../localControl/claudeLocalLifecycleTracker';
+import { isClaudeMainChainCompactBoundary } from '../localControl/readClaudeTranscriptTurnSignal';
 import {
   type createClaudeProviderActivityLedger,
 } from '../providerActivity/createClaudeProviderActivityLedger';
@@ -17,13 +18,14 @@ import type { createClaudeProviderRuntimeActivityAdapter } from '../providerActi
 import { isClaudeRuntimeAuthFailureEvidence } from '../connectedServices/classifyClaudeConnectedServiceRuntimeAuthFailure';
 import { containsDefinitiveClaudeOAuthRevocationEvidence } from '../connectedServices/surfaceClaudeRuntimeIssues';
 import {
-  mapClaudeRateLimitEventToUsageDetails,
+  mapClaudeProviderFailureToUsageDetails,
+  mapClaudeRateLimitEventToQuotaEvidence,
   mapClaudeStopFailureHookToUsageDetails,
   type NormalizedProviderUsageLimitDetailsV1,
 } from '../connectedServices/mapClaudeRateLimitEventToUsageDetails';
 import type { RawJSONLines } from '../types';
 import type { SessionHookData } from '../utils/startHookServer';
-import { isSidechainSessionHook } from '../utils/sessionHookAttribution';
+import { isLivePrimaryClaudeProviderHook, isSidechainSessionHook } from '../utils/sessionHookAttribution';
 import type {
   ClaudeUnifiedInputArbiter,
   ClaudeUnifiedPromptBatch,
@@ -35,13 +37,14 @@ import { isClaudeUnifiedTrustedHookActivationEvidence } from './claudeUnifiedHoo
 import { normalizeClaudeUnifiedPromptIdentityText } from './promptIdentity';
 
 export type ClaudeUnifiedSessionHookSubscription = (
-  callback: (data: SessionHookData) => void,
+  callback: (data: SessionHookData, observation?: Readonly<{ observedAt?: number; startupReplay?: true }>) => void,
 ) => (() => void) | null | undefined;
 
 export type ClaudeUnifiedHookLifecycleBridge = ClaudeUnifiedStartableDisposable & Readonly<{
   observeTranscript(message: RawJSONLines): void;
   observeLiveProviderActivityRow(message: unknown, expectedSessionId: string): void;
   handleProviderActivityObservationLoss(reason: string): void;
+  observeProcessExit(): void;
   settleAttemptLocalCommandCompleted(): Promise<void>;
   settleAttemptLocalCommandAborted(source: string): boolean;
 }>;
@@ -58,28 +61,30 @@ export type ClaudeUnifiedSessionEndEvent = Readonly<{
   source: string;
 }>;
 
-export type ClaudeUnifiedTurnStallScreenProbe = Readonly<{
-  quietMs: number;
-  maxAttempts?: number | undefined;
-  onStalled: () => void | Promise<void>;
-  /**
-   * Fired ONCE per stall episode when the bounded `maxAttempts` budget exhausts while the turn is
-   * still active-but-stuck (e.g. an API-retry loop that never reaches turn-terminal). Without it the
-   * mid-turn window went silently blind after the last attempt, so a dialog that surfaced late in the
-   * stuck turn (Fable safeguard chooser, incident cmr3dpuka) was never made user-visible. This is the
-   * mid-turn analog of the turn-end tail's one-shot `onStarvation` — same escalation discipline,
-   * never a silent stop. A genuine progress event re-arms the window and clears the latch.
-   */
-  onStarvation?: (() => void) | undefined;
-}>;
-
 /**
- * Result of a single turn-end dialog probe shot. `resolved` means the screen is clear or a dialog was
+ * Result of a single dialog screen probe shot. `resolved` means the screen is clear or a dialog was
  * surfaced/answered (episode complete — stop the tail). `pending` means a dialog is still visible but
  * not yet surfaced, or the probe could not run (keep re-arming through the bounded tail, then escalate
  * once). A `void`/`undefined` return is treated as `pending`.
  */
-export type ClaudeUnifiedTurnEndProbeOutcome = 'resolved' | 'pending';
+export type ClaudeUnifiedDialogProbeOutcome = 'resolved' | 'pending';
+
+export type ClaudeUnifiedTurnStallScreenProbe = Readonly<{
+  quietMs: number;
+  maxAttempts?: number | undefined;
+  onStalled: () => ClaudeUnifiedDialogProbeOutcome | void | Promise<ClaudeUnifiedDialogProbeOutcome | void>;
+  /**
+   * Fired ONCE per stall episode when the bounded `maxAttempts` budget exhausts while the turn is
+   * still active and the last probe reported `pending` (e.g. an API-retry loop that never reaches
+   * turn-terminal with a dialog the probe could not evaluate). Without it the mid-turn window went
+   * silently blind after the last attempt, so a dialog that surfaced late in the stuck turn (Fable
+   * safeguard chooser, incident cmr3dpuka) was never made user-visible. This is the mid-turn analog of
+   * the turn-end tail's one-shot `onStarvation` — same escalation discipline. A `resolved` last probe
+   * means the turn is merely quiet (long tool call, subagent, long generation) and stops the window
+   * without escalating. A genuine progress event re-arms the window and clears the latch.
+   */
+  onStarvation?: (() => void) | undefined;
+}>;
 
 /**
  * Idle-time dialog evaluation trigger (incident cmr377jsr). A queued control (e.g. `/effort`) can pop
@@ -97,7 +102,7 @@ export type ClaudeUnifiedTurnEndProbeOutcome = 'resolved' | 'pending';
  * cancelled when the next turn starts, on compaction start, and on dispose.
  */
 export type ClaudeUnifiedTurnEndScreenProbe = Readonly<{
-  onProbe: () => ClaudeUnifiedTurnEndProbeOutcome | void | Promise<ClaudeUnifiedTurnEndProbeOutcome | void>;
+  onProbe: () => ClaudeUnifiedDialogProbeOutcome | void | Promise<ClaudeUnifiedDialogProbeOutcome | void>;
   delaysMs: readonly number[];
   /**
    * Fired once per turn-end episode when the bounded re-arm tail exhausts with a dialog still
@@ -113,7 +118,7 @@ function disposeSubscription(dispose: (() => void) | null): void {
 }
 
 function readHookEventName(data: SessionHookData): string {
-  const raw = data.hook_event_name ?? data.hookEventName;
+  const raw = data.hook_event_name ?? data.hookEventName ?? data.eventName;
   return typeof raw === 'string' ? raw : '';
 }
 
@@ -129,12 +134,6 @@ function readHookRequestId(data: SessionHookData): string {
     || readHookString(data, 'id');
 }
 
-function readSystemSubtype(message: RawJSONLines): string {
-  if (message.type !== 'system') return '';
-  const raw = (message as Record<string, unknown>).subtype;
-  return typeof raw === 'string' ? raw : '';
-}
-
 export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   subscribeClaudeSessionHooks: ClaudeUnifiedSessionHookSubscription;
   arbiter: Pick<ClaudeUnifiedInputArbiter, 'observeLifecycle' | 'confirmPromptAcceptedByProvider' | 'drainWhenSafe'>
@@ -146,6 +145,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   onThinkingChange?: ((thinking: boolean) => void) | undefined;
   onReady?: (() => void | Promise<void>) | undefined;
   onUsageLimitDetails?: ((details: NormalizedProviderUsageLimitDetailsV1) => void | Promise<void>) | undefined;
+  onQuotaEvidence?: ((windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => void | Promise<void>) | undefined;
   onRuntimeAuthFailureEvent?: ((error: unknown) => void | Promise<void>) | undefined;
   onProviderPromptStarted?: (() => void | Promise<void>) | undefined;
   /**
@@ -166,6 +166,8 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   }>) => void) | undefined;
   onTrustedHookActivation?: (() => void) | undefined;
   onTrustedProviderProgress?: (() => void) | undefined;
+  onProviderEvent?: (() => void) | undefined;
+  readProviderSessionId?: (() => string | null) | undefined;
   /**
    * Authenticated primary-session lifecycle evidence that Claude may have changed the visible TUI.
    * The terminal screen controller remains the sole dialog owner; this is only an event-driven
@@ -189,6 +191,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   let turnStallAttempts = 0;
   let turnStallProbeInFlight = false;
   let turnStallEscalated = false;
+  let turnStallLastOutcome: ClaudeUnifiedDialogProbeOutcome = 'pending';
   let turnEndProbeTimer: NodeJS.Timeout | null = null;
   let turnEndProbeEscalated = false;
   // Bumped whenever the tail is cancelled/restarted so an in-flight async probe cannot re-arm or
@@ -197,7 +200,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   let terminalSideEffects: Promise<void> = Promise.resolve();
   let anonymousPermissionBlockCount = 0;
   let nativeResumeContinuationPending = false;
-  const pendingPermissionRequestIds = new Set<string>();
+  const permissionBlockCountByRequestId = new Map<string, number>();
 
   const clearQuietDrainTimer = (): void => {
     if (!quietDrainTimer) return;
@@ -226,6 +229,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
     if (!probe?.onStarvation) return;
     if (!turnStallActive || turnStallEscalated) return;
     if (turnStallAttempts < turnStallProbeMaxAttempts()) return;
+    if (turnStallLastOutcome !== 'pending') return;
     turnStallEscalated = true;
     try {
       probe.onStarvation();
@@ -238,10 +242,11 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
     const probe = opts.turnStallScreenProbe;
     if (!probe || !turnStallActive || turnStallProbeInFlight) return;
     if (turnStallAttempts >= turnStallProbeMaxAttempts()) {
-      // Budget exhausted while the turn is still active-but-stalled (e.g. an API-retry loop that never
-      // reaches turn-terminal). Rather than going silently blind, escalate ONCE per stall episode so a
-      // dialog surfacing in the stuck window is still made user-visible (mid-turn analog of the
-      // turn-end tail's one-shot starvation). A genuine progress event re-arms and clears the latch.
+      // Budget exhausted while the turn is still active. A quiet turn whose last probe found a clear
+      // screen (long tool call, subagent, long generation) just stops probing until progress re-arms
+      // it. Only a last probe that could not evaluate the screen or still sees an unsurfaced dialog
+      // escalates ONCE per stall episode (mid-turn analog of the turn-end tail's one-shot starvation),
+      // so a dialog surfacing in a stuck turn is still made user-visible.
       escalateTurnStallStarvation();
       return;
     }
@@ -252,7 +257,11 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
       turnStallAttempts += 1;
       turnStallProbeInFlight = true;
       Promise.resolve(probe.onStalled())
+        .then((outcome) => {
+          turnStallLastOutcome = outcome === 'resolved' ? 'resolved' : 'pending';
+        })
         .catch((error) => {
+          turnStallLastOutcome = 'pending';
           logger.debug('[unified]: Claude unified terminal turn-stall screen probe failed', error);
         })
         .finally(() => {
@@ -267,6 +276,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
     if (!opts.turnStallScreenProbe || !turnStallActive) return;
     turnStallAttempts = 0;
     turnStallEscalated = false;
+    turnStallLastOutcome = 'pending';
     scheduleTurnStallProbe();
   };
 
@@ -280,6 +290,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
     turnStallActive = false;
     turnStallAttempts = 0;
     turnStallEscalated = false;
+    turnStallLastOutcome = 'pending';
     clearTurnStallTimer();
   };
 
@@ -311,7 +322,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   const runTurnEndProbe = async (index: number, generation: number): Promise<void> => {
     const probe = opts.turnEndScreenProbe;
     if (!probe || disposed || generation !== turnEndProbeGeneration) return;
-    let outcome: ClaudeUnifiedTurnEndProbeOutcome = 'pending';
+    let outcome: ClaudeUnifiedDialogProbeOutcome = 'pending';
     try {
       outcome = (await probe.onProbe()) === 'resolved' ? 'resolved' : 'pending';
     } catch (error) {
@@ -427,13 +438,13 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   };
 
   const hasPendingPermissionBlock = (): boolean => (
-    anonymousPermissionBlockCount > 0 || pendingPermissionRequestIds.size > 0
+    anonymousPermissionBlockCount > 0 || permissionBlockCountByRequestId.size > 0
   );
 
   const observePermissionBlocked = (data: SessionHookData): void => {
     const requestId = readHookRequestId(data);
     if (requestId) {
-      pendingPermissionRequestIds.add(requestId);
+      permissionBlockCountByRequestId.set(requestId, (permissionBlockCountByRequestId.get(requestId) ?? 0) + 1);
     } else {
       anonymousPermissionBlockCount += 1;
     }
@@ -446,11 +457,17 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   ): void => {
     if (optsOverride?.releaseAll === true) {
       anonymousPermissionBlockCount = 0;
-      pendingPermissionRequestIds.clear();
+      permissionBlockCountByRequestId.clear();
     } else {
       const requestId = readHookRequestId(data);
       if (requestId) {
-        pendingPermissionRequestIds.delete(requestId);
+        const count = permissionBlockCountByRequestId.get(requestId) ?? 0;
+        // Each hook transport completes independently; PostToolUse proves the shared provider request ended.
+        if (readHookEventName(data) === 'PermissionRequestCompleted' && count > 1) {
+          permissionBlockCountByRequestId.set(requestId, count - 1);
+        } else {
+          permissionBlockCountByRequestId.delete(requestId);
+        }
       } else if (anonymousPermissionBlockCount > 0) {
         anonymousPermissionBlockCount -= 1;
       }
@@ -572,14 +589,17 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
         runtimeActivityAdapter: opts.runtimeActivityAdapter ?? null,
         providerActivityLedger: opts.providerActivityLedger,
       });
-      unsubscribe = opts.subscribeClaudeSessionHooks((data) => {
+      unsubscribe = opts.subscribeClaudeSessionHooks((data, observation) => {
         const hookEventName = readHookEventName(data);
+        // The workflow source resolves startup native identity and terminal ordering after replay.
+        if (hookEventName === 'SubagentStart' && observation?.startupReplay) return;
         // Sidechain (subagent) hooks carry an agent_id attribution. They must not
         // drive main-conversation lifecycle behavior: prompt acceptance, compaction
         // gating, turn-terminal projection, release-all permission unblocking, or
         // session end. Per-request permission accounting and account-level
         // StopFailure usage evidence remain valid from sidechains.
         const sidechain = isSidechainSessionHook(data);
+        if (!observation?.startupReplay && isLivePrimaryClaudeProviderHook(data, opts.readProviderSessionId?.())) opts.onProviderEvent?.();
         if (isClaudeUnifiedTrustedHookActivationEvidence(data)) {
           opts.onTrustedHookActivation?.();
         }
@@ -605,17 +625,16 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
             const submittedPrompt = readHookString(data, 'prompt');
             const normalizedSubmittedPrompt = normalizeClaudeUnifiedPromptIdentityText(submittedPrompt);
             if (normalizedSubmittedPrompt && opts.arbiter.confirmPromptAcceptedByProviderIf) {
-              // UserPromptSubmit is authenticated provider evidence. Correlate its exact prompt
-              // before waiting for turn-end arming: a queued steer may be submitted by Claude at
-              // the same boundary, with this hook arriving before any separate idle observation.
-              // Exact matching keeps terminal custody/output from settling a neighbor Pending row.
+              // Claude can emit UserPromptSubmit before a steer leaves its native queue. The
+              // arbiter preserves that custody until the ordered transcript proves consumption;
+              // an exact hook can still accept a prompt injected to start a new turn.
               let matchedBatch: ClaudeUnifiedPromptBatch | null = null;
               void opts.arbiter.confirmPromptAcceptedByProviderIf((batch) => {
                 const matches =
                   normalizeClaudeUnifiedPromptIdentityText(batch.message) === normalizedSubmittedPrompt;
                 if (matches) matchedBatch = batch;
                 return matches;
-              }).then((confirmed) => {
+              }, 'prompt_submit').then((confirmed) => {
                 if (!confirmed || !matchedBatch || !opts.onAcceptedPromptSubmitEvidence) return;
                 const sessionId = readHookString(data, 'session_id') || readHookString(data, 'sessionId');
                 const promptId = readHookString(data, 'prompt_id') || readHookString(data, 'promptId');
@@ -646,6 +665,11 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
           }
         } else if (hookEventName === 'PermissionRequest') {
           observePermissionBlocked(data);
+          if (!sidechain) {
+            void Promise.resolve(opts.onMainSessionScreenMayHaveChanged?.()).catch((error) => {
+              logger.infoFile('[unified]: Native permission screen observation failed', error);
+            });
+          }
         } else if (
           hookEventName === 'PostToolUse'
           || hookEventName === 'PermissionRequestCompleted'
@@ -680,13 +704,17 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
     },
     observeTranscript(message) {
       noteTurnStallProgress();
-      if (readSystemSubtype(message) === 'compact_boundary') {
+      if (isClaudeMainChainCompactBoundary(message)) {
         observeCompactionCompleted();
       }
       if (isClaudeRuntimeAuthFailureEvidence(message)) {
         chainTerminalSideEffect('runtime-auth', () => opts.onRuntimeAuthFailureEvent?.(message));
       }
-      const usageLimitDetails = mapClaudeRateLimitEventToUsageDetails(message);
+      const quotaEvidence = mapClaudeRateLimitEventToQuotaEvidence(message);
+      if (quotaEvidence.length > 0) {
+        chainTerminalSideEffect('quota-evidence', () => opts.onQuotaEvidence?.(quotaEvidence));
+      }
+      const usageLimitDetails = mapClaudeProviderFailureToUsageDetails(message);
       if (usageLimitDetails) {
         chainTerminalSideEffect('usage-limit', () => opts.onUsageLimitDetails?.(usageLimitDetails));
       }
@@ -697,6 +725,17 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
     },
     handleProviderActivityObservationLoss(reason) {
       tracker?.handleProviderActivityObservationLoss(reason);
+    },
+    observeProcessExit() {
+      if (tracker) {
+        tracker.observeProcessExit({ providerStopped: true });
+      } else {
+        // Owned process exit may arrive before observer startup or after lifecycle disposal
+        // during teardown. The captured adapter still enforces the session runtime binding.
+        void opts.runtimeActivityAdapter?.handleRuntimeLoss('claude_process_exit', { providerStopped: true }).catch((error) => {
+          logger.debug('[unified]: Claude process-exit activity observation failed', error);
+        });
+      }
     },
     settleAttemptLocalCommandCompleted: settleCompletedTurn,
     settleAttemptLocalCommandAborted(source) {

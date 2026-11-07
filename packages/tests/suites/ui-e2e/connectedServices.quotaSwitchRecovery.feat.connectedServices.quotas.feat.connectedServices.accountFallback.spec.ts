@@ -5,13 +5,23 @@ import { join, resolve } from 'node:path';
 
 import {
     buildConnectedServiceCredentialRecord,
+    buildUsageLimitIssueFingerprint,
+    buildProviderAccountUsageRecordId,
+    ProviderAccountUsageSnapshotV1Schema,
+    sealProviderAccountUsageSnapshot,
     sealAccountScopedBlobCiphertext,
     type ConnectedServiceId,
     type ConnectedServiceCredentialHealthV1,
     type SessionRuntimeIssueV1,
+    type SessionUsageLimitRecoveryOperationResultV1,
+    type ConnectedServiceQuotaRecoveryCreditConsumeResponseV1,
 } from '@happier-dev/protocol';
+import { RPC_METHODS, SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 import { seedCliAuthForServer } from '../../src/testkit/cliAuth';
+import { upsertEncryptedAccountSettingsV2 } from '../../src/testkit/accountSettings';
+import { registerMachineIdentity } from '../../src/testkit/machineIdentity';
+import { encryptLegacyBase64 } from '../../src/testkit/messageCrypto';
 import { startTestDaemon, type StartedDaemon } from '../../src/testkit/daemon/daemon';
 import { decryptLegacyBase64Normalized } from '../../src/testkit/decryptLegacyBase64Normalized';
 import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
@@ -20,6 +30,8 @@ import { startServerLight, type StartedServer } from '../../src/testkit/process/
 import { startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
 import { createRunDirs } from '../../src/testkit/runDir';
 import { fetchMessagesPage, fetchSessionV2 } from '../../src/testkit/sessions';
+import { createMachineBoundSessionScopedSocketCollector } from '../../src/testkit/sessionSocketBinding';
+import type { SocketCollector } from '../../src/testkit/socketClient';
 import { waitFor } from '../../src/testkit/timing';
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
 import { setUiFeatureToggle } from '../../src/testkit/uiE2e/setUiFeatureToggle';
@@ -27,6 +39,9 @@ import { waitForInitialAppUi } from '../../src/testkit/uiE2e/waitForInitialAppUi
 import { ensureAccountReadyForConnect } from '../../src/testkit/uiE2e/ensureAccountReadyForConnect';
 import { CLAUDE_CODE_E2E_OAUTH_SCOPE } from '../../src/testkit/connectedServicesRecovery';
 import { waitForDaemonMachineIdFromCliSettings } from '../../src/testkit/uiE2e/daemonMachineId';
+import { appendBrowserDiagnostics, collectBrowserDiagnostics } from '../../src/testkit/uiE2e/browserDiagnostics';
+import { readUiE2eScopedAccountSettings } from '../../src/testkit/uiE2e/scopedAccountSettingsStorage';
+import { attachRelayMachineRpcTap } from '../../src/testkit/uiE2e/desktopSetup/relayMachineRpcTap';
 
 const run = createRunDirs({ runLabel: 'ui-e2e' });
 const CONNECTED_SERVICE_FEATURE_ENV = {
@@ -170,6 +185,7 @@ async function createPlainSession(params: Readonly<{
     token: string;
     codexBackendMode?: 'appServer' | 'exec';
     providerUsageSourceKind?: string;
+    metadata?: Readonly<Record<string, unknown>>;
 }>): Promise<string> {
     const response = await fetchJson<{ session?: { id?: unknown } }>(`${params.baseUrl}/v1/sessions`, {
         method: 'POST',
@@ -185,6 +201,7 @@ async function createPlainSession(params: Readonly<{
                 path: '/tmp/provider-quota-ui-e2e',
                 flavor: 'codex',
                 codexBackendMode: params.codexBackendMode ?? 'appServer',
+                ...params.metadata,
                 sessionProviderUsageV1: {
                     v: 1,
                     serviceId: 'openai-codex',
@@ -531,8 +548,10 @@ async function publishProviderUsageRuntimeIssue(params: Readonly<{
     profileId?: string;
     groupId?: string;
     groupExhausted?: boolean;
+    occurredAtMs?: number;
+    recoverability?: 'wait' | 'switch_account';
 }>): Promise<void> {
-    const occurredAt = Date.now();
+    const occurredAt = params.occurredAtMs ?? Date.now();
     const turnId = `turn-${randomUUID()}`;
     const serviceId = params.serviceId ?? 'openai-codex';
     const profileId = params.profileId ?? 'primary';
@@ -551,7 +570,7 @@ async function publishProviderUsageRuntimeIssue(params: Readonly<{
             resetAtMs: occurredAt + 3_600_000,
             retryAfterMs: 3_600_000,
             quotaScope: 'account',
-            recoverability: 'switch_account',
+            recoverability: params.recoverability ?? 'switch_account',
             limitCategory: 'usage_limit',
             quotaSnapshotRef: {
                 serviceId,
@@ -637,6 +656,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
             env: {
                 ...process.env,
                 EXPO_PUBLIC_DEBUG: '1',
+                EXPO_PUBLIC_HAPPIER_SOCKET_FORCE_WEBSOCKET: '1',
                 EXPO_PUBLIC_HAPPY_SERVER_URL: server.baseUrl,
                 EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: `e2e-connected-services-quota-recovery-${run.runId}`,
             },
@@ -652,7 +672,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('shows the provider quota composer badge and remaining-first popover', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
 
         await page.setViewportSize({ width: 1440, height: 900 });
@@ -676,8 +696,199 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
         await expect(popover.getByTestId('agent-input-provider-usage-meter:daily')).toContainText(/44%/);
     });
 
+    test('keeps ready recovery actionable when automatic resume prompts are off', async ({ page }) => {
+        test.setTimeout(180_000);
+        if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
+        const diagnostics = collectBrowserDiagnostics({ page });
+        const tap = await attachRelayMachineRpcTap(page);
+        let runtimePublisher: SocketCollector | null = null;
+        try {
+            await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/?happier_hmr=0`, 180_000);
+            await waitForInitialAppUi({ page, timeoutMs: 180_000 });
+            await createAccountIfNeeded(page);
+            await enableConnectedServiceQuotaUi({ page, baseUrl: uiBaseUrl });
+            const auth = await readLegacyAuthCredentialsFromBrowserStorage(page);
+            await upsertEncryptedAccountSettingsV2({
+                baseUrl: server.baseUrl, token: auth.token, secret: auth.secret,
+                settings: {
+                    ...await readUiE2eScopedAccountSettings({ page }),
+                    usageLimitRecoverySettingsV1: { v: 1, mode: 'ask', resumePromptMode: 'off' },
+                },
+            });
+            const sessionId = await createPlainSession({ baseUrl: server.baseUrl, token: auth.token });
+            await publishProviderUsageRuntimeIssue({ baseUrl: server.baseUrl, token: auth.token, sessionId, recoverability: 'wait' });
+            const result = { ok: true, status: 'ready', sessionId, resumePromptMode: 'off' } satisfies SessionUsageLimitRecoveryOperationResultV1;
+            tap.setMethodResponse({ method: `${sessionId}:${SESSION_RPC_METHODS.SESSION_USAGE_LIMIT_CHECK_NOW}`, ack: { ok: true, result } });
+
+            await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionId}?happier_hmr=0`, 180_000);
+            await expect(page.getByTestId('session-usageLimit-recovery-checkNow')).toBeVisible({ timeout: 60_000 });
+            const publisher = await createMachineBoundSessionScopedSocketCollector({ baseUrl: server.baseUrl, token: auth.token, sessionId });
+            runtimePublisher = publisher.socket;
+            publisher.socket.connect();
+            await waitFor(async () => publisher.socket.isConnected(), { timeoutMs: 20_000, context: 'connect recovery runtime presence fixture' });
+            publisher.socket.emit('session-alive', { sid: sessionId, time: Date.now(), thinking: false });
+            await waitFor(async () => (await fetchSessionV2(server!.baseUrl, auth.token, sessionId)).active === true, {
+                timeoutMs: 20_000, context: 'persist active recovery runtime presence',
+            });
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            await expect(page.getByTestId('session-usageLimit-recovery-checkNow')).toBeVisible({ timeout: 60_000 });
+            expect((await fetchSessionV2(server.baseUrl, auth.token, sessionId)).active).toBe(true);
+            await page.getByTestId('session-usageLimit-recovery-checkNow').click();
+            await expect(page.getByTestId('session-usageLimit-recovery')).toBeVisible();
+            await expect(page.getByTestId('session-usageLimit-recovery-resumeNow')).toBeVisible();
+            await expect(page.getByTestId('session-usageLimit-status-badge')).toContainText('Ready');
+            expect(tap.calls().some((call) => call.injected && call.method.endsWith(`:${SESSION_RPC_METHODS.SESSION_USAGE_LIMIT_CHECK_NOW}`))).toBe(true);
+            const messages = await fetchMessagesPage({ baseUrl: server.baseUrl, token: auth.token, sessionId, afterSeq: 0 });
+            expect(messages.messages).toHaveLength(0);
+        } catch (error) {
+            throw appendBrowserDiagnostics(error, diagnostics());
+        } finally {
+            runtimePublisher?.close();
+        }
+    });
+
+    test('settles Apply reset after a rejected connected-service credit operation', async ({ page }) => {
+        test.setTimeout(180_000);
+        if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
+        const diagnostics = collectBrowserDiagnostics({ page });
+        const tap = await attachRelayMachineRpcTap(page);
+        try {
+            await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/?happier_hmr=0`, 180_000);
+            await waitForInitialAppUi({ page, timeoutMs: 180_000 });
+            await createAccountIfNeeded(page);
+            await enableConnectedServiceQuotaUi({ page, baseUrl: uiBaseUrl });
+            const auth = await readLegacyAuthCredentialsFromBrowserStorage(page);
+            const machine = await registerMachineIdentity({
+                baseUrl: server.baseUrl, token: auth.token, dataEncryptionKey: null,
+                metadata: encryptLegacyBase64({ host: 'recovery-fixture', platform: 'linux', homeDir: '/tmp', happyCliVersion: '0.2.0' }, auth.secret),
+            });
+            expect(machine.status).toBe(200);
+            const occurredAt = Date.now();
+            const issue: SessionRuntimeIssueV1 = {
+                v: 1, scope: 'primary_session', status: 'failed', code: 'provider_usage_limit',
+                source: 'usage_limit', provider: 'codex', occurredAt,
+                usageLimit: { v: 1, resetAtMs: occurredAt + 3_600_000, retryAfterMs: 3_600_000, quotaScope: 'account', recoverability: 'wait' },
+            };
+            const sessionId = await createPlainSession({
+                baseUrl: server.baseUrl, token: auth.token,
+                metadata: {
+                    machineId: machine.machineId,
+                    sessionUsageLimitRecoveryV1: {
+                        v: 1, status: 'paused', issueFingerprint: buildUsageLimitIssueFingerprint(issue), armedAtMs: occurredAt,
+                        resetAtMs: occurredAt + 3_600_000, nextCheckAtMs: null, attemptCount: 0, maxAttempts: 0,
+                        lastProbeError: null, resumePromptMode: 'off', selectedAuth: { kind: 'profile', serviceId: 'openai-codex', profileId: 'primary' },
+                        recoveryCredits: { kind: 'usage_limit_resets', availableCount: 1, credits: [{ kind: 'usage_limit_reset', status: 'available' }] },
+                    },
+                },
+            });
+            await publishProviderUsageRuntimeIssue({ baseUrl: server.baseUrl, token: auth.token, sessionId, occurredAtMs: occurredAt, recoverability: 'wait' });
+            const result = { ok: false, errorCode: 'no_recovery_credit_available', error: 'No reset credit is available.' } satisfies ConnectedServiceQuotaRecoveryCreditConsumeResponseV1;
+            tap.setMethodResponse({
+                method: `${machine.machineId}:${RPC_METHODS.DAEMON_CONNECTED_SERVICE_QUOTA_RECOVERY_CREDIT_CONSUME}`,
+                ack: { ok: true, result: encryptLegacyBase64(result, auth.secret) },
+            });
+
+            await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionId}?happier_hmr=0`, 180_000);
+            const applyReset = page.getByTestId('session-usageLimit-recovery-consumeResetCredit');
+            await expect(applyReset).toBeVisible({ timeout: 60_000 });
+            await applyReset.click();
+            await expect(page.getByRole('dialog')).toBeVisible();
+            await page.getByRole('button', { name: 'OK', exact: true }).click();
+            await expect(applyReset).toBeEnabled();
+            await expect(page.getByTestId('session-usageLimit-recovery')).toBeVisible();
+            await expect(page.getByTestId('session-usageLimit-status-badge')).not.toContainText('Checking');
+            expect(tap.calls().some((call) => call.injected && call.method.endsWith(`:${RPC_METHODS.DAEMON_CONNECTED_SERVICE_QUOTA_RECOVERY_CREDIT_CONSUME}`))).toBe(true);
+        } catch (error) {
+            throw appendBrowserDiagnostics(error, diagnostics());
+        }
+    });
+
+    test('shows saved Claude resets with unavailable status without allowing consumption', async ({ page }) => {
+        test.setTimeout(180_000);
+        if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
+        const diagnostics = collectBrowserDiagnostics({ page });
+        try {
+            await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/?happier_hmr=0`, 180_000);
+            await waitForInitialAppUi({ page, timeoutMs: 180_000 });
+            await createAccountIfNeeded(page);
+            await enableConnectedServiceQuotaUi({ page, baseUrl: uiBaseUrl });
+            const auth = await readLegacyAuthCredentialsFromBrowserStorage(page);
+            const serviceId = 'claude-subscription' satisfies ConnectedServiceId;
+            const profileId = `saved-reset-${run.runId}`;
+            await createConnectedServiceProfile({
+                baseUrl: server.baseUrl, token: auth.token, secret: auth.secret,
+                serviceId, profileId, providerEmail: 'saved-reset@example.test',
+            });
+            const now = Date.now();
+            const recordKey = {
+                providerId: 'claude', accountSubjectId: `acct-${profileId}`,
+                subjectKind: 'account' as const, quotaScope: 'account' as const,
+            };
+            const snapshot = ProviderAccountUsageSnapshotV1Schema.parse({
+                v: 1, recordId: buildProviderAccountUsageRecordId(recordKey), recordKey,
+                providerId: recordKey.providerId, accountSubject: { kind: 'providerSubject', id: recordKey.accountSubjectId },
+                observedAtMs: now, fetchedAtMs: now, staleAfterMs: 60_000,
+                source: 'connectedServiceProbe', confidence: 'confirmed', state: 'loaded_data',
+                meters: [{
+                    meterId: 'weekly', label: 'Weekly', used: 88, limit: 100, unit: 'count',
+                    utilizationPct: 88, resetsAt: now + 3_600_000, status: 'ok',
+                    details: { providerLimitId: 'seven_day' },
+                }],
+                recoveryCredits: {
+                    kind: 'usage_limit_resets', availableCount: 0,
+                    credits: [{ providerCreditId: 'saved-reset', kind: 'rate_limit_reset', status: 'unknown', expiresAtMs: now + 86_400_000 }],
+                },
+                recoveryCreditDetails: {
+                    'saved-reset': {
+                        remainingCount: 2,
+                        appliesToProviderLimitIds: ['seven_day', 'provider_future_window'],
+                        unavailableReason: 'ineligible',
+                    },
+                },
+            });
+            const write = await fetchJson<{ success?: boolean }>(`${server.baseUrl}/v2/connect/provider-account-usage/${snapshot.recordId}`, {
+                method: 'POST', headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    recordKey,
+                    sealed: sealProviderAccountUsageSnapshot({ material: { type: 'legacy', secret: auth.secret }, snapshot, randomBytes }),
+                    metadata: { fetchedAt: now, staleAfterMs: snapshot.staleAfterMs, status: 'ok' },
+                    source: { serviceId, profileId, bindingKind: 'profile' },
+                }),
+                timeoutMs: 20_000,
+            });
+            expect(write.status).toBe(200);
+            expect(write.data?.success).toBe(true);
+
+            const root = `account-block:${profileId}`;
+            const assertSavedReset = async () => {
+                const header = page.getByTestId(`${root}:header`);
+                await expect(header).toBeVisible({ timeout: 60_000 });
+                await expect(page.getByTestId(`${root}:reset-row:saved-reset`)).toBeVisible({ timeout: 60_000 });
+                await expect(page.getByTestId(`${root}:reset-count:saved-reset`)).toContainText('2');
+                await expect(page.getByTestId(`${root}:reset-applies-to:saved-reset`)).toContainText('Weekly');
+                await expect(page.getByTestId(`${root}:reset-applies-to:saved-reset`)).toContainText('provider_future_window');
+                await expect(page.getByTestId(`${root}:reset-unavailable:saved-reset`)).toContainText('Not eligible');
+                await expect(page.getByTestId(`${root}:reset-use:saved-reset`)).toBeDisabled();
+                await expect(page.getByTestId(`${root}:meter:weekly`)).toBeVisible();
+                await expect(page.getByTestId(`${root}:quota-error`)).toHaveCount(0);
+            };
+            await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/settings/connected-services/${serviceId}?happier_hmr=0`, 180_000);
+            await assertSavedReset();
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            await assertSavedReset();
+            const use = page.getByTestId(`${root}:reset-use:saved-reset`);
+            await use.evaluate((element) => (element as HTMLElement).focus());
+            await page.keyboard.press('Enter');
+            await page.keyboard.press('Space');
+            await assertSavedReset();
+            await expect(page.getByRole('dialog')).toHaveCount(0);
+        } catch (error) {
+            throw appendBrowserDiagnostics(error, diagnostics());
+        }
+    });
+
     test('renders connected-service switch event rows and notification topic controls', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
         await page.setViewportSize({ width: 1440, height: 900 });
         await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/?happier_hmr=0`, 180_000);
@@ -732,7 +943,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('routes reconnect-required connected profiles through the same profile identity', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
 
         const serviceId = 'claude-subscription' satisfies ConnectedServiceId;
@@ -831,7 +1042,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('shows connected-service restart status before inactive resume status', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
 
         const serviceId = 'claude-subscription' satisfies ConnectedServiceId;
@@ -888,7 +1099,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('records a switch event emitted by the real auth-group switch path', async ({ page }) => {
-        test.setTimeout(720_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
 
         const serviceId = 'claude-subscription' satisfies ConnectedServiceId;
@@ -1027,7 +1238,7 @@ test.describe('ui e2e: connected-service quota switch and recovery surfaces', ()
     });
 
     test('hides app-server quota affordances for non-app-server Codex sessions', async ({ page }) => {
-        test.setTimeout(540_000);
+        test.setTimeout(180_000);
         if (!server || !uiBaseUrl) throw new Error('missing ui e2e fixtures');
         await page.setViewportSize({ width: 1440, height: 900 });
         await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/?happier_hmr=0`, 180_000);

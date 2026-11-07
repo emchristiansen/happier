@@ -38,7 +38,7 @@ describe('listBuiltInHappierTools', () => {
     expect(names).toContain('review_start');
   });
 
-  it('keeps only bootstrap tools directly exposed to session agents by default', async () => {
+  it('keeps bootstrap and execution-run observation tools directly exposed to session agents by default', async () => {
     const { listBuiltInHappierTools } = await import('./listBuiltInHappierTools');
     const names = listBuiltInHappierTools({ surface: 'session_agent' }).map((tool) => tool.name);
 
@@ -48,12 +48,14 @@ describe('listBuiltInHappierTools', () => {
       'action_spec_get',
       'action_options_resolve',
       'action_execute',
+      'execution_run_list',
+      'execution_run_get',
+      'execution_run_wait',
     ]));
     expect(names).not.toContain('review_start');
     expect(names).not.toContain('subagents_plan_start');
     expect(names).not.toContain('subagents_delegate_start');
     expect(names).not.toContain('execution_run_start');
-    expect(names).not.toContain('execution_run_get');
     expect(names).not.toContain('execution_run_action');
     expect(names).not.toContain('agents_backends_list');
     expect(names).not.toContain('session_list');

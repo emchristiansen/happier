@@ -7,6 +7,7 @@ import {
   type BugReportCommandDependencies,
   type BugReportCommandResult,
 } from '@/diagnostics/bugReportCommandCore';
+import { fail } from '@happier-dev/cli-common/output';
 
 async function handleBugReportCommand(args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) {
@@ -15,6 +16,14 @@ async function handleBugReportCommand(args: string[]): Promise<void> {
   }
 
   const result = await runBugReportCommand(args);
+  if (result.mode === 'exported') {
+    console.log(chalk.green('✓ Diagnostics exported'));
+    console.log(chalk.gray(`  File: ${result.outputPath}`));
+    console.log(chalk.gray(`  Diagnostics included: ${result.diagnosticsIncluded ? 'yes' : 'no'}`));
+    console.log(chalk.gray(`  Artifacts: ${result.artifactCount}`));
+    return;
+  }
+
   if (result.mode === 'fallback') {
     const reasonLine = result.reason === 'submit-failed'
       ? 'Bug report submission failed. You can still file the issue manually using this fallback URL:'
@@ -44,7 +53,7 @@ export async function handleBugReportCliCommand(context: CommandContext): Promis
       console.log(bugReportUsage());
       return;
     }
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }

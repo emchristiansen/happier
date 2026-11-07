@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SDKMessage, SDKUserMessage } from '@/backends/claude/sdk';
 import type { EnhancedMode } from './loop';
+import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
 
 const mockQuery = vi.fn();
 const ensureJavaScriptRuntimeExecutableMock = vi.fn(async () => '/managed/js-runtime');
@@ -51,10 +52,7 @@ vi.mock('./utils/resolveClaudeCliPath', () => ({
 type RemoteOptions = Parameters<(typeof import('./claudeRemote'))['claudeRemote']>[0];
 type QueryCall = Readonly<{
   prompt?: AsyncIterable<SDKUserMessage>;
-  onPromptTransportOutcome?: (
-    message: SDKUserMessage,
-    outcome: 'accepted' | 'rejected_before_effect' | 'effect_may_have_occurred',
-  ) => void;
+  onMessageReceived?: (message: SDKMessage) => void;
   options?: Readonly<{
     resume?: string;
     continue?: boolean;
@@ -112,6 +110,44 @@ describe('claudeRemote', () => {
     ensureJavaScriptRuntimeExecutableMock.mockResolvedValue('/managed/js-runtime');
     resolveClaudeCliPathMock.mockReset();
     resolveClaudeCliPathMock.mockReturnValue('/resolved/claude-cli.js');
+  });
+
+
+  it('does not refresh turn silence from replay, foreign sessions or sidechain SDK traffic', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const notices: unknown[] = [];
+    const lifecycle = createSessionTurnLifecycle({ sessionId: 'legacy-happier', enqueueSessionTurn: async () => {},
+      turnStallWarnMs: 100, onTurnStallNotice: notice => notices.push(notice) });
+    // The Claude SDK query is the boundary; its callback and turn observer remain real.
+    mockQuery.mockImplementation((config: QueryCall) => ({
+      async *[Symbol.asyncIterator]() {
+        config.onMessageReceived?.(systemInitMessage('native-main'));
+        // Stdout can advance ahead of the iterator while transcript work is pending.
+        config.onMessageReceived?.({ type: 'system', subtype: 'compact_boundary', session_id: 'native-compacted' });
+        yield systemInitMessage('native-main');
+        await vi.advanceTimersByTimeAsync(75);
+        config.onMessageReceived?.({ type: 'assistant', session_id: 'native-compacted', message: { role: 'assistant', content: [] } });
+        await vi.advanceTimersByTimeAsync(99);
+        expect(notices).toEqual([]);
+        config.onMessageReceived?.({ type: 'assistant', session_id: 'foreign', message: { role: 'assistant', content: [] } });
+        config.onMessageReceived?.({ type: 'assistant', session_id: 'native-compacted', parent_tool_use_id: 'child', message: { role: 'assistant', content: [] } });
+        config.onMessageReceived?.({ type: 'assistant', session_id: 'native-compacted', isSidechain: true, message: { role: 'assistant', content: [] } });
+        config.onMessageReceived?.({ type: 'assistant', session_id: 'native-compacted', isReplay: true, message: { role: 'assistant', content: [] } });
+        await vi.advanceTimersByTimeAsync(1);
+        expect(notices).toHaveLength(1);
+        expect(notices[0]).toMatchObject({ lastEventAgeMs: 100 });
+        yield resultMessage();
+      },
+    }));
+    try {
+      await lifecycle.beginTurn({ provider: 'claude' });
+      const { claudeRemote } = await import('./claudeRemote');
+      await claudeRemote(createBaseOptions({ onProviderEvent: () => lifecycle.observeProviderTurnEvent() }));
+    } finally {
+      await lifecycle.endSession();
+      vi.useRealTimers();
+    }
   });
 
   it('keeps resume sessionId even if claudeCheckSession returns false (avoid false-negative context loss)', async () => {
@@ -241,20 +277,20 @@ describe('claudeRemote', () => {
 
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
     expect(call?.options?.extraArgs).toEqual([
+      '--replay-user-messages',
       '--plugin-dir',
       '/tmp/happier-hook-plugin',
     ]);
     expect((call?.options as any)?.canCallTool).toBeUndefined();
   });
 
-  it('confirms provider acceptance after the legacy SDK reports successful prompt transport', async () => {
+  it('confirms provider acceptance from the legacy native input acknowledgment', async () => {
     const onPromptAcceptedByProvider = vi.fn();
     mockQuery.mockImplementation((config: QueryCall & { prompt: AsyncIterable<SDKUserMessage> }) => ({
       async *[Symbol.asyncIterator]() {
         const consumed = await config.prompt[Symbol.asyncIterator]().next();
-        if (!consumed.done) {
-          config.onPromptTransportOutcome?.(consumed.value, 'accepted');
-        }
+        if (consumed.done) throw new Error('expected prompt input');
+        config.onMessageReceived?.({ ...consumed.value, isReplay: true, session_id: 'native-session' });
         yield resultMessage();
       },
     }));
@@ -329,6 +365,7 @@ describe('claudeRemote', () => {
 
   it('forwards the resolved Claude config dir override into the remote launcher env', async () => {
     mockQuery.mockReturnValue(messageStream(resultMessage()));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', '');
     vi.stubEnv('HAPPIER_CLAUDE_CONFIG_DIR', '/tmp/happier-claude-config');
     vi.unstubAllGlobals();
 
@@ -375,8 +412,9 @@ describe('claudeRemote', () => {
 
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
-    expect(call?.options?.extraArgs?.[0]).toBe('--mcp-config');
-    const configPath = call?.options?.extraArgs?.[1];
+    const mcpIndex = call?.options?.extraArgs?.indexOf('--mcp-config') ?? -1;
+    expect(mcpIndex).toBeGreaterThanOrEqual(0);
+    const configPath = call?.options?.extraArgs?.[mcpIndex + 1];
     expect(configPath).not.toBe(mcpRaw);
     expect(JSON.stringify(call?.options?.extraArgs)).not.toContain('server.mjs');
     await expect(stat(configPath!)).rejects.toMatchObject({ code: 'ENOENT' });
@@ -397,7 +435,7 @@ describe('claudeRemote', () => {
 
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
-    const materializedArg = call?.options?.extraArgs?.[0];
+    const materializedArg = call?.options?.extraArgs?.find(value => value.startsWith('--mcp-config='));
     expect(materializedArg).toMatch(/^--mcp-config=.+/);
     expect(materializedArg).not.toBe(arg);
     expect(materializedArg).not.toContain('server.mjs');
@@ -430,12 +468,32 @@ describe('claudeRemote', () => {
   });
 
   it('injects --effort when the mode specifies a non-default reasoningEffort', async () => {
-    mockQuery.mockReturnValue(messageStream(resultMessage()));
+    const onEffectiveModel = vi.fn();
+    mockQuery.mockImplementation((config: QueryCall) => ({
+      async *[Symbol.asyncIterator]() {
+        const init = { ...systemInitMessage('effort-init'), model: 'claude-opus-4-6' };
+        config.onMessageReceived?.(init);
+        yield init;
+        expect(onEffectiveModel).not.toHaveBeenCalled();
+        const assistant: SDKMessage = { type: 'assistant', message: {
+          role: 'assistant', model: 'claude-opus-4-6', content: [{ type: 'text', text: 'Response' }],
+        } };
+        config.onMessageReceived?.(assistant);
+        yield assistant;
+        const nextAssistant: SDKMessage = { type: 'assistant', message: {
+          role: 'assistant', model: 'claude-next', content: [{ type: 'text', text: 'Next response' }],
+        } };
+        config.onMessageReceived?.(nextAssistant);
+        yield nextAssistant;
+        yield resultMessage();
+      },
+    }));
 
     const { claudeRemote } = await import('./claudeRemote');
 
     await claudeRemote(
       createBaseOptions({
+        onEffectiveModel,
         nextMessage: async () => ({
           message: 'hello',
           mode: defaultMode({ model: 'claude-opus-4-6', reasoningEffort: 'medium' }),
@@ -445,7 +503,9 @@ describe('claudeRemote', () => {
 
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
-    expect(call?.options?.extraArgs).toEqual(['--effort', 'medium']);
+    expect(call?.options?.extraArgs).toEqual(['--replay-user-messages', '--effort', 'medium']);
+    expect(onEffectiveModel).toHaveBeenCalledWith({ modelId: 'claude-opus-4-6', reasoningEffort: 'medium' });
+    expect(onEffectiveModel).toHaveBeenLastCalledWith({ modelId: 'claude-next' });
   });
 
   it('injects --effort high for Opus 4.7 because xhigh is the model default', async () => {
@@ -464,7 +524,7 @@ describe('claudeRemote', () => {
 
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
-    expect(call?.options?.extraArgs).toEqual(['--effort', 'high']);
+    expect(call?.options?.extraArgs).toEqual(['--replay-user-messages', '--effort', 'high']);
   });
 
   it('injects Claude Code experimental Agent Teams env var when enabled on the mode', async () => {
@@ -530,7 +590,7 @@ describe('claudeRemote', () => {
 
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
-    expect(call?.options?.extraArgs).toEqual(['--setting-sources', 'project']);
+    expect(call?.options?.extraArgs).toEqual(['--replay-user-messages', '--setting-sources', 'project']);
   });
 
   it('does not force --setting-sources when claudeRemoteSettingSourcesV2 selects all sources', async () => {
@@ -549,7 +609,7 @@ describe('claudeRemote', () => {
 
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
-    expect(call?.options?.extraArgs).toBeUndefined();
+    expect(call?.options?.extraArgs).toEqual(['--replay-user-messages']);
   });
 
   it('does not forward an invalid --setting-sources override when claudeRemoteSettingSourcesV2 selects no sources', async () => {
@@ -568,7 +628,7 @@ describe('claudeRemote', () => {
 
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
-    expect(call?.options?.extraArgs).toBeUndefined();
+    expect(call?.options?.extraArgs).toEqual(['--replay-user-messages']);
   });
 
   it('does not forward a legacy "none" setting-sources override to the Claude Code CLI', async () => {
@@ -587,7 +647,7 @@ describe('claudeRemote', () => {
 
     expect(mockQuery).toHaveBeenCalledTimes(1);
     const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
-    expect(call?.options?.extraArgs).toBeUndefined();
+    expect(call?.options?.extraArgs).toEqual(['--replay-user-messages']);
   });
 
   it('appends Happier MCP config after user MCP config while keeping both payloads out of argv', async () => {

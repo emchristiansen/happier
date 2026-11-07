@@ -210,7 +210,10 @@ describe('maybeAutoUpdateNotice', () => {
     }
   });
 
-  it('does not print an update notice for self commands when argv includes flag values', () => {
+  it.each([
+    ['existing flag', ['--config', '/path/to/config']],
+    ['runtime context', ['--runtime-context', Buffer.from(JSON.stringify({ HAPPIER_HOME_DIR: '/sentinel/home' })).toString('base64url')]],
+  ] as const)('does not print an update notice for self commands after a %s prefix', (_kind, prefix) => {
     withUpdateHomeDir((homeDir) => {
       const output = captureConsoleText();
       try {
@@ -230,7 +233,7 @@ describe('maybeAutoUpdateNotice', () => {
         const spawnDetached = vi.fn();
 
         maybeAutoUpdateNotice({
-          argv: ['--config', '/path/to/config', 'self', 'check'],
+          argv: [...prefix, 'self', 'check'],
           isTTY: true,
           homeDir,
           cliRootDir: '/repo/apps/cli',

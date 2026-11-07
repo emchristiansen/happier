@@ -35,6 +35,75 @@ import {
   resolveSelfHostServerInstallFromReleaseParams,
 } from './self_host_runtime.mjs';
 import { buildServiceDefinition, resolveServiceBackend } from './utils/service/service_manager.mjs';
+import { buildStackHarnessEnv, writeFakeBin } from './testkit/core/fake_bin_harness.mjs';
+import { runNodeCaptureSync } from './testkit/core/run_node_capture.mjs';
+import { createTempFixture } from './testkit/core/temp_fixture.mjs';
+
+test('self-host uninstall preserves payload and retained data when service teardown fails', async (t) => {
+  const fixture = await createTempFixture(t, { prefix: 'happier-self-host-uninstall-refusal-' });
+  const installRoot = fixture.path('install');
+  const configDir = fixture.path('config');
+  const dataDir = fixture.path('data');
+  const logDir = fixture.path('logs');
+  const serverBinaryName = process.platform === 'win32' ? 'happier-server.exe' : 'happier-server';
+  const retainedFiles = [
+    join(installRoot, 'bin', serverBinaryName),
+    join(installRoot, 'self-host-state.json'),
+    join(configDir, 'server.env'),
+    join(dataDir, 'retained-data'),
+    join(logDir, 'server.err.log'),
+  ];
+  for (const file of retainedFiles) {
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, 'retained\n', 'utf8');
+  }
+  const command = process.platform === 'win32' ? 'powershell.exe' : process.platform === 'darwin' ? 'launchctl' : 'systemctl';
+  const { binDir } = writeFakeBin({ root: fixture.path('commands'), name: command, content: '' });
+  const serviceName = 'happier-self-host-uninstall-refusal';
+  const moduleUrl = new URL('./self_host_runtime.mjs', import.meta.url).href;
+  const result = runNodeCaptureSync(['--input-type=module', '--eval', [
+    'import childProcess from "node:child_process";',
+    'import os from "node:os";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    // Only OS command execution and the OS home-directory adapter are replaced.
+    // The CLI dispatcher, service registration inspection, teardown and filesystem stay real.
+    'os.homedir = () => process.env.HAPPIER_TEST_SELF_HOST_HOME;',
+    'const spawnSync = childProcess.spawnSync;',
+    'childProcess.spawnSync = (command, args, options) => {',
+    '  if (command === "sh" && args[0] === "-lc" && args[1]?.startsWith("command -v ")) return spawnSync(command, args, options);',
+    `  if (command !== ${JSON.stringify(command)} && command !== "schtasks") throw new Error("Unexpected OS command: " + command);`,
+    '  const raw = args.join(" ");',
+    `  const serverTarget = args.includes(${JSON.stringify(`${serviceName}.service`)}) || raw.includes(${JSON.stringify(`/${serviceName}`)}) || raw.includes(${JSON.stringify(`$taskName = "${serviceName}"`)});`,
+    '  const inspecting = args.includes("show") || args[0] === "print" || (raw.includes("Get-ScheduledTaskInfo") && !raw.includes("Stop-ScheduledTask"));',
+    '  if (serverTarget && !inspecting) return { status: 1, stdout: "", stderr: "self-host teardown denied sentinel" };',
+    '  return { status: 0, stdout: command === "powershell.exe" ? JSON.stringify({ exists: true }) : "loaded", stderr: "" };',
+    '};',
+    'syncBuiltinESMExports();',
+    `const { runSelfHostCli } = await import(${JSON.stringify(moduleUrl)});`,
+    'await runSelfHostCli(["uninstall", "--mode=user", "--yes", "--purge-data", "--json"]);',
+  ].join('\n')], {
+    env: buildStackHarnessEnv({
+      binDirs: [binDir],
+      extraEnv: {
+        HAPPIER_TEST_SELF_HOST_HOME: fixture.path('home'),
+        HAPPIER_STACK_SELF_HOST_FORWARD: '0',
+        HAPPIER_SELF_HOST_INSTALL_ROOT: installRoot,
+        HAPPIER_SELF_HOST_BIN_DIR: fixture.path('exposed-bin'),
+        HAPPIER_SELF_HOST_CONFIG_DIR: configDir,
+        HAPPIER_SELF_HOST_DATA_DIR: dataDir,
+        HAPPIER_SELF_HOST_LOG_DIR: logDir,
+        HAPPIER_SELF_HOST_SERVICE_NAME: serviceName,
+      },
+    }),
+  });
+
+  assert.equal(result.status, 1, result.stderr || result.stdout);
+  assert.match(result.stderr, /self-host teardown denied sentinel/);
+  assert.doesNotMatch(result.stdout, /"ok"\s*:\s*true/);
+  for (const file of retainedFiles) {
+    assert.equal(await readFile(file, 'utf8'), 'retained\n');
+  }
+});
 
 function b64(buf) {
   return Buffer.from(buf).toString('base64');
@@ -90,6 +159,82 @@ async function createLocalSelfHostRuntimePayloadRoot({ rootDir, binaryName, bina
   await writeFile(binaryPath, binaryText, 'utf-8');
   await chmod(binaryPath, 0o755);
   return binaryPath;
+}
+
+for (const { action, registrationFails = false } of [
+  { action: 'install' },
+  { action: 'update' },
+  { action: 'rollback' },
+  { action: 'rollback', registrationFails: true },
+]) {
+  test(`self-host ${action}${registrationFails ? ' after registration failure' : ''} checks health without starting the installed service a second time`, { skip: process.platform !== 'linux' }, async (t) => {
+    const fixture = await createTempFixture(t, { prefix: 'happier-self-host-single-start-' });
+    const sourceBinaryPath = await createLocalSelfHostRuntimePayloadRoot({
+      rootDir: fixture.path('payload'),
+      binaryName: 'happier-server',
+    });
+    const commandLog = fixture.path('commands.jsonl');
+    const serviceName = 'happier-self-host-single-start';
+    if (action === 'update') {
+      await mkdir(fixture.path('config'), { recursive: true });
+      await writeFile(fixture.path('config', 'server.env'), 'PORT=42347\n');
+    }
+    if (action === 'rollback') {
+      await mkdir(fixture.path('install', 'bin'), { recursive: true });
+      await writeFile(fixture.path('install', 'bin', 'happier-server.previous'), 'previous-runtime\n');
+    }
+    const moduleUrl = new URL('./self_host_runtime.mjs', import.meta.url).href;
+    const result = runNodeCaptureSync(['--input-type=module', '--eval', [
+      'import childProcess from "node:child_process";',
+      'import os from "node:os";',
+      'import { appendFileSync } from "node:fs";',
+      'import { syncBuiltinESMExports } from "node:module";',
+      // Replace OS commands, home discovery and HTTP only; execute the real install
+      // dispatcher, payload promotion, service planner and health orchestration.
+      'os.homedir = () => process.env.HAPPIER_TEST_SELF_HOST_HOME;',
+      'childProcess.spawnSync = (command, args) => {',
+      '  appendFileSync(process.env.HAPPIER_TEST_COMMAND_LOG, JSON.stringify({ command, args }) + "\\n");',
+      '  if (command === "sh" && args[0] === "-lc" && args[1]?.startsWith("command -v ")) return { status: 0, stdout: "/fixture/bin", stderr: "" };',
+      '  if (command !== "systemctl" && !args.includes("--migrate-only")) throw new Error("Unexpected OS command: " + command);',
+      `  if (${registrationFails} && command === "systemctl" && args.includes("daemon-reload")) return { status: 1, stdout: "", stderr: "registration failure sentinel" };`,
+      '  return { status: 0, stdout: "", stderr: "" };',
+      '};',
+      'globalThis.fetch = async (url) => {',
+      '  appendFileSync(process.env.HAPPIER_TEST_COMMAND_LOG, JSON.stringify({ url }) + "\\n");',
+      '  return { ok: true, json: async () => ({ ok: true }) };',
+      '};',
+      'syncBuiltinESMExports();',
+      `const { runSelfHostCli } = await import(${JSON.stringify(moduleUrl)});`,
+      `await runSelfHostCli([${JSON.stringify(action)}, "--mode=user", "--non-interactive", "--without-cli", "--without-ui", "--json"]);`,
+    ].join('\n')], {
+      env: buildStackHarnessEnv({
+        extraEnv: {
+          HAPPIER_TEST_SELF_HOST_HOME: fixture.path('home'),
+          HAPPIER_TEST_COMMAND_LOG: commandLog,
+          HAPPIER_STACK_SELF_HOST_FORWARD: '0',
+          HAPPIER_SELF_HOST_INSTALL_ROOT: fixture.path('install'),
+          HAPPIER_SELF_HOST_BIN_DIR: fixture.path('exposed-bin'),
+          HAPPIER_SELF_HOST_CONFIG_DIR: fixture.path('config'),
+          HAPPIER_SELF_HOST_DATA_DIR: fixture.path('data'),
+          HAPPIER_SELF_HOST_LOG_DIR: fixture.path('logs'),
+          HAPPIER_SELF_HOST_SERVICE_NAME: serviceName,
+          HAPPIER_SELF_HOST_SERVER_BINARY: sourceBinaryPath,
+          HAPPIER_SELF_HOST_AUTO_UPDATE: '0',
+          HAPPIER_WITH_UI: '0',
+          HAPPIER_SERVER_PORT: '42347',
+        },
+      }),
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout).ok, true);
+    const commands = (await readFile(commandLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    const serverStarts = commands.filter(({ command, args }) => command === 'systemctl'
+      && args.includes(`${serviceName}.service`)
+      && (args.includes('start') || args.includes('restart')));
+    assert.equal(serverStarts.length, 1, 'installation owns the only service start before health verification');
+    assert.ok(commands.indexOf(serverStarts[0]) < commands.findIndex(({ url }) => url === 'http://127.0.0.1:42347/v1/version'), 'health is verified after service installation starts it');
+  });
 }
 
 test('local self-host runtime promotion exposes the server-embedded UI to the post-promote owner', async (t) => {

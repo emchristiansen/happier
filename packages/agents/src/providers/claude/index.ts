@@ -53,3 +53,5 @@ export {
   CLAUDE_OAUTH_TOKEN_URL,
   type ClaudeOauthEntitlementMetadata,
 } from './oauthProfile.js';
+
+export { isClaudeInternalEventType } from './internalEventTypes.js';

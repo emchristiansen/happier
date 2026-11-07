@@ -10,9 +10,19 @@ import {
 } from '@/sync/domains/pets/companionSizeScale';
 import {
     DEFAULT_THEME_PROFILES_LOCAL_STATE,
+    ThemeProfileSelectionSchema,
     ThemeProfilesLocalStateSchema,
 } from '@/theme/profiles/themeProfilePersistence';
 import { SessionListFocusedFolderV1Schema } from '@/sync/domains/session/folders';
+import { AccountPetDesktopOverlayVisibilityModeSchema } from '../account/accountPetSettingDefinitions';
+import {
+    DEFAULT_LOADING_INDICATOR_PAUSE_ID,
+    DEFAULT_LOADING_INDICATOR_SPEED_ID,
+    DEFAULT_LOADING_INDICATOR_STYLE_ID,
+    LoadingIndicatorPauseIdSchema,
+    LoadingIndicatorSpeedIdSchema,
+    LoadingIndicatorStyleIdSchema,
+} from './loadingIndicatorStyleSetting';
 import {
     SESSION_LIST_FOLDER_SORT_MODE_DEFAULT_V1,
     SESSION_LIST_FOLDER_SORT_MODES_V1,
@@ -56,7 +66,7 @@ function serializePetCompanionSizeScaleBucket(value: number): 'small' | 'default
     return 'xlarge';
 }
 
-const PetEnabledOverrideSchema = z.enum(['inherit', 'enabled', 'disabled']);
+export const PetEnabledOverrideSchema = z.enum(['inherit', 'enabled', 'disabled']);
 const PetSelectedOverrideSchema = z.discriminatedUnion('kind', [
     z.object({ kind: z.literal('inherit') }),
     z.object({
@@ -68,13 +78,11 @@ const PetSelectedOverrideSchema = z.discriminatedUnion('kind', [
         sourceKey: z.string().min(1),
     }),
 ]);
-const DesktopPetOverlayVisibilityModeOverrideSchema = z.enum([
+export const DesktopPetOverlayVisibilityModeOverrideSchema = z.enum([
     'inherit',
-    'attentionOrActive',
-    'alwaysWhenEnabled',
-    'attentionOnly',
+    ...AccountPetDesktopOverlayVisibilityModeSchema.options,
 ]);
-const DesktopPetOverlayAnchorSchema = z.enum(['bottomRight', 'bottomLeft', 'topRight', 'topLeft']);
+export const DesktopPetOverlayAnchorSchema = z.enum(['bottomRight', 'bottomLeft', 'topRight', 'topLeft']);
 const DesktopPetOverlayOffsetSchema = z.object({
     x: z.number(),
     y: z.number(),
@@ -160,13 +168,38 @@ export const LOCAL_SETTING_DEFINITIONS = defineSettingDefinitions({
     themeProfiles: {
         schema: ThemeProfilesLocalStateSchema,
         default: DEFAULT_THEME_PROFILES_LOCAL_STATE,
-        description: 'Local custom theme profiles and active profile selection',
+        description: 'Legacy device theme library retained until account migration succeeds',
+        storageScope: 'local',
+    },
+    themeProfileSelection: {
+        schema: ThemeProfileSelectionSchema.nullable(),
+        default: null,
+        description: 'Active light and dark theme profile IDs on this device',
+        storageScope: 'local',
+    },
+    themeProfileLegacyAccountScope: {
+        schema: z.object({ serverId: z.string(), accountId: z.string() }).nullable().catch(null),
+        default: null,
+        description: 'Account receiving the legacy device theme library during migration',
         storageScope: 'local',
     },
     uiBackdropBlurEnabled: {
         schema: z.boolean(),
         default: true,
         description: 'Enable backdrop blur effects behind modals and overlay menus',
+        storageScope: 'local',
+    },
+    hapticsEnabled: {
+        schema: z.boolean().catch(true),
+        default: true,
+        description: 'Enable haptic feedback on this device',
+        storageScope: 'local',
+    },
+    systemTabBarEnabled: {
+        // A malformed/newer value must not reset every other device preference.
+        schema: z.boolean().catch(true),
+        default: true,
+        description: 'Show tabs in the system side rail on supported iOS windows',
         storageScope: 'local',
     },
     uiContentWidthMode: {
@@ -202,6 +235,27 @@ export const LOCAL_SETTING_DEFINITIONS = defineSettingDefinitions({
         schema: z.enum(['comfortable', 'cozy', 'compact']),
         default: 'cozy',
         description: 'Preferred item density for Item-based UI rows',
+        storageScope: 'local',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'device_user' },
+    },
+    loadingIndicatorStyle: {
+        schema: LoadingIndicatorStyleIdSchema,
+        default: DEFAULT_LOADING_INDICATOR_STYLE_ID,
+        description: 'Which loading indicator spinners draw: a dotted Happier mark or H, or the classic ring',
+        storageScope: 'local',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'device_user' },
+    },
+    loadingIndicatorSpeed: {
+        schema: LoadingIndicatorSpeedIdSchema,
+        default: DEFAULT_LOADING_INDICATOR_SPEED_ID,
+        description: 'How fast dot loading indicators play: slow, normal or fast',
+        storageScope: 'local',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'device_user' },
+    },
+    loadingIndicatorPause: {
+        schema: LoadingIndicatorPauseIdSchema,
+        default: DEFAULT_LOADING_INDICATOR_PAUSE_ID,
+        description: 'How long dot loading indicators rest between loops: none, short or long',
         storageScope: 'local',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'device_user' },
     },
@@ -390,6 +444,19 @@ export const LOCAL_SETTING_DEFINITIONS = defineSettingDefinitions({
         description: 'Discover Codex pet packages from local Codex homes on this device',
         storageScope: 'local',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'device_user' },
+    },
+    desktopAlwaysMoveDefaultFollowingService: {
+        schema: z.boolean(),
+        default: false,
+        description: 'Move this device\u2019s default-following background service with the selected default relay without asking',
+        storageScope: 'local',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'device_user' },
+    },
+    desktopKeptBackgroundService: {
+        schema: z.object({ relayKey: z.string().min(1), accountId: z.string().min(1).nullable() }).nullable().catch(null),
+        default: null,
+        description: 'The background service this device chose to keep as it is: its relay and account (D5)',
+        storageScope: 'local',
     },
     desktopPetOverlayEnabledOverride: {
         schema: PetEnabledOverrideSchema,

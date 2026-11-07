@@ -69,6 +69,8 @@ function readNormalizedOrganizationState(state: SessionOrganizationDomain): Norm
         tagsByTagKey: state.sessionOrganizationTagsByTagKey,
         tagAssignmentsBySessionKey: state.sessionOrganizationTagAssignmentsBySessionKey,
         attentionStandingsBySessionKey: state.sessionOrganizationAttentionStandingsBySessionKey,
+        appearancesBySessionKey: state.sessionOrganizationAppearancesBySessionKey,
+        sessionAppearancesSupportedByServerId: state.sessionOrganizationSessionAppearancesSupportedByServerId,
         orderEntriesByScopeKey: state.sessionOrganizationOrderEntriesByScopeKey,
         labelsByLabelKey: state.sessionOrganizationLabelsByLabelKey,
     };
@@ -151,7 +153,13 @@ describe('attention standing reaches the visible session list through the real c
         });
 
         const policy = buildPolicyFromStore(harness.get(), false);
-        expect(policy.overridesBySessionKey).toEqual({ [`${SERVER_ID}:${SESSION_ID}`]: true });
+        expect(policy.overridesBySessionKey).toEqual({
+            [`${SERVER_ID}:${SESSION_ID}`]: {
+                sessionId: SESSION_ID,
+                standing: true,
+                updatedAt: NOW,
+            },
+        });
 
         expect(renderRows(policy)).toEqual([
             'h:attention',

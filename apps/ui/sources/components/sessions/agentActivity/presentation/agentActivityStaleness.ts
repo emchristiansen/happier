@@ -52,6 +52,7 @@ const PROGRESS_CLAIMING_STATUSES: ReadonlySet<AgentActivityStatusV1> = new Set([
  */
 export type AgentActivityStalenessInput = Readonly<{
     status: AgentActivityStatusV1;
+    isActive?: boolean;
     /** Last moment we have evidence of activity, epoch ms. Absent means no claim is made. */
     updatedAtMs?: number | null;
     /** Terminal instant. Present means the work is over and silence means nothing. */
@@ -61,6 +62,7 @@ export type AgentActivityStalenessInput = Readonly<{
 type StalenessInput = AgentActivityStalenessInput;
 
 function readSilenceStartMs(input: StalenessInput): number | null {
+    if (input.isActive === false) return null;
     if (readTimestamp(input.endedAtMs) != null) return null;
     if (!PROGRESS_CLAIMING_STATUSES.has(input.status)) return null;
     return readTimestamp(input.updatedAtMs);

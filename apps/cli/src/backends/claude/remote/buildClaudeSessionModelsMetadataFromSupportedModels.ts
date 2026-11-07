@@ -139,6 +139,7 @@ function readNewestClaudeSessionModelsState(metadata: Metadata | null | undefine
 export type ClaudeCurrentModelFacts = Readonly<{
     name?: string | undefined;
     contextWindowTokens?: number | undefined;
+    reasoningEffort?: string | undefined;
 }>;
 
 function normalizePositiveTokens(value: unknown): number | null {
@@ -176,6 +177,7 @@ function upsertCurrentModelEntry(params: Readonly<{
 
 export function buildClaudeSessionModelsMetadataWithCurrentModelId(params: Readonly<{
     currentModelId: unknown;
+    reconcileModels?: typeof reconcileClaudeSessionModelsState;
     metadata: Metadata | null | undefined;
     nowMs?: () => number;
     currentModel?: ClaudeCurrentModelFacts | undefined;
@@ -190,20 +192,42 @@ export function buildClaudeSessionModelsMetadataWithCurrentModelId(params: Reado
     const existingAcpState = existingSessionState;
 
     const contextWindowTokens = normalizePositiveTokens(params.currentModel?.contextWindowTokens);
+    const reasoningEffort = normalizeNonEmptyString(params.currentModel?.reasoningEffort);
+    if (params.reconcileModels) {
+        const currentModel = {
+            id: currentModelId,
+            name: providers.claude.normalizeClaudeModelDisplayName(params.currentModel?.name, currentModelId),
+            ...(contextWindowTokens !== null ? { contextWindowTokens } : {}),
+            ...(reasoningEffort ? { modelOptions: [{ id: 'reasoning_effort', name: 'Thinking', type: 'select', currentValue: reasoningEffort }] } : {}),
+        };
+        const state = params.reconcileModels({
+            metadata: params.metadata,
+            source: 'current_model',
+            incomingState: {
+                v: 1, provider: 'claude', currentModelId,
+                updatedAt: params.nowMs ? params.nowMs() : Date.now(),
+                availableModels: [currentModel],
+            },
+        });
+        return { sessionModelsV1: state, acpSessionModelsV1: state };
+    }
     const windowAlreadyReflected = contextWindowTokens === null || (
         findModelEntry(existingSessionState, currentModelId)?.contextWindowTokens === contextWindowTokens
         && findModelEntry(existingAcpState, currentModelId)?.contextWindowTokens === contextWindowTokens
+    );
+    const effortAlreadyReflected = !reasoningEffort || (
+        findModelEntry(existingSessionState, currentModelId)?.modelOptions?.find(option => option.id === 'reasoning_effort')?.currentValue === reasoningEffort
     );
 
     if (
         existingSessionState?.currentModelId === currentModelId &&
         existingAcpState?.currentModelId === currentModelId &&
-        windowAlreadyReflected
+        windowAlreadyReflected && effortAlreadyReflected
     ) {
         return null;
     }
 
-    const updatedAt = params.nowMs ? params.nowMs() : Date.now();
+    const updatedAt = existingState?.updatedAt ?? 0;
     const currentModelName = providers.claude.normalizeClaudeModelDisplayName(
         params.currentModel?.name,
         currentModelId,
@@ -223,8 +247,7 @@ export function buildClaudeSessionModelsMetadataWithCurrentModelId(params: Reado
                 currentModelId,
                 availableModels: [],
             };
-        if (contextWindowTokens === null) return base;
-        return {
+        const withContext = contextWindowTokens === null ? base : {
             ...base,
             availableModels: upsertCurrentModelEntry({
                 availableModels: Array.isArray(base.availableModels) ? base.availableModels : [],
@@ -233,6 +256,10 @@ export function buildClaudeSessionModelsMetadataWithCurrentModelId(params: Reado
                 contextWindowTokens,
             }),
         };
+        if (!reasoningEffort) return withContext;
+        return { ...withContext, availableModels: withContext.availableModels.map(model => model.id === currentModelId && model.modelOptions
+            ? { ...model, modelOptions: model.modelOptions.map(option => option.id === 'reasoning_effort' ? { ...option, currentValue: reasoningEffort } : option) }
+            : model) };
     };
 
     return {
@@ -243,6 +270,7 @@ export function buildClaudeSessionModelsMetadataWithCurrentModelId(params: Reado
 
 export function buildClaudeSessionModelsMetadataFromSupportedModels(params: Readonly<{
     modelsRaw: unknown;
+    reconcileModels?: typeof reconcileClaudeSessionModelsState;
     metadata: Metadata | null | undefined;
     nowMs?: () => number;
 }>): Pick<Metadata, 'sessionModelsV1' | 'acpSessionModelsV1'> | null {
@@ -251,12 +279,12 @@ export function buildClaudeSessionModelsMetadataFromSupportedModels(params: Read
     const availableModels = params.modelsRaw
         .map((model) => normalizeSupportedModel(model))
         .filter((model): model is SessionModelEntry => model !== null);
-    if (availableModels.length === 0) return null;
+    if (params.modelsRaw.length > 0 && availableModels.length === 0) return null;
 
     const updatedAt = params.nowMs ? params.nowMs() : Date.now();
     const currentModelId = resolveCurrentModelId(params.metadata);
 
-    const state = reconcileClaudeSessionModelsState({
+    const state = (params.reconcileModels ?? reconcileClaudeSessionModelsState)({
       metadata: params.metadata,
       source: 'agent_sdk',
       incomingState: {

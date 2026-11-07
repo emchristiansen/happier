@@ -8,6 +8,7 @@ import { createV2SessionListVisibilityWhere } from "@/app/api/routes/session/v2S
 import {
     createSessionOrganizationSnapshot,
     mapSessionAttentionStanding,
+    mapSessionAppearance,
     mapSessionOrganizationFolder,
     mapSessionOrganizationLabel,
     mapSessionOrganizationOrderEntry,
@@ -129,6 +130,7 @@ export async function fetchSessionOrganizationSnapshot(params: Readonly<{
         orderEntries,
         labels,
         attentionStandings,
+        sessionAppearances,
     ] = await Promise.all([
         db.sessionOrganizationCheckpoint.findUnique({
             where: { accountId: params.accountId },
@@ -220,7 +222,17 @@ export async function fetchSessionOrganizationSnapshot(params: Readonly<{
                     session: createVisibleUnarchivedOrganizationSessionWhere(params.accountId),
                 },
                 orderBy: { sessionId: "asc" },
-                select: { sessionId: true, standing: true, updatedAt: true },
+                select: { sessionId: true, standing: true, remindAt: true, updatedAt: true },
+            })
+            : Promise.resolve(null),
+        params.request.includeSessionAppearances
+            ? db.sessionAppearance.findMany({
+                where: {
+                    accountId: params.accountId,
+                    session: createVisibleUnarchivedOrganizationSessionWhere(params.accountId),
+                },
+                orderBy: { sessionId: "asc" },
+                select: { sessionId: true, displayDbValue: true, updatedAt: true },
             })
             : Promise.resolve(null),
     ]);
@@ -247,6 +259,16 @@ export async function fetchSessionOrganizationSnapshot(params: Readonly<{
         tagAssignments: [...groupedTagAssignments.entries()].map(([sessionId, tagIds]) => ({ sessionId, tagIds })),
         orderEntries: validOrderEntries.map(mapSessionOrganizationOrderEntry),
         labels: labels.map(mapSessionOrganizationLabel),
-        ...(attentionStandings ? { attentionStandings: attentionStandings.map(mapSessionAttentionStanding) } : {}),
+        ...(sessionAppearances ? { sessionAppearances: sessionAppearances.map(mapSessionAppearance) } : {}),
+        ...(attentionStandings ? {
+            attentionStandings: attentionStandings.map((row) => {
+                const mapped = mapSessionAttentionStanding(row);
+                if (params.request.includeAttentionReminderTimes) return mapped;
+                if (row.remindAt && row.remindAt.getTime() > Date.now()) {
+                    return { sessionId: mapped.sessionId, standing: false, updatedAt: mapped.updatedAt };
+                }
+                return { sessionId: mapped.sessionId, standing: mapped.standing, updatedAt: mapped.updatedAt };
+            }),
+        } : {}),
     });
 }

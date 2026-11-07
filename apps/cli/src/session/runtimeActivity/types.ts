@@ -1,10 +1,9 @@
 import type { SessionRuntimeActivitySnapshot } from '@happier-dev/protocol';
-import { SessionRuntimeActivitySnapshotSchema } from '@happier-dev/protocol';
 
 export type RuntimeActivityApplicability = 'supported' | 'unavailable' | 'not_applicable';
 export type RuntimeActivitySlot = 'agentRuntime' | 'executionRuns';
 
-export const SessionRuntimeActivityContributionSchema = SessionRuntimeActivitySnapshotSchema;
+export { SessionRuntimeActivitySnapshotSchema as SessionRuntimeActivityContributionSchema } from '@happier-dev/protocol';
 
 export type SessionRuntimeActivityContribution = SessionRuntimeActivitySnapshot;
 

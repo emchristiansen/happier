@@ -199,12 +199,12 @@ describe('resolveSessionAgentContinuationEligibility', () => {
         }
     });
 
-    it('blocks a configured ACP backend whose contract is not proven', () => {
+    it('offers a configured ACP backend only when its exact inspection proves support', () => {
         expect(resolveSessionAgentContinuationEligibility({
             entry: configuredAcpEntry(),
             source: eligibleSource,
             inspection: SUPPORTED,
-        })).toEqual({ status: 'unavailable', kind: 'local', reason: 'target_not_proven' });
+        })).toEqual({ status: 'eligible' });
     });
 
     it('answers about this Session before answering about the target', () => {

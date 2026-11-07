@@ -32,6 +32,8 @@ const claudeConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCrede
     // Retain the existing no-restart policy for credential refresh. Ordinary Agent SDK
     // runner selection does not prove getOAuthToken callback support or live credential
     // adoption; capability reporting must not infer either from this policy.
+    // Group account switches also apply mid-turn through the shared generation writer/verifier:
+    // the in-flight request finishes on the old account, and the next request uses the new one.
     noRestartRequiredServiceIds: ['claude-subscription'],
   },
   predictiveSoftSwitch: {
@@ -48,7 +50,7 @@ const claudeConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCrede
   sharedGenerationApplicationServiceIds: ['claude-subscription'],
   runtimeAuthApply: {
     directLiveHotAuth: {
-      supportsInTurnApply: false,
+      supportsInTurnApply: true,
       requiresExactRuntimeIdentity: false,
       refreshSelectionResync: 'not_applicable',
       authMode: {
@@ -88,6 +90,7 @@ export const agent = {
   getConnectedServiceCredentialLifecycleDescriptor: async () => claudeConnectedServiceCredentialLifecycleDescriptor,
   getConnectedServiceStateSharingDescriptor: async () => claudeConnectedServiceStateSharingDescriptor,
   connectedServiceQuotaFetcherDescriptor: claudeSubscriptionQuotaFetcherDescriptor,
+  guardedQuotaRecoveryServiceId: 'claude-subscription',
   getSessionUsageLimitRecoveryControlAdapter: async () => claudeUsageLimitRecoveryControlAdapter,
   getSessionGoalControlAdapter: async () => (await import('./goalControl/claudeGoalControlAdapter')).claudeGoalControlAdapter,
   resolveConnectedServiceSwitchContinuity: async (params) => await resolveClaudeConnectedServiceSwitchContinuity(params),
@@ -105,6 +108,8 @@ export const agent = {
       targetStrict: input.targetStrict === true,
     }),
   getDirectSessionProviderOps: async () => (await import('@/backends/claude/directSessions/providerOps')).claudeDirectSessionProviderOps,
+  resolveAgentNativeSessionLogPath: async (input) =>
+    await (await import('@/backends/claude/utils/resolveClaudeNativeSessionLogPath')).resolveClaudeNativeSessionLogPath(input),
   onTerminalAttachmentRetired: async ({ happyHomeDir, sessionId, attachmentInfo }) => {
     const result = await (await import('./endpointRecovery/claudeEndpointArtifacts'))
       .retireClaudeEndpointArtifactsForTerminalAttachment({
@@ -121,6 +126,8 @@ export const agent = {
       .hasClaudeEndpointDescriptorForSession(params),
   vendorResumeSupport: AGENTS_CORE.claude.resume.vendorResume,
   buildRuntimeLocalHandoffMetadata: buildClaudeRuntimeLocalHandoffMetadata,
+  resolveExistingSessionHandoffState: async (params) =>
+    await (await import('./sessionHandoff/resolveExistingSessionHandoffState')).resolveExistingClaudeSessionHandoffState(params),
   needsAccountSettingsForProbes: true,
   resolveModelsProbeVariant: ({ connectedServices }) => {
     const binding = connectedServices?.bindingsByServiceId?.['claude-subscription'];

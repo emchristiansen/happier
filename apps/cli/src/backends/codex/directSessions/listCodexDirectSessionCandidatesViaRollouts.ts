@@ -8,7 +8,9 @@ import { deriveDirectSessionActivityFromTimestamp } from '@/api/directSessions/a
 import { mapWithConcurrency } from '@/api/directSessions/discovery/mapWithConcurrency';
 
 import { readCodexSessionMetaFromRollout } from '../localControl/rolloutDiscovery';
+import { parseCodexRolloutFilename } from '../utils/codexSessionFiles';
 import { readCodexSessionTitleFromRollout } from './readCodexSessionTitleFromRollout';
+import { isCodexGuardianReviewSource } from './isCodexGuardianReviewSource';
 import type { CodexDirectSessionHomeEntry } from './resolveCodexHomeEntriesForDirectSessionsSource';
 import { resolveCodexHomeEntriesForDirectSessionsSource } from './resolveCodexHomeEntriesForDirectSessionsSource';
 
@@ -68,10 +70,26 @@ async function collectRolloutFiles(params: Readonly<{
   return out;
 }
 
-function parseResumeIdFromRolloutFilename(filePath: string): string | null {
-  const name = basename(filePath);
-  const match = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)\.jsonl$/i.exec(name);
-  return match ? match[1] : null;
+/** Codex app-server resume accepts canonical UUID thread IDs. */
+function isCanonicalCodexThreadId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+/** Reads the resumable thread UUID from either supported rollout filename form. */
+/** Resolves a rollout to a validated Codex thread ID without exposing arbitrary filename suffixes. */
+async function resolveResumeIdFromRolloutFile(filePath: string): Promise<string | null> {
+  const filename = parseCodexRolloutFilename(filePath);
+  if (!filename) return null;
+  const metadata = await readCodexSessionMetaFromRollout(filePath);
+  if (isCodexGuardianReviewSource(metadata?.source)) return null;
+
+  // Codex rollout filenames end with the thread UUID, optionally followed by a turn UUID for
+  // continuations (`<thread>_<turn>`). Both filename forms identify the resumable thread directly.
+  // Other suffixes need metadata to prove the ID; never expose an unresolved suffix as a resume ID.
+  if (filename.threadId) return filename.threadId;
+
+  const metadataId = typeof metadata?.id === 'string' ? metadata.id.trim() : '';
+  return isCanonicalCodexThreadId(metadataId) ? metadataId : null;
 }
 
 function parseRolloutTimestampMs(filePath: string): number {
@@ -189,8 +207,10 @@ export async function listCodexDirectSessionCandidatesViaRollouts(params: Readon
         ...(await collectRolloutFiles({ rootDir: join(homeEntry.codexHome, 'sessions'), maxDepth: 10, archived: false, filenameIncludes })),
         ...(await collectRolloutFiles({ rootDir: join(homeEntry.codexHome, 'archived_sessions'), maxDepth: 10, archived: true, filenameIncludes })),
       ];
-      for (const entry of files) {
-        const resumeId = parseResumeIdFromRolloutFilename(entry.filePath);
+      const resumeIds = await mapWithConcurrency(files, resolveRolloutSearchBuildConcurrency(env),
+        (entry) => resolveResumeIdFromRolloutFile(entry.filePath));
+      for (const [index, entry] of files.entries()) {
+        const resumeId = resumeIds[index];
         if (!resumeId) continue;
         const existing = grouped.get(resumeId);
         const entrySortMs = parseRolloutTimestampMs(entry.filePath);
@@ -238,21 +258,15 @@ export async function listCodexDirectSessionCandidatesViaRollouts(params: Readon
     );
   }
 
-  if (searchTerm && canSearchRolloutFilename(searchTerm)) {
+  if (searchTerm && canSearchRolloutFilename(searchTerm) && (params.searchMode === 'fast' || isCanonicalCodexThreadId(searchTerm))) {
     const filenameMatches = await collectGroupedCandidates(searchTerm);
     if (filenameMatches.length > 0) {
       const pageEntries = filenameMatches.slice(offset, offset + requestedLimit);
       const candidates = await buildCandidates(pageEntries);
       const exactIdMatch = filenameMatches.some(({ remoteSessionId }) => remoteSessionId.toLowerCase() === searchTerm);
-      return {
-        candidates,
-        totalCount: filenameMatches.length,
-        searchIncomplete: params.searchMode === 'fast' && !exactIdMatch,
-      };
+      return { candidates, totalCount: filenameMatches.length, searchIncomplete: !exactIdMatch };
     }
-    if (params.searchMode === 'fast') {
-      return { candidates: [], totalCount: 0, searchIncomplete: true };
-    }
+    return { candidates: [], totalCount: 0, searchIncomplete: true };
   }
 
   const groupedCandidates = await collectGroupedCandidates();

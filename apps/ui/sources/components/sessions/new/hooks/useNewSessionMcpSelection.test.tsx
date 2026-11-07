@@ -182,27 +182,9 @@ describe('useNewSessionMcpSelection', () => {
         await renderScreen(React.createElement(Probe));
         await flushHookEffects();
 
-        expect(previewSpy).toHaveBeenCalledWith(
-            'machine-1',
-            expect.objectContaining({
-                agentId: 'codex',
-                directory: '/workspace',
-                selection: expect.objectContaining({ managedServersEnabled: true }),
-            }),
-            { serverId: 'server-a' },
-        );
+        expect(previewSpy).not.toHaveBeenCalled();
 
-        expect(chip?.key).toBe('new-session-mcp');
-        expect(chip?.controlId).toBe('mcp');
-        expect(chip?.collapsedContentPopover).toEqual(expect.objectContaining({
-            title: 'MCP',
-            scrollEnabled: false,
-            maxHeightCap: 760,
-            maxWidthCap: 620,
-            renderContent: expect.any(Function),
-        }));
-
-        const renderedChip = chip!.render({
+        let renderedChip = chip!.render({
             chipStyle: () => null,
             iconColor: '#000',
             showLabel: true,
@@ -213,9 +195,46 @@ describe('useNewSessionMcpSelection', () => {
             toggleCollapsedPopover,
         }) as React.ReactElement<{
             onPress?: () => void;
+            onPressIn?: () => void;
             testID?: string;
             children?: React.ReactNode;
         }>;
+
+        await act(async () => {
+            renderedChip.props.onPressIn?.();
+            await flushHookEffects();
+        });
+
+        expect(previewSpy).toHaveBeenCalledWith(
+            'machine-1',
+            expect.objectContaining({
+                agentId: 'codex',
+                directory: '/workspace',
+                selection: expect.objectContaining({ managedServersEnabled: true }),
+            }),
+            { serverId: 'server-a' },
+        );
+
+        renderedChip = chip!.render({
+            chipStyle: () => null,
+            iconColor: '#000',
+            showLabel: true,
+            textStyle: null,
+            countTextStyle: null,
+            chipAnchorRef: { current: null },
+            popoverAnchorRef: { current: null },
+            toggleCollapsedPopover,
+        }) as typeof renderedChip;
+
+        expect(chip?.key).toBe('new-session-mcp');
+        expect(chip?.controlId).toBe('mcp');
+        expect(chip?.collapsedContentPopover).toEqual(expect.objectContaining({
+            title: 'MCP',
+            scrollEnabled: false,
+            maxHeightCap: 760,
+            maxWidthCap: 620,
+            renderContent: expect.any(Function),
+        }));
 
         expect(renderedChip.props.testID).toBe('new-session-mcp-chip');
         expect(React.isValidElement(renderedChip.props.children)).toBe(false);
@@ -305,6 +324,12 @@ describe('useNewSessionMcpSelection', () => {
         await renderScreen(React.createElement(Probe));
         await flushHookEffects({ cycles: 1, turns: 2 });
 
+        expect(previewSpy).not.toHaveBeenCalled();
+        await act(async () => {
+            chip?.onIntent?.();
+            await flushHookEffects({ cycles: 1, turns: 2 });
+        });
+
         expect(chip).toBeTruthy();
         const renderedContent = chip!.collapsedContentPopover.renderContent({
             requestClose: () => {},
@@ -347,6 +372,12 @@ describe('useNewSessionMcpSelection', () => {
 
         await renderScreen(React.createElement(Probe));
         await flushHookEffects({ cycles: 1, turns: 2 });
+
+        expect(previewSpy).not.toHaveBeenCalled();
+        await act(async () => {
+            chip?.onIntent?.();
+            await flushHookEffects({ cycles: 1, turns: 2 });
+        });
 
         expect(chip).toBeTruthy();
         const renderedContent = chip!.collapsedContentPopover.renderContent({

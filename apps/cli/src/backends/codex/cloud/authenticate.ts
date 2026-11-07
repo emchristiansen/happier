@@ -23,6 +23,7 @@ import {
   exchangeCodexAuthorizationGrant,
   type CodexAuthTokens,
 } from './oauthExchange';
+import { info, ok } from '@happier-dev/cli-common/output';
 
 export type { CodexAuthTokens } from './oauthExchange';
 
@@ -134,7 +135,7 @@ export async function authenticateCodex(opts?: CloudConnectAuthenticateOptions):
       },
     });
 
-    console.log('🎉 Authentication successful!');
+    console.log(ok('Signed in to Codex'));
     return tokens;
   };
 
@@ -174,7 +175,7 @@ export async function authenticateCodex(opts?: CloudConnectAuthenticateOptions):
       promptForPastedRedirectUrl: () => promptInput('Paste redirect URL: '),
       openAuthorizationUrl: async ({ authorizationUrl }) => {
         if (params.opts?.noOpen) return;
-        console.log('📋 Opening browser for authentication...');
+        console.log(info('Opening your browser to sign in'));
         console.log(`If browser doesn't open, visit:\n${authorizationUrl}\n`);
         await openBrowser(authorizationUrl);
       },
@@ -193,7 +194,7 @@ export async function authenticateCodex(opts?: CloudConnectAuthenticateOptions):
       },
     });
 
-    console.log('🎉 Authentication successful!');
+    console.log(ok('Signed in to Codex'));
     return tokens;
   };
 

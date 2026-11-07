@@ -15,6 +15,8 @@
  * operation on a transaction client) stays on the write connection.
  */
 
+import { readPrismaSqliteConnectionParams } from "@happier-dev/cli-common/firstPartyRuntime";
+
 export const SQLITE_READ_POOL_SIZE_ENV = "HAPPIER_SQLITE_READ_POOL_SIZE";
 const SQLITE_READ_POOL_SIZE_MAX = 64;
 
@@ -34,25 +36,22 @@ export function resolveSqliteReadPoolConfigFromEnv(env: NodeJS.ProcessEnv): Sqli
     return { kind: "enabled", connectionLimit: parsed };
 }
 
-type SplitDatabaseUrl = Readonly<{ base: string; searchParams: URLSearchParams; hash: string }>;
+type SplitDatabaseUrl = Readonly<{ base: string; searchParams: URLSearchParams }>;
 
 function splitDatabaseUrl(databaseUrl: string): SplitDatabaseUrl {
-    const hashIndex = databaseUrl.indexOf("#");
-    const beforeHash = hashIndex >= 0 ? databaseUrl.slice(0, hashIndex) : databaseUrl;
-    const hash = hashIndex >= 0 ? databaseUrl.slice(hashIndex) : "";
-    const queryIndex = beforeHash.indexOf("?");
+    // Prisma consumes the file payload as a native path, including literal hashes.
+    const queryIndex = databaseUrl.indexOf("?");
     return {
-        base: queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash,
-        searchParams: new URLSearchParams(queryIndex >= 0 ? beforeHash.slice(queryIndex + 1) : ""),
-        hash,
+        base: queryIndex >= 0 ? databaseUrl.slice(0, queryIndex) : databaseUrl,
+        searchParams: readPrismaSqliteConnectionParams(databaseUrl),
     };
 }
 
 /** The read client's URL: the write URL with only `connection_limit` replaced. */
 export function renderSqliteReadPoolDatabaseUrl(databaseUrl: string, connectionLimit: number): string {
-    const { base, searchParams, hash } = splitDatabaseUrl(databaseUrl);
+    const { base, searchParams } = splitDatabaseUrl(databaseUrl);
     searchParams.set("connection_limit", String(connectionLimit));
-    return `${base}?${searchParams.toString()}${hash}`;
+    return `${base}?${searchParams.toString()}`;
 }
 
 /**

@@ -3,7 +3,7 @@ import { MMKV } from 'react-native-mmkv';
 import { getActiveServerAccountScope } from '@/sync/domains/scope/activeServerAccountScope';
 import { serverAccountScopedStorageKey, type ServerAccountScope } from '@/sync/domains/scope/serverAccountScope';
 import { readStorageScopeFromEnv, scopedStorageId } from '@/utils/system/storageScope';
-import { fromRecord, toRecord, type PendingSetupIntent } from './pendingSetupIntent.shared';
+import { emitPendingSetupIntentChanged, fromSerializedRecord, toRecord, type PendingSetupIntent } from './pendingSetupIntent.shared';
 import {
     getActivePendingServerUrl,
     isPendingServerUrlActive,
@@ -29,18 +29,12 @@ function resolveActiveServerScopedKey(): string | null {
 function readRecord(key: string): PendingSetupIntent | null {
     const raw = storage.getString(key);
     if (!raw) return null;
-    try {
-        const parsed = JSON.parse(raw) as unknown;
-        const record = fromRecord(parsed);
-        if (!record) {
-            storage.delete(key);
-            return null;
-        }
-        return record;
-    } catch {
+    const record = fromSerializedRecord(raw);
+    if (!record) {
         storage.delete(key);
         return null;
     }
+    return record;
 }
 
 export function setPendingSetupIntent(value: PendingSetupIntent): void {
@@ -53,9 +47,11 @@ export function setPendingSetupIntent(value: PendingSetupIntent): void {
         storage.set(serverAccountScopedStorageKey(KEY_RECORD_PREFIX, activeScope), JSON.stringify(record));
         const serverScopedKey = resolveActiveServerScopedKey();
         if (serverScopedKey) storage.delete(serverScopedKey);
+        emitPendingSetupIntentChanged();
         return;
     }
     storage.set(pendingServerScopedKey(KEY_SERVER_RECORD_PREFIX, serverUrl), JSON.stringify(record));
+    emitPendingSetupIntentChanged();
 }
 
 export function getPendingSetupIntent(): PendingSetupIntent | null {
@@ -78,15 +74,13 @@ export function clearPendingSetupIntent(): void {
         storage.delete(serverScopedKey);
     }
     const legacy = storage.getString(KEY_RECORD);
-    if (!legacy) return;
-    try {
-        const record = fromRecord(JSON.parse(legacy) as unknown);
+    if (legacy) {
+        const record = fromSerializedRecord(legacy);
         if (!record || !record.relayUrl || isPendingServerUrlActive(record.relayUrl)) {
             storage.delete(KEY_RECORD);
         }
-    } catch {
-        storage.delete(KEY_RECORD);
     }
+    emitPendingSetupIntentChanged();
 }
 
 export function migratePendingSetupIntentScopes(

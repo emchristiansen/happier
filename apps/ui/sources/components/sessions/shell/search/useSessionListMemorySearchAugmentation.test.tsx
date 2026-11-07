@@ -7,6 +7,8 @@ import { flushHookEffects, renderHook, standardCleanup } from '@/dev/testkit';
 import type { FlushHookEffectsOptions } from '@/dev/testkit';
 import type { Machine } from '@/sync/domains/state/storageTypes';
 
+import { useSessionListMemorySearchAugmentation } from './useSessionListMemorySearchAugmentation';
+
 const machineRpcWithServerScopeMock = vi.hoisted(() => vi.fn());
 const featureEnabledState = vi.hoisted(() => ({ memorySearch: true }));
 const activeServerState = vi.hoisted(() => ({ serverId: 'server-a' as string | null }));
@@ -48,7 +50,9 @@ vi.mock('@/sync/domains/state/storage', async (importOriginal) => {
     return createStorageModuleMock({
         importOriginal,
         overrides: {
-            useAllMachines: () => machinesState.machines,
+            useFirstVisibleMachineId: (enabled: boolean = true) => (
+                enabled ? machinesState.machines[0]?.id ?? null : null
+            ),
         },
     });
 });
@@ -109,10 +113,9 @@ function createDeferred<T>() {
 
 async function renderMemoryAugmentationHook(props: Readonly<{
     searchQuery: string;
-    candidateSessionKeys: ReadonlySet<string>;
+    getCandidateSessionKeys: () => ReadonlySet<string>;
     enabled?: boolean;
 }>, options?: Readonly<{ flushOptions?: FlushHookEffectsOptions }>) {
-    const { useSessionListMemorySearchAugmentation } = await import('./useSessionListMemorySearchAugmentation');
     return await renderHook(
         (nextProps: typeof props) => useSessionListMemorySearchAugmentation(nextProps),
         { initialProps: props, flushOptions: options?.flushOptions },
@@ -130,15 +133,17 @@ afterEach(() => {
 describe('useSessionListMemorySearchAugmentation', () => {
     it('does not call the daemon when the list surface is not data-active', async () => {
         vi.useFakeTimers();
+        const getCandidateSessionKeys = vi.fn(() => new Set(['server-a:session-1']));
         const hook = await renderMemoryAugmentationHook({
             searchQuery: 'vector',
-            candidateSessionKeys: new Set(['server-a:session-1']),
+            getCandidateSessionKeys,
             enabled: false,
         });
 
         await flushHookEffects({ advanceTimersMs: 500, cycles: 2 });
 
         expect(machineRpcWithServerScopeMock).not.toHaveBeenCalled();
+        expect(getCandidateSessionKeys).not.toHaveBeenCalled();
         expect(hook.getCurrent().memoryMatchedSessionKeys.size).toBe(0);
         expect(hook.getCurrent().isSearchingMemory).toBe(false);
     });
@@ -154,8 +159,7 @@ describe('useSessionListMemorySearchAugmentation', () => {
                 {props.children}
             </React.Profiler>
         );
-        const { useSessionListMemorySearchAugmentation } = await import('./useSessionListMemorySearchAugmentation');
-        const Harness = (props: Readonly<{ searchQuery: string; candidateSessionKeys: ReadonlySet<string> }>) => {
+        const Harness = (props: Readonly<{ searchQuery: string; getCandidateSessionKeys: () => ReadonlySet<string> }>) => {
             latestState = useSessionListMemorySearchAugmentation(props);
             return null;
         };
@@ -164,7 +168,7 @@ describe('useSessionListMemorySearchAugmentation', () => {
         act(() => {
             tree = renderer.create(
                 <Wrapper>
-                    <Harness searchQuery="" candidateSessionKeys={candidateSessionKeys} />
+                    <Harness searchQuery="" getCandidateSessionKeys={() => candidateSessionKeys} />
                 </Wrapper>,
             );
         });
@@ -176,7 +180,7 @@ describe('useSessionListMemorySearchAugmentation', () => {
         act(() => {
             tree.update(
                 <Wrapper>
-                    <Harness searchQuery="v" candidateSessionKeys={candidateSessionKeys} />
+                    <Harness searchQuery="v" getCandidateSessionKeys={() => candidateSessionKeys} />
                 </Wrapper>,
             );
         });
@@ -192,16 +196,32 @@ describe('useSessionListMemorySearchAugmentation', () => {
 
     it('does not call the daemon for short queries', async () => {
         vi.useFakeTimers();
+        const getCandidateSessionKeys = vi.fn(() => new Set(['server-a:session-1']));
         const hook = await renderMemoryAugmentationHook({
             searchQuery: 'v',
-            candidateSessionKeys: new Set(['server-a:session-1']),
+            getCandidateSessionKeys,
         });
 
         await flushHookEffects({ advanceTimersMs: 500, cycles: 2 });
 
         expect(machineRpcWithServerScopeMock).not.toHaveBeenCalled();
+        expect(getCandidateSessionKeys).not.toHaveBeenCalled();
         expect(hook.getCurrent().memoryMatchedSessionKeys.size).toBe(0);
         expect(hook.getCurrent().isSearchingMemory).toBe(false);
+    });
+
+    it('does not build candidates when memory search is disabled', async () => {
+        featureEnabledState.memorySearch = false;
+        const getCandidateSessionKeys = vi.fn(() => new Set(['server-a:session-1']));
+
+        const hook = await renderMemoryAugmentationHook({
+            searchQuery: 'vector',
+            getCandidateSessionKeys,
+        });
+
+        expect(getCandidateSessionKeys).not.toHaveBeenCalled();
+        expect(machineRpcWithServerScopeMock).not.toHaveBeenCalled();
+        expect(hook.getCurrent().memoryMatchedSessionKeys.size).toBe(0);
     });
 
     it('shows loading while daemon status is pending', async () => {
@@ -215,7 +235,7 @@ describe('useSessionListMemorySearchAugmentation', () => {
 
         const hook = await renderMemoryAugmentationHook({
             searchQuery: 'vector',
-            candidateSessionKeys: new Set(['server-a:session-1']),
+            getCandidateSessionKeys: () => new Set(['server-a:session-1']),
         });
 
         await flushHookEffects({ advanceTimersMs: 300, cycles: 2 });
@@ -245,7 +265,7 @@ describe('useSessionListMemorySearchAugmentation', () => {
 
         const hook = await renderMemoryAugmentationHook({
             searchQuery: 'vector',
-            candidateSessionKeys: new Set(['server-a:session-1']),
+            getCandidateSessionKeys: () => new Set(['server-a:session-1']),
         });
 
         await flushHookEffects({ advanceTimersMs: 300, cycles: 4 });
@@ -281,7 +301,7 @@ describe('useSessionListMemorySearchAugmentation', () => {
 
         const hook = await renderMemoryAugmentationHook({
             searchQuery: 'vector',
-            candidateSessionKeys: new Set(['server-a:session-1']),
+            getCandidateSessionKeys: () => new Set(['server-a:session-1']),
         });
         await flushHookEffects({ advanceTimersMs: 300, cycles: 4 });
 
@@ -290,7 +310,7 @@ describe('useSessionListMemorySearchAugmentation', () => {
 
         await hook.rerender({
             searchQuery: 'vector',
-            candidateSessionKeys: new Set(['server-a:session-1']),
+            getCandidateSessionKeys: () => new Set(['server-a:session-1']),
         });
         await flushHookEffects({ advanceTimersMs: 500, cycles: 4 });
 
@@ -299,7 +319,7 @@ describe('useSessionListMemorySearchAugmentation', () => {
 
         await hook.rerender({
             searchQuery: 'vector',
-            candidateSessionKeys: new Set(['server-a:session-1', 'server-a:session-2']),
+            getCandidateSessionKeys: () => new Set(['server-a:session-1', 'server-a:session-2']),
         });
 
         expect([...hook.getCurrent().memoryMatchedSessionKeys]).toEqual(['server-a:session-1']);
@@ -320,7 +340,7 @@ describe('useSessionListMemorySearchAugmentation', () => {
 
         const hook = await renderMemoryAugmentationHook({
             searchQuery: 'vector',
-            candidateSessionKeys: new Set(['server-a:session-1']),
+            getCandidateSessionKeys: () => new Set(['server-a:session-1']),
         });
 
         await flushHookEffects({ advanceTimersMs: 300, cycles: 4 });
@@ -350,13 +370,13 @@ describe('useSessionListMemorySearchAugmentation', () => {
 
         const hook = await renderMemoryAugmentationHook({
             searchQuery: 'vector',
-            candidateSessionKeys: new Set(['server-a:session-1', 'server-a:session-2']),
+            getCandidateSessionKeys: () => new Set(['server-a:session-1', 'server-a:session-2']),
         });
         await flushHookEffects({ advanceTimersMs: 300, cycles: 3 });
 
         await hook.rerender({
             searchQuery: 'parser',
-            candidateSessionKeys: new Set(['server-a:session-1', 'server-a:session-2']),
+            getCandidateSessionKeys: () => new Set(['server-a:session-1', 'server-a:session-2']),
         });
         await flushHookEffects({ advanceTimersMs: 300, cycles: 4 });
         firstSearch.resolve({
@@ -368,5 +388,61 @@ describe('useSessionListMemorySearchAugmentation', () => {
 
         expect([...hook.getCurrent().memoryMatchedSessionKeys]).toEqual(['server-a:session-2']);
         expect(hook.getCurrent().lastSuccessfulQuery).toBe('parser');
+    });
+
+    it('cancels an in-flight search while inactive and refreshes the current query on resume', async () => {
+        vi.useFakeTimers();
+        const firstSearch = createDeferred<unknown>();
+        let searchCallCount = 0;
+        machineRpcWithServerScopeMock.mockImplementation((params: { method?: string }) => {
+            if (params.method === RPC_METHODS.DAEMON_MEMORY_STATUS) {
+                return Promise.resolve(createMemoryStatusResponse(true));
+            }
+            if (params.method === RPC_METHODS.DAEMON_MEMORY_SEARCH) {
+                searchCallCount += 1;
+                if (searchCallCount === 1) return firstSearch.promise;
+                return Promise.resolve({
+                    v: 1,
+                    ok: true,
+                    hits: [createMemorySearchHit('session-1', 'Resumed summary')],
+                });
+            }
+            throw new Error('unexpected rpc');
+        });
+        const getCandidateSessionKeys = () => new Set(['server-a:session-1']);
+
+        const hook = await renderMemoryAugmentationHook({
+            searchQuery: 'vector',
+            getCandidateSessionKeys,
+            enabled: true,
+        });
+        await flushHookEffects({ advanceTimersMs: 300, cycles: 3 });
+        expect(searchCallCount).toBe(1);
+
+        await hook.rerender({
+            searchQuery: 'vector',
+            getCandidateSessionKeys,
+            enabled: false,
+        });
+        expect(hook.getCurrent().memoryMatchedSessionKeys.size).toBe(0);
+
+        firstSearch.resolve({
+            v: 1,
+            ok: true,
+            hits: [createMemorySearchHit('session-1', 'Stale summary')],
+        });
+        await flushHookEffects({ cycles: 3 });
+        expect(hook.getCurrent().memoryMatchedSessionKeys.size).toBe(0);
+
+        await hook.rerender({
+            searchQuery: 'vector',
+            getCandidateSessionKeys,
+            enabled: true,
+        });
+        await flushHookEffects({ advanceTimersMs: 300, cycles: 4 });
+
+        expect(searchCallCount).toBe(2);
+        expect([...hook.getCurrent().memoryMatchedSessionKeys]).toEqual(['server-a:session-1']);
+        expect(hook.getCurrent().lastSuccessfulQuery).toBe('vector');
     });
 });

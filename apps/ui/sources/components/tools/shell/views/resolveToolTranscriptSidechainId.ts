@@ -1,8 +1,6 @@
+import { readNonBlankOpaqueIdentifier } from '@happier-dev/protocol';
+import { isSubAgentTranscriptToolName } from '@happier-dev/protocol/tools/v2';
 import type { ToolCall } from '@/sync/domains/messages/messageTypes';
-
-function readNonEmptyString(value: unknown): string | null {
-    return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
-}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -15,13 +13,13 @@ export function resolveToolTranscriptSidechainId(params: Readonly<{
 }>): string | null {
     const { tool, normalizedToolName } = params;
 
-    if (normalizedToolName === 'SubAgentRun') {
+    if (isSubAgentTranscriptToolName(normalizedToolName)) {
         const result = asRecord(tool.result);
-        const sidechainId = readNonEmptyString(result?.sidechainId);
+        const sidechainId = readNonBlankOpaqueIdentifier(result?.sidechainId);
         if (sidechainId) return sidechainId;
 
         const input = asRecord(tool.input);
-        const inputSidechainId = readNonEmptyString(input?.sidechainId) ?? readNonEmptyString(input?.callId);
+        const inputSidechainId = readNonBlankOpaqueIdentifier(input?.sidechainId) ?? readNonBlankOpaqueIdentifier(input?.callId);
         if (inputSidechainId) return inputSidechainId;
     }
 

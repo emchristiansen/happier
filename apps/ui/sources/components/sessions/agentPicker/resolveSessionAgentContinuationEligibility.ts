@@ -30,10 +30,7 @@ export type SessionAgentContinuationSessionReason =
  * with another Agent. Machine and daemon availability is not modelled here: that
  * branch belongs to the protocol's continuation-presentation owner.
  */
-export type SessionAgentContinuationLocalReason =
-    | SessionAgentContinuationSessionReason
-    /** The target's create/resume/context contract is not proven for in-place continuation. */
-    | 'target_not_proven';
+export type SessionAgentContinuationLocalReason = SessionAgentContinuationSessionReason;
 
 /**
  * What the machine has said about one exact target so far.
@@ -182,13 +179,6 @@ export function resolveSessionAgentContinuationEligibility(params: Readonly<{
     if (sessionReason !== null) {
         return { status: 'unavailable', kind: 'local', reason: sessionReason };
     }
-    // Configured ACP backends stay visible so the catalog reads the same everywhere,
-    // but in-place continuation waits until their create/resume/context contract is
-    // proven rather than failing at send time.
-    if (entry.family !== 'builtInAgent') {
-        return { status: 'unavailable', kind: 'local', reason: 'target_not_proven' };
-    }
-
     if (inspection.status === 'checking') {
         return { status: 'checking' };
     }

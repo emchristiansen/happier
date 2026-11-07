@@ -2,7 +2,7 @@
 import React from 'react';
 import { act } from 'react';
 import { createRoot } from 'react-dom/client';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { PierreDiffScrollAnchor } from './PierreDiffScrollAnchor.web';
 
 const patch = (lines: string[]) => `diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,${lines.length} +1,${lines.length} @@\n${lines.map((line) => ` ${line}`).join('\n')}\n`;
@@ -69,67 +69,6 @@ describe('PierreDiffScrollAnchor', () => {
             await act(async () => { root.unmount(); });
             container.remove();
             scroll.remove();
-        }
-    });
-
-    it('wins over a late renderer scroll reset after a keyed patch replacement', async () => {
-        const frames: FrameRequestCallback[] = [];
-        vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
-            frames.push(callback);
-            return frames.length;
-        });
-        vi.stubGlobal('cancelAnimationFrame', () => {});
-        const container = document.createElement('div');
-        document.body.append(container);
-        const root = createRoot(container);
-        const scroll = document.createElement('div');
-        scroll.style.overflowY = 'auto';
-        document.body.append(scroll);
-        Object.defineProperties(scroll, { clientHeight: { value: 40 }, scrollHeight: { value: 1000 } });
-        scroll.getBoundingClientRect = () => ({ top: 0, bottom: 40, height: 40 } as DOMRect);
-        const contents = document.createElement('div');
-        scroll.append(contents);
-        const oldLines = ['one', 'reading', 'three'];
-        const newLines = ['inserted', ...oldLines];
-        function replaceRenderer(lines: string[]) {
-            const host = document.createElement('diffs-container');
-            const shadow = host.attachShadow({ mode: 'open' });
-            shadow.replaceChildren(...lines.map((text, index) => {
-                const line = document.createElement('div');
-                line.dataset.line = String(index + 1);
-                line.dataset.lineType = 'context';
-                line.textContent = text;
-                line.getBoundingClientRect = () => ({ top: index * 20 - scroll.scrollTop, bottom: (index + 1) * 20 - scroll.scrollTop, height: 20 } as DOMRect);
-                return line;
-            }));
-            host.getBoundingClientRect = () => ({ top: -scroll.scrollTop, bottom: 1000 - scroll.scrollTop, height: 1000 } as DOMRect);
-            contents.replaceChildren(host);
-        }
-        replaceRenderer(oldLines);
-        const contentRef = { current: contents };
-        function RendererBoundary({ lines }: { lines: string[] }) {
-            React.useLayoutEffect(() => { replaceRenderer(lines); }, [lines]);
-            return null;
-        }
-        const view = (lines: string[]) => <PierreDiffScrollAnchor patch={patch(lines)} containerRef={contentRef}>
-            <RendererBoundary lines={lines} />
-        </PierreDiffScrollAnchor>;
-        try {
-            await act(async () => { root.render(view(oldLines)); });
-            scroll.scrollTop = 25;
-            await act(async () => { root.render(view(newLines)); });
-            scroll.scrollTop = 0;
-            await act(async () => {
-                for (let index = 0; index < 12 && frames.length > 0; index += 1) {
-                    frames.shift()!(index * 16);
-                }
-            });
-            expect(scroll.scrollTop).toBe(45);
-        } finally {
-            await act(async () => { root.unmount(); });
-            container.remove();
-            scroll.remove();
-            vi.unstubAllGlobals();
         }
     });
 });

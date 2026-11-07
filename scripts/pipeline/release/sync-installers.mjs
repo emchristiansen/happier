@@ -5,6 +5,7 @@
 import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createPlanetFrame } from '../../../packages/cli-common/planetFrame.mjs';
 
 import {
   INSTALLER_FILENAMES,
@@ -74,6 +75,51 @@ async function fileExists(path) {
   }
 }
 
+// Project the CLI's planet at authoring time: shipped installers remain
+// standalone Bash/PowerShell, with no renderer or JavaScript runtime dependency.
+function projectInstallerPlanet(source, filename) {
+  const marker = /^([ \t]*)# BEGIN GENERATED PLANET\r?\n[\s\S]*?^[ \t]*# END GENERATED PLANET/m;
+  if (!source.includes('# BEGIN GENERATED PLANET')) return source;
+  if (!marker.test(source)) throw new Error('Unterminated installer planet projection: ' + filename);
+  // The settled, fully lit pose of the same planet `happier setup` animates.
+  const frame = createPlanetFrame({ columns: 28 });
+  const isShell = filename.endsWith('.sh');
+  // PowerShell 5.1 may decode a downloaded script with a legacy code page: spell each
+  // Braille cell as a code point so the generated block stays ASCII.
+  const glyph = (cell) => (isShell ? cell.ch : '$([char]0x' + cell.ch.codePointAt(0).toString(16) + ')');
+  const escape = isShell ? '\\033' : '$([char]27)';
+  const plain = frame.map((row) => row.map((cell) => (cell ? glyph(cell) : ' ')).join(''));
+  const colored = frame.map((row) => {
+    let line = '';
+    let current = '';
+    for (const cell of row) {
+      if (!cell) { line += ' '; continue; }
+      const sgr = escape + '[38;2;' + cell.rgb.join(';') + 'm';
+      if (sgr !== current) { line += sgr; current = sgr; }
+      line += glyph(cell);
+    }
+    return line + escape + '[0m';
+  });
+  const lines = isShell
+    ? [
+        'HAPPIER_INSTALLER_ART_ROWS=(',
+        ...plain.map((row) => "  '" + row + "'"), ')',
+        'HAPPIER_INSTALLER_ART_RGB_ROWS=(',
+        ...colored.map((row) => "  $'" + row + "'"), ')',
+      ]
+    : [
+        '$rows = @(',
+        ...plain.map((row, index) => '  "' + row + '"' + (index < plain.length - 1 ? ',' : '')), ')',
+        '$rgbRows = @(',
+        ...colored.map((row, index) => '  "' + row + '"' + (index < colored.length - 1 ? ',' : '')), ')',
+      ];
+  return source.replace(marker, (_match, indent) => [
+    '# BEGIN GENERATED PLANET',
+    ...lines,
+    '# END GENERATED PLANET',
+  ].map((line) => indent + line).join(source.includes('\r\n') ? '\r\n' : '\n'));
+}
+
 export async function syncInstallers({
   sourceDir,
   targetDir,
@@ -86,9 +132,15 @@ export async function syncInstallers({
   const desiredTargetMode = 0o644;
   for (const spec of INSTALLER_PUBLISH_SPECS) {
     const sourcePath = join(sourceDir, spec.source);
-    const sourceContents = await readFileOrNull(sourcePath);
+    let sourceContents = await readFileOrNull(sourcePath);
     if (!sourceContents) {
       throw new Error(`[release] missing installer source file: ${sourcePath}`);
+    }
+    const projected = Buffer.from(projectInstallerPlanet(sourceContents.toString('utf8'), spec.source));
+    if (!buffersEqual(sourceContents, projected)) {
+      if (checkOnly) throw new Error('[release] installer source planet is out of sync: ' + sourcePath);
+      await writeFile(sourcePath, projected);
+      sourceContents = projected;
     }
     const publishedContents = applyInstallerPublishTransform(sourceContents, spec.transform);
 

@@ -189,7 +189,6 @@ installApprovalCommonModuleMocks({
             theme: {
                 colors: {
                     groupped: { background: '#111' },
-                    text: '#fff',
                     textSecondary: '#999',
                     divider: '#333',
                     surface: '#171717',
@@ -319,8 +318,7 @@ describe('ApprovalDetailScreen', () => {
             await screen.pressByTestIdAsync('approvals.open-session');
         });
 
-        expect(navigateSpy).toHaveBeenCalledWith('/session/session-1?serverId=server-cache', expect.any(Object));
-        expect(navigateSpy.mock.calls[0]?.[1]?.dangerouslySingular?.()).toBe('session');
+        expect(pushSpy).toHaveBeenCalledWith('/session/session-1?serverId=server-cache');
     });
 
     it('places the primary approve action before the reject action', async () => {
@@ -368,7 +366,8 @@ describe('ApprovalDetailScreen', () => {
         const text = screen.getTextContent();
         expect(fetchArtifactWithBodySpy).toHaveBeenCalledWith('artifact-1');
         expect(text).toContain('approvals.loadError');
-        expect(screen.findAllByType('ActivityIndicator')).toHaveLength(0);
+        const { ActivitySpinner } = await import('@/components/ui/feedback/ActivitySpinner');
+        expect(screen.findAllByType(ActivitySpinner)).toHaveLength(0);
     });
 
     it('creates the action executor with the session-to-server resolver and routes approval decisions with a server hint', async () => {

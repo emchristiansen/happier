@@ -44,21 +44,12 @@ import {
     shouldUseReadableNativePhoneMinimalSessionRow,
 } from '@/components/sessions/shell/sessionListRowDensity';
 import { useIsTablet } from '@/utils/platform/responsive';
+import { deleteNewSessionDraftAfterConfirmation } from '@/components/sessions/drafts/deleteNewSessionDraftAfterConfirmation';
 
 export { buildNewSessionDraftRowPresentation } from '@/components/sessions/drafts/newSessionDraftPresentation';
+export { deleteNewSessionDraftAfterConfirmation } from '@/components/sessions/drafts/deleteNewSessionDraftAfterConfirmation';
 
 const EMPTY_DRAFTS: readonly NewSessionDraftProjection[] = Object.freeze([]);
-
-export async function deleteNewSessionDraftAfterConfirmation(params: Readonly<{
-    confirm: () => Promise<boolean>;
-    readCurrentDraftDeletionDisposition: () => 'deletable' | 'missing' | 'launch-custody';
-    deleteDraft: () => Promise<void>;
-}>): Promise<boolean> {
-    if (!await params.confirm()) return false;
-    if (params.readCurrentDraftDeletionDisposition() !== 'deletable') return false;
-    await params.deleteDraft();
-    return true;
-}
 
 const stylesheet = StyleSheet.create(() => ({
     section: {

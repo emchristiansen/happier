@@ -43,8 +43,9 @@ import type {
   RunningDaemonDuplicateProfile,
   ServerProfileMissing,
 } from '@/diagnostics/doctorRepair';
+import { cmd as presentationCmd } from '@happier-dev/cli-common/output';
 
-export const CLEAN_STATE_HEADER = '✔  Your Happier installation looks good.';
+export const CLEAN_STATE_HEADER = '✓ Your Happier installation looks good.';
 export const MISMATCHED_STATE_HEADER = chalk.yellow.bold('Your Happier setup might need some attention:');
 
 /**
@@ -106,7 +107,7 @@ export function findingHeadline(finding: RepairFinding): string {
       const runningChannel = finding.daemon.startedWithReleaseChannel;
       const descriptor = runningChannel && runningVersion
         ? `${runningChannel} • ${runningVersion}`
-        : 'an older CLI version';
+        : 'a different CLI version';
       // Cross-channel: the daemon is on a DIFFERENT release channel than the
       // current CLI. The classifier only emits this when the daemon is on a
       // profile we actually care about (the active one, or one a configured
@@ -116,9 +117,9 @@ export function findingHeadline(finding: RepairFinding): string {
         return `A ${runningChannel ?? 'different-channel'} daemon (${descriptor}) is holding your active profile — take over with ${finding.currentCliReleaseChannel}?`;
       }
       if (finding.daemon.startedBy === 'automatic-startup') {
-        return `A running background service is older than this CLI (${descriptor})`;
+        return `A running background service uses a different CLI version (${descriptor})`;
       }
-      return `A manually-started daemon is running an older CLI version (${descriptor})`;
+      return `A manually-started daemon is running a different CLI version (${descriptor})`;
     }
     case 'running_daemon_duplicate_profile':
       return 'Two daemons own the same relay profile';
@@ -304,25 +305,25 @@ export function recapAppliedAll(applied: number): string {
 // ─────── Success confirmations ───────
 
 export function confirmAutomaticStartupSwitched(target: string, version: string): string {
-  return ` ✔ Automatic startup switched to ${target} • ${version}.`;
+  return ` ✓ Automatic startup switched to ${target} • ${version}.`;
 }
 export function confirmBackgroundServiceRestarted(): string {
-  return ' ✔ Background service restarted.';
+  return ' ✓ Background service restarted.';
 }
 export function confirmDaemonRestarted(pid: number | null): string {
-  return pid ? ` ✔ Daemon restarted (pid ${pid}).` : ' ✔ Daemon restarted.';
+  return pid ? ` ✓ Daemon restarted (pid ${pid}).` : ' ✓ Daemon restarted.';
 }
 export function confirmDaemonStopped(pid: number): string {
-  return ` ✔ Stopped duplicate daemon (pid ${pid}).`;
+  return ` ✓ Stopped duplicate daemon (pid ${pid}).`;
 }
 export function confirmAutomaticStartupInstalled(target: string): string {
-  return ` ✔ Automatic startup enabled for the ${target} channel.`;
+  return ` ✓ Automatic startup enabled for the ${target} channel.`;
 }
 export function confirmLocalRelayInstalled(channel: string, url: string): string {
-  return ` ✔ ${channel[0].toUpperCase()}${channel.slice(1)} relay installed at ${url}.`;
+  return ` ✓ ${channel[0].toUpperCase()}${channel.slice(1)} relay installed at ${url}.`;
 }
 export function confirmLocalRelayUpdated(channel: string, version: string): string {
-  return ` ✔ ${channel[0].toUpperCase()}${channel.slice(1)} relay updated to ${version}.`;
+  return ` ✓ ${channel[0].toUpperCase()}${channel.slice(1)} relay updated to ${version}.`;
 }
 
 // ─────── Per-finding prompt copy ───────
@@ -918,7 +919,7 @@ export function copyLocalRelayOffChannelLeftovers(
   // remove-command hint. All muted \u2014 these are FYI, not action items. The
   // header (gray bullet + title) is rendered by `formatFindingHeader()`.
   const mute = (s: string) => chalk.gray(s);
-  const cmd = (s: string) => chalk.cyan(s);
+  const cmd = (s: string) => presentationCmd(s);
   const lines: string[] = [];
   for (const e of finding.leftovers) {
     const version = cleanRelayRuntimeVersion(e.version);

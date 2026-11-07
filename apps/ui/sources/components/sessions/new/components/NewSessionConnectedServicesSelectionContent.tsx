@@ -2,7 +2,8 @@ import * as React from 'react';
 import { View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
-import type { ConnectedServiceId } from '@happier-dev/protocol';
+import { RELEASED_CONNECTED_SERVICE_IDS, type ConnectedServiceId } from '@happier-dev/protocol';
+import { getMachineConnectedServiceAuthSupportedServiceIds } from '@/sync/ops/connectedServiceAuthSupport';
 
 import { resolveConnectedServiceDisplayName } from '@/components/settings/connectedServices/model/resolveConnectedServiceDisplayName';
 import { ConnectedServiceQuotaBadgesView } from '@/components/settings/connectedServices/ConnectedServiceQuotaBadgesView';
@@ -38,7 +39,10 @@ export type NewSessionConnectedServicesSelectionContentProps = Readonly<{
     onOpenSettings: (serviceId: string) => void;
     requestClose?: () => void;
     maxHeight: number;
+    launchTarget?: Readonly<{ machineId: string | null; serverId: string | null; agentId: string }>;
 }>;
+
+const releasedServiceIds: ReadonlySet<string> = new Set(RELEASED_CONNECTED_SERVICE_IDS);
 
 function SelectionStateIcon(props: Readonly<{ selected: boolean; variant?: 'default' | 'warning' }>) {
     const { theme } = useUnistyles();
@@ -65,6 +69,27 @@ function SettingsActionIcon() {
 export function NewSessionConnectedServicesSelectionContent(props: NewSessionConnectedServicesSelectionContentProps) {
     const styles = stylesheet;
     const [bindingsByServiceId, setBindingsByServiceId] = React.useState(props.bindingsByServiceId);
+    const machineId = props.launchTarget?.machineId;
+    const serverId = props.launchTarget?.serverId;
+    const agentId = props.launchTarget?.agentId;
+    const supportKey = JSON.stringify([machineId, serverId, agentId]);
+    const needsLaunchAdmission = props.launchTarget !== undefined && props.supportedServiceIds.some((id) => !releasedServiceIds.has(id));
+    const [launchSupport, setLaunchSupport] = React.useState<Readonly<{ key: string; serviceIds: readonly string[] }> | null>(null);
+    React.useEffect(() => {
+        if (!needsLaunchAdmission || !machineId || !agentId) return;
+        let cancelled = false;
+        void getMachineConnectedServiceAuthSupportedServiceIds({ machineId, serverId, agentId }).then((serviceIds) => {
+            if (!cancelled) setLaunchSupport({ key: supportKey, serviceIds });
+        });
+        return () => { cancelled = true; };
+    }, [agentId, machineId, needsLaunchAdmission, serverId, supportKey]);
+    const resolveOptionAvailability = React.useCallback<NonNullable<NewSessionConnectedServicesSelectionContentProps['resolveOptionAvailability']>>((params) => {
+        if (needsLaunchAdmission && !releasedServiceIds.has(params.serviceId) && params.binding.source === 'connected'
+            && (launchSupport?.key !== supportKey || !launchSupport.serviceIds.includes(params.serviceId))) {
+            return { disabled: true, subtitle: t('connectedServices.defaultAuth.warning.connected_service_unsupported') };
+        }
+        return props.resolveOptionAvailability?.(params) ?? {};
+    }, [launchSupport, needsLaunchAdmission, props.resolveOptionAvailability, supportKey]);
 
     React.useEffect(() => {
         setBindingsByServiceId(props.bindingsByServiceId);
@@ -151,7 +176,7 @@ export function NewSessionConnectedServicesSelectionContent(props: NewSessionCon
                 />
             ),
             onReconnectProfile: reconnectProfile,
-            resolveOptionAvailability: props.resolveOptionAvailability,
+            resolveOptionAvailability,
         });
     }, [
         bindingsByServiceId,
@@ -163,7 +188,7 @@ export function NewSessionConnectedServicesSelectionContent(props: NewSessionCon
         // INVOKED during the build and its result is baked into every option's
         // `disabled` / `subtitle` / icon variant, so a stale reference would
         // freeze availability. Each host supplies it as a memoised callback.
-        props.resolveOptionAvailability,
+        resolveOptionAvailability,
         props.supportedServiceIds,
         quotaBadgesByKey,
         reconnectProfile,

@@ -57,8 +57,10 @@ export function useNewSessionConnectedServices(params: Readonly<{
     connectedServicesProfileLabelByKey: Record<string, string | undefined>;
     connectedServicesDefaultProfileByServiceId: Record<string, string | undefined>;
     connectedServicesDefaultAuthByAgentIdV1?: unknown;
+    connectedServicesAdditionalDefaultAuthByAgentIdV1?: unknown;
   };
   targetServerId: string | null;
+  targetMachineId?: string | null;
   router: {
     push: (path: string | {
       pathname: string;
@@ -203,6 +205,7 @@ export function useNewSessionConnectedServices(params: Readonly<{
 
   const connectedServicesAuthPopoverContent = React.useCallback(({ requestClose, maxHeight }: AgentInputContentPopoverRenderArgs) => (
     <NewSessionConnectedServicesSelectionContent
+      launchTarget={{ machineId: params.targetMachineId ?? null, serverId: targetServerId, agentId }}
       supportedServiceIds={supportedConnectedServiceIds}
       profileOptionsByServiceId={connectedServiceProfileOptionsByServiceId}
       accountGroupOptionsByServiceId={connectedServiceAccountGroupOptionsByServiceId}
@@ -242,6 +245,9 @@ export function useNewSessionConnectedServices(params: Readonly<{
     setBindingForService,
     settings.connectedServicesDefaultProfileByServiceId,
     supportedConnectedServiceIds,
+    params.targetMachineId,
+    targetServerId,
+    agentId,
   ]);
 
   const connectedServicesAuthChip = React.useMemo<AgentInputExtraActionChip | null>(() => {

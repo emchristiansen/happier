@@ -1,12 +1,19 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
-import { reserveEphemeralPort } from '@/testkit/http/portUtils';
+import { reserveEphemeralPort, waitForHttpReady } from '@/testkit/http/portUtils';
 
 import { spawnSleepyDetachedProcess, spawnStoppableHttpDaemon } from './testkit/fakeDaemonLifecycle.testkit';
+
+const { readFileSyncMock } = vi.hoisted(() => ({ readFileSyncMock: vi.fn() }));
+// Service-definition reads are the filesystem boundary; status selection and parsing stay real.
+vi.mock('node:fs', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:fs')>(),
+  readFileSync: readFileSyncMock,
+}));
 
 const envScope = createEnvKeyScope([
   'HAPPIER_HOME_DIR',
@@ -14,10 +21,26 @@ const envScope = createEnvKeyScope([
   'HAPPIER_ACTIVE_SERVER_ID',
   'HAPPIER_SERVER_URL',
   'HAPPIER_WEBAPP_URL',
+  'HAPPIER_DAEMON_SERVICE_PLATFORM',
+  'HAPPIER_DAEMON_SERVICE_USER_HOME_DIR',
+  'HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR',
+  'HAPPIER_DAEMON_SERVICE_CHANNEL',
+  'HAPPIER_DAEMON_SERVICE_TARGET_MODE',
+  'HAPPIER_DAEMON_SERVICE_INSTANCE_ID',
+  // An inherited dev-stack lifecycle scope would move the reaped/read state to the stack's directory.
+  'HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID',
+  'HAPPIER_DAEMON_SERVICE_MANAGED_BY',
 ]);
 
 describe('multiDaemon release ring scoping', () => {
   let homeDir = '';
+
+  beforeEach(async () => {
+    const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    readFileSyncMock.mockReset();
+    readFileSyncMock.mockImplementation(fs.readFileSync);
+    envScope.patch({ HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID: undefined, HAPPIER_DAEMON_SERVICE_MANAGED_BY: undefined });
+  });
 
   afterEach(() => {
     envScope.restore();
@@ -175,13 +198,15 @@ describe('multiDaemon release ring scoping', () => {
       'utf-8',
     );
 
+    const exited = spawnSleepyDetachedProcess();
+    await exited.kill();
     const serverDir = join(homeDir, 'servers', 'cloud');
     mkdirSync(serverDir, { recursive: true });
     writeFileSync(
       join(serverDir, 'daemon.state.json'),
       JSON.stringify(
         {
-          pid: Number.MAX_SAFE_INTEGER,
+          pid: exited.pid,
           httpPort: 7780,
           startedAt: Date.now(),
           startedWithCliVersion: '0.1.3',
@@ -223,7 +248,7 @@ describe('multiDaemon release ring scoping', () => {
     }
   });
 
-  it('reaps live same-home orphan daemon states without stopping the active daemon pid', async () => {
+  it('reaps a live orphan in the starting daemon lifecycle scope while daemons of other relays keep running', async () => {
     homeDir = join(tmpdir(), `happier-multi-daemon-orphan-reap-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     envScope.patch({
       HAPPIER_HOME_DIR: homeDir,
@@ -278,30 +303,57 @@ describe('multiDaemon release ring scoping', () => {
       'utf-8',
     );
 
+    // A pre-canonical CLI published ring-scoped state (and held a ring-scoped lock) in the SAME
+    // lifecycle directory, so the canonical lock cannot keep it from running beside the new daemon.
     const orphanPort = await reserveEphemeralPort();
     const orphan = spawnStoppableHttpDaemon(orphanPort);
+    // The daemon another relay's profile runs on this machine is not an orphan of this one.
+    const otherRelayPort = await reserveEphemeralPort();
+    const otherRelayDaemon = spawnStoppableHttpDaemon(otherRelayPort);
     try {
-      const orphanServerDir = join(homeDir, 'servers', 'company');
-      mkdirSync(orphanServerDir, { recursive: true });
-      const orphanState = JSON.stringify(
+      expect(await waitForHttpReady(orphanPort)).toBe(true);
+      expect(await waitForHttpReady(otherRelayPort)).toBe(true);
+      const orphanStatePath = join(activeServerDir, 'daemon.dev.state.json');
+      writeFileSync(
+        orphanStatePath,
+        JSON.stringify(
+          {
+            pid: orphan.pid,
+            httpPort: orphanPort,
+            startedAt: Date.now(),
+            startedWithCliVersion: '0.1.4',
+            controlToken: 'orphan-token',
+          },
+          null,
+          2,
+        ),
+        'utf-8',
+      );
+
+      const otherRelayServerDir = join(homeDir, 'servers', 'company');
+      mkdirSync(otherRelayServerDir, { recursive: true });
+      const otherRelayState = JSON.stringify(
         {
-          pid: orphan.pid,
-          httpPort: orphanPort,
+          pid: otherRelayDaemon.pid,
+          httpPort: otherRelayPort,
           startedAt: Date.now(),
-          startedWithCliVersion: '0.1.4',
-          controlToken: 'orphan-token',
+          startedWithCliVersion: '0.1.5',
+          controlToken: 'company-token',
         },
         null,
         2,
       );
-      const canonicalOrphanStatePath = join(orphanServerDir, 'daemon.state.json');
-      const legacyOrphanStatePath = join(orphanServerDir, 'daemon.dev.state.json');
-      writeFileSync(canonicalOrphanStatePath, orphanState, 'utf-8');
-      writeFileSync(legacyOrphanStatePath, orphanState, 'utf-8');
+      const otherRelayCanonicalStatePath = join(otherRelayServerDir, 'daemon.state.json');
+      const otherRelayLegacyStatePath = join(otherRelayServerDir, 'daemon.dev.state.json');
+      writeFileSync(otherRelayCanonicalStatePath, otherRelayState, 'utf-8');
+      writeFileSync(otherRelayLegacyStatePath, otherRelayState, 'utf-8');
+
       const staleServerDir = join(homeDir, 'servers', 'stale');
       const staleStatePath = join(staleServerDir, 'daemon.state.json');
+      const exited = spawnSleepyDetachedProcess();
+      await exited.kill();
       const staleStateRaw = JSON.stringify({
-        pid: Number.MAX_SAFE_INTEGER,
+        pid: exited.pid,
         httpPort: 7791,
         startedAt: Date.now(),
         startedWithCliVersion: '0.1.2',
@@ -310,23 +362,28 @@ describe('multiDaemon release ring scoping', () => {
       writeFileSync(staleStatePath, staleStateRaw, 'utf-8');
 
       vi.resetModules();
-      const { reapSameHomeDaemonOrphansBeforeStart } = await import('./multiDaemon');
+      const { reapCurrentLifecycleDaemonOrphansBeforeStart } = await import('./multiDaemon');
 
-      const result = await reapSameHomeDaemonOrphansBeforeStart({ preservePids: [process.pid] });
+      const result = await reapCurrentLifecycleDaemonOrphansBeforeStart({ preservePids: [process.pid] });
 
-      expect(result.stoppedPids).toContain(orphan.pid);
+      expect(result.stoppedPids).toEqual([orphan.pid]);
+      expect(result.failedPids).toEqual([]);
       expect(result.preservedPids).toContain(process.pid);
       expect(() => process.kill(process.pid, 0)).not.toThrow();
       expect(() => process.kill(orphan.pid, 0)).toThrow();
-      expect(existsSync(canonicalOrphanStatePath)).toBe(true);
-      expect(existsSync(legacyOrphanStatePath)).toBe(true);
+      expect(existsSync(orphanStatePath)).toBe(true);
+
+      expect(() => process.kill(otherRelayDaemon.pid, 0)).not.toThrow();
+      expect(existsSync(otherRelayCanonicalStatePath)).toBe(true);
+      expect(existsSync(otherRelayLegacyStatePath)).toBe(true);
       expect(readFileSync(staleStatePath, 'utf-8')).toBe(staleStateRaw);
     } finally {
       await orphan.kill();
+      await otherRelayDaemon.kill();
     }
   });
 
-  it('does not stop live same-home daemon states when authenticated control is unavailable', async () => {
+  it('does not stop a live same-scope orphan when authenticated control is unavailable', async () => {
     homeDir = join(tmpdir(), `happier-multi-daemon-tokenless-orphan-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     envScope.patch({
       HAPPIER_HOME_DIR: homeDir,
@@ -366,9 +423,9 @@ describe('multiDaemon release ring scoping', () => {
     const orphanPort = await reserveEphemeralPort();
     const orphan = spawnStoppableHttpDaemon(orphanPort);
     try {
-      const orphanServerDir = join(homeDir, 'servers', 'company');
+      const orphanServerDir = join(homeDir, 'servers', 'cloud');
       mkdirSync(orphanServerDir, { recursive: true });
-      const orphanStatePath = join(orphanServerDir, 'daemon.state.json');
+      const orphanStatePath = join(orphanServerDir, 'daemon.dev.state.json');
       writeFileSync(
         orphanStatePath,
         JSON.stringify(
@@ -385,9 +442,9 @@ describe('multiDaemon release ring scoping', () => {
       );
 
       vi.resetModules();
-      const { reapSameHomeDaemonOrphansBeforeStart } = await import('./multiDaemon');
+      const { reapCurrentLifecycleDaemonOrphansBeforeStart } = await import('./multiDaemon');
 
-      const result = await reapSameHomeDaemonOrphansBeforeStart();
+      const result = await reapCurrentLifecycleDaemonOrphansBeforeStart();
 
       expect(result.stoppedPids).not.toContain(orphan.pid);
       expect(result.failedPids).toContain(orphan.pid);
@@ -396,5 +453,97 @@ describe('multiDaemon release ring scoping', () => {
     } finally {
       await orphan.kill();
     }
+  });
+  it('reports for each relay the background service that serves it: its pinned service, or the default one for the selected relay', async () => {
+    homeDir = join(tmpdir(), `happier-multi-daemon-service-per-relay-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const happierHomeDir = join(homeDir, '.happier');
+    envScope.patch({
+      HAPPIER_HOME_DIR: happierHomeDir,
+      HAPPIER_ACTIVE_SERVER_ID: undefined,
+      HAPPIER_SERVER_URL: undefined,
+      HAPPIER_WEBAPP_URL: undefined,
+      HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+      HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: homeDir,
+      HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: happierHomeDir,
+      HAPPIER_DAEMON_SERVICE_CHANNEL: 'stable',
+      HAPPIER_DAEMON_SERVICE_TARGET_MODE: undefined,
+      HAPPIER_DAEMON_SERVICE_INSTANCE_ID: undefined,
+    });
+    mkdirSync(happierHomeDir, { recursive: true });
+    const profile = (id: string, url: string) => ({ id, name: id, serverUrl: url, webappUrl: url, createdAt: 1, updatedAt: 1, lastUsedAt: 1 });
+    writeFileSync(join(happierHomeDir, 'settings.json'), JSON.stringify({
+      schemaVersion: 6,
+      activeServerId: 'cloud',
+      servers: {
+        cloud: profile('cloud', 'https://api.happier.dev'),
+        personal: profile('personal', 'https://personal.example.test'),
+        company: profile('company', 'https://company.example.test'),
+      },
+    }), 'utf-8');
+
+    const { planDaemonServiceInstall } = await import('./service/plan');
+    const writeServiceDefinition = (params: Readonly<{ targetMode: 'pinned' | 'default-following'; serverId: string; serverUrl: string }>) => {
+      const plan = planDaemonServiceInstall({
+        platform: 'linux',
+        channel: 'stable',
+        targetMode: params.targetMode,
+        instanceId: params.serverId,
+        activeServerId: params.serverId,
+        userHomeDir: homeDir,
+        happierHomeDir,
+        serverUrl: params.serverUrl,
+        webappUrl: params.serverUrl,
+        publicServerUrl: params.serverUrl,
+        nodePath: '/usr/local/bin/happier',
+        entryPath: '',
+      });
+      const file = plan.files[0]!;
+      mkdirSync(dirname(file.path), { recursive: true });
+      writeFileSync(file.path, file.content, 'utf-8');
+      return file.path;
+    };
+    const personalServicePath = writeServiceDefinition({ targetMode: 'pinned', serverId: 'personal', serverUrl: 'https://personal.example.test' });
+    const defaultServicePath = writeServiceDefinition({ targetMode: 'default-following', serverId: 'default', serverUrl: 'https://api.happier.dev' });
+
+    vi.resetModules();
+    const { listDaemonStatusesForAllKnownServers } = await import('./multiDaemon');
+    const entries = await listDaemonStatusesForAllKnownServers();
+    const byId = new Map(entries.map((entry) => [entry.serverId, entry]));
+
+    expect(byId.get('personal')?.service).toMatchObject({ installed: true, installedPath: personalServicePath });
+    expect(byId.get('cloud')?.service).toMatchObject({ installed: true, installedPath: defaultServicePath });
+    expect(byId.get('company')?.service.installed).toBe(false);
+
+    const cloudPinnedPath = writeServiceDefinition({ targetMode: 'pinned', serverId: 'cloud', serverUrl: 'https://api.happier.dev' });
+    const withPinnedWinner = await listDaemonStatusesForAllKnownServers();
+    expect(withPinnedWinner.find((entry) => entry.serverId === 'cloud')?.service)
+      .toMatchObject({ installed: true, installedPath: cloudPinnedPath });
+  });
+
+  it.each(['EACCES', 'EIO'])('preserves %s from service-definition reads instead of reporting not installed', async (code) => {
+    homeDir = join(tmpdir(), `happier-multi-daemon-read-error-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    envScope.patch({
+      HAPPIER_HOME_DIR: homeDir,
+      HAPPIER_DAEMON_SERVICE_PLATFORM: 'linux',
+      HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: homeDir,
+      HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: homeDir,
+      HAPPIER_DAEMON_SERVICE_TARGET_MODE: undefined,
+      HAPPIER_DAEMON_SERVICE_INSTANCE_ID: undefined,
+    });
+    mkdirSync(homeDir, { recursive: true });
+    writeFileSync(join(homeDir, 'settings.json'), JSON.stringify({
+      activeServerId: 'cloud',
+      servers: { cloud: { id: 'cloud', name: 'Cloud', serverUrl: 'https://api.happier.dev', webappUrl: 'https://app.happier.dev' } },
+    }), 'utf-8');
+    const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const cause = Object.assign(new Error('cannot read service definition'), { code });
+    readFileSyncMock.mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+      if (String(args[0]).endsWith('.service')) throw cause;
+      return fs.readFileSync(...args);
+    });
+    vi.resetModules();
+    const { listDaemonStatusesForAllKnownServers } = await import('./multiDaemon');
+    await expect(listDaemonStatusesForAllKnownServers())
+      .rejects.toMatchObject({ code: 'service_inventory_unavailable', cause });
   });
 });

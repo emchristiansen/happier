@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
+import { projectSourceSuiteReuse } from './source-suite-evidence.mjs';
 import { getPublicReleaseRingEntry } from './lib/public-release-rings.mjs';
 
 const CANONICAL_RELEASE_CI_WORKFLOW = 'tests.yml';
@@ -81,7 +82,7 @@ export function validateCanonicalCiRun(runValue, expected) {
 
 /**
  * @param {unknown} summaryValue
- * @param {{ runId: string; sourceSha: string; requiredLanes: string[] }} expected
+ * @param {{ runId: string; sourceSha: string; requiredLanes: string[]; allowNotesOnly?: boolean }} expected
  */
 export function validateCiLaneSummary(summaryValue, expected) {
   const summary = requireRecord(summaryValue);
@@ -99,7 +100,24 @@ export function validateCiLaneSummary(summaryValue, expected) {
     if (lane.result !== 'success' && lane.result !== 'skipped') throw new Error(`CI lane summary lane ${lane.id} has an invalid result`);
     lanes.set(lane.id, lane);
   }
-  for (const laneId of expected.requiredLanes) {
+  const planOutputs = lanes.get('ci_plan')?.outputs;
+  const notesOnly = expected.allowNotesOnly !== false
+    && expected.requiredLanes.length === DEFAULT_RELEASE_CI_LANES.length
+    && DEFAULT_RELEASE_CI_LANES.every((lane) => expected.requiredLanes.includes(lane))
+    && planOutputs?.notes_only === 'true';
+  if (notesOnly) {
+    const outputs = requireRecord(planOutputs);
+    if (typeof outputs.notes_base_sha !== 'string' || !/^[0-9a-f]{40}$/u.test(outputs.notes_base_sha)
+      || outputs.notes_base_sha === expected.sourceSha || !/^[1-9][0-9]*$/u.test(String(outputs.notes_base_run_id))
+      || String(outputs.notes_base_run_id) === expected.runId
+      || Object.keys(CLASSIFIED_CI_LANE_GROUPS).some((selection) => outputs[selection] !== 'false')) {
+      throw new Error('CI notes-only source basis is invalid');
+    }
+    if (outputs.run_build_smoke !== 'true' || lanes.get('build-smoke')?.result !== 'success') {
+      throw new Error('CI metadata child requires successful versioned build-smoke');
+    }
+  }
+  for (const laneId of notesOnly ? ['ci_plan', 'trusted_ref_guard'] : expected.requiredLanes) {
     if (lanes.get(laneId)?.result !== 'success') throw new Error(`CI lane summary required lane ${laneId} did not succeed`);
   }
   if (expected.requiredLanes.includes('ci_plan')) {
@@ -123,6 +141,25 @@ function runGh(args) {
   return String(result.stdout ?? '');
 }
 
+/** Verify the existing exact-run artifact, without selecting a different source.
+ * @param {{repository: string; sourceSha: string; sourceBranch: string; runId: string; requiredLanes: string[]; allowNotesOnly?: boolean; sourceProfile?: string}} expected
+ */
+export async function verifyCanonicalCiEvidence(expected) {
+  const run = JSON.parse(runGh(['api', `repos/${expected.repository}/actions/runs/${expected.runId}`]));
+  validateCanonicalCiRun(run, expected);
+  let sourceSuiteReuse = {};
+  const evidenceRoot = await mkdtemp(join(tmpdir(), 'happier-ci-evidence-'));
+  try {
+    runGh(['run', 'download', expected.runId, '--repo', expected.repository, '--name', 'ci-lane-summary', '--dir', evidenceRoot]);
+    const summary = JSON.parse(await readFile(join(evidenceRoot, 'ci-summary.json'), 'utf8'));
+    validateCiLaneSummary(summary, expected);
+    if (expected.sourceProfile) sourceSuiteReuse = projectSourceSuiteReuse(summary, { ...expected, profile: expected.sourceProfile });
+  } finally {
+    await rm(evidenceRoot, { recursive: true, force: true });
+  }
+  return expected.sourceProfile ? { ...run, sourceSuiteReuse } : run;
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const { values } = parseArgs({
     args: argv,
@@ -133,9 +170,12 @@ export async function main(argv = process.argv.slice(2)) {
       'run-id': { type: 'string' },
       'required-lanes': { type: 'string', default: '' },
       'github-output': { type: 'string', default: '' },
+      'source-profile': { type: 'string', default: '' },
     },
     allowPositionals: false,
   });
+  const sourceProfile = String(values['source-profile'] ?? '').trim();
+  if (sourceProfile && !['integrated', 'stable'].includes(sourceProfile)) throw new Error('Unsupported source validation profile');
   const repository = String(values.repository ?? '').trim();
   const sourceSha = String(values['source-sha'] ?? '').trim();
   const sourceBranch = String(values['source-branch'] ?? '').trim();
@@ -149,21 +189,12 @@ export async function main(argv = process.argv.slice(2)) {
   if (!/^[1-9][0-9]*$/u.test(runId)) throw new Error('--run-id must be a positive integer');
   if (new Set(requiredLanes).size !== requiredLanes.length) throw new Error('--required-lanes must not contain duplicates');
 
-  const run = JSON.parse(runGh(['api', `repos/${repository}/actions/runs/${runId}`]));
-  validateCanonicalCiRun(run, { repository, sourceSha, sourceBranch, runId });
+  const run = await verifyCanonicalCiEvidence({ repository, sourceSha, sourceBranch, runId, requiredLanes, sourceProfile });
 
-  const evidenceRoot = await mkdtemp(join(tmpdir(), 'happier-ci-evidence-'));
-  try {
-    runGh(['run', 'download', runId, '--repo', repository, '--name', 'ci-lane-summary', '--dir', evidenceRoot]);
-    const summary = JSON.parse(await readFile(join(evidenceRoot, 'ci-summary.json'), 'utf8'));
-    validateCiLaneSummary(summary, { runId, sourceSha, requiredLanes });
-  } finally {
-    await rm(evidenceRoot, { recursive: true, force: true });
-  }
-
+  const sourceSuiteReuse = sourceProfile ? requireRecord(run).sourceSuiteReuse : {};
   const output = { runId: Number(runId), runUrl: String(requireRecord(run).html_url ?? ''), sourceSha, sourceBranch };
   const githubOutput = String(values['github-output'] ?? '').trim();
-  if (githubOutput) await appendFile(githubOutput, `ci_run_id=${output.runId}\nci_run_url=${output.runUrl}\n`, 'utf8');
+  if (githubOutput) await appendFile(githubOutput, `ci_run_id=${output.runId}\nci_run_url=${output.runUrl}\n${Object.entries(sourceSuiteReuse).map(([key, value]) => `${key}=${value}\n`).join('')}`, 'utf8');
   else process.stdout.write(`${JSON.stringify(output)}\n`);
   return output;
 }

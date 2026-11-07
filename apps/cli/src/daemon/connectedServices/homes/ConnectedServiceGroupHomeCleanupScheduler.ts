@@ -7,6 +7,7 @@ import { ConnectedServiceIdSchema, type ConnectedServiceId } from '@happier-dev/
 import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import type { CatalogAgentId } from '@/backends/types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '../credentials/lifecycleTypes';
+import type { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
 import {
   createPendingPathCleanupQueue,
   type PendingPathCleanupRetryExhaustedEvent,
@@ -105,12 +106,12 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
   private readonly cleanupQueue: ReturnType<typeof createPendingPathCleanupQueue<DeletedGroupCleanupTarget>>;
   private readonly nowMs: () => number;
   private readonly quarantineTtlMs: number;
-  private readonly purgePath: typeof rm;
   private readonly renamePath: typeof rename;
   private readonly resolveCredentialLifecycleDescriptor: ResolveCredentialLifecycleDescriptor;
 
   constructor(private readonly deps: Readonly<{
     activeServerDir: string;
+    runtimeRegistry?: ConnectedServiceRuntimeRegistry;
     hasLiveTarget(input: Readonly<{
       serviceId: ConnectedServiceId;
       groupId: string;
@@ -120,7 +121,6 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
     resolveGroupDeletionAuthority?: ResolveGroupDeletionAuthority;
     maxCleanupRetries?: number;
     removePath?: typeof rm;
-    purgePath?: typeof rm;
     renamePath?: typeof rename;
     resolveCredentialLifecycleDescriptor?: ResolveCredentialLifecycleDescriptor;
     nowMs?: () => number;
@@ -129,7 +129,6 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
   }>) {
     this.nowMs = deps.nowMs ?? (() => Date.now());
     this.quarantineTtlMs = Math.max(0, Math.trunc(deps.quarantineTtlMs ?? CONNECTED_SERVICE_GROUP_HOME_QUARANTINE_TTL_MS));
-    this.purgePath = deps.purgePath ?? rm;
     this.renamePath = deps.renamePath ?? rename;
     this.resolveCredentialLifecycleDescriptor = deps.resolveCredentialLifecycleDescriptor
       ?? resolveConnectedServiceCredentialLifecycleDescriptor;
@@ -138,6 +137,13 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
       removePath: deps.removePath ?? (async (path) => {
         await this.quarantineGroupHome(path);
       }),
+      beforeRemove: async (target) => {
+        // Revoke at the original path, before its path-hashed Keychain identity changes.
+        const descriptor = await this.resolveCredentialLifecycleDescriptor(target.agentId);
+        await descriptor.credentialStorageCleanup?.deleteCredentialStorageForHomeRoot({
+          rootDir: target.path, kind: 'group_home',
+        });
+      },
       onRetryExhausted: deps.onCleanupRetryExhausted,
     });
   }
@@ -174,7 +180,7 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
     throw new Error(`Failed to allocate connected-service group-home quarantine path for ${path}`);
   }
 
-  private async purgeExpiredQuarantineHomes(): Promise<void> {
+  private async revokeExpiredQuarantineCredentials(): Promise<void> {
     const homesRoot = join(this.deps.activeServerDir, 'daemon', 'connected-services', 'homes');
     const nowMs = this.nowMs();
     for (const serviceDirName of await readDirectoryNames(homesRoot)) {
@@ -188,7 +194,7 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
           if (quarantinedAtMs === null || nowMs - quarantinedAtMs < this.quarantineTtlMs) continue;
           const quarantinedPath = join(quarantineRoot, entryName);
           await this.deleteQuarantinedCredentialStorage({ entryName, quarantinedPath });
-          await this.purgePath(quarantinedPath, { recursive: true, force: true });
+          // Quarantine retains history indefinitely, including across daemon restarts.
         }
       }
     }
@@ -207,6 +213,15 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
     return null;
   }
 
+  private hasLiveTarget(target: GroupHomeTarget): boolean {
+    return this.deps.runtimeRegistry?.listTargets().some((runtimeTarget) => (
+      runtimeTarget.agentId === target.agentId
+      && runtimeTarget.activeBindings.some((binding) => (
+        binding.serviceId === target.serviceId && binding.groupId === target.groupId
+      ))
+    )) === true || this.deps.hasLiveTarget(target);
+  }
+
   async scheduleDeletedGroupCleanup(input: Readonly<{
     serviceId: ConnectedServiceId;
     groupId: string;
@@ -218,7 +233,7 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
       groupId: input.groupId,
       agentId: input.agentId,
     });
-    if (this.deps.hasLiveTarget(input)) {
+    if (this.hasLiveTarget(input)) {
       this.cleanupQueue.setPending(targetKey(input), { ...input, path });
       return { cleaned: false, pending: true, path };
     }
@@ -249,7 +264,7 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
     groupExists?: GroupExists;
     resolveGroupDeletionAuthority?: ResolveGroupDeletionAuthority;
   }>): Promise<ReadonlyArray<DeletedGroupCleanupResult>> {
-    await this.purgeExpiredQuarantineHomes();
+    await this.revokeExpiredQuarantineCredentials();
     const resolveGroupDeletionAuthority = input.resolveGroupDeletionAuthority ?? this.deps.resolveGroupDeletionAuthority;
     const groupExists = input.groupExists ?? this.deps.groupExists;
     if (!resolveGroupDeletionAuthority && !groupExists) return [];
@@ -271,7 +286,7 @@ export class ConnectedServiceGroupHomeCleanupScheduler {
         return authority?.status === 'exists';
       },
       shouldKeepPending: async (target) => {
-        if (this.deps.hasLiveTarget(target)) return true;
+        if (this.hasLiveTarget(target)) return true;
         const authority = await this.resolveDeletionAuthority(target);
         return authority?.status === 'unknown';
       },

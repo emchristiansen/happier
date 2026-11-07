@@ -79,6 +79,7 @@ describe('ToolStatusIndicator (permission states)', () => {
 
     it('uses the neutral loading color while running', async () => {
         const { ToolStatusIndicator } = await import('./ToolStatusIndicator');
+        const { ActivitySpinner } = await import('@/components/ui/feedback/ActivitySpinner');
 
         const screen = await renderScreen(
             <ToolStatusIndicator
@@ -95,7 +96,8 @@ describe('ToolStatusIndicator (permission states)', () => {
             />,
         );
 
-        const spinner = screen.findByProps({ accessibilityRole: 'progressbar' });
-        expect(spinner?.props?.style?.[0]?.borderColor).toBe('#555555');
+        // The indicator owns which color its spinner gets; how the spinner draws it depends on the
+        // user's loading indicator style.
+        expect(screen.findByType(ActivitySpinner).props.color).toBe('#555555');
     });
 });

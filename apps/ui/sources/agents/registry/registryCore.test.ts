@@ -55,6 +55,7 @@ describe('agents/registryCore', () => {
             { detectKey: 'codex', expected: 'codex' },
             { detectKey: 'opencode', expected: 'opencode' },
             { detectKey: 'kiro-cli', expected: 'kiro' },
+            { detectKey: 'devin', expected: 'devin' },
             { detectKey: 'custom-acp', expected: 'customAcp' },
             { detectKey: '  ', expected: null },
             { detectKey: 'unknown', expected: null },
@@ -107,6 +108,68 @@ describe('agents/registryCore', () => {
         expect(customAcp.cli.detectKey).toBe('custom-acp');
     });
 
+    it('provides Devin as a resumable catalog ACP provider', () => {
+        expect(getAgentCore('devin')).toMatchObject({
+            id: 'devin',
+            cli: { detectKey: 'devin', machineLoginKey: 'devin' },
+            sessionModes: { kind: 'acpAgentModes' },
+            model: { acpModelConfigOptionId: 'model', acpModelSetMethod: 'config_option' },
+            resume: { vendorResumeIdField: 'devinSessionId', supportsVendorResume: true },
+            tools: { delivery: 'native_mcp', support: 'supported' },
+        });
+    });
+
+    it.each(['devin', 'kimi'] as const)('projects shared tmux-backed local control for %s', (agentId) => {
+        expect(getAgentCore(agentId).localControl).toEqual({
+            supported: true,
+            topology: 'exclusive',
+            attachStrategy: 'tmux',
+        });
+    });
+
+    it('keeps local control unavailable for an unsupported provider', () => {
+        expect(getAgentCore('gemini').localControl).toBeUndefined();
+    });
+
+    it.each([
+        ['fx', 'fx', 'fxSessionId'],
+        ['droid', 'droid', 'droidSessionId'],
+    ] as const)('provides %s as a discoverable resumable ACP Agent', (agentId, detectKey, resumeField) => {
+        expect(getAgentCore(agentId as never)).toMatchObject({
+            id: agentId,
+            cli: { detectKey, machineLoginKey: agentId, spawnAgent: agentId },
+            sessionModes: { kind: 'acpAgentModes' },
+            model: { dynamicProbe: 'auto', acpModelConfigOptionId: 'model' },
+            resume: { vendorResumeIdField: resumeField, supportsVendorResume: true },
+            tools: { delivery: 'native_mcp', support: 'supported' },
+        });
+    });
+
+    it('provides CodeBuddy Code as a resumable ACP agent with persisted transcripts', () => {
+        expect(getAgentCore('codebuddy')).toMatchObject({
+            id: 'codebuddy',
+            cli: { detectKey: 'codebuddy', machineLoginKey: 'codebuddy', spawnAgent: 'codebuddy' },
+            sessionModes: { kind: 'acpAgentModes' },
+            model: { dynamicProbe: 'auto', acpModelConfigOptionId: 'model', acpModelSetMethod: 'config_option' },
+            resume: { vendorResumeIdField: 'codebuddySessionId', supportsVendorResume: true },
+            sessionStorage: { direct: false, persisted: true },
+            tools: { delivery: 'native_mcp', support: 'experimental' },
+        });
+    });
+
+    it('provides Agy as a managed, resumable ACP agent while keeping the interactive CLI distinct', () => {
+        expect(getAgentCore('agy')).toMatchObject({
+            id: 'agy',
+            cli: { detectKey: 'agy', machineLoginKey: 'antigravity-cli', spawnAgent: 'agy' },
+            sessionModes: { kind: 'acpAgentModes' },
+            model: { dynamicProbe: 'auto', acpModelConfigOptionId: 'model' },
+            resume: { vendorResumeIdField: 'agySessionId', supportsVendorResume: true },
+            sessionStorage: { direct: false, persisted: true },
+            tools: { delivery: 'native_mcp', support: 'supported' },
+            ui: { agentPickerIconName: 'rocket-outline' },
+        });
+    });
+
     it('provides a conservative first-class Grok core config', () => {
         const grok = getAgentCore('grok');
         expect(grok).toMatchObject({
@@ -128,7 +191,7 @@ describe('agents/registryCore', () => {
     });
 
     it('uses generic installer guidance instead of hardcoded package-manager commands', () => {
-        for (const agentId of ['codex', 'opencode', 'qwen', 'kilo', 'kiro', 'customAcp', 'pi', 'copilot', 'grok'] as const) {
+        for (const agentId of ['codex', 'opencode', 'qwen', 'kilo', 'kiro', 'devin', 'customAcp', 'pi', 'copilot', 'grok'] as const) {
             const core = getAgentCore(agentId);
             expect(core.cli.installBanner.installKind).toBe('ifAvailable');
             expect(core.cli.installBanner.installCommand).toBeUndefined();
@@ -164,6 +227,11 @@ describe('agents/registryCore', () => {
         expect(getAgentCore('opencode').uiConnectedService).toEqual({
             serviceId: null,
             label: 'OpenCode',
+            connectRoute: null,
+        });
+        expect(getAgentCore('agy').uiConnectedService).toEqual({
+            serviceId: 'antigravity',
+            label: 'Google Antigravity',
             connectRoute: null,
         });
     });

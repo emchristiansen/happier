@@ -1,8 +1,103 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { startConnectedServiceQuotasLoop } from './startConnectedServiceQuotasLoop';
+import { buildConnectedServiceCredentialRecord, projectProviderAccountUsageSnapshotToConnectedServiceQuotaSnapshotV1, type ProviderAccountUsageSnapshotV1 } from '@happier-dev/protocol';
+import { createAgyQuotaFetcher } from '@/backends/agy/connectedServices/quotaFetcher';
+import { invalidateConnectedServiceAccountMode } from '@/cloud/connectedServices/resolveConnectedServiceAccountMode';
+import { ConnectedServiceQuotasCoordinator } from './ConnectedServiceQuotasCoordinator';
 
 describe('startConnectedServiceQuotasLoop', () => {
+  it.each([false, true])('refreshes a ready profile after selected credential changes (during fetch: %s)', async duringFetch => {
+    invalidateConnectedServiceAccountMode();
+    const now = 1_000_000;
+    let accessToken = 'selected-a';
+    const firstFetch: { release?: () => void } = {};
+    let published: ProviderAccountUsageSnapshotV1 | null = null;
+    const record = () => buildConnectedServiceCredentialRecord({ now, serviceId: 'antigravity',
+      profileId: 'connected', kind: 'oauth', expiresAt: now + 60_000,
+      oauth: { accessToken, refreshToken: 'refresh', idToken: null, scope: null, tokenType: null,
+        providerAccountId: 'selected-account', providerEmail: null } });
+    const fetcher = createAgyQuotaFetcher({ fetchRuntime: async (url, init) => {
+      if (String(url).endsWith(':loadCodeAssist')) {
+        return new Response(JSON.stringify({ currentTier: {}, cloudaicompanionProject: 'project' }));
+      }
+      const selectedA = new Headers(init.headers).get('Authorization') === 'Bearer selected-a';
+      if (duringFetch && selectedA) await new Promise<void>(resolve => { firstFetch.release = resolve; });
+      return new Response(JSON.stringify({ buckets: [{ bucketId: 'weekly', remainingFraction: selectedA ? 0.8 : 0.2 }] }));
+    } });
+    const coordinator = new ConnectedServiceQuotasCoordinator({
+      credentials: { token: 'account', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      quotaFetchers: [fetcher], discoveryEnabled: false, now: () => now,
+      randomBytes: length => new Uint8Array(length),
+      api: {
+        getAccountEncryptionMode: async () => 'plain',
+        listConnectedServiceProfiles: async () => ({ serviceId: 'antigravity', profiles: [{ profileId: 'connected', status: 'connected' }] }),
+        getConnectedServiceCredentialPlain: async () => ({ content: { t: 'plain', v: record() } }),
+        getConnectedServiceQuotaSnapshotPlain: async ({ serviceId, profileId }) => {
+          if (!published) return null;
+          const snapshot = projectProviderAccountUsageSnapshotToConnectedServiceQuotaSnapshotV1({
+            snapshot: published, source: { serviceId, profileId, bindingKind: 'profile' },
+          });
+          if (!snapshot) throw new Error('Fixture quota source did not resolve');
+          return { content: { t: 'plain', v: snapshot },
+            metadata: { fetchedAt: now, staleAfterMs: 300_000, status: 'ok' } };
+        },
+        registerProviderAccountUsageSnapshotPlain: async input => { published = input.content.v; },
+        getConnectedServiceQuotaSnapshotSealed: async () => null,
+        getConnectedServiceCredentialSealed: async () => null,
+      },
+    });
+    const handle = startConnectedServiceQuotasLoop({ enabled: true, tickMs: 10_000, coordinator,
+      onTickError: error => { throw error; }, setIntervalFn: () => 1, clearIntervalFn: () => {} });
+    const source = { serviceId: 'antigravity' as const, profileId: 'connected', bindingKind: 'profile' as const };
+    handle?.wake([source]);
+    if (duringFetch) await vi.waitFor(() => expect(firstFetch.release).toBeDefined());
+    else await vi.waitFor(() => expect(published).toMatchObject({ meters: [{ remainingPct: 80 }] }));
+    accessToken = 'selected-b';
+    handle?.wake([source]);
+    firstFetch.release?.();
+    await vi.waitFor(() => expect(published).toMatchObject({ meters: [{ remainingPct: 20 }] }));
+    await handle?.stop();
+    invalidateConnectedServiceAccountMode();
+  });
+  it.each([0, 2000])('wakes the existing loop after profile changes and preserves an in-flight wake (jitter %s)', async tickJitterMs => {
+    let ticks = 0;
+    let release: () => void = () => {};
+    // The real coordinator owns discovery; only its clock and account HTTP are controlled.
+    const coordinator = new ConnectedServiceQuotasCoordinator({
+      credentials: { token: 'quota-loop-account', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+      quotaFetchers: [], discoveryEnabled: false,
+      now: () => { ticks += 1; return 500; },
+      randomBytes: length => new Uint8Array(length),
+      api: {
+        getAccountEncryptionMode: async () => { await new Promise<void>(resolve => { release = resolve; }); return 'plain'; },
+        getConnectedServiceQuotaSnapshotSealed: async () => null,
+        getConnectedServiceCredentialSealed: async () => null,
+      },
+    });
+    const handle = startConnectedServiceQuotasLoop({
+      enabled: true, tickMs: 10000, tickJitterMs,
+      coordinator,
+      onTickError: () => {},
+      setIntervalFn: () => 1, clearIntervalFn: () => {},
+      ...(tickJitterMs ? { setTimeoutFn: () => 1, clearTimeoutFn: () => {} } : {}),
+    });
+    handle?.wake();
+    expect(ticks).toBe(1);
+    handle?.wake();
+    handle?.wake();
+    expect(ticks).toBe(1);
+    release();
+    await vi.waitFor(() => expect(ticks).toBe(2));
+    handle?.pause();
+    handle?.wake();
+    expect(ticks).toBe(2);
+    handle?.resume();
+    await vi.waitFor(() => expect(ticks).toBe(3));
+    await handle?.stop();
+    handle?.wake();
+    expect(ticks).toBe(3);
+  });
   it('schedules tickOnce when enabled', async () => {
     const coordinator: { tickOnce: () => Promise<void> } = { tickOnce: vi.fn(async () => {}) };
 

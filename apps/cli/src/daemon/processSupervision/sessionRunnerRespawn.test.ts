@@ -13,6 +13,87 @@ import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers
 import { createSessionRunnerRespawnManager, type SessionRunnerRespawnOptionsResolver } from './sessionRunnerRespawn';
 
 describe('createSessionRunnerRespawnManager', () => {
+  it.each([false, true])('keeps Stop authoritative across held automatic preflight (quota=%s)', async (quota) => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered = false;
+    const spawnSession = vi.fn(async () => ({ type: 'success', pid: 900 }));
+    const terminal = vi.fn();
+    const manager = createSessionRunnerRespawnManager({
+      enabled: true, maxRestarts: 2, baseDelayMs: 1, maxDelayMs: 1, jitterMs: 0,
+      isSessionAlreadyRunning: async () => false, spawnSession,
+      resolveRespawnOptions: async ({ defaultOptions }) => { entered = true; await held; return defaultOptions; },
+      onRespawnTerminal: terminal, random: () => 0, logDebug: () => {}, logWarn: () => {},
+    });
+    const tracked: TrackedSession = { startedBy: 'daemon', happySessionId: 'held-session', pid: 100,
+      vendorResumeId: 'same-native', spawnOptions: { directory: '/fixture' } };
+    try {
+      manager.handleUnexpectedExit(tracked, { reason: 'process-exit', code: 1, signal: null },
+        quota ? { forceRestart: true, quotaRecoveryAttemptId: 'quota-1' } : undefined);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(entered).toBe(true);
+      manager.markStopRequested('held-session', { reason: 'daemon_stop_session', requestedAtMs: 1 });
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(spawnSession).not.toHaveBeenCalled();
+      expect(terminal).toHaveBeenCalledWith(expect.objectContaining({ reason: 'stop_requested' }));
+    } finally { release(); vi.useRealTimers(); }
+  });
+
+  it.each([false, true])('cancels an entered automatic spawn preflight even after explicit Resume clears Stop (clear=%s)', async (clear) => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const physicalLaunch = vi.fn();
+    let entered = false;
+    const manager = createSessionRunnerRespawnManager({
+      enabled: true, maxRestarts: 1, baseDelayMs: 1, maxDelayMs: 1, jitterMs: 0,
+      isSessionAlreadyRunning: async () => false,
+      spawnSession: async (_options, signal?: AbortSignal) => {
+        entered = true; await held; signal?.throwIfAborted(); physicalLaunch();
+        return { type: 'success', pid: 900 };
+      },
+      random: () => 0, logDebug: () => {}, logWarn: () => {},
+    });
+    try {
+      manager.handleUnexpectedExit({ startedBy: 'daemon', happySessionId: 'held-session', pid: 100,
+        vendorResumeId: 'same-native', spawnOptions: { directory: '/fixture' } },
+        { reason: 'process-exit', code: 1, signal: null }, { forceRestart: true, quotaRecoveryAttemptId: 'quota-1' });
+      await vi.advanceTimersByTimeAsync(1);
+      expect(entered).toBe(true);
+      manager.markStopRequested('held-session', { reason: 'daemon_stop_session', requestedAtMs: 1 });
+      if (clear) manager.clearStopRequested('held-session');
+      release(); await vi.advanceTimersByTimeAsync(0);
+      expect(physicalLaunch).not.toHaveBeenCalled();
+    } finally { release(); vi.useRealTimers(); }
+  });
+
+  it('admits each distinct guarded quota attempt once without a default intended-restart cap', async () => {
+    vi.useFakeTimers();
+    try {
+      const spawnSession = vi.fn(async (_options: SpawnSessionOptions) => ({ type: 'success' as const, pid: 900 }));
+      const manager = createSessionRunnerRespawnManager({
+        enabled: true, maxRestarts: 1, maxIntendedRestarts: 1,
+        baseDelayMs: 1, maxDelayMs: 1, jitterMs: 0,
+        isSessionAlreadyRunning: async () => false, spawnSession,
+        random: () => 0, logDebug: () => {}, logWarn: () => {},
+      });
+      const tracked: TrackedSession = { startedBy: 'daemon', happySessionId: 'quota-session', pid: 100,
+        vendorResumeId: 'same-native', spawnOptions: { directory: '/fixture', resume: 'same-native' } };
+      for (let index = 0; index < 4; index++) {
+        const attempt = Object.assign({ forceRestart: true }, { quotaRecoveryAttemptId: `guarded-${index}` });
+        manager.handleUnexpectedExit(tracked, { reason: 'process-exit', code: 0, signal: null }, attempt);
+        await vi.advanceTimersByTimeAsync(1);
+        manager.handleUnexpectedExit(tracked, { reason: 'process-exit', code: 0, signal: null }, attempt);
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      expect(spawnSession).toHaveBeenCalledTimes(4);
+      expect(spawnSession.mock.calls.every(([options]) => options.resume === 'same-native'
+        && options.existingSessionId === 'quota-session')).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('spawns a replacement runner after an unexpected termination', async () => {
     vi.useFakeTimers();
     const spawnSession = vi.fn(async (_opts: unknown) => ({ type: 'success' as const, pid: 123 }));

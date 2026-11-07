@@ -13,7 +13,7 @@ Session forking lets you branch a session without losing the original conversati
 - **Ancestor context without duplication**: the child renders read-only ancestor messages inline; scrolling pages parent segments automatically.
 - **Branch-and-edit**: when you fork on a user message, the child composer is prefilled with that message so you can revise and resend.
 - **Recognizable child titles**: when the parent has a session title, the child keeps it with `(fork 1)` appended. Forking that child increments the number instead of stacking another suffix.
-- **Provider-native when available**: OpenCode server-native fork-at-message; Codex app-server native fork-at-latest plus rollback-to-point; ACP fork-at-latest when supported. Compatibility callers that choose `auto` can use replay otherwise.
+- **Provider-native when available**: Codex app-server supports native fork-at-latest plus rollback-to-point, and ACP can support fork-at-latest. OpenCode's legacy V1 server has a native fork route, but pure V2 does not; current server-mode admission therefore uses replay instead of making a dialect-ambiguous native claim.
 
 ## How fork selection works
 
@@ -63,7 +63,7 @@ You can adjust the replay seed budget in Settings (`max seed characters`) to tra
 ## OpenCode specifics
 
 - Two backends:
-  - **Server-native (default)**: supports native fork-at-message, question events, and richer lifecycle. Uses a managed local OpenCode server unless you set an explicit server URL.
+  - **Server-native (default)**: negotiates either the legacy V1 or pure V2 server API. V1 has native fork-at-message, while pure V2 has no fork route. Because this client cannot publish that distinction per live server, it fails closed and does not offer native server fork; use replay instead. It uses a managed local OpenCode server unless you set an explicit server URL.
   - **ACP (legacy fallback)**: best-effort fork-at-latest when the ACP backend exposes `session/fork`; otherwise replay is used.
 - Explicit external server URL (Settings) is opt-in; only loopback `http` or `https` origins without credentials are accepted. Happier persists this URL per session when you explicitly set it; managed servers are not persisted.
 - Managed OpenCode server is shared per machine; if it dies, Happier restarts it automatically instead of blocking new sessions.

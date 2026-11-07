@@ -5,8 +5,18 @@ import { join, resolve } from 'node:path';
 import { createRunDirs } from '../../src/testkit/runDir';
 import { startServerLight, type StartedServer } from '../../src/testkit/process/serverLight';
 import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '../../src/testkit/process/uiWeb';
-import { startTestDaemon, type StartedDaemon } from '../../src/testkit/daemon/daemon';
-import { startCliAuthLoginForTerminalConnect, type StartedCliTerminalConnect } from '../../src/testkit/uiE2e/cliTerminalConnect';
+import {
+  resolveTestDaemonCliLaunchSpec,
+  startTestDaemon,
+  type PreparedTestDaemonCliLaunchSpec,
+  type StartedDaemon,
+} from '../../src/testkit/daemon/daemon';
+import {
+  resolveCliTerminalConnectLaunchSpec,
+  startCliAuthLoginForTerminalConnect,
+  type PreparedCliTerminalConnectLaunchSpec,
+  type StartedCliTerminalConnect,
+} from '../../src/testkit/uiE2e/cliTerminalConnect';
 import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
 import {
   createSessionFromNewSessionComposer,
@@ -87,11 +97,35 @@ test.describe('ui e2e: session subroutes', () => {
 
   const suiteDir = run.testDir('session-subroutes-suite');
   const cliHomeDir = resolve(join(suiteDir, 'cli-home'));
+  const t1TestDir = resolve(join(suiteDir, 't1-subroutes'));
+  const t1CliLoginEnv = (): NodeJS.ProcessEnv => ({
+    ...process.env,
+    HOME: cliHomeDir,
+    CI: '1',
+    HAPPIER_DISABLE_CAFFEINATE: '1',
+    HAPPIER_VARIANT: 'dev',
+  });
+  const t1DaemonEnv = (serverUrl: string, webappUrl: string): NodeJS.ProcessEnv => ({
+    ...process.env,
+    HOME: cliHomeDir,
+    CI: '1',
+    HAPPIER_HOME_DIR: cliHomeDir,
+    HAPPIER_SERVER_URL: serverUrl,
+    HAPPIER_WEBAPP_URL: webappUrl,
+    HAPPIER_DISABLE_CAFFEINATE: '1',
+    HAPPIER_VARIANT: 'dev',
+    HAPPIER_CLAUDE_PATH: fakeClaudeFixturePath(),
+    HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
+    HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
+  });
 
   let server: StartedServer | null = null;
   let ui: StartedUiWeb | null = null;
   let uiBaseUrl: string | null = null;
   let daemon: StartedDaemon | null = null;
+  // Immutable CLI launch specs prepared once here (outside the per-test budget) and borrowed by t1.
+  let t1CliLoginLaunchSpec: PreparedCliTerminalConnectLaunchSpec | null = null;
+  let t1DaemonLaunchSpec: PreparedTestDaemonCliLaunchSpec | null = null;
 
   test.beforeAll(async () => {
     test.setTimeout(resolveUiWebBeforeAllTimeoutMs(process.env));
@@ -118,6 +152,13 @@ test.describe('ui e2e: session subroutes', () => {
     });
 
     uiBaseUrl = normalizeLoopbackBaseUrl(ui.baseUrl);
+
+    await mkdir(t1TestDir, { recursive: true });
+    t1CliLoginLaunchSpec = await resolveCliTerminalConnectLaunchSpec({ testDir: t1TestDir, env: t1CliLoginEnv() });
+    t1DaemonLaunchSpec = await resolveTestDaemonCliLaunchSpec({
+      testDir: t1TestDir,
+      env: t1DaemonEnv(server.baseUrl, uiBaseUrl),
+    });
   });
 
   test.afterAll(async () => {
@@ -127,16 +168,17 @@ test.describe('ui e2e: session subroutes', () => {
     await server?.stop().catch(() => {});
   });
 
-  test('resolves session info/runs/files subroutes without redirecting', async ({ page }) => {
-    test.setTimeout(540_000);
+  test('resolves session info/runs/files subroutes without redirecting', { tag: "@smoke" }, async ({ page }) => {
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
+    if (!t1CliLoginLaunchSpec || !t1DaemonLaunchSpec) throw new Error('missing prepared CLI launch specs');
 
     await page.setViewportSize({ width: 1440, height: 900 });
     await gotoDomContentLoadedWithRetries(page, uiBaseUrl);
 
     await ensureAccountReadyForConnect({ page, timeoutMs: 120_000 });
 
-    const testDir = resolve(join(suiteDir, 't1-subroutes'));
+    const testDir = t1TestDir;
     await mkdir(testDir, { recursive: true });
 
     const cliLogin: StartedCliTerminalConnect = await startCliAuthLoginForTerminalConnect({
@@ -144,13 +186,8 @@ test.describe('ui e2e: session subroutes', () => {
       cliHomeDir,
       serverUrl: server.baseUrl,
       webappUrl: uiBaseUrl,
-      env: {
-        ...process.env,
-        HOME: cliHomeDir,
-        CI: '1',
-        HAPPIER_DISABLE_CAFFEINATE: '1',
-        HAPPIER_VARIANT: 'dev',
-      },
+      env: t1CliLoginEnv(),
+      preparedCliLaunchSpec: t1CliLoginLaunchSpec,
     });
 
     await page.goto(cliLogin.connectUrl, { waitUntil: 'domcontentloaded' });
@@ -159,23 +196,11 @@ test.describe('ui e2e: session subroutes', () => {
     await cliLogin.waitForSuccess();
     await cliLogin.stop().catch(() => {});
 
-    const fakeClaudePath = fakeClaudeFixturePath();
     daemon = await startTestDaemon({
       testDir,
       happyHomeDir: cliHomeDir,
-      env: {
-        ...process.env,
-        HOME: cliHomeDir,
-        CI: '1',
-        HAPPIER_HOME_DIR: cliHomeDir,
-        HAPPIER_SERVER_URL: server.baseUrl,
-        HAPPIER_WEBAPP_URL: uiBaseUrl,
-        HAPPIER_DISABLE_CAFFEINATE: '1',
-        HAPPIER_VARIANT: 'dev',
-        HAPPIER_CLAUDE_PATH: fakeClaudePath,
-        HAPPIER_E2E_FAKE_CLAUDE_SESSION_ID: `fake-claude-session-${run.runId}`,
-        HAPPIER_E2E_FAKE_CLAUDE_INVOCATION_ID: `fake-claude-invocation-${run.runId}`,
-      },
+      env: t1DaemonEnv(server.baseUrl, uiBaseUrl),
+      preparedCliLaunchSpec: t1DaemonLaunchSpec,
     });
 
     const machineId = await waitForDaemonMachineIdFromCliSettings({ cliHomeDir, timeoutMs: 120_000 });
@@ -220,7 +245,7 @@ test.describe('ui e2e: session subroutes', () => {
   });
 
   test('renders stable unavailable selectors for missing session routes', async ({ page }) => {
-    test.setTimeout(240_000);
+    test.setTimeout(180_000);
     if (!uiBaseUrl) throw new Error('missing ui fixture');
 
     await page.setViewportSize({ width: 1440, height: 900 });

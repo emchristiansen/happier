@@ -42,7 +42,7 @@ describe('resolveClaudeCodeUserAgent', () => {
     });
     execFileSyncMock.mockReturnValue('2.1.138 (Claude Code)\n');
 
-    expect(resolveClaudeCodeUserAgent()).toBe('claude-code/2.1.138');
+    expect(resolveClaudeCodeUserAgent()).toBe('claude-cli/2.1.138 (external, cli)');
     expect(execFileSyncMock).toHaveBeenCalledWith(
       '/usr/local/bin/claude',
       ['--version'],
@@ -59,8 +59,8 @@ describe('resolveClaudeCodeUserAgent', () => {
     });
     execFileSyncMock.mockReturnValue('3.0.0\n');
 
-    expect(resolveClaudeCodeUserAgent()).toBe('claude-code/3.0.0');
-    expect(resolveClaudeCodeUserAgent()).toBe('claude-code/3.0.0');
+    expect(resolveClaudeCodeUserAgent()).toBe('claude-cli/3.0.0 (external, cli)');
+    expect(resolveClaudeCodeUserAgent()).toBe('claude-cli/3.0.0 (external, cli)');
     expect(execFileSyncMock).toHaveBeenCalledTimes(1);
     expect(execFileSyncMock).toHaveBeenCalledWith(
       '/managed/js-runtime',

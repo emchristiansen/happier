@@ -1,7 +1,75 @@
 import { describe, expect, it } from 'vitest';
 import * as protocol from '../index.js';
+import { SessionTerminalMetadataSchema as ReleasedUiTerminalSchema } from './fixtures/uiWeb0212TerminalMetadata.js';
 
 describe('sessionMetadata terminal metadata', () => {
+  it.each(['herdr', 'plain'] as const)('round-trips %s hosting with a Herdr preference through the released UI reader', (mode) => {
+    const metadata = {
+      path: '/repo', host: 'machine', name: 'original',
+      terminal: {
+        mode, requested: 'herdr' as const,
+        ...(mode === 'herdr' ? {
+          herdr: { sessionName: 'work', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' },
+        } : { fallbackReason: 'runtime_has_no_terminal' }),
+      },
+      providerExtension: { retained: true },
+    };
+    const wire = protocol.projectSessionMetadataForWire(metadata);
+    expect(wire).toMatchObject({ terminal: { mode: 'plain', requested: 'plain', requestedHostKind: 'herdr' } });
+    if (!wire || typeof wire !== 'object' || !('terminal' in wire)) throw new Error('Missing terminal projection');
+    const oldTerminal = ReleasedUiTerminalSchema.parse(wire.terminal);
+    expect(oldTerminal.mode).toBe('plain');
+    const oldUiMutation = { ...metadata, name: 'renamed', terminal: oldTerminal };
+    const hydrated = protocol.normalizeSessionMetadataForRead(oldUiMutation);
+    expect(hydrated).toEqual({ ...metadata, name: 'renamed' });
+    expect(protocol.projectSessionMetadataForWire(hydrated)).toEqual({ ...wire, name: 'renamed' });
+    expect(metadata.name).toBe('original');
+    expect(metadata.terminal.mode).toBe(mode);
+  });
+
+  it('does not retain a wire selector when a canonical terminal changes hosts', () => {
+    const hydrated = protocol.normalizeSessionMetadataForRead({ terminal: {
+      mode: 'plain', hostKind: 'herdr', requested: 'plain', requestedHostKind: 'herdr',
+      herdr: { sessionName: 'work', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' },
+    } });
+    const wire = protocol.projectSessionMetadataForWire({ terminal: {
+      ...hydrated.terminal, mode: 'tmux', requested: 'tmux', tmux: { target: 'work:1' },
+    } });
+    expect(wire).toMatchObject({ terminal: { mode: 'tmux', requested: 'tmux' } });
+    expect(wire).not.toMatchObject({ terminal: { hostKind: 'herdr' } });
+    expect(wire).not.toMatchObject({ terminal: { requestedHostKind: 'herdr' } });
+  });
+  it('reads the additive Herdr wire projection without leaving competing mode selectors in domain metadata', () => {
+    const parsed = protocol.SessionTerminalMetadataSchema.parse({
+      mode: 'plain',
+      hostKind: 'herdr',
+      requested: 'plain',
+      requestedHostKind: 'herdr',
+      herdr: { sessionName: 'work', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' },
+      providerExtension: { retained: true },
+    });
+    expect(parsed).toEqual({
+      mode: 'herdr',
+      requested: 'herdr',
+      herdr: { sessionName: 'work', socketPath: '/tmp/herdr.sock', terminalId: 'term_123' },
+      providerExtension: { retained: true },
+    });
+  });
+  it('keeps the stable Herdr terminal identity needed after a pane moves', () => {
+    expect(protocol.SessionTerminalMetadataSchema.parse({
+      mode: 'herdr',
+      requested: 'herdr',
+      herdr: {
+        sessionName: 'work',
+        socketPath: '/tmp/herdr.sock',
+        terminalId: 'term_123',
+        paneId: 'w1:p2',
+      },
+    })).toMatchObject({
+      mode: 'herdr',
+      herdr: { terminalId: 'term_123' },
+    });
+  });
   it('parses tmux terminal metadata and preserves unknown fields', () => {
     const parsed = (protocol as any).SessionTerminalMetadataSchema.parse({
       mode: 'tmux',

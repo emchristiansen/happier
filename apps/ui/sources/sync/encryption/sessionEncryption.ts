@@ -1,4 +1,5 @@
 import { encodeBase64 } from '@/encryption/base64';
+import { projectSessionMetadataForWire } from '@happier-dev/protocol';
 import { RawRecordSchema, type RawRecord } from '../typesRaw';
 import { ApiMessage } from '../api/types/apiTypes';
 import { DecryptedMessage, Metadata, MetadataSchema, AgentState, AgentStateSchema } from '../domains/state/storageTypes';
@@ -257,7 +258,7 @@ export class SessionEncryption {
             'sync.encryption.session.encryptMetadata',
             { items: 1 },
             async () => {
-                const encrypted = await this.encryptor.encrypt([metadata]);
+                const encrypted = await this.encryptor.encrypt([projectSessionMetadataForWire(metadata)]);
                 return encodeBase64(encrypted[0], 'base64');
             },
         );

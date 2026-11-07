@@ -1,9 +1,11 @@
+import type { reconcileClaudeSessionModelsState } from './reconcileClaudeSessionModelsState';
 import type { Metadata } from '@/api/types';
 import { updateMetadataBestEffort } from '@/api/session/sessionWritesBestEffort';
 
 import { buildClaudeSessionModelsMetadataWithCurrentModelId } from '../remote/buildClaudeSessionModelsMetadataFromSupportedModels';
 
-export type ClaudeEffectiveModelUpdateSource = 'statusline' | 'transcript' | 'sdk';
+export type ClaudeEffectiveModelUpdateSource = 'statusline' | 'transcript' | 'sdk' | 'control';
+export type ClaudeEffectiveModelObservation = Readonly<{ modelId: string; reasoningEffort?: string }>;
 
 type ClaudeEffectiveModelUpdateClient = Readonly<{
   sendSessionEvent(event: { type: 'message'; message: string }, id?: string): void;
@@ -68,12 +70,15 @@ function hasRequestedModelDetails(params: Readonly<{
   modelId: string;
   displayName: string | null;
   contextWindowTokens: number | null;
+  reasoningEffort: string | null;
 }>): boolean {
-  if (params.displayName === null && params.contextWindowTokens === null) return true;
+  if (params.displayName === null && params.contextWindowTokens === null && params.reasoningEffort === null) return true;
   const entry = findSessionModelEntry(params.metadata, params.modelId);
   if (!entry) return false;
   if (params.displayName !== null && entry.name !== params.displayName) return false;
   if (params.contextWindowTokens !== null && entry.contextWindowTokens !== params.contextWindowTokens) return false;
+  const effortOption = entry.modelOptions?.find(option => option.id === 'reasoning_effort');
+  if (params.reasoningEffort !== null && effortOption && effortOption.currentValue !== params.reasoningEffort) return false;
   return true;
 }
 
@@ -89,8 +94,9 @@ function buildMetadataRequestKey(params: Readonly<{
   modelId: string;
   displayName: string | null;
   contextWindowTokens: number | null;
+  reasoningEffort: string | null;
 }>): string {
-  return `${params.modelId}|${params.displayName ?? ''}|${params.contextWindowTokens ?? ''}`;
+  return `${params.modelId}|${params.displayName ?? ''}|${params.contextWindowTokens ?? ''}|${params.reasoningEffort ?? ''}`;
 }
 
 function buildModelChangedEventId(params: Readonly<{
@@ -110,38 +116,65 @@ function resolveModelLabel(params: Readonly<{
 
 export function applyClaudeEffectiveModelUpdate(params: Readonly<{
   client: ClaudeEffectiveModelUpdateClient;
-  modelId: string;
+  reconcileModels?: typeof reconcileClaudeSessionModelsState;
+  modelId?: string | null;
   displayName?: string | null;
   contextWindowTokens?: number | null;
+  reasoningEffort?: string | null;
   source: ClaudeEffectiveModelUpdateSource;
   logPrefix: string;
 }>): void {
-  const modelId = readString(params.modelId);
+  const state = stateFor(params.client);
+  // Effort-only control evidence can refine the last observed model, never a catalog/selection seed.
+  const modelId = readString(params.modelId) ?? state.lastSeenModelId;
   if (!modelId) return;
 
   const displayName = readString(params.displayName);
   const contextWindowTokens = readPositiveTokens(params.contextWindowTokens);
+  const reasoningEffort = readString(params.reasoningEffort);
   const metadataSnapshot = readMetadataSnapshot(params.client);
-  const state = stateFor(params.client);
   const previousModelId = readActiveClaudeModelId(metadataSnapshot) ?? state.lastSeenModelId;
-  const metadataRequestKey = buildMetadataRequestKey({ modelId, displayName, contextWindowTokens });
+  const metadataRequestKey = buildMetadataRequestKey({ modelId, displayName, contextWindowTokens, reasoningEffort });
 
   const alreadyAppliedInMemory = state.lastSeenModelId === modelId;
+  const appliedModel = metadataSnapshot?.sessionAppliedModelV1;
   const shouldUpdateMetadata =
-    (!alreadyAppliedInMemory && previousModelId !== modelId)
-    || !hasRequestedModelDetails({ metadata: metadataSnapshot, modelId, displayName, contextWindowTokens });
+    appliedModel?.provider !== 'claude' || appliedModel.modelId !== modelId
+    || (!alreadyAppliedInMemory && previousModelId !== modelId)
+    || !hasRequestedModelDetails({ metadata: metadataSnapshot, modelId, displayName, contextWindowTokens, reasoningEffort });
+  // Even when metadata already matches, record the live observation in the session's source
+  // contributions so a later catalog/SDK publication cannot replace it with a catalog estimate.
+  if (!shouldUpdateMetadata && params.reconcileModels) {
+    buildClaudeSessionModelsMetadataWithCurrentModelId({
+      currentModelId: modelId,
+      metadata: metadataSnapshot,
+      reconcileModels: params.reconcileModels,
+      currentModel: {
+        ...(displayName ? { name: displayName } : {}),
+        ...(contextWindowTokens !== null ? { contextWindowTokens } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+      },
+    });
+  }
   if (shouldUpdateMetadata && state.lastMetadataRequestKey !== metadataRequestKey) {
     state.lastMetadataRequestKey = metadataRequestKey;
     updateMetadataBestEffort(
       params.client,
       (metadata) => ({
         ...metadata,
+        // Observed Claude runtime evidence owns Running; prompt acceptance proves input custody only.
+        sessionAppliedModelV1: metadata.sessionAppliedModelV1?.provider === 'claude'
+          && metadata.sessionAppliedModelV1.modelId === modelId
+          ? metadata.sessionAppliedModelV1
+          : { v: 1, provider: 'claude', modelId, updatedAt: Date.now() },
         ...(buildClaudeSessionModelsMetadataWithCurrentModelId({
           currentModelId: modelId,
+          reconcileModels: params.reconcileModels,
           metadata,
           currentModel: {
             ...(displayName ? { name: displayName } : {}),
             ...(contextWindowTokens !== null ? { contextWindowTokens } : {}),
+            ...(reasoningEffort ? { reasoningEffort } : {}),
           },
         }) ?? {}),
       }),

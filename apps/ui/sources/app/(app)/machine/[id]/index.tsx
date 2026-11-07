@@ -33,7 +33,8 @@ import { MultiTextInput, type MultiTextInputHandle } from '@/components/ui/forms
 import { DetectedClisList } from '@/components/machines/DetectedClisList';
 import { useMachineCapabilitiesCache } from '@/hooks/server/useMachineCapabilitiesCache';
 import { areServerProfileIdentifiersEquivalent, getActiveServerId } from '@/sync/domains/server/serverProfiles';
-import { resolveTerminalSpawnOptions } from '@/sync/domains/settings/terminalSettings';
+import { buildMachineTerminalSettingsPatch, resolveTerminalHost, resolveTerminalSpawnOptions } from '@/sync/domains/settings/terminalSettings';
+import { useApplySettings } from '@/sync/store/settingsWriters';
 import {
     readMachineWindowsRemoteSessionLaunchMode,
     resolveEffectiveWindowsRemoteSessionLaunchMode,
@@ -168,6 +169,7 @@ export default function MachineDetailScreen() {
     const [isRenamingMachine, setIsRenamingMachine] = useState(false);
     const [isUpdatingWindowsConsoleMode, setIsUpdatingWindowsConsoleMode] = useState(false);
     const [openWindowsRemoteSessionLaunchModeMenu, setOpenWindowsRemoteSessionLaunchModeMenu] = useState(false);
+    const [openTerminalHostOverrideMenu, setOpenTerminalHostOverrideMenu] = useState(false);
     const [isRevokingMachine, setIsRevokingMachine] = useState(false);
     const [replacingMachineId, setReplacingMachineId] = useState<string | null>(null);
     const [isClearingReplacement, setIsClearingReplacement] = useState(false);
@@ -186,13 +188,10 @@ export default function MachineDetailScreen() {
     const windowsRemoteSessionLaunchModeOverrideEnabled =
         isWindowsMachine && machineWindowsRemoteSessionLaunchMode !== undefined;
 
-    const terminalUseTmux = useSetting('sessionUseTmux');
-    const terminalTmuxSessionName = useSetting('sessionTmuxSessionName');
-    const terminalTmuxIsolated = useSetting('sessionTmuxIsolated');
-    const terminalTmuxTmpDir = useSetting('sessionTmuxTmpDir');
     const windowsRemoteSessionLaunchModeDefault = useSetting('sessionWindowsRemoteSessionLaunchMode');
     const [terminalTmuxByMachineId, setTerminalTmuxByMachineId] = useSettingMutable('sessionTmuxByMachineId');
     const settings = useSettings();
+    const applySettings = useApplySettings();
     const activeServerId = getActiveServerId();
     const [executionRunsState, setExecutionRunsState] = useState<
         | { status: 'idle' | 'loading'; runs: readonly DaemonExecutionRunEntry[] }
@@ -271,7 +270,9 @@ export default function MachineDetailScreen() {
     }).mode;
 
     const tmuxOverride = machineId ? terminalTmuxByMachineId?.[machineId] : undefined;
-    const tmuxOverrideEnabled = Boolean(tmuxOverride);
+    const tmuxOverrideEnabled = Boolean(tmuxOverride || (machineId && settings.sessionTerminalHostByMachineId?.[machineId]));
+    const selectedGlobalTerminalHost = resolveTerminalHost({ settings, machineId: null });
+    const selectedMachineTerminalHost = resolveTerminalHost({ settings, machineId: machineId ?? null });
 
     const tmuxAvailable = React.useMemo(() => {
         const snapshot =
@@ -290,30 +291,12 @@ export default function MachineDetailScreen() {
 
     const setTmuxOverrideEnabled = useCallback((enabled: boolean) => {
         if (!machineId) return;
-        if (enabled) {
-            setTerminalTmuxByMachineId({
-                ...terminalTmuxByMachineId,
-                [machineId]: {
-                    useTmux: terminalUseTmux,
-                    sessionName: terminalTmuxSessionName,
-                    isolated: terminalTmuxIsolated,
-                    tmpDir: terminalTmuxTmpDir,
-                },
-            });
-            return;
-        }
-
-        const next = { ...terminalTmuxByMachineId };
-        delete next[machineId];
-        setTerminalTmuxByMachineId(next);
+        applySettings(buildMachineTerminalSettingsPatch({ settings, machineId, host: enabled ? selectedGlobalTerminalHost : null }));
     }, [
         machineId,
-        setTerminalTmuxByMachineId,
-        terminalTmuxByMachineId,
-        terminalUseTmux,
-        terminalTmuxIsolated,
-        terminalTmuxSessionName,
-        terminalTmuxTmpDir,
+        applySettings,
+        settings,
+        selectedGlobalTerminalHost,
     ]);
 
     const updateTmuxOverride = useCallback((patch: Partial<NonNullable<typeof tmuxOverride>>) => {
@@ -327,13 +310,14 @@ export default function MachineDetailScreen() {
         });
     }, [machineId, setTerminalTmuxByMachineId, terminalTmuxByMachineId, tmuxOverride]);
 
-    const setTmuxOverrideUseTmux = useCallback((next: boolean) => {
-        if (next && tmuxAvailable === false) {
+    const setTerminalHostOverride = useCallback((next: 'none' | 'tmux' | 'zellij' | 'herdr') => {
+        if (next === 'tmux' && tmuxAvailable === false) {
             Modal.alert(t('common.error'), t('machine.tmux.notDetectedMessage'));
             return;
         }
-        updateTmuxOverride({ useTmux: next });
-    }, [tmuxAvailable, updateTmuxOverride]);
+        if (!machineId) return;
+        applySettings(buildMachineTerminalSettingsPatch({ settings, machineId, host: next }));
+    }, [tmuxAvailable, machineId, applySettings, settings]);
 
     const handleRevokeMachine = useCallback(() => {
         if (!machineId || isRevokingMachine) return;
@@ -690,8 +674,6 @@ export default function MachineDetailScreen() {
                     updatedMetadata,
                     machine.metadataVersion
                 );
-                
-                Modal.alert(t('common.success'), t('machine.renamedSuccess'));
             } catch (error) {
                 Modal.alert(
                     t('common.error'),
@@ -1039,9 +1021,9 @@ export default function MachineDetailScreen() {
                     </>
                 )}
 
-                {/* Machine-specific tmux override */}
+                {/* Machine-specific terminal-host override; tmux details remain available below. */}
                 {!!machineId && (
-                    <ItemGroup title={t('profiles.tmux.title')}>
+                    <ItemGroup title={t('settingsSession.terminalHostTitle')}>
                         <Item
                             title={t('machine.tmux.overrideTitle')}
                             subtitle={tmuxOverrideEnabled ? t('machine.tmux.overrideEnabledSubtitle') : t('machine.tmux.overrideDisabledSubtitle')}
@@ -1050,27 +1032,49 @@ export default function MachineDetailScreen() {
                             onPress={() => setTmuxOverrideEnabled(!tmuxOverrideEnabled)}
                         />
 
-                                {tmuxOverrideEnabled && tmuxOverride && (
+                        {!tmuxOverrideEnabled && (
+                            <Item
+                                testID="machine-terminal-effective-host"
+                                title={t('settingsSession.terminalHostTitle')}
+                                subtitle={selectedMachineTerminalHost === 'none'
+                                    ? t('settingsSession.terminalHostNone')
+                                    : selectedMachineTerminalHost === 'tmux' ? 'tmux' : selectedMachineTerminalHost === 'zellij' ? 'Zellij' : 'Herdr'}
+                                mode="info"
+                                showChevron={false}
+                            />
+                        )}
+
+                        {tmuxOverrideEnabled && (
                             <>
-                                <Item
-                                    title={t('profiles.tmux.spawnSessionsTitle')}
-                                    subtitle={
-                                        tmuxAvailable === false
-                                            ? t('machine.tmux.notDetectedSubtitle')
-                                            : (tmuxOverride.useTmux ? t('profiles.tmux.spawnSessionsEnabledSubtitle') : t('profiles.tmux.spawnSessionsDisabledSubtitle'))
-                                    }
-                                    rightElement={
-                                        <Switch
-                                            value={tmuxOverride.useTmux}
-                                            onValueChange={setTmuxOverrideUseTmux}
-                                            disabled={tmuxAvailable === false && !tmuxOverride.useTmux}
-                                        />
-                                    }
-                                    showChevron={false}
-                                    onPress={() => setTmuxOverrideUseTmux(!tmuxOverride.useTmux)}
+                                <DropdownMenu
+                                    open={openTerminalHostOverrideMenu}
+                                    onOpenChange={setOpenTerminalHostOverrideMenu}
+                                    items={[
+                                        { id: 'none', title: t('settingsSession.terminalHostNone') },
+                                        { id: 'tmux', title: 'tmux' },
+                                        { id: 'zellij', title: 'Zellij' },
+                                        { id: 'herdr', title: 'Herdr' },
+                                    ]}
+                                    selectedId={selectedMachineTerminalHost}
+                                    onSelect={(id) => {
+                                        if (id === 'none' || id === 'tmux' || id === 'zellij' || id === 'herdr') {
+                                            setTerminalHostOverride(id);
+                                            setOpenTerminalHostOverrideMenu(false);
+                                        }
+                                    }}
+                                    itemTrigger={{
+                                        title: t('settingsSession.terminalHostTitle'),
+                                        subtitle: selectedMachineTerminalHost === 'none'
+                                            ? t('settingsSession.terminalHostNone')
+                                            : selectedMachineTerminalHost === 'tmux' ? 'tmux' : selectedMachineTerminalHost === 'zellij' ? 'Zellij' : 'Herdr',
+                                        icon: <Icon name="terminal" size={29} color={theme.colors.accent.indigo} />,
+                                    }}
+                                    rowKind="item"
+                                    connectToTrigger
+                                    variant="default"
                                 />
 
-                                {tmuxOverride.useTmux && (
+                                {selectedMachineTerminalHost === 'tmux' && tmuxOverride && (
                                     <>
                                         <View style={[styles.tmuxInputContainer, { paddingTop: 0 }]}>
                                             <Text style={styles.tmuxFieldLabel}>

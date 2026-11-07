@@ -10,6 +10,7 @@ import {
 import { resolveCanonicalCodexBackendMode } from '@/rpc/handlers/codexBackendMode';
 import type { SpawnSessionOptions, SpawnSessionResult } from '@/rpc/handlers/registerSessionHandlers';
 import { normalizeSpawnSessionDirectory } from '@/rpc/handlers/spawnSessionOptionsContract';
+import { normalizeSpawnNonce } from './daemonSpawnAttemptRegistry';
 
 function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -66,6 +67,7 @@ function normalizeMcpSelectionForFingerprint(value: SpawnSessionOptions['mcpSele
   return {
     v,
     managedServersEnabled,
+    happierToolsEnabled: parsed.data.happierToolsEnabled ?? true,
     forceIncludeServerIds: [...forceIncludeServerIds].sort(),
     forceExcludeServerIds: [...forceExcludeServerIds].sort(),
   };
@@ -183,7 +185,7 @@ export function computeDaemonSpawnRequestKey(options: SpawnSessionOptions): Daem
     };
   }
 
-  const spawnNonce = normalizeNonEmptyString(options.spawnNonce);
+  const spawnNonce = normalizeSpawnNonce(options.spawnNonce);
   if (spawnNonce) {
     return { kind: 'new', key: `new:nonce:${sha256Hex(spawnNonce)}` };
   }

@@ -9,6 +9,8 @@ import {
     areServerAccountScopesEqual,
     type ServerAccountScope,
 } from '@/sync/domains/scope/serverAccountScope';
+import { log } from '@/log';
+import { isSessionDraftContextUnavailableError } from '@/sync/ops/sessionDrafts/sessionDraftCipherError';
 
 export class SessionDraftRuntimeHydrationGate {
     private hydratedScope: ServerAccountScope | null = null;
@@ -66,7 +68,15 @@ export async function materializeSessionDraftSocketWake(params: Readonly<{
     if (!update || !areServerAccountScopesEqual(params.readActiveScope(), params.capturedScope)) {
         return false;
     }
-    await params.materializeExact(params.capturedScope, update.address);
+    try {
+        await params.materializeExact(params.capturedScope, update.address);
+    } catch (error) {
+        if (isSessionDraftContextUnavailableError(error)) {
+            log.log('[session-drafts] Socket wake deferred reason=session_context_unavailable');
+            return false;
+        }
+        throw error;
+    }
     return areServerAccountScopesEqual(params.readActiveScope(), params.capturedScope);
 }
 

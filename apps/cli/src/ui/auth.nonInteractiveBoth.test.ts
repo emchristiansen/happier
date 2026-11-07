@@ -5,6 +5,8 @@ import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { createTempDir, removeTempDir } from '@/testkit/fs/tempDir';
 import { captureConsoleLogAndMuteStdout } from '@/testkit/logger/captureOutput';
 import { setStdioTtyForTest } from '@/testkit/process/stdio';
+import { reloadConfiguration } from '@/configuration';
+import { doAuth } from './auth';
 
 const runTailscaleServeStatusMock = vi.fn<
   (params: Readonly<{ timeoutMs: number; env: NodeJS.ProcessEnv; tailscaleBin: string }>) => Promise<string>
@@ -32,6 +34,7 @@ type AxiosLike = {
 };
 
 let capturedPublicKeyBase64: string | null = null;
+let requestExpiresAt: number | null = null;
 
 function encryptLegacyBundleForRecipientPublicKey(recipientPublicKeyBase64: string): string {
   const recipientPublicKey = new Uint8Array(Buffer.from(recipientPublicKeyBase64, 'base64'));
@@ -55,7 +58,7 @@ vi.mock('axios', async () => {
       if (url.endsWith('/v1/auth/request')) {
         const publicKey = (body as { publicKey?: unknown } | undefined)?.publicKey;
         capturedPublicKeyBase64 = typeof publicKey === 'string' ? publicKey : '';
-        return { data: { state: 'requested' } };
+        return { data: { state: 'requested', ...(requestExpiresAt === null ? {} : { expiresAt: requestExpiresAt }) } };
       }
       if (url.endsWith('/v1/auth/request/claim')) {
         const claimBody = body as { publicKey?: unknown } | undefined;
@@ -92,7 +95,8 @@ describe.sequential('doAuth (non-interactive)', () => {
     'HAPPIER_TAILSCALE_AUTO_PUBLIC_URL',
   ] as const;
 
-  it('prints both web + mobile instructions when method is not specified', async () => {
+  it.each([240_000, null])('prints both web + mobile instructions with server expiry %s when method is not specified', async (remainingMs) => {
+    requestExpiresAt = remainingMs === null ? null : Date.now() + remainingMs;
     const home = await createTempDir('happier-cli-auth-noninteractive-');
     const envScope = createEnvKeyScope(envKeys);
     const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
@@ -109,17 +113,26 @@ describe.sequential('doAuth (non-interactive)', () => {
         HAPPIER_AUTH_METHOD: undefined,
       });
 
-      vi.resetModules();
-      const { doAuth } = await import('./auth');
+      reloadConfiguration();
 
       const creds = await doAuth();
       expect(creds?.token).toBe('tok');
 
       const out = output.logs.join('\n');
-      expect(out).toContain('Relay URL: https://server.example.test');
-      expect(out).toContain('Web app URL: https://webapp.example.test');
-      expect(out).toContain('Mobile (recommended)');
-      expect(out).toContain('Web (fallback)');
+      // One aligned definition list for the relay, sections titled like the rest of the CLI.
+      expect(out).toMatch(/Relay URL: +https:\/\/server\.example\.test/u);
+      expect(out).toMatch(/Web app URL: +https:\/\/webapp\.example\.test/u);
+      expect(out).toContain('Mobile app (recommended)');
+      expect(out).toContain('Web browser');
+      if (requestExpiresAt === null) {
+        expect(out).toMatch(/link expires soon/i);
+        expect(out).toMatch(/rerun.*approval fails/i);
+      } else {
+        expect(out).toContain(new Date(requestExpiresAt).toISOString());
+        expect(out).toContain(`expiresAt=${requestExpiresAt}`);
+      }
+      // The wait resolves as a step instead of trailing off.
+      expect(out).toMatch(/^- \[✓\] Approved$/mu);
       expect(out).toContain('webapp.example.test/terminal/connect#key=');
       expect(out).toContain('happier://terminal?');
       expect(displayQRCodeMock).toHaveBeenCalledTimes(1);
@@ -128,6 +141,7 @@ describe.sequential('doAuth (non-interactive)', () => {
       restoreTty();
       envScope.restore();
       await removeTempDir(home);
+      requestExpiresAt = null;
     }
   }, 15_000);
 
@@ -157,8 +171,7 @@ describe.sequential('doAuth (non-interactive)', () => {
         HAPPIER_AUTH_METHOD: undefined,
       });
 
-      vi.resetModules();
-      const { doAuth } = await import('./auth');
+      reloadConfiguration();
 
       const creds = await doAuth();
       expect(creds?.token).toBe('tok');
@@ -193,8 +206,7 @@ describe.sequential('doAuth (non-interactive)', () => {
         HAPPIER_AUTH_METHOD: undefined,
       });
 
-      vi.resetModules();
-      const { doAuth } = await import('./auth');
+      reloadConfiguration();
 
       const creds = await doAuth();
       expect(creds?.token).toBe('tok');
@@ -229,8 +241,7 @@ describe.sequential('doAuth (non-interactive)', () => {
         HAPPIER_AUTH_METHOD: undefined,
       });
 
-      vi.resetModules();
-      const { doAuth } = await import('./auth');
+      reloadConfiguration();
 
       const creds = await doAuth();
       expect(creds?.token).toBe('tok');
@@ -265,8 +276,7 @@ describe.sequential('doAuth (non-interactive)', () => {
         HAPPIER_AUTH_METHOD: 'web',
       });
 
-      vi.resetModules();
-      const { doAuth } = await import('./auth');
+      reloadConfiguration();
 
       const creds = await doAuth();
       expect(creds?.token).toBe('tok');
@@ -275,7 +285,7 @@ describe.sequential('doAuth (non-interactive)', () => {
       expect(out).toContain(encodeURIComponent('http://localhost:3010').toLowerCase());
       expect(out).toContain('same machine');
       expect(out).not.toContain('same lan');
-      expect(out).toContain('does not include a relay url');
+      expect(out).toContain('relay url is a localhost/loopback url');
     } finally {
       output.restore();
       restoreTty();
@@ -302,13 +312,12 @@ describe.sequential('doAuth (non-interactive)', () => {
         HAPPIER_AUTH_METHOD: 'web',
       });
 
-      vi.resetModules();
+      reloadConfiguration();
       const axiosModule = await import('axios');
       const axiosDefault = axiosModule.default as AxiosLike;
       (axiosDefault.post as unknown as { mockClear: () => void }).mockClear();
       (axiosDefault.get as unknown as { mockClear: () => void }).mockClear();
 
-      const { doAuth } = await import('./auth');
       const creds = await doAuth();
       expect(creds?.token).toBe('tok');
 
@@ -370,14 +379,46 @@ describe.sequential('doAuth (non-interactive)', () => {
         HAPPIER_AUTH_METHOD: undefined,
       });
 
-      vi.resetModules();
-      const { doAuth } = await import('./auth');
+      reloadConfiguration();
       const creds = await doAuth();
 
       expect(creds).toBeNull();
-      expect(output.logs.join('\n')).toContain('Unexpected response from the relay. Please try again.');
+      const logs = output.logs.join('\n');
+      expect(logs).toMatch(/^- \[x\] Unexpected response from the relay$/mu);
+      expect(logs).toContain('Please try again.');
     } finally {
       axiosDefault.post = originalPost;
+      output.restore();
+      restoreTty();
+      envScope.restore();
+      await removeTempDir(home);
+    }
+  }, 15_000);
+
+  it('prints only the mobile link when mobile is explicitly selected', async () => {
+    const home = await createTempDir('happier-cli-auth-mobile-');
+    const envScope = createEnvKeyScope(envKeys);
+    const restoreTty = setStdioTtyForTest({ stdin: false, stdout: false });
+    const output = captureConsoleLogAndMuteStdout();
+    displayQRCodeMock.mockClear();
+
+    try {
+      envScope.patch({
+        HAPPIER_HOME_DIR: home,
+        HAPPIER_SERVER_URL: 'https://server.example.test',
+        HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
+        HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
+        HAPPIER_AUTH_METHOD: 'mobile',
+      });
+      reloadConfiguration();
+
+      expect((await doAuth())?.token).toBe('tok');
+      expect(displayQRCodeMock).toHaveBeenCalledTimes(1);
+      const out = output.logs.join('\n');
+      expect(out).toContain('Connect this computer');
+      expect(out).toContain('happier://terminal?');
+      expect(out).not.toContain('webapp.example.test/terminal/connect#key=');
+    } finally {
       output.restore();
       restoreTty();
       envScope.restore();
@@ -397,21 +438,24 @@ describe.sequential('doAuth (non-interactive)', () => {
         HAPPIER_HOME_DIR: home,
         HAPPIER_SERVER_URL: 'https://server.example.test',
         HAPPIER_WEBAPP_URL: 'https://webapp.example.test',
-        HAPPIER_NO_BROWSER_OPEN: '1',
+        HAPPIER_NO_BROWSER_OPEN: undefined,
         HAPPIER_AUTH_POLL_INTERVAL_MS: '1',
         HAPPIER_AUTH_METHOD: 'web',
       });
 
-      vi.resetModules();
-      const { doAuth } = await import('./auth');
+      reloadConfiguration();
 
       const creds = await doAuth();
       expect(creds?.token).toBe('tok');
       expect(displayQRCodeMock).not.toHaveBeenCalled();
 
       const out = output.logs.join('\n');
+      expect(out).toContain('Connect this computer');
+      expect(out).toContain('normal on a headless or remote computer');
+      expect(out).toContain('Copy this link into any browser');
       expect(out).toContain('webapp.example.test/terminal/connect#key=');
-      expect(out).toContain('happier://terminal?');
+      expect(out).not.toContain('happier://terminal?');
+      expect(out.match(/Authentication successful/gu) ?? []).toHaveLength(0);
     } finally {
       output.restore();
       restoreTty();

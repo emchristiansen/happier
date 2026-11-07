@@ -35,9 +35,9 @@ export function resolveAgentActivityMetaLine(
      */
     staleness: AgentActivityStaleness = 'fresh',
 ): string | null {
-    const statusWord = SELF_EVIDENT_STATUSES.has(entry.status)
+    const statusWord = entry.isActive !== false && SELF_EVIDENT_STATUSES.has(entry.status)
         ? null
-        : resolveAgentActivityStatusWord(entry.status);
+        : resolveAgentActivityStatusWord(entry.status, entry.isActive);
     const detail = collapseToSingleLine(entry.metaDetail);
 
     // The silence note goes before the detail, because the line is tail-truncated and the detail is

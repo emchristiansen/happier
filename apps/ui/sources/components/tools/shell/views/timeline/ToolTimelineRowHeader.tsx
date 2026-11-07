@@ -6,7 +6,7 @@ import { Typography } from '@/constants/Typography';
 import { Text } from '@/components/ui/text/Text';
 import { t } from '@/text';
 import { RowActionRevealSlot } from '@/components/sessions/transcript/messageActions/RowActionRevealSlot';
-import { readCoarsePrimaryPointer } from '@/components/sessions/transcript/messageActions/rowActionRevealHost';
+import { readCoarsePrimaryPointer, useRowActionHoverHost } from '@/components/sessions/transcript/messageActions/rowActionRevealHost';
 import {
     shouldShowTranscriptRowActions,
     shouldShowTranscriptRowPinAction,
@@ -60,10 +60,14 @@ export const ToolTimelineRowHeader = React.memo(function ToolTimelineRowHeader(p
     const revealAction = props.revealAction ?? null;
     const hasRevealSlot = canOpen || revealAction != null;
     const trackHoverState = hoverEnabled || (Platform.OS === 'web' && (Boolean(props.onPress) || hasRevealSlot));
-    const [isHovered, setIsHovered] = React.useState(false);
+    // Hover is tracked on the container that spans the row AND its action slots, so moving the
+    // pointer from the row onto the pin/open actions never un-hovers the header and hides them.
+    const hoverHost = useRowActionHoverHost();
+    const isHovered = trackHoverState && hoverHost.isHovered;
+    const [isActionFocused, setIsActionFocused] = React.useState(false);
 
-    const handleHoverIn = React.useCallback(() => setIsHovered(true), []);
-    const handleHoverOut = React.useCallback(() => setIsHovered(false), []);
+    const handleActionFocus = React.useCallback(() => setIsActionFocused(true), []);
+    const handleActionBlur = React.useCallback(() => setIsActionFocused(false), []);
     const handleOpenPress = React.useCallback((event?: { stopPropagation?: () => void }) => {
         event?.stopPropagation?.();
         props.onOpen?.();
@@ -73,6 +77,7 @@ export const ToolTimelineRowHeader = React.memo(function ToolTimelineRowHeader(p
         platformOS: Platform.OS,
         isRowHovered: isHovered,
         isActionHovered: false,
+        isRowFocused: isActionFocused,
         coarsePrimaryPointer: readCoarsePrimaryPointer(),
     } as const;
     // A pinned row keeps its pin visible; the open-details icon still waits for
@@ -88,13 +93,11 @@ export const ToolTimelineRowHeader = React.memo(function ToolTimelineRowHeader(p
         disclosure?.state === 'expanded' ? 'caret-up' : disclosure?.state === 'collapsed' ? 'caret-down' : null;
 
     return (
-        <View style={styles.container}>
+        <View style={styles.container} {...(trackHoverState ? hoverHost.hoverProps : null)}>
             <Pressable
                 testID={props.testID}
                 onPress={props.onPress ?? undefined}
                 disabled={!props.onPress}
-                onHoverIn={trackHoverState ? handleHoverIn : undefined}
-                onHoverOut={trackHoverState ? handleHoverOut : undefined}
                 style={({ pressed }) => [
                     styles.row,
                     props.density === 'compact' ? styles.rowCompact : null,
@@ -159,8 +162,8 @@ export const ToolTimelineRowHeader = React.memo(function ToolTimelineRowHeader(p
                             revealed={pinRevealed}
                             reserveWidth={TOOL_TIMELINE_ROW_REVEAL_ACTION_WIDTH}
                             style={styles.revealSlot}
-                            onFocus={trackHoverState ? handleHoverIn : undefined}
-                            onBlur={trackHoverState ? handleHoverOut : undefined}
+                            onFocus={trackHoverState ? handleActionFocus : undefined}
+                            onBlur={trackHoverState ? handleActionBlur : undefined}
                             testID={TOOL_TIMELINE_ROW_PIN_SLOT_TEST_ID}
                         >
                             {revealAction}
@@ -171,15 +174,13 @@ export const ToolTimelineRowHeader = React.memo(function ToolTimelineRowHeader(p
                             revealed={openRevealed}
                             reserveWidth={TOOL_TIMELINE_ROW_OPEN_SLOT_WIDTH}
                             style={styles.revealSlot}
-                            onFocus={trackHoverState ? handleHoverIn : undefined}
-                            onBlur={trackHoverState ? handleHoverOut : undefined}
+                            onFocus={trackHoverState ? handleActionFocus : undefined}
+                            onBlur={trackHoverState ? handleActionBlur : undefined}
                             testID={TOOL_TIMELINE_ROW_REVEAL_SLOT_TEST_ID}
                         >
                             <Pressable
                                 testID={props.openActionTestID}
                                 onPress={handleOpenPress}
-                                onHoverIn={trackHoverState ? handleHoverIn : undefined}
-                                onHoverOut={trackHoverState ? handleHoverOut : undefined}
                                 accessibilityRole="button"
                                 accessibilityLabel={t('toolView.open')}
                                 style={({ pressed }) => [styles.open, pressed && styles.openPressed]}

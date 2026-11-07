@@ -13,31 +13,31 @@ function fakeFetch(response: Partial<Response> & { status: number; ok?: boolean 
 }
 
 describe('checkAuthLive', () => {
-  it('returns ok on 200', async () => {
+  it('preserves the confirmed account on 200', async () => {
     const result = await checkAuthLive({
       serverUrl: 'https://api.happier.dev',
       token: 'abc',
       fetchImpl: fakeFetch({ status: 200 }),
     });
-    expect(result).toBe('ok');
+    expect(result).toMatchObject({ state: 'valid', accountId: 'account-1' });
   });
 
-  it('returns expired on 401', async () => {
+  it('returns invalid on 401', async () => {
     const result = await checkAuthLive({
       serverUrl: 'https://api.happier.dev',
       token: 'abc',
       fetchImpl: fakeFetch({ status: 401 }),
     });
-    expect(result).toBe('expired');
+    expect(result).toMatchObject({ state: 'invalid' });
   });
 
-  it('returns expired on 403', async () => {
+  it('returns invalid on 403', async () => {
     const result = await checkAuthLive({
       serverUrl: 'https://api.happier.dev',
       token: 'abc',
       fetchImpl: fakeFetch({ status: 403 }),
     });
-    expect(result).toBe('expired');
+    expect(result).toMatchObject({ state: 'invalid' });
   });
 
   it('returns unknown on 500', async () => {
@@ -46,7 +46,7 @@ describe('checkAuthLive', () => {
       token: 'abc',
       fetchImpl: fakeFetch({ status: 500 }),
     });
-    expect(result).toBe('unknown');
+    expect(result).toMatchObject({ state: 'unknown' });
   });
 
   it('returns unknown on fetch throw (network failure)', async () => {
@@ -56,14 +56,14 @@ describe('checkAuthLive', () => {
       token: 'abc',
       fetchImpl: throwing,
     });
-    expect(result).toBe('unknown');
+    expect(result).toMatchObject({ state: 'unknown' });
   });
 
   it('returns unknown when url or token is empty', async () => {
     const calledFetch = { count: 0 } as { count: number };
     const spyFetch: typeof fetch = (async () => { calledFetch.count += 1; return { ok: true, status: 200 } as Response; }) as typeof fetch;
-    expect(await checkAuthLive({ serverUrl: '', token: 'abc', fetchImpl: spyFetch })).toBe('unknown');
-    expect(await checkAuthLive({ serverUrl: 'https://x', token: '', fetchImpl: spyFetch })).toBe('unknown');
+    expect(await checkAuthLive({ serverUrl: '', token: 'abc', fetchImpl: spyFetch })).toMatchObject({ state: 'unknown' });
+    expect(await checkAuthLive({ serverUrl: 'https://x', token: '', fetchImpl: spyFetch })).toMatchObject({ state: 'unknown' });
     expect(calledFetch.count).toBe(0);
   });
 
@@ -83,6 +83,6 @@ describe('checkAuthLive', () => {
     // or the fetch resolves on time; either way we shouldn't hang longer
     // than the timeout + a small margin.
     expect(Date.now() - start).toBeLessThan(500);
-    expect(['unknown', 'ok']).toContain(result);
+    expect(['unknown', 'valid']).toContain(result.state);
   });
 });

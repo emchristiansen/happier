@@ -3,12 +3,15 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import { act } from 'react-test-renderer';
 import type { PermissionMode, ModelMode } from '@/sync/domains/permissions/permissionTypes';
 import type { Settings } from '@/sync/domains/settings/settings';
+import { localSettingsDefaults } from '@/sync/domains/settings/localSettings';
+import { purchasesDefaults } from '@/sync/domains/purchases/purchases';
+import { profileDefaults } from '@/sync/domains/profiles/profile';
 import type { UseMachineEnvPresenceResult } from '@/hooks/machine/useMachineEnvPresence';
-import { SPAWN_SESSION_ERROR_CODES } from '@happier-dev/protocol';
+import { SPAWN_SESSION_ERROR_CODES, type SpawnSessionErrorDetail } from '@happier-dev/protocol';
 import { flushHookEffects, renderHook } from '@/dev/testkit';
 import { createStorageModuleStub } from '@/dev/testkit/mocks/storage';
 import { createTextModuleMock } from '@/dev/testkit/mocks/text';
-import { createSocketIoAckTimeoutError } from '@/sync/runtime/socketIoAckTimeout';
+import { createSocketIoAckTimeoutError } from '@happier-dev/protocol/rpcErrors';
 
 import { installNewSessionScreenModelCommonModuleMocks } from './newSessionScreenModelTestHelpers';
 import { createNewSessionPromptStore } from '@/components/sessions/new/hooks/screenModel/newSessionPromptStore';
@@ -36,6 +39,7 @@ async function createHarness() {
           | typeof SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED
           | typeof SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST;
         errorMessage: string;
+        errorDetail?: SpawnSessionErrorDetail;
         spawnAttemptCustody?: SpawnAttemptCustodyTestResult;
       }>
     | Readonly<{
@@ -146,51 +150,55 @@ async function createHarness() {
   vi.doMock('@/sync/store/settingsWriters', () => ({
     useApplySettings: () => vi.fn(),
   }));
-  vi.doMock('@/sync/domains/state/persistence', () => ({
-    clearNewSessionDraft: vi.fn(),
-    loadSettings: () => ({ settings: {}, version: null }),
-    loadDeviceAnalyticsId: () => null,
-    saveDeviceAnalyticsId: vi.fn(),
-    saveSettings: vi.fn(),
-    loadPendingSettings: () => ({}),
-    savePendingSettings: vi.fn(),
-    loadLocalSettings: () => ({}),
-    saveLocalSettings: vi.fn(),
-    loadThemePreference: () => 'adaptive',
-    loadPurchases: () => ({}),
-    savePurchases: vi.fn(),
-    loadSessionDrafts: () => ({}),
-    saveSessionDrafts: vi.fn(),
-    loadSessionReviewCommentsDrafts: () => ({}),
-    saveSessionReviewCommentsDrafts: vi.fn(),
-    loadWorkspaceReviewCommentsDrafts: () => ({}),
-    saveWorkspaceReviewCommentsDrafts: vi.fn(),
-    loadSessionActionDrafts: () => ({}),
-    saveSessionActionDrafts: vi.fn(),
-    loadLocalPetSourcesBySourceKey: () => ({}),
-    saveLocalPetSourcesBySourceKey: vi.fn(),
-    loadNewSessionDraft: () => null,
-    saveNewSessionDraft: vi.fn(),
-    loadSessionPermissionModes: () => ({}),
-    saveSessionPermissionModes: vi.fn(),
-    loadSessionPermissionModeUpdatedAts: () => ({}),
-    saveSessionPermissionModeUpdatedAts: vi.fn(),
-    loadSessionLastViewed: () => ({}),
-    saveSessionLastViewed: vi.fn(),
-    loadSessionModelModes: () => ({}),
-    saveSessionModelModes: vi.fn(),
-    loadSessionModelModeUpdatedAts: () => ({}),
-    saveSessionModelModeUpdatedAts: vi.fn(),
-    loadSessionMaterializedMaxSeqById: () => ({}),
-    saveSessionMaterializedMaxSeqById: vi.fn(),
-    loadChangesCursor: () => null,
-    saveChangesCursor: vi.fn(),
-    loadLastChangesCursorByAccountId: () => ({}),
-    saveLastChangesCursorByAccountId: vi.fn(),
-    loadProfile: () => ({}),
-    saveProfile: vi.fn(),
-    clearPersistence: vi.fn(),
-  }));
+  vi.doMock('@/sync/domains/state/persistence', async (importOriginal) =>
+    (await import('@/dev/testkit/mocks/persistence')).createPersistenceModuleMock({
+      importOriginal,
+      overrides: {
+        clearNewSessionDraft: vi.fn(),
+        loadSettings: () => ({ settings: {}, version: null }),
+        loadDeviceAnalyticsId: () => null,
+        saveDeviceAnalyticsId: vi.fn(),
+        saveSettings: vi.fn(),
+        loadPendingSettings: () => ({}),
+        savePendingSettings: vi.fn(),
+        loadLocalSettings: () => ({ ...localSettingsDefaults }),
+        saveLocalSettings: vi.fn(),
+        loadThemePreference: () => 'adaptive',
+        loadPurchases: () => ({ ...purchasesDefaults }),
+        savePurchases: vi.fn(),
+        loadSessionDrafts: () => ({}),
+        saveSessionDrafts: vi.fn(),
+        loadSessionReviewCommentsDrafts: () => ({}),
+        saveSessionReviewCommentsDrafts: vi.fn(),
+        loadWorkspaceReviewCommentsDrafts: () => ({}),
+        saveWorkspaceReviewCommentsDrafts: vi.fn(),
+        loadSessionActionDrafts: () => ({}),
+        saveSessionActionDrafts: vi.fn(),
+        loadLocalPetSourcesBySourceKey: () => ({}),
+        saveLocalPetSourcesBySourceKey: vi.fn(),
+        loadNewSessionDraft: () => null,
+        saveNewSessionDraft: vi.fn(),
+        loadSessionPermissionModes: () => ({}),
+        saveSessionPermissionModes: vi.fn(),
+        loadSessionPermissionModeUpdatedAts: () => ({}),
+        saveSessionPermissionModeUpdatedAts: vi.fn(),
+        loadSessionLastViewed: () => ({}),
+        saveSessionLastViewed: vi.fn(),
+        loadSessionModelModes: () => ({}),
+        saveSessionModelModes: vi.fn(),
+        loadSessionModelModeUpdatedAts: () => ({}),
+        saveSessionModelModeUpdatedAts: vi.fn(),
+        loadSessionMaterializedMaxSeqById: () => ({}),
+        saveSessionMaterializedMaxSeqById: vi.fn(),
+        loadChangesCursor: () => null,
+        saveChangesCursor: vi.fn(),
+        loadLastChangesCursorByAccountId: () => ({}),
+        saveLastChangesCursorByAccountId: vi.fn(),
+        loadProfile: () => ({ ...profileDefaults }),
+        saveProfile: vi.fn(),
+        clearPersistence: vi.fn(),
+      },
+    }));
   vi.doMock('@/sync/domains/server/serverRuntime', () => ({
     getActiveServerSnapshot: vi.fn(() => ({
       serverId: 'server-a',
@@ -377,6 +385,9 @@ async function createHarness() {
 type Harness = Awaited<ReturnType<typeof createHarness>>;
 let sharedHarness: Harness | null = null;
 
+// Resolve the existing boundary harness outside the interaction timeout.
+sharedHarness = await createHarness();
+
 async function setupHarness(): Promise<Harness> {
   sharedHarness ??= await createHarness();
   sharedHarness.reset();
@@ -399,14 +410,22 @@ describe('useCreateNewSession (daemon unavailable UX)', () => {
     vi.restoreAllMocks();
   });
 
-  it('shows a daemon-unavailable alert with a Retry action', async () => {
+  it.each(['daemon', 'terminal_host'] as const)('preserves the draft with actionable %s startup recovery', async (failure) => {
     const {
       useCreateNewSession,
       modalAlertSpy,
       captureSessionDraftLaunchCurrentnessSpy,
       clearSessionDraftCurrentnessSpy,
       clearSessionDraftLaunchCurrentnessSpy,
+      machineSpawnNewSessionSpy,
     } = await setupHarness();
+
+    if (failure === 'terminal_host') {
+      machineSpawnNewSessionSpy.mockResolvedValue({
+        type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.SPAWN_FAILED, errorMessage: 'Host launch failed',
+        errorDetail: { kind: 'terminal_host_unavailable', host: 'herdr', reason: 'installation_unavailable' },
+      });
+    }
 
     const setIsCreating = vi.fn();
     const persistDraftForLaunch = vi.fn();
@@ -463,6 +482,15 @@ describe('useCreateNewSession (daemon unavailable UX)', () => {
 
     expect(modalAlertSpy).toHaveBeenCalled();
     const args = modalAlertSpy.mock.calls[0] ?? [];
+    if (failure === 'terminal_host') {
+      expect(args[0]).toBe('newSession.terminalHostUnavailableTitle');
+      expect(args[1]).toBe('newSession.terminalHostUnavailableBody');
+      expect(persistDraftForLaunch).toHaveBeenCalledTimes(1);
+      expect(clearSessionDraftCurrentnessSpy).not.toHaveBeenCalled();
+      expect(clearSessionDraftLaunchCurrentnessSpy).not.toHaveBeenCalled();
+      expect(setIsCreating).toHaveBeenLastCalledWith(false);
+      return;
+    }
     expect(args[0]).toBe('newSession.daemonRpcUnavailableTitle');
     expect(String(args[1] ?? '')).toContain('newSession.daemonRpcUnavailableBody');
     expect(String(args[1] ?? '')).toContain('status.lastSeen:time.minutesAgo:5');

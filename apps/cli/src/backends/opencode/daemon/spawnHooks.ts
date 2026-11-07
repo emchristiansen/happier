@@ -1,6 +1,21 @@
 import type { DaemonSpawnHooks } from '@/daemon/spawnHooks';
-import { validateProviderCliSpawn } from '@/runtime/managedTools/validateProviderCliSpawn';
+import { resolveOpenCodeCliLaunchSpec } from '@/backends/opencode/utils/resolveOpenCodeCliCommand';
+import { resolveOpenCodeBackendModeFromEnv } from '@/backends/opencode/backendMode';
 
 export const opencodeDaemonSpawnHooks: DaemonSpawnHooks = {
-  validateSpawn: async () => validateProviderCliSpawn({ agentId: 'opencode' }),
+  resolveTerminalPresentation: ({ processEnv }) => {
+    if (resolveOpenCodeBackendModeFromEnv(processEnv) === 'acp') return { kind: 'none' };
+    return { kind: 'provider_attach', startingMode: 'local' };
+  },
+  validateSpawn: async ({ environmentVariables }) => {
+    try {
+      resolveOpenCodeCliLaunchSpec(environmentVariables);
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      };
+    }
+  },
 };

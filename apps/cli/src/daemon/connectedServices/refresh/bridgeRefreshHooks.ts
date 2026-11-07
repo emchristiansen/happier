@@ -1,5 +1,4 @@
 import type {
-  AccountSettings,
   ConnectedServiceCredentialRecordV1,
   ConnectedServiceId,
 } from '@happier-dev/protocol';
@@ -32,10 +31,6 @@ export type ConnectedServiceBridgeRefreshCapabilities = Readonly<{
   isOauthSourceStillValid: (source: ConnectedServiceCredentialSource) => boolean;
   resolveSourceExpiresAt: (source: ConnectedServiceCredentialSource) => number | null;
   rematerializeTargets: (binding: BoundProfile) => Promise<ReadonlyArray<SpawnTarget>>;
-  activeServerDir: string;
-  baseDir: string;
-  accountSettings: AccountSettings | Readonly<Record<string, unknown>> | null;
-  processEnv: NodeJS.ProcessEnv;
 }>;
 
 /**
@@ -47,7 +42,7 @@ export type ConnectedServiceBridgeRefreshCapabilities = Readonly<{
  */
 export type ConnectedServiceBridgeCurrentTokenProbe<TResponse> =
   | Readonly<{ kind: 'non_refreshable'; accessToken: string; response: TResponse }>
-  | Readonly<{ kind: 'adoptable'; accessToken: string; buildResponse: () => TResponse }>
+  | Readonly<{ kind: 'adoptable'; accessToken: string; buildResponse: (selection?: ConnectedServiceChildSelection) => TResponse }>
   | Readonly<{ kind: 'needs_refresh' }>;
 
 /**

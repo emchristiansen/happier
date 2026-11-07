@@ -11,9 +11,12 @@ import { useHeaderHeight } from '@/utils/platform/responsive';
 import { useLayoutMaxWidth } from '@/components/ui/layout/layout';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { Text } from '@/components/ui/text/Text';
+import { StatusPill } from '@/components/ui/status/StatusPill';
 import { t } from '@/text';
 import { resolveOptionalSessionScreenTestId, useSessionScreenTestIdsEnabled } from '../shell/sessionScreenTestIds';
+import { resolveChatHeaderContentInsets } from './chatHeaderLayout';
 import { Icon } from '@/components/ui/icons/Icon';
+import { resolveSessionHeaderActionTargetPx } from '@/components/sessions/actions/sessionHeaderIconMetrics';
 
 
 /** The gutter control's tap target, matching every other header action. */
@@ -23,7 +26,7 @@ const GUTTER_TAP_TARGET_PX = 44;
 const GUTTER_MIN_WIDTH_PX = 60;
 
 /** The header's own horizontal inset — the margin every other control in it is measured from. */
-const HEADER_HORIZONTAL_PADDING_PX = Platform.OS === 'ios' ? 8 : 16;
+const HEADER_HORIZONTAL_PADDING_PX = 8;
 
 interface ChatHeaderViewProps {
     title: string;
@@ -40,6 +43,8 @@ interface ChatHeaderViewProps {
     isConnected?: boolean;
     flavor?: string | null;
     constrainWidth?: boolean;
+    /** Space reserved beside the transcript, without moving the trailing header actions. */
+    contentTrailingInsetPx?: number;
     includeTopInset?: boolean;
     /**
      * Defaults to shown. Suppressed where a permanent sidebar is on screen: there is no stack to
@@ -67,6 +72,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
     isConnected = true,
     flavor,
     constrainWidth = true,
+    contentTrailingInsetPx = 0,
     includeTopInset = true,
     showBackButton = true,
     gutterElement,
@@ -89,9 +95,13 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
     const handleWrapperLayout = React.useCallback((event: LayoutChangeEvent) => {
         setWrapperWidth(event.nativeEvent.layout.width);
     }, []);
-    const trailingGutterWidth = constrainWidth && wrapperWidth > 0
-        ? Math.max(0, (wrapperWidth - Math.min(wrapperWidth, maxWidth)) / 2)
-        : 0;
+    const contentInsets = resolveChatHeaderContentInsets({
+        containerWidth: wrapperWidth,
+        maxWidth,
+        contentTrailingInsetPx,
+        constrainWidth,
+    });
+    const trailingGutterWidth = contentInsets.trailing;
     const gutterHoldsElement = gutterElement != null && trailingGutterWidth >= GUTTER_MIN_WIDTH_PX;
     // Half the leftover once the tap target is centred in `headerHeight` — which is also the gap the
     // control leaves above itself. Using it horizontally makes the icon's distance to the window's
@@ -108,7 +118,7 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
             return agentId ? <AgentIcon agentId={agentId} size={26} /> : null;
         }
         return avatarId
-            ? <Avatar id={avatarId} size={32} monochrome={!isConnected} flavor={flavor} />
+            ? <Avatar id={avatarId} size={32} monochrome={!isConnected} flavor={agentId ?? flavor} />
             : null;
     }, [agentId, avatarId, flavor, identityMode, isConnected]);
 
@@ -121,20 +131,34 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
     };
 
     return (
-        <View style={[styles.container, { paddingTop: includeTopInset ? insets.top : 0, backgroundColor: theme.colors.chrome.header.background }]}>
+        <View style={[styles.container, { paddingTop: includeTopInset ? insets.top : 0, backgroundColor: theme.colors.surface.base }]}>
             <View
                 onLayout={handleWrapperLayout}
                 style={[styles.contentWrapper, constrainWidth ? null : { alignItems: 'stretch' }]}
             >
-                <View style={[styles.content, { height: headerHeight, maxWidth }, constrainWidth ? null : { maxWidth: '100%' }]}>
+                <View style={[
+                    styles.content,
+                    { minHeight: headerHeight, maxWidth },
+                    constrainWidth ? null : { maxWidth: '100%' },
+                    wrapperWidth > 0 && contentTrailingInsetPx > 0 && constrainWidth ? {
+                        alignSelf: 'flex-start',
+                        marginLeft: contentInsets.leading,
+                        width: wrapperWidth - contentInsets.leading - contentInsets.trailing,
+                        maxWidth: '100%',
+                    } : null,
+                ]}>
                 {showBackButton ? (
                     <Pressable
                         onPress={handleBackPress}
                         testID={backButtonTestId}
                         accessibilityRole="button"
                         accessibilityLabel={t('common.back')}
-                        style={styles.backButton}
-                        hitSlop={15}
+                        style={{
+                            width: resolveSessionHeaderActionTargetPx(),
+                            height: resolveSessionHeaderActionTargetPx(),
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                        }}
                     >
                         <Icon
                             name={Platform.OS === 'ios' ? 'caret-left' : 'arrow-left'}
@@ -151,67 +175,59 @@ export const ChatHeaderView = React.memo(function ChatHeaderView({
                 ) : null}
 
                 <View style={styles.titleContainer}>
-                    <View style={styles.titleRow}>
-                        <Text
-                            numberOfLines={1}
-                            ellipsizeMode="tail"
-                            style={[
-                                styles.title,
-                                {
-                                    color: theme.colors.chrome.header.foreground,
-                                    ...Typography.default('semiBold')
-                                }
-                            ]}
-                        >
-                            {title}
-                        </Text>
-                        {badges && badges.length > 0 ? (
-                            badges.map((badge, index) => (
-                                <View
-                                    key={`${badge}:${index}`}
+                    <Text
+                        numberOfLines={1}
+                        ellipsizeMode="tail"
+                        accessibilityRole="header"
+                        style={[
+                            styles.title,
+                            {
+                                color: theme.colors.chrome.header.foreground,
+                                ...Typography.default('semiBold'),
+                            },
+                        ]}
+                    >
+                        {title}
+                    </Text>
+                    {badges?.length || subtitle ? (
+                        <View style={styles.metadataRow}>
+                            {subtitle ? (
+                                <Text
+                                    numberOfLines={1}
+                                    ellipsizeMode={shouldUseWebSubtitleStartEllipsis ? undefined : subtitleEllipsizeMode}
                                     style={[
-                                        styles.badge,
-                                        { backgroundColor: theme.colors.state.neutral.background },
+                                        styles.subtitle,
+                                        shouldUseWebSubtitleStartEllipsis ? styles.subtitleHeadWeb : null,
+                                        {
+                                            color: theme.colors.chrome.header.foreground,
+                                            opacity: 0.7,
+                                            ...Typography.default(),
+                                        },
                                     ]}
-                                    testID={resolveOptionalSessionScreenTestId(sessionScreenTestIdsEnabled, `session-header-badge:${index}`)}
                                 >
-                                    <Text
-                                        numberOfLines={1}
-                                        style={[
-                                            styles.badgeText,
-                                            {
-                                                color: theme.colors.state.neutral.foreground,
-                                                ...Typography.default('semiBold'),
-                                            },
-                                        ]}
-                                    >
-                                        {badge}
-                                    </Text>
-                                </View>
-                            ))
-                        ) : null}
-                    </View>
-                    {subtitle && (
-                        <Text
-                            numberOfLines={1}
-                            ellipsizeMode={shouldUseWebSubtitleStartEllipsis ? undefined : subtitleEllipsizeMode}
-                            style={[
-                                styles.subtitle,
-                                shouldUseWebSubtitleStartEllipsis ? styles.subtitleHeadWeb : null,
-                                {
-                                    color: theme.colors.chrome.header.foreground,
-                                    opacity: 0.7,
-                                    ...Typography.default()
-                                }
-                            ]}
-                        >
-                            {shouldUseWebSubtitleStartEllipsis ? (
-                                <Text style={styles.subtitleHeadTextWeb}>
-                                    {subtitle}
+                                    {shouldUseWebSubtitleStartEllipsis ? (
+                                        <Text style={styles.subtitleHeadTextWeb}>
+                                            {subtitle}
+                                        </Text>
+                                    ) : subtitle}
                                 </Text>
-                            ) : subtitle}
-                        </Text>
-                    )}
+                            ) : null}
+                            {badges?.map((badge, index) => (
+                                <StatusPill
+                                    key={`${badge}:${index}`}
+                                    variant="neutral"
+                                    chrome="plain"
+                                    foregroundColor={theme.colors.text.secondary}
+                                    hideDot
+                                    label={badge}
+                                    labelVariant="phrase"
+                                    labelNumberOfLines={1}
+                                    style={styles.badge}
+                                    testID={resolveOptionalSessionScreenTestId(sessionScreenTestIdsEnabled, `session-header-badge:${index}`)}
+                                />
+                            ))}
+                        </View>
+                    ) : null}
                 </View>
 
                 {rightElement ? (
@@ -263,11 +279,9 @@ const styles = StyleSheet.create(() => ({
         paddingHorizontal: HEADER_HORIZONTAL_PADDING_PX,
         width: '100%',
     },
-    backButton: {
-        marginRight: 8,
-    },
     avatarLeading: {
-        marginRight: 10,
+        marginRight: 8,
+        flexShrink: 0,
     },
     trailingGutter: {
         position: 'absolute',
@@ -284,11 +298,14 @@ const styles = StyleSheet.create(() => ({
         alignItems: 'flex-start',
         minWidth: 0,
     },
-    titleRow: {
+    metadataRow: {
         flexDirection: 'row',
         alignItems: 'center',
         gap: 6,
         width: '100%',
+        minWidth: 0,
+        marginTop: 1,
+        flexShrink: 0,
     },
     title: {
         fontSize: Platform.select({
@@ -297,13 +314,15 @@ const styles = StyleSheet.create(() => ({
             default: 16
         }),
         fontWeight: '600',
-        flexShrink: 1,
+        flexShrink: 0,
+        width: '100%',
     },
     subtitle: {
         fontSize: 12,
         fontWeight: '400',
         lineHeight: 14,
-        marginTop: 1,
+        flexShrink: 1,
+        minWidth: 0,
     },
     subtitleHeadWeb: {
         writingDirection: 'rtl' as const,
@@ -313,21 +332,16 @@ const styles = StyleSheet.create(() => ({
         writingDirection: 'ltr' as const,
         unicodeBidi: 'isolate' as const,
     },
-    // Matches the canonical badge (components/ui/status/StatusPill): background-only, no border
-    // chrome, 8px radius. A bordered capsule in the header read as a different species from every
-    // other badge in the product.
+    // Metadata yields to the session name and stays inside its column, beside the actions.
     badge: {
-        borderWidth: 0,
-        borderRadius: 8,
-        paddingHorizontal: 8,
-        paddingVertical: 2,
-    },
-    badgeText: {
-        fontSize: 10,
-        lineHeight: 14,
+        flexShrink: 1,
+        minWidth: 0,
+        maxWidth: '100%',
+        overflow: 'hidden',
     },
     rightElementContainer: {
         flexDirection: 'row',
         alignItems: 'center',
+        flexShrink: 0,
     },
 }));

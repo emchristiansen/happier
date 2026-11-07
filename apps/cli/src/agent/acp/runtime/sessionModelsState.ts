@@ -1,4 +1,6 @@
 import type { Metadata } from '@/api/types';
+import { isDeepStrictEqual } from 'node:util';
+import { reconcileAcpCatalogRows } from '@/agent/acp/reconcileAcpCatalogRows';
 import { updateMetadataBestEffort } from '@/api/session/sessionWritesBestEffort';
 import { normalizeAcpConfigOptionChoices } from '@/agent/acp/configOptionChoiceNormalization';
 import { readNonBlankSessionControlIdentifier } from '@/agent/runtime/sessionControlIdentifiers';
@@ -58,6 +60,30 @@ export function isAcpModelScopedConfigOption(option: Readonly<{
     || name === 'context';
 }
 
+/** Current-session options are authoritative only for the observed model. */
+export function applyObservedAcpModelOptions<
+  TOption extends Readonly<{ id: string }>,
+  TModel extends Readonly<{ id: string; modelOptions?: ReadonlyArray<TOption> }>,
+>(
+  models: ReadonlyArray<TModel>,
+  currentModelId: unknown,
+  observedOptions: ReadonlyArray<TOption>,
+  previousModels: ReadonlyArray<TModel> = [],
+): TModel[] {
+  const previousById = new Map(previousModels.map((model) => [model.id, model]));
+  const catalogModels = models.map((model) => {
+    if (model.id === 'default') return model;
+    const previous = previousById.get(model.id);
+    return previous ? { ...previous, ...model } : model;
+  });
+  return reconcileAcpCatalogRows(previousModels, catalogModels.map((model) => {
+    if (model.id === 'default' || model.id !== currentModelId) return model;
+    return { ...model, modelOptions: observedOptions.length > 0
+      ? reconcileAcpCatalogRows(previousById.get(model.id)?.modelOptions, [...observedOptions])
+      : undefined };
+  }));
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -99,7 +125,7 @@ export function normalizeConfigOptionsArray(raw: unknown): NormalizedConfigOptio
       currentValue,
       ...(description ? { description } : {}),
       ...(category ? { category } : {}),
-      ...(options.length > 0 ? { options } : {}),
+      ...(options.length > 0 || (Array.isArray(optionsRaw) && optionsRaw.length === 0) ? { options } : {}),
     });
   }
 
@@ -146,7 +172,7 @@ function normalizeAcpSessionModels(raw: unknown): AcpSessionModel[] {
 export function buildAcpSessionModelsStateFromPayload(params: Readonly<{
   provider: string;
   payload: unknown;
-  previousAvailableModels?: unknown;
+  previousState?: AcpSessionModelsState | null;
   requireAvailableModels?: boolean;
 }>): AcpSessionModelsState | null {
   const payload = asRecord(params.payload);
@@ -154,17 +180,32 @@ export function buildAcpSessionModelsStateFromPayload(params: Readonly<{
   const currentModelId = typeof currentModelIdRaw === 'string' ? currentModelIdRaw : '';
   if (!currentModelId) return null;
 
-  const nextModels = normalizeAcpSessionModels(payload?.availableModels);
-  const previousModels = normalizeAcpSessionModels(params.previousAvailableModels);
-  const availableModels = nextModels.length > 0 ? nextModels : previousModels;
-  if (params.requireAvailableModels === true && availableModels.length === 0) return null;
+  const modelsRaw = payload?.availableModels;
+  const hasCatalog = Array.isArray(modelsRaw);
+  if (!hasCatalog && modelsRaw !== undefined) return null;
+  if (!hasCatalog && params.requireAvailableModels === true) return null;
+  const availableModels = hasCatalog
+    ? normalizeAcpSessionModels(modelsRaw)
+    : normalizeAcpSessionModels(params.previousState?.availableModels);
+  if (hasCatalog && modelsRaw.length > 0 && availableModels.length === 0) return null;
+  const observedAt = typeof payload?.observedAt === 'number'
+    && Number.isFinite(payload.observedAt) && payload.observedAt >= 0
+    ? payload.observedAt
+    : Date.now();
+
+  const previous = params.previousState;
+  const reconciledModels = reconcileAcpCatalogRows(previous?.availableModels, availableModels);
+  if (previous?.provider === params.provider
+    && previous.currentModelId === currentModelId
+    && isDeepStrictEqual(previous.availableModels, reconciledModels)) return previous;
 
   return {
     v: 1,
     provider: params.provider,
-    updatedAt: Date.now(),
+    // Current-model telemetry does not establish or renew catalog freshness.
+    updatedAt: hasCatalog ? observedAt : (params.previousState?.updatedAt ?? 0),
     currentModelId,
-    availableModels,
+    availableModels: reconciledModels,
   };
 }
 
@@ -180,16 +221,16 @@ export function publishAcpSessionModelsState(params: Readonly<{
   updateMetadataBestEffort(
     params.session,
     (metadata) => {
-      const previous = params.preservePreviousAvailableModels === true
-        ? readNewestSessionModelsMetadataStateV1(metadata as unknown as Record<string, unknown>) as AcpSessionModelsState | null
-        : null;
+      const previous = readNewestSessionModelsMetadataStateV1(metadata as unknown as Record<string, unknown>) as AcpSessionModelsState | null;
       const next = buildAcpSessionModelsStateFromPayload({
         provider: params.provider,
         payload: params.payload,
-        previousAvailableModels: previous?.provider === params.provider ? previous.availableModels : undefined,
+        previousState: previous?.provider === params.provider
+          && (params.preservePreviousAvailableModels === true || Array.isArray(asRecord(params.payload)?.availableModels))
+          ? previous : undefined,
         requireAvailableModels: params.requireAvailableModels,
       });
-      return next ? { ...metadata, sessionModelsV1: next, acpSessionModelsV1: next } : metadata;
+      return next && next !== previous ? { ...metadata, sessionModelsV1: next, acpSessionModelsV1: next } : metadata;
     },
     params.logPrefix,
     params.reason,

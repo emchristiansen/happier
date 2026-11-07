@@ -8,7 +8,13 @@ const WINDOW_RESIZED_EVENT = 'tauri://resize';
 export type FakeTauriDesktopPlatform = 'macos' | 'windows' | 'linux';
 export type FakeTauriDesktopStrategy = 'none' | 'native-macos-traffic-lights' | 'custom-controls';
 
-export type FakeTauriDesktopUpdateState = Readonly<{ installed?: boolean; version: string }>;
+export type FakeTauriDesktopUpdateState = Readonly<{ installed?: boolean; version: string; currentVersion?: string }>;
+
+/**
+ * How `desktop_download_update` behaves: `succeed` resolves at once, `fail` rejects, `hold` emits one
+ * progress event (`holdPercent`, default 42) and waits for `releaseFakeTauriDesktopDownload`.
+ */
+export type FakeTauriDesktopUpdateDownload = 'succeed' | 'fail' | 'hold';
 
 export type FakeTauriDesktopControlsState = Readonly<{
   closeCount: number;
@@ -29,6 +35,8 @@ export type FakeTauriDesktopState = Readonly<{
   strategy: FakeTauriDesktopStrategy;
   trayState: Record<string, unknown> | null;
   updateAvailable: FakeTauriDesktopUpdateState | null;
+  updateDownload: FakeTauriDesktopUpdateDownload;
+  holdPercent: number;
 }>;
 
 export type FakeTauriDesktopCommandResult = Readonly<{
@@ -39,6 +47,10 @@ export type FakeTauriDesktopCommandResult = Readonly<{
 type MutableFakeTauriDesktopWindow = Window & {
   __HAPPIER_FAKE_TAURI_DESKTOP__?: FakeTauriDesktopState;
   __HAPPIER_FAKE_TAURI_EVENT_LISTENERS__?: Record<string, number[]>;
+  /** Delivers a Tauri event to the page's listeners, as the Rust side's `app.emit` does. */
+  __HAPPIER_FAKE_TAURI_EMIT__?: (event: string, payload: unknown) => void;
+  /** Settles a held `desktop_download_update` (`true` → downloaded, `false` → the download fails). */
+  __HAPPIER_FAKE_TAURI_RELEASE_DOWNLOAD__?: (ok: boolean) => void;
   __TAURI__?: { core?: { invoke?: (command: string, args?: Record<string, unknown>) => Promise<unknown> } };
   __TAURI_EVENT_PLUGIN_INTERNALS__?: { unregisterListener: (event: string, id: number) => void };
   __TAURI_INTERNALS__?: {
@@ -153,6 +165,8 @@ export function createFakeTauriDesktopState(
     strategy: overrides.strategy ?? resolveDefaultStrategy(platform),
     trayState: overrides.trayState ?? null,
     updateAvailable: overrides.updateAvailable ?? null,
+    updateDownload: overrides.updateDownload ?? 'succeed',
+    holdPercent: overrides.holdPercent ?? 42,
   };
 }
 
@@ -177,6 +191,9 @@ export async function applyFakeTauriDesktopCommand(
       };
     case 'desktop_fetch_update':
       return { result: nextStateBase.updateAvailable, state: nextStateBase };
+    case 'desktop_download_update':
+      if (nextStateBase.updateDownload === 'fail') throw new Error('error sending request for url');
+      return { result: nextStateBase.updateAvailable != null, state: nextStateBase };
     case 'desktop_install_update': {
       const updateAvailable = nextStateBase.updateAvailable
         ? { ...nextStateBase.updateAvailable, installed: true }
@@ -219,6 +236,13 @@ export async function installFakeTauriDesktopBridge(
     const windowMovedEvent = 'tauri://move';
     const windowResizedEvent = 'tauri://resize';
     const win = window as MutableFakeTauriDesktopWindow;
+    const systemTaskHostBinding = '__HAPPIER_FAKE_TAURI_SYSTEM_TASK_HOST__';
+    const systemTaskCommands = [
+      'start_system_task',
+      'get_system_task_snapshot',
+      'cancel_system_task',
+      'respond_system_task_prompt',
+    ];
     const callbacks = new Map<number, (data: unknown) => unknown>();
     const listenersByEvent: Record<string, number[]> = Object.create(null);
     let nextCallbackId = 1;
@@ -250,6 +274,15 @@ export async function installFakeTauriDesktopBridge(
       return callbackId;
     };
     const apply = async (command: string, args?: Record<string, unknown>): Promise<unknown> => {
+      // System-task commands go to the Node-side host when a spec attached one
+      // (`desktopSystemTaskHost.ts`), the way the Rust bridge relays them to the bundled hsetup.
+      const systemTaskHost = (win as unknown as Record<string, unknown>)[systemTaskHostBinding];
+      if (systemTaskCommands.includes(command) && typeof systemTaskHost === 'function') {
+        return await (systemTaskHost as (command: string, args: Record<string, unknown> | null) => Promise<unknown>)(
+          command,
+          args ?? null,
+        );
+      }
       const current = win.__HAPPIER_FAKE_TAURI_DESKTOP__ ?? serializedState;
       const base = {
         ...current,
@@ -265,6 +298,26 @@ export async function installFakeTauriDesktopBridge(
         result = { isMaximized: base.isMaximized };
       } else if (command === 'desktop_fetch_update') {
         result = base.updateAvailable;
+      } else if (command === 'desktop_download_update') {
+        win.__HAPPIER_FAKE_TAURI_DESKTOP__ = base;
+        const offered = base.updateAvailable;
+        if (!offered) return false;
+        if (base.updateDownload === 'fail') throw new Error('error sending request for url');
+        if (base.updateDownload === 'hold') {
+          emitEvent('desktop_update_download_progress', {
+            version: offered.version,
+            downloadedBytes: base.holdPercent,
+            totalBytes: 100,
+          });
+          return await new Promise<boolean>((resolve, reject) => {
+            win.__HAPPIER_FAKE_TAURI_RELEASE_DOWNLOAD__ = (ok) => {
+              win.__HAPPIER_FAKE_TAURI_RELEASE_DOWNLOAD__ = undefined;
+              if (ok) resolve(true);
+              else reject(new Error('error sending request for url'));
+            };
+          });
+        }
+        return true;
       } else if (command === 'desktop_install_update') {
         const updateAvailable = base.updateAvailable ? { ...base.updateAvailable, installed: true } : null;
         nextState = { ...base, updateAvailable };
@@ -356,6 +409,7 @@ export async function installFakeTauriDesktopBridge(
       unregisterCallback: (id) => callbacks.delete(id),
     };
     win.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener };
+    win.__HAPPIER_FAKE_TAURI_EMIT__ = emitEvent;
     win.__TAURI__ = { core: { invoke: apply } };
   };
 
@@ -397,4 +451,12 @@ export async function navigateSpa(page: Page, path: string): Promise<void> {
     window.history.pushState({}, '', nextPath);
     window.dispatchEvent(new PopStateEvent('popstate'));
   }, path);
+}
+
+/** Settles a download the fake bridge is holding (`updateDownload: 'hold'`). */
+export async function releaseFakeTauriDesktopDownload(page: Page, ok: boolean): Promise<void> {
+  await page.evaluate((resolvedOk) => {
+    const win = window as MutableFakeTauriDesktopWindow;
+    win.__HAPPIER_FAKE_TAURI_RELEASE_DOWNLOAD__?.(resolvedOk);
+  }, ok);
 }

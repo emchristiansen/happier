@@ -70,6 +70,7 @@ function identityFragment(
  */
 export async function materializeOpenCodeConnectedServiceAuth(params: MaterializeInput): Promise<Readonly<{ env: Record<string, string> }>> {
   const auth: Record<string, unknown> = {};
+  const v2Providers: Record<string, { settings: { apiKey: string } }> = {};
   const brokerSelections: { -readonly [K in OpenCodeBrokerProvider]?: OpenCodeBrokerProviderSelection } = {};
   const brokeredProviders: OpenCodeBrokerProvider[] = [];
   const identityFragments: string[] = [];
@@ -96,6 +97,7 @@ export async function materializeOpenCodeConnectedServiceAuth(params: Materializ
   } else if (params.openai) {
     const record = requireConnectedServiceTokenCredentialRecord(params.openai);
     auth.openai = { type: 'api', key: record.token.token };
+    v2Providers.openai = { settings: { apiKey: record.token.token } };
     identityFragments.push(identityFragment(record, params.selectionsByServiceId));
   }
 
@@ -106,6 +108,7 @@ export async function materializeOpenCodeConnectedServiceAuth(params: Materializ
   } else if (params.anthropic) {
     const record = requireConnectedServiceTokenCredentialRecord(params.anthropic);
     auth.anthropic = { type: 'api', key: record.token.token };
+    v2Providers.anthropic = { settings: { apiKey: record.token.token } };
     identityFragments.push(identityFragment(record, params.selectionsByServiceId));
   }
 
@@ -125,7 +128,13 @@ export async function materializeOpenCodeConnectedServiceAuth(params: Materializ
   // `OPENCODE_CONFIG_CONTENT.plugin` — live-verified (opencode v1.14.41): an absolute path there does
   // NOT load, and the auto-discovery glob matches `*.js` ONLY (never `*.mjs`).
   env.XDG_CONFIG_HOME = resolveOpenCodeConnectedConfigHomeDir();
-  env.OPENCODE_CONFIG_CONTENT = JSON.stringify({});
+  // Released OpenCode V2 does not consume OPENCODE_AUTH_CONTENT. Its canonical transient provider
+  // configuration is `providers.<id>.settings.apiKey`; keep V1's auth envelope above and describe
+  // the same direct credentials here for V2. The managed-server admission owner merges broker plugin
+  // declarations into this object when brokered providers are also selected.
+  env.OPENCODE_CONFIG_CONTENT = JSON.stringify(
+    Object.keys(v2Providers).length > 0 ? { providers: v2Providers } : {},
+  );
 
   if (brokeredProviders.length > 0) {
     env[OPEN_CODE_BROKER_SELECTIONS_ENV] = serializeOpenCodeBrokerSelections(brokerSelections);

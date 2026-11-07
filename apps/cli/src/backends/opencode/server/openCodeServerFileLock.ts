@@ -1,26 +1,34 @@
 import { mkdir, open, readFile, stat, unlink } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { dirname, resolve } from 'node:path';
 
 import { isOpenCodeServerPidAlive } from './openCodeServerProcessState';
+import { resolveOpenCodeManagedServerLockTimeoutMsFromEnv } from './openCodeManagedServerTimeouts';
 
-function resolveManagedServerStartTimeoutMsFromEnv(env: NodeJS.ProcessEnv): number {
-  const raw = typeof env.HAPPIER_OPENCODE_SERVER_START_TIMEOUT_MS === 'string'
-    ? env.HAPPIER_OPENCODE_SERVER_START_TIMEOUT_MS.trim()
-    : '';
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return 30_000;
-  return Math.min(Math.floor(n), 120_000);
+type OpenCodeServerLockScope = Readonly<{ path: string; parent?: OpenCodeServerLockScope }> & {
+  held: boolean;
+  pending: Promise<void>;
+};
+const lockScope = new AsyncLocalStorage<OpenCodeServerLockScope>();
+
+async function runInLockScope<T>(path: string, parent: OpenCodeServerLockScope | undefined, fn: () => Promise<T>): Promise<T> {
+  const scope: OpenCodeServerLockScope = { path, parent, held: true, pending: Promise.resolve() };
+  try {
+    return await lockScope.run(scope, fn);
+  } finally {
+    // Finish already-admitted nested mutations before surrendering the physical lock, including
+    // work started by an admitted callback while an earlier mutation was settling.
+    let pending: Promise<void>;
+    do {
+      pending = scope.pending;
+      await pending;
+    } while (pending !== scope.pending);
+    scope.held = false;
+  }
 }
 
 export function resolveOpenCodeServerLockTimeoutMsFromEnv(env: NodeJS.ProcessEnv): number {
-  const raw = typeof env.HAPPIER_OPENCODE_SERVER_LOCK_TIMEOUT_MS === 'string'
-    ? env.HAPPIER_OPENCODE_SERVER_LOCK_TIMEOUT_MS.trim()
-    : '';
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) {
-    return Math.max(20_000, Math.min(resolveManagedServerStartTimeoutMsFromEnv(env), 60_000));
-  }
-  return Math.min(Math.floor(n), 60_000);
+  return resolveOpenCodeManagedServerLockTimeoutMsFromEnv(env);
 }
 
 function resolveLockStaleAfterMsFromEnv(env: NodeJS.ProcessEnv): number {
@@ -63,6 +71,15 @@ async function shouldBreakLock(
 }
 
 export async function withOpenCodeServerFileLock<T>(lockFile: string, fn: () => Promise<T>): Promise<T> {
+  const lockPath = resolve(lockFile);
+  const parent = lockScope.getStore();
+  for (let scope = parent; scope; scope = scope.parent) {
+    if (scope.path === lockPath && scope.held) {
+      const operation = scope.pending.then(async () => await runInLockScope(lockPath, parent, fn));
+      scope.pending = operation.then(() => {}, () => {});
+      return await operation;
+    }
+  }
   const timeoutMs = resolveOpenCodeServerLockTimeoutMsFromEnv(process.env);
   const staleAfterMs = resolveLockStaleAfterMsFromEnv(process.env);
   const startedAt = Date.now();
@@ -113,7 +130,9 @@ export async function withOpenCodeServerFileLock<T>(lockFile: string, fn: () => 
   }
 
   try {
-    return await fn();
+    // A bounded operation can ensure/retry under its own lock. Nested mutations serialize;
+    // unrelated callers acquire the file and escaped callbacks cannot reuse expired custody.
+    return await runInLockScope(lockPath, parent, fn);
   } finally {
     try {
       await handle.close();

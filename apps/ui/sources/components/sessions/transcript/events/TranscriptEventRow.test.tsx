@@ -1,9 +1,12 @@
-import { ActivityIndicator, StyleSheet } from 'react-native';
+import { StyleSheet } from 'react-native';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 import { renderScreen } from '@/dev/testkit';
 import { rawRecordSchema, type AgentEvent } from '@/sync/typesRaw/schemas';
 import { t } from '@/text';
+import { Text } from '@/components/ui/text/Text';
+import { normalizeRawMessage } from '@/sync/typesRaw/normalize';
 
 import { TranscriptEventRow } from './TranscriptEventRow';
 
@@ -45,6 +48,23 @@ function parseProtocolValidAgentEvent<T extends AgentEvent>(event: T): T {
 }
 
 describe('TranscriptEventRow', () => {
+    it.each(['failure', 'notice'] as const)('renders the provider startup %s through the existing session message row', async (kind) => {
+        const message = kind === 'failure'
+            ? "Required MCP server 'happier' failed to start: connection refused"
+            : 'Continued without MCP server "happier": connection refused';
+        const normalized = normalizeRawMessage(`startup-${kind}`, null, 1_000, {
+            role: 'agent', content: kind === 'failure'
+                ? { type: 'acp', provider: 'fx', data: { type: 'turn_failed', id: 'startup-1', issue: {
+                    v: 1, scope: 'primary_session', status: 'failed', code: 'provider_session_error',
+                    source: 'provider_session_error', occurredAt: 1_000, provider: 'fx', sanitizedPreview: message,
+                } } }
+                : { type: 'event', id: 'startup-notice', data: { type: 'message', message } },
+        });
+        if (normalized?.role !== 'event') throw new Error('Startup outcome must project to a visible event');
+        const screen = await renderScreen(<TranscriptEventRow event={normalized.content} sessionId="session-1" />);
+        expect(screen.findAllByType(Text).some((node) => node.props.children === message)).toBe(true);
+    });
+
     beforeEach(() => {
         eventRowMocks.actionExecute.mockReset();
         eventRowMocks.actionExecute.mockResolvedValue({ ok: true, result: { ok: true, status: 'cleared' } });
@@ -109,7 +129,7 @@ describe('TranscriptEventRow', () => {
             />,
         );
 
-        expect(screen.findByType(ActivityIndicator)).toBeTruthy();
+        expect(screen.findByType(ActivitySpinner)).toBeTruthy();
         expect(screen.findByProps({ testID: 'transcript-event-context-compaction-started' })).toBeTruthy();
     });
 
@@ -125,7 +145,7 @@ describe('TranscriptEventRow', () => {
             />,
         );
 
-        expect(() => screen.findByType(ActivityIndicator)).toThrow();
+        expect(() => screen.findByType(ActivitySpinner)).toThrow();
         expect(screen.findByProps({ testID: 'transcript-event-context-compaction-completed' })).toBeTruthy();
     });
 
@@ -143,7 +163,7 @@ describe('TranscriptEventRow', () => {
             />,
         );
 
-        expect(() => screen.findByType(ActivityIndicator)).toThrow();
+        expect(() => screen.findByType(ActivitySpinner)).toThrow();
         expect(screen.findByProps({ testID: 'transcript-event-context-compaction-paused' })).toBeTruthy();
     });
 
@@ -160,7 +180,7 @@ describe('TranscriptEventRow', () => {
             />,
         );
 
-        expect(() => screen.findByType(ActivityIndicator)).toThrow();
+        expect(() => screen.findByType(ActivitySpinner)).toThrow();
         expect(screen.findByProps({ testID: 'transcript-event-context-compaction-cancelled' })).toBeTruthy();
     });
 
@@ -586,6 +606,20 @@ describe('TranscriptEventRow', () => {
         expect(serialized).not.toContain('unsupported_service');
     });
 
+    it('explains a restart policy refusal in the transcript', async () => {
+        const event = parseProtocolValidAgentEvent({
+            type: 'connected-service-account-switch-attempt',
+            ok: false,
+            action: 'restart_requested',
+            errorCode: 'restart_disallowed_by_execution_policy',
+        });
+        const screen = await renderScreen(<TranscriptEventRow event={event} />);
+
+        expect(JSON.stringify(screen.tree.toJSON())).toContain(
+            t('connectedServices.authSwitch.errors.restartDisallowedByExecutionPolicy'),
+        );
+    });
+
     it('uses explicit failed outcome fields before legacy successful switch-attempt actions', async () => {
         const event = parseProtocolValidAgentEvent({
             type: 'connected-service-account-switch-attempt',
@@ -605,7 +639,7 @@ describe('TranscriptEventRow', () => {
 
         const serialized = JSON.stringify(screen.tree.toJSON());
         expect(screen.findByProps({ testID: 'transcript-event-connected-service-account-switch-attempt' })).toBeTruthy();
-        expect(serialized).toContain(t('connectedServices.authSwitch.switchFailed'));
+        expect(serialized).toContain(t('connectedServices.authSwitch.errors.hotApplyFailed'));
         expect(serialized).toContain('hot_apply_failed');
         expect(serialized).not.toContain(t('connectedServices.authSwitch.confirmAction'));
     });
@@ -764,6 +798,18 @@ describe('TranscriptEventRow', () => {
         expect(screen.findByProps({ testID: 'transcript-event-connected-service-runtime-auth-recovery' })).toBeTruthy();
         expect(serialized).toContain(t('connectedServices.diagnostics.status.recovery_retry_scheduled'));
         expect(serialized).not.toContain(t('message.unknownEvent'));
+    });
+
+    it('does not describe a terminal policy decision as a user cancellation', async () => {
+        const screen = await renderScreen(<TranscriptEventRow event={{
+            type: 'connected-service-runtime-auth-recovery',
+            status: 'cancelled', serviceId: 'claude-subscription', profileId: 'work',
+            terminal: true, reason: 'switch_reason_disabled',
+        }} />);
+        const serialized = JSON.stringify(screen.tree.toJSON());
+        expect(serialized).not.toContain(t('message.connectedServiceRuntimeAuthRecoveryCancelled'));
+        expect(serialized).toContain(t('message.connectedServiceRuntimeAuthRecoveryStopped'));
+        expect(screen.findByProps({ testID: 'transcript-event-connected-service-runtime-auth-recovery' })).toBeTruthy();
     });
 
     it('renders runtime-auth recovery recovered events without diagnostic data', async () => {

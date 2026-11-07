@@ -1,8 +1,23 @@
 import { describe, expect, it } from 'vitest';
 
+import { buildCursorSessionModelsFromConfigOptions } from '../../cursorModelConfigProjection';
+
 import { projectCursorAvailableModels } from '../projectAvailableModels';
 
 describe('projectCursorAvailableModels', () => {
+  it.each([false, true])('replaces empty standard choices while retaining any proprietary contribution (%s)', (hasProprietary) => {
+    const standardProjection = buildCursorSessionModelsFromConfigOptions([{
+      id: 'model', name: 'Model', type: 'select', currentValue: 'current', options: [],
+    }]);
+    expect(projectCursorAvailableModels({
+      proprietaryModels: hasProprietary ? [{ value: 'proprietary', name: 'Proprietary' }] : [],
+      standardProjection,
+    })).toEqual({
+      currentModelId: hasProprietary ? 'proprietary' : 'current',
+      availableModels: hasProprietary ? [{ id: 'proprietary', name: 'Proprietary' }] : [],
+    });
+  });
+
   it('dedupes proprietary ids, retains per-model options, and appends standard-only models', () => {
     expect(projectCursorAvailableModels({
       proprietaryModels: [

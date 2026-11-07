@@ -23,7 +23,7 @@ export type SessionRunnerRespawnManager = Readonly<{
   handleUnexpectedExit: (
     trackedSession: TrackedSession,
     exit: DaemonChildExit,
-    options?: Readonly<{ forceRestart?: boolean }>,
+    options?: Readonly<{ forceRestart?: boolean; quotaRecoveryAttemptId?: string }>,
   ) => void;
 }>;
 
@@ -114,7 +114,8 @@ function buildRespawnOptions(params: Readonly<{
   const resumeFromOptions = normalizeOptionalString(params.spawnOptions.resume);
   const resumeFromTracked = normalizeOptionalString(params.vendorResumeId);
   const effectiveResume = resumeFromOptions || resumeFromTracked;
-  const { resume: _resume, ...spawnOptionsWithoutResume } = params.spawnOptions;
+  // Recovery is a new launch, not a retry of the caller's already accepted request.
+  const { resume: _resume, spawnNonce: _spawnNonce, ...spawnOptionsWithoutResume } = params.spawnOptions;
   return {
     ...spawnOptionsWithoutResume,
     ...(effectiveResume ? { resume: effectiveResume } : {}),
@@ -143,7 +144,7 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
   maxDelayMs: number;
   jitterMs: number;
   isSessionAlreadyRunning: (sessionId: string) => boolean | Promise<boolean>;
-  spawnSession: (opts: SpawnSessionOptions) => Promise<unknown>;
+  spawnSession: (opts: SpawnSessionOptions, signal?: AbortSignal) => Promise<unknown>;
   resolveRespawnOptions?: SessionRunnerRespawnOptionsResolver;
   onRespawnSuccess?: (input: Readonly<{
     sessionId: string;
@@ -161,9 +162,10 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
   logWarn: (message: string) => void;
 }>): SessionRunnerRespawnManager {
   const stopRequestedBySessionId = new Map<string, StopRequest>();
+  const enteredQuotaAttempts = new Set<string>();
   const stateBySessionId = new Map<
     string,
-    { controller: RestartController; timer: NodeJS.Timeout | null; intended: boolean }
+    { controller: RestartController; timer: NodeJS.Timeout | null; intended: boolean; quotaRecoveryAttemptId?: string; spawnAbort?: AbortController }
   >();
 
   const getOrCreateController = (sessionId: string): RestartController => {
@@ -203,6 +205,11 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
     controller: RestartController,
     event: TerminationEvent,
   ): ReturnType<RestartController['nextDecisionForTermination']> => {
+    if (stateBySessionId.get(sessionId)?.quotaRecoveryAttemptId) {
+      // One guarded occurrence owns one launch. A technical failure is not another quota
+      // refusal and never silently re-enters either the launch or an ordinary retry budget.
+      return { type: 'no_restart', reason: 'quota_recovery_attempt_failed' };
+    }
     return stateBySessionId.get(sessionId)?.intended === true
       ? controller.nextDecisionForIntendedRestart()
       : controller.nextDecisionForTermination(event);
@@ -210,6 +217,7 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
 
   const clearTimer = (sessionId: string) => {
     const existing = stateBySessionId.get(sessionId);
+    existing?.spawnAbort?.abort(new Error('automatic_respawn_cancelled'));
     if (!existing?.timer) return;
     clearTimeout(existing.timer);
     stateBySessionId.set(sessionId, { ...existing, timer: null });
@@ -227,6 +235,8 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
   const endRespawnCycle = (sessionId: string) => {
     const existing = stateBySessionId.get(sessionId);
     if (!existing) return;
+    delete existing.quotaRecoveryAttemptId;
+    delete existing.spawnAbort;
     if (existing.controller.hasRecentIntendedRestarts()) {
       existing.controller.resetCrashBudget();
       existing.intended = false;
@@ -271,10 +281,24 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
     clearTimer(sessionId);
     const existing = stateBySessionId.get(sessionId);
     if (!existing) return;
+    const spawnAbort = new AbortController();
+    let cancellationNotified = false;
+    const cancelled = () => {
+      if (!spawnAbort.signal.aborted && !stopRequestedBySessionId.has(sessionId)) return false;
+      // A later explicit Resume may clear Stop and start another cycle. Its state
+      // cannot revive this admitted callback or be retired by its completion.
+      if (stateBySessionId.get(sessionId)?.spawnAbort === spawnAbort) endRespawnCycle(sessionId);
+      if (!cancellationNotified) {
+        cancellationNotified = true;
+        params.onRespawnTerminal?.({ sessionId, previousPid, reason: 'stop_requested' });
+      }
+      return true;
+    };
 
     const timer = setTimeout(() => {
       void (async () => {
         const alreadyRunning = await params.isSessionAlreadyRunning(sessionId);
+        if (cancelled()) return;
         if (alreadyRunning) {
           endRespawnCycle(sessionId);
           params.onRespawnTerminal?.({ sessionId, previousPid, reason: 'already_running' });
@@ -291,14 +315,16 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
         const respawnOptions = params.resolveRespawnOptions
           ? await params.resolveRespawnOptions({ sessionId, previousPid, spawnOptions, vendorResumeId, defaultOptions })
           : defaultOptions;
+        if (cancelled()) return;
         params.logDebug(
           `[DAEMON RUN] Respawning runner for session ${sessionId} after ${delayMs}ms (attempt ${attempt})`,
           { exit: event, attempt, respawnKind: resolveRespawnKind(event) },
         );
 
         void params
-          .spawnSession(respawnOptions)
+          .spawnSession(respawnOptions, spawnAbort.signal)
           .then((result) => {
+            if (cancelled()) return;
             if (result && typeof result === 'object' && (result as any).type === 'success') {
               params.onRespawnSuccess?.({ sessionId, previousPid, result });
               // Cycle end, NOT a full reset: the intended-restart window must survive a successful
@@ -351,6 +377,7 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
             scheduleRetryFromTermination(sessionId, spawnOptions, vendorResumeId, retryEvent, previousPid);
           })
           .catch((error) => {
+            if (cancelled()) return;
             params.logDebug(`[DAEMON RUN] Failed to respawn runner for session ${sessionId}`, error);
             const retryEvent: TerminationEvent = {
               type: 'spawn_error',
@@ -360,6 +387,7 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
             scheduleRetryFromTermination(sessionId, spawnOptions, vendorResumeId, retryEvent, previousPid);
           });
       })().catch((error) => {
+        if (cancelled()) return;
         params.logDebug(`[DAEMON RUN] Failed to evaluate respawn preflight for session ${sessionId}`, error);
         const retryEvent: TerminationEvent = {
           type: 'spawn_error',
@@ -370,7 +398,7 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
       });
     }, delayMs) as unknown as { unref?: () => void };
     timer.unref?.();
-    stateBySessionId.set(sessionId, { ...existing, timer: timer as any });
+    stateBySessionId.set(sessionId, { ...existing, timer: timer as any, spawnAbort });
   };
 
   return {
@@ -399,10 +427,13 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
       const sessionId = normalizeSessionId(trackedSession.happySessionId);
       if (!sessionId) return;
       const forceRestart = options?.forceRestart === true;
+      if (options?.quotaRecoveryAttemptId !== undefined && stopRequestedBySessionId.has(sessionId)) {
+        params.onRespawnTerminal?.({ sessionId, previousPid: trackedSession.pid, reason: 'stop_requested' });
+        return;
+      }
       if (forceRestart) {
         // A connected-service-initiated forced restart explicitly supersedes any prior stop request
-        // (e.g. a stale flag left by an earlier manual stop that the resume path never cleared --
-        // `clearStopRequested` has no production caller). Without this, the forced kill's respawn is
+        // (e.g. a stop request before an explicit connected-service restart). Without this, the forced kill's respawn is
         // silently vetoed and the session dies, surfaced to the user as an exit-143 crash. Clearing
         // here makes the manager map, a freshly-created controller, and the scheduled-spawn re-check
         // all treat this as the intentional restart it is.
@@ -422,6 +453,25 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
 
       const vendorResumeId = normalizeOptionalString(trackedSession.vendorResumeId);
       const controller = getOrCreateController(sessionId);
+      if (options?.quotaRecoveryAttemptId !== undefined) {
+        const attemptId = options.quotaRecoveryAttemptId;
+        if (!forceRestart || !attemptId || !vendorResumeId) {
+          params.onRespawnTerminal?.({ sessionId, previousPid: trackedSession.pid,
+            reason: 'no_restart', detail: 'quota_recovery_attempt_unbound' });
+          return;
+        }
+        const key = JSON.stringify([sessionId, attemptId]);
+        if (enteredQuotaAttempts.has(key)) return;
+        enteredQuotaAttempts.add(key);
+        const state = stateBySessionId.get(sessionId)!;
+        state.quotaRecoveryAttemptId = attemptId;
+        // Fresh provider refusals have no arbitrary per-session count limit. The daemon's
+        // guarded quota owner supplies each new occurrence; ordinary intended/crash
+        // restarts keep their existing budgets and are never classified as quota here.
+        scheduleSpawn(sessionId, spawnOptions, vendorResumeId, 0, 1,
+          connectedServiceRestartRequestedTerminationEvent, trackedSession.pid);
+        return;
+      }
       if (forceRestart) {
         // Mark this as an intended (connected-service-initiated) restart cycle so its whole storm —
         // the initial relaunch plus any retries — runs on the intended budget, never the generic

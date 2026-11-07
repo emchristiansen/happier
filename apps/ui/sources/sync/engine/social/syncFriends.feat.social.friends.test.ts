@@ -132,6 +132,21 @@ describe('syncFriends', () => {
         expect(applyFriends).toHaveBeenCalledWith([]);
     });
 
+    it('rejects a transient feature probe failure so the sync owner retries it', async () => {
+        const { fetchAndApplyFriends } = await import('./syncFriends');
+
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            throw new TypeError('network unavailable');
+        }) as unknown as typeof fetch);
+
+        const applyFriends = vi.fn();
+        await expect(fetchAndApplyFriends({ credentials, applyFriends })).rejects.toMatchObject({
+            name: 'RuntimeFeatureDecisionUnavailableError',
+            retryable: true,
+        });
+        expect(applyFriends).not.toHaveBeenCalled();
+    });
+
     it('drops fetched friends when the captured sync scope is stale before apply', async () => {
         const { fetchAndApplyFriends } = await import('./syncFriends');
 

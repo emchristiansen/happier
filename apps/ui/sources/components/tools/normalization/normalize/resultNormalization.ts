@@ -1,3 +1,5 @@
+import { isGenericSubAgentToolName } from '@happier-dev/protocol/tools/v2';
+
 import { asRecord } from './_shared';
 import {
     normalizeCodeSearchResultForRendering,
@@ -26,6 +28,14 @@ export function normalizeToolResultForRendering(params: { canonicalToolName: str
     const canonicalLower = params.canonicalToolName.toLowerCase();
     let nextResult: unknown = params.result;
 
+    if (isGenericSubAgentToolName(params.canonicalToolName)) {
+        const record = asRecord(nextResult);
+        // Native Claude task notifications carry findings as result; renderers
+        // consume the canonical Task content field while status stays intact.
+        if (record && record.content === undefined && typeof record.result === 'string') {
+            nextResult = { ...record, content: record.result };
+        }
+    }
     if (canonicalLower === 'patch') {
         nextResult = normalizeAppliedResultAliases(nextResult) ?? nextResult;
     }

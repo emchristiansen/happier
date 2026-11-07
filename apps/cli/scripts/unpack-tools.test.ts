@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream } from 'node:fs';
-import { copyFile, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { createReadStream, createWriteStream, existsSync } from 'node:fs';
+import { copyFile, cp, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { createGzip } from 'node:zlib';
 import { createRequire } from 'node:module';
@@ -25,8 +26,8 @@ type UnpackToolsModule = typeof import('./unpack-tools.cjs') & {
     licenseName?: string;
     sha256?: string;
   }[];
-  areToolsUnpacked: (toolsDir: string, platformDir: string) => boolean;
-  unpackTools: (options?: { platformDir?: string; toolsDir?: string }) => Promise<{ success: boolean; alreadyUnpacked: boolean }>;
+  areToolsUnpacked: (toolsDir: string, platformDir: string, tools?: readonly string[]) => boolean;
+  unpackTools: (options?: { platformDir?: string; toolsDir?: string; tools?: readonly string[] }) => Promise<{ success: boolean; alreadyUnpacked: boolean }>;
 };
 
 async function sha256(path: string): Promise<string> {
@@ -61,19 +62,31 @@ async function writeManifestChecksums(archivesDir: string, checksums: Record<str
 }
 
 describe('unpack-tools script', () => {
-  it('manifest includes explicit zellij archive mappings including Windows zip', () => {
+  it('extracts and reuses a requested optional tool without requiring the other archives', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-unpack-selected-'));
+    const archives = join(root, 'archives');
+    const staging = join(root, 'staging');
+    await mkdir(archives);
+    await mkdir(staging);
+    await writeFile(join(staging, 'difft.exe'), 'optional difft');
+    await writeFile(join(archives, 'difftastic-LICENSE'), 'license');
+    const archive = join(archives, 'difftastic-x64-win32.tar.gz');
+    await createTarGz(staging, archive, ['difft.exe']);
+    await writeManifestChecksums(archives, { 'difftastic-x64-win32.tar.gz': await sha256(archive) });
+    const unpacker = require('./unpack-tools.cjs') as UnpackToolsModule;
+    const options = { toolsDir: root, platformDir: 'x64-win32', tools: ['difftastic'] };
+    await expect(unpacker.unpackTools(options)).resolves.toEqual({ success: true, alreadyUnpacked: false });
+    await expect(readFile(join(root, 'unpacked', 'difft.exe'), 'utf8')).resolves.toBe('optional difft');
+    expect(unpacker.areToolsUnpacked(root, 'x64-win32', ['difftastic'])).toBe(true);
+    expect(unpacker.areToolsUnpacked(root, 'x64-win32')).toBe(false);
+    await expect(unpacker.unpackTools(options)).resolves.toEqual({ success: true, alreadyUnpacked: true });
+  });
+
+  it('manifest includes zellij only for supported POSIX targets', () => {
     const unpackTools = require('./unpack-tools.cjs') as UnpackToolsModule;
-    expect(unpackTools.getToolArchiveManifest()).toEqual(
+    const manifest = unpackTools.getToolArchiveManifest();
+    expect(manifest).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
-          tool: 'zellij',
-          platformDir: 'x64-win32',
-          archiveName: 'zellij-no-web-x86_64-pc-windows-msvc.zip',
-          archiveType: 'zip',
-          binaryName: 'zellij.exe',
-          licenseName: 'zellij-LICENSE',
-          version: '0.44.3',
-        }),
         expect.objectContaining({
           tool: 'zellij',
           platformDir: 'arm64-darwin',
@@ -85,6 +98,9 @@ describe('unpack-tools script', () => {
         }),
       ]),
     );
+    expect(manifest).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ tool: 'zellij', platformDir: 'x64-win32' }),
+    ]));
   });
 
   it('does not treat rg and difftastic alone as fully unpacked for zellij platforms', async () => {
@@ -135,7 +151,7 @@ describe('unpack-tools script', () => {
     });
   });
 
-  it('extracts tar.gz and zip archives, verifies checksums, copies licenses, and writes version markers', async () => {
+  it('extracts supported Windows tools without materializing zellij', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-unpack-tools-'));
     const archives = join(root, 'archives');
     const staging = join(root, 'staging');
@@ -168,10 +184,10 @@ describe('unpack-tools script', () => {
       alreadyUnpacked: false,
     });
 
-    await expect(readFile(join(root, 'unpacked', 'zellij.exe'), 'utf8')).resolves.toBe('zellij');
-    await expect(readFile(join(root, 'unpacked', 'zellij-LICENSE'), 'utf8')).resolves.toBe('zellij license');
-    await expect(readFile(join(root, 'unpacked', '.happier-tools-manifest.json'), 'utf8')).resolves.toContain('"zellij"');
-    await expect(stat(join(root, 'unpacked', 'zellij.exe'))).resolves.toMatchObject({ isFile: expect.any(Function) });
+    await expect(readFile(join(root, 'unpacked', 'rg.exe'), 'utf8')).resolves.toBe('rg');
+    await expect(stat(join(root, 'unpacked', 'zellij.exe'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(join(root, 'unpacked', 'zellij-LICENSE'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(join(root, 'unpacked', '.happier-tools-manifest.json'), 'utf8')).resolves.not.toContain('"zellij"');
   });
 
   it('fails closed on checksum mismatch', async () => {
@@ -262,5 +278,42 @@ describe('unpack-tools script', () => {
       success: true,
       alreadyUnpacked: false,
     });
+  });
+});
+
+describe('unpack-tools CLI entry', () => {
+  it('finishes a successful postinstall unpack through natural exit, never process.exit()', async () => {
+    // process.exit() can wedge Node 24 in NodePlatform::Shutdown (nodejs/node#54918);
+    // the CI install hung right after this script printed its success line.
+    const cliRoot = resolve(dirname(require.resolve('./unpack-tools.cjs')), '..');
+    const root = await mkdtemp(join(tmpdir(), 'happier-unpack-tools-entry-'));
+    await mkdir(join(root, 'scripts'), { recursive: true });
+    await copyFile(join(cliRoot, 'scripts', 'unpack-tools.cjs'), join(root, 'scripts', 'unpack-tools.cjs'));
+    await cp(join(cliRoot, 'tools', 'archives'), join(root, 'tools', 'archives'), { recursive: true });
+    const exitLog = join(root, 'process-exit.log');
+    const preload = join(root, 'record-process-exit.cjs');
+    await writeFile(preload, [
+      "const fs = require('node:fs');",
+      'const exit = process.exit;',
+      'process.exit = function recordedExit(code) {',
+      "  fs.writeFileSync(process.env.HAPPIER_TEST_EXIT_LOG, String(code));",
+      '  return exit.call(process, code);',
+      '};',
+    ].join('\n'));
+
+    const result = spawnSync(process.execPath, ['--require', preload, join(root, 'scripts', 'unpack-tools.cjs')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HAPPIER_TEST_EXIT_LOG: exitLog,
+        NODE_PATH: [join(cliRoot, 'node_modules'), join(cliRoot, '..', '..', 'node_modules')].join(delimiter),
+      },
+    });
+
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('Tools unpacked successfully');
+    expect(existsSync(exitLog)).toBe(false);
   });
 });

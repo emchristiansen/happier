@@ -125,14 +125,13 @@ describe('protected local state Windows ACL boundary', () => {
     expect(run.mock.calls.map(([command]) => command)).toEqual([
       'whoami.exe',
       'icacls.exe',
-      'icacls.exe',
+      'powershell.exe',
       'powershell.exe',
     ]);
     expect(run.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['/setowner', '*S-1-5-21-123']));
-    const icaclsArgs = run.mock.calls[2]?.[1] ?? [];
-    expect(icaclsArgs).toContain('/inheritancelevel:r');
-    expect(icaclsArgs).toContain('*S-1-5-21-123:(OI)(CI)F');
-    expect(icaclsArgs).toContain('*S-1-5-18:(OI)(CI)F');
+    const applyArgs = run.mock.calls[2]?.[1] ?? [];
+    expect(applyArgs[3]).toContain('SetSecurityDescriptorSddlForm');
+    expect(applyArgs).toEqual(expect.arrayContaining(['S-1-5-21-123', 'directory']));
   });
 
   it('verifies an existing file without mutating its ACL', async () => {

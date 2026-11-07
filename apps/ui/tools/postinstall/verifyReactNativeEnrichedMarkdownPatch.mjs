@@ -19,6 +19,7 @@ export function verifyReactNativeEnrichedMarkdownPatch({ packageDir }) {
     const wasmSourceModulePath = path.resolve(packageDir, 'src', 'web', 'wasm', 'md4c.js');
     const wasmBuiltModulePath = path.resolve(packageDir, 'lib', 'module', 'web', 'wasm', 'md4c.js');
     const iosTailFadeAnimatorPath = path.resolve(packageDir, 'ios', 'utils', 'ENRMTailFadeInAnimator.m');
+    const iosRendererDirectory = path.resolve(packageDir, 'ios', 'renderer');
     const androidTailFadeAnimatorPath = path.resolve(
         packageDir,
         'android',
@@ -33,6 +34,13 @@ export function verifyReactNativeEnrichedMarkdownPatch({ packageDir }) {
         'text',
         'TailFadeInAnimator.kt',
     );
+    const androidMarkdownDirectory = path.resolve(packageDir, 'android/src/main/java/com/swmansion/enriched/markdown');
+    const androidSpanIndexFiles = [
+        ['renderer/Renderer.kt', 'MarkdownSpannableFactory.newSpannable(builder)'],
+        ['utils/text/MarkdownSpannableFactory.kt', 'is SpannableStringBuilder -> InsertionOrderedSpannable(source)'],
+        ['utils/text/view/TextViewSetup.kt', 'setSpannableFactory(MarkdownSpannableFactory)'],
+        ['views/TableContainerView.kt', 'setSpannableFactory(MarkdownSpannableFactory)'],
+    ].map(([relativePath, marker]) => ({ filePath: path.join(androidMarkdownDirectory, relativePath), marker }));
 
     const requiredPaths = [
         enrichedMarkdownTextPath,
@@ -45,7 +53,9 @@ export function verifyReactNativeEnrichedMarkdownPatch({ packageDir }) {
         wasmSourceModulePath,
         wasmBuiltModulePath,
         iosTailFadeAnimatorPath,
+        iosRendererDirectory,
         androidTailFadeAnimatorPath,
+        ...androidSpanIndexFiles.map(({ filePath }) => filePath),
     ];
     if (requiredPaths.some((filePath) => !fs.existsSync(filePath))) return false;
 
@@ -62,9 +72,20 @@ export function verifyReactNativeEnrichedMarkdownPatch({ packageDir }) {
     const wasmBuiltModuleBytes = fs.readFileSync(wasmBuiltModulePath);
     const iosTailFadeAnimatorContents = fs.readFileSync(iosTailFadeAnimatorPath, 'utf8');
     const androidTailFadeAnimatorContents = fs.readFileSync(androidTailFadeAnimatorPath, 'utf8');
+    // AttributedRenderer owns the factory. Its cached children must not own it back;
+    // checking this also makes partial repair notice stale installed native files.
+    const cachedRendererPaths = fs.readdirSync(iosRendererDirectory)
+        .filter((name) => name.endsWith('Renderer.m') && name !== 'AttributedRenderer.m')
+        .map((name) => path.join(iosRendererDirectory, name));
+    const nativeRendererOwnershipPatched = cachedRendererPaths.length > 0
+        && cachedRendererPaths.every((filePath) => !/^\s*(?:RendererFactory\s*\*|id\s+)\s*_rendererFactory\s*;/m.test(
+            fs.readFileSync(filePath, 'utf8'),
+        ));
 
     return (
-        enrichedMarkdownTextContents.includes('markStreamingRevealOffsets')
+        nativeRendererOwnershipPatched
+        && androidSpanIndexFiles.every(({ filePath, marker }) => fs.readFileSync(filePath, 'utf8').includes(marker))
+        && enrichedMarkdownTextContents.includes('markStreamingRevealOffsets')
         && enrichedMarkdownTextContents.includes('streamingAnimation')
         && enrichedMarkdownTextContents.includes('updateStreamingRevealRanges')
         && enrichedMarkdownTextContents.includes('if (syncAst) return;')

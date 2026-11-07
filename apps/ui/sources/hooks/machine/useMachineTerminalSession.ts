@@ -11,8 +11,14 @@ import {
     TERMINAL_AUTO_RETRY_MAX_ATTEMPTS,
 } from '@/components/sessions/terminal/terminalRpcRecovery';
 import {
+    OwnedTerminalLifetime,
     claimTerminalReaderLease,
     hasTerminalReaderLease,
+    isTerminalReaderDisposing,
+    publishTerminalReaderConnection,
+    readTerminalReaderConnection,
+    reconnectTerminalReader,
+    subscribeTerminalReaderConnection,
     releaseTerminalReaderLease,
     subscribeTerminalReaderLeaseAvailability,
 } from '@/components/sessions/terminal/terminalReaderLeaseRegistry';
@@ -27,9 +33,11 @@ import {
 } from '@/sync/ops/machineTerminal';
 import { delay } from '@/utils/timing/time';
 
-export type TerminalStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'exited';
+import type { EmbeddedTerminalPaneStatus as TerminalStatus } from '@/components/terminal/embedded/types';
+export type { EmbeddedTerminalPaneStatus as TerminalStatus } from '@/components/terminal/embedded/types';
 
 export function useMachineTerminalSession(params: Readonly<{
+    active?: boolean;
     machineId: string | null;
     cwd: string | null;
     launch?: DaemonTerminalLaunchIntent | null;
@@ -45,16 +53,32 @@ export function useMachineTerminalSession(params: Readonly<{
         [params.terminalKey],
     );
 
-    const [status, setStatus] = React.useState<TerminalStatus>('idle');
-    const [error, setError] = React.useState<string | null>(null);
+    const active = params.active !== false;
+    // A machine change is a new owner lifetime: a private terminal stays bound to the machine that made it.
+    const ownerToken = React.useMemo(() => Symbol(params.terminalKey), [params.terminalKey, params.machineId]);
+    const subscribeConnection = React.useCallback(
+        (listener: () => void) => subscribeTerminalReaderConnection(params.terminalKey, listener),
+        [params.terminalKey],
+    );
+    const readConnection = React.useCallback(() => readTerminalReaderConnection(params.terminalKey), [params.terminalKey]);
+    const { status, error } = React.useSyncExternalStore(subscribeConnection, readConnection, readConnection);
+    const publishConnection = React.useCallback((status: TerminalStatus, error: string | null = null) => {
+        publishTerminalReaderConnection(params.terminalKey, ownerToken, { status, error });
+    }, [ownerToken, params.terminalKey]);
 
     const [connectionNonce, bumpConnectionNonce] = React.useReducer((x: number) => x + 1, 0);
     const restartRequestedRef = React.useRef(false);
     const autoRetryAttemptRef = React.useRef(0);
     const autoRetryTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     const clearNonceRef = React.useRef(0);
-    const terminalReaderOwnerTokenRef = React.useRef(Symbol(params.terminalKey));
-    const ignoreNextLeaseAvailabilityRef = React.useRef(false);
+    const ownsAuthTerminal = params.closeOnUnmount === true && params.launch?.kind !== 'session_attach';
+    const ownedLifetime = React.useMemo(() => {
+        const machineId = params.machineId;
+        return ownsAuthTerminal && machineId
+            ? new OwnedTerminalLifetime(params.terminalKey, ownerToken,
+                (terminalId) => machineTerminalClose(machineId, { terminalId }))
+            : null;
+    }, [ownsAuthTerminal, params.machineId, params.terminalKey, ownerToken]);
 
     const terminalIdRef = React.useRef<string | null>(initialSurfaceState.terminalId);
     const cursorRef = React.useRef(initialSurfaceState.cursor);
@@ -103,95 +127,84 @@ export function useMachineTerminalSession(params: Readonly<{
             autoRetryTimeoutRef.current = null;
             bumpConnectionNonce();
         }, resolveTerminalAutoRetryDelayMs(nextAttempt));
-        setError(null);
-        setStatus('connecting');
+        publishConnection('connecting');
         return true;
-    }, []);
+    }, [publishConnection]);
 
-    const requestRestart = React.useCallback(() => {
+    const reconnect = React.useCallback((restart: boolean) => {
         resetAutoRetryState();
-        restartRequestedRef.current = true;
-        clearTerminalOutput();
-        syncDetectedUrl(null);
+        restartRequestedRef.current = restart;
+        if (restart) {
+            clearTerminalOutput();
+            syncDetectedUrl(null);
+        }
         bumpConnectionNonce();
     }, [clearTerminalOutput, resetAutoRetryState, syncDetectedUrl]);
 
+    const requestRestart = React.useCallback(() => {
+        if (!reconnectTerminalReader(params.terminalKey, true)) reconnect(true);
+    }, [params.terminalKey, reconnect]);
+
     const retryConnect = React.useCallback(() => {
-        resetAutoRetryState();
-        restartRequestedRef.current = false;
-        bumpConnectionNonce();
-    }, [resetAutoRetryState]);
+        if (!reconnectTerminalReader(params.terminalKey, false)) reconnect(false);
+    }, [params.terminalKey, reconnect]);
 
     React.useEffect(() => {
-        return () => {
-            safeTimeoutClear(autoRetryTimeoutRef.current);
-            autoRetryTimeoutRef.current = null;
-        };
-    }, []);
-
-    React.useEffect(() => {
-        terminalReaderOwnerTokenRef.current = Symbol(params.terminalKey);
-    }, [params.terminalKey]);
-
-    React.useEffect(() => {
+        if (!active || !initialTerminalSize) return;
         return subscribeTerminalReaderLeaseAvailability(params.terminalKey, () => {
-            if (ignoreNextLeaseAvailabilityRef.current) {
-                ignoreNextLeaseAvailabilityRef.current = false;
-                return;
-            }
-            if (!hasTerminalReaderLease(params.terminalKey, terminalReaderOwnerTokenRef.current)) {
-                bumpConnectionNonce();
-            }
+            if (!hasTerminalReaderLease(params.terminalKey, ownerToken)) bumpConnectionNonce();
         });
-    }, [params.terminalKey]);
+    }, [active, initialTerminalSize, ownerToken, params.terminalKey]);
+
+    // Declared before the lease release below: on unmount or owner replacement, disposal must
+    // reserve the key before release notifies availability listeners that could claim it.
+    React.useEffect(() => {
+        return () => {
+            ownedLifetime?.dispose();
+        };
+    }, [ownedLifetime]);
 
     React.useEffect(() => {
         return () => {
-            releaseTerminalReaderLease(params.terminalKey, terminalReaderOwnerTokenRef.current);
+            resetAutoRetryState();
+            releaseTerminalReaderLease(params.terminalKey, ownerToken);
         };
-    }, [params.terminalKey]);
+    }, [active, ownerToken, params.terminalKey, resetAutoRetryState]);
 
     React.useEffect(() => {
         let canceled = false;
-        let readerLeaseReleased = false;
-
-        const releaseReaderLease = () => {
-            if (readerLeaseReleased) {
-                return;
-            }
-            readerLeaseReleased = true;
-            ignoreNextLeaseAvailabilityRef.current = true;
-            releaseTerminalReaderLease(params.terminalKey, terminalReaderOwnerTokenRef.current);
-        };
 
         const failTerminalSession = (errorCode: string) => {
-            releaseReaderLease();
-            setStatus('error');
-            setError(errorCode);
+            publishConnection('error', errorCode);
+            releaseTerminalReaderLease(params.terminalKey, ownerToken);
         };
 
         const exitTerminalSession = () => {
-            releaseReaderLease();
-            setStatus('exited');
-            setError(null);
+            publishConnection('exited');
+            releaseTerminalReaderLease(params.terminalKey, ownerToken);
         };
 
         const start = async () => {
+            if (!active || !initialTerminalSize) return;
             const previousTerminalId = terminalIdRef.current;
             const previousCursor = cursorRef.current;
             const cachedSurfaceState = readTerminalSurfaceState(params.terminalKey) ?? createEmptyTerminalSurfaceState();
 
-            if (!claimTerminalReaderLease(params.terminalKey, terminalReaderOwnerTokenRef.current)) {
+            if (ownedLifetime && !ownedLifetime.isActive()) return;
+            if (!claimTerminalReaderLease(params.terminalKey, ownerToken, reconnect)) {
+                if (isTerminalReaderDisposing(params.terminalKey)) {
+                    // A private terminal is still closing under this key: never adopt its cached ID.
+                    // The shared connection reads 'connecting'; release of the reservation re-notifies.
+                    terminalIdRef.current = null;
+                    return;
+                }
                 terminalIdRef.current = cachedSurfaceState.terminalId;
                 cursorRef.current = cachedSurfaceState.cursor;
-                setError(null);
-                setStatus(cachedSurfaceState.terminalId ? 'connected' : 'connecting');
                 hydrateTerminalRendererIfNeeded();
                 return;
             }
 
-            setError(null);
-            setStatus('connecting');
+            publishConnection('connecting');
 
             if (!params.machineId || (!params.cwd && !params.launch)) {
                 failTerminalSession('terminal_missing_machine_target');
@@ -203,10 +216,6 @@ export function useMachineTerminalSession(params: Readonly<{
             }
             if (params.machineReachable === false) {
                 failTerminalSession('terminal_machine_unreachable');
-                return;
-            }
-            if (!initialTerminalSize) {
-                setStatus('connecting');
                 return;
             }
 
@@ -226,12 +235,25 @@ export function useMachineTerminalSession(params: Readonly<{
                     rows: terminalSize.rows,
                     initialCommand: params.initialCommand ?? undefined,
                 };
-            const ensured = restartRequestedRef.current
-                ? await machineTerminalRestart(params.machineId, request)
-                : await machineTerminalEnsure(params.machineId, request);
+            const restartRequested = restartRequestedRef.current;
             restartRequestedRef.current = false;
+            const settleAcquisition = ownedLifetime?.beginAcquisition();
+            if (ownedLifetime && !settleAcquisition) return;
+            const ensured = await (async () => {
+                try {
+                    const result = restartRequested
+                        ? await machineTerminalRestart(params.machineId!, request)
+                        : await machineTerminalEnsure(params.machineId!, request);
+                    settleAcquisition?.(result.ok ? result : undefined);
+                    return result;
+                } catch (error) {
+                    settleAcquisition?.();
+                    throw error;
+                }
+            })();
 
-            if (canceled) return;
+            if (canceled || (ownedLifetime && !ownedLifetime.isActive())
+                || !hasTerminalReaderLease(params.terminalKey, ownerToken)) return;
             if (!ensured.ok) {
                 if (isRecoverableTerminalSessionErrorCode(ensured.errorCode) && scheduleAutoRetry()) {
                     return;
@@ -266,7 +288,7 @@ export function useMachineTerminalSession(params: Readonly<{
                 });
                 hydrateTerminalRendererIfNeeded();
             }
-            setStatus('connected');
+            publishConnection('connected');
 
             let idleCount = 0;
             while (!canceled) {
@@ -278,7 +300,8 @@ export function useMachineTerminalSession(params: Readonly<{
                     terminalId,
                     cursor: cursorRef.current,
                 });
-                if (canceled) return;
+                if (canceled || (ownedLifetime && !ownedLifetime.isActive())
+                    || !hasTerminalReaderLease(params.terminalKey, ownerToken)) return;
 
                 if (!read.ok) {
                     if (isRecoverableTerminalSessionErrorCode(read.errorCode) && scheduleAutoRetry()) {
@@ -346,7 +369,12 @@ export function useMachineTerminalSession(params: Readonly<{
             canceled = true;
         };
     }, [
+        active,
+        ownerToken,
+        publishConnection,
+        reconnect,
         connectionNonce,
+        ownedLifetime,
         hydrateTerminalRendererIfNeeded,
         initialTerminalSize,
         latestTerminalSizeRef,
@@ -366,13 +394,6 @@ export function useMachineTerminalSession(params: Readonly<{
         updateSurfaceState,
         writeTerminalOutput,
     ]);
-
-    React.useEffect(() => {
-        return () => {
-            if (!params.closeOnUnmount || !params.machineId || !terminalIdRef.current) return;
-            void machineTerminalClose(params.machineId, { terminalId: terminalIdRef.current });
-        };
-    }, [params.closeOnUnmount, params.machineId]);
 
     const dismissDetectedUrl = React.useCallback(() => {
         syncDetectedUrl(null);

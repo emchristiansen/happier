@@ -1,3 +1,4 @@
+import { withConnectedServiceReaderSupport } from '@happier-dev/protocol';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { AuthCredentials } from '@/auth/storage/tokenStorage';
@@ -77,13 +78,13 @@ describe('apiConnectedServicesV3', () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      'https://api.example.test/v3/connect/openai-codex/profiles/work/credential',
+      withConnectedServiceReaderSupport('https://api.example.test/v3/connect/openai-codex/profiles/work/credential'),
       expect.objectContaining({
         method: 'POST',
         headers: expect.any(Headers),
       }),
     );
-    const init = resolveNonHealthCall(fetchMock, 'https://api.example.test/v3/connect/openai-codex/profiles/work/credential');
+    const init = resolveNonHealthCall(fetchMock, withConnectedServiceReaderSupport('https://api.example.test/v3/connect/openai-codex/profiles/work/credential'));
     expect((init.headers as Headers).get('Authorization')).toBe('Bearer t');
     expect(JSON.parse(String(init.body))).toEqual(expect.objectContaining({ expectedCredentialRevision: null }));
   });
@@ -157,10 +158,10 @@ describe('apiConnectedServicesV3', () => {
     })).resolves.toBeUndefined();
 
     expect(fetchMock).toHaveBeenCalledWith(
-      'https://api.example.test/v3/connect/anthropic/profiles/work/credential?expectedCredentialRevision=csr_0123456789ABCDEFGHJKMNPQRS',
+      withConnectedServiceReaderSupport('https://api.example.test/v3/connect/anthropic/profiles/work/credential?expectedCredentialRevision=csr_0123456789ABCDEFGHJKMNPQRS'),
       expect.objectContaining({ method: 'DELETE', headers: expect.any(Headers) }),
     );
-    const init = resolveNonHealthCall(fetchMock, 'https://api.example.test/v3/connect/anthropic/profiles/work/credential?expectedCredentialRevision=csr_0123456789ABCDEFGHJKMNPQRS');
+    const init = resolveNonHealthCall(fetchMock, withConnectedServiceReaderSupport('https://api.example.test/v3/connect/anthropic/profiles/work/credential?expectedCredentialRevision=csr_0123456789ABCDEFGHJKMNPQRS'));
     expect((init.headers as Headers).get('Content-Type')).toBeNull();
   });
 
@@ -184,7 +185,7 @@ describe('apiConnectedServicesV3', () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      'https://api.example.test/v3/connect/claude-subscription/profiles/work/credential?cleanupGroupReferences=true&expectedCredentialRevision=csr_0123456789ABCDEFGHJKMNPQRS',
+      withConnectedServiceReaderSupport('https://api.example.test/v3/connect/claude-subscription/profiles/work/credential?cleanupGroupReferences=true&expectedCredentialRevision=csr_0123456789ABCDEFGHJKMNPQRS'),
       expect.objectContaining({ method: 'DELETE', headers: expect.any(Headers) }),
     );
   });

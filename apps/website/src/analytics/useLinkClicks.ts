@@ -3,6 +3,7 @@ import { useEffect } from 'react';
 import {
     ANDROID_APK_URL,
     ANDROID_PLAY_TESTING_OPT_IN_URL,
+    ANDROID_PLAY_URL,
     APP_STORE_URL,
     CHANGELOG_URL,
     DESKTOP_PLATFORMS,
@@ -54,6 +55,7 @@ import { locationOf } from './location';
 /** href → outbound destination. Longest match wins, so specific beats generic. */
 const DESTINATIONS: ReadonlyArray<[string, OutboundDestination]> = [
     [ANDROID_PLAY_TESTING_OPT_IN_URL, 'play-testing'],
+    [ANDROID_PLAY_URL, 'google-play'],
     [ANDROID_APK_URL, 'android-apk'],
     [APP_STORE_URL, 'app-store'],
     [LICENSE_URL, 'license'],
@@ -70,6 +72,7 @@ const DESTINATIONS: ReadonlyArray<[string, OutboundDestination]> = [
 /** Store-badge hrefs that should read as a download, not a generic exit. */
 const STORES: ReadonlyArray<[string, DownloadStore]> = [
     [ANDROID_PLAY_TESTING_OPT_IN_URL, 'android-play-testing'],
+    [ANDROID_PLAY_URL, 'android-play'],
     [ANDROID_APK_URL, 'android-apk'],
     [APP_STORE_URL, 'ios'],
     [WEB_APP_URL, 'web'],

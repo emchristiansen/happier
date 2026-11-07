@@ -23,6 +23,20 @@ type QuotaDescriptorModule = Readonly<{
 describe('createClaudeSubscriptionQuotaFetcher', () => {
   const claudeCodeScope = 'user:inference user:profile user:sessions:claude_code user:mcp_servers user:file_upload';
 
+  it('preserves the attested credential organization without a second profile request', async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request) => new Response(JSON.stringify({ five_hour: { utilization: 40 } }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const record = buildConnectedServiceCredentialRecord({
+      now: 1_000, serviceId: 'claude-subscription', profileId: 'work', kind: 'oauth',
+      oauth: { accessToken: 'at', refreshToken: 'rt', idToken: null, scope: claudeCodeScope,
+        tokenType: null, providerAccountId: 'user-1', providerEmail: null,
+        raw: { claudeAiOauth: { organizationUuid: 'org-team' } } },
+    });
+    const snapshot = await createClaudeSubscriptionQuotaFetcher().fetch({ record, now: 1_000, signal: new AbortController().signal });
+    expect(snapshot).toMatchObject({ providerId: 'claude', activeAccountId: 'user-1', providerOrganizationId: 'org-team' });
+    expect(fetchMock.mock.calls.every(([url]) => !String(url).endsWith('/profile'))).toBe(true);
+  });
+
   it('does not claim exact quota support for setup-token credentials', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
@@ -135,7 +149,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       headers: expect.objectContaining({
         Authorization: 'Bearer at',
         'anthropic-beta': 'oauth-2025-04-20',
-        'User-Agent': expect.stringMatching(/^claude-code\/[0-9][a-zA-Z0-9._+-]*$/u),
+        'User-Agent': expect.stringMatching(/^claude-cli\/[0-9][a-zA-Z0-9._+-]* \(external, cli\)$/u),
       }),
     }));
   });
@@ -174,7 +188,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
 
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
     expect(snapshot?.meters.find((meter) => meter.meterId === 'five_hour')?.utilizationPct).toBe(20);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('fetches and parses Claude subscription oauth usage into a quota snapshot', async () => {
@@ -341,6 +355,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
 
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
     expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_fable')).toMatchObject({
+      windowDurationMs: 604_800_000,
       label: 'Weekly (Fable)',
       utilizationPct: 61,
       resetsAt: Date.parse('2026-02-24T00:00:00Z'),
@@ -396,6 +411,19 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
               surface: null,
             },
           },
+          {
+            kind: 'weekly_scoped',
+            group: 'weekly',
+            percent: 31,
+            resets_at: '2026-07-07T19:59:59.748308+00:00',
+            scope: {
+              model: {
+                id: null,
+                display_name: 'Opus',
+              },
+              surface: null,
+            },
+          },
         ],
       }),
     }));
@@ -425,11 +453,21 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
 
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
     expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_fable')).toMatchObject({
+      providerLimitId: 'seven_day_fable',
       label: 'Weekly (Fable)',
       utilizationPct: 22,
       resetsAt: Date.parse('2026-07-07T19:59:59.748308+00:00'),
       status: 'ok',
+      details: { rawScope: 'weekly_scoped', modelDisplayName: 'Fable' },
     });
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_fable')).not.toHaveProperty('modelId');
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_opus')).toMatchObject({
+      providerLimitId: 'seven_day_opus',
+      label: 'Weekly (Opus)',
+      utilizationPct: 31,
+      details: { rawScope: 'weekly_scoped', modelDisplayName: 'Opus' },
+    });
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'seven_day_opus')).not.toHaveProperty('modelId');
     expect(snapshot?.meters.find((meter) => meter.meterId === 'five_hour')).toMatchObject({
       utilizationPct: 63,
     });
@@ -687,7 +725,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
     expect(String(fetchMock.mock.calls[0]?.[0] ?? '')).toContain('/anthropic/oauth/usage');
   });
 
-  it('backs off after 429 Retry-After and leaves existing snapshots stale until polling is allowed again', async () => {
+  it('signals 429 as a provider_backoff error with Retry-After and keeps the cooldown for later polls', async () => {
     const now = 5_000_000;
     const fetchMock = vi.fn(async (input: unknown) => {
       const url = String(input ?? '');
@@ -728,7 +766,11 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       nowMs: () => clock,
     });
 
-    await expect(fetcher.fetch({ record, now: clock, signal: new AbortController().signal })).resolves.toBeNull();
+    await expect(fetcher.fetch({ record, now: clock, signal: new AbortController().signal })).rejects.toMatchObject({
+      quotaFetchErrorCode: 'provider_backoff',
+      status: 429,
+      retryAfterMs: 120_000,
+    });
     clock += 60_000;
     await expect(fetcher.fetch({ record, now: clock, signal: new AbortController().signal })).resolves.toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -742,7 +784,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       if (!url.includes('/anthropic/oauth/usage')) {
         throw new Error(`Unexpected URL in test: ${url}`);
       }
-      usageCalls += 1;
+      if (!url.includes('?')) usageCalls += 1;
       const auth = (() => {
         const headers: unknown =
           init && typeof init === 'object' && 'headers' in init ? (init as { headers?: unknown }).headers : undefined;
@@ -810,12 +852,78 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       nowMs: () => clock,
     });
 
-    await expect(fetcher.fetch({ record: staleRecord, now: clock, signal: new AbortController().signal })).resolves.toBeNull();
+    await expect(fetcher.fetch({ record: staleRecord, now: clock, signal: new AbortController().signal })).rejects.toMatchObject({
+      quotaFetchErrorCode: 'provider_backoff',
+      status: 429,
+    });
     clock += 60_000;
     await expect(fetcher.fetch({ record: reconnectedRecord, now: clock, signal: new AbortController().signal }))
       .resolves
       .toMatchObject({ profileId: 'work' });
     expect(usageCalls).toBe(2);
+  });
+
+  it.each([
+    { scenario: 'initial 429', firstStatus: 429, finalStatus: 429, initialRetryAfter: true, requestCount: 1, retryAfterSeconds: 120, remainingBackoffMs: 840_000 },
+    { scenario: 'retried 429', firstStatus: 503, finalStatus: 429, initialRetryAfter: false, requestCount: 2, retryAfterSeconds: 1_800, remainingBackoffMs: 1_740_000 },
+    { scenario: 'retried 503', firstStatus: 503, finalStatus: 503, initialRetryAfter: false, requestCount: 2, retryAfterSeconds: 1_800, remainingBackoffMs: 1_740_000 },
+    { scenario: 'initial 503', firstStatus: 503, finalStatus: 503, initialRetryAfter: true, requestCount: 1, retryAfterSeconds: 1_800, remainingBackoffMs: 1_740_000 },
+    { scenario: 'short initial 503', firstStatus: 503, finalStatus: 503, initialRetryAfter: true, requestCount: 1, retryAfterSeconds: 30, advanceBeforeRetryMs: 29_999, remainingBackoffMs: 1 },
+  ])('preserves provider Retry-After for a forced refresh attempt after $scenario', async ({ firstStatus, finalStatus, initialRetryAfter, requestCount, retryAfterSeconds, advanceBeforeRetryMs = 60_000, remainingBackoffMs }) => {
+    const now = 5_100_000;
+    const fetchMock429 = vi.fn()
+      .mockResolvedValueOnce(new Response('', { status: firstStatus, headers: initialRetryAfter ? { 'retry-after': String(retryAfterSeconds) } : {} }))
+      .mockResolvedValue(new Response('', { status: finalStatus, headers: { 'retry-after': String(retryAfterSeconds) } }));
+    const fetchMock = vi.fn(async (_input: unknown) => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        five_hour: { utilization: 10, resets_at: '2026-02-16T00:00:00Z' },
+      }),
+    }));
+    const record = buildConnectedServiceCredentialRecord({
+      now,
+      serviceId: 'claude-subscription',
+      profileId: 'work',
+      kind: 'oauth',
+      expiresAt: now + 60_000,
+      oauth: {
+        accessToken: 'at',
+        refreshToken: 'rt',
+        idToken: null,
+        scope: claudeCodeScope,
+        tokenType: null,
+        providerAccountId: null,
+        providerEmail: 'user@example.com',
+      },
+    });
+
+    let clock = now;
+    const fetcher = createClaudeSubscriptionQuotaFetcher({
+      usageUrl: 'https://api.anthropic.com/api/oauth/usage',
+      staleAfterMs: 300_000,
+      nowMs: () => clock,
+    });
+
+    vi.stubGlobal('fetch', fetchMock429 as unknown as typeof fetch);
+    const failure = await fetcher.fetch({ record, now: clock, signal: new AbortController().signal }).catch((error: unknown) => error);
+    expect(fetchMock429).toHaveBeenCalledTimes(requestCount);
+    expect(failure).toMatchObject({
+      quotaFetchErrorCode: 'provider_backoff',
+      status: finalStatus,
+      retryAfterMs: retryAfterSeconds * 1_000,
+    });
+    clock += advanceBeforeRetryMs;
+
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+    await expect(fetcher.fetch({ record, now: clock, signal: new AbortController().signal, force: true }))
+      .rejects.toMatchObject({ quotaFetchErrorCode: 'provider_backoff', retryAfterMs: remainingBackoffMs });
+    expect(fetchMock).not.toHaveBeenCalled();
+    if (retryAfterSeconds === 30) {
+      clock += 1;
+      await expect(fetcher.fetch({ record, now: clock, signal: new AbortController().signal, force: true }))
+        .resolves.toMatchObject({ meters: expect.arrayContaining([expect.objectContaining({ utilizationPct: 10 })]) });
+    }
   });
 
   it('records cooldown before fetching so repeated provider failures do not immediately refetch', async () => {
@@ -912,7 +1020,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       if (!url.includes('/anthropic/oauth/usage')) {
         throw new Error(`Unexpected URL in test: ${url}`);
       }
-      usageCalls += 1;
+      if (!url.includes('?')) usageCalls += 1;
       if (usageCalls === 1) {
         return {
           ok: false,

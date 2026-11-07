@@ -74,7 +74,7 @@ function resolveBindingProfileId(params: Readonly<{
     payloadBinding: Record<string, unknown> | null;
     accountProfileConnectedServicesV2: ReadonlyArray<AccountProfileConnectedService>;
     serviceId: string;
-}>): Readonly<{ profileId: string; selection: 'group' | 'profile' }> | null {
+}>): Readonly<{ profileId: string; selection: 'group' | 'profile'; groupId?: string }> | null {
     const optionBindingRecord = readObjectRecord(params.optionBinding);
     const selection =
         readTrimmedString(optionBindingRecord?.selection)
@@ -82,15 +82,18 @@ function resolveBindingProfileId(params: Readonly<{
     const explicitProfileId =
         readTrimmedString(optionBindingRecord?.profileId)
         ?? readTrimmedString(params.payloadBinding?.profileId);
-    if (explicitProfileId) {
-        return { profileId: explicitProfileId, selection: selection === 'group' ? 'group' : 'profile' };
-    }
-
-    if (selection !== 'group') return null;
-
     const groupId =
         readTrimmedString(optionBindingRecord?.groupId)
         ?? readTrimmedString(params.payloadBinding?.groupId);
+    if (explicitProfileId) {
+        return {
+            profileId: explicitProfileId,
+            selection: selection === 'group' ? 'group' : 'profile',
+            ...(selection === 'group' && groupId ? { groupId } : {}),
+        };
+    }
+
+    if (selection !== 'group') return null;
     if (!groupId) return null;
 
     const activeProfileId = resolveActiveGroupProfileId({
@@ -98,12 +101,13 @@ function resolveBindingProfileId(params: Readonly<{
         serviceId: params.serviceId,
         groupId,
     });
-    return activeProfileId ? { profileId: activeProfileId, selection: 'group' } : null;
+    return activeProfileId ? { profileId: activeProfileId, selection: 'group', groupId } : null;
 }
 
 export type ConnectedServiceQuotaProfileRefForSession = Readonly<{
     serviceId: string;
     profileId: string;
+    groupId?: string;
     credentialHealthStatus?: ConnectedServiceCredentialHealthStatusV1;
     provenance: ConnectedServiceQuotaProfileRefProvenance;
 }>;
@@ -151,10 +155,12 @@ export function resolveConnectedServiceQuotaProfileRefForSession(params: Readonl
             services: params.accountProfileConnectedServicesV2,
             serviceId,
             profileId: binding.profileId,
+            ...(binding.groupId ? { groupId: binding.groupId } : {}),
         });
         return {
             serviceId,
             profileId: binding.profileId,
+            ...(binding.groupId ? { groupId: binding.groupId } : {}),
             ...(credentialHealthStatus ? { credentialHealthStatus } : {}),
             provenance: binding.selection === 'group' ? 'connected_binding_group' : 'connected_binding_profile',
         };

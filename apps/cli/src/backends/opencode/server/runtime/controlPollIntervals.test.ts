@@ -6,7 +6,7 @@ describe('resolveOpenCodeServerControlPollIntervals', () => {
   it('uses an explicit server-control default independent of pending queue idle polling', () => {
     expect(resolveOpenCodeServerControlPollIntervals({})).toEqual({
       pollSleepMs: 2_000,
-      turnActivePollSleepMs: 250,
+      turnActivePollSleepMs: 2_000,
     });
   });
 

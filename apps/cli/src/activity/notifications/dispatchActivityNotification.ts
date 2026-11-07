@@ -179,6 +179,8 @@ export async function dispatchActivityNotificationAsync(params: Readonly<{
           channel,
           event: params.event,
           sender: params.expoPushSender,
+          suppressIfComputerFocused: params.settings?.notificationsSettingsV1?.mutePhoneWhenComputerFocused === true
+            && (params.event.topic === 'ready' || params.event.topic === 'permission_request' || params.event.topic === 'user_action_request'),
         });
         deliveredChannels += 1;
         continue;

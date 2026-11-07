@@ -1,6 +1,6 @@
 import { deriveManagedConnectionReason } from './managedConnectionEvents.js';
 import { computeManagedConnectionBackoffMs } from './reconnectBackoff.js';
-import type { ManagedConnectionState, ReadinessProbeResult } from './managedConnectionTypes.js';
+import type { ManagedConnectionState, ManagedProbeReportScope, ReadinessProbeResult } from './managedConnectionTypes.js';
 import type {
   ManagedEndpointFailureReport,
   ManagedEndpointSupervisor,
@@ -172,8 +172,16 @@ export function createManagedEndpointSupervisor(config: ManagedEndpointSuperviso
     });
   }
 
-  function reportProbeResult(probe: Exclude<ReadinessProbeResult, Readonly<{ status: 'ready' }>>): void {
+  function captureProbeReportScope(): ManagedProbeReportScope {
+    return { generation };
+  }
+
+  function reportProbeResult(
+    probe: Exclude<ReadinessProbeResult, Readonly<{ status: 'ready' }>>,
+    scope?: ManagedProbeReportScope,
+  ): void {
     if (isStopped) return;
+    if (!scope || scope.generation !== generation) return;
     if (state.phase !== 'online' && state.phase !== 'connecting' && state.phase !== 'offline') return;
     generation += 1;
     clearRetryTimer();
@@ -295,6 +303,7 @@ export function createManagedEndpointSupervisor(config: ManagedEndpointSuperviso
     invalidate,
     reportFailure,
     reportProbeResult,
+    captureProbeReportScope,
     waitUntilOnline,
     getState(): ManagedEndpointSupervisorState {
       return state;

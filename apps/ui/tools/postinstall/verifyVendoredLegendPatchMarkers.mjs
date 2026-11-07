@@ -5,7 +5,7 @@ import path from 'node:path';
  * Integrity gate for the vendored `@legendapp/list` patch.
  *
  * WHY THIS EXISTS
- * The patch carries five behaviour fixes for defects that fail SILENTLY when the hunk is lost —
+ * The patch carries behaviour fixes for defects that fail SILENTLY when the hunk is lost —
  * one of them leaves the whole transcript permanently invisible. `patch-package` regenerates the
  * patch from whatever is in `node_modules` at the time, so a regeneration performed against a
  * partially-reverted tree drops hunks without any error. Nothing then fails until a user reports
@@ -54,11 +54,44 @@ export const LEGEND_NATIVE_RUNTIME_BUILDS = Object.freeze(['react-native.mjs', '
  */
 export const LEGEND_PATCH_MARKERS = Object.freeze([
     {
-        id: 'maintained-end-commit-anchor',
-        marker: 'HAPPIER-MVCP-END-ANCHOR',
+        id: 'physical-reader-mvcp-baseline',
+        marker: 'getCachedVisibleRange(ctx, scroll, scroll + state.scrollLength)',
         minOccurrences: 1,
-        defect: 'Suppressing MVCP while following the tail exposed prepended geometry before the deferred end-maintenance scroll. Nonanimated maintenance now anchors the end through the same commit, without taking over an explicit command.',
-        evidence: 'sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.real.integration.test.tsx, sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.native.real.integration.test.tsx',
+        builds: ['react-native.web.mjs', 'react-native.web.js', 'react.mjs', 'react.js'],
+        defect: 'Browser user scrolling can advance before its throttled scroll event. Applying '
+            + 'row measurement deltas to the stale modeled offset rolls the physical reader backward.',
+        evidence: 'sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.real.integration.test.tsx (preserves physical user scroll progress when measurements precede its scroll event); real-account cold transcript reproduced on 2026-10-08',
+        removeWhen: 'upstream bases DOM MVCP measurement adjustment on current physical reader position before changing geometry',
+    },
+    {
+        id: 'settled-geometry-tail-maintenance',
+        marker: 'if (getContentSize(ctx) !== previousContentSize) {\n    doMaintainScrollAtEnd(ctx);',
+        minOccurrences: 1,
+        defect: 'Final scroll reconciliation can invalidate offscreen size versions and change '
+            + 'the content extent after the last row-measurement maintenance pass. Returning '
+            + 'that geometry change to the existing end-maintenance owner prevents a completed '
+            + 'jump from remaining short of the live tail without taking over detached readers.',
+        evidence: 'sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.real.integration.test.tsx (lands the live tail after a detached entry reconciles offscreen row geometry); live detached-return jump reproduced on 2026-09-22',
+        removeWhen: 'upstream notifies end maintenance when terminal scroll reconciliation changes the content extent',
+    },
+    {
+        id: 'terminal-bootstrap-retirement',
+        marker: 'geometry reconciliation so its ticker cannot later overwrite the accepted viewport.\n    clearBootstrapInitialScrollSession(state);',
+        minOccurrences: 1,
+        defect: 'A layout rearm could survive initial-scroll completion and target retirement. '
+            + 'Its orphan watchdog later stamped a stale estimated offset over an already accepted '
+            + 'physical viewport, leaving the rendered range stale until user scroll. Retiring the '
+            + 'child before terminal geometry reconciliation preserves the one-write tail handoff.',
+        evidence: 'sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.real.integration.test.tsx (retains the accepted physical viewport after late bootstrap geometry settles); live cached reopen reproduced with HMR disabled on 2026-09-22',
+        removeWhen: 'upstream retires rearmed bootstrap work before initial-scroll terminal reconciliation and preserves accepted physical viewport state',
+    },
+    {
+        id: 'maintained-end-commit-anchor',
+        marker: 'if (shouldAdjustMaintainedEnd && !(positionDiff > MVCP_POSITION_EPSILON)) {',
+        minOccurrences: 1,
+        defect: 'Suppressing MVCP while following the tail exposed prepended geometry before the deferred end-maintenance scroll. Nonanimated maintenance now anchors the end through the same commit, without taking over an explicit command. '
+            + 'Content the same commit inserted above the reader\'s anchor keeps the anchor-preserving correction, so stale end ownership cannot throw a parked reader to the tail.',
+        evidence: 'sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.real.integration.test.tsx, sources/components/sessions/transcript/viewport/shell/renderer/legendListRenderer.native.real.integration.test.tsx, sources/components/sessions/transcript/viewport/shell/renderer/legendEndAnchorPrependWhileParked.real.integration.test.tsx',
         removeWhen: 'upstream preserves nonanimated held-end geometry through MVCP commits and respects explicit scrolling authority',
     },
     {
@@ -325,7 +358,9 @@ export function verifyVendoredLegendPatchMarkers(params) {
             missingBuilds.push(build);
             continue;
         }
-        const contents = fs.readFileSync(buildPath, 'utf8');
+        // Windows patch additions can carry CRLF into otherwise LF runtime builds. Match the
+        // same source lines without relaxing marker text, indentation, or occurrence counts.
+        const contents = fs.readFileSync(buildPath, 'utf8').replace(/\r\n/g, '\n');
         for (const entry of LEGEND_PATCH_MARKERS) {
             // A hunk scoped to a subset of builds is not expected in the others. This is the only
             // supported reason to skip a check, and it is declared per entry rather than inferred,
@@ -370,6 +405,7 @@ export function formatVendoredLegendPatchFailure(result) {
     return lines.join('\n');
 }
 
+/** @param {string} haystack @param {string} needle */
 function countOccurrences(haystack, needle) {
     let count = 0;
     let index = haystack.indexOf(needle);

@@ -4,24 +4,19 @@ import { delimiter, join, resolve } from 'node:path';
 
 import { createProbeTempDir, writeExecutableScript } from '@/capabilities/probes/agentModelsProbe.testkit';
 import { writePnpmNodeBridge } from '@/testkit/fs/executableShim';
+import { createEnvKeyScope } from '@/testkit/env/envScope';
 import type { DetectCliRequest } from './cliSnapshot';
 
 describe('detectCliSnapshotOnDaemonPath (cache)', () => {
-  const previousOpenCodePath = process.env.HAPPIER_OPENCODE_PATH;
+  const envScope = createEnvKeyScope(['HAPPIER_OPENCODE_PATH', 'HAPPIER_CLAUDE_PATH']);
 
   beforeEach(() => {
-    // Some CLI unit lanes provide a default OpenCode stub for machine-agnostic tests.
-    // Cache behavior tests need full control over PATH vs overrides, so clear the global
-    // override by default and let individual tests set it when needed.
-    delete process.env.HAPPIER_OPENCODE_PATH;
+    // These fixtures own PATH; inherited overrides must not select a different executable.
+    envScope.patch({ HAPPIER_OPENCODE_PATH: undefined, HAPPIER_CLAUDE_PATH: undefined });
   });
 
   afterEach(() => {
-    if (previousOpenCodePath === undefined) {
-      delete process.env.HAPPIER_OPENCODE_PATH;
-    } else {
-      process.env.HAPPIER_OPENCODE_PATH = previousOpenCodePath;
-    }
+    envScope.restore();
   });
 
   it('returns a timed-out auth status instead of hanging when a CLI auth probe never settles', async () => {

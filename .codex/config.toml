@@ -10,6 +10,13 @@ developer_instructions = """
 - With fork_turns="none", give a detailed self-contained brief: goal, observed evidence, exact paths/symbols, success criteria, constraints/permissions, required validation, expected output, and stop/fallback rules.
 - Refer to large logs and artifacts by path with a short digest; do not paste them into the child brief.
 
+# Codex long-operation waits and resumption
+
+- Apply the task-local waiting and recovery policy in AGENTS.md. Prefer actual completion notifications; otherwise use the existing handle's interruptible wait. For operations expected to take minutes, normally request 120 seconds; after unchanged pending results, use 300 seconds where supported. Respect tool limits and timeout units (120000/300000 for milliseconds); these are waiting preferences, not operation deadlines or evidence-based stall thresholds. Use a shorter wait when interaction, failure evidence, or a time-sensitive diagnostic requires it.
+- While all useful work is waiting on a healthy operation, this policy supersedes the generic periodic-commentary cadence and advice against waits longer than 60 seconds. Explain what is pending once, preserve user interruption, and report meaningful changes and terminal results promptly. Do not schedule model turns or perform status checks solely to produce commentary. Continue normal progress updates during active work.
+- Use longer waits only when the tool remains responsive to completion or user interruption; do not substitute long blind sleeps. A heartbeat may end a wait early: requesting a larger timeout does not guarantee fewer model turns. Use a supported completion-only mechanism when available, and do not invent notification support or claim an unresolved runtime limitation is fixed.
+- With the current agents tools, followup_task resumes an idle existing agent; send_message alone does not start it. Inspect the available tool contract if names or behavior differ. Do not replace a resumable agent merely because it hit a usage limit.
+
 # Codex Code Mode tool staging
 
 - Put already-known, necessary, independent, non-conflicting nested tool calls in one bounded `exec` cell. Use `Promise.all(...)` when any failure makes the stage unusable; use `Promise.allSettled(...)` when partial results remain useful, and inspect every rejection.

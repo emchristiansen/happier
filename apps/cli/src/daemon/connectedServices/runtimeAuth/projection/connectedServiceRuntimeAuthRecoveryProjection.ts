@@ -1,6 +1,7 @@
 import {
   CONNECTED_SERVICE_UX_DIAGNOSTIC_CODES,
   ConnectedServiceIdSchema,
+  isConnectedServiceRuntimeAuthRecoveryCancellation,
   TranscriptRawAgentEventV1Schema,
   normalizeConnectedServiceUxDiagnosticV1,
   type ConnectedServiceUxDiagnosticV1,
@@ -199,7 +200,9 @@ function readRecoveryTerminalResultStatus(recovery: Readonly<Record<string, unkn
   | 'recovery_cancelled'
   | 'recovery_terminal' {
   if (recovery?.status === 'exhausted') return 'recovery_dead_lettered';
-  if (recovery?.status === 'cancelled') return 'recovery_cancelled';
+  if (recovery?.status === 'cancelled' && isConnectedServiceRuntimeAuthRecoveryCancellation(readString(recovery.terminalReason))) {
+    return 'recovery_cancelled';
+  }
   return 'recovery_terminal';
 }
 

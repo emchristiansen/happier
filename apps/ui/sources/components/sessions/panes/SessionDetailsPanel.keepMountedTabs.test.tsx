@@ -192,8 +192,7 @@ describe('SessionDetailsPanel (keep mounted tabs)', () => {
             && getStyleValue(surface.props.style, 'opacity') === 0
         ));
         expect(inactiveSurface).toBeTruthy();
-        expect(getStyleValue(inactiveSurface!.props.style, 'display')).toBe('flex');
-        expect(getStyleValue(inactiveSurface!.props.style, 'visibility')).toBe('hidden');
+        expect(getStyleValue(inactiveSurface!.props.style, 'display')).toBe('none');
         expect((inactiveSurface!.props as any).accessibilityElementsHidden).toBeUndefined();
         expect((inactiveSurface!.props as any).importantForAccessibility).toBeUndefined();
     });
@@ -215,6 +214,10 @@ describe('SessionDetailsPanel (keep mounted tabs)', () => {
             defaultView: {
                 getComputedStyle: () => ({ overflow: 'hidden', overflowY: 'hidden' }),
             },
+            // A real page also takes the stylesheets web components inject (e.g. the loading spinner).
+            getElementById: () => null,
+            createElement: (tagName: string) => ({ tagName: tagName.toUpperCase(), id: '', textContent: '' }),
+            head: { appendChild: (node: unknown) => node },
         };
 
         try {

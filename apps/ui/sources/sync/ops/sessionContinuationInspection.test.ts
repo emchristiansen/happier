@@ -7,7 +7,10 @@ vi.mock('@/sync/runtime/orchestration/serverScopedRpc/serverScopedMachineRpc', (
     machineRpcWithServerScope: (params: unknown) => machineRpcWithServerScope(params),
 }));
 
-const { inspectSessionContinuationOnMachine } = await import('./sessionContinuationInspection');
+const {
+    inspectSessionContinuationOnMachine,
+    inspectSessionContinuationsOnMachine,
+} = await import('./sessionContinuationInspection');
 
 const AVAILABLE = {
     type: 'available',
@@ -82,5 +85,107 @@ describe('inspectSessionContinuationOnMachine', () => {
             machineRpcWithServerScope.mockResolvedValueOnce(answer);
             await expect(inspect()).resolves.toEqual({ status: 'indeterminate' });
         }
+    });
+});
+
+describe('inspectSessionContinuationsOnMachine', () => {
+    beforeEach(() => {
+        machineRpcWithServerScope.mockReset();
+    });
+
+    it('projects every requested target through one machine RPC', async () => {
+        machineRpcWithServerScope.mockResolvedValue({
+            v: 1,
+            inspections: [
+                AVAILABLE,
+                { type: 'unavailable', reason: 'target_unavailable' },
+            ],
+        });
+
+        await expect(inspectSessionContinuationsOnMachine({
+            machineId: 'machine-1',
+            serverId: 'server-1',
+            sessionId: 'session-1',
+            selections: [
+                { v: 1, agentId: 'codex' },
+                { v: 1, agentId: 'gemini' },
+            ],
+        })).resolves.toEqual([
+            { status: 'answered', inspection: AVAILABLE },
+            { status: 'answered', inspection: { type: 'unavailable', reason: 'target_unavailable' } },
+        ]);
+        expect(machineRpcWithServerScope).toHaveBeenCalledTimes(1);
+        expect(machineRpcWithServerScope).toHaveBeenCalledWith({
+            machineId: 'machine-1',
+            serverId: 'server-1',
+            method: 'session.continuation.inspectBatch',
+            payload: {
+                v: 1,
+                sourceSessionId: 'session-1',
+                selections: [
+                    { v: 1, agentId: 'codex' },
+                    { v: 1, agentId: 'gemini' },
+                ],
+            },
+        });
+    });
+
+    it('falls back through the existing single-target contract for an older daemon', async () => {
+        machineRpcWithServerScope
+            .mockRejectedValueOnce(Object.assign(
+                new Error('RPC method not available'),
+                { rpcErrorCode: 'RPC_METHOD_NOT_AVAILABLE' },
+            ))
+            .mockResolvedValueOnce(AVAILABLE)
+            .mockResolvedValueOnce({ type: 'unavailable', reason: 'target_unavailable' });
+
+        await expect(inspectSessionContinuationsOnMachine({
+            machineId: 'machine-1',
+            serverId: 'server-1',
+            sessionId: 'session-1',
+            selections: [
+                { v: 1, agentId: 'codex' },
+                { v: 1, agentId: 'gemini' },
+            ],
+        })).resolves.toEqual([
+            { status: 'answered', inspection: AVAILABLE },
+            { status: 'answered', inspection: { type: 'unavailable', reason: 'target_unavailable' } },
+        ]);
+        expect(machineRpcWithServerScope).toHaveBeenCalledTimes(3);
+    });
+});
+
+
+describe('configured target inspection', () => {
+    beforeEach(() => { machineRpcWithServerScope.mockReset(); });
+
+    it('uses the configured operation for a single exact target without a legacy fallback', async () => {
+        const selection = { v: 1, agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'b' } } as const;
+        machineRpcWithServerScope.mockResolvedValue({ v: 1, inspections: [AVAILABLE] });
+        await expect(inspectSessionContinuationOnMachine({ machineId: 'machine-1', serverId: 'server-1', sessionId: 'session-1', selection }))
+            .resolves.toEqual({ status: 'answered', inspection: AVAILABLE });
+        expect(machineRpcWithServerScope).toHaveBeenCalledWith(expect.objectContaining({
+            method: 'session.continuation.inspectBackendTargets', payload: { v: 1, sourceSessionId: 'session-1', selections: [selection] },
+        }));
+    });
+
+    it('keeps configured identity off the released builtin batch and preserves builtin answers', async () => {
+        const configured = { v: 1, agentId: 'customAcp', backendTarget: { kind: 'configuredAcpBackend', backendId: 'backend-b' } } as const;
+        machineRpcWithServerScope.mockImplementation(async (request: { method: string; payload: { selections: unknown[] } }) => {
+            if (request.method === 'session.continuation.inspectBackendTargets') {
+                expect(request.payload.selections).toEqual([configured]);
+                throw Object.assign(new Error('method unavailable'), { rpcErrorCode: 'RPC_METHOD_NOT_AVAILABLE' });
+            }
+            expect(request.method).toBe('session.continuation.inspectBatch');
+            expect(request.payload.selections).toEqual([{ v: 1, agentId: 'codex' }]);
+            return { v: 1, inspections: [AVAILABLE] };
+        });
+        await expect(inspectSessionContinuationsOnMachine({
+            machineId: 'machine-1', serverId: 'server-1', sessionId: 'session-1',
+            selections: [configured, { v: 1, agentId: 'codex' }],
+        })).resolves.toEqual([
+            { status: 'answered', inspection: { type: 'unavailable', reason: 'operation_unavailable' } },
+            { status: 'answered', inspection: AVAILABLE },
+        ]);
     });
 });

@@ -1,4 +1,3 @@
-import chalk from 'chalk';
 
 import type { CommandContext } from '@/cli/commandRegistry';
 import { mapUnknownErrorToControlError } from '@/cli/control/controlErrorMapping';
@@ -7,6 +6,7 @@ import { wantsJson, printJsonEnvelope } from '@/cli/output/jsonEnvelope';
 import { resolveMcpCommandDeps, type McpCommandDeps } from './mcp/deps';
 import { runMcpServeCommand } from './mcp/serve';
 import { runMcpServersSubcommand } from './mcp/servers/subcommands';
+import { fail } from '@happier-dev/cli-common/output';
 
 function isHelpToken(value: string): boolean {
   const trimmed = String(value ?? '').trim();
@@ -15,7 +15,7 @@ function isHelpToken(value: string): boolean {
 
 function printMcpUsage(): void {
   console.log('happier mcp serve [--session <session-id>]');
-  console.log('happier mcp servers list [--dir <path>] [--json]');
+  console.log('happier mcp servers list [--name <name>] [--details --json] [--dir <path>] [--json]');
   console.log('happier mcp servers add --name <name> --transport stdio --command <cmd> [--arg <arg>] [--json]');
   console.log('happier mcp servers bind --mcp-server <name|id> --all-machines [--json]');
   console.log('happier mcp servers unbind --binding-id <id> [--json]');
@@ -24,7 +24,7 @@ function printMcpUsage(): void {
 }
 
 function printMcpServersUsage(): void {
-  console.log('happier mcp servers list [--dir <path>] [--json]');
+  console.log('happier mcp servers list [--name <name>] [--details --json] [--dir <path>] [--json]');
   console.log('happier mcp servers add --name <name> --transport stdio --command <cmd> [--arg <arg>] [--json]');
   console.log('happier mcp servers bind --mcp-server <name|id> --all-machines [--json]');
   console.log('happier mcp servers unbind --binding-id <id> [--json]');
@@ -118,7 +118,7 @@ export async function handleMcpCliCommand(context: CommandContext): Promise<void
       );
       return;
     }
-    console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) console.error(error);
     process.exitCode = typeof process.exitCode === 'number' && process.exitCode > 1 ? process.exitCode : 1;
   }

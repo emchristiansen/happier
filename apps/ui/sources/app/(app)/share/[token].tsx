@@ -24,8 +24,6 @@ import { sortNormalizedMessagesOldestFirst } from '@/utils/sessions/sortNormaliz
 import { parsePlainSessionAgentState, parsePlainSessionMetadata } from '@/sync/engine/sessions/parsePlainSessionPayload';
 import { readStoredSessionRawRecord } from '@/sync/runtime/readStoredSessionContent';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
-import { useHeaderHeight } from '@/utils/platform/responsive';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Icon } from '@/components/ui/icons/Icon';
 
 const SHARE_SCREEN_OPTIONS = { headerShown: false } as const;
@@ -68,6 +66,7 @@ type PublicShareConsentResponse = {
 
 type PublicShareMessagesResponse = {
     messages: ApiMessage[];
+    hasMore?: boolean;
 };
 
 type PublicShareDataset = Readonly<{
@@ -143,8 +142,6 @@ export default memo(function PublicShareViewerScreen() {
     const { credentials } = useAuth();
     const router = useRouter();
     const { theme } = useUnistyles();
-    const safeArea = useSafeAreaInsets();
-    const headerHeight = useHeaderHeight();
     const tokenParam = resolvePublicShareTokenParam(
         typeof token === 'string' ? token : null,
         typeof window === 'undefined' ? null : window.location.pathname,
@@ -240,6 +237,7 @@ export default memo(function PublicShareViewerScreen() {
                 return;
             }
 
+            const reducerSessionContext = { mainHistoryStartLoaded: messagesData.hasMore === false };
             const sessionEncryptionMode = data.session.encryptionMode === 'plain' ? 'plain' : 'e2ee';
             const plainMetadata = sessionEncryptionMode === 'plain'
                 ? parsePlainSessionMetadata(data.session.metadata)
@@ -254,7 +252,7 @@ export default memo(function PublicShareViewerScreen() {
                 sortNormalizedMessagesOldestFirst(normalized);
 
                 const reducerState = createReducer();
-                const reduced = reducer(reducerState, normalized, plainAgentState);
+                const reduced = reducer(reducerState, normalized, plainAgentState, reducerSessionContext);
 
                 setDataset({
                     share: data,
@@ -326,7 +324,7 @@ export default memo(function PublicShareViewerScreen() {
                 sortNormalizedMessagesOldestFirst(normalized);
 
                 const reducerState = createReducer();
-                const reduced = reducer(reducerState, normalized, e2eeAgentState);
+                const reduced = reducer(reducerState, normalized, e2eeAgentState, reducerSessionContext);
 
                 setDataset({
                     share: data,
@@ -421,7 +419,7 @@ export default memo(function PublicShareViewerScreen() {
         <>
             <Stack.Screen options={SHARE_SCREEN_OPTIONS} />
             <View style={{ flex: 1, backgroundColor: theme.colors.surface.base }}>
-                <View style={{ position: 'absolute', top: 0, left: 0, right: 0, zIndex: 1000 }}>
+                <View style={{ zIndex: 1000 }}>
                     <ChatHeaderView
                         title={sessionName}
                         subtitle={t('session.sharing.sharedBy', { name: ownerName })}
@@ -430,7 +428,7 @@ export default memo(function PublicShareViewerScreen() {
                         flavor={null}
                     />
                 </View>
-                <View style={{ flex: 1, paddingTop: safeArea.top + headerHeight }}>
+                <View style={{ flex: 1 }}>
                     <TranscriptList
                         key={publicDatasetKey}
                         sessionId={share.session.id}

@@ -81,55 +81,18 @@ function resolveOpenCodeBrokerBridgeParams(provider: OpenCodeBrokerProvider) {
 }
 
 /**
- * Build the self-contained ESM source for the Happier OpenCode auth broker plugin for one provider.
- *
- * The returned string is written to disk and loaded by OpenCode's own Bun runtime as a local
- * plugin file. It imports NOTHING (no Happier modules, no npm deps) and uses only Bun/Node globals
- * (`fetch`, `process`, `node:fs`). It:
- *   - engages on Happier's broker auth marker (NOT on real provider tokens),
- *   - obtains a fresh ACCESS token from the Happier daemon bridge over local HTTP (the daemon is the
- *     sole refresher; NO refresh token is ever present here),
- *   - reads one matching daemon port + scoped capability snapshot from broker-state at call time,
- *   - shapes the provider request (Codex backend rewrite + headers, or Anthropic Bearer+beta),
- *   - caches the access token in-memory and refreshes once on a 401.
+ * Shared broker payload JS: model normalization, token cache, Codex/Anthropic shaping, and the
+ * load handshake. Single owner for both generations: V1 (auth loader + brokeredFetch) and V2
+ * (session hooks) embed this identical snippet so there is exactly one request-auth policy. The
+ * snippet expects the wrapper to define PROVIDER and BRIDGE facts (via the shared bridge builder)
+ * plus SELECTION_IDENTITY_ENV, LOAD_NONCE_ENV, LOADED_HANDSHAKE_PATH, MARKER, Codex and Anthropic constants.
+ * It defines MODEL_MAP, normalizeCodexModel, getAccessToken, rewriteCodexUrl, buildCodexHeaders,
+ * transformCodexBody, buildAnthropicHeaders, injectAnthropicSystemIdentity, sendLoadHandshake.
+ * V1 adds brokeredFetch + the legacy auth factory; V2 adds session-hook registration. No global
+ * env fallback and no user-DB reads: the daemon bridge is the sole credential authority.
  */
-export function buildOpenCodeBrokerPluginSource(provider: OpenCodeBrokerProvider): string {
-  // The bridge-call portion (atomic daemon endpoint read, selection resolve, POST shape) is
-  // emitted by the SHARED, provider-agnostic builder so the OpenCode plugin and the Pi extension stay
-  // in lockstep. Provider-owned bridge metadata supplies the endpoint/service-id facts; the shared
-  // builder owns only broker-state read, selection resolve, and POST mechanics.
-  const bridgeParams = resolveOpenCodeBrokerBridgeParams(provider);
-  const sharedBridgeCallSource = buildBrokerBridgeCallSource({
-    ...bridgeParams,
-    selectionsEnv: OPEN_CODE_BROKER_SELECTIONS_ENV,
-    brokerStatePathEnv: OPEN_CODE_BROKER_STATE_PATH_ENV,
-    pluginVersionEnv: OPEN_CODE_BROKER_PLUGIN_VERSION_ENV,
-    pluginVersion: OPEN_CODE_BROKER_PLUGIN_VERSION,
-    sessionTag: 'opencode-broker',
-    selectionIdentityEnv: OPEN_CODE_BROKER_SELECTION_IDENTITY_ENV,
-  });
-  return `// Happier OpenCode auth broker plugin (generated). Provider: ${provider}. Version: ${OPEN_CODE_BROKER_PLUGIN_VERSION}.
-// Self-contained ESM: loaded by OpenCode's Bun runtime. No Happier imports, no npm deps.
-import { readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
-
-${sharedBridgeCallSource}
-
-const SELECTION_IDENTITY_ENV = ${jsString(OPEN_CODE_BROKER_SELECTION_IDENTITY_ENV)};
-const LOAD_NONCE_ENV = ${jsString(OPEN_CODE_BROKER_LOAD_NONCE_ENV)};
-const LOADED_HANDSHAKE_PATH = ${jsString(OPEN_CODE_BROKER_LOADED_HANDSHAKE_PATH)};
-const MARKER = ${jsString(buildOpenCodeBrokerMarker(provider, OPEN_CODE_BROKER_PLUGIN_VERSION))};
-
-const CODEX_BASE_URL = ${jsString(OPEN_CODE_BROKER_CODEX_BASE_URL)};
-const CODEX_FROM = ${jsString(OPEN_CODE_BROKER_CODEX_RESPONSES_FROM)};
-const CODEX_TO = ${jsString(OPEN_CODE_BROKER_CODEX_RESPONSES_TO)};
-const CODEX_ORIGINATOR = ${jsString(OPEN_CODE_BROKER_CODEX_ORIGINATOR)};
-const CODEX_OPENAI_BETA = ${jsString(OPEN_CODE_BROKER_CODEX_OPENAI_BETA)};
-
-const ANTHROPIC_BETA = ${jsString(OPEN_CODE_BROKER_ANTHROPIC_BETA)};
-const ANTHROPIC_SYSTEM_IDENTITY = ${jsString(OPEN_CODE_BROKER_ANTHROPIC_SYSTEM_IDENTITY)};
-
-// Static, binary-safe model normalization (subset of the official Codex CLI map). No remote fetch.
+function buildOpenCodeBrokerSharedPayloadJs(): string {
+  return `// Static, binary-safe model normalization (subset of the official Codex CLI map). No remote fetch.
 const MODEL_MAP = {
   "gpt-5": "gpt-5.1",
   "gpt-5-codex": "gpt-5.1-codex",
@@ -237,31 +200,6 @@ function injectAnthropicSystemIdentity(init) {
   return Object.assign({}, init, { body: JSON.stringify(body) });
 }
 
-async function brokeredFetch(input, init) {
-  const url = typeof input === "string" ? input : (input && input.url ? input.url : String(input));
-  let token = await getAccessToken(false);
-  const doRequest = async (accessToken, accountId) => {
-    if (PROVIDER === "openai") {
-      const transformed = transformCodexBody(init);
-      const headers = buildCodexHeaders(
-        Object.assign({}, transformed.init, { __promptCacheKey: transformed.promptCacheKey }),
-        accountId,
-        accessToken,
-      );
-      return fetch(rewriteCodexUrl(url), Object.assign({}, transformed.init, { headers: headers }));
-    }
-    const withIdentity = injectAnthropicSystemIdentity(init);
-    const headers = buildAnthropicHeaders(withIdentity, accessToken);
-    return fetch(url, Object.assign({}, withIdentity, { headers: headers }));
-  };
-  let response = await doRequest(token.accessToken, token.accountId);
-  if (response.status === 401) {
-    token = await getAccessToken(true);
-    response = await doRequest(token.accessToken, token.accountId);
-  }
-  return response;
-}
-
 // Best-effort, bounded load handshake (F4): tell the daemon this broker plugin actually loaded in the
 // OpenCode runtime, keyed by the stable selection identity so the preflight (same env) can match it.
 // Never throws and never blocks the plugin: failures are swallowed (the file-existence + non-functional
@@ -298,6 +236,91 @@ async function sendLoadHandshake() {
   } catch (error) {
     // Swallow: auth still flows via the loader + bridge, and a later factory invocation can retry.
   }
+}`;
+}
+
+/**
+ * Build the self-contained ESM source for the Happier OpenCode auth broker plugin for one provider.
+ *
+ * The returned string is written to disk and loaded by OpenCode's own Bun runtime as a local
+ * plugin file. It imports NOTHING (no Happier modules, no npm deps) and uses only Bun/Node globals
+ * (`fetch`, `process`, `node:fs`). It:
+ *   - engages on Happier's broker auth marker (NOT on real provider tokens),
+ *   - obtains a fresh ACCESS token from the Happier daemon bridge over local HTTP (the daemon is the
+ *     sole refresher; NO refresh token is ever present here),
+ *   - reads one matching daemon port + scoped capability snapshot from broker-state at call time,
+ *   - shapes the provider request (Codex backend rewrite + headers, or Anthropic Bearer+beta),
+ *   - caches the access token in-memory and refreshes once on a 401.
+ */
+function buildOpenCodeBrokerBridgeCallSourceFor(provider: OpenCodeBrokerProvider): string {
+  const bridgeParams = resolveOpenCodeBrokerBridgeParams(provider);
+  return buildBrokerBridgeCallSource({
+    ...bridgeParams,
+    selectionsEnv: OPEN_CODE_BROKER_SELECTIONS_ENV,
+    brokerStatePathEnv: OPEN_CODE_BROKER_STATE_PATH_ENV,
+    pluginVersionEnv: OPEN_CODE_BROKER_PLUGIN_VERSION_ENV,
+    pluginVersion: OPEN_CODE_BROKER_PLUGIN_VERSION,
+    sessionTag: 'opencode-broker',
+    selectionIdentityEnv: OPEN_CODE_BROKER_SELECTION_IDENTITY_ENV,
+  });
+}
+
+/**
+ * Build the self-contained ESM source for the Happier OpenCode auth broker plugin for one provider.
+ *
+ * V1 generation: legacy async factory `{ return { auth: { provider, methods, loader } } }` loaded
+ * by OpenCode 1.x auto-discovery from `<XDG_CONFIG_HOME>/opencode/plugin/*.js`. Preserved
+ * unchanged in behavior; now embeds the shared payload so V1/V2 share one policy.
+ */
+export function buildOpenCodeBrokerPluginSource(provider: OpenCodeBrokerProvider): string {
+  const sharedBridgeCallSource = buildOpenCodeBrokerBridgeCallSourceFor(provider);
+  const sharedPayload = buildOpenCodeBrokerSharedPayloadJs();
+  return `// Happier OpenCode auth broker plugin (generated). Provider: ${provider}. Version: ${OPEN_CODE_BROKER_PLUGIN_VERSION}.
+// Self-contained ESM: loaded by OpenCode's Bun runtime. No Happier imports, no npm deps.
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+
+${sharedBridgeCallSource}
+
+const SELECTION_IDENTITY_ENV = ${jsString(OPEN_CODE_BROKER_SELECTION_IDENTITY_ENV)};
+const LOAD_NONCE_ENV = ${jsString(OPEN_CODE_BROKER_LOAD_NONCE_ENV)};
+const LOADED_HANDSHAKE_PATH = ${jsString(OPEN_CODE_BROKER_LOADED_HANDSHAKE_PATH)};
+const MARKER = ${jsString(buildOpenCodeBrokerMarker(provider, OPEN_CODE_BROKER_PLUGIN_VERSION))};
+
+const CODEX_BASE_URL = ${jsString(OPEN_CODE_BROKER_CODEX_BASE_URL)};
+const CODEX_FROM = ${jsString(OPEN_CODE_BROKER_CODEX_RESPONSES_FROM)};
+const CODEX_TO = ${jsString(OPEN_CODE_BROKER_CODEX_RESPONSES_TO)};
+const CODEX_ORIGINATOR = ${jsString(OPEN_CODE_BROKER_CODEX_ORIGINATOR)};
+const CODEX_OPENAI_BETA = ${jsString(OPEN_CODE_BROKER_CODEX_OPENAI_BETA)};
+
+const ANTHROPIC_BETA = ${jsString(OPEN_CODE_BROKER_ANTHROPIC_BETA)};
+const ANTHROPIC_SYSTEM_IDENTITY = ${jsString(OPEN_CODE_BROKER_ANTHROPIC_SYSTEM_IDENTITY)};
+
+${sharedPayload}
+
+async function brokeredFetch(input, init) {
+  const url = typeof input === "string" ? input : (input && input.url ? input.url : String(input));
+  let token = await getAccessToken(false);
+  const doRequest = async (accessToken, accountId) => {
+    if (PROVIDER === "openai") {
+      const transformed = transformCodexBody(init);
+      const headers = buildCodexHeaders(
+        Object.assign({}, transformed.init, { __promptCacheKey: transformed.promptCacheKey }),
+        accountId,
+        accessToken,
+      );
+      return fetch(rewriteCodexUrl(url), Object.assign({}, transformed.init, { headers: headers }));
+    }
+    const withIdentity = injectAnthropicSystemIdentity(init);
+    const headers = buildAnthropicHeaders(withIdentity, accessToken);
+    return fetch(url, Object.assign({}, withIdentity, { headers: headers }));
+  };
+  let response = await doRequest(token.accessToken, token.accountId);
+  if (response.status === 401) {
+    token = await getAccessToken(true);
+    response = await doRequest(token.accessToken, token.accountId);
+  }
+  return response;
 }
 
 export const HappierOpenCodeAuthBrokerPlugin = async () => {
@@ -324,5 +347,141 @@ export const HappierOpenCodeAuthBrokerPlugin = async () => {
 };
 
 export default HappierOpenCodeAuthBrokerPlugin;
+`;
+}
+
+/**
+ * Build the released-V2 (`opencode` 2.x) broker plugin source for one provider.
+ *
+ * Released module contract (`packages/core/src/plugin/module.ts` at 6f3639d): default must be
+ * `{ id, setup }` (promise) or `{ id, effect }`. The legacy V1 async factory
+ * `{ return { auth: { provider, methods, loader } } }` is rejected with
+ * `Plugin must export a default definition with an id and an effect or setup function.`
+ * This V2 bridge therefore registers `model.request` (Codex baseURL) + `http.request`
+ * (daemon-bridge Bearer + Codex rewrite / Anthropic shaping) + `http.response` (single 401
+ * refresh + retry) scoped to its providerID. It reuses the daemon bridge (sole refresher),
+ * the shared payload (token cache, Codex/Anthropic shaping, handshake), and the same
+ * Codex endpoint/body and Anthropic Bearer/headers semantics as V1. No global-env fallback,
+ * no user-DB reads, no new credential authority/store/registry/retry budget.
+ *
+ * The module is written as a local plugin directory under `happier-v2-plugins/` and registered via
+ * explicit config;
+ * it is never auto-loaded from the V1 `opencode/plugin/` dir, so one module cannot load twice.
+ * Native sessions have no V2 plugin and no hook, preserving native unbound isolation. Direct API
+ * keys stay on `OPENCODE_AUTH_CONTENT` for V1 and are also materialized through V2's canonical
+ * `providers.<id>.settings.apiKey` configuration. This bridge covers brokered subscription OAuth only.
+ */
+export function buildOpenCodeBrokerV2PluginSource(provider: OpenCodeBrokerProvider): string {
+  const sharedBridgeCallSource = buildOpenCodeBrokerBridgeCallSourceFor(provider);
+  const sharedPayload = buildOpenCodeBrokerSharedPayloadJs();
+  return `// Happier OpenCode auth broker plugin (generated, V2). Provider: ${provider}. Version: ${OPEN_CODE_BROKER_PLUGIN_VERSION}.
+// Self-contained ESM: loaded by released OpenCode 2.x via explicit config. No Happier imports, no npm deps.
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+
+${sharedBridgeCallSource}
+
+const SELECTION_IDENTITY_ENV = ${jsString(OPEN_CODE_BROKER_SELECTION_IDENTITY_ENV)};
+const LOAD_NONCE_ENV = ${jsString(OPEN_CODE_BROKER_LOAD_NONCE_ENV)};
+const LOADED_HANDSHAKE_PATH = ${jsString(OPEN_CODE_BROKER_LOADED_HANDSHAKE_PATH)};
+
+const CODEX_BASE_URL = ${jsString(OPEN_CODE_BROKER_CODEX_BASE_URL)};
+const CODEX_FROM = ${jsString(OPEN_CODE_BROKER_CODEX_RESPONSES_FROM)};
+const CODEX_TO = ${jsString(OPEN_CODE_BROKER_CODEX_RESPONSES_TO)};
+const CODEX_ORIGINATOR = ${jsString(OPEN_CODE_BROKER_CODEX_ORIGINATOR)};
+const CODEX_OPENAI_BETA = ${jsString(OPEN_CODE_BROKER_CODEX_OPENAI_BETA)};
+
+const ANTHROPIC_BETA = ${jsString(OPEN_CODE_BROKER_ANTHROPIC_BETA)};
+const ANTHROPIC_SYSTEM_IDENTITY = ${jsString(OPEN_CODE_BROKER_ANTHROPIC_SYSTEM_IDENTITY)};
+
+${sharedPayload}
+
+// Read the outgoing body as text without consuming the live Request.
+async function readRequestBodyText(request) {
+  try { return await request.clone().text(); } catch { return null; }
+}
+
+function buildReplacementRequest(original, url, headers, bodyText) {
+  return new Request(url, {
+    method: original.method,
+    headers: headers,
+    body: bodyText === null || bodyText === undefined ? undefined : bodyText,
+    signal: original.signal,
+    redirect: original.redirect,
+  });
+}
+
+async function shapeCodexHttpRequest(original) {
+  const token = await getAccessToken(false);
+  const bodyText = await readRequestBodyText(original);
+  // Reuse the single Codex body policy (model normalize, store=false, include).
+  const fakeInit = bodyText === null ? null : { body: bodyText };
+  const transformed = transformCodexBody(fakeInit);
+  const finalBody = transformed.init && typeof transformed.init.body === "string" ? transformed.init.body : bodyText;
+  const headers = buildCodexHeaders(
+    { headers: original.headers, __promptCacheKey: transformed.promptCacheKey },
+    token.accountId,
+    token.accessToken,
+  );
+  return { request: buildReplacementRequest(original, rewriteCodexUrl(original.url), headers, finalBody), token: token };
+}
+
+async function shapeAnthropicHttpRequest(original) {
+  const token = await getAccessToken(false);
+  const bodyText = await readRequestBodyText(original);
+  const withIdentity = bodyText === null ? { headers: original.headers } : injectAnthropicSystemIdentity({ headers: original.headers, body: bodyText });
+  const finalBody = withIdentity && typeof withIdentity.body === "string" ? withIdentity.body : bodyText;
+  const headers = buildAnthropicHeaders({ headers: original.headers }, token.accessToken);
+  return { request: buildReplacementRequest(original, original.url, headers, finalBody), token: token };
+}
+
+async function shapeHttpRequest(original) {
+  if (PROVIDER === "openai") return shapeCodexHttpRequest(original);
+  return shapeAnthropicHttpRequest(original);
+}
+
+async function retryHttpResponseWithFreshToken(originalRequest) {
+  const fresh = await getAccessToken(true);
+  const bodyText = await readRequestBodyText(originalRequest);
+  let headers;
+  let url = originalRequest.url;
+  let finalBody = bodyText;
+  if (PROVIDER === "openai") {
+    const fakeInit = bodyText === null ? null : { body: bodyText };
+    const transformed = transformCodexBody(fakeInit);
+    finalBody = transformed.init && typeof transformed.init.body === "string" ? transformed.init.body : bodyText;
+    headers = buildCodexHeaders(
+      { headers: originalRequest.headers, __promptCacheKey: transformed.promptCacheKey },
+      fresh.accountId,
+      fresh.accessToken,
+    );
+    url = rewriteCodexUrl(originalRequest.url);
+  } else {
+    const withIdentity = bodyText === null ? { headers: originalRequest.headers } : injectAnthropicSystemIdentity({ headers: originalRequest.headers, body: bodyText });
+    finalBody = withIdentity && typeof withIdentity.body === "string" ? withIdentity.body : bodyText;
+    headers = buildAnthropicHeaders({ headers: originalRequest.headers }, fresh.accessToken);
+  }
+  const retried = await fetch(buildReplacementRequest(originalRequest, url, headers, finalBody));
+  return retried;
+}
+
+export default {
+  id: "happier-broker-" + PROVIDER,
+  setup: async (ctx) => {
+    void sendLoadHandshake();
+    await ctx.session.hook("model.request", async (evt) => {
+      if (PROVIDER === "openai") evt.baseURL = CODEX_BASE_URL;
+    }, { providerID: PROVIDER });
+    await ctx.session.hook("http.request", async (evt) => {
+      const shaped = await shapeHttpRequest(evt.request);
+      evt.request = shaped.request;
+    }, { providerID: PROVIDER });
+    await ctx.session.hook("http.response", async (evt) => {
+      if (!evt.response || evt.response.status !== 401) return;
+      try { await evt.response.body?.cancel().catch(() => undefined); } catch {}
+      evt.response = await retryHttpResponseWithFreshToken(evt.request);
+    }, { providerID: PROVIDER });
+  },
+};
 `;
 }

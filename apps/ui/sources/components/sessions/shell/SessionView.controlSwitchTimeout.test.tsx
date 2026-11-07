@@ -4,6 +4,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AppPaneProvider } from '@/components/appShell/panes/AppPaneProvider';
 import { createSessionFixture, flushHookEffects, renderScreen } from '@/dev/testkit';
+import { MetadataSchema } from '@/sync/domains/state/storageTypes';
 import { installSessionShellCommonModuleMocks } from './sessionShellTestHelpers';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -17,6 +18,7 @@ const chatListPropsSpy = vi.hoisted(() => vi.fn());
 const cliDetectionState = vi.hoisted(() => ({
   authStatus: {} as Record<string, { state: 'logged_in' | 'logged_out' | 'unknown'; checkedAt: number } | null>,
 }));
+const transcriptState = vi.hoisted(() => ({ ids: ['m1'] as string[] }));
 const sessionState = vi.hoisted(() => ({
   session: {
     id: 's1',
@@ -110,7 +112,7 @@ installSessionShellCommonModuleMocks({
       useRealtimeStatus: () => ({ current: { status: 'connected' } as any }),
       useSessionMessages: () => ({ messages: [], isLoaded: true }),
       useSessionSubagentSourceMessages: () => [],
-      useSessionTranscriptIds: () => ({ ids: ['m1'], isLoaded: true }),
+      useSessionTranscriptIds: () => ({ ids: transcriptState.ids, isLoaded: true }),
       useSessionPendingMessages: () => ({ messages: [] }),
       useSessionReviewCommentsDrafts: () => [],
       useSessionUsage: () => null,
@@ -299,6 +301,7 @@ describe('SessionView (control switch timeout)', () => {
   function resetSession(overrides: Partial<ReturnType<typeof createSessionFixture>> = {}) {
     Object.assign(sessionState.session, createSessionFixture({
       id: 's1',
+      active: true,
       metadata: null,
       accessLevel: 'edit',
       canApprovePermissions: true,
@@ -337,6 +340,7 @@ describe('SessionView (control switch timeout)', () => {
   beforeEach(() => {
     (globalThis as { __DEV__?: boolean }).__DEV__ = false;
     resetSession();
+    transcriptState.ids = ['m1'];
     sessionSwitchSpy.mockResolvedValue(true);
     modalAlertSpy.mockClear();
     chatListPropsSpy.mockClear();
@@ -422,6 +426,70 @@ describe('SessionView (control switch timeout)', () => {
     expect(chatList.onRequestSwitchToRemote).toBeUndefined();
 
     await screen.unmount();
+  });
+
+  it('offers explicit release for a zero-turn managed shared terminal while the UI stays writable', async () => {
+    resetSession({ metadata: MetadataSchema.parse({ machineId: 'machine-1', host: 'machine', flavor: 'codex' }),
+      agentState: { controlledByUser: false, localControl: {
+        attached: true, topology: 'shared', remoteWritable: true, canDetach: true,
+      } } });
+    transcriptState.ids = [];
+    cliDetectionState.authStatus = { codex: { state: 'logged_out', checkedAt: 1 } };
+    const screen = await renderSessionView();
+    try {
+      const chatList = getChatListProps();
+      expect(chatList.onRequestSwitchToRemote).toBeTypeOf('function');
+      await act(async () => { chatList.onRequestSwitchToRemote(); });
+      expect(sessionSwitchSpy).toHaveBeenCalledWith('s1', 'remote');
+      expect(sessionState.session.agentState.controlledByUser).toBe(false);
+      expect(sessionState.session.agentState.localControl.remoteWritable).toBe(true);
+    } finally {
+      await screen.unmount();
+    }
+  });
+
+  it.each([false, undefined])('does not offer release of an external unowned shared terminal (%s)', async (canDetach) => {
+    resetSession({ agentState: { controlledByUser: false, localControl: {
+      attached: true, topology: 'shared', remoteWritable: true, ...(canDetach === undefined ? {} : { canDetach }),
+    } } });
+    const screen = await renderSessionView();
+    try {
+      expect(getChatListProps().onRequestSwitchToRemote).toBeUndefined();
+    } finally {
+      await screen.unmount();
+    }
+  });
+
+  it('offers switch-to-remote for selected connected authentication despite ambient CLI logout', async () => {
+    Object.assign(sessionState.session, createSessionFixture({
+      id: 's1',
+      active: true,
+      accessLevel: 'edit',
+      canApprovePermissions: true,
+      agentState: { controlledByUser: true },
+      metadata: MetadataSchema.parse({
+        machineId: 'machine-1',
+        host: 'mac-mini',
+        flavor: 'claude',
+        connectedServices: {
+          v: 1,
+          bindingsByServiceId: {
+            'claude-subscription': { source: 'connected', selection: 'group', groupId: 'work-pool' },
+          },
+        },
+      }),
+    }));
+    cliDetectionState.authStatus = { claude: { state: 'logged_out', checkedAt: 1 } };
+
+    const screen = await renderSessionView();
+    try {
+      const chatList = getChatListProps();
+      expect(chatList.onRequestSwitchToRemote).toBeTypeOf('function');
+      await act(async () => { chatList.onRequestSwitchToRemote(); });
+      expect(sessionSwitchSpy).toHaveBeenCalledWith('s1', 'remote');
+    } finally {
+      await screen.unmount();
+    }
   });
 
   it('shows only one failure alert when a timed-out switch later fails', async () => {

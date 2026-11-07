@@ -88,7 +88,10 @@ export function SessionAutomationsScreen(props: { sessionId: string; hydrationOp
         [availability],
     );
 
-    if (loading) {
+    // A refresh is authoritative for freshness, but it does not invalidate an
+    // already-hydrated session projection. Keep those rows readable while a
+    // slow refresh settles.
+    if (loading && linked.length === 0) {
         return (
             <View style={styles.loading}>
                 <ActivitySpinner size="small" color={theme.colors.text.secondary} />

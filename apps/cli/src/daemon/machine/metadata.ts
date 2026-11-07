@@ -5,6 +5,7 @@ import { promisify } from 'util';
 import { configuration } from '@/configuration';
 import { projectPath } from '@/projectPath';
 import type { MachineMetadata } from '@/api/types';
+import type { CliUpdateFacts } from '@happier-dev/protocol';
 import packageJson from '../../../package.json';
 
 const execFileAsync = promisify(execFile);
@@ -32,9 +33,17 @@ export async function getPreferredHostName(): Promise<string> {
     ?? fallback;
 }
 
+/**
+ * The daemon-owned metadata fields, refreshed on the daemon's first connect after start without
+ * touching user-owned ones (e.g. `displayName`). `cliUpdate` is the daemon's K5 CLI update facts
+ * (plan R13): read once here, so a machine that restarted onto a new version (or was rolled back)
+ * reports it — and the last update outcome — on its next connect. Callers that are not the daemon
+ * leave it as it was.
+ */
 export function refreshMachineMetadataForCurrentDaemon(
   current: Partial<MachineMetadata>,
   host: string,
+  cliUpdate?: CliUpdateFacts,
 ): MachineMetadata {
   const next: MachineMetadata = {
     ...current,
@@ -46,6 +55,7 @@ export function refreshMachineMetadataForCurrentDaemon(
     happyLibDir: projectPath(),
     daemonTerminalSessionAttachSupported: true,
     daemonSessionGoalControlsSupported: true,
+    ...(cliUpdate ? { cliUpdate } : {}),
   };
   if (
     current.host === next.host
@@ -56,6 +66,7 @@ export function refreshMachineMetadataForCurrentDaemon(
     && current.happyLibDir === next.happyLibDir
     && current.daemonTerminalSessionAttachSupported === next.daemonTerminalSessionAttachSupported
     && current.daemonSessionGoalControlsSupported === next.daemonSessionGoalControlsSupported
+    && JSON.stringify(current.cliUpdate ?? null) === JSON.stringify(next.cliUpdate ?? null)
   ) {
     return current as MachineMetadata;
   }

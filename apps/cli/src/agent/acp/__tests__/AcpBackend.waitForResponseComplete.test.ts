@@ -5,10 +5,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { OpenCodeTransport } from '@/backends/opencode/acp/transport';
+import { DefaultTransport } from '@/agent/transport/DefaultTransport';
 import { AcpBackend } from '../AcpBackend';
 import type { ToolPattern, TransportHandler } from '@/agent/transport/TransportHandler';
 import { createAcpTestTransportHandler } from '../testkit/subprocessHarness';
 import { withTempDir } from '@/testkit/fs/tempDir';
+import { createTestAcpRuntime } from '@/testkit/backends/acpRuntime';
+import { createApprovedPermissionHandler } from '@/testkit/backends/permissionHandler';
+import { createBasicSessionClientWithOverrides } from '@/testkit/backends/sessionFixtures';
+import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
+import type { SessionTurnMutationV1 } from '@/api/session/mutations/sessionMutationTypes';
+import { MessageBuffer } from '@/ui/ink/messageBuffer';
 
 function writeFakeAcpAgentScript(params: {
   dir: string;
@@ -18,6 +25,7 @@ function writeFakeAcpAgentScript(params: {
   emitMessageChunkAfterPrompt?: boolean;
   messageChunkDelayMs?: number;
   selfTerminateSignalAfterPrompt?: NodeJS.Signals;
+  supportsLoadSession?: boolean;
 }): string {
   const scriptPath = join(params.dir, 'fake-acp-agent.mjs');
   const shouldExitAfterPrompt = typeof params.exitCodeAfterPrompt === 'number';
@@ -56,7 +64,7 @@ function writeFakeAcpAgentScript(params: {
         if (id === undefined || id === null || typeof method !== 'string') continue;
 
         if (method === 'initialize') {
-          ok(id, { protocolVersion: 1, authMethods: [] });
+          ok(id, { protocolVersion: 1, authMethods: [], agentCapabilities: { loadSession: ${params.supportsLoadSession === true} } });
           continue;
         }
 
@@ -1064,6 +1072,43 @@ describe('AcpBackend.waitForResponseComplete', () => {
   const readDispatchedPromptTurnGeneration = (backend: AcpBackend): number | null =>
     (backend as unknown as { dispatchedPromptTurnGeneration: number | null }).dispatchedPromptTurnGeneration;
 
+  it.each(['fresh', 'resume'] as const)('keeps the first host turn open across %s session readiness', async (mode) => {
+    await withTempDir('happier-acp-host-readiness-', async (dir) => {
+      const backend = new AcpBackend({
+        agentName: 'test', cwd: dir, command: process.execPath,
+        args: [writeFakeAcpAgentScript({ dir, supportsLoadSession: true })],
+        transportHandler: createAcpTestTransportHandler({ idleTimeoutMs: 1 }),
+      });
+      const mutations: SessionTurnMutationV1[] = [];
+      const lifecycle = createSessionTurnLifecycle({
+        sessionId: 'host-readiness', enqueueSessionTurn: async (mutation) => { mutations.push(mutation); },
+      });
+      const runtime = createTestAcpRuntime({
+        provider: 'opencode', directory: dir, messageBuffer: new MessageBuffer(), mcpServers: {},
+        permissionHandler: createApprovedPermissionHandler(), onThinkingChange: () => {},
+        ensureBackend: async () => backend,
+        session: createBasicSessionClientWithOverrides({
+          sessionTurnLifecycle: lifecycle,
+          sendAgentMessage: (provider, body) => { void lifecycle.observeAcpLifecycleMarker({ provider, body }).pendingWrite; },
+        }),
+      });
+      try {
+        // The shared prompt loop begins the host turn before starting or resuming its backend.
+        runtime.beginTurn();
+        await runtime.startOrLoad({ resumeId: mode === 'resume' ? 'test-session' : null });
+        await runtime.sendPrompt('first host prompt');
+        const result = await runtime.flushTurn();
+
+        expect(result.assistantText).toBe('hello');
+        expect(mutations.map((mutation) => mutation.action)).toEqual(['begin', 'complete']);
+        expect(mutations[0]?.turnId).toBe(mutations[1]?.turnId);
+        expect(lifecycle.hasActiveTurn()).toBe(false);
+      } finally {
+        await runtime.reset();
+      }
+    });
+  });
+
   it('does not apply a default timeout when timeoutMs is omitted', async () => {
     vi.useFakeTimers();
 
@@ -1225,6 +1270,10 @@ describe('AcpBackend.waitForResponseComplete', () => {
         });
         backendForCleanup = backend;
 
+        const finalStatuses: unknown[] = [];
+        backend.onMessage((message) => {
+          if (message.type === 'status' && message.status === 'idle') finalStatuses.push(message);
+        });
         const started = await backend.startSession();
         await backend.sendPrompt(started.sessionId, 'hi');
 
@@ -1232,6 +1281,7 @@ describe('AcpBackend.waitForResponseComplete', () => {
           kind: 'completed',
           stopReason: 'end_turn',
         });
+        expect(finalStatuses).toContainEqual({ type: 'status', status: 'idle', turnFinished: true });
       } finally {
         await backendForCleanup?.dispose().catch(() => {});
       }
@@ -2206,6 +2256,94 @@ describe('AcpBackend.waitForResponseComplete', () => {
         await expect(backend.waitForResponseComplete(250)).rejects.toThrow(/auth invalid/);
       } finally {
         await backendForCleanup?.dispose().catch(() => {});
+      }
+    });
+  }, 20_000);
+
+  it('continues the in-flight turn when stderr contains an incidental 401 identifier', async () => {
+    await withTempDir('happier-acp-benign-401-stderr-', async (dir) => {
+      const scriptPath = writeFakeAcpAgentScript({
+        dir,
+        stderrAfterPromptText: '[agy-acp] WARN: failed to decode gen_metadata 401: cant skip wire type 6',
+      });
+      const defaultTransport = new DefaultTransport('generic');
+      const backend = new AcpBackend({
+        agentName: 'test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        transportHandler: createAcpTestTransportHandler({
+          idleTimeoutMs: 1,
+          handleStderr: (text, context) => defaultTransport.handleStderr(text, context),
+          filterStdoutLine: (line) => defaultTransport.filterStdoutLine(line),
+        }),
+      });
+
+      try {
+        const started = await backend.startSession();
+        await backend.sendPrompt(started.sessionId, 'hi');
+        await expect(backend.waitForResponseComplete(1_000)).resolves.toBeUndefined();
+      } finally {
+        await backend.dispose().catch(() => {});
+      }
+    });
+  }, 20_000);
+
+  it('continues the in-flight turn when dropped stdout contains an incidental 401 identifier', async () => {
+    await withTempDir('happier-acp-benign-401-stdout-', async (dir) => {
+      const scriptPath = writeFakeAcpAgentScript({
+        dir,
+        stdoutAfterPromptText: 'error decoding gen_metadata 401: cant skip wire type 6',
+      });
+      const defaultTransport = new DefaultTransport('generic');
+      const backend = new AcpBackend({
+        agentName: 'test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        transportHandler: createAcpTestTransportHandler({
+          idleTimeoutMs: 1,
+          handleStderr: (text, context) => defaultTransport.handleStderr(text, context),
+          filterStdoutLine: (line) => defaultTransport.filterStdoutLine(line),
+        }),
+      });
+
+      try {
+        const started = await backend.startSession();
+        await backend.sendPrompt(started.sessionId, 'hi');
+        await expect(backend.waitForResponseComplete(1_000)).resolves.toBeUndefined();
+      } finally {
+        await backend.dispose().catch(() => {});
+      }
+    });
+  }, 20_000);
+
+  it('fails the in-flight turn promptly for contextual 401 stderr', async () => {
+    await withTempDir('happier-acp-auth-401-stderr-', async (dir) => {
+      const scriptPath = writeFakeAcpAgentScript({
+        dir,
+        stderrAfterPromptText: 'Request failed with status code 401',
+        emitMessageChunkAfterPrompt: false,
+      });
+      const defaultTransport = new DefaultTransport('generic');
+      const backend = new AcpBackend({
+        agentName: 'test',
+        cwd: dir,
+        command: process.execPath,
+        args: [scriptPath],
+        transportHandler: createAcpTestTransportHandler({
+          idleTimeoutMs: 1,
+          handleStderr: (text, context) => defaultTransport.handleStderr(text, context),
+          filterStdoutLine: (line) => defaultTransport.filterStdoutLine(line),
+        }),
+      });
+
+      try {
+        const started = await backend.startSession();
+        await backend.sendPrompt(started.sessionId, 'hi');
+        await expect(backend.waitForResponseComplete(1_000)).rejects.toThrow(/Authentication error/);
+      } finally {
+        await backend.dispose().catch(() => {});
       }
     });
   }, 20_000);

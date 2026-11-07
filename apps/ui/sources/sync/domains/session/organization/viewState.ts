@@ -5,19 +5,45 @@ import {
     type SessionWorkspaceOrderV1,
 } from '@/sync/domains/session/listing/sessionWorkspaceOrderStateV1';
 import type { ReorderSessionOrganizationRequest } from '@happier-dev/protocol';
+import type { SessionAttentionStanding } from '@happier-dev/protocol';
 
 import type { SessionOrganizationProjection } from './types';
 import { buildSessionOrganizationTagLabelById } from './tagLabels';
+import { readWorkspaceDisplay, resolveServerWorkspaceDisplay } from './workspaceDisplay';
+import { areSessionAppearanceColorsEqual, type SessionAppearanceColor } from './appearanceColor';
+import type { SessionListViewItem } from '@/sync/domains/session/listing/sessionListViewData';
+import type { SessionOrganizationLabel } from '@happier-dev/protocol';
+
+const coloredProjectHeaders = new WeakMap<SessionListViewItem[], SessionListViewItem[]>();
+
+/** Adds exact-Home project display data, retaining equivalent header/list identities. */
+export function applyWorkspaceDisplayToSessionListViewData(items: SessionListViewItem[] | null, labelsByLabelKey: Readonly<Record<string, SessionOrganizationLabel>>): SessionListViewItem[] | null {
+    if (!items) return null;
+    const previous = coloredProjectHeaders.get(items);
+    const next = items.map((item, index) => {
+        if (item.type !== 'header' || item.headerKind !== 'project') return item;
+        const { label, color } = resolveServerWorkspaceDisplay(labelsByLabelKey, item.workspaceScopeHint?.serverId ?? item.serverId, item.workspaceKey);
+        if ((item.workspaceLabel ?? null) === label && areSessionAppearanceColorsEqual(item.appearanceColor, color)) return item;
+        const cached = previous?.[index];
+        return cached?.type === 'header' && cached.workspaceLabel === label && areSessionAppearanceColorsEqual(cached.appearanceColor, color)
+            ? cached : { ...item, workspaceLabel: label, appearanceColor: color };
+    });
+    const result = previous && next.every((item, index) => item === previous[index]) ? previous
+        : next.every((item, index) => item === items[index]) ? items : next;
+    coloredProjectHeaders.set(items, result);
+    return result;
+}
 
 export type SessionOrganizationListViewState = Readonly<{
     pinnedSessionKeysV1: readonly string[];
     sessionFoldersV1: SessionFoldersV1;
     sessionFolderAssignmentsBySessionKey: Record<string, string | null>;
     sessionTagsV1: Record<string, readonly string[]>;
-    attentionStandingOverridesBySessionKey: Record<string, boolean>;
+    attentionStandingOverridesBySessionKey: Record<string, SessionAttentionStanding>;
     sessionListGroupOrderV1: Record<string, readonly string[]>;
     sessionWorkspaceOrderV1: SessionWorkspaceOrderV1;
     workspaceLabelsV1: Record<string, string>;
+    workspaceColorsV1: Record<string, SessionAppearanceColor>;
 }>;
 
 function buildServerSessionKey(serverId: string, sessionId: string): string {
@@ -38,12 +64,6 @@ function readFolderName(display: unknown): string | null {
     const record = readPlainDisplayRecord(display);
     const name = typeof record?.name === 'string' ? record.name.trim() : '';
     return name || null;
-}
-
-function readLabel(display: unknown): string | null {
-    const record = readPlainDisplayRecord(display);
-    const label = typeof record?.label === 'string' ? record.label.trim() : '';
-    return label || null;
 }
 
 function readWorkspaceRef(display: unknown): SessionFolderWorkspaceRefV1 | null {
@@ -181,6 +201,7 @@ export function buildSessionOrganizationListViewState(params: Readonly<{
             sessionListGroupOrderV1: {},
             sessionWorkspaceOrderV1: {},
             workspaceLabelsV1: {},
+            workspaceColorsV1: {},
         };
     }
 
@@ -195,7 +216,7 @@ export function buildSessionOrganizationListViewState(params: Readonly<{
     const attentionStandingOverridesBySessionKey = Object.fromEntries(
         Object.entries(projection.attentionStandingsBySessionId).map(([sessionId, standing]) => [
             buildServerSessionKey(serverId, sessionId),
-            standing.standing,
+            standing,
         ]),
     );
     const sessionFolderAssignmentsBySessionKey = Object.fromEntries(
@@ -227,6 +248,7 @@ export function buildSessionOrganizationListViewState(params: Readonly<{
     const sessionListGroupOrderV1: Record<string, string[]> = {};
     const sessionWorkspaceOrderV1: Record<string, string[]> = {};
     const workspaceLabelsV1: Record<string, string> = {};
+    const workspaceColorsV1: Record<string, SessionAppearanceColor> = {};
     for (const entries of Object.values(projection.orderEntriesByScopeKey)) {
         const orderedEntries = [...entries].sort((a, b) => compareBySortKey(a, b) || a.itemKey.localeCompare(b.itemKey));
         for (const entry of orderedEntries) {
@@ -249,11 +271,11 @@ export function buildSessionOrganizationListViewState(params: Readonly<{
     }
     for (const label of Object.values(projection.labelsByLabelKey)) {
         if (label.labelKind !== 'workspace' || label.archivedAt != null) continue;
-        const displayLabel = readLabel(label.display);
-        if (!displayLabel) continue;
+        const display = readWorkspaceDisplay(label.display);
         const scopeKey = label.scopeKey.trim();
         if (scopeKey) {
-            workspaceLabelsV1[scopeKey] = displayLabel;
+            if (display.label) workspaceLabelsV1[scopeKey] = display.label;
+            if (display.color) workspaceColorsV1[scopeKey] = display.color;
         }
     }
 
@@ -266,5 +288,6 @@ export function buildSessionOrganizationListViewState(params: Readonly<{
         sessionListGroupOrderV1,
         sessionWorkspaceOrderV1,
         workspaceLabelsV1,
+        workspaceColorsV1,
     };
 }

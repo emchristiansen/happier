@@ -1,3 +1,4 @@
+import { removeConnectedServiceCredentialFiles } from '@/daemon/connectedServices/credentials/removeConnectedServiceCredentialFiles';
 import { AGENTS_CORE } from '@happier-dev/agents';
 import { resolveCodexSessionBackendMode } from '@happier-dev/agents';
 import { INSTALLABLE_KEYS } from '@happier-dev/protocol';
@@ -17,13 +18,17 @@ import { codexAppServerCatalogControlAdapter } from '@/backends/codex/appServer/
 import { codexAppServerGoalControlAdapter } from '@/backends/codex/appServer/goalControl/codexAppServerGoalControlAdapter';
 import { codexAppServerUsageLimitRecoveryControlAdapter } from '@/backends/codex/appServer/usageLimitRecoveryControl/codexAppServerUsageLimitRecoveryControlAdapter';
 import { buildCodexRuntimeLocalHandoffMetadata } from '@/backends/codex/sessionHandoff/runtimeLocalMetadata';
-import { reconcileStableCodexHomesAtStartup } from '@/backends/codex/connectedServices/reconcileStableCodexHomes';
 import type { AgentCatalogEntry } from '../types';
 import type { ConnectedServiceCredentialLifecycleDescriptor } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 import type { ConnectedServiceBindingsV1 } from '@happier-dev/protocol';
 
 const codexConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCredentialLifecycleDescriptor = {
   providerId: 'codex',
+  credentialStorageCleanup: {
+    async deleteCredentialStorageForHomeRoot({ rootDir }) {
+      await removeConnectedServiceCredentialFiles(rootDir, codexConnectedServiceStateSharingDescriptor.authIsolation.secretEntries.map((entry) => `codex-home/${entry}`));
+    },
+  },
   serviceIds: AGENTS_CORE.codex.connectedServices.supportedServiceIds,
   spawnPreflightOauthRefresh: { mode: 'expiry_window' },
   refreshedCredentialApplication: {
@@ -48,11 +53,6 @@ const codexConnectedServiceCredentialLifecycleDescriptor: ConnectedServiceCreden
     reason: 'diagnostic',
     authGeneration: currentTruth,
   }),
-  materializedHomeMaintenance: {
-    // Triage #4: stable codex homes are not refresh-target bound, so nothing else keeps their auth
-    // store format-valid or in sync with the store record. The startup reconcile owner drives this.
-    reconcileStableHomesAtStartup: reconcileStableCodexHomesAtStartup,
-  },
 };
 
 function resolveCodexProbeConnectedServicesIdentity(
@@ -67,6 +67,7 @@ function resolveCodexProbeConnectedServicesIdentity(
 export const agent = {
   id: AGENTS_CORE.codex.id,
   cliSubcommand: AGENTS_CORE.codex.cliSubcommand,
+  autostartDaemonInInteractiveTerminal: false,
   getCliCommandHandler: async () => (await import('@/backends/codex/cli/command')).handleCodexCliCommand,
   getCliCapabilityOverride: async () => (await import('@/backends/codex/cli/capability')).cliCapability,
   getCapabilities: async () => (await import('@/backends/codex/cli/extraCapabilities')).capabilities,
@@ -77,6 +78,7 @@ export const agent = {
   getConnectedServiceMaterializer: async () => createCodexConnectedServicesMaterializer(),
   getConnectedServiceStateSharingDescriptor: async () => codexConnectedServiceStateSharingDescriptor,
   connectedServiceQuotaFetcherDescriptor: openAiCodexQuotaFetcherDescriptor,
+  guardedQuotaRecoveryServiceId: 'openai-codex',
   getConnectedServiceRuntimeAuthAdapter: async () => createCodexConnectedServiceRuntimeAuthAdapter(),
   materializeConnectedServiceRuntimeAuthSelection: materializeCodexConnectedServiceRuntimeAuthSelection,
   getConnectedServiceCredentialLifecycleDescriptor: async () => codexConnectedServiceCredentialLifecycleDescriptor,
@@ -91,11 +93,14 @@ export const agent = {
     await (await import('@/backends/codex/utils/resolveCodexNativeSessionLogPath'))
       .resolveCodexNativeSessionLogPath({ vendorResumeId }),
   getDirectSessionProviderOps: async () => (await import('@/backends/codex/directSessions/providerOps')).codexDirectSessionProviderOps,
+  getProviderAttachOps: async () => (await import('@/backends/codex/attach/providerAttachOps')).codexProviderAttachOps,
   getSessionGoalControlAdapter: async () => codexAppServerGoalControlAdapter,
   getSessionCatalogControlAdapter: async () => codexAppServerCatalogControlAdapter,
   getSessionUsageLimitRecoveryControlAdapter: async () => codexAppServerUsageLimitRecoveryControlAdapter,
   vendorResumeSupport: AGENTS_CORE.codex.resume.vendorResume,
   buildRuntimeLocalHandoffMetadata: buildCodexRuntimeLocalHandoffMetadata,
+  resolveExistingSessionHandoffState: async (params) =>
+    await (await import('./sessionHandoff/resolveExistingSessionHandoffState')).resolveExistingCodexSessionHandoffState(params),
   getVendorResumeSupport: async () => supportsCodexVendorResume,
   getAcpBackendFactory: async () => {
     const { createCodexAcpBackend } = await import('@/backends/codex/acp/backend');

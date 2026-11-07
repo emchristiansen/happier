@@ -5,6 +5,66 @@ import type { NormalizedMessage } from '../typesRaw';
 import type { AgentState } from '../domains/state/storageTypes';
 
 describe('Permission placeholder should not override real tool output', () => {
+    it('defers historical completed questions until their surrounding history is loaded', () => {
+        const state = createReducer();
+        const agentState: AgentState = {
+            requests: {},
+            completedRequests: {
+                historicalQuestion: {
+                    tool: 'AskUserQuestion',
+                    arguments: { questions: [] },
+                    createdAt: 100,
+                    completedAt: 200,
+                    status: 'approved',
+                    answers: { choice: 'yes' },
+                },
+            },
+        };
+        const textRow = (seq: number, createdAt: number): NormalizedMessage => ({
+            id: `row-${seq}`, localId: null, seq, createdAt,
+            role: 'agent', isSidechain: false,
+            content: [{ type: 'text', text: 'Transcript content', uuid: `text-${seq}`, parentUUID: null }],
+        });
+
+        expect(reducer(state, [], agentState).messages).toEqual([]);
+        const coldPage = Array.from({ length: 12 }, (_, index) => textRow(151 + index, 1000 + index));
+        expect(reducer(state, coldPage, agentState).messages.every((message) => message.kind !== 'tool-call')).toBe(true);
+        expect(reducer(state, [], agentState).messages).toEqual([]);
+
+        const olderPage = Array.from({ length: 150 }, (_, index) => textRow(index + 1, index + 1));
+        const loaded = reducer(state, olderPage, agentState);
+        const question = loaded.messages.find((message) => message.kind === 'tool-call');
+        expect(question).toMatchObject({ createdAt: 100, tool: { result: { answers: { choice: 'yes' } } } });
+        expect(reducer(state, [], agentState).messages).toEqual([]);
+    });
+
+    it('keeps pending questions visible before history loads and completes the same row', () => {
+        const state = createReducer();
+        const request = { tool: 'AskUserQuestion', arguments: { questions: [] }, createdAt: 100 };
+        const pending = reducer(state, [], { requests: { question: request }, completedRequests: {} });
+        expect(pending.messages).toHaveLength(1);
+        const completed = reducer(state, [], {
+            requests: {},
+            completedRequests: { question: { ...request, status: 'approved', completedAt: 200, answers: { choice: 'yes' } } },
+        });
+        expect(completed.messages).toHaveLength(1);
+        expect(completed.messages[0]).toMatchObject({ id: pending.messages[0]?.id, tool: { state: 'completed', result: { answers: { choice: 'yes' } } } });
+    });
+
+    it('retains completed AgentState-only answers when the entire transcript has been loaded', () => {
+        const state = createReducer();
+        const agentState: AgentState = {
+            completedRequests: { question: {
+                tool: 'AskUserQuestion', arguments: { questions: [] }, createdAt: 100,
+                completedAt: 200, status: 'approved', answers: { choice: 'yes' },
+            } },
+        };
+        expect(reducer(state, [], agentState).messages).toEqual([]);
+        const loaded = reducer(state, [], agentState, { mainHistoryStartLoaded: true });
+        expect(loaded.messages).toHaveLength(1);
+        expect(loaded.messages[0]).toMatchObject({ tool: { result: { answers: { choice: 'yes' } } } });
+    });
+
     it('updates an approved permission-only tool message when a tool-result arrives later (even without tool-call)', () => {
         const state = createReducer();
 
@@ -49,4 +109,3 @@ describe('Permission placeholder should not override real tool output', () => {
         expect(toolMsg.tool?.result).toMatchObject({ stdout: 'REAL_OUTPUT', exit_code: 0 });
     });
 });
-

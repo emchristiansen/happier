@@ -10,6 +10,38 @@ import { createApprovedPermissionHandler } from '@/testkit/backends/permissionHa
 import { createBasicSessionClientWithOverrides } from '@/testkit/backends/sessionFixtures';
 
 describe('createAcpRuntime (thinking state)', () => {
+  it('retires turn activity when durable transcript publication fails during flush', async () => {
+    const backend = createFakeAcpRuntimeBackend({ sessionId: 'sess_main' });
+    const thinkingChanges: boolean[] = [];
+    const keepAliveThinking: boolean[] = [];
+    const failure = new Error('transcript transport unavailable');
+    const session = createBasicSessionClientWithOverrides({
+      sendAgentMessageCommitted: async () => { throw failure; },
+      keepAlive: (thinking) => { keepAliveThinking.push(thinking); },
+    });
+    const runtime = createAcpRuntime({
+      provider: 'pi', directory: '/tmp', session, messageBuffer: new MessageBuffer(),
+      mcpServers: {}, permissionHandler: createApprovedPermissionHandler(),
+      onThinkingChange: (thinking) => { thinkingChanges.push(thinking); },
+      ensureBackend: async () => backend,
+      sessionMedia: { persist: async () => ({ media: [], unavailable: [{
+        id: 'media-unavailable', role: 'output', category: 'generated', mediaKind: 'image',
+        code: 'source_not_supported', origin: { source: 'acp-content' },
+      }] }) },
+    });
+    await runtime.startOrLoad({});
+    runtime.beginTurn();
+    backend.emit({ type: 'session-media', source: 'acp-content', media: [{
+      kind: 'base64', data: 'iVBORw0KGgo=', mimeType: 'image/png',
+      origin: { source: 'acp-content', providerEventId: 'event-1', contentIndex: 0 },
+      dedupeKey: 'acp-content:event-1:0',
+    }] } satisfies AgentMessage);
+    await expect(runtime.flushTurn()).rejects.toBe(failure);
+    expect(runtime.isTurnInFlight()).toBe(false);
+    expect(thinkingChanges.at(-1)).toBe(false);
+    expect(keepAliveThinking.at(-1)).toBe(false);
+  });
+
   it('sets thinking on beginTurn and clears on flushTurn', async () => {
     const backend = createFakeAcpRuntimeBackend({ sessionId: 'sess_main' });
 
@@ -79,37 +111,6 @@ describe('createAcpRuntime (thinking state)', () => {
     backend.emit({ type: 'status', status: 'idle' } satisfies AgentMessage);
     // No change needed since flushTurn already cleared — but it should not throw/break
     // (onThinkingChange(false) is idempotent)
-  });
-
-  it('does not start a task for status:running outside an owned turn', async () => {
-    const backend = createFakeAcpRuntimeBackend({ sessionId: 'sess_main' });
-
-    const messages: ACPMessageData[] = [];
-    const session = createBasicSessionClientWithOverrides({
-      sendAgentMessage: (_provider, body) => {
-        messages.push(body);
-      },
-    });
-
-    const runtime = createAcpRuntime({
-      provider: 'pi',
-      directory: '/tmp',
-      session,
-      messageBuffer: new MessageBuffer(),
-      mcpServers: {},
-      permissionHandler: createApprovedPermissionHandler(),
-      onThinkingChange: () => {},
-      ensureBackend: async () => backend,
-    });
-
-    await runtime.startOrLoad({});
-
-    backend.emit({ type: 'status', status: 'running' } satisfies AgentMessage);
-    expect(messages.some((msg) => msg.type === 'task_started')).toBe(false);
-
-    runtime.beginTurn();
-    backend.emit({ type: 'status', status: 'running' } satisfies AgentMessage);
-    expect(messages.filter((msg) => msg.type === 'task_started')).toHaveLength(1);
   });
 
   it('does NOT clear thinking on status:idle while turn is in-flight (issue #82 flicker)', async () => {

@@ -1,4 +1,5 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { withWorkspaceBundleLock } from '@happier-dev/cli-common/workspaceBundleLock';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { randomInt } from 'node:crypto';
@@ -223,10 +224,6 @@ export type ServerStartLaunchSpec = Readonly<{
   env?: NodeJS.ProcessEnv;
 }>;
 
-type BuildLockOwner = {
-  pid: number | null;
-  createdAtMs: number | null;
-};
 
 let sharedDepsReady = false;
 let sharedDepsBuildPromise: Promise<void> | null = null;
@@ -282,116 +279,18 @@ export function hasServerSharedDepsOutputs(rootDir: string): boolean {
   return resolveServerSharedDepsOutputPaths(rootDir).every((outputPath) => existsSync(outputPath));
 }
 
-function parseBuildLockOwner(raw: string): BuildLockOwner {
-  const text = raw.trim();
-  if (!text) return { pid: null, createdAtMs: null };
-
-  try {
-    const parsed = JSON.parse(text) as { pid?: unknown; createdAtMs?: unknown };
-    return {
-      pid: typeof parsed.pid === 'number' && Number.isFinite(parsed.pid) && parsed.pid > 0 ? parsed.pid : null,
-      createdAtMs:
-        typeof parsed.createdAtMs === 'number' && Number.isFinite(parsed.createdAtMs) && parsed.createdAtMs > 0
-          ? parsed.createdAtMs
-          : null,
-    };
-  } catch {
-    return { pid: null, createdAtMs: null };
-  }
-}
-
-function isRunningPid(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error: any) {
-    if (error?.code === 'ESRCH') return false;
-    return true;
-  }
-}
-
 export async function withServerSharedDepsBuildLock<T>(
   fn: () => Promise<T>,
-  options?: {
-    lockPath?: string;
-    timeoutMs?: number;
-    pollIntervalMs?: number;
-    staleAfterMs?: number;
-  },
+  options?: { lockPath?: string; timeoutMs?: number; pollIntervalMs?: number; staleAfterMs?: number },
 ): Promise<T> {
-  const lockPath = options?.lockPath ?? resolve(repoRootDir(), '.project', 'tmp', 'server-shared-deps-build.lock');
-  mkdirSync(dirname(lockPath), { recursive: true });
-
   const timeoutMs = options?.timeoutMs ?? 240_000;
-  const pollIntervalMs = options?.pollIntervalMs ?? 250;
-  const staleAfterMs = options?.staleAfterMs ?? timeoutMs;
-  const startedAt = Date.now();
-
-  let fd: number | null = null;
-  let heartbeatTimer: NodeJS.Timeout | null = null;
-  while (true) {
-    try {
-      fd = openSync(lockPath, 'wx');
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAtMs: Date.now() }), 'utf8');
-      break;
-    } catch (error: any) {
-      if (error?.code !== 'EEXIST') throw error;
-
-      let reclaim = false;
-      try {
-        const owner = parseBuildLockOwner(readFileSync(lockPath, 'utf8'));
-        if (owner.pid == null && owner.createdAtMs == null) reclaim = true;
-        else if (owner.pid != null && !isRunningPid(owner.pid)) reclaim = true;
-        else if (owner.createdAtMs != null && Date.now() - owner.createdAtMs > staleAfterMs) reclaim = true;
-      } catch {
-        reclaim = true;
-      }
-
-      if (reclaim) {
-        try {
-          unlinkSync(lockPath);
-          continue;
-        } catch {
-          // ignore and continue waiting
-        }
-      }
-
-      if (Date.now() - startedAt > timeoutMs) {
-        throw new Error(`Timed out waiting for server shared deps build lock: ${lockPath}`);
-      }
-      await sleep(pollIntervalMs);
-    }
-  }
-
-  try {
-    if (staleAfterMs > 0) {
-      const heartbeatIntervalMs = Math.max(250, Math.min(5_000, Math.floor(staleAfterMs / 4) || 250));
-      heartbeatTimer = setInterval(() => {
-        try {
-          writeFileSync(lockPath, JSON.stringify({ pid: process.pid, createdAtMs: Date.now() }), 'utf8');
-        } catch {
-          // Best-effort lease heartbeat only.
-        }
-      }, heartbeatIntervalMs);
-      heartbeatTimer.unref();
-    }
-
-    return await fn();
-  } finally {
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-    }
-    try {
-      if (fd != null) closeSync(fd);
-    } catch {
-      // ignore
-    }
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      // ignore
-    }
-  }
+  return await withWorkspaceBundleLock(fn, {
+    lockPath: options?.lockPath ?? resolve(repoRootDir(), '.project', 'tmp', 'server-shared-deps-build.lock'),
+    timeoutMs,
+    pollIntervalMs: options?.pollIntervalMs ?? 250,
+    staleAfterMs: options?.staleAfterMs ?? timeoutMs,
+    errorLabel: 'server shared deps build lock',
+  });
 }
 
 function resolveServerGenerateProvidersSourcePaths(rootDir: string): Readonly<{

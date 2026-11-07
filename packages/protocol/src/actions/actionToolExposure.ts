@@ -8,10 +8,21 @@ import type { ActionSpec, ActionToolExposureMode, ActionToolExposureSurface } fr
 
 export { ACTION_TOOL_EXPOSURE_SURFACES };
 
-export const SESSION_AGENT_DIRECT_ACTION_TOOL_ALLOW_LIST = [
+/**
+ * Read-only bootstrap/observation Actions that Session Agents must be able to
+ * call directly.
+ */
+export const SESSION_AGENT_SAFE_OBSERVATION_ACTION_IDS = [
   'action.spec.search',
   'action.spec.get',
   'action.options.resolve',
+  'execution.run.list',
+  'execution.run.get',
+  'execution.run.wait',
+] as const satisfies readonly ActionId[];
+
+export const SESSION_AGENT_DIRECT_ACTION_TOOL_ALLOW_LIST = [
+  ...SESSION_AGENT_SAFE_OBSERVATION_ACTION_IDS,
 ] as const satisfies readonly ActionId[];
 
 const SESSION_AGENT_DIRECT_ACTION_TOOL_ALLOW_SET = new Set<ActionId>(SESSION_AGENT_DIRECT_ACTION_TOOL_ALLOW_LIST);

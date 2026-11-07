@@ -62,6 +62,50 @@ vi.mock('react-native-safe-area-context', () => ({
 }));
 
 describe('PublicShareViewerScreen (e2ee)', () => {
+    it('preserves completed questions from an encrypted share with complete empty history', async () => {
+        transcriptListSpy.mockClear();
+        serverFetchSpy.mockReset();
+        decryptDataKeyFromPublicShareSpy.mockReset();
+        const dataKey = new Uint8Array(32).fill(8);
+        decryptDataKeyFromPublicShareSpy.mockResolvedValue(dataKey);
+        const encryptor = new AES256Encryption(dataKey);
+        const [metadataBytes, stateBytes] = await encryptor.encrypt([
+            { path: '/repo', host: 'devbox', name: 'E2EE Session' },
+            { completedRequests: { 'old-question': {
+                tool: 'AskUserQuestion', arguments: { questions: [{ question: 'Choose a mode' }] },
+                createdAt: 1, completedAt: 2, status: 'approved', answers: { 'Choose a mode': 'Fast' },
+            } } },
+        ]);
+        serverFetchSpy
+            .mockResolvedValueOnce({
+                ok: true, status: 200,
+                json: async () => ({
+                    session: {
+                        id: 's1', seq: 1, encryptionMode: 'e2ee', createdAt: 1, updatedAt: 2,
+                        active: false, activeAt: 2,
+                        metadata: encodeBase64(metadataBytes, 'base64'), metadataVersion: 1,
+                        agentState: encodeBase64(stateBytes, 'base64'), agentStateVersion: 1,
+                    },
+                    owner: { id: 'u1', username: 'alice', firstName: null, lastName: null, avatar: null },
+                    accessLevel: 'view', encryptedDataKey: 'encrypted-data-key-placeholder', isConsentRequired: false,
+                }),
+            })
+            .mockResolvedValueOnce({
+                ok: true, status: 200, json: async () => ({ messages: [], hasMore: false }),
+            });
+        const { default: PublicShareViewerScreen } = await import('@/app/(app)/share/[token]');
+        await renderScreen(<PublicShareViewerScreen />);
+        await vi.waitFor(async () => {
+            await flushHookEffects({ cycles: 1, turns: 2 });
+            expect(transcriptListSpy).toHaveBeenCalled();
+        });
+        const messages = transcriptListSpy.mock.calls.at(-1)?.[0]?.messages;
+        expect(messages).toHaveLength(1);
+        expect(messages[0]).toMatchObject({ kind: 'tool-call', tool: {
+            name: 'AskUserQuestion', result: { answers: { 'Choose a mode': 'Fast' } },
+        } });
+    });
+
     it('fails closed when an encrypted share message cannot be decrypted instead of silently skipping it', async () => {
         transcriptListSpy.mockClear();
         serverFetchSpy.mockReset();
@@ -128,8 +172,11 @@ describe('PublicShareViewerScreen (e2ee)', () => {
 
         const { default: PublicShareViewerScreen } = await import('@/app/(app)/share/[token]');
 
-        await renderScreen(<PublicShareViewerScreen />);
-        await flushHookEffects({ cycles: 1, turns: 2 });
+        const screen = await renderScreen(<PublicShareViewerScreen />);
+        await vi.waitFor(async () => {
+            await flushHookEffects({ cycles: 1, turns: 2 });
+            expect(screen.findAllByProps({ subtitle: 'session.sharing.failedToDecrypt' })).not.toHaveLength(0);
+        });
 
         expect(decryptDataKeyFromPublicShareSpy).toHaveBeenCalled();
         expect(transcriptListSpy).not.toHaveBeenCalled();
@@ -205,7 +252,10 @@ describe('PublicShareViewerScreen (e2ee)', () => {
         const { default: PublicShareViewerScreen } = await import('@/app/(app)/share/[token]');
 
         await renderScreen(<PublicShareViewerScreen />);
-        await flushHookEffects({ cycles: 1, turns: 2 });
+        await vi.waitFor(async () => {
+            await flushHookEffects({ cycles: 1, turns: 2 });
+            expect(transcriptListSpy).toHaveBeenCalled();
+        });
 
         const last = transcriptListSpy.mock.calls[transcriptListSpy.mock.calls.length - 1]?.[0];
         expect(last?.messages ?? []).toEqual([]);

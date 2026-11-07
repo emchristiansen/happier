@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { UsageSchema } from '@/api/usage'
 import { SOCKET_RPC_EVENTS, type SocketRpcRequestPayload as ProtocolSocketRpcRequestPayload } from '@happier-dev/protocol/socketRpc'
-import { SentFromSchema } from '@happier-dev/protocol'
+import { CliUpdateFactsSchema, SentFromSchema } from '@happier-dev/protocol'
 import type { ExecutionRunPublicState } from '@happier-dev/protocol'
 import type {
   AcpConfigOptionOverridesV1,
@@ -59,6 +59,7 @@ import type {
   UpdateMetadataAckResponse,
   UpdateStateAckResponse,
 } from '@happier-dev/protocol/updates'
+import { lazySchema } from '@happier-dev/protocol';
 
 /**
  * Permission mode values - includes both Claude and Codex modes
@@ -161,6 +162,7 @@ export interface ServerToClientEvents {
   session: (data: SessionBroadcast) => void
   'server:restarting': (data: { retryAfterMs?: number }) => void
   [SOCKET_RPC_EVENTS.REQUEST]: (data: SocketRpcRequestPayload, callback: (response: unknown) => void) => void
+  [SOCKET_RPC_EVENTS.CANCEL]: (data: { requestId: string }) => void
   [SOCKET_RPC_EVENTS.REGISTERED]: (data: { method: string }) => void
   [SOCKET_RPC_EVENTS.UNREGISTERED]: (data: { method: string }) => void
   [SOCKET_RPC_EVENTS.ERROR]: (data: { type: string, error: string }) => void
@@ -308,6 +310,7 @@ export interface ClientToServerEvents {
   [SOCKET_RPC_EVENTS.REGISTER]: (data: { method: string }) => void
   [SOCKET_RPC_EVENTS.UNREGISTER]: (data: { method: string }) => void
   [SOCKET_RPC_EVENTS.CALL]: (data: SocketRpcCallPayload, callback: (response: SocketRpcCallResponse) => void) => void
+  [SOCKET_RPC_EVENTS.CANCEL]: (data: { requestId: string }) => void
   'usage-report': (data: {
     key: string
     sessionId: string
@@ -351,7 +354,7 @@ export type Session =
 /**
  * Machine metadata - static information (rarely changes)
  */
-export const MachineMetadataSchema = z.object({
+export const MachineMetadataSchema = lazySchema(() => z.object({
   host: z.string(),
   platform: z.string(),
   happyCliVersion: z.string(),
@@ -360,11 +363,13 @@ export const MachineMetadataSchema = z.object({
   happyLibDir: z.string(),
   daemonTerminalSessionAttachSupported: z.boolean().optional(),
   daemonSessionGoalControlsSupported: z.boolean().optional(),
-})
+  /** K5 — this machine's first-party CLI update facts (plan R13); absent from older daemons. */
+  cliUpdate: CliUpdateFactsSchema.optional(),
+}))
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
 
-export const MachineRegistrationIdentitySchema = z.object({
+export const MachineRegistrationIdentitySchema = lazySchema(() => z.object({
   installationId: z.string().trim().min(1),
   installationPublicKey: MachineInstallationPublicKeySchema,
   installationProof: MachineInstallationProofV1Schema,
@@ -372,7 +377,7 @@ export const MachineRegistrationIdentitySchema = z.object({
   replacementReason: MachineReplacementReasonSchema.optional(),
   contentPublicKeyFingerprint: ContentPublicKeyFingerprintSchema.optional(),
   replacementCandidateAccountId: z.string().trim().min(1).optional(),
-});
+}));
 
 export type MachineRegistrationIdentity = Readonly<
   Omit<z.infer<typeof MachineRegistrationIdentitySchema>, 'replacementReason' | 'contentPublicKeyFingerprint'>
@@ -385,7 +390,7 @@ export type MachineRegistrationIdentity = Readonly<
 /**
  * Daemon state - dynamic runtime information (frequently updated)
  */
-export const DaemonStateSchema = z.object({
+export const DaemonStateSchema = lazySchema(() => z.object({
   status: z.union([
     z.enum(['running', 'shutting-down']),
     z.string() // Forward compatibility
@@ -401,24 +406,26 @@ export const DaemonStateSchema = z.object({
       z.enum(['mobile-app', 'cli', 'os-signal', 'unknown']),
       z.string() // Forward compatibility
     ]).optional()
-})
+}))
 
 export type DaemonState = z.infer<typeof DaemonStateSchema>
 
 export type Machine = {
   id: string,
-  encryptionKey: Uint8Array;
-  encryptionVariant: 'legacy' | 'dataKey';
+  publishedDataEncryptionKey?: string | null;
   metadata: MachineMetadata | null,
   metadataVersion: number,
   daemonState: DaemonState | null,
   daemonStateVersion: number,
-}
+} & (
+  | { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }
+  | { encryptionKey: null; encryptionVariant: 'plain' }
+)
 
 /**
  * Session message from API
  */
-export const SessionMessageSchema = z.object({
+export const SessionMessageSchema = lazySchema(() => z.object({
   content: SessionMessageContentSchema,
   createdAt: z.number(),
   id: z.string(),
@@ -426,14 +433,14 @@ export const SessionMessageSchema = z.object({
   seq: z.number(),
   sidechainId: z.string().nullable(),
   updatedAt: z.number()
-}).passthrough()
+}).passthrough())
 
 export type SessionMessage = z.infer<typeof SessionMessageSchema>
 
 /**
  * Message metadata schema
  */
-export const MessageMetaSchema = z.object({
+export const MessageMetaSchema = lazySchema(() => z.object({
   sentFrom: SentFromSchema.optional(), // Source identifier
   /**
    * High-level origin of the message. This is used to prevent reliability features
@@ -450,14 +457,14 @@ export const MessageMetaSchema = z.object({
   appendSystemPrompt: z.string().nullable().optional(), // Append to system prompt for this message (null = reset)
   allowedTools: z.array(z.string()).nullable().optional(), // Allowed tools for this message (null = reset)
   disallowedTools: z.array(z.string()).nullable().optional() // Disallowed tools for this message (null = reset)
-}).passthrough()
+}).passthrough())
 
 export type MessageMeta = z.infer<typeof MessageMetaSchema>
 
 /**
  * API response types
  */
-export const CreateSessionResponseSchema = z.object({
+export const CreateSessionResponseSchema = lazySchema(() => z.object({
   resolution: z.enum(['created', 'existing']).optional(),
   session: z.object({
     id: z.string(),
@@ -471,11 +478,11 @@ export const CreateSessionResponseSchema = z.object({
     agentStateVersion: z.number(),
     dataEncryptionKey: z.string().nullable().optional(),
   }).passthrough(),
-})
+}))
 
 export type CreateSessionResponse = z.infer<typeof CreateSessionResponseSchema>
 
-export const UserMessageSchema = z.object({
+export const UserMessageSchema = lazySchema(() => z.object({
   role: z.literal('user'),
   content: z.object({
     type: z.literal('text'),
@@ -491,22 +498,22 @@ export const UserMessageSchema = z.object({
   localId: z.string().nullish().optional(),
   localKey: z.string().optional(), // Mobile messages include this
   meta: MessageMetaSchema.optional()
-}).passthrough()
+}).passthrough())
 
 export type UserMessage = z.infer<typeof UserMessageSchema>
 
-export const AgentMessageSchema = z.object({
+export const AgentMessageSchema = lazySchema(() => z.object({
   role: z.literal('agent'),
   content: z.object({
     type: z.literal('output'),
     data: z.any()
   }).passthrough(),
   meta: MessageMetaSchema.optional()
-}).passthrough()
+}).passthrough())
 
 export type AgentMessage = z.infer<typeof AgentMessageSchema>
 
-export const MessageContentSchema = z.union([UserMessageSchema, AgentMessageSchema])
+export const MessageContentSchema = lazySchema(() => z.union([UserMessageSchema, AgentMessageSchema]))
 
 export type MessageContent = z.infer<typeof MessageContentSchema>
 
@@ -563,6 +570,8 @@ export type Metadata = {
    * Null indicates "no profile".
    */
   profileId?: string | null,
+  /** Non-secret native account directory overrides captured by the creating runner. */
+  nativeAgentEnvironmentV1?: import('@/agent/runtime/sessionNativeEnvironment').SessionNativeEnvironment,
   summary?: {
     text: string,
     updatedAt: number
@@ -583,6 +592,7 @@ export type Metadata = {
     serviceIds: ConnectedServiceId[],
   },
   codexSessionId?: string, // Codex session/conversation ID (uuid)
+  customAcpSessionId?: string, // Configured ACP backend session ID (vendor resume)
   codexBackendMode?: 'mcp' | 'acp' | 'appServer',
   agentRuntimeDescriptorV1?: unknown,
   // Compact, count-only workflow activity headline (CWF3). The live invalidation pointer to durable
@@ -614,6 +624,7 @@ export type Metadata = {
   kimiSessionId?: string, // Kimi ACP session ID (opaque)
   kiloSessionId?: string, // Kilo ACP session ID (opaque)
   kiroSessionId?: string, // Kiro ACP session ID (opaque)
+  devinSessionId?: string, // Devin ACP session ID (opaque)
   piSessionId?: string, // Pi RPC session ID (opaque)
   piSessionFile?: string, // Absolute Pi session file path (preferred resume primitive)
   sessionUsageLimitRecoveryV1?: SessionUsageLimitRecoveryV1,
@@ -792,6 +803,8 @@ export type Metadata = {
   happyToolsDir: string,
   startedFromDaemon?: boolean,
   hostPid?: number,
+  /** OS generation of hostPid; permits safe pre-webhook startup association. */
+  hostProcessInstanceFingerprint?: string,
   sessionLogPath?: string,
   startedBy?: 'daemon' | 'terminal',
   // Lifecycle state management
@@ -904,6 +917,8 @@ export type AgentState = {
           kind?: 'permission' | 'user_action' | string,
           arguments: any,
           createdAt: number
+          /** Opaque identity of this permission occurrence, safe to include in notification data. */
+          occurrenceId?: string
           /**
            * Optional provider-provided permission suggestions for this request.
            * (e.g. Claude Agent SDK `permission_suggestions`).
@@ -923,6 +938,7 @@ export type AgentState = {
         arguments: any,
         createdAt: number,
         completedAt: number,
+        occurrenceId?: string,
         status: 'canceled' | 'denied' | 'approved',
       reason?: string,
       mode?: PermissionMode,

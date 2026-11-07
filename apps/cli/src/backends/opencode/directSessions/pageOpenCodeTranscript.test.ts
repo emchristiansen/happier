@@ -155,6 +155,7 @@ describe('pageOpenCodeTranscript', () => {
     expect(page.items).toHaveLength(1);
     expect(page.hasMore).toBe(true);
     expect(page.truncated).toBe(true);
+    expect(page.truncationReason).toBe('page_limit');
   });
 
   it('does not skip unseen tail messages when byte truncation cuts a backward page short', async () => {

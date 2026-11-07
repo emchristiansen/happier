@@ -30,33 +30,49 @@ async function callScopedSessionRpc<R, A>(params: Readonly<{
   method: string;
   payload: A;
   context: Extract<ResolvedServerSessionRpcContext, { scope: 'scoped' }>;
+  operationTimeoutMs: number | null;
   onIssued?: () => void;
+  networkMode?: 'background-task';
+  signal?: AbortSignal;
 }>): Promise<R> {
+  const assertActive = () => {
+    if (params.signal?.aborted) throw new Error('Scoped RPC aborted');
+  };
+  assertActive();
   const cryptoContext = await resolveScopedSessionCryptoContext({
     serverId: params.context.targetServerId,
     serverUrl: params.context.targetServerUrl,
     token: params.context.token,
     sessionId: params.sessionId,
     timeoutMs: params.context.timeoutMs,
+    networkMode: params.networkMode,
     decryptEncryptionKey: (value) => params.context.encryption.decryptEncryptionKey(value),
   });
 
+    assertActive();
     const socket = await createEphemeralServerSocketClient({
         serverUrl: params.context.targetServerUrl,
         token: params.context.token,
         timeoutMs: params.context.timeoutMs,
+        networkMode: params.networkMode,
+        signal: params.signal,
     });
     try {
+        // A connection may complete in the same turn as cancellation. Never
+        // prepare/emit with a late socket; finally releases it immediately.
+        assertActive();
         if (cryptoContext.encryptionMode === 'plain') {
-            const socketEmission = socket.timeout(params.context.timeoutMs);
+            const socketEmission = params.operationTimeoutMs === null
+                ? socket
+                : socket.timeout(params.operationTimeoutMs);
             params.onIssued?.();
             const result = (await raceSocketIoAckTimeout(
                 socketEmission.emitWithAck(SOCKET_RPC_EVENTS.CALL, {
                     method: `${params.sessionId}:${params.method}`,
                     params: params.payload,
-                    timeoutMs: params.context.timeoutMs,
+                    ...(params.operationTimeoutMs === null ? {} : { timeoutMs: params.operationTimeoutMs }),
                 }) as Promise<SocketRpcResult>,
-                params.context.timeoutMs,
+                params.operationTimeoutMs ?? undefined,
             )) as SocketRpcResult;
 
       if (result.ok) return result.result as R;
@@ -84,15 +100,18 @@ async function callScopedSessionRpc<R, A>(params: Readonly<{
     }
 
     const encryptedPayload = await sessionEncryption.encryptRaw(params.payload);
-    const socketEmission = socket.timeout(params.context.timeoutMs);
+    const socketEmission = params.operationTimeoutMs === null
+      ? socket
+      : socket.timeout(params.operationTimeoutMs);
+    assertActive();
     params.onIssued?.();
     const result = (await raceSocketIoAckTimeout(
       socketEmission.emitWithAck(SOCKET_RPC_EVENTS.CALL, {
         method: `${params.sessionId}:${params.method}`,
         params: encryptedPayload,
-        timeoutMs: params.context.timeoutMs,
+        ...(params.operationTimeoutMs === null ? {} : { timeoutMs: params.operationTimeoutMs }),
       }) as Promise<SocketRpcResult>,
-      params.context.timeoutMs,
+      params.operationTimeoutMs ?? undefined,
     )) as SocketRpcResult;
 
     if (result.ok) {
@@ -113,11 +132,15 @@ export async function sessionRpcWithServerScope<R, A>(params: Readonly<{
   serverId?: string | null;
   method: string;
   payload: A;
-  timeoutMs?: number;
+  timeoutMs?: number | null;
   onIssued?: () => void;
 }>): Promise<R> {
   const sessionId = normalizeId(params.sessionId);
-  const context = await resolveServerScopedSessionContext({ serverId: params.serverId, timeoutMs: params.timeoutMs });
+  const context = await resolveServerScopedSessionContext({
+    serverId: params.serverId,
+    ...(typeof params.timeoutMs === 'number' ? { timeoutMs: params.timeoutMs } : {}),
+  });
+  const operationTimeoutMs = params.timeoutMs === null ? null : context.timeoutMs;
   let exactIssuanceAttempted = false;
   const onIssued = params.onIssued
     ? () => {
@@ -129,7 +152,7 @@ export async function sessionRpcWithServerScope<R, A>(params: Readonly<{
   if (context.scope === 'active') {
     try {
       return await apiSocket.sessionRPC<R, A>(sessionId, params.method, params.payload, {
-        timeoutMs: context.timeoutMs,
+        timeoutMs: operationTimeoutMs,
         ...(onIssued ? { onIssued } : {}),
       });
     } catch (error) {
@@ -137,7 +160,7 @@ export async function sessionRpcWithServerScope<R, A>(params: Readonly<{
       if (!shouldRetryWithScopedSessionContext(error)) throw error;
       const retryContext = await resolveServerScopedSessionContext({
         serverId: params.serverId,
-        timeoutMs: params.timeoutMs,
+        ...(typeof params.timeoutMs === 'number' ? { timeoutMs: params.timeoutMs } : {}),
         preferScoped: true,
       });
       if (retryContext.scope !== 'scoped') throw error;
@@ -146,6 +169,7 @@ export async function sessionRpcWithServerScope<R, A>(params: Readonly<{
         method: params.method,
         payload: params.payload,
         context: retryContext,
+        operationTimeoutMs,
         onIssued,
       });
     }
@@ -155,6 +179,7 @@ export async function sessionRpcWithServerScope<R, A>(params: Readonly<{
     method: params.method,
     payload: params.payload,
     context,
+    operationTimeoutMs,
     onIssued,
   });
 }
@@ -166,6 +191,8 @@ export async function sessionRpcWithServerAccountScope<R, A>(params: Readonly<{
   payload: A;
   timeoutMs?: number;
   onIssued?: () => void;
+  networkMode?: 'background-task';
+  signal?: AbortSignal;
 }>): Promise<R> {
   const context = await resolveServerScopedSessionContext({
     serverId: params.scope.serverId,
@@ -184,6 +211,9 @@ export async function sessionRpcWithServerAccountScope<R, A>(params: Readonly<{
     method: params.method,
     payload: params.payload,
     context,
+    operationTimeoutMs: context.timeoutMs,
     onIssued: params.onIssued,
+    networkMode: params.networkMode,
+    signal: params.signal,
   });
 }

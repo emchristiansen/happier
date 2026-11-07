@@ -1,3 +1,4 @@
+import type { BackendTargetRefV1 } from '@happier-dev/protocol';
 import { Modal } from '@/modal';
 import { t } from '@/text';
 
@@ -17,6 +18,8 @@ export type OpenAgentTransitionHandedOverContextModalParams = Readonly<{
     /** The boundary's two Agents, exactly as the divider records them. */
     sourceAgentId: string;
     targetAgentId: string;
+    sourceBackendTarget?: BackendTargetRefV1;
+    targetBackendTarget?: BackendTargetRefV1;
     /** Names both Agents, so the card says which boundary it is explaining. */
     boundaryTitle: string;
     onJumpToCutoff: (() => void) | null;
@@ -42,6 +45,8 @@ export function openAgentTransitionHandedOverContextModal(
             returningAgentLastSeenSeqInclusive: params.returningAgentLastSeenSeqInclusive,
             sourceAgentId: params.sourceAgentId,
             targetAgentId: params.targetAgentId,
+            ...(params.sourceBackendTarget ? { sourceBackendTarget: params.sourceBackendTarget } : {}),
+            ...(params.targetBackendTarget ? { targetBackendTarget: params.targetBackendTarget } : {}),
             onJumpToCutoff: params.onJumpToCutoff,
         },
         chrome: {

@@ -1,10 +1,10 @@
 import type {
-  ConnectedServiceCredentialRecordV1,
   ConnectedServiceId,
   ConnectedServiceMaterializationIdentityV1,
 } from '@happier-dev/protocol';
 
 import type { ConnectedServiceResolvedSelection } from '../materialize/materializeConnectedServicesForSpawn';
+import type { ResolvedConnectedServiceCredential } from '@/cloud/connectedServices/resolveConnectedServiceCredentials';
 import { readConnectedServiceMaterializationIdentityV1 } from '../materialize/createConnectedServiceMaterializationIdentity';
 import type { ConnectedServiceChildSelection } from '../connectedServiceChildEnvironment';
 import type { SpawnTarget } from './refreshTypes';
@@ -35,12 +35,13 @@ export function resolveSpawnTargetMaterializationIdentity(
 
 export function buildResolvedSelectionsForTarget(
   target: SpawnTarget,
-  recordsByServiceId: ReadonlyMap<ConnectedServiceId, ConnectedServiceCredentialRecordV1>,
+  credentialsByServiceId: ReadonlyMap<ConnectedServiceId, ResolvedConnectedServiceCredential>,
 ): ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedSelection> {
   const selectionsByServiceId = new Map<ConnectedServiceId, ConnectedServiceResolvedSelection>();
   for (const selection of target.selectionsByServiceId.values()) {
-    const record = recordsByServiceId.get(selection.serviceId);
-    if (!record) continue;
+    const credential = credentialsByServiceId.get(selection.serviceId);
+    if (!credential) continue;
+    const { record, credentialRevision } = credential;
     if (selection.kind === 'group') {
       selectionsByServiceId.set(selection.serviceId, {
         kind: 'group',
@@ -49,6 +50,7 @@ export function buildResolvedSelectionsForTarget(
         activeProfileId: selection.activeProfileId,
         fallbackProfileId: selection.fallbackProfileId,
         generation: selection.generation,
+        credentialRevision,
         record,
         policy: null,
       });
@@ -58,6 +60,7 @@ export function buildResolvedSelectionsForTarget(
       kind: 'profile',
       serviceId: selection.serviceId,
       profileId: selection.profileId,
+      credentialRevision,
       record,
     });
   }

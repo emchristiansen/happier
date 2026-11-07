@@ -4,7 +4,7 @@ import { fetchAndApplyAutomations } from './syncAutomations';
 
 const listAutomationsMock = vi.hoisted(() => vi.fn());
 const listAutomationRunsMock = vi.hoisted(() => vi.fn());
-const isRuntimeFeatureEnabledMock = vi.hoisted(() => vi.fn());
+const resolveRuntimeFeatureDecisionOrThrowMock = vi.hoisted(() => vi.fn());
 const getActiveServerSnapshotMock = vi.hoisted(() => vi.fn(() => ({ serverId: 'server-1' })));
 
 vi.mock('@/sync/api/automations/apiAutomations', () => ({
@@ -16,7 +16,7 @@ vi.mock('@/sync/api/automations/apiAutomationRuns', () => ({
 }));
 
 vi.mock('@/sync/domains/features/featureDecisionInputs', () => ({
-    isRuntimeFeatureEnabled: isRuntimeFeatureEnabledMock,
+    resolveRuntimeFeatureDecisionOrThrow: resolveRuntimeFeatureDecisionOrThrowMock,
 }));
 
 vi.mock('@/sync/domains/server/serverRuntime', () => ({
@@ -27,10 +27,10 @@ describe('fetchAndApplyAutomations', () => {
     beforeEach(() => {
         listAutomationsMock.mockReset();
         listAutomationRunsMock.mockReset();
-        isRuntimeFeatureEnabledMock.mockReset();
+        resolveRuntimeFeatureDecisionOrThrowMock.mockReset();
         getActiveServerSnapshotMock.mockClear();
 
-        isRuntimeFeatureEnabledMock.mockResolvedValue(true);
+        resolveRuntimeFeatureDecisionOrThrowMock.mockResolvedValue({ state: 'enabled' });
         listAutomationsMock.mockResolvedValue([
             {
                 id: 'a1',
@@ -106,5 +106,27 @@ describe('fetchAndApplyAutomations', () => {
         expect(applyAutomations).not.toHaveBeenCalled();
         expect(listAutomationRunsMock).not.toHaveBeenCalled();
         expect(setAutomationRuns).not.toHaveBeenCalled();
+    });
+
+    it('propagates an unknown feature decision instead of treating the list as empty', async () => {
+        const error = Object.assign(new Error('feature state unavailable'), {
+            name: 'RuntimeFeatureDecisionUnavailableError',
+            retryable: true,
+        });
+        resolveRuntimeFeatureDecisionOrThrowMock.mockRejectedValue(error);
+
+        await expect(fetchAndApplyAutomations({
+            credentials: { accessToken: 'token' } as any,
+            applyAutomations: vi.fn(),
+        })).rejects.toMatchObject({
+            name: 'RuntimeFeatureDecisionUnavailableError',
+            retryable: true,
+        });
+
+        expect(resolveRuntimeFeatureDecisionOrThrowMock).toHaveBeenCalledWith({
+            featureId: 'automations',
+            serverId: 'server-1',
+        });
+        expect(listAutomationsMock).not.toHaveBeenCalled();
     });
 });

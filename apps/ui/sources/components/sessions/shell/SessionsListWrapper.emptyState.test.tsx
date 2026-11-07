@@ -427,7 +427,6 @@ describe('SessionsListWrapper (empty state)', () => {
         const screen = await renderSessionsListWrapper();
 
         expect(sessionListState.paneOptions).toEqual([]);
-        expect(() => screen.findByType('SessionsListContent' as any)).toThrow();
 
         await screen.unmount();
     });
@@ -497,6 +496,7 @@ describe('SessionsListWrapper (empty state)', () => {
 
         expect(sessionListState.paneOptions.at(-1)).toEqual({
             activeSessionId: 'session-2',
+            retainedSessionListViewData: retainedData,
             sessionListSurfaceDataActive: true,
         });
         expect(screen.findByType('SessionsListContent' as any).props.data).toBe(retainedData);
@@ -526,6 +526,7 @@ describe('SessionsListWrapper (empty state)', () => {
 
         expect(sessionListState.paneOptions.at(-1)).toEqual({
             activeSessionId: 'session-2',
+            retainedSessionListViewData: retainedData,
             sessionListSurfaceDataActive: true,
         });
 

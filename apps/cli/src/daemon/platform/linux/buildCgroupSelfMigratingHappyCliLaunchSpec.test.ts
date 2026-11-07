@@ -1,8 +1,16 @@
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { getPriority, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// Scheduling priority is an OS boundary; exercise the real governor and launch composition.
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return { ...actual, getPriority: vi.fn(() => 0) };
+});
 
 const mocks = vi.hoisted(() => ({
   systemdResourceGovernorExecFile: vi.fn(async () => ({ stdout: '', stderr: '' })),
@@ -16,6 +24,10 @@ const LAUNCH_ID = '5f0e9d8c-7b6a-4954-8372-615049382716' as SessionLaunchId;
 describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
   let sandboxDir: string | null = null;
 
+  beforeEach(() => {
+    vi.mocked(getPriority).mockReturnValue(0);
+  });
+
   afterEach(async () => {
     if (!sandboxDir) return;
     await rm(sandboxDir, { recursive: true, force: true });
@@ -27,7 +39,7 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
     mocks.systemdResourceGovernorExecFile.mockResolvedValue({ stdout: '', stderr: '' });
   });
 
-  it('targets a sibling scope outside app.slice when the daemon runs as a user service', async () => {
+  it.skipIf(process.platform === 'win32')('preserves the selected environment and argv while migrating outside the daemon app.slice', async () => {
     sandboxDir = await mkdtemp(join(tmpdir(), 'happier-cgroup-launch-spec-'));
     const procfsRootDir = join(sandboxDir, 'proc');
     const daemonProcDir = join(procfsRootDir, '111');
@@ -37,25 +49,51 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
       '0::/user.slice/user-501.slice/user@501.service/app.slice/happier-daemon.default.service\n',
       'utf8',
     );
+    const home = join(sandboxDir, 'home');
+    await mkdir(home);
+    await writeFile(join(home, '.profile'), 'export PATH=/login-profile-path\nexport HERMES_ROLE=login-profile-role\n');
+    const profilePath = '/selected-profile/bin:/usr/bin:/bin';
+    const cgroupRootDir = join(sandboxDir, 'cgroup');
+    const runnerArgs = ['space and \'quote', '${HOME}', '$(must-not-execute)', '--flag=value'];
 
     const plan = await buildCgroupSelfMigratingHappyCliLaunchSpec({
       launchId: LAUNCH_ID,
-      args: ['codex', '--happy-starting-mode', 'remote'],
+      launchSpec: {
+        runtime: 'node',
+        filePath: process.execPath,
+        args: ['-e', 'process.stdout.write(JSON.stringify({ pid: process.pid, argv: process.argv.slice(1), PATH: process.env.PATH, HERMES_HOME: process.env.HERMES_HOME, HERMES_ROLE: process.env.HERMES_ROLE }))', '--', ...runnerArgs],
+      },
       daemonPid: 111,
       procfsRootDir,
+      cgroupRootDir,
+      environment: { HOME: home, PATH: profilePath },
       systemdUserResourceGovernorExecFile: mocks.systemdResourceGovernorExecFile,
     });
     const result = plan.launchSpec;
 
     expect(result?.filePath).toBe('/bin/sh');
     expect(result?.env?.HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR).toBe(
-      '/sys/fs/cgroup/user.slice/user-501.slice/user@501.service',
+      join(cgroupRootDir, 'user.slice/user-501.slice/user@501.service'),
     );
     expect(result?.args.join(' ')).toContain('happier-session-$$.scope');
 
     const shellScript = result?.args[1] ?? '';
     expect(shellScript).toContain('exec "$@"');
     expect(shellScript).toContain('|| true');
+
+    if (!result) throw new Error('expected fallback launch');
+    const { stdout } = await promisify(execFile)(result.filePath, result.args, {
+      env: { HOME: home, PATH: profilePath, HERMES_HOME: '/selected/hermes', HERMES_ROLE: 'operator', ...result.env },
+    });
+    const observed = JSON.parse(stdout);
+    expect(observed).toEqual({
+      pid: expect.any(Number), argv: runnerArgs,
+      PATH: profilePath, HERMES_HOME: '/selected/hermes', HERMES_ROLE: 'operator',
+    });
+    expect(await readFile(join(
+      result.env!.HAPPIER_DAEMON_SESSION_CGROUP_BASE_DIR,
+      `happier-session-${observed.pid}.scope`, 'cgroup.procs',
+    ), 'utf8')).toBe(`${observed.pid}\n`);
   });
 
   it('wraps the admitted immutable runner decision without recomputing the child entrypoint', async () => {
@@ -98,6 +136,7 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
   });
 
   it('uses the provisioned lower-weight jobs slice instead of the daemon control-plane slice', async () => {
+    vi.mocked(getPriority).mockReturnValue(19);
     const originalPlatform = process.platform;
     Object.defineProperty(process, 'platform', {
       configurable: true,
@@ -127,7 +166,7 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
         '--scope',
         '--slice=happier-jobs.slice',
         `--unit=happier-launch-${LAUNCH_ID}.scope`,
-        '--nice=10',
+        '--nice=19',
         '--expand-environment=no',
         '--',
         'codex',

@@ -1,10 +1,23 @@
+import { ConnectedServiceIdSchema, readConnectedServiceReaderSupport } from "@happier-dev/protocol";
+
 export type SocketClientType = "session-scoped" | "user-scoped" | "machine-scoped";
+
+export const RELEASED_CONNECTED_SERVICE_READER_ROOM = "connected-services-reader:released";
+export const CURRENT_CONNECTED_SERVICE_READER_ROOM = "connected-services-reader:current";
+
+export function getConnectedServiceReaderRoom(raw: unknown): string {
+    const supportedIds = readConnectedServiceReaderSupport(raw);
+    return ConnectedServiceIdSchema.options.every(serviceId => supportedIds.includes(serviceId))
+        ? CURRENT_CONNECTED_SERVICE_READER_ROOM
+        : RELEASED_CONNECTED_SERVICE_READER_ROOM;
+}
 
 export function getSocketRooms(params: {
     userId: string;
     clientType: SocketClientType;
     sessionId?: string | undefined;
     machineId?: string | undefined;
+    connectedServiceIds?: unknown;
 }): string[] {
     if (!params.userId) {
         throw new Error("getSocketRooms: userId is required");
@@ -42,5 +55,8 @@ export function getSocketRooms(params: {
         rooms.push(`machine:${params.machineId}:${params.userId}`);
     }
 
+    // Reader rooms are exclusion cohorts only; emission remains scoped to the
+    // original account/session/machine rooms, preserving participant isolation.
+    rooms.push(getConnectedServiceReaderRoom(params.connectedServiceIds));
     return rooms;
 }

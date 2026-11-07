@@ -122,7 +122,7 @@ export function useSessionAgentActivity(params: Readonly<{
     // P-2: the subagent-source projection, not the full transcript. It is LRU-cached on
     // `subagentSourceVersion`, so a token streaming into an unrelated message does not re-derive it.
     const messages = useSessionSubagentSourceMessages(params.sessionId);
-    const { subagents } = useSessionSubagents({
+    const { subagents, runtimeLostSinceMs } = useSessionSubagents({
         sessionId: params.sessionId,
         session,
         messages,
@@ -146,6 +146,7 @@ export function useSessionAgentActivity(params: Readonly<{
         sessionId: params.sessionId,
         metadata: session?.metadata,
         subagents,
+        runtimeLostSinceMs,
         messages,
         enrichment: NO_SESSION_AGENT_ACTIVITY_ENRICHMENT,
         backgroundTasks,
@@ -167,7 +168,7 @@ export function useSessionAgentActivityRoster(params: Readonly<{
 }>): SessionAgentActivityState {
     const session = useSession(params.sessionId);
     const messages = useSessionSubagentSourceMessages(params.sessionId);
-    const { subagents } = useSessionSubagents({
+    const { subagents, runtimeLostSinceMs } = useSessionSubagents({
         sessionId: params.sessionId,
         session,
         messages,
@@ -191,6 +192,7 @@ export function useSessionAgentActivityRoster(params: Readonly<{
         sessionId: params.sessionId,
         metadata: session?.metadata,
         subagents,
+        runtimeLostSinceMs,
         messages,
         enrichment,
         backgroundTasks,
@@ -200,6 +202,7 @@ export function useSessionAgentActivityRoster(params: Readonly<{
 function useMergedSessionAgentActivity(params: Readonly<{
     sessionId: string;
     metadata: unknown;
+    runtimeLostSinceMs: number | null;
     subagents: readonly SessionSubagent[];
     messages: readonly Message[];
     enrichment: SessionAgentActivityEnrichment;
@@ -234,6 +237,7 @@ function useMergedSessionAgentActivity(params: Readonly<{
         return deriveAgentActivityEntries({
             headline,
             workflowHeadline,
+            runtimeLostSinceMs: params.runtimeLostSinceMs,
             // Background commands join the same list, at the end: they are the least agent-like
             // thing on it, and the section model re-orders by status anyway.
             local: [...local, ...deriveBackgroundTaskActivityEntries({
@@ -250,6 +254,7 @@ function useMergedSessionAgentActivity(params: Readonly<{
         enrichment.lastActivityAtMsById,
         enrichment.pendingPermissionIds,
         headline,
+        params.runtimeLostSinceMs,
         subagents,
         workflowHeadline,
     ]);

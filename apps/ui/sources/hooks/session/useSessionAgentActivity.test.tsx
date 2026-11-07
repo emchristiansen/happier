@@ -1,11 +1,15 @@
 import { act } from 'react-test-renderer';
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
     buildAgentActivityEntryId,
     type SessionAgentActivityEntryV1,
     type SessionAgentActivityHeadlineV1,
 } from '@happier-dev/protocol';
+
+import * as testkit from '@/dev/testkit';
+import { storage } from '@/sync/domains/state/storageStore';
+import { useSessionAgentActivity } from './useSessionAgentActivity';
 
 import { clearSessionTranscriptDerivedCachesForSession } from '@/sync/runtime/sessionTranscriptDerivedCaches';
 
@@ -73,9 +77,6 @@ vi.mock('@/components/sessions/model/useDirectSessionRuntime', () => ({
 const SESSION_ID = 's1';
 const IMPLICIT_RUN_ID = 'implicit:agent-activity';
 
-let testkit: typeof import('@/dev/testkit');
-let storage: typeof import('@/sync/domains/state/storageStore')['storage'];
-let useSessionAgentActivity: typeof import('./useSessionAgentActivity')['useSessionAgentActivity'];
 let previousStorageState: ReturnType<(typeof storage)['getState']> | null = null;
 
 /** An agent named by the CLI, spelled through the protocol builder both sides import. */
@@ -162,12 +163,6 @@ function workEntries<T extends Readonly<{ kind: string }>>(entries: readonly T[]
 }
 
 describe('useSessionAgentActivity', () => {
-    beforeAll(async () => {
-        testkit = await import('@/dev/testkit');
-        ({ storage } = await import('@/sync/domains/state/storageStore'));
-        ({ useSessionAgentActivity } = await import('./useSessionAgentActivity'));
-    }, 300_000);
-
     beforeEach(() => {
         previousStorageState = storage.getState();
     });
@@ -278,6 +273,85 @@ describe('useSessionAgentActivity', () => {
         expect(activity.entries).toHaveLength(2);
         expect(activity.entries.every((row) => row.provenance === 'local')).toBe(true);
         expect(activity.counts).toMatchObject({ total: 2, live: 1 });
+    }, 120_000);
+
+    it('reconciles a loaded roster on presence-only loss without waiting for another message', async () => {
+        seed({ subagents: [{ key: 'alpha', title: 'Audit', status: 'running' }] });
+        const { getCurrent } = await renderActivity();
+        expect(getCurrent().counts.live).toBe(1);
+        await act(async () => {
+            storage.setState((state) => ({
+                ...state,
+                sessions: { ...state.sessions, [SESSION_ID]: {
+                    ...state.sessions[SESSION_ID]!, active: false, presence: 10_000, activeAt: 10_000,
+                } },
+            }));
+            await testkit.flushHookEffects();
+        });
+        expect(getCurrent().entries[0]?.status).toBe('unknown');
+        expect(getCurrent().subagents[0]?.status).toBe('unknown');
+        expect(getCurrent().counts.live).toBe(0);
+    }, 120_000);
+
+    it('preserves the background inventory on read failure and refreshes it after reconnect', async () => {
+        const { apiSocket } = await import('@/sync/api/session/apiSocket');
+        const request = vi.spyOn(apiSocket, 'request');
+        const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const page = (status: 'running' | 'succeeded') => new Response(JSON.stringify({ records: [{
+            id: 'background', sessionId: SESSION_ID, namespace: 'activity', kind: 'background_task.v1',
+            localId: 'activity:background_task:v1:background',
+            content: { t: 'plain', v: { v: 1, taskId: 'background', kind: 'command', status, updatedAt: 1_000 } },
+            createdAt: '2026-10-08T00:00:00.000Z', updatedAt: '2026-10-08T00:00:00.000Z',
+        }], nextCursor: null, hasNext: false }));
+        try {
+            request.mockResolvedValueOnce(page('running'));
+            seed({ subagents: [] });
+            storage.setState((state) => ({ ...state, sessions: { ...state.sessions, [SESSION_ID]: { ...state.sessions[SESSION_ID]!, runtimeActivityRevision: 1 } } }));
+            const { getCurrent } = await renderActivity();
+            await vi.waitFor(() => expect(getCurrent().counts.liveBackgroundTasks).toBe(1));
+            request.mockResolvedValueOnce(new Response(null, { status: 503 }));
+            await act(async () => {
+                storage.setState((state) => ({ ...state, sessions: { ...state.sessions, [SESSION_ID]: { ...state.sessions[SESSION_ID]!, runtimeActivityRevision: 2 } } }));
+                await testkit.flushHookEffects();
+            });
+            await vi.waitFor(() => expect(warning).toHaveBeenCalled());
+            expect(getCurrent().counts.liveBackgroundTasks).toBe(1);
+            request.mockResolvedValueOnce(page('succeeded'));
+            await act(async () => {
+                storage.setState((state) => ({ ...state, socketLastConnectedAt: (state.socketLastConnectedAt ?? 0) + 1 }));
+                await testkit.flushHookEffects();
+            });
+            await vi.waitFor(() => expect(getCurrent().entries[0]?.status).toBe('succeeded'));
+            expect(getCurrent().counts.liveBackgroundTasks).toBe(0);
+        } finally {
+            request.mockRestore();
+            warning.mockRestore();
+        }
+    }, 120_000);
+
+    it("does not show another session's retained background inventory when its read fails", async () => {
+        const { apiSocket } = await import('@/sync/api/session/apiSocket');
+        const { useSessionBackgroundTaskActivity } = await import('./useSessionBackgroundTaskActivity');
+        const request = vi.spyOn(apiSocket, 'request');
+        const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+            request.mockResolvedValueOnce(new Response(JSON.stringify({ records: [{
+                id: 'background', sessionId: SESSION_ID, namespace: 'activity', kind: 'background_task.v1',
+                localId: 'activity:background_task:v1:background',
+                content: { t: 'plain', v: { v: 1, taskId: 'background', kind: 'command', status: 'running', updatedAt: 1_000 } },
+                createdAt: '2026-10-08T00:00:00.000Z', updatedAt: '2026-10-08T00:00:00.000Z',
+            }], nextCursor: null, hasNext: false })));
+            const hook = await testkit.renderHook(({ sessionId }: { sessionId: string }) =>
+                useSessionBackgroundTaskActivity({ sessionId }), { initialProps: { sessionId: SESSION_ID } });
+            await vi.waitFor(() => expect(hook.getCurrent().records).toHaveLength(1));
+            request.mockResolvedValueOnce(new Response(null, { status: 503 }));
+            await hook.rerender({ sessionId: 'other-session' });
+            await vi.waitFor(() => expect(warning).toHaveBeenCalled());
+            expect(hook.getCurrent().records).toEqual([]);
+        } finally {
+            request.mockRestore();
+            warning.mockRestore();
+        }
     }, 120_000);
 
     // INV-3. The tempting wrong implementation is the repo's own "preserve last-known-good" habit:

@@ -37,10 +37,6 @@ vi.mock('@/backends/catalog', () => ({
     },
     kimi: {
       getAcpBackendFactory: vi.fn(),
-      resolveModelsProbeVariant: ({ accountSettings }: { accountSettings?: Record<string, unknown> | null }) =>
-        `kimi:${typeof accountSettings?.kimiAcpPythonSelector === 'string' ? accountSettings.kimiAcpPythonSelector : 'auto'}`,
-      resolveModelsProbeBackendOptions: ({ accountSettings }: { accountSettings?: Record<string, unknown> | null }) =>
-        accountSettings?.kimiAcpPythonSelector === 'poll' ? { kimiAcpPythonSelector: 'poll' } : {},
     },
   },
 }));
@@ -105,51 +101,6 @@ describe('probeAgentModelsBestEffort (static-only providers)', () => {
       permissionMode: 'default',
     }));
     expect(dispose).toHaveBeenCalled();
-  });
-
-  it('passes Kimi selector settings to ACP model probing and partitions the probe cache by selector', async () => {
-    validateCatalogAcpProbeSpawnMock.mockResolvedValue({ ok: true });
-    createCatalogAcpBackendMock.mockImplementation(async (_agentId: string, opts: Record<string, unknown>) => ({
-      backend: {
-        startSession: async () => ({ sessionId: 'kimi-probe-session' }),
-        getSessionModelState: () => ({
-          availableModels: [
-            opts.kimiAcpPythonSelector === 'poll'
-              ? { id: 'poll-model', name: 'Poll model' }
-              : { id: 'auto-model', name: 'Auto model' },
-          ],
-        }),
-        getSessionConfigOptionsState: () => null,
-        dispose: vi.fn(async () => undefined),
-      },
-    }));
-
-    const poll = await probeAgentModelsBestEffort({
-      agentId: 'kimi',
-      cwd: process.cwd(),
-      timeoutMs: 100,
-      accountSettings: { kimiAcpPythonSelector: 'poll' },
-    });
-    expect(poll.availableModels).toEqual([
-      { id: 'default', name: 'Default' },
-      { id: 'poll-model', name: 'Poll model' },
-    ]);
-
-    const auto = await probeAgentModelsBestEffort({
-      agentId: 'kimi',
-      cwd: process.cwd(),
-      timeoutMs: 100,
-      accountSettings: { kimiAcpPythonSelector: 'auto' },
-    });
-    expect(auto.availableModels).toEqual([
-      { id: 'default', name: 'Default' },
-      { id: 'auto-model', name: 'Auto model' },
-    ]);
-
-    expect(createCatalogAcpBackendMock).toHaveBeenNthCalledWith(1, 'kimi', expect.objectContaining({
-      kimiAcpPythonSelector: 'poll',
-    }));
-    expect(createCatalogAcpBackendMock).toHaveBeenCalledTimes(2);
   });
 
   it('falls back to curated static Claude model labels when dynamic probing is unavailable', async () => {

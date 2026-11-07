@@ -7,6 +7,7 @@ export function resolveConnectedServiceOauthErrorMessage(
   if (!(error instanceof Error)) return fallbackMessage;
   const code = error.message.trim();
   if (!code) return fallbackMessage;
+  if (code === 'connect_service_unsupported') return t('connectedServices.detail.errors.serviceUnsupportedServer');
 
   if (code === 'connect_oauth_state_mismatch') return t('errors.oauthStateMismatch');
   if (code === 'connect_oauth_timeout') return t('errors.connectionTimeout');

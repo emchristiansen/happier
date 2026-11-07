@@ -13,8 +13,6 @@ import { ScrollEdgeFades } from './ScrollEdgeFades';
 import { ScrollEdgeIndicators } from './ScrollEdgeIndicators';
 import { useScrollEdgeFades } from './useScrollEdgeFades';
 
-const HORIZONTAL_SCROLL_END_GUTTER_WIDTH = 24;
-
 const ScrollViewWithWheel = ScrollView as unknown as React.ComponentType<
     React.ComponentPropsWithRef<typeof ScrollView> & {
         onWheel?: any;
@@ -60,10 +58,7 @@ export function HorizontalScrollableRow(props: HorizontalScrollableRowProps) {
             nativeEvent: { layout: { x: 0, y: 0, width: clientWidth, height: clientHeight ?? 0 } },
         } as unknown as LayoutChangeEvent;
         fades.onViewportLayout(layoutEvent);
-        fades.onContentSizeChange(
-            Math.max(0, scrollWidth - HORIZONTAL_SCROLL_END_GUTTER_WIDTH),
-            clientHeight ?? 0,
-        );
+        fades.onContentSizeChange(scrollWidth, clientHeight ?? 0);
     }, [fades, getScrollNode]);
 
     const reportWebScroll = React.useCallback((nodeOverride?: any) => {
@@ -83,7 +78,7 @@ export function HorizontalScrollableRow(props: HorizontalScrollableRowProps) {
                 contentOffset: { x: scrollLeft, y: 0 },
                 layoutMeasurement: { width: clientWidth, height: clientHeight },
                 contentSize: {
-                    width: Math.max(0, scrollWidth - HORIZONTAL_SCROLL_END_GUTTER_WIDTH),
+                    width: scrollWidth,
                     height: clientHeight,
                 },
                 zoomScale: 1,
@@ -152,6 +147,7 @@ export function HorizontalScrollableRow(props: HorizontalScrollableRowProps) {
                 alwaysBounceHorizontal={false}
                 directionalLockEnabled
                 keyboardShouldPersistTaps="handled"
+                contentContainerStyle={props.contentStyle}
                 onWheel={(event: any) => {
                     if (Platform.OS !== 'web') return;
                     const node = getScrollNode() as any;
@@ -167,10 +163,7 @@ export function HorizontalScrollableRow(props: HorizontalScrollableRowProps) {
                 }}
                 onLayout={fades.onViewportLayout}
                 onContentSizeChange={(width: number, height: number) => {
-                    fades.onContentSizeChange(
-                        Math.max(0, width - HORIZONTAL_SCROLL_END_GUTTER_WIDTH),
-                        height,
-                    );
+                    fades.onContentSizeChange(width, height);
                 }}
                 onScroll={(event: any) => {
                     if (Platform.OS === 'web') {
@@ -193,22 +186,22 @@ export function HorizontalScrollableRow(props: HorizontalScrollableRowProps) {
                             ...nativeEvent,
                             contentSize: {
                                 ...nativeEvent.contentSize,
-                                width: Math.max(0, contentSizeWidth - HORIZONTAL_SCROLL_END_GUTTER_WIDTH),
+                                width: contentSizeWidth,
                             },
                         },
                     });
                 }}
                 scrollEventThrottle={16}
             >
-                <View testID={props.contentTestID} style={props.contentStyle}>
-                    {props.children}
-                </View>
-                <View
-                    testID={props.testID ? `${props.testID}-end-gutter` : undefined}
-                    pointerEvents="none"
-                    accessible={false}
-                    style={{ width: HORIZONTAL_SCROLL_END_GUTTER_WIDTH, flexShrink: 0 }}
-                />
+                {props.contentTestID ? (
+                    <View
+                        testID={props.contentTestID}
+                        pointerEvents="none"
+                        accessible={false}
+                        style={{ position: 'absolute', width: 0, height: 0 }}
+                    />
+                ) : null}
+                {props.children}
             </ScrollViewWithWheel>
             <ScrollEdgeFades
                 color={props.fadeColor}

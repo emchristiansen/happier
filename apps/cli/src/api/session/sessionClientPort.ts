@@ -2,6 +2,7 @@ import type { RpcHandlerManagerLike } from '@/api/rpc/types';
 import type { RawJSONLines } from '@/backends/claude/types';
 import type { ACPMessageData, ACPProvider, SessionEventMessage } from './sessionMessageTypes';
 import type { AgentState, Metadata } from '../types';
+import type { AgentStateWriteOptions } from './sessionWritesBestEffort';
 import type { TurnAssistantTextSnapshot } from './turnAssistantTextSnapshot';
 import type { CommittedUserMessageSeqWaitOptions } from './committedUserMessageSeqTracker';
 import type { SessionTurnLifecycleController } from '@/agent/runtime/session/turn/types';
@@ -29,6 +30,7 @@ import type {
   SessionSystemRecordKind,
   SessionSystemRecordNamespace,
   SessionSystemRecordUpsertRequest,
+  SessionTurnsProjectionV1,
 } from '@happier-dev/protocol';
 import type { EphemeralSendResult } from './ephemeralSendOutcome';
 import type { RuntimeActivitySnapshotTail } from './mutations/createSessionMutationOutbox';
@@ -84,6 +86,7 @@ export type SessionUserMessageDeliveryInfo = Readonly<{
   seq: number | null;
   providerAcceptancePending?: boolean | undefined;
   pendingProviderAction?: PendingProviderAction | undefined;
+  pendingRequestedAction?: PendingRequestedActionV1 | undefined;
 }>;
 
 export type BoundCodexSteerDelivery = Readonly<{
@@ -97,6 +100,7 @@ export type BoundCodexSteerDelivery = Readonly<{
 
 export interface SessionClientPort {
   sessionId: string;
+  updateAgentStateRequestSettlement(updater: (state: AgentState) => AgentState): Promise<void>;
   rpcHandlerManager: RpcHandlerManagerLike;
   getOrCreatePermissionRpcRouter?(): SessionPermissionRpcRouter;
 
@@ -128,8 +132,9 @@ export interface SessionClientPort {
   hasActiveCanonicalTurn?(): boolean;
   fetchCommittedClaudeJsonlMessageBaseline?(opts?: { take?: number }): Promise<import('@/backends/claude/utils/claudeJsonlMessageKey').CommittedClaudeJsonlMessageBaseline>;
   fetchRecentTranscriptTextItemsForAcpImport?(opts?: { take?: number }): Promise<Array<{ role: 'user' | 'agent'; text: string }>>;
+  fetchCommittedTranscriptIdentitySnapshot?(): Promise<import('./transcriptQueries').CommittedTranscriptIdentitySnapshot>;
   sendAgentMessage(provider: ACPProvider, body: ACPMessageData, opts?: { localId?: string; meta?: Record<string, unknown> }): void;
-  sendAgentMessageCommitted(provider: ACPProvider, body: ACPMessageData, opts: { localId: string; meta?: Record<string, unknown> }): Promise<void>;
+  sendAgentMessageCommitted(provider: ACPProvider, body: ACPMessageData, opts: { localId: string; meta?: Record<string, unknown>; provenance?: SessionTranscriptObservationProvenanceV1 }): Promise<void>;
   sendAgentMessageEphemeral?(
     provider: ACPProvider,
     body: ACPMessageData,
@@ -143,7 +148,7 @@ export interface SessionClientPort {
   getEphemeralStreamConnectionEpoch?(): number;
 
   updateMetadata(updater: (metadata: Metadata) => Metadata): void | Promise<void>;
-  updateAgentState(updater: (state: AgentState) => AgentState): void | Promise<void>;
+  updateAgentState(updater: (state: AgentState) => AgentState, options?: AgentStateWriteOptions): void | Promise<void>;
   /** Phase-5 transport seam; absent until a client owns a real journal-backed snapshot handle. */
   getRuntimeActivitySnapshotPublisher?(): SessionRuntimeActivitySnapshotPublisher | null;
   readRuntimeActivitySnapshotTail?(): RuntimeActivitySnapshotTail;
@@ -167,6 +172,7 @@ export interface SessionClientPort {
     ctx?: SessionEncryptionContext;
   }>;
   getAgentStateSnapshot?(): AgentState | null;
+  readSessionTurnsProjection?(): Promise<SessionTurnsProjectionV1 | null>;
   sessionTurnLifecycle?: SessionTurnLifecycleController;
 
   keepAlive(thinking: boolean, mode: 'local' | 'remote'): void;

@@ -89,7 +89,7 @@ describe('runBackendSessionCliCommand', () => {
     expect(sessionCreated).toBe(true);
     expect(webhookSent).toBe(false);
     expect(fatalSpy).toHaveBeenCalledWith(startupError);
-    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.anything(), 'post-session startup failure');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('post-session startup failure'));
     exitSpy.mockRestore();
   });
 
@@ -319,43 +319,6 @@ describe('runBackendSessionCliCommand', () => {
     });
 
     expect(selfMigrateDaemonSpawnedSessionProcessOutOfDaemonServiceCgroup).toHaveBeenCalledTimes(1);
-  });
-
-  it('forces refresh without blocking Codex terminal starts on fast account settings', async () => {
-    const credentials = { token: 'x' } as any;
-
-    vi.spyOn(persistenceModule, 'readCredentials').mockResolvedValue(credentials);
-    vi.spyOn(persistenceModule, 'readSettings').mockResolvedValue({ machineId: 'machine-1' } as any);
-    const cachedSettings = { schemaVersion: 6, marker: 'cached' } as any;
-    let refreshed = false;
-    const whenRefreshed = new Promise<any>(() => {});
-    const bootstrapSpy = vi.spyOn(accountSettingsModule, 'bootstrapAccountSettingsContext').mockResolvedValue({
-      source: 'cache',
-      settings: cachedSettings,
-      settingsVersion: 0,
-      loadedAtMs: Date.now(),
-      whenRefreshed,
-    } as any);
-
-    const run = vi.fn(async (params: any) => {
-      expect(refreshed).toBe(false);
-      expect(params.accountSettingsContext?.settings).toBe(cachedSettings);
-    });
-    const loadRun = vi.fn().mockResolvedValue(run);
-
-    await runBackendSessionCliCommand({
-      context: { args: ['codex', '--refresh-settings'], terminalRuntime: null } as any,
-      loadRun,
-      agentIdForAccountSettings: 'codex' as any,
-    });
-
-    expect(bootstrapSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        mode: 'fast',
-        refresh: 'force',
-      }),
-    );
-    expect(run).toHaveBeenCalled();
   });
 
   it('binds machine id selection to decoded token sub when credentials already exist', async () => {

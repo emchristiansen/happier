@@ -23,6 +23,7 @@ describe('agent model config', () => {
 
   it('keeps the flagship Claude default pointing at a real catalog model', () => {
     const claudeModels = getAgentStaticModels('claude');
+    expect(CURRENT_FLAGSHIP_CLAUDE_MODEL_ID).toBe('claude-opus-5-5');
     expect(claudeModels.some((model) => model.id === CURRENT_FLAGSHIP_CLAUDE_MODEL_ID)).toBe(true);
   });
 
@@ -32,6 +33,27 @@ describe('agent model config', () => {
     const claudeModels = getAgentStaticModels('claude');
     const geminiModels = getAgentStaticModels('gemini');
 
+    expect(claude.staticModels?.slice(0, 2)).toMatchObject([
+      { id: 'claude-opus-5-5', name: 'Opus 5.5', contextWindowTokens: 1_000_000 },
+      { id: 'claude-fable-5-1', name: 'Fable 5.1', contextWindowTokens: 1_000_000 },
+    ]);
+
+    expect(claude.staticModels?.find((model) => model.id === 'claude-sonnet-5-5')).toMatchObject({
+      id: 'claude-sonnet-5-5',
+      name: 'Sonnet 5.5',
+      description: expect.any(String),
+      contextWindowTokens: 1_000_000,
+      modelOptions: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'reasoning_effort',
+          currentValue: 'high',
+          options: expect.arrayContaining([
+            expect.objectContaining({ value: 'xhigh' }),
+            expect.objectContaining({ value: 'max' }),
+          ]),
+        }),
+      ]),
+    });
     expect(claude.staticModels?.find((model) => model.id === 'claude-sonnet-5')).toMatchObject({
       id: 'claude-sonnet-5',
       name: 'Sonnet 5',
@@ -133,7 +155,7 @@ describe('agent model config', () => {
     const optionIdsFor = (modelId: string): string[] =>
       claudeModels.find((model) => model.id === modelId)?.modelOptions?.map((option) => option.id) ?? [];
 
-    for (const modelId of ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7']) {
+    for (const modelId of ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7']) {
       expect(optionIdsFor(modelId)).toContain('ultracode');
       const ultracode = claudeModels
         .find((model) => model.id === modelId)?.modelOptions?.find((option) => option.id === 'ultracode');
@@ -159,6 +181,9 @@ describe('agent model config', () => {
     expect(variantFor('claude-opus-4-6')).toBe('claude-opus-4-6[1m]');
     // Always-1M on the API: no opt-in toggle surfaced.
     expect(variantFor('claude-opus-5')).toBeUndefined();
+    expect(variantFor('claude-opus-5-5')).toBeUndefined();
+    expect(variantFor('claude-fable-5-1')).toBeUndefined();
+    expect(variantFor('claude-sonnet-5-5')).toBeUndefined();
     expect(variantFor('claude-sonnet-5')).toBeUndefined();
     expect(variantFor('claude-fable-5')).toBeUndefined();
     expect(variantFor('claude-opus-4-8')).toBeUndefined();
@@ -208,12 +233,35 @@ describe('agent model config', () => {
     const kimi = getAgentModelConfig('kimi');
     expect(kimi).toMatchObject({
       supportsSelection: true,
+      supportsFreeform: false,
+      nonAcpApplyScope: 'next_prompt',
+      acpApplyBehavior: 'set_model',
+      acpModelConfigOptionId: 'model',
+      acpModelSetMethod: 'config_option',
+      dynamicProbe: 'auto',
+      defaultMode: 'default',
+      allowedModes: ['default'],
+    });
+  });
+
+  it('treats Qwen models as dynamically probed ACP controls', () => {
+    expect(getAgentModelConfig('qwen')).toMatchObject({
+      supportsSelection: true,
+      supportsFreeform: false,
       nonAcpApplyScope: 'next_prompt',
       acpModelConfigOptionId: 'model',
       dynamicProbe: 'auto',
       defaultMode: 'default',
       allowedModes: ['default'],
     });
-    expect(kimi.supportsFreeform).not.toBe(true);
+  });
+
+  it('restricts Kilo model selection to its advertised ACP catalog', () => {
+    expect(getAgentModelConfig('kilo')).toMatchObject({
+      supportsSelection: true,
+      supportsFreeform: false,
+      acpModelConfigOptionId: 'model',
+      dynamicProbe: 'auto',
+    });
   });
 });

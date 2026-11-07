@@ -163,6 +163,29 @@ describe('sessionRunnerRespawnDescriptor', () => {
     });
   });
 
+  it('round-trips Herdr terminal placement through the respawn descriptor', () => {
+    const options = {
+      directory: '/tmp/repo',
+      backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      terminal: { mode: 'herdr', herdr: { sessionName: 'work' } },
+    } satisfies SpawnSessionOptions;
+
+    const descriptor = buildSessionRunnerRespawnDescriptorV1FromSpawnOptions(options);
+    expect(descriptor?.terminal).toEqual(options.terminal);
+    expect(buildSpawnSessionOptionsFromRespawnDescriptorV1(descriptor!).terminal).toEqual(options.terminal);
+  });
+
+  it('round-trips Zellij terminal placement through the same descriptor', () => {
+    const options = {
+      directory: '/tmp/repo',
+      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+      terminal: { mode: 'zellij' },
+    } satisfies SpawnSessionOptions;
+    const descriptor = buildSessionRunnerRespawnDescriptorV1FromSpawnOptions(options);
+    expect(descriptor?.terminal).toEqual(options.terminal);
+    expect(buildSpawnSessionOptionsFromRespawnDescriptorV1(descriptor!).terminal).toEqual(options.terminal);
+  });
+
   it('tolerates newer persisted respawn fields while preserving known ones', () => {
     const parsed = SessionRunnerRespawnDescriptorV1Schema.safeParse({
       version: 1,
@@ -405,10 +428,10 @@ describe('sessionRunnerRespawnDescriptor', () => {
   });
 
   it('persists only safe runtime locator environment variables in the respawn descriptor while keeping connected-services bindings', () => {
-    const credentials: Credentials = {
+    const credentials = {
       token: 't',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     const descriptor = buildSessionRunnerRespawnDescriptorV1FromSpawnOptions({
       directory: '/tmp/repo',
       backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
@@ -416,6 +439,7 @@ describe('sessionRunnerRespawnDescriptor', () => {
         CLAUDE_CONFIG_DIR: '/tmp/claude-config',
         CODEX_HOME: '/tmp/codex-home',
         CODEX_SQLITE_HOME: '/tmp/codex-sqlite-home',
+        HAPPIER_CODEX_APP_SERVER_TRANSPORT: 'daemonProxy',
         OPENAI_API_KEY: 'test-key',
         ANTHROPIC_AUTH_TOKEN: 'test-token',
       },
@@ -478,6 +502,7 @@ describe('sessionRunnerRespawnDescriptor', () => {
       },
       approvedNewDirectoryCreation: true,
     });
+    expect(restored.environmentVariables).not.toHaveProperty('HAPPIER_CODEX_APP_SERVER_TRANSPORT');
   });
 
   it('builds tracked respawn environment variables from expanded env plus safe child runtime locators only', () => {

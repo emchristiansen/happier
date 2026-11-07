@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { TransportDisconnectEvent } from '@happier-dev/connection-supervisor';
 import axios from 'axios';
+import { ConnectedServiceIdSchema } from '@happier-dev/protocol';
 import { bindApiSessionSocketMock, createApiSessionSocketStub } from '@/testkit/backends/apiSessionSocketHarness';
 
 const { mockIo } = vi.hoisted(() => ({
@@ -42,6 +43,7 @@ describe('createSessionSocketTransport', () => {
         const runnerPublisherIncarnationId = getRunnerPublisherIncarnationId();
         expect(opts.auth).toMatchObject({ publisherIncarnationId: runnerPublisherIncarnationId });
         expect(runnerPublisherIncarnationId).toMatch(/^[0-9a-f-]{36}$/);
+        expect(opts.auth).toMatchObject({ connectedServiceIds: ConnectedServiceIdSchema.options });
 
         const connectedListener = vi.fn();
         const disconnectedListener = vi.fn<(event: TransportDisconnectEvent) => void>();

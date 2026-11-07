@@ -15,10 +15,12 @@
  *     the types are real rather than regex-guessed.
  *   - `apps/ui/sources/agents/providers/<id>/core.ts` owns whether the app
  *     presents the agent as Stable or Experimental, which is a product decision
- *     the client makes and the shared package does not model. That one field is
- *     read from source, and `collectStability` throws if any agent is missing,
- *     so a shape change fails loudly here instead of silently publishing a
- *     wrong status column.
+ *     the client makes and the shared package does not model. It also owns each
+ *     agent's `displayNameKey`, which resolves through the client's `en.ts` to
+ *     the name the AI backends list actually renders. Both are read from source,
+ *     and `collectStability` / `collectDisplayNames` throw if any agent is
+ *     missing, so a shape change fails loudly here instead of silently
+ *     publishing a wrong status column or a raw agent id.
  *
  * Regenerate with `yarn --cwd apps/docs generate:reference`. The drift test in
  * `generateAgentReference.test.mjs` fails the build if the published page and
@@ -34,28 +36,13 @@ const UI_PROVIDERS = join(REPO, 'apps', 'ui', 'sources', 'agents', 'providers');
 const UI_PLUGIN_BUNDLE = join(
   REPO, 'apps', 'ui', 'sources', 'agents', 'registry', 'generatedBundledPluginEntries.ts',
 );
+const UI_TRANSLATIONS = join(
+  REPO, 'apps', 'ui', 'sources', 'text', 'translations', 'en.ts',
+);
 export const OUTPUT_PATH = join(HERE, '..', 'content', 'docs', 'agents', 'capabilities.mdx');
 
 const AGENTS_DIST = join(REPO, 'packages', 'agents', 'dist', 'index.js');
 const CLI_RUNTIME_DIST = join(REPO, 'packages', 'agents', 'dist', 'providers', 'providerCliRuntime.js');
-
-/** Display names as the app renders them in the AI backends list. */
-const DISPLAY_NAMES = {
-  claude: 'Claude',
-  codex: 'Codex',
-  opencode: 'OpenCode',
-  gemini: 'Gemini',
-  auggie: 'Auggie',
-  qwen: 'Qwen Code',
-  kimi: 'Kimi',
-  kilo: 'Kilo',
-  kiro: 'Kiro',
-  customAcp: 'Custom ACP',
-  pi: 'Pi',
-  copilot: 'Copilot',
-  cursor: 'Cursor',
-  grok: 'Grok',
-};
 
 /**
  * Read `availability.experimental` for every agent, or fail.
@@ -119,6 +106,217 @@ function readBundledStability(bundlePath) {
   return out;
 }
 
+/**
+ * Read the name the app renders for every agent, or fail.
+ *
+ * This used to be a hand-written map in this file, which is the one thing a
+ * generator must never carry: it drifted the moment three agents shipped, and
+ * the published page rendered `agy`, `fx` and `droid` as bare ids while the app
+ * showed Antigravity, FX and Factory Droid. The name is a product decision the client
+ * owns, so it is read where the client owns it — `displayNameKey` on the agent's
+ * core config, resolved through the client's English translations.
+ */
+export function collectDisplayNames({
+  providersDir = UI_PROVIDERS,
+  bundlePath = UI_PLUGIN_BUNDLE,
+  translationsPath = UI_TRANSLATIONS,
+  agentIds,
+} = {}) {
+  const bundled = readBundledDisplayNameKeys(bundlePath);
+  let translations;
+  try {
+    translations = readFileSync(translationsPath, 'utf8');
+  } catch {
+    throw new Error(`Could not read agent display names: ${translationsPath} is missing.`);
+  }
+
+  const names = {};
+  const missing = [];
+  for (const id of agentIds) {
+    const key = readAgentDirDisplayNameKey(providersDir, id) ?? bundled[id] ?? null;
+    const value = key === null ? null : readTranslationString(translations, key);
+    if (value === null) missing.push(key === null ? id : `${id} (${key})`);
+    else names[id] = value;
+  }
+  if (missing.length) {
+    throw new Error(
+      `Could not resolve a display name for: ${missing.join(', ')}. ` +
+        `Looked for displayNameKey in ${providersDir} and ${bundlePath}, and for its value in ${translationsPath}.`,
+    );
+  }
+  return names;
+}
+
+function readAgentDirDisplayNameKey(providersDir, id) {
+  let source;
+  try {
+    source = readFileSync(join(providersDir, id, 'core.ts'), 'utf8');
+  } catch {
+    return null;
+  }
+  const match = source.match(/displayNameKey:\s*'([^']+)'/);
+  return match ? match[1] : null;
+}
+
+/** `id: 'claude', … displayNameKey: 'agentInput.agent.claude'` within one bundle. */
+function readBundledDisplayNameKeys(bundlePath) {
+  let source;
+  try {
+    source = readFileSync(bundlePath, 'utf8');
+  } catch {
+    return {};
+  }
+  const out = {};
+  for (const match of source.matchAll(
+    /id:\s*'([a-zA-Z]+)'[\s\S]{0,600}?displayNameKey:\s*'([^']+)'/g,
+  )) {
+    out[match[1]] = match[2];
+  }
+  return out;
+}
+
+/**
+ * Resolve one dotted key out of the client's `en.ts`.
+ *
+ * `checkContent.mjs` reads that file line by line because it only needs the set
+ * of shipped values; a key lookup needs the structure, since the same leaf name
+ * lives under a dozen parents. So this walks the object, skipping comments,
+ * strings and template expressions — a brace or an apostrophe inside copy must
+ * not desynchronise the walk, which is exactly how the naive version of this
+ * loses the rest of the file.
+ */
+function readTranslationString(source, dottedKey) {
+  // The locale file is one root object plus a handful of `const …Extension` objects spread into
+  // it, so a key can live in either. Try each root and take the first that resolves the whole path.
+  for (const root of rootObjectBodies(source)) {
+    const value = resolveTranslationInRange(source, root, dottedKey);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function* rootObjectBodies(source) {
+  const declaration = /(?:^|\n)(?:export\s+)?const\s+[A-Za-z0-9_$]+\s*(?::[^=\n]*)?=\s*\{/g;
+  let match = declaration.exec(source);
+  while (match !== null) {
+    const body = objectBody(source, source.indexOf('{', match.index + match[0].length - 1));
+    if (body !== null) yield body;
+    match = declaration.exec(source);
+  }
+}
+
+function resolveTranslationInRange(source, range, dottedKey) {
+  const segments = dottedKey.split('.');
+  let from = range.start;
+  let to = range.end;
+  for (let i = 0; i < segments.length; i += 1) {
+    const valueAt = findPropertyValue(source, from, to, segments[i]);
+    if (valueAt === null) return null;
+    if (i === segments.length - 1) return readStringLiteral(source, valueAt);
+    if (source[valueAt] !== '{') return null;
+    const body = objectBody(source, valueAt);
+    if (body === null) return null;
+    from = body.start;
+    to = body.end;
+  }
+  return null;
+}
+
+const IDENTIFIER = /[A-Za-z0-9_$]/;
+
+function endOfString(source, at) {
+  const quote = source[at];
+  let i = at + 1;
+  while (i < source.length) {
+    const ch = source[i];
+    if (ch === '\\') { i += 2; continue; }
+    if (ch === quote) return i + 1;
+    if (quote === '`' && ch === '$' && source[i + 1] === '{') {
+      i = endOfBraces(source, i + 1);
+      continue;
+    }
+    i += 1;
+  }
+  return source.length;
+}
+
+/** Index just past the `}` that closes the `{` at `at`, strings and nesting aware. */
+function endOfBraces(source, at) {
+  let depth = 0;
+  let i = at;
+  while (i < source.length) {
+    const ch = source[i];
+    if (ch === '"' || ch === "'" || ch === '`') { i = endOfString(source, i); continue; }
+    if (ch === '{') { depth += 1; i += 1; continue; }
+    if (ch === '}') { depth -= 1; i += 1; if (depth === 0) return i; continue; }
+    i += 1;
+  }
+  return source.length;
+}
+
+function objectBody(source, at) {
+  const end = endOfBraces(source, at);
+  if (end > source.length) return null;
+  return { start: at + 1, end: end - 1 };
+}
+
+/** Index of the value of `name` declared directly (not nested) inside `[from, to)`. */
+function findPropertyValue(source, from, to, name) {
+  let depth = 0;
+  let i = from;
+  while (i < to) {
+    const ch = source[i];
+    if (ch === '/' && source[i + 1] === '/') {
+      const newline = source.indexOf('\n', i);
+      i = newline === -1 ? to : newline + 1;
+      continue;
+    }
+    if (ch === '/' && source[i + 1] === '*') {
+      const close = source.indexOf('*/', i);
+      i = close === -1 ? to : close + 2;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { i = endOfString(source, i); continue; }
+    if (ch === '{' || ch === '(' || ch === '[') { depth += 1; i += 1; continue; }
+    if (ch === '}' || ch === ')' || ch === ']') {
+      depth -= 1;
+      i += 1;
+      if (depth < 0) return null;
+      continue;
+    }
+    if (IDENTIFIER.test(ch)) {
+      let end = i;
+      while (end < to && IDENTIFIER.test(source[end])) end += 1;
+      if (depth === 0 && source.slice(i, end) === name) {
+        let colon = end;
+        while (colon < to && /\s/.test(source[colon])) colon += 1;
+        if (source[colon] === ':') {
+          let value = colon + 1;
+          while (value < to && /\s/.test(source[value])) value += 1;
+          return value;
+        }
+      }
+      i = end;
+      continue;
+    }
+    i += 1;
+  }
+  return null;
+}
+
+function readStringLiteral(source, at) {
+  const quote = source[at];
+  if (quote !== '"' && quote !== "'" && quote !== '`') return null;
+  const raw = source.slice(at + 1, endOfString(source, at) - 1);
+  if (quote === '`' && raw.includes('${')) return null;
+  return raw.replace(/\\(u[0-9a-fA-F]{4}|.)/g, (match, escape) => {
+    if (escape[0] === 'u') return String.fromCharCode(parseInt(escape.slice(1), 16));
+    if (escape === 'n') return '\n';
+    if (escape === 't') return '\t';
+    return escape;
+  });
+}
+
 const YES = 'Yes';
 const NO = '—';
 
@@ -134,10 +332,8 @@ function supported(value) {
  *
  * This replaced a bare "Plan mode: yes/no" column, which was actively
  * misleading. `supportsPlanMode` is derived from `semantics === 'agent-modes'`
- * and describes whether Happier offers Claude's *dedicated* plan-mode control —
- * not whether the agent has a plan mode at all. Codex's modes arrive over ACP
- * and really can include `plan`; rendering that as a dash told readers the
- * opposite of the truth.
+ * and cannot establish whether a negotiated ACP catalog contains `plan`.
+ * Both agent modes and policy presets can expose it through the Mode control.
  */
 function sessionModesCell(descriptor) {
   if (!descriptor || descriptor.source === 'none') return NO;
@@ -170,6 +366,11 @@ function authCell(probe) {
   return bits.length ? bits.join(' or ') : 'Agent-managed';
 }
 
+export function toolsCell(tools) {
+  if (!tools || tools.support === 'unsupported' || tools.delivery === 'unsupported') return NO;
+  return `${supported(tools.support)} (\`${tools.delivery}\`)`;
+}
+
 function table(headers, rows) {
   const head = `| ${headers.join(' | ')} |`;
   const rule = `| ${headers.map(() => '---').join(' | ')} |`;
@@ -181,13 +382,15 @@ export async function renderAgentReferenceMarkdown({
   cliRuntimeModulePath = CLI_RUNTIME_DIST,
   providersDir = UI_PROVIDERS,
   bundlePath = UI_PLUGIN_BUNDLE,
+  translationsPath = UI_TRANSLATIONS,
 } = {}) {
   const agents = await import(`file://${agentsModulePath}`);
   const cliRuntime = await import(`file://${cliRuntimeModulePath}`);
   const ids = [...agents.AGENT_IDS];
   const stability = collectStability({ providersDir, bundlePath, agentIds: ids });
+  const displayNames = collectDisplayNames({ providersDir, bundlePath, translationsPath, agentIds: ids });
 
-  const name = (id) => DISPLAY_NAMES[id] ?? id;
+  const name = (id) => displayNames[id];
   const core = (id) => agents.AGENTS_CORE[id];
 
   const overview = table(
@@ -202,7 +405,7 @@ export async function renderAgentReferenceMarkdown({
   );
 
   const sessions = table(
-    ['Agent', 'Resume its own sessions', 'Fork a conversation', 'Fork from a message', 'Roll back', 'Declares session listing'],
+    ['Agent', 'Resume by agent session ID', 'Fork a conversation', 'Fork from a message', 'Roll back', 'Browse resume candidates'],
     ids.map((id) => {
       const c = core(id).sessionCapabilities;
       return [
@@ -220,11 +423,12 @@ export async function renderAgentReferenceMarkdown({
     ['Agent', 'Steer a running turn', 'Session modes', 'Dedicated plan control', 'Accept edits'],
     ids.map((id) => {
       const advanced = agents.getAgentAdvancedModeCapabilities(id);
+      const descriptor = agents.getAgentSessionModeDescriptor(id);
       return [
         `**${name(id)}**`,
         supported(core(id).runtimeInput?.inFlightSteerSupported),
-        sessionModesCell(agents.getAgentSessionModeDescriptor(id)),
-        supported(advanced.supportsPlanMode),
+        sessionModesCell(descriptor),
+        descriptor.source === 'acp' ? 'Runtime-dependent' : supported(advanced.supportsPlanMode),
         supported(advanced.supportsAcceptEdits),
       ];
     }),
@@ -241,7 +445,7 @@ export async function renderAgentReferenceMarkdown({
         supported(m.emitsSessionMedia),
         supported(m.acceptsImageInput),
         supported(m.nativeImageGeneration),
-        t?.support === 'supported' ? `Yes (\`${t.delivery}\`)` : NO,
+        toolsCell(t),
         cs.length ? cs.map((s) => `\`${s}\``).join(', ') : NO,
       ];
     }),
@@ -304,16 +508,22 @@ work everywhere. They do not.
 
 ${sessions}
 
-"Resume its own sessions" means Happier can reattach to a conversation the agent
-started outside Happier. "Fork" means the agent's own runtime can branch a
+"Resume by agent session ID" means Happier can pass a saved agent-owned ID back
+to that agent. It does not establish that the interactive terminal and ACP use
+the same session IDs. "Fork" means the agent's own runtime can branch a
 conversation; where it cannot, Happier's replay fork still works, because that
 is Happier's own mechanism rather than the agent's. See
 [Session forking](/sessions/session-forking).
 
-The last column is a declaration rather than a gate — nothing currently reads
-it, so it does not decide whether you can browse an agent's own sessions. What
-you can actually browse and import is described in
-[Continuing a session](/sessions/continuing-a-session).
+The last column means Happier offers a browser for the agent's resume
+candidates. FX and Kimi use the shared ACP \`session/list\` source; agents with
+dedicated session integrations use their own established sources. An ACP-listed
+result only starts a Happier-controlled resume, and the live handshake still
+decides whether the installed agent can list sessions. Listing does not
+establish terminal/ACP identity, live takeover, writer safety, transcript
+following, transcript import, or terminal attachment. See
+[Continuing a session](/sessions/continuing-a-session) for the distinct session
+continuation paths.
 
 ## Running a turn
 
@@ -326,9 +536,10 @@ which is slower and loses less than it sounds — see [Steering](/sessions/steer
 **Session modes are not permission modes.** Where the list comes *from the
 agent*, Happier shows whichever modes that build advertises for the session, so
 the choices can differ between versions and the Mode control is hidden when the
-runtime offers none. A dash under "Dedicated plan control" means Happier has no
-plan-specific affordance for that agent — **not** that the agent lacks a plan
-mode. Codex, for instance, reaches \`plan\` through the Mode control.
+runtime offers none. "Runtime-dependent" under "Dedicated plan control" means
+Plan is available only when the session advertises a \`plan\` mode or policy
+preset. Codex, for instance, reaches \`plan\` through the Mode control. A dash
+means Happier declares no plan-specific affordance for that agent.
 
 ## Media and tools
 
@@ -354,9 +565,10 @@ some declarations to lag the runtime.
 
 ${auth}
 
-Agents whose background checks are manual only will not be re-probed on a timer;
-their status refreshes when you open the backend's settings screen or start a
-session. See [Agent authentication](/agents/provider-authentication).
+Agents whose background checks are manual only are not re-probed on a timer.
+Whether a manual refresh can resolve a status depends on the agent's configured
+status check; an agent-managed row may remain **Unknown** even when Happier can
+open its login flow. See [Agent authentication](/agents/provider-authentication).
 
 ## Related
 

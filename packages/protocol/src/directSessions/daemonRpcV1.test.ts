@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import * as directSessionsRpc from './daemonRpcV1';
-import { DirectSessionsSourceSchema, DirectTranscriptRawMessageV1Schema } from './daemonRpcV1';
+import {
+  DirectSessionsSourceSchema,
+  DirectTranscriptRawMessageV1Schema,
+  DirectTranscriptPageResponseSchema,
+  DirectTranscriptReadAfterResponseSchema,
+  resolveDirectTranscriptContinuation,
+} from './daemonRpcV1';
 
 describe('DirectSessionsSourceSchema', () => {
   it('accepts exact Codex user-home identity', () => {
@@ -48,6 +54,55 @@ describe('DirectTranscriptRawMessageV1Schema', () => {
 
   it('rejects invalid message-role metadata', () => {
     expect(DirectTranscriptRawMessageV1Schema.safeParse({ ...item, messageRole: 'not-a-role' }).success).toBe(false);
+  });
+});
+
+describe('resolveDirectTranscriptContinuation', () => {
+  it('authorizes adjacent continuation only for an explicit page limit', () => {
+    expect(resolveDirectTranscriptContinuation({ truncated: false, truncationReason: 'page_limit' })).toBe('page_limit');
+    expect(resolveDirectTranscriptContinuation({ truncated: true, truncationReason: 'page_limit' })).toBe('page_limit');
+  });
+
+  it('fails closed for source discontinuity and legacy truncation without a reason', () => {
+    expect(resolveDirectTranscriptContinuation({ truncated: true, truncationReason: 'source_discontinuity' })).toBe('source_discontinuity');
+    expect(resolveDirectTranscriptContinuation({ truncated: true })).toBe('source_discontinuity');
+    expect(resolveDirectTranscriptContinuation({ truncated: false })).toBe('complete');
+  });
+
+  it('requires a usable adjacent cursor for page-limit responses', () => {
+    expect(DirectTranscriptReadAfterResponseSchema.safeParse({
+      ok: true,
+      items: [],
+      nextCursor: null,
+      truncated: false,
+      truncationReason: 'page_limit',
+    }).success).toBe(false);
+    expect(DirectTranscriptReadAfterResponseSchema.safeParse({
+      ok: true,
+      items: [],
+      nextCursor: 'next-page',
+      truncated: false,
+      truncationReason: 'page_limit',
+    }).success).toBe(true);
+
+    expect(DirectTranscriptPageResponseSchema.safeParse({
+      ok: true,
+      items: [],
+      nextCursor: null,
+      tailCursor: 'tail',
+      hasMore: true,
+      truncated: true,
+      truncationReason: 'page_limit',
+    }).success).toBe(false);
+    expect(DirectTranscriptPageResponseSchema.safeParse({
+      ok: true,
+      items: [],
+      nextCursor: 'older-page',
+      tailCursor: 'tail',
+      hasMore: true,
+      truncated: true,
+      truncationReason: 'page_limit',
+    }).success).toBe(true);
   });
 });
 
@@ -100,5 +155,17 @@ describe('direct session follow lifecycle schemas', () => {
       source: { kind: 'claudeConfig', configDir: '/tmp/.claude', projectId: 'project-1' },
       enabled: true,
     });
+  });
+});
+
+describe.each([
+  directSessionsRpc.DirectSessionTakeoverRequestSchema,
+  directSessionsRpc.DirectSessionTakeoverPersistRequestSchema,
+])('direct takeover terminal request', (schema) => {
+  it('accepts legacy requests and rejects invalid terminal settings at the RPC boundary', () => {
+    const request = { machineId: 'm1', sessionId: 's1' };
+    expect(schema.parse(request)).toEqual(request);
+    expect(schema.safeParse({ ...request, terminal: { mode: 'tmux', tmux: { isolated: 'true' } } }).success).toBe(false);
+    expect(schema.safeParse({ ...request, terminal: { mode: 'integrated' } }).success).toBe(false);
   });
 });

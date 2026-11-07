@@ -84,17 +84,9 @@ const DEFAULT_SIZE_PX = ICON_SIZE.md;
  * full-bleed rectangle at the same number, so the number is not what the eye compares.
  */
 const ICON_INK_SCALE: Partial<Record<IconName, number>> = {
-    // Empty on purpose, and that is the headline result of the migration.
-    //
-    // Under four icon families this table was load-bearing: `terminal-outline` (Ionicons) and
-    // `sidebar-expand` (Octicons) were drawn to different grids, so matching their declared sizes
-    // produced visibly different ink and every mismatch had to be measured off a screenshot and
-    // corrected by hand. Phosphor draws one family on one grid, so a row of icons at one number now
-    // simply looks like one size — measured in the running app: the header cluster renders every
-    // glyph at exactly 20px.
-    //
-    // The mechanism stays because a genuinely sparse or dense glyph could still need it. Anything
-    // added here must come from a measurement, not an impression.
+    // The mailbox outline is unusually sparse inside its 24-unit box. Measured beside the
+    // pulse and sliders glyphs in the desktop chrome, 1.08 equalizes its visible ink footprint.
+    mailbox: 1.08,
 };
 
 /**

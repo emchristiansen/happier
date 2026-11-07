@@ -535,6 +535,7 @@ async function runNodeCapture({ cwd, env, args, stdin }) {
       cwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
     let stdout = '';
     let stderr = '';
@@ -1553,7 +1554,7 @@ async function cmdLogin({ argv, json }) {
   const webappModeRaw =
     (argvKvValue(argv, '--webapp') || (kv.get('--webapp') ?? '')).toString().trim().toLowerCase();
   const requestedWebappMode = webappModeRaw || 'auto'; // auto|stack|public|expo|hosted
-  const HOSTED_WEBAPP_URL = 'https://app.happier.dev';
+  const HOSTED_WEBAPP_URL = 'https://cloud.happier.dev';
   const explicitWebappUrl =
     (argvKvValue(argv, '--webapp-url') || (kv.get('--webapp-url') ?? '')).toString().trim();
   const methodRaw = (argvKvValue(argv, '--method') || (kv.get('--method') ?? '')).toString().trim().toLowerCase();

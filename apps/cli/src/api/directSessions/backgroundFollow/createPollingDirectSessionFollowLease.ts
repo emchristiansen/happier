@@ -1,4 +1,6 @@
-import type { DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import type { DirectTranscriptRawMessageV1, DirectTranscriptTruncationReason } from '@happier-dev/protocol';
+import { resolveDirectTranscriptContinuation } from '@happier-dev/protocol';
+import { logger } from '@/ui/logger';
 
 import type {
   DirectSessionFollowLease,
@@ -10,6 +12,7 @@ type DirectSessionTranscriptReadAfter = Readonly<{
   items: readonly DirectTranscriptRawMessageV1[];
   nextCursor?: string | null;
   truncated: boolean;
+  truncationReason?: DirectTranscriptTruncationReason;
 }>;
 
 type DirectSessionPollingFollowLeaseParams = Readonly<{
@@ -57,11 +60,22 @@ export async function createPollingDirectSessionFollowLease(
   const maxItems = resolveMaxItems(env);
   const listeners = new Set<DirectSessionTranscriptUpdateListener>();
 
+  let readFailureReported = false;
+  const reportReadFailure = (error: unknown): void => {
+    if (!readFailureReported) {
+      logger.infoFile('[directSessions] Transcript read failed; background follow will retry', error);
+      readFailureReported = true;
+    }
+  };
+
   let tailCursor = await params.readAfterTranscript({
     cursor: 'tail',
     maxBytes,
     maxItems,
-  }).then((result) => result.nextCursor ?? null).catch(() => null);
+  }).then((result) => result.nextCursor ?? null).catch((error) => {
+    reportReadFailure(error);
+    return null;
+  });
   let released = false;
   let polling = false;
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -90,20 +104,25 @@ export async function createPollingDirectSessionFollowLease(
         maxBytes,
         maxItems,
       });
+      readFailureReported = false;
       const items = Array.from(result.items);
+      const cursorAdvanced = typeof result.nextCursor === 'string'
+        && result.nextCursor !== fromCursor;
       if (typeof result.nextCursor === 'string' || result.nextCursor === null) {
         tailCursor = result.nextCursor ?? tailCursor;
       }
-      if (items.length > 0 || result.truncated === true) {
+      if (items.length > 0 || cursorAdvanced || resolveDirectTranscriptContinuation(result) !== 'complete') {
         await notifyTranscriptListeners(listeners, {
           items,
           fromCursor,
           nextCursor: result.nextCursor ?? null,
           truncated: result.truncated === true,
+          ...(result.truncationReason ? { truncationReason: result.truncationReason } : {}),
         });
       }
-    } catch {
+    } catch (error) {
       // Follow leases are best-effort; the next poll can recover from transient read failures.
+      reportReadFailure(error);
     } finally {
       polling = false;
       schedulePoll();

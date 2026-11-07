@@ -1,9 +1,10 @@
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
-import type { MemoryEmbeddingsLocalTransformersConfig } from '@happier-dev/protocol';
+import { INSTALLABLE_KEYS, type MemoryEmbeddingsLocalTransformersConfig } from '@happier-dev/protocol';
 
 import { resolveCliRuntimeAssetPath } from '@/runtime/assets/resolveCliRuntimeAssetPath';
+import { ensureOptionalRuntime } from '@/installables/runtime/optionalRuntimeInstallables';
 
 import type { EmbeddingsProvider } from './embeddingsProviderTypes';
 import { tensorToVectors } from './tensorToVectors';
@@ -23,7 +24,7 @@ type CreateFeatureExtractionPipelineDependencies = Partial<ImportTransformersMod
 
 function isTransformersModuleResolutionFailure(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? '');
-  if (message.includes("Cannot find module '@huggingface/transformers'")) {
+  if (message.includes("Cannot find module '@huggingface/transformers'") || message.includes("Cannot find package '@huggingface/transformers'")) {
     return true;
   }
 
@@ -83,6 +84,10 @@ async function importRuntimeTransformersModule(params: Readonly<{
     }
   }
 
+  if (isTransformersModuleResolutionFailure(lastError)) {
+    const managedModule = await ensureOptionalRuntime(INSTALLABLE_KEYS.LOCAL_EMBEDDINGS);
+    return await params.runtimeImport(pathToFileURL(managedModule).href);
+  }
   throw lastError;
 }
 

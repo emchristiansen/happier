@@ -37,6 +37,24 @@ export const ELICITATION_DECISION_MAX_VERSION: CodexVersionTarget = {
 
 const cachedCodexVersionInfoByCommand = new Map<string, CodexVersionInfo>();
 
+export function parseCodexVersionInfo(raw: string): CodexVersionInfo {
+    const normalized = raw.trim();
+    const match = normalized.match(/(?:codex(?:-cli)?)\s+v?(\d+)\.(\d+)\.(\d+)(?:-([a-z]+)\.(\d+))?/i)
+        ?? normalized.match(/\b(\d+)\.(\d+)\.(\d+)(?:-([a-z]+)\.(\d+))?\b/);
+    if (!match) {
+        return { raw: normalized, parsed: false, major: 0, minor: 0, patch: 0 };
+    }
+    return {
+        raw: normalized,
+        parsed: true,
+        major: Number(match[1]),
+        minor: Number(match[2]),
+        patch: Number(match[3]),
+        prereleaseTag: match[4],
+        prereleaseNum: match[5] ? Number(match[5]) : undefined,
+    };
+}
+
 export function getCodexVersionInfo(codexCommand: string): CodexVersionInfo {
     const cached = cachedCodexVersionInfoByCommand.get(codexCommand);
     if (cached) return cached;
@@ -52,30 +70,7 @@ export function getCodexVersionInfo(codexCommand: string): CodexVersionInfo {
             windowsHide: true,
             windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         };
-        const raw = execFileSync(invocation.command, invocation.args, execOptions).trim();
-        const match = raw.match(/(?:codex(?:-cli)?)\s+v?(\d+)\.(\d+)\.(\d+)(?:-([a-z]+)\.(\d+))?/i)
-            ?? raw.match(/\b(\d+)\.(\d+)\.(\d+)(?:-([a-z]+)\.(\d+))?\b/);
-        if (!match) {
-            const info: CodexVersionInfo = {
-                raw,
-                parsed: false,
-                major: 0,
-                minor: 0,
-                patch: 0,
-            };
-            cachedCodexVersionInfoByCommand.set(codexCommand, info);
-            return info;
-        }
-
-        const info: CodexVersionInfo = {
-            raw,
-            parsed: true,
-            major: Number(match[1]),
-            minor: Number(match[2]),
-            patch: Number(match[3]),
-            prereleaseTag: match[4],
-            prereleaseNum: match[5] ? Number(match[5]) : undefined,
-        };
+        const info = parseCodexVersionInfo(execFileSync(invocation.command, invocation.args, execOptions));
         cachedCodexVersionInfoByCommand.set(codexCommand, info);
         return info;
     } catch (error) {

@@ -7,6 +7,23 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..', '..');
 
+test('install.ps1 exposes final service failures without contaminating result objects', async () => {
+  const source = await readFile(join(repoRoot, 'scripts', 'release', 'installers', 'install.ps1'), 'utf8');
+  for (const [name, resultName, failureField] of [
+    ['Invoke-BackgroundServiceInstallCompatibly', 'installResult', 'Ok = $false'],
+    ['Invoke-DoctorRepairIfSupported', 'repairResult', "Status = 'failed'"],
+  ]) {
+    const body = source.match(new RegExp('function ' + name + '\\s*\\{[\\s\\S]*?\\n\\}'))?.[0];
+    assert.ok(body, 'expected canonical service helper');
+    const emission = '[Console]::Error.WriteLine([string]$' + resultName + '.Output)';
+    assert.ok(body.includes(emission), name + ' must expose the failed native command diagnostic on stderr');
+    assert.equal(body.split(emission).length - 1, 1, 'emit only the final failure, not compatibility probes');
+    assert.ok(body.indexOf('ExitCode -eq 0') < body.indexOf(emission), 'successful commands stay quiet');
+    assert.ok(body.indexOf(emission) < body.lastIndexOf(failureField), 'keep the structured failure return');
+    assert.doesNotMatch(body, /Write-Output/, 'diagnostics must not join the result-object pipeline');
+  }
+});
+
 test('install.ps1 defaults background service installation to opt-in when noninteractive', async () => {
   const path = join(repoRoot, 'scripts', 'release', 'installers', 'install.ps1');
   const raw = await readFile(path, 'utf8');

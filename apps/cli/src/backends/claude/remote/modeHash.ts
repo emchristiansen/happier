@@ -1,3 +1,4 @@
+import { resolveClaudeSettingSources } from '@/backends/claude/utils/resolveClaudeSettingSources';
 import { hashObject } from '@/utils/deterministicJson';
 
 import type { EnhancedMode } from '@/backends/claude/loop';
@@ -10,27 +11,9 @@ import {
 import { normalizeClaudeRemoteMode } from './normalizeClaudeRemoteMode';
 
 function resolveClaudeRemoteSettingSourcesOverrideForAgentSdk(mode: EnhancedMode): readonly ('user' | 'project' | 'local')[] | null {
-    const rawV2 = (mode as any).claudeRemoteSettingSourcesV2 as unknown;
-    if (Array.isArray(rawV2)) {
-        const set = new Set<string>();
-        for (const value of rawV2) {
-            if (typeof value === 'string') set.add(value);
-        }
-        const normalized: Array<'user' | 'project' | 'local'> = [];
-        for (const key of ['user', 'project', 'local'] as const) {
-            if (set.has(key)) normalized.push(key);
-        }
-        // All sources selected => don't force an override.
-        if (normalized.length === 3) return null;
-        return normalized;
-    }
-
-    // Legacy v1 mapping (back-compat).
-    const legacy = mode.claudeRemoteSettingSources;
-    if (legacy === 'none') return [];
-    if (legacy === 'user_project') return ['user', 'project'];
-    if (legacy === 'project') return ['project'];
-    return null;
+    const sources = resolveClaudeSettingSources(mode);
+    // The hash represents the all-sources native default as no override.
+    return sources.length === 3 ? null : sources;
 }
 
 const DEBUG_CATEGORIES_ORDER = ['api', 'mcp', 'hooks', 'file', '1p'] as const;
@@ -88,6 +71,7 @@ function buildClaudeUnifiedTerminalLaunchOptionsHashInput(mode: EnhancedMode): R
         customSystemPrompt: mode.customSystemPrompt,
         appendSystemPrompt: mode.appendSystemPrompt,
         claudeRemoteSettingSourcesOverride: resolveClaudeRemoteSettingSourcesOverrideForAgentSdk(mode),
+        claudeCodeIncludeInNativeHistory: mode.claudeCodeIncludeInNativeHistory === true,
         claudeRemoteDisableTodos: mode.claudeRemoteDisableTodos,
         claudeRemoteStrictMcpServerConfig: mode.claudeRemoteStrictMcpServerConfig,
         claudeRemoteMaxThinkingTokens: mode.claudeRemoteMaxThinkingTokens,
@@ -102,7 +86,7 @@ export function hashClaudeUnifiedTerminalLaunchOptionsForQueue(mode: EnhancedMod
     return hashObject(buildClaudeUnifiedTerminalLaunchOptionsHashInput(mode));
 }
 
-export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
+export function hashClaudeEnhancedModeForLaunch(mode: EnhancedMode): string {
     const remoteMode = normalizeClaudeRemoteMode(mode);
     const effectiveAgentModeId = resolveEffectiveClaudeAgentModeId(mode);
     const claudeSdkPermissionMode = resolveClaudeSdkPermissionModeFromEnhancedMode({
@@ -111,7 +95,7 @@ export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
     });
 
     // Spawn-only config for Claude: effort is a query-start option in the Agent SDK and has no dynamic setter.
-    // We normalize effort to the effective value the provider would actually apply (treating "high" as default).
+    // Explicit effort remains distinct from inheriting native saved settings, including catalog defaults.
     const supportedLevels = resolveModeEffortLevelsForModel(mode, mode.model);
     const resolvedEffort = resolveClaudeEffortForModel({
         modelId: mode.model,
@@ -144,6 +128,7 @@ export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
             fallbackModel: mode.fallbackModel,
             customSystemPrompt: mode.customSystemPrompt,
             appendSystemPrompt: mode.appendSystemPrompt,
+            claudeCodeIncludeInNativeHistory: mode.claudeCodeIncludeInNativeHistory === true,
             claudeRemoteDisableTodos: mode.claudeRemoteDisableTodos,
             claudeRemoteDebugEnabled: mode.claudeRemoteDebugEnabled === true,
             claudeRemoteVerboseEnabled: mode.claudeRemoteVerboseEnabled === true,
@@ -160,6 +145,7 @@ export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
         replaySeedAllowed: mode.replaySeedAllowed !== false,
         claudeRemoteSettingSourcesOverride: settingSourcesOverride,
         claudeRemoteEnableFileCheckpointing: mode.claudeRemoteEnableFileCheckpointing,
+        claudeCodeIncludeInNativeHistory: mode.claudeCodeIncludeInNativeHistory === true,
         claudeRemoteDisableTodos: mode.claudeRemoteDisableTodos,
         claudeRemoteStrictMcpServerConfig: mode.claudeRemoteStrictMcpServerConfig,
         claudeRemoteDebugEnabled: mode.claudeRemoteDebugEnabled === true,
@@ -172,5 +158,17 @@ export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
         fallbackModel: mode.fallbackModel,
         customSystemPrompt: mode.customSystemPrompt,
         appendSystemPrompt: mode.appendSystemPrompt,
+    });
+}
+
+export function hashClaudeEnhancedModeForQueue(mode: EnhancedMode): string {
+    const launchHash = hashClaudeEnhancedModeForLaunch(mode);
+    if (normalizeClaudeRemoteMode(mode).kind === 'unifiedTerminal') return launchHash;
+    // A batching key includes policy as well as launch options: combining prompts with different
+    // policies would keep the first prompt's mode and silently discard a later opt-out.
+    return hashObject({
+        launchHash,
+        claudeRemoteIdleReclaimEnabled: mode.claudeRemoteIdleReclaimEnabled === true,
+        claudeRemoteIdleReclaimTimeoutMinutes: mode.claudeRemoteIdleReclaimTimeoutMinutes,
     });
 }

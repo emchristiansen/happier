@@ -57,6 +57,7 @@ export function createSessionConfigOptionOverrideSynchronizer(params: Readonly<{
 }>): {
   syncFromMetadata: () => void;
   flushPendingAfterStart: () => Promise<void>;
+  flushPendingAfterStartWithOutcome: () => Promise<boolean>;
   retirePendingThrough: (updatedAt: number) => Promise<void>;
   rebindSession: (session: {
     getMetadataSnapshot: () => Metadata | null;
@@ -67,7 +68,7 @@ export function createSessionConfigOptionOverrideSynchronizer(params: Readonly<{
   let session = params.session;
   const settledByConfigId = new Map<string, { updatedAt: number; valueIds: Set<string> }>();
   const pendingByConfigId = new Map<string, ConfigCommand>();
-  const inFlightByConfigId = new Map<string, Promise<void>>();
+  const inFlightByConfigId = new Map<string, Promise<boolean>>();
   const cleanupByConfigId = new Map<string, ConfigCommand>();
   const cleanupPromiseByConfigId = new Map<string, Promise<void>>();
 
@@ -120,17 +121,17 @@ export function createSessionConfigOptionOverrideSynchronizer(params: Readonly<{
     return promise;
   };
 
-  const applyPendingForConfigId = (configId: string): Promise<void> => {
+  const applyPendingForConfigId = (configId: string): Promise<boolean> => {
     const inFlight = inFlightByConfigId.get(configId);
     if (inFlight) return inFlight;
 
     const candidate = pendingByConfigId.get(configId);
-    if (!candidate) return Promise.resolve();
-    if (!params.isStarted()) return Promise.resolve();
+    if (!candidate) return Promise.resolve(true);
+    if (!params.isStarted()) return Promise.resolve(false);
 
     if (isSettled(candidate)) {
       pendingByConfigId.delete(configId);
-      return Promise.resolve();
+      return Promise.resolve(true);
     }
 
     const promise = params.runtime
@@ -141,6 +142,7 @@ export function createSessionConfigOptionOverrideSynchronizer(params: Readonly<{
         if (isSameCommand(currentPending, candidate)) {
           pendingByConfigId.delete(candidate.configId);
         }
+        return true;
       })
       .catch(async (error) => {
         if (isDefinitiveSessionControlApplyError(error)) {
@@ -156,9 +158,10 @@ export function createSessionConfigOptionOverrideSynchronizer(params: Readonly<{
             requested: candidate.valueId,
             error,
           });
-          return;
+          return false;
         }
         // Best-effort only. Keep the candidate pending so a later sync or flush can retry it.
+        return false;
       })
       .finally(() => {
         inFlightByConfigId.delete(configId);
@@ -203,25 +206,29 @@ export function createSessionConfigOptionOverrideSynchronizer(params: Readonly<{
     }
   };
 
-  const flushPendingAfterStart = async (): Promise<void> => {
+  const flushPendingAfterStartWithOutcome = async (): Promise<boolean> => {
     for (const configId of Array.from(cleanupByConfigId.keys()).sort()) {
       await retryCleanupForConfigId(configId);
     }
-    if (pendingByConfigId.size === 0) return;
-    if (!params.isStarted()) return;
+    if (pendingByConfigId.size === 0) return true;
+    if (!params.isStarted()) return false;
 
     const pending = Array.from(pendingByConfigId.values()).sort(
       (a, b) => (a.updatedAt - b.updatedAt) || a.configId.localeCompare(b.configId),
     );
 
+    let applied = true;
     for (const item of pending) {
-      await applyPendingForConfigId(item.configId);
+      const outcome = await applyPendingForConfigId(item.configId);
+      applied = outcome && applied;
     }
+    return applied;
   };
 
   return {
     syncFromMetadata,
-    flushPendingAfterStart,
+    flushPendingAfterStart: async () => { await flushPendingAfterStartWithOutcome(); },
+    flushPendingAfterStartWithOutcome,
     retirePendingThrough: async (updatedAt) => {
       const retired: ConfigCommand[] = [];
       for (const command of pendingByConfigId.values()) {

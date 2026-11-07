@@ -13,6 +13,13 @@ export type GeminiPromptBackend =
     waitForResponseComplete?: (timeoutMs?: number | null) => Promise<AcpTurnOutcome | void>;
   }>;
 
+export type GeminiPromptRetryDiagnostic = Readonly<{
+  failedAttempt: number;
+  nextAttempt: number;
+  maxAttempts: number;
+  failureKind: 'empty_response' | 'internal_error' | 'stall_timeout';
+}>;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -51,7 +58,7 @@ export async function sendGeminiPromptWithRetry(params: {
   prompt: string;
   messageBuffer: MessageBuffer;
   session: ApiSessionClient;
-  onDebug: (message: string) => void;
+  onDebug: (message: string, diagnostic?: GeminiPromptRetryDiagnostic) => void;
   maxRetries?: number;
   retryDelayMs?: number;
   waitForResponseTimeoutMs?: number;
@@ -171,7 +178,16 @@ export async function sendGeminiPromptWithRetry(params: {
       );
 
       if (isRetryable && attempt < maxRetries) {
-        params.onDebug(`[gemini] Retryable error on attempt ${attempt}/${maxRetries}: ${errorDetails}`);
+        params.onDebug('[gemini] Retrying provider prompt admission', {
+          failedAttempt: attempt,
+          nextAttempt: attempt + 1,
+          maxAttempts: maxRetries,
+          failureKind: isEmptyResponseError
+            ? 'empty_response'
+            : isInternalError
+              ? 'internal_error'
+              : 'stall_timeout',
+        });
         params.messageBuffer.addMessage(`Gemini returned empty response, retrying (${attempt}/${maxRetries})...`, 'status');
         await new Promise((resolve) => setTimeout(resolve, retryDelayMs * attempt));
         continue;

@@ -43,6 +43,22 @@ function createDeps(overrides: Partial<ActionExecutorDeps> = {}): ActionExecutor
 }
 
 describe('createActionExecutor (session.handoff)', () => {
+  it('preserves the App handoff dependency errorMessage as the Action error', async () => {
+    const executor = createActionExecutor(createDeps({
+      sessionHandoffStart: async () => ({ ok: false, errorCode: 'existing_session_state_unavailable', errorMessage: 'Claude existing native session is unreachable' }),
+    }));
+    expect(await executor.execute('session.handoff', { sessionId: 'sess_1', targetMachineId: 'machine_2' }, { surface: 'ui_button' })).toEqual({
+      ok: false, errorCode: 'existing_session_state_unavailable', error: 'Claude existing native session is unreachable',
+    });
+  });
+
+  it('forwards existing-state intent through the public CLI handoff action', async () => {
+    const sessionHandoffStart = vi.fn(async () => ({ handoffId: 'handoff_1' }));
+    const executor = createActionExecutor(createDeps({ sessionHandoffStart }));
+    expect(await executor.execute('session.handoff', { sessionId: 'sess_1', targetMachineId: 'machine_2', stateTransfer: 'existing' }, { surface: 'cli', actionRequestId: 'request_1' })).toMatchObject({ ok: true });
+    expect(sessionHandoffStart).toHaveBeenCalledWith(expect.objectContaining({ stateTransfer: 'existing', requestId: 'request_1' }));
+  });
+
   it('returns unsupported_action when the handoff dependency is unavailable', async () => {
     const deps = createDeps();
     const executor = createActionExecutor(deps);
@@ -58,6 +74,13 @@ describe('createActionExecutor (session.handoff)', () => {
       errorCode: 'unsupported_action',
       error: 'unsupported_action:session.handoff',
     });
+  });
+
+  it('omits explicit default transfer mode from legacy-compatible requests', async () => {
+    const sessionHandoffStart = vi.fn(async () => ({ handoffId: 'handoff_1' }));
+    const executor = createActionExecutor(createDeps({ sessionHandoffStart }));
+    expect(await executor.execute('session.handoff', { sessionId: 'sess_1', targetMachineId: 'machine_2', stateTransfer: 'transfer' }, { surface: 'cli' })).toMatchObject({ ok: true });
+    expect(sessionHandoffStart).toHaveBeenCalledWith({ sessionId: 'sess_1', targetMachineId: 'machine_2' });
   });
 
   it('delegates to sessionHandoffStart with the resolved session and server ids', async () => {

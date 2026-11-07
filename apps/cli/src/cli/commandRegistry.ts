@@ -1,4 +1,6 @@
 import type { TerminalRuntimeFlags } from '@/terminal/runtime/terminalRuntimeFlags';
+import type { Credentials } from '@/persistence';
+import type { AccountSettingsContext } from '@/settings/accountSettings/bootstrapAccountSettingsContext';
 
 import { AGENTS, type AgentCatalogEntry } from '@/backends/catalog';
 
@@ -10,6 +12,7 @@ import { handleCapabilitiesCliCommand } from './commands/capabilities';
 import { handleConnectCliCommand } from './commands/connect';
 import { handleDaemonCliCommand } from './commands/daemon';
 import { handleDoctorCliCommand } from './commands/doctor';
+import { handleHerdrCliCommand } from './commands/herdr';
 import { handleInstallCliCommand } from './commands/install';
 import { handleLogoutCliCommand } from './commands/logout';
 import { handleMachineCliCommand } from './commands/machine';
@@ -33,6 +36,8 @@ export type CommandContext = Readonly<{
   args: string[];
   rawArgv: string[];
   terminalRuntime: TerminalRuntimeFlags | null;
+  /** Prepared by implicit profile dispatch and consumed by this invocation's session handler. */
+  sessionStart?: Readonly<{ credentials: Credentials; accountSettingsContext: AccountSettingsContext }>;
 }>;
 
 export type CommandHandler = (context: CommandContext) => Promise<void>;
@@ -65,6 +70,7 @@ export const commandRegistry: Readonly<Record<string, CommandHandler>> = {
   connect: handleConnectCliCommand,
   daemon: handleDaemonCliCommand,
   doctor: handleDoctorCliCommand,
+  herdr: handleHerdrCliCommand,
   install: handleInstallCliCommand,
   logout: handleLogoutCliCommand,
   machine: handleMachineCliCommand,

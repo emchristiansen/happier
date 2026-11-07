@@ -138,6 +138,16 @@ describe('routeClaudeSdkMessageToWorkflowSource', () => {
     expect(committed).toHaveLength(0);
   });
 
+  it.each(['agentSdk', 'legacy'] as const)('does not publish replayed workflow anchors as live through %s', async (runnerKind) => {
+    const { committed, source } = setup();
+    routeClaudeSdkMessageToWorkflowSource({ message: { ...workflowAnchor(), isReplay: true }, runnerKind, workflowActivitySource: source });
+    await source.flush();
+    expect(committed).toEqual([]);
+    await source.reconcileStartupInterruptedRuns([{ runId: 'toolu_wf', title: 'ship-feature', totalAgents: 0, completedAgents: 0 }]);
+    expect(committed.at(-1)?.status).toBe('stopped');
+    source.dispose();
+  });
+
   it('is a no-op when no workflow source is wired (no credentials yet)', () => {
     expect(() => routeClaudeSdkMessageToWorkflowSource({
       message: workflowAnchor(),

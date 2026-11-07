@@ -31,6 +31,10 @@ export type ActiveServerAuthReadiness = Readonly<{
   unusableReason: ActiveServerAuthUnusableReason | null;
   machineId: string | null;
   machineRegistered: boolean;
+  /** The account the active relay confirmed the stored token belongs to; null unless `credentialState` is `valid`. */
+  validatedAccountId: string | null;
+  /** The readable name of that account from the same profile read; null when it has none. */
+  validatedAccountLabel: string | null;
 }>;
 
 export async function resolveActiveServerAuthReadiness(): Promise<ActiveServerAuthReadiness> {
@@ -52,6 +56,8 @@ export async function resolveActiveServerAuthReadiness(): Promise<ActiveServerAu
       unusableReason: 'no-credentials',
       machineId,
       machineRegistered: machineId !== null,
+      validatedAccountId: null,
+      validatedAccountLabel: null,
     };
   }
 
@@ -67,5 +73,7 @@ export async function resolveActiveServerAuthReadiness(): Promise<ActiveServerAu
     unusableReason: credentialState === 'rejected' ? 'credentials-rejected' : null,
     machineId,
     machineRegistered: machineId !== null,
+    validatedAccountId: validation.state === 'valid' ? validation.accountId : null,
+    validatedAccountLabel: validation.state === 'valid' ? validation.accountLabel : null,
   };
 }

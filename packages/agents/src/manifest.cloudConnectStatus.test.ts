@@ -45,7 +45,7 @@ describe('AGENTS_CORE cloudConnect status', () => {
     });
     expect(AGENTS_CORE.gemini.connectedServices?.sessionAuthSwitch).toEqual({
       continuityMode: 'restart_same_home',
-      supportedTransitions: ['native_to_connected', 'connected_to_connected'],
+      supportedTransitions: ['native_to_connected', 'connected_to_connected', 'same_connected_group'],
     });
     expect(AGENTS_CORE.pi.connectedServices?.sessionAuthSwitch).toEqual({
       continuityMode: 'restart_same_home',

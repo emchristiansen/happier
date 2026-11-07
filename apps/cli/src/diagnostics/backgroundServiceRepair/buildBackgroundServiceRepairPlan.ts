@@ -2,6 +2,7 @@ import type { PublicReleaseRingId } from '@happier-dev/release-runtime/releaseRi
 import type { DaemonServiceListEntry } from '@/daemon/service/cli';
 import type { DaemonServiceMode } from '@/daemon/service/plan';
 import { resolveHappierHomeDirComparableKey } from '@/daemon/ownership/happierHomeDirComparableKey';
+import { daemonServiceRelaysMayMatch, resolvePinnedDaemonServiceRelay } from '@/daemon/service/daemonInstallConflict';
 
 import type { BackgroundServiceRepairAction, BackgroundServiceRepairPlan } from './types';
 
@@ -12,12 +13,21 @@ function isCompatibleDefaultService(params: Readonly<{
   return params.service.targetMode === 'default-following' && params.service.releaseChannel === params.currentReleaseChannel;
 }
 
+/**
+ * A pinned service serving the relay the default-following service serves: the 0.2.3 migration's
+ * legacy per-server unit, or a duplicate of it under another profile id. A pinned service for any
+ * other relay is intentional (one daemon per relay on one machine) and is never repaired away.
+ */
 function isCurrentServerPinnedService(params: Readonly<{
   service: DaemonServiceListEntry;
   currentServerId: string;
+  currentServerUrl?: string | null;
 }>): boolean {
   return params.service.targetMode === 'pinned'
-    && params.service.serverId === params.currentServerId;
+    && daemonServiceRelaysMayMatch(resolvePinnedDaemonServiceRelay(params.service), {
+      serverId: params.currentServerId,
+      serverUrl: params.currentServerUrl ?? null,
+    });
 }
 
 function isForeignHomeService(params: Readonly<{
@@ -120,6 +130,8 @@ export function buildBackgroundServiceRepairPlan(params: Readonly<{
   currentReleaseChannel: PublicReleaseRingId;
   currentHappierHomeDir?: string | null;
   currentServerId: string;
+  /** The relay URL of `currentServerId`, when known. */
+  currentServerUrl?: string | null;
   preferredMode: DaemonServiceMode;
   services: readonly DaemonServiceListEntry[];
 }>): BackgroundServiceRepairPlan {
@@ -185,6 +197,7 @@ export function buildBackgroundServiceRepairPlan(params: Readonly<{
     && isCurrentServerPinnedService({
       service,
       currentServerId: params.currentServerId,
+      currentServerUrl: params.currentServerUrl,
     }),
   );
   if (foreignHomePinnedCurrentServerServices.length > 0) {
@@ -212,6 +225,7 @@ export function buildBackgroundServiceRepairPlan(params: Readonly<{
   const currentServerPinnedServices = scopedServices.filter((service) => isCurrentServerPinnedService({
     service,
     currentServerId: params.currentServerId,
+    currentServerUrl: params.currentServerUrl,
   }));
   const defaultFollowingServices = scopedServices.filter((service) => service.targetMode === 'default-following');
   const compatibleDefaultService = [...compatibleDefaultServices]
@@ -240,16 +254,9 @@ export function buildBackgroundServiceRepairPlan(params: Readonly<{
     });
   }
 
-  const shouldRemoveOtherSameHomeServices = compatibleDefaultService !== null && currentHappierHomeDir !== null;
   const removableServices = scopedServices.filter((service) => {
     if (service === compatibleDefaultService) {
       return compatibleDefaultServiceShouldBeRemoved;
-    }
-    if (shouldRemoveOtherSameHomeServices) {
-      const serviceHappierHomeDir = resolveHappierHomeDirComparableKey(service.happierHomeDir);
-      if (serviceHappierHomeDir !== null && serviceHappierHomeDir === currentHappierHomeDir) {
-        return true;
-      }
     }
     if (defaultFollowingServices.includes(service)) {
       return true;
@@ -277,12 +284,21 @@ export function buildBackgroundServiceRepairPlan(params: Readonly<{
     || compatibleDefaultServiceNeedsReinstall;
 
   if (shouldInstallDefaultFollowingService) {
+    // The selected compatible default owns a rewrite's settings. A migration inherits the
+    // preferred prior default (using the same existing priority), or the current relay's pin
+    // when there was no default to replace. Unrelated pins are never predecessors.
+    const predecessor = compatibleDefaultService
+      ?? [...defaultFollowingServices, ...repairableExternalDefaultServices]
+        .sort((left, right) => compareCompatibleDefaultServicePriority(left, right, params.preferredMode))[0]
+      ?? [...currentServerPinnedServices]
+        .sort((left, right) => compareCompatibleDefaultServicePriority(left, right, params.preferredMode))[0];
     actions.push({
       kind: 'install-default-following-service',
       releaseChannel: params.currentReleaseChannel,
       mode: compatibleDefaultServiceNeedsReinstall
         ? (compatibleDefaultService?.mode === 'system' ? 'system' : 'user')
         : params.preferredMode,
+      ...(predecessor ? { preserveFrom: predecessor.path } : {}),
     });
   }
 

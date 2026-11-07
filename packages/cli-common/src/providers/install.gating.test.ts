@@ -5,12 +5,64 @@ import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+import type { runCommandCapture } from '../process/index.js';
 import { installProviderCli, resolvePlatformFromNodePlatform } from './install.js';
+
+type SpawnSyncShapedMock = (
+  command: string,
+  args?: ReadonlyArray<string>,
+  options?: import('node:child_process').SpawnSyncOptions,
+) => import('node:child_process').SpawnSyncReturns<Buffer | string>;
+
+/**
+ * Long-running install commands run through the async process owner (`runCommand`);
+ * these tests describe the child process with one spawnSync-shaped fake, so adapt it.
+ */
+function runCommandFrom(mock: SpawnSyncShapedMock): typeof runCommandCapture {
+  return async ({ cmd, args, cwd, env }) => {
+    const result = mock(cmd, args, { cwd, env });
+    if (result.error) return { kind: 'spawn-failed', message: result.error.message, error: result.error };
+    return {
+      kind: 'exited',
+      status: result.status,
+      signal: result.signal,
+      stdout: String(result.stdout ?? ''),
+      stderr: String(result.stderr ?? ''),
+    };
+  };
+}
 
 const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 const originalArchDescriptor = Object.getOwnPropertyDescriptor(process, 'arch');
 
 describe('installProviderCli vendor_recipe execution gating', () => {
+  it.skipIf(process.platform === 'win32')('preserves a Windows Path-only environment when executing a vendor recipe', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'happier-vendor-windows-path-'));
+    if (!originalPlatformDescriptor) throw new Error('Expected configurable platform');
+    const previousPath = process.env.PATH;
+    try {
+      // A real harmless executable stands in for the vendor's OS process. The
+      // install owner, PATH resolution and child-process capture remain real.
+      const executable = join(homeDir, 'powershell.exe');
+      await writeFile(executable, '#!/bin/sh\nprintf vendor-process-started\n', 'utf8');
+      await chmod(executable, 0o755);
+      delete process.env.PATH;
+      Object.defineProperty(process, 'platform', { ...originalPlatformDescriptor, value: 'win32' });
+      const result = await installProviderCli({
+        providerId: 'droid', platform: 'win32',
+        env: { Path: homeDir, HAPPIER_HOME_DIR: homeDir },
+        logDir: homeDir, skipIfInstalled: false, allowVendorRecipeExecution: true,
+      });
+      expect(result.ok, result.ok ? undefined : result.errorMessage).toBe(true);
+      if (result.logPath) expect(await readFile(result.logPath, 'utf8')).toContain('vendor-process-started');
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatformDescriptor);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
   it('denies vendor_recipe execution by default (but still returns the plan)', async () => {
     const logDir = await mkdtemp(join(tmpdir(), 'happier-cli-common-install-gating-log-'));
     try {
@@ -79,6 +131,7 @@ describe('installProviderCli vendor_recipe execution gating', () => {
           ensureManagedJavaScriptRuntimeCommand: async () => '/nonexistent/node',
           // Intentionally inject a spawnSync implementation so tests never spawn real processes.
           spawnSync: spawnSyncMock as unknown as SpawnSyncFn,
+          runCommand: runCommandFrom(spawnSyncMock),
         },
       });
 
@@ -169,6 +222,7 @@ describe('installProviderCli vendor_recipe execution gating', () => {
           ensureManagedPnpmCommand: async () => 'C:\\happier\\managed\\pnpm.cmd',
           ensureManagedJavaScriptRuntimeCommand: async () => runtimeCommand,
           spawnSync: spawnSyncMock as unknown as SpawnSyncFn,
+          runCommand: runCommandFrom(spawnSyncMock),
         },
       });
 
@@ -293,6 +347,7 @@ describe('installProviderCli vendor_recipe execution gating', () => {
           ensureManagedPnpmCommand: async () => '/managed/pnpm',
           ensureManagedJavaScriptRuntimeCommand: async () => '/managed/node/bin/node',
           spawnSync: spawnSyncMock as unknown as SpawnSyncFn,
+          runCommand: runCommandFrom(spawnSyncMock),
         },
       });
 
@@ -363,6 +418,7 @@ describe('installProviderCli vendor_recipe execution gating', () => {
           ensureManagedPnpmCommand: async () => 'pnpm-does-not-exist',
           ensureManagedJavaScriptRuntimeCommand: async () => '/nonexistent/node',
           spawnSync: spawnSyncMock as unknown as SpawnSyncFn,
+          runCommand: runCommandFrom(spawnSyncMock),
         },
       });
 
@@ -421,6 +477,7 @@ describe('installProviderCli vendor_recipe execution gating', () => {
           ensureManagedPnpmCommand: async () => 'pnpm-does-not-exist',
           ensureManagedJavaScriptRuntimeCommand: async () => runtimeCommand,
           spawnSync: spawnSyncMock as unknown as SpawnSyncFn,
+          runCommand: runCommandFrom(spawnSyncMock),
         },
       });
 
@@ -482,6 +539,7 @@ describe('installProviderCli vendor_recipe execution gating', () => {
         allowVendorRecipeExecution: true,
         deps: {
           spawnSync: spawnSyncMock as unknown as SpawnSyncFn,
+          runCommand: runCommandFrom(spawnSyncMock),
         },
       });
 

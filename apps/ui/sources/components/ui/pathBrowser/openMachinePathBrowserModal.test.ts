@@ -5,6 +5,7 @@ const showModalMock = vi.hoisted(() => vi.fn<IModal['show']>(() => 'modal-id'));
 const browserModuleGate = vi.hoisted(() => ({
     block: false,
     release: null as (() => void) | null,
+    onRequested: null as (() => void) | null,
 }));
 
 vi.mock('@/modal', async () => {
@@ -17,6 +18,7 @@ vi.mock('@/modal', async () => {
 });
 
 vi.mock('./MachinePathBrowserModal', async () => {
+    browserModuleGate.onRequested?.();
     if (browserModuleGate.block) {
         await new Promise<void>((resolve) => {
             browserModuleGate.release = resolve;
@@ -30,21 +32,20 @@ describe('openMachinePathBrowserModal', () => {
         await import('./openMachinePathBrowserModal');
         vi.resetModules();
         browserModuleGate.block = true;
-        const openerImport = import('./openMachinePathBrowserModal');
-        let openerLoaded = false;
-        void openerImport.then(() => {
-            openerLoaded = true;
+        // Decide on module-graph order, not wall-clock: loading the opener's shared graph (the
+        // spinner, stores) can take seconds on a busy runner, but it must finish without ever
+        // requesting the path browser implementation.
+        const browserRequested = new Promise<'browser-requested'>((resolve) => {
+            browserModuleGate.onRequested = () => resolve('browser-requested');
         });
+        const openerLoaded = import('./openMachinePathBrowserModal').then(() => 'opener-loaded' as const);
 
         try {
-            await vi.waitFor(() => {
-                expect(openerLoaded).toBe(true);
-            }, { timeout: 1000 });
+            expect(await Promise.race([openerLoaded, browserRequested])).toBe('opener-loaded');
         } finally {
+            browserModuleGate.onRequested = null;
             browserModuleGate.release?.();
         }
-
-        expect(openerLoaded).toBe(true);
     });
 
     it('opens the path browser with shared modal-card chrome so contained native modals own the sizing frame', async () => {

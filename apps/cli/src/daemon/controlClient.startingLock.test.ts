@@ -136,7 +136,8 @@ describe('daemon control client startup lock inspection', () => {
       })
       .mockResolvedValueOnce({ kind: 'unknown' as const });
     vi.doMock('@/daemon/doctor', () => ({ classifyDaemonLifecycleProcessByPid }));
-    vi.doMock('@/daemon/processRunState', () => ({
+    vi.doMock('@/daemon/processRunState', async (importOriginal) => ({
+      ...await importOriginal<typeof import('@/daemon/processRunState')>(),
       readProcessRunState: vi.fn(async () => 'servable'),
     }));
 
@@ -194,7 +195,7 @@ describe('daemon control client startup lock inspection', () => {
       mkdirSync(dirname(configuration.daemonLockFile), { recursive: true });
       writeFileSync(configuration.daemonLockFile, '424244', 'utf-8');
 
-      await stopDaemon();
+      await expect(stopDaemon()).rejects.toMatchObject({ code: 'daemon_stop_incomplete', reason: 'startup_in_progress', pid: 424244 });
 
       expect(killCalls).toEqual([{ pid: 424244, signal: 0 }]);
       expect(existsSync(configuration.daemonLockFile)).toBe(true);

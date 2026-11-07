@@ -21,6 +21,7 @@ import {
 } from './reportOutbox/runtimeAuthFailureReportOutbox';
 import { scheduleRuntimeAuthFailureReportOutboxDrainToDaemon } from './reportOutbox/runtimeAuthFailureReportOutboxDrainScheduler';
 import type { RuntimeAuthFailureReportOutboxItem } from './reportOutbox/runtimeAuthFailureReportOutboxTypes';
+import type { NativeProviderTurnSource } from '../connectedServiceTurnLifecycleContract';
 import { resolveRuntimeAuthFailureReportOutboxDelivery } from './reportOutbox/resolveRuntimeAuthFailureReportOutboxDelivery';
 
 type RuntimeAuthFailureNotifyBody = Readonly<{
@@ -33,6 +34,7 @@ type RuntimeAuthFailureNotifyBody = Readonly<{
 
 type RuntimeAuthFailureNotifyOptions = Readonly<{
   timeoutMs?: number | null;
+  nativeProviderSource?: NativeProviderTurnSource;
 }>;
 
 type RuntimeAuthFailureNotify = (
@@ -78,11 +80,19 @@ export const CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS = null;
 const RUNTIME_AUTH_FAILURE_REPORT_DEDUPE_WINDOW_MS = 15_000;
 
 type RuntimeAuthFailureReportDedupeEntry = Readonly<{
+  sessionId: string;
   reportedAtMs: number;
   result: Promise<ConnectedServiceRuntimeAuthFailureDaemonReport>;
 }>;
 
 const recentRuntimeAuthFailureReportsByStableKey = new Map<string, RuntimeAuthFailureReportDedupeEntry>();
+
+/** A genuine completed provider turn separates later failures from duplicate observers. */
+export function recordRuntimeAuthProviderCompletion(sessionId: string): void {
+  for (const [key, entry] of recentRuntimeAuthFailureReportsByStableKey) {
+    if (entry.sessionId === sessionId) recentRuntimeAuthFailureReportsByStableKey.delete(key);
+  }
+}
 
 export function resetConnectedServiceRuntimeAuthFailureReportDedupeForTests(): void {
   recentRuntimeAuthFailureReportsByStableKey.clear();
@@ -118,9 +128,12 @@ function pruneStaleRuntimeAuthFailureReportDedupeEntries(nowMs: number): void {
 
 export async function reportConnectedServiceRuntimeAuthFailureToDaemon(input: Readonly<{
 	  sessionId: string;
+  /** Runs retain recovery custody in-process; session reports use the durable outbox by default. */
+  delivery?: 'caller_owned' | 'durable';
 	  switchesThisTurn?: number;
 	  resumePromptMode?: unknown;
 	  classification: unknown;
+	  nativeProviderSource?: NativeProviderTurnSource;
 	  notify?: RuntimeAuthFailureNotify;
 	  logger?: RuntimeAuthFailureLogger;
   logPrefix?: string;
@@ -129,6 +142,8 @@ export async function reportConnectedServiceRuntimeAuthFailureToDaemon(input: Re
   nowMs?: () => number;
   createReportId?: () => string;
 }>): Promise<ConnectedServiceRuntimeAuthFailureDaemonReport> {
+  // Provider-started turns can lack request-local account attribution. Only daemon
+  // source authorization can determine whether this session has a binding to recover.
   const notify = input.notify ?? notifyDaemonConnectedServiceRuntimeAuthFailure;
   const logger = input.logger ?? defaultLogger;
   const logPrefix = input.logPrefix ?? '[connected-services]';
@@ -156,6 +171,7 @@ export async function reportConnectedServiceRuntimeAuthFailureToDaemon(input: Re
     scheduleDrain: boolean;
     incrementAttemptCount?: boolean;
   }>): Promise<RuntimeAuthFailureReportOutboxItem | null> {
+    if (input.delivery === 'caller_owned') return null;
     try {
       const result = await enqueueRuntimeAuthFailureReportOutboxItem({
         ...(input.reportOutboxDir ? { outboxDir: input.reportOutboxDir } : {}),
@@ -212,6 +228,7 @@ export async function reportConnectedServiceRuntimeAuthFailureToDaemon(input: Re
     try {
       const report = await notify(reportBody, {
         timeoutMs: CONNECTED_SERVICE_RUNTIME_AUTH_FAILURE_REPORT_TIMEOUT_MS,
+        ...(input.nativeProviderSource ? { nativeProviderSource: input.nativeProviderSource } : {}),
       });
       const statusNote = resolveConnectedServiceRuntimeAuthFailureStatusMessage(report);
       const projection = normalizeConnectedServiceRuntimeAuthRecoveryProjection({
@@ -281,6 +298,7 @@ export async function reportConnectedServiceRuntimeAuthFailureToDaemon(input: Re
   }
   const result = performReport();
   recentRuntimeAuthFailureReportsByStableKey.set(dedupeKey, {
+    sessionId: input.sessionId,
     reportedAtMs: nowMs,
     result,
   });

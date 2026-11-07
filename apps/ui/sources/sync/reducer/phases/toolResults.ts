@@ -3,6 +3,7 @@ import type { ReducerState } from '../reducer';
 import { applyToolResultUpdateToReducerMessage } from '../helpers/applyToolResultUpdateToReducerMessage';
 import { bufferOrphanToolResult } from '../helpers/orphanToolResults';
 import type { ToolResultUpdate } from '../helpers/toolResultUpdateTypes';
+import { selectToolResultSessionMediaMeta } from '@/sync/domains/sessionMedia/sessionMediaMessageMeta';
 
 function toToolResultUpdate(c: Readonly<{
     tool_use_id: string;
@@ -16,6 +17,31 @@ function toToolResultUpdate(c: Readonly<{
         is_error: c.is_error,
         ...(c.permissions ? { permissions: c.permissions } : {}),
     };
+}
+
+/** AgentState creates permission-only mirrors with no transcript call identity. */
+export function resolveSidechainPermissionMirror(state: ReducerState, toolUseId: string): string | null {
+    const messageId = state.toolIdToMessageId.get(toolUseId);
+    const message = messageId ? state.messages.get(messageId) : null;
+    return message?.realID == null && message?.tool?.permission ? messageId ?? null : null;
+}
+
+/** Explicit scope selects its child; an unscoped result requires one current sidechain owner. */
+export function resolveSidechainToolMessage(state: ReducerState, toolUseId: string, explicitSidechainId?: string): Readonly<{ messageId: string; sidechainId: string }> | null {
+    const candidate = state.sidechainToolIdToMessageId.get(toolUseId);
+    if (!candidate && !explicitSidechainId) return null;
+    let owner: string | null = null;
+    let ownerSidechainId: string | null = null;
+    for (const [sidechainId, sidechain] of state.sidechains) {
+        if (explicitSidechainId && sidechainId !== explicitSidechainId) continue;
+        for (const message of sidechain) {
+            if (message.tool?.id !== toolUseId) continue;
+            if (owner && owner !== message.id) return null;
+            owner = message.id;
+            ownerSidechainId = sidechainId;
+        }
+    }
+    return owner && ownerSidechainId ? { messageId: owner, sidechainId: ownerSidechainId } : null;
 }
 
 export function runToolResultsPhase(params: Readonly<{
@@ -34,8 +60,11 @@ export function runToolResultsPhase(params: Readonly<{
             for (const [contentIndex, content] of msg.content.entries()) {
                 const c = content;
                 if (c.type === 'tool-result') {
+                    const resultMeta = selectToolResultSessionMediaMeta(msg, c.tool_use_id);
                     // Find the message containing this tool
-                    let messageId = state.toolIdToMessageId.get(c.tool_use_id);
+                    const mainMessageId = state.toolIdToMessageId.get(c.tool_use_id);
+                    const sidechain = mainMessageId ? null : resolveSidechainToolMessage(state, c.tool_use_id);
+                    const messageId = mainMessageId ?? sidechain?.messageId;
                     if (!messageId) {
                         const toolResult = toToolResultUpdate(c);
                         bufferOrphanToolResult({
@@ -44,7 +73,7 @@ export function runToolResultsPhase(params: Readonly<{
                             result: {
                                 key: `${msg.id}:${contentIndex}`,
                                 createdAt: msg.createdAt,
-                                meta: msg.meta,
+                                meta: resultMeta,
                                 toolResult,
                             },
                         });
@@ -61,9 +90,13 @@ export function runToolResultsPhase(params: Readonly<{
                         messageId,
                         toolResult,
                         resultCreatedAt: msg.createdAt,
-                        meta: msg.meta,
+                        meta: resultMeta,
                         changed,
                     });
+                    if (sidechain) {
+                        const parentId = state.toolIdToMessageId.get(sidechain.sidechainId);
+                        if (parentId) changed.add(parentId);
+                    }
                 }
             }
         }

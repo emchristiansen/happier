@@ -17,7 +17,6 @@ import { normalizeSessionAuthoringConnectedServices } from '@/sync/domains/sessi
 import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
 import { resolveNewSessionServerTarget } from '@/sync/domains/server/selection/serverSelectionResolver';
 import { getMissingRequiredConfigEnvVarNames } from '@/utils/profiles/profileConfigRequirements';
-import { getSecretSatisfaction } from '@/utils/secrets/secretSatisfaction';
 import type { SecretChoiceByProfileIdByEnvVarName } from '@/utils/secrets/secretRequirementApply';
 import { getBuiltInProfile } from '@/sync/domains/profiles/profileUtils';
 import { isProfileCompatibleWithBackendTarget, type AIBackendProfile } from '@/sync/domains/profiles/profileCompatibility';
@@ -27,7 +26,7 @@ import type { ServerAccountScope } from '@/sync/domains/scope/serverAccountScope
 import { resolveEffectiveWindowsRemoteSessionLaunchMode } from '@/sync/domains/session/spawn/windowsRemoteSessionLaunchMode';
 import { getAgentCore, type AgentId } from '@/agents/catalog/catalog';
 import { buildSpawnEnvironmentVariablesFromUiState, buildSpawnSessionExtrasFromUiState, getAgentResumeExperimentsFromSettings, getNewSessionPreflightIssues } from '@/agents/catalog/catalog';
-import { transformProfileToEnvironmentVars } from '@/components/sessions/new/modules/profileHelpers';
+import { buildProfileEnvironmentVariablesForSession } from '@/components/sessions/new/modules/profileHelpers';
 import type { NewSessionPromptStore } from '@/components/sessions/new/hooks/screenModel/newSessionPromptStore';
 import type { UseMachineEnvPresenceResult } from '@/hooks/machine/useMachineEnvPresence';
 import { getMachineCapabilitiesSnapshot } from '@/hooks/server/useMachineCapabilitiesCache';
@@ -45,7 +44,7 @@ import { executeSessionComposerResolution } from '@/sync/domains/input/slashComm
 import { resolvePromptInvocationComposerSendAction } from '@/sync/domains/input/slashCommands/promptInvocationBehavior';
 import { createDefaultActionExecutor } from '@/sync/ops/actions/defaultActionExecutor';
 import { resolveServerIdForSessionIdFromLocalCache } from '@/sync/runtime/orchestration/serverScopedRpc/resolveServerIdForSessionIdFromLocalCache';
-import { isSocketIoAckTimeoutError } from '@/sync/runtime/socketIoAckTimeout';
+import { isSocketIoAckTimeoutError } from '@happier-dev/protocol/rpcErrors';
 import { readNonBlankSessionControlIdentifier } from '@/sync/domains/sessionControl/opaqueIdentifiers';
 import type { PreflightModelList } from '@/sync/domains/models/modelOptions';
 import { getModelOptionsForAgentType } from '@/sync/domains/models/modelOptions';
@@ -494,8 +493,6 @@ export function useCreateNewSession(params: Readonly<{
                         return;
                     }
 
-                    environmentVariables = transformProfileToEnvironmentVars(selectedProfile);
-
                     const selectedSecretIdByEnvVarName = current.selectedSecretIdByProfileIdByEnvVarName[current.selectedProfileId] ?? {};
                     const sessionOnlySecretValueByEnvVarName = current.sessionOnlySecretValueByProfileIdByEnvVarName[current.selectedProfileId] ?? {};
                     const machineEnvReadyByName = Object.fromEntries(
@@ -514,44 +511,22 @@ export function useCreateNewSession(params: Readonly<{
                         }
                     }
 
-                    const satisfaction = getSecretSatisfaction({
+                    const profileEnvironment = buildProfileEnvironmentVariablesForSession({
                         profile: selectedProfile,
                         secrets: current.secrets,
                         defaultBindings: current.secretBindingsByProfileId[current.selectedProfileId] ?? null,
                         selectedSecretIds: selectedSecretIdByEnvVarName,
                         sessionOnlyValues: sessionOnlySecretValueByEnvVarName,
                         machineEnvReadyByName,
+                        decryptSecretValue: (value) => sync.decryptSecretValue(value),
                     });
-
-                    if (!satisfaction.isSatisfied) {
+                    if (!profileEnvironment.satisfaction.isSatisfied) {
                         Modal.alert(t('common.error'), t('profiles.requirements.modalBody'));
                         current.setIsCreating(false);
                         return;
                     }
 
-                    for (const item of satisfaction.items) {
-                        if (!item.isSatisfied) continue;
-                        let injected: string | null = null;
-
-                        if (item.satisfiedBy === 'sessionOnly') {
-                            injected = sessionOnlySecretValueByEnvVarName[item.envVarName] ?? null;
-                        } else if (
-                            item.satisfiedBy === 'selectedSaved' ||
-                            item.satisfiedBy === 'rememberedSaved' ||
-                            item.satisfiedBy === 'defaultSaved'
-                        ) {
-                            const id = item.savedSecretId;
-                            const secret = id ? (current.secrets.find((key) => key.id === id) ?? null) : null;
-                            injected = sync.decryptSecretValue(secret?.encryptedValue ?? null);
-                        }
-
-                        if (typeof injected === 'string' && injected.length > 0) {
-                            environmentVariables = {
-                                ...environmentVariables,
-                                [item.envVarName]: injected,
-                            };
-                        }
-                    }
+                    environmentVariables = profileEnvironment.environmentVariables;
                 }
             }
 
@@ -1437,6 +1412,16 @@ export function useCreateNewSession(params: Readonly<{
                                 : []),
                             { text: t('common.cancel'), style: 'cancel' as const },
                         ],
+                    );
+                    return;
+                }
+                if (result.errorDetail?.kind === 'terminal_host_unavailable') {
+                    current.setIsCreating(false);
+                    Modal.alert(
+                        t('newSession.terminalHostUnavailableTitle'),
+                        t('newSession.terminalHostUnavailableBody', {
+                            host: result.errorDetail.host === 'herdr' ? 'Herdr' : 'Zellij',
+                        }),
                     );
                     return;
                 }

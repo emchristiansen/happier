@@ -4,6 +4,18 @@ import { readServerEnabledBit } from '../serverEnabledBit.js';
 import { FeaturesResponseSchema } from './featuresResponseSchema.js';
 
 describe('FeatureGatesSchema', () => {
+  it('negotiates plain Machine support independently of released plain Session support', () => {
+    const oldServer = FeaturesResponseSchema.parse({
+      features: { encryption: { plaintextStorage: { enabled: true } } },
+      capabilities: {},
+    });
+    expect(readServerEnabledBit(oldServer, 'encryption.plaintextMachine')).toBe(false);
+    const currentServer = FeaturesResponseSchema.parse({
+      features: { encryption: { plaintextStorage: { enabled: true }, plaintextMachine: { enabled: true } } },
+      capabilities: {},
+    });
+    expect(readServerEnabledBit(currentServer, 'encryption.plaintextMachine')).toBe(true);
+  });
   it('preserves pets companion and sync gates', () => {
     const parsed = FeaturesResponseSchema.parse({
       features: {
@@ -75,7 +87,9 @@ describe('FeatureGatesSchema', () => {
           accountGroups: { enabled: true },
           accountFallback: { enabled: true },
           autoQuotaReset: { enabled: true },
+          poolQuotaLimitSelection: { enabled: true },
           subscription: { enabled: true },
+          quotaRecoveryCreditDetails: { enabled: true },
         },
         sessions: {
           enabled: true,
@@ -88,7 +102,9 @@ describe('FeatureGatesSchema', () => {
     expect(readServerEnabledBit(parsed, 'connectedServices.accountGroups')).toBe(true);
     expect(readServerEnabledBit(parsed, 'connectedServices.accountFallback')).toBe(true);
     expect(readServerEnabledBit(parsed, 'connectedServices.autoQuotaReset')).toBe(true);
+    expect(readServerEnabledBit(parsed, 'connectedServices.poolQuotaLimitSelection')).toBe(true);
     expect(readServerEnabledBit(parsed, 'connectedServices.subscription')).toBe(true);
+    expect(readServerEnabledBit(parsed, 'connectedServices.quotaRecoveryCreditDetails')).toBe(true);
     expect(readServerEnabledBit(parsed, 'sessions.usageLimitRecovery')).toBe(true);
   });
 
@@ -102,7 +118,9 @@ describe('FeatureGatesSchema', () => {
     expect(readServerEnabledBit(parsed, 'connectedServices.accountGroups')).toBe(false);
     expect(readServerEnabledBit(parsed, 'connectedServices.accountFallback')).toBe(false);
     expect(readServerEnabledBit(parsed, 'connectedServices.autoQuotaReset')).toBe(false);
+    expect(readServerEnabledBit(parsed, 'connectedServices.poolQuotaLimitSelection')).toBe(false);
     expect(readServerEnabledBit(parsed, 'connectedServices.subscription')).toBe(false);
+    expect(readServerEnabledBit(parsed, 'connectedServices.quotaRecoveryCreditDetails')).toBe(false);
     expect(readServerEnabledBit(parsed, 'sessions.drafts')).toBe(false);
   });
 

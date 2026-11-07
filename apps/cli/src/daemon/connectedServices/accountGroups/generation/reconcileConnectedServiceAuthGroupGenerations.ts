@@ -7,6 +7,7 @@ import {
   type ConnectedServiceProviderAdoptedGenerationTarget,
 } from '../../sessionAuthSwitch/connectedServiceAuthSwitchOutcome';
 import type { ConnectedServiceAuthGroupGenerationConsumer } from './ConnectedServiceAuthGroupGenerationConsumer';
+import type { ConnectedServiceRuntimeTargetRegistration } from '../../runtimeRegistry/registry';
 import type { ConnectedServiceGenerationExecutionAuthority } from '../../sessionAuthSwitch/connectedServiceAuthSwitchOutcome';
 import type {
   ConnectedServiceProjectedAuthGroup,
@@ -43,6 +44,13 @@ export type ConnectedServiceGenerationRuntimeTarget = Readonly<{
   revision?: number;
   connectedServiceMaterializationIdentityV1?: Readonly<{ id: string }> | null;
 }>;
+
+export function listSessionGenerationRuntimeTargets(
+  registrations: readonly ConnectedServiceRuntimeTargetRegistration[],
+): ConnectedServiceGenerationRuntimeTarget[] {
+  // Runs retain their parent's sessionId, but cannot receive a session auth application.
+  return registrations.flatMap((registration) => registration.key.kind === 'session' ? [registration.target] : []);
+}
 
 type ConnectedServiceAuthGroupRuntimeScope = Readonly<{
   sessionId: string;
@@ -384,15 +392,8 @@ async function reconcileKnownConnectedServiceAuthGroupScopes(params: Readonly<{
         session.applicationSettledProfileId !== activeProfileId
         || session.applicationSettledGeneration !== group.generation
       ) return true;
-      if (
-        credentialBoundary.status === 'present'
-        && credentialBoundary.revisionSemantics === 'legacy_unfenced'
-      ) {
-        return !(
-          session.applicationSettledCredentialRevision === null
-          && session.applicationSettledBySpawnMaterialization
-        );
-      }
+      // A revisionless projection is not runner availability. Re-read/apply the selected
+      // account through the owner, which obtains the server's current (also legacy-row) revision.
       return !(
         credentialBoundary.status === 'present'
         && credentialBoundary.revisionSemantics === 'revisioned'
@@ -420,15 +421,14 @@ async function reconcileKnownConnectedServiceAuthGroupScopes(params: Readonly<{
       throw new ConnectedServiceGenerationReconciliationNotAcknowledgeableError();
     }
     if (sessionsRequiringCurrentTruthNotification.length > 0) {
-      const credentialRevision = committedGeneration.decisionCommittedTarget.credentialRevision;
-      if (credentialRevision === null) {
+      if (credentialBoundary.status !== 'present' || credentialBoundary.revisionSemantics !== 'revisioned') {
         throw new ConnectedServiceGenerationReconciliationNotAcknowledgeableError();
       }
       const truthResult = await params.consumer.consumeAvailableCurrentTruth({
         serviceId: committedGeneration.decisionCommittedTarget.serviceId,
         groupId: committedGeneration.decisionCommittedTarget.groupId,
         generation: committedGeneration.decisionCommittedTarget.generation,
-        credentialRevision,
+        credentialRevision: credentialBoundary.credentialRevision,
         sessions: sessionsRequiringCurrentTruthNotification.map((session) => ({
           sessionId: session.sessionId,
           activity: 'live',

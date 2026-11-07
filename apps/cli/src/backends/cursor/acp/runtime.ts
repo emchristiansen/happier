@@ -5,7 +5,6 @@ import type { ApiSessionClient } from '@/api/session/sessionClient';
 import type { PermissionMode } from '@/api/types';
 import type { CursorBackendOptions } from '@/backends/cursor/acp/backend';
 import {
-  buildCursorSessionModelsFromConfigOptions,
   resolveCursorSessionConfigOptionUpdate,
   resolveCursorSessionModelConfigUpdate,
 } from '@/backends/cursor/acp/cursorModelConfig';
@@ -49,7 +48,8 @@ export function createCursorAcpRuntime(params: {
     pendingQueueDrainMaxPopPerWake: params.pendingQueueDrainMaxPopPerWake,
     providerInputConsumer: params.providerInputConsumer,
     resolveSessionModelConfigUpdate: resolveCursorSessionModelConfigUpdate,
-    deriveSessionModelsFromConfigOptions: buildCursorSessionModelsFromConfigOptions,
+    // CursorAcpBackend alone publishes the merged standard/proprietary catalog.
+    deriveSessionModelsFromConfigOptions: () => null,
     resolveSessionConfigOptionUpdate: resolveCursorSessionConfigOptionUpdate,
     sessionMediaProviderRoots: [resolveCursorGeneratedMediaRoot({
       directory: params.directory,

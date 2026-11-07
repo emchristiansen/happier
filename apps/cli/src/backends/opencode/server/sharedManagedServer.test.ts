@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import os from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -8,12 +8,14 @@ import type { ProviderCliLaunchSpec } from '@/backends/opencode/utils/resolveOpe
 
 import {
   persistManagedOpenCodeBrokerActivationProof,
+  readSharedManagedOpenCodeServerStateByBaseUrlBestEffort,
   readSharedManagedOpenCodeServerStateBestEffort,
   rehydrateManagedOpenCodeBrokerActivationProof,
   resolveManagedOpenCodeDaemonOwnerIdFromState,
   resolveSharedManagedOpenCodeServerStatePathForEnv,
   resolveSharedManagedOpenCodeServerBaseUrl,
   stopSharedManagedOpenCodeServerFromState,
+  stopSharedManagedOpenCodeServerFromEnvBestEffort,
   type ManagedOpenCodeBrokerActivationExpectation,
   type SharedManagedOpenCodeServerState,
 } from './sharedManagedServer';
@@ -301,6 +303,34 @@ describe('managed OpenCode broker activation proof continuity', () => {
 });
 
 describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
+  it('finds the exact target state in another launch-fingerprint pool', async () => {
+    const defaultState: SharedManagedOpenCodeServerState = {
+      baseUrl: 'http://127.0.0.1:4100',
+      pid: 4100,
+      startedAtMs: 1,
+      authPassword: 'default-secret',
+    };
+    const targetState: SharedManagedOpenCodeServerState = {
+      baseUrl: 'http://127.0.0.1:4200',
+      pid: 4200,
+      startedAtMs: 2,
+      authPassword: 'target-secret',
+    };
+    const statesByPath = new Map([
+      ['/managed-servers/default.json', defaultState],
+      ['/managed-servers/connected-profile.json', targetState],
+    ]);
+
+    await expect(readSharedManagedOpenCodeServerStateByBaseUrlBestEffort(
+      'http://127.0.0.1:4200/',
+      {
+        readCurrentState: async () => defaultState,
+        listPooledStatePaths: async () => [...statesByPath.keys()],
+        readStatePath: async (statePath) => statesByPath.get(statePath) ?? null,
+      },
+    )).resolves.toEqual(targetState);
+  });
+
   it('scopes the default managed-server state path by launch fingerprint without raw auth content', () => {
     const envA = {
       HOME: '/Users/example',
@@ -511,6 +541,91 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
     }));
   });
 
+  it('probes a reuse candidate with the credential retained for that server and keeps it across restarts', async () => {
+    // Released OpenCode 2 answers 401 to an unauthenticated probe, so a reuse probe without the
+    // retained credential would report a healthy managed server as unusable and churn a replacement.
+    const commandLine = 'opencode serve --hostname=127.0.0.1 --port=1234';
+    const deps = {
+      withLock: async <T>(fn: () => Promise<T>) => await fn(),
+      readState: vi.fn(async () => ({
+        v: 2 as const,
+        baseUrl: 'http://127.0.0.1:1234',
+        pid: 111,
+        startedAtMs: 1,
+        status: 'failed' as const,
+        launchEnvFingerprint: 'scope-a',
+        ownerToken: 'owner-token-a',
+        startTimeMs: 2_500,
+        expectedCmdlineHash: hashCommandLine(commandLine),
+        activeServerDir: '/tmp/happy/servers/cloud',
+        daemonInstanceId: 'old-daemon',
+        apiGeneration: 'auto' as const,
+        authPassword: 'retained-secret',
+      })),
+      writeState: vi.fn(async (_state: unknown) => {}),
+      isPidAlive: vi.fn(() => true),
+      probeHealth: vi.fn(async () => true),
+      getProcessInfo: vi.fn(async () => ({ name: 'opencode', cmd: commandLine })),
+      readProcessStartTimeMs: vi.fn(async () => 2_501),
+      killPid: vi.fn(() => true),
+      startServer: vi.fn(async () => ({ baseUrl: 'http://127.0.0.1:9999', pid: 222 })),
+      currentLaunchFingerprint: 'scope-a',
+      currentActiveServerDir: '/tmp/happy/servers/cloud',
+      currentDaemonInstanceId: 'new-daemon',
+      nowMs: () => 5,
+    };
+
+    const out = await resolveSharedManagedOpenCodeServerBaseUrl(deps);
+
+    expect(out).toMatchObject({ baseUrl: 'http://127.0.0.1:1234', didStart: false });
+    expect(deps.probeHealth).toHaveBeenCalledWith(
+      'http://127.0.0.1:1234',
+      'auto',
+      { username: 'opencode', password: 'retained-secret' },
+    );
+    expect(deps.startServer).not.toHaveBeenCalled();
+    // The recovery write must not drop the credential, or the next reader loses access to this server.
+    expect(deps.writeState).toHaveBeenLastCalledWith(expect.objectContaining({
+      status: 'ready',
+      authPassword: 'retained-secret',
+    }));
+  });
+
+  it('retains the password of a freshly started managed server from the first state write', async () => {
+    const deps = {
+      withLock: async <T>(fn: () => Promise<T>) => await fn(),
+      readState: vi.fn(async () => null),
+      writeState: vi.fn(async (_state: unknown) => {}),
+      isPidAlive: vi.fn(() => false),
+      probeHealth: vi.fn(async () => true),
+      getProcessInfo: vi.fn(async () => ({ name: 'opencode', cmd: 'opencode serve' })),
+      readProcessStartTimeMs: vi.fn(async () => 2_501),
+      killPid: vi.fn(() => true),
+      startServer: vi.fn(async (params?: {
+        onSpawned?: (started: {
+          baseUrl: string;
+          pid: number;
+          authPassword?: string;
+        }) => void | Promise<void>;
+      }) => {
+        await params?.onSpawned?.({ baseUrl: 'http://127.0.0.1:9999', pid: 222, authPassword: 'minted-secret' });
+        return { baseUrl: 'http://127.0.0.1:9999', pid: 222, authPassword: 'minted-secret' };
+      }),
+      currentLaunchFingerprint: 'scope-a',
+      currentActiveServerDir: '/tmp/happy/servers/cloud',
+      currentDaemonInstanceId: 'cloud',
+      nowMs: () => 5,
+    };
+
+    const out = await resolveSharedManagedOpenCodeServerBaseUrl(deps);
+
+    expect(out).toMatchObject({ baseUrl: 'http://127.0.0.1:9999', didStart: true });
+    expect(deps.writeState.mock.calls.map(([state]) => state)).toEqual([
+      expect.objectContaining({ status: 'starting', authPassword: 'minted-secret' }),
+      expect.objectContaining({ status: 'ready', authPassword: 'minted-secret' }),
+    ]);
+  });
+
   it('reuses a healthy current-generation managed server across daemon replacement', async () => {
     const commandLine = 'opencode serve --hostname=127.0.0.1 --port=1234';
     const deps = {
@@ -547,7 +662,7 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
     const out = await resolveSharedManagedOpenCodeServerBaseUrl(deps);
 
     expect(out).toEqual({ baseUrl: 'http://127.0.0.1:1234', didStart: false });
-    expect(deps.probeHealth).toHaveBeenCalledWith('http://127.0.0.1:1234');
+    expect(deps.probeHealth).toHaveBeenCalledWith('http://127.0.0.1:1234', undefined, null);
     expect(deps.killPid).not.toHaveBeenCalled();
     expect(deps.startServer).not.toHaveBeenCalled();
     expect(deps.writeState).not.toHaveBeenCalled();
@@ -633,6 +748,7 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
       probeHealth: vi.fn(async () => true),
       getProcessInfo: vi.fn(async () => ({ name: 'opencode', cmd: commandLine })),
       readProcessStartTimeMs: vi.fn(async () => 2_501),
+      readProcessInstanceFingerprint: vi.fn(async () => 'linux-proc:90'),
       killPid: vi.fn(() => true),
       startServer: vi.fn(async (params?: { onSpawned?: (started: { baseUrl: string; pid: number }) => void | Promise<void> }) => {
         await params?.onSpawned?.({ baseUrl: 'http://127.0.0.1:9999', pid: 222 });
@@ -658,6 +774,7 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
           startedAtMs: 5,
           status: 'starting',
           launchEnvFingerprint: 'scope-b',
+          processInstanceFingerprint: 'linux-proc:90',
           ownerToken: expect.any(String),
           startTimeMs: expect.any(Number),
           expectedCmdlineHash: expect.any(String),
@@ -673,6 +790,7 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
           startedAtMs: 5,
           status: 'ready',
           launchEnvFingerprint: 'scope-b',
+          processInstanceFingerprint: 'linux-proc:90',
           ownerToken: expect.any(String),
           startTimeMs: expect.any(Number),
           expectedCmdlineHash: expect.any(String),
@@ -741,9 +859,9 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
       writeState: vi.fn(async () => {}),
       isPidAlive: vi.fn(() => false),
       probeHealth: vi.fn(async () => false),
-      startServer: vi.fn(async (params?: { onSpawned?: (started: { baseUrl: string; pid: number; logPath?: string }) => void | Promise<void> }) => {
-        await params?.onSpawned?.({ baseUrl: 'http://127.0.0.1:9999', pid: 222, logPath });
-        return { baseUrl: 'http://127.0.0.1:9999', pid: 222, logPath };
+      startServer: vi.fn(async (params?: { onSpawned?: (started: { baseUrl: string; pid: number; logPath?: string; apiGeneration?: 'v2' }) => void | Promise<void> }) => {
+        await params?.onSpawned?.({ baseUrl: 'http://127.0.0.1:9999', pid: 222, logPath, apiGeneration: 'v2' });
+        return { baseUrl: 'http://127.0.0.1:9999', pid: 222, logPath, apiGeneration: 'v2' as const };
       }),
       nowMs: () => 5,
     };
@@ -752,8 +870,8 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
 
     expect(out).toEqual({ baseUrl: 'http://127.0.0.1:9999', didStart: true });
     expect(deps.writeState.mock.calls).toEqual([
-      [{ baseUrl: 'http://127.0.0.1:9999', pid: 222, startedAtMs: 5, status: 'starting', logPath }],
-      [{ baseUrl: 'http://127.0.0.1:9999', pid: 222, startedAtMs: 5, status: 'ready', logPath }],
+      [{ baseUrl: 'http://127.0.0.1:9999', pid: 222, startedAtMs: 5, status: 'starting', logPath, apiGeneration: 'v2' }],
+      [{ baseUrl: 'http://127.0.0.1:9999', pid: 222, startedAtMs: 5, status: 'ready', logPath, apiGeneration: 'v2' }],
     ]);
   });
 
@@ -781,7 +899,7 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
     ]);
   });
 
-  it('starts a replacement without killing an unhealthy untrusted v1 state that only matches opencode serve shape', async () => {
+  it('retains unhealthy live legacy custody when only the broad opencode serve shape matches', async () => {
     const deps = {
       withLock: async <T>(fn: () => Promise<T>) => await fn(),
       readState: vi.fn(async () => ({ baseUrl: 'http://127.0.0.1:1234', pid: 111, startedAtMs: 1, status: 'ready' as const })),
@@ -797,18 +915,13 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
       nowMs: () => 9,
     };
 
-    const out = await resolveSharedManagedOpenCodeServerBaseUrl(deps);
-
-    expect(out).toEqual({ baseUrl: 'http://127.0.0.1:9999', didStart: true });
+    await expect(resolveSharedManagedOpenCodeServerBaseUrl(deps)).rejects.toThrow(/Cannot release the previous managed OpenCode server/);
     expect(deps.killPid).not.toHaveBeenCalled();
-    expect(deps.startServer).toHaveBeenCalledTimes(1);
-    expect(deps.writeState.mock.calls).toEqual([
-      [{ baseUrl: 'http://127.0.0.1:9999', pid: 222, startedAtMs: 9, status: 'starting' }],
-      [{ baseUrl: 'http://127.0.0.1:9999', pid: 222, startedAtMs: 9, status: 'ready' }],
-    ]);
+    expect(deps.startServer).not.toHaveBeenCalled();
+    expect(deps.writeState).not.toHaveBeenCalled();
   });
 
-  it('starts a replacement without killing a failed untrusted v1 state that only matches opencode serve shape', async () => {
+  it('retains failed live legacy custody when only the broad opencode serve shape matches', async () => {
     const deps = {
       withLock: async <T>(fn: () => Promise<T>) => await fn(),
       readState: vi.fn(async () => ({
@@ -830,15 +943,10 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
       nowMs: () => 9,
     };
 
-    const out = await resolveSharedManagedOpenCodeServerBaseUrl(deps);
-
-    expect(out).toEqual({ baseUrl: 'http://127.0.0.1:9999', didStart: true });
+    await expect(resolveSharedManagedOpenCodeServerBaseUrl(deps)).rejects.toThrow(/Cannot release the previous managed OpenCode server/);
     expect(deps.killPid).not.toHaveBeenCalled();
-    expect(deps.startServer).toHaveBeenCalledTimes(1);
-    expect(deps.writeState.mock.calls).toEqual([
-      [{ baseUrl: 'http://127.0.0.1:9999', pid: 222, startedAtMs: 9, status: 'starting' }],
-      [{ baseUrl: 'http://127.0.0.1:9999', pid: 222, startedAtMs: 9, status: 'ready' }],
-    ]);
+    expect(deps.startServer).not.toHaveBeenCalled();
+    expect(deps.writeState).not.toHaveBeenCalled();
   });
 
   it('kills an unhealthy trusted v2 state when command hash and start time still match', async () => {
@@ -933,7 +1041,7 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
     expect(deps.startServer).toHaveBeenCalledTimes(1);
   });
 
-  it('does not kill an unhealthy recorded pid when the command only matches the broad opencode serve heuristic but not the launch spec identity', async () => {
+  it('retains unhealthy live legacy custody without exact launch identity', async () => {
     const wrapperLaunchSpec = {
       command: 'node',
       args: ['/tmp/custom-launch.js'],
@@ -965,17 +1073,22 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
       nowMs: () => 9,
     };
 
-    const out = await resolveSharedManagedOpenCodeServerBaseUrl(deps);
-
-    expect(out).toEqual({ baseUrl: 'http://127.0.0.1:9999', didStart: true });
+    await expect(resolveSharedManagedOpenCodeServerBaseUrl(deps)).rejects.toThrow(/Cannot release the previous managed OpenCode server/);
     expect(deps.killPid).not.toHaveBeenCalled();
-    expect(deps.startServer).toHaveBeenCalledTimes(1);
+    expect(deps.startServer).not.toHaveBeenCalled();
+    expect(deps.writeState).not.toHaveBeenCalled();
   });
 
   it('starts a new managed server after a failed startup when the recorded pid no longer looks like opencode', async () => {
     const deps = {
       withLock: async <T>(fn: () => Promise<T>) => await fn(),
       readState: vi.fn(async () => ({
+        v: 2 as const,
+        ownerToken: 'previous-owner',
+        expectedCmdlineHash: hashCommandLine('opencode serve --hostname=127.0.0.1 --port=1234'),
+        startTimeMs: 2500,
+        activeServerDir: '/tmp/happy/servers/cloud',
+        daemonInstanceId: 'cloud',
         baseUrl: 'http://127.0.0.1:1234',
         pid: 111,
         startedAtMs: 1,
@@ -991,6 +1104,8 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
         await params?.onSpawned?.({ baseUrl: 'http://127.0.0.1:9999', pid: 222 });
         return { baseUrl: 'http://127.0.0.1:9999', pid: 222 };
       }),
+      readProcessStartTimeMs: async () => 2500,
+      currentActiveServerDir: '/tmp/happy/servers/cloud',
       nowMs: () => 9,
     };
 
@@ -1038,7 +1153,7 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
     ]);
   });
 
-  it('starts a new managed server even when a trusted stale opencode pid cannot be killed', async () => {
+  it.each(['termination failed', 'identity unavailable'] as const)('retains live managed-server custody when %s during replacement', async (failure) => {
     const commandLine = 'opencode serve --hostname=127.0.0.1 --port=1234';
     const deps = {
       withLock: async <T>(fn: () => Promise<T>) => await fn(),
@@ -1058,7 +1173,7 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
       writeState: vi.fn(async () => {}),
       isPidAlive: vi.fn(() => true),
       probeHealth: vi.fn(async () => false),
-      getProcessInfo: vi.fn(async () => ({ name: 'opencode', cmd: commandLine })),
+      getProcessInfo: vi.fn(async () => failure === 'identity unavailable' ? null : ({ name: 'opencode', cmd: commandLine })),
       readProcessStartTimeMs: vi.fn(async () => 2_501),
       killPid: vi.fn(() => {
         throw new Error('stuck process');
@@ -1072,31 +1187,11 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
       nowMs: () => 9,
     };
 
-    const out = await resolveSharedManagedOpenCodeServerBaseUrl(deps);
-
-    expect(out).toEqual({ baseUrl: 'http://127.0.0.1:9999', didStart: true });
-    expect(deps.killPid).toHaveBeenCalledWith(111);
-    expect(deps.startServer).toHaveBeenCalledTimes(1);
-    expect(deps.writeState.mock.calls).toEqual([
-      [expect.objectContaining({
-        v: 2,
-        baseUrl: 'http://127.0.0.1:9999',
-        pid: 222,
-        startedAtMs: 9,
-        status: 'starting',
-        activeServerDir: '/tmp/happy/servers/cloud',
-        daemonInstanceId: 'cloud',
-      })],
-      [expect.objectContaining({
-        v: 2,
-        baseUrl: 'http://127.0.0.1:9999',
-        pid: 222,
-        startedAtMs: 9,
-        status: 'ready',
-        activeServerDir: '/tmp/happy/servers/cloud',
-        daemonInstanceId: 'cloud',
-      })],
-    ]);
+    await expect(resolveSharedManagedOpenCodeServerBaseUrl(deps)).rejects.toThrow(/Cannot release the previous managed OpenCode server/);
+    expect(deps.startServer).not.toHaveBeenCalled();
+    expect(deps.writeState).not.toHaveBeenCalled();
+    if (failure === 'termination failed') expect(deps.killPid).toHaveBeenCalledWith(111);
+    else expect(deps.killPid).not.toHaveBeenCalled();
   });
 
   it('reuses a previously failed managed server when the pid is alive and health probe now succeeds', async () => {
@@ -1108,6 +1203,14 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
         startedAtMs: 1,
         status: 'failed' as const,
         lastFailureAtMs: 2,
+        apiGeneration: 'v2' as const,
+        v: 2 as const,
+        ownerToken: 'recovered-owner',
+        expectedCmdlineHash: hashCommandLine('opencode serve --port 1234'),
+        startTimeMs: 2500,
+        activeServerDir: '/tmp/happy/servers/cloud',
+        daemonInstanceId: 'prior-daemon',
+
       })),
       writeState: vi.fn(async () => {}),
       isPidAlive: vi.fn(() => true),
@@ -1128,6 +1231,14 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
       pid: 111,
       startedAtMs: 1,
       status: 'ready',
+      apiGeneration: 'v2',
+      v: 2,
+      ownerToken: 'recovered-owner',
+      expectedCmdlineHash: hashCommandLine('opencode serve --port 1234'),
+      startTimeMs: 2500,
+      activeServerDir: '/tmp/happy/servers/cloud',
+      daemonInstanceId: 'prior-daemon',
+
     });
   });
 
@@ -1153,7 +1264,182 @@ describe('resolveSharedManagedOpenCodeServerBaseUrl', () => {
   });
 });
 
+describe('stopSharedManagedOpenCodeServerFromEnvBestEffort daemon shutdown', () => {
+  async function writeClaimMarker(happySessionId: string, metadata: Readonly<Record<string, unknown>>) {
+    const { configuration } = await import('@/configuration');
+    const { resolveReleaseRingScopedBasename } = await import('@/cli/runtime/publicReleaseChannel');
+    const markerDir = join(configuration.happyHomeDir, 'tmp',
+      resolveReleaseRingScopedBasename('daemon-sessions', configuration.publicReleaseRing));
+    await mkdir(markerDir, { recursive: true });
+    const markerPath = join(markerDir, `pid-${process.pid}.json`);
+    await writeFile(markerPath, JSON.stringify({ pid: process.pid, happySessionId,
+      happyHomeDir: configuration.happyHomeDir, createdAt: 1, updatedAt: 1, flavor: 'opencode', metadata }));
+    return markerPath;
+  }
+
+  it.each(['flavor-only', 'malformed', 'unreadable'] as const)(
+    'retains owned servers when the real session registry has %s custody', async (kind) => {
+      const { configuration } = await import('@/configuration');
+      const { resolveReleaseRingScopedBasename } = await import('@/cli/runtime/publicReleaseChannel');
+      const markerDir = join(configuration.happyHomeDir, 'tmp',
+        resolveReleaseRingScopedBasename('daemon-sessions', configuration.publicReleaseRing));
+      const markerPath = join(markerDir, `pid-${process.pid}.json`);
+      const command = 'opencode serve --hostname=127.0.0.1 --port=1234';
+      let state: SharedManagedOpenCodeServerState | null = {
+        v: 2, baseUrl: 'http://127.0.0.1:1234', pid: 111, startedAtMs: 1,
+        daemonInstanceId: 'current-daemon', activeServerDir: '/tmp/current-server',
+        ownerToken: 'exact-owner', expectedCmdlineHash: hashCommandLine(command),
+        startTimeMs: 10_000, launchEnvFingerprint: 'connected-active',
+      };
+      const killed: number[] = [];
+      try {
+        await mkdir(markerDir, { recursive: true });
+        if (kind === 'flavor-only') {
+          await writeClaimMarker('active-session', { launchEnvFingerprint: 'connected-active' });
+        } else if (kind === 'malformed') {
+          await writeFile(markerPath, '{invalid-json', 'utf8');
+        } else {
+          await mkdir(markerPath);
+        }
+        await stopSharedManagedOpenCodeServerFromEnvBestEffort({ daemonInstanceId: 'current-daemon' }, {
+          statePath: 'connected-active.json',
+          listStateKeys: async () => ['connected-active.json'],
+          withStateLock: async <T>(_key: string, fn: () => Promise<T>) => await fn(),
+          readState: async () => state,
+          removeState: async () => { state = null; },
+          isPidAlive: () => true,
+          probeHealth: async () => true,
+          getProcessInfo: async () => ({ name: 'opencode', cmd: command }),
+          killPid: (pid) => { killed.push(pid); return true; },
+          currentActiveServerDir: '/tmp/current-server',
+          readProcessStartTimeMs: async () => 10_000,
+          readProcessInstanceFingerprint: async () => null,
+        });
+
+        expect(killed).toEqual([]);
+        expect(state).not.toBeNull();
+      } finally {
+        await rm(markerPath, { recursive: kind === 'unreadable', force: true });
+      }
+    },
+  );
+
+  it('retires every owned idle pooled server and preserves live claims independently of ambient fingerprint', async () => {
+    const poolPath = (name: string) => join(dirname(resolveSharedManagedOpenCodeServerStatePathForEnv({})), name);
+    const command = 'opencode serve --hostname=127.0.0.1 --port=1234';
+    const makeState = (pid: number, launchEnvFingerprint: string): SharedManagedOpenCodeServerState => ({
+      v: 2, baseUrl: 'http://127.0.0.1:1234', pid, startedAtMs: 1,
+      daemonInstanceId: 'current-daemon', activeServerDir: '/tmp/current-server',
+      ownerToken: `owner-${pid}`, expectedCmdlineHash: hashCommandLine(command),
+      startTimeMs: 10_000, launchEnvFingerprint,
+      apiGeneration: 'v2', authPassword: `secret-${pid}`,
+    });
+    const states = new Map([
+      [poolPath('connected-one.json'), makeState(111, 'connected-one')],
+      [poolPath('connected-two.json'), makeState(222, 'connected-two')],
+      [poolPath('active.json'), makeState(333, 'active')],
+      [poolPath('borrowed.json'), { ...makeState(444, 'borrowed'), daemonInstanceId: 'other-daemon' }],
+    ]);
+    const killed: number[] = [];
+    const probes: unknown[] = [];
+    const deps = {
+      statePath: poolPath('ambient-default.json'),
+      listStateKeys: async () => [...states.keys()],
+      withStateLock: async <T>(_key: string, fn: () => Promise<T>) => await fn(),
+      readState: async (key: string) => states.get(key) ?? null,
+      removeState: async (key: string) => { states.delete(key); },
+      isPidAlive: () => true,
+      probeHealth: async (_url: string, _generation: 'auto' | 'v2' | undefined, auth: unknown) => { probes.push(auth); return true; },
+      getProcessInfo: async () => ({ name: 'opencode', cmd: command }),
+      killPid: (pid: number) => { killed.push(pid); return true; },
+      currentActiveServerDir: '/tmp/current-server',
+      readProcessStartTimeMs: async () => 10_000,
+      readProcessInstanceFingerprint: async () => null,
+    };
+    const markerPath = await writeClaimMarker('active-session', { flavor: 'opencode', launchEnvFingerprint: 'active' });
+    try {
+      await stopSharedManagedOpenCodeServerFromEnvBestEffort({ daemonInstanceId: 'current-daemon' }, deps);
+
+      expect(killed).toEqual([111, 222]);
+      expect([...states.keys()]).toEqual(['active.json', 'borrowed.json'].map(poolPath));
+      expect(probes).toEqual([
+        { username: 'opencode', password: 'secret-111' },
+        { username: 'opencode', password: 'secret-222' },
+      ]);
+      await writeClaimMarker('unknown-claim-session', { flavor: 'opencode' });
+      states.set(poolPath('unknown-claim.json'), makeState(555, 'unknown-claim'));
+      await stopSharedManagedOpenCodeServerFromEnvBestEffort({ daemonInstanceId: 'current-daemon' }, deps);
+      expect(killed).toEqual([111, 222]);
+      expect([...states.keys()]).toEqual(['active.json', 'borrowed.json', 'unknown-claim.json'].map(poolPath));
+    } finally {
+      await rm(markerPath, { force: true });
+    }
+  });
+});
+
 describe('stopSharedManagedOpenCodeServerFromState', () => {
+  it.each([
+    { case: 'another daemon', daemonInstanceId: 'other-daemon' },
+    { case: 'another server scope', activeServerDir: '/tmp/other-server' },
+    { case: 'a reused PID', startTimeMs: 1_000 },
+    { case: 'unverified custody', v: undefined },
+  ])('preserves a healthy server with $case during daemon shutdown', async ({ case: _case, ...overrides }) => {
+    const command = 'opencode serve --hostname=127.0.0.1 --port=1234';
+    const state: SharedManagedOpenCodeServerState = {
+      v: 2, baseUrl: 'http://127.0.0.1:1234', pid: 111, startedAtMs: 1,
+      daemonInstanceId: 'current-daemon', activeServerDir: '/tmp/current-server',
+      ownerToken: 'exact-owner', expectedCmdlineHash: hashCommandLine(command),
+      startTimeMs: 10_000,
+      ...overrides,
+    };
+    let retainedState: SharedManagedOpenCodeServerState | null = state;
+    const killed: number[] = [];
+    const deps = {
+      withLock: async <T>(fn: () => Promise<T>) => await fn(),
+      readState: async () => retainedState,
+      removeState: async () => { retainedState = null; },
+      isPidAlive: () => true,
+      probeHealth: async () => true,
+      getProcessInfo: async () => ({ name: 'opencode', cmd: command }),
+      killPid: (pid: number) => { killed.push(pid); return true; },
+      currentDaemonInstanceId: 'current-daemon',
+      currentActiveServerDir: '/tmp/current-server',
+      readProcessStartTimeMs: async () => 10_000,
+      readProcessInstanceFingerprint: async () => null,
+    };
+
+    await expect(stopSharedManagedOpenCodeServerFromState(deps)).resolves.toEqual({ didKill: false });
+    expect(killed).toEqual([]);
+    expect(retainedState).toEqual(state);
+  });
+
+  it('probes the stopping server with its retained credential so a live server is never mistaken for dead', async () => {
+    const deps = {
+      withLock: async <T>(fn: () => Promise<T>) => await fn(),
+      readState: vi.fn(async () => ({
+        baseUrl: 'http://127.0.0.1:1234',
+        pid: 111,
+        startedAtMs: 1,
+        status: 'ready' as const,
+        apiGeneration: 'v2' as const,
+        authPassword: 'retained-secret',
+      })),
+      removeState: vi.fn(async () => {}),
+      isPidAlive: vi.fn(() => true),
+      probeHealth: vi.fn(async () => true),
+      getProcessInfo: vi.fn(async () => null),
+      killPid: vi.fn(() => true),
+    };
+
+    await expect(stopSharedManagedOpenCodeServerFromState(deps)).resolves.toEqual({ didKill: true });
+
+    expect(deps.probeHealth).toHaveBeenCalledWith(
+      'http://127.0.0.1:1234',
+      'v2',
+      { username: 'opencode', password: 'retained-secret' },
+    );
+  });
+
   it('kills the managed server when health probe succeeds', async () => {
     const deps = {
       withLock: async <T>(fn: () => Promise<T>) => await fn(),
@@ -1187,7 +1473,7 @@ describe('stopSharedManagedOpenCodeServerFromState', () => {
 
     expect(out).toEqual({ didKill: false });
     expect(deps.killPid).not.toHaveBeenCalled();
-    expect(deps.removeState).toHaveBeenCalledTimes(1);
+    expect(deps.removeState).not.toHaveBeenCalled();
   });
 
   it('kills during stop when health probe fails and launch identity proves ownership', async () => {
@@ -1233,7 +1519,7 @@ describe('stopSharedManagedOpenCodeServerFromState', () => {
 
     expect(out).toEqual({ didKill: false });
     expect(deps.killPid).not.toHaveBeenCalled();
-    expect(deps.removeState).toHaveBeenCalledTimes(1);
+    expect(deps.removeState).not.toHaveBeenCalled();
   });
 
   it('does not kill when only the process name mentions opencode but the command is not an opencode serve process', async () => {
@@ -1251,7 +1537,7 @@ describe('stopSharedManagedOpenCodeServerFromState', () => {
 
     expect(out).toEqual({ didKill: false });
     expect(deps.killPid).not.toHaveBeenCalled();
-    expect(deps.removeState).toHaveBeenCalledTimes(1);
+    expect(deps.removeState).not.toHaveBeenCalled();
   });
 
   it('does not fail when the managed server pid resists shutdown', async () => {
@@ -1271,7 +1557,7 @@ describe('stopSharedManagedOpenCodeServerFromState', () => {
 
     expect(out).toEqual({ didKill: false });
     expect(deps.killPid).toHaveBeenCalledWith(444);
-    expect(deps.removeState).toHaveBeenCalledTimes(1);
+    expect(deps.removeState).not.toHaveBeenCalled();
   });
 
   it('does not probe health for non-loopback baseUrl while stopping (prevents SSRF if state file is tampered)', async () => {
@@ -1292,7 +1578,7 @@ describe('stopSharedManagedOpenCodeServerFromState', () => {
     expect(out).toEqual({ didKill: false });
     expect(deps.probeHealth).not.toHaveBeenCalled();
     expect(deps.killPid).not.toHaveBeenCalled();
-    expect(deps.removeState).toHaveBeenCalledTimes(1);
+    expect(deps.removeState).not.toHaveBeenCalled();
   });
 
   it('does not kill during stop when the command only matches the broad opencode serve heuristic but not the launch spec identity', async () => {
@@ -1320,6 +1606,6 @@ describe('stopSharedManagedOpenCodeServerFromState', () => {
 
     expect(out).toEqual({ didKill: false });
     expect(deps.killPid).not.toHaveBeenCalled();
-    expect(deps.removeState).toHaveBeenCalledTimes(1);
+    expect(deps.removeState).not.toHaveBeenCalled();
   });
 });

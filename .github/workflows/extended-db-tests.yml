@@ -1,4 +1,4 @@
-name: CI — Extended DB Matrix
+name: Nightly — full E2E + extended DB
 
 on:
   workflow_dispatch:
@@ -39,6 +39,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  ui-e2e-nightly:
+    if: ${{ github.event_name == 'schedule' }}
+    name: Full UI E2E nightly
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    uses: ./.github/workflows/tests.yml
+    with:
+      select_jobs_explicitly: true
+      run_ui_e2e: true
+      run_ui: false
+      run_shared_packages: false
+      run_server: false
+      run_server_db_contract: false
+      run_cli: false
+      run_stack: false
+      run_typecheck: false
+      run_cli_daemon_e2e: false
+      run_e2e_core: false
+      run_installers_smoke: false
+      run_binary_smoke: false
+
   e2e-postgres:
     if: ${{ !inputs.select_jobs_explicitly || inputs.run_e2e_postgres }}
     name: Core E2E (Postgres)
@@ -67,9 +90,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
 
       - name: Enable Corepack
         uses: ./.github/actions/enable-corepack-yarn
@@ -151,9 +172,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
 
       - name: Enable Corepack
         uses: ./.github/actions/enable-corepack-yarn
@@ -211,7 +230,7 @@ jobs:
   db-contract-postgres:
     if: ${{ !inputs.select_jobs_explicitly || inputs.run_db_contract_postgres }}
     name: DB Contract (Postgres)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     services:
       postgres:
@@ -236,9 +255,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
 
       - name: Enable Corepack
         uses: ./.github/actions/enable-corepack-yarn
@@ -265,7 +282,7 @@ jobs:
   db-contract-mysql:
     if: ${{ !inputs.select_jobs_explicitly || inputs.run_db_contract_mysql }}
     name: DB Contract (MySQL)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     services:
       mysql:
@@ -289,9 +306,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
-          cache: yarn
-          cache-dependency-path: yarn.lock
+          node-version-file: .node-version
 
       - name: Enable Corepack
         uses: ./.github/actions/enable-corepack-yarn

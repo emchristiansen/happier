@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
-import { createInflateRaw } from 'node:zlib';
+import { createGunzip, createInflateRaw } from 'node:zlib';
 
 import * as tar from 'tar';
 import type { TarOptionsWithAliasesAsyncNoFile } from 'tar';
@@ -15,6 +15,15 @@ import * as yauzl from 'yauzl';
 const WINDOWS_INVALID_PATH_CHARACTER = /[\u0000-\u001f<>:"|?*]/u;
 const WINDOWS_RESERVED_PATH_SEGMENT = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/iu;
 const MAX_TAR_METADATA_ENTRY_BYTES = 1024 * 1024;
+
+export class ArchiveExpandedByteLimitError extends Error {
+  readonly code = 'archive-expanded-byte-limit';
+
+  constructor() {
+    super('[release-runtime] archive exceeds expanded-byte limit');
+    this.name = 'ArchiveExpandedByteLimitError';
+  }
+}
 
 export type ArchiveExtractionLimits = Readonly<{
   maxArchiveBytes: number;
@@ -116,7 +125,7 @@ function createArchiveBudget(params: Readonly<{
       }
       expandedBytes += byteLength;
       if (expandedBytes > params.limits.maxExpandedBytes) {
-        throw new Error('[release-runtime] archive exceeds expanded-byte limit');
+        throw new ArchiveExpandedByteLimitError();
       }
       if (expandedBytes / Math.max(1, params.archiveBytes) > params.limits.maxCompressionRatio) {
         throw new Error('[release-runtime] archive exceeds compression ratio limit');
@@ -726,7 +735,7 @@ async function publishStagedExtraction(params: Readonly<{
   await rename(params.stagingDir, params.extractDir);
 }
 
-function createXzDecompressionRatioGuard(params: Readonly<{
+function createDecompressionRatioGuard(params: Readonly<{
   abortContext: ArchiveAbortContext;
   archiveBytes: number;
   limits: ArchiveExtractionLimits;
@@ -769,15 +778,38 @@ async function extractTarArchiveToDirectory(params: Readonly<{
     params.allowedEntryRoots,
     params.abortContext.abort,
   );
+  const pendingEntries = new Set<tar.ReadEntry>();
+  const acceptedRoots = new Set<string>();
   const unpackOptions: BoundedTarOptions = {
     cwd: params.extractDir,
-    filter: (_path, entry) => 'meta' in entry ? validateEntry.accept(entry) : true,
+    filter: (_path, entry) => {
+      if (params.abortContext.signal.aborted) return false;
+      if (!('meta' in entry)) return true;
+      if (!validateEntry.accept(entry)) return false;
+      if (!entry.meta) {
+        // Unpack reserves relative entry paths, including their parent paths.
+        // A reservation on each accepted root drains the whole staging tree.
+        acceptedRoots.add(entry.path.split('/').find((segment) => segment && segment !== '.') ?? '.');
+        pendingEntries.add(entry);
+        entry.once('end', () => pendingEntries.delete(entry));
+      }
+      return true;
+    },
     maxDecompressionRatio: params.limits.maxCompressionRatio,
     maxMetaEntrySize: MAX_TAR_METADATA_ENTRY_BYTES,
+    // Every accepted path and entry type has already passed the canonical
+    // archive validator, and extraction targets a fresh private staging tree.
+    // Let node-tar use recursive mkdir instead of re-statting every parent for
+    // every file; link entries never reach the filesystem.
+    preservePaths: true,
     preserveOwner: false,
     strict: true,
   };
   const unpack = tar.x(unpackOptions);
+  let extractionFailed = false;
+  const unpackFinished = new Promise<void>((resolveFinished) => {
+    unpack.once('finish', resolveFinished);
+  });
   attachTarMetadataBudget({ parser: unpack, budget, abort: params.abortContext.abort });
 
   try {
@@ -787,13 +819,17 @@ async function extractTarArchiveToDirectory(params: Readonly<{
       const decompressedStream = new XzReadableStream(Readable.toWeb(source));
       await pipeline(
         Readable.fromWeb(decompressedStream),
-        createXzDecompressionRatioGuard(params),
+        createDecompressionRatioGuard(params),
         unpack,
         { signal: params.abortContext.signal },
       );
     } else {
+      // Keep gzip teardown inside pipeline: node-tar's internal gunzip can emit
+      // a late stream error after a rejected entry has already settled extraction.
       await pipeline(
         createOpenArchiveRangeStream(params.archiveFile, 0, params.archiveBytes),
+        createGunzip(),
+        createDecompressionRatioGuard(params),
         unpack,
         { signal: params.abortContext.signal },
       );
@@ -801,9 +837,36 @@ async function extractTarArchiveToDirectory(params: Readonly<{
     params.abortContext.throwIfAborted();
     validateEntry.assertValid();
   } catch (error) {
+    extractionFailed = true;
     params.abortContext.throwIfAborted();
     validateEntry.assertValid();
     throw error;
+  } finally {
+    // Pipeline synthesizes close for node-tar's legacy stream on failure;
+    // that does not drain its pending filesystem callbacks. Successful unpack
+    // emits finish after those callbacks, but parser abort and CwdError do not.
+    unpack.end();
+    if (extractionFailed) {
+      // End and consume every accepted entry, including queued entries, before
+      // taking the reservation barrier so no later entry can start a staging
+      // write. Failed extraction discards these bodies; CwdError otherwise
+      // leaves its entry paused forever.
+      await Promise.all([...pendingEntries].map((entry) => new Promise<void>((resolveEntry) => {
+        entry.once('end', resolveEntry);
+        entry.end();
+        entry.resume();
+      })));
+      if (acceptedRoots.size > 0) {
+        await new Promise<void>((resolveDrained) => {
+          unpack.reservations.reserve([...acceptedRoots], (release) => {
+            release();
+            resolveDrained();
+          });
+        });
+      }
+    } else {
+      await unpackFinished;
+    }
   }
 }
 

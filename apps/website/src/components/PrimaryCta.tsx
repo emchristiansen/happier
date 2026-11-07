@@ -1,4 +1,4 @@
-import { APP_STORE_URL, ANDROID_APK_URL, WEB_APP_URL } from '../data/downloads';
+import { APP_STORE_URL, ANDROID_PLAY_URL, WEB_APP_URL } from '../data/downloads';
 import { HandoffToComputer } from './HandoffToComputer';
 import { InstallCommand } from './InstallCommand';
 import { VerifyInstaller } from './VerifyInstaller';
@@ -21,8 +21,7 @@ import { Island } from '../islands';
  *                    every crawler get, so the fold has real text in the HTML.
  *   iOS / iPadOS     <Island name="handoff-to-computer" component={HandoffToComputer} />, then the App Store link labelled as
  *                    the companion it is.
- *   Android          <Island name="handoff-to-computer" component={HandoffToComputer} />, then the APK link — because there is
- *                    no Play listing to send anyone to (see data/downloads.ts).
+ *   Android          <Island name="handoff-to-computer" component={HandoffToComputer} />, then the public Play listing.
  */
 export function PrimaryCta() {
     const { pageProse: { PAGE_PROSE } } = useSiteData();
@@ -37,7 +36,7 @@ export function PrimaryCta() {
                     Already have a machine set up?{' '}
                     {platform === 'android' ? (
                         <a
-                            href={ANDROID_APK_URL}
+                            href={ANDROID_PLAY_URL}
                             className="font-medium underline underline-offset-2"
                             style={{ color: 'var(--fg)' }}
                         >

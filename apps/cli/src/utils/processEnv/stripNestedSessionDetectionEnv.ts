@@ -11,6 +11,8 @@ export function stripNestedSessionDetectionEnv(input: NodeJS.ProcessEnv): NodeJS
   const out: NodeJS.ProcessEnv = { ...input };
   delete out.CLAUDECODE;
   delete out.CLAUDE_CODE_ENTRYPOINT;
+  // Happier reports managed agent lifecycle to Herdr. Its native provider hooks
+  // must not claim the same pane and replace Happier's resume command.
+  delete out.HERDR_ENV;
   return out;
 }
-

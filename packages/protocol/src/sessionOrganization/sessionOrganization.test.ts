@@ -15,6 +15,9 @@ import {
   SESSION_ORGANIZATION_ORDER_SCOPE_KINDS,
   SESSION_ORGANIZATION_SNAPSHOT_VERSION,
   SessionOrganizationContentEnvelopeSchema,
+  SessionOrganizationSessionAppearanceSchema,
+  SetSessionAppearanceRequestSchema,
+  SetSessionAppearanceResponseSchema,
   SessionOrganizationFolderSchema,
   SessionOrganizationLabelSchema,
   SessionAttentionStandingSchema,
@@ -30,6 +33,38 @@ import {
 } from './index.js';
 
 describe('session organization protocol contracts', () => {
+  it('validates strict appearance mutations without interpreting display contents', () => {
+    const display = { t: 'plain', v: { color: '#123456', extension: [true, 7] } };
+    const appearance = { sessionId: 'session_1', display, updatedAt: 10 };
+    expect(SessionOrganizationSessionAppearanceSchema.parse(appearance)).toEqual(appearance);
+    expect(SetSessionAppearanceRequestSchema.parse({ display })).toEqual({ display });
+    expect(SetSessionAppearanceRequestSchema.parse({ display: null })).toEqual({ display: null });
+    expect(SetSessionAppearanceResponseSchema.parse({ appearance })).toEqual({ appearance });
+    expect(SetSessionAppearanceResponseSchema.parse({ appearance: null })).toEqual({ appearance: null });
+    expect(SetSessionAppearanceRequestSchema.safeParse({}).success).toBe(false);
+    expect(SetSessionAppearanceRequestSchema.safeParse({ display, extra: true }).success).toBe(false);
+    expect(SessionOrganizationSessionAppearanceSchema.safeParse({ ...appearance, display: null }).success).toBe(false);
+    expect(SessionOrganizationSessionAppearanceSchema.safeParse({ ...appearance, updatedAt: -1 }).success).toBe(false);
+    expect(SessionOrganizationSessionAppearanceSchema.safeParse({ ...appearance, sessionId: 'x'.repeat(192) }).success).toBe(false);
+  });
+
+  it('opts in to session appearances without changing legacy snapshot requests', () => {
+    expect(SessionOrganizationSnapshotRequestSchema.parse({}).includeSessionAppearances).toBe(false);
+    expect(SessionOrganizationSnapshotRequestSchema.parse({ includeSessionAppearances: true }).includeSessionAppearances).toBe(true);
+    const snapshot = {
+      schemaVersion: SESSION_ORGANIZATION_SNAPSHOT_VERSION,
+      version: 1,
+      pins: [], folders: [], folderAssignments: [], tags: [], tagAssignments: [], orderEntries: [], labels: [],
+    };
+    expect(SessionOrganizationSnapshotResponseSchema.parse({ snapshot }).snapshot).not.toHaveProperty('sessionAppearances');
+    const appearance = { sessionId: 'session_1', display: { t: 'encrypted', c: 'opaque' }, updatedAt: 10 };
+    expect(SessionOrganizationSnapshotResponseSchema.parse({ snapshot: { ...snapshot, sessionAppearances: [appearance] } })
+      .snapshot.sessionAppearances).toEqual([appearance]);
+    expect(SessionOrganizationSnapshotResponseSchema.safeParse({ snapshot: {
+      ...snapshot, sessionAppearances: Array.from({ length: 1_001 }, () => appearance),
+    } }).success).toBe(false);
+  });
+
   it('uses the canonical stored JSON content envelope for private display content', () => {
     expect(SessionOrganizationContentEnvelopeSchema.parse({ t: 'plain', v: { name: 'Work' } }))
       .toEqual(StoredJsonContentEnvelopeSchema.parse({ t: 'plain', v: { name: 'Work' } }));
@@ -180,6 +215,7 @@ describe('session organization protocol contracts', () => {
   it('carries attention standings through the snapshot and its set mutation', () => {
     const request = SessionOrganizationSnapshotRequestSchema.parse({});
     expect(request.includeAttentionStandings).toBe(false);
+    expect(request.includeAttentionReminderTimes).toBe(false);
     expect(SessionOrganizationSnapshotRequestSchema.parse({ includeAttentionStandings: true }).includeAttentionStandings).toBe(true);
 
     const standing = SessionAttentionStandingSchema.parse({ sessionId: 'session_1', standing: true, updatedAt: 10 });
@@ -205,6 +241,21 @@ describe('session organization protocol contracts', () => {
     expect(SetSessionAttentionStandingRequestSchema.parse({ standing: null })).toEqual({ standing: null });
     expect(SetSessionAttentionStandingResponseSchema.parse({ standing: null })).toEqual({ standing: null });
     expect(SetSessionAttentionStandingResponseSchema.parse({ standing }).standing).toEqual(standing);
+  });
+
+  it('models a timed attention reminder on the existing standing contract', () => {
+    const remindAt = 2_000;
+    const standing = SessionAttentionStandingSchema.parse({
+      sessionId: 'session_1',
+      standing: true,
+      remindAt,
+      updatedAt: 10,
+    });
+    expect(standing.remindAt).toBe(remindAt);
+    expect(SetSessionAttentionStandingRequestSchema.parse({ remindAt })).toEqual({ remindAt });
+    expect(SetSessionAttentionStandingRequestSchema.parse({ remindAt: null })).toEqual({ remindAt: null });
+    expect(SetSessionAttentionStandingRequestSchema.safeParse({}).success).toBe(false);
+    expect(SetSessionAttentionStandingRequestSchema.safeParse({ standing: true, remindAt }).success).toBe(false);
   });
 
   it('defines mutations for pins, folder delete defaults, tags, assignments, and ordering', () => {

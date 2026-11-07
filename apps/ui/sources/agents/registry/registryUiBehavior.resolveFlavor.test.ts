@@ -41,7 +41,9 @@ describe('resolveAgentUiBehaviorFromFlavor', () => {
 
         expect(behavior?.permissions?.footer?.stopHandling).toBe('denyOnly');
         expect(behavior?.permissions?.footer?.supportsExecPolicyAmendment).toBe(true);
-        expect(behavior?.sessionUsage?.supportsExactContextUsageBadge).toBe(false);
+        // Codex token_count rows carry cumulative thread totals, so the composer may only show
+        // context the runtime reported explicitly.
+        expect(behavior?.sessionUsage?.contextUsageBadge).toBe('reportedOnly');
     });
 
     it('projects pending delivery presentation through the Claude provider behavior', () => {
@@ -174,6 +176,6 @@ describe('resolveAgentUiBehaviorFromFlavor', () => {
 
         expect(behavior?.permissions?.footer?.stopHandling).toBe('denyAndAbortRun');
         expect(behavior?.permissions?.footer?.supportsExecPolicyAmendment).toBe(false);
-        expect(behavior?.sessionUsage?.supportsExactContextUsageBadge).toBe(true);
+        expect(behavior?.sessionUsage?.contextUsageBadge).toBe('derived');
     });
 });

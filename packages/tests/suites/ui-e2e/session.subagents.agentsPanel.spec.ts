@@ -10,7 +10,7 @@ import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticate
 import { fakeClaudeFixturePath, waitForFakeClaudeUserText } from '../../src/testkit/fakeClaude';
 import { gotoDomContentLoadedWithRetries, normalizeLoopbackBaseUrl } from '../../src/testkit/uiE2e/pageNavigation';
 import { spawnSessionFromDaemon } from '../../src/testkit/uiE2e/spawnSessionFromDaemon';
-import { setUiFeatureToggle } from '../../src/testkit/uiE2e/setUiFeatureToggle';
+import { mutateUiE2eScopedAccountSettings } from '../../src/testkit/uiE2e/scopedAccountSettingsStorage';
 import { waitForInitialAppUi } from '../../src/testkit/uiE2e/waitForInitialAppUi';
 import { collectBrowserDiagnostics } from '../../src/testkit/uiE2e/browserDiagnostics';
 
@@ -62,6 +62,8 @@ test.describe('ui e2e: session subagents agents panel', () => {
         EXPO_PUBLIC_HAPPY_SERVER_URL: server.baseUrl,
         EXPO_PUBLIC_HAPPY_STORAGE_SCOPE: `e2e-${run.runId}`,
         HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS: process.env.HAPPIER_E2E_UI_WEB_SCRIPT_FETCH_TIMEOUT_MS ?? '420000',
+        // Exercise real browser chunk fetching through the source development server.
+        HAPPIER_E2E_UI_WEB_MODE: 'metro',
       },
     });
 
@@ -76,11 +78,19 @@ test.describe('ui e2e: session subagents agents panel', () => {
   });
 
   test('shows the Agents surface on a fresh session and records execution-run rows after quick launch', async ({ page }) => {
-    test.setTimeout(540_000);
+    test.setTimeout(180_000);
     if (!server || !uiBaseUrl) throw new Error('missing server/ui fixtures');
 
     const browserDiagnostics = collectBrowserDiagnostics({ page });
 
+    // Install before navigation so all application timers use the browser clock.
+    await page.clock.install();
+    const subagentDetailsRequests: string[] = [];
+    page.on('request', (request) => {
+      if (request.resourceType() === 'script' && new URL(request.url()).pathname.includes('SessionSubagentDetailsView')) {
+        subagentDetailsRequests.push(request.url());
+      }
+    });
     await page.setViewportSize({ width: 1440, height: 900 });
     const testDir = resolve(join(suiteDir, 't1-agents-panel'));
     await mkdir(testDir, { recursive: true });
@@ -107,12 +117,14 @@ test.describe('ui e2e: session subagents agents panel', () => {
     });
     await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/`, 180_000);
     await waitForInitialAppUi({ page, browserDiagnostics });
-    await setUiFeatureToggle({
+    await mutateUiE2eScopedAccountSettings({
       page,
-      baseUrl: uiBaseUrl,
-      featureId: 'execution.runs',
-      enabled: true,
+      // This isolated browser owns both its bootstrap and authenticated scopes.
+      applyToAllScopes: true,
+      experiments: true,
+      featureToggles: { 'execution.runs': true },
     });
+    await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/`, 180_000);
     await waitForInitialAppUi({ page, browserDiagnostics });
 
     const sessionWorkspaceDir = resolve(join(testDir, 'session-workspace'));
@@ -126,13 +138,14 @@ test.describe('ui e2e: session subagents agents panel', () => {
     await gotoDomContentLoadedWithRetries(page, `${uiBaseUrl}/session/${sessionId}`, 120_000);
     await expect(page.getByTestId('session-composer-input')).toHaveCount(1, { timeout: 180_000 });
 
-    const rightSidebarToggle = page.getByTestId('session-header-right-sidebar-button');
-    await expect(rightSidebarToggle).toHaveCount(1, { timeout: 60_000 });
-    await rightSidebarToggle.click();
+    // The regression prefetched closed details after 3 seconds. Advance that
+    // actual failure window without adding a wall-clock sleep to this flow.
+    await page.clock.runFor(3_001);
+    expect(subagentDetailsRequests, 'closed subagent details must not fetch their chunk').toEqual([]);
 
-    const agentsTab = page.getByTestId('session-rightpanel-tab:agents');
-    await expect(agentsTab).toHaveCount(1, { timeout: 60_000 });
-    await agentsTab.click();
+    const agentsAction = page.getByTestId('session-action-rail:agents');
+    await expect(agentsAction).toHaveCount(1, { timeout: 60_000 });
+    await agentsAction.click();
     await waitForAgentsRightPanel({ page });
     await expect(page.getByTestId('session-subagent-launch-execution-run:plan')).toHaveCount(1, { timeout: 60_000 });
 
@@ -150,6 +163,15 @@ test.describe('ui e2e: session subagents agents panel', () => {
 
     const executionRunRows = page.locator('[data-testid^="session-agents-roster:row:execution_run:"]');
 
-    await expect(executionRunRows.first()).toBeVisible({ timeout: 180_000 });
+    const executionRunRow = executionRunRows.first();
+    await expect(executionRunRow).toBeVisible({ timeout: 180_000 });
+    expect(subagentDetailsRequests).toEqual([]);
+    const rowTestId = await executionRunRow.getAttribute('data-testid');
+    if (!rowTestId) throw new Error('Missing execution-run row identity');
+    const subagentId = rowTestId.slice('session-agents-roster:row:'.length);
+    await executionRunRow.click();
+    await expect(page.getByTestId(`session-subagent-overview:${subagentId}`)).toBeVisible({ timeout: 180_000 });
+    await expect(page.getByTestId('session-subagent-details-loading')).toHaveCount(0);
+    expect(subagentDetailsRequests.length, 'opening details must reach the real demand-loaded chunk').toBeGreaterThan(0);
   });
 });

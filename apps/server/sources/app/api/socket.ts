@@ -20,6 +20,7 @@ import { machineTransferHandler } from "./socket/machineTransferHandler";
 import { artifactUpdateHandler } from "./socket/artifactUpdateHandler";
 import { accessKeyHandler } from "./socket/accessKeyHandler";
 import { getSocketRooms } from "./socketRooms";
+import { CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD, readConnectedServiceReaderSupport } from "@happier-dev/protocol";
 import { createAdapter } from "@socket.io/redis-streams-adapter";
 import { getRedisClient } from "@/storage/redis/redis";
 import { randomUUID } from "node:crypto";
@@ -37,6 +38,7 @@ import {
     registerSessionRuntimeActivitySnapshotSocketEvent,
 } from "@/app/session/runtimeActivity/socketEvents";
 import { publishSessionPublisherLifecycleUpdate } from "@/app/session/runtimeActivity/publishPublisherLifecycleUpdate";
+import { registerUiFocusSocketEvent } from "./socket/registerUiFocusSocketEvent";
 import { readHappierSocketData } from "./socket/socketData";
 import { registerReleasedUiV021SessionEndSocketEvent } from "@/app/session/compatibility/registerReleasedUiV021SessionEndSocketEvent";
 
@@ -234,6 +236,7 @@ export function startSocket(app: Fastify) {
         socketData.clientPurpose = clientPurpose;
         socketData.sessionId = sessionId;
         socketData.machineId = machineId;
+        socketData.connectedServiceIds = readConnectedServiceReaderSupport(socket.handshake.auth[CONNECTED_SERVICE_READER_SUPPORT_SOCKET_AUTH_FIELD]);
         return next();
     });
 
@@ -320,6 +323,7 @@ export function startSocket(app: Fastify) {
             clientType: metadata.clientType,
             sessionId,
             machineId,
+            connectedServiceIds: socketData.connectedServiceIds,
         }));
 
         // Broadcast daemon online status
@@ -362,8 +366,8 @@ export function startSocket(app: Fastify) {
                     });
                 }).catch((error) => {
                     log(
-                        { module: 'session-publisher-presence', sessionId: connection.sessionId, error },
-                        'Failed to publish disconnected session publisher Activity',
+                        { module: 'session-publisher-presence', level: 'warn', sessionId: connection.sessionId, error },
+                        'Failed to settle or publish disconnected session publisher lifecycle',
                     );
                 });
             }
@@ -447,10 +451,10 @@ export function startSocket(app: Fastify) {
             });
         }
         if (connection.connectionType === "user-scoped") {
+            registerUiFocusSocketEvent(socket);
             registerReleasedUiV021SessionEndSocketEvent({
                 socket,
                 accountId: userId,
-                connection,
             });
         }
         if (connection.connectionType === "session-scoped") {

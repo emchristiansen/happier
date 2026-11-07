@@ -2,6 +2,7 @@ import { realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 
 import type { CatalogAgentId } from '@/backends/types';
+import type { ExecutionRunRetentionPolicy } from '@happier-dev/protocol';
 import { resolveConnectedServiceMaterializedRootDir } from '../materialize/resolveConnectedServiceMaterializedRootDir';
 
 export function createAdoptedExecutionRunRootCleanup(input: Readonly<{
@@ -9,7 +10,8 @@ export function createAdoptedExecutionRunRootCleanup(input: Readonly<{
   materializedRoot: string;
   agentId: CatalogAgentId;
   materializationKey: string;
-  removeRoot: (root: string) => Promise<void>;
+  retentionPolicy?: ExecutionRunRetentionPolicy | null;
+  retireRoot: (root: string) => Promise<void>;
 }>): (() => Promise<void>) | null {
   const base = resolve(input.materializationBaseDir);
   const root = resolve(input.materializedRoot);
@@ -22,6 +24,10 @@ export function createAdoptedExecutionRunRootCleanup(input: Readonly<{
   }));
   if (root !== expectedRoot) return null;
   return async () => {
+    // Match the execution-run isolation owner: only an explicit ephemeral policy authorizes
+    // revoking private credentials. Transcripts survive even an ephemeral run; unknown legacy
+    // policy must never become disposal authority.
+    if (input.retentionPolicy !== 'ephemeral') return;
     try {
       const [realBase, realRoot] = await Promise.all([realpath(base), realpath(root)]);
       if (relative(realBase, realRoot) !== relative(base, expectedRoot)) return;
@@ -30,6 +36,6 @@ export function createAdoptedExecutionRunRootCleanup(input: Readonly<{
       // follow a symlinked ancestor or guess at a filesystem target.
       return;
     }
-    await input.removeRoot(root);
+    await input.retireRoot(root);
   };
 }

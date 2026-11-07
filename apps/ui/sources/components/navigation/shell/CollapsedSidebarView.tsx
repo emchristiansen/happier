@@ -17,15 +17,18 @@ import { DesktopShellWindowControlsHost } from './desktopChrome/DesktopShellWind
 import { useResolvedDesktopWindowControls } from './desktopChrome/useResolvedDesktopWindowControls';
 import { runGuardedNavigation } from '@/utils/navigation/runGuardedNavigation';
 import { fireAndForget } from '@/utils/system/fireAndForget';
-import type { AppUpdateStatusTagProps } from '@/components/ui/feedback/AppUpdateStatusTag';
 import { ActionOperationActivityButton } from '@/components/inbox/actionOperations/ActionOperationActivityButton';
+import { InboxPopoverButton } from '@/components/inbox/InboxPopoverButton';
+import { UpdatesEntry } from '@/components/updates/UpdatesPopoverButton';
+import type { InboxSummary } from '@/hooks/inbox/useInboxSummary';
 
 export type CollapsedSidebarViewProps = Readonly<{
     desktopWindowControls?: React.ReactNode;
-    desktopUpdateIndicator?: React.ReactNode;
     focusModeActive?: boolean;
     onExitFocusMode?: () => void;
     onRequestExpand?: () => void;
+    inboxSummary?: InboxSummary | null;
+    inboxEnabled?: boolean;
 }>;
 
 const styles = StyleSheet.create((theme) => ({
@@ -54,9 +57,6 @@ const styles = StyleSheet.create((theme) => ({
     controlsContent: {
         justifyContent: 'center',
     },
-    updateIndicatorHost: {
-        alignSelf: 'stretch',
-    },
     button: {
         alignItems: 'center',
         justifyContent: 'center',
@@ -70,24 +70,6 @@ const styles = StyleSheet.create((theme) => ({
         height: 32,
     },
 }));
-
-function renderUpdateIndicatorWithFallback(
-    indicator: React.ReactNode,
-    fallback: React.ReactNode,
-): React.ReactNode {
-    if (!indicator) {
-        return fallback;
-    }
-
-    if (!React.isValidElement<AppUpdateStatusTagProps>(indicator)) {
-        return indicator;
-    }
-
-    return React.cloneElement(indicator, {
-        fallback,
-        labelVariant: 'short',
-    });
-}
 
 export const CollapsedSidebarView = React.memo((props: CollapsedSidebarViewProps) => {
     const { focusModeActive = false, onExitFocusMode, onRequestExpand } = props;
@@ -120,14 +102,6 @@ export const CollapsedSidebarView = React.memo((props: CollapsedSidebarViewProps
         }
     }, [focusModeActive, onExitFocusMode, router]);
 
-    const logoButton = (
-        <SidebarLogoButton
-            testID="collapsed-sidebar-home-button"
-            onPress={handleHome}
-            style={styles.logoButton}
-        />
-    );
-
     return (
         <View style={[styles.container, { paddingTop: safeArea.top }]}>
             <View testID="desktop-collapsed-shell-chrome" style={[styles.chrome, { minHeight: headerHeight }]}>
@@ -138,8 +112,25 @@ export const CollapsedSidebarView = React.memo((props: CollapsedSidebarViewProps
                 >
                     {resolvedDesktopWindowControls}
                 </DesktopShellWindowControlsHost>
-                {renderUpdateIndicatorWithFallback(props.desktopUpdateIndicator, logoButton)}
-                <ActionOperationActivityButton testID="collapsed-sidebar-action-operations" />
+                <SidebarLogoButton
+                    testID="collapsed-sidebar-home-button"
+                    onPress={handleHome}
+                    style={styles.logoButton}
+                />
+                {props.inboxEnabled && props.inboxSummary ? (
+                    <InboxPopoverButton
+                        summary={props.inboxSummary}
+                        buttonSize={32}
+                        iconSize={DESKTOP_SIDEBAR_CHROME_ICON_GLYPH_SIZE_PX}
+                        testID="collapsed-sidebar-inbox-button"
+                    />
+                ) : null}
+                <UpdatesEntry variant="icon" buttonSize={32} iconSize={DESKTOP_SIDEBAR_CHROME_ICON_GLYPH_SIZE_PX} testID="collapsed-sidebar-updates-button" />
+                <ActionOperationActivityButton
+                    testID="collapsed-sidebar-action-operations"
+                    buttonSize={32}
+                    iconSize={DESKTOP_SIDEBAR_CHROME_ICON_GLYPH_SIZE_PX}
+                />
                 {Platform.OS === 'web' ? (
                     <Pressable
                         testID="sidebar-expand-button"

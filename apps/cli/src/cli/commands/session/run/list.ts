@@ -15,6 +15,7 @@ import {
   formatProtocolEnumUsage,
   parseProtocolEnumFlag,
 } from '@/cli/commands/shared/parseProtocolEnumFlag';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 const EXECUTION_RUN_STATUS_USAGE = formatProtocolEnumUsage(ExecutionRunStatusSchema);
 
@@ -49,7 +50,7 @@ export async function cmdSessionRunList(
       await printJsonEnvelope({ ok: false, kind: 'session_run_list', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 

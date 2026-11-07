@@ -3,6 +3,32 @@ import { describe, expect, it } from 'vitest';
 import * as protocol from '../index.js';
 
 describe('sessionControl contract exports', () => {
+  it('distinguishes legacy unsupported recovery status from absence at an actual version', () => {
+    const session = { id: 'session-1', createdAt: 1, updatedAt: 2, active: false, activeAt: 0, encryption: { type: 'plain' } };
+    expect(protocol.SessionStatusResultSchema.parse({ session }).usageLimitRecovery).toEqual({ state: 'unsupported' });
+    for (const state of ['absent', 'malformed', 'unreadable']) {
+      const usageLimitRecovery = { state, metadataVersion: 17 };
+      expect(protocol.SessionStatusResultSchema.parse({ session, usageLimitRecovery }).usageLimitRecovery).toEqual(usageLimitRecovery);
+      expect(protocol.SessionStatusResultSchema.safeParse({ session, usageLimitRecovery: { state } }).success).toBe(false);
+    }
+    expect(protocol.SessionStatusResultSchema.safeParse({ session, usageLimitRecovery: {
+      state: 'present', metadataVersion: 17, recovery: { status: 'waiting', issueFingerprint: 'issue', armedAtMs: 'wrong' },
+    } }).success).toBe(false);
+  });
+  it('reports token-only authentication separately from Session storage mode', () => {
+    const status = {
+      authenticated: true, encryption: { type: 'tokenOnly' }, machineRegistered: false,
+      host: 'dev', happyHomeDir: '/home/dev/.happier', daemonRunning: false,
+    };
+    expect(protocol.AuthStatusResultSchema.parse(status)).toEqual(status);
+  });
+  it('represents a plain Session without inventing an encryption key variant', () => {
+    const session = {
+      id: 'plain-session', createdAt: 1, updatedAt: 2, active: false, activeAt: 0,
+      encryptionMode: 'plain', encryption: { type: 'plain' },
+    };
+    expect(protocol.SessionSummarySchema.parse(session)).toEqual(session);
+  });
   it('exports base and per-command envelope schemas', () => {
     expect(typeof (protocol as any).SessionControlEnvelopeBaseSchema).toBe('object');
     expect(typeof (protocol as any).AuthStatusEnvelopeSchema).toBe('object');
@@ -164,6 +190,52 @@ describe('sessionControl contract exports', () => {
     });
     expect(summaryParsed.success).toBe(true);
     expect(summaryParsed.data.runtimeActivityActiveCount).toBe(2);
+  });
+
+  it('validates optional Machine binding and canonical permission intent on session summaries', () => {
+    const summary = {
+      id: 'sess_binding',
+      createdAt: 1,
+      updatedAt: 2,
+      active: false,
+      activeAt: 0,
+      encryption: { type: 'dataKey' },
+    };
+    expect(protocol.SessionSummarySchema.safeParse(summary).success).toBe(true);
+    expect(protocol.SessionSummarySchema.safeParse({
+      ...summary,
+      machineId: 'machine-target',
+      permissionMode: 'safe-yolo',
+    }).success).toBe(true);
+    for (const invalid of [
+      { machineId: '' },
+      { machineId: '   ' },
+      { machineId: 1 },
+      { permissionMode: 'unknown' },
+      { permissionMode: 'acceptEdits' },
+      { permissionMode: null },
+    ]) {
+      expect(protocol.SessionSummarySchema.safeParse({ ...summary, ...invalid }).success).toBe(false);
+    }
+  });
+
+  it('declares rollback eligibility sequence facts on session summaries and records', () => {
+    expect(typeof (protocol as any).SessionSummarySchema.shape.rollbackEligibleTurnStarts?.safeParse).toBe('function');
+    expect(typeof (protocol as any).V2SessionRecordSchema.shape.rollbackEligibleTurnStarts?.safeParse).toBe('function');
+    expect((protocol as any).V2SessionRecordSchema.safeParse({
+      id: 'sess_rollback_projection',
+      seq: 7,
+      createdAt: 1,
+      updatedAt: 2,
+      active: false,
+      activeAt: 0,
+      metadata: '{}',
+      metadataVersion: 1,
+      agentState: null,
+      agentStateVersion: 1,
+      dataEncryptionKey: null,
+      rollbackEligibleTurnStarts: [1, 4],
+    }).data.rollbackEligibleTurnStarts).toEqual([1, 4]);
   });
 
   it('exports and validates session turn schemas', () => {

@@ -27,7 +27,7 @@ type InteractiveTransactionBoundary = <T>(
     options?: unknown,
 ) => Promise<T>;
 
-function installSingleAcquisitionFailure(): Readonly<{
+function installAcquisitionFailures(failureCount: number): Readonly<{
     attempts: () => number;
     callbackEntries: () => number;
     restore: () => void;
@@ -37,12 +37,12 @@ function installSingleAcquisitionFailure(): Readonly<{
     const originalTransaction = mutableDb.$transaction;
     let attempts = 0;
     let callbackEntries = 0;
-    let failNextAcquisition = true;
+    let remainingFailures = failureCount;
 
     mutableDb.$transaction = async <T>(operation: (tx: Prisma.TransactionClient) => Promise<T>, options?: unknown) => {
         attempts += 1;
-        if (failNextAcquisition) {
-            failNextAcquisition = false;
+        if (remainingFailures > 0) {
+            remainingFailures -= 1;
             throw new Prisma.PrismaClientKnownRequestError(
                 "Transaction API error: Unable to start a transaction in the given time.",
                 {
@@ -139,7 +139,7 @@ describe("pendingMessageService transaction acquisition", () => {
         })).resolves.toMatchObject({ ok: true, didMaterialize: true });
 
         process.env.HAPPIER_DB_PROVIDER = "sqlite";
-        const transactionBoundary = installSingleAcquisitionFailure();
+        const transactionBoundary = installAcquisitionFailures(1);
         try {
             await expect(resolveAcceptedPendingDelivery({
                 actorUserId: owner.id,
@@ -173,6 +173,48 @@ describe("pendingMessageService transaction acquisition", () => {
         }
         await expect(db.sessionPendingMessage.count({ where: { sessionId: session.id, localId } })).resolves.toBe(0);
         await expect(db.sessionMessage.count({ where: { sessionId: session.id, localId } })).resolves.toBe(1);
+    });
+
+    it("returns retryable transaction-unavailable when enqueue cannot acquire a transaction", async () => {
+        const owner = await db.account.create({
+            data: { publicKey: `pk-pending-enqueue-busy-${randomUUID()}` },
+            select: { id: true },
+        });
+        const session = await db.session.create({
+            data: {
+                tag: `tag-pending-enqueue-busy-${randomUUID()}`,
+                accountId: owner.id,
+                metadata: "meta",
+                metadataVersion: 0,
+                agentState: null,
+                agentStateVersion: 0,
+            },
+            select: { id: true },
+        });
+        const localId = `pending-enqueue-busy-${randomUUID()}`;
+
+        process.env.HAPPIER_DB_PROVIDER = "sqlite";
+        process.env.HAPPIER_DB_TX_MAX_RETRIES = "0";
+        const transactionBoundary = installAcquisitionFailures(1);
+        try {
+            await expect(enqueuePendingMessage({
+                actorUserId: owner.id,
+                sessionId: session.id,
+                localId,
+                ciphertext: "cipher-pending-enqueue-busy",
+                diagnosticCorrelationId: "req-pending-enqueue-busy",
+            })).resolves.toEqual({
+                ok: false,
+                error: "transaction-unavailable",
+                retryAfterMs: 1_000,
+                correlationId: "req-pending-enqueue-busy",
+            });
+            expect(transactionBoundary.attempts()).toBe(1);
+            expect(transactionBoundary.callbackEntries()).toBe(0);
+        } finally {
+            transactionBoundary.restore();
+        }
+        await expect(db.sessionPendingMessage.count({ where: { sessionId: session.id, localId } })).resolves.toBe(0);
     });
 
 });

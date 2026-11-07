@@ -302,6 +302,7 @@ describe('happier (default claude) help output', () => {
 
   it('surfaces centralized missing-cli guidance without invoking legacy npm detection when Claude is unavailable', async () => {
     const root = createTempRoot('happier-claude-help-missing-cli-');
+    delete process.env.HAPPIER_CLAUDE_PATH;
     process.env.HAPPIER_JS_RUNTIME_PATH = createRuntimeExecutable(root);
     process.env.PATH = root;
     process.env.HOME = root;

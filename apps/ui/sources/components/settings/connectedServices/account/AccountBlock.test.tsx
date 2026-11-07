@@ -8,6 +8,8 @@ import {
 } from '@happier-dev/protocol';
 import type { ItemAction } from '@/components/ui/lists/itemActions';
 import type { UseConnectedServiceQuotaSnapshotResult } from '@/hooks/server/connectedServices/useConnectedServiceQuotaSnapshot';
+import { buildQuotaResetRows } from '@/sync/domains/connectedServices/buildQuotaResetRows';
+import { en } from '@/text/translations/en';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -44,7 +46,22 @@ vi.mock('react-native-gesture-handler', async () => {
 
 vi.mock('@/text', async () => {
     const { createTextModuleMock } = await import('@/dev/testkit/mocks/text');
-    return createTextModuleMock({ translate: (key) => key });
+    const { en } = await import('@/text/translations/en');
+    return createTextModuleMock({ translate: (key, params) => {
+        if (key === 'connectedServices.account.resets.remainingCount') {
+            return en.connectedServices.account.resets.remainingCount({ count: Number(params?.count) });
+        }
+        if (key === 'connectedServices.account.resets.appliesTo') {
+            return en.connectedServices.account.resets.appliesTo({ limits: String(params?.limits) });
+        }
+        if (key === 'connectedServices.account.resets.fiveHourLimit') return en.connectedServices.account.resets.fiveHourLimit;
+        if (key === 'connectedServices.account.resets.weeklyLimit') return en.connectedServices.account.resets.weeklyLimit;
+        if (key.startsWith('connectedServices.account.resets.unavailableReasons.')) {
+            const reasons: Record<string, string> = en.connectedServices.account.resets.unavailableReasons;
+            return reasons[key.split('.').at(-1) ?? ''] ?? key;
+        }
+        return key;
+    } });
 });
 
 const reducedMotionRef = vi.hoisted(() => ({ value: true }));
@@ -183,6 +200,75 @@ async function renderAccountBlock(props: Partial<React.ComponentProps<typeof imp
 }
 
 describe('AccountBlock', () => {
+    it('shows localized structured grant facts while keeping a saved grant action inert', async () => {
+        const { AccountBlockView } = await import('./AccountBlockView');
+        const details = { saved: {
+            remainingCount: 2,
+            appliesToProviderLimitIds: ['five_hour', 'seven_day', 'provider-special'],
+            unavailableReason: 'paused' as const,
+        } };
+        const consume = vi.fn(async () => {});
+        const screen = await renderScreen(<AccountBlockView
+            serviceId="anthropic" profileId="work" title="Work" testID="facts-acct"
+            quota={{
+                loading: false, hasSnapshot: true, nowMs: NOW_MS, isStale: false,
+                canRefresh: true, isRefreshing: false, error: null, refresh: async () => {},
+                planLabel: null, usageRows: [], capacityPct: null, capacityRings: [],
+                resetRows: buildQuotaResetRows({ kind: 'usage_limit_resets', availableCount: 0, credits: [
+                    { kind: 'usage_limit_reset', status: 'unknown', providerCreditId: 'saved' },
+                ] }, NOW_MS, { now: () => 'now', inDays: ({ days }) => `in ${days}d` }, details),
+                resetAvailableCount: 0, pinnedMeterIds: [], togglePinnedMeter: () => {},
+                consumeRecoveryCredit: consume, consumeRecoveryCreditPending: false,
+                consumeRecoveryCreditPendingTarget: null, canConsume: true, subscription: null,
+            }}
+        />);
+        expect(screen.getTextContent()).toContain(en.connectedServices.account.resets.remainingCount({ count: 2 }));
+        expect(screen.getTextContent()).toContain(en.connectedServices.account.resets.appliesTo({
+            limits: `${en.connectedServices.account.resets.fiveHourLimit} · ${en.connectedServices.account.resets.weeklyLimit} · provider-special`,
+        }));
+        expect(screen.getTextContent()).toContain(en.connectedServices.account.resets.unavailableReasons.paused);
+        expect(screen.findByTestId('facts-acct:reset-use:saved')?.props.disabled).toBe(true);
+        await screen.pressByTestIdAsync('facts-acct:reset-use:saved');
+        expect(consume).not.toHaveBeenCalled();
+    });
+
+    it('renders provider grant metadata with an inert action when the saved grant is not usable', async () => {
+        const { AccountBlockView } = await import('./AccountBlockView');
+        const snapshot = buildSnapshot({ recoveryCredits: {
+            kind: 'usage_limit_resets', availableCount: 0, totalCount: 5,
+            credits: [{
+                kind: 'usage_limit_reset', status: 'unknown', providerCreditId: 'saved',
+                title: 'Claude promotional reset',
+                description: '2 resets saved. Applies to weekly limits. Not usable now.',
+                expiresAtMs: NOW_MS + DAY_MS,
+            }],
+        } });
+        const consume = vi.fn(async () => {});
+        const screen = await renderScreen(<AccountBlockView
+            serviceId="anthropic" profileId="work" title="Work" status="connected" testID="saved-acct"
+            quota={{
+                loading: false, hasSnapshot: true, nowMs: NOW_MS, isStale: false,
+                canRefresh: true, isRefreshing: false, error: null, refresh: async () => {},
+                planLabel: null, usageRows: [], capacityPct: null, capacityRings: [],
+                resetRows: buildQuotaResetRows(snapshot.recoveryCredits, NOW_MS, {
+                    now: () => 'now', inDays: ({ days }) => `in ${days}d`,
+                }),
+                resetAvailableCount: 0, pinnedMeterIds: [], togglePinnedMeter: () => {},
+                consumeRecoveryCredit: consume, consumeRecoveryCreditPending: false,
+                consumeRecoveryCreditPendingTarget: null, canConsume: false, subscription: null,
+            }}
+        />);
+        expect(screen.getTextContent()).toContain(snapshot.recoveryCredits?.credits[0]?.title);
+        expect(screen.getTextContent()).toContain(snapshot.recoveryCredits?.credits[0]?.description);
+        const action = screen.findByTestId('saved-acct:reset-use:saved');
+        expect(action?.props.disabled).toBe(true);
+        expect(action?.props.accessibilityState).toEqual({ disabled: true });
+        expect(screen.findAllByTestId('saved-acct:resets-hint')).toHaveLength(0);
+        await screen.pressByTestIdAsync('saved-acct:reset-use:saved');
+        expect(consume).not.toHaveBeenCalled();
+        expect(modalState.confirmSpy).not.toHaveBeenCalled();
+    });
+
     it('renders a calm collapsed meta line (resets + pools counts) with capacity in the ring', async () => {
         settingsState.collapsed = { 'anthropic:account:work': true };
         const screen = await renderAccountBlock({ poolLabels: ['Team'] });
@@ -301,6 +387,24 @@ describe('AccountBlock', () => {
         expect(screen.findByTestId('acct:meter:weekly')).toBeTruthy();
         expect(screen.findByTestId('acct:reset-row:pc-1')).toBeTruthy();
         expect(screen.findByTestId('acct:reset-use:pc-1')).toBeTruthy();
+    });
+
+    it('shows only the allowance selected by the owning pool', async () => {
+        quotaHookState.value = buildQuotaResult({
+            snapshot: buildSnapshot({
+                meters: [
+                    { meterId: 'standard:primary', providerLimitId: 'standard', label: 'Session', used: null, limit: null, unit: 'unknown', utilizationPct: 20, resetsAt: null, status: 'ok', details: {} },
+                    { meterId: 'spark:primary', providerLimitId: 'spark', label: 'Spark', used: null, limit: null, unit: 'unknown', utilizationPct: 95, resetsAt: null, status: 'ok', details: {} },
+                ],
+            }),
+        });
+
+        const screen = await renderAccountBlock({
+            quotaLimitSelection: { mode: 'selected', providerLimitIds: ['standard'] },
+        });
+
+        expect(screen.findByTestId('acct:meter:standard:primary')).toBeTruthy();
+        expect(screen.findAllByTestId('acct:meter:spark:primary')).toHaveLength(0);
     });
 
     it('confirms before consuming a reset and skips consume when cancelled', async () => {
@@ -467,6 +571,8 @@ describe('AccountBlock', () => {
         const refresh = screen.findByTestId('acct:refresh');
 
         expect(screen.findByTestId('acct:refreshing')).toBeTruthy();
+        expect(screen.findByTestId('acct:refresh-status')).toBeTruthy();
+        expect(screen.findByTestId('acct:meter:weekly')).toBeTruthy();
         expect(refresh?.props.disabled).toBe(true);
         expect(refresh?.props.accessibilityState).toEqual(expect.objectContaining({
             busy: true,

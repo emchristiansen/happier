@@ -1,6 +1,6 @@
 import { posix as pathPosix } from 'node:path';
 
-export type TerminalMode = 'plain' | 'tmux' | 'windows_terminal' | 'windows_console';
+export type TerminalMode = 'plain' | 'tmux' | 'zellij' | 'herdr' | 'windows_terminal' | 'windows_console';
 
 export type TerminalTmuxSpawnOptions = {
   /**
@@ -25,10 +25,13 @@ export type TerminalTmuxSpawnOptions = {
 export type TerminalSpawnOptions = {
   mode?: TerminalMode;
   tmux?: TerminalTmuxSpawnOptions;
+  herdr?: { sessionName?: string };
 };
 
 export type ResolvedTerminalRequest =
   | { requested: 'plain' }
+  | { requested: 'zellij' }
+  | { requested: 'herdr'; herdr: { sessionName: string } }
   | {
     requested: 'tmux';
     tmux: {
@@ -54,6 +57,14 @@ export function resolveTerminalRequestFromSpawnOptions(params: {
   const terminal = params.terminal;
   if (terminal?.mode === 'plain') {
     return { requested: 'plain' };
+  }
+
+  if (terminal?.mode === 'zellij') {
+    return { requested: 'zellij' };
+  }
+
+  if (terminal?.mode === 'herdr') {
+    return { requested: 'herdr', herdr: { sessionName: terminal.herdr?.sessionName?.trim() || 'default' } };
   }
 
   if (terminal?.mode === 'tmux') {

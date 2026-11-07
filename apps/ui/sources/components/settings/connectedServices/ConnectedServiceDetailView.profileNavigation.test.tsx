@@ -12,6 +12,7 @@ import {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const applySettingsSpy = vi.fn(async () => {});
+const promptSpy = vi.fn(async () => 'native-work');
 
 installConnectedServicesCommonModuleMocks({
     searchParams: { serviceId: 'openai-codex' },
@@ -19,7 +20,7 @@ installConnectedServicesCommonModuleMocks({
         const { createModalModuleMock } = await import('@/dev/testkit/mocks/modal');
         return createModalModuleMock({
             spies: {
-                prompt: vi.fn(async () => null),
+                prompt: promptSpy,
                 alert: vi.fn(async () => {}),
                 confirm: vi.fn(async () => false),
             },
@@ -28,9 +29,11 @@ installConnectedServicesCommonModuleMocks({
 });
 installConnectedServiceDetailShellMocks();
 
-vi.mock('@/auth/context/AuthContext', () => ({
-  useAuth: () => ({ credentials: { token: 't', secret: Buffer.from(new Uint8Array(32).fill(3)).toString('base64url') } }),
-}));
+vi.mock('@/auth/context/AuthContext', () => {
+  // AuthProvider retains credentials identity until authentication changes.
+  const credentials = { token: 't', secret: Buffer.from(new Uint8Array(32).fill(3)).toString('base64url') };
+  return { useAuth: () => ({ credentials }) };
+});
 
 vi.mock('@/hooks/server/useFeatureEnabled', () => ({
   useFeatureEnabled: (featureId: string) => featureId !== 'connectedServices.accountGroups',
@@ -78,6 +81,17 @@ vi.mock('@/components/ui/lists/ItemRowActions', () => {
 });
 
 describe('ConnectedServiceDetailView profile navigation', () => {
+  it('offers native login import into a user named profile', async () => {
+    const { ConnectedServiceDetailView } = await import('./ConnectedServiceDetailView');
+    const screen = await renderScreen(<ConnectedServiceDetailView />);
+    const action = screen.tree.root.findAllByProps({ testID: 'connected-services-action:import-native-login' })[0];
+    expect(action).toBeTruthy();
+    await act(async () => { await action.props.onPress(); });
+    expect(connectedServicesModuleState.routerPushSpy).toHaveBeenCalledWith({
+      pathname: '/settings/connected-services/import',
+      params: { serviceId: 'openai-codex', profileId: 'native-work' },
+    });
+  });
   it('opens account detail via the AccountBlock open action', async () => {
     const { ConnectedServiceDetailView } = await import('./ConnectedServiceDetailView');
 

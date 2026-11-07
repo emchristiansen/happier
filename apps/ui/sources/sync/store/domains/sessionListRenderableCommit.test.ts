@@ -4,9 +4,11 @@ import type { SessionListViewItem } from '../../domains/session/listing/sessionL
 import type { SessionListRenderableSession } from '../../domains/session/listing/sessionListRenderable';
 import {
     applySessionListRenderableCommitPlan,
+    didSessionListRenderableListViewFieldsChangeForSettings,
     planSessionListRenderablePatchesCommit,
     type SessionListRenderableCommitState,
 } from './sessionListRenderableCommit';
+import { didSessionListRenderableEmbeddedListRowFieldsChange } from '../../domains/session/listing/sessionListRenderable';
 
 vi.mock('../../domains/server/serverRuntime', () => ({
     getActiveServerSnapshot: () => ({
@@ -60,6 +62,48 @@ function makeState(input: Readonly<{
 }
 
 describe('sessionListRenderableCommit', () => {
+    it('uses meaningful activity rather than transport update time for date-group rebuilds', () => {
+        const previous = makeRenderable('s1', {
+            createdAt: 100,
+            updatedAt: 200,
+            meaningfulActivityAt: 150,
+        });
+
+        expect(didSessionListRenderableListViewFieldsChangeForSettings(previous, {
+            ...previous,
+            updatedAt: 300,
+        }, {
+            groupInactiveSessionsByProject: false,
+            sessionListInactiveGroupingV1: 'date',
+        })).toBe(false);
+
+        expect(didSessionListRenderableListViewFieldsChangeForSettings(previous, {
+            ...previous,
+            meaningfulActivityAt: 250,
+        }, {
+            groupInactiveSessionsByProject: false,
+            sessionListInactiveGroupingV1: 'date',
+        })).toBe(true);
+    });
+
+    it('ignores read-state conflict timestamps that do not change list-row output', () => {
+        const previous = makeRenderable('s1', {
+            metadata: {
+                path: '/repo',
+                readStateV1: { v: 1, sessionSeq: 7, pendingActivityAt: 500, updatedAt: 600 },
+            },
+        });
+        const next = {
+            ...previous,
+            metadata: {
+                ...previous.metadata!,
+                readStateV1: { v: 1 as const, sessionSeq: 7, pendingActivityAt: 500, updatedAt: 700 },
+            },
+        };
+
+        expect(didSessionListRenderableEmbeddedListRowFieldsChange(previous, next)).toBe(false);
+    });
+
     it('does not refresh the active cache for display-only patches scoped to a non-active uncached server', () => {
         const activeRenderable = makeRenderable('s1', { pendingCount: 0 });
         const targetRenderable = makeRenderable('s1', { pendingCount: 0 });
@@ -123,6 +167,32 @@ describe('sessionListRenderableCommit', () => {
         expect(next.sessionListRenderables.s1.pendingBlockedCount).toBe(1);
         expect(next.sessionListViewData).toBe(activeListViewData);
         expect(next.sessionListViewDataByServerId.server_active).toBe(activeListViewData);
+    });
+
+    it('reuses the refreshed active array for the active-server cache', () => {
+        const renderable = makeRenderable('s1', {
+            metadata: { path: '/repo', name: 'Before' },
+        });
+        const activeListViewData: SessionListViewItem[] = [{
+            type: 'session',
+            session: renderable,
+            serverId: 'server_active',
+        }];
+        const state = makeState({ activeListViewData, targetRenderable: renderable });
+        const plan = planSessionListRenderablePatchesCommit({
+            state,
+            patches: [{
+                sessionId: 's1',
+                patch: { metadata: { path: '/repo', name: 'After' } },
+            }],
+        });
+
+        const next = applySessionListRenderableCommitPlan({ state, plan });
+
+        expect(plan.needsSessionListViewDataRebuild).toBe(false);
+        expect(plan.listViewRowRefreshSessionIds).toEqual(['s1']);
+        expect(next.sessionListViewData).not.toBe(activeListViewData);
+        expect(next.sessionListViewDataByServerId.server_active).toBe(next.sessionListViewData);
     });
 
     it('caches rebuilt target-server data without replacing it with the active list', () => {

@@ -203,8 +203,14 @@ describe('materializeOpenCodeConnectedServiceAuth', () => {
       openai: { type: 'api', key: 'sk-openai-test' },
       anthropic: { type: 'api', key: 'sk-ant-api-test' },
     });
-    // Direct keys: no broker plugin registered, but still config-isolated.
-    expect(JSON.parse(result.env.OPENCODE_CONFIG_CONTENT ?? 'null')).toEqual({});
+    // V2 does not consume OPENCODE_AUTH_CONTENT. Materialize direct keys through its incumbent
+    // provider settings owner while retaining the V1 auth envelope above.
+    expect(JSON.parse(result.env.OPENCODE_CONFIG_CONTENT ?? 'null')).toEqual({
+      providers: {
+        openai: { settings: { apiKey: 'sk-openai-test' } },
+        anthropic: { settings: { apiKey: 'sk-ant-api-test' } },
+      },
+    });
     expect(result.env[OPEN_CODE_BROKER_SELECTIONS_ENV]).toBeUndefined();
     expect(result.env.XDG_CONFIG_HOME).toContain('connected-config');
   });

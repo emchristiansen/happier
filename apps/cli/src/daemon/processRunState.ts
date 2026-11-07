@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { isPidAliveBySignal as probePidAliveBySignal } from '../../scripts/process_tree.cjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -18,13 +19,7 @@ const execFileAsync = promisify(execFile);
 export type ProcessRunState = 'dead' | 'servable' | 'stopped' | 'zombie';
 
 export function isPidAliveBySignal(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // Access denial or an unrecognized probe failure does not establish process death.
-    return !(typeof error === 'object' && error !== null && 'code' in error && error.code === 'ESRCH');
-  }
+  return probePidAliveBySignal(pid);
 }
 
 function classifyPosixStateChar(stateOutput: string): ProcessRunState | null {
@@ -62,7 +57,7 @@ export async function readProcessRunState(pid: number, deps?: Readonly<{
   } catch {
     // ps exits non-zero when the pid does not exist; fall through to the signal probe.
   }
-  // No ps row: trust the signal probe (a pid can be unobservable to ps but still signalable in
-  // rare sandboxed setups — stay fail-closed and treat alive as servable).
-  return alive ? 'servable' : 'dead';
+  // The runner may exit while ps is pending. Re-observe the signal boundary instead of
+  // retaining the pre-probe snapshot; unobservable live PIDs still fail closed as servable.
+  return isPidAlive(pid) ? 'servable' : 'dead';
 }

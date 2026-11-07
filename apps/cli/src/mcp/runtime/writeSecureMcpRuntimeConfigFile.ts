@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { rmdirSync, unlinkSync } from 'node:fs';
 import { rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   createProtectedLocalStateDirectory,
@@ -13,6 +14,18 @@ import {
 
 function isErrnoException(err: unknown): err is NodeJS.ErrnoException {
   return typeof err === 'object' && err !== null && 'code' in err;
+}
+
+/** Retire a path returned by this writer once its owning MCP configuration is done. */
+export function removeWrittenMcpRuntimeConfigFile(configPath: string, ownsBaseDir: boolean): void {
+  try { unlinkSync(configPath); } catch (error) {
+    if (!isErrnoException(error) || error.code !== 'ENOENT') throw error;
+  }
+  if (ownsBaseDir) {
+    try { rmdirSync(dirname(configPath)); } catch (error) {
+      if (!isErrnoException(error) || (error.code !== 'ENOENT' && error.code !== 'ENOTEMPTY')) throw error;
+    }
+  }
 }
 
 export async function writeSecureMcpRuntimeConfigFile(params: Readonly<{

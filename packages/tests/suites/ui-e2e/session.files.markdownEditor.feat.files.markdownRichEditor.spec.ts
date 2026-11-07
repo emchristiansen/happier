@@ -8,13 +8,13 @@ import { resolveUiWebBeforeAllTimeoutMs, startUiWeb, type StartedUiWeb } from '.
 import { type StartedDaemon } from '../../src/testkit/daemon/daemon';
 import { authenticateAndStartDaemon } from '../../src/testkit/uiE2e/authenticateAndStartDaemon';
 import { fakeClaudeFixturePath } from '../../src/testkit/fakeClaude';
+import { focusMonacoEditor } from '../../src/testkit/uiE2e/focusMonacoEditor';
 import { execGit, initGitRepo } from '../../src/testkit/uiE2e/gitRepoFixtures';
 import {
   gotoCommittedWithRetries,
   gotoDomContentLoadedWithPathFallback,
   normalizeLoopbackBaseUrl,
 } from '../../src/testkit/uiE2e/pageNavigation';
-import { clickScopedButtonByTestIdOrRole } from '../../src/testkit/uiE2e/clickScopedButtonByTestIdOrRole';
 import { spawnSessionFromDaemon } from '../../src/testkit/uiE2e/spawnSessionFromDaemon';
 import { toTestIdSafeValue } from '../../src/testkit/uiE2e/testIdSafeValue';
 import { waitForInitialAppUi } from '../../src/testkit/uiE2e/waitForInitialAppUi';
@@ -44,6 +44,35 @@ function visibleDetailsByTestId(page: Page, testId: string): Locator {
 
 function firstVisibleDetailsByTestId(page: Page, testId: string): Locator {
   return visibleDetailsByTestId(page, testId).first();
+}
+
+async function positionRichEditorSelection(editor: Locator, word: string, mode: 'text' | 'after'): Promise<void> {
+  await editor.focus();
+  await editor.evaluate((element, target) => {
+    const document = element.ownerDocument;
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const start = node.textContent?.indexOf(target.word) ?? -1;
+      if (start < 0) continue;
+      const end = start + target.word.length;
+      const range = document.createRange();
+      range.setStart(node, target.mode === 'text' ? start : end);
+      if (target.mode === 'text') range.setEnd(node, end);
+      else range.collapse(true);
+      const selection = document.defaultView?.getSelection();
+      if (!selection) throw new Error('Rich editor has no browser selection');
+      selection.removeAllRanges();
+      selection.addRange(range);
+      if (target.mode === 'text' && selection.toString() !== target.word) {
+        throw new Error(`Rich editor did not select ${target.word}`);
+      }
+      if (target.mode === 'after' && (selection.anchorNode !== node || selection.anchorOffset !== end)) {
+        throw new Error(`Rich editor did not position after ${target.word}`);
+      }
+      return;
+    }
+    throw new Error(`Rich editor is missing ${target.word}`);
+  }, { word, mode });
 }
 
 async function ensureSwitchEnabled(toggle: Locator): Promise<void> {
@@ -98,13 +127,11 @@ async function openFileInDetailsPane(params: Readonly<{
   await expect(rightPaneLocator(page)).toHaveCount(1, { timeout: 60_000 });
 
   const rightPane = rightPaneLocator(page);
-  await clickScopedButtonByTestIdOrRole({
-    scope: rightPane,
-    testId: 'session-rightpanel-tab:files',
-    roleName: 'Files',
-    timeoutMs: 180_000,
-  });
-  await expect(rightPane.getByTestId('session-rightpanel-surface-files')).toHaveCount(1, { timeout: 120_000 });
+  const filesSurface = rightPane.getByTestId('session-rightpanel-surface-files');
+  if (!(await filesSurface.isVisible())) {
+    await page.getByTestId('session-action-rail:files').click();
+  }
+  await expect(filesSurface).toBeVisible({ timeout: 120_000 });
 
   const row = rightPane.getByTestId(`repository-tree-row-${toTestIdSafeValue(filePath)}`);
   await expect(row).toHaveCount(1, { timeout: 180_000 });
@@ -148,9 +175,6 @@ test.describe('ui e2e: markdown rich editor (feat.files.markdownRichEditor)', ()
       extraEnv: {
         HAPPIER_BUILD_FEATURES_DENY: 'sharing.contentKeys',
         HAPPIER_FEATURE_AUTH_LOGIN__KEY_CHALLENGE_ENABLED: '1',
-        HAPPIER_PRESENCE_SESSION_TIMEOUT_MS: '300000',
-        HAPPIER_PRESENCE_MACHINE_TIMEOUT_MS: '60000',
-        HAPPIER_PRESENCE_TIMEOUT_TICK_MS: '1000',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_SHARED_DEPS_BUILD: '1',
         HAPPIER_E2E_PROVIDER_SKIP_SERVER_GENERATE: '1',
         HAPPIER_E2E_PROVIDER_USE_SERVER_SOURCE_ENTRYPOINT: '1',
@@ -246,16 +270,10 @@ test.describe('ui e2e: markdown rich editor (feat.files.markdownRichEditor)', ()
 
       // Type an appended line in raw mode (Monaco), the most deterministic way to
       // make a precise on-disk assertion across the rich<->raw round-trip.
-      const monacoRoot = rawEditor.locator('.monaco-editor');
-      await expect(monacoRoot).toHaveCount(1, { timeout: 60_000 });
-      const monacoInput = monacoRoot.locator('textarea');
-      if (await monacoInput.count()) {
-        await monacoInput.first().click({ force: true });
-      } else {
-        await monacoRoot.click({ force: true, position: { x: 60, y: 40 } });
-      }
+      await focusMonacoEditor(rawEditor);
       await page.keyboard.press('Control+End');
       await page.keyboard.type('\nAppended by e2e.');
+      await expect(rawEditor.locator('.view-lines')).toContainText('Appended by e2e.');
 
       // Switch back to Rich; the rich surface must remount with the latest text
       // (no character loss across the toggle).
@@ -387,31 +405,34 @@ test.describe('ui e2e: markdown rich editor (feat.files.markdownRichEditor)', ()
       await page.keyboard.press('Control+End');
       await page.keyboard.press('Enter');
 
-      // 1) Bold: type a word, select it back to the line start, toggle bold via
-      //    the toolbar chip. `@tiptap/markdown` serializes a bold mark as
-      //    `**...**`, which we assert on disk below.
+      // 1) Bold: select only the new word before using the toolbar chip.
+      //    Home and double-click selection differ across macOS/Linux, so pin
+      //    the browser selection to the exact text node under test.
       const boldWord = 'BoldByE2E';
       await page.keyboard.type(boldWord);
-      await page.keyboard.press('Shift+Home');
+      await positionRichEditorSelection(proseMirror, boldWord, 'text');
       await firstVisibleDetailsByTestId(page, 'file-details-rich-editor-toolbar:bold').click({ force: true });
+      await expect(proseMirror.locator('strong', { hasText: boldWord })).toHaveCount(1);
+      await expect(proseMirror.locator('p').first().locator('strong')).toHaveCount(0);
 
       // 2) List: start a new line, type an item, toggle a bullet list via the
-      //    toolbar chip. TipTap can preserve the active bold mark across the
-      //    caret transition, so the disk assertion below checks the stable
-      //    toolbar contract (a persisted list marker) rather than the incidental
-      //    mark state of the list text.
-      await page.keyboard.press('ArrowRight');
-      await firstVisibleDetailsByTestId(page, 'file-details-rich-editor-toolbar:bold').click({ force: true });
+      //    toolbar chip. Collapse the exact bold-word selection before typing;
+      //    an End key on a focused contenteditable can leave that word selected.
+      await positionRichEditorSelection(proseMirror, boldWord, 'after');
       await page.keyboard.press('Enter');
+      await expect(proseMirror.locator('strong', { hasText: boldWord })).toHaveCount(1);
       const listItem = 'ListItemByE2E';
       await page.keyboard.type(listItem);
       await firstVisibleDetailsByTestId(page, 'file-details-rich-editor-toolbar:bulletList').click({
         force: true,
       });
+      await expect(proseMirror.locator('li')).toContainText(listItem);
+      await expect(proseMirror.locator('strong', { hasText: boldWord })).toHaveCount(1);
 
       // 3) Heading: start a new line, type text, apply H1 via the toolbar chip.
       //    Serializes as a leading `# `; the heading text may still carry the
       //    active bold mark, which is orthogonal to the block-format contract.
+      await positionRichEditorSelection(proseMirror, listItem, 'after');
       await page.keyboard.press('Enter');
       await page.keyboard.press('Enter');
       const headingText = 'HeadingByE2E';
@@ -419,6 +440,7 @@ test.describe('ui e2e: markdown rich editor (feat.files.markdownRichEditor)', ()
       await firstVisibleDetailsByTestId(page, 'file-details-rich-editor-toolbar:heading1').click({
         force: true,
       });
+      await expect(proseMirror.locator('h1')).toContainText(headingText);
 
       // Save and assert the on-disk markdown reflects the toolbar formatting:
       // a bold span (`**...**`), a bullet-list marker (`- `), and an H1 (`# `).

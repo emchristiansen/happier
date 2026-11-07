@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+
+import { createWindowsServiceLauncherPeFixture } from '@/testkit/fs/windowsServiceLauncherFixture';
 
 import type { InstalledDaemonServiceEntry } from './discoverInstalledDaemonServiceEntries';
 import type { DaemonServiceInstallPlan } from './plan';
@@ -48,11 +51,21 @@ vi.mock('./apply', async () => {
 
 vi.mock('./resolveDaemonServiceInstallRuntimeTarget', () => ({
   resolveDaemonServiceInstallRuntimeTarget: resolveDaemonServiceInstallRuntimeTargetMock,
+  // No managed shim installed in these fixtures: no runtime replacement is ever proposed.
+  resolveManagedDaemonServiceShimPath: async () => null,
 }));
 
-vi.mock('./discoverInstalledDaemonServiceEntries', () => ({
-  discoverInstalledDaemonServiceEntries: discoverInstalledDaemonServiceEntriesMock,
-}));
+vi.mock('./discoverInstalledDaemonServiceEntries', async () => {
+  // Spread the real module: only discovery is faked here, and the installer also
+  // reads the installed definition's autostart declaration from this owner.
+  const actual = await vi.importActual<typeof import('./discoverInstalledDaemonServiceEntries')>(
+    './discoverInstalledDaemonServiceEntries',
+  );
+  return {
+    ...actual,
+    discoverInstalledDaemonServiceEntries: discoverInstalledDaemonServiceEntriesMock,
+  };
+});
 
 describe('installDaemonService conflict handling', () => {
   afterEach(() => {
@@ -699,6 +712,45 @@ describe('installDaemonService conflict handling', () => {
     expect(applyDaemonServiceInstallPlanMock).toHaveBeenCalledTimes(1);
   });
 
+  it('installs a pinned service for one relay beside the pinned service of another relay on the same ring', async () => {
+    discoverInstalledDaemonServiceEntriesMock.mockResolvedValueOnce([
+      {
+        serverId: 'personal',
+        activeServerId: 'personal',
+        name: 'Personal',
+        relayUrl: 'https://personal.example.test',
+        installed: true,
+        path: '/home/tester/.config/systemd/user/happier-daemon.personal.service',
+        platform: 'linux',
+        mode: 'user',
+        happierHomeDir: '/home/tester/.happier',
+        releaseChannel: 'stable',
+        label: 'happier-daemon.personal',
+        targetMode: 'pinned',
+      },
+    ]);
+
+    const { installDaemonService } = await import('./installer');
+
+    await installDaemonService({
+      platform: 'linux',
+      uid: 123,
+      userHomeDir: '/home/tester',
+      happierHomeDir: '/home/tester/.happier',
+      channel: 'stable',
+      targetMode: 'pinned',
+      instanceId: 'company',
+      activeServerId: 'company',
+      serverUrl: 'https://company.example.test',
+      webappUrl: 'https://company.example.test',
+      publicServerUrl: 'https://company.example.test',
+      runCommands: false,
+    });
+
+    expect(planDaemonServiceUninstallMock).not.toHaveBeenCalled();
+    expect(applyDaemonServiceInstallPlanMock).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps same-instance pinned services from other release channels when replacing the ring target', async () => {
     discoverInstalledDaemonServiceEntriesMock.mockResolvedValueOnce([
       {
@@ -779,5 +831,183 @@ describe('installDaemonService conflict handling', () => {
 
     expect(planDaemonServiceUninstallMock).not.toHaveBeenCalled();
     expect(applyDaemonServiceInstallPlanMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [true, 1],
+    [false, 0],
+  ])('reinstalls a Windows task with an unchanged wrapper when its launcher upgrade is needed (%s)', async (upgradeNeeded, applies) => {
+    const homeDir = mkdtempSync(join(tmpdir(), 'happier-installer-launcher-upgrade-'));
+    const installedPath = join(homeDir, '.happier', 'services', 'happier-daemon.default.ps1');
+    mkdirSync(dirname(installedPath), { recursive: true });
+    writeFileSync(installedPath, 'expected wrapper', 'utf8');
+    planDaemonServiceInstallMock.mockReturnValueOnce({
+      platform: 'win32',
+      files: [{ path: installedPath, content: 'expected wrapper', mode: 0o644 }],
+      commands: [],
+    });
+    discoverInstalledDaemonServiceEntriesMock.mockResolvedValueOnce([
+      {
+        serverId: 'default',
+        name: 'Default background service',
+        installed: true,
+        path: installedPath,
+        platform: 'win32',
+        happierHomeDir: join(homeDir, '.happier'),
+        releaseChannel: 'stable',
+        label: 'Happier\\happier-daemon.default',
+        targetMode: 'default-following',
+        windowsLauncherUpgradeNeeded: upgradeNeeded,
+      },
+    ]);
+
+    const { installDaemonService } = await import('./installer');
+
+    await installDaemonService({
+      platform: 'win32',
+      userHomeDir: homeDir,
+      happierHomeDir: join(homeDir, '.happier'),
+      channel: 'stable',
+      targetMode: 'default-following',
+      instanceId: 'default',
+      runCommands: false,
+    });
+
+    expect(applyDaemonServiceInstallPlanMock).toHaveBeenCalledTimes(applies);
+  });
+
+  it('rejects different launcher bytes at the planned destination before removing a competing service', async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), 'happier-installer-launcher-destination-'));
+    const sourcePath = join(homeDir, 'package', 'happier-service-launcher.exe');
+    const destinationPath = join(homeDir, '.happier', 'services', 'happier-daemon.default', 'launcher-1-abc', 'happier-service-launcher.exe');
+    mkdirSync(dirname(sourcePath), { recursive: true });
+    mkdirSync(dirname(destinationPath), { recursive: true });
+    writeFileSync(sourcePath, createWindowsServiceLauncherPeFixture());
+    writeFileSync(destinationPath, Buffer.concat([createWindowsServiceLauncherPeFixture(), Buffer.from('different build')]));
+    planDaemonServiceInstallMock.mockReturnValueOnce({
+      platform: 'win32',
+      files: [{ path: join(homeDir, '.happier', 'services', 'happier-daemon.default.ps1'), content: 'expected wrapper', mode: 0o644 }],
+      copies: [{ sourcePath, destinationPath, validation: 'windows-service-launcher-x64-v1' }],
+      commands: [],
+    });
+    discoverInstalledDaemonServiceEntriesMock.mockResolvedValueOnce([
+      {
+        serverId: 'default',
+        name: 'Default background service',
+        installed: true,
+        path: join(homeDir, 'other-home', 'services', 'happier-daemon.default.ps1'),
+        platform: 'win32',
+        mode: 'user',
+        happierHomeDir: join(homeDir, 'other-home'),
+        releaseChannel: 'stable',
+        label: 'Happier\\happier-daemon.default',
+        targetMode: 'default-following',
+      },
+    ]);
+    const beforeApply = vi.fn(async () => undefined);
+
+    const { installDaemonService } = await import('./installer');
+
+    await expect(installDaemonService({
+      platform: 'win32',
+      userHomeDir: homeDir,
+      happierHomeDir: join(homeDir, '.happier'),
+      channel: 'publicdev',
+      targetMode: 'default-following',
+      instanceId: 'default',
+      strategy: 'replace-all',
+      runCommands: false,
+      beforeApply,
+    })).rejects.toThrow(/refusing to replace a different versioned Windows service launcher/u);
+
+    expect(planDaemonServiceUninstallMock).not.toHaveBeenCalled();
+    expect(applyDaemonServiceUninstallPlanMock).not.toHaveBeenCalled();
+    expect(beforeApply).not.toHaveBeenCalled();
+    expect(applyDaemonServiceInstallPlanMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unreadable launcher destination before removing a competing service', async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), 'happier-installer-launcher-destination-dir-'));
+    const sourcePath = join(homeDir, 'package', 'happier-service-launcher.exe');
+    const destinationPath = join(homeDir, '.happier', 'services', 'happier-daemon.default', 'launcher-1-abc', 'happier-service-launcher.exe');
+    mkdirSync(dirname(sourcePath), { recursive: true });
+    writeFileSync(sourcePath, createWindowsServiceLauncherPeFixture());
+    // A directory occupies the destination: it cannot be read as the launcher nor replaced by it.
+    mkdirSync(destinationPath, { recursive: true });
+    planDaemonServiceInstallMock.mockReturnValueOnce({
+      platform: 'win32',
+      files: [{ path: join(homeDir, '.happier', 'services', 'happier-daemon.default.ps1'), content: 'expected wrapper', mode: 0o644 }],
+      copies: [{ sourcePath, destinationPath, validation: 'windows-service-launcher-x64-v1' }],
+      commands: [],
+    });
+    discoverInstalledDaemonServiceEntriesMock.mockResolvedValueOnce([
+      {
+        serverId: 'default',
+        name: 'Default background service',
+        installed: true,
+        path: join(homeDir, 'other-home', 'services', 'happier-daemon.default.ps1'),
+        platform: 'win32',
+        mode: 'user',
+        happierHomeDir: join(homeDir, 'other-home'),
+        releaseChannel: 'stable',
+        label: 'Happier\\happier-daemon.default',
+        targetMode: 'default-following',
+      },
+    ]);
+    const beforeApply = vi.fn(async () => undefined);
+
+    const { installDaemonService } = await import('./installer');
+
+    await expect(installDaemonService({
+      platform: 'win32',
+      userHomeDir: homeDir,
+      happierHomeDir: join(homeDir, '.happier'),
+      channel: 'publicdev',
+      targetMode: 'default-following',
+      instanceId: 'default',
+      strategy: 'replace-all',
+      runCommands: false,
+      beforeApply,
+    })).rejects.toMatchObject({ code: 'EISDIR' });
+
+    expect(planDaemonServiceUninstallMock).not.toHaveBeenCalled();
+    expect(beforeApply).not.toHaveBeenCalled();
+    expect(applyDaemonServiceInstallPlanMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid packaged launcher before stopping the current owner', async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), 'happier-installer-launcher-preflight-'));
+    const installedPath = join(homeDir, '.happier', 'services', 'happier-daemon.default.ps1');
+    mkdirSync(dirname(installedPath), { recursive: true });
+    writeFileSync(installedPath, 'stale wrapper', 'utf8');
+    planDaemonServiceInstallMock.mockReturnValueOnce({
+      platform: 'win32',
+      files: [{ path: installedPath, content: 'expected wrapper', mode: 0o644 }],
+      copies: [{
+        sourcePath: join(homeDir, 'missing', 'happier-service-launcher.exe'),
+        destinationPath: join(homeDir, '.happier', 'services', 'happier-daemon.default', 'launcher-1', 'happier-service-launcher.exe'),
+        validation: 'windows-service-launcher-x64-v1',
+      }],
+      commands: [],
+    });
+    discoverInstalledDaemonServiceEntriesMock.mockResolvedValueOnce([]);
+    const beforeApply = vi.fn(async () => undefined);
+
+    const { installDaemonService } = await import('./installer');
+
+    await expect(installDaemonService({
+      platform: 'win32',
+      userHomeDir: homeDir,
+      happierHomeDir: join(homeDir, '.happier'),
+      channel: 'stable',
+      targetMode: 'default-following',
+      instanceId: 'default',
+      runCommands: false,
+      beforeApply,
+    })).rejects.toThrow(/launcher is unavailable/u);
+
+    expect(beforeApply).not.toHaveBeenCalled();
+    expect(applyDaemonServiceUninstallPlanMock).not.toHaveBeenCalled();
+    expect(applyDaemonServiceInstallPlanMock).not.toHaveBeenCalled();
   });
 });

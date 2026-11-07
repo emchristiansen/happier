@@ -19,9 +19,9 @@ export type SetupRelaySelection =
 /**
  * How a phone will be able to reach a relay hosted on this computer.
  *
- * A relay the user's phone cannot reach is the worst outcome of setup, because
- * it is only discovered later and from somewhere else. Setup states the answer
- * before and after installing rather than leaving it to be found out.
+ * Setup reports this after the installer has selected the actual address. The
+ * authentication owner separately explains method-specific constraints only
+ * when it creates a new sign-in request.
  */
 export type SetupRelayReachability =
   | Readonly<{ kind: 'tailnet'; tailnetName: string | null }>
@@ -30,13 +30,13 @@ export type SetupRelayReachability =
 
 export type SetupStep =
   | Readonly<{ kind: 'alreadyConfigured'; relayUrl: string }>
-  | Readonly<{ kind: 'explainRelayReachability'; reachability: SetupRelayReachability }>
   | Readonly<{ kind: 'installLocalRelay' }>
   | Readonly<{ kind: 'selectRelay'; relayUrl: string }>
   | Readonly<{ kind: 'selectCloudRelay' }>
   | Readonly<{ kind: 'reportRelayReachability'; reachability: SetupRelayReachability }>
   | Readonly<{ kind: 'offerTailscaleSetup' }>
   | Readonly<{ kind: 'authLogin' }>
+  | Readonly<{ kind: 'setupAgents'; installedAgentIds: readonly string[] }>
   | Readonly<{ kind: 'warnNoAgent' }>;
 
 /**
@@ -221,6 +221,22 @@ function classifyRelayReachability(
   return { kind: 'tailnet', tailnetName: tailscale.tailnetName };
 }
 
+const HOST_ON_THIS_COMPUTER_DEFAULT = 'Installs an additional server; needs a reachable network route';
+
+/**
+ * The "Host on this computer" choice, described by who could reach it.
+ *
+ * The default text leaves reachability as homework. A running Tailscale already
+ * answers it — the relay install publishes on the tailnet — so the choice says
+ * so before the user commits an account to it.
+ */
+export function describeHostOnThisComputerChoice(tailscale: TailscaleStatusSnapshot | null): string {
+  const reachability = classifyRelayReachability(tailscale);
+  if (reachability.kind !== 'tailnet') return HOST_ON_THIS_COMPUTER_DEFAULT;
+  const devices = reachability.tailnetName ? `devices on ${reachability.tailnetName}` : 'devices on your tailnet';
+  return `Installs an additional server; Tailscale can publish it to ${devices}`;
+}
+
 function normalizeUrl(value: string): string {
   return value.trim().replace(/\/+$/u, '');
 }
@@ -276,9 +292,17 @@ export function buildSetupPlan(params: BuildSetupPlanParams): SetupPlan {
     };
   }
 
-  // Nothing to do: this machine already has credentials against a relay and the
-  // user has not asked to move to a different one.
+  // Interactive re-entry still passes through the idempotent auth owner so it
+  // can reconcile the background service, then fills the only remaining setup
+  // gap if no coding agent is installed. Unattended modes keep this a no-op.
   if (configured && !selection) {
+    if (params.autonomy === 'interactive') {
+      const steps: SetupStep[] = [{ kind: 'authLogin' }];
+      if (params.installedAgentIds.length === 0) {
+        steps.push({ kind: 'setupAgents', installedAgentIds: params.installedAgentIds });
+      }
+      return { steps, stop: null };
+    }
     return { steps: [{ kind: 'alreadyConfigured', relayUrl: activeRelayUrl! }], stop: null };
   }
 
@@ -299,7 +323,9 @@ export function buildSetupPlan(params: BuildSetupPlanParams): SetupPlan {
     const steps: SetupStep[] = params.autonomy === 'interactive'
       ? [{ kind: 'authLogin' }]
       : [];
-    if (params.installedAgentIds.length === 0) {
+    if (params.autonomy === 'interactive' && params.installedAgentIds.length === 0) {
+      steps.push({ kind: 'setupAgents', installedAgentIds: params.installedAgentIds });
+    } else if (params.installedAgentIds.length === 0) {
       steps.push({ kind: 'warnNoAgent' });
     }
     return {
@@ -339,7 +365,6 @@ export function buildSetupPlan(params: BuildSetupPlanParams): SetupPlan {
 
   if (selection.kind === 'thisComputer') {
     const reachability = classifyRelayReachability(params.tailscale);
-    steps.push({ kind: 'explainRelayReachability', reachability });
     steps.push({ kind: 'installLocalRelay' });
     steps.push({ kind: 'reportRelayReachability', reachability });
     // Opt-in, and only where there is something to install: a stopped Tailscale
@@ -364,7 +389,9 @@ export function buildSetupPlan(params: BuildSetupPlanParams): SetupPlan {
     steps.push({ kind: 'authLogin' });
   }
 
-  if (params.installedAgentIds.length === 0) {
+  if (interactive && params.installedAgentIds.length === 0) {
+    steps.push({ kind: 'setupAgents', installedAgentIds: params.installedAgentIds });
+  } else if (params.installedAgentIds.length === 0) {
     // Never blocking: the user can finish setup and install an agent after.
     steps.push({ kind: 'warnNoAgent' });
   }

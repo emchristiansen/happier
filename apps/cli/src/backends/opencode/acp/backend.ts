@@ -15,7 +15,7 @@ import { openCodeTransport } from '@/backends/opencode/acp/transport';
 import { logger } from '@/ui/logger';
 import type { PermissionMode } from '@/api/types';
 import { buildOpenCodeFamilyPermissionEnv } from '@/backends/openCodeFamily/permission/openCodeFamilyPermissionEnv';
-import { requireProviderCliLaunchSpec } from '@/runtime/managedTools/requireProviderCliLaunchSpec';
+import { resolveOpenCodeCliLaunchSpec } from '@/backends/opencode/utils/resolveOpenCodeCliCommand';
 import { parseBooleanEnv } from '@happier-dev/protocol';
 
 export interface OpenCodeBackendOptions extends AgentFactoryOptions {
@@ -42,12 +42,10 @@ export function createOpenCodeBackend(options: OpenCodeBackendOptions): AgentBac
 
   const shouldPrintLogs = parseBooleanEnv(mergedEnv['HAPPIER_OPENCODE_ACP_PRINT_LOGS'], true);
 
-  const resolvedLogLevel = (() => {
-    const raw = (mergedEnv['HAPPIER_OPENCODE_ACP_LOG_LEVEL'] ?? '').toString().trim().toUpperCase();
-    if (raw === 'DEBUG' || raw === 'INFO' || raw === 'WARN' || raw === 'ERROR') return raw;
-    return 'ERROR';
-  })();
-  const launch = requireProviderCliLaunchSpec('opencode', { processEnv: mergedEnv });
+  // OpenCode 1 accepts uppercase levels; OpenCode 2 accepts lowercase levels.
+  // Let the executable own its default and validate explicitly requested values.
+  const logLevel = mergedEnv['HAPPIER_OPENCODE_ACP_LOG_LEVEL']?.trim();
+  const launch = resolveOpenCodeCliLaunchSpec(mergedEnv);
 
   const backendOptions: AcpBackendOptions = {
     agentName: 'opencode',
@@ -57,8 +55,7 @@ export function createOpenCodeBackend(options: OpenCodeBackendOptions): AgentBac
       ...launch.args,
       'acp',
       ...(shouldPrintLogs ? (['--print-logs'] as const) : []),
-      '--log-level',
-      resolvedLogLevel,
+      ...(logLevel ? ['--log-level', logLevel] : []),
     ],
     env: mergedEnv,
     mcpServers: options.mcpServers,

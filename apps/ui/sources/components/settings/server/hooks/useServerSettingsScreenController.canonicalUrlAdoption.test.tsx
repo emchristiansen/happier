@@ -72,19 +72,29 @@ const removeServerProfileMock = vi.fn((..._args: unknown[]) => undefined);
 const setActiveServerIdMock = vi.fn((..._args: unknown[]) => undefined);
 const getServerProfileByIdMock = vi.fn((..._args: unknown[]): ServerProfile | null => null);
 const activeServerSnapshot = { serverId: 'server-a', serverUrl: 'https://a.example.test', generation: 1 };
-vi.mock('@/sync/domains/server/serverProfiles', () => ({
-    getActiveServerSnapshot: () => activeServerSnapshot,
-    subscribeActiveServer: () => () => {},
-    listServerProfiles: () => [],
-    getActiveServerId: () => '',
-    getDeviceDefaultServerId: () => '',
-    getResetToDefaultServerId: () => '',
-    setActiveServerId: (...args: unknown[]) => setActiveServerIdMock(...args),
-    upsertServerProfile: (...args: unknown[]) => upsertServerProfileMock(...args),
-    removeServerProfile: (...args: unknown[]) => removeServerProfileMock(...args),
-    getServerProfileById: (...args: unknown[]) => getServerProfileByIdMock(...args),
-    resolveServerProfileScopeId: (profile: { id: string; serverIdentityId?: string | null }) => profile.serverIdentityId ?? profile.id,
-}));
+vi.mock('@/sync/domains/server/serverProfiles', async (importOriginal) => {
+    const { createServerProfilesModuleMock } = await import('@/dev/testkit/mocks/serverProfiles');
+    const mock = await createServerProfilesModuleMock({
+        importOriginal,
+        overrides: {
+            getActiveServerSnapshot: () => activeServerSnapshot as any,
+            subscribeActiveServer: () => () => {},
+            listServerProfiles: () => [],
+            getActiveServerId: () => '',
+            getDeviceDefaultServerId: () => '',
+            getResetToDefaultServerId: () => '',
+            getTabActiveServerId: () => null,
+            setActiveServerId: (...args: unknown[]) => setActiveServerIdMock(...args),
+            upsertServerProfile: ((...args: unknown[]) => upsertServerProfileMock(...args)) as any,
+            removeServerProfile: (...args: unknown[]) => removeServerProfileMock(...args),
+        },
+    });
+    // The testkit derives lookup from `listServerProfiles`; this suite drives lookup directly.
+    return {
+        ...mock,
+        getServerProfileById: ((...args: unknown[]) => getServerProfileByIdMock(...args)) as any,
+    };
+});
 
 vi.mock('@/sync/domains/server/serverConfig', () => ({
     validateServerUrl: () => ({ valid: true, error: null }),

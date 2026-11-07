@@ -109,6 +109,25 @@ vi.mock('@/sync/domains/server/serverProfiles', () => ({
     listServerProfiles: () => listServerProfilesMock(),
     resolveServerProfileScopeId: (profile: { id: string; serverIdentityId?: string | null }) => profile.serverIdentityId ?? profile.id,
     setActiveServerId: (id: string, opts: { scope: 'tab' | 'device' }) => setActiveServerIdMock(id, opts),
+    // Read by the canonical switch and the direct-selection intent (both real in this suite).
+    areServerProfileIdentifiersEquivalent: (left: string, right: string) => String(left).trim() === String(right).trim(),
+    getDeviceDefaultServerId: () => activeServerSnapshot.serverId,
+    getTabActiveServerId: () => null,
+}));
+
+const settingsWrites = vi.hoisted(() => ({ values: {} as Record<string, unknown> }));
+vi.mock('@/sync/domains/state/storage', async () => {
+    const { createStorageModuleStub } = await import('@/dev/testkit/mocks/storage');
+    return createStorageModuleStub({
+        useSettingMutable: (key: string) => [settingsWrites.values[key] ?? null, (value: unknown) => {
+            settingsWrites.values[key] = value;
+        }],
+    });
+});
+
+const switchConnectionToActiveServerMock = vi.hoisted(() => vi.fn(async () => null));
+vi.mock('@/sync/runtime/orchestration/connectionManager', () => ({
+    switchConnectionToActiveServer: () => switchConnectionToActiveServerMock(),
 }));
 
 vi.mock('@/sync/domains/server/serverRuntime', () => ({
@@ -337,7 +356,49 @@ describe('/setup route', () => {
         const screen = await renderScreen(React.createElement(Screen));
 
         expect(screen.findAllByType('UnauthenticatedSplitShell' as never)).toHaveLength(0);
-        expect(screen.findByTestId('setup.postAuth')).toBeTruthy();
+    });
+
+    it('sends a desktop post-auth visit with no live continuation to the setup gate instead of a second surface', async () => {
+        tauriDesktopState.value = true;
+        isAuthenticated = true;
+        getPendingSetupIntentMock.mockReturnValue(null);
+
+        const Screen = (await import('@/app/(app)/setup/index')).default;
+        const screen = await renderScreen(React.createElement(Screen));
+
+        expect(screen.findByTestId('setup.postAuth')).toBeNull();
+        expect(screen.findByTestId('setup.postAuthDiscard')).toBeNull();
+        expect(screen.findAllByType('MachineSetupFlowScreen' as never)).toHaveLength(0);
+        expect(expoRouterMock.spies.replace).toHaveBeenCalledWith('/');
+    });
+
+    it('does not render the readiness control panel or the first-run drift card on the post-auth route', async () => {
+        tauriDesktopState.value = true;
+        isAuthenticated = true;
+        getPendingSetupIntentMock.mockReturnValue({
+            branch: 'thisComputer',
+            phase: 'post_auth',
+            relayUrl: 'https://relay.example.test',
+        });
+        relayDriftBannerMock.mockReturnValue({
+            kind: 'warning',
+            title: 'drift',
+            description: 'drift',
+            actionLabel: 'repair',
+            onPress: vi.fn(),
+            isRepairStarting: false,
+            repairTaskSnapshot: null,
+            onCancelRepair: vi.fn(),
+        });
+
+        const Screen = (await import('@/app/(app)/setup/index')).default;
+        const screen = await renderScreen(React.createElement(Screen));
+
+        expect(screen.findByTestId('setup.summary.activeRelay')).toBeNull();
+        expect(screen.findByTestId('setup.summary.thisComputer')).toBeNull();
+        expect(screen.findByTestId('setup.summary.nextAction')).toBeNull();
+        expect(screen.findAllByType('RelayDriftActionCard' as never)).toHaveLength(0);
+        expect(relayDriftBannerMock).not.toHaveBeenCalled();
     });
 
     it('does not show local relay runtime controls before auth (setup remains relay-choice only)', async () => {
@@ -379,6 +440,61 @@ describe('/setup route', () => {
             relayUrl: 'https://relay.custom.test',
         });
         expect(expoRouterMock.spies.replace).toHaveBeenCalledWith('/');
+    });
+
+    /**
+     * R8/INV7 — a relay picked or added here is a person choosing where this computer belongs, so
+     * it arms the one direct-selection intent the desktop setup gate spends after sign-in to offer
+     * moving this computer's background service. Continuing on the relay already shown chooses
+     * nothing new and arms nothing. The intent module is real: this is what the gate consumes.
+     */
+    it('arms the direct relay selection for a saved relay picked before sign-in', async () => {
+        vi.resetModules();
+        const Screen = (await import('@/app/(app)/setup/index')).default;
+        const intent = await import('@/setup/directRelaySelectionIntent');
+        const screen = await renderScreen(React.createElement(Screen));
+
+        const targetRow = screen.findAllByType('Item' as never).find((entry) => entry.props.testID === 'setup.savedRelay.relay-2');
+        if (!targetRow) throw new Error('Expected saved relay row for relay-2');
+        await act(async () => {
+            await targetRow.props.onPress?.();
+        });
+
+        expect(setActiveServerIdMock).toHaveBeenCalledWith('relay-2', { scope: 'device' });
+        expect(settingsWrites.values.serverSelectionActiveTargetId).toBe('relay-2');
+        expect(intent.consumeDirectRelaySelectionIntent('relay-2')).toBe(true);
+    });
+
+    it('arms the direct relay selection for a custom relay added before sign-in', async () => {
+        vi.resetModules();
+        upsertServerProfileMock.mockImplementationOnce((params) => ({ id: 'server-added', serverUrl: params.serverUrl }));
+        const Screen = (await import('@/app/(app)/setup/index')).default;
+        const intent = await import('@/setup/directRelaySelectionIntent');
+        const screen = await renderScreen(React.createElement(Screen));
+
+        await screen.pressByTestIdAsync('setup.changeRelay');
+        await act(async () => {
+            screen.changeTextByTestId('setup.customRelayUrl', 'https://relay.custom.test/');
+        });
+        await screen.pressByTestIdAsync('setup.addRelay');
+
+        expect(intent.consumeDirectRelaySelectionIntent('server-added')).toBe(true);
+        expect(expoRouterMock.spies.replace).toHaveBeenCalledWith('/');
+    });
+
+    it('arms nothing when the person continues on the relay already selected', async () => {
+        vi.resetModules();
+        const Screen = (await import('@/app/(app)/setup/index')).default;
+        const intent = await import('@/setup/directRelaySelectionIntent');
+        const screen = await renderScreen(React.createElement(Screen));
+
+        const continueButton = requireButton(screen, 'setup.continueToAuth');
+        await act(async () => {
+            const handler = continueButton.props.action ?? continueButton.props.onPress;
+            await handler?.();
+        });
+
+        expect(intent.consumeDirectRelaySelectionIntent('relay-1')).toBe(false);
     });
 
     it('lets the user switch to another saved relay without leaving setup', async () => {
@@ -466,7 +582,7 @@ describe('/setup route', () => {
         expect(idsInGroup(discardGroup)).toEqual(['setup.discard']);
     });
 
-    it('marks the first-launch onboarding as dismissed when discard is pressed', async () => {
+    it('clears the first-launch onboarding intent when discard is pressed', async () => {
         const Screen = (await import('@/app/(app)/setup/index')).default;
         const screen = await renderScreen(React.createElement(Screen));
 
@@ -477,12 +593,10 @@ describe('/setup route', () => {
             await handler?.();
         });
 
-        expect(setPendingSetupIntentMock).toHaveBeenCalledWith({
-            branch: 'thisComputer',
-            phase: 'dismissed',
-            relayUrl: 'https://relay.example.test',
-        });
-        expect(clearPendingSetupIntentMock).not.toHaveBeenCalled();
+        // Discarding leaves no intent behind: a "dismissed" marker said exactly the same thing to
+        // every reader while keeping a record alive for a day.
+        expect(clearPendingSetupIntentMock).toHaveBeenCalledTimes(1);
+        expect(setPendingSetupIntentMock).not.toHaveBeenCalled();
         expect(expoRouterMock.spies.replace).toHaveBeenCalledWith('/');
     });
 
@@ -497,7 +611,7 @@ describe('/setup route', () => {
         expect(upsertServerProfileMock).not.toHaveBeenCalled();
     });
 
-    it('marks setup as post-auth, auto-starts local setup, and clears the pending intent after local success', async () => {
+    it('never starts local setup from the post-auth route — the desktop gate is the only auto-start owner', async () => {
         tauriDesktopState.value = true;
         isAuthenticated = true;
         getPendingSetupIntentMock.mockReturnValue({
@@ -509,30 +623,13 @@ describe('/setup route', () => {
         const Screen = (await import('@/app/(app)/setup/index')).default;
         const screen = await renderScreen(React.createElement(Screen));
 
-        const machineSetupFlow = screen.findByType('MachineSetupFlowScreen' as never);
-        expect(machineSetupFlow.props.autoStartLocalTask).toBe(true);
-        expect(machineSetupFlow.props.embedded).toBe(true);
-
-        const items = screen.findAllByType('Item' as never);
-        const thisComputer = items.find((entry) => entry.props.testID === 'setup.summary.thisComputer');
-        const nextAction = items.find((entry) => entry.props.testID === 'setup.summary.nextAction');
-
-        expect(thisComputer?.props.subtitle).toBe('settings.machineSetupCurrentMachineSubtitle');
-        expect(nextAction?.props.subtitle).toBe('settings.machineSetupStageConnect');
-
-        await act(async () => {
-            machineSetupFlow.props.onLocalSetupSucceeded?.('machine-1');
-        });
-
-        expect(setPendingSetupIntentMock).toHaveBeenCalledWith({
-            branch: 'thisComputer',
-            phase: 'post_auth',
-            relayUrl: 'https://relay.example.test',
-        });
-        expect(clearPendingSetupIntentMock).toHaveBeenCalledTimes(1);
+        expect(screen.findAllByType('MachineSetupFlowScreen' as never)).toHaveLength(0);
+        expect(screen.findByTestId('setup.postAuth')).toBeNull();
+        expect(setPendingSetupIntentMock).not.toHaveBeenCalled();
+        expect(expoRouterMock.spies.replace).toHaveBeenCalledWith('/');
     });
 
-    it('shows the web-safe post-auth summary when not running in Tauri', async () => {
+    it('shows the desktop-only notice instead of the local setup flow when not running in Tauri', async () => {
         tauriDesktopState.value = false;
         isAuthenticated = true;
         getPendingSetupIntentMock.mockReturnValue({
@@ -545,11 +642,9 @@ describe('/setup route', () => {
         const screen = await renderScreen(React.createElement(Screen));
 
         expect(screen.findByTestId('setup.postAuth')).toBeTruthy();
-        expect(screen.findByTestId('setup.summary.activeRelay')).toBeTruthy();
-        expect(screen.findByTestId('setup.summary.thisComputer')).toBeTruthy();
-        expect(screen.findByTestId('setup.summary.nextAction')).toBeTruthy();
         expect(screen.findAllByType('MachineSetupFlowScreen' as never)).toHaveLength(0);
-        expect(screen.findByTestId('setup.desktopOnlyNotice')).toBeNull();
+        expect(screen.findByTestId('setup.desktopOnlyNotice')).toBeTruthy();
+        expect(expoRouterMock.spies.replace).not.toHaveBeenCalledWith('/');
     });
 
     it('resumes provider follow-up for a remote machine after relay adoption auth completes', async () => {
@@ -566,18 +661,11 @@ describe('/setup route', () => {
         const screen = await renderScreen(React.createElement(Screen));
 
         const machineSetupFlow = screen.findByType('MachineSetupFlowScreen' as never);
-        expect(machineSetupFlow.props.autoStartLocalTask).toBe(false);
+        expect(machineSetupFlow.props.autoStartLocalTask).toBeUndefined();
         expect(machineSetupFlow.props.initialProviderMachineId).toBe('machine-remote-1');
         expect(machineSetupFlow.props.embedded).toBe(true);
+        expect(expoRouterMock.spies.replace).not.toHaveBeenCalledWith('/');
 
-        const items = screen.findAllByType('Item' as never);
-        const activeRelay = items.find((entry) => entry.props.testID === 'setup.summary.activeRelay');
-        const thisComputer = items.find((entry) => entry.props.testID === 'setup.summary.thisComputer');
-        const nextAction = items.find((entry) => entry.props.testID === 'setup.summary.nextAction');
-
-        expect(activeRelay?.props.subtitle).toBe('https://relay.example.test');
-        expect(thisComputer?.props.subtitle).toBe('settings.machineSetupSshMachineSubtitle');
-        expect(nextAction?.props.subtitle).toBe('settingsProviders.setup.startTitle');
         expect(setPendingSetupIntentMock).toHaveBeenCalledWith({
             branch: 'remoteMachine',
             phase: 'post_auth',
@@ -590,9 +678,10 @@ describe('/setup route', () => {
         tauriDesktopState.value = true;
         isAuthenticated = true;
         getPendingSetupIntentMock.mockReturnValue({
-            branch: 'thisComputer',
+            branch: 'remoteMachine',
             phase: 'post_auth',
-            relayUrl: 'https://relay.example.test',
+            relayUrl: 'https://relay.remote.example.test',
+            machineId: 'machine-remote-1',
         });
 
         const Screen = (await import('@/app/(app)/setup/index')).default;
@@ -606,38 +695,5 @@ describe('/setup route', () => {
 
         expect(clearPendingSetupIntentMock).toHaveBeenCalledTimes(1);
         expect(expoRouterMock.spies.replace).toHaveBeenCalledWith('/');
-    });
-
-    it('shows the post-auth readiness summary and relay repair surface when this computer drifts', async () => {
-        tauriDesktopState.value = true;
-        isAuthenticated = true;
-        getPendingSetupIntentMock.mockReturnValue({
-            branch: 'thisComputer',
-            phase: 'post_auth',
-            relayUrl: 'https://relay.example.test',
-        });
-        relayDriftBannerMock.mockReturnValue({
-            kind: 'warning',
-            title: 'Your background service is connected to a different Relay',
-            description: 'App: relay-a · Background service: relay-b',
-            actionLabel: 'Connect background service to this Relay',
-            onPress: vi.fn(),
-            isRepairStarting: false,
-            repairTaskSnapshot: null,
-            onCancelRepair: vi.fn(),
-        });
-
-        const Screen = (await import('@/app/(app)/setup/index')).default;
-        const screen = await renderScreen(React.createElement(Screen));
-
-        const items = screen.findAllByType('Item' as never);
-        const activeRelay = items.find((entry) => entry.props.testID === 'setup.summary.activeRelay');
-        const thisComputer = items.find((entry) => entry.props.testID === 'setup.summary.thisComputer');
-        const nextAction = items.find((entry) => entry.props.testID === 'setup.summary.nextAction');
-
-        expect(activeRelay?.props.subtitle).toBe('https://relay.example.test');
-        expect(thisComputer?.props.subtitle).toBe('Your background service is connected to a different Relay');
-        expect(nextAction?.props.subtitle).toBe('Connect background service to this Relay');
-        expect(() => screen.findByType('RelayDriftActionCard' as never)).not.toThrow();
     });
 });

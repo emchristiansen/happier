@@ -1128,6 +1128,8 @@ async function main() {
     }
   };
 
+  // The lifecycle owner must stay alive until a shutdown signal is dispatched, even when it supervises no child/watch handle.
+  setInterval(() => {}, 2 ** 30);
   if (pendingShutdownSignal) dispatchShutdown(pendingShutdownSignal);
 
   await new Promise(() => {});

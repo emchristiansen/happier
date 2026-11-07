@@ -70,7 +70,10 @@ export function setAuthState(next: { isAuthenticated: boolean; credentials: { to
     authState = next;
 }
 
-vi.mock('react-native-reanimated', () => ({}));
+vi.mock('react-native-reanimated', async () => {
+    const { createReanimatedModuleMock } = await import('@/dev/testkit/mocks/reanimated');
+    return createReanimatedModuleMock();
+});
 
 vi.mock('@/components/onboarding/unauthShell', async () => {
     const React = await import('react');

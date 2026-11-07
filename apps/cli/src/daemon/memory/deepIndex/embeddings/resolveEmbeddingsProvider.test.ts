@@ -145,11 +145,16 @@ describe('resolveEmbeddingsProvider', () => {
     transformersState.failPipelineInit = true;
 
     const { resolveEmbeddingsProvider } = await import('./resolveEmbeddingsProvider');
+    const { logger } = await import('@/ui/logger');
+    const warning = vi.spyOn(logger, 'warn').mockImplementation(() => {});
 
     const resolution = await resolveEmbeddingsProvider({ settings: createPresetOperationalSettings(), cacheDir: '/tmp/happier-memory-embeddings-test' });
 
     expect(resolution.provider).toBeNull();
     expect(resolution.runtimeState).toBe('error');
+    expect(resolution.usingFallback).toBe(true);
+    expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ message: 'missing onnx runtime' }));
+    warning.mockRestore();
   });
 
   it('retries provider initialization after a previous failure', async () => {

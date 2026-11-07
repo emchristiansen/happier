@@ -15,7 +15,7 @@ import { isTty, prompt, promptSelect, withRl } from './utils/cli/wizard.mjs';
 import { isSandboxed, sandboxAllowsGlobalSideEffects } from './utils/env/sandbox.mjs';
 import { bold, cyan, dim, green } from './utils/ui/ansi.mjs';
 import { getVerbosityLevel } from './utils/cli/verbosity.mjs';
-import { createStepPrinter } from './utils/cli/progress.mjs';
+import { createStepPrinter } from '@happier-dev/cli-common/output';
 
 /**
  * Install/setup the local stack:

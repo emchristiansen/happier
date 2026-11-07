@@ -248,6 +248,7 @@ describe('reducer', () => {
                 cacheCreation: 10,
                 cacheRead: 30,
                 contextSize: 160,
+                contextSizeIsReported: false,
             });
             expect(state.latestUsage).toEqual({
                 inputTokens: 120,
@@ -255,6 +256,7 @@ describe('reducer', () => {
                 cacheCreation: 10,
                 cacheRead: 30,
                 contextSize: 160,
+                contextSizeIsReported: false,
                 timestamp: 1000,
             });
         });
@@ -288,6 +290,7 @@ describe('reducer', () => {
                 cacheCreation: 0,
                 cacheRead: 200,
                 contextSize: 1_200,
+                contextSizeIsReported: true,
                 contextWindowTokens: 258_400,
             });
             expect(state.latestUsage).toEqual({
@@ -296,6 +299,7 @@ describe('reducer', () => {
                 cacheCreation: 0,
                 cacheRead: 200,
                 contextSize: 1_200,
+                contextSizeIsReported: true,
                 contextWindowTokens: 258_400,
                 timestamp: 1000,
             });
@@ -345,6 +349,7 @@ describe('reducer', () => {
                 cacheCreation: 769_000,
                 cacheRead: 39_231_000,
                 contextSize: 938_843,
+                contextSizeIsReported: false,
                 contextWindowTokens: 1_000_000,
             });
         });
@@ -390,6 +395,7 @@ describe('reducer', () => {
                 cacheCreation: 0,
                 cacheRead: 0,
                 contextSize: 0,
+                contextSizeIsReported: false,
                 contextWindowTokens: 258_400,
                 timestamp: 2000,
             });
@@ -437,6 +443,7 @@ describe('reducer', () => {
                 cacheCreation: 0,
                 cacheRead: 0,
                 contextSize: 0,
+                contextSizeIsReported: false,
                 contextWindowTokens: 258_400,
                 timestamp: 2000,
             });
@@ -1243,7 +1250,7 @@ describe('reducer', () => {
                 }
             };
 
-            const result1 = reducer(state, [], agentState);
+            const result1 = reducer(state, [], agentState, { mainHistoryStartLoaded: true });
             expect(result1.messages).toHaveLength(1);
 
             // Then receive the actual tool call from the agent
@@ -1382,7 +1389,7 @@ describe('reducer', () => {
                 }
             };
 
-            const result1 = reducer(state, [], agentState);
+            const result1 = reducer(state, [], agentState, { mainHistoryStartLoaded: true });
             expect(result1.messages).toHaveLength(2);
 
             // Store the message IDs
@@ -1456,7 +1463,7 @@ describe('reducer', () => {
             };
 
             // First call - should create messages
-            const result1 = reducer(state, [], agentState);
+            const result1 = reducer(state, [], agentState, { mainHistoryStartLoaded: true });
             expect(result1.messages).toHaveLength(2);
 
             // Verify the messages were created
@@ -1726,7 +1733,7 @@ describe('reducer', () => {
             };
 
             // Process permissions
-            const result1 = reducer(state, [], agentState);
+            const result1 = reducer(state, [], agentState, { mainHistoryStartLoaded: true });
             expect(result1.messages).toHaveLength(2);
 
             // Both should be separate messages
@@ -2709,7 +2716,7 @@ describe('reducer', () => {
                 }
             ];
 
-            const result = reducer(state, messages, agentState);
+            const result = reducer(state, messages, agentState, { mainHistoryStartLoaded: true });
 
             // Should create: 1 user, 1 agent text, 1 tool from permission request,
             // 1 tool from completed permission, 1 new tool call

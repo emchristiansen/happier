@@ -1,11 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import fsPromises from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
+import axios from 'axios';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   buildConnectedServiceCredentialRecord,
+  ConnectedServiceAuthGroupV1Schema,
   deriveAccountMachineKeyFromRecoverySecret,
   deriveSettingsSecretsKeyV1,
   encryptSecretStringV1,
@@ -13,7 +18,7 @@ import {
 import { RPC_METHODS } from '@happier-dev/protocol/rpc';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
-import type { ApiClient } from '@/api/api';
+import { writeExecutableShim } from '@/testkit/fs/executableShim';
 import type { Credentials } from '@/persistence';
 
 const envKeys = [
@@ -32,6 +37,8 @@ let envScope = createEnvKeyScope(envKeys);
 let tempDir: string | null = null;
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
   vi.doUnmock('@/api/api');
   vi.doUnmock('@/persistence');
   vi.doUnmock('@/settings/accountSettings/bootstrapAccountSettingsContext');
@@ -45,6 +52,38 @@ afterEach(() => {
 });
 
 describe('capabilities.invoke connected-service preflight', () => {
+  it('probes native Codex auth without requiring a connected-service credential', async () => {
+    vi.resetModules();
+    tempDir = mkdtempSync(join(tmpdir(), 'happier-capability-native-preflight-'));
+    process.env.HAPPIER_HOME_DIR = tempDir;
+    process.env.HAPPIER_CODEX_APP_SERVER_BIN = fileURLToPath(
+      new URL('../../backends/codex/preflight/__fixtures__/fakeCodexAppServer.mjs', import.meta.url),
+    );
+    vi.doMock('@/persistence', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('@/persistence')>()),
+      readCredentials: vi.fn(async () => null),
+    }));
+
+    const { reloadConfiguration } = await import('@/configuration');
+    reloadConfiguration();
+    const { registerCapabilitiesHandlers } = await import('./capabilities');
+    const { createEncryptedRpcTestClient } = await import('./encryptedRpc.testkit');
+    const { call } = createEncryptedRpcTestClient({
+      scopePrefix: 'machine-test',
+      encryptionKey: new Uint8Array(32).fill(7),
+      logger: () => undefined,
+      registerHandlers: (manager) => registerCapabilitiesHandlers(manager),
+    });
+    const response = await call(RPC_METHODS.CAPABILITIES_INVOKE, {
+      id: 'cli.codex', method: 'probeModels',
+      params: {
+        cwd: tempDir, timeoutMs: 5_000,
+        connectedServices: { v: 1, bindingsByServiceId: { 'openai-codex': { source: 'native' } } },
+      },
+    });
+    expect(response).toMatchObject({ ok: true, result: { source: 'dynamic' } });
+  }, 90_000);
+
   it('resolves the selected backend profile environment and encrypted Saved Secret before probing controls', async () => {
     vi.resetModules();
     tempDir = mkdtempSync(join(tmpdir(), 'happier-capability-profile-preflight-'));
@@ -135,25 +174,43 @@ describe('capabilities.invoke connected-service preflight', () => {
     });
   }, 90_000);
 
-  it('materializes a selected Codex auth group through the canonical spawn resolver without a legacy stable home', async () => {
+  it.each([
+    { stateMode: 'isolated', retirementFails: false },
+    { stateMode: 'shared', retirementFails: false },
+    { stateMode: 'isolated', retirementFails: true },
+  ] as const)('retains $stateMode probe history and reports retirement failure $retirementFails', async ({ stateMode, retirementFails }) => {
     vi.resetModules();
     tempDir = mkdtempSync(join(tmpdir(), 'happier-capability-connected-preflight-'));
     process.env.HAPPIER_HOME_DIR = tempDir;
-    process.env.HAPPIER_CODEX_APP_SERVER_BIN = fileURLToPath(
-      new URL('../../backends/codex/preflight/__fixtures__/fakeCodexAppServer.mjs', import.meta.url),
-    );
+    const fixtureUrl = new URL('../../backends/codex/preflight/__fixtures__/fakeCodexAppServer.mjs', import.meta.url);
+    process.env.HAPPIER_CODEX_APP_SERVER_BIN = await writeExecutableShim({
+      dir: tempDir, fileName: 'history-writing-codex.mjs', contents: `#!${process.execPath}\n
+        import { lstatSync, mkdirSync, writeFileSync } from 'node:fs';
+        import { join } from 'node:path';
+        const sessions = join(process.env.CODEX_HOME, 'sessions');
+        mkdirSync(sessions, { recursive: true });
+        writeFileSync(join(sessions, 'probe.jsonl'), 'synthetic probe history\\n');
+        writeFileSync(${JSON.stringify(join(tempDir, 'history-ownership.json'))}, JSON.stringify({
+          homeIsSymlink: lstatSync(process.env.CODEX_HOME).isSymbolicLink(),
+          sessionsIsSymlink: lstatSync(sessions).isSymbolicLink(),
+          transcriptIsFile: lstatSync(join(sessions, 'probe.jsonl')).isFile(),
+        }));
+        await import(${JSON.stringify(fixtureUrl.href)});
+      `,
+    });
     process.env.HAPPIER_FAKE_CODEX_APP_SERVER_DELAY_MS = '1';
     const captureFile = join(tempDir, 'captured-env.json');
     process.env.HAPPIER_FAKE_CODEX_APP_SERVER_ENV_CAPTURE_FILE = captureFile;
     delete process.env.OPENAI_API_KEY;
     delete process.env.CODEX_API_KEY;
-    delete process.env.CODEX_HOME;
-    delete process.env.CODEX_SQLITE_HOME;
+    // Keep real native-state sharing inside this fixture rather than the user's ambient home.
+    process.env.CODEX_HOME = join(tempDir, 'native-codex-home');
+    process.env.CODEX_SQLITE_HOME = process.env.CODEX_HOME;
 
-    const credentials: Credentials = {
+    const credentials = {
       token: 'test-happier-token',
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
-    };
+    } satisfies Credentials;
     const credentialRecord = buildConnectedServiceCredentialRecord({
       now: 1_800_000_000_000,
       serviceId: 'openai-codex',
@@ -170,51 +227,55 @@ describe('capabilities.invoke connected-service preflight', () => {
         providerEmail: null,
       },
     });
-    const getConnectedServiceAuthGroup = vi.fn(async () => ({
-      v: 1 as const,
-      serviceId: 'openai-codex' as const,
+    const group = ConnectedServiceAuthGroupV1Schema.parse({
+      v: 1,
+      serviceId: 'openai-codex',
       groupId: 'happier',
+      displayName: 'Selected accounts',
       activeProfileId: 'leeroy',
       generation: 1340,
-      policy: { autoSwitch: true, strategy: 'priority' as const },
-      members: [{ profileId: 'leeroy', enabled: true, priority: 0 }],
-    }));
-    const getConnectedServiceCredentialPlain = vi.fn(async () => ({
-      content: { t: 'plain' as const, v: credentialRecord },
-      revisionSemantics: 'legacy_unfenced' as const,
-      credentialRevision: null,
-    }));
-    const updateConnectedServiceAuthGroupActiveProfile = vi.fn();
-    const api = {
-      getAccountEncryptionMode: async () => 'plain' as const,
-      getConnectedServiceAuthGroup,
-      getConnectedServiceCredentialPlain,
-      updateConnectedServiceAuthGroupActiveProfile,
-      listConnectedServiceProfiles: async () => ({
-        serviceId: 'openai-codex' as const,
-        profiles: [{ profileId: 'leeroy', status: 'healthy' as const }],
-      }),
-    } as unknown as ApiClient;
-
-    vi.doMock('@/persistence', async (importOriginal) => ({
-      ...(await importOriginal<typeof import('@/persistence')>()),
-      readCredentials: vi.fn(async () => credentials),
-    }));
-    vi.doMock('@/api/api', async (importOriginal) => {
-      const actual = await importOriginal<typeof import('@/api/api')>();
-      return {
-        ...actual,
-        ApiClient: { create: vi.fn(async () => api) },
-      };
+      runtimeStateRevision: 1,
+      policy: { autoSwitch: true, strategy: 'priority' },
+      state: {}, createdAt: 1, updatedAt: 1,
+      members: [{ v: 1, serviceId: 'openai-codex', groupId: 'happier',
+        profileId: 'leeroy', enabled: true, priority: 0, state: {}, createdAt: 1, updatedAt: 1 }],
     });
-    vi.doMock('@/settings/accountSettings/bootstrapAccountSettingsContext', () => ({
-      bootstrapAccountSettingsContext: vi.fn(async () => ({
-        settings: { codexBackendMode: 'appServer' },
-      })),
-    }));
-
+    const requests: string[] = [];
+    vi.spyOn(axios, 'get').mockImplementation(async (url, options) => {
+      const path = new URL(String(url)).pathname;
+      requests.push(path);
+      expect(options?.headers).toMatchObject({ Authorization: 'Bearer test-happier-token' });
+      const data = path === '/v2/account/settings'
+        ? { content: { t: 'plain', v: { schemaVersion: 6, codexBackendMode: 'appServer',
+          connectedServicesProviderStateSharingSettingsV1: {
+            v: 1, defaults: { configMode: 'isolated', stateMode },
+            byAgentId: {}, acknowledgedRisksByAgentId: {},
+          },
+        } }, version: 1 }
+        : path === '/v1/account/encryption' ? { mode: 'plain', updatedAt: 0 }
+        : path === '/v3/connect/openai-codex/groups/happier' ? { group }
+        : path === '/v3/connect/openai-codex/profiles/leeroy/credential'
+          ? { content: { t: 'plain', v: credentialRecord }, credentialRevision: 'csr_1123456789ABCDEFGHJKMNPQRS' }
+        : path === '/v2/connect/openai-codex/profiles'
+          ? { serviceId: 'openai-codex', profiles: [{ profileId: 'leeroy', status: 'connected' }] } : null;
+      if (!data) throw new Error(`Unexpected selected-account HTTP request: ${path}`);
+      return { status: 200, data };
+    });
+    const mutation = vi.spyOn(axios, 'post').mockRejectedValue(new Error('Preflight must not mutate the selected group'));
+    // Load the real API module before measuring the selected-account probe budget.
+    await import('@/api/api');
     const { configuration, reloadConfiguration } = await import('@/configuration');
     reloadConfiguration();
+    await writeFile(configuration.privateKeyFile, JSON.stringify({ token: credentials.token,
+      secret: Buffer.from(credentials.encryption.secret).toString('base64') }));
+    const unlink = fsPromises.unlink;
+    vi.spyOn(fsPromises, 'unlink').mockImplementation(async (path) => {
+      if (retirementFails && existsSync(captureFile) && String(path).endsWith(join('codex-home', 'auth.json'))) {
+        throw Object.assign(new Error('Synthetic credential retirement denied'), { code: 'EACCES' });
+      }
+      await unlink(path);
+    });
+    syncBuiltinESMExports();
     const legacyGroupHome = join(
       configuration.activeServerDir,
       'daemon',
@@ -237,6 +298,8 @@ describe('capabilities.invoke connected-service preflight', () => {
       registerHandlers: (manager) => registerCapabilitiesHandlers(manager),
     });
 
+    // Resolve cold lazy catalog imports before measuring the selected-auth probe budget.
+    await call(RPC_METHODS.CAPABILITIES_DESCRIBE, {});
     const response = await call(RPC_METHODS.CAPABILITIES_INVOKE, {
       id: 'cli.codex',
       method: 'probeModels',
@@ -257,25 +320,32 @@ describe('capabilities.invoke connected-service preflight', () => {
       },
     });
 
-    expect(response).toMatchObject({ ok: true, result: { source: 'dynamic' } });
-    expect(getConnectedServiceAuthGroup).toHaveBeenCalledWith({
-      serviceId: 'openai-codex',
-      groupId: 'happier',
-    });
-    expect(getConnectedServiceCredentialPlain).toHaveBeenCalledWith({
-      serviceId: 'openai-codex',
-      profileId: 'leeroy',
-    });
-    expect(updateConnectedServiceAuthGroupActiveProfile).not.toHaveBeenCalled();
+    expect(response, JSON.stringify(response)).toMatchObject(retirementFails
+      ? { ok: false, error: { code: 'preflight-catalog-unavailable' } }
+      : { ok: true, result: { source: 'dynamic' } });
+    expect(requests).toEqual(expect.arrayContaining([
+      '/v3/connect/openai-codex/groups/happier',
+      '/v3/connect/openai-codex/profiles/leeroy/credential',
+    ]));
+    expect(mutation).not.toHaveBeenCalled();
     const captured = JSON.parse(readFileSync(captureFile, 'utf8')) as Record<string, unknown>;
     expect(captured.CODEX_AUTH_FILE_PRESENT).toBe(true);
     const materializedBase = join(tempDir, 'daemon', 'connected-services', 'materialized');
     expect(relative(materializedBase, String(captured.CODEX_HOME))).not.toMatch(/^\.\.(?:[\\/]|$)/u);
-    // Connected auth stays isolated while the default state-sharing policy keeps
-    // Codex's SQLite/session state rooted in the configured native home.
-    expect(relative(materializedBase, String(captured.CODEX_SQLITE_HOME))).toMatch(/^\.\.(?:[\\/]|$)/u);
+    const sqliteRelative = relative(materializedBase, String(captured.CODEX_SQLITE_HOME));
+    if (stateMode === 'shared') {
+      expect(sqliteRelative).toMatch(/^\.\.(?:[\\/]|$)/u);
+      // Shared native history must survive independently of its materialized link.
+      expect(readFileSync(join(tempDir, 'native-codex-home', 'sessions', 'probe.jsonl'), 'utf8')).toBe('synthetic probe history\n');
+    } else {
+      expect(sqliteRelative).not.toMatch(/^\.\.(?:[\\/]|$)/u);
+    }
     expect(String(captured.CODEX_HOME)).not.toBe(legacyGroupHome);
-    expect(existsSync(String(captured.CODEX_HOME))).toBe(false);
+    expect(JSON.parse(readFileSync(join(tempDir, 'history-ownership.json'), 'utf8'))).toEqual({
+      homeIsSymlink: false, sessionsIsSymlink: stateMode === 'shared', transcriptIsFile: true,
+    });
+    expect(readFileSync(join(String(captured.CODEX_HOME), 'sessions', 'probe.jsonl'), 'utf8')).toBe('synthetic probe history\n');
+    expect(existsSync(join(String(captured.CODEX_HOME), 'auth.json'))).toBe(retirementFails);
   }, 90_000);
 
   it('fails closed instead of probing ambient auth when selected connected-service credentials are unavailable', async () => {

@@ -106,19 +106,24 @@ export function isCodexAppServerInvalidParamsForFieldError(error: unknown, field
     return includesFieldName(readMessage(error), fieldName) || includesFieldName(readDataText(error), fieldName);
 }
 
+/** Codex's managed approval-policy constraint rejected Granular but permits OnRequest. */
+export function isCodexAppServerManagedGranularApprovalRejection(error: unknown, method: string): boolean {
+    if (!error || typeof error !== 'object') return false;
+    if (readCode(error) !== -32602
+        || (error as { method?: unknown }).method !== method
+        || (error as { [CODEX_APP_SERVER_RPC_ERROR]?: unknown })[CODEX_APP_SERVER_RPC_ERROR] !== true) return false;
+    const match = readMessage(error).match(/^invalid value for `approval_policy`: `Granular\([^`]*\)` is not in the allowed set \[([^\]]+)\] \(set by [^)]+\)$/);
+    if (!match) return false;
+    const allowed = match[1].split(',').map((value) => value.trim());
+    return allowed.includes('OnRequest') && !allowed.some((value) => value.startsWith('Granular'));
+}
+
 export function isCodexAppServerInvalidRequestForMethodError(error: unknown, method: string): boolean {
     if (readCode(error) !== -32600) return false;
     if (!error || typeof error !== 'object') return false;
     const errorMethod = (error as { method?: unknown }).method;
     if (errorMethod === method) return true;
     return readMessage(error).includes(method);
-}
-
-export function isCodexAppServerInvalidRequestMapExpectedStringError(error: unknown): boolean {
-    if (readCode(error) !== -32600) return false;
-    const message = readMessage(error);
-    return /invalid\s+request/i.test(message)
-        && /invalid\s+type:\s*map,\s*expected\s+a\s*string/i.test(message);
 }
 
 export function isCodexAppServerExperimentalApiUnavailableError(error: unknown): boolean {

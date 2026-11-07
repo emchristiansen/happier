@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ConnectedServiceIdSchema } from '@happier-dev/protocol';
 
 import { reloadConfiguration } from '@/configuration';
 import { bindApiSessionSocketMock, createApiSessionSocketStub } from '@/testkit/backends/apiSessionSocketHarness';
@@ -43,6 +44,7 @@ describe('session sockets transports', () => {
     expect(opts.transports).toEqual(['polling', 'websocket']);
     expect(opts.reconnection).toBe(false);
     expect(opts.autoConnect).toBe(false);
+    expect(opts.auth).toMatchObject({ connectedServiceIds: ConnectedServiceIdSchema.options });
   });
 
   it('can force websocket-only via config flag', async () => {

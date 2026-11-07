@@ -1,10 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import axios from 'axios';
 
 import { ApiClient } from './api';
 import { logger } from '@/ui/logger';
 import { resetServerEndpointFailureLogSamplingForTests } from './client/serverEndpointFailureLog';
+import { resetServerFeaturesClientForTests } from '@/features/serverFeaturesClient';
 import type { Credentials } from '@/persistence';
 import {
   buildConnectedServiceCredentialRecord,
@@ -14,9 +15,10 @@ import {
   type ProviderAccountUsageSnapshotV1,
 } from '@happier-dev/protocol';
 
-const { mockPost, mockGet } = vi.hoisted(() => ({
+const { mockPost, mockGet, mockFetch } = vi.hoisted(() => ({
   mockPost: vi.fn(),
   mockGet: vi.fn(),
+  mockFetch: vi.fn(),
 }));
 
 vi.mock('axios', () => ({
@@ -102,7 +104,12 @@ describe('ApiClient connected services quotas v3', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetServerEndpointFailureLogSamplingForTests();
+    resetServerFeaturesClientForTests();
+    mockFetch.mockResolvedValue(new Response('{}', { status: 404 }));
+    vi.stubGlobal('fetch', mockFetch);
   });
+
+  afterEach(() => vi.unstubAllGlobals());
 
   it('gets the account encryption mode from /v1/account/encryption', async () => {
     mockGet.mockResolvedValue({ status: 200, data: { mode: 'plain', updatedAt: 1 } });
@@ -254,13 +261,14 @@ describe('ApiClient connected services quotas v3', () => {
             meters: [],
           },
         },
-        metadata: { fetchedAt: 1, staleAfterMs: 300_000, status: 'ok' },
+        metadata: { fetchedAt: 1, staleAfterMs: 300_000, status: 'error', refreshErrorAt: 2_000 },
       },
     });
 
     const api = await ApiClient.create(createTestCredentials());
 
     const res = await api.getConnectedServiceQuotaSnapshotPlain({ serviceId: 'openai-codex', profileId: 'work' });
+    expect(res?.metadata).toMatchObject({ status: 'error', refreshErrorAt: 2_000 });
     expect(res?.content?.v?.serviceId).toBe('openai-codex');
     expect(axios.get).toHaveBeenCalledWith(
       expect.stringContaining('/v3/connect/openai-codex/profiles/work/quotas'),
@@ -338,6 +346,7 @@ describe('ApiClient connected services quotas v3', () => {
       }),
     );
     expect(String(vi.mocked(axios.post).mock.calls[0]?.[0])).not.toContain('/profiles/');
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('keeps subscription observations outside the released strict plaintext snapshot on writes and restores them on reads', async () => {
@@ -358,6 +367,47 @@ describe('ApiClient connected services quotas v3', () => {
       metadata: { ...metadata, subscription },
     });
     expect(mockPost.mock.calls.at(-1)?.[1].content.v).not.toHaveProperty('subscription');
+  });
+
+  it('restores both supplemental facets on reads and sends details only outside the strict base when supported', async () => {
+    const base = createProviderAccountUsageSnapshot();
+    const subscription = { status: 'none', renewal: 'unknown', observedAtMs: 1_000, staleAfterMs: 300_000 } as const;
+    const recoveryCreditDetails: NonNullable<ProviderAccountUsageSnapshotV1['recoveryCreditDetails']> = {
+      grant: { remainingCount: 2, appliesToProviderLimitIds: ['weekly'], unavailableReason: 'cooldown' },
+    };
+    const snapshot: ProviderAccountUsageSnapshotV1 = { ...base, subscription, recoveryCreditDetails };
+    const metadata = { fetchedAt: 1_000, staleAfterMs: 300_000, status: 'ok' } as const;
+    mockFetch.mockResolvedValue(new Response(JSON.stringify({ features: { connectedServices: {
+      enabled: true, quotas: { enabled: true }, quotaRecoveryCreditDetails: { enabled: true },
+    } }, capabilities: {} }), { status: 200 }));
+    mockPost.mockResolvedValue({ status: 200, data: { success: true } });
+    mockGet.mockResolvedValue({ status: 200, data: { content: { t: 'plain', v: base }, subscription, recoveryCreditDetails, metadata } });
+    const api = await ApiClient.create(createTestCredentials());
+
+    expect((await api.getProviderAccountUsageSnapshotPlain({ recordId: base.recordId }))?.content.v).toEqual(snapshot);
+    await api.registerProviderAccountUsageSnapshotPlain({ recordId: base.recordId, content: { t: 'plain', v: snapshot }, metadata });
+    expect(mockPost.mock.calls.at(-1)?.[1]).toEqual({
+      content: { t: 'plain', v: base }, metadata: { ...metadata, subscription, recoveryCreditDetails },
+    });
+  });
+
+  it.each([
+    ['missing', { features: {}, capabilities: {} }, 200],
+    ['disabled', { features: { connectedServices: { quotaRecoveryCreditDetails: { enabled: false } } }, capabilities: {} }, 200],
+    ['malformed', { features: { connectedServices: { quotaRecoveryCreditDetails: { enabled: 'true' } } }, capabilities: {} }, 200],
+    ['older endpoint', {}, 404],
+  ])('omits recovery details from the entire write when server support is %s', async (_label, payload, status) => {
+    const base = createProviderAccountUsageSnapshot();
+    const snapshot: ProviderAccountUsageSnapshotV1 = { ...base,
+      recoveryCreditDetails: { grant: { remainingCount: 2, appliesToProviderLimitIds: [] } } };
+    const metadata = { fetchedAt: 1_000, staleAfterMs: 300_000, status: 'ok' } as const;
+    mockFetch.mockResolvedValue(new Response(JSON.stringify(payload), { status }));
+    mockPost.mockResolvedValue({ status: 200, data: { success: true } });
+    const api = await ApiClient.create(createTestCredentials());
+
+    await api.registerProviderAccountUsageSnapshotPlain({ recordId: base.recordId, content: { t: 'plain', v: snapshot }, metadata });
+
+    expect(mockPost.mock.calls.at(-1)?.[1]).toEqual({ content: { t: 'plain', v: base }, metadata });
   });
 
   it('posts plaintext provider account usage snapshots with source context to the v3 canonical endpoint', async () => {
@@ -434,7 +484,7 @@ describe('ApiClient connected services quotas v3', () => {
       status: 200,
       data: {
         content: { t: 'plain', v: snapshot },
-        metadata: { fetchedAt: 1_000, staleAfterMs: 300_000, status: 'ok' },
+        metadata: { fetchedAt: 1_000, staleAfterMs: 300_000, status: 'error', refreshErrorAt: 2_000 },
         sources: [source],
       },
     });
@@ -442,6 +492,7 @@ describe('ApiClient connected services quotas v3', () => {
     const api = await ApiClient.create(createTestCredentials());
 
     const res = await api.getProviderAccountUsageSnapshotPlain({ recordId: snapshot.recordId });
+    expect(res?.metadata).toMatchObject({ status: 'error', refreshErrorAt: 2_000 });
 
     expect(res?.content).toEqual({ t: 'plain', v: snapshot });
     expect(res?.sources).toEqual([source]);

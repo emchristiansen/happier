@@ -21,7 +21,19 @@ export function buildLaunchdPlistXml(params: Readonly<{
   stderrPath: string;
   workingDirectory?: string;
   abandonProcessGroup?: boolean;
+  /**
+   * Whether launchd starts the job as soon as it loads the definition — which,
+   * for a LaunchAgent in ~/Library/LaunchAgents, is at login. Defaults to true.
+   * Pass false for an installed-but-not-login-started service that only runs
+   * when something explicitly starts it.
+   */
+  runAtLoad?: boolean;
   keepAliveOnFailure?: boolean;
+  /**
+   * The apps this job belongs to (`AssociatedBundleIdentifiers`): macOS System Settings › Login
+   * Items then shows the job under that app's name instead of an anonymous background item.
+   */
+  associatedBundleIdentifiers?: readonly string[];
   startIntervalSec?: number;
   startCalendarInterval?: Readonly<{ hour: number; minute: number }>;
 }>): string {
@@ -59,6 +71,11 @@ export function buildLaunchdPlistXml(params: Readonly<{
         `      <false/>\n` +
         `    </dict>\n`
       );
+
+  const bundleIds = (params.associatedBundleIdentifiers ?? []).map((id) => String(id ?? '').trim()).filter(Boolean);
+  const associatedBundleIdentifiersXml = bundleIds.length > 0
+    ? `\n    <key>AssociatedBundleIdentifiers</key>\n    <array>\n${bundleIds.map((id) => `      <string>${xmlEscape(id)}</string>`).join('\n')}\n    </array>\n`
+    : '';
 
   const intervalRaw = Number(params.startIntervalSec);
   const interval = Number.isFinite(intervalRaw) && intervalRaw > 0 ? Math.floor(intervalRaw) : 0;
@@ -102,8 +119,8 @@ ${programArgsXml}
     </array>
 
     <key>RunAtLoad</key>
-    <true/>
-${keepAlive}
+    ${params.runAtLoad === false ? '<false/>' : '<true/>'}
+${associatedBundleIdentifiersXml}${keepAlive}
 ${startCalendarInterval || startInterval}
 ${abandonProcessGroupXml}
 ${workingDirXml}    <key>StandardOutPath</key>

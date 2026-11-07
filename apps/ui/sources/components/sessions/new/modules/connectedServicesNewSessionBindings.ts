@@ -1,6 +1,6 @@
 import type { ConnectedServiceId } from '@happier-dev/agents';
 import type { AccountProfile, ConnectedServiceBindingsV1, ConnectedServicesDefaultAuthByAgentIdV1 } from '@happier-dev/protocol';
-import { ConnectedServicesDefaultAuthByAgentIdV1Schema } from '@happier-dev/protocol';
+import { readConnectedServicesDefaultAuthSettings, type ConnectedServicesDefaultAuthSettings } from '@happier-dev/protocol';
 import {
   buildConnectedServiceAccountGroupOptionsByServiceId,
   buildConnectedServiceProfileOptionsByServiceId as buildCoreConnectedServiceProfileOptionsByServiceId,
@@ -55,9 +55,9 @@ const EMPTY_DEFAULT_AUTH_SETTINGS: ConnectedServicesDefaultAuthByAgentIdV1 = {
   bindingsByAgentId: {},
 };
 
-function parseConnectedServicesDefaultAuthSettings(value: unknown): ConnectedServicesDefaultAuthByAgentIdV1 {
+function parseConnectedServicesDefaultAuthSettings(settings: ConnectedServicesDefaultAuthSettings): ConnectedServicesDefaultAuthByAgentIdV1 {
   try {
-    return ConnectedServicesDefaultAuthByAgentIdV1Schema.parse(value ?? EMPTY_DEFAULT_AUTH_SETTINGS);
+    return readConnectedServicesDefaultAuthSettings(settings);
   } catch {
     return EMPTY_DEFAULT_AUTH_SETTINGS;
   }
@@ -109,6 +109,7 @@ export function resolveNewSessionConnectedServicesBindingsForAgent(params: Reado
     connectedServicesProfileLabelByKey: Record<string, string | undefined>;
     connectedServicesDefaultProfileByServiceId: Record<string, string | undefined>;
     connectedServicesDefaultAuthByAgentIdV1?: unknown;
+    connectedServicesAdditionalDefaultAuthByAgentIdV1?: unknown;
   };
   connectedServicesFeatureEnabled: boolean;
   accountGroupsFeatureEnabled: boolean;
@@ -137,7 +138,7 @@ export function resolveNewSessionConnectedServicesBindingsForAgent(params: Reado
     && Object.prototype.hasOwnProperty.call(params.agentOptionState, CONNECTED_SERVICES_BINDINGS_KEY),
   );
   const connectedServicesDefaultAuthSettings = parseConnectedServicesDefaultAuthSettings(
-    params.settings.connectedServicesDefaultAuthByAgentIdV1,
+    params.settings,
   );
   const normalizedAgentId = params.agentId.trim();
   const connectedServicesBindingsByServiceId = params.connectedServicesBindingsByServiceIdOverride

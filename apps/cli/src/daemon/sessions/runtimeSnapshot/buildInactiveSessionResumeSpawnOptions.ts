@@ -48,7 +48,7 @@ function comparableDirectoryIdentity(value: string): string {
  * Ambiguity still fails closed: several flat keys with no higher authority
  * resolve to no Agent rather than to the first Agent in catalog order.
  */
-function resolveExactPersistedRuntimeIdentity(
+export function resolveSessionPersistedRuntimeIdentity(
   metadata: Record<string, unknown>,
 ): Readonly<{
   backendTarget: NonNullable<SpawnSessionOptions['backendTarget']>;
@@ -68,6 +68,8 @@ function resolveExactPersistedRuntimeIdentity(
   const identity = resolveSessionMetadataAgentIdentity(metadata);
 
   if (configuredBackend) {
+    const flavor = readNonEmptyString(metadata.flavor);
+    if (flavor?.startsWith('acp:') && flavor !== `acp:${configuredBackend.backendId}`) return null;
     // A configured ACP backend must carry no built-in Agent evidence; any is a
     // contradiction between the persisted target and the identity. Generic ACP
     // identity is not built-in evidence: a configured backend persists
@@ -115,7 +117,7 @@ export function buildInactiveSessionResumeSpawnOptions(
 
   const directory = rawDirectory ?? metadataDirectory;
   const machineId = rawMachineId ?? metadataMachineId ?? readNonEmptyString(params.fallbackMachineId);
-  const runtimeIdentity = resolveExactPersistedRuntimeIdentity(params.metadata);
+  const runtimeIdentity = resolveSessionPersistedRuntimeIdentity(params.metadata);
   if (!runtimeIdentity || !directory || !machineId) return null;
 
   const baseOptions: SpawnSessionOptions = {

@@ -5,66 +5,20 @@ import { Modal } from '@/modal';
 import { sync } from '@/sync/sync';
 import {
     createConnectedServiceAuthGroupV3,
-    listConnectedServiceAuthGroupsV3,
 } from '@/sync/api/account/apiConnectedServiceAuthGroupsV3';
+import {
+    useConnectedServiceAuthGroupsQuery,
+    type ConnectedServiceAuthGroupsLoadStatus,
+} from '@/hooks/server/connectedServices/useConnectedServiceAuthGroupsQuery';
 import { deriveConnectedServiceAuthGroupIdFromName } from '@/sync/domains/connectedServices/deriveConnectedServiceAuthGroupIdFromName';
 import { t } from '@/text';
 import type { ConnectedServiceAuthGroupV1, ConnectedServiceId } from '@happier-dev/protocol';
 
 import { resolveConnectedServiceSettingsErrorMessage } from '../errors/connectedServiceSettingsErrors';
-import {
-    useConnectedServiceGroupsRefreshSignal,
-} from '../connectedServiceGroupsRefreshSignal';
-
-export type ConnectedServiceAuthGroupsLoadStatus = 'idle' | 'loading' | 'refreshing' | 'loaded' | 'error';
-
-const CONNECTED_SERVICE_AUTH_GROUPS_LOAD_STATUS_KEY = '__connectedServiceAuthGroupsLoadStatus';
-
-type GroupsWithLoadStatus = ReadonlyArray<ConnectedServiceAuthGroupV1> & Readonly<{
-    [CONNECTED_SERVICE_AUTH_GROUPS_LOAD_STATUS_KEY]?: ConnectedServiceAuthGroupsLoadStatus;
-}>;
-
-type ConnectedServiceAuthGroupsState = Readonly<{
-    groups: ReadonlyArray<ConnectedServiceAuthGroupV1>;
-    loadStatus: ConnectedServiceAuthGroupsLoadStatus;
-    hasLoaded: boolean;
-}>;
-
-const emptyGroupsState: ConnectedServiceAuthGroupsState = {
-    groups: [],
-    loadStatus: 'idle',
-    hasLoaded: false,
-};
-
-function withConnectedServiceAuthGroupsLoadStatus(
-    groups: ReadonlyArray<ConnectedServiceAuthGroupV1>,
-    loadStatus: ConnectedServiceAuthGroupsLoadStatus,
-): GroupsWithLoadStatus {
-    const tagged = groups.slice() as ConnectedServiceAuthGroupV1[] & {
-        [CONNECTED_SERVICE_AUTH_GROUPS_LOAD_STATUS_KEY]?: ConnectedServiceAuthGroupsLoadStatus;
-    };
-    Object.defineProperty(tagged, CONNECTED_SERVICE_AUTH_GROUPS_LOAD_STATUS_KEY, {
-        value: loadStatus,
-        enumerable: false,
-        configurable: true,
-    });
-    return tagged;
-}
-
-export function readConnectedServiceAuthGroupsLoadStatus(value: unknown): ConnectedServiceAuthGroupsLoadStatus | undefined {
-    if (!Array.isArray(value)) return undefined;
-    const tagged = value as {
-        [CONNECTED_SERVICE_AUTH_GROUPS_LOAD_STATUS_KEY]?: unknown;
-    };
-    const status = tagged[CONNECTED_SERVICE_AUTH_GROUPS_LOAD_STATUS_KEY];
-    return status === 'idle'
-        || status === 'loading'
-        || status === 'refreshing'
-        || status === 'loaded'
-        || status === 'error'
-        ? status
-        : undefined;
-}
+export {
+    readConnectedServiceAuthGroupsLoadStatus,
+    type ConnectedServiceAuthGroupsLoadStatus,
+} from '@/hooks/server/connectedServices/useConnectedServiceAuthGroupsQuery';
 
 export type UseConnectedServiceAuthGroupsParams = Readonly<{
     serviceId: ConnectedServiceId | null;
@@ -107,14 +61,11 @@ export function useConnectedServiceAuthGroups(
         serviceProjectionSignature,
     } = params;
     const auth = useAuth();
-    const authCredentials = auth.credentials ?? null;
-    const groupsRefreshSignal = useConnectedServiceGroupsRefreshSignal();
-    const [state, setState] = React.useState<ConnectedServiceAuthGroupsState>(emptyGroupsState);
-    const groups = React.useMemo(
-        () => withConnectedServiceAuthGroupsLoadStatus(state.groups, state.loadStatus),
-        [state.groups, state.loadStatus],
-    );
-    const loadedServiceIdRef = React.useRef<ConnectedServiceId | null>(null);
+    const { groups, loadStatus, refresh, upsertGroup } = useConnectedServiceAuthGroupsQuery({
+        serviceId,
+        enabled: accountGroupsEnabled,
+        serviceProjectionSignature,
+    });
 
     const ensureCredentials = React.useCallback(() => {
         if (!auth.credentials) {
@@ -122,83 +73,6 @@ export function useConnectedServiceAuthGroups(
         }
         return auth.credentials;
     }, [auth]);
-
-    const fetchGroups = React.useCallback(async () => {
-        if (!serviceId || !accountGroupsEnabled || !authCredentials) return [];
-        return await listConnectedServiceAuthGroupsV3(authCredentials, { serviceId });
-    }, [accountGroupsEnabled, authCredentials, serviceId]);
-
-    const refresh = React.useCallback(async () => {
-        setState((prev) => ({
-            ...prev,
-            loadStatus: prev.hasLoaded || prev.groups.length > 0 ? 'refreshing' : 'loading',
-        }));
-        try {
-            const next = await fetchGroups();
-            setState({ groups: next, loadStatus: 'loaded', hasLoaded: true });
-            return next;
-        } catch (error) {
-            setState((prev) => ({
-                groups: prev.hasLoaded ? prev.groups : [],
-                loadStatus: 'error',
-                hasLoaded: prev.hasLoaded,
-            }));
-            throw error;
-        }
-    }, [fetchGroups]);
-
-    React.useEffect(() => {
-        let cancelled = false;
-
-        if (!serviceId || !accountGroupsEnabled || !authCredentials) {
-            loadedServiceIdRef.current = serviceId;
-            setState(emptyGroupsState);
-            return () => {
-                cancelled = true;
-            };
-        }
-
-        const serviceChanged = loadedServiceIdRef.current !== serviceId;
-        loadedServiceIdRef.current = serviceId;
-        setState((prev) => ({
-            groups: serviceChanged ? [] : prev.groups,
-            hasLoaded: serviceChanged ? false : prev.hasLoaded,
-            loadStatus: serviceChanged || (!prev.hasLoaded && prev.groups.length === 0) ? 'loading' : 'refreshing',
-        }));
-        void (async () => {
-            try {
-                const next = await fetchGroups();
-                if (!cancelled) setState({ groups: next, loadStatus: 'loaded', hasLoaded: true });
-            } catch {
-                if (!cancelled) {
-                    setState((prev) => ({
-                        groups: prev.hasLoaded ? prev.groups : [],
-                        loadStatus: 'error',
-                        hasLoaded: prev.hasLoaded,
-                    }));
-                }
-            }
-        })();
-
-        return () => {
-            cancelled = true;
-        };
-    }, [accountGroupsEnabled, authCredentials, fetchGroups, groupsRefreshSignal, serviceId, serviceProjectionSignature]);
-
-    const upsertGroup = React.useCallback((group: ConnectedServiceAuthGroupV1) => {
-        setState((prev) => {
-            const index = prev.groups.findIndex((candidate) => candidate.groupId === group.groupId);
-            const next = index === -1 ? [...prev.groups, group] : [...prev.groups];
-            if (index !== -1) {
-                next[index] = group;
-            }
-            return {
-                groups: next,
-                loadStatus: 'loaded',
-                hasLoaded: true,
-            };
-        });
-    }, []);
 
     const createPool = React.useCallback(async () => {
         if (!serviceId || !accountGroupsEnabled || !groupConfigurationSupported) {
@@ -249,5 +123,5 @@ export function useConnectedServiceAuthGroups(
         upsertGroup,
     ]);
 
-    return { groups, loadStatus: state.loadStatus, refresh, createPool };
+    return { groups, loadStatus, refresh, createPool };
 }

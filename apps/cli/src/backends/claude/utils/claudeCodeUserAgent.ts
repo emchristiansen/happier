@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { configuration } from '@/configuration';
 import { resolveProviderCliLaunchSpec } from '@/runtime/managedTools/requireProviderCliLaunchSpec';
 
-export const DEFAULT_CLAUDE_CODE_USER_AGENT = 'claude-code/0.0.0';
+export const DEFAULT_CLAUDE_CODE_USER_AGENT = 'claude-cli/0.0.0 (external, cli)';
 
 let cachedClaudeCodeUserAgent: string | null = null;
 
@@ -40,7 +40,7 @@ export function resolveClaudeCodeUserAgent(value?: unknown): string {
       },
     );
     const version = parseClaudeCodeVersionForUserAgent(rawVersion);
-    cachedClaudeCodeUserAgent = version ? `claude-code/${version}` : DEFAULT_CLAUDE_CODE_USER_AGENT;
+    cachedClaudeCodeUserAgent = version ? `claude-cli/${version} (external, cli)` : DEFAULT_CLAUDE_CODE_USER_AGENT;
     return cachedClaudeCodeUserAgent;
   } catch {
     cachedClaudeCodeUserAgent = DEFAULT_CLAUDE_CODE_USER_AGENT;

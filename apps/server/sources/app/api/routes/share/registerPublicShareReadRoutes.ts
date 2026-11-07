@@ -1,7 +1,7 @@
 import { type Fastify } from "../../types";
 import { db } from "@/storage/db";
 import { z } from "zod";
-import { logPublicShareAccess, getIpAddress, getUserAgent } from "@/app/share/accessLogger";
+import { logPublicShareAccess, getUserAgent } from "@/app/share/accessLogger";
 import { PROFILE_SELECT, toShareUserProfile } from "@/app/share/types";
 import { createHash } from "crypto";
 import { auth } from "@/app/auth/auth";
@@ -101,7 +101,7 @@ export function registerPublicShareReadRoutes(app: Fastify): void {
         // Optional auth: never call `app.authenticate()` here because it sends a reply on failure,
         // which can cause "Reply was already sent" issues for public routes.
         const userId = await getOptionalAuthenticatedUserId(request);
-        const ipAddress = getIpAddress(request.headers);
+        const ipAddress = request.ip;
         const userAgent = getUserAgent(request.headers);
 
         // Use transaction to atomically check limits and increment use count
@@ -351,14 +351,15 @@ export function registerPublicShareReadRoutes(app: Fastify): void {
                 }
             }
 
-            const messages = await tx.sessionMessage.findMany({
+            const pageSize = 150;
+            const fetchedMessages = await tx.sessionMessage.findMany({
                 where: { sessionId: publicShare.sessionId, sidechainId: null },
                 // Canonical transcript order is seq, not wall-clock: createdAt can
                 // disagree with seq (imported/migrated sessions, clock skew, out-of-order
                 // writes), and selecting the newest page by createdAt silently omits
                 // newer transcript rows under the page cap.
                 orderBy: { seq: 'desc' },
-                take: 150,
+                take: pageSize + 1,
                 select: {
                     id: true,
                     seq: true,
@@ -370,7 +371,9 @@ export function registerPublicShareReadRoutes(app: Fastify): void {
                 },
             });
 
-            return { success: true, messages };
+            const hasMore = fetchedMessages.length > pageSize;
+            const messages = hasMore ? fetchedMessages.slice(0, pageSize) : fetchedMessages;
+            return { success: true, messages, hasMore };
         });
 
         if ('error' in accessResult) {
@@ -406,7 +409,8 @@ export function registerPublicShareReadRoutes(app: Fastify): void {
                     createdAt: v.createdAt.getTime(),
                     updatedAt: v.updatedAt.getTime()
                 };
-            })
+            }),
+            hasMore: accessResult.hasMore,
         });
     });
 }

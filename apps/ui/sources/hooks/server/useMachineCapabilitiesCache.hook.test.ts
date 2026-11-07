@@ -800,6 +800,74 @@ describe('useMachineCapabilitiesCache (hook)', () => {
         });
     });
 
+    it('an errored agent probe counts as checked: an Updates request does not refetch it until the failure retry is due', async () => {
+        vi.resetModules();
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(new Date('2026-09-25T10:00:00Z'));
+        const machineCapabilitiesDetect = vi.fn(async () => ({
+            supported: true,
+            response: {
+                protocolVersion: 1,
+                results: { 'cli.claude': { ok: false, checkedAt: Date.now(), error: { message: 'probe failed' } } },
+            },
+        }));
+        vi.doMock('@/sync/ops', () => ({ machineCapabilitiesDetect }));
+        const { prefetchMachineCapabilitiesIfStale } = await import('./useMachineCapabilitiesCache');
+        const updatesRequest: CapabilitiesDetectRequest = { requests: [{ id: 'cli.claude', params: { includeLatestVersion: true } }] };
+
+        await prefetchMachineCapabilitiesIfStale({ machineId: 'm-err', staleMs: 24 * 60 * 60 * 1000, request: updatesRequest, timeoutMs: 1 });
+        await prefetchMachineCapabilitiesIfStale({ machineId: 'm-err', staleMs: 24 * 60 * 60 * 1000, request: updatesRequest, timeoutMs: 1 });
+        expect(machineCapabilitiesDetect).toHaveBeenCalledTimes(1);
+
+        vi.setSystemTime(new Date('2026-09-25T10:31:00Z'));
+        await prefetchMachineCapabilitiesIfStale({ machineId: 'm-err', staleMs: 24 * 60 * 60 * 1000, request: updatesRequest, timeoutMs: 1 });
+        expect(machineCapabilitiesDetect).toHaveBeenCalledTimes(2);
+        vi.useRealTimers();
+    });
+
+    it('keeps an agent CLI latest version (K6) through a later detect that did not ask for it, and refetches when Updates needs it', async () => {
+        vi.resetModules();
+        let includeLatestServed = true;
+        const machineCapabilitiesDetect = vi.fn(async (_machineId: string, request: CapabilitiesDetectRequest) => {
+            const wantsLatest = (request.requests ?? []).some((entry) => entry.id === 'cli.claude' && Boolean((entry.params as { includeLatestVersion?: boolean } | undefined)?.includeLatestVersion));
+            const base = { available: true, version: '2.1.3', installSource: 'managed', updateSupported: true, updateCommand: null };
+            return {
+                supported: true,
+                response: {
+                    protocolVersion: 1,
+                    results: {
+                        'cli.claude': {
+                            ok: true,
+                            checkedAt: wantsLatest ? 10 : 20,
+                            data: wantsLatest && includeLatestServed ? { ...base, latestVersion: '2.1.4' } : base,
+                        },
+                    },
+                },
+            };
+        });
+        vi.doMock('@/sync/ops', () => ({ machineCapabilitiesDetect }));
+        const { prefetchMachineCapabilities, prefetchMachineCapabilitiesIfStale, getMachineCapabilitiesSnapshot } = await import('./useMachineCapabilitiesCache');
+        const updatesRequest: CapabilitiesDetectRequest = { requests: [{ id: 'cli.claude', params: { includeLatestVersion: true } }] };
+
+        await prefetchMachineCapabilities({ machineId: 'm1', request: updatesRequest, timeoutMs: 1 });
+        // The new-session picker / machine page detect every agent without the latest version.
+        await prefetchMachineCapabilities({ machineId: 'm1', request: { requests: [{ id: 'cli.claude' }] }, timeoutMs: 1 });
+
+        const data = getMachineCapabilitiesSnapshot('m1')?.response.results['cli.claude'];
+        expect(data).toMatchObject({ ok: true, checkedAt: 20, data: { version: '2.1.3', latestVersion: '2.1.4', latestVersionCheckedAt: 10 } });
+
+        // A cached answer that never carried the latest version does not satisfy an Updates request.
+        vi.resetModules();
+        includeLatestServed = true;
+        machineCapabilitiesDetect.mockClear();
+        vi.doMock('@/sync/ops', () => ({ machineCapabilitiesDetect }));
+        const fresh = await import('./useMachineCapabilitiesCache');
+        await fresh.prefetchMachineCapabilities({ machineId: 'm2', request: { requests: [{ id: 'cli.claude' }] }, timeoutMs: 1 });
+        await fresh.prefetchMachineCapabilitiesIfStale({ machineId: 'm2', staleMs: 60_000, request: updatesRequest, timeoutMs: 1 });
+        expect(machineCapabilitiesDetect).toHaveBeenCalledTimes(2);
+        void prefetchMachineCapabilitiesIfStale;
+    });
+
     it('preserves latest-version freshness when a dep cache merge reuses an older version-check payload', async () => {
         vi.resetModules();
 

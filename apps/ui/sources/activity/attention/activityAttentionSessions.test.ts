@@ -8,6 +8,8 @@ import {
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
 import type { Session } from '@/sync/domains/state/storageTypes';
 import type { StorageState } from '@/sync/store/types';
+import type { Message } from '@/sync/domains/messages/messageTypes';
+import { buildTranscriptRenderableAggregate } from '@/sync/domains/messages/transcriptRenderableAggregate';
 import {
     deriveActivityAttentionFlags,
     hasActivityAttention,
@@ -16,6 +18,35 @@ import {
 
 const NOW_MS = 1_000_000;
 const LIVE_SESSION_ID = 'session-live';
+
+it('uses the maintained unread watermark without revisiting historical message attention', () => {
+    let historicalVisits = 0;
+    const message: Message = {
+        id: 'historical',
+        seq: 5,
+        kind: 'agent-text',
+        localId: null,
+        createdAt: 100,
+        text: 'done',
+        get transcriptObservationProvenance() {
+            historicalVisits += 1;
+            return undefined;
+        },
+    };
+    const renderableAggregate = buildTranscriptRenderableAggregate({ messages: [message], completedRequests: null });
+    const sessionMessagesById = {
+        [LIVE_SESSION_ID]: createSessionMessagesFixture({
+            isLoaded: true,
+            messageIdsOldestFirst: [message.id],
+            messagesById: { [message.id]: message },
+            renderableAggregate,
+        }),
+    };
+    historicalVisits = 0;
+
+    expect(deriveActivityAttentionFlags(createLiveCaughtUpSession(), attentionOptions(sessionMessagesById)).hasUnread).toBe(false);
+    expect(historicalVisits).toBe(0);
+});
 
 /**
  * Attention is derived from the account's *stored* transcripts. Passing the
@@ -146,15 +177,16 @@ describe('hasActivityAttention', () => {
         expect(hasActivityAttention(decryptable, attentionOptions())).toBe(true);
     });
 
-    it('does not treat ordinary queued user input as attention', () => {
+    it('treats queued user input as attention only when the badge option is enabled', () => {
         const session = createLiveCaughtUpSession({ pendingCount: 4 });
 
-        const flags = deriveActivityAttentionFlags(session, attentionOptions());
+        const enabledOptions = { ...attentionOptions(), showQueuedUserInput: true };
+        const disabledOptions = { ...attentionOptions(), showQueuedUserInput: false };
+        const flags = deriveActivityAttentionFlags(session, enabledOptions);
 
-        // The queued input is observed — it is deliberately not an attention
-        // reason, so a rule that folded it into the badge would fail here.
         expect(flags.hasQueuedUserInput).toBe(true);
-        expect(hasActivityAttention(session, attentionOptions())).toBe(false);
+        expect(hasActivityAttention(session, enabledOptions)).toBe(true);
+        expect(hasActivityAttention(session, disabledOptions)).toBe(false);
     });
 
     it('treats blocked pending delivery as attention even alongside ordinary queued input', () => {

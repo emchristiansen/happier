@@ -6,9 +6,23 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { Text } from '@/components/ui/text/Text';
 import { GradientSurface, type SurfaceGradient } from '@/components/ui/surfaces/GradientSurface';
 import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
+import { FocusRing, WEB_FOCUS_OUTLINE_RESET } from '@/components/ui/interaction/FocusRing';
+import { useIsKeyboardModality } from '@/components/ui/interaction/inputModalityStore';
 
 
 export type RoundButtonSize = 'large' | 'normal' | 'small';
+const RoundButtonSizeContext = React.createContext<RoundButtonSize | undefined>(undefined);
+
+export function RoundButtonSizeScope(props: Readonly<{
+    size: RoundButtonSize;
+    children: React.ReactNode;
+}>) {
+    return (
+        <RoundButtonSizeContext.Provider value={props.size}>
+            {props.children}
+        </RoundButtonSizeContext.Provider>
+    );
+}
 const sizes: { [key in RoundButtonSize]: { fontSize: number, hitSlop: number, pad: number } } = {
     large: { fontSize: 21, hitSlop: 0, pad: Platform.OS == 'ios' ? 0 : -1 },
     normal: { fontSize: 16, hitSlop: 8, pad: Platform.OS == 'ios' ? 1 : -2 },
@@ -57,12 +71,18 @@ const stylesheet = StyleSheet.create((theme) => ({
         fontWeight: '600',
         includeFontPadding: false,
     },
+    completeTitle: {
+        maxWidth: '100%',
+        textAlign: 'center',
+    },
 }));
 
-export const RoundButton = React.memo((props: {
+export type RoundButtonProps = {
     size?: RoundButtonSize,
     display?: RoundButtonDisplay,
     title?: any,
+    /** Preserve the full action wording when a constrained surface needs wrapping. */
+    titleNumberOfLines?: 1 | 'complete',
     /**
      * A mark drawn before the title, inside the same fill.
      *
@@ -95,8 +115,14 @@ export const RoundButton = React.memo((props: {
     accessibilityHint?: string,
     onPress?: (event: GestureResponderEvent) => void,
     action?: () => Promise<any>
-}) => {
+};
+
+export const RoundButton = React.memo(React.forwardRef<
+    React.ElementRef<typeof Pressable>,
+    RoundButtonProps
+>(function RoundButton(props, ref) {
     const { theme } = useUnistyles();
+    const scopedSize = React.useContext(RoundButtonSizeContext);
     const styles = stylesheet;
     const [loading, setLoading] = React.useState(false);
     const doLoading = props.loading !== undefined ? props.loading : loading;
@@ -135,17 +161,31 @@ export const RoundButton = React.memo((props: {
         }
     }
 
-    const size = sizes[props.size || 'large'];
+    const size = sizes[props.size ?? scopedSize ?? 'large'];
     const display = displays[props.display || 'default'];
+
+    // React Native has no `:focus-visible`, so the ring is gated on keyboard modality by the
+    // canonical input-modality store; a ring that flashed on every tap would be worse than none.
+    // The ring is mounted only once focus has been possible, because `FocusRing` runs a Reanimated
+    // animated style and this primitive is on nearly every screen.
+    const keyboardModality = useIsKeyboardModality();
+    const [focused, setFocused] = React.useState(false);
+    const handleFocus = React.useCallback(() => setFocused(true), []);
+    const handleBlur = React.useCallback(() => setFocused(false), []);
+    const disabled = doLoading || props.disabled === true;
+    const ringVisible = focused && keyboardModality && !disabled;
 
     return (
         <Pressable
+            ref={ref}
             testID={props.testID}
             accessibilityRole="button"
             accessibilityLabel={props.accessibilityLabel}
             accessibilityHint={props.accessibilityHint}
-            disabled={doLoading || props.disabled}
+            disabled={disabled}
             hitSlop={size.hitSlop}
+            onFocus={handleFocus}
+            onBlur={handleBlur}
             style={(p) => ([
                 {
                     borderWidth: 1,
@@ -155,6 +195,7 @@ export const RoundButton = React.memo((props: {
                     opacity: props.disabled ? 0.35 : (p.pressed ? 0.9 : 1),
                     overflow: 'hidden',
                 },
+                Platform.OS === 'web' ? WEB_FOCUS_OUTLINE_RESET : null,
                 props.style])}
             onPress={doAction}
         >
@@ -192,9 +233,10 @@ export const RoundButton = React.memo((props: {
                             color: display.textColor,
                             fontSize: size.fontSize,
                         },
+                        props.titleNumberOfLines === 'complete' ? styles.completeTitle : null,
                         props.textStyle
                     ]}
-                    numberOfLines={1}
+                    numberOfLines={props.titleNumberOfLines === 'complete' ? undefined : 1}
                 >
                     {props.title}
                 </Text>
@@ -204,6 +246,18 @@ export const RoundButton = React.memo((props: {
                     </View>
                 ) : null}
             </View>
+            {keyboardModality || focused ? (
+                <FocusRing
+                    testID={props.testID === undefined ? undefined : `${props.testID}-focus-ring`}
+                    visible={ringVisible}
+                    // The pill clips its gradient with `overflow: hidden`, so an outside ring would
+                    // be cut off exactly where it needs to be seen.
+                    placement="inside"
+                    radius={10}
+                />
+            ) : null}
         </Pressable>
     )
-});
+}));
+
+RoundButton.displayName = 'RoundButton';

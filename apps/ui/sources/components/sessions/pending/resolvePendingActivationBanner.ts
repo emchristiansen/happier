@@ -48,7 +48,9 @@ export function resolvePendingActivationBanner(input: Readonly<{
             return {
                 kind: 'failed',
                 row,
-                primaryAction: row ? 'retry' : null,
+                primaryAction: row
+                    ? (input.machineReachable ? 'retry' : 'process_when_online')
+                    : null,
                 secondaryAction: row ? 'keep_queued' : null,
                 settingsAction: 'settings',
             };

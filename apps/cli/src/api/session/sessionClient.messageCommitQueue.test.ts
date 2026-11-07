@@ -8,6 +8,7 @@ import {
   createApiSessionSocketStub,
 } from '@/testkit/backends/apiSessionSocketHarness';
 import { installAxiosFastifyAdapter } from '@/testkit/http/axiosAdapter';
+import type { UsageReportV1 } from './acpTokenCountUsageReport';
 
 type Ack = { ok: true; id: string; seq: number; localId: string; didWrite?: boolean };
 
@@ -226,7 +227,7 @@ describe('ApiSessionClient message commit queue', () => {
     await client.close();
   });
 
-  it('requests reconnect when message commits queue while disconnected', async () => {
+  it('leaves reconnect timing with an already-active supervisor when message commits queue while disconnected', async () => {
     vi.resetModules();
     supervisorStartCount = 0;
     sessionSocketStub = createApiSessionSocketStub({
@@ -247,7 +248,8 @@ describe('ApiSessionClient message commit queue', () => {
 
     client.sendAgentMessage('claude' as any, { type: 'message', message: 'FAKE_CLAUDE_OK_2' } as any);
 
-    await expect.poll(() => supervisorStartCount).toBeGreaterThan(0);
+    await flushMicrotasks();
+    expect(supervisorStartCount).toBe(0);
   });
 
   it('redacts socket commit errors before logging', async () => {
@@ -291,6 +293,59 @@ describe('ApiSessionClient message commit queue', () => {
       await client.close();
     } finally {
       debugSpy.mockRestore();
+    }
+  });
+
+  it.each(['agent', 'codex'] as const)('preserves complete scalar usage across paid context, replay, and a fresh %s client', async (path) => {
+    vi.resetModules();
+    const stored = new Map<string, UsageReportV1>();
+    const { ApiSessionClient } = await import('./sessionClient');
+    const createClient = () => {
+      sessionSocketStub = createApiSessionSocketStub({
+        connected: true,
+        emit: (event, args) => {
+          if (event !== 'usage-report') return;
+          const report = args[0] as UsageReportV1;
+          // Released scalar servers replace the entire session/key row.
+          stored.set(JSON.stringify([report.sessionId, report.key]), report);
+        },
+        emitWithAckResult: { ok: true, id: 'message', seq: 1, localId: 'local' },
+      });
+      userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+      return new ApiSessionClient('tok', createPlainSessionFixture({ id: 'usage-session' }));
+    };
+    const totals = () => [...stored.values()].reduce((sum, report) => ({
+      tokens: sum.tokens + report.tokens.total,
+      cost: sum.cost + report.cost.total,
+    }), { tokens: 0, cost: 0 });
+    const send = (client: InstanceType<typeof ApiSessionClient>, tokens: Record<string, number>, cost: number) => {
+      const body = { type: 'token_count' as const, key: 'acp-usage-update', tokens, cost: { total: cost } };
+      if (path === 'agent') client.sendAgentMessage('opencode', body);
+      else client.sendCodexMessage(body);
+    };
+    const context = { total: 900, used: 900, size: 1000 };
+    const first = createClient();
+    try {
+      send(first, { total: 100, input: 80, output: 20 }, 0.1);
+      send(first, context, 0.2);
+      expect(totals()).toEqual({ tokens: 100, cost: 0.1 });
+      send(first, { total: 150, input: 120, output: 30 }, 0.3);
+      send(first, { total: 150, input: 120, output: 30 }, 0.3);
+      expect(totals()).toEqual({ tokens: 150, cost: 0.3 });
+    } finally {
+      await first.close();
+    }
+    const resumed = createClient();
+    try {
+      send(resumed, context, 0.4);
+      expect(totals()).toEqual({ tokens: 150, cost: 0.3 });
+      send(resumed, { total: 150, input: 120, output: 30 }, 0.3);
+      send(resumed, { total: 200, input: 160, output: 40 }, 0.5);
+      send(resumed, context, 0.6);
+      expect(totals()).toEqual({ tokens: 200, cost: 0.5 });
+      expect(stored.size).toBe(1);
+    } finally {
+      await resumed.close();
     }
   });
 
@@ -440,6 +495,67 @@ describe('ApiSessionClient message commit queue', () => {
     secondBestEffort.resolve();
     await expect(requiredCommit).resolves.toBeUndefined();
     await expect(secondBestEffortCommit).resolves.toBeUndefined();
+  }, 60_000);
+
+  it('serializes cumulative same-localId required snapshots without dropping the terminal update', async () => {
+    vi.resetModules();
+    supervisorStartCount = 0;
+    const delayedSocket = createDelayedSocketStub();
+    sessionSocketStub = delayedSocket;
+    userSocketStub = createApiSessionSocketStub({ connected: true, emitWithAckResult: { ok: true } });
+
+    const { ApiSessionClient } = await import('./sessionClient');
+    const client = new ApiSessionClient('tok', createPlainSessionFixture({ id: 's1' }));
+    const localId = 'cumulative-segment-1';
+    const streamingCommit = client.sendAgentMessageCommitted(
+      'codex',
+      { type: 'message', message: 'partial' },
+      {
+        localId,
+        meta: { happierStreamSegmentV1: { segmentState: 'streaming' } },
+      },
+    );
+
+    await vi.waitFor(() => {
+      expect(delayedSocket.state.pendingResolvers).toHaveLength(1);
+    });
+    const terminalCommit = client.sendAgentMessageCommitted(
+      'codex',
+      { type: 'message', message: 'partial plus final' },
+      {
+        localId,
+        meta: { happierStreamSegmentV1: { segmentState: 'complete' } },
+      },
+    );
+    await flushMicrotasks();
+    expect(delayedSocket.emitWithAck.mock.calls.filter(([event]) => event === 'message')).toHaveLength(1);
+
+    delayedSocket.resolveNext({ ok: true, id: 'm1', seq: 1, localId });
+    await vi.waitFor(() => {
+      expect(delayedSocket.emitWithAck.mock.calls.filter(([event]) => event === 'message')).toHaveLength(2);
+    });
+    const messageCalls = delayedSocket.emitWithAck.mock.calls.filter(([event]) => event === 'message');
+    expect(messageCalls[1]?.[1]).toMatchObject({
+      localId,
+      message: {
+        t: 'plain',
+        v: {
+          content: {
+            type: 'acp',
+            provider: 'codex',
+            data: { type: 'message', message: 'partial plus final' },
+          },
+          meta: {
+            happierStreamSegmentV1: { segmentState: 'complete' },
+          },
+        },
+      },
+    });
+
+    delayedSocket.resolveNext({ ok: true, id: 'm1', seq: 1, localId });
+    await expect(streamingCommit).resolves.toBeUndefined();
+    await expect(terminalCommit).resolves.toBeUndefined();
+    expect(delayedSocket.state.maxInFlight).toBe(1);
   }, 60_000);
 
   it('records committed user message seqs from commit acks', async () => {

@@ -10,13 +10,17 @@ import { ItemList } from '@/components/ui/lists/ItemList';
 import { Text, TextInput } from '@/components/ui/text/Text';
 import { Typography } from '@/constants/Typography';
 import { t } from '@/text';
-import { useSettingMutable } from '@/sync/domains/state/storage';
+import { useSetting, useSettingMutable } from '@/sync/domains/state/storage';
+import { resolveTerminalHost } from '@/sync/domains/settings/terminalSettings';
+import { useApplySettings } from '@/sync/store/settingsWriters';
 import { WINDOWS_REMOTE_SESSION_LAUNCH_MODE_OPTIONS } from '@/sync/domains/session/spawn/windowsRemoteSessionLaunchModeOptions';
 import { Icon } from '@/components/ui/icons/Icon';
 
 export const SessionRuntimeSettingsView = React.memo(function SessionRuntimeSettingsView() {
     const { theme } = useUnistyles();
-    const [useTmux, setUseTmux] = useSettingMutable('sessionUseTmux');
+    const useTmux = useSetting('sessionUseTmux');
+    const terminalHost = useSetting('sessionTerminalHost');
+    const applySettings = useApplySettings();
     const [tmuxSessionName, setTmuxSessionName] = useSettingMutable('sessionTmuxSessionName');
     const [tmuxIsolated, setTmuxIsolated] = useSettingMutable('sessionTmuxIsolated');
     const [tmuxTmpDir, setTmuxTmpDir] = useSettingMutable('sessionTmuxTmpDir');
@@ -24,20 +28,44 @@ export const SessionRuntimeSettingsView = React.memo(function SessionRuntimeSett
     const [windowsTerminalWindowName, setWindowsTerminalWindowName] = useSettingMutable('sessionWindowsTerminalWindowName');
     const [terminalConnectLegacySecretExportEnabled, setTerminalConnectLegacySecretExportEnabled] = useSettingMutable('terminalConnectLegacySecretExportEnabled');
     const [openWindowsRemoteSessionLaunchModeMenu, setOpenWindowsRemoteSessionLaunchModeMenu] = React.useState(false);
+    const [openTerminalHostMenu, setOpenTerminalHostMenu] = React.useState(false);
+    const selectedTerminalHost = resolveTerminalHost({ settings: {
+        sessionUseTmux: useTmux, sessionTerminalHost: terminalHost,
+        sessionTmuxByMachineId: {}, sessionTerminalHostByMachineId: {},
+    }, machineId: null });
 
     return (
         <ItemList style={{ paddingTop: 0 }}>
-            <ItemGroup title={t('profiles.tmux.title')}>
-                <Item
-                    testID="settings-session-tmux-enabled-item"
-                    title={t('profiles.tmux.spawnSessionsTitle')}
-                    subtitle={useTmux ? t('profiles.tmux.spawnSessionsEnabledSubtitle') : t('profiles.tmux.spawnSessionsDisabledSubtitle')}
-                    icon={<Icon name="terminal" size={29} color={theme.colors.accent.indigo} />}
-                    rightElement={<Switch value={useTmux} onValueChange={setUseTmux} />}
-                    showChevron={false}
-                    onPress={() => setUseTmux(!useTmux)}
+            <ItemGroup title={t('settingsSession.terminalHostTitle')}>
+                <DropdownMenu
+                    open={openTerminalHostMenu}
+                    onOpenChange={setOpenTerminalHostMenu}
+                    items={[
+                        { id: 'none', title: t('settingsSession.terminalHostNone') },
+                        { id: 'tmux', title: 'tmux', testID: 'settings-session-terminal-host-option-tmux' },
+                        { id: 'zellij', title: 'Zellij' },
+                        { id: 'herdr', title: 'Herdr' },
+                    ]}
+                    selectedId={selectedTerminalHost}
+                    onSelect={(id) => {
+                        if (id === 'none' || id === 'tmux' || id === 'zellij' || id === 'herdr') {
+                            applySettings({ sessionTerminalHost: id, sessionUseTmux: id === 'tmux' });
+                            setOpenTerminalHostMenu(false);
+                        }
+                    }}
+                    itemTrigger={{
+                        itemProps: { testID: 'settings-session-terminal-host-item' },
+                        title: t('settingsSession.terminalHostTitle'),
+                        subtitle: selectedTerminalHost === 'none'
+                            ? t('settingsSession.terminalHostNone')
+                            : selectedTerminalHost === 'tmux' ? 'tmux' : selectedTerminalHost === 'zellij' ? 'Zellij' : 'Herdr',
+                        icon: <Icon name="terminal" size={29} color={theme.colors.accent.indigo} />,
+                    }}
+                    rowKind="item"
+                    connectToTrigger
+                    variant="default"
                 />
-                {useTmux ? (
+                {selectedTerminalHost === 'tmux' ? (
                     <>
                         <View style={[styles.inputContainer, { paddingTop: 0 }]}>
                             <Text style={styles.fieldLabel}>{t('profiles.tmuxSession')} ({t('common.optional')})</Text>

@@ -31,12 +31,15 @@ export type ConnectedServiceQuotaFetcher = Readonly<{
     record: ConnectedServiceCredentialRecordV1;
     now: number;
     signal: AbortSignal;
+    /** Current-source refresh: bypass local cache cooldowns, never provider Retry-After. */
+    force?: boolean;
   }>) => Promise<ConnectedServiceQuotaSnapshotV1 | null>;
   consumeRecoveryCredit?: (params: Readonly<{
     record: ConnectedServiceCredentialRecordV1;
     now: number;
     idempotencyKey: string;
     providerCreditId?: string;
+    providerLimitIds?: ReadonlyArray<string>;
     signal: AbortSignal;
   }>) => Promise<ConnectedServiceQuotaRecoveryCreditConsumeOutcome>;
 }>;

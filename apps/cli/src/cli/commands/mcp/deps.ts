@@ -5,13 +5,14 @@ import { updateAccountSettingsV2WithRetry } from '@/settings/accountSettings/upd
 import { detectProviderMcpServers } from '@/mcp/providerDetection/detectProviderMcpServers';
 import { probeMcpStdioServerTools } from '@/mcp/servers/probeMcpStdioServerTools';
 import { createExternalMcpServer } from '@/mcp/createExternalMcpServer';
-import { readCredentials, type Credentials } from '@/persistence';
+import { readCredentials, readSettings, type Credentials } from '@/persistence';
 import { ensureMachineIdForCredentials } from '@/ui/auth';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 export type McpCommandDeps = Readonly<{
   readCredentials: () => Promise<Credentials | null>;
+  readSettings: typeof readSettings;
   bootstrapAccountSettingsContext: typeof bootstrapAccountSettingsContext;
   updateAccountSettingsV2WithRetry: typeof updateAccountSettingsV2WithRetry;
   ensureMachineIdForCredentials: typeof ensureMachineIdForCredentials;
@@ -26,6 +27,7 @@ export type McpCommandDeps = Readonly<{
 export function resolveMcpCommandDeps(overrides?: Partial<McpCommandDeps>): McpCommandDeps {
   return {
     readCredentials: overrides?.readCredentials ?? readCredentials,
+    readSettings: overrides?.readSettings ?? readSettings,
     bootstrapAccountSettingsContext: overrides?.bootstrapAccountSettingsContext ?? bootstrapAccountSettingsContext,
     updateAccountSettingsV2WithRetry: overrides?.updateAccountSettingsV2WithRetry ?? updateAccountSettingsV2WithRetry,
     ensureMachineIdForCredentials: overrides?.ensureMachineIdForCredentials ?? ensureMachineIdForCredentials,

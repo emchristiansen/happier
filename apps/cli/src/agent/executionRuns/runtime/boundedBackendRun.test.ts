@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { AgentBackend, SessionId } from '@/agent/core/AgentBackend';
+import type { AgentBackend, AgentMessage, SessionId } from '@/agent/core/AgentBackend';
+import type { ACPMessageData } from '@/api/session/sessionMessageTypes';
 import type { ExecutionRunBackendController } from '@/agent/executionRuns/controllers/types';
 import type { FinishExecutionRun } from '@/agent/executionRuns/runtime/executionRunFinishRun';
+import type { ExecutionRunState } from '@/agent/executionRuns/runtime/executionRunTypes';
+import { finishExecutionRun } from './executionRunManager/finishExecutionRun';
+import { createBackendControllerMessageHandler } from './createBackendControllerMessageHandler';
 
 import { executeBoundedBackendRun } from './boundedBackendRun';
 
@@ -685,6 +689,175 @@ describe('executeBoundedBackendRun', () => {
       }),
       expect.objectContaining({ kind: 'delegate_output.v1' }),
     );
+  });
+
+  it('keeps a Pi artifact segment when bounded completion receives a later acknowledgement segment', async () => {
+    const runId = 'run_delegate_segment_artifact_1';
+    const callId = 'subagent_run_delegate_segment_artifact_1';
+    const sidechainId = callId;
+    const childSessionId: SessionId = 'child_session_delegate_segment_artifact' as SessionId;
+    const prompts: string[] = [];
+    const acpMessages: ACPMessageData[] = [];
+    let sendPromptCount = 0;
+    let messageHandler: ((message: AgentMessage) => void) | null = null;
+
+    let resolveTerminal!: () => void;
+    const terminalPromise = new Promise<void>((resolve) => {
+      resolveTerminal = resolve;
+    });
+
+    let ctrl!: ExecutionRunBackendController;
+    const backend: AgentBackend = {
+      async startSession(): Promise<{ sessionId: SessionId }> {
+        return { sessionId: childSessionId };
+      },
+      async sendPrompt(_sessionId: SessionId, prompt: string): Promise<void> {
+        prompts.push(prompt);
+        sendPromptCount += 1;
+        if (sendPromptCount === 1) {
+          messageHandler?.({ type: 'model-output', fullText: 'stale draft', fullTextScope: 'segment' });
+          messageHandler?.({ type: 'model-output', fullText: 'artifact payload', fullTextScope: 'segment' });
+          messageHandler?.({ type: 'tool-call', toolName: 'write', args: {}, callId: 'tool_1' });
+          messageHandler?.({ type: 'tool-result', toolName: 'write', result: 'ok', callId: 'tool_1' });
+          messageHandler?.({ type: 'model-output', fullText: 'Done', fullTextScope: 'segment' });
+          return;
+        }
+        messageHandler?.({
+          type: 'model-output',
+          fullText: '{"summary":"Ok","deliverables":[{"id":"d1","title":"artifact payload"}]}',
+          fullTextScope: 'turn',
+        });
+      },
+      async cancel(_sessionId: SessionId): Promise<void> {},
+      onMessage(handler): void {
+        messageHandler = handler;
+      },
+      async dispose(): Promise<void> {},
+      async waitForResponseComplete(): Promise<void> {},
+    };
+
+    ctrl = {
+      kind: 'backend',
+      backend,
+      backendSupportsResume: false,
+      childSessionId,
+      buffer: '',
+      sidechainStreamBuffer: '',
+      sidechainStreamKey: '',
+      streamWriter: null,
+      cancelled: false,
+      turnCount: 0,
+      turnEpoch: 0,
+      turnInFlight: false,
+      turnCancelReason: null,
+      turnCancelEpoch: null,
+      pendingExternalMessages: [],
+      pendingExternalMessagesSignal: null,
+      lastMarkerWriteAtMs: 0,
+      terminalPromise,
+      resolveTerminal,
+    };
+
+    const controllers = new Map([[runId, ctrl]]);
+    const runs = new Map<string, ExecutionRunState>([[runId, {
+      runId,
+      callId,
+      sidechainId,
+      sessionId: 'parent_session_delegate_segment_artifact',
+      depth: 0,
+      intent: 'delegate',
+      backendTarget: { kind: 'builtInAgent', agentId: 'pi' },
+      backendId: 'pi',
+      instructions: 'write the artifact',
+      permissionMode: 'read_only',
+      retentionPolicy: 'ephemeral',
+      runClass: 'bounded',
+      ioMode: 'request_response',
+      status: 'running',
+      startedAtMs: 0,
+    }]]);
+    const finishRun = vi.fn<FinishExecutionRun>((finishedRunId, next, toolResult, structuredMeta) => {
+      finishExecutionRun({
+        runId: finishedRunId,
+        next,
+        toolResult,
+        structuredMeta,
+        runs,
+        controllers,
+        budgetRegistry: null,
+        parentProvider: 'pi',
+        sendAcp: (_provider, body) => acpMessages.push(body),
+        // Machine listing marker IO is outside the artifact/result contract under test.
+        enqueueMarkerWrite: async () => {},
+        terminalMarkerWritePromises: new Map(),
+      });
+    });
+    messageHandler = createBackendControllerMessageHandler({
+      ctrl,
+      runId,
+      sidechainId,
+      intent: 'delegate',
+      ioMode: 'request_response',
+      sendAcp: (_provider, body) => acpMessages.push(body),
+      parentProvider: 'pi',
+      runs,
+      backendSupportsResume: false,
+      writeActivityMarker: async () => {},
+      getNowMs: () => 1,
+      isCurrentController: () => true,
+    });
+
+    await executeBoundedBackendRun({
+      runId,
+      callId,
+      sidechainId,
+      startedAtMs: 0,
+      params: {
+        sessionId: 'parent_session_delegate_segment_artifact',
+        intent: 'delegate',
+        backendTarget: { kind: 'builtInAgent', agentId: 'pi' },
+        instructions: 'write the artifact',
+        permissionMode: 'read_only',
+        retentionPolicy: 'ephemeral',
+        runClass: 'bounded',
+        ioMode: 'request_response',
+      },
+      controllers,
+      sendAcp: (_provider, body) => acpMessages.push(body),
+      parentProvider: 'pi',
+      getNowMs: () => 1,
+      boundedTimeoutMs: null,
+      finishRun,
+    });
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain('artifact payloadDone');
+    expect(prompts[1]).not.toContain('stale draft');
+    expect(acpMessages).toContainEqual(expect.objectContaining({
+      type: 'message',
+      message: expect.stringContaining('artifact payload'),
+      sidechainId,
+    }));
+    expect(finishRun).toHaveBeenCalledWith(
+      runId,
+      expect.objectContaining({ status: 'succeeded' }),
+      expect.objectContaining({ output: expect.objectContaining({ status: 'succeeded' }) }),
+      expect.objectContaining({ kind: 'delegate_output.v1' }),
+    );
+    expect(acpMessages.filter((body) => body.type === 'message')).toEqual([
+      expect.objectContaining({ type: 'message', message: 'artifact payloadDone', sidechainId }),
+    ]);
+    expect(runs.get(runId)).toMatchObject({
+      status: 'succeeded',
+      latestToolResult: {
+        status: 'succeeded',
+        runId,
+        callId,
+        sidechainId,
+        deliverablesDigest: [{ id: 'd1', title: 'artifact payload' }],
+      },
+      structuredMeta: { kind: 'delegate_output.v1', payload: { deliverables: [{ id: 'd1', title: 'artifact payload' }] } },
+    });
   });
 
   it('uses a repair prompt whose JSON example can be copied verbatim (delegate)', async () => {

@@ -46,7 +46,7 @@ function normalizeReportedClaudeEffortLevels(raw: unknown): readonly ClaudeEffor
  * session-scoped and is not cleared when the model changes, so an unrecognised id is not by
  * itself a reason to forward a carried level.
  */
-function resolveEvidencedClaudeEffortLevels(
+export function resolveClaudeEffortLevelsForModel(
     modelIdRaw: unknown,
     reportedRaw: unknown,
 ): readonly ClaudeEffortLevel[] {
@@ -165,7 +165,9 @@ export function resolveModeEffortLevelsForModel(
     return mode.modelEffortLevelsModelId === normalized ? mode.modelEffortLevels : undefined;
 }
 
-export function resolveClaudeEffectiveEffortForModel(params: Readonly<{
+// Explicit selections must override native saved settings, even at the catalog default.
+// Launch flags, SDK options, runtime controls, and launch hashes share this resolution.
+export function resolveClaudeEffortForModel(params: Readonly<{
     modelId: unknown;
     effort: unknown;
     /** Effort tiers the model reported (Anthropic Models API). Required for discovered models. */
@@ -178,24 +180,11 @@ export function resolveClaudeEffectiveEffortForModel(params: Readonly<{
     const normalizedModelId = normalizeClaudeModelIdForKnownCheck(params.modelId);
     if (!normalizedModelId || normalizedModelId === 'default') return null;
 
-    const supportedLevels = resolveEvidencedClaudeEffortLevels(params.modelId, params.supportedLevels);
+    const supportedLevels = resolveClaudeEffortLevelsForModel(params.modelId, params.supportedLevels);
     if (supportedLevels.length === 0) return null;
 
     const normalized = resolveBestSupportedClaudeEffort(effort, supportedLevels);
     return normalized;
-}
-
-export function resolveClaudeEffortForModel(params: Readonly<{
-    modelId: unknown;
-    effort: unknown;
-    /** Effort tiers the model reported (Anthropic Models API). Required for discovered models. */
-    supportedLevels?: readonly unknown[];
-}>): ClaudeEffortLevel | null {
-    const normalized = resolveClaudeEffectiveEffortForModel(params);
-    if (!normalized) return null;
-    const defaultEffort = resolveClaudeDefaultEffortForKnownAliasOrModel(params.modelId);
-
-    return normalized === defaultEffort ? null : normalized;
 }
 
 export function buildClaudeEffortCliArgs(params: Readonly<{
@@ -237,7 +226,7 @@ export function resolveClaudeUltracodeForModel(params: Readonly<{
 
     // Ultracode forces xhigh, so it needs the same evidence as an xhigh effort selection. A
     // discovered model qualifies only when the caller passes the tiers the API reported.
-    return resolveEvidencedClaudeEffortLevels(params.modelId, params.supportedLevels).includes('xhigh');
+    return resolveClaudeEffortLevelsForModel(params.modelId, params.supportedLevels).includes('xhigh');
 }
 
 /** The `--settings` JSON overlay value that turns ultracode on for a spawned Claude CLI. */

@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Metadata } from '@/api/types';
+import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
 
 import type { Session } from '../session';
+import { createClaudeSessionModelsReconciler } from '../sessionModels/reconcileClaudeSessionModelsState';
 import { createClaudeStatuslineApplier } from './applyClaudeStatuslineUpdate';
 import type { ClaudeStatuslinePayload } from './statuslinePayload';
 
@@ -11,6 +13,7 @@ import type { ClaudeStatuslinePayload } from './statuslinePayload';
 function createSessionFixture(params?: Readonly<{
   sessionId?: string | null;
   transcriptPath?: string | null;
+  metadata?: Metadata;
 }>): Readonly<{
   session: Session;
   getMetadata: () => Metadata;
@@ -18,13 +21,14 @@ function createSessionFixture(params?: Readonly<{
   getSessionEventCalls: () => readonly Readonly<{ event: unknown; id: string | undefined }>[];
   getRuntimeReconcileCalls: () => readonly Readonly<{ model?: string; reasoningEffort?: string }>[];
 }> {
-  let metadata: Metadata = {} as Metadata;
+  let metadata: Metadata = params?.metadata ?? {} as Metadata;
   let updateMetadataCallCount = 0;
   const sessionEventCalls: Array<Readonly<{ event: unknown; id: string | undefined }>> = [];
   const runtimeReconcileCalls: Readonly<{ model?: string; reasoningEffort?: string }>[] = [];
   const session = {
     sessionId: params?.sessionId ?? null,
     transcriptPath: params?.transcriptPath ?? null,
+    reconcileSessionModels: createClaudeSessionModelsReconciler(),
     reconcileClaudeRuntimeFromStatusline: (input: Readonly<{ model?: string; reasoningEffort?: string }>) => {
       runtimeReconcileCalls.push(input);
     },
@@ -65,6 +69,25 @@ function buildPayload(overrides?: Partial<ClaudeStatuslinePayload>): ClaudeStatu
 }
 
 describe('createClaudeStatuslineApplier', () => {
+  it('publishes observed effort changes without overwriting the requested effort', () => {
+    const fixture = createSessionFixture({ sessionId: 'claude-session-id', metadata: createTestMetadata({
+      sessionConfigOptionOverridesV1: { v: 1, updatedAt: 20, overrides: { reasoning_effort: { value: 'medium', updatedAt: 20 } } },
+    }) });
+    fixture.session.reconcileSessionModels({ metadata: fixture.getMetadata(), source: 'catalog', incomingState: {
+      v: 1, provider: 'claude', updatedAt: 10, currentModelId: 'claude-sonnet-4-6', availableModels: [{
+        id: 'claude-sonnet-4-6', name: 'Sonnet', modelOptions: [{ id: 'reasoning_effort', name: 'Thinking', type: 'select', currentValue: 'high' }],
+      }],
+    } });
+    const applier = createClaudeStatuslineApplier({ logPrefix: '[test]' });
+    for (const reasoningEffort of ['low', 'medium']) {
+      applier.apply(fixture.session, buildPayload({ model: { id: 'claude-sonnet-4-6', display_name: 'Sonnet' }, effort: { level: reasoningEffort } }));
+      expect(fixture.getMetadata().sessionModelsV1?.availableModels[0]?.modelOptions?.[0]?.currentValue).toBe(reasoningEffort);
+    }
+    expect(fixture.getMetadata().sessionConfigOptionOverridesV1?.overrides.reasoning_effort?.value).toBe('medium');
+    expect(fixture.getMetadata().sessionModelsV1?.updatedAt).toBe(10);
+    expect(fixture.getMetadata().sessionModelsV1).toEqual(fixture.getMetadata().acpSessionModelsV1);
+  });
+
   it('adopts the live model and direct context window into session models metadata', () => {
     const fixture = createSessionFixture({ sessionId: 'claude-session-id' });
     const applier = createClaudeStatuslineApplier({ logPrefix: '[test]' });
@@ -85,6 +108,22 @@ describe('createClaudeStatuslineApplier', () => {
     expect(fixture.getMetadata().acpSessionModelsV1).toMatchObject({
       currentModelId: 'claude-haiku-4-5-20251001',
     });
+    expect(fixture.getMetadata().sessionAppliedModelV1).toMatchObject({
+      v: 1, provider: 'claude', modelId: 'claude-haiku-4-5-20251001',
+    });
+  });
+
+  it('repairs Running from an observation even when current-model metadata already matches', () => {
+    const fixture = createSessionFixture({ sessionId: 'claude-session-id', metadata: createTestMetadata({
+      sessionModelsV1: {
+        v: 1, provider: 'claude', updatedAt: 1, currentModelId: 'claude-haiku-4-5-20251001',
+        availableModels: [{ id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5', contextWindowTokens: 200_000 }],
+      },
+      sessionAppliedModelV1: { v: 1, provider: 'claude', updatedAt: 2, modelId: 'requested-but-refused' },
+    }) });
+    const applier = createClaudeStatuslineApplier({ logPrefix: '[test]' });
+    applier.apply(fixture.session, buildPayload());
+    expect(fixture.getMetadata().sessionAppliedModelV1?.modelId).toBe('claude-haiku-4-5-20251001');
   });
 
   it('dedupes repeated identical payloads to a single metadata write', () => {
@@ -112,7 +151,6 @@ describe('createClaudeStatuslineApplier', () => {
     expect(fixture.getMetadata().sessionModelsV1).toMatchObject({
       currentModelId: 'claude-fable-5',
       availableModels: [
-        expect.objectContaining({ id: 'claude-haiku-4-5-20251001' }),
         expect.objectContaining({ id: 'claude-fable-5', contextWindowTokens: 1_000_000 }),
       ],
     });
@@ -208,8 +246,7 @@ describe('createClaudeStatuslineApplier — runtime reconcile feed (lane Y)', ()
       { model: 'claude-haiku-4-5-20251001', reasoningEffort: 'high' },
     ]);
 
-    // An effort-only change re-feeds the reconciler even though model/window (and thus the
-    // metadata write key) did not change.
+    // An effort-only change re-feeds the reconciler, but Haiku has no effort control to publish.
     applier.apply(fixture.session, buildPayload({ effort: { level: 'medium' } }));
     expect(fixture.getRuntimeReconcileCalls()).toEqual([
       { model: 'claude-haiku-4-5-20251001', reasoningEffort: 'high' },
@@ -253,6 +290,6 @@ describe('createClaudeStatuslineApplier — runtime reconcile feed (lane Y)', ()
     expect(metadata.permissionModeUpdatedAt).toBeUndefined();
     expect(metadata.acpSessionModeOverrideV1).toBeUndefined();
     // Only the effective/display surfaces are written.
-    expect(Object.keys(metadata).sort()).toEqual(['acpSessionModelsV1', 'sessionModelsV1']);
+    expect(Object.keys(metadata).sort()).toEqual(['acpSessionModelsV1', 'sessionAppliedModelV1', 'sessionModelsV1']);
   });
 });

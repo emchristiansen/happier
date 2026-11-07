@@ -84,7 +84,11 @@ export function useSessionListScrollRetention(params: Readonly<{
      */
     surfaceActive?: boolean;
 }>) {
-    const surfaceActive = params.surfaceActive !== false;
+    // Native event subscriptions outlive a render. Read activity at delivery time and
+    // keep the handler bundle stable across list/detail transitions; recreating it
+    // also retained older list render environments through memoized layout callbacks.
+    const surfaceActiveRef = React.useRef(params.surfaceActive !== false);
+    surfaceActiveRef.current = params.surfaceActive !== false;
     const scrollToOffsetRef = React.useRef(params.scrollToOffset);
     scrollToOffsetRef.current = params.scrollToOffset;
     const retentionEntry = React.useMemo(
@@ -105,7 +109,7 @@ export function useSessionListScrollRetention(params: Readonly<{
         const offsetY = readFiniteNumber(event.nativeEvent?.contentOffset?.y);
         if (offsetY == null) return;
 
-        if (!surfaceActive) {
+        if (!surfaceActiveRef.current) {
             // An inactive surface's scroll events are not the reader's intent. Deactivating the
             // screen moves the native scroll view, and MEASURED on device that arrives as `y: 0` in
             // some runs and `y: -9999055` in others - indistinguishable by value from a real scroll
@@ -137,7 +141,7 @@ export function useSessionListScrollRetention(params: Readonly<{
         // this, coming back to the list and immediately scrolling yanks them to the old position
         // mid-gesture - a worse defect than the one the restore exists to fix.
         retentionEntry.restorePending = false;
-    }, [retentionEntry, surfaceActive]);
+    }, [retentionEntry]);
 
     /**
      * A restore is armed by the position actually being LOST, which means this surface stopped

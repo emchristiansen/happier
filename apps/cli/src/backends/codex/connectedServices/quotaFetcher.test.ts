@@ -184,6 +184,71 @@ describe('createOpenAiCodexQuotaFetcher', () => {
     }
   });
 
+  it.each([
+    { reset: '2026-06-17T12:00:00.000Z', expected: Date.parse('2026-06-17T12:00:00.000Z'), relative: undefined },
+    { reset: '2026-06-17T12:00:00.000Z', expected: Date.parse('2026-06-17T12:00:00.000Z'), relative: 120 },
+    { reset: Date.parse('2026-06-17T12:00:00.000Z'), expected: Date.parse('2026-06-17T12:00:00.000Z'), relative: 120 },
+    { reset: String(Date.parse('2026-06-17T12:00:00.000Z') / 1000), expected: Date.parse('2026-06-17T12:00:00.000Z'), relative: 120 },
+    { reset: '2020-01-01T00:00:00.000Z', expected: Date.parse('2026-06-17T10:00:00.000Z') + 120_000, relative: 120 },
+    { reset: 'not-a-timestamp', expected: Date.parse('2026-06-17T10:00:00.000Z') + 120_000, relative: 120 },
+  ])('preserves supported absolute reset timestamps and the plausibility fallback: $reset', async ({ reset, expected, relative }) => {
+    const now = Date.parse('2026-06-17T10:00:00.000Z');
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ rate_limit: {
+        primary_window: { limit_window_seconds: 604800, used_percent: 25, reset_at: reset, resets_in_seconds: relative },
+        secondary_window: { limit_window_seconds: 18000, used_percent: 10, reset_at: reset, resets_in_seconds: relative },
+      } }),
+    })));
+    try {
+      const record = buildConnectedServiceCredentialRecord({
+        now, serviceId: 'openai-codex', profileId: 'timestamp', kind: 'oauth', expiresAt: now + 60_000,
+        oauth: { accessToken: 'synthetic-at', refreshToken: 'synthetic-rt', idToken: null, scope: null, tokenType: null, providerAccountId: null, providerEmail: null },
+      });
+      const snapshot = await createOpenAiCodexQuotaFetcher({ usageUrl: 'https://quota.test/usage', resetCreditsUrl: null })
+        .fetch({ record, now, signal: new AbortController().signal });
+      expect(snapshot?.meters).toMatchObject([
+        { meterId: 'weekly', resetsAt: expected },
+        { meterId: 'session', resetsAt: expected },
+      ]);
+      expect(snapshot?.meters.every((meter) => meter.providerLimitId === undefined)).toBe(true);
+      expect(ConnectedServiceQuotaSnapshotV1Schema.safeParse(snapshot).success).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('preserves additional provider allowance ids from the HTTP usage response', async () => {
+    const now = 1_000_000;
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        plan_type: 'pro',
+        rate_limit: { primary_window: { used_percent: 10 } },
+        additional_rate_limits: [{
+          limit_name: 'GPT-5.3-Codex-Spark',
+          metered_feature: 'codex_bengalfox',
+          rate_limit: {
+            primary_window: { used_percent: 80 },
+            secondary_window: { used_percent: 35 },
+          },
+        }],
+      }),
+    })) as unknown as typeof fetch);
+    const record = buildConnectedServiceCredentialRecord({
+      now, serviceId: 'openai-codex', profileId: 'work', kind: 'oauth', expiresAt: now + 60_000,
+      oauth: { accessToken: 'at', refreshToken: 'rt', idToken: null, scope: null, tokenType: null, providerAccountId: 'acct', providerEmail: null },
+    });
+    const snapshot = await createOpenAiCodexQuotaFetcher({ usageUrl: 'https://quota.test/usage', resetCreditsUrl: null })
+      .fetch({ record, now, signal: new AbortController().signal });
+    expect(snapshot?.meters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ meterId: 'codex_primary_window', utilizationPct: 10 }),
+      expect.objectContaining({ meterId: 'codex_bengalfox:primary', providerLimitId: 'codex_bengalfox', label: 'GPT-5.3-Codex-Spark · Primary', utilizationPct: 80 }),
+      expect.objectContaining({ meterId: 'codex_bengalfox:secondary', providerLimitId: 'codex_bengalfox', label: 'GPT-5.3-Codex-Spark · Secondary', utilizationPct: 35 }),
+    ]));
+    expect(snapshot?.meters.find((meter) => meter.meterId === 'codex_primary_window')).not.toHaveProperty('providerLimitId');
+  });
+
   it('fetches Codex reset-credit collection details with connected account headers', async () => {
     const now = 1_768_000_000_000;
     const usageUrl = 'https://quota.happier.dev/openai-codex/usage';

@@ -106,7 +106,7 @@ describe('AcpBackend subprocess stderr artifacts', () => {
           args: [scriptPath],
           transportHandler: createAcpTestTransportHandler({
             agentName: 'kimi',
-            initTimeoutMs: 10,
+            initTimeoutMs: 1_000,
           }),
         });
 

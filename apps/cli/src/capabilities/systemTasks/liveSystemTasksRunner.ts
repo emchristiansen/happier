@@ -16,6 +16,10 @@ import {
   stopLiveRelayRuntime,
 } from './relayRuntime/liveRelayRuntime';
 import { createLiveRemoteSshBootstrapTaskKind } from './ssh/liveRemoteSshBootstrap';
+import { CLI_UPDATE_SYSTEM_TASK_KIND, createCliUpdateRemoteTaskKind } from './kinds/cliUpdateRemote';
+import { readCliUpdateFactsForThisCli } from '@/cli/runtime/update/cliUpdateFacts';
+import { configuration } from '@/configuration';
+import { projectPath } from '@/projectPath';
 import { createSystemTasksRunner } from './systemTasksRunner';
 
 function requireLocalRelayRuntimeParams(params: RelayRuntimeTaskParams): Readonly<{
@@ -71,6 +75,13 @@ export function getLiveSystemTasksRunnerAdapter(): SystemTasksRunnerAdapter {
   const runner = createSystemTasksRunner({
     kinds: {
       'remote.ssh.bootstrapMachine.v1': createLiveRemoteSshBootstrapTaskKind(),
+      [CLI_UPDATE_SYSTEM_TASK_KIND]: createCliUpdateRemoteTaskKind({
+        readFacts: readCliUpdateFactsForThisCli,
+        publicReleaseRing: configuration.publicReleaseRing,
+        script: process.argv[1] ?? process.execPath,
+        cwd: projectPath(),
+        logsDir: configuration.logsDir,
+      }),
       'relay.runtime.installOrUpdate.v1': createRelayRuntimeInstallOrUpdateTaskKind({
         installOrUpdate: async (params) => {
           const localParams = requireLocalRelayRuntimeParams(params);

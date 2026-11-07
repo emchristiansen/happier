@@ -1,6 +1,4 @@
 import { describe, expect, it, vi } from 'vitest';
-import { dirname } from 'node:path';
-import { access } from 'node:fs/promises';
 
 import type { AgentBackend, SessionId } from '@/agent/core/AgentBackend';
 import type { ExecutionRunBackendFactoryOptions } from '@/agent/executionRuns/registry/executionRunBackendTypes';
@@ -142,12 +140,10 @@ describe('createExecutionRunBackend connected-services env merge', () => {
     await vi.waitFor(() => expect(connectedServicesCleanup).toHaveBeenCalledTimes(1));
   });
 
-  it('preserves a resolveIsolation construction error while cleaning both acquired resources exactly once', async () => {
-    let isolationRoot: string | null = null;
+  it('preserves a resolveIsolation construction error while cleaning selected connected services exactly once', async () => {
     getExecutionRunBackendDescriptorMock.mockReturnValue({
       factory: () => createStubBackend(),
-      resolveIsolation: vi.fn((_request, baseBundle) => {
-        isolationRoot = dirname(dirname(String(baseBundle.env.XDG_STATE_HOME)));
+      resolveIsolation: vi.fn(() => {
         throw new Error('resolve isolation failed');
       }),
     });
@@ -165,10 +161,8 @@ describe('createExecutionRunBackend connected-services env merge', () => {
       connectedServicesCleanup,
     })).toThrow('resolve isolation failed');
 
-    await vi.waitFor(async () => {
+    await vi.waitFor(() => {
       expect(connectedServicesCleanup).toHaveBeenCalledTimes(1);
-      expect(isolationRoot).not.toBeNull();
-      await expect(access(isolationRoot!)).rejects.toThrow();
     });
   });
 });

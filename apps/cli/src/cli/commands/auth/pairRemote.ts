@@ -92,7 +92,7 @@ function normalizeUrlOrFail(raw: string, label: string): string {
 
 function deriveDefaultWebappUrl(serverUrl: string): string {
   if (serverUrl.replace(/\/+$/, '') === 'https://api.happier.dev') {
-    return 'https://app.happier.dev';
+    return 'https://cloud.happier.dev';
   }
   try {
     return new URL(serverUrl).origin;

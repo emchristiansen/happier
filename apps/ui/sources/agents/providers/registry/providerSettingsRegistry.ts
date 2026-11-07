@@ -10,6 +10,7 @@ import { GEMINI_PROVIDER_SETTINGS_PLUGIN } from '../gemini/settings/plugin';
 import { KILO_PROVIDER_SETTINGS_PLUGIN } from '../kilo/settings/plugin';
 import { KIMI_PROVIDER_SETTINGS_PLUGIN } from '../kimi/settings/plugin';
 import { KIRO_PROVIDER_SETTINGS_PLUGIN } from '../kiro/settings/plugin';
+import { DEVIN_PROVIDER_SETTINGS_PLUGIN } from '../devin/settings/plugin';
 import { CUSTOM_ACP_PROVIDER_SETTINGS_PLUGIN } from '../customAcp/settings/plugin';
 import { OPENCODE_PROVIDER_SETTINGS_PLUGIN } from '../opencode/settings/plugin';
 import { PI_PROVIDER_SETTINGS_PLUGIN } from '../pi/settings/plugin';
@@ -17,6 +18,10 @@ import { QWEN_PROVIDER_SETTINGS_PLUGIN } from '../qwen/settings/plugin';
 import { COPILOT_PROVIDER_SETTINGS_PLUGIN } from '../copilot/settings/plugin';
 import { CURSOR_PROVIDER_SETTINGS_PLUGIN } from '../cursor/settings/plugin';
 import { GROK_PROVIDER_SETTINGS_PLUGIN } from '../grok/settings/plugin';
+import { AGY_PROVIDER_SETTINGS_PLUGIN } from '../agy/settings/plugin';
+import { FX_PROVIDER_SETTINGS_PLUGIN } from '../fx/settings/plugin';
+import { DROID_PROVIDER_SETTINGS_PLUGIN } from '../droid/settings/plugin';
+import { CODEBUDDY_PROVIDER_SETTINGS_PLUGIN } from '../codebuddy/settings/plugin';
 
 function isTranslationRef(value: unknown): value is Readonly<{ key: string }> {
     return Boolean(
@@ -147,11 +152,16 @@ export const PROVIDER_SETTINGS_PLUGINS = [
     KIMI_PROVIDER_SETTINGS_PLUGIN,
     KILO_PROVIDER_SETTINGS_PLUGIN,
     KIRO_PROVIDER_SETTINGS_PLUGIN,
+    DEVIN_PROVIDER_SETTINGS_PLUGIN,
     CUSTOM_ACP_PROVIDER_SETTINGS_PLUGIN,
     PI_PROVIDER_SETTINGS_PLUGIN,
     COPILOT_PROVIDER_SETTINGS_PLUGIN,
     CURSOR_PROVIDER_SETTINGS_PLUGIN,
     GROK_PROVIDER_SETTINGS_PLUGIN,
+    AGY_PROVIDER_SETTINGS_PLUGIN,
+    FX_PROVIDER_SETTINGS_PLUGIN,
+    DROID_PROVIDER_SETTINGS_PLUGIN,
+    CODEBUDDY_PROVIDER_SETTINGS_PLUGIN,
 ] as const satisfies readonly ProviderSettingsPlugin[];
 
 assertProviderSettingsPluginsValid(PROVIDER_SETTINGS_PLUGINS);

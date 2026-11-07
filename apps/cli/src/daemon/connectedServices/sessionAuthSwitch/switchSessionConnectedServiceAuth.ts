@@ -1,4 +1,5 @@
 import type { HotApplyRestartRequirement } from './sessionConnectedServiceAuthHotApply';
+import type { QuotaRecoveryGuard } from './quotaRecoveryGuard';
 import {
   CONNECTED_SERVICE_UX_DIAGNOSTIC_CODES,
   ConnectedServiceUxDiagnosticCodeV1Schema,
@@ -17,6 +18,7 @@ import {
   type ConnectedServiceMaterializationIdentityV1,
 } from '@happier-dev/protocol';
 import { AGENTS_CORE } from '@happier-dev/agents';
+import { logger } from '@/ui/logger';
 
 import type { CatalogAgentId, ConnectedServiceResumeContinuityDiagnostics } from '@/backends/types';
 import type { TrackedSession } from '@/daemon/types';
@@ -27,7 +29,10 @@ import {
   type ConnectedServiceChildSelection,
 } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import { resolveTrackedConnectedServiceBindingsRaw } from '../trackedSessionConnectedServiceBindings';
-import { createConnectedServiceAuthGenerationApplyFailureError } from '../runtimeAuth/connectedServiceAuthGenerationApplyFailure';
+import {
+  isRetryableConnectedServiceCredentialApplyFailure,
+  readConnectedServiceAuthGenerationApplyFailure,
+} from '../runtimeAuth/connectedServiceAuthGenerationApplyFailure';
 import {
   createConnectedServiceMaterializationIdentity,
   readConnectedServiceMaterializationIdentityV1,
@@ -138,6 +143,7 @@ export type SessionConnectedServiceAuthSwitchErrorCode =
   | 'metadata_update_failed'
   | 'restart_failed'
   | 'hot_apply_failed'
+  | 'credential_revision_missing'
   | 'credential_revision_superseded'
   | 'bindings_rollback_failed'
   | 'post_switch_recovery_failed'
@@ -284,7 +290,9 @@ export type SessionConnectedServiceRuntimeAuthSelectionMaterializerMode = 'apply
 
 export type SessionConnectedServiceRuntimeAuthSelectionMaterializerInput = Readonly<{
   mode: SessionConnectedServiceRuntimeAuthSelectionMaterializerMode;
-  tracked: TrackedSession;
+  tracked: TrackedSession | null;
+  cwd?: string | null;
+  persistedSessionMetadata?: Record<string, unknown> | null;
   sessionId: string;
   agentId: CatalogAgentId;
   serviceId: ConnectedServiceId;
@@ -343,6 +351,7 @@ export type SwitchSessionConnectedServiceAuthInput = Readonly<{
    */
   emitFromProfileIdByServiceId?: ReadonlyMap<ConnectedServiceId, string | null>;
   getChildren: () => ReadonlyArray<TrackedSession>;
+  quotaRecoveryGuard?: QuotaRecoveryGuard;
   resolveInactiveSession?(input: Readonly<{ sessionId: string }>): Promise<Readonly<{
     agentId: CatalogAgentId;
     connectedServices: ConnectedServiceBindingsV1;
@@ -352,6 +361,7 @@ export type SwitchSessionConnectedServiceAuthInput = Readonly<{
     cwd?: string | null;
     /** Persisted vendor session-file hint (provider-derived by the caller) — reachability fast path. */
     candidatePersistedSessionFile?: string | null;
+    metadata?: Record<string, unknown> | null;
   }> | null>;
   api: ConnectedServiceProfilesApi;
   resolveContinuity(input: Readonly<{
@@ -364,13 +374,14 @@ export type SwitchSessionConnectedServiceAuthInput = Readonly<{
     previousBindings: ConnectedServiceBindingsV1;
     normalizedBindings: ConnectedServiceBindingsV1;
     runtimeAuthSelection?: unknown;
+    persistedSessionMetadata?: Record<string, unknown> | null;
     connectedServiceMaterializationIdentityV1?: ConnectedServiceMaterializationIdentityV1 | null;
     vendorResumeId?: string | null;
     /**
      * For an INACTIVE switch (tracked=null) the daemon adapter cannot read cwd/target root from a
      * tracked session, so the switch forwards the inactive session's working directory and persisted
-     * session-file hint here. The adapter uses them (plus the deterministic reconstructed materialized
-     * root) to prove shared-state resume reachability instead of fail-closing a resumable session.
+     * session-file hint here. Preparation supplies the post-switch target; persisted metadata supplies
+     * the previous runtime's state source without inventing a tracked process.
      */
     cwd?: string | null;
     candidatePersistedSessionFile?: string | null;
@@ -1209,11 +1220,12 @@ function buildRuntimeAuthMaterializationFailureResult(input: Readonly<{
   const reason = primary?.reason
     ? sanitizeConnectedServiceDiagnosticString(primary.reason)
     : null;
-  return failureResult('post_switch_verification_failed', {
+  const superseded = input.diagnostics.some(isAuthoritativeGroupTargetSupersededMaterializationDiagnostic);
+  return failureResult(superseded ? 'credential_revision_superseded' : 'post_switch_verification_failed', {
     serviceId: input.serviceId,
     failurePhase: 'materialization',
     diagnosticSource: input.diagnosticSource,
-    retryable: false,
+    retryable: superseded,
     uxDiagnostic: buildConnectedServiceUxDiagnostic({
       code,
       failurePhase: 'materialization',
@@ -1223,7 +1235,7 @@ function buildRuntimeAuthMaterializationFailureResult(input: Readonly<{
       serviceId: primary?.serviceId ?? input.serviceId,
       ...(input.next.profileId ? { profileId: input.next.profileId } : {}),
       ...(input.next.groupId ? { groupId: input.next.groupId } : {}),
-      retryable: false,
+      retryable: superseded,
       diagnostics: {
         reason,
         materializationCode: primary?.code ?? null,
@@ -1304,7 +1316,9 @@ async function runContinuationRecovery(input: SwitchContinuationRecoveryInput & 
   continueAfterRuntimeAuthSwitch: SwitchSessionConnectedServiceAuthInput['continueAfterRuntimeAuthSwitch'];
   diagnosticSource: ConnectedServiceUxDiagnosticV1['source'];
 }>): Promise<SessionConnectedServiceAuthSwitchFailure | null> {
-  if (input.switchReason === 'pre_turn_group_policy') return null;
+  // Automatic recovery continues only after its owner settles application, with
+  // one durable identity and current-work admission. This primitive serves manual input.
+  if ((input.switchReason ?? 'manual') !== 'manual') return null;
   if (!input.continueAfterRuntimeAuthSwitch) return null;
   try {
     await input.continueAfterRuntimeAuthSwitch({
@@ -1448,7 +1462,9 @@ function verificationFailureResult(input: Readonly<{
 
 async function maybeMaterializeRuntimeAuthSelection(input: Readonly<{
   materializeRuntimeAuthSelection: SwitchSessionConnectedServiceAuthInput['materializeRuntimeAuthSelection'];
-  tracked: TrackedSession;
+  tracked: TrackedSession | null;
+  cwd?: string | null;
+  persistedSessionMetadata?: Record<string, unknown> | null;
   sessionId: string;
   agentId: CatalogAgentId;
   serviceId: ConnectedServiceId;
@@ -1466,6 +1482,8 @@ async function maybeMaterializeRuntimeAuthSelection(input: Readonly<{
   const materialized = await input.materializeRuntimeAuthSelection({
     mode: input.mode,
     tracked: input.tracked,
+    ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
+    ...(input.persistedSessionMetadata === undefined ? {} : { persistedSessionMetadata: input.persistedSessionMetadata }),
     sessionId: input.sessionId,
     agentId: input.agentId,
     serviceId: input.serviceId,
@@ -1479,20 +1497,6 @@ async function maybeMaterializeRuntimeAuthSelection(input: Readonly<{
       ? {}
       : { expectedCredentialRevision: input.expectedCredentialRevision }),
   });
-  if (input.expectedCredentialRevision === undefined) return materialized;
-  const actualCredentialRevision = ConnectedServiceCredentialRevisionV1Schema.safeParse(
-    readRecord(materialized)?.credentialRevision,
-  );
-  if (!actualCredentialRevision.success) {
-    throw createConnectedServiceAuthGenerationApplyFailureError({
-      errorCode: 'credential_revision_missing',
-    });
-  }
-  if (actualCredentialRevision.data !== input.expectedCredentialRevision) {
-    throw createConnectedServiceAuthGenerationApplyFailureError({
-      errorCode: 'credential_revision_superseded',
-    });
-  }
   return materialized;
 }
 
@@ -1802,16 +1806,20 @@ async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
           ...(runtimeAuthSelectionsByServiceId ? { runtimeAuthSelectionsByServiceId } : {}),
         });
       } catch (error) {
+        const applyErrorCode = readConnectedServiceAuthGenerationApplyFailure(error)?.errorCode ?? 'hot_apply_failed';
+        const errorCode = isRetryableConnectedServiceCredentialApplyFailure(applyErrorCode) ? applyErrorCode : 'hot_apply_failed';
+        logger.warn('[ConnectedServices] Session credential hot application failed', { errorCode });
         hotApplyResult = {
           ok: false,
-          errorCode: 'hot_apply_failed',
+          errorCode,
           underlyingError: summarizeConnectedServiceSwitchApplyError(error),
         };
       }
       if (!hotApplyResult.ok) {
         input.tracked.spawnOptions = previousSpawnOptions;
+        const applyErrorCode = hotApplyResult.errorCode ?? 'hot_apply_failed';
         return {
-          ...failureResult('hot_apply_failed', {
+          ...failureResult(isRetryableConnectedServiceCredentialApplyFailure(applyErrorCode) ? applyErrorCode : 'hot_apply_failed', {
             serviceId: hotApplyResult.serviceId ?? serviceId,
             continuityByServiceId: { [serviceId]: continuity.mode },
             failurePhase: 'hot_apply',
@@ -1939,6 +1947,8 @@ export async function switchSessionConnectedServiceAuth(
   const execute = async (
     authoritativeGroupTargetRetriesRemaining = 1,
   ): Promise<SessionConnectedServiceAuthSwitchResult> => {
+      input.quotaRecoveryGuard?.assertCurrent();
+      input.quotaRecoveryGuard?.assertBindings(input.request.bindings);
       const tracked = findTrackedSession(input.getChildren(), input.request.sessionId);
       if (!tracked) {
         const inactive = await input.resolveInactiveSession?.({ sessionId: input.request.sessionId }) ?? null;
@@ -1986,6 +1996,32 @@ export async function switchSessionConnectedServiceAuth(
         for (const serviceId of changedServiceIds) {
           const next = nextByServiceId.get(serviceId);
           if (!next) continue;
+          const runtimeAuthSelection = await maybeMaterializeRuntimeAuthSelection({
+            materializeRuntimeAuthSelection: input.materializeRuntimeAuthSelection,
+            tracked: null,
+            cwd: inactive.cwd,
+            persistedSessionMetadata: inactive.metadata,
+            sessionId: input.request.sessionId,
+            agentId: inactive.agentId,
+            serviceId,
+            previous: previousByServiceId.get(serviceId) ?? null,
+            next,
+            previousBindings,
+            normalizedBindings: normalized.normalized,
+            groupMetadataByServiceId: normalized.groupMetadataByServiceId,
+            mode: input.dryRun ? 'preflight' : 'apply',
+            groupSwitchTriggerReason: input.groupSwitchTriggerReason,
+            ...(input.expectedCredentialRevisionByServiceId?.[serviceId] === undefined ? {} : {
+              expectedCredentialRevision: input.expectedCredentialRevisionByServiceId[serviceId],
+            }),
+          });
+          await awaitRuntimeAuthCredentialWriteCommitted(runtimeAuthSelection);
+          const blockingDiagnostics = readRuntimeAuthSelectionBlockingMaterializationDiagnostics(runtimeAuthSelection);
+          if (blockingDiagnostics.length > 0) {
+            return buildRuntimeAuthMaterializationFailureResult({
+              agentId: inactive.agentId, serviceId, next, diagnostics: blockingDiagnostics, diagnosticSource,
+            });
+          }
           const continuity = await observeConnectedServiceAuthStage({
             sessionId: input.request.sessionId,
             bindings: [{
@@ -2002,14 +2038,16 @@ export async function switchSessionConnectedServiceAuth(
             next,
             previousBindings,
             normalizedBindings: normalized.normalized,
+            persistedSessionMetadata: inactive.metadata,
+            ...(runtimeAuthSelection === null || runtimeAuthSelection === undefined ? {} : { runtimeAuthSelection }),
             ...(connectedServiceMaterializationIdentityV1
               ? { connectedServiceMaterializationIdentityV1 }
               : {}),
             ...(typeof inactive.vendorResumeId === 'string' && inactive.vendorResumeId.trim()
               ? { vendorResumeId: inactive.vendorResumeId.trim() }
               : {}),
-            // Inactive switch (tracked=null): forward the session cwd + persisted hint so the daemon
-            // adapter can reconstruct the target materialized root and prove resume reachability.
+            // Inactive switches use the same prepared target as tracked switches, with source context
+            // from the authoritative inactive-session metadata read.
             ...(typeof inactive.cwd === 'string' && inactive.cwd.trim()
               ? { cwd: inactive.cwd.trim() }
               : {}),
@@ -2031,6 +2069,10 @@ export async function switchSessionConnectedServiceAuth(
           continuityProofDiagnostics ??= continuity.diagnostics ?? null;
         }
 
+        if (input.dryRun) {
+          return { ok: true, action: 'metadata_updated', normalizedBindings: normalized.normalized,
+            continuityByServiceId, warnings, ...spreadContinuityProofDiagnostics(continuityProofDiagnostics) };
+        }
         try {
           await input.persistSessionBindings?.({
             sessionId: input.request.sessionId,
@@ -2076,6 +2118,7 @@ export async function switchSessionConnectedServiceAuth(
 	        dryRun: input.dryRun === true,
 	      }));
       if (!normalized.ok) return normalized;
+      input.quotaRecoveryGuard?.assertCurrent();
 
       const previousBindings = readConnectedServiceBindingsOrEmpty(
         resolveTrackedConnectedServiceBindingsRaw(tracked),
@@ -2309,7 +2352,7 @@ export async function switchSessionConnectedServiceAuth(
         ...(runtimeAuthSelectionsByServiceId.size === 0 ? {} : { runtimeAuthSelectionsByServiceId }),
         groupMetadataByServiceId: normalized.groupMetadataByServiceId,
       });
-      tracked.spawnOptions = {
+      const nextSpawnOptions = {
         ...(tracked.spawnOptions ?? { directory: '' }),
         connectedServices: normalized.normalized,
         connectedServicesUpdatedAt: Date.now(),
@@ -2318,6 +2361,8 @@ export async function switchSessionConnectedServiceAuth(
           : {}),
         environmentVariables: nextEnvironmentVariables,
       };
+      input.quotaRecoveryGuard?.acceptAccountChange(nextSpawnOptions);
+      tracked.spawnOptions = nextSpawnOptions;
 
       try {
         if (action === 'hot_applied') {
@@ -2335,6 +2380,7 @@ export async function switchSessionConnectedServiceAuth(
           }
           let hotApplyResult: Awaited<ReturnType<SwitchSessionConnectedServiceAuthInput['hotApply']>>;
           try {
+            input.quotaRecoveryGuard?.assertCurrent();
             hotApplyResult = await input.hotApply({
               tracked,
               normalizedBindings: normalized.normalized,
@@ -2342,9 +2388,12 @@ export async function switchSessionConnectedServiceAuth(
               ...(runtimeAuthSelectionsByServiceId.size === 0 ? {} : { runtimeAuthSelectionsByServiceId }),
             });
           } catch (error) {
+            const applyErrorCode = readConnectedServiceAuthGenerationApplyFailure(error)?.errorCode ?? 'hot_apply_failed';
+            const errorCode = isRetryableConnectedServiceCredentialApplyFailure(applyErrorCode) ? applyErrorCode : 'hot_apply_failed';
+            logger.warn('[ConnectedServices] Session credential hot application failed', { errorCode });
             hotApplyResult = {
               ok: false,
-              errorCode: 'hot_apply_failed',
+              errorCode,
               underlyingError: summarizeConnectedServiceSwitchApplyError(error),
             };
           }
@@ -2366,8 +2415,9 @@ export async function switchSessionConnectedServiceAuth(
 	                });
 	              }
             }
+            const applyErrorCode = hotApplyResult.errorCode ?? 'hot_apply_failed';
             return {
-              ...failureResult('hot_apply_failed', {
+              ...failureResult(isRetryableConnectedServiceCredentialApplyFailure(applyErrorCode) ? applyErrorCode : 'hot_apply_failed', {
                 serviceId: hotApplyResult.serviceId,
                 continuityByServiceId,
                 failurePhase: 'hot_apply',
@@ -2427,6 +2477,7 @@ export async function switchSessionConnectedServiceAuth(
             // daemon route is not held open until the current turn reaches a restart boundary.
           } else {
           try {
+            input.quotaRecoveryGuard?.assertCurrent();
             await input.restartSession(tracked);
           } catch (error) {
             const rolledBack = await rollbackPersistedSessionBindings({

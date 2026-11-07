@@ -51,24 +51,31 @@ export function reportRequestOutcomeToSupervisor(params: Readonly<{
   statusCode?: number | null;
   error?: unknown;
   hadAuth: boolean;
-  scope?: 'connection_health' | 'authentication_only';
+  probeReportScope: ReturnType<NonNullable<ManagedConnectionSupervisor['captureProbeReportScope']>> | undefined;
+  outcomeSupervision?: 'connection_health' | 'authentication_only';
 }>): void {
   const probe = toProbeResult({
     statusCode: params.statusCode ?? readHttpStatus(params.error),
     error: params.error,
     hadAuth: params.hadAuth,
-    scope: params.scope ?? 'connection_health',
+    scope: params.outcomeSupervision ?? 'connection_health',
   });
   if (!probe) {
     return;
   }
-  params.supervisor.reportProbeResult?.(probe);
+  const scope = params.probeReportScope;
+  if (scope === undefined) {
+    params.supervisor.reportProbeResult?.(probe);
+    return;
+  }
+  params.supervisor.reportProbeResult?.(probe, scope);
 }
 
 export function handleRequestAuthenticationFailure(params: Readonly<{
   supervisor?: ManagedConnectionSupervisor | null;
   error: unknown;
   hadAuth: boolean;
+  probeReportScope: ReturnType<NonNullable<ManagedConnectionSupervisor['captureProbeReportScope']>> | undefined;
 }>): boolean {
   if (!params.hadAuth || !readAuthenticationStatus(params.error)) {
     return false;
@@ -82,6 +89,7 @@ export function handleRequestAuthenticationFailure(params: Readonly<{
     supervisor: params.supervisor,
     error: params.error,
     hadAuth: params.hadAuth,
+    probeReportScope: params.probeReportScope,
   });
   return true;
 }

@@ -305,9 +305,7 @@ test('fails closed when token is missing', () => {
   assert.match(res.stderr, /HAPPIER_GITHUB_BOT_TOKEN/);
 });
 
-test('uses the execution-host credential broker when the VM has no environment token', {
-  skip: process.platform !== 'linux' ? 'execution-host credential brokering is Linux-VM-only' : false,
-}, () => {
+test('uses the execution-host credential broker when the VM has no environment token', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ghops-mac-host-token-test-'));
   const { fakeGh } = createFakeBotAuthTools(dir);
   const fixture = createMacHostCredentialFixture(dir);
@@ -330,9 +328,7 @@ test('uses the execution-host credential broker when the VM has no environment t
   assert.deepEqual(JSON.parse(input), { version: 1, operation: 'read-ghops-credential' });
 });
 
-test('keeps an explicit bot push on the authoritative checkout when the credential comes from mac-host', {
-  skip: process.platform !== 'linux' ? 'execution-host credential brokering is Linux-VM-only' : false,
-}, () => {
+test('keeps an explicit bot push on the authoritative checkout when the credential comes from mac-host', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ghops-mac-host-git-push-test-'));
   const { fakeGh } = createFakeBotAuthTools(dir);
   const { fakeGit, gitLog } = createFakeGitPushTool(dir);
@@ -363,9 +359,7 @@ test('keeps an explicit bot push on the authoritative checkout when the credenti
   assert.equal(readFileSync(fixture.sshLog, 'utf8').trim().split('\n').length, 1);
 });
 
-test('fails closed when the configured mac-host credential route is unavailable', {
-  skip: process.platform !== 'linux' ? 'execution-host credential brokering is Linux-VM-only' : false,
-}, () => {
+test('fails closed when the configured mac-host credential route is unavailable', () => {
   const dir = mkdtempSync(join(tmpdir(), 'ghops-mac-host-unavailable-test-'));
   const { fakeGh } = createFakeBotAuthTools(dir);
   const fixture = createMacHostCredentialFixture(dir);

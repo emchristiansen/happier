@@ -326,7 +326,7 @@ describe('createManagedEndpointSupervisor', () => {
     });
 
     await supervisor.start();
-    supervisor.reportProbeResult({ status: 'auth_failed', statusCode: 403, errorMessage: 'forbidden' });
+    supervisor.reportProbeResult({ status: 'auth_failed', statusCode: 403, errorMessage: 'forbidden' }, supervisor.captureProbeReportScope());
 
     expect(supervisor.getState()).toEqual(
       expect.objectContaining({
@@ -352,7 +352,7 @@ describe('createManagedEndpointSupervisor', () => {
     });
 
     await supervisor.start();
-    supervisor.reportProbeResult({ status: 'retry_later', retryAfterMs: 50, errorMessage: 'busy' });
+    supervisor.reportProbeResult({ status: 'retry_later', retryAfterMs: 50, errorMessage: 'busy' }, supervisor.captureProbeReportScope());
 
     expect(supervisor.getState()).toEqual(
       expect.objectContaining({
@@ -392,7 +392,7 @@ describe('createManagedEndpointSupervisor', () => {
     await supervisor.start();
     expect(supervisor.getState()).toEqual(expect.objectContaining({ phase: 'offline', attempt: 1 }));
 
-    supervisor.reportProbeResult({ status: 'auth_failed', statusCode: 403, errorMessage: 'forbidden' });
+    supervisor.reportProbeResult({ status: 'auth_failed', statusCode: 403, errorMessage: 'forbidden' }, supervisor.captureProbeReportScope());
 
     expect(supervisor.getState()).toEqual(
       expect.objectContaining({
@@ -431,7 +431,7 @@ describe('createManagedEndpointSupervisor', () => {
     await supervisor.start();
 
     vi.setSystemTime(5);
-    supervisor.reportProbeResult({ status: 'retry_later', retryAfterMs: 50, errorMessage: 'busy' });
+    supervisor.reportProbeResult({ status: 'retry_later', retryAfterMs: 50, errorMessage: 'busy' }, supervisor.captureProbeReportScope());
 
     expect(supervisor.getState()).toEqual(
       expect.objectContaining({
@@ -473,7 +473,7 @@ describe('createManagedEndpointSupervisor', () => {
     await supervisor.start();
 
     vi.setSystemTime(5);
-    supervisor.reportProbeResult({ status: 'server_unreachable', errorMessage: 'network down' });
+    supervisor.reportProbeResult({ status: 'server_unreachable', errorMessage: 'network down' }, supervisor.captureProbeReportScope());
 
     expect(supervisor.getState()).toEqual(
       expect.objectContaining({
@@ -508,8 +508,8 @@ describe('createManagedEndpointSupervisor', () => {
     });
 
     await supervisor.start();
-    supervisor.reportProbeResult({ status: 'auth_failed', statusCode: 403, errorMessage: 'forbidden' });
-    supervisor.reportProbeResult({ status: 'retry_later', retryAfterMs: 50, errorMessage: 'busy' });
+    supervisor.reportProbeResult({ status: 'auth_failed', statusCode: 403, errorMessage: 'forbidden' }, supervisor.captureProbeReportScope());
+    supervisor.reportProbeResult({ status: 'retry_later', retryAfterMs: 50, errorMessage: 'busy' }, supervisor.captureProbeReportScope());
 
     expect(supervisor.getState()).toEqual(
       expect.objectContaining({

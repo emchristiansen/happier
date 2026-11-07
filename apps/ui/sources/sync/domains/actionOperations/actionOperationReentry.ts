@@ -251,6 +251,15 @@ export function createActionOperationReentryRegistry(options?: Readonly<{ maxEnt
                 ? { kind: 'setup_needs_attention' }
                 : null;
         },
+        acknowledgeSetupNeedsAttention(snapshot: ActionOperationSnapshotV1): boolean {
+            if (snapshot.actionId !== 'session.spawn_new' || snapshot.state !== 'succeeded') return false;
+            const requestId = snapshotRequestId(snapshot);
+            const entry = requestId ? entries.get(entryKey(snapshot.scope.accountId, requestId)) : null;
+            if (entry?.workflow !== 'setup_needs_attention' || !entry.createdSessionId) return false;
+            entry.workflow = 'complete';
+            retain(entry);
+            return true;
+        },
         subscribe(listener: () => void): () => void {
             listeners.add(listener);
             return () => listeners.delete(listener);

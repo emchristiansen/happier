@@ -87,7 +87,11 @@ export type VoiceAgentSessionController = Readonly<{
   appendContextUpdate: (sessionId: string, update: string) => void;
   commit: (sessionId: string) => Promise<string>;
   ensureRunning: (sessionId: string) => Promise<void>;
-  ensureRunningAndMaybeWelcome: (sessionId: string) => Promise<string | null>;
+  /**
+   * `signal` is the welcome attempt's ownership: once it is aborted the attempt is superseded, and its
+   * outcome no longer counts as this agent's welcome even when the agent itself is still current.
+   */
+  ensureRunningAndMaybeWelcome: (sessionId: string, options?: Readonly<{ signal?: AbortSignal }>) => Promise<string | null>;
   isActive: (sessionId: string) => boolean;
   commitUserTranscript: (sessionId: string, userText: string, localId: string) => Promise<void>;
   sendInterruptingTextUpdate: (
@@ -454,7 +458,7 @@ export function createVoiceAgentSessionController(): VoiceAgentSessionController
     ensureRunning: async (sessionId: string) => {
       await getVoiceAgentHandle(sessionId);
     },
-    ensureRunningAndMaybeWelcome: async (sessionId: string) => {
+    ensureRunningAndMaybeWelcome: async (sessionId: string, options?: Readonly<{ signal?: AbortSignal }>) => {
       const settings: any = storage.getState().settings;
       const agentCfg = settings?.voice?.adapters?.local_conversation?.agent ?? null;
       const welcomeCfg = agentCfg?.welcome ?? null;
@@ -474,14 +478,21 @@ export function createVoiceAgentSessionController(): VoiceAgentSessionController
       }
 
       const handle = await getVoiceAgentHandle(sessionId);
+      // The welcome belongs to the agent it was requested from. Once stop() or a reconnect has
+      // replaced that agent, its late outcome must not touch the successor's bookkeeping.
+      const isRequestingAgentCurrent = () => voiceAgentBySessionId.get(sessionId) === handle;
+      // A cancel and rearm keeps the same agent, so the attempt must also still be current: a superseded
+      // welcome was never delivered and must not stand in for the welcome of the attempt that replaced it.
+      const isWelcomeAttemptCurrent = () => isRequestingAgentCurrent() && options?.signal?.aborted !== true;
       try {
         const res = await handle.client.welcome({ sessionId: handle.rpcSessionId, voiceAgentId: handle.voiceAgentId });
         const assistantText = String(res?.assistantText ?? '').trim();
         if (!assistantText) return null;
-        voiceAgentWelcomeEpochBySessionId.set(sessionId, epoch);
+        if (isWelcomeAttemptCurrent()) voiceAgentWelcomeEpochBySessionId.set(sessionId, epoch);
         return assistantText;
       } catch (error) {
-        if (isVoiceAgentNotFoundError(error)) {
+        // Not-found describes the agent, not the attempt: it invalidates the handle whichever attempt saw it.
+        if (isVoiceAgentNotFoundError(error) && isRequestingAgentCurrent()) {
           voiceAgentBySessionId.delete(sessionId);
         }
         return null;

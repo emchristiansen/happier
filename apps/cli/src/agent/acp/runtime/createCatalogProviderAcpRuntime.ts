@@ -8,14 +8,9 @@ import type { ApiSessionClient } from '@/api/session/sessionClient';
 import type { PermissionMode } from '@/api/types';
 import type { MessageBuffer } from '@/ui/ink/messageBuffer';
 import { logger } from '@/ui/logger';
-import {
-  sendPermissionRequestPushNotificationForActiveAccount,
-  type PermissionRequestPushSender,
-} from '@/settings/notifications/permissionRequestPush';
 import { createAgentSessionMediaPersister } from '@/session/sessionMedia/createAgentSessionMediaPersister';
 import { createSessionMediaAccessPolicy } from '@/session/sessionMedia/createSessionMediaAccessPolicy';
-import { AGENTS_CORE, getProviderCliRuntimeSpec, isAgentMediaCapabilitySupported } from '@happier-dev/agents';
-import { getSessionNotificationTitle } from '@/agent/runtime/readyNotificationContext';
+import { AGENTS_CORE, isAgentMediaCapabilitySupported, supportsAgentInFlightSteer } from '@happier-dev/agents';
 import type { SessionProviderInputConsumer } from '@/agent/runtime/sessionInput/types';
 import { createVendorResumeIdMetadataPublisher } from '@/session/metadata/createVendorResumeIdMetadataPublisher';
 
@@ -27,21 +22,20 @@ export type CatalogProviderSessionIdentityPublication =
 
 /** Backend options a pre-spawn resolver may contribute — everything except the host-owned fields. */
 export type CatalogBackendOptionsBeforeSpawn<TBackendOptions extends object> =
-  Partial<Omit<TBackendOptions, 'cwd' | 'mcpServers' | 'permissionHandler' | 'permissionMode' | 'happierSessionId'>>;
+  Partial<Omit<TBackendOptions, 'cwd' | 'mcpServers' | 'permissionHandler' | 'permissionMode' | 'getPermissionMode' | 'happierSessionId'>>;
 
 type CatalogAcpProviderRuntimeParams<TBackendOptions extends object> = {
   provider: Parameters<typeof createCatalogAcpBackend>[0];
   loggerLabel: string;
   directory: string;
   session: ApiSessionClient;
-  pushSender?: PermissionRequestPushSender;
   messageBuffer: MessageBuffer;
   mcpServers: Record<string, McpServerConfig>;
   permissionHandler: AcpPermissionHandler;
   onThinkingChange: (thinking: boolean) => void;
   processEnv?: NodeJS.ProcessEnv;
   getSessionOpenAbortSignal?: () => AbortSignal | undefined;
-  backendOptions?: Omit<TBackendOptions, 'cwd' | 'mcpServers' | 'permissionHandler' | 'permissionMode' | 'happierSessionId'>;
+  backendOptions?: Omit<TBackendOptions, 'cwd' | 'mcpServers' | 'permissionHandler' | 'permissionMode' | 'getPermissionMode' | 'happierSessionId'>;
   /**
    * Additional backend options resolved inside `ensureBackend`, immediately before the
    * backend process is constructed and spawned — for options (e.g. a resolved system
@@ -49,7 +43,7 @@ type CatalogAcpProviderRuntimeParams<TBackendOptions extends object> = {
    * runtime-construction time.
    *
    * The returned shape is the same host-excluded subset as {@link backendOptions}:
-   * `cwd`, `mcpServers`, `permissionHandler`, `permissionMode`, and `happierSessionId`
+   * `cwd`, `mcpServers`, `permissionHandler`, `permissionMode`, `getPermissionMode`, and `happierSessionId`
    * are owned by the runtime and cannot be overridden here (the merge applies them last
    * as defense in depth). Rejection propagates and prevents the spawn.
    */
@@ -76,39 +70,6 @@ type CatalogAcpProviderRuntimeParams<TBackendOptions extends object> = {
 export function createCatalogProviderAcpRuntime<TBackendOptions extends object = Record<string, never>>(
   params: CatalogAcpProviderRuntimeParams<TBackendOptions>,
 ) {
-  const sendPermissionPush = (evt: { permissionId: string; toolName: string }): void => {
-    if (!params.pushSender) return;
-    try {
-      sendPermissionRequestPushNotificationForActiveAccount({
-        pushSender: params.pushSender,
-        sessionId: params.session.sessionId,
-        sessionTitle: getSessionNotificationTitle(params.session.getMetadataSnapshot?.bind(params.session)) ?? params.session.sessionId,
-        agentDisplayName: getProviderCliRuntimeSpec(params.provider).title,
-        permissionId: evt.permissionId,
-        toolName: evt.toolName,
-        permissionMode: params.getPermissionMode?.(),
-      });
-    } catch {
-      // best-effort
-    }
-  };
-  const hooks = params.hooks
-    ? {
-        ...params.hooks,
-        onPermissionRequest: (evt: { permissionId: string; toolName: string; payload: unknown; reason: string }) => {
-          try {
-            params.hooks?.onPermissionRequest?.(evt);
-          } catch {
-            // ignore
-          }
-          sendPermissionPush(evt);
-        },
-      }
-    : {
-        onPermissionRequest: (evt: { permissionId: string; toolName: string; payload: unknown; reason: string }) => {
-          sendPermissionPush(evt);
-        },
-      };
   const shouldPersistSessionMedia =
     process.env.HAPPIER_TRANSCRIPT_STORAGE !== 'direct' &&
     isAgentMediaCapabilitySupported(params.provider, 'emitsSessionMedia');
@@ -131,10 +92,18 @@ export function createCatalogProviderAcpRuntime<TBackendOptions extends object =
     return params.sessionIdentity;
   })();
 
+  const getPermissionMode = () => params.resolvePermissionMode
+    ? params.resolvePermissionMode({
+        getPermissionMode: params.getPermissionMode,
+        session: params.session,
+      })
+    : params.getPermissionMode?.();
+
   return createAcpRuntime({
     provider: params.provider,
     directory: params.directory,
     happierSessionId: params.session.sessionId,
+    processEnv: params.processEnv,
     session: params.session,
     messageBuffer: params.messageBuffer,
     mcpServers: params.mcpServers,
@@ -143,8 +112,8 @@ export function createCatalogProviderAcpRuntime<TBackendOptions extends object =
     getSessionOpenAbortSignal: params.getSessionOpenAbortSignal,
     sessionIdentity,
     resolveExpectedVendorSessionIdForResume: params.resolveExpectedVendorSessionIdForResume,
-    hooks,
-    inFlightSteer: params.inFlightSteer,
+    hooks: params.hooks,
+    inFlightSteer: params.inFlightSteer ?? { enabled: supportsAgentInFlightSteer(params.provider) },
     memoryRecallGuidance: params.memoryRecallGuidance,
     resolveSessionModelConfigUpdate: params.resolveSessionModelConfigUpdate,
     deriveSessionModelsFromConfigOptions: params.deriveSessionModelsFromConfigOptions,
@@ -171,12 +140,7 @@ export function createCatalogProviderAcpRuntime<TBackendOptions extends object =
         }
       : {}),
     ensureBackend: async () => {
-      const permissionModeRaw = params.resolvePermissionMode
-        ? params.resolvePermissionMode({
-            getPermissionMode: params.getPermissionMode,
-            session: params.session,
-          })
-        : params.getPermissionMode?.();
+      const permissionModeRaw = getPermissionMode();
       const permissionMode = typeof permissionModeRaw === 'string' ? permissionModeRaw : undefined;
 
       const resolvedBackendOptions = params.resolveBackendOptionsBeforeSpawn
@@ -191,6 +155,7 @@ export function createCatalogProviderAcpRuntime<TBackendOptions extends object =
         mcpServers: params.mcpServers,
         permissionHandler: params.permissionHandler,
         permissionMode,
+        getPermissionMode,
         happierSessionId: params.session.sessionId,
         ...(params.processEnv ? { env: params.processEnv } : {}),
       } as unknown as TBackendOptions);

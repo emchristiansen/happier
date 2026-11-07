@@ -41,7 +41,15 @@ export function resolveVitestShardRange(env, shardCount) {
   return { start, end, part, parts };
 }
 
-export function resolveVitestIsolationPlan(configPath) {
+function buildCompleteIsolatedRuns(file, patterns) {
+  return [
+    ...patterns.map((testNamePattern) => ({ file, testNamePattern })),
+    // Keep the final fresh process exhaustive when a case or describe is renamed.
+    { file, testNamePattern: `^(?![\\s\\S]*(?:${patterns.join('|')}))[\\s\\S]*$` },
+  ];
+}
+
+export function resolveVitestIsolationPlan(configPath, { part = 1, parts = 1 } = {}) {
   if (typeof configPath !== 'string' || basename(configPath) !== 'vitest.config.ts') {
     return { shardExcludes: [], runs: [] };
   }
@@ -59,7 +67,10 @@ export function resolveVitestIsolationPlan(configPath) {
   const claudeSignalCleanupFile = 'src/backends/claude/sdk/query.signalCleanup.test.ts';
   const codexAppServerClientFile = 'src/backends/codex/appServer/client/createCodexAppServerClient.test.ts';
   const processRunStateFile = 'src/daemon/processRunState.test.ts';
+  const daemonStartSyncOwnershipFile = 'src/cli/commands/daemon.startSyncOwnership.test.ts';
+  const nonInteractiveAuthFile = 'src/ui/auth.nonInteractiveBoth.test.ts';
   const durableMutationOutboxFile = 'src/api/session/sessionClient.durableMutationOutbox.test.ts';
+  const ephemeralExecutionRunPromptFile = 'src/agent/executionRuns/runtime/runEphemeralExecutionRunTextPrompt.test.ts';
   return {
     shardExcludes: [
       daemonServiceFile,
@@ -76,16 +87,21 @@ export function resolveVitestIsolationPlan(configPath) {
       claudeSignalCleanupFile,
       codexAppServerClientFile,
       processRunStateFile,
+      daemonStartSyncOwnershipFile,
+      nonInteractiveAuthFile,
       durableMutationOutboxFile,
+      ephemeralExecutionRunPromptFile,
     ],
     runs: [
-      { file: daemonServiceFile, testNamePattern: 'runDaemonServiceCliCommand (?:allows|expands|prefers|resolves|restarts|restores|sets|treats)\\b' },
-      { file: daemonServiceFile, testNamePattern: 'runDaemonServiceCliCommand (?:defaults|fails|plans|refreshes|reports|stops|supports|uses)\\b' },
-      { file: daemonServiceFile, testNamePattern: 'runDaemonServiceCliCommand (?:builds|includes|keeps|passes|rejects|respects|scopes|uninstalls)\\b' },
-      { file: sessionHandoffFile, testNamePattern: '^rpcHandlers \\(session handoff\\) (?:aborts|acknowledges|applies|claims|classifies|delegates|does|durably)\\b' },
-      { file: sessionHandoffFile, testNamePattern: '^rpcHandlers \\(session handoff\\) (?:fails|keeps)\\b' },
-      { file: sessionHandoffFile, testNamePattern: '^rpcHandlers \\(session handoff\\) (?:maps|normalizes|omits|passes|persists|prefers|propagates|publishes|recovers|registers|rejects|retries)\\b' },
-      { file: sessionHandoffFile, testNamePattern: '^rpcHandlers \\(session handoff\\) (?:returns|reuses|serves|starts|stops|surfaces|tracks|uses|waits)\\b' },
+      ...buildCompleteIsolatedRuns(daemonServiceFile, [
+        'runDaemonServiceCliCommand (?:allows|expands|prefers|resolves|restarts|restores|sets|treats)\\b',
+        'runDaemonServiceCliCommand (?:defaults|fails|plans|refreshes|reports|stops|supports|uses)\\b',
+      ]),
+      ...buildCompleteIsolatedRuns(sessionHandoffFile, [
+        '^rpcHandlers \\(session handoff\\) (?:aborts|acknowledges|applies|claims|classifies|delegates|does|durably)\\b',
+        '^rpcHandlers \\(session handoff\\) (?:fails|keeps)\\b',
+        '^rpcHandlers \\(session handoff\\) (?:maps|normalizes|omits|passes|persists|prefers|propagates|publishes|recovers|registers|rejects|retries)\\b',
+      ]),
       { file: unifiedTranscriptBridgeFile, testNamePattern: '.*' },
       { file: sessionScannerFile, testNamePattern: '.*' },
       { file: codexAppServerRuntimeFile, testNamePattern: '.*' },
@@ -98,8 +114,11 @@ export function resolveVitestIsolationPlan(configPath) {
       { file: claudeSignalCleanupFile, testNamePattern: '.*' },
       { file: codexAppServerClientFile, testNamePattern: '.*' },
       { file: processRunStateFile, testNamePattern: '.*' },
+      { file: daemonStartSyncOwnershipFile, testNamePattern: '.*' },
+      { file: nonInteractiveAuthFile, testNamePattern: '.*' },
       { file: durableMutationOutboxFile, testNamePattern: '.*' },
-    ],
+      { file: ephemeralExecutionRunPromptFile, testNamePattern: '.*' },
+    ].filter((_, index) => index % parts === part - 1),
   };
 }
 
@@ -160,9 +179,7 @@ async function main(argv) {
   const shardCount = resolveVitestShardCount(process.env, configPath);
   const workerArgs = resolveVitestWorkerArgs(process.env, configPath);
   const shardRange = resolveVitestShardRange(process.env, shardCount);
-  const isolationPlan = shardRange.part === 1
-    ? resolveVitestIsolationPlan(configPath)
-    : { shardExcludes: resolveVitestIsolationPlan(configPath).shardExcludes, runs: [] };
+  const isolationPlan = resolveVitestIsolationPlan(configPath, shardRange);
   const sizeMb = resolveMaxOldSpaceSizeMb(process.env);
   const nodeOptions = upsertMaxOldSpaceSize(process.env.NODE_OPTIONS, sizeMb);
 

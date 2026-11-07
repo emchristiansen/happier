@@ -3,6 +3,8 @@ import {
   installProviderCli as installProviderCliDefault,
   resolvePlatformFromNodePlatform,
   type InstallProviderCliResult,
+  type ProviderCliCommandResolution,
+  type ProviderCliInstallIntent,
 } from '@happier-dev/cli-common/providers';
 
 export type ProviderCliInstallInvocationParams = Readonly<{
@@ -10,6 +12,8 @@ export type ProviderCliInstallInvocationParams = Readonly<{
   skipIfInstalled?: boolean;
   platform?: string;
   allowVendorRecipeExecution?: boolean;
+  intent?: ProviderCliInstallIntent;
+  updateTarget?: ProviderCliCommandResolution | null;
 }>;
 
 export type ProviderCliInstallInvocationResult =
@@ -21,7 +25,13 @@ export type ProviderCliInstallInvocationResult =
     }>
   | Readonly<{
       ok: false;
-      errorCode: 'unsupported-platform' | 'install-not-available' | 'install-confirmation-required' | 'install-failed';
+      errorCode:
+        | 'unsupported-platform'
+        | 'install-not-available'
+        | 'install-confirmation-required'
+        | 'install-failed'
+        | 'archive-expanded-byte-limit'
+        | 'update-not-available';
       errorMessage: string;
       logPath: string | null;
     }>;
@@ -41,6 +51,7 @@ export async function invokeProviderCliInstall(params: Readonly<{
   env?: NodeJS.ProcessEnv;
   nodePlatform?: string;
   installProviderCli?: typeof installProviderCliDefault;
+  signal?: AbortSignal;
 }>): Promise<ProviderCliInstallInvocationResult> {
   const nodePlatform = params.nodePlatform ?? process.platform;
   const platform = resolveProviderCliInstallPlatform({
@@ -63,6 +74,7 @@ export async function invokeProviderCliInstall(params: Readonly<{
     typeof params.params?.allowVendorRecipeExecution === 'boolean'
       ? params.params.allowVendorRecipeExecution
       : !dryRun;
+  const intent = params.params?.intent === 'update' ? 'update' : null;
   const result = await installProviderCli({
     providerId: params.agentId,
     platform,
@@ -70,6 +82,8 @@ export async function invokeProviderCliInstall(params: Readonly<{
     skipIfInstalled,
     allowVendorRecipeExecution,
     env: params.env ?? process.env,
+    ...(params.signal ? { signal: params.signal } : {}),
+    ...(intent ? { intent, updateTarget: params.params?.updateTarget ?? null } : {}),
   });
 
   if (!result.ok) {
@@ -80,7 +94,9 @@ export async function invokeProviderCliInstall(params: Readonly<{
           ? 'install-not-available'
           : result.errorCode === 'vendor-recipe-disallowed'
             ? 'install-confirmation-required'
-            : 'install-failed',
+            : result.errorCode === 'update-not-available' || result.errorCode === 'archive-expanded-byte-limit'
+              ? result.errorCode
+              : 'install-failed',
       errorMessage: result.errorMessage,
       logPath: result.logPath ?? null,
     };

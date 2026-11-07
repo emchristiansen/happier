@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { AgentBackend, SessionId } from '@/agent/core/AgentBackend';
+import { logger } from '@/ui/logger';
 import { extractVoiceActionsFromAssistantText, type ExecutionRunResumeHandle, type VoiceAssistantAction } from '@happier-dev/protocol';
 
 import { appendVoiceAgentHistoryTurn } from './voiceAgentHistory';
@@ -27,6 +28,7 @@ import type {
   VoiceAgentTurnStreamStartResult,
 } from './voiceAgentTypes';
 import { VoiceAgentError } from './voiceAgentTypes';
+
 import { resolveVoiceActionBlockMemoryRecallGuidanceEnabled } from './resolveVoiceActionBlockMemoryRecallGuidanceEnabled';
 
 export type {
@@ -39,6 +41,40 @@ export type {
 } from './voiceAgentTypes';
 export { VoiceAgentError } from './voiceAgentTypes';
 
+type InitializingVoiceAgent = Readonly<{
+  kind: 'initializing';
+  id: string;
+  dispose: () => Promise<void>;
+}>;
+
+/** Models often decorate the READY handshake ("Ready.", "READY!"); only the word itself matters. */
+function isVoiceAgentReadyHandshakeReply(text: string): boolean {
+  return text.trim().replace(/[\s.!"'`*]+$/u, '').replace(/^[\s"'`*]+/u, '').toUpperCase() === 'READY';
+}
+
+async function awaitWithinVoiceAgentBootstrapBudget<T>(promise: Promise<T>, budgetMs: number): Promise<T> {
+  if (budgetMs <= 0) {
+    // The deadline error supersedes whatever the abandoned step settles with later.
+    promise.catch(() => {});
+    throw new VoiceAgentError('VOICE_AGENT_START_FAILED', 'Voice agent bootstrap budget exhausted');
+  }
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new VoiceAgentError('VOICE_AGENT_START_FAILED', `Voice agent bootstrap timed out after ${budgetMs}ms`)),
+          budgetMs,
+        );
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export class VoiceAgentManager {
   private static readonly MAX_HISTORY_TURNS = 48;
   private static readonly MAX_TURN_TEXT_CHARS = 4_000;
@@ -48,9 +84,16 @@ export class VoiceAgentManager {
   private readonly resolveSystemAppendBlocks: (args: ResolveVoiceSystemAppendBlocksArgs) => Promise<readonly string[]>;
   private readonly responseTimeoutMs: number;
   private readonly getNowMs: () => number;
-  private readonly voiceAgents = new Map<string, VoiceAgentInstance>();
+  private readonly onActivityChanged: ((voiceAgentId: string) => void) | undefined;
+  private readonly voiceAgents = new Map<string, VoiceAgentInstance | InitializingVoiceAgent>();
   private readonly reaper: NodeJS.Timeout;
   private disposed = false;
+  private disposalPromise: Promise<void> | null = null;
+
+  private getReadyVoiceAgent(voiceAgentId: string): VoiceAgentInstance | null {
+    const entry = this.voiceAgents.get(voiceAgentId);
+    return entry && !('kind' in entry) ? entry : null;
+  }
 
   private normalizeAssistantTextForActions(
     assistantText: string,
@@ -76,6 +119,7 @@ export class VoiceAgentManager {
     responseTimeoutMs?: number;
     getNowMs?: () => number;
     reaperIntervalMs?: number;
+    onActivityChanged?: (voiceAgentId: string) => void;
   }>) {
     this.createBackend = opts.createBackend;
     this.resolveSystemAppendBlocks = opts.resolveSystemAppendBlocks ?? (async () => []);
@@ -84,6 +128,7 @@ export class VoiceAgentManager {
         ? Math.floor(opts.responseTimeoutMs)
         : 120_000;
     this.getNowMs = opts.getNowMs ?? (() => Date.now());
+    this.onActivityChanged = opts.onActivityChanged;
     const intervalMs = Math.max(5_000, Math.floor(opts.reaperIntervalMs ?? 30_000));
     this.reaper = setInterval(() => {
       void this.reapIdle();
@@ -91,8 +136,30 @@ export class VoiceAgentManager {
     this.reaper.unref?.();
   }
 
+  isTurnInFlight(voiceAgentId: string): boolean {
+    return this.getReadyVoiceAgent(voiceAgentId)?.inFlight != null;
+  }
+
+  private notifyActivityChanged(voiceAgentId: string): void {
+    try {
+      this.onActivityChanged?.(voiceAgentId);
+    } catch (error) {
+      logger.infoFile('[VOICE AGENT] Failed to publish work activity', { voiceAgentId, error });
+    }
+  }
+
+  private trackInFlight<T>(voiceAgent: VoiceAgentInstance, run: Promise<T>): Promise<T> {
+    voiceAgent.inFlight = run;
+    this.notifyActivityChanged(voiceAgent.id);
+    return run.finally(() => {
+      if (voiceAgent.inFlight !== run) return;
+      voiceAgent.inFlight = null;
+      if (this.voiceAgents.get(voiceAgent.id) === voiceAgent) this.notifyActivityChanged(voiceAgent.id);
+    });
+  }
+
   getResumeHandle(voiceAgentId: string): ExecutionRunResumeHandle | null {
-    const voiceAgent = this.voiceAgents.get(voiceAgentId) ?? null;
+    const voiceAgent = this.getReadyVoiceAgent(voiceAgentId);
     if (!voiceAgent) return null;
     if (voiceAgent.commitBackend && voiceAgent.commitSessionId) {
       return {
@@ -129,6 +196,9 @@ export class VoiceAgentManager {
         if (typeof msg.fullText === 'string') voiceAgent.commitBuffer = msg.fullText;
       });
 
+      // The instance owns the acquired process before native-open acknowledgement.
+      voiceAgent.commitBackend = commitBackend;
+
       const sessionId = await (async () => {
         if (voiceAgent.commitResumeSessionId && commitBackend.loadSession) {
           const loaded = await commitBackend.loadSession(voiceAgent.commitResumeSessionId);
@@ -138,10 +208,16 @@ export class VoiceAgentManager {
         return started.sessionId;
       })();
 
-      voiceAgent.commitBackend = commitBackend;
+      if (this.disposed || this.voiceAgents.get(voiceAgent.id) !== voiceAgent) {
+        throw new VoiceAgentError('VOICE_AGENT_START_FAILED', 'Voice agent is no longer active');
+      }
       voiceAgent.commitSessionId = sessionId;
       voiceAgent.commitResumeSessionId = null;
     } catch (e: any) {
+      if (voiceAgent.commitBackend === commitBackend) {
+        voiceAgent.commitBackend = null;
+        voiceAgent.commitSessionId = null;
+      }
       if (commitBackend) await commitBackend.dispose().catch(() => {});
       throw new VoiceAgentError('VOICE_AGENT_START_FAILED', e instanceof Error ? e.message : 'commit backend unavailable');
     }
@@ -183,6 +259,17 @@ export class VoiceAgentManager {
 
     let chatBackendForCleanup: AgentBackend | undefined;
     let instanceRef: VoiceAgentInstance | null = null;
+    let backendDisposal: Promise<void> | null = null;
+    const disposeAcquiredBackends = (): Promise<void> => {
+      backendDisposal ??= (async () => {
+        const disposals: Promise<unknown>[] = [];
+        if (chatBackendForCleanup) disposals.push(chatBackendForCleanup.dispose());
+        if (instanceRef?.commitBackend) disposals.push(instanceRef.commitBackend.dispose());
+        await Promise.allSettled(disposals);
+        await releaseConnectedServicesOnce();
+      })();
+      return backendDisposal;
+    };
     try {
       const resume = (() => {
         const handle = params.resumeHandle ?? null;
@@ -198,6 +285,8 @@ export class VoiceAgentManager {
 
       const connectedServicesEnv = params.connectedServicesEnv ?? null;
 
+      if (this.disposed) throw new VoiceAgentError('VOICE_AGENT_START_FAILED', 'Manager is disposed');
+
       const chatBackend = (chatBackendForCleanup = this.createBackend({
         agentId: params.agentId,
         modelId: params.chatModelId,
@@ -205,6 +294,10 @@ export class VoiceAgentManager {
         start: { intent: 'voice_agent' },
         connectedServicesEnv,
       }));
+      const initializing: InitializingVoiceAgent = {
+        kind: 'initializing', id: voiceAgentId, dispose: disposeAcquiredBackends,
+      };
+      this.voiceAgents.set(voiceAgentId, initializing);
 
       const clearChatBuffer = () => {
         if (instanceRef) instanceRef.chatBuffer = '';
@@ -233,7 +326,11 @@ export class VoiceAgentManager {
         }
       });
 
-      const chatSessionId = await (async () => {
+      // Session start/load and the READY handshake are one bootstrap: they share a single deadline
+      // derived from the bootstrap budget instead of each waiting the full budget (or unbounded).
+      const bootstrapDeadlineMs = this.getNowMs() + this.resolveResponseTimeoutMs(params.bootstrapTimeoutMs);
+      const remainingBootstrapBudgetMs = () => Math.max(0, bootstrapDeadlineMs - this.getNowMs());
+      const chatSessionId = await awaitWithinVoiceAgentBootstrapBudget((async () => {
         if (resume.chatSessionId) {
           if (!chatBackend.loadSession) {
             throw new VoiceAgentError('VOICE_AGENT_START_FAILED', 'Backend does not support resume');
@@ -243,7 +340,11 @@ export class VoiceAgentManager {
         }
         const started = await chatBackend.startSession();
         return started.sessionId;
-      })();
+      })(), remainingBootstrapBudgetMs());
+
+      if (this.disposed || this.voiceAgents.get(voiceAgentId) !== initializing) {
+        throw new VoiceAgentError('VOICE_AGENT_START_FAILED', 'Voice agent is no longer active');
+      }
 
       const instance: VoiceAgentInstance = {
         id: voiceAgentId,
@@ -273,45 +374,43 @@ export class VoiceAgentManager {
         clearChatBuffer,
         clearCommitBuffer,
         activeTurnStream: null,
-        dispose: async () => {
-          const disposals: Promise<unknown>[] = [chatBackend.dispose()];
-          if (instance.commitBackend) disposals.push(instance.commitBackend.dispose());
-          await Promise.allSettled(disposals);
-          // Run-scoped CS release: exactly once, AFTER the backends are gone (the materialized run
-          // root must outlive both chat + commit backends). Idempotent across stop/reap/dispose.
-          await releaseConnectedServicesOnce();
-        },
+        dispose: disposeAcquiredBackends,
       };
       instanceRef = instance;
 
       this.voiceAgents.set(voiceAgentId, instance);
 
       if (resume.commitSessionId) {
-        await this.ensureCommitBackendSession(instance);
+        await this.trackInFlight(instance, this.ensureCommitBackendSession(instance));
       }
 
       const bootstrapMode = params.bootstrapMode ?? 'none';
       if (!resume.chatSessionId && bootstrapMode === 'ready_handshake') {
-        const shouldDeferInitialContextUntilFirstTurn = params.initialContextMode === 'first_turn';
-        instance.clearChatBuffer();
-        const prompt = buildVoiceAgentBootstrapPrompt({
-          verbosity: instance.verbosity,
-          initialContext: shouldDeferInitialContextUntilFirstTurn ? '' : instance.initialContext,
-          mode: 'ready_handshake',
-          disabledActionIds: instance.disabledActionIds,
-          memoryRecallGuidanceEnabled: instance.memoryRecallGuidanceEnabled,
-          systemAppendBlocks: instance.systemAppendBlocks,
-        });
-        await instance.chatBackend.sendPrompt(instance.chatSessionId, prompt);
-        if (instance.chatBackend.waitForResponseComplete) {
-          await instance.chatBackend.waitForResponseComplete(this.resolveResponseTimeoutMs(params.bootstrapTimeoutMs));
-        }
-        const response = instance.chatBuffer.trim();
-        if (response.toUpperCase() !== 'READY') {
-          throw new VoiceAgentError('VOICE_AGENT_START_FAILED', 'Bootstrap failed');
-        }
-        instance.clearChatBuffer();
-        instance.bootstrapped = !shouldDeferInitialContextUntilFirstTurn;
+        await this.trackInFlight(instance, (async () => {
+          const shouldDeferInitialContextUntilFirstTurn = params.initialContextMode === 'first_turn';
+          instance.clearChatBuffer();
+          const prompt = buildVoiceAgentBootstrapPrompt({
+            verbosity: instance.verbosity,
+            initialContext: shouldDeferInitialContextUntilFirstTurn ? '' : instance.initialContext,
+            mode: 'ready_handshake',
+            disabledActionIds: instance.disabledActionIds,
+            memoryRecallGuidanceEnabled: instance.memoryRecallGuidanceEnabled,
+            systemAppendBlocks: instance.systemAppendBlocks,
+          });
+          // The whole handshake (prompt write + response) stays inside the bootstrap deadline: a stalled
+          // write or a backend whose response wait extends on every update must not outlive it.
+          await awaitWithinVoiceAgentBootstrapBudget((async () => {
+            await instance.chatBackend.sendPrompt(instance.chatSessionId, prompt);
+            if (instance.chatBackend.waitForResponseComplete) {
+              await instance.chatBackend.waitForResponseComplete(Math.max(1, remainingBootstrapBudgetMs()));
+            }
+          })(), remainingBootstrapBudgetMs());
+          if (!isVoiceAgentReadyHandshakeReply(instance.chatBuffer)) {
+            throw new VoiceAgentError('VOICE_AGENT_START_FAILED', 'Bootstrap failed');
+          }
+          instance.clearChatBuffer();
+          instance.bootstrapped = !shouldDeferInitialContextUntilFirstTurn;
+        })());
       }
 
       return {
@@ -323,20 +422,8 @@ export class VoiceAgentManager {
         },
       };
     } catch (e: any) {
-      if (instanceRef) {
-        // Post-registration failure (e.g. bootstrap handshake throw): drop the half-started instance
-        // from the registry and route through its dispose, which tears down both backends and releases
-        // the run root exactly once (R4-1) — the reaper/dispose must never see a failed instance.
-        this.voiceAgents.delete(instanceRef.id);
-        await instanceRef.dispose().catch(() => {});
-      } else {
-        // Pre-instance failure: no instance owns the release, so dispose the bare chat backend and
-        // release the materialized run root here so it does not leak (R4-1).
-        const disposals: Promise<unknown>[] = [];
-        if (chatBackendForCleanup) disposals.push(chatBackendForCleanup.dispose());
-        await Promise.allSettled(disposals);
-        await releaseConnectedServicesOnce();
-      }
+      this.voiceAgents.delete(voiceAgentId);
+      await disposeAcquiredBackends().catch(() => {});
       if (e instanceof VoiceAgentError) {
         throw e;
       }
@@ -344,24 +431,28 @@ export class VoiceAgentManager {
     }
   }
 
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
+  dispose(): Promise<void> {
+    if (this.disposalPromise) return this.disposalPromise;
     this.disposed = true;
     clearInterval(this.reaper);
 
     const toStop = [...this.voiceAgents.values()];
     this.voiceAgents.clear();
+    for (const voiceAgent of toStop) {
+      if (!('kind' in voiceAgent) && voiceAgent.inFlight) this.notifyActivityChanged(voiceAgent.id);
+    }
 
-    await Promise.allSettled(
+    this.disposalPromise = Promise.allSettled(
       toStop.map(async (m) => {
-        if (m.inFlight) await m.inFlight.catch(() => {});
         await m.dispose();
+        if (!('kind' in m) && m.inFlight) await m.inFlight.catch(() => {});
       }),
-    );
+    ).then(() => {});
+    return this.disposalPromise;
   }
 
   async sendTurn(params: Readonly<{ voiceAgentId: string; userText: string }>): Promise<VoiceAgentSendTurnResult> {
-    const voiceAgent = this.voiceAgents.get(params.voiceAgentId);
+    const voiceAgent = this.getReadyVoiceAgent(params.voiceAgentId);
     if (!voiceAgent) throw new VoiceAgentError('VOICE_AGENT_NOT_FOUND', 'Voice agent not found');
     if (voiceAgent.inFlight) throw new VoiceAgentError('VOICE_AGENT_BUSY', 'Voice agent busy');
 
@@ -394,16 +485,11 @@ export class VoiceAgentManager {
 		      return extracted.actions.length > 0 ? { assistantText, actions: extracted.actions } : { assistantText };
 		    })();
 
-    voiceAgent.inFlight = run;
-    try {
-      return await run;
-    } finally {
-      if (voiceAgent.inFlight === run) voiceAgent.inFlight = null;
-    }
+    return await this.trackInFlight(voiceAgent, run);
   }
 
   async welcome(params: Readonly<{ voiceAgentId: string; welcomeText?: string }>): Promise<Readonly<{ assistantText: string }>> {
-    const voiceAgent = this.voiceAgents.get(params.voiceAgentId);
+    const voiceAgent = this.getReadyVoiceAgent(params.voiceAgentId);
     if (!voiceAgent) throw new VoiceAgentError('VOICE_AGENT_NOT_FOUND', 'Voice agent not found');
     if (voiceAgent.inFlight || voiceAgent.activeTurnStream) throw new VoiceAgentError('VOICE_AGENT_BUSY', 'Voice agent busy');
 
@@ -432,16 +518,11 @@ export class VoiceAgentManager {
       return { assistantText };
     })();
 
-    voiceAgent.inFlight = run;
-    try {
-      return await run;
-    } finally {
-      if (voiceAgent.inFlight === run) voiceAgent.inFlight = null;
-    }
+    return await this.trackInFlight(voiceAgent, run);
   }
 
   async startTurnStream(params: Readonly<{ voiceAgentId: string; userText: string }>): Promise<VoiceAgentTurnStreamStartResult> {
-    const voiceAgent = this.voiceAgents.get(params.voiceAgentId);
+    const voiceAgent = this.getReadyVoiceAgent(params.voiceAgentId);
     if (!voiceAgent) throw new VoiceAgentError('VOICE_AGENT_NOT_FOUND', 'Voice agent not found');
     if (voiceAgent.inFlight || voiceAgent.activeTurnStream) throw new VoiceAgentError('VOICE_AGENT_BUSY', 'Voice agent busy');
 
@@ -512,11 +593,7 @@ export class VoiceAgentManager {
       }
     })();
 
-	    stream.run = run;
-	    voiceAgent.inFlight = run;
-	    void run.finally(() => {
-	      if (voiceAgent.inFlight === run) voiceAgent.inFlight = null;
-	    });
+    stream.run = this.trackInFlight(voiceAgent, run);
 
     return { streamId };
   }
@@ -524,7 +601,7 @@ export class VoiceAgentManager {
   async readTurnStream(
     params: Readonly<{ voiceAgentId: string; streamId: string; cursor: number; maxEvents?: number }>,
   ): Promise<VoiceAgentTurnStreamReadResult> {
-    const voiceAgent = this.voiceAgents.get(params.voiceAgentId);
+    const voiceAgent = this.getReadyVoiceAgent(params.voiceAgentId);
     if (!voiceAgent) throw new VoiceAgentError('VOICE_AGENT_NOT_FOUND', 'Voice agent not found');
     const stream = voiceAgent.activeTurnStream;
     if (!stream || stream.id !== params.streamId) {
@@ -553,7 +630,7 @@ export class VoiceAgentManager {
   }
 
   async cancelTurnStream(params: Readonly<{ voiceAgentId: string; streamId: string }>): Promise<{ ok: true }> {
-    const voiceAgent = this.voiceAgents.get(params.voiceAgentId);
+    const voiceAgent = this.getReadyVoiceAgent(params.voiceAgentId);
     if (!voiceAgent) throw new VoiceAgentError('VOICE_AGENT_NOT_FOUND', 'Voice agent not found');
     const stream = voiceAgent.activeTurnStream;
     if (!stream || stream.id !== params.streamId) {
@@ -564,7 +641,7 @@ export class VoiceAgentManager {
   }
 
   async commit(params: Readonly<{ voiceAgentId: string; maxChars?: number }>): Promise<VoiceAgentCommitResult> {
-    const voiceAgent = this.voiceAgents.get(params.voiceAgentId);
+    const voiceAgent = this.getReadyVoiceAgent(params.voiceAgentId);
     if (!voiceAgent) throw new VoiceAgentError('VOICE_AGENT_NOT_FOUND', 'Voice agent not found');
     if (voiceAgent.inFlight) throw new VoiceAgentError('VOICE_AGENT_BUSY', 'Voice agent busy');
 
@@ -606,12 +683,7 @@ export class VoiceAgentManager {
       const commitText = voiceAgent.commitBuffer.trim();
       return { commitText };
     })();
-    voiceAgent.inFlight = run;
-    try {
-      return await run;
-    } finally {
-      if (voiceAgent.inFlight === run) voiceAgent.inFlight = null;
-    }
+    return await this.trackInFlight(voiceAgent, run);
   }
 
   async stop(params: Readonly<{ voiceAgentId: string }>): Promise<{ ok: true }> {
@@ -619,13 +691,20 @@ export class VoiceAgentManager {
     if (!voiceAgent) throw new VoiceAgentError('VOICE_AGENT_NOT_FOUND', 'Voice agent not found');
     // Remove from registry first to prevent new operations from starting while we await in-flight work.
     this.voiceAgents.delete(params.voiceAgentId);
-    if (voiceAgent.activeTurnStream) {
-      await this.cancelActiveTurnStream(voiceAgent, voiceAgent.activeTurnStream, { awaitCompletion: false });
+    if ('kind' in voiceAgent) {
+      await voiceAgent.dispose();
+      return { ok: true };
     }
+    if (voiceAgent.inFlight) this.notifyActivityChanged(voiceAgent.id);
+    const cancellation = voiceAgent.activeTurnStream
+      ? this.cancelActiveTurnStream(voiceAgent, voiceAgent.activeTurnStream, { awaitCompletion: false })
+      : Promise.resolve();
+    // Releasing the backend interrupts a pending turn; waiting for that turn first can
+    // retain its process indefinitely when the provider never produces a terminal event.
+    await Promise.all([cancellation, voiceAgent.dispose()]);
     if (voiceAgent.inFlight && !voiceAgent.activeTurnStream) {
       await voiceAgent.inFlight.catch(() => {});
     }
-    await voiceAgent.dispose();
 		    return { ok: true };
 		  }
 
@@ -633,6 +712,7 @@ export class VoiceAgentManager {
 		    const now = this.getNowMs();
 		    const toDispose: VoiceAgentInstance[] = [];
     for (const voiceAgent of this.voiceAgents.values()) {
+      if ('kind' in voiceAgent) continue;
       if (voiceAgent.inFlight) continue;
       if (now - voiceAgent.lastUsedAt > voiceAgent.idleTtlMs) {
         this.voiceAgents.delete(voiceAgent.id);

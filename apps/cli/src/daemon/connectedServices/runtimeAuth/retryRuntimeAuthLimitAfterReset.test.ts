@@ -69,7 +69,7 @@ function harness(input: { lookupGate?: () => Promise<void>; loseAcknowledgement?
     vendorResumeId: 'vendor-1', spawnOptions: { directory: '/project', backendTarget: { kind: 'builtInAgent' as const, agentId: 'claude' as const } } };
   const session = createSessionRecordFixture({ id: sessionId, encryptionMode: 'plain', metadata: '{}', active: false });
   vi.spyOn(axios, 'get').mockImplementation(async (url) => {
-    if (String(url).endsWith(`/v2/sessions/${sessionId}`)) {
+    if (new URL(String(url)).pathname === `/v2/sessions/${sessionId}`) {
       await input.lookupGate?.();
       return { status: 200, data: { session } };
     }
@@ -79,7 +79,7 @@ function harness(input: { lookupGate?: () => Promise<void>; loseAcknowledgement?
   // Consumption removes a queued row but retains its terminal localId/content.
   const terminal = input.terminal ?? new Map<string, unknown>();
   const post = vi.spyOn(axios, 'post').mockImplementation(async (url, body: any) => {
-    if (!String(url).endsWith(`/v2/sessions/${sessionId}/pending`)) throw new Error(`Unexpected HTTP POST: ${url}`);
+    if (new URL(String(url)).pathname !== `/v2/sessions/${sessionId}/pending`) throw new Error(`Unexpected HTTP POST: ${url}`);
     await input.postGate?.();
     if (input.alwaysLoseAcknowledgement || (input.alwaysLoseAcknowledgementAfterFirst && post.mock.calls.length > 1)) {
       terminal.set(body.localId, body);

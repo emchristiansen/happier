@@ -53,7 +53,8 @@ test('the exact server-v0.2.1 gate accepts an optional immutable candidate check
     default: '',
     type: 'string',
   });
-  assert.deepEqual(job.needs, ['trusted_ref_guard']);
+  assert.ok(job.needs.includes('trusted_ref_guard'));
+  assert.ok(job.needs.includes('build-cli'));
   assert.equal(validation?.if, "${{ inputs.checkout_sha != '' }}");
   assert.equal(validation?.env?.CHECKOUT_SHA, '${{ inputs.checkout_sha }}');
   assert.equal(checkout?.with?.ref, "${{ inputs.checkout_sha != '' && inputs.checkout_sha || github.sha }}");
@@ -75,11 +76,13 @@ test('the exact server-v0.2.1 gate accepts an optional immutable candidate check
 });
 
 test('normal release orchestration does not present the two exact regressions as a general compatibility verdict', () => {
-  const releaseWorkflow = workflow('release.yml');
+  const releaseWorkflow = workflow('release-channel.yml');
+  const releaseRoot = workflow('release.yml');
+  const sourceValidation = workflow('release-source-validation.yml');
   const candidateVerification = releaseWorkflow.jobs.verify_release_candidates;
 
-  assert.ok(releaseWorkflow.jobs.ci.needs.includes('release_preflight'));
-  assert.doesNotMatch(JSON.stringify(releaseWorkflow.jobs.ci), /run_e2e_core_slow/);
+  assert.ok(releaseRoot.jobs.source_validation.needs.includes('release_preflight'));
+  assert.doesNotMatch(JSON.stringify(sourceValidation.jobs.ci), /run_e2e_core_slow/);
   assert.equal(releaseWorkflow.jobs.supported_old_relay_compatibility, undefined);
   assert.ok(!candidateVerification.needs.includes('supported_old_relay_compatibility'));
 });

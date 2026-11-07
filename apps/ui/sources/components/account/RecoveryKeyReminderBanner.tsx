@@ -30,7 +30,7 @@ export const RecoveryKeyReminderBanner = React.memo(() => {
         fireAndForget((async () => {
             const [isDismissed, features] = await Promise.all([
                 TokenStorage.getRecoveryKeyReminderDismissed().catch(() => true),
-                getReadyServerFeatures({ timeoutMs: 800 }).catch(() => null),
+                getReadyServerFeatures().catch(() => null),
             ]);
 
             const featureEnabled = isRecoveryKeyReminderEnabled(features);
@@ -53,6 +53,7 @@ export const RecoveryKeyReminderBanner = React.memo(() => {
     return (
         <ItemGroup>
             <Item
+                testID="recovery-key-reminder"
                 title={t('settingsAccount.secretKey')}
                 subtitle={t('settingsAccount.backupDescription')}
                 icon={<Icon name="key" size={29} color={theme.colors.text.secondary} />}
@@ -65,6 +66,7 @@ export const RecoveryKeyReminderBanner = React.memo(() => {
                 showChevron={false}
                 rightElement={
                     <Pressable
+                        testID="recovery-key-reminder-dismiss"
                         onPress={async (event: GestureResponderEvent) => {
                             event.stopPropagation();
                             try {
@@ -79,6 +81,7 @@ export const RecoveryKeyReminderBanner = React.memo(() => {
                         <Icon name="x" size={20} color={theme.colors.text.secondary} />
                     </Pressable>
                 }
+                rightElementOutsidePressable={true}
             />
         </ItemGroup>
     );

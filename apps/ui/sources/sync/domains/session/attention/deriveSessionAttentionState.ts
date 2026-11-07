@@ -13,8 +13,8 @@ export function deriveSessionAttentionState(
     input: DeriveSessionAttentionStateInput,
 ): SessionAttentionState {
     if (input.hasWaitingActivity === true) return 'waiting';
-    if (input.isRunning === true) return 'running';
     if (input.latestTurnStatus === 'failed' && input.lastRuntimeIssue != null) return 'failed';
+    if (input.isRunning === true) return 'running';
     if (hasTerminalMaterializedTurnStatus(input)) return 'idle';
     if (input.hasReviewActivity === true) return 'review';
     return 'idle';

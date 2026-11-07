@@ -13,9 +13,9 @@ import { getTempData, type NewSessionData } from '@/utils/sessions/tempDataStore
 import { fireAndForget } from '@/utils/system/fireAndForget';
 import { tryShowDaemonUnavailableAlertForRpcError } from '@/utils/errors/daemonUnavailableAlert';
 import { type PermissionMode, type ModelMode } from '@/sync/domains/permissions/permissionTypes';
-import { normalizePermissionModeForAgentType } from '@/sync/domains/permissions/permissionModeOptions';
 import {
     getProfileEnvironmentVariables,
+    getProfileDefaultBackendTarget,
     isProfileCompatibleWithBackendTarget,
     type AIBackendProfile,
 } from '@/sync/domains/profiles/profileCompatibility';
@@ -38,10 +38,11 @@ import { normalizeSessionAuthoringConnectedServices } from '@/sync/domains/sessi
 import type { CapabilityId } from '@/sync/api/capabilities/capabilitiesProtocol';
 import {
     buildNewSessionOptionsFromUiState,
+    buildSpawnEnvironmentVariablesFromUiState,
 } from '@/agents/catalog/catalog';
 import { getSecretSatisfaction } from '@/utils/secrets/secretSatisfaction';
 import { isMobileLayoutWidth } from '@/components/sessions/layout/isMobileLayoutWidth';
-import { useProfileMap } from '@/components/sessions/new/modules/profileHelpers';
+import { buildProfileEnvironmentVariablesForSession, useProfileMap } from '@/components/sessions/new/modules/profileHelpers';
 import { newSessionScreenStyles } from '@/components/sessions/new/newSessionScreenStyles';
 import { coerceNewSessionModelMode } from '@/components/sessions/new/hooks/newSessionModelModePolicy';
 import { useCreateNewSession } from '@/components/sessions/new/hooks/useCreateNewSession';
@@ -54,6 +55,7 @@ import { resolveNewSessionCapabilityServerId } from '@/components/sessions/new/m
 import { resolveNewSessionCapabilityProbeContext } from '@/components/sessions/new/modules/newSessionCapabilityProbeContext';
 import type { NewSessionTranscriptStorage } from '@/components/sessions/new/modules/newSessionTranscriptStorage';
 import {
+    isBackendEntrySelectableForNewSession,
     resolveNextSelectableBackendEntryForNewSession,
 } from '@/components/sessions/new/modules/newSessionAgentSelection';
 import type { AgentInputChipPickerOption } from '@/components/sessions/agentInput/components/AgentInputChipPickerTypes';
@@ -123,6 +125,9 @@ import {
     useDeferredRememberedEngineSelection,
 } from '@/components/sessions/new/hooks/screenModel/useDeferredRememberedEngineSelection';
 import { getSuggestions } from '@/components/autocomplete/suggestions';
+import { createPreflightComposerSuggestionCatalogSource } from '@/components/autocomplete/composerSuggestionCatalogs';
+import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
+import { NEW_SESSION_CAPABILITY_PROBE_TIMEOUT_MS } from '@/components/sessions/new/modules/newSessionCapabilityProbeTimeoutMs';
 import type { ComposerSuggestionKindId } from '@/components/autocomplete/composerSuggestionKinds';
 import { resolveNewSessionFileSuggestionScope } from '@/components/sessions/new/modules/resolveNewSessionFileSuggestionScope';
 import { resolveNewSessionDraftAttachmentFlowId } from '@/components/sessions/new/attachments/newSessionDraftAttachmentFlowId';
@@ -144,8 +149,8 @@ import {
 
 // Configuration constants
 const RECENT_PATHS_DEFAULT_VISIBLE = 5;
-// R-9: plugins and skills are session metadata published after spawn, so this host cannot offer
-// them — there is no session to read a catalog from.
+// Native skills and commands are discovered for the selected launch scope before spawn.
+// Vendor plugins remain session-published catalogs.
 //
 // `file` IS offered, because files are not session state: a file search is scoped by machine and
 // folder, and this host has both (the user picks them before composing). It resolves through the
@@ -157,7 +162,9 @@ const RECENT_PATHS_DEFAULT_VISIBLE = 5;
 // would have named its server. It names that server directly instead (`targetServerId`, the
 // server this new session will spawn on), which keeps D-8's same-server rule exact rather than
 // approximate. The reference itself stays relative (`session:<id>`) and carries no server.
-const NEW_SESSION_COMPOSER_SUGGESTION_KINDS: readonly ComposerSuggestionKindId[] = ['file', 'session', 'slashCommand'];
+const NEW_SESSION_COMPOSER_SUGGESTION_KINDS: readonly ComposerSuggestionKindId[] = ['file', 'session', 'skill', 'slashCommand'];
+const readAbsentComposerCatalogs = () => undefined;
+const subscribeAbsentComposerCatalogs = (_listener: () => void) => () => {};
 const styles = newSessionScreenStyles;
 
 function buildNewSessionPopoverSignature(value: unknown): string {
@@ -182,7 +189,7 @@ function setNavigationParams(navigation: unknown, params: Record<string, unknown
     return true;
 }
 
-export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>): NewSessionScreenModel {
+export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string; onDraftRemoved?: () => void }>): NewSessionScreenModel {
     const { theme, rt } = useUnistyles();
     const router = useRouter();
     const navigation = useNavigation();
@@ -567,7 +574,20 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         return raw || null;
     }, [worktreeParam]);
 
-    const { backendTarget, setBackendTarget, builtInAgentId: agentType } = useNewSessionBackendTargetState({
+    // The currently selected profile constrains the new-session backend target: its default
+    // backend target seeds the initial agent, and its allowed backends bound later selections.
+    const selectedProfileForBackendTarget = React.useMemo(() => {
+        if (!useProfiles || !selectedProfileId) return null;
+        return profileMap.get(selectedProfileId) ?? getBuiltInProfile(selectedProfileId) ?? null;
+    }, [profileMap, selectedProfileId, useProfiles]);
+
+    const {
+        backendTarget,
+        setBackendTarget,
+        setBackendTargetAutomatically,
+        hasExplicitBackendTarget,
+        builtInAgentId: agentType,
+    } = useNewSessionBackendTargetState({
         entries: resolvedBackendEntries,
         lastUsedAgent,
         lastUsedBackendTarget,
@@ -740,27 +760,9 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         return machines.find(m => m.id === selectedMachineId) ?? null;
     }, [selectedMachineId, machines]);
     const selectedMachineHomeDir = selectedMachine?.metadata?.homeDir ?? null;
-    // Routed through the registry like every other composer host: the eligible-kind
-    // subset is the only thing that decides which triggers resolve here (INV-1),
-    // and a hand-rolled `startsWith('/')` would be a second decision-maker.
-    const emptyAutocompleteSuggestions = React.useCallback(
-        (query: string, signal: AbortSignal) => getSuggestions(null, query, {
-            kinds: NEW_SESSION_COMPOSER_SUGGESTION_KINDS,
-            // There is genuinely no session yet, so say so rather than passing a fake id. The
-            // spawn target is the only correct scope for `@session` here (D-8).
-            serverId: targetServerId,
-            // The machine and folder the user has chosen for the session about to be spawned:
-            // the same addressing an existing session resolves for itself.
-            workspace: resolveNewSessionFileSuggestionScope({
-                targetServerId,
-                selectedMachineId,
-                selectedMachineHomeDir,
-                selectedPath,
-            }),
-            signal,
-        }),
-        [selectedMachineId, selectedMachineHomeDir, selectedPath, targetServerId],
-    );
+    const composerWorkspace = React.useMemo(() => resolveNewSessionFileSuggestionScope({
+        targetServerId, selectedMachineId, selectedMachineHomeDir, selectedPath,
+    }), [selectedMachineId, selectedMachineHomeDir, selectedPath, targetServerId]);
     const {
         cliAvailability,
         selectedMachineCapabilities,
@@ -841,6 +843,7 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         agentOptionState,
         settings,
         targetServerId,
+        targetMachineId: selectedMachineId,
         router,
         setAgentOptionStateForCurrentAgent,
     });
@@ -928,13 +931,6 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         persistedDraftEntryIntent: scopedPersistedDraft?.entryIntent,
         hydratedTempAuthoringDraft,
         hydratedPersistedAuthoringDraft: hydratedPersistedContentAuthoringDraft,
-    });
-    useNewSessionDraftPromptProjection({
-        scope: draftScope,
-        draftId,
-        promptStore,
-        hasLocalEdit: hasUserEditedSessionPrompt,
-        preferInitialPrompt: hydratedTempAuthoringDraft?.displayText !== undefined || typeof prompt === 'string',
     });
     const [isCreatingLocally, setIsCreating] = React.useState(false);
     const accountActionOperations = useAllActionOperations(draftScope?.accountId ?? '');
@@ -1066,18 +1062,94 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         secretRequirementResultId: typeof secretRequirementResultId === 'string' ? secretRequirementResultId : undefined,
     });
 
+    const catalogProfile = useProfiles ? selectedProfile : null;
+    const catalogProfileId = catalogProfile?.id ?? null;
+    const catalogSelectedSecrets = catalogProfileId ? selectedSecretIdByProfileIdByEnvVarName[catalogProfileId] ?? {} : {};
+    const catalogSessionOnlyValues = catalogProfileId ? sessionOnlySecretValueByProfileIdByEnvVarName[catalogProfileId] ?? {} : {};
+    const catalogDefaultSecrets = catalogProfileId ? secretBindingsByProfileId[catalogProfileId] ?? {} : {};
+    const catalogSecretIds = new Set([...Object.values(catalogSelectedSecrets), ...Object.values(catalogDefaultSecrets)]);
+    const catalogSecrets = secrets.filter((secret) => catalogSecretIds.has(secret.id));
+    const catalogMachineEnv = Object.fromEntries((catalogProfile?.envVarRequirements ?? []).map((requirement) => [
+        requirement.name, Boolean(machineEnvPresence.meta?.[requirement.name]?.isSet),
+    ]));
+    const catalogBaseEnvironment = buildSpawnEnvironmentVariablesFromUiState({
+        agentId: agentType, settings,
+        environmentVariables: catalogProfile ? getProfileEnvironmentVariables(catalogProfile) : undefined,
+        newSessionOptions: { ...agentNewSessionOptions, targetServerId },
+    });
+    const catalogScopeValue = {
+        workspace: composerWorkspace, agentId: agentType, backendTarget,
+        accountId: draftScope?.serverId === targetServerId ? draftScope.accountId : null,
+        profile: catalogProfile, profileId: catalogProfileId,
+        selectedSecretIds: catalogSelectedSecrets, sessionOnlyValues: catalogSessionOnlyValues,
+        defaultBindings: catalogDefaultSecrets, secrets: catalogSecrets, machineEnvReadyByName: catalogMachineEnv,
+        environmentVariables: catalogBaseEnvironment,
+        probeContext: resolveNewSessionCapabilityProbeContext({ backendTarget, settings }),
+        connectedServices: connectedServicesBindingsPayload,
+    };
+    const catalogScope = useStableValueBySignature(catalogScopeValue, stableJsonStringify({
+        ...catalogScopeValue,
+        profile: catalogProfile ? { envVarRequirements: catalogProfile.envVarRequirements } : null,
+        secrets: catalogSecrets.map((secret) => ({ id: secret.id, encryptedValue: secret.encryptedValue })),
+    }));
+    const loadComposerCatalogs = React.useMemo(() => {
+        const workspace = catalogScope.workspace;
+        if (!workspace) return undefined;
+        return createPreflightComposerSuggestionCatalogSource({
+            machineId: workspace.machineId, serverId: workspace.serverId ?? targetServerId,
+            accountId: catalogScope.accountId, agentId: catalogScope.agentId, backendTarget: catalogScope.backendTarget,
+            capabilityParams: () => {
+                const profileEnvironment = catalogScope.profile ? buildProfileEnvironmentVariablesForSession({
+                    profile: catalogScope.profile, secrets: catalogScope.secrets,
+                    defaultBindings: catalogScope.defaultBindings, selectedSecretIds: catalogScope.selectedSecretIds,
+                    sessionOnlyValues: catalogScope.sessionOnlyValues, machineEnvReadyByName: catalogScope.machineEnvReadyByName,
+                    decryptSecretValue: (value) => sync.decryptSecretValue(value),
+                }) : null;
+                if (profileEnvironment && !profileEnvironment.satisfaction.isSatisfied) throw new Error('Selected profile secrets are unresolved');
+                const environmentVariables = buildSpawnEnvironmentVariablesFromUiState({
+                    agentId: catalogScope.agentId, settings,
+                    environmentVariables: profileEnvironment?.environmentVariables,
+                    newSessionOptions: { ...agentNewSessionOptions, targetServerId },
+                });
+                return {
+                    cwd: workspace.path, timeoutMs: NEW_SESSION_CAPABILITY_PROBE_TIMEOUT_MS,
+                    ...(catalogScope.profileId ? { profileId: catalogScope.profileId } : {}),
+                    ...catalogScope.probeContext?.capabilityParams,
+                    ...(catalogScope.connectedServices ? { connectedServices: catalogScope.connectedServices } : {}),
+                    environmentVariables: environmentVariables ?? {},
+                };
+            },
+        });
+    }, [catalogScope]);
+    const preflightComposerCatalogs = React.useSyncExternalStore(
+        loadComposerCatalogs?.subscribe ?? subscribeAbsentComposerCatalogs,
+        loadComposerCatalogs?.getSnapshot ?? readAbsentComposerCatalogs,
+        readAbsentComposerCatalogs,
+    );
+    // Handler identity follows the launch scope. useActiveSuggestions cancels superseded
+    // queries and never applies a late result from the previous machine/folder/provider.
+    const emptyAutocompleteSuggestions = React.useCallback(
+        (query: string, signal: AbortSignal) => getSuggestions(null, query, {
+            kinds: NEW_SESSION_COMPOSER_SUGGESTION_KINDS, serverId: targetServerId,
+            workspace: composerWorkspace, catalogs: preflightComposerCatalogs,
+            loadCatalogs: loadComposerCatalogs?.read, signal,
+        }), [composerWorkspace, loadComposerCatalogs, preflightComposerCatalogs, targetServerId],
+    );
+
     // NOTE: we intentionally do NOT clear per-profile secret overrides when profile changes.
     // Users may resolve secrets for multiple profiles and then switch between them before creating a session.
 
     // On iOS, keep tap handlers extremely light so selection state can commit instantly.
-    // We defer any follow-up adjustments (agent/session-type/permission defaults) until after interactions.
-    const pendingProfileSelectionRef = React.useRef<{ profileId: string; prevProfileId: string | null } | null>(null);
+    // Permission follow-up stays deferred; the effect below owns backend selection.
+    const pendingProfileSelectionRef = React.useRef<{ profileId: string; applyBackendDefault: boolean } | null>(null);
+    const initialProfileIdParamRef = React.useRef(normalizeOptionalParam(profileIdParam));
 
-    const selectProfile = React.useCallback((profileId: string) => {
+    const selectProfile = React.useCallback((profileId: string, applyBackendDefault = true) => {
         prepareSecretPromptForProfileSelection(selectedProfileId);
-        const prevSelectedProfileId = selectedProfileId;
         hasUserTouchedProfileSelectionRef.current = true;
-        pendingProfileSelectionRef.current = { profileId, prevProfileId: prevSelectedProfileId };
+        pendingProfileSelectionRef.current = profileId === selectedProfileId
+            ? null
+            : { profileId, applyBackendDefault };
         setSelectedProfileId(profileId);
     }, [prepareSecretPromptForProfileSelection, selectedProfileId]);
 
@@ -1106,11 +1178,7 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
     });
     const {
         permissionMode,
-        hasUserSelectedPermissionModeRef,
-        permissionModeRef,
-        applyPermissionMode,
         handlePermissionModeChange,
-        resolveDefaultPermissionMode,
     } = useNewSessionPermissionModeState({
         agentType,
         backendTarget,
@@ -1121,10 +1189,6 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         enabledAgentIds,
         sessionDefaultPermissionModeByTargetKey,
     });
-
-    // NOTE: Permission mode reset on agentType change is handled by the validation useEffect below (lines ~670-681)
-    // which intelligently resets only when the current mode is invalid for the new agent type.
-    // A duplicate unconditional reset here was removed to prevent race conditions.
 
     const handleDeleteProfile = React.useCallback((profile: AIBackendProfile) => {
         Modal.alert(
@@ -1305,22 +1369,32 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         setSelectedPath,
     ]);
 
-    const resolvePreferredCompatibleProfileBackendEntry = React.useCallback((profile: AIBackendProfile) => {
+    const resolvePreferredCompatibleProfileBackendEntry = React.useCallback((profile: AIBackendProfile, applyDefault: boolean) => {
         const compatibleBackendEntries = getCompatibleProfileBackendEntries(profile);
-        const currentCompatible = compatibleBackendEntries.some((entry) => entry.targetKey === selectedBackendTargetKey);
-
-        if (compatibleBackendEntries.length === 0 || currentCompatible) {
-            return null;
-        }
-
-        return resolveNextSelectableBackendEntryForNewSession({
-            candidateBackendEntries: compatibleBackendEntries,
-            currentTargetKey: selectedBackendTargetKey,
+        if (compatibleBackendEntries.length === 0) return null;
+        const availability = {
             detectionTimestamp: cliAvailability.timestamp,
             availabilityById: cliAvailability.available,
             authStatusById: cliAvailability.authStatus,
             installableDepKeyCountByAgentId,
             selectableWithoutCliByAgentId,
+        };
+        if (applyDefault) {
+            const defaultTarget = getProfileDefaultBackendTarget(profile);
+            const defaultTargetKey = defaultTarget ? buildBackendTargetKey(defaultTarget) : null;
+            const defaultEntry = compatibleBackendEntries.find((entry) => entry.targetKey === defaultTargetKey);
+            if (defaultEntry && isBackendEntrySelectableForNewSession({ ...availability, entry: defaultEntry })) {
+                return defaultEntry.targetKey === selectedBackendTargetKey ? null : defaultEntry;
+            }
+        }
+        const currentEntry = compatibleBackendEntries.find((entry) => entry.targetKey === selectedBackendTargetKey);
+        if (currentEntry && isBackendEntrySelectableForNewSession({ ...availability, entry: currentEntry })) {
+            return null;
+        }
+        return resolveNextSelectableBackendEntryForNewSession({
+            ...availability,
+            candidateBackendEntries: compatibleBackendEntries,
+            currentTargetKey: selectedBackendTargetKey,
         });
     }, [
         cliAvailability.authStatus,
@@ -1332,40 +1406,34 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         selectedBackendTargetKey,
     ]);
 
+    const previousBackendProfileIdRef = React.useRef<string | null>(null);
     React.useEffect(() => {
-        if (!selectedProfileId) return;
+        const profile = selectedProfileForBackendTarget;
+        const profileChanged = previousBackendProfileIdRef.current !== (profile?.id ?? null);
+        previousBackendProfileIdRef.current = profile?.id ?? null;
+        if (!profile) return;
         const pending = pendingProfileSelectionRef.current;
-        if (!pending || pending.profileId !== selectedProfileId) return;
-        pendingProfileSelectionRef.current = null;
+        const pendingSelection = pending?.profileId === profile.id ? pending : null;
+        if (pendingSelection) pendingProfileSelectionRef.current = null;
 
-        InteractionManager.runAfterInteractions(() => {
-            // Ensure nothing changed while we waited.
-            if (selectedProfileId !== pending.profileId) return;
-
-            const profile = profileMap.get(pending.profileId) || getBuiltInProfile(pending.profileId);
-            if (!profile) return;
-
-            const nextEntry = resolvePreferredCompatibleProfileBackendEntry(profile);
-            if (nextEntry) {
-                setBackendTarget(nextEntry.target);
-            }
-
-            if (!hasUserSelectedPermissionModeRef.current) {
-                applyPermissionMode(resolveDefaultPermissionMode(profile), 'auto');
-            }
-        });
+        // One decision owns both profile defaults and compatibility corrections. Hydration
+        // preserves authored backend choices; a fresh profile selection applies its default.
+        const preserveAuthoredTarget = hasExplicitBackendTarget && pendingSelection?.applyBackendDefault !== true;
+        const nextEntry = preserveAuthoredTarget ? null : resolvePreferredCompatibleProfileBackendEntry(
+            profile,
+            pendingSelection?.applyBackendDefault === true || profileChanged,
+        );
+        if (nextEntry) setBackendTargetAutomatically(nextEntry.target);
     }, [
         agentType,
-        applyPermissionMode,
-        resolveDefaultPermissionMode,
         cliAvailability.available,
         cliAvailability.timestamp,
         installableDepKeyCountByAgentId,
         selectableWithoutCliByAgentId,
-        profileMap,
+        hasExplicitBackendTarget,
         resolvePreferredCompatibleProfileBackendEntry,
-        selectedProfileId,
-        setBackendTarget,
+        selectedProfileForBackendTarget,
+        setBackendTargetAutomatically,
     ]);
 
     // Keep ProfilesList props stable to avoid rerendering the whole list on
@@ -1434,10 +1502,12 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
                 setSelectedProfileId(null);
             }
         } else if (typeof nextSelectedProfileId === 'string' && !rejectedProfileIdParam) {
-            selectProfile(nextSelectedProfileId);
+            const isInitialRouteSelection = initialProfileIdParamRef.current === nextSelectedProfileId;
+            selectProfile(nextSelectedProfileId, !isInitialRouteSelection || !hasExplicitBackendTarget);
         }
 
         if (shouldClearParam || rejectedProfileIdParam) {
+            initialProfileIdParamRef.current = undefined;
             if (setNavigationParams(navigation, { profileId: undefined })) {
                 return;
             }
@@ -1446,53 +1516,7 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
                 payload: { params: { profileId: undefined } },
             } as never);
         }
-    }, [canSelectProfile, navigation, profileIdParam, selectedProfileId, selectProfile, setSelectedProfileId, useProfiles]);
-
-    // Keep agentType compatible with the currently selected profile.
-    React.useEffect(() => {
-        if (!useProfiles || selectedProfileId === null) {
-            return;
-        }
-
-        const profile = profileMap.get(selectedProfileId) || getBuiltInProfile(selectedProfileId);
-        if (!profile) {
-            return;
-        }
-
-        const nextEntry = resolvePreferredCompatibleProfileBackendEntry(profile);
-        if (nextEntry) {
-            setBackendTarget(nextEntry.target);
-        }
-    }, [profileMap, resolvePreferredCompatibleProfileBackendEntry, selectedProfileId, setBackendTarget, useProfiles]);
-
-    const prevAgentTypeRef = React.useRef(agentType);
-
-    // When agent type changes, keep the "permission level" consistent by mapping modes across backends.
-    React.useEffect(() => {
-        const prev = prevAgentTypeRef.current;
-        if (prev === agentType) {
-            return;
-        }
-        prevAgentTypeRef.current = agentType;
-
-        // Defaults should only apply in the new-session flow (not in existing sessions),
-        // and only if the user hasn't explicitly chosen a mode on this screen.
-        if (!hasUserSelectedPermissionModeRef.current) {
-            const profile = selectedProfileId ? (profileMap.get(selectedProfileId) || getBuiltInProfile(selectedProfileId)) : null;
-            applyPermissionMode(resolveDefaultPermissionMode(profile), 'auto');
-            return;
-        }
-
-        const current = permissionModeRef.current;
-        const mapped = normalizePermissionModeForAgentType(current, agentType);
-        applyPermissionMode(mapped, 'auto');
-    }, [
-        agentType,
-        applyPermissionMode,
-        profileMap,
-        resolveDefaultPermissionMode,
-        selectedProfileId,
-    ]);
+    }, [canSelectProfile, hasExplicitBackendTarget, navigation, profileIdParam, selectedProfileId, selectProfile, setSelectedProfileId, useProfiles]);
 
     // Reset model mode when agent type changes to appropriate default
     React.useEffect(() => {
@@ -1614,6 +1638,7 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
                                 agentOptionState,
                                 profile: accountProfile,
                                 settings,
+                                directory: selectedPath,
                             });
                             if (!source) return null;
                             requestClose();
@@ -1644,6 +1669,7 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         agentType,
         resumeSessionId,
         selectedMachineId,
+        selectedPath,
         settings,
         targetServerId,
     ]);
@@ -1696,6 +1722,21 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         draftScope,
         draftId,
         launchUserAttemptId,
+    });
+
+    const onDraftRemoved = params?.onDraftRemoved;
+    const retireRemovedDraft = React.useCallback(() => {
+        // Launch completion already disables persistence before clearing its draft.
+        // Only an editor that was still active needs a fresh draft route.
+        if (disableDraftPersistence()) onDraftRemoved?.();
+    }, [disableDraftPersistence, onDraftRemoved]);
+    useNewSessionDraftPromptProjection({
+        scope: draftScope,
+        draftId,
+        promptStore,
+        hasLocalEdit: hasUserEditedSessionPrompt,
+        preferInitialPrompt: hydratedTempAuthoringDraft?.displayText !== undefined || typeof prompt === 'string',
+        onDraftRemoved: retireRemovedDraft,
     });
 
     // V1 requires the source Session and the target to share a server. Block
@@ -1898,8 +1939,9 @@ export function useNewSessionScreenModel(params?: Readonly<{ draftId?: string }>
         : undefined;
     const modelOptionsProbe = React.useMemo(() => ({
         phase: modelOptionsProbeState.phase,
+        error: modelOptionsProbeState.error,
         onRefresh: modelOptionsProbeState.onRefresh,
-    }), [modelOptionsProbeState.onRefresh, modelOptionsProbeState.phase]);
+    }), [modelOptionsProbeState.onRefresh, modelOptionsProbeState.phase, modelOptionsProbeState.error]);
     const acpSessionModeProbe = React.useMemo(() => ({
         phase: acpSessionModeProbeState.phase,
         onRefresh: acpSessionModeProbeState.onRefresh,

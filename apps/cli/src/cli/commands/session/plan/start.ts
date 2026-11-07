@@ -9,6 +9,7 @@ import { resolveSessionEncryptionContextFromCredentials, resolveSessionStoredCon
 import { readCommandPositionals, readFlagValue } from '@/cli/commands/shared/argvFlags';
 import { resolveSessionIdOrPrefix } from '@/session/query/resolveSessionId';
 import { normalizeBackendTargetKeysFromCsv } from '../shared/normalizeBackendTargetKeys';
+import { cmd, fail } from '@happier-dev/cli-common/output';
 
 export async function cmdSessionPlanStart(
   argv: string[],
@@ -51,7 +52,7 @@ export async function cmdSessionPlanStart(
       await printJsonEnvelope({ ok: false, kind: 'session_plan_start', error: { code: 'not_authenticated' } });
       return;
     }
-    console.error(chalk.red('Error:'), 'Not authenticated. Run "happier auth login" first.');
+    console.error(fail(`Not signed in. Run ${cmd('happier auth login')} first.`));
     process.exit(1);
   }
 
@@ -75,7 +76,7 @@ export async function cmdSessionPlanStart(
       await printJsonEnvelope({ ok: false, kind: 'session_plan_start', error: { code: 'session_not_found', sessionId } });
       return;
     }
-    console.error(chalk.red('Error:'), `Session not found: ${sessionId}`);
+    console.error(fail(`Session not found: ${sessionId}`));
     process.exit(1);
   }
 
@@ -90,7 +91,7 @@ export async function cmdSessionPlanStart(
       await printJsonEnvelope({ ok: false, kind: 'session_plan_start', error: { code: started.errorCode } });
       return;
     }
-    console.error(chalk.red('Error:'), started.errorCode);
+    console.error(fail(started.errorCode));
     process.exit(1);
   }
 

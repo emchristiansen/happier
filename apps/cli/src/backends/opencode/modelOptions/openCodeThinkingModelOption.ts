@@ -46,9 +46,15 @@ export function buildOpenCodeThinkingModelOptionsFromVariants(
   currentValueCandidate: string | null,
 ): SessionModelOptions | null {
   const variants = asRecord(variantsRaw);
-  if (!variants) return null;
-
-  const variantIds = Object.keys(variants).filter((k) => variantSupportsReasoningEffort(variants[k]));
+  const variantIds = Array.isArray(variantsRaw)
+    ? [...new Set(variantsRaw.flatMap((rawVariant) => {
+        const variant = asRecord(rawVariant);
+        const id = normalizeString(variant?.id);
+        return id ? [id] : [];
+      }))]
+    : variants
+      ? Object.keys(variants).filter((key) => variantSupportsReasoningEffort(variants[key]))
+      : [];
   if (variantIds.length === 0) return null;
 
   const sorted = sortVariantIds(variantIds);

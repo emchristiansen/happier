@@ -2,6 +2,7 @@ import { assertOrdinaryReaderPath } from '@/rpc/handlers/pathSecurity';
 import { stat } from 'node:fs/promises';
 
 import type { DirectTranscriptRawMessageV1 } from '@happier-dev/protocol';
+import type { DirectSessionTranscriptReadAfter } from '@/backends/directSessions/providerOps';
 
 import { readJsonlFileBackwardPage } from '@/api/directSessions/filePaging/jsonlBackwardPager';
 import { readJsonlFileForward } from '@/api/directSessions/filePaging/jsonlForwardReader';
@@ -175,6 +176,7 @@ async function collectReadAfterRecords(params: Readonly<{
   records: readonly CodexProjectedTranscriptRecord[];
   baseProgressByStreamId: ReadonlyMap<string, CodexBoundaryProgress>;
   boundaryChanged: boolean;
+  pageLimited: boolean;
   remainingHistoricalUnknownStreamIds: ReadonlySet<string>;
 }>> {
   const streamsById = new Map(params.initialStreams.map((stream) => [stream.fileRelPath, stream] as const));
@@ -192,6 +194,7 @@ async function collectReadAfterRecords(params: Readonly<{
   const remainingHistoricalUnknownStreamIds = new Set(params.historicalUnknownStreamIds);
   const semanticTrackerByStreamId = new Map<string, ReturnType<typeof createCodexRolloutSemanticTracker>>();
   let boundaryChanged = false;
+  let pageLimited = false;
 
   for (let queueIndex = 0; queueIndex < streamQueue.length; queueIndex += 1) {
     const stream = streamQueue[queueIndex]!;
@@ -213,6 +216,7 @@ async function collectReadAfterRecords(params: Readonly<{
       maxBytes: Math.max(params.maxBytes, 1),
       maxItems: Math.max(params.maxItems * 2, 1),
     });
+    pageLimited = pageLimited || page.hitPageLimit;
     if (page.truncated || !(await codexRolloutFileBoundaryMatches(stream.filePath, expectedBoundary))) {
       const tail = await captureCodexRolloutTailProgress(stream.filePath);
       if (tail) {
@@ -286,6 +290,7 @@ async function collectReadAfterRecords(params: Readonly<{
     records,
     baseProgressByStreamId,
     boundaryChanged,
+    pageLimited,
     remainingHistoricalUnknownStreamIds,
   };
 }
@@ -297,7 +302,7 @@ export async function readAfterCodexRolloutStreams(params: Readonly<{
   maxBytes: number;
   maxItems: number;
   initialRolloutFiles?: readonly CodexRolloutFile[];
-}>): Promise<Readonly<{ items: DirectTranscriptRawMessageV1[]; nextCursor: string | null; truncated: boolean }>> {
+}>): Promise<DirectSessionTranscriptReadAfter> {
   assertOrdinaryReaderPath(params.codexHome);
   for (const file of params.initialRolloutFiles ?? []) assertOrdinaryReaderPath(file.filePath);
   const streams = await collectCodexDirectTranscriptRolloutStreams({
@@ -321,6 +326,7 @@ export async function readAfterCodexRolloutStreams(params: Readonly<{
       items: [],
       nextCursor: await buildCodexStreamVectorTailCursor(streams),
       truncated: true,
+      truncationReason: 'source_discontinuity',
     };
   }
 
@@ -367,9 +373,10 @@ export async function readAfterCodexRolloutStreams(params: Readonly<{
   const maxItems = Math.max(1, Math.trunc(params.maxItems));
   const items: DirectTranscriptRawMessageV1[] = [];
   let usedBytes = 0;
-  let truncated = boundaryChanged
+  const sourceDiscontinuity = boundaryChanged
     || collected.boundaryChanged
     || collected.remainingHistoricalUnknownStreamIds.size > 0;
+  let truncated = sourceDiscontinuity || collected.pageLimited;
   const progressByStreamId = new Map(collected.baseProgressByStreamId);
 
   for (let index = 0; index < collected.records.length; index += 1) {
@@ -399,10 +406,13 @@ export async function readAfterCodexRolloutStreams(params: Readonly<{
   }
 
   const builtCursor = await buildStreamVectorCursorFromProgress(collected.streams, progressByStreamId);
+  const requiresRefresh = sourceDiscontinuity || builtCursor.resetStreamIds.size > 0;
+  const isTruncated = truncated || requiresRefresh;
   return {
     items,
     nextCursor: builtCursor.cursor,
-    truncated: truncated || builtCursor.resetStreamIds.size > 0,
+    truncated: isTruncated,
+    ...(isTruncated ? { truncationReason: requiresRefresh ? 'source_discontinuity' as const : 'page_limit' as const } : {}),
   };
 }
 
@@ -420,6 +430,7 @@ export async function pageCodexRolloutStreams(params: Readonly<{
   tailCursor: string | null;
   hasMore: boolean;
   truncated?: boolean;
+  truncationReason?: 'page_limit' | 'source_discontinuity';
 }>> {
   assertOrdinaryReaderPath(params.codexHome);
   for (const file of params.initialRolloutFiles ?? []) assertOrdinaryReaderPath(file.filePath);
@@ -619,6 +630,8 @@ export async function pageCodexRolloutStreams(params: Readonly<{
     nextCursor,
     tailCursor,
     hasMore,
-    ...(decoded === null && typeof params.cursor === 'string' && params.cursor.trim().length > 0 ? { truncated: true } : {}),
+    ...(decoded === null && typeof params.cursor === 'string' && params.cursor.trim().length > 0
+      ? { truncated: true, truncationReason: 'source_discontinuity' as const }
+      : {}),
   };
 }

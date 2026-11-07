@@ -12,13 +12,14 @@ type ExecuteSessionHandoffActionArgs = Readonly<{
   targetMachineId: string;
   targetPath?: string;
   targetSessionStorageMode?: 'direct' | 'persisted';
+  stateTransfer?: 'transfer' | 'existing';
   workspaceTransfer?: SessionHandoffWorkspaceTransfer;
   context: ActionExecutorContext;
 }>;
 
 type ExecuteSessionHandoffActionResult =
   | Readonly<{ ok: true; handoffId: string }>
-  | Readonly<{ ok: false; error: string; recovery?: unknown }>;
+  | Readonly<{ ok: false; error: string; errorCode?: string; recovery?: unknown }>;
 
 function normalizeNonEmptyString(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -36,18 +37,27 @@ export async function executeSessionHandoffAction(
       targetMachineId: args.targetMachineId,
       ...(args.targetPath ? { targetPath: args.targetPath } : {}),
       ...(args.targetSessionStorageMode ? { targetSessionStorageMode: args.targetSessionStorageMode } : {}),
+      ...(args.stateTransfer ? { stateTransfer: args.stateTransfer } : {}),
       ...(args.workspaceTransfer ? { workspaceTransfer: args.workspaceTransfer } : {}),
     },
     args.context,
   );
   if (!actionResult.ok) {
-    return { ok: false, error: normalizeNonEmptyString(actionResult.error) ?? 'failed_to_start_session_handoff' };
-  }
-
-  const handoffResult = actionResult.result as any;
-  if (handoffResult?.ok !== true) {
     return {
       ok: false,
+      error: normalizeNonEmptyString(actionResult.error) ?? 'failed_to_start_session_handoff',
+      ...(actionResult.errorCode ? { errorCode: actionResult.errorCode } : {}),
+    };
+  }
+
+  const handoffResult = actionResult.result && typeof actionResult.result === 'object'
+    ? actionResult.result as Record<string, unknown>
+    : null;
+  if (handoffResult?.ok !== true) {
+    const errorCode = normalizeNonEmptyString(handoffResult?.errorCode);
+    return {
+      ok: false,
+      ...(errorCode ? { errorCode } : {}),
       error:
         normalizeNonEmptyString(handoffResult?.errorMessage)
         ?? normalizeNonEmptyString(handoffResult?.error)

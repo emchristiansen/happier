@@ -1,15 +1,18 @@
-import { mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import cliDistBuildManifest from '../../cliDistBuildManifest.cjs';
 import { buildCliBinaryArtifactPayload } from './buildCliBinaryArtifactPayload.js';
+import { CLI_BINARY_TARGETS } from './targets.js';
 
 const tempDirs: string[] = [];
+const sourceRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
 
 async function createTempDir(): Promise<string> {
     const dir = await mkdtemp(join(tmpdir(), 'build-cli-binary-artifact-payload-'));
@@ -42,8 +45,7 @@ async function collectFiles(dir: string): Promise<string[]> {
 }
 
 async function collectStaticRuntimeScriptAssetSegments(): Promise<string[][]> {
-    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
-    const cliSourceFiles = (await collectFiles(join(repoRoot, 'apps', 'cli', 'src')))
+    const cliSourceFiles = (await collectFiles(join(sourceRepoRoot, 'apps', 'cli', 'src')))
         .filter((file) => file.endsWith('.ts') || file.endsWith('.tsx'));
     const assetKeys = new Set<string>();
 
@@ -84,8 +86,17 @@ async function unpackTools(options = {}) {
     const toolsDir = options.toolsDir || path.resolve(__dirname, '..', 'tools');
     const unpackedPath = path.join(toolsDir, 'unpacked');
     fs.mkdirSync(unpackedPath, { recursive: true });
-    const binaryName = platformDir === 'x64-win32' ? 'zellij.exe' : 'zellij';
-    fs.writeFileSync(path.join(unpackedPath, binaryName), 'zellij 0.44.3 for ' + platformDir + '\\n');
+    if (!options.tools || options.tools.includes('ripgrep')) {
+        fs.writeFileSync(path.join(unpackedPath, platformDir === 'x64-win32' ? 'rg.exe' : 'rg'), 'ripgrep for ' + platformDir + '\\n');
+        fs.writeFileSync(path.join(unpackedPath, 'ripgrep.node'), 'legacy addon\\n');
+    }
+    if (!options.tools || options.tools.includes('zellij')) {
+        const binaryName = platformDir === 'x64-win32' ? 'zellij.exe' : 'zellij';
+        fs.writeFileSync(path.join(unpackedPath, binaryName), 'zellij 0.44.3 for ' + platformDir + '\\n');
+    }
+    if (!options.tools || options.tools.includes('difftastic')) {
+        fs.writeFileSync(path.join(unpackedPath, 'difft'), 'difftastic optional runtime\\n');
+    }
     fs.writeFileSync(path.join(unpackedPath, '.happier-tools-manifest.json'), JSON.stringify({
         platformDir,
         tools: { zellij: { version: '0.44.3' } },
@@ -104,7 +115,12 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
         }));
     });
 
-    it('rebuilds a stale-version cli dist and forwards the exact release version', async () => {
+    it.each(CLI_BINARY_TARGETS)('stages target-native PTY assets and rebuilds stale CLI dist for $os-$arch', async (target) => {
+        const platform = target.os === 'windows' ? 'win32' : target.os;
+        const targetKey = `${platform}-${target.arch}`;
+        const sharpPackages = [`@img/sharp-${targetKey}`,
+            ...(target.os === 'windows' ? [] : [`@img/sharp-libvips-${targetKey}`]),
+            ...(target.os === 'linux' ? [`@img/sharp-linuxmusl-${target.arch}`, `@img/sharp-libvips-linuxmusl-${target.arch}`] : [])];
         const repoRoot = await createTempDir();
         const payloadDir = join(repoRoot, 'artifacts', 'payload');
         const older = new Date('2026-04-13T18:00:00.000Z');
@@ -140,6 +156,10 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
             bundledDependencies: ['@happier-dev/cli-common'],
             dependencies: {
                 '@happier-dev/cli-common': '0.0.0',
+                '@huggingface/transformers': '0.0.0',
+                'node-pty': '0.0.0',
+                '@homebridge/node-pty-prebuilt-multiarch': '0.0.0',
+                sharp: '0.0.0',
             },
         }, null, 2)}\n`, older);
         const cliDistEntrypoint = join(repoRoot, 'apps', 'cli', 'dist', 'index.mjs');
@@ -155,12 +175,19 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
             ['apps', 'cli', 'scripts', 'session_hook_forwarder.cjs'],
             ['apps', 'cli', 'scripts', 'permission_hook_forwarder.cjs'],
             ['apps', 'cli', 'scripts', 'ripgrep_launcher.cjs'],
+            // On-disk launchers still need this packaged sidecar even when CLI consumers embed it.
+            ['apps', 'cli', 'scripts', 'process_tree.cjs'],
             ...staticRuntimeScriptAssets.map((segments) => ['apps', 'cli', 'scripts', ...segments]),
             ['apps', 'cli', 'scripts', 'runtime', 'placeholder.txt'],
             ['apps', 'cli', 'scripts', 'shims', 'placeholder.txt'],
         ];
         for (const sidecarPath of new Map(sidecarPaths.map((path) => [path.join('/'), path])).values()) {
             await writeRepoFile(join(repoRoot, ...sidecarPath), 'placeholder\n', older);
+        }
+        // Import the real installed launcher, including its transitive native-exit dependency.
+        for (const script of ['claude_launcher_runtime.cjs', 'childProcessOptions.cjs', 'native_process_exit.cjs']) {
+            await writeRepoFile(join(repoRoot, 'apps', 'cli', 'scripts', script),
+                await readFile(join(sourceRepoRoot, 'apps', 'cli', 'scripts', script), 'utf8'), older);
         }
         await writeCliToolUnpackFixture(repoRoot, older);
 
@@ -172,9 +199,12 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
             exports: {
                 '.': './dist/index.js',
                 './firstPartyRuntime': './dist/firstPartyRuntime/index.js',
+                './expandHomeDirPath': './expandHomeDirPath.cjs',
             },
         }, null, 2)}\n`);
         await writeRepoFile(join(repoRoot, 'packages', 'cli-common', 'README.md'), 'cli-common');
+        await writeRepoFile(join(repoRoot, 'packages', 'cli-common', 'expandHomeDirPath.cjs'),
+            await readFile(join(sourceRepoRoot, 'packages', 'cli-common', 'expandHomeDirPath.cjs'), 'utf8'), older);
         await writeRepoFile(join(repoRoot, 'packages', 'cli-common', 'dist', 'index.js'), 'export {};\n', older);
         await writeRepoFile(join(repoRoot, 'packages', 'cli-common', 'dist', 'firstPartyRuntime', 'index.js'), 'export {};\n', older);
         await writeRepoFile(sourceWorkspaceInstallPath, currentSourceContent, older);
@@ -187,6 +217,7 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
             exports: {
                 '.': './dist/index.js',
                 './firstPartyRuntime': './dist/firstPartyRuntime/index.js',
+                './expandHomeDirPath': './expandHomeDirPath.cjs',
             },
         }, null, 2)}\n`);
         await writeRepoFile(join(repoRoot, 'apps', 'cli', 'node_modules', '@happier-dev', 'cli-common', 'dist', 'index.js'), 'export {};\n', older);
@@ -196,6 +227,8 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
             '@huggingface/transformers',
             'node-pty',
             '@homebridge/node-pty-prebuilt-multiarch',
+            'sharp',
+            ...sharpPackages,
         ]) {
             await writeRepoFile(
                 join(repoRoot, 'node_modules', ...packageName.split('/'), 'package.json'),
@@ -203,6 +236,7 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
                     name: packageName,
                     version: '0.0.0',
                     main: './index.js',
+                    ...(packageName === 'sharp' ? { optionalDependencies: Object.fromEntries(sharpPackages.map((name) => [name, '0.0.0'])) } : {}),
                 }, null, 2)}\n`,
                 older,
             );
@@ -211,10 +245,24 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
 
         const compileObservedContents: string[] = [];
         const buildVersions: string[] = [];
+        // node-pty 1.1.0 ships macOS/Windows prebuilds; Linux is source-built.
+        for (const key of ['darwin-arm64', 'darwin-x64', 'win32-x64']) {
+            const binding = key.startsWith('win32-') ? 'conpty.node' : 'pty.node';
+            await writeRepoFile(join(repoRoot, 'node_modules', 'node-pty', 'prebuilds', key, binding), key, older);
+        }
+        await writeRepoFile(join(repoRoot, 'node_modules/node-pty/build/Release/pty.node'), `${process.platform}-${process.arch}`, older);
+        await cp(join(repoRoot, 'node_modules/node-pty'), join(repoRoot, 'apps/cli/node_modules/node-pty'), { recursive: true });
+        // The CLI's dependency closure must not be overwritten by a root copy.
+        await writeRepoFile(join(repoRoot, 'node_modules/node-pty/build/Release/pty.node'), 'stale root addon', older);
+        for (const arch of ['x64', 'arm64']) {
+            await writeRepoFile(join(repoRoot, 'dist/native/node-pty', `linux-${arch}`, 'pty.node'), `linux-${arch}`, older);
+        }
+        await writeRepoFile(join(repoRoot, 'packages/cli-common/native/windows/bin/windows-x64/happier-service-launcher.exe'), 'launcher', older);
 
         await buildCliBinaryArtifactPayload({
             repoRoot,
             payloadDir,
+            target,
             releaseVersion: '0.2.10-dev.61',
             ensureWorkspacePackagesBuiltByName: async (_root, packageNames) => ({
                 ok: true,
@@ -237,7 +285,23 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
         });
 
         expect(buildVersions).toEqual(['0.2.10-dev.61']);
+        await expect(readFile(join(payloadDir, 'node_modules', 'sharp', 'index.js'), 'utf8'))
+            .resolves.toBe('module.exports = {};\n');
+        for (const packageName of sharpPackages) {
+            await expect(readFile(join(payloadDir, 'node_modules', packageName, 'index.js'), 'utf8'))
+                .resolves.toBe('module.exports = {};\n');
+        }
         expect(compileObservedContents).toEqual([currentSourceContent]);
+        const requireFromPayload = createRequire(join(payloadDir, 'scripts', 'claude_remote_launcher.cjs'));
+        expect(requireFromPayload('./claude_launcher_runtime.cjs')).toHaveProperty('runClaudeCli', expect.any(Function));
+        expect(await readdir(join(payloadDir, 'node_modules', 'node-pty', 'prebuilds'))).toEqual(target.os === 'linux' ? [] : [targetKey]);
+        const ptyBinding = target.os === 'linux' ? 'build/Release/pty.node'
+            : `prebuilds/${targetKey}/${target.os === 'windows' ? 'conpty.node' : 'pty.node'}`;
+        await expect(readFile(join(payloadDir, 'node_modules/node-pty', ptyBinding), 'utf8')).resolves.toBe(targetKey);
+        await expect(readFile(join(payloadDir, 'node_modules', '@huggingface', 'transformers', 'index.js'), 'utf8'))
+            .rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(readFile(join(payloadDir, 'tools', 'unpacked', 'difft'), 'utf8'))
+            .rejects.toMatchObject({ code: 'ENOENT' });
         await expect(readFile(join(payloadDir, 'node_modules', '@happier-dev', 'cli-common', 'dist', 'firstPartyRuntime', 'installVersionedPayload.js'), 'utf8'))
             .resolves.toBe(currentSourceContent);
         for (const segments of staticRuntimeScriptAssets) {
@@ -246,6 +310,13 @@ describe('buildCliBinaryArtifactPayload bundled workspace sync', () => {
         }
         await expect(readFile(join(payloadDir, 'tools', 'unpacked', '.happier-tools-manifest.json'), 'utf8'))
             .resolves.toContain('"zellij"');
+        await expect(readFile(join(payloadDir, 'tools', 'unpacked', target.os === 'windows' ? 'rg.exe' : 'rg'), 'utf8'))
+            .resolves.toContain('ripgrep');
+        if (target.os !== 'windows') {
+            await expect(readFile(join(payloadDir, 'tools', 'unpacked', 'zellij'), 'utf8')).resolves.toContain('zellij');
+        }
+        await expect(readFile(join(payloadDir, 'tools', 'unpacked', 'ripgrep.node'), 'utf8'))
+            .rejects.toMatchObject({ code: 'ENOENT' });
     });
 
 });

@@ -1,6 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { resolveExecutionRunConnectedServiceMaterializeTimeoutMs } from './controlClient';
+vi.mock('@/persistence', () => ({
+  readDaemonState: vi.fn(async () => ({
+    pid: process.pid,
+    httpPort: 43_210,
+    controlToken: 'test-control-token',
+  })),
+}));
+
+import {
+  materializeDaemonConnectedServicesForExecutionRun,
+  resolveExecutionRunConnectedServiceMaterializeTimeoutMs,
+} from './controlClient';
 import { ExecutionRunConnectedServiceMaterializeResponseSchema } from './connectedServices/runsBridge/contract';
 
 const PROOF = {
@@ -15,9 +26,14 @@ const PROOF = {
   },
 };
 
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
 describe('resolveExecutionRunConnectedServiceMaterializeTimeoutMs (A1)', () => {
-  it('defaults to a materialization-sized bound, NOT the generic 10s daemonPost default', () => {
-    expect(resolveExecutionRunConnectedServiceMaterializeTimeoutMs({})).toBe(120_000);
+  it('covers the daemon materialization tail backstop plus the materialization work itself', () => {
+    expect(resolveExecutionRunConnectedServiceMaterializeTimeoutMs({})).toBe(600_000);
   });
 
   it('honors the env override within bounds', () => {
@@ -33,7 +49,32 @@ describe('resolveExecutionRunConnectedServiceMaterializeTimeoutMs (A1)', () => {
     })).toBe(600_000);
     expect(resolveExecutionRunConnectedServiceMaterializeTimeoutMs({
       HAPPIER_EXECUTION_RUN_CS_MATERIALIZE_TIMEOUT_MS: 'garbage',
-    })).toBe(120_000);
+    })).toBe(600_000);
+  });
+
+  it('applies the complete materialization budget to the effective request AbortSignal', async () => {
+    const timeoutSignal = new AbortController().signal;
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutSignal);
+    vi.spyOn(process, 'kill').mockImplementation(() => true);
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      expect(init?.signal).toBe(timeoutSignal);
+      return new Response(JSON.stringify({
+        result: {
+          env: { CODEX_HOME: '/tmp/materialized-codex-home' },
+          proof: PROOF,
+        },
+      }), { status: 200 });
+    }));
+
+    await expect(materializeDaemonConnectedServicesForExecutionRun({
+      runId: 'run-1',
+      agentId: 'codex',
+      pid: process.pid,
+      materializationKey: PROOF.materializationKey,
+      connectedServicesBindingsRaw: PROOF.connectedServicesBindings,
+    })).resolves.toMatchObject({ env: { CODEX_HOME: '/tmp/materialized-codex-home' } });
+
+    expect(timeoutSpy).toHaveBeenCalledWith(600_000);
   });
 });
 

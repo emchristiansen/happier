@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createOnChildExited } from './onChildExited';
+import type { TrackedSession } from '../types';
 
 const hookSettingsMock = vi.hoisted(() => ({
   cleanupHookPluginDir: vi.fn(),
@@ -14,6 +15,91 @@ describe('createOnChildExited', () => {
   beforeEach(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     hookSettingsMock.cleanupHookPluginDir.mockClear();
+  });
+
+  it('does not promote a live PID belonging to a different runner generation', async () => {
+    const pid = 681004;
+    const tracked: TrackedSession = {
+      pid, startedBy: 'daemon', sessionRunnerPid: process.pid,
+      processInstanceFingerprint: 'linux-proc:unrelated-generation',
+    };
+    const pidToTrackedSession = new Map([[pid, tracked]]);
+    const onChildExited = createOnChildExited({
+      pidToTrackedSession, spawnResourceCleanupByPid: new Map(), sessionAttachCleanupByPid: new Map(),
+      getApiMachineForSessions: () => null,
+      removeSessionMarkerFn: async () => {}, // Filesystem boundary; exercise real exit staging.
+    });
+    await onChildExited(pid, { reason: 'process-exited', code: 0, signal: null });
+    expect(pidToTrackedSession.has(process.pid)).toBe(false);
+    expect(pidToTrackedSession.has(pid)).toBe(false);
+  });
+
+  it('does not register disconnected terminal recovery after an owned startup launch was cancelled before acknowledgement', async () => {
+    const pid = 121;
+    const tracked = {
+      pid,
+      startedBy: 'daemon',
+      happySessionId: `PID-${pid}`,
+    };
+    const pidToTrackedSession = new Map<number, any>([[pid, tracked]]);
+    const onFinalTrackedSessionExitStaged = vi.fn(async () => {
+      throw new Error('startup terminal has already been disposed');
+    });
+    const onChildExited = createOnChildExited({
+      pidToTrackedSession,
+      spawnResourceCleanupByPid: new Map<number, () => void>(),
+      sessionAttachCleanupByPid: new Map<number, () => Promise<void>>(),
+      getApiMachineForSessions: () => null,
+      removeSessionMarkerFn: vi.fn(async () => undefined),
+      stageObservedExitFn: vi.fn(async () => undefined),
+      onFinalTrackedSessionExitStaged,
+    } as any);
+
+    await onChildExited(pid, {
+      reason: 'startup-cancelled-before-ack',
+      code: null,
+      signal: 'SIGTERM',
+    });
+
+    expect(onFinalTrackedSessionExitStaged).not.toHaveBeenCalled();
+    expect(pidToTrackedSession.has(pid)).toBe(false);
+  });
+
+  it('cleans a PID-only pre-webhook exit without session recovery or respawn', async () => {
+    const pid = 120;
+    const tracked = {
+      pid,
+      startedBy: 'daemon',
+      happySessionId: `PID-${pid}`,
+      hostedTerminal: { mode: 'herdr' },
+    };
+    const pidToTrackedSession = new Map<number, any>([[pid, tracked]]);
+    const removeSessionMarkerFn = vi.fn(async () => undefined);
+    const onUnexpectedExit = vi.fn();
+    const onFinalTrackedSessionExitStaged = vi.fn(async () => {
+      throw new Error('PID-only sessions have no terminal attachment');
+    });
+    const onChildExited = createOnChildExited({
+      pidToTrackedSession,
+      spawnResourceCleanupByPid: new Map<number, () => void>(),
+      sessionAttachCleanupByPid: new Map<number, () => Promise<void>>(),
+      getApiMachineForSessions: () => null,
+      removeSessionMarkerFn,
+      onUnexpectedExit,
+      shouldPreserveSessionMarkerOnExit: () => true,
+      onFinalTrackedSessionExitStaged,
+    } as any);
+
+    await onChildExited(pid, {
+      reason: 'process-error',
+      code: 1,
+      signal: null,
+    });
+
+    expect(onUnexpectedExit).not.toHaveBeenCalled();
+    expect(onFinalTrackedSessionExitStaged).not.toHaveBeenCalled();
+    expect(removeSessionMarkerFn).toHaveBeenCalledWith(pid);
+    expect(pidToTrackedSession.has(pid)).toBe(false);
   });
 
   it('does not report exit completion or release tracking before exact-turn staging is durable', async () => {
@@ -439,34 +525,38 @@ describe('createOnChildExited', () => {
   it('promotes tracking to the runner pid and preserves the runner marker when the wrapper exits', async () => {
     const wrapperPid = 123;
     const runnerPid = 456;
-    const tracked = { pid: wrapperPid, startedBy: 'daemon', happySessionId: 'session-1', sessionRunnerPid: runnerPid };
+    let startupExitObserved = false;
+    let finishStartup!: () => void;
+    const startupCustody: NonNullable<TrackedSession['startupCustody']> = {
+      finalization: new Promise<void>((resolve) => { finishStartup = resolve; }),
+      observeExit: () => { startupExitObserved = true; },
+    };
+    const tracked: TrackedSession = { pid: wrapperPid, startedBy: 'daemon', happySessionId: 'session-1', sessionRunnerPid: runnerPid, startupCustody };
 
-    const pidToTrackedSession = new Map<number, any>([[wrapperPid, tracked]]);
+    const pidToTrackedSession = new Map<number, TrackedSession>([[wrapperPid, tracked]]);
     const spawnResourceCleanupByPid = new Map<number, () => void>();
     const sessionAttachCleanupByPid = new Map<number, () => Promise<void>>();
 
     const removeSessionMarkerFn = vi.fn(async (_pid: number) => {});
     const originalKill = process.kill.bind(process);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((targetPid: number, signal?: any) => {
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((targetPid, signal) => {
       if (targetPid === runnerPid && signal === 0) {
         return true;
       }
-      return originalKill(targetPid, signal as any);
-    }) as any);
+      return originalKill(targetPid, signal);
+    });
 
     const onChildExited = createOnChildExited({
       pidToTrackedSession,
       spawnResourceCleanupByPid,
       sessionAttachCleanupByPid,
-      getApiMachineForSessions: () => ({
-        enqueueDaemonTerminalExactTurnEnd: vi.fn(async () => {}),
-      }) as any,
+      getApiMachineForSessions: () => null,
       removeSessionMarkerFn,
-    } as any);
+    });
 
-    onChildExited(wrapperPid, { reason: 'process-exited', code: 0, signal: null });
+    await onChildExited(wrapperPid, { reason: 'process-exited', code: 0, signal: null });
 
-    await expect.poll(() => removeSessionMarkerFn.mock.calls.map(([pid]) => pid)).toContain(wrapperPid);
+    expect(removeSessionMarkerFn).not.toHaveBeenCalled();
     expect(removeSessionMarkerFn).not.toHaveBeenCalledWith(runnerPid);
     expect(pidToTrackedSession.has(wrapperPid)).toBe(false);
     expect(pidToTrackedSession.get(runnerPid)).toEqual(
@@ -476,6 +566,10 @@ describe('createOnChildExited', () => {
       }),
     );
     expect(pidToTrackedSession.get(runnerPid)?.sessionRunnerPid).toBeUndefined();
+    expect(startupExitObserved).toBe(false);
+    expect(pidToTrackedSession.get(runnerPid)?.startupCustody).toBe(startupCustody);
+    finishStartup();
+    await expect.poll(() => removeSessionMarkerFn.mock.calls.map(([pid]) => pid)).toContain(wrapperPid);
     killSpy.mockRestore();
   });
 
@@ -611,7 +705,7 @@ describe('createOnChildExited', () => {
       sessionAttachCleanupByPid: new Map(),
       getApiMachineForSessions: () => null,
       removeSessionMarkerFn,
-      shouldPreserveSessionMarkerOnExit: () => true,
+      shouldPreserveSessionMarkerOnExit: async () => true,
     } as any);
 
     await onChildExited(pid, { reason: 'process-exited', code: null, signal: 'SIGTERM' });

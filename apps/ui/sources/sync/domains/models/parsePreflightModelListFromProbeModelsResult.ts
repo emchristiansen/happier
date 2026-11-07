@@ -29,6 +29,6 @@ export function parsePreflightModelListFromProbeModelsResult(raw: unknown): Pref
         supportsFreeform: Boolean(supportsFreeformRaw),
     };
 
-    if (parsed.availableModels.length === 0 && parsed.supportsFreeform !== true) return null;
+    if (modelsRaw.length > 0 && parsed.availableModels.length === 0 && parsed.supportsFreeform !== true) return null;
     return parsed;
 }

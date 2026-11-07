@@ -10,6 +10,7 @@ import { writeSyncDebugLog } from '@/sync/runtime/syncDebugLogging';
 import { syncPerformanceTelemetry } from '@/sync/runtime/syncPerformanceTelemetry';
 import { nowServerMs } from '@/sync/runtime/time';
 import type { TaskLifecycleEvent } from './taskLifecycle';
+import { nextRollbackEligibilityObservation } from '@/sync/domains/sessionRollback/rollbackEligibilityObservation';
 import { parsePlainSessionAgentState, parsePlainSessionMetadata } from './parsePlainSessionPayload';
 import {
     runSessionMessagesPagePipeline,
@@ -198,6 +199,10 @@ export function buildUpdatedSessionProjectionFromSocketUpdate(params: {
             rollbackEligibleTurnStarts !== undefined
                 ? rollbackEligibleTurnStarts
                 : session.rollbackEligibleTurnStarts,
+        rollbackEligibilityObservedAt:
+            rollbackEligibleTurnStarts !== undefined
+                ? nextRollbackEligibilityObservation()
+                : session.rollbackEligibilityObservedAt,
         archivedAt:
             typeof updateBody.archivedAt === 'number' || updateBody.archivedAt === null
                 ? updateBody.archivedAt
@@ -357,6 +362,7 @@ export async function repairInvalidReadStateV1(params: {
 
 export async function fetchAndApplyMessages(params: {
     sessionId: string;
+    shouldContinue?: () => boolean;
     scope?: 'main' | 'sidechain' | 'all';
     sidechainId?: string | null;
     limit?: number;
@@ -404,6 +410,7 @@ export async function fetchAndApplyMessages(params: {
             sidechainId,
         },
         lifecyclePolicy: 'emit',
+        shouldContinue: params.shouldContinue,
         getSessionEncryption: params.getSessionEncryption,
         isSessionKnown: params.isSessionKnown,
         request,
@@ -418,7 +425,7 @@ export async function fetchAndApplyMessages(params: {
         messageDecryptYieldDelayMs: params.messageDecryptYieldDelayMs,
         yieldToMessageDecryptBatch: params.yieldToMessageDecryptBatch,
     });
-    if (result.skippedMissingSession) {
+    if (result.skippedMissingSession || result.skippedSuperseded) {
         return;
     }
 
@@ -441,6 +448,7 @@ export async function fetchAndApplyMessages(params: {
 
 export async function fetchAndApplyOlderMessages(params: {
     sessionId: string;
+    shouldContinue?: () => boolean;
     beforeSeq: number;
     limit: number;
     scope?: 'main' | 'sidechain' | 'all';
@@ -473,6 +481,7 @@ export async function fetchAndApplyOlderMessages(params: {
     const result = await runSessionMessagesPagePipeline({
         sessionId,
         purpose: 'older',
+        shouldContinue: params.shouldContinue,
         page: {
             direction: 'older',
             requestPath,
@@ -502,6 +511,7 @@ export async function fetchAndApplyOlderMessages(params: {
 
 export async function fetchAndApplyNewerMessages(params: {
     sessionId: string;
+    shouldContinue?: () => boolean;
     afterSeq: number;
     limit: number;
     scope?: 'main' | 'sidechain' | 'all';
@@ -534,6 +544,7 @@ export async function fetchAndApplyNewerMessages(params: {
     const result = await runSessionMessagesPagePipeline({
         sessionId,
         purpose: 'newer',
+        shouldContinue: params.shouldContinue,
         page: {
             direction: 'newer',
             requestPath,

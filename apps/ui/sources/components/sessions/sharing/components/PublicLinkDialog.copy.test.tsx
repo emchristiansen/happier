@@ -11,7 +11,7 @@ import { renderScreen } from '@/dev/testkit';
 };
 
 const clipboardMocks = vi.hoisted(() => ({
-    setStringAsync: vi.fn(async () => {}),
+    setStringAsync: vi.fn(async () => true),
 }));
 const modalMocks = vi.hoisted(() => ({
     alert: vi.fn(),

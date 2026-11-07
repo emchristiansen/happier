@@ -590,6 +590,90 @@ describe('double-typed control concatenation (incident cmq7pyqkj, U1)', () => {
     expect(port.sentLiteral).toEqual(['/effort medium']);
   });
 
+  it('defers leftover slash draft clearing without cancelling the provider automatic usage-limit wait', async () => {
+    const port = createFakeControlPort({ captures: [[
+      LEFTOVER_DRAFT_NO_PICKER,
+      '  ⚠ Usage limit reached · limit resets 5:10pm',
+      '    Continuing automatically at 5:10pm · esc to cancel',
+    ].join('\n')] });
+    const { guard } = await makeGuard();
+
+    expect(await applyEffortControl(contextFor(port, guard), 'medium')).toMatchObject({
+      kind: 'scheduled', timing: 'queued_until_safe_window', reason: 'usage_limit_wait',
+    });
+    expect(port.sentLiteral).toEqual([]);
+    expect(port.sentKeys).toEqual([]);
+  });
+
+  it('stops leftover clearing when the automatic wait appears after the first Escape', async () => {
+    const waitScreen = [LEFTOVER_DRAFT_NO_PICKER, '    Continuing automatically at 5:10pm · esc to cancel'].join('\n');
+    const port = createFakeControlPort({ captures: [LEFTOVER_DRAFT_NO_PICKER, waitScreen] });
+    const { guard } = await makeGuard();
+
+    expect(await applyEffortControl(contextFor(port, guard), 'medium')).toMatchObject({
+      kind: 'scheduled', timing: 'queued_until_safe_window', reason: 'usage_limit_wait',
+    });
+    expect(port.sentLiteral).toEqual([]);
+    expect(port.sentKeys).toEqual(['Escape']);
+  });
+
+  it('does not submit or dismiss Rewind when it takes input after command typing', async () => {
+    const rewind = [
+      'Rewind',
+      'Restore the code and/or conversation to the point before…',
+      '',
+      '   ❯ (current)',
+      '',
+      'Enter to continue · Esc to cancel',
+    ].join('\n');
+    const port = createFakeControlPort({ captures: [IDLE, rewind] });
+    const { guard } = await makeGuard();
+
+    expect(await applyEffortControl(contextFor(port, guard), 'medium')).toMatchObject({
+      kind: 'scheduled', timing: 'queued_until_safe_window', reason: 'unsafe_overlay',
+    });
+    expect(port.sentLiteral).toEqual(['/effort medium']);
+    expect(port.sentKeys).toEqual([]);
+  });
+
+  it('still applies a control from an empty composer during the provider automatic wait', async () => {
+    const footer = '    Continuing automatically at 5:10pm · esc to cancel';
+    const port = createFakeControlPort({ captures: [
+      [IDLE, footer].join('\n'),
+      [LEFTOVER_DRAFT_NO_PICKER, footer].join('\n'),
+      EFFORT_SET_MEDIUM,
+    ] });
+    const { guard } = await makeGuard();
+
+    expect(await applyEffortControl(contextFor(port, guard), 'medium')).toMatchObject({ kind: 'applied', effective: 'medium' });
+    expect(port.sentLiteral).toEqual(['/effort medium']);
+    expect(port.sentKeys).toEqual(['Enter']);
+  });
+
+  it('does not Escape a known automatic wait when command staging capture fails', async () => {
+    const port = createFakeControlPort({
+      captures: [[IDLE, '    Continuing automatically at 5:10pm · esc to cancel'].join('\n')],
+      failCaptureAtIndexes: [1],
+    });
+    const { guard } = await makeGuard();
+
+    expect(await applyEffortControl(contextFor(port, guard), 'medium')).toMatchObject({ kind: 'failed' });
+    expect(port.sentLiteral).toEqual(['/effort medium']);
+    expect(port.sentKeys).toEqual([]);
+  });
+
+  it('preserves an unverified control draft if cleanup would cancel the provider automatic wait', async () => {
+    const waitScreen = [LEFTOVER_DRAFT_NO_PICKER, '    Continuing automatically at 5:10pm · esc to cancel'].join('\n');
+    const changedDraft = [IDLE.replace('>   ', '> a changed control draft'), '    Continuing automatically at 5:10pm · esc to cancel'].join('\n');
+    const port = createFakeControlPort({ captures: [IDLE, waitScreen, changedDraft] });
+    const { guard } = await makeGuard();
+
+    expect(await applyEffortControl(contextFor(port, guard), 'medium')).toMatchObject({
+      kind: 'scheduled', timing: 'queued_until_safe_window', reason: 'usage_limit_wait',
+    });
+    expect(port.sentKeys).toEqual(['Enter']);
+  });
+
   it('defers without typing when the leftover slash draft survives the bounded clears', async () => {
     const port = createFakeControlPort({ captures: [LEFTOVER_DRAFT_NO_PICKER] });
     const { guard } = await makeGuard();

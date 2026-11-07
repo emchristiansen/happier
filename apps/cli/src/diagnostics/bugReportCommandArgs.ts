@@ -3,10 +3,12 @@ import type {
   BugReportDeploymentType,
   BugReportFrequency,
   BugReportSeverity,
+  BugReportLogSelection,
 } from '@happier-dev/protocol';
 import {
   BUG_REPORT_DEFAULT_ISSUE_OWNER,
   BUG_REPORT_DEFAULT_ISSUE_REPO,
+  resolveBugReportLogSelection,
 } from '@happier-dev/protocol';
 
 export type BugReportAttachmentArg = {
@@ -29,10 +31,13 @@ export type ParsedBugReportArgs = {
   acceptedPrivacyNotice: boolean;
   providerUrl: string;
   existingIssueNumber: number | null;
+  exportPath: string;
+  dryRun: boolean;
   skipSimilarIssues: boolean;
   serverVersion: string;
   deploymentType: BugReportDeploymentType | null;
   sessionId: string;
+  logSelection: BugReportLogSelection;
   attachments: BugReportAttachmentArg[];
 };
 
@@ -58,11 +63,16 @@ export function bugReportUsage(): string {
     '  --include-diagnostics / --no-include-diagnostics',
     '  --accept-privacy-notice            Skip interactive privacy confirmation',
     '  --provider-url <url>               Override diagnostics service URL',
+    '  --export <path>                    Write a redacted diagnostics bundle without submitting',
+    '  --dry-run --output <path>          Collect and export diagnostics without submitting',
     '  --existing-issue-number <number>   Post report as a comment on an existing issue',
     '  --no-similar-issues                Skip searching for similar issues',
     '  --server-version <version>',
     '  --deployment-type <cloud|self-hosted|enterprise>',
     '  --session-id <id>                  Bind the report to a specific Happier session id',
+    '  --include-daemon-logs / --no-include-daemon-logs       Default: included',
+    '  --include-session-logs / --no-include-session-logs     Default: included',
+    '  --include-provider-transcript / --no-include-provider-transcript   Default: excluded',
     '  --attach <path>                    Attach an additional file (repeatable)',
     '  --attach-session-log <path>        Attach a Happier session log file (repeatable)',
     '  --attach-provider-transcript <path> Attach a provider transcript (Claude/Codex/...) (repeatable)',
@@ -86,10 +96,13 @@ export function parseBugReportArgs(args: string[]): ParsedBugReportArgs {
     acceptedPrivacyNotice: false,
     providerUrl: '',
     existingIssueNumber: null,
+    exportPath: '',
+    dryRun: false,
     skipSimilarIssues: false,
     serverVersion: '',
     deploymentType: null,
     sessionId: '',
+    logSelection: resolveBugReportLogSelection(),
     attachments: [],
   };
 
@@ -118,6 +131,19 @@ export function parseBugReportArgs(args: string[]): ParsedBugReportArgs {
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
+    const logFlags = {
+      '--include-daemon-logs': ['daemon', true],
+      '--no-include-daemon-logs': ['daemon', false],
+      '--include-session-logs': ['session', true],
+      '--no-include-session-logs': ['session', false],
+      '--include-provider-transcript': ['provider', true],
+      '--no-include-provider-transcript': ['provider', false],
+    } as const;
+    if (arg in logFlags) {
+      const [kind, enabled] = logFlags[arg as keyof typeof logFlags];
+      parsed.logSelection[kind] = enabled;
+      continue;
+    }
     if (arg === '-h' || arg === '--help') {
       parsed.showHelp = true;
       continue;
@@ -196,6 +222,14 @@ export function parseBugReportArgs(args: string[]): ParsedBugReportArgs {
       parsed.existingIssueNumber = parsedNumber;
       continue;
     }
+    if (arg === '--export' || arg === '--output') {
+      [parsed.exportPath, index] = readValue(index, arg);
+      continue;
+    }
+    if (arg === '--dry-run') {
+      parsed.dryRun = true;
+      continue;
+    }
     if (arg === '--no-similar-issues') {
       parsed.skipSimilarIssues = true;
       continue;
@@ -246,6 +280,10 @@ export function parseBugReportArgs(args: string[]): ParsedBugReportArgs {
   parsed.expectedBehavior = parsed.expectedBehavior.trim();
   parsed.whatChangedRecently = parsed.whatChangedRecently.trim();
   parsed.providerUrl = parsed.providerUrl.trim();
+  parsed.exportPath = parsed.exportPath.trim();
+  if (parsed.dryRun && !parsed.exportPath) {
+    throw new Error('The --dry-run option requires --output <path>');
+  }
   parsed.serverVersion = parsed.serverVersion.trim();
   parsed.sessionId = parsed.sessionId.trim();
   parsed.attachments = parsed.attachments

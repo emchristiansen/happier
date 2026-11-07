@@ -154,23 +154,25 @@ const idleResolvedDrop: UseSessionInlineDragResolvedDrop = Object.freeze({
         visual: Object.freeze({ kind: 'none' }),
     }),
     geometry: Object.freeze({ kind: 'none' }),
+    destinationKey: null,
 });
 
 function createBoundaryProps() {
     return {
         activeServerId: 'server_a',
+        adjacency: { isFirst: true, isLast: true, isSingle: true },
         dataActive: true,
         dataIndex: 0,
         dragEnabled: true,
         draggingSessionKey: null,
         folderViewEnabled: false,
+        folderActionsEnabled: false,
         getRowMoveActionHandlers: vi.fn(() => ({})),
         getRowNativeContextMenuOpenChangeHandler: vi.fn(() => vi.fn()),
         getRowSetTagsHandler: vi.fn(() => vi.fn()),
         getRowTogglePinnedHandler: vi.fn(() => vi.fn()),
         groupKey: 'day:today',
         item: baseItem,
-        items: [baseItem],
         nativeContextMenuSessionKey: null,
         onDragCancel: vi.fn(),
         onDragStart: vi.fn(),
@@ -239,6 +241,13 @@ describe('SessionListRowModelBoundary', () => {
         standardCleanup();
     });
 
+    it('keeps folder actions available with the folder view disabled', async () => {
+        const { SessionListRowModelBoundary } = await import('./SessionListRowModelBoundary');
+        const onMoveToFolder = vi.fn();
+        await renderScreen(<SessionListRowModelBoundary {...createBoundaryProps()} folderActionsEnabled getRowMoveActionHandlers={() => ({ onMoveToFolder })} />);
+        expect(rowRenderProps.at(-1)?.onMoveToFolder).toBe(onMoveToFolder);
+    });
+
     it('updates one row from its row-store subscription without a parent rerender', async () => {
         const { SessionListRowModelBoundary } = await import('./SessionListRowModelBoundary');
         const screen = await renderScreen(<SessionListRowModelBoundary {...createBoundaryProps()} />);
@@ -285,6 +294,42 @@ describe('SessionListRowModelBoundary', () => {
         expect(updatedRow?.props.rowModel.session.thinking).toBe(true);
         expect(updatedRow?.props.rowModel.status.state).toBe('thinking');
         expect(rowRenderProps.length).toBeGreaterThan(renderCountBeforeScopedUpdate);
+    });
+
+    it('keeps row-model identity when only the structural index changes', async () => {
+        const { SessionListRowModelBoundary } = await import('./SessionListRowModelBoundary');
+        const firstItem = {
+            ...baseItem,
+            session: { ...baseSession, id: 'sess_first' },
+        };
+        const trailingItem = {
+            ...baseItem,
+            session: { ...baseSession, id: 'sess_trailing' },
+        };
+        const movedItem = {
+            ...baseItem,
+            session: { ...baseSession, id: 'sess_moved' },
+        };
+        const initialProps = {
+            ...createBoundaryProps(),
+            adjacency: { isFirst: false, isLast: false, isSingle: false },
+            dataIndex: 1,
+        };
+        const screen = await renderScreen(<SessionListRowModelBoundary {...initialProps} />);
+        const initialRowModel = rowRenderProps.at(-1)?.rowModel;
+        const rebuiltBaseItem = { ...baseItem };
+
+        await screen.update(
+            <SessionListRowModelBoundary
+                {...initialProps}
+                dataIndex={2}
+                item={rebuiltBaseItem}
+            />,
+        );
+
+        const movedRowProps = rowRenderProps.at(-1);
+        expect(movedRowProps?.dataIndex).toBe(2);
+        expect(movedRowProps?.rowModel).toBe(initialRowModel);
     });
 
     it('projects canonical existing-session draft updates into the same row and deletes only the draft', async () => {

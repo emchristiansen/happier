@@ -30,6 +30,8 @@ export interface TrackedSession {
   publisherIncarnationId?: string;
   /** Spawn options used to start the current runner process (in-memory only). */
   spawnOptions?: SpawnSessionOptions;
+  /** Positive in-memory custody from accepted launch; never restored from markers or metadata. */
+  spawnOptionsCustody?: 'accepted_live_launch';
   /** Vendor resume id (e.g. Claude/Codex session id) supplied/derived at spawn time. */
   vendorResumeId?: string;
   /** Exact session-owned foreground turn currently open in this runner. */
@@ -56,6 +58,14 @@ export interface TrackedSession {
   /** Best-effort observed process command line used for startup runtime refresh checks. */
   processCommand?: string;
   childProcess?: ChildProcess;
+  /** Transient correlated report writes; shared across wrapper promotion, never persisted. */
+  reportMarkerCustody?: { pending: Promise<void>; retiring: boolean };
+  /** Transient startup custody only; never persisted or projected to public metadata. */
+  startupCustody?: Readonly<{
+    finalization: Promise<void>;
+    promotePid?: (pid: number) => void;
+    observeExit: (exit: Readonly<{ reason: string; code: number | null; signal: string | null }>) => void;
+  }>;
   error?: string;
   directoryCreated?: boolean;
   message?: string;
@@ -79,5 +89,7 @@ export interface TrackedSession {
    * Prevents repeated capability probes when the runner reports unrelated metadata later.
    */
   publishedTerminalControlServiceabilityAttachmentId?: string;
+  /** Lifecycle of the exact attachment whose serviceability was published. */
+  publishedTerminalControlServiceabilityAttachmentLifecycle?: 'owned' | 'borrowed';
   terminalHostHealth?: TerminalHostHealthState;
 }

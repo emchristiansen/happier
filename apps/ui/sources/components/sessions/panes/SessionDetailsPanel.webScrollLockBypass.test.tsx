@@ -37,6 +37,10 @@ function setFakeDocument(scrollLocked: boolean) {
                 overflowY: scrollLocked ? 'hidden' : 'visible',
             }),
         },
+        // A real page also takes the stylesheets web components inject (e.g. the loading spinner).
+        getElementById: () => null,
+        createElement: (tagName: string) => ({ tagName: tagName.toUpperCase(), id: '', textContent: '' }),
+        head: { appendChild: (node: unknown) => node },
     };
 }
 

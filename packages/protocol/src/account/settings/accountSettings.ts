@@ -8,6 +8,7 @@ import {
 } from '../../prompts/codingPromptBehaviorV1.js';
 import {
   ConnectedServicesDefaultAuthByAgentIdV1Schema,
+  ConnectedServicesAdditionalDefaultAuthByAgentIdV1Schema,
   ConnectedServicesProviderStateSharingSettingsV1Schema,
   DEFAULT_CONNECTED_SERVICES_DEFAULT_AUTH_BY_AGENT_ID_V1,
   DEFAULT_CONNECTED_SERVICES_PROVIDER_STATE_SHARING_SETTINGS_V1,
@@ -22,6 +23,8 @@ import {
   type NotificationChannelsV1,
 } from './notificationChannels.js';
 import { SESSION_PERMISSION_MODES } from '../../sessionMetadata/sessionPermissionModes.js';
+import { ClientEncryptionRequirementSchema } from '../../encryption/clientEncryptionRequirement.js';
+import { lazySchema } from '../../lazySchema.js';
 
 function rekeyLegacyBuiltInAgentMap<T>(raw: unknown): Record<string, T> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
@@ -33,7 +36,7 @@ function rekeyLegacyBuiltInAgentMap<T>(raw: unknown): Record<string, T> {
 
 export const ACCOUNT_SETTINGS_SUPPORTED_SCHEMA_VERSION = 2;
 
-export const ForegroundBehaviorSchema = z.enum(['full', 'silent', 'off']);
+export const ForegroundBehaviorSchema = lazySchema(() => z.enum(['full', 'silent', 'off']));
 export type ForegroundBehavior = z.infer<typeof ForegroundBehaviorSchema>;
 
 function normalizeNotificationsSettingsV1Input(raw: unknown): unknown {
@@ -48,7 +51,7 @@ function normalizeNotificationsSettingsV1Input(raw: unknown): unknown {
   return raw;
 }
 
-export const NotificationsSettingsV1Schema = z.preprocess(
+export const NotificationsSettingsV1Schema = lazySchema(() => z.preprocess(
   normalizeNotificationsSettingsV1Input,
   z
   .object({
@@ -63,6 +66,8 @@ export const NotificationsSettingsV1Schema = z.preprocess(
     connectedServiceQuotaBlocked: z.boolean().default(true),
     connectedServiceQuotaRecovered: z.boolean().default(true),
     foregroundBehavior: ForegroundBehaviorSchema.default('full'),
+    // Missing on released clients: keep phone push delivery enabled.
+    mutePhoneWhenComputerFocused: z.boolean().optional(),
   })
   .catch({
     v: 1,
@@ -77,19 +82,19 @@ export const NotificationsSettingsV1Schema = z.preprocess(
     connectedServiceQuotaRecovered: true,
     foregroundBehavior: 'full',
   }),
-);
+));
 
 export type NotificationsSettingsV1 = z.infer<typeof NotificationsSettingsV1Schema>;
 
 export const DEFAULT_NOTIFICATIONS_SETTINGS_V1: NotificationsSettingsV1 = NotificationsSettingsV1Schema.parse({});
 
-const SessionAgentSpawnPermissionCeilingV1Schema = z
+const SessionAgentSpawnPermissionCeilingV1Schema = lazySchema(() => z
   .enum(SESSION_PERMISSION_MODES)
   .nullable()
   .default(null)
-  .catch(null);
+  .catch(null));
 
-export const SessionAgentSpawnPolicyV1Schema = z
+export const SessionAgentSpawnPolicyV1Schema = lazySchema(() => z
   .object({
     v: z.literal(1).default(1),
     allowCustomDirectory: z.boolean().default(true),
@@ -122,7 +127,7 @@ export const SessionAgentSpawnPolicyV1Schema = z
     allowMcpSelectionOverride: true,
     allowTranscriptStorageOverride: true,
     permissionCeiling: null,
-  });
+  }));
 
 export type SessionAgentSpawnPolicyV1 = z.infer<typeof SessionAgentSpawnPolicyV1Schema>;
 
@@ -263,18 +268,18 @@ function migrateLegacyDefaultActionsSettingsV1(settings: ActionsSettingsV1): Act
   return changed ? { ...settings, actions } : settings;
 }
 
-const BackendEnabledByTargetKeySchema = z.record(z.string(), z.boolean()).catch({});
-const BackendCliSourcePreferenceSchema = z.enum(['system-first', 'managed-first']);
-const BackendCliSourcePreferenceByTargetKeySchema = z.preprocess((raw) => {
+const BackendEnabledByTargetKeySchema = lazySchema(() => z.record(z.string(), z.boolean()).catch({}));
+const BackendCliSourcePreferenceSchema = lazySchema(() => z.enum(['system-first', 'managed-first']));
+const BackendCliSourcePreferenceByTargetKeySchema = lazySchema(() => z.preprocess((raw) => {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   return Object.fromEntries(
     Object.entries(raw as Record<string, unknown>).filter(
       ([, value]) => value === 'system-first' || value === 'managed-first',
     ),
   );
-}, z.record(z.string(), BackendCliSourcePreferenceSchema)).default({});
+}, z.record(z.string(), BackendCliSourcePreferenceSchema)).default({}));
 
-export const UsageLimitRecoverySettingsV1Schema = z
+export const UsageLimitRecoverySettingsV1Schema = lazySchema(() => z
   .object({
     v: z.literal(1).default(1),
     mode: z.enum(['ask', 'auto_wait']).default('ask'),
@@ -293,7 +298,7 @@ export const UsageLimitRecoverySettingsV1Schema = z
     mode: 'ask',
     promptMode: 'standard',
     resumePromptMode: 'standard',
-  });
+  }));
 
 export type UsageLimitRecoverySettingsV1 = z.infer<typeof UsageLimitRecoverySettingsV1Schema>;
 
@@ -302,16 +307,16 @@ export const DEFAULT_USAGE_LIMIT_RECOVERY_SETTINGS_V1: UsageLimitRecoverySetting
 
 export const SESSION_PENDING_QUEUE_DRAIN_MODES = ['one_at_a_time', 'drain_all'] as const;
 export const DEFAULT_SESSION_PENDING_QUEUE_DRAIN_MODE = 'one_at_a_time' as const;
-export const SessionPendingQueueDrainModeSchema = z
+export const SessionPendingQueueDrainModeSchema = lazySchema(() => z
   .enum(SESSION_PENDING_QUEUE_DRAIN_MODES)
-  .catch(DEFAULT_SESSION_PENDING_QUEUE_DRAIN_MODE);
+  .catch(DEFAULT_SESSION_PENDING_QUEUE_DRAIN_MODE));
 export type SessionPendingQueueDrainMode = z.infer<typeof SessionPendingQueueDrainModeSchema>;
 
 export const SESSION_PENDING_QUEUE_DELIVERY_TIMINGS = ['after_foreground_ready', 'after_runtime_idle'] as const;
 export const DEFAULT_SESSION_PENDING_QUEUE_DELIVERY_TIMING = 'after_foreground_ready' as const;
-export const SessionPendingQueueDeliveryTimingSchema = z
+export const SessionPendingQueueDeliveryTimingSchema = lazySchema(() => z
   .enum(SESSION_PENDING_QUEUE_DELIVERY_TIMINGS)
-  .catch(DEFAULT_SESSION_PENDING_QUEUE_DELIVERY_TIMING);
+  .catch(DEFAULT_SESSION_PENDING_QUEUE_DELIVERY_TIMING));
 export type SessionPendingQueueDeliveryTiming = z.infer<typeof SessionPendingQueueDeliveryTimingSchema>;
 
 function backfillLegacyTargetKeyedAccountSettings(raw: Record<string, unknown>): Record<string, unknown> {
@@ -354,7 +359,7 @@ function backfillLegacyTargetKeyedAccountSettings(raw: Record<string, unknown>):
 
 // This is the canonical, forward-compatible schema for the server-synced account settings blob.
 // It MUST preserve unknown keys so newer clients can add fields without breaking older ones.
-export const AccountSettingsSchema = z.preprocess(
+export const AccountSettingsSchema = lazySchema(() => z.preprocess(
   (raw) => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
     return backfillLegacyTargetKeyedAccountSettings(raw as Record<string, unknown>);
@@ -367,6 +372,7 @@ export const AccountSettingsSchema = z.preprocess(
         .min(0)
         .catch(ACCOUNT_SETTINGS_SUPPORTED_SCHEMA_VERSION)
         .default(ACCOUNT_SETTINGS_SUPPORTED_SCHEMA_VERSION),
+      clientEncryptionRequirementV1: ClientEncryptionRequirementSchema,
       backendEnabledByTargetKey: BackendEnabledByTargetKeySchema.default({}),
       backendCliSourcePreferenceByTargetKey: BackendCliSourcePreferenceByTargetKeySchema,
       scmIncludeCoAuthoredBy: z.boolean().optional().catch(undefined),
@@ -382,6 +388,9 @@ export const AccountSettingsSchema = z.preprocess(
       connectedServicesDefaultAuthByAgentIdV1: ConnectedServicesDefaultAuthByAgentIdV1Schema.default(
         DEFAULT_CONNECTED_SERVICES_DEFAULT_AUTH_BY_AGENT_ID_V1,
       ),
+      connectedServicesAdditionalDefaultAuthByAgentIdV1: ConnectedServicesAdditionalDefaultAuthByAgentIdV1Schema.default(
+        DEFAULT_CONNECTED_SERVICES_DEFAULT_AUTH_BY_AGENT_ID_V1,
+      ),
       connectedServicesProviderStateSharingSettingsV1:
         ConnectedServicesProviderStateSharingSettingsV1Schema.default(
           DEFAULT_CONNECTED_SERVICES_PROVIDER_STATE_SHARING_SETTINGS_V1,
@@ -393,7 +402,7 @@ export const AccountSettingsSchema = z.preprocess(
       acpCatalogSettingsV1: AcpCatalogSettingsV1Schema.catch({ v: 2, backends: [] }).default({ v: 2, backends: [] }),
     })
     .passthrough(),
-);
+));
 
 export type AccountSettings = z.infer<typeof AccountSettingsSchema>;
 

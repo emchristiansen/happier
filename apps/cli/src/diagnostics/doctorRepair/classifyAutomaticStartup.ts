@@ -7,6 +7,7 @@ import {
 
 import type { BackgroundServiceRepairPlan } from '@/diagnostics/backgroundServiceRepair';
 import type { DaemonServiceMode } from '@/daemon/service/plan';
+import { semverLessThan } from './_shared';
 
 import type {
   AutomaticStartupDuplicateDefaultFollowing,
@@ -92,11 +93,9 @@ export function classifyAutomaticStartup(params: Readonly<{
     return !entry.isForeignHome;
   });
 
-  // Duplicate pinned same-server
-  const duplicatePinnedSameServerRemoves = removeActions.filter((a) => {
-    if (a.service.targetMode !== 'pinned') return false;
-    return a.service.instanceId === params.currentServerId;
-  });
+  // Duplicate pinned same-server: the plan owner removes a pinned service only when it serves the
+  // current relay (under its own or another profile id), so every pinned removal is one.
+  const duplicatePinnedSameServerRemoves = removeActions.filter((a) => a.service.targetMode === 'pinned');
 
   // Legacy-pinned current server: pinned removals whose target is current server
   if (duplicatePinnedSameServerRemoves.length > 0 && installActions.length > 0) {
@@ -219,7 +218,7 @@ export function classifyAutomaticStartup(params: Readonly<{
     && e.ringId === params.currentCliRingId
     && e.running === true
     && e.runningCliVersion !== null
-    && e.runningCliVersion !== params.currentCliVersion,
+    && semverLessThan(e.runningCliVersion, params.currentCliVersion),
   );
   if (runningEntry && runningEntry.runningCliVersion !== null) {
     const versionStale: AutomaticStartupVersionStale = {

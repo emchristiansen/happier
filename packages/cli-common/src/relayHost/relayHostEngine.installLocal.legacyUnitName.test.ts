@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { renderWindowsScheduledTaskWrapperPs1 } from '../service/windows.js';
 
 describe('RelayHostEngine (installOrUpdate local legacy unit name)', () => {
   it('migrates the legacy unsuffixed unit to the suffixed unit when the suffixed unit is missing', async () => {
@@ -287,9 +288,8 @@ describe('RelayHostEngine (installOrUpdate local legacy unit name)', () => {
 
   it('ignores and removes the legacy unsuffixed Windows wrapper when it is owned by the preview install root', async () => {
     const originalPlatform = process.platform;
-    const originalArch = process.arch;
 
-    const homeDir = await mkdtemp(join(tmpdir(), 'happier-relay-host-legacy-windows-'));
+    const homeDir = await mkdtemp(join(tmpdir(), 'happier-relay-host-legacy-windows-$HOME-'));
     const payloadRoot = join(homeDir, 'payload');
     await mkdir(payloadRoot, { recursive: true });
     await mkdir(join(payloadRoot, 'prisma', 'sqlite', 'migrations', '20200101000000_init'), { recursive: true });
@@ -299,7 +299,6 @@ describe('RelayHostEngine (installOrUpdate local legacy unit name)', () => {
     await writeFile(serverBinaryPath, 'stub exe\n', 'utf8');
 
     Object.defineProperty(process, 'platform', { value: 'win32' });
-    Object.defineProperty(process, 'arch', { value: 'x64' });
 
     try {
       vi.doMock('node:os', async () => {
@@ -342,12 +341,34 @@ describe('RelayHostEngine (installOrUpdate local legacy unit name)', () => {
         };
       });
 
+      // The packaged Windows service launcher is a release-built native asset that clean checkouts
+      // and non-Windows runners do not have; this Windows-target install stages a minimal launcher PE.
+      const launcherFixturePath = join(homeDir, 'launcher-fixture', 'happier-service-launcher.exe');
+      const launcherBytes = Buffer.alloc(512);
+      launcherBytes.writeUInt16LE(0x5a4d, 0);
+      launcherBytes.writeUInt32LE(0x80, 0x3c);
+      launcherBytes.writeUInt32LE(0x00004550, 0x80);
+      launcherBytes.writeUInt16LE(0x8664, 0x84);
+      launcherBytes.writeUInt16LE(0x20b, 0x98);
+      launcherBytes.writeUInt16LE(2, 0x98 + 68);
+      launcherBytes.write('HAPPIER_SERVICE_LAUNCHER_V1', 0x120, 'ascii');
+      await mkdir(join(homeDir, 'launcher-fixture'), { recursive: true });
+      await writeFile(launcherFixturePath, launcherBytes);
+      vi.doMock('../service/windowsLauncher.js', async () => {
+        const actual = await vi.importActual<typeof import('../service/windowsLauncher.js')>('../service/windowsLauncher.js');
+        return {
+          ...actual,
+          resolvePackagedWindowsServiceLauncherInstallSpec: () =>
+            actual.resolveWindowsServiceLauncherInstallSpec(launcherFixturePath),
+        };
+      });
+
       const previewInstallRoot = `${homeDir}\\.happier\\self-host-preview`;
       const legacyWrapperPath = `${homeDir}\\.happier\\services\\happier-server.ps1`;
       await mkdir(join(homeDir, '.happier', 'services'), { recursive: true });
       await writeFile(
         legacyWrapperPath,
-        `$ErrorActionPreference = "Stop"\nSet-Location -LiteralPath "${previewInstallRoot}"\n`,
+        renderWindowsScheduledTaskWrapperPs1({ workingDirectory: previewInstallRoot }),
         'utf8',
       );
 
@@ -378,7 +399,6 @@ describe('RelayHostEngine (installOrUpdate local legacy unit name)', () => {
       await expect(access(`${homeDir}\\.happier\\services\\happier-server-preview.ps1`)).resolves.toBeUndefined();
     } finally {
       Object.defineProperty(process, 'platform', { value: originalPlatform });
-      Object.defineProperty(process, 'arch', { value: originalArch });
       vi.resetModules();
       vi.clearAllMocks();
       await rm(homeDir, { recursive: true, force: true });

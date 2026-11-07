@@ -35,7 +35,8 @@ export type PushPermissionOutcome =
 
 export type ExpoPushTokenOutcome =
     | Readonly<{ ok: true; token: string }>
-    | Readonly<{ ok: false; reason: PushNotificationRuntimeFailure | 'token_unavailable' }>;
+    | Readonly<{ ok: false; reason: PushNotificationRuntimeFailure }>
+    | Readonly<{ ok: false; reason: 'token_unavailable'; message?: string }>;
 
 export type PushNotificationAccessOptions = Readonly<{
     timeoutMs?: number;
@@ -169,15 +170,21 @@ export async function readExpoPushToken(
                 const result = projectId
                     ? await notifications.getExpoPushTokenAsync({ projectId })
                     : await notifications.getExpoPushTokenAsync();
-                return typeof result?.data === 'string' ? result.data.trim() : '';
-            } catch {
+                return { token: typeof result?.data === 'string' ? result.data.trim() : '' };
+            } catch (error) {
                 // A device that cannot mint a token (missing entitlement, simulator, revoked APNs
                 // registration) is a device-level fact, not a runtime reachability failure.
-                return '';
+                return {
+                    token: '',
+                    message: error instanceof Error ? error.message : String(error),
+                };
             }
         },
     );
 
     if (!outcome.ok) return outcome;
-    return outcome.value ? { ok: true, token: outcome.value } : { ok: false, reason: 'token_unavailable' };
+    if (outcome.value.token) return { ok: true, token: outcome.value.token };
+    return outcome.value.message
+        ? { ok: false, reason: 'token_unavailable', message: outcome.value.message }
+        : { ok: false, reason: 'token_unavailable' };
 }

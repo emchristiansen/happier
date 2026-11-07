@@ -15,6 +15,7 @@ type PartitionableEntry = Readonly<{
     id: string;
     kind: string;
     status: Parameters<typeof resolveAgentActivitySectionId>[0];
+    isActive?: boolean;
     parentId?: string | null;
 }>;
 
@@ -41,12 +42,12 @@ export function partitionAgentActivityRuns<TEntry extends PartitionableEntry>(
     }>,
 ): AgentActivityRunPartition<TEntry> {
     const scoped = options?.liveOnly === true
-        ? entries.filter((entry) => resolveAgentActivitySectionId(entry.status) === 'working')
+        ? entries.filter((entry) => resolveAgentActivitySectionId(entry.status, entry.isActive) === 'working')
         : entries;
     // A run is drawn as a panel only while it is in flight: a finished run and its agents belong to
     // the terminal list, where they are ordered by recency with everything else that just happened.
     const runEntries = scoped.filter((entry) => (
-        entry.kind === 'workflow_run' && resolveAgentActivitySectionId(entry.status) === 'working'
+        entry.kind === 'workflow_run' && resolveAgentActivitySectionId(entry.status, entry.isActive) === 'working'
     ));
     if (runEntries.length === 0) return { runEntries, listedEntries: scoped };
     const drawnRunIds = new Set(runEntries.map((entry) => entry.id));

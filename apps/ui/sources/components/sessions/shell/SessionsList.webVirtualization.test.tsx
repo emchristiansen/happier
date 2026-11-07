@@ -323,9 +323,6 @@ vi.mock('@/components/account/RecoveryKeyReminderBanner', () => ({
     RecoveryKeyReminderBanner: 'RecoveryKeyReminderBanner',
 }));
 
-vi.mock('@/components/ui/feedback/UpdateBanner', () => ({
-    UpdateBanner: 'UpdateBanner',
-}));
 
 vi.mock('@/utils/sessions/sessionUtils', async (importOriginal) => {
     const actual = await importOriginal<typeof import('@/utils/sessions/sessionUtils')>();
@@ -624,6 +621,24 @@ describe('SessionsList web virtualization', () => {
         expect(preloadEnrichedMarkdownRuntimeSpy).toHaveBeenCalledOnce();
     });
 
+    it('preserves the search input while filtering a large list down to no results and back', async () => {
+        mockVisibleSessionListViewData = mockVisibleSessionListViewData.map((item) => item.type === 'header'
+            ? { ...item, headerKind: 'active' }
+            : item);
+        const screen = await renderSessionsList();
+        await act(async () => {
+            screen.findByTestId('session-list-search-trigger')?.props.onPress?.({ stopPropagation: vi.fn() });
+        });
+        const input = screen.findByTestId('session-list-search-input');
+        expect(input).toBeTruthy();
+        await act(async () => { input?.props.onChangeText?.('no-matching-session'); });
+        expect(screen.findByTestId('session-list-search-input')).toBe(input);
+        expect(capturedWebFlashListProps?.data).toHaveLength(1);
+        await act(async () => { input?.props.onChangeText?.(''); });
+        expect(screen.findByTestId('session-list-search-input')).toBe(input);
+        expect(capturedWebFlashListProps?.data).toHaveLength(LARGE_SESSION_COUNT + 1);
+    });
+
     it('does not mount every row of a large web session list', async () => {
         const screen = await renderSessionsList();
 
@@ -865,9 +880,9 @@ describe('SessionsList web virtualization', () => {
         ];
 
         const screen = await renderSessionsList();
-        const firstSessionItem = capturedWebFlatListProps!.data.find((item: any) => item?.session?.id === 'small_a');
+        const firstSessionItem = capturedWebFlashListProps!.data.find((item: any) => item?.session?.id === 'small_a');
         await act(async () => {
-            capturedWebFlatListProps!.onViewableItemsChanged?.({
+            capturedWebFlashListProps!.onViewableItemsChanged?.({
                 viewableItems: [{ isViewable: true, item: firstSessionItem }],
             });
         });

@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 
 /**
  * @param {string} cmd
- * @param {Record<string, string>} env
+ * @param {NodeJS.ProcessEnv} env
  * @returns {boolean}
  */
 function commandExists(cmd, env) {
@@ -36,7 +36,7 @@ function readPlistXmlStringValue(key, xml) {
 
 /**
  * @param {string} zipPath
- * @param {Record<string, string>} env
+ * @param {NodeJS.ProcessEnv} env
  * @returns {string[]}
  */
 function listZipEntries(zipPath, env) {
@@ -55,7 +55,7 @@ function listZipEntries(zipPath, env) {
 /**
  * @param {string} zipPath
  * @param {string} entry
- * @param {Record<string, string>} env
+ * @param {NodeJS.ProcessEnv} env
  * @returns {Buffer}
  */
 function extractZipEntry(zipPath, entry, env) {
@@ -69,7 +69,7 @@ function extractZipEntry(zipPath, entry, env) {
 }
 
 /**
- * @param {{ ipaPath: string; env: Record<string, string> }} opts
+ * @param {{ ipaPath: string; env: NodeJS.ProcessEnv }} opts
  * @returns {{ bundleIdentifier: string; displayName: string; buildNumber: string; version: string } | null}
  */
 export function readIosIpaMetadata(opts) {
@@ -90,6 +90,7 @@ export function readIosIpaMetadata(opts) {
     const plistPath = path.join(dir, 'Info.plist');
     fs.writeFileSync(plistPath, plistBuf);
 
+    /** @param {string} key */
     const readKey = (key) => {
       try {
         return execFileSync('plutil', ['-extract', key, 'raw', '-o', '-', plistPath], {

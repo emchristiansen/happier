@@ -175,10 +175,12 @@ describe('happier daemon start output', () => {
 
       const stdout = await runDaemonStartAndCapture(0);
 
-      expect(stdout).toContain('Daemon started successfully');
-      expect(stdout).toContain('Relay URL: http://localhost:4321');
-      expect(stdout).toContain('Relay profile: env_test');
-      expect(stdout).toContain('Account: account-123');
+      // Starting is a timed step; the details follow as one aligned list.
+      expect(stdout).toContain('- [..] Starting daemon');
+      expect(stdout).toContain('- [✓] Started daemon');
+      expect(stdout).toMatch(/Relay URL: +http:\/\/localhost:4321/u);
+      expect(stdout).toMatch(/Relay profile: +env_test/u);
+      expect(stdout).toMatch(/Account: +account-123/u);
     } finally {
       envScope.restore();
       await removeTempDir(tmp);
@@ -252,6 +254,21 @@ describe('happier daemon start output', () => {
     } finally {
       envScope.restore();
       await removeTempDir(tmp);
+    }
+  }, 60_000);
+
+  it('marks the start step failed when the daemon cannot be spawned', async () => {
+    vi.useRealTimers();
+    spawnDetachedDaemonStartSyncMock.mockRejectedValue(new Error('spawn EACCES'));
+    vi.resetModules();
+    const output = captureConsoleText();
+    try {
+      const { handleDaemonCliCommand } = await import('./daemon');
+      await expect(handleDaemonCliCommand({ args: ['daemon', 'start'], rawArgv: [], terminalRuntime: null }))
+        .rejects.toThrow('spawn EACCES');
+      expect(output.text()).toContain('- [x] Starting daemon');
+    } finally {
+      output.restore();
     }
   }, 60_000);
 

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { lazySchema } from '../lazySchema.js';
 
 /** Pending identity is opaque after admission; validation must never normalize it. */
 export function isPendingLocalId(value: unknown): value is string {
@@ -9,11 +10,11 @@ export function readPendingLocalId(value: unknown): string | null {
   return isPendingLocalId(value) ? value : null;
 }
 
-export const PendingLocalIdSchema = z.string().refine(isPendingLocalId, {
+export const PendingLocalIdSchema = lazySchema(() => z.string().refine(isPendingLocalId, {
   message: 'Pending localId must not be blank',
-});
+}));
 
 export type PendingLocalId = z.infer<typeof PendingLocalIdSchema>;
 
 /** Optional materialize request field; omission preserves the released rejoin behavior. */
-export const PendingMaterializeHeldLocalIdsSchema = z.array(PendingLocalIdSchema);
+export const PendingMaterializeHeldLocalIdsSchema = lazySchema(() => z.array(PendingLocalIdSchema));

@@ -8,6 +8,10 @@ export function getAttachCommandForSession(params: {
     if (!terminal) return null;
     if (terminal.mode === 'tmux') {
         if (!terminal.tmux?.target) return null;
+    } else if (terminal.mode === 'zellij') {
+        if (!terminal.zellij?.sessionName) return null;
+    } else if (terminal.mode === 'herdr') {
+        if (!terminal.herdr?.sessionName || !terminal.herdr.socketPath || !terminal.herdr.terminalId) return null;
     } else if (terminal.mode === 'windows_terminal') {
         if (!terminal.windows?.windowId) return null;
     } else if (terminal.mode === 'windows_console') {

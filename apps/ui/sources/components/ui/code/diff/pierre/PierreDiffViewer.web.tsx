@@ -1,9 +1,9 @@
 import * as React from 'react';
 import { PierreDiffScrollAnchor } from './PierreDiffScrollAnchor.web';
 import { useUnistyles } from 'react-native-unistyles';
-import { createTwoFilesPatch } from 'diff';
+import { createTwoFilesPatch, formatPatch, parsePatch } from 'diff';
 
-import { getSingularPatch } from '@pierre/diffs';
+import { getSingularPatch, processFile } from '@pierre/diffs';
 import type { DiffLineAnnotation, FileDiffMetadata, FileDiffOptions, OnDiffLineClickProps } from '@pierre/diffs';
 import { FileDiff, Virtualizer, WorkerPoolContext, useVirtualizer } from '@pierre/diffs/react';
 
@@ -282,22 +282,11 @@ function extractFirstDiffSegment(patch: string): string {
         return text.slice(first, second).trimEnd() + '\n';
     }
 
-    // Some SCMs emit unified diffs without `diff ...` headers. Fall back to splitting on `---` preludes.
-    const preludeIndices: number[] = [];
-    const preludeRe = /^---[ \t]/gm;
-    while ((match = preludeRe.exec(text)) !== null) {
-        if (typeof match.index === 'number') {
-            preludeIndices.push(match.index);
-            if (preludeIndices.length >= 2) break;
-        }
-    }
-    if (preludeIndices.length >= 2) {
-        const first = preludeIndices[0]!;
-        const second = preludeIndices[1]!;
-        return text.slice(first, second).trimEnd() + '\n';
-    }
+    // A single explicit diff header owns the entire patch, including hunk lines
+    // such as a removed SQL comment ("--- heading").
+    if (indices.length === 1) return patch;
 
-    return patch;
+    return extractUnifiedPreludeDiffForSingleFile({ patch });
 }
 
 function sanitizeUnifiedPatchForPierre(patch: string): string {
@@ -321,36 +310,28 @@ function normalizeDiffPath(value: string): string {
     return String(value ?? '').replace(/\\/g, '/').replace(/^\.\/+/, '').trim();
 }
 
-function extractUnifiedPreludeDiffForSingleFile(params: Readonly<{ patch: string; filePath: string }>): string {
+function extractUnifiedPreludeDiffForSingleFile(params: Readonly<{ patch: string; filePath?: string }>): string {
     const patch = typeof params.patch === 'string' ? params.patch : '';
-    const normalizedPath = normalizeDiffPath(params.filePath);
-    if (!patch || !normalizedPath) return patch;
+    const normalizedPath = normalizeDiffPath(params.filePath ?? '');
+    if (!patch) return patch;
 
-    const normalizedPatch = patch.replace(/\r\n/g, '\n');
-    const preludeMatches = normalizedPatch.match(/^---[ \t]/gm) ?? [];
-    if (preludeMatches.length <= 1) return patch;
-
-    const lines = normalizedPatch.split('\n');
-    const preludeIndices: number[] = [];
-    for (let i = 0; i < lines.length; i += 1) {
-        const line = lines[i] ?? '';
-        if (line.startsWith('--- ')) preludeIndices.push(i);
-    }
-    if (preludeIndices.length <= 1) return patch;
-
-    const needles = [`a/${normalizedPath}`, normalizedPath];
-    for (let i = 0; i < preludeIndices.length; i += 1) {
-        const start = preludeIndices[i]!;
-        const end = preludeIndices[i + 1] ?? lines.length;
-        const headerLine = lines[start] ?? '';
-
-        if (!needles.some((needle) => headerLine.includes(needle))) continue;
-
-        const segment = lines.slice(start, end).join('\n');
+    // File-looking lines inside a hunk are data. Reuse the installed diff parser,
+    // which consumes the declared hunk line counts before looking for another file.
+    try {
+        const files = parsePatch(patch.replace(/\r\n/g, '\n'));
+        if (files.length <= 1) return patch;
+        const needles = new Set([normalizedPath, `a/${normalizedPath}`, `b/${normalizedPath}`]);
+        const selected = normalizedPath
+            ? files.find((file) => needles.has(normalizeDiffPath(file.oldFileName ?? ''))
+                || needles.has(normalizeDiffPath(file.newFileName ?? '')))
+            : files[0];
+        if (!selected) return patch;
+        const segment = formatPatch(selected);
         return patch.includes('\r\n') ? segment.replace(/\n/g, '\r\n') : segment;
+    } catch {
+        // Leave malformed/unsupported input intact for the existing render fallback.
+        return patch;
     }
-
-    return patch;
 }
 
 export function resolvePierreTypographyStyle(): React.CSSProperties {
@@ -455,7 +436,12 @@ export const PierreDiffViewer = React.memo<DiffViewerProps>((props) => {
         // and for empty diff strings. Some versions log diagnostics before throwing.
         if (!looksLikeUnifiedDiff(sanitizedPatch)) return null;
         try {
-            return getSingularPatch(sanitizedPatch);
+            if (/^diff --git[ \t]/m.test(sanitizedPatch)) return getSingularPatch(sanitizedPatch);
+            // Pierre's patch-level headerless splitter also mistakes removed SQL
+            // comments for file headers. Validate singularity with the hunk-aware
+            // diff parser, then use Pierre's public single-file parser directly.
+            if (parsePatch(sanitizedPatch).length !== 1) return null;
+            return processFile(sanitizedPatch, { isGitDiff: false, throwOnError: true });
         } catch {
             return null;
         }
@@ -837,7 +823,7 @@ export const PierreDiffViewer = React.memo<DiffViewerProps>((props) => {
 
     const body = props.virtualized && !sharedVirtualizer ? (
         <Virtualizer
-            style={{ flex: '1 1 0%', minHeight: 0, maxHeight: 'inherit', overflowY: 'auto' }}
+            style={{ maxHeight: 'inherit', overflowY: 'auto' }}
         >
             {/* Pierre's virtualized instance retains its initial fileDiff; remount
                 only that inner renderer when the content hash changes. */}
@@ -864,17 +850,7 @@ export const PierreDiffViewer = React.memo<DiffViewerProps>((props) => {
     );
 
     const wrapperStyle = props.virtualized
-        ? ({
-            ...typographyStyle,
-            ...selectionStyle,
-            display: 'flex',
-            flex: '1 1 0%',
-            flexDirection: 'column',
-            minHeight: 0,
-            maxHeight: 'inherit',
-            overflow: 'hidden',
-            ...(!sharedVirtualizer ? { position: 'absolute', inset: 0 } : null),
-        } as React.CSSProperties)
+        ? ({ ...typographyStyle, ...selectionStyle, maxHeight: 'inherit' } as React.CSSProperties)
         : ({ ...typographyStyle, ...selectionStyle } as React.CSSProperties);
 
     return (

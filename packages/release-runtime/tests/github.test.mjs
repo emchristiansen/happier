@@ -1,7 +1,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 
 import { fetchGitHubLatestRelease, fetchGitHubReleaseByTag, fetchFirstGitHubReleaseByTags } from '../dist/github.js';
+
+test('fetchGitHubLatestRelease preserves caller cancellation through a stalled metadata body', async () => {
+  const controller = new AbortController();
+  const reason = new Error('stop metadata request');
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('{');
+    setTimeout(() => controller.abort(reason), 25);
+  });
+  let watchdog;
+  try {
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    await assert.rejects(Promise.race([
+      fetchGitHubLatestRelease({
+        githubRepo: 'pnpm/pnpm', signal: controller.signal,
+        fetchImpl: (_url, init) => fetch(`http://127.0.0.1:${port}/latest`, init),
+      }),
+      new Promise((_resolve, reject) => { watchdog = setTimeout(() => reject(new Error('metadata did not cancel')), 500); }),
+    ]), (error) => error === reason);
+  } finally {
+    clearTimeout(watchdog);
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
 
 function createFetchStub(routeMap) {
   const calls = [];
@@ -81,6 +108,18 @@ test('fetchGitHubReleaseByTag tolerates the bounded rolling-release replacement 
   });
   assert.equal(calls, 3);
   assert.equal(release.tag_name, 'server-preview');
+});
+
+test('fetchGitHubReleaseByTag preserves the network failure cause for acquisition diagnostics', async () => {
+  const networkError = Object.assign(new Error('Connection refused'), { code: 'ECONNREFUSED' });
+  await assert.rejects(fetchGitHubReleaseByTag({
+    githubRepo: 'happier-dev/happier',
+    tag: 'cli-stable',
+    fetchImpl: async () => { throw networkError; },
+  }), (error) => {
+    assert.equal(error.cause, networkError);
+    return true;
+  });
 });
 
 test('fetchFirstGitHubReleaseByTags returns first non-404 release', async () => {

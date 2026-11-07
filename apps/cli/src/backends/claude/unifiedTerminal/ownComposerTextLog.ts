@@ -1,5 +1,4 @@
 import {
-  countPromptNewlines,
   pastedTextLineCountMatchesPrompt,
   parseExactClaudePastedTextMarkerLineCount,
 } from './claudePastedTextMarker';
@@ -47,7 +46,7 @@ type OwnComposerTextLogEntry = Readonly<{
   text: string;
   collapsedText: string;
   clearableCandidates: readonly string[];
-  collapsedPasteLineCount?: number | undefined;
+  injectedText: string;
   recordedAtMs: number;
   shortPrefixResidueUntilMs?: number | undefined;
   minShortPrefixResidueChars: number;
@@ -84,9 +83,8 @@ function isCollapsedPasteMarkerMatch(params: Readonly<{
 }>): boolean {
   if (
     params.collapsedPasteLineCount === null
-    || params.entry.collapsedPasteLineCount === undefined
     || !pastedTextLineCountMatchesPrompt({
-      promptText: params.entry.text,
+      promptText: params.entry.injectedText,
       pastedLineCount: params.collapsedPasteLineCount,
     })
   ) {
@@ -121,19 +119,21 @@ export function createClaudeOwnComposerTextLog(opts?: Readonly<{
 
   const createEntry = (
     normalized: string,
+    injectedText: string,
     recordedAtMs: number,
     shortPrefixResidueUntilMs?: number | undefined,
     minShortPrefixResidueChars = MIN_CONTEXTUAL_PREFIX_RESIDUE_CHARS,
   ): OwnComposerTextLogEntry => {
     const collapsedText = normalizeClaudeUnifiedComposerRenderingText(normalized);
-    const newlineCount = countPromptNewlines(normalized);
     return {
       text: normalized,
       collapsedText,
       // Clearable ownership is intentionally limited to the full injected text. Individual
       // prompt lines are only near-match evidence and must not become an Escape-clearing action.
       clearableCandidates: [normalized, collapsedText],
-      ...(newlineCount > 0 ? { collapsedPasteLineCount: newlineCount } : {}),
+      // Claude counts the pasted bytes, including wrapper and outer blank lines that semantic
+      // identity deliberately removes. Keep the original input as the single counting source.
+      injectedText,
       recordedAtMs,
       shortPrefixResidueUntilMs,
       minShortPrefixResidueChars,
@@ -148,7 +148,7 @@ export function createClaudeOwnComposerTextLog(opts?: Readonly<{
     record(text) {
       const normalized = normalize(text);
       if (normalized.length === 0) return;
-      entries.push(createEntry(normalized, nowMs()));
+      entries.push(createEntry(normalized, text, nowMs()));
       trimToLimit();
     },
     recordPossiblePartialResidue(text, recordOpts) {
@@ -160,7 +160,7 @@ export function createClaudeOwnComposerTextLog(opts?: Readonly<{
         1,
         Math.trunc(recordOpts?.minPrefixChars ?? MIN_CONTEXTUAL_PREFIX_RESIDUE_CHARS),
       );
-      const existingIndex = entries.findIndex((entry) => entry.text === normalized);
+      const existingIndex = entries.findIndex((entry) => entry.injectedText === text);
       if (existingIndex >= 0) {
         const existing = entries[existingIndex];
         if (existing) {
@@ -172,7 +172,7 @@ export function createClaudeOwnComposerTextLog(opts?: Readonly<{
         }
         return;
       }
-      entries.push(createEntry(normalized, now, shortPrefixResidueUntilMs, minShortPrefixResidueChars));
+      entries.push(createEntry(normalized, text, now, shortPrefixResidueUntilMs, minShortPrefixResidueChars));
       trimToLimit();
     },
     matches(draft) {

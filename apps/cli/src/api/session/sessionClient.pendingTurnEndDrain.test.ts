@@ -1,15 +1,21 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import axios from 'axios';
+import type { ManagedConnectionSupervisor } from '@happier-dev/connection-supervisor';
 import { readFileSync } from 'node:fs';
 
+import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
+import { createSessionProviderInputConsumer } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
+import { createClaudeUnifiedInputArbiter } from '@/backends/claude/unifiedTerminal/createClaudeUnifiedInputArbiter';
+import { createClaudeUnifiedPendingQueuePump } from '@/backends/claude/unifiedTerminal/createClaudeUnifiedPendingQueuePump';
 import { createDeferred } from '@/testkit/async/deferred';
 import { createPlainSessionFixture } from '@/testkit/backends/sessionFixtures';
 import {
   type ApiSessionSocketStub,
   createApiSessionSocketStub,
+  resolveApiSessionSocketDefaultAck,
 } from '@/testkit/backends/apiSessionSocketHarness';
 import { encodeBase64, encrypt } from '../encryption';
-import { accountSettingsParse } from '@happier-dev/protocol';
+import { accountSettingsParse, type AcceptedPendingSettlementResponseV1 } from '@happier-dev/protocol';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 import { configuration } from '@/configuration';
@@ -17,12 +23,10 @@ import {
   getActiveAccountSettingsSnapshot,
   setActiveAccountSettingsSnapshot,
 } from '@/settings/accountSettings/activeAccountSettingsSnapshot';
-import type { SessionMutationOutbox } from './mutations/createSessionMutationOutbox';
+import type { CreateSessionMutationOutboxParams, SessionMutationOutbox } from './mutations/createSessionMutationOutbox';
 import { logger } from '@/ui/logger';
 import type { SessionProviderInputOutcomeObserver } from './sessionClient';
 import { createCodexAppServerProviderInputOutcomeBridge } from '@/backends/codex/appServer/codexAppServerProviderInputOutcome';
-import { createSessionProviderInputConsumer } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
-import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { createSocketAckError } from '@/session/transport/shared/socketAck';
 import {
   PendingQueueAcceptedSettlementError,
@@ -36,10 +40,16 @@ const offlineBoundary = vi.hoisted(() => {
   for (const key of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
     vi.stubEnv(key, origin);
   }
+  const denyNetwork = vi.fn((operation: string) => { throw new Error(`Unconfigured offline network: ${operation}`); });
+  // Positive boundary check before project imports; subsequent calls must remain zero.
+  try { denyNetwork('boundary-check'); } catch (error) {
+    if (!(error instanceof Error) || error.message !== 'Unconfigured offline network: boundary-check') throw error;
+  }
+  denyNetwork.mockClear();
   const fetch = vi.fn(async (input: string | URL | Request) => {
     const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
     if (url.origin !== origin || url.pathname !== '/v1/features') {
-      throw new Error(`Unconfigured offline fetch: ${url.href}`);
+      return denyNetwork(`fetch ${url.href}`);
     }
     return new Response(JSON.stringify({
       features: {
@@ -58,14 +68,44 @@ const offlineBoundary = vi.hoisted(() => {
     }), { status: 200 });
   });
   vi.stubGlobal('fetch', fetch);
-  return { origin, fetch };
+  return { origin, fetch, denyNetwork };
 });
+
+// J100 exercises real pending parsers/supervision, with no host process observation.
+const j100ProcessBoundary = vi.hoisted(() => {
+  const denyChild = vi.fn(() => { throw new Error('J100 child process boundary denied'); });
+  const fingerprint = vi.fn((pid: number) => {
+    if (pid !== process.pid) throw new Error('J100 foreign process observation denied');
+    return 'j100-inert-process-instance';
+  });
+  // Verify the denial before SessionClient or any of its project dependencies import.
+  try { denyChild(); } catch (error) {
+    if (!(error instanceof Error) || error.message !== 'J100 child process boundary denied') throw error;
+  }
+  denyChild.mockClear();
+  vi.spyOn(process, 'kill').mockImplementation(denyChild);
+  return { denyChild, fingerprint };
+});
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  const denied = Object.fromEntries(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']
+    .map((name) => [name, j100ProcessBoundary.denyChild]));
+  return { ...actual, ...denied, default: { ...actual, ...denied } };
+});
+vi.mock('@happier-dev/cli-common/processInstance', () => ({
+  readProcessInstanceFingerprintSync: j100ProcessBoundary.fingerprint,
+  processInstanceFingerprintMatches: (expected: string, observed: string) => expected === observed,
+}));
 
 vi.mock('axios', async () => {
   const { createOfflineAxios } = await import('@/testkit/http/offlineAxios');
   return { default: {
     ...createOfflineAxios(async (url) => {
-      throw new Error(`Unconfigured offline GET: ${url}`);
+      // Preserve this fixture's existing unsupported-changes fallback without real HTTP.
+      if (new URL(url).pathname === '/v2/changes') {
+        return { status: 404, data: { error: 'not-found' } };
+      }
+      return offlineBoundary.denyNetwork(`GET ${url}`);
     }),
     isAxiosError: (payload: unknown) => payload !== null && typeof payload === 'object'
       && 'isAxiosError' in payload && payload.isAxiosError === true,
@@ -73,9 +113,11 @@ vi.mock('axios', async () => {
 });
 
 vi.mock('socket.io-client', () => ({
-  io: () => { throw new Error('Unconfigured offline socket'); },
+  io: () => offlineBoundary.denyNetwork('socket.io'),
 }));
 
+// These composed regressions keep the real supervisor and pending wire parser; only sockets/HTTP are offline.
+let useRealSupervisorAndPendingTransport = false;
 const clients: import('./sessionClient').ApiSessionClient[] = [];
 const providerInputOutcomeObservers = new WeakMap<object, SessionProviderInputOutcomeObserver>();
 
@@ -132,14 +174,18 @@ vi.mock('./sockets', () => ({
 vi.mock('./connection/createSessionSocketTransport', () => ({
   createSessionSocketTransport: () => {
     if (!sessionSocketStub) throw new Error('Missing session socket stub');
+    const socket = sessionSocketStub;
     return {
       socket: sessionSocketStub as any,
       transport: {
-        connect: async () => {},
-        disconnect: async () => {},
-        destroy: async () => {},
-        isConnected: () => sessionSocketStub?.connected === true,
-        onConnected: () => () => {},
+        connect: async () => { socket.connect(); },
+        disconnect: async () => { socket.disconnect(); },
+        destroy: async () => { socket.removeAllListeners(); },
+        isConnected: () => socket.connected === true,
+        onConnected: (listener: () => void) => {
+          socket.on('connect', listener);
+          return () => { socket.off('connect', listener); };
+        },
         onDisconnected: () => () => {},
         onError: () => () => {},
       },
@@ -154,8 +200,13 @@ const closeOutboxMock = vi.fn(async () => {});
 const setServerContractMock = vi.fn(async (_result: unknown) => {});
 
 vi.mock('./mutations/createSessionMutationOutbox', () => ({
-  createSessionMutationOutbox: (): SessionMutationOutbox => ({
-    enqueueSessionTurn: (mutation: { action?: unknown }) => enqueueSessionTurnMock(mutation),
+  createSessionMutationOutbox: (params: CreateSessionMutationOutboxParams): SessionMutationOutbox => ({
+    enqueueAgentStateRequestSettlement: async () => ({ persisted: true, delivered: true }),
+    // Like the real outbox, report a session-turn mutation only after its durable delivery.
+    enqueueSessionTurn: async (mutation: Parameters<SessionMutationOutbox['enqueueSessionTurn']>[0]) => {
+      await enqueueSessionTurnMock(mutation);
+      params.onSessionTurnDelivered?.(mutation);
+    },
     enqueueTranscriptMessage: (mutation: unknown) => enqueueTranscriptMessageMock(mutation),
     enqueueRuntimeActivitySnapshot: async () => ({ persisted: true, delivered: true }),
     setSessionSyncPendingInputServerContract: (result: unknown) => setServerContractMock(result),
@@ -182,20 +233,28 @@ let supervisorOnConnected: (() => Promise<void> | void) | null = null;
 let supervisorConnectedPromise: Promise<void> | null = null;
 const supervisorReportProbeResultMock = vi.fn();
 
-vi.mock('@happier-dev/connection-supervisor', () => ({
-  DEFAULT_MANAGED_CONNECTION_POLICY: {},
-  createManagedConnectionSupervisor: (params: { createTransport: () => unknown; onConnected?: () => Promise<void> | void }) => ({
+vi.mock('@happier-dev/connection-supervisor', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@happier-dev/connection-supervisor')>();
+  return {
+  ...actual,
+  createManagedConnectionSupervisor: (params: Parameters<typeof actual.createManagedConnectionSupervisor>[0]) => useRealSupervisorAndPendingTransport
+    ? actual.createManagedConnectionSupervisor(params)
+    : ({
     start: async () => {
       params.createTransport();
-      supervisorOnConnected = params.onConnected ?? null;
-      supervisorConnectedPromise = Promise.resolve(params.onConnected?.());
+      supervisorOnConnected = () => params.onConnected?.({ state: {
+        phase: 'online', reason: null, attempt: 0, nextRetryAt: null,
+        lastConnectedAt: null, lastDisconnectedAt: null, lastErrorMessage: null,
+      } });
+      supervisorConnectedPromise = Promise.resolve(supervisorOnConnected());
       await supervisorConnectedPromise;
     },
     stop: async () => {},
     getState: () => ({ phase: supervisorPhase }),
     reportProbeResult: supervisorReportProbeResultMock,
   }),
-}));
+  };
+});
 
 const catchUpMock = vi.fn(async (_opts?: unknown) => {});
 
@@ -215,8 +274,12 @@ vi.mock('./pendingQueueV2Transport', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./pendingQueueV2Transport')>();
   return {
     ...actual,
-    materializeNextPendingQueueV2Message: (...args: unknown[]) => materializeNextMock(...args),
-    resolveAcceptedPendingQueueV2Delivery: (...args: unknown[]) => resolveAcceptedPendingDeliveryMock(...args),
+    materializeNextPendingQueueV2Message: (...args: Parameters<typeof actual.materializeNextPendingQueueV2Message>) => useRealSupervisorAndPendingTransport
+      ? actual.materializeNextPendingQueueV2Message(...args)
+      : materializeNextMock(...args),
+    resolveAcceptedPendingQueueV2Delivery: (...args: Parameters<typeof actual.resolveAcceptedPendingQueueV2Delivery>) => useRealSupervisorAndPendingTransport
+      ? actual.resolveAcceptedPendingQueueV2Delivery(...args)
+      : resolveAcceptedPendingDeliveryMock(...args),
     blockPendingQueueV2Delivery: (...args: unknown[]) => blockPendingDeliveryMock(...args),
     listPendingQueueV2ProviderDeliveryLocalIdsFromServer: (...args: unknown[]) => listProviderDeliveryLocalIdsMock(...args),
     listPendingQueueV2DeliveryStatusesFromServer: (...args: unknown[]) => listDeliveryStatusesMock(...args),
@@ -247,7 +310,9 @@ async function createClient(
         if (options.serverContractMode === 'released') return {};
         return { v: 1 };
       }
-      return customEmitWithAck?.(event, payload, socket) ?? { ok: true };
+      const customAck = customEmitWithAck?.(event, payload, socket);
+      if (customAck !== undefined) return customAck;
+      return resolveApiSessionSocketDefaultAck(event, payload);
     },
   });
   userSocketStub = createApiSessionSocketStub({ id: 'user-socket', connected: false });
@@ -405,6 +470,10 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   }, 120_000);
 
   beforeEach(() => {
+    useRealSupervisorAndPendingTransport = false;
+    offlineBoundary.denyNetwork.mockClear();
+    j100ProcessBoundary.denyChild.mockClear();
+    vi.spyOn(process, 'kill').mockImplementation(j100ProcessBoundary.denyChild);
     for (const key of ['HAPPIER_SERVER_URL', 'HAPPIER_LOCAL_SERVER_URL', 'HAPPIER_PUBLIC_SERVER_URL', 'HAPPIER_WEBAPP_URL']) {
       vi.stubEnv(key, offlineBoundary.origin);
     }
@@ -451,24 +520,30 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   afterEach(async () => {
-    for (const client of clients.splice(0)) {
-      const pending = client as unknown as {
-        changesSyncInFlight: Promise<void> | null;
-        userSocketSettingsConvergenceInFlight: Promise<void> | null;
-        accountSettingsHintConvergenceInFlight: Promise<void> | null;
-        accountSettingsRequestInFlight: Promise<boolean> | null;
-      };
-      const drains = [pending.changesSyncInFlight, pending.userSocketSettingsConvergenceInFlight,
-        pending.accountSettingsHintConvergenceInFlight, pending.accountSettingsRequestInFlight];
-      await client.close();
-      await Promise.allSettled([...drains, pending.changesSyncInFlight,
-        pending.userSocketSettingsConvergenceInFlight, pending.accountSettingsHintConvergenceInFlight,
-        pending.accountSettingsRequestInFlight]);
+    try {
+      for (const client of clients.splice(0)) {
+        const pending = client as unknown as {
+          changesSyncInFlight: Promise<void> | null;
+          userSocketSettingsConvergenceInFlight: Promise<void> | null;
+          accountSettingsHintConvergenceInFlight: Promise<void> | null;
+          accountSettingsRequestInFlight: Promise<boolean> | null;
+        };
+        const drains = [pending.changesSyncInFlight, pending.userSocketSettingsConvergenceInFlight,
+          pending.accountSettingsHintConvergenceInFlight, pending.accountSettingsRequestInFlight];
+        await client.close();
+        await Promise.allSettled([...drains, pending.changesSyncInFlight,
+          pending.userSocketSettingsConvergenceInFlight, pending.accountSettingsHintConvergenceInFlight,
+          pending.accountSettingsRequestInFlight]);
+      }
+      expect(j100ProcessBoundary.denyChild).not.toHaveBeenCalled();
+      expect(offlineBoundary.denyNetwork).not.toHaveBeenCalled();
+      expect(j100ProcessBoundary.fingerprint.mock.calls.every(([pid]) => pid === process.pid)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
     }
-    vi.useRealTimers();
-    vi.unstubAllEnvs();
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
   });
 
   it('blocks a contract-invalid provider action before invoking provider input', async () => {
@@ -589,6 +664,10 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       if (!String(url).includes('/messages/by-local-id/released-local-1')) {
         throw new Error(`Unexpected HTTP GET in released adapter test: ${String(url)}`);
       }
+      sessionSocketStub!.trigger('update', {
+        id: 'released-materialization-pending-hint', seq: 1, createdAt: 1,
+        body: { t: 'pending-changed', sid: 's1', pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 2 },
+      });
       return {
         status: 200,
         data: {
@@ -609,7 +688,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     });
     const client = await createClient({
       latestTurnStatus: 'completed',
-      pendingCount: 1,
+      pendingCount: 2,
       pendingBlockedCount: 0,
       pendingVersion: 1,
     }, {
@@ -638,6 +717,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       });
     expect(materializeNextMock).not.toHaveBeenCalled();
     expect(delivered).toHaveLength(1);
+    expect(client.shouldAttemptPendingMaterialization()).toBe(true);
   });
 
   it.each([
@@ -1724,7 +1804,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
         return {
           ...result,
           pendingQueueState: { known: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 2 },
-          message: { ...result.message, providerAction: 'steer' as const },
+          message: { ...result.message, providerAction: 'steer' as const, requestedAction: { v: 1 as const, kind: 'steer_now' as const } },
         };
       });
 
@@ -1732,7 +1812,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
         reconcileWhenEmpty: 'force',
         activeTurnSteerability: 'steerable',
       })).resolves.toMatchObject({ type: 'materialized', localId: 'explicit-steer-local' });
-      expect(delivered).toEqual([{ info: expect.objectContaining({ pendingProviderAction: 'steer' }) }]);
+      expect(delivered).toEqual([{ info: expect.objectContaining({ pendingProviderAction: 'steer', pendingRequestedAction: { v: 1, kind: 'steer_now' } }) }]);
     } finally {
       if (previous) setActiveAccountSettingsSnapshot(previous);
     }
@@ -1895,6 +1975,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
     expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
     const bridge = createCodexAppServerProviderInputOutcomeBridge(client, { isCurrentRuntimeMode: () => true });
+    // Native Codex input binds its canonical turn before dispatch (upstream 54642ce03d).
+    await client.sessionTurnLifecycle.beginTurn({ provider: 'codex', startingInputLocalIds: [localId] });
     bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T1' });
     await vi.waitFor(() => expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledWith(expect.objectContaining({ localId })));
   });
@@ -1989,7 +2071,11 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     const { createCodexPendingInputSteerControl, createCodexPendingInputBoundSteerHandler } = await import('@/backends/codex/runCodex');
     const runtime = { getActiveSteerableTurnId: vi.fn().mockResolvedValueOnce('T1').mockResolvedValue('T2') };
     const turnBindings: Parameters<typeof createCodexPendingInputSteerControl>[0]['turnBindings'] = new Map();
-    const steer = vi.fn(async () => { bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T2' }); });
+    const steer = vi.fn(async () => {
+      // Native Codex steering binds its canonical turn before dispatch (upstream 54642ce03d).
+      await client.sessionTurnLifecycle.beginTurn({ provider: 'codex', startingInputLocalIds: [localId] });
+      bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T2' });
+    });
     client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, {
       onBoundCodexSteer: createCodexPendingInputBoundSteerHandler({
         turnBindings, getRuntime: () => runtime, isAdmissionOpen: () => true, steer,
@@ -2070,6 +2156,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     const bridge = createCodexAppServerProviderInputOutcomeBridge(client, { isCurrentRuntimeMode: () => true });
     client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, { onBoundCodexSteer: () => {} });
     await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    // Native Codex input binds its canonical turn before dispatch (upstream 54642ce03d).
+    await client.sessionTurnLifecycle.beginTurn({ provider: 'codex', startingInputLocalIds: [localId] });
     bridge.observeAccepted({ localIds: [localId], providerTurnId: 'T1' });
     await vi.waitFor(() => expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalled());
     const patch = vi.spyOn(axios, 'patch');
@@ -2162,7 +2250,9 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       message: { ...materialized.message, requestedAction: { v: 1, kind: 'steer_now' }, providerAction: 'steer' },
     }).mockResolvedValue({ didMaterialize: false });
     const bridge = createCodexAppServerProviderInputOutcomeBridge(client, { isCurrentRuntimeMode: () => true });
-    client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, { onBoundCodexSteer: () => {
+    client.onUserMessage(() => { throw new Error('Bound action reached ordinary callback'); }, { onBoundCodexSteer: async () => {
+      // Native Codex steering binds its canonical turn before dispatch (upstream 54642ce03d).
+      await client.sessionTurnLifecycle.beginTurn({ provider: 'codex', startingInputLocalIds: [localId] });
       bridge.observeAccepted({ localIds: [localId], providerTurnId: 'captured-native-turn' });
     } });
     vi.spyOn(axios, 'patch').mockImplementationOnce(async (_url, body) => {
@@ -2314,7 +2404,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
         }),
       }),
     );
-    expect(infoFileSpy).toHaveBeenCalledTimes(1);
+    expect(infoFileSpy.mock.calls.filter(([event]) => event === '[pendingQueue] materialize request failed')).toHaveLength(1);
     expect((client as unknown as { pendingMaterializeRetryWakeTimer?: unknown }).pendingMaterializeRetryWakeTimer)
       .toBeUndefined();
 
@@ -2367,6 +2457,252 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       await supervisorOnConnected();
     };
 
+    const realSupervisor = (client: Awaited<ReturnType<typeof createClient>>) =>
+      (client as unknown as { sessionConnectionSupervisor: ManagedConnectionSupervisor }).sessionConnectionSupervisor;
+    const currentEpoch = (client: Awaited<ReturnType<typeof createClient>>) =>
+      (client as unknown as { sessionConnectionEpoch: number }).sessionConnectionEpoch;
+    const waitForNewPublisher = async (client: Awaited<ReturnType<typeof createClient>>, previousEpoch: number) => {
+      await waitUntil(() => currentEpoch(client) > previousEpoch && realSupervisor(client).getState().phase === 'online');
+      await waitForCurrentPendingInputContract(client);
+    };
+
+    it('J100 preserves a newer recovery and its deadline after ordered retry-backed batched ACKs', async () => {
+      useRealSupervisorAndPendingTransport = true;
+      const localId = 'j100-accepted';
+      const initial = createProviderDeliveryMaterializeResult(localId);
+      const materializationAck = createDeferred<unknown>();
+      const retryAck = createDeferred<unknown>();
+      const emissions: string[] = [];
+      let materializations = 0;
+      let settlements = 0;
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
+        sessionSocketEmitWithAck: (event) => {
+          if (event === 'pending-materialize-next') {
+            materializations += 1;
+            if (materializations === 1) return {
+              ok: true, ...initial,
+              message: { ...initial.message, requestedAction: { v: 1, kind: 'send_now' }, providerAction: 'send' },
+            };
+            emissions.push('M');
+            return materializationAck.promise;
+          }
+          if (event === 'pending-delivery-accepted-v1') {
+            emissions.push(`S${settlements++}`);
+            return settlements === 1
+              ? { ok: false, error: 'transaction-unavailable', retryAfterMs: 1250 }
+              : retryAck.promise;
+          }
+          return undefined;
+        },
+      });
+      await waitForCurrentPendingInputContract(client);
+      const delivered = vi.fn();
+      client.onUserMessage(delivered);
+      listDeliveryStatusesMock.mockResolvedValue([{ localId, status: 'delivering' }]);
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toMatchObject({ type: 'materialized', localId });
+      expect(delivered).toHaveBeenCalledTimes(1);
+      vi.useFakeTimers();
+      const warning = vi.spyOn(logger, 'warn');
+      confirmProviderInputAccepted(client, localId);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(emissions).toEqual(['S0']);
+      expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        localId, willRetry: true, retryAfterMs: 1250,
+      }));
+      expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+      const pending = client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(emissions).toEqual(['S0', 'M']);
+      await vi.advanceTimersByTimeAsync(1250);
+      expect(emissions).toEqual(['S0', 'M', 'S1']);
+      expect(materializations).toBe(2); // Initial custody acquisition, then exactly one ordinary M.
+      const recovery = client as unknown as {
+        pendingPublisherRecovery: { state: string };
+        pendingPublisherRecoveryDeadlineTimer: unknown;
+      };
+      let refusedObservation: unknown;
+      let refusedDeadline: unknown;
+      const infoFile = logger.infoFile.bind(logger);
+      vi.spyOn(logger, 'infoFile').mockImplementation((...args) => {
+        if (String(args[0]).includes('session socket lost publisher status')) {
+          refusedObservation = recovery.pendingPublisherRecovery;
+          refusedDeadline = recovery.pendingPublisherRecoveryDeadlineTimer;
+        }
+        return infoFile(...args);
+      });
+      // The external transport delivers FIFO M-success, then S1-forbidden in one batch.
+      // There is no await between these resolutions; all internal parsers remain real.
+      materializationAck.resolve({ ok: true, didMaterialize: false });
+      retryAck.resolve({ ok: false, error: 'forbidden' });
+      await pending;
+      expect(refusedObservation).toEqual({ state: 'reconnect_requested', episode: 1 });
+      expect(refusedDeadline).not.toBeNull();
+      expect(recovery.pendingPublisherRecovery).toBe(refusedObservation);
+      expect(recovery.pendingPublisherRecoveryDeadlineTimer).toBe(refusedDeadline);
+      expect(client.hasCanonicalPendingProviderInputDelivery(localId)).toBe(true);
+      expect(delivered).toHaveBeenCalledTimes(1);
+      // The socket boundary does not reconnect: the real episode deadline must remain armed.
+      sessionSocketStub!.connect.mockImplementation(() => sessionSocketStub);
+      await vi.advanceTimersByTimeAsync(configuration.pendingPublisherRecoveryDeadlineMs);
+      expect(recovery.pendingPublisherRecovery.state).toBe('publisher_lost');
+      expect(sessionSocketStub!.disconnect).toHaveBeenCalledTimes(1);
+      expect(delivered).toHaveBeenCalledTimes(1);
+    });
+
+    const holdJ100ReclaimedMaterialization = async () => {
+      const localId = 'j100-reclaimed-accepted';
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 });
+      await waitForCurrentPendingInputContract(client);
+      const delivered = vi.fn();
+      client.onUserMessage(delivered);
+      materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult(localId));
+      await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      const settlement = createDeferred<never>();
+      resolveAcceptedPendingDeliveryMock
+        .mockRejectedValueOnce(new PendingQueueAcceptedSettlementError('forbidden'))
+        .mockReturnValueOnce(settlement.promise);
+      confirmProviderInputAccepted(client, localId);
+      await waitUntil(() => supervisorReportProbeResultMock.mock.calls.length === 1);
+      await reconnect();
+      await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 2);
+      const owner = client as unknown as {
+        pendingPublisherRecovery: { state: string };
+        pendingPublisherRecoveryDeadlineTimer: unknown;
+        sessionSyncPendingInputServerContract: object;
+      };
+      expect(owner.pendingPublisherRecovery.state).toBe('reclaimed');
+      const success = createDeferred<{ didMaterialize: boolean; localId: null; didWrite: boolean }>();
+      materializeNextMock.mockReturnValueOnce(success.promise);
+      const pending = client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      await waitUntil(() => materializeNextMock.mock.calls.length === 2);
+      return { client, localId, owner, delivered, settlement, success, pending };
+    };
+
+    it('J100 keeps a newer terminal observation on the same reclaimed contract', async () => {
+      const held = await holdJ100ReclaimedMaterialization();
+      const contract = held.owner.sessionSyncPendingInputServerContract;
+      held.settlement.reject(new PendingQueueAcceptedSettlementError('forbidden'));
+      await waitUntil(() => held.owner.pendingPublisherRecovery.state === 'publisher_lost');
+      const terminal = held.owner.pendingPublisherRecovery;
+      expect(held.owner.sessionSyncPendingInputServerContract).toBe(contract);
+      held.success.resolve({ didMaterialize: false, localId: null, didWrite: false });
+      await held.pending;
+      expect(held.owner.pendingPublisherRecovery).toBe(terminal);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+      expect(held.client.hasCanonicalPendingProviderInputDelivery(held.localId)).toBe(true);
+      expect(held.delivered).toHaveBeenCalledTimes(1);
+    });
+
+    it('J100 leaves a replacement connection recovery observation intact after old success', async () => {
+      const held = await holdJ100ReclaimedMaterialization();
+      const previousContract = held.owner.sessionSyncPendingInputServerContract;
+      const observation = held.owner.pendingPublisherRecovery;
+      // The actual connection setup replaces the contract/epoch while the old ACK is held.
+      await reconnect();
+      expect(held.owner.sessionSyncPendingInputServerContract).not.toBe(previousContract);
+      held.success.resolve({ didMaterialize: false, localId: null, didWrite: false });
+      await expect(held.pending).resolves.toEqual({ type: 'retryable_transport' });
+      // Settle the originating ACK even if the following regression assertion fails.
+      held.settlement.reject(new PendingQueueAcceptedSettlementError('forbidden'));
+      expect(held.owner.pendingPublisherRecovery).toBe(observation);
+      expect(supervisorReportProbeResultMock).toHaveBeenCalledTimes(1);
+      expect(held.client.hasCanonicalPendingProviderInputDelivery(held.localId)).toBe(true);
+      expect(held.delivered).toHaveBeenCalledTimes(1);
+    });
+
+    it('J100 closes an unchanged reclaimed observation and permits a later refusal episode', async () => {
+      const held = await holdJ100ReclaimedMaterialization();
+      held.success.resolve({ didMaterialize: false, localId: null, didWrite: false });
+      await held.pending;
+      expect(held.owner.pendingPublisherRecovery.state).toBe('current');
+      // This accepted settlement is still owned and was never delivered to the provider twice.
+      held.settlement.reject(new PendingQueueAcceptedSettlementError('forbidden'));
+      await waitUntil(() => supervisorReportProbeResultMock.mock.calls.length === 2);
+      expect(held.owner.pendingPublisherRecovery).toEqual({ state: 'reconnect_requested', episode: 2 });
+      expect(held.owner.pendingPublisherRecoveryDeadlineTimer).not.toBeNull();
+      expect(held.client.hasCanonicalPendingProviderInputDelivery(held.localId)).toBe(true);
+      expect(held.delivered).toHaveBeenCalledTimes(1);
+    });
+
+    it('requests a real supervised reconnect for a current publisher refusal', async () => {
+      useRealSupervisorAndPendingTransport = true;
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
+        sessionSocketEmitWithAck: (event) => event === 'pending-materialize-next' ? { ok: false, error: 'forbidden' } : undefined,
+      });
+      await waitForCurrentPendingInputContract(client);
+      const epoch = currentEpoch(client);
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toEqual({ type: 'publisher_lost' });
+      // No manual onConnected call: the real supervisor must disconnect, retry and reconnect.
+      await waitForNewPublisher(client, epoch);
+      expect(sessionSocketStub?.disconnect).toHaveBeenCalledTimes(1);
+      expect(sessionSocketStub?.connect).toHaveBeenCalledTimes(2);
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
+    it('keeps a newer real supervised generation when an old publisher refusal arrives late', async () => {
+      useRealSupervisorAndPendingTransport = true;
+      const ack = createDeferred<unknown>();
+      const requested = createDeferred<void>();
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
+        sessionSocketEmitWithAck: (event) => {
+          if (event !== 'pending-materialize-next') return undefined;
+          requested.resolve();
+          return ack.promise;
+        },
+      });
+      await waitForCurrentPendingInputContract(client);
+      const epoch = currentEpoch(client);
+      const pending = client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+      await requested.promise;
+      const supervisor = realSupervisor(client);
+      supervisor.reportProbeResult?.({ status: 'retry_later', reason: 'probe_failed' }, supervisor.captureProbeReportScope?.());
+      await waitForNewPublisher(client, epoch);
+      const scope = supervisor.captureProbeReportScope?.();
+      ack.resolve({ ok: false, error: 'forbidden' });
+      await expect(pending).resolves.toEqual({ type: 'retryable_transport' });
+      expect(supervisor.captureProbeReportScope?.()).toEqual(scope);
+      expect(supervisor.getState().phase).toBe('online');
+      expect(sessionSocketStub?.disconnect).toHaveBeenCalledTimes(1);
+      expect(sessionSocketStub?.connect).toHaveBeenCalledTimes(2);
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
+    it('reconnects through the real supervisor to settle an already accepted provider input', async () => {
+      useRealSupervisorAndPendingTransport = true;
+      const localId = 'real-supervised-settlement';
+      let settlementCalls = 0;
+      const materialized = createProviderDeliveryMaterializeResult(localId);
+      const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1 }, {
+        sessionSocketEmitWithAck: (event) => {
+          if (event === 'pending-materialize-next') return { ok: true, ...materialized, message: { ...materialized.message, requestedAction: { v: 1, kind: 'send_now' }, providerAction: 'send' } };
+          if (event === 'pending-delivery-accepted-v1') {
+            settlementCalls += 1;
+            return settlementCalls === 1 ? { ok: false, error: 'forbidden' } : {
+              ok: true, didResolve: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3,
+              message: { id: 'committed-real-supervised', seq: 10, localId, messageRole: 'user', content: materialized.message.content, createdAt: 1000, updatedAt: 1000 },
+            };
+          }
+          return undefined;
+        },
+      });
+      await waitForCurrentPendingInputContract(client);
+      const delivered = vi.fn();
+      client.onUserMessage((message) => {
+        delivered(message);
+        confirmProviderInputAccepted(client, localId);
+      });
+      listDeliveryStatusesMock.mockResolvedValue([{ localId, status: 'delivering' }]);
+      await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
+        .resolves.toMatchObject({ type: 'materialized', localId });
+      expect(delivered).toHaveBeenCalledTimes(1);
+      await waitUntil(() => settlementCalls === 2 && !client.hasCanonicalPendingProviderInputDelivery(localId));
+      expect(sessionSocketStub?.connect).toHaveBeenCalledTimes(2);
+      expect(delivered).toHaveBeenCalledTimes(1);
+      await expect(readWakeCapability(client)).resolves.toEqual(servableCapability);
+    });
+
     it('reconnects once, then stops materializing and reports publisher_lost until a new publisher claim', async () => {
       const client = await createClient({
         latestTurnStatus: 'completed',
@@ -2381,6 +2717,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
         .resolves.toEqual({ type: 'publisher_lost' });
       expect(supervisorReportProbeResultMock).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ status: 'retry_later' }),
+        undefined, // This legacy state-machine double has no generation capture; real-owner cases above do.
       );
       // A refusal on the same connection while the reconnect is pending is not a second episode.
       await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' }))
@@ -2428,6 +2765,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       await waitUntil(() => supervisorReportProbeResultMock.mock.calls.length === 1);
       expect(supervisorReportProbeResultMock).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ status: 'retry_later' }),
+        undefined, // This legacy state-machine double has no generation capture; real-owner cases above do.
       );
       expect(warningSpy).toHaveBeenCalledWith('[pendingQueue] accepted provider settlement remains unresolved', expect.objectContaining({
         sessionId: 's1', localId: 'settle-forbidden-reclaimed', attempt: 1, retryAfterMs: null, willRetry: false,
@@ -3246,6 +3584,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   it('retries only the exact accepted settlement at typed 503 delay without changing socket health', async () => {
+    const infoFileSpy = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -3326,6 +3666,10 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(userSocketStub?.connect).not.toHaveBeenCalled();
     expect(userSocketStub?.disconnect).not.toHaveBeenCalled();
     expect(userSocketStub?.close).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[pendingQueue] accepted provider settlement remains unresolved',
+      expect.objectContaining({ localId: 'watermark-held-local', retryAfterMs: 1_250 }),
+    );
 
     await vi.advanceTimersByTimeAsync(1_249);
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
@@ -3347,6 +3691,11 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(sessionSocketStub?.connect).not.toHaveBeenCalled();
     expect(sessionSocketStub?.disconnect).not.toHaveBeenCalled();
     expect(sessionSocketStub?.close).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[pendingQueue] accepted provider settlement remains unresolved',
+      expect.objectContaining({ localId: 'watermark-held-local', retryAfterMs: 1_250 }),
+    );
+    expect(warnSpy).toHaveBeenCalledOnce();
 
   });
 
@@ -3405,30 +3754,37 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   it('rejoins the same operation after a socket ACK timeout without granting unrelated wakes retry authority', async () => {
+    const actualTransport = await vi.importActual<typeof import('./pendingQueueV2Transport')>('./pendingQueueV2Transport');
+    resolveAcceptedPendingDeliveryMock.mockImplementation(actualTransport.resolveAcceptedPendingQueueV2Delivery);
+    const settlementLocalIds: unknown[] = [];
     const client = await createClient({
       latestTurnStatus: 'completed',
       pendingCount: 1,
       pendingVersion: 1,
       metadata: { deliveredUserMessageSeqV1: 0 },
+    }, {
+      // The real transport constructs and parses ACKs; only the socket boundary is fake.
+      sessionSocketEmitWithAck: (event, payload) => {
+        if (event !== 'pending-delivery-accepted-v1') return { ok: true };
+        settlementLocalIds.push((payload as { localId?: unknown }).localId);
+        if (settlementLocalIds.length === 1) throw new Error('operation has timed out');
+        return {
+          ok: true, didResolve: false,
+          pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3,
+          message: {
+            id: 'committed-ack-timeout-settlement',
+            seq: 43,
+            localId: 'ack-timeout-settlement',
+            messageRole: 'user',
+            content: createProviderDeliveryMaterializeResult('ack-timeout-settlement').message.content,
+            createdAt: 1000,
+            updatedAt: 1000,
+          },
+        } satisfies AcceptedPendingSettlementResponseV1;
+      },
     });
     await waitForCurrentPendingInputContract(client);
     materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('ack-timeout-settlement'));
-    const timeoutError = Object.assign(new Error('socket acknowledgement timed out'), {
-      code: 'socket_ack_timeout' as const,
-      retryable: true as const,
-    });
-    resolveAcceptedPendingDeliveryMock
-      .mockRejectedValueOnce(timeoutError)
-      .mockResolvedValueOnce({
-        didResolve: false,
-        pendingQueueState: { known: true, pendingCount: 0, pendingBlockedCount: 0, pendingVersion: 3 },
-        message: {
-          ...createProviderDeliveryMaterializeResult('ack-timeout-settlement').message,
-          id: 'committed-ack-timeout-settlement',
-          seq: 43,
-          deliveryState: null,
-        },
-      });
 
     await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
     vi.useFakeTimers();
@@ -3452,8 +3808,12 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(1);
-    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(2);
-    expect((client as any).canonicalPendingDeliveryByLocalId.has('ack-timeout-settlement')).toBe(false);
+    expect(settlementLocalIds).toEqual(['ack-timeout-settlement', 'ack-timeout-settlement']);
+    expect(client.hasCanonicalPendingProviderInputDelivery('ack-timeout-settlement')).toBe(false);
+    expect(client.getCommittedUserMessageSeq('ack-timeout-settlement')).toBe(43);
+    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+    expect(sessionSocketStub?.disconnect).not.toHaveBeenCalled();
+    expect(sessionSocketStub?.close).not.toHaveBeenCalled();
   });
 
   it('continues exact accepted settlement after repeated response loss without reconnecting', async () => {
@@ -3559,9 +3919,66 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
   });
 
+  it('recovers internal settlement ACKs and drains the next row without replaying accepted provider input', async () => {
+    const actualTransport = await vi.importActual<typeof import('./pendingQueueV2Transport')>('./pendingQueueV2Transport');
+    // Keep request construction, ACK parsing, and typed failures real; only the socket is fake.
+    resolveAcceptedPendingDeliveryMock.mockImplementation(actualTransport.resolveAcceptedPendingQueueV2Delivery);
+    let settlementRequests = 0;
+    const first = createProviderDeliveryMaterializeResult('accepted-before-internal');
+    const committedMessage = {
+      id: 'committed-first', seq: 43, localId: first.localId,
+      messageRole: 'user', content: first.message.content,
+      createdAt: 1000, updatedAt: 1000,
+    };
+    const client = await createClient({
+      latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1,
+      metadata: { deliveredUserMessageSeqV1: 0 },
+    }, {
+      sessionSocketEmitWithAck: (event) => {
+        if (event !== 'pending-delivery-accepted-v1') return { ok: true };
+        settlementRequests += 1;
+        if (settlementRequests <= 2) return { ok: false, error: 'internal' };
+        return {
+          ok: true, didResolve: false, message: committedMessage,
+          pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 4,
+        };
+      },
+    });
+    await waitForCurrentPendingInputContract(client);
+    listDeliveryStatusesMock.mockResolvedValue([
+      { localId: 'accepted-before-internal', status: 'delivering' },
+    ]);
+    materializeNextMock
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('next-queued-row', 5));
+    await client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' });
+    vi.useFakeTimers();
+    confirmProviderInputAccepted(client, 'accepted-before-internal');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.hasCanonicalPendingProviderInputDelivery('accepted-before-internal')).toBe(true);
+    // The accepted row retains exact settlement custody during retry, but must
+    // not prevent an independent later Pending row from reaching the provider.
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
+      type: 'materialized', localId: 'next-queued-row',
+    });
+
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(settlementRequests).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settlementRequests).toBe(3);
+    expect(client.hasCanonicalPendingProviderInputDelivery('accepted-before-internal')).toBe(false);
+    expect(client.getCommittedUserMessageSeq('accepted-before-internal')).toBe(43);
+    expect(materializeNextMock.mock.results).toHaveLength(2);
+    expect(sessionSocketStub?.disconnect).not.toHaveBeenCalled();
+    expect(sessionSocketStub?.close).not.toHaveBeenCalled();
+    client.beginRuntimeTermination();
+  });
+
   it('retries an uncertain accepted-settlement internal failure with correlated diagnostics and no socket teardown', async () => {
     const { logger } = await import('@/ui/logger');
     const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    const infoFileSpy = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const client = await createClient({
       latestTurnStatus: 'completed',
       pendingCount: 1,
@@ -3628,6 +4045,46 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       type: 'materialized', localId: 'later-queued-local',
     });
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('records an unexpected accepted-settlement resolution crash in the default file log without terminal output', async () => {
+    const infoFileSpy = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const client = await createClient({
+      latestTurnStatus: 'completed',
+      pendingCount: 1,
+      pendingVersion: 1,
+      metadata: { deliveredUserMessageSeqV1: 0 },
+    });
+    await waitForCurrentPendingInputContract(client);
+    materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('crashed-settlement-local'));
+    resolveAcceptedPendingDeliveryMock.mockRejectedValueOnce({
+      toString() {
+        throw new Error('settlement diagnostic serialization failed');
+      },
+    });
+
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
+      type: 'materialized',
+      localId: 'crashed-settlement-local',
+    });
+
+    confirmProviderInputAccepted(client, 'crashed-settlement-local');
+    await waitUntil(() => infoFileSpy.mock.calls.some(([event]) => event === '[pendingQueue] accepted provider delivery resolution crashed'));
+
+    expect(infoFileSpy.mock.calls.filter(([event]) => event === '[pendingQueue] accepted provider delivery resolution crashed')).toHaveLength(1);
+    expect(infoFileSpy).toHaveBeenCalledWith(
+      '[pendingQueue] accepted provider delivery resolution crashed',
+      expect.objectContaining({
+        sessionId: 's1',
+        localId: 'crashed-settlement-local',
+        error: expect.objectContaining({
+          message: 'settlement diagnostic serialization failed',
+        }),
+      }),
+    );
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect((client as any).canonicalPendingDeliveryByLocalId.has('crashed-settlement-local')).toBe(true);
   });
 
   it('delivers provider-claimed pending rows directly without a committed transcript seq', async () => {
@@ -3836,9 +4293,7 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
         updatedAt: 1000,
       },
     });
-    resolveAcceptedPendingDeliveryMock
-      .mockRejectedValueOnce(new Error('temporary accepted resolution failure'))
-      .mockRejectedValueOnce(new Error('still temporarily unavailable'));
+    resolveAcceptedPendingDeliveryMock.mockRejectedValue(new PendingQueueAcceptedSettlementError('internal'));
 
     await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
       type: 'materialized',
@@ -3846,11 +4301,13 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       deliveryState,
     });
 
+    vi.useFakeTimers();
     confirmProviderInputAccepted(client, 'close-accepted-retry-local');
-    await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
+    await vi.advanceTimersByTimeAsync(0);
     (client as any).rpcLifecycleRegistrations.splice(0);
 
     await client.close();
+    await vi.advanceTimersByTimeAsync(10_000);
 
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
     expect(blockPendingDeliveryMock).not.toHaveBeenCalled();
@@ -4514,6 +4971,92 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
   });
 
+  it.each(['while_waiting', 'before_waiting'] as const)(
+    'wakes the idle terminal pump when explicit server discard clears its submitted head %s', async (retirementTiming) => {
+    const client = await createClient({
+      latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1,
+      metadata: { deliveredUserMessageSeqV1: 0 },
+    });
+    await waitForCurrentPendingInputContract(client);
+    // The pump's eligibility wait converges account settings on its user-socket connect.
+    const offlineGet = axios.get;
+    vi.spyOn(axios, 'get').mockImplementation(async (url, config) => String(url).endsWith('/v2/account/settings')
+      ? { status: 200, data: { content: { t: 'plain', v: {} }, version: 0 } } as never
+      : offlineGet(url, config));
+    const messageQueue = new MessageQueue2<null>(() => 'mode');
+    client.onUserMessage((message) => {
+      messageQueue.push(message.content.text, null, { userMessageLocalId: message.localId });
+    });
+    materializeNextMock
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('manual-handled-local', 2))
+      .mockResolvedValueOnce(createProviderDeliveryMaterializeResult('later-local', 4));
+    listDeliveryStatusesMock.mockResolvedValue([{ localId: 'manual-handled-local', status: 'delivering' }]);
+    const injected: string[] = [];
+    const arbiter = createClaudeUnifiedInputArbiter<null>({
+      quietPeriodMs: 0,
+      injectPrompt: async (batch) => {
+        injected.push(batch.userMessageLocalIds?.[0] ?? 'missing');
+        if (injected.length === 1 && retirementTiming === 'before_waiting') {
+          listDeliveryStatusesMock.mockResolvedValue([{ localId: 'manual-handled-local', status: 'discarded' }, { localId: 'later-local', status: 'queued' }]);
+          await client.reconcilePendingQueueState();
+        }
+        return { status: 'injected', at: Date.now(), bytesWritten: batch.message.length };
+      },
+      resolvePromptDeliveryState: (batch) => client.hasCanonicalPendingProviderInputDelivery(batch.userMessageLocalIds?.[0] ?? '')
+        ? 'pending' : 'retired',
+    });
+    arbiter.observeLifecycle({ type: 'turn_state', state: 'idle', observedAtMs: Date.now() });
+    arbiter.observeLifecycle({ type: 'output', observedAtMs: Date.now() });
+    const inputConsumer = createSessionProviderInputConsumer({ messageQueue, session: client });
+    const pendingDeliveryState = {
+      waitForPendingEligibilityUpdate: client.waitForPendingEligibilityUpdate.bind(client),
+      reconcilePendingQueueState: client.reconcilePendingQueueState.bind(client),
+    };
+    const pump = createClaudeUnifiedPendingQueuePump({ inputConsumer, arbiter, pendingDeliveryState });
+    const abortController = new AbortController();
+    const running = pump.start({ abortSignal: abortController.signal });
+    try {
+      if (retirementTiming === 'while_waiting') {
+        await waitUntil(() => arbiter.snapshot().providerAcceptancePendingCount === 1);
+        expect(injected).toEqual(['manual-handled-local']);
+        // An explicit server discard supplies retirement proof without provider acceptance.
+        listDeliveryStatusesMock.mockResolvedValue([{ localId: 'manual-handled-local', status: 'discarded' }, { localId: 'later-local', status: 'queued' }]);
+        await client.reconcilePendingQueueState();
+        expect(client.hasCanonicalPendingProviderInputDelivery('manual-handled-local')).toBe(false);
+      }
+      await waitUntil(() => injected.length === 2);
+      expect(injected).toEqual(['manual-handled-local', 'later-local']);
+      expect(client.hasPendingProviderInputAcceptance('manual-handled-local')).toBe(false);
+      expect(materializeNextMock).toHaveBeenCalledTimes(2);
+    } finally {
+      abortController.abort();
+      pump.dispose();
+      await running;
+      await arbiter.dispose();
+    }
+    expect(client.listenerCount('pending-eligibility-updated')).toBe(0);
+  });
+
+  it('retires explicitly discarded blocked custody without manufacturing provider acceptance', async () => {
+    const client = await createClient({
+      latestTurnStatus: 'completed', pendingCount: 1, pendingVersion: 1,
+      metadata: { deliveredUserMessageSeqV1: 0 },
+    });
+    await waitForCurrentPendingInputContract(client);
+    client.onUserMessage(() => {});
+    materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('blocked-handled-local'));
+    blockPendingDeliveryMock.mockResolvedValueOnce({
+      pendingQueueState: { known: true, pendingCount: 1, pendingBlockedCount: 1, pendingVersion: 3 },
+    });
+    await client.materializeNextPendingMessageSafely();
+    await client.blockPendingMessageDelivery({ localIds: ['blocked-handled-local'], reason: 'ambiguous_terminal_delivery' });
+    expect(client.hasCanonicalPendingProviderInputDelivery('blocked-handled-local')).toBe(true);
+    listDeliveryStatusesMock.mockResolvedValue([{ localId: 'blocked-handled-local', status: 'discarded' }]);
+    await client.reconcilePendingQueueState({ force: true });
+    expect(client.hasCanonicalPendingProviderInputDelivery('blocked-handled-local')).toBe(false);
+    expect(client.hasPendingProviderInputAcceptance('blocked-handled-local')).toBe(false);
+  });
+
   it('retains reserved custody after server-row absence until accepted exact committed proof releases the later row', async () => {
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -4607,6 +5150,89 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect((client as any).canonicalPendingDeliveryByLocalId.has('discarded-local')).toBe(false);
   });
 
+  it('does not let terminal reconciliation erase late acceptance after an uncertain delivery was dismissed', async () => {
+    const dismissedLocalId = 'dismissed-uncertain-local';
+    const laterLocalId = 'later-local';
+    const client = await createClient({
+      latestTurnStatus: 'completed',
+      pendingCount: 2,
+      pendingVersion: 1,
+      metadata: { deliveredUserMessageSeqV1: 0 },
+    });
+    const providerInvocations: string[] = [];
+    client.onUserMessage((message) => {
+      if (message.localId) providerInvocations.push(message.localId);
+    });
+    listDeliveryStatusesMock.mockResolvedValue([
+      { localId: dismissedLocalId, status: 'blocked' },
+      { localId: laterLocalId, status: 'queued' },
+    ]);
+    materializeNextMock
+      .mockResolvedValueOnce({
+        ...createProviderDeliveryMaterializeResult(dismissedLocalId, 2),
+        pendingQueueState: { known: true, pendingCount: 2, pendingBlockedCount: 0, pendingVersion: 2 },
+      })
+      .mockResolvedValueOnce({
+        ...createProviderDeliveryMaterializeResult(laterLocalId, 4),
+        pendingQueueState: { known: true, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 4 },
+      });
+    blockPendingDeliveryMock.mockResolvedValueOnce({
+      pendingQueueState: { known: true, pendingCount: 2, pendingBlockedCount: 1, pendingVersion: 3 },
+    });
+    const acceptedResult = {
+      didResolve: true,
+      pendingQueueState: { known: true, pendingCount: 1, pendingBlockedCount: 0, pendingVersion: 5 },
+      message: {
+        id: `message-${dismissedLocalId}`,
+        seq: 91,
+        localId: dismissedLocalId,
+        messageRole: 'user',
+        content: { t: 'plain', v: { role: 'user', content: { type: 'text', text: 'dismissed prompt' } } },
+        createdAt: 1_000,
+        updatedAt: 1_001,
+        deliveryState: null,
+      },
+    };
+    const acceptedResolution = createDeferred<typeof acceptedResult>();
+    resolveAcceptedPendingDeliveryMock.mockImplementationOnce(() => acceptedResolution.promise);
+
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
+      type: 'materialized',
+      localId: dismissedLocalId,
+    });
+    await expect(client.blockPendingMessageDelivery({
+      localIds: [dismissedLocalId],
+      reason: 'ambiguous_terminal_delivery',
+    })).resolves.toBe(true);
+    await expect(client.materializeNextPendingMessageSafely({ reconcileWhenEmpty: 'force' })).resolves.toMatchObject({
+      type: 'materialized',
+      localId: laterLocalId,
+    });
+
+    expect(providerInvocations).toEqual([dismissedLocalId, laterLocalId]);
+    expect((client as any).canonicalPendingDeliveryByLocalId.has(dismissedLocalId)).toBe(true);
+
+    confirmProviderInputAccepted(client, dismissedLocalId);
+    await waitUntil(() => resolveAcceptedPendingDeliveryMock.mock.calls.length === 1);
+    // The UI dismissal archives the first row outside this process. The ordinary pending
+    // projection therefore contains only the later live claim while acceptance settlement waits.
+    listDeliveryStatusesMock.mockResolvedValueOnce([
+      { localId: laterLocalId, status: 'delivering' },
+    ]);
+    await expect((client as any).reconcileCanonicalPendingDeliveriesBeforeMaterialization())
+      .resolves.toBe(false);
+    expect((client as any).canonicalPendingDeliveryByLocalId.has(dismissedLocalId)).toBe(true);
+
+    acceptedResolution.resolve(acceptedResult);
+    await waitUntil(() => (client as any).canonicalPendingDeliveryByLocalId.has(dismissedLocalId) === false);
+
+    expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledWith({
+      socket: sessionSocketStub,
+      sessionId: 's1',
+      localId: dismissedLocalId,
+    });
+  });
+
   it.each(['queued', 'delivering'] as const)(
     'retains exact local custody while the server row remains %s',
     async (status) => {
@@ -4678,6 +5304,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   it('retains canonical ownership and progress when accepted delivery is a server no-op', async () => {
+    const infoFileSpy = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -4735,6 +5363,14 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect((client as any).canonicalPendingDeliveryByLocalId.has('provider-noop')).toBe(true);
+    expect(warnSpy).toHaveBeenCalledOnce();
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[pendingQueue] accepted settlement lacks exact committed proof; retrying',
+      expect.objectContaining({
+        sessionId: 's1',
+        localId: 'provider-noop',
+      }),
+    );
   });
 
   it('does not grant a delivery-status snapshot retry authority after a settlement no-op', async () => {
@@ -5057,6 +5693,8 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
   });
 
   it('retains accepted settlement identity after not-found without holding the later row', async () => {
+    const infoFileSpy = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const deliveryState = { mode: 'provider' as const, unresolved: true };
     const client = await createClient({
       latestTurnStatus: 'completed',
@@ -5144,6 +5782,23 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     expect(resolveAcceptedPendingDeliveryMock).toHaveBeenCalledTimes(1);
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
     expect((client as any).canonicalPendingDeliveryByLocalId.has('stale-accepted-provider-m1')).toBe(false);
+    expect(infoFileSpy.mock.calls.filter(([event]) => event === '[pendingQueue] accepted provider delivery remains unresolved')).toHaveLength(1);
+    expect(infoFileSpy).toHaveBeenCalledWith(
+      '[pendingQueue] accepted provider delivery remains unresolved',
+      expect.objectContaining({
+        sessionId: 's1',
+        localId: 'stale-accepted-provider-m1',
+        reason: 'settlement_not_found_without_exact_commit',
+        error: expect.objectContaining({
+          code: 'pending_queue_accepted_settlement_failed',
+          settlementError: 'not-found',
+        }),
+      }),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[pendingQueue] accepted provider settlement remains unresolved',
+      expect.objectContaining({ localId: 'stale-accepted-provider-m1', willRetry: true }),
+    );
     expect(hasProviderInputAcceptance(client, 'stale-accepted-provider-m1')).toBe(true);
   });
 
@@ -5320,6 +5975,10 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
       metadata: { deliveredUserMessageSeqV1: 0 },
     });
     await waitForCurrentPendingInputContract(client);
+    listDeliveryStatusesMock.mockResolvedValue([
+      { localId: uncertainLocalId, status: 'blocked' },
+      { localId: replacementLocalId, status: 'queued' },
+    ]);
     materializeNextMock
       .mockResolvedValueOnce({
         ...createProviderDeliveryMaterializeResult(uncertainLocalId, 2),

@@ -1,5 +1,7 @@
+import { isConnectedServiceProfileStatusSelectable } from '@happier-dev/agents';
 import {
   ConnectedServiceBindingsV1Schema,
+  normalizeConnectedServiceCredentialHealthStatus,
   type ConnectedServiceBindingSelectionV1,
   type ConnectedServiceBindingsV1,
 } from '@happier-dev/protocol';
@@ -88,6 +90,16 @@ function readString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+// Selectability follows the canonical session-option rule, so a profile whose credential is refreshing
+// stays selectable here as it is in the new-session UI. Unknown statuses normalize to needs_reauth and
+// fail closed; an entry without a status remains selectable, as before.
+function isProfileStatusSelectable(status: string | null): boolean {
+  if (status === null) return true;
+  return isConnectedServiceProfileStatusSelectable(
+    status === 'unsupported_kind' ? status : normalizeConnectedServiceCredentialHealthStatus(status),
+  );
+}
+
 function collectOptions(
   candidates: InventoryCandidate[],
   serviceId: string,
@@ -100,7 +112,7 @@ function collectOptions(
     const option = asRecord(raw);
     const id = readString(option?.[idKey]);
     const status = readString(option?.status);
-    if (!id || (selection === 'profile' && status && status !== 'connected')) continue;
+    if (!id || (selection === 'profile' && !isProfileStatusSelectable(status))) continue;
     candidates.push({ serviceId, selection, id });
   }
 }

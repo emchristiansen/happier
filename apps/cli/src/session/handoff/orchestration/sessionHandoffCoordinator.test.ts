@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { FeaturesResponseSchema } from '@happier-dev/protocol';
+import { RPC_ERROR_CODES } from '@happier-dev/protocol/rpc';
+import { readRpcErrorCode, RpcError } from '@happier-dev/protocol/rpcErrors';
 
 import { createSessionHandoffCoordinator } from './sessionHandoffCoordinator';
 
@@ -39,6 +42,20 @@ function createHarness(overrides: Partial<Parameters<typeof createSessionHandoff
   const calls: string[] = [];
   const update = vi.fn();
   const port = {
+    assertExistingStateSupported: async () => {
+      const { resolveExistingSessionHandoffEligibilityThroughCatalog } = await import('@/backends/catalog');
+      const eligibility = resolveExistingSessionHandoffEligibilityThroughCatalog({ flavor: 'claude', machineId: baseInput.sourceMachineId, claudeSessionId: 'native-1' });
+      if (!eligibility.eligible) throw new Error(eligibility.reasonCode);
+    },
+    readServerFeatures: async () => FeaturesResponseSchema.parse({
+      features: {
+        sessions: { enabled: true, handoff: { enabled: true } },
+        machines: { enabled: true, transfer: { enabled: true, directPeer: { enabled: false }, serverRouted: { enabled: true } } },
+      },
+      capabilities: {},
+    }),
+    directPeerAvailable: true,
+    preferredTransportStrategies: ['direct_peer', 'server_routed_stream'] as const,
     probeTargetCapability: vi.fn(async () => ({ protocolVersion: 2 as const, atomicTargetResume: true, targetCleanup: true })),
     startSource: vi.fn(async () => { calls.push('start'); return readyStart(); }),
     prepareTarget: vi.fn(async () => { calls.push('prepare'); return readyTarget(); }),
@@ -64,6 +81,109 @@ function createHarness(overrides: Partial<Parameters<typeof createSessionHandoff
 }
 
 describe('sessionHandoffCoordinator', () => {
+  it('preserves a message-less capability refusal before source mutation', async () => {
+    const { coordinator, calls } = createHarness({
+      probeTargetCapability: async () => ({ ok: false, errorCode: RPC_ERROR_CODES.FORBIDDEN }),
+    });
+    const error = await coordinator.admit({ ...baseInput, stateTransfer: 'existing' }).catch((caught: unknown) => caught);
+
+    expect(readRpcErrorCode(error)).toBe(RPC_ERROR_CODES.FORBIDDEN);
+    expect(error).toMatchObject({ message: 'Session handoff failed' });
+    expect(calls).toEqual([]);
+  });
+
+  it.each([
+    { role: 'target', decoded: true, code: RPC_ERROR_CODES.FORBIDDEN },
+    { role: 'source', decoded: true, code: RPC_ERROR_CODES.METHOD_NOT_AVAILABLE },
+    { role: 'target', decoded: false, code: RPC_ERROR_CODES.METHOD_NOT_FOUND },
+  ] as const)('preserves capability refusal policy for $role ($code, decoded=$decoded)', async ({ role, decoded, code }) => {
+    const capability = { protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, existingState: true };
+    const refusal = async () => {
+      if (decoded) return { error: 'Capability request refused', errorCode: code };
+      throw new RpcError('Capability request refused', code);
+    };
+    const { coordinator, calls } = createHarness({
+      probeTargetCapability: role === 'target' ? refusal : async () => capability,
+      probeSourceCapability: role === 'source' ? refusal : async () => capability,
+    });
+    const error = await coordinator.admit({ ...baseInput, stateTransfer: 'existing' }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(readRpcErrorCode(error)).toBe(code === RPC_ERROR_CODES.METHOD_NOT_FOUND ? undefined : code);
+    expect(calls).toEqual([]);
+  });
+
+  it('applies actual catalog admission before source mutation for unsupported existing-state Agents', async () => {
+    const harness = createHarness({
+      probeSourceCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, existingState: true }),
+      probeTargetCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, existingState: true }),
+      assertExistingStateSupported: async () => {
+        const { resolveExistingSessionHandoffEligibilityThroughCatalog } = await import('@/backends/catalog');
+        const eligibility = resolveExistingSessionHandoffEligibilityThroughCatalog({ flavor: 'opencode', machineId: baseInput.sourceMachineId, opencodeSessionId: 'native-1' });
+        if (!eligibility.eligible) throw new Error(eligibility.reasonCode);
+      },
+    });
+    await expect(harness.coordinator.admit({ ...baseInput, stateTransfer: 'existing' })).rejects.toThrow('existing_state_unsupported');
+    expect(harness.calls).toEqual([]);
+  });
+
+  it('refuses existing state before source mutation unless both peers advertise support', async () => {
+    for (const [sourceSupports, targetSupports] of [[false, true], [true, false], [undefined, true]]) {
+      const harness = createHarness({
+        probeSourceCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, existingState: sourceSupports }),
+        probeTargetCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, existingState: targetSupports }),
+      });
+      await expect(harness.coordinator.admit({ ...baseInput, stateTransfer: 'existing' })).rejects.toThrow('existing');
+      expect(harness.port.startSource).not.toHaveBeenCalled();
+    }
+  });
+
+  it('uses existing state without a transfer carrier and preserves the atomic cutover sequence', async () => {
+    const harness = createHarness({
+      probeSourceCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, existingState: true }),
+      probeTargetCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, existingState: true }),
+      readServerFeatures: async () => FeaturesResponseSchema.parse({ features: { sessions: { enabled: true, handoff: { enabled: true } }, machines: { enabled: true, transfer: { enabled: false } } }, capabilities: {} }),
+      directPeerAvailable: false,
+    });
+    const result = await (await harness.coordinator.admit({ ...baseInput, stateTransfer: 'existing' })).execute({ update: harness.update });
+    expect(result).toMatchObject({ ok: true });
+    expect(harness.port.startSource).toHaveBeenCalledWith(expect.objectContaining({ stateTransfer: 'existing' }));
+    expect(harness.port.prepareTarget).toHaveBeenCalledWith(expect.objectContaining({ stateTransfer: 'existing' }));
+    expect(harness.calls).toEqual(['start', 'prepare', 'resume', 'confirm', 'bind', 'commit', 'cleanup', 'bind']);
+  });
+
+  it('admits a local move only on a daemon that advertises same-machine lifecycle support', async () => {
+    const input = { ...baseInput, targetMachineId: baseInput.sourceMachineId, targetPath: '/workspace/my-app' };
+    const old = createHarness();
+    await expect(old.coordinator.admit(input)).rejects.toThrow('same-machine');
+    expect(old.port.startSource).not.toHaveBeenCalled();
+    const local = createHarness({ probeTargetCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, sameMachineHandoff: true }) });
+    const result = await (await local.coordinator.admit(input)).execute({ update: local.update });
+    expect(result).toMatchObject({ ok: true });
+    expect(local.port.startSource).toHaveBeenCalledWith(expect.objectContaining({ targetPath: input.targetPath }));
+  });
+
+  it('cancels a same-machine handoff through a single daemon abort after source start', async () => {
+    const controller = new AbortController();
+    const local = createHarness({
+      probeTargetCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, sameMachineHandoff: true }),
+      startSource: async () => { controller.abort(); return readyStart(); },
+    });
+    const admitted = await local.coordinator.admit({ ...baseInput, targetMachineId: baseInput.sourceMachineId, targetPath: '/workspace/my-app' });
+    await expect(admitted.execute({ update: local.update, signal: controller.signal })).resolves.toEqual({ kind: 'cancelled' });
+    expect(local.port.abortTarget).toHaveBeenCalledOnce();
+    expect(local.port.abortSource).not.toHaveBeenCalled();
+  });
+
+  it('uses local bundle reuse when no machine-transfer carrier is enabled', async () => {
+    const local = createHarness({
+      probeTargetCapability: async () => ({ protocolVersion: 2, atomicTargetResume: true, targetCleanup: true, sameMachineHandoff: true }),
+      readServerFeatures: async () => FeaturesResponseSchema.parse({ features: { sessions: { enabled: true, handoff: { enabled: true } }, machines: { enabled: true, transfer: { enabled: false } } }, capabilities: {} }),
+      directPeerAvailable: false,
+    });
+    const result = await (await local.coordinator.admit({ ...baseInput, targetMachineId: baseInput.sourceMachineId, targetPath: '/workspace/my-app' })).execute({ update: local.update });
+    expect(result).toMatchObject({ ok: true });
+  });
+
   it('admits capability before source mutation and runs the complete existing primitive sequence', async () => {
     const { coordinator, port, calls, update } = createHarness();
     const admitted = await coordinator.admit(baseInput);
@@ -79,6 +199,81 @@ describe('sessionHandoffCoordinator', () => {
       'starting_source', 'preparing_target', 'resuming_target', 'confirming_target',
       'binding_target', 'committing_target', 'cleaning_source', 'finalizing_target',
     ]);
+  });
+
+  it('uses the enabled relay when direct peer is preferred but disabled by the server', async () => {
+    const { coordinator, port, update } = createHarness({ transportStrategy: 'direct_peer' });
+    const result = await (await coordinator.admit(baseInput)).execute({ update });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(port.startSource).toHaveBeenCalledWith(expect.objectContaining({
+      negotiatedTransportStrategy: 'server_routed_stream',
+    }));
+    expect(port.prepareTarget).toHaveBeenCalledWith(expect.objectContaining({
+      negotiatedTransportStrategy: 'server_routed_stream',
+      allowServerRoutedFallback: true,
+    }));
+  });
+
+  it.each([true, false])('allows direct-peer relay fallback only when enabled (%s)', async (relayEnabled) => {
+    const { coordinator, port, update } = createHarness({
+      readServerFeatures: async () => FeaturesResponseSchema.parse({
+        features: {
+          sessions: { enabled: true, handoff: { enabled: true } },
+          machines: { enabled: true, transfer: { enabled: true, directPeer: { enabled: true }, serverRouted: { enabled: relayEnabled } } },
+        },
+        capabilities: {},
+      }),
+    });
+    expect(await (await coordinator.admit(baseInput)).execute({ update })).toMatchObject({ ok: true });
+    expect(port.startSource).toHaveBeenCalledWith(expect.objectContaining({
+      preferredTransportStrategies: relayEnabled ? ['direct_peer', 'server_routed_stream'] : ['direct_peer'],
+    }));
+    expect(port.prepareTarget).toHaveBeenCalledWith(expect.objectContaining({
+      negotiatedTransportStrategy: 'direct_peer',
+      allowServerRoutedFallback: relayEnabled,
+    }));
+  });
+
+  it('uses the relay when the source has no direct-peer transport', async () => {
+    const { coordinator, port, update } = createHarness({
+      directPeerAvailable: false,
+      readServerFeatures: async () => FeaturesResponseSchema.parse({
+        features: {
+          sessions: { enabled: true, handoff: { enabled: true } },
+          machines: { enabled: true, transfer: { enabled: true, directPeer: { enabled: true }, serverRouted: { enabled: true } } },
+        },
+        capabilities: {},
+      }),
+    });
+    expect(await (await coordinator.admit(baseInput)).execute({ update })).toMatchObject({ ok: true });
+    expect(port.startSource).toHaveBeenCalledWith(expect.objectContaining({
+      negotiatedTransportStrategy: 'server_routed_stream',
+    }));
+  });
+
+  it.each([
+    [null, 'server_features_unavailable'],
+    [FeaturesResponseSchema.parse({ features: {}, capabilities: {} }), 'handoff_disabled'],
+    [
+      FeaturesResponseSchema.parse({ features: { sessions: { enabled: true, handoff: { enabled: true } } }, capabilities: {} }),
+      'transfer_disabled',
+    ],
+    [
+      FeaturesResponseSchema.parse({
+        features: {
+          sessions: { enabled: true, handoff: { enabled: true } },
+          machines: { enabled: true, transfer: { enabled: true, directPeer: { enabled: false }, serverRouted: { enabled: false } } },
+        },
+        capabilities: {},
+      }),
+      'server_routed_transfer_disabled',
+    ],
+  ] as const)('fails closed before mutating the source when transfer policy is unavailable or disabled (%#)', async (features, errorCode) => {
+    const { coordinator, port, update } = createHarness({ readServerFeatures: async () => features });
+    expect(await (await coordinator.admit(baseInput)).execute({ update })).toMatchObject({ ok: false, errorCode });
+    expect(port.startSource).not.toHaveBeenCalled();
+    expect(port.prepareTarget).not.toHaveBeenCalled();
   });
 
   it('uses an explicitly selected target directory instead of the source-derived path', async () => {
@@ -283,6 +478,28 @@ describe('sessionHandoffCoordinator', () => {
     resolvePending(readyTarget());
     await expect(execution).resolves.toMatchObject({ ok: true });
     expect(port.commitTarget).toHaveBeenCalledOnce();
+  });
+
+  it('lets cancellation interrupt the pending transfer-policy read before the source is touched', async () => {
+    const controller = new AbortController();
+    const readServerFeatures = vi.fn((signal?: AbortSignal) => new Promise<null>((resolve) => {
+      // Settles only through the forwarded cancellation signal, like a fetch that is still in flight.
+      signal?.addEventListener('abort', () => resolve(null), { once: true });
+    }));
+    const { coordinator, port, update } = createHarness({ readServerFeatures });
+
+    const pending = (await coordinator.admit(baseInput)).execute({ update, signal: controller.signal });
+    await vi.waitFor(() => expect(readServerFeatures).toHaveBeenCalledOnce());
+    controller.abort();
+
+    const result = await Promise.race([
+      pending,
+      new Promise<'still_waiting'>((resolve) => setTimeout(() => resolve('still_waiting'), 1_000)),
+    ]);
+    expect(result).toEqual({ kind: 'cancelled' });
+    expect(readServerFeatures).toHaveBeenCalledWith(controller.signal);
+    expect(port.startSource).not.toHaveBeenCalled();
+    expect(port.abortSource).not.toHaveBeenCalled();
   });
 
   it('acknowledges tracked-operation cancellation through the canonical abort primitives before commit', async () => {

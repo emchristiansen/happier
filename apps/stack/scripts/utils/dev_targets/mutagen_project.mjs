@@ -1,3 +1,34 @@
+import { constants } from 'node:fs';
+import { access, stat } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export const DEV_TARGET_SOURCE_REPO = fileURLToPath(new URL('../../../../../', import.meta.url));
+
+// Match hstack-exec's optional sibling delegation. The sibling remains the
+// only sync owner; an absent standalone sibling retains predecessor behavior.
+export async function loadSiblingMutagenOwner(sourceDir = DEV_TARGET_SOURCE_REPO) {
+  const siblingRoot = resolve(sourceDir, '../0.3');
+  const launcher = join(siblingRoot, 'apps/stack/bin/hstack-exec');
+  try {
+    if (!(await stat(launcher)).isFile()) return null;
+    await access(launcher, constants.X_OK);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'EACCES') return null;
+    throw error;
+  }
+  const modulesDir = join(siblingRoot, 'apps/stack/scripts/utils/dev_targets');
+  const runtime = await import(pathToFileURL(join(modulesDir, 'mutagen_runtime.mjs')));
+  const project = await import(pathToFileURL(join(modulesDir, 'mutagen_project.mjs')));
+  const sync = await import(pathToFileURL(join(modulesDir, 'sync_project.mjs')));
+  return {
+    resolveRuntime: runtime.resolveDevTargetMutagenRuntime,
+    resolveSessionName: (name) => project.resolveMutagenSessionName(name, sourceDir),
+    ensureProject: sync.ensureDevTargetSyncProject,
+    flush: sync.flushDevTargetSync,
+  };
+}
+
 const DEFAULT_IGNORES = [
   'node_modules',
   'dist',
@@ -40,6 +71,12 @@ const DEFAULT_IGNORES = [
   // Expo prebuild generates this entire Git-ignored tree for the target's
   // native identity and toolchain. Replication would undo its Info.plist.
   'apps/ui/ios',
+  // Desktop preparation owns these generated sidecars and their JS runtime companions.
+  // Replicating a local build would replace the target-native executable after Cargo builds it.
+  'apps/ui/src-tauri/binaries',
+  'apps/ui/src-tauri/systemTasks',
+  'apps/ui/src-tauri/ssh',
+  'apps/ui/src-tauri/integrations',
   'apps/ui/android/app/build',
   'apps/ui/android/build',
   'apps/ui/android/.gradle',

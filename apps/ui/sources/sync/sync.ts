@@ -1,6 +1,10 @@
 import Constants from 'expo-constants';
+import { parsePermissionIntentAlias, resolvePermissionIntentFromSessionMetadata } from '@happier-dev/agents';
 import { apiSocket } from '@/sync/api/session/apiSocket';
+import { StaleServerGenerationError } from '@/sync/http/client';
 import { ensureSessionRuntimeForPendingInput } from '@/sync/ops';
+import { needsRollbackEligibilityRead } from '@/sync/domains/sessionRollback/rollbackUiSupport';
+import { didRollbackEligibilityBecomeStale } from '@/sync/domains/sessionRollback/rollbackEligibilityFreshness';
 import { shouldDelegatePendingActivationToDaemon } from '@/sync/domains/session/input/pendingActivationWakeDecision';
 import { isMachineOnline } from '@/utils/sessions/machineUtils';
 import { type AuthCredentials } from '@/auth/storage/tokenStorage';
@@ -9,9 +13,13 @@ import {
     ClientVersionCheckResponseV1Schema,
     SESSION_USER_MESSAGE_DELIVERY_INTENT_META_KEY,
     isRecoveredHistoryTranscriptObservationProvenance,
+    projectSessionMetadataForWire,
     readPendingLocalId,
     type DirectTranscriptRawMessageV1,
+    type DirectTranscriptTruncationReason,
+    resolveDirectTranscriptContinuation,
     type PendingDeliveryBlockedReason,
+    SessionUserMessageSendResponseSchema,
     type SessionUserMessageSendResponse,
 } from '@happier-dev/protocol';
 import { readCurrentUiClientCompatibilityDeclaration } from '@/sync/runtime/clientCompatibility/uiClientCompatibility';
@@ -31,6 +39,7 @@ import type { ApiEphemeralActivityUpdate } from './api/types/apiTypes';
 import { Session, Machine, MetadataSchema, type Metadata } from './domains/state/storageTypes';
 import { InvalidateSync } from '@/utils/sessions/sync';
 import { PauseController } from '@/utils/timing/pauseController';
+import { SupersededOperationError } from '@/utils/timing/time';
 import {
     invalidateAllServerReachabilitySupervisors,
     setServerReachabilityNetworkAllowed,
@@ -40,7 +49,7 @@ import { bindManagedConnectionStateToRealtimeStore } from '@/sync/runtime/connec
 import { assertEndpointAuthenticatedWithProbe } from '@/sync/runtime/connectivity/assertEndpointAuthenticatedWithProbe';
 import { isTerminalAuthError } from '@/sync/runtime/connectivity/authErrors';
 import { isTransientConnectivityError } from '@/sync/runtime/connectivity/transientConnectivityErrors';
-import { isSocketIoAckTimeoutError } from '@/sync/runtime/socketIoAckTimeout';
+import { isSocketIoAckTimeoutError } from '@happier-dev/protocol/rpcErrors';
 import { applyInitialAppStateConnectivityGate } from '@/sync/runtime/connectivity/appStateConnectivityGate';
 import { loadSyncTuning, type SyncTuning } from '@/sync/runtime/syncTuning';
 import {
@@ -49,7 +58,10 @@ import {
 } from '@/sync/runtime/sessionMessagesPagination';
 import {
     applyTailDiscontinuityOlderPage,
+    applyTailDiscontinuityOpaqueOlderPage,
+    applyTailDiscontinuityOpaqueForwardPage,
     openTailDiscontinuityFromSnapshot,
+    openTailDiscontinuityFromOpaqueSnapshot,
     type SessionMessagesTailDiscontinuity,
 } from '@/sync/runtime/sessionMessagesTailDiscontinuity';
 import {
@@ -60,15 +72,19 @@ import {
 } from '@/sync/runtime/sessionMessagesWindowState';
 import {
     acknowledgeStaleTranscriptRepair,
+    acknowledgeTranscriptGap,
     clearDeferredTranscriptStateForSession,
     createDeferredTranscriptState,
     hasStaleTranscriptMarkers,
     markDeferredTranscriptRemoteSeq,
     markTranscriptDeferred,
+    markTranscriptGap,
     markTranscriptStale,
     readDeferredTranscriptDurableSeq,
     readStaleTranscriptMessageIds,
+    readStaleTranscriptMessageSeqs,
     readStaleTranscriptMinSeq,
+    readTranscriptGap,
     type DeferredTranscriptMarker,
     type DeferredTranscriptState,
 } from '@/sync/domains/session/realtime/deferredTranscriptState';
@@ -96,6 +112,10 @@ import { buildOutgoingUserTextRecord } from './domains/messages/outgoingUserMess
 import { resolveSentFrom } from './domains/messages/sentFrom';
 import { NormalizedMessage, normalizeRawMessage, RawRecord, RawRecordSchema } from './typesRaw';
 import { applySettings, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './domains/settings/settings';
+import {
+    assertUiSessionEncryptionModeAllowed,
+    resolveUiClientEncryptionRequirement,
+} from './domains/settings/clientEncryptionRequirement';
 import { Profile, profileDefaults } from './domains/profiles/profile';
 import {
     loadSessionMaterializedMaxSeqById,
@@ -141,12 +161,33 @@ type LoadOlderMessagesOptions = Readonly<{
 
 class PendingOutboxSessionNotHydratedError extends Error {}
 
+type PendingQueueRequestBinding =
+    | Readonly<{ scope: 'active'; serverGeneration: number; request: typeof apiSocket.request }>
+    | Readonly<{ scope: 'scoped'; serverUrl: string; token: string }>;
+
+function arePendingQueueRequestBindingsEqual(left: PendingQueueRequestBinding, right: PendingQueueRequestBinding): boolean {
+    if (left.scope === 'active') {
+        return right.scope === 'active'
+            && left.serverGeneration === right.serverGeneration
+            && left.request === right.request;
+    }
+    return right.scope === 'scoped' && left.serverUrl === right.serverUrl && left.token === right.token;
+}
+
 type ResolvedPendingQueueOwnerContext = Readonly<{
     outboxScope: ServerAccountScope;
     request: (path: string, init?: RequestInit) => Promise<Response>;
+    requestBinding: PendingQueueRequestBinding;
     enqueueEncryption: PendingQueueEncryption;
     readEncryption: PendingQueueReadEncryption;
 }>;
+
+type PendingQueueRefreshOwner = {
+    readonly generation: number;
+    readonly context: ResolvedPendingQueueOwnerContext;
+    readonly isOutboxScopeCurrent: () => Promise<boolean>;
+    users: number;
+};
 
 export type LoadTargetWindowMessagesTarget =
     | Readonly<{ kind: 'seq'; seq: number }>
@@ -171,7 +212,7 @@ export type LoadTargetWindowMessagesResult = Readonly<{
 }>;
 
 function isRetryableTargetWindowLoadError(error: unknown): boolean {
-    if (isTransientConnectivityError(error) || isSocketIoAckTimeoutError(error)) {
+    if (error instanceof SessionMessagePageDecryptionError || isTransientConnectivityError(error) || isSocketIoAckTimeoutError(error)) {
         return true;
     }
     // React Native's fetch boundary uses this exact TypeError before endpoint
@@ -181,6 +222,7 @@ function isRetryableTargetWindowLoadError(error: unknown): boolean {
 }
 
 import { createSyncGenerationGuard } from './domains/scope/syncGenerationGuard';
+import { SessionMessagePageDecryptionError } from './engine/sessions/sessionMessagesPagePipeline';
 import {
     clearWarmCacheAccountScope,
     loadMachineDisplayWarmCacheEntries,
@@ -201,7 +243,7 @@ import {
     isTerminalTaskLifecycleEventType,
     type TaskLifecycleEvent,
 } from '@/sync/engine/sessions/taskLifecycle';
-import { initializeTracking, tracking } from '@/track';
+import { initializeTracking, tracking, trackLogout } from '@/track';
 import { applyCrashReportsOptOut } from '@/utils/system/sentry';
 import { parseToken } from '@/utils/auth/parseToken';
 import { fireAndForget } from '@/utils/system/fireAndForget';
@@ -282,6 +324,7 @@ import { submitSessionUserMessage } from './domains/session/input/submitSessionU
 import type {
     SessionMessageCallerSurface,
     SessionSubmitPort,
+    SubmitSessionUserMessageResult,
 } from './domains/session/input/types';
 import type { SavedSecret } from './domains/settings/savedSecretTypes';
 import type { PermissionMode } from './domains/permissions/permissionTypes';
@@ -311,7 +354,8 @@ import {
     type SafeCursorLagTripwireState,
 } from '@/sync/runtime/orchestration/safeCursorLagTripwire';
 import { runWithInFlightDedupe } from '@/sync/runtime/orchestration/runWithInFlightDedupe';
-import { runTasksWithLimit } from '@/sync/runtime/orchestration/runTasksWithLimit';
+import { createTaskLimiter, runTasksWithLimit } from '@/sync/runtime/orchestration/runTasksWithLimit';
+import { readServerFetchWriteTimeoutMs } from '@/sync/runtime/connectivity/serverReachabilityTuning';
 import {
     emitSyncPerformanceSummaryToConsole,
     installSyncPerformanceTelemetryGlobal,
@@ -342,12 +386,13 @@ import {
 } from '@/utils/system/versionUtils';
 import { applyMessageCatchUpDecision } from '@/sync/runtime/orchestration/applyMessageCatchUpDecision';
 import { readDirectSessionLink, type DirectSessionLink } from '@/sync/domains/session/directSessions/readDirectSessionLink';
+import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
 import { normalizeDirectTranscriptMessages } from '@/sync/runtime/directSessions/normalizeDirectTranscriptMessages';
 import { readStoredSessionRawRecord } from '@/sync/runtime/readStoredSessionContent';
 import { resolvePreferredServerIdForSessionId } from '@/sync/runtime/orchestration/serverScopedRpc/resolvePreferredServerIdForSessionId';
 import { resolveServerIdForSessionIdFromLocalCache } from '@/sync/runtime/orchestration/serverScopedRpc/resolveServerIdForSessionIdFromLocalCache';
 import { emitSessionMetadataUpdateWithServerScope } from '@/sync/runtime/orchestration/serverScopedRpc/emitSessionMetadataUpdateWithServerScope';
-import { fetchSessionByIdWithServerScope } from '@/sync/runtime/orchestration/serverScopedRpc/fetchSessionByIdWithServerScope';
+import { fetchSessionByIdWithServerScope, throwForFailedSessionHydration } from '@/sync/runtime/orchestration/serverScopedRpc/fetchSessionByIdWithServerScope';
 import type {
     EnsureSessionVisibleForRouteResult,
     SessionRouteHydrationMissingCause,
@@ -422,7 +467,7 @@ import {
     materializeExactSessionDraft,
 } from '@/sync/ops/sessionDrafts/sessionDraftRepository';
 import { migrateLegacySessionDrafts } from '@/sync/domains/input/drafts/sessionDraftLegacyMigration';
-import { serverFetch } from './http/client';
+import { abortServerFetches, serverFetch, type ServerReadRequestInit } from './http/client';
 import { logNativeUpdateFetchFailure } from '@/sync/runtime/nativeUpdate/logNativeUpdateFetchFailure';
 import {
     buildUpdatedSessionFromSocketUpdate,
@@ -435,6 +480,7 @@ import {
     repairInvalidReadStateV1 as repairInvalidReadStateV1Engine,
 } from './engine/sessions/syncSessions';
 import { fetchAndApplyTargetWindowMessages, clearTargetWindowRequestEpochs } from './engine/sessions/fetchAndApplyTargetWindowMessages';
+import { fetchAndApplyTranscriptRepair } from './engine/sessions/fetchAndApplyTranscriptRepair';
 import {
     buildSessionListFetchHydrationTelemetryFields,
     type SessionListFetchHydrationTelemetrySource,
@@ -473,6 +519,7 @@ import {
     type PendingQueueEncryption,
     type PendingQueueReadEncryption,
 } from './engine/pending/pendingQueueV2';
+import { createPendingQueueRequest } from './engine/pending/createPendingQueueRequest';
 import {
     resolvePendingInputServerWireMode,
     type PendingInputServerWireMode,
@@ -487,6 +534,7 @@ import {
     handleEphemeralSocketUpdate,
     handleSocketUpdate,
     parseUpdateContainer,
+    resetSocketSessionProjectionStateForServerScope,
 } from './engine/socket/socket';
 import { actionOperationStore } from './domains/actionOperations/actionOperationStore';
 import { openActionOperationRevisionEphemeral } from './domains/actionOperations/actionOperationEphemeral';
@@ -716,6 +764,11 @@ function mapSessionByIdTerminalCodeToMissingCause(code: string): SessionRouteHyd
     return null;
 }
 
+function throwForFailedSessionRouteHydration(result: EnsureSessionVisibleForRouteResult): void {
+    if (result.kind === 'available') return;
+    throwForFailedSessionHydration({ ok: false, session: null, errorCode: result.cause });
+}
+
 function mapSessionByIdRetryableCodeToCause(code: string): SessionRouteHydrationRetryCause {
     if (code === 'network_error') {
         return 'server_unavailable';
@@ -855,6 +908,7 @@ type FetchSessionsOptions = Readonly<{
     requiredHydrationSessionIds?: ReadonlyArray<string>;
     prioritizeSessionIds?: ReadonlyArray<string>;
     hydrationTelemetrySource?: SessionListFetchHydrationTelemetrySource;
+    sessionListScope?: 'account' | 'required';
     mode?: 'replace' | 'append';
 }>;
 
@@ -866,6 +920,7 @@ function canShareFetchSessionsInFlight(options?: FetchSessionsOptions): boolean 
     return options?.awaitSessionListHydration !== true
         && (options?.requiredHydrationSessionIds?.length ?? 0) === 0
         && (options?.prioritizeSessionIds?.length ?? 0) === 0
+        && options?.sessionListScope !== 'required'
         && options?.mode !== 'append';
 }
 
@@ -879,6 +934,8 @@ type SessionOrganizationSyncState = Pick<
     | 'sessionOrganizationTagsByTagKey'
     | 'sessionOrganizationTagAssignmentsBySessionKey'
     | 'sessionOrganizationAttentionStandingsBySessionKey'
+    | 'sessionOrganizationAppearancesBySessionKey'
+    | 'sessionOrganizationSessionAppearancesSupportedByServerId'
     | 'sessionOrganizationOrderEntriesByScopeKey'
     | 'sessionOrganizationLabelsByLabelKey'
 >;
@@ -898,6 +955,8 @@ function buildOrganizationProjectionForServer(
         tagsByTagKey: state.sessionOrganizationTagsByTagKey,
         tagAssignmentsBySessionKey: state.sessionOrganizationTagAssignmentsBySessionKey,
         attentionStandingsBySessionKey: state.sessionOrganizationAttentionStandingsBySessionKey,
+        appearancesBySessionKey: state.sessionOrganizationAppearancesBySessionKey,
+        sessionAppearancesSupportedByServerId: state.sessionOrganizationSessionAppearancesSupportedByServerId,
         orderEntriesByScopeKey: state.sessionOrganizationOrderEntriesByScopeKey,
         labelsByLabelKey: state.sessionOrganizationLabelsByLabelKey,
     }, normalizedServerId);
@@ -947,14 +1006,16 @@ class Sync {
 
         encryption!: Encryption;
         serverID!: string;
-        anonID!: string;
+        anonID: string | null = null;
         private credentials!: AuthCredentials;
         private pauseController = new PauseController();
         private syncTuning: SyncTuning = loadSyncTuning();
+        private readonly snapshotSyncAttemptLimiter = createTaskLimiter(this.syncTuning.bootstrapConcurrencyLimit);
         private sessionTranscriptRetention!: SessionTranscriptRetentionController;
       private resumeInFlight: Promise<void> | null = null;
       private changesCatchUpQueuedAfterResume = false;
       private pendingOutboxRearmInFlightByScope = new Map<string, Promise<void>>();
+      private pendingQueueRefreshOwners = new Map<string, PendingQueueRefreshOwner>();
       private readonly usesPersistentDesktopSync = isTauriDesktop();
       private isForeground = this.usesPersistentDesktopSync || AppState.currentState === 'active';
       public encryptionCache = new EncryptionCache();
@@ -975,6 +1036,8 @@ class Sync {
     private hasFetchedSessionsSnapshotForActiveServer = false;
     private serverScopeGeneration = 0;
       private sessionByIdHydrationInFlight = new Map<string, Promise<EnsureSessionVisibleForRouteResult>>();
+      /** Sessions whose stale rollback starts a completed exact read already answered; see `refreshVisibleStaleRollbackEligibility`. */
+      private rollbackEligibilityStaleReadSettledSessionIds = new Set<string>();
       private sessionReceivedMessages = new Map<string, Map<string, number>>();
       private sessionMessagesBeforeSeqByKey = new Map<string, number>();
       private sessionMessagesHasMoreOlderByKey = new Map<string, boolean>();
@@ -989,7 +1052,15 @@ class Sync {
       private sessionMessagesWindowStateBySessionId = new Map<string, SessionMessagesWindowState>();
       private directSessionOlderCursorBySessionId = new Map<string, string | null>();
       private directSessionHasMoreOlderBySessionId = new Map<string, boolean>();
-      private directSessionTailCursorBySessionId = new Map<string, string | null>();
+      private directSessionLatestSnapshotPendingBySessionId = new Set<string>();
+      // An observed source reset cannot be forgotten: index/offset cursors may become valid
+      // again after the replacement source grows, without restoring the accepted history.
+      private directSessionTailStateBySessionId = new Map<string, {
+          cursor: string | null;
+          readonly sourceKey: string | null;
+          readonly requiresRefresh: boolean;
+          lastSourceMessageIds?: readonly string[];
+      }>();
       private sessionViewport = new Map<string, SessionViewportSnapshot>();
       private sessionViewportHydratedStorageKey: string | null = null;
       /**
@@ -1254,8 +1325,24 @@ class Sync {
                 maxFailureCount: 'infinite' as const,
             };
 
-            this.sessionsSync = new InvalidateSync(this.fetchSessions, { onError, onSuccess, onRetry, pause, backoff });
-            this.settingsSync = new InvalidateSync(this.syncSettings, {
+            // Wait budgets belong to bootstrap/resume callers; capacity belongs
+            // to the actual network attempt. Holding the permit here prevents a
+            // timed-out waiter from starting an unbounded second wave while the
+            // first request is still running. Backoff sleeps occur outside the
+            // permit because InvalidateSync invokes this wrapper per attempt.
+            const limitSnapshotSyncAttempt = (command: () => Promise<void>) => (
+                () => this.snapshotSyncAttemptLimiter.run(command)
+            );
+
+            this.sessionsSync = new InvalidateSync(limitSnapshotSyncAttempt(async () => {
+                // A direct list read may have started before this refresh was requested.
+                // Drain that shared read before fetching, so this cycle materializes a
+                // fresh snapshot rather than adopting the direct read's older basis.
+                const inFlight = this.fetchSessionsInFlight;
+                if (inFlight?.generation === this.serverScopeGeneration) await inFlight.promise;
+                await this.fetchSessions();
+            }), { onError, onSuccess, onRetry, pause, backoff });
+            this.settingsSync = new InvalidateSync(limitSnapshotSyncAttempt(this.syncSettings), {
                 onError: onSettingsError,
                 onSuccess: onSettingsSuccess,
                 onRetry,
@@ -1263,16 +1350,16 @@ class Sync {
                 pause,
                 backoff,
             });
-            this.profileSync = new InvalidateSync(this.fetchProfile, { onError, onSuccess, onRetry, pause, backoff });
-            this.purchasesSync = new InvalidateSync(this.syncPurchases, { onError, onSuccess, onRetry, pause, backoff });
-            this.machinesSync = new InvalidateSync(this.fetchMachines, { onError, onSuccess, onRetry, pause, backoff });
-            this.nativeUpdateSync = new InvalidateSync(this.fetchNativeUpdate, { pause, backoff });
-            this.artifactsSync = new InvalidateSync(this.fetchArtifactsList, { pause, backoff });
-            this.friendsSync = new InvalidateSync(this.fetchFriends, { pause, backoff });
-            this.friendRequestsSync = new InvalidateSync(this.fetchFriendRequests, { pause, backoff });
-            this.feedSync = new InvalidateSync(this.fetchFeed, { pause, backoff });
-            this.todosSync = new InvalidateSync(this.fetchTodos, { pause, backoff });
-            this.automationsSync = new InvalidateSync(this.fetchAutomations, { pause, backoff });
+            this.profileSync = new InvalidateSync(limitSnapshotSyncAttempt(this.fetchProfile), { onError, onSuccess, onRetry, pause, backoff });
+            this.purchasesSync = new InvalidateSync(limitSnapshotSyncAttempt(this.syncPurchases), { onError, onSuccess, onRetry, pause, backoff });
+            this.machinesSync = new InvalidateSync(limitSnapshotSyncAttempt(this.fetchMachines), { onError, onSuccess, onRetry, pause, backoff });
+            this.nativeUpdateSync = new InvalidateSync(limitSnapshotSyncAttempt(this.fetchNativeUpdate), { pause, backoff });
+            this.artifactsSync = new InvalidateSync(limitSnapshotSyncAttempt(this.fetchArtifactsList), { pause, backoff });
+            this.friendsSync = new InvalidateSync(limitSnapshotSyncAttempt(this.fetchFriends), { pause, backoff });
+            this.friendRequestsSync = new InvalidateSync(limitSnapshotSyncAttempt(this.fetchFriendRequests), { pause, backoff });
+            this.feedSync = new InvalidateSync(limitSnapshotSyncAttempt(this.fetchFeed), { pause, backoff });
+            this.todosSync = new InvalidateSync(limitSnapshotSyncAttempt(this.fetchTodos), { pause, backoff });
+            this.automationsSync = new InvalidateSync(limitSnapshotSyncAttempt(this.fetchAutomations), { pause, backoff });
 
           const registerPushToken = async () => {
               if (__DEV__ && config.enableDevPushTokenRegistration !== true) {
@@ -1280,7 +1367,7 @@ class Sync {
               }
               await this.registerPushToken();
           }
-            this.pushTokenSync = new InvalidateSync(registerPushToken, { pause, backoff });
+            this.pushTokenSync = new InvalidateSync(limitSnapshotSyncAttempt(registerPushToken), { pause, backoff });
             this.activityAccumulator = new ActivityUpdateAccumulator(
                 this.flushActivityUpdates.bind(this),
                 this.syncTuning.activityUpdateDebounceMs,
@@ -1525,6 +1612,18 @@ class Sync {
           return Math.max(1, Math.trunc(this.syncTuning.sessionMessagesPageSize));
       }
 
+      private getInitialSessionMessagesPageSize(): number {
+          if (Platform.OS === 'web') {
+              return WEB_INITIAL_SESSION_MESSAGES_PAGE_SIZE;
+          }
+          // A first native viewport and a native history prepend have the same
+          // bounded rendering job. Reuse the transcript page owner instead of
+          // decrypting a larger catch-up page before the first paint.
+          return this.getSessionMessagesPageSize({
+              limit: this.syncTuning.transcriptNativeOlderMessagesPageSize,
+          });
+      }
+
       private getMessageDecryptBatchOptions() {
           return {
               initialMessageDecryptBatchSize: this.syncTuning.initialMessageDecryptBatchSize,
@@ -1582,6 +1681,8 @@ class Sync {
       }
 
       private configureEncryptionRuntime(encryption: Encryption, accountId: string): void {
+          if (encryption.anonID) initializeTracking(encryption.anonID);
+          else trackLogout();
           const serverId = String(getActiveServerSnapshot().serverId ?? '').trim() || null;
           encryption.configureAesBatchConcurrencyLimit(this.syncTuning.encryptionAesBatchConcurrencyLimit);
           // Routing is NOT set here. It arrives with the instance: Encryption resolves it
@@ -1615,8 +1716,9 @@ class Sync {
                   ? createApiSessionDraftsTransport({ credentials })
                   : undefined,
               cipher: createSessionDraftCipher({
-                  accountMode,
-                  accountCryptoMaterial: resolveAccountScopedCryptoMaterialFromCredentials(credentials),
+                  ...(accountMode === 'plain'
+                      ? { accountMode, accountCryptoMaterial: null }
+                      : { accountMode, accountCryptoMaterial: resolveAccountScopedCryptoMaterialFromCredentials(credentials) }),
                   getSessionContext: (sessionId) => {
                       const session = storage.getState().sessions[sessionId] ?? null;
                       if (!session) return null;
@@ -1777,6 +1879,7 @@ class Sync {
     }
 
     private clearActiveAccountSettingsScope(): void {
+        actionOperationStore.activateScope(null);
         this.flushSessionMaterializedMaxSeqForCurrentScopeNow();
         this.pendingSettings = {};
         this.pendingSettingsScope = null;
@@ -1812,6 +1915,7 @@ class Sync {
         migratePendingTerminalConnectScopes(scope, legacyScopes);
         migratePendingNotificationActionScopes(scope, legacyScopes);
         migratePendingNotificationNavScopes(scope, legacyScopes);
+        actionOperationStore.activateScope(scope);
         storage.getState().activateSettingsScope(scope, legacyScopes);
         storage.getState().activateProfileScope(scope, legacyScopes);
         storage.getState().activatePetsScope(scope, legacyScopes);
@@ -1994,6 +2098,7 @@ class Sync {
         this.deferredWebVisibilityTeardown = null;
         this.stopJsThreadLagTelemetryRuntime();
         this.serverScopeGeneration += 1;
+        this.pendingQueueRefreshOwners.clear();
         this.flushPendingSettingsForCurrentScopeNow();
         this.flushSessionMaterializedMaxSeq();
         this.clearActiveAccountSettingsScope();
@@ -2018,7 +2123,7 @@ class Sync {
         this.sessionMessagesBeforeSeqByKey.clear();
         this.sessionMessagesHasMoreOlderByKey.clear();
         for (const sessionId of [...this.sessionMessagesTailDiscontinuityBySessionId.keys()]) {
-            storage.getState().setSessionTailContiguousFloorSeq(sessionId, null);
+            storage.getState().setSessionTailContiguousBoundary(sessionId, null);
         }
         this.sessionMessagesTailDiscontinuityBySessionId.clear();
         this.sessionMessagesFetchLatestInFlightByKey.clear();
@@ -2032,12 +2137,14 @@ class Sync {
             this.notifySessionTargetWindowStateListeners(sessionId);
         }
         clearTargetWindowRequestEpochs(); // invalidate any in-flight window fetches so stale commits fail the epoch guard
-        this.directSessionTailCursorBySessionId.clear();
+        this.directSessionTailStateBySessionId.clear();
         this.sessionViewport.clear();
         // Re-hydrate persisted viewport anchors for whichever scope becomes
         // active next; persisted records themselves are scope-keyed and survive.
         this.sessionViewportHydratedStorageKey = null;
         this.sessionByIdHydrationInFlight.clear();
+        this.rollbackEligibilityStaleReadSettledSessionIds.clear();
+        resetSocketSessionProjectionStateForServerScope();
         clearActiveViewingSessionsForServerScopeReset();
         clearMountedSessionRealtimeScmConsumerScopes();
         this.deferredForwardLoadingSessions.clear();
@@ -2094,8 +2201,12 @@ class Sync {
                 return next;
             })(),
             sessionMessages: {},
+            sessionMessagesHistoryStartLoaded: {},
             sessionPending: {},
             artifacts: {},
+            artifactsLoaded: false,
+            automations: {},
+            automationRunsByAutomationId: {},
             friends: {},
             users: {},
             friendsLoaded: false,
@@ -2197,26 +2308,22 @@ class Sync {
                 fireAndForget(this.repairDeferredStaleTranscriptRegion(sessionId, {
                     minSeq: staleMinSeq,
                     messageIds: staleMessageIds,
+                    messageSeqs: readStaleTranscriptMessageSeqs(this.deferredTranscriptState, sessionId),
                 }), {
                     tag: 'Sync.onSessionVisible.staleRefetch',
                 });
             }
             if (hasDeferredSessionStateHydration(this.deferredSessionStateHydrationState, sessionId)) {
-                this.deferredSessionStateHydrationState = clearDeferredSessionStateHydration(
-                    this.deferredSessionStateHydrationState,
-                    sessionId,
-                );
                 fireAndForget(this.ensureSessionVisibleForMessageRoute(sessionId, { forceRefresh: true }), {
                     tag: 'Sync.onSessionVisible.deferredSessionStateHydration',
                 });
+            } else if (needsRollbackEligibilityRead(storage.getState().sessions[sessionId])) {
+                // Session-list rows do not carry rollback eligibility; the exact read does. One
+                // deduped read on open confirms unknown or stale starts; afterwards this stays quiet.
+                this.readRollbackEligibility(sessionId, 'Sync.onSessionVisible.rollbackEligibility');
             }
             this.replayDeferredMessagesFetch(sessionId);
             this.getOrCreateMessagesSync(sessionId).invalidateCoalesced();
-
-            // C6/D3: reopening a session is a reactive, list-independent bottom arrival. Drain any
-            // deferred-newer backlog here so newer-message catch-up never stalls waiting for a
-            // ChatList scroll event.
-            this.maybeDrainDeferredNewerMessages(sessionId, { isPinned: true, distanceFromBottomPx: 0 });
 
             // Notify voice assistant about session visibility
             const session = storage.getState().sessions[sessionId];
@@ -2334,6 +2441,16 @@ class Sync {
                 return await existing;
             }
 
+            // Consume only the invalidation this exact read can satisfy. A hidden update
+            // arriving while it is in flight must remain pending for the next reveal.
+            const hadDeferredSessionState = hasDeferredSessionStateHydration(
+                this.deferredSessionStateHydrationState,
+                normalized,
+            );
+            this.deferredSessionStateHydrationState = clearDeferredSessionStateHydration(
+                this.deferredSessionStateHydrationState,
+                normalized,
+            );
             const inFlight = (async () => {
                 try {
                     if (DEBUG_SESSION_HYDRATE) {
@@ -2441,6 +2558,9 @@ class Sync {
             });
 
             const result = await inFlight;
+            if (result.kind !== 'available' && hadDeferredSessionState && isRouteHydrationScopeCurrent()) {
+                this.markSessionStateHydrationDeferred(normalized);
+            }
             if (result.kind === 'available') {
                 // A message invalidation may have observed the session before this route
                 // hydration committed its owner. Replay that deferred attempt now that the
@@ -2485,53 +2605,37 @@ class Sync {
     ) {
         let session = storage.getState().sessions[sessionId] ?? null;
         if (!session) {
+            let hydration: EnsureSessionVisibleForRouteResult;
             try {
-                await this.ensureSessionVisibleForMessageRoute(sessionId, { forceRefresh: true });
-            } catch {
-                // Best effort only. Fall through to the missing-session error below if the hydrate did not land.
+                hydration = await this.ensureSessionVisibleForMessageRoute(sessionId, { forceRefresh: true });
+            } catch (error) {
+                storage.getState().clearSessionOptimisticThinking(sessionId);
+                throw error;
             }
             session = storage.getState().sessions[sessionId] ?? null;
-        }
-        if (!session) {
-            storage.getState().clearSessionOptimisticThinking(sessionId);
-            throw new Error(`Session ${sessionId} not found in storage`);
+            if (!session) {
+                storage.getState().clearSessionOptimisticThinking(sessionId);
+                throwForFailedSessionRouteHydration(hydration);
+                throw new Error(`Session ${sessionId} not found in storage`);
+            }
         }
 
         this.markSessionLiveTailIntent(sessionId);
         storage.getState().markSessionOptimisticThinking(sessionId);
 
         const sessionEncryptionMode: 'e2ee' | 'plain' = session.encryptionMode === 'plain' ? 'plain' : 'e2ee';
+        const currentSettings = storage.getState().settings;
+        assertUiSessionEncryptionModeAllowed({
+            mode: sessionEncryptionMode,
+            requirement: resolveUiClientEncryptionRequirement({
+                syncedSettings: currentSettings,
+                localSettings: currentSettings,
+            }),
+        });
 
         try {
-            const publishNextPromptPermissionModeIfNeeded = async (): Promise<void> => {
-                const settingsApplyTiming = storage.getState().settings.sessionPermissionModeApplyTiming ?? 'immediate';
-                if (settingsApplyTiming !== 'next_prompt') {
-                    return;
-                }
-
-                const latestSession = storage.getState().sessions[sessionId] ?? null;
-                const localUpdatedAt = latestSession?.permissionModeUpdatedAt ?? null;
-                const metadataUpdatedAtRaw = latestSession?.metadata?.permissionModeUpdatedAt ?? null;
-                const metadataUpdatedAt =
-                    typeof metadataUpdatedAtRaw === 'number' && Number.isFinite(metadataUpdatedAtRaw)
-                        ? metadataUpdatedAtRaw
-                        : 0;
-
-                if (!(typeof localUpdatedAt === 'number' && Number.isFinite(localUpdatedAt) && localUpdatedAt > metadataUpdatedAt)) {
-                    return;
-                }
-
-                const modeToPublish = (latestSession?.permissionMode ?? 'default') as PermissionMode;
-                try {
-                    await this.publishSessionPermissionModeToMetadata({
-                        sessionId,
-                        permissionMode: modeToPublish,
-                        permissionModeUpdatedAt: localUpdatedAt,
-                    });
-                } catch {
-                    // Best-effort only: sending messages must not fail due to metadata publish failures.
-                }
-            };
+            const permissionPublicationScope = getActiveServerAccountScope();
+            const isPermissionPublicationScopeCurrent = this.createServerScopeGuard();
 
             // Read permission mode from session state
             const permissionMode = session.permissionMode || 'default';
@@ -2570,6 +2674,12 @@ class Sync {
                 session,
                 metaOverrides,
             });
+            const publishNextPromptPermissionModeIfNeeded = () => this.publishNextPromptPermissionModeAfterAdmission({
+                sessionId,
+                admittedPermissionMode: content.meta?.permissionMode,
+                expectedAccountScope: permissionPublicationScope,
+                isCurrent: isPermissionPublicationScopeCurrent,
+            });
 
             const messagePayload =
                 sessionEncryptionMode === 'plain'
@@ -2600,8 +2710,9 @@ class Sync {
 
             let runtimeRpcFallbackRequiresWake = false;
             if (session.active === true && canUseSessionUserMessageRuntimeRpc(session)) {
+                let rpcAck: SessionUserMessageSendResponse | null = null;
                 try {
-                    const rpcAck = await apiSocket.sessionRPC<SessionUserMessageSendResponse, {
+                    rpcAck = SessionUserMessageSendResponseSchema.parse(await apiSocket.sessionRPC<unknown, {
                         text: string;
                         localId: string;
                         meta: Record<string, unknown>;
@@ -2617,26 +2728,7 @@ class Sync {
                                     : {},
                         },
                         { timeoutMs: this.syncTuning.sessionRpcTimeoutMs },
-                    );
-                    storage.getState().upsertPendingMessage(sessionId, {
-                        id: localId,
-                        localId,
-                        createdAt,
-                        updatedAt: nowServerMs(),
-                        source: 'local_outbound',
-                        deliveryStatus: 'accepted',
-                        text,
-                        displayText,
-                        rawRecord: content,
-                    });
-                    await publishNextPromptPermissionModeIfNeeded();
-                    return {
-                        localId,
-                        persistence: 'provider_direct' as const,
-                        ...(rpcAck.ok === true && rpcAck.providerAcceptancePending === true
-                            ? { providerAcceptancePending: true }
-                            : {}),
-                    };
+                    ));
                 } catch (error) {
                     if (isSocketIoAckTimeoutError(error)) {
                         storage.getState().upsertPendingMessage(sessionId, {
@@ -2673,6 +2765,37 @@ class Sync {
                         return { localId: queued.localId, persistence: 'pending' as const };
                     }
                     runtimeRpcFallbackRequiresWake = true;
+                }
+                if (rpcAck !== null) {
+                    // Transport success does not admit a refused application request. Keep this
+                    // outside transport fallback handling even when refusal text resembles a socket error.
+                    if (rpcAck.ok !== true) {
+                        removePendingMessageCreatedForSend();
+                        throw createSessionMessageSubmitFailureError(
+                            rpcAck.errorCode,
+                            rpcAck.error,
+                            'Message send rejected',
+                        );
+                    }
+                    storage.getState().upsertPendingMessage(sessionId, {
+                        id: localId,
+                        localId,
+                        createdAt,
+                        updatedAt: nowServerMs(),
+                        source: 'local_outbound',
+                        deliveryStatus: 'accepted',
+                        text,
+                        displayText,
+                        rawRecord: content,
+                    });
+                    await publishNextPromptPermissionModeIfNeeded();
+                    return {
+                        localId,
+                        persistence: 'provider_direct' as const,
+                        ...(rpcAck.providerAcceptancePending === true
+                            ? { providerAcceptancePending: true }
+                            : {}),
+                    };
                 }
             }
 
@@ -2734,7 +2857,7 @@ class Sync {
             } else {
                 storage.getState().removePendingMessage(sessionId, localId);
             }
-            this.markSessionMaterializedMaxSeq(sessionId, ack.seq);
+            this.markSessionAckedMessageSeq(sessionId, ack.seq);
 
             // If we miss the broadcast socket update, we still need to advance session.seq so
             // catch-up (`afterSeq`) works correctly across reconnects.
@@ -2852,13 +2975,6 @@ class Sync {
                     );
             }
         } catch (e) {
-            if (
-                e
-                && typeof e === 'object'
-                && (e as { code?: unknown }).code === 'action-conflict'
-            ) {
-                await this.fetchPendingMessages(sessionId).catch(() => {});
-            }
             if (isTerminalAuthError(e)) {
                 recordTerminalAuthSyncError(e);
             }
@@ -2986,7 +3102,7 @@ class Sync {
                 } else {
                     storage.getState().removePendingMessage(params.sessionId, params.localId);
                 }
-                this.markSessionMaterializedMaxSeq(params.sessionId, ack.data.seq);
+                this.markSessionAckedMessageSeq(params.sessionId, ack.data.seq);
 
                 const currentSession = storage.getState().sessions[params.sessionId];
                 if (currentSession) {
@@ -3135,17 +3251,34 @@ class Sync {
         const wireMode = resolvePendingInputServerWireMode(await getServerFeaturesSnapshot({
             serverId: ownerContext.outboxScope.serverId,
         }));
-        await updatePendingRequestedActionV2({
-            sessionId,
-            localId,
-            requestedAction,
-            ...(options?.resumeWhenAvailable !== undefined
-                ? { resumeWhenAvailable: options.resumeWhenAvailable }
-                : {}),
-            request: ownerContext.request,
-            outboxScope: ownerContext.outboxScope,
-            wireMode,
-        });
+        try {
+            await updatePendingRequestedActionV2({
+                sessionId,
+                localId,
+                requestedAction,
+                ...(options?.resumeWhenAvailable !== undefined
+                    ? { resumeWhenAvailable: options.resumeWhenAvailable }
+                    : {}),
+                request: ownerContext.request,
+                outboxScope: ownerContext.outboxScope,
+                wireMode,
+            });
+        } catch (error) {
+            const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+            if (code === 'action-conflict' || code === 'not-found') {
+                try {
+                    await this.fetchPendingMessages(sessionId);
+                } catch (refreshError) {
+                    log.log('Failed to reconcile pending messages after a stale requested action: ' + String(refreshError));
+                }
+            }
+            throw error;
+        }
+        if (options?.resumeWhenAvailable !== undefined) {
+            await this.refreshSessionForSubmit(sessionId, {
+                serverId: ownerContext.outboxScope.serverId,
+            });
+        }
     }
 
     private createSessionSubmitPort(): SessionSubmitPort {
@@ -3192,20 +3325,17 @@ class Sync {
             callerSurface?: SessionMessageCallerSurface | null;
             forceImmediate?: boolean;
         }>,
-    ): Promise<void> {
+    ): Promise<SubmitSessionUserMessageResult> {
         let state = storage.getState();
         let session = state.sessions[sessionId] ?? null;
         if (!session) {
-            try {
-                await this.ensureSessionVisibleForMessageRoute(sessionId, { forceRefresh: true });
-            } catch {
-                // Best effort only. Fall through to the low-level missing-session error if hydrate did not land.
-            }
+            const hydration = await this.ensureSessionVisibleForMessageRoute(sessionId, { forceRefresh: true });
             state = storage.getState();
             session = state.sessions[sessionId] ?? null;
-        }
-        if (!session) {
-            throw new Error(`Session ${sessionId} not available for pending-aware submit`);
+            if (!session) {
+                throwForFailedSessionRouteHydration(hydration);
+                throw new Error(`Session ${sessionId} not available for pending-aware submit`);
+            }
         }
 
         const port = this.createSessionSubmitPort();
@@ -3243,12 +3373,13 @@ class Sync {
                 'Failed to submit message',
             );
         }
+        return result;
     }
 
     private async updateSessionMetadataWithRetry(
         sessionId: string,
         updater: (metadata: Metadata) => Metadata,
-        options?: Readonly<{ serverId?: string | null }>,
+        options?: Readonly<{ serverId?: string | null; shouldContinue?: () => boolean }>,
     ): Promise<void> {
         const resolvedServerIdOverride =
             typeof options?.serverId === 'string' && options.serverId.trim().length > 0
@@ -3259,7 +3390,7 @@ class Sync {
             if (!this.credentials) {
                 throw new Error('Sync credentials not available');
             }
-            await fetchSessionByIdWithServerScope({
+            const hydrationResult = await fetchSessionByIdWithServerScope({
                 sessionId,
                 serverId: resolvedServerIdOverride ?? resolvePreferredServerIdForSessionId(sessionId),
                 activeCredentials: this.credentials,
@@ -3271,6 +3402,7 @@ class Sync {
                 getExistingSession: (targetSessionId) => storage.getState().sessions[targetSessionId] ?? null,
                 log,
             });
+            throwForFailedSessionHydration(hydrationResult);
         };
 
         const resolvePatchContext = () => {
@@ -3303,7 +3435,7 @@ class Sync {
             },
             encryptMetadata: async (metadata) => {
                 if (patchContext.sessionEncryptionMode === 'plain') {
-                    return JSON.stringify(metadata);
+                    return JSON.stringify(projectSessionMetadataForWire(metadata));
                 }
                 if (!patchContext.encryption) {
                     throw new Error(`Session ${sessionId} not found`);
@@ -3342,6 +3474,7 @@ class Sync {
             },
             updater,
             maxAttempts: 8,
+            shouldContinue: options?.shouldContinue,
         });
     }
 
@@ -3445,13 +3578,50 @@ class Sync {
         sessionId: string;
         permissionMode: PermissionMode;
         permissionModeUpdatedAt: number;
+        shouldContinue?: () => boolean;
     }): Promise<void> {
         await publishPermissionModeToMetadataEngine({
             sessionId: params.sessionId,
             permissionMode: params.permissionMode,
             permissionModeUpdatedAt: params.permissionModeUpdatedAt,
-            updateSessionMetadataWithRetry: (sessionId, updater) => this.updateSessionMetadataWithRetry(sessionId, updater),
+            updateSessionMetadataWithRetry: (sessionId, updater) => this.updateSessionMetadataWithRetry(sessionId, updater, { shouldContinue: params.shouldContinue }),
         });
+    }
+
+    async publishNextPromptPermissionModeAfterAdmission(params: Readonly<{
+        sessionId: string;
+        admittedPermissionMode: unknown;
+        expectedAccountScope: ServerAccountScope | null;
+        isCurrent?: () => boolean;
+    }>): Promise<boolean> {
+        const admitted = typeof params.admittedPermissionMode === 'string'
+            ? parsePermissionIntentAlias(params.admittedPermissionMode) : null;
+        if (!admitted || storage.getState().settings.sessionPermissionModeApplyTiming !== 'next_prompt') return false;
+        const isServerScopeCurrent = this.createServerScopeGuard();
+        const shouldContinue = () => {
+            const latest = storage.getState().sessions[params.sessionId];
+            return isServerScopeCurrent()
+                && params.isCurrent?.() !== false
+                && areServerAccountScopesEqual(params.expectedAccountScope, getActiveServerAccountScope())
+                && (typeof latest?.permissionMode === 'string' ? parsePermissionIntentAlias(latest.permissionMode) : 'default') === admitted;
+        };
+        if (!shouldContinue()) return false;
+        const latest = storage.getState().sessions[params.sessionId];
+        const updatedAt = latest?.permissionModeUpdatedAt;
+        const committed = resolvePermissionIntentFromSessionMetadata(latest?.metadata);
+        if (!(typeof updatedAt === 'number' && Number.isFinite(updatedAt) && updatedAt > (committed?.updatedAt ?? 0))) return false;
+        try {
+            await this.publishSessionPermissionModeToMetadata({
+                sessionId: params.sessionId,
+                permissionMode: admitted,
+                permissionModeUpdatedAt: updatedAt,
+                shouldContinue,
+            });
+            return shouldContinue();
+        } catch (error) {
+            console.warn('[sync] Could not publish the admitted permission intent', error);
+            return false;
+        }
     }
 
     async publishSessionAcpSessionModeOverrideToMetadata(params: {
@@ -3534,6 +3704,7 @@ class Sync {
         ) {
             return;
         }
+        const generation = this.serverScopeGeneration;
         const ownerContext = await this.resolvePendingQueueOwnerContext(sessionId);
         const outboxScope = ownerContext.outboxScope;
         if (
@@ -3546,13 +3717,54 @@ class Sync {
         for (const localId of replayLocalIds) {
             this.schedulePendingOutboxOperationRetry({ sessionId, localId, outboxScope });
         }
-        await fetchAndApplyPendingMessagesV2({
-            sessionId,
-            encryption: ownerContext.readEncryption,
-            request: ownerContext.request,
-            outboxScope,
-            isOutboxScopeCurrent: () => this.isPendingQueueOwnerScopeCurrent(sessionId, outboxScope),
-        });
+        if (generation !== this.serverScopeGeneration) return;
+        const refreshOwner = this.acquirePendingQueueRefreshOwner(sessionId, ownerContext, generation);
+        try {
+            await fetchAndApplyPendingMessagesV2({
+                sessionId,
+                encryption: ownerContext.readEncryption,
+                request: refreshOwner.context.request,
+                outboxScope,
+                isOutboxScopeCurrent: refreshOwner.isOutboxScopeCurrent,
+            });
+        } finally {
+            refreshOwner.users -= 1;
+            if (refreshOwner.users === 0 && this.pendingQueueRefreshOwners.get(sessionId) === refreshOwner) {
+                this.pendingQueueRefreshOwners.delete(sessionId);
+            }
+        }
+    }
+
+    private acquirePendingQueueRefreshOwner(
+        sessionId: string,
+        context: ResolvedPendingQueueOwnerContext,
+        generation: number,
+    ): PendingQueueRefreshOwner {
+        const existing = this.pendingQueueRefreshOwners.get(sessionId);
+        if (existing && existing.generation === generation
+            && areServerAccountScopesEqual(existing.context.outboxScope, context.outboxScope)
+            && arePendingQueueRequestBindingsEqual(existing.context.requestBinding, context.requestBinding)) {
+            existing.users += 1;
+            return existing;
+        }
+        // Retain callbacks only for overlapping reads of this transport/scope lifetime. The
+        // Pending owner still decides whether version, transcript, encryption or local writes
+        // demand a separate read. A newly allocated wrapper alone is not a new transport.
+        const isCurrent = (): boolean => this.pendingQueueRefreshOwners.get(sessionId) === owner
+            && this.serverScopeGeneration === generation
+            && (context.requestBinding.scope !== 'active'
+                || (getActiveServerSnapshot().generation === context.requestBinding.serverGeneration
+                    && apiSocket.request === context.requestBinding.request));
+        const owner: PendingQueueRefreshOwner = {
+            generation,
+            context,
+            users: 1,
+            isOutboxScopeCurrent: async () => isCurrent()
+                && await this.isPendingQueueOwnerScopeCurrent(sessionId, context.outboxScope)
+                && isCurrent(),
+        };
+        this.pendingQueueRefreshOwners.set(sessionId, owner);
+        return owner;
     }
 
     private rearmPendingOutboxForActiveScope = (): Promise<void> => {
@@ -3816,7 +4028,8 @@ class Sync {
         });
     }
 
-    applySettings = (delta: Partial<Settings>, options?: { source?: SettingsAnalyticsSource }) => {
+    applySettings = (delta: Partial<Settings>, options?: { source?: SettingsAnalyticsSource; durability?: 'immediate';
+        themeProfileMigration?: import('@/theme/profiles/themeProfileTypes').ThemeProfileMigrationIntent }) => {
         applySettingsLocalDelta({
             delta,
             settingsSecretsKey: this.settingsSecretsKey,
@@ -3826,6 +4039,8 @@ class Sync {
             },
             schedulePendingSettingsFlush: () => this.schedulePendingSettingsFlush(),
             source: options?.source,
+            durability: options?.durability,
+            themeProfileMigration: options?.themeProfileMigration,
         });
     }
 
@@ -4002,8 +4217,9 @@ class Sync {
             || explicitPrioritizedHydrationIdSet.has(sessionId)
         ));
         const isAppend = options?.mode === 'append';
-        const includeActiveSessionRows = !isAppend;
-        const includeSessionListAttentionRows = !isAppend && shouldIncludeSessionListAttentionRows(initialState.settings);
+        const isRequiredScope = options?.sessionListScope === 'required';
+        const includeActiveSessionRows = !isAppend && !isRequiredScope;
+        const includeSessionListAttentionRows = !isAppend && !isRequiredScope && shouldIncludeSessionListAttentionRows(initialState.settings);
         // The list paints pinned rows, folders and manual order from organization state, so a
         // boot with none of it would either wait for this round trip or rearrange itself once
         // the snapshot lands. The warm cache removes both: boot hydration restores the
@@ -4013,7 +4229,7 @@ class Sync {
         const hasLastKnownOrganizationSnapshot = activeServerId
             ? typeof initialState.sessionOrganizationSnapshotVersionByServerId[activeServerId] === 'number'
             : false;
-        const organizationSnapshotRefresh = !isAppend && activeServerId
+        const organizationSnapshotRefresh = !isAppend && !isRequiredScope && activeServerId
             ? fetchAndApplySessionOrganizationSnapshot({
                 credentials: this.credentials,
                 serverId: activeServerId,
@@ -4038,7 +4254,7 @@ class Sync {
                 await organizationSnapshotRefresh;
             }
         }
-        const organizationProjection = isAppend
+        const organizationProjection = isAppend || isRequiredScope
             ? null
             : buildOrganizationProjectionForServer(storage.getState(), activeServerId);
         const hasOrganizationSnapshot = organizationProjection?.version != null;
@@ -4076,9 +4292,16 @@ class Sync {
             );
         }
         const result = await fetchAndApplySessions({
+            clientEncryptionRequirement: resolveUiClientEncryptionRequirement({
+                syncedSettings: storage.getState().settings,
+                localSettings: storage.getState().settings,
+            }),
             serverId: activeServerId,
+            serverUrl: activeServerSnapshot.serverUrl,
             sessionListCursor: isAppend ? this.sessionListNextCursor : null,
             sessionListMaxPages: 1,
+            sessionListScope: options?.sessionListScope,
+            requiredSessionIds: requiredHydrationSessionIds,
             includeActiveSessionRows,
             includeSessionListAttentionRows,
             credentials: this.credentials,
@@ -4091,7 +4314,7 @@ class Sync {
             shouldContinue,
             applySessionListRenderables: (sessions) => {
                 if (!shouldContinue()) return;
-                if (isAppend) {
+                if (isAppend || isRequiredScope) {
                     storage.getState().mergeSessionListRenderables(sessions);
                     return;
                 }
@@ -4103,10 +4326,10 @@ class Sync {
             },
             onSnapshotFetched: (sessionIds) => {
                 if (!shouldContinue()) return;
-                this.activeServerSessionIds = isAppend
+                this.activeServerSessionIds = isAppend || isRequiredScope
                     ? new Set([...this.activeServerSessionIds, ...sessionIds])
                     : new Set(sessionIds);
-                this.hasFetchedSessionsSnapshotForActiveServer = true;
+                if (!isRequiredScope) this.hasFetchedSessionsSnapshotForActiveServer = true;
             },
             prioritizeSessionIds: prioritizedHydrationIds,
             activeSessionIds: activeHydrationSessionIds,
@@ -4131,7 +4354,32 @@ class Sync {
             log,
         });
         if (!shouldContinue()) return;
+        // Warm organization hydration may overlap first paint, but it is part of the
+        // completed snapshot: fresh pins/standings must not be skipped by its checkpoint.
+        await organizationSnapshotRefresh;
+        if (!shouldContinue()) return;
         const fetchedSessionIdSet = new Set(result.sessionIds);
+        const settledRequiredHydrationSessionIds = Array.from(new Set([
+            ...requiredHydrationSessionIds,
+            ...(organizationSnapshotRefresh ? listSessionOrganizationRequiredHydrationSessionIds(
+                buildOrganizationProjectionForServer(storage.getState(), activeServerId),
+            ) : []),
+        ]));
+        const initialRequiredHydrationSessionIdSet = new Set(requiredHydrationSessionIds);
+        const newlyRequiredHydrationSessionIds = settledRequiredHydrationSessionIds.filter(
+            (sessionId) => !initialRequiredHydrationSessionIdSet.has(sessionId),
+        );
+        if (newlyRequiredHydrationSessionIds.length > 0) {
+            // The ordinary page did not await these rows as required. Membership alone
+            // proves no readable materialization; let the same required-list owner prove
+            // completion in one batch, including its exact-read compatibility fallback.
+            await this.fetchSessionsOnce({
+                sessionListScope: 'required',
+                requiredHydrationSessionIds: newlyRequiredHydrationSessionIds,
+                awaitSessionListHydration: true,
+            }, generation);
+            if (!shouldContinue()) return;
+        }
         const missingRequiredHydrationSessionIds = requiredHydrationSessionIds.filter(
             (sessionId) => !fetchedSessionIdSet.has(sessionId),
         );
@@ -4153,6 +4401,11 @@ class Sync {
                     getExistingSession: (targetSessionId) => storage.getState().sessions[targetSessionId] ?? null,
                     applySessions: (sessions) => {
                         if (!shouldContinue()) return;
+                        // Exact-read compatibility must meet the same required-row completion
+                        // contract as the list reader before a changes page can be acknowledged.
+                        if (sessions.some((session) => session.metadata == null)) {
+                            throw new Error(`Required session shell hydration failed for ${sessionId}`);
+                        }
                         this.applySessions(sessions);
                     },
                     log,
@@ -4191,8 +4444,10 @@ class Sync {
             this.syncTuning.sessionListHydrationConcurrencyLimit,
         );
         if (!shouldContinue()) return;
-        this.sessionListNextCursor = result.hasNext ? result.nextCursor : null;
-        this.sessionListHasMore = result.hasNext;
+        if (!isRequiredScope) {
+            this.sessionListNextCursor = result.hasNext ? result.nextCursor : null;
+            this.sessionListHasMore = result.hasNext;
+        }
     }
 
     public fetchMoreSessions = async (): Promise<void> => {
@@ -4213,6 +4468,10 @@ class Sync {
         const shouldContinue = () => this.serverScopeGeneration === generation;
         const isAppend = options?.mode === 'append';
         const result = await fetchAndApplySessions({
+            clientEncryptionRequirement: resolveUiClientEncryptionRequirement({
+                syncedSettings: storage.getState().settings,
+                localSettings: storage.getState().settings,
+            }),
             sessionListPath: '/v2/sessions/archived',
             sessionListCursor: isAppend ? this.archivedSessionListNextCursor : null,
             sessionListMaxPages: 1,
@@ -4281,7 +4540,7 @@ class Sync {
         return Boolean(storage.getState().sessions[sessionId]);
     }
 
-    private createSessionRequest = (sessionId: string): ((path: string, init?: RequestInit) => Promise<Response>) => {
+    private createSessionRequest = (sessionId: string): ((path: string, init?: ServerReadRequestInit) => Promise<Response>) => {
         return createSessionRequestWithServerScope({
             serverId: resolvePreferredServerIdForSessionId(sessionId),
             activeRequest: (path, init) => apiSocket.request(path, init),
@@ -4309,6 +4568,12 @@ class Sync {
         sessionId: string,
         expectedActiveScope?: ServerAccountScope,
     ): Promise<ResolvedPendingQueueOwnerContext> {
+        const ownPendingRequest = (
+            request: (path: string, init?: RequestInit) => Promise<Response>,
+        ) => createPendingQueueRequest({
+            request,
+            writeTimeoutMs: readServerFetchWriteTimeoutMs(),
+        });
         if (expectedActiveScope) {
             const assertCapturedActiveScope = (): void => {
                 if (!areServerAccountScopesEqual(getActiveServerAccountScope(), expectedActiveScope)) {
@@ -4317,12 +4582,13 @@ class Sync {
             };
             return {
                 outboxScope: expectedActiveScope,
-                request: async (path, init) => {
+                requestBinding: { scope: 'active', serverGeneration: getActiveServerSnapshot().generation, request: apiSocket.request },
+                request: ownPendingRequest(async (path, init) => {
                     assertCapturedActiveScope();
                     const response = await apiSocket.request(path, init);
                     assertCapturedActiveScope();
                     return response;
-                },
+                }),
                 enqueueEncryption: this.encryption,
                 readEncryption: this.encryption,
             };
@@ -4336,14 +4602,15 @@ class Sync {
             };
             return {
                 outboxScope: route.outboxScope,
-                request: async (path, init) => {
+                requestBinding: { scope: 'active', serverGeneration: getActiveServerSnapshot().generation, request: apiSocket.request },
+                request: ownPendingRequest(async (path, init) => {
                     // apiSocket is dynamically bound to the active account. Fence immediately
                     // before entering it, then fence again before any caller applies completion.
                     assertCapturedActiveScope();
                     const response = await apiSocket.request(path, init);
                     assertCapturedActiveScope();
                     return response;
-                },
+                }),
                 enqueueEncryption: this.encryption,
                 readEncryption: this.encryption,
             };
@@ -4359,12 +4626,13 @@ class Sync {
         } satisfies PendingQueueEncryption & PendingQueueReadEncryption;
         return {
             outboxScope: route.outboxScope,
-            request: createSessionRequestForResolvedServerScope({
+            requestBinding: { scope: 'scoped', serverUrl: route.context.targetServerUrl, token: route.context.token },
+            request: ownPendingRequest(createSessionRequestForResolvedServerScope({
                 context: route.context,
                 activeRequest: async () => {
                     throw new Error('Pending queue owner unexpectedly resolved through the active request');
                 },
-            }),
+            })),
             enqueueEncryption: ownerEncryption,
             readEncryption: ownerEncryption,
         };
@@ -4392,7 +4660,9 @@ class Sync {
 
     private createSessionMessagesRequest = (sessionId: string): ((path: string) => Promise<Response>) => {
         const request = this.createSessionRequest(sessionId);
-        return (path: string) => request(path, { method: 'GET' });
+        // The messages route enforces limit <= 500 (default 150). Unlike unpaged session
+        // metadata, these pages may use a native pre-resolution inactivity window.
+        return (path: string) => request(path, { method: 'GET', responseSizeBounded: true });
     }
 
     /**
@@ -4424,6 +4694,12 @@ class Sync {
     }
 
       public retryNow = () => {
+          // Changes adapters return an error result on cancellation; retire the resume guard
+          // first so a superseded read cannot launch fallback materialization.
+          this.manualResumeGeneration += 1;
+          const supersededResume = this.resumeInFlight;
+          this.resumeWaitController?.abort();
+          abortServerFetches('manual-retry', { readOnly: true });
           let reconnectSocket = false;
           try {
               storage.getState().clearSyncError();
@@ -4444,7 +4720,13 @@ class Sync {
           } catch {
               // ignore
           }
-          const resume = this.resumeSync('manual');
+          // Unwind the existing finally/dedupe owners before acquiring them for a fresh run. Settle
+          // in the same hop as other waiters queued on the superseded run (reconnect catch-up), so
+          // the manual resume claims the dedupe slot instead of joining an incremental catch-up.
+          const startManualResume = () => this.resumeSync('manual');
+          const resume = supersededResume
+              ? supersededResume.then(startManualResume, startManualResume)
+              : startManualResume();
           fireAndForget(resume, { tag: 'Sync.resumeSync.manual' });
           if (reconnectSocket) {
               try {
@@ -4456,6 +4738,10 @@ class Sync {
           }
       }
 
+      private manualResumeGeneration = 0;
+      // Wakes only the resume's queue waiters; the generation guard still owns validity.
+      private resumeWaitController: AbortController | null = null;
+
       public resumeSync = (reason: 'app-foreground' | 'socket-reconnect' | 'manual' | 'server-reachable' | 'changes-catch-up'): Promise<void> => {
           return runWithInFlightDedupe(
               {
@@ -4465,121 +4751,133 @@ class Sync {
                   },
               },
               async () => {
-                  const shouldContinue = this.createServerScopeGuard();
-                  if (
-                      (reason === 'socket-reconnect' || reason === 'server-reachable' || reason === 'changes-catch-up')
-                      && !this.isForeground
-                  ) {
-                      return;
-                  }
-                  if (this.pauseController.isPaused()) {
-                      return;
-                  }
-                  await this.pauseController.waitUntilResumed();
-                  if (!shouldContinue()) {
-                      return;
-                  }
-                  if (!this.credentials) {
-                      return;
-                  }
-
-                  const accountId = String(this.serverID ?? '').trim() || null;
-
-                  if (!accountId) {
+                  const generation = this.manualResumeGeneration;
+                  const isServerScopeCurrent = this.createServerScopeGuard();
+                  const shouldContinue = () => generation === this.manualResumeGeneration && isServerScopeCurrent();
+                  const waitController = new AbortController();
+                  this.resumeWaitController = waitController;
+                  const signal = waitController.signal;
+                  try {
+                      if (
+                          (reason === 'socket-reconnect' || reason === 'server-reachable' || reason === 'changes-catch-up')
+                          && !this.isForeground
+                      ) {
+                          return;
+                      }
+                      if (this.pauseController.isPaused()) {
+                          return;
+                      }
+                      await this.pauseController.waitUntilResumed();
                       if (!shouldContinue()) {
                           return;
                       }
-                      await this.snapshotRefreshOnResume({ mode: 'fallback', reason: 'missing-profile' });
-                      return;
-                  }
-
-                  if (reason !== 'changes-catch-up') {
-                      await this.rearmPendingOutboxForActiveScope();
-                      if (!shouldContinue()) {
+                      if (!this.credentials) {
                           return;
                       }
 
-                      await this.refreshSessionDraftRepositoryForSync({
-                          forceSnapshotHydration: reason === 'manual' || this.sessionDraftOfflineCatchUpPending,
+                      const accountId = String(this.serverID ?? '').trim() || null;
+
+                      if (!accountId) {
+                          if (!shouldContinue()) {
+                              return;
+                          }
+                          await this.snapshotRefreshOnResume({ mode: 'fallback', reason: 'missing-profile', shouldContinue, signal });
+                          return;
+                      }
+
+                      if (reason !== 'changes-catch-up') {
+                          await this.rearmPendingOutboxForActiveScope();
+                          if (!shouldContinue()) {
+                              return;
+                          }
+
+                          await this.refreshSessionDraftRepositoryForSync({
+                              forceSnapshotHydration: reason === 'manual' || this.sessionDraftOfflineCatchUpPending,
+                          });
+                          if (!shouldContinue()) {
+                              return;
+                          }
+                      }
+
+                      const { status, refreshedByCatchUp } = await this.resumeViaChanges({
+                          accountId,
+                          shouldContinue,
+                          signal,
+                          allowOfflineSnapshotRefresh: reason !== 'changes-catch-up',
                       });
+                      if (status === 'aborted') {
+                          return;
+                      }
+                      if (status === 'fallback') {
+                          if (!shouldContinue()) {
+                              return;
+                          }
+                          await this.snapshotRefreshOnResume({ mode: 'fallback', reason: 'changes-fallback', shouldContinue, signal });
+                          return;
+                      }
+
+                      if (reason === 'changes-catch-up') {
+                          return;
+                      }
+
                       if (!shouldContinue()) {
                           return;
                       }
-                  }
-
-                  const { status, refreshedByCatchUp } = await this.resumeViaChanges({
-                      accountId,
-                      shouldContinue,
-                      allowOfflineSnapshotRefresh: reason !== 'changes-catch-up',
-                  });
-                  if (status === 'aborted') {
-                      return;
-                  }
-                  if (status === 'fallback') {
+                      await this.catchUpLoadedDirectSessionsOnResume();
                       if (!shouldContinue()) {
                           return;
                       }
-                      await this.snapshotRefreshOnResume({ mode: 'fallback', reason: 'changes-fallback' });
-                      return;
-                  }
 
-                  if (reason === 'changes-catch-up') {
-                      return;
-                  }
+                      const invalidateBounded = async (syncUnit: InvalidateSync, timeoutMs: number): Promise<void> => {
+                          if (!shouldContinue()) {
+                              return;
+                          }
+                          syncUnit.invalidateCoalesced();
+                          await syncUnit.awaitQueue({ timeoutMs, signal });
+                      };
 
-                  if (!shouldContinue()) {
-                      return;
-                  }
-                  await this.catchUpLoadedDirectSessionsOnResume();
-                  if (!shouldContinue()) {
-                      return;
-                  }
-
-                  const invalidateBounded = async (syncUnit: InvalidateSync, timeoutMs: number): Promise<void> => {
-                      if (!shouldContinue()) {
-                          return;
+                      // Activity/presence updates are delivered via ephemerals and are not recovered for the
+                      // window in which the socket was down. Gate this on measured socket downtime rather than the
+                      // resume reason: a background→foreground cycle disconnects the socket intentionally, and an
+                      // intentional disconnect resets apiSocket's reconnect bookkeeping, so `socket-reconnect`
+                      // never fires for it. Gating on the reason left a resuming client with stale session.active
+                      // and machine-online state until the next keep-alive ephemeral (0–20s).
+                      //
+                      // Skip whatever the changes catch-up already refreshed in this same resume: it
+                      // runs the identical full refresh (session-organization + sessions/active +
+                      // /v2/sessions?includeAttention, /v1/machines) and its session refresh awaits
+                      // hydration, so repeating it here fired a second complete catch-up wave seconds
+                      // after the first.
+                      if (this.readSocketOfflineDurationMs() > 0) {
+                          const offlineRecoveryTasks: Array<() => Promise<void>> = [];
+                          if (!refreshedByCatchUp.sessions) {
+                              offlineRecoveryTasks.push(
+                                  () => invalidateBounded(this.sessionsSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
+                              );
+                          }
+                          if (!refreshedByCatchUp.machines) {
+                              offlineRecoveryTasks.push(
+                                  () => invalidateBounded(this.machinesSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
+                              );
+                          }
+                          if (offlineRecoveryTasks.length > 0) {
+                              await runTasksWithLimit(offlineRecoveryTasks, this.syncTuning.resumeConcurrencyLimit);
+                          }
                       }
-                      syncUnit.invalidateCoalesced();
-                      await syncUnit.awaitQueue({ timeoutMs });
-                  };
 
-                  // Activity/presence updates are delivered via ephemerals and are not recovered for the
-                  // window in which the socket was down. Gate this on measured socket downtime rather than the
-                  // resume reason: a background→foreground cycle disconnects the socket intentionally, and an
-                  // intentional disconnect resets apiSocket's reconnect bookkeeping, so `socket-reconnect`
-                  // never fires for it. Gating on the reason left a resuming client with stale session.active
-                  // and machine-online state until the next keep-alive ephemeral (0–20s).
-                  //
-                  // Skip whatever the changes catch-up already refreshed in this same resume: it
-                  // runs the identical full refresh (session-organization + sessions/active +
-                  // /v2/sessions?includeAttention, /v1/machines) and its session refresh awaits
-                  // hydration, so repeating it here fired a second complete catch-up wave seconds
-                  // after the first.
-                  if (this.readSocketOfflineDurationMs() > 0) {
-                      const offlineRecoveryTasks: Array<() => Promise<void>> = [];
-                      if (!refreshedByCatchUp.sessions) {
-                          offlineRecoveryTasks.push(
-                              () => invalidateBounded(this.sessionsSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
-                          );
-                      }
-                      if (!refreshedByCatchUp.machines) {
-                          offlineRecoveryTasks.push(
-                              () => invalidateBounded(this.machinesSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
-                          );
-                      }
-                      if (offlineRecoveryTasks.length > 0) {
-                          await runTasksWithLimit(offlineRecoveryTasks, this.syncTuning.resumeConcurrencyLimit);
-                      }
+                        await runTasksWithLimit(
+                            [
+                                () => invalidateBounded(this.purchasesSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
+                                () => invalidateBounded(this.pushTokenSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
+                                () => invalidateBounded(this.nativeUpdateSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
+                            ],
+                            this.syncTuning.resumeConcurrencyLimit
+                        );
+                  } catch (error) {
+                      if (!(error instanceof SupersededOperationError) || shouldContinue()) throw error;
+                  } finally {
+                      if (this.resumeWaitController === waitController) this.resumeWaitController = null;
                   }
-
-                    await runTasksWithLimit(
-                        [
-                            () => invalidateBounded(this.purchasesSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
-                            () => invalidateBounded(this.pushTokenSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
-                            () => invalidateBounded(this.nativeUpdateSync, this.syncTuning.resumeQuickInvalidateTimeoutMs),
-                        ],
-                        this.syncTuning.resumeConcurrencyLimit
-                    );
                 }
             );
         };
@@ -4659,32 +4957,45 @@ class Sync {
           }
         };
 
-      private snapshotRefreshOnResume = async (opts: { mode: 'fallback' | 'long-offline'; reason: string }): Promise<void> => {
-          if (this.pauseController.isPaused()) {
-              return;
+      private snapshotRefreshOnResume = async (opts: {
+          mode: 'fallback' | 'long-offline';
+          reason: string;
+          shouldContinue?: () => boolean;
+          signal?: AbortSignal;
+      }): Promise<{ status: 'complete' | 'error' }> => {
+          const shouldContinue = opts.shouldContinue ?? this.createServerScopeGuard();
+          if (!shouldContinue() || this.pauseController.isPaused()) {
+              return { status: 'error' };
           }
           await this.pauseController.waitUntilResumed();
-          if (!this.credentials) {
-              return;
+          if (!this.credentials || !shouldContinue() || this.pauseController.isPaused()) {
+              return { status: 'error' };
           }
 
-          const invalidateBounded = async (syncUnit: InvalidateSync, timeoutMs: number): Promise<void> => {
-              syncUnit.invalidateCoalesced();
-              await syncUnit.awaitQueue({ timeoutMs });
+          const invalidateBounded = async (syncUnit: InvalidateSync, timeoutMs: number) => {
+              if (!shouldContinue()) return { status: 'stopped' } as const;
+              try {
+                  return await syncUnit.invalidateAndAwait({ timeoutMs, signal: opts.signal });
+              } catch (error) {
+                  if (error instanceof SupersededOperationError && !shouldContinue()) return { status: 'stopped' } as const;
+                  throw error;
+              }
           };
 
           const concurrencyLimit = this.syncTuning.resumeConcurrencyLimit;
 
           // Rebuild core lists first (sessions drives most downstream state).
-          await runTasksWithLimit(
+          const core = await runTasksWithLimit(
               [
                   () => invalidateBounded(this.sessionsSync, this.syncTuning.invalidateSyncAwaitTimeoutMs),
                   () => invalidateBounded(this.machinesSync, this.syncTuning.invalidateSyncAwaitTimeoutMs),
               ],
               concurrencyLimit
           );
+          if (!shouldContinue() || core.some((outcome) => outcome.status !== 'completed')) return { status: 'error' };
 
           await this.refreshSessionDraftRepositoryForSync({ forceSnapshotHydration: true });
+          if (!shouldContinue()) return { status: 'error' };
 
           // Catch up transcripts only for sessions that are already loaded locally AND are live
           // content consumers right now. The catch-up policy already no-ops for hidden
@@ -4705,16 +5016,18 @@ class Sync {
               // ignore
           }
 
-          await runTasksWithLimit(
+          const transcripts = await runTasksWithLimit(
               loadedSessionIds.map((sessionId) => async () => {
-                  await invalidateBounded(this.getOrCreateMessagesSync(sessionId), this.syncTuning.invalidateSyncAwaitTimeoutMs);
-                  scmStatusSync.invalidate(sessionId);
+                  const outcome = await invalidateBounded(this.getOrCreateMessagesSync(sessionId), this.syncTuning.invalidateSyncAwaitTimeoutMs);
+                  if (shouldContinue() && outcome.status === 'completed') scmStatusSync.invalidate(sessionId);
+                  return outcome;
               }),
               this.syncTuning.messageCatchUpConcurrencyLimit
           );
+          if (!shouldContinue() || transcripts.some((outcome) => outcome.status !== 'completed')) return { status: 'error' };
 
           // Refresh the rest with bounded concurrency.
-          await runTasksWithLimit(
+          const remaining = await runTasksWithLimit(
               [
                   () => invalidateBounded(this.artifactsSync, this.syncTuning.invalidateSyncAwaitTimeoutMs),
                   () => invalidateBounded(this.automationsSync, this.syncTuning.invalidateSyncAwaitTimeoutMs),
@@ -4727,6 +5040,7 @@ class Sync {
               ],
               concurrencyLimit
           );
+          return { status: shouldContinue() && remaining.every((outcome) => outcome.status === 'completed') ? 'complete' : 'error' };
       };
 
     public refreshMachinesThrottled = async (params?: { staleMs?: number; force?: boolean }) => {
@@ -4800,7 +5114,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const created = await createAutomationApi(this.credentials, input);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(created);
         return created;
     }
@@ -4809,7 +5125,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const updated = await updateAutomationApi(this.credentials, automationId, input);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(updated);
         return updated;
     }
@@ -4821,7 +5139,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const updated = await replaceAutomationAssignmentsApi(this.credentials, automationId, assignments);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(updated);
         return updated;
     }
@@ -4830,7 +5150,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const updated = await pauseAutomationApi(this.credentials, automationId);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(updated);
         return updated;
     }
@@ -4839,7 +5161,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const updated = await resumeAutomationApi(this.credentials, automationId);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomation(updated);
         return updated;
     }
@@ -4848,7 +5172,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         await deleteAutomationApi(this.credentials, automationId);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().removeAutomation(automationId);
     }
 
@@ -4856,7 +5182,9 @@ class Sync {
         if (!this.credentials) {
             throw new Error('Not authenticated');
         }
+        const generation = this.serverScopeGeneration;
         const run = await runAutomationNowApi(this.credentials, automationId);
+        if (generation !== this.serverScopeGeneration) throw new StaleServerGenerationError();
         storage.getState().upsertAutomationRun(run);
         return run;
     }
@@ -4981,8 +5309,9 @@ class Sync {
         await fetchAndApplyMachines({
             credentials: this.credentials,
             encryption: this.encryption,
+            getAccountEncryptionMode: async () => (await fetchAccountEncryptionMode(this.credentials, { retry: 'none' })).mode,
             machineDataKeys: this.machineDataKeys,
-            throwOnError: false,
+            throwOnError: true,
             getExistingMachine: (machineId) => storage.getState().machines[machineId] ?? null,
             cachedMachineDisplayEntries,
             shouldContinue,
@@ -4991,8 +5320,6 @@ class Sync {
                 storage.getState().replaceMachineDisplays(machines, { sourceServerId });
             },
             machineDisplayHydrationConcurrencyLimit: this.syncTuning.machineDisplayHydrationConcurrencyLimit,
-            machineDisplayEagerHydrationCount: this.syncTuning.machineDisplayEagerHydrationCount,
-            machineDisplayBackgroundHydrationMaxRows: this.syncTuning.machineDisplayBackgroundHydrationMaxRows,
             machineDisplayBackgroundHydrationApplyBatchSize: this.syncTuning.machineDisplayBackgroundHydrationApplyBatchSize,
             applyMachines: (machines, replace) => {
                 if (!shouldContinue()) return;
@@ -5085,6 +5412,8 @@ class Sync {
             encryption: this.encryption,
             settingsScope,
             pendingSettings,
+            getLatestPendingSettings: () => areAccountSettingsScopesEqual(this.pendingSettingsScope, settingsScope)
+                ? this.pendingSettings : null,
             settingsSecretsKey: this.settingsSecretsKey,
             settingsSecretsReadKeys: this.settingsSecretsReadKeys,
             clearPendingSettings: (nextPendingSettings) => {
@@ -5227,7 +5556,7 @@ class Sync {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify(requestBody),
-            }, { includeAuth: false });
+            }, { includeAuth: false, recoveryRead: 'unbounded' });
 
             if (!response.ok) {
                 log.log(`[fetchNativeUpdate] Request failed: ${response.status}`);
@@ -5375,13 +5704,26 @@ class Sync {
 
           const session = storage.getState().sessions[sessionId] ?? null;
           const directSessionLink = readDirectSessionLink(session?.metadata);
+          const replacesDirectTranscript = !directSessionLink && (
+              this.directSessionTailStateBySessionId.has(sessionId)
+              || this.sessionMessagesTailDiscontinuityBySessionId.get(sessionId)?.kind === 'opaque'
+          );
+          const isSourceCurrent = this.createSessionTranscriptSourceGuard(sessionId);
+          const retiredDirectWindow = this.directSessionTailStateBySessionId.get(sessionId);
+          const shouldContinue = () => isSourceCurrent() && (!replacesDirectTranscript
+              || (this.directSessionTailStateBySessionId.get(sessionId) === retiredDirectWindow
+                  && this.isDirectSessionLiveTail(sessionId)));
           const hasLoadedMessages = storage.getState().sessionMessages[sessionId]?.isLoaded === true;
           const hasExplicitTailProbe = this.explicitSessionTailProbeIds.has(sessionId);
           // IMPORTANT: `session.seq` is a "latest known session message seq" hint (often coming from `/sessions`),
           // not necessarily the last message seq that *this device has materialized*. Using it here can cause gaps.
-          const afterSeq = hasLoadedMessages ? (this.sessionMaterializedMaxSeqById[sessionId] ?? 0) : 0;
+          const afterSeq = hasLoadedMessages ? this.readSessionMessagesCatchUpAfterSeq(sessionId) : 0;
           const deferredDurableSeq = readDeferredTranscriptDurableSeq(this.deferredTranscriptState, sessionId);
-          const sessionSeqHint = Math.max(session?.seq ?? 0, deferredDurableSeq ?? 0);
+          const sessionSeqHint = Math.max(
+              session?.seq ?? 0,
+              deferredDurableSeq ?? 0,
+              readTranscriptGap(this.deferredTranscriptState, sessionId)?.throughSeq ?? 0,
+          );
 
           const viewport = this.sessionViewport.get(sessionId) ?? null;
           const isPinned = viewport?.isPinned ?? true;
@@ -5394,7 +5736,10 @@ class Sync {
           const sessionEncryptionMode = session?.encryptionMode === 'plain' ? 'plain' : 'e2ee';
 
           if (directSessionLink) {
-              if (!hasLoadedMessages) {
+              // Target/sidechain pages can accept source rows before the main
+              // initial-load flag. They still need normal handoff/viewport admission.
+              const hasAcceptedRows = (storage.getState().sessionMessages[sessionId]?.reducerState.messageIds.size ?? 0) > 0;
+              if (!hasLoadedMessages && !hasAcceptedRows && !this.getSessionTargetWindowState(sessionId).isWindowMode) {
                   await this.fetchDirectSessionMessages(sessionId, directSessionLink);
                   return;
               }
@@ -5410,24 +5755,43 @@ class Sync {
           const hasMaterializedMessages = Object.keys(loadedTranscript?.messagesById ?? {}).length > 0;
           // A previous empty or interrupted open can leave a non-empty session hint with a loaded,
           // zero-row cache. Recover with a snapshot so catch-up does not preserve the blank projection.
-          const needsSnapshotLoad = !hasLoadedMessages || (!hasMaterializedMessages && sessionSeqHint > 0);
+          const needsSnapshotLoad = replacesDirectTranscript || !hasLoadedMessages || (!hasMaterializedMessages && sessionSeqHint > 0);
           if (needsSnapshotLoad) {
-              this.deferredForwardLoadingSessions.delete(sessionId);
+              if (replacesDirectTranscript) {
+                  this.deferredForwardLoadingSessions.add(sessionId);
+                  if (!this.isDirectSessionLiveTail(sessionId)) return;
+              } else {
+                  this.deferredForwardLoadingSessions.delete(sessionId);
+              }
+              // Stage a source handoff with separate dedupe receipts; the accepted rows,
+              // cursors and gap remain authoritative until the replacement can commit.
+              const receivedMessages = replacesDirectTranscript ? new Map<string, Map<string, number>>() : this.sessionReceivedMessages;
               const fetchSnapshot = () => fetchAndApplyMessages({
                   sessionId,
+                  shouldContinue,
                   sessionEncryptionMode,
-                  limit: Platform.OS === 'web'
-                      ? WEB_INITIAL_SESSION_MESSAGES_PAGE_SIZE
-                      : this.getSessionMessagesPageSize(),
+                  limit: this.getInitialSessionMessagesPageSize(),
                   getSessionEncryption: (id) => this.encryption.getSessionEncryption(id),
                   isSessionKnown: (id) => this.isSessionKnownOnResolvedOwnerServer(id),
                   request: requestMessages,
-                  sessionReceivedMessages: this.sessionReceivedMessages,
-                  applyMessages: (sid, messages) => this.applyMessages(sid, messages),
+                  sessionReceivedMessages: receivedMessages,
+                  applyMessages: (sid, messages) => {
+                      if (replacesDirectTranscript) {
+                          this.resetSessionTranscriptState(sid);
+                          this.sessionReceivedMessages.set(sid, receivedMessages.get(sid) ?? new Map());
+                      }
+                      this.applyMessages(sid, messages);
+                  },
                   onTaskLifecycleEvent: (event) => this.applySessionThinkingFromTaskLifecycle(sessionId, event),
-                  markMessagesLoaded: (sid) => storage.getState().applyMessagesLoaded(sid),
+                  markMessagesLoaded: (sid) => {
+                      this.publishSessionMessagesHistoryStartCoverage(sid);
+                      storage.getState().applyMessagesLoaded(sid);
+                  },
                   onMessagesPage: (page) => {
-                      this.updateSessionMessagesPaginationFromPage(sessionId, { scope: 'main' }, page, { allowHasMoreInference: true });
+                      this.updateSessionMessagesPaginationFromPage(sessionId, { scope: 'main' }, page, {
+                          allowHasMoreInference: true,
+                          deferHistoryStartCoverage: true,
+                      });
                   },
                   ...this.getMessageDecryptBatchOptions(),
                   log,
@@ -5438,6 +5802,7 @@ class Sync {
               await (hasLoadedMessages
                   ? this.withSessionCatchUpNewer(sessionId, fetchSnapshot)
                   : fetchSnapshot());
+              if (replacesDirectTranscript && !this.isDirectSessionLiveTail(sessionId)) return;
               if (hasExplicitTailProbe) {
                   this.explicitSessionTailProbeIds.delete(sessionId);
               }
@@ -5456,6 +5821,7 @@ class Sync {
                 offlineForMs,
                 hasAcceptedLocalPending,
                 hasExplicitTailProbe,
+                hasDeferredNewer: this.hasDeferredNewerMessages(sessionId),
                 thresholds: {
                     largeGapSeq: this.syncTuning.messageLargeGapSeq,
                     maxIncrementalPagesOnResume: this.syncTuning.messageMaxIncrementalPagesOnResume,
@@ -5468,14 +5834,21 @@ class Sync {
           // otherwise opening a normal session that advanced in the background performs real
           // newer-message fetching with no "Catching up…" overlay. `do_nothing` decisions and the
           // first-ever snapshot load (handled earlier) are intentionally NOT bracketed.
-          const isCatchUpWork = decision.kind !== 'do_nothing';
+          const isCatchUpWork = decision.kind === 'incremental_batched' || decision.kind === 'tail_reset_latest_page';
+          const canRefreshLiveTail = () => (this.sessionViewport.get(sessionId)?.isPinned ?? true)
+              && !this.getSessionTargetWindowState(sessionId).isWindowMode
+              && this.isForeground && !this.pauseController.isPaused()
+              && resolveSessionLiveConsumption(sessionId).isFullContentConsumer;
           const applyCatchUpDecision = () => applyMessageCatchUpDecision({
               decision,
               afterSeq,
-              onIncrementalExhausted: isPinned ? 'tail_reset_latest_page' : 'defer_forward_loading',
+              onIncrementalExhausted: () => canRefreshLiveTail()
+                  ? 'tail_reset_latest_page' : 'defer_forward_loading',
               fetchNewerPage: async (cursor) => {
+                  const expectedGap = readTranscriptGap(this.deferredTranscriptState, sessionId);
                   const result = await fetchAndApplyNewerMessages({
                       sessionId,
+                      shouldContinue,
                       sessionEncryptionMode,
                       afterSeq: cursor,
                       // Deliberately the CONFIGURED page size on every platform, not the small
@@ -5484,7 +5857,8 @@ class Sync {
                       // large a background gap can be absorbed incrementally: 3 x 150 = 450
                       // messages, versus 3 x 12 = 36. Below that, a session that advanced while
                       // backgrounded falls to `onIncrementalExhausted` -> `tail_reset_latest_page`,
-                      // which REPLACES transcript content instead of extending it.
+                      // which merges the latest page and records any omitted interval
+                      // in the existing tail-discontinuity owner.
                       limit: this.getSessionMessagesPageSize(),
                       getSessionEncryption: (id) => this.encryption.getSessionEncryption(id),
                       isSessionKnown: (id) => this.isSessionKnownOnResolvedOwnerServer(id),
@@ -5495,6 +5869,9 @@ class Sync {
                       onTaskLifecycleEvent: (event) => this.applySessionThinkingFromTaskLifecycle(sessionId, event),
                       onMessagesPage: (page) => {
                           this.updateSessionMessagesPaginationFromPage(sessionId, { scope: 'main' }, page, { allowHasMoreInference: true, direction: 'newer' });
+                          this.deferredTranscriptState = acknowledgeTranscriptGap(this.deferredTranscriptState, sessionId, {
+                              afterSeq: cursor, expectedGap, page,
+                          });
                       },
                       ...this.getMessageDecryptBatchOptions(),
                       log,
@@ -5508,10 +5885,17 @@ class Sync {
               fetchSnapshotLatestPage: async () => {
                   // Read at snapshot time, not decision time: the incremental-exhausted
                   // branch advanced the contiguous head with its newer pages first.
-                  const prefixMaxSeqBeforeSnapshot = this.sessionMaterializedMaxSeqById[sessionId] ?? 0;
+                  const prefixMaxSeqBeforeSnapshot = this.readSessionMessagesCatchUpAfterSeq(sessionId);
+                  const expectedGap = readTranscriptGap(this.deferredTranscriptState, sessionId);
                   await fetchAndApplyMessages({
                       sessionId,
                       sessionEncryptionMode,
+                      shouldContinue: () => {
+                          if (!shouldContinue()) return false;
+                          const canRefresh = canRefreshLiveTail();
+                          if (!canRefresh) this.deferredForwardLoadingSessions.add(sessionId);
+                          return canRefresh;
+                      },
                       limit: this.getSessionMessagesPageSize(),
                       getSessionEncryption: (id) => this.encryption.getSessionEncryption(id),
                       isSessionKnown: (id) => this.isSessionKnownOnResolvedOwnerServer(id),
@@ -5519,17 +5903,27 @@ class Sync {
                       sessionReceivedMessages: this.sessionReceivedMessages,
                       applyMessages: (sid, messages) => this.applyMessages(sid, messages),
                       onTaskLifecycleEvent: (event) => this.applySessionThinkingFromTaskLifecycle(sessionId, event),
-                      markMessagesLoaded: (sid) => storage.getState().applyMessagesLoaded(sid),
+                      markMessagesLoaded: (sid) => {
+                          this.publishSessionMessagesHistoryStartCoverage(sid);
+                          storage.getState().applyMessagesLoaded(sid);
+                      },
                       onMessagesPage: (page) => {
-                          this.updateSessionMessagesPaginationFromPage(sessionId, { scope: 'main' }, page, { allowHasMoreInference: true });
+                          this.updateSessionMessagesPaginationFromPage(sessionId, { scope: 'main' }, page, {
+                              allowHasMoreInference: true,
+                              deferHistoryStartCoverage: true,
+                          });
                           this.openSessionTailDiscontinuityFromSnapshotPage(sessionId, prefixMaxSeqBeforeSnapshot, page);
+                          this.deferredTranscriptState = acknowledgeTranscriptGap(this.deferredTranscriptState, sessionId, {
+                              afterSeq: prefixMaxSeqBeforeSnapshot, expectedGap, page,
+                          });
                       },
                       ...this.getMessageDecryptBatchOptions(),
                       log,
                   });
               },
-              markLoaded: () => storage.getState().applyMessagesLoaded(sessionId),
+              markLoaded: () => { if (shouldContinue()) storage.getState().applyMessagesLoaded(sessionId); },
               setDeferredForwardLoading: (deferred) => {
+                  if (!shouldContinue()) return;
                   if (deferred) {
                       this.deferredForwardLoadingSessions.add(sessionId);
                   } else {
@@ -5674,6 +6068,7 @@ class Sync {
           }
           this.directSessionOlderCursorBySessionId.delete(sessionId);
           this.directSessionHasMoreOlderBySessionId.delete(sessionId);
+          this.directSessionLatestSnapshotPendingBySessionId.delete(sessionId);
           this.clearDirectSessionTailCursor(sessionId);
       }
 
@@ -5682,15 +6077,15 @@ class Sync {
       }
 
       private getDirectSessionTailCursor(sessionId: string): string | null {
-          const inMemory = this.directSessionTailCursorBySessionId.get(sessionId);
-          if (typeof inMemory === 'string' && inMemory.trim().length > 0) {
-              return inMemory;
-          }
-          if (inMemory === null) return null;
+          const inMemory = this.directSessionTailStateBySessionId.get(sessionId);
+          if (inMemory) return inMemory.cursor;
 
           const persisted = loadDirectSessionTailCursor(sessionId, this.getDirectSessionCursorScope(sessionId));
           if (persisted) {
-              this.directSessionTailCursorBySessionId.set(sessionId, persisted);
+              this.directSessionTailStateBySessionId.set(sessionId, {
+                  cursor: persisted, requiresRefresh: false,
+                  sourceKey: this.getDirectSessionTranscriptSourceKey(readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata)),
+              });
               return persisted;
           }
           return null;
@@ -5698,13 +6093,31 @@ class Sync {
 
       private setDirectSessionTailCursor(sessionId: string, cursor: string | null): void {
           const normalized = typeof cursor === 'string' && cursor.trim().length > 0 ? cursor.trim() : null;
-          this.directSessionTailCursorBySessionId.set(sessionId, normalized);
+          const accepted = this.directSessionTailStateBySessionId.get(sessionId);
+          // Tail growth keeps the accepted window alive for concurrent older
+          // paging. Only discontinuity/reset replaces this owner record.
+          if (accepted) accepted.cursor = normalized;
+          else this.directSessionTailStateBySessionId.set(sessionId, {
+              cursor: normalized, requiresRefresh: false,
+              sourceKey: this.getDirectSessionTranscriptSourceKey(readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata)),
+          });
           saveDirectSessionTailCursor(sessionId, normalized, this.getDirectSessionCursorScope(sessionId));
       }
 
       private clearDirectSessionTailCursor(sessionId: string): void {
-          this.directSessionTailCursorBySessionId.delete(sessionId);
+          this.directSessionTailStateBySessionId.delete(sessionId);
           saveDirectSessionTailCursor(sessionId, null, this.getDirectSessionCursorScope(sessionId));
+      }
+
+      private requireDirectSessionTranscriptRefresh(sessionId: string): void {
+          this.directSessionLatestSnapshotPendingBySessionId.delete(sessionId);
+          this.directSessionTailStateBySessionId.set(sessionId, {
+              cursor: this.getDirectSessionTailCursor(sessionId),
+              sourceKey: this.directSessionTailStateBySessionId.get(sessionId)?.sourceKey
+                  ?? this.getDirectSessionTranscriptSourceKey(readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata)),
+              requiresRefresh: true,
+          });
+          this.deferredForwardLoadingSessions.add(sessionId);
       }
 
       private createServerScopeGuard(): () => boolean {
@@ -5712,11 +6125,88 @@ class Sync {
           return () => this.serverScopeGeneration === generation;
       }
 
+      private getDirectSessionTranscriptSourceKey(link: DirectSessionLink | null): string | null {
+          if (!link) return null;
+          // Only transcript RPC routing identifies the source. Activity/backend-mode
+          // metadata may change without retiring its accepted transcript window.
+          return stableJsonStringify({ machineId: link.machineId, providerId: link.providerId,
+              remoteSessionId: link.remoteSessionId, source: link.source });
+      }
+
+      private createSessionTranscriptSourceGuard(
+          sessionId: string,
+          link: DirectSessionLink | null = readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata),
+      ): () => boolean {
+          const isServerScopeCurrent = this.createServerScopeGuard();
+          const sourceKey = this.getDirectSessionTranscriptSourceKey(link);
+          return () => isServerScopeCurrent()
+              && this.getDirectSessionTranscriptSourceKey(readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata)) === sourceKey;
+      }
+
+      private hasAcceptedDirectSessionSource(sessionId: string, link: DirectSessionLink): boolean {
+          // Hydrate a warm direct cache, but never adopt an old persisted direct cursor
+          // as authority for a currently accepted hosted transcript.
+          if (!this.sessionReceivedMessages.has(sessionId)) this.getDirectSessionTailCursor(sessionId);
+          return this.directSessionTailStateBySessionId.get(sessionId)?.sourceKey === this.getDirectSessionTranscriptSourceKey(link);
+      }
+
+      private isDirectSessionLiveTail(sessionId: string): boolean {
+          return this.getSessionViewport(sessionId)?.isPinned !== false
+              && !this.getSessionTargetWindowState(sessionId).isWindowMode;
+      }
+
+      private recordDirectSessionSourcePage(sessionId: string, items: ReadonlyArray<DirectTranscriptRawMessageV1>): void {
+          if (items.length === 0) return;
+          const accepted = this.directSessionTailStateBySessionId.get(sessionId);
+          if (accepted) accepted.lastSourceMessageIds = items.map((item) => item.id);
+      }
+
+      private readDirectSessionPrefixMessageIds(sessionId: string): readonly string[] {
+          const accepted = this.directSessionTailStateBySessionId.get(sessionId)?.lastSourceMessageIds;
+          if (accepted?.length) return accepted;
+          // A warm cache from before raw-page receipts still has canonical source
+          // identities. Never substitute tool IDs or internal rendered row IDs.
+          const reducer = storage.getState().sessionMessages[sessionId]?.reducerState;
+          if (!reducer) return [];
+          const ids = new Set(reducer.messageIds.keys());
+          for (const message of reducer.messages.values()) {
+              if (message.realID) ids.add(message.realID);
+          }
+          return [...ids];
+      }
+
+      private readDirectSessionPageMaterializedIds(
+          sessionId: string,
+          items: ReadonlyArray<DirectTranscriptRawMessageV1>,
+          changed: readonly string[],
+      ): readonly string[] {
+          const reducer = storage.getState().sessionMessages[sessionId]?.reducerState;
+          const ids = new Set(changed);
+          for (const item of items) {
+              const id = reducer?.messageIds.get(item.id)
+                  ?? (item.localId ? reducer?.localIds.get(item.localId) : undefined);
+              if (id) ids.add(id);
+          }
+          return [...ids];
+      }
+
       private async fetchDirectSessionMessages(
           sessionId: string,
           directSessionLink: ReturnType<typeof readDirectSessionLink> extends infer T ? Exclude<T, null> : never,
+          options?: Readonly<{ mode: 'replace' | 'merge_latest' }>,
       ): Promise<void> {
-          const shouldContinue = this.createServerScopeGuard();
+          const isSourceCurrent = this.createSessionTranscriptSourceGuard(sessionId, directSessionLink);
+          // Warm any persisted cursor before capturing the accepted source window. Cache
+          // hydration is not a source change, while a later push or discontinuity is.
+          const acceptedCursor = this.getDirectSessionTailCursor(sessionId);
+          const acceptedWindow = this.directSessionTailStateBySessionId.get(sessionId);
+          const prefixMessageIds = options?.mode === 'merge_latest' ? this.readDirectSessionPrefixMessageIds(sessionId) : [];
+          const prefixMaterializedMessageIds = options?.mode === 'merge_latest'
+              ? storage.getState().sessionMessages[sessionId]?.messageIdsOldestFirst ?? []
+              : [];
+          const shouldContinue = () => isSourceCurrent()
+              && this.directSessionTailStateBySessionId.get(sessionId) === acceptedWindow
+              && this.getDirectSessionTailCursor(sessionId) === acceptedCursor;
           const page = await machineDirectSessionTranscriptPage({
               machineId: directSessionLink.machineId,
               providerId: directSessionLink.providerId,
@@ -5730,34 +6220,54 @@ class Sync {
               throw new Error(page.error);
           }
 
-          const normalizedMessages = normalizeDirectTranscriptMessages(page.items);
-          if (normalizedMessages.length > 0) {
-              this.applyMessages(sessionId, normalizedMessages, { notifyVoice: false });
+          let tailCursor = page.tailCursor;
+          if (typeof tailCursor !== 'string' || tailCursor.trim().length === 0) {
+              const tail = await machineDirectSessionTranscriptReadAfter({
+                  machineId: directSessionLink.machineId,
+                  providerId: directSessionLink.providerId,
+                  remoteSessionId: directSessionLink.remoteSessionId,
+                  source: directSessionLink.source,
+                  cursor: 'tail',
+              }, { serverId: this.getDirectSessionServerScope(sessionId) });
+              if (!shouldContinue()) return;
+              if (!tail.ok) throw new Error(tail.error);
+              tailCursor = tail.nextCursor;
           }
 
-          this.directSessionOlderCursorBySessionId.set(sessionId, page.nextCursor ?? null);
-          this.directSessionHasMoreOlderBySessionId.set(sessionId, page.hasMore === true);
-          storage.getState().applyMessagesLoaded(sessionId);
-
-          if (typeof page.tailCursor === 'string' && page.tailCursor.trim().length > 0) {
-              this.setDirectSessionTailCursor(sessionId, page.tailCursor);
+          // Keep the accepted transcript and cursors until every replacement read succeeds.
+          if (options && !this.isDirectSessionLiveTail(sessionId)) {
+              this.deferredForwardLoadingSessions.add(sessionId);
               return;
           }
-
-          const tail = await machineDirectSessionTranscriptReadAfter({
-              machineId: directSessionLink.machineId,
-              providerId: directSessionLink.providerId,
-              remoteSessionId: directSessionLink.remoteSessionId,
-              source: directSessionLink.source,
-              cursor: 'tail',
-          }, { serverId: this.getDirectSessionServerScope(sessionId) });
-          if (!shouldContinue()) return;
-
-          if (!tail.ok) {
-              throw new Error(tail.error);
+          const normalizedMessages = normalizeDirectTranscriptMessages(page.items);
+          if (options?.mode === 'replace') this.resetSessionTranscriptState(sessionId);
+          let changedMessageIds: readonly string[] = [];
+          if (normalizedMessages.length > 0) {
+              changedMessageIds = this.applyMessages(sessionId, normalizedMessages, { notifyVoice: false }).changed;
           }
-
-          this.setDirectSessionTailCursor(sessionId, tail.nextCursor ?? null);
+          if (options?.mode === 'merge_latest') {
+              const previous = this.sessionMessagesTailDiscontinuityBySessionId.get(sessionId);
+              this.commitSessionTailDiscontinuity(sessionId, openTailDiscontinuityFromOpaqueSnapshot({
+                  prev: previous?.kind === 'opaque' ? previous : null,
+                  prefixMessageIds,
+                  prefixMaterializedMessageIds,
+                  snapshotMessageIds: page.items.map((item) => item.id),
+                  snapshotMaterializedMessageIds: this.readDirectSessionPageMaterializedIds(sessionId, page.items, changedMessageIds),
+                  nextCursor: page.hasMore ? page.nextCursor ?? null : null,
+              }));
+          } else {
+              this.directSessionOlderCursorBySessionId.set(sessionId, page.nextCursor ?? null);
+              this.directSessionHasMoreOlderBySessionId.set(sessionId, page.hasMore === true);
+          }
+          this.setDirectSessionTailCursor(sessionId, tailCursor ?? null);
+          this.directSessionTailStateBySessionId.set(sessionId, {
+              cursor: this.getDirectSessionTailCursor(sessionId), requiresRefresh: false,
+              sourceKey: this.getDirectSessionTranscriptSourceKey(directSessionLink),
+              lastSourceMessageIds: page.items.length > 0 ? page.items.map((item) => item.id) : acceptedWindow?.lastSourceMessageIds,
+          });
+          this.directSessionLatestSnapshotPendingBySessionId.delete(sessionId);
+          this.deferredForwardLoadingSessions.delete(sessionId);
+          storage.getState().applyMessagesLoaded(sessionId);
       }
 
       /**
@@ -5790,11 +6300,31 @@ class Sync {
       private async catchUpDirectSessionMessages(
           sessionId: string,
           directSessionLink: ReturnType<typeof readDirectSessionLink> extends infer T ? Exclude<T, null> : never,
-          options?: Readonly<{ surfaceCatchUp?: boolean }>,
-      ): Promise<void> {
-          const probeAndApply = async (): Promise<void> => {
-              const shouldContinue = this.createServerScopeGuard();
+          options?: Readonly<{ surfaceCatchUp?: boolean; allowAdjacentPage?: boolean }>,
+      ): Promise<number> {
+          const probeAndApply = async (): Promise<number> => {
+              if (this.getSessionTargetWindowState(sessionId).isWindowMode
+                  || (!this.isDirectSessionLiveTail(sessionId) && options?.allowAdjacentPage !== true)) {
+                  this.deferredForwardLoadingSessions.add(sessionId);
+                  return 0;
+              }
+              const replacesSource = !this.hasAcceptedDirectSessionSource(sessionId, directSessionLink);
+              if (replacesSource || this.directSessionTailStateBySessionId.get(sessionId)?.requiresRefresh === true
+                  || (this.directSessionLatestSnapshotPendingBySessionId.has(sessionId) && this.isDirectSessionLiveTail(sessionId))) {
+                  this.deferredForwardLoadingSessions.add(sessionId);
+                  if (this.isDirectSessionLiveTail(sessionId)) {
+                      await this.withSessionCatchUpNewer(sessionId, () => this.fetchDirectSessionMessages(
+                          sessionId, directSessionLink,
+                          replacesSource || this.directSessionTailStateBySessionId.get(sessionId)?.requiresRefresh === true
+                              ? { mode: 'replace' }
+                              : { mode: 'merge_latest' },
+                      ));
+                  }
+                  return 0;
+              }
+              const shouldContinue = this.createSessionTranscriptSourceGuard(sessionId, directSessionLink);
               const cursor = this.getDirectSessionTailCursor(sessionId) ?? 'tail';
+              const acceptedWindow = this.directSessionTailStateBySessionId.get(sessionId);
               const tail = await machineDirectSessionTranscriptReadAfter({
                   machineId: directSessionLink.machineId,
                   providerId: directSessionLink.providerId,
@@ -5802,21 +6332,36 @@ class Sync {
                   source: directSessionLink.source,
                   cursor,
               }, { serverId: this.getDirectSessionServerScope(sessionId) });
-              if (!shouldContinue()) return;
+              // A push can replace the accepted window or advance its cursor while
+              // this read is held. Neither response may overwrite that newer state.
+              if (!shouldContinue()
+                  || this.directSessionTailStateBySessionId.get(sessionId) !== acceptedWindow
+                  || (this.getDirectSessionTailCursor(sessionId) ?? 'tail') !== cursor) return 0;
 
               if (!tail.ok) {
                   throw new Error(tail.error);
               }
 
-              if (tail.truncated === true) {
-                  // Real catch-up whatever triggered the probe: the transcript is dropped and
-                  // refetched, which is exactly the window the overlay exists to cover. The
-                  // bracket is ref-counted, so nesting inside `surfaceCatchUp` is safe.
-                  await this.withSessionCatchUpNewer(sessionId, async () => {
-                      this.resetSessionTranscriptState(sessionId);
-                      await this.fetchDirectSessionMessages(sessionId, directSessionLink);
-              });
-              return;
+              const continuation = resolveDirectTranscriptContinuation(tail);
+              if (continuation === 'source_discontinuity') {
+                  this.deferredForwardLoadingSessions.add(sessionId);
+                  // Missing reasons retain the released conservative reset semantics.
+                  this.requireDirectSessionTranscriptRefresh(sessionId);
+                  if (this.isDirectSessionLiveTail(sessionId)) {
+                      await this.withSessionCatchUpNewer(sessionId, () => this.fetchDirectSessionMessages(
+                          sessionId, directSessionLink, { mode: 'replace' },
+                      ));
+                  }
+                  return 0;
+              }
+              if (continuation === 'page_limit') {
+                  this.directSessionLatestSnapshotPendingBySessionId.add(sessionId);
+                  this.deferredForwardLoadingSessions.add(sessionId);
+              }
+              if (this.getSessionTargetWindowState(sessionId).isWindowMode
+                  || (!this.isDirectSessionLiveTail(sessionId) && options?.allowAdjacentPage !== true)) {
+                  this.deferredForwardLoadingSessions.add(sessionId);
+                  return 0;
               }
 
               const normalizedMessages = normalizeDirectTranscriptMessages(tail.items);
@@ -5824,13 +6369,15 @@ class Sync {
                   this.applyMessages(sessionId, normalizedMessages, { notifyVoice: false });
               }
               this.setDirectSessionTailCursor(sessionId, tail.nextCursor ?? null);
+              this.recordDirectSessionSourcePage(sessionId, tail.items);
+              if (continuation === 'complete') this.deferredForwardLoadingSessions.delete(sessionId);
+              return normalizedMessages.length;
           };
 
           if (options?.surfaceCatchUp === true) {
-              await this.withSessionCatchUpNewer(sessionId, probeAndApply);
-              return;
+              return await this.withSessionCatchUpNewer(sessionId, probeAndApply);
           }
-          await probeAndApply();
+          return await probeAndApply();
       }
 
       private collectLoadedDirectSessionsForResume(): Array<{ sessionId: string; directSessionLink: DirectSessionLink }> {
@@ -5838,6 +6385,7 @@ class Sync {
           const loadedDirectSessions: Array<{ sessionId: string; directSessionLink: DirectSessionLink }> = [];
           for (const [sessionId, messages] of Object.entries(state.sessionMessages)) {
               if (messages?.isLoaded !== true) continue;
+              if (!resolveSessionLiveConsumption(sessionId).isFullContentConsumer) continue;
               const directSessionLink = readDirectSessionLink(state.sessions[sessionId]?.metadata);
               if (!directSessionLink) continue;
               loadedDirectSessions.push({ sessionId, directSessionLink });
@@ -5895,6 +6443,7 @@ class Sync {
           if (Object.prototype.hasOwnProperty.call(options ?? {}, 'nextCursor')) {
               this.setDirectSessionTailCursor(sessionId, options?.nextCursor ?? null);
           }
+          this.recordDirectSessionSourcePage(sessionId, items);
       }
 
       private resolveDirectSessionTranscriptDeltaCursor(ephemeralUpdate: Readonly<{
@@ -5918,6 +6467,15 @@ class Sync {
           }
 
           const currentCursor = this.getDirectSessionTailCursor(ephemeralUpdate.sessionId);
+          if (currentCursor === null && fromCursor === 'tail') {
+              if (typeof ephemeralUpdate.nextCursor === 'string' || ephemeralUpdate.nextCursor === null) {
+                  return ephemeralUpdate.nextCursor;
+              }
+              if (typeof ephemeralUpdate.tailCursor === 'string' || ephemeralUpdate.tailCursor === null) {
+                  return ephemeralUpdate.tailCursor;
+              }
+              return undefined;
+          }
           if (currentCursor !== fromCursor) {
               return undefined;
           }
@@ -5938,6 +6496,7 @@ class Sync {
           nextCursor?: string | null;
           tailCursor?: string | null;
           truncated?: boolean;
+          truncationReason?: DirectTranscriptTruncationReason;
       }>): Promise<void> {
           const session = storage.getState().sessions[ephemeralUpdate.sessionId] ?? null;
           const directSessionLink = readDirectSessionLink(session?.metadata);
@@ -5945,15 +6504,55 @@ class Sync {
               return;
           }
 
-          if (ephemeralUpdate.truncated === true) {
-              this.directSessionOlderCursorBySessionId.delete(ephemeralUpdate.sessionId);
-              this.directSessionHasMoreOlderBySessionId.delete(ephemeralUpdate.sessionId);
-              this.clearDirectSessionTailCursor(ephemeralUpdate.sessionId);
-              await this.fetchDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink);
+          const continuation = resolveDirectTranscriptContinuation(ephemeralUpdate);
+          if (continuation === 'source_discontinuity') {
+              this.requireDirectSessionTranscriptRefresh(ephemeralUpdate.sessionId);
+          }
+          if (!this.isDirectSessionLiveTail(ephemeralUpdate.sessionId)) {
+              this.deferredForwardLoadingSessions.add(ephemeralUpdate.sessionId);
+              return;
+          }
+          if (continuation === 'source_discontinuity' || this.directSessionTailStateBySessionId.get(ephemeralUpdate.sessionId)?.requiresRefresh === true
+              || ((storage.getState().sessionMessages[ephemeralUpdate.sessionId]?.isLoaded === true
+                  || (storage.getState().sessionMessages[ephemeralUpdate.sessionId]?.reducerState.messageIds.size ?? 0) > 0)
+                  && !this.hasAcceptedDirectSessionSource(ephemeralUpdate.sessionId, directSessionLink))) {
+              this.deferredForwardLoadingSessions.add(ephemeralUpdate.sessionId);
+              await this.fetchDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink, { mode: 'replace' });
+              return;
+          }
+          if (this.directSessionLatestSnapshotPendingBySessionId.has(ephemeralUpdate.sessionId)) {
+              await this.catchUpDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink);
+              return;
+          }
+          const resolvedCursor = this.resolveDirectSessionTranscriptDeltaCursor(ephemeralUpdate);
+          const hasAnchoredFromCursor = typeof ephemeralUpdate.fromCursor === 'string'
+              && ephemeralUpdate.fromCursor.trim().length > 0;
+          if (hasAnchoredFromCursor && resolvedCursor === undefined) {
+              this.deferredForwardLoadingSessions.add(ephemeralUpdate.sessionId);
+              if (this.getDirectSessionTailCursor(ephemeralUpdate.sessionId) === null) {
+                  await this.fetchDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink, { mode: 'replace' });
+              } else {
+                  await this.catchUpDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink);
+              }
+              return;
+          }
+          if (continuation === 'page_limit') {
+              this.directSessionLatestSnapshotPendingBySessionId.add(ephemeralUpdate.sessionId);
+              this.deferredForwardLoadingSessions.add(ephemeralUpdate.sessionId);
+              if (typeof resolvedCursor !== 'string') {
+                  await this.catchUpDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink);
+                  return;
+              }
+              await this.applyDirectSessionTranscriptItems(ephemeralUpdate.sessionId, ephemeralUpdate.items, {
+                  nextCursor: resolvedCursor,
+              });
+              return;
+          }
+          if (this.deferredForwardLoadingSessions.has(ephemeralUpdate.sessionId)) {
+              await this.catchUpDirectSessionMessages(ephemeralUpdate.sessionId, directSessionLink);
               return;
           }
 
-          const resolvedCursor = this.resolveDirectSessionTranscriptDeltaCursor(ephemeralUpdate);
           await this.applyDirectSessionTranscriptItems(
               ephemeralUpdate.sessionId,
               ephemeralUpdate.items,
@@ -5976,6 +6575,13 @@ class Sync {
               const session = storage.getState().sessions[params.sessionId] ?? null;
               const directSessionLink = readDirectSessionLink(session?.metadata);
               if (directSessionLink) {
+                  if (!this.hasAcceptedDirectSessionSource(params.sessionId, directSessionLink)
+                      || this.directSessionTailStateBySessionId.get(params.sessionId)?.requiresRefresh) {
+                      if (this.isDirectSessionLiveTail(params.sessionId)) {
+                          await this.fetchDirectSessionMessages(params.sessionId, directSessionLink, { mode: 'replace' });
+                      }
+                      return { loaded: 0, hasMore: this.directSessionHasMoreOlderBySessionId.get(params.sessionId) ?? true, status: 'not_ready' };
+                  }
                   const loadingKey = `${params.sessionId}:direct`;
                   if (this.sessionMessagesLoadingOlderByKey.has(loadingKey)) {
                       return {
@@ -5986,18 +6592,21 @@ class Sync {
                   }
 
                   const knownHasMore = this.directSessionHasMoreOlderBySessionId.get(params.sessionId);
-                  if (knownHasMore === false) {
+                  const recordedGap = this.sessionMessagesTailDiscontinuityBySessionId.get(params.sessionId);
+                  const opaqueGap = recordedGap?.kind === 'opaque' ? recordedGap : null;
+                  if (opaqueGap ? opaqueGap.walkCursor === null : knownHasMore === false) {
                       return { loaded: 0, hasMore: false, status: 'no_more' };
                   }
 
-                  const cursor = this.directSessionOlderCursorBySessionId.get(params.sessionId) ?? null;
+                  const cursor = opaqueGap?.walkCursor ?? this.directSessionOlderCursorBySessionId.get(params.sessionId) ?? null;
                   if (!cursor) {
                       return { loaded: 0, hasMore: knownHasMore ?? false, status: 'not_ready' };
                   }
 
                   this.sessionMessagesLoadingOlderByKey.add(loadingKey);
                   try {
-                      const shouldContinue = this.createServerScopeGuard();
+                      const shouldContinue = this.createSessionTranscriptSourceGuard(params.sessionId, directSessionLink);
+                      const acceptedWindow = this.directSessionTailStateBySessionId.get(params.sessionId);
                       const requestedLimit =
                           typeof params.limit === 'number' && Number.isFinite(params.limit)
                               ? this.getSessionMessagesPageSize({ limit: params.limit })
@@ -6011,7 +6620,7 @@ class Sync {
                           cursor,
                           ...(requestedLimit !== null ? { maxItems: requestedLimit } : {}),
                       }, { serverId: this.getDirectSessionServerScope(params.sessionId) });
-                      if (!shouldContinue()) {
+                      if (!shouldContinue() || this.directSessionTailStateBySessionId.get(params.sessionId) !== acceptedWindow) {
                           return { loaded: 0, hasMore: knownHasMore ?? true, status: 'not_ready' };
                       }
 
@@ -6019,9 +6628,12 @@ class Sync {
                           throw new Error(page.error);
                       }
 
-                      if (page.truncated === true) {
-                          this.resetSessionTranscriptState(params.sessionId);
-                          await this.fetchDirectSessionMessages(params.sessionId, directSessionLink);
+                      const pageContinuation = resolveDirectTranscriptContinuation(page);
+                      if (pageContinuation === 'source_discontinuity') {
+                          this.requireDirectSessionTranscriptRefresh(params.sessionId);
+                          if (this.isDirectSessionLiveTail(params.sessionId)) {
+                              await this.fetchDirectSessionMessages(params.sessionId, directSessionLink, { mode: 'replace' });
+                          }
                           return {
                               loaded: 0,
                               hasMore:
@@ -6032,9 +6644,31 @@ class Sync {
                           };
                       }
 
+                      if (opaqueGap && page.hasMore === true && page.nextCursor === cursor
+                          && applyTailDiscontinuityOpaqueOlderPage({
+                              prev: opaqueGap,
+                              pageMessageIds: page.items.map((item) => item.id),
+                              pageMaterializedMessageIds: [],
+                              nextCursor: cursor,
+                          }) !== null) {
+                          console.error('Failed to load older direct session messages: page cursor did not advance');
+                          return { loaded: 0, hasMore: true, status: 'not_ready' };
+                      }
                       const normalizedMessages = normalizeDirectTranscriptMessages(page.items);
+                      let changedMessageIds: readonly string[] = [];
                       if (normalizedMessages.length > 0) {
-                          this.applyMessages(params.sessionId, normalizedMessages, { notifyVoice: false });
+                          changedMessageIds = this.applyMessages(params.sessionId, normalizedMessages, { notifyVoice: false }).changed;
+                      }
+                      if (opaqueGap) {
+                          const nextGap = applyTailDiscontinuityOpaqueOlderPage({
+                              prev: opaqueGap,
+                              pageMessageIds: page.items.map((item) => item.id),
+                              pageMaterializedMessageIds: this.readDirectSessionPageMaterializedIds(params.sessionId, page.items, changedMessageIds),
+                              nextCursor: page.hasMore ? page.nextCursor ?? null : null,
+                          });
+                          this.commitSessionTailDiscontinuity(params.sessionId, nextGap);
+                          const hasMore = nextGap ? nextGap.walkCursor !== null : knownHasMore ?? false;
+                          return { loaded: normalizedMessages.length, hasMore, status: hasMore ? 'loaded' : 'no_more' };
                       }
 
                       this.directSessionOlderCursorBySessionId.set(params.sessionId, page.nextCursor ?? null);
@@ -6080,9 +6714,10 @@ class Sync {
           // monotone-min cursor — that cursor still points below the pre-gap prefix and
           // paging from it skipped the hole forever. Cursor-override loads (fork parent
           // context) keep legacy behavior and never advance the walk.
-          const tailDiscontinuity = params.scope === 'main' && normalizedBeforeSeqOverride === null
+          const recordedDiscontinuity = params.scope === 'main' && normalizedBeforeSeqOverride === null
               ? this.sessionMessagesTailDiscontinuityBySessionId.get(params.sessionId) ?? null
               : null;
+          const tailDiscontinuity = recordedDiscontinuity?.kind === 'seq' ? recordedDiscontinuity : null;
           if (
               knownHasMore === false
               && (
@@ -6109,9 +6744,11 @@ class Sync {
           const requestMessages = this.createSessionMessagesRequest(params.sessionId);
           const session = storage.getState().sessions[params.sessionId] ?? null;
           const sessionEncryptionMode = session?.encryptionMode === 'plain' ? 'plain' : 'e2ee';
+          const shouldContinue = this.createSessionTranscriptSourceGuard(params.sessionId);
           try {
               const result = await fetchAndApplyOlderMessages({
                   sessionId: params.sessionId,
+                  shouldContinue,
                   sessionEncryptionMode,
                   beforeSeq,
                   limit: this.getSessionMessagesPageSize({ limit: params.limit }),
@@ -6126,6 +6763,7 @@ class Sync {
                   log,
               });
 
+              if (!shouldContinue()) return { loaded: 0, hasMore: true, status: 'not_ready' };
               if (result.page.messages.length === 0) {
                   this.updateSessionMessagesPaginationFromPage(
                       params.sessionId,
@@ -6282,6 +6920,7 @@ class Sync {
           try {
               return await fetchAndApplyTargetWindowMessages({
                   sessionId: normalizedSessionId,
+                  shouldContinue: this.createSessionTranscriptSourceGuard(normalizedSessionId),
                   windowId,
                   target,
                   direction,
@@ -6371,9 +7010,11 @@ class Sync {
           const requestMessages = this.createSessionMessagesRequest(normalizedSessionId);
           const session = storage.getState().sessions[normalizedSessionId] ?? null;
           const sessionEncryptionMode = session?.encryptionMode === 'plain' ? 'plain' : 'e2ee';
+          const shouldContinue = this.createSessionTranscriptSourceGuard(normalizedSessionId);
           try {
               await fetchAndApplyMessages({
                   sessionId: normalizedSessionId,
+                  shouldContinue,
                   sessionEncryptionMode,
                   scope: 'sidechain',
                   sidechainId: normalizedSidechainId,
@@ -6398,6 +7039,7 @@ class Sync {
                   ...this.getMessageDecryptBatchOptions(),
                   log,
               });
+              if (!shouldContinue()) return 'not_ready';
               this.sessionMessagesFetchedLatestByKey.add(pagingKey);
               return 'loaded';
           } catch (error) {
@@ -6597,7 +7239,9 @@ class Sync {
           // set is only a cache and cannot authorize skipping durable live-tail.
           deletePersistedSessionViewport(sessionId, getActiveServerAccountScope());
           if (hadDeferredForwardLoading) {
-              this.getOrCreateMessagesSync(sessionId).invalidateCoalesced();
+              // Intent can arrive while the preceding deferred cycle publishes completion.
+              // Preserve its required follow-up even before that cycle releases ownership.
+              this.getOrCreateMessagesSync(sessionId).invalidate();
           }
       }
 
@@ -6747,20 +7391,21 @@ class Sync {
       /**
        * C6/D3: sync-owned reactive drain for the deferred-forward-loading backlog (mechanism B).
        *
-       * The data layer accrues the backlog and must own when to release it. Previously the
-       * release lived only in ChatList.onScroll, so a list shell that did not reproduce those
-       * callbacks silently stalled newer-message catch-up. The list now only reports geometry;
-       * the threshold + decision + fetch are owned here. Drains when pinned or near the bottom
-       * (within the forward-prefetch threshold); a scrolled-up session is left deferred so the
-       * viewport is never yanked.
+       * Live-tail demand uses the normal catch-up policy. A detached reader can instead load
+       * one adjacent page near the loaded history edge. Historical target windows own their
+       * directional cursors, so their rendered bottom must never request a global-tail page.
        */
       public maybeDrainDeferredNewerMessages(
           sessionId: string,
           viewport: Readonly<{ isPinned: boolean; distanceFromBottomPx: number }>,
       ): void {
           if (!sessionId || !this.hasDeferredNewerMessages(sessionId)) return;
-          const nearBottom = viewport.isPinned
-              || viewport.distanceFromBottomPx <= this.syncTuning.transcriptForwardPrefetchThresholdPx;
+          if (this.getSessionTargetWindowState(sessionId).isWindowMode) return;
+          if (viewport.isPinned || this.getSessionViewport(sessionId)?.isPinned !== false) {
+              this.getOrCreateMessagesSync(sessionId).invalidateCoalesced();
+              return;
+          }
+          const nearBottom = viewport.distanceFromBottomPx <= this.syncTuning.transcriptForwardPrefetchThresholdPx;
           if (!nearBottom) return;
           fireAndForget(this.loadNewerMessages(sessionId), { tag: 'Sync.maybeDrainDeferredNewerMessages' });
       }
@@ -6775,13 +7420,31 @@ class Sync {
               return { loaded: 0, hasMore: true, status: 'in_flight' };
           }
 
+          const directSessionLink = readDirectSessionLink(storage.getState().sessions[sessionId]?.metadata);
+          if (directSessionLink) {
+              if (this.getSessionTargetWindowState(sessionId).isWindowMode
+                  || (this.directSessionTailStateBySessionId.get(sessionId)?.requiresRefresh === true && !this.isDirectSessionLiveTail(sessionId))) {
+                  return { loaded: 0, hasMore: true, status: 'not_ready' };
+              }
+              this.sessionMessagesLoadingNewerByKey.add(pagingKey);
+              try {
+                  const loaded = await this.catchUpDirectSessionMessages(sessionId, directSessionLink, {
+                      surfaceCatchUp: true, allowAdjacentPage: true,
+                  });
+                  const hasMore = this.deferredForwardLoadingSessions.has(sessionId);
+                  return { loaded, hasMore, status: hasMore ? 'loaded' : 'no_more' };
+              } finally {
+                  this.sessionMessagesLoadingNewerByKey.delete(pagingKey);
+              }
+          }
+
           const supported = this.sessionMessagesPaginationSupportedByKey.get(pagingKey);
           if (supported === false) {
               return { loaded: 0, hasMore: false, status: 'no_more' };
           }
 
-          const afterSeq = this.sessionMaterializedMaxSeqById[sessionId] ?? 0;
-          if (!afterSeq) {
+          const afterSeq = this.readSessionMessagesCatchUpAfterSeq(sessionId);
+          if (!afterSeq && !readTranscriptGap(this.deferredTranscriptState, sessionId)) {
               return { loaded: 0, hasMore: true, status: 'not_ready' };
           }
 
@@ -6792,9 +7455,12 @@ class Sync {
           const requestMessages = this.createSessionMessagesRequest(sessionId);
           const session = storage.getState().sessions[sessionId] ?? null;
           const sessionEncryptionMode = session?.encryptionMode === 'plain' ? 'plain' : 'e2ee';
+          const shouldContinue = this.createSessionTranscriptSourceGuard(sessionId);
           try {
+              const expectedGap = readTranscriptGap(this.deferredTranscriptState, sessionId);
               const result = await fetchAndApplyNewerMessages({
                   sessionId,
+                  shouldContinue,
                   sessionEncryptionMode,
                   afterSeq,
                   limit: this.getSessionMessagesPageSize(),
@@ -6807,11 +7473,15 @@ class Sync {
                   onTaskLifecycleEvent: (event) => this.applySessionThinkingFromTaskLifecycle(sessionId, event),
                   onMessagesPage: (page) => {
                       this.updateSessionMessagesPaginationFromPage(sessionId, { scope: 'main' }, page, { allowHasMoreInference: true, direction: 'newer' });
+                      this.deferredTranscriptState = acknowledgeTranscriptGap(this.deferredTranscriptState, sessionId, {
+                          afterSeq, expectedGap, page,
+                      });
                   },
                   ...this.getMessageDecryptBatchOptions(),
                   log,
               });
 
+              if (!shouldContinue()) return { loaded: 0, hasMore: true, status: 'not_ready' };
               if (result.page.messages.length === 0) {
                   this.deferredForwardLoadingSessions.delete(sessionId);
                   return { loaded: 0, hasMore: false, status: 'no_more' };
@@ -6834,16 +7504,12 @@ class Sync {
       }
 
       /**
-       * C6/D2a: re-materialize the stale (edited-while-hidden) region and merge it in place.
-       *
-       * Fetches newer messages from just below the lowest stale seq so the edited rows are
-       * re-pulled and upserted by applyMessages without dropping any other materialized row.
-       * Falls back to a coalesced catch-up invalidate when the stale seq is unknown (the
-       * catch-up policy then fetches-and-merges; it is non-destructive after D2b).
+       * Re-materialize edited rows in bounded groups without moving transcript pagination,
+       * target-window selection, viewport anchors, or current task activity.
        */
       private async fetchStaleTranscriptRegion(
           sessionId: string,
-          staleSnapshot: Readonly<{ minSeq: number | null; messageIds: readonly string[] }>,
+          staleSnapshot: Readonly<{ minSeq: number | null; messageIds: readonly string[]; messageSeqs?: Readonly<Record<string, number>> }>,
       ): Promise<ReadonlySet<string>> {
           const staleMinSeq = staleSnapshot.minSeq;
           if (typeof staleMinSeq !== 'number' || !Number.isFinite(staleMinSeq) || staleMinSeq <= 0) {
@@ -6853,67 +7519,69 @@ class Sync {
           if (this.hasFetchedSessionsSnapshotForActiveServer && !this.isSessionKnownOnResolvedOwnerServer(sessionId)) {
               return new Set();
           }
-          let afterSeq = Math.max(0, Math.trunc(staleMinSeq) - 1);
           const requestMessages = this.createSessionMessagesRequest(sessionId);
           const session = storage.getState().sessions[sessionId] ?? null;
           const sessionEncryptionMode = session?.encryptionMode === 'plain' ? 'plain' : 'e2ee';
-          const unresolvedMessageIds = new Set(staleSnapshot.messageIds);
-          const resolvedMessageIds = new Set<string>();
+          const targets = staleSnapshot.messageIds.map((messageId) => ({
+              messageId,
+              seq: staleSnapshot.messageSeqs?.[messageId]
+                  ?? this.resolveDurableSessionMessageIdentity(sessionId, messageId).seq
+                  ?? staleMinSeq,
+          }));
+          // Hidden edits and changes-feed revisions are deliberate catch-up. Their repair
+          // can outlive the independent tail probe, so keep its signal until these pages settle.
+          storage.getState().beginSessionCatchUpNewer(sessionId);
           try {
-              while (unresolvedMessageIds.size > 0) {
-                  const result = await fetchAndApplyNewerMessages({
-                      sessionId,
-                      sessionEncryptionMode,
-                      afterSeq,
-                      limit: this.getSessionMessagesPageSize(),
-                      getSessionEncryption: (id) => this.encryption.getSessionEncryption(id),
-                      isSessionKnown: (id) => this.isSessionKnownOnResolvedOwnerServer(id),
-                      request: requestMessages,
-                      sessionReceivedMessages: this.sessionReceivedMessages,
-                      applyMessages: (sid, messages) => this.applyMessages(sid, messages, { notifyVoice: false }),
-                      onNormalizedMessages: (messages) => {
-                          ingestWorkspaceMutationMessages(sessionId, messages);
-                          for (const message of messages) {
-                              if (!unresolvedMessageIds.delete(message.id)) continue;
-                              resolvedMessageIds.add(message.id);
-                          }
-                      },
-                      onTaskLifecycleEvent: (event) => this.applySessionThinkingFromTaskLifecycle(sessionId, event),
-                      onMessagesPage: (page) => {
-                          this.updateSessionMessagesPaginationFromPage(sessionId, { scope: 'main' }, page, { allowHasMoreInference: true, direction: 'newer' });
-                      },
-                      ...this.getMessageDecryptBatchOptions(),
-                      log,
-                  });
-                  const nextAfterSeq = result.page.nextAfterSeq;
-                  if (!nextAfterSeq || result.page.messages.length === 0) break;
-                  afterSeq = nextAfterSeq;
-              }
+              return await fetchAndApplyTranscriptRepair({
+                  sessionId,
+                  shouldContinue: this.createSessionTranscriptSourceGuard(sessionId),
+                  sessionEncryptionMode,
+                  targets,
+                  pageSize: this.getSessionMessagesPageSize(),
+                  isMessageMaterialized: (id, localId) => {
+                      const reducerState = storage.getState().sessionMessages[sessionId]?.reducerState;
+                      if (reducerState?.messageIds.has(id)) return true;
+                      const localMessageId = localId ? reducerState?.localIds.get(localId) : undefined;
+                      return localMessageId !== undefined && reducerState?.messages.get(localMessageId)?.realID === id;
+                  },
+                  getSessionEncryption: (id) => this.encryption.getSessionEncryption(id),
+                  isSessionKnown: (id) => this.isSessionKnownOnResolvedOwnerServer(id),
+                  request: requestMessages,
+                  sessionReceivedMessages: this.sessionReceivedMessages,
+                  applyMessages: (sid, messages) => this.applyMessages(sid, messages, { notifyVoice: false }),
+                  onNormalizedMessages: (messages) => ingestWorkspaceMutationMessages(sessionId, messages),
+                  ...this.getMessageDecryptBatchOptions(),
+                  log,
+              });
           } catch (error) {
               console.error('Failed to refetch stale transcript region:', error);
+          } finally {
+              storage.getState().endSessionCatchUpNewer(sessionId);
           }
-          return resolvedMessageIds;
+          return new Set();
       }
 
       private async repairDeferredStaleTranscriptRegion(
           sessionId: string,
-          staleSnapshot: Readonly<{ minSeq: number | null; messageIds: readonly string[] }>,
+          staleSnapshot: Readonly<{ minSeq: number | null; messageIds: readonly string[]; messageSeqs?: Readonly<Record<string, number>> }>,
       ): Promise<void> {
+          const expectedMessageSeqs = readStaleTranscriptMessageSeqs(this.deferredTranscriptState, sessionId);
           const resolvedMessageIds = await this.fetchStaleTranscriptRegion(sessionId, staleSnapshot);
           if (!staleSnapshot.messageIds.every((messageId) => resolvedMessageIds.has(messageId))) return;
           this.deferredTranscriptState = acknowledgeStaleTranscriptRepair(
               this.deferredTranscriptState,
               sessionId,
-              { messageIds: staleSnapshot.messageIds, minSeq: staleSnapshot.minSeq },
+              expectedMessageSeqs,
           );
       }
 
       private async repairSessionTranscriptRevision(
-          repair: Readonly<{ sessionId: string; minSeq: number; messageIds: readonly string[] }>,
+          repair: Readonly<{ sessionId: string; minSeq: number; messageIds: readonly string[]; messageSeqs?: Readonly<Record<string, number>> }>,
       ): Promise<void> {
           const resolvedMessageIds = await this.fetchStaleTranscriptRegion(repair.sessionId, {
               minSeq: repair.minSeq,
               messageIds: repair.messageIds,
+              messageSeqs: repair.messageSeqs,
           });
           if (!repair.messageIds.every((messageId) => resolvedMessageIds.has(messageId))) {
               throw new Error('Durable transcript revision could not be materialized');
@@ -7112,11 +7780,16 @@ class Sync {
       private async resumeViaChanges(opts: {
           accountId: string;
           shouldContinue?: () => boolean;
+          signal?: AbortSignal;
           allowOfflineSnapshotRefresh?: boolean;
       }): Promise<ResumeViaChangesOutcome> {
           const CHANGES_PAGE_LIMIT = this.syncTuning.changesPageLimit;
-          const afterCursor = this.changesCursor ?? '0';
+          const afterCursor = this.changesCursor;
           const shouldContinue = opts.shouldContinue ?? (() => true);
+          const invalidateForResume = async (syncUnit: InvalidateSync): Promise<void> => {
+              if (!shouldContinue()) throw new SupersededOperationError();
+              await syncUnit.invalidateAndAwait({ signal: opts.signal });
+          };
           const cursorScope = this.getChangesCursorScope();
           let aborted = false;
           // Only a *completed* refresh counts: a failed one must still be retried by the resume tail.
@@ -7234,28 +7907,46 @@ class Sync {
                     });
                 },
                 snapshotRefresh: async () => {
-                    await this.snapshotRefreshOnResume({ mode: 'long-offline', reason: 'snapshot-refresh' });
+                    if (!shouldContinue()) {
+                        aborted = true;
+                        return { status: 'error' };
+                    }
+                    const snapshot = await this.snapshotRefreshOnResume({ mode: 'long-offline', reason: 'snapshot-refresh', shouldContinue, signal: opts.signal });
+                    if (!shouldContinue()) {
+                        aborted = true;
+                        return { status: 'error' };
+                    }
+                    if (snapshot.status !== 'complete') return snapshot;
+                    refreshedByCatchUp.sessions = true;
+                    refreshedByCatchUp.machines = true;
+                    return { status: 'complete' };
                 },
                 applyPlanned: async (planned) => {
+                    if (!shouldContinue()) {
+                        aborted = true;
+                        return { status: 'partial', safeAdvanceCursor: null };
+                    }
                     return await applyPlannedChangeActions({
                         planned,
+                        shouldContinue,
                         credentials: this.credentials,
                         isSessionMessagesLoaded: (sessionId) => storage.getState().sessionMessages[sessionId]?.isLoaded === true,
                         shouldCatchUpSessionMessages: (sessionId) =>
                             resolveSessionLiveConsumption(sessionId).isFullContentConsumer,
                         getSessionMaterializedMaxSeq: (sessionId) => this.sessionMaterializedMaxSeqById[sessionId] ?? 0,
+                        isSessionMessagesDeferred: (sessionId) => this.hasDeferredNewerMessages(sessionId),
                         invalidate: {
-                            settings: () => this.settingsSync.invalidateAndAwait(),
-                            profile: () => this.profileSync.invalidateAndAwait(),
+                            settings: () => invalidateForResume(this.settingsSync),
+                            profile: () => invalidateForResume(this.profileSync),
                             machines: async () => {
-                                await this.machinesSync.invalidateAndAwait();
+                                await invalidateForResume(this.machinesSync);
                                 refreshedByCatchUp.machines = true;
                             },
-                            artifacts: () => this.artifactsSync.invalidateAndAwait(),
-                            friends: () => this.friendsSync.invalidateAndAwait(),
-                            friendRequests: () => this.friendRequestsSync.invalidateAndAwait(),
-                            feed: () => this.feedSync.invalidateAndAwait(),
-                            automations: () => this.automationsSync.invalidateAndAwait(),
+                            artifacts: () => invalidateForResume(this.artifactsSync),
+                            friends: () => invalidateForResume(this.friendsSync),
+                            friendRequests: () => invalidateForResume(this.friendRequestsSync),
+                            feed: () => invalidateForResume(this.feedSync),
+                            automations: () => invalidateForResume(this.automationsSync),
                             pets: () => fetchAndApplyAccountPets({
                                 credentials: this.credentials,
                                 readScope: () => storage.getState().petsScope,
@@ -7263,20 +7954,44 @@ class Sync {
                                 applyAccountPetsForScope: (scope, pets) =>
                                     storage.getState().applyAccountPetsForScope(scope, pets),
                             }),
-                            sessions: async ({ requiredHydrationSessionIds, prioritizeSessionIds }) => {
-                                await this.fetchSessions({
-                                    awaitSessionListHydration: true,
-                                    requiredHydrationSessionIds,
-                                    prioritizeSessionIds,
-                                    hydrationTelemetrySource: 'changesCatchUp',
+                            sessions: async ({ requiredHydrationSessionIds, prioritizeSessionIds, reconcileList }) => {
+                                const before = storage.getState();
+                                const previousRows = requiredHydrationSessionIds.map((id) => (
+                                    before.sessionListRenderables[id] ?? before.sessions[id] ?? null
+                                ));
+                                if (!reconcileList && requiredHydrationSessionIds.length > 0) {
+                                    await this.fetchSessions({
+                                        sessionListScope: 'required',
+                                        awaitSessionListHydration: true,
+                                        requiredHydrationSessionIds,
+                                        prioritizeSessionIds,
+                                        hydrationTelemetrySource: 'changesCatchUp',
+                                    });
+                                }
+                                // Metadata/activity updates do not change account membership. New,
+                                // removed, archived and shared rows still need the ordinary list owner.
+                                const after = storage.getState();
+                                const membershipChanged = requiredHydrationSessionIds.some((id, index) => {
+                                    const previous = previousRows[index];
+                                    const current = after.sessionListRenderables[id] ?? after.sessions[id] ?? null;
+                                    return !previous || !current || (previous.archivedAt ?? null) !== (current.archivedAt ?? null);
                                 });
-                                refreshedByCatchUp.sessions = true;
+                                if (!shouldContinue()) return;
+                                if (reconcileList || membershipChanged) {
+                                    await this.fetchSessions({
+                                        awaitSessionListHydration: true,
+                                        requiredHydrationSessionIds,
+                                        prioritizeSessionIds,
+                                        hydrationTelemetrySource: 'changesCatchUp',
+                                    });
+                                    refreshedByCatchUp.sessions = true;
+                                }
                             },
-                            todos: () => this.todosSync.invalidateAndAwait(),
+                            todos: () => invalidateForResume(this.todosSync),
                         },
                         invalidateMessagesForSession: async (sessionId) => {
                             await this.withSessionCatchUpNewer(sessionId, () =>
-                                this.getOrCreateMessagesSync(sessionId).invalidateAndAwait());
+                                invalidateForResume(this.getOrCreateMessagesSync(sessionId)));
                         },
                         repairSessionTranscriptRevision: (repair) => this.repairSessionTranscriptRevision(repair),
                         invalidateScmStatusForSession: (sessionId) => scmStatusSync.invalidate(sessionId),
@@ -7313,6 +8028,8 @@ class Sync {
                                     includeTags: plan.includeTags,
                                     includeLabels: plan.includeLabels,
                                     includeAttentionStandings: true,
+                                    includeSessionAppearances: true,
+                                    includeAttentionReminderTimes: true,
                                     assignmentSessionIds: plan.assignmentSessionIds,
                                     folderIds: plan.folderIds,
                                     tagIds: plan.tagIds,
@@ -7435,6 +8152,7 @@ class Sync {
           await handleSocketUpdate({
               update,
               encryption: this.encryption,
+              getAccountEncryptionMode: async () => (await fetchAccountEncryptionMode(this.credentials, { retry: 'none' })).mode,
               settingsScope: this.pendingSettingsScope,
               getPendingSettings: () => this.pendingSettings,
               sourceServerId,
@@ -7459,9 +8177,7 @@ class Sync {
                 isSessionMessagesLoaded: (sessionId) => storage.getState().sessionMessages[sessionId]?.isLoaded === true,
                 getSessionMaterializedMaxSeq: (sessionId) => this.sessionMaterializedMaxSeqById[sessionId] ?? 0,
               markSessionMaterializedMaxSeq: (sessionId, seq) => this.markSessionMaterializedMaxSeq(sessionId, seq),
-              onMessageGapDetected: (sessionId, _info) => {
-                  this.getOrCreateMessagesSync(sessionId).invalidateCoalesced();
-              },
+              onMessageGapDetected: (sessionId, info) => this.recoverSessionMessageGap(sessionId, info),
               markSessionKnownRemoteSeq: (sessionId, seq) => this.markSessionKnownRemoteSeq(sessionId, seq),
               markSessionTranscriptDeferred: (sessionId, marker) => this.markSessionTranscriptDeferred(sessionId, marker),
               markSessionTranscriptStale: (sessionId, marker) => this.markSessionTranscriptStale(sessionId, marker),
@@ -7533,11 +8249,20 @@ class Sync {
             getSession: (sessionId) => storage.getState().sessions[sessionId],
             applyMessages: (sessionId, messages) => this.applyMessages(sessionId, messages, { notifyVoice: false, notifyActivity: true }),
             updateDirectSessionTranscript: (ephemeralUpdate) => this.handleDirectSessionTranscriptEphemeralUpdate(ephemeralUpdate),
-            applyActionOperationRevision: (ephemeralUpdate) => {
+            applyActionOperationRevision: async (ephemeralUpdate) => {
                 if (!this.encryption || !shouldContinue()) return;
+                const machineEncryption = this.encryption.getMachineEncryption(ephemeralUpdate.machineId);
+                if (!machineEncryption) {
+                    this.machinesSync.invalidate();
+                    return;
+                }
+                if (machineEncryption.mode === 'plain' && (await fetchAccountEncryptionMode(this.credentials, { retry: 'none' })).mode !== 'plain') return;
+                if (!shouldContinue()) return;
                 const snapshot = openActionOperationRevisionEphemeral({
                     update: ephemeralUpdate,
-                    machineKey: this.encryption.getContentPrivateKey(),
+                    machineKey: machineEncryption.mode === 'plain' ? null : this.encryption.getContentPrivateKey(),
+                    machineMode: machineEncryption.mode,
+                    accountId: this.serverID,
                 });
                 if (!snapshot || !shouldContinue()) return;
                 actionOperationStore.merge(snapshot);
@@ -7623,23 +8348,33 @@ class Sync {
         options?: { notifyVoice?: boolean; notifyActivity?: boolean }
     ) => {
         const result = storage.getState().applyMessages(sessionId, messages);
-        const serverPendingLocalIds = new Set(
-            (storage.getState().sessionPending[sessionId]?.messages ?? [])
-                .filter((message) => message.source === 'server_pending')
-                .map((message) => message.localId)
-                .filter((localId): localId is string => typeof localId === 'string' && localId.length > 0),
-        );
-        const receivedCommittedTwinOfServerPending = result.changed.length > 0
-            && messages.some((message) => (
-                message.role === 'user'
+        const tailGap = this.sessionMessagesTailDiscontinuityBySessionId.get(sessionId);
+        if (tailGap?.kind === 'opaque') {
+            this.commitSessionTailDiscontinuity(sessionId, applyTailDiscontinuityOpaqueForwardPage({
+                prev: tailGap,
+                pageMaterializedMessageIds: result.changed,
+            }));
+        }
+        let receivedCommittedUserLocalIds: Set<string> | null = null;
+        for (const message of messages) {
+            if (message.role === 'user' && typeof message.localId === 'string' && message.localId.length > 0) {
+                (receivedCommittedUserLocalIds ??= new Set<string>()).add(message.localId);
+            }
+        }
+        const committedUserLocalIds = receivedCommittedUserLocalIds;
+        const receivedCommittedTwinOfServerPending = committedUserLocalIds !== null
+            && (storage.getState().sessionPending[sessionId]?.messages ?? []).some((message) => (
+                message.source === 'server_pending'
                 && typeof message.localId === 'string'
-                && serverPendingLocalIds.has(message.localId)
+                && committedUserLocalIds.has(message.localId)
             ));
         if (receivedCommittedTwinOfServerPending) {
             // Settlement publishes the committed message and the pending-state receipt separately.
             // If the receipt is lost, the committed twin cannot itself prove whether the durable row
             // was removed or intentionally retained. Ask the canonical pending snapshot owner rather
-            // than leaving the last server-delivering projection visible until a page refresh.
+            // than leaving the last server-delivering projection visible until a page refresh. The
+            // receipt can repeat a committed message already in this transcript, so store equality
+            // is not evidence that the pending projection is current.
             fireAndForget(this.fetchPendingMessages(sessionId), {
                 tag: 'Sync.applyMessages.fetchPendingMessages',
                 logToConsole: false,
@@ -7673,6 +8408,15 @@ class Sync {
         return result;
     }
 
+    private publishSessionMessagesHistoryStartCoverage(sessionId: string): void {
+        const pagingKey = this.buildSessionMessagesPaginationKey({ sessionId, scope: 'main' });
+        // Later tail snapshots merge into the cache and can reopen pagination without
+        // removing its materialized start. Only the cache's clear paths revoke this fact.
+        if (this.sessionMessagesHasMoreOlderByKey.get(pagingKey) === false) {
+            storage.getState().markSessionMessagesHistoryStartLoaded(sessionId);
+        }
+    }
+
     private updateSessionMessagesPaginationFromPage(
         sessionId: string,
         chain: { scope: SessionMessagesScope; sidechainId?: string | null },
@@ -7682,7 +8426,7 @@ class Sync {
             nextBeforeSeq?: number | null;
             nextAfterSeq?: number | null;
         },
-        options?: { allowHasMoreInference?: boolean; direction?: 'older' | 'newer' },
+        options?: { allowHasMoreInference?: boolean; direction?: 'older' | 'newer'; deferHistoryStartCoverage?: boolean },
     ): void {
         const pagingKey = this.buildSessionMessagesPaginationKey({
             sessionId,
@@ -7722,6 +8466,13 @@ class Sync {
             this.sessionMessagesHasMoreOlderByKey.set(pagingKey, update.next.hasMoreOlder);
         }
 
+        if (chain.scope === 'main' && options?.direction !== 'newer' && options?.deferHistoryStartCoverage !== true) {
+            // Snapshot callbacks run before decryption/application; their loaded callback
+            // publishes coverage after materialization. Older pages reach here after apply,
+            // including empty final pages that cannot trigger a message-store update.
+            this.publishSessionMessagesHistoryStartCoverage(sessionId);
+        }
+
         if (update.next.paginationSupported == null) {
             this.sessionMessagesPaginationSupportedByKey.delete(pagingKey);
         } else {
@@ -7733,6 +8484,15 @@ class Sync {
      * Commit a tail-reset discontinuity transition (open/advance/close) for the session's
      * MAIN chain and publish the display floor the transcript tail consumes. `null` closes.
      */
+    public getSessionTailDiscontinuityOlderAvailability(sessionId: string): boolean | null {
+        if (this.getSessionTargetWindowState(sessionId).isWindowMode) return null;
+        const gap = this.sessionMessagesTailDiscontinuityBySessionId.get(sessionId);
+        if (!gap) return null;
+        return gap.kind === 'opaque'
+            ? gap.walkCursor !== null
+            : this.sessionMessagesHasMoreOlderByKey.get(this.buildSessionMessagesPaginationKey({ sessionId, scope: 'main' })) ?? true;
+    }
+
     private commitSessionTailDiscontinuity(
         sessionId: string,
         record: SessionMessagesTailDiscontinuity | null,
@@ -7742,15 +8502,19 @@ class Sync {
             this.sessionMessagesTailDiscontinuityBySessionId.set(sessionId, record);
             // While a hole is open there IS more older content by construction (the hole
             // and the prefix), regardless of page-size inference on individual walk pages.
-            const pagingKey = this.buildSessionMessagesPaginationKey({ sessionId, scope: 'main' });
-            this.sessionMessagesHasMoreOlderByKey.set(pagingKey, true);
+            if (record.kind === 'seq') {
+                const pagingKey = this.buildSessionMessagesPaginationKey({ sessionId, scope: 'main' });
+                this.sessionMessagesHasMoreOlderByKey.set(pagingKey, true);
+            }
         } else {
             this.sessionMessagesTailDiscontinuityBySessionId.delete(sessionId);
         }
         if (previous === record) return;
-        storage.getState().setSessionTailContiguousFloorSeq(
+        storage.getState().setSessionTailContiguousBoundary(
             sessionId,
-            record ? record.walkCursor : null,
+            record?.kind === 'seq'
+                ? { kind: 'seq', seq: record.walkCursor }
+                : record?.kind === 'opaque' ? { kind: 'messageIds', messageIds: record.boundaryMessageIds } : null,
         );
     }
 
@@ -7774,7 +8538,8 @@ class Sync {
             }
         }
         if (!Number.isFinite(snapshotMinSeq)) return;
-        const prev = this.sessionMessagesTailDiscontinuityBySessionId.get(sessionId) ?? null;
+        const previous = this.sessionMessagesTailDiscontinuityBySessionId.get(sessionId);
+        const prev = previous?.kind === 'seq' ? previous : null;
         const next = openTailDiscontinuityFromSnapshot({
             prev,
             prefixMaxSeq: prefixMaxSeqBeforeSnapshot,
@@ -7799,9 +8564,90 @@ class Sync {
                 this.activeServerSessionIds.add(session.id);
             }
         }
+        const previousSessions = storage.getState().sessions;
         storage.getState().applySessions(sessions);
         const newActive = storage.getState().getActiveSessions();
         this.applySessionDiff(active, newActive);
+        this.refreshVisibleStaleRollbackEligibility(previousSessions, sessions);
+    }
+
+    /**
+     * A snapshot without eligibility (a session-list refresh, e.g. after reconnect) leaves known
+     * rollback starts unconfirmed. Sessions already on screen get no `onSessionVisible`, so confirm
+     * theirs with the same deduped exact read. A visible session with stale known starts is read
+     * until one read has completed for that stale period; a read that fails leaves no mark, so the
+     * next snapshot retries it. A completed read that carries no starts (an older server) leaves the
+     * session stale but marked, so it cannot schedule another until the starts are confirmed and
+     * later turn stale again.
+     */
+    private refreshVisibleStaleRollbackEligibility(
+        previousSessions: Readonly<Record<string, Session>>,
+        appliedSessions: readonly Readonly<{ id: string }>[],
+    ): void {
+        const visibleSessionIds = new Set(getVisibleSessionIds());
+        const activeViewingSessionId = getActiveViewingSessionId();
+        if (activeViewingSessionId) visibleSessionIds.add(activeViewingSessionId);
+        const storedSessions = storage.getState().sessions;
+        for (const sessionId of new Set(appliedSessions.map((session) => session.id))) {
+            const next = storedSessions[sessionId];
+            if (next?.rollbackEligibilityStale !== true || next.rollbackEligibleTurnStarts === undefined) {
+                this.rollbackEligibilityStaleReadSettledSessionIds.delete(sessionId);
+                continue;
+            }
+            if (didRollbackEligibilityBecomeStale(previousSessions[sessionId], next)) {
+                this.rollbackEligibilityStaleReadSettledSessionIds.delete(sessionId);
+            }
+            if (!visibleSessionIds.has(sessionId)) continue;
+            if (this.rollbackEligibilityStaleReadSettledSessionIds.has(sessionId)) continue;
+            if (!needsRollbackEligibilityRead(next)) continue;
+            this.readRollbackEligibility(sessionId, 'Sync.applySessions.staleRollbackEligibility');
+        }
+    }
+
+    /**
+     * The exact read that confirms unknown or stale rollback eligibility, deduped with any by-id read
+     * already in flight. Only a completed read settles the session's current stale period (see
+     * `refreshVisibleStaleRollbackEligibility`); an unavailable server, a changed scope or an error
+     * leaves it to be retried by the next snapshot.
+     */
+    private readRollbackEligibility(sessionId: string, tag: string): void {
+        const read = (async () => {
+            const result = await this.ensureSessionVisibleForMessageRoute(sessionId, { forceRefresh: true });
+            if (result.kind !== 'available') return;
+            if (storage.getState().sessions[sessionId]?.rollbackEligibilityStale === true) {
+                this.rollbackEligibilityStaleReadSettledSessionIds.add(sessionId);
+            }
+        })();
+        fireAndForget(read, { tag });
+    }
+
+    private readSessionMessagesCatchUpAfterSeq(sessionId: string): number {
+        const materializedMaxSeq = this.sessionMaterializedMaxSeqById[sessionId] ?? 0;
+        const gap = readTranscriptGap(this.deferredTranscriptState, sessionId);
+        return gap ? Math.min(materializedMaxSeq, gap.afterSeq) : materializedMaxSeq;
+    }
+
+    private recoverSessionMessageGap(
+        sessionId: string,
+        info: Readonly<{ prevMaterializedMaxSeq: number; messageSeq: number | null }>,
+    ): void {
+        this.deferredTranscriptState = markTranscriptGap(this.deferredTranscriptState, sessionId, {
+            afterSeq: info.prevMaterializedMaxSeq,
+            throughSeq: info.messageSeq,
+        });
+        // Retain a later cycle when this observation races an already-running page.
+        this.getOrCreateMessagesSync(sessionId).invalidate();
+    }
+
+    private markSessionAckedMessageSeq(sessionId: string, seq: number): void {
+        const prevMaterializedMaxSeq = this.sessionMaterializedMaxSeqById[sessionId] ?? 0;
+        this.markSessionMaterializedMaxSeq(sessionId, seq);
+        if (
+            seq > prevMaterializedMaxSeq + 1
+            && storage.getState().sessionMessages[sessionId]?.isLoaded === true
+        ) {
+            this.recoverSessionMessageGap(sessionId, { prevMaterializedMaxSeq, messageSeq: seq });
+        }
     }
 
     private markSessionMaterializedMaxSeq(sessionId: string, seq: number): void {
@@ -7909,9 +8755,6 @@ async function syncInit(credentials: AuthCredentials, restore: boolean) {
 
     // Initialize sync engine
     const encryption = await createEncryptionFromAuthCredentials(credentials);
-
-    // Initialize tracking
-    initializeTracking(encryption.anonID);
 
     // Initialize socket connection
     apiSocket.initialize({ endpoint: getActiveServerSnapshot().serverUrl, token: credentials.token }, encryption);

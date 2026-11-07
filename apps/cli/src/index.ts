@@ -7,7 +7,7 @@
  */
 
 import { dispatchCli } from '@/cli/dispatch';
-import { normalizeCliArgv, parseCliArgs } from '@/cli/parseArgs';
+import { readCliProcessArgs, parseCliArgs } from '@/cli/parseArgs';
 import { initToolTraceIfEnabled } from '@/agent/tools/trace/toolTrace';
 import axios from 'axios';
 import { configuration } from '@/configuration';
@@ -22,6 +22,7 @@ import { ensureWindowsUtf8CodePage } from '@/utils/platform/windows/ensureWindow
 import { installConsoleWriteErrorGuards, shouldInstallConsoleWriteErrorGuards } from '@/utils/writeConsoleBestEffort';
 import { logger } from '@/ui/logger';
 import { applyStackSessionPriority } from '@/utils/process/applyStackSessionPriority';
+import { fail } from '@happier-dev/cli-common/output';
 
 async function main() {
   applyStackSessionPriority();
@@ -34,7 +35,7 @@ async function main() {
   initToolTraceIfEnabled();
   installAxiosProxySupport({ axios, env: process.env });
   const cliRootDir = dirname(dirname(fileURLToPath(import.meta.url)));
-  const normalizedArgv = normalizeCliArgv(process.argv.slice(2));
+  const normalizedArgv = readCliProcessArgs();
   const updatePackageName = resolveNpmPackageNameOverride({
     envValue: process.env.HAPPIER_CLI_UPDATE_PACKAGE_NAME,
     fallback: packageJson.name,
@@ -62,7 +63,7 @@ async function main() {
 if (process.env.HAPPIER_CLI_DIST_INTEGRITY_PROBE !== '1') {
   void main().catch((error) => {
     logger.fatal(error);
-    console.error('Error:', error instanceof Error ? error.message : 'Unknown error');
+    console.error(fail(error instanceof Error ? error.message : 'Unknown error'));
     if (process.env.DEBUG) {
       console.error(error);
     }

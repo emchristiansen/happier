@@ -21,6 +21,7 @@ describe('daemonServiceInventory', () => {
         'HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR',
         'HAPPIER_DAEMON_SERVICE_CHANNEL',
         'HAPPIER_DAEMON_SERVICE_TARGET_MODE',
+        'PATH',
     ]);
 
     afterEach(() => {
@@ -132,10 +133,11 @@ describe('daemonServiceInventory', () => {
                 HAPPIER_DAEMON_SERVICE_USER_HOME_DIR: homeDir,
                 HAPPIER_DAEMON_SERVICE_HAPPIER_HOME_DIR: join(homeDir, '.happier'),
                 HAPPIER_DAEMON_SERVICE_CHANNEL: 'stable',
+                HAPPIER_DAEMON_SERVICE_TARGET_MODE: 'default-following',
             });
             vi.resetModules();
 
-            const [{ resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServicePaths }, { resolveInstalledDaemonServiceInventoryForCurrentRelay }] = await Promise.all([
+            const [{ resolveDaemonServiceCliRuntimeFromEnv, resolveDaemonServicePaths }, { resolveInstalledDaemonServiceInventoryForCurrentRelay, evaluateDaemonStartupServiceConflict }] = await Promise.all([
                 import('@/daemon/service/cli'),
                 import('./daemonServiceInventory'),
             ]);
@@ -149,6 +151,7 @@ describe('daemonServiceInventory', () => {
                     description: 'Happier Daemon',
                     execStart: ['/Users/tester/.happier/cli/current/happier', 'daemon', 'start-sync'],
                     env: {
+                        HAPPIER_HOME_DIR: runtime.happierHomeDir,
                         HAPPIER_DAEMON_STARTUP_SOURCE: 'background-service',
                         HAPPIER_PUBLIC_RELEASE_CHANNEL: 'stable',
                     },
@@ -162,6 +165,12 @@ describe('daemonServiceInventory', () => {
             expect(services).toHaveLength(1);
             expect(services[0]?.targetMode).toBe('default-following');
             expect(services[0]?.releaseChannel).toBe('stable');
+            envScope.patch({ PATH: homeDir });
+            expect(await evaluateDaemonStartupServiceConflict({ startupSource: 'manual', runtime })).toEqual({ kind: 'none' });
+            writeFileSync(join(homeDir, 'systemctl'), 'fixture', 'utf8');
+            expect(await evaluateDaemonStartupServiceConflict({ startupSource: 'manual', runtime })).toMatchObject({
+                kind: 'installed-background-service-conflict',
+            });
         });
     });
 

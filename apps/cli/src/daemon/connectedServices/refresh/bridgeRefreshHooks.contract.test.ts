@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { buildConnectedServiceCredentialRecord } from '@happier-dev/protocol';
 
@@ -8,8 +8,8 @@ import type { ConnectedServiceBridgeRefreshCapabilities } from './bridgeRefreshH
 import type { ConnectedServiceCredentialSource } from './refreshTypes';
 
 /**
- * CS-FIX-1 contract test: the provider-specific bridge quirks (Codex ChatGPT response shape +
- * post-rotation rematerialize fallback; Claude setup-token short-circuit + expiry shaping) live in
+ * CS-FIX-1 contract test: the provider-specific bridge quirks (Codex ChatGPT response shape;
+ * Claude setup-token short-circuit + expiry shaping) live in
  * the provider-owned hook modules, reached ONLY through the coordinator-supplied capabilities. This
  * pins the "a new provider needs only a hook module, no coordinator edit" claim: everything below is
  * exercised without touching the coordinator.
@@ -23,10 +23,6 @@ function buildCapabilities(
     isOauthSourceStillValid: () => false,
     resolveSourceExpiresAt: () => null,
     rematerializeTargets: async () => [],
-    activeServerDir: '/tmp/server',
-    baseDir: '/tmp/base',
-    accountSettings: null,
-    processEnv: {},
     ...overrides,
   };
 }
@@ -98,36 +94,6 @@ describe('createClaudeSubscriptionBridgeRefreshHooks', () => {
 });
 
 describe('createCodexChatGptBridgeRefreshHooks', () => {
-  it('runs the post-rotation rematerialize fallback only when no live target rematerialized', async () => {
-    const rematerializeTargets = vi.fn(async () => [] as never[]);
-    const hooks = createCodexChatGptBridgeRefreshHooks({
-      chatgptPlanType: 'pro',
-      capabilities: buildCapabilities({ rematerializeTargets }),
-    });
-    const credential = oauthSource('rotated-access').record;
-    if (credential.kind !== 'oauth') throw new Error('expected oauth');
-
-    const response = await hooks.finalizeRefreshedResponse({
-      binding: { serviceId: 'openai-codex', profileId: 'primary' },
-      selection: {
-        kind: 'profile',
-        serviceId: 'openai-codex',
-        profileId: 'primary',
-        credentialRevision: 'csr_abcdefghijklmnopqrstuv',
-      },
-      credential,
-      credentialRevision: 'csr_bcdefghijklmnopqrstuvw',
-    });
-
-    expect(rematerializeTargets).toHaveBeenCalledTimes(1);
-    expect(response).toEqual({
-      accessToken: 'rotated-access',
-      chatgptAccountId: 'acct',
-      chatgptPlanType: 'pro',
-      credentialRevision: 'csr_bcdefghijklmnopqrstuvw',
-    });
-  });
-
   it('carries the canonical revision when adopting the current Codex token', async () => {
     const source = oauthSource('valid-access');
     const hooks = createCodexChatGptBridgeRefreshHooks({
@@ -141,11 +107,13 @@ describe('createCodexChatGptBridgeRefreshHooks', () => {
     const probe = await hooks.probeCurrentToken({ serviceId: 'openai-codex', profileId: 'primary' });
     expect(probe.kind).toBe('adoptable');
     if (probe.kind !== 'adoptable') throw new Error('unreachable');
-    expect(probe.buildResponse()).toEqual({
+    const selection = { kind: 'profile', serviceId: 'openai-codex', profileId: 'primary', credentialRevision: null } as const;
+    expect(probe.buildResponse(selection)).toEqual({
       accessToken: 'valid-access',
       chatgptAccountId: 'acct',
       chatgptPlanType: 'plus',
       credentialRevision: 'csr_abcdefghijklmnopqrstuv',
+      selection: { kind: 'profile', serviceId: 'openai-codex', profileId: 'primary' },
     });
   });
 

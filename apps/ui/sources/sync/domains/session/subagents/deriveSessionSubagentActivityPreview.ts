@@ -1,3 +1,4 @@
+import { readNonBlankOpaqueIdentifier } from '@happier-dev/protocol';
 import type { SessionSubagent } from './types';
 import { shouldIgnoreProviderActivityPreviewText } from '@/sync/domains/session/providers/sessionProviderBehaviorRegistry';
 
@@ -24,7 +25,7 @@ export function deriveSessionSubagentActivityPreview(params: Readonly<{
     subagent: SessionSubagent;
     reducerState: SidechainStateLike;
 }>): string | null {
-    const sidechainId = params.subagent.transcript.sidechainId?.trim();
+    const sidechainId = readNonBlankOpaqueIdentifier(params.subagent.transcript.sidechainId);
     if (!sidechainId) return null;
 
     const sidechainMessages = params.reducerState?.sidechains?.get(sidechainId);
@@ -67,7 +68,7 @@ export function deriveSessionSubagentLastActivityAtMs(params: Readonly<{
     subagent: SessionSubagent;
     reducerState: SidechainStateLike;
 }>): number | null {
-    const sidechainId = params.subagent.transcript.sidechainId?.trim();
+    const sidechainId = readNonBlankOpaqueIdentifier(params.subagent.transcript.sidechainId);
     if (!sidechainId) return null;
 
     const sidechainMessages = params.reducerState?.sidechains?.get(sidechainId);

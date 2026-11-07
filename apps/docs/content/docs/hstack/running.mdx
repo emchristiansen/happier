@@ -74,6 +74,10 @@ In interactive TTY runs, `hstack dev` enables watch mode by default:
 - `happier-cli` changes → rebuild + restart the daemon
 - some long-lived processes can be restarted safely when hstack knows they are stack-owned
 
+Restarting the daemon does not replace session runners that are already running. Each existing runner stays pinned to the immutable CLI snapshot admitted when it started, so its Agent process and bundled tools continue on one consistent runtime. Fresh sessions, and eligible runners that you explicitly restart, select the daemon's current admitted snapshot.
+
+Use `happier daemon restart-session-runners --dry-run` to preview which stale daemon-started runners are eligible, then run `happier daemon restart-session-runners` when you are ready to refresh them. The Happier sessions stay the same.
+
 Control flags:
 
 - Force enable: `hstack dev --watch`

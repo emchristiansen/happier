@@ -35,6 +35,7 @@ export type PlannedChangesApplyResult =
 export type SessionListInvalidationContext = Readonly<{
     requiredHydrationSessionIds: readonly string[];
     prioritizeSessionIds: readonly string[];
+    reconcileList: boolean;
 }>;
 
 export async function applyPlannedChangeActions(params: {
@@ -43,7 +44,9 @@ export async function applyPlannedChangeActions(params: {
     isSessionMessagesLoaded: (sessionId: string) => boolean;
     shouldCatchUpSessionMessages?: (sessionId: string) => boolean;
     getSessionMaterializedMaxSeq?: (sessionId: string) => number;
+    isSessionMessagesDeferred?: (sessionId: string) => boolean;
     concurrencyLimit?: number;
+    shouldContinue?: () => boolean;
     invalidate: {
         settings?: () => Promise<void>;
         profile?: () => Promise<void>;
@@ -98,6 +101,7 @@ export async function applyPlannedChangeActions(params: {
     const sessionListInvalidationContext: SessionListInvalidationContext = {
         requiredHydrationSessionIds: changedSessionIds,
         prioritizeSessionIds: changedSessionIds,
+        reconcileList: planned.reconcileSessionList === true || changedSessionIds.length === 0,
     };
 
     let sessionsInvalidationFailed = false;
@@ -186,6 +190,7 @@ export async function applyPlannedChangeActions(params: {
                     return;
                 }
             }
+            if (params.shouldContinue?.() === false) return;
 
             if (shouldCatchUpMessages) {
                 try {
@@ -198,6 +203,7 @@ export async function applyPlannedChangeActions(params: {
             }
 
             if (repair) {
+                if (params.shouldContinue?.() === false) return;
                 try {
                     if (!params.repairSessionTranscriptRevision) {
                         failedTranscriptRepairSessionIds.add(sessionId);
@@ -269,18 +275,39 @@ export async function applyPlannedChangeActions(params: {
 
             try {
                 const bulk = await params.kvBulkGet(params.credentials, todoKeys);
+                if (params.shouldContinue?.() === false) return;
                 if (bulk.values.length !== todoKeys.length) {
                     await (params.invalidate.todos?.() ?? Promise.resolve());
                     return;
                 }
                 await params.applyTodoSocketUpdates(bulk.values.map((value): TodoSocketUpdate => ({ key: value.key, value: value.value, version: value.version })));
             } catch {
+                if (params.shouldContinue?.() === false) return;
                 await (params.invalidate.todos?.() ?? Promise.resolve());
             }
         });
     }
 
-    await runTasksWithLimit(tasks, concurrencyLimit);
+    // Drain started work before returning; queued work must not outlive its resume.
+    await runTasksWithLimit(tasks.map((task) => async () => {
+        if (params.shouldContinue?.() === false) return;
+        try {
+            await task();
+        } catch (error) {
+            if (params.shouldContinue?.() !== false) throw error;
+        }
+    }), concurrencyLimit);
+
+    if (params.shouldContinue?.() === false) {
+        return {
+            status: 'partial',
+            safeAdvanceCursor: null,
+            blockedCursor: String(planned.changes[0]?.cursor ?? ''),
+            blockedReason: 'partial-materialization',
+            processedChanges: 0,
+            blockedChanges: planned.changes.length,
+        };
+    }
 
     let safeAdvanceCursor: string | null = null;
     let processedChanges = 0;
@@ -422,7 +449,11 @@ export async function applyPlannedChangeActions(params: {
         ) {
             const targetSeq = getChangeTargetMessageSeq(change);
             const materializedSeq = params.getSessionMaterializedMaxSeq?.(classification.entityId) ?? null;
-            if (targetSeq !== null && (materializedSeq === null || materializedSeq < targetSeq)) {
+            if (
+                targetSeq !== null
+                && (materializedSeq === null || materializedSeq < targetSeq)
+                && params.isSessionMessagesDeferred?.(classification.entityId) !== true
+            ) {
                 return {
                     status: 'partial',
                     safeAdvanceCursor,

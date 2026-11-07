@@ -36,7 +36,7 @@ describe('resolveJavaScriptRuntimeExecutable', () => {
     writeFileSync(overridePath, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n', 'utf8');
     if (process.platform !== 'win32') chmodSync(overridePath, 0o755);
 
-    envScope.patch({ HAPPIER_MANAGED_NODE_BIN: overridePath });
+    envScope.patch({ HAPPIER_MANAGED_NODE_BIN: overridePath, HAPPIER_JS_RUNTIME_PATH: undefined });
 
     expect(resolveJavaScriptRuntimeExecutable({ isBunRuntime: false })).toBe(overridePath);
   });

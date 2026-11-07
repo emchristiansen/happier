@@ -47,6 +47,10 @@ on:
         type: string
   workflow_call:
     inputs:
+      source_binary_smoke_validated:
+        required: false
+        default: false
+        type: boolean
       channel:
         required: true
         type: string
@@ -111,15 +115,11 @@ permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: release-verify-${{ inputs.channel }}-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   verify_candidate:
     name: Verify exact immutable candidate artifacts
     if: ${{ inputs.candidate_source_sha != '' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - name: Checkout trusted workflow control bytes
@@ -134,7 +134,21 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22.x
+          node-version-file: .release-control/.node-version
+
+      - name: Enable trusted control Yarn
+        working-directory: .release-control
+        run: bash scripts/ci/corepack-prepare-yarn-with-retry.sh
+
+      - name: Install trusted verification dependencies
+        working-directory: .release-control
+        env:
+          YARN_PRODUCTION: 'false'
+          npm_config_production: 'false'
+          HAPPIER_INSTALL_SCOPE: protocol,agents,release-runtime,cli-common
+          HAPPIER_UI_VENDOR_WEB_ASSETS: '0'
+          ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+        run: bash scripts/ci/yarn-install-with-retry.sh --frozen-lockfile --ignore-engines --network-timeout 600000 --prefer-offline --non-interactive
 
       - name: Install minisign from trusted control bytes
         uses: ./.release-control/.github/actions/bootstrap-minisign
@@ -199,7 +213,7 @@ jobs:
 
   resolve_validation_profile:
     name: Resolve bounded validation profile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -226,10 +240,11 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 22.x
+          node-version-file: .release-control/.node-version
       - name: Resolve candidate-applicable validation suites
         id: profile
         env:
+          SOURCE_BINARY_SMOKE_VALIDATED: ${{ inputs.source_binary_smoke_validated }}
           VALIDATION_PROFILE: ${{ inputs.validation_profile }}
           INCLUDE_VALIDATION_SUITES: ${{ inputs.include_validation_suites }}
           WAIVE_VALIDATION_SUITES: ${{ inputs.waive_validation_suites }}
@@ -243,6 +258,7 @@ jobs:
           set -euo pipefail
           node "$GITHUB_WORKSPACE/.release-control/scripts/pipeline/release-validation/resolve-validation-plan.mjs" \
             --profile "$VALIDATION_PROFILE" \
+            --source-binary-smoke-validated "$SOURCE_BINARY_SMOKE_VALIDATED" \
             --has-cli-candidate "$([[ -n "$CANDIDATE_CLI_VERSION" ]] && echo true || echo false)" \
             --has-server-candidate "$([[ -n "$CANDIDATE_SERVER_VERSION" ]] && echo true || echo false)" \
             --has-published-relay-predecessor "$([[ "$RELEASE_CHANNEL" == preview || "$RELEASE_CHANNEL" == production ]] && echo true || echo false)" \
@@ -263,8 +279,10 @@ jobs:
       pull-requests: read
     uses: ./.github/workflows/tests.yml
     with:
+      artifact_namespace: ${{ format('verify-{0}-{1}-{2}-{3}-{4}', inputs.channel, inputs.candidate_cli_version, inputs.candidate_stack_version, inputs.candidate_server_version, inputs.candidate_ui_web_version) }}
       select_jobs_explicitly: true
       run_ui: false
+      run_shared_packages: false
       run_server: false
       run_cli: false
       run_stack: false
@@ -280,6 +298,7 @@ jobs:
       installers_source: ${{ inputs.candidate_cli_version != '' && 'published-tag' || 'published-channel' }}
       installers_ref: ${{ inputs.candidate_cli_version != '' && format('cli-v{0}', inputs.candidate_cli_version) || '' }}
       run_binary_smoke: ${{ fromJSON(needs.resolve_validation_profile.outputs.run_binary_smoke) }}
+      run_build_smoke: false
       run_cli_update_continuity: ${{ fromJSON(needs.resolve_validation_profile.outputs.run_cli_update_continuity) }}
       cli_update_to_source: ${{ inputs.candidate_cli_version != '' && 'published-tag' || 'local-build' }}
       cli_update_to_ref: ${{ inputs.candidate_cli_version != '' && format('cli-v{0}', inputs.candidate_cli_version) || '.' }}

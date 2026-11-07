@@ -20,6 +20,26 @@ const codexProfileDefaultSettings = {
 };
 
 describe('resolveSpawnConnectedServicesDefaults (R4-2 literal resolver)', () => {
+  it('resolves the exact Antigravity saved profile from the additive settings carrier', () => {
+    const result = resolveSpawnConnectedServicesDefaults({
+      agentId: 'agy',
+      accountSettings: {
+        ...codexProfileDefaultSettings,
+        connectedServicesAdditionalDefaultAuthByAgentIdV1: {
+          v: 1,
+          bindingsByAgentId: {
+            agy: { v: 1, bindingsByServiceId: {
+              antigravity: { source: 'connected', selection: 'profile', profileId: 'google-work' },
+            } },
+          },
+        },
+      },
+    });
+    expect(result?.bindingsByServiceId.antigravity).toEqual({
+      source: 'connected', selection: 'profile', profileId: 'google-work',
+    });
+  });
+
   it('resolves a configured PROFILE default to that exact profile binding', () => {
     // Literal semantics (user-ruled canonical): a stored profile default means that exact account —
     // the resolver never silently upgrades it to an autoSwitch pool at resolution time.
@@ -32,6 +52,16 @@ describe('resolveSpawnConnectedServicesDefaults (R4-2 literal resolver)', () => 
       selection: 'profile',
       profileId: 'test-profile-1',
     });
+  });
+
+  it('rejects a malformed additional carrier instead of launching native', () => {
+    expect(resolveSpawnConnectedServicesDefaultDisposition({
+      agentId: 'agy', accountSettings: {
+        connectedServicesAdditionalDefaultAuthByAgentIdV1: { v: 1, bindingsByAgentId: {
+          agy: { v: 1, bindingsByServiceId: { antigravity: { source: 'connected', profileId: '' } } },
+        } },
+      },
+    })).toEqual({ kind: 'unavailable', reason: 'connected_services_default_settings_invalid' });
   });
 
   it('resolves a configured GROUP default to that group binding', () => {

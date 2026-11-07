@@ -50,9 +50,9 @@ export async function buildDoctorRepairReport(params: Readonly<{
   uid: number | null;
   onMigration?: boolean;
   /**
-   * When true (the `doctor repair` path), the CLI classifier performs a live
-   * npm dist-tag lookup with a short timeout so the user always sees the
-   * current state rather than a possibly-stale cached hint.
+   * When true (the `doctor repair` path), the CLI classifier starts the background update check
+   * even when the cached one is fresh, so the next report shows the current state. The report
+   * itself always reads the cached check (no network call on this path).
    */
   forceRefreshLatestCli?: boolean;
   /**
@@ -70,6 +70,7 @@ export async function buildDoctorRepairReport(params: Readonly<{
 }>): Promise<DoctorRepairReport> {
   const cliSelfUpdateFindings = await classifyCurrentCli({
     currentCliReleaseChannel: params.currentCli.releaseChannel,
+    currentCliRingId: params.currentCli.ringId,
     currentCliVersion: params.currentCli.version,
     onMigration: params.onMigration,
     forceRefresh: params.forceRefreshLatestCli,

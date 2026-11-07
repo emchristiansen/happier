@@ -213,8 +213,9 @@ function main() {
   // Apply any local changes from the src checkout. We intentionally avoid copying the full working tree,
   // since it may contain large untracked directories (e.g. nested node_modules).
   // NOTE: we do copy untracked-but-not-ignored files so local worktree changes are represented in the clone.
-  applyDiff({ srcDir: src, dstDir: dst, args: [] });
+  // The clone starts at HEAD: apply HEAD -> index before index -> working tree.
   applyDiff({ srcDir: src, dstDir: dst, args: ['--cached'] });
+  applyDiff({ srcDir: src, dstDir: dst, args: [] });
   copyUntrackedFiles({ srcDir: src, dstDir: dst });
   copyGeneratedSourceFiles({ srcDir: src, dstDir: dst });
 

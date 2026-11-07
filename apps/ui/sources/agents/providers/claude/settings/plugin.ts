@@ -1,9 +1,28 @@
 import {
     buildClaudeRemoteOutgoingMessageMetaExtras,
     CLAUDE_REMOTE_PROVIDER_FIELDS,
+    MAX_CLAUDE_REMOTE_IDLE_RECLAIM_TIMEOUT_MINUTES,
 } from '@happier-dev/agents';
 
-import type { ProviderSettingsPlugin } from '@/agents/providers/shared/providerSettingsPlugin';
+import type { ProviderSettingEnumOption, ProviderSettingsPlugin } from '@/agents/providers/shared/providerSettingsPlugin';
+
+const responseLocationOptions = [
+    {
+        id: 'app_and_terminal',
+        title: { key: 'settingsProviders.plugins.claude.responseLocationOptions.app_and_terminal.title' },
+        subtitle: { key: 'settingsProviders.plugins.claude.responseLocationOptions.app_and_terminal.subtitle' },
+    },
+    {
+        id: 'app_only',
+        title: { key: 'settingsProviders.plugins.claude.responseLocationOptions.app_only.title' },
+        subtitle: { key: 'settingsProviders.plugins.claude.responseLocationOptions.app_only.subtitle' },
+    },
+    {
+        id: 'terminal_only',
+        title: { key: 'settingsProviders.plugins.claude.responseLocationOptions.terminal_only.title' },
+        subtitle: { key: 'settingsProviders.plugins.claude.responseLocationOptions.terminal_only.subtitle' },
+    },
+] as const satisfies readonly ProviderSettingEnumOption[];
 
 export const CLAUDE_PROVIDER_SETTINGS_PLUGIN: ProviderSettingsPlugin = {
     providerId: 'claude',
@@ -28,6 +47,19 @@ export const CLAUDE_PROVIDER_SETTINGS_PLUGIN: ProviderSettingsPlugin = {
     ],
     uiSections: [
         {
+            id: 'claudeModelDiscovery',
+            title: { key: 'settingsProviders.plugins.claude.sections.claudeModelDiscovery.title' },
+            footer: { key: 'settingsProviders.plugins.claude.sections.claudeModelDiscovery.footer' },
+            fields: [
+                {
+                    key: 'claudeDynamicModelProbeEnabled',
+                    kind: 'boolean',
+                    title: { key: 'settingsProviders.plugins.claude.fields.claudeDynamicModelProbeEnabled.title' },
+                    subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeDynamicModelProbeEnabled.subtitle' },
+                },
+            ],
+        },
+        {
             id: 'claudeUnifiedTerminal',
             featureId: 'providers.claude.unifiedTerminal',
             title: { key: 'settingsProviders.plugins.claude.sections.claudeUnifiedTerminal.title' },
@@ -38,6 +70,20 @@ export const CLAUDE_PROVIDER_SETTINGS_PLUGIN: ProviderSettingsPlugin = {
                     kind: 'boolean',
                     title: { key: 'settingsProviders.plugins.claude.fields.claudeUnifiedTerminalEnabled.title' },
                     subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeUnifiedTerminalEnabled.subtitle' },
+                },
+                {
+                    key: 'claudeUnifiedTerminalQuestionResponseLocation',
+                    kind: 'enum',
+                    title: { key: 'settingsProviders.plugins.claude.fields.claudeUnifiedTerminalQuestionResponseLocation.title' },
+                    subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeUnifiedTerminalQuestionResponseLocation.subtitle' },
+                    enumOptions: responseLocationOptions,
+                },
+                {
+                    key: 'claudeUnifiedTerminalPermissionResponseLocation',
+                    kind: 'enum',
+                    title: { key: 'settingsProviders.plugins.claude.fields.claudeUnifiedTerminalPermissionResponseLocation.title' },
+                    subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeUnifiedTerminalPermissionResponseLocation.subtitle' },
+                    enumOptions: responseLocationOptions,
                 },
                 {
                     key: 'claudeUnifiedTerminalHost',
@@ -116,10 +162,36 @@ export const CLAUDE_PROVIDER_SETTINGS_PLUGIN: ProviderSettingsPlugin = {
             footer: { key: 'settingsProviders.plugins.claude.sections.claudeCodeExperiments.footer' },
             fields: [
                 {
+                    key: 'claudeCodeIncludeInNativeHistory',
+                    kind: 'boolean',
+                    title: { key: 'settingsProviders.plugins.claude.fields.claudeCodeIncludeInNativeHistory.title' },
+                    subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeCodeIncludeInNativeHistory.subtitle' },
+                },
+                {
                     key: 'claudeCodeExperimentalAgentTeamsEnabled',
                     kind: 'boolean',
                     title: { key: 'settingsProviders.plugins.claude.fields.claudeCodeExperimentalAgentTeamsEnabled.title' },
                     subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeCodeExperimentalAgentTeamsEnabled.subtitle' },
+                },
+            ],
+        },
+        {
+            id: 'claudeIdleReclaim',
+            title: { key: 'settingsProviders.plugins.claude.sections.claudeIdleReclaim.title' },
+            footer: { key: 'settingsProviders.plugins.claude.sections.claudeIdleReclaim.footer' },
+            fields: [
+                {
+                    key: 'claudeRemoteIdleReclaimEnabled',
+                    kind: 'boolean',
+                    title: { key: 'settingsProviders.plugins.claude.fields.claudeRemoteIdleReclaimEnabled.title' },
+                    subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeRemoteIdleReclaimEnabled.subtitle' },
+                },
+                {
+                    key: 'claudeRemoteIdleReclaimTimeoutMinutes',
+                    kind: 'number',
+                    title: { key: 'settingsProviders.plugins.claude.fields.claudeRemoteIdleReclaimTimeoutMinutes.title' },
+                    subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeRemoteIdleReclaimTimeoutMinutes.subtitle' },
+                    numberSpec: { min: 1, max: MAX_CLAUDE_REMOTE_IDLE_RECLAIM_TIMEOUT_MINUTES, step: 1 },
                 },
             ],
         },
@@ -221,7 +293,7 @@ export const CLAUDE_PROVIDER_SETTINGS_PLUGIN: ProviderSettingsPlugin = {
                     subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeLocalPermissionBridgeTimeoutSeconds.subtitle' },
                     numberSpec: {
                         min: 1,
-                        step: 30,
+                        step: 1,
                         placeholder: '600',
                     },
                 },
@@ -238,7 +310,7 @@ export const CLAUDE_PROVIDER_SETTINGS_PLUGIN: ProviderSettingsPlugin = {
                     subtitle: { key: 'settingsProviders.plugins.claude.fields.claudeRemoteMaxThinkingTokens.subtitle' },
                     numberSpec: {
                         min: 1,
-                        step: 100,
+                        step: 1,
                         placeholder: { key: 'common.default' },
                     },
                 },

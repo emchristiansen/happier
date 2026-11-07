@@ -9,24 +9,14 @@ import {
     WEB_START_ELLIPSIS_CONTAINER_TEXT_STYLE,
     WEB_START_ELLIPSIS_CONTENT_TEXT_STYLE,
 } from '@/components/ui/text/webStartEllipsisTextStyles';
-import { Avatar } from '@/components/ui/avatar/Avatar';
-import { AgentIcon } from '@/agents/registry/AgentIcon';
-import {
-    DEFAULT_AGENT_ID,
-    getAgentCore,
-    getAgentPickerIconScale,
-    resolveAgentIdFromFlavor,
-} from '@/agents/catalog/catalog';
-import { resolveAgentIdFromSessionMetadata } from '@happier-dev/agents';
 import { Typography } from '@/constants/Typography';
 import { formatPendingCountBadge } from '@/components/sessions/pendingBadge';
 import { useNavigateToSession } from '@/hooks/session/useNavigateToSession';
 import { t } from '@/text';
 import type { SessionListSecondaryLineMode } from '@/sync/domains/session/listing/deriveSessionListActivity';
 import { Session } from '@/sync/domains/state/storageTypes';
-import { storage, useLocalSetting } from '@/sync/domains/state/storage';
+import { storage } from '@/sync/domains/state/storage';
 import type { SessionListRenderableSession } from '@/sync/domains/session/listing/sessionListRenderable';
-import { getSessionAvatarId } from '@/utils/sessions/sessionUtils';
 import { PinIcon, PinSlashIcon } from './sessionPinIcons';
 import { TagIcon } from './sessionTagIcons';
 import { DropdownMenu, type DropdownMenuItem } from '@/components/ui/forms/dropdown/DropdownMenu';
@@ -59,6 +49,9 @@ import { planSessionTagDisplay } from './sessionTagPlacement';
 import { useIsTablet } from '@/utils/platform/responsive';
 import type { SessionStatus } from '@/utils/sessions/sessionUtils';
 import { useSessionRowActionMenu } from './row/actionMenu/useSessionRowActionMenu';
+import { useSessionRowAppearanceMenu, type SetSessionAppearance } from './row/actionMenu/useSessionRowAppearanceMenu';
+import { resolveSessionAppearanceColor } from '@/sync/domains/session/organization/appearanceColor';
+import { formatSessionAttentionReminderDateTime } from './row/actionMenu/sessionAttentionReminderAction';
 import { createSessionActionTarget } from '@/components/sessions/actions/sessionActionContext';
 import { executeSessionAction } from '@/components/sessions/actions/sessionActionExecution';
 import {
@@ -68,39 +61,56 @@ import {
 } from '@/components/sessions/actions/sessionActionIds';
 import { resolveKeyboardPlatform } from '@/keyboard/runtime';
 import { SessionListSelectionCheckbox } from './selection/SessionListSelectionCheckbox';
+import {
+    SessionListIdentity,
+    normalizeSessionListIdentityDisplay,
+    type SessionListIdentityDisplay,
+} from './SessionListIdentity';
 import { useOptionalSessionListSelectionRow } from './selection/SessionListSelectionContext';
 import { resolveSessionListSelectionPointerAction } from './selection/sessionListSelectionPointer';
 import {
-    buildSessionDebugInformation,
-    isSessionDebugInformationEnabled,
-    resolveProviderSessionIdForDebug,
+    buildSessionDebugInformationForSession,
 } from '@/components/sessions/debug/sessionDebugInformation';
-import { copySessionDebugInformationToClipboard } from '@/components/sessions/debug/sessionDebugClipboard';
+import { copySessionDebugInformationToClipboard, isSessionCopyActionId } from '@/components/sessions/debug/sessionDebugClipboard';
 import { Icon } from '@/components/ui/icons/Icon';
 import { Modal } from '@/modal';
 import {
-    createCopySessionDebugInformationMenuItem,
-    SESSION_COPY_DEBUG_INFORMATION_MENU_ITEM_ID,
+    createSessionCopyMenuItem,
 } from '@/components/sessions/debug/sessionDebugMenuItem';
 import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
 import { canForkConversation } from '@/sync/domains/sessionFork/forkUiSupport';
-import { deferOnWeb } from '@/utils/platform/deferOnWeb';
 import { resolveMachineTargetForSessionFromState } from '@/sync/ops/sessionMachineTarget';
 import { fireAndForget } from '@/utils/system/fireAndForget';
-import type { SessionForkReplaySettingsSource } from '@/sync/domains/sessionFork/resolveSessionForkReplayOptions';
 
 const SESSION_LIST_MINIMAL_IDENTITY_GAP = 8;
 const CONTEXT_MENU_PRESS_SUPPRESSION_TIMEOUT_MS = 600;
 const CONTEXT_MENU_PRESS_IN_OPEN_DELAY_MS = 350;
-const CONTEXT_MENU_DEFERRED_ACTION_DELAY_MS = 0;
 const SESSION_IDENTITY_SKELETON_ANIMATION_MS = 900;
 const SESSION_FOLDER_ROW_CHROME_INDENT_BASE = 38;
 const SESSION_FOLDER_ROW_CHROME_INDENT_STEP = 12;
 const SESSION_FOLDER_ROW_INDENT_CAP = 3;
 const SESSION_DELETE_DRAFT_MENU_ITEM_ID = 'session-draft.delete';
 
+let sessionForkStrategyFlowModulePromise:
+    Promise<typeof import('@/components/sessions/fork/openSessionForkStrategyFlow')> | null = null;
+
+function loadSessionForkStrategyFlowModule() {
+    if (!sessionForkStrategyFlowModulePromise) {
+        sessionForkStrategyFlowModulePromise = import(
+            '@/components/sessions/fork/openSessionForkStrategyFlow'
+        ).catch((error: unknown) => {
+            sessionForkStrategyFlowModulePromise = null;
+            throw error;
+        });
+    }
+    return sessionForkStrategyFlowModulePromise;
+}
+
+function preloadSessionForkStrategyFlowModule(): void {
+    void loadSessionForkStrategyFlowModule().catch(() => undefined);
+}
+
 type SessionItemActivityTimeMode = 'meaningful' | 'updatedAt';
-type SessionItemIdentityDisplay = 'avatar' | 'agentLogo' | 'none';
 type SessionItemActiveColorMode = 'activityAndAttention' | 'attentionOnly' | 'allActive';
 type SessionItemWorkingIndicatorMode = 'spinner' | 'pulse';
 
@@ -124,6 +134,8 @@ type SessionItemBaseProps = Readonly<{
     allKnownTags?: readonly string[];
     onSetTags?: ((newTags: string[]) => void) | null;
     tagsEnabled?: boolean;
+    /** The list's canonical session-colour writer; absent hides the row's colour action. */
+    onSetSessionAppearance?: SetSessionAppearance | null;
     selected?: boolean;
     isFirst?: boolean;
     isLast?: boolean;
@@ -140,14 +152,11 @@ type SessionItemBaseProps = Readonly<{
     onNativeContextMenuOpenChange?: (next: boolean) => void;
     rowAttentionAnimationEnabled?: boolean;
     folderDepth?: number;
-    folderMoveMenuItems?: readonly DropdownMenuItem[];
     onMoveDown?: () => void;
     onMoveToFolder?: () => void;
     onMoveToWorkspaceRoot?: () => void;
     onMoveUp?: () => void;
-    onSelectFolderMoveMenuItem?: (itemId: string) => void;
     forkActionContext?: Readonly<{
-        settings: SessionForkReplaySettingsSource | null;
         replayEnabled: boolean;
         executionRunsEnabled: boolean;
     }>;
@@ -163,7 +172,11 @@ type SessionItemRenderProps = Omit<SessionItemBaseProps, 'activityTimeMode' | 's
     sessionNameResolved: string;
     sessionSubtitle: string;
     pendingCount: number;
+    hasUnreadMessages: boolean;
     draft: SessionListRowModel['draft'];
+    reminder: SessionListRowModel['reminder'];
+    /** Effective colour (session override, else its project's). */
+    appearanceColor: SessionListRowModel['appearanceColor'];
     /** Live agent work in this session, already named. `null` unless the person opted in (R-8). */
     agentActivityLabel: string | null;
     isSessionIdentityLoading: boolean;
@@ -173,14 +186,10 @@ type SessionItemRenderProps = Omit<SessionItemBaseProps, 'activityTimeMode' | 's
     workingIndicatorMode: SessionItemWorkingIndicatorMode;
     workingIndicatorPaused?: boolean;
     rowAttentionAnimationEnabled: boolean;
-    sessionListIdentityDisplay: SessionItemIdentityDisplay;
+    sessionListIdentityDisplay: SessionListIdentityDisplay;
     sessionListActiveColorMode: SessionItemActiveColorMode;
     hideInactiveSessions: boolean;
 }>;
-
-function normalizeSessionItemIdentityDisplay(value: unknown): SessionItemIdentityDisplay {
-    return value === 'agentLogo' || value === 'none' ? value : 'avatar';
-}
 
 function normalizeSessionItemActiveColorMode(value: unknown): SessionItemActiveColorMode {
     switch (value) {
@@ -259,6 +268,24 @@ const stylesheet = StyleSheet.create((theme) => ({
     sessionItemSelected: {
         backgroundColor: theme.colors.surface.selected,
         borderColor: theme.dark ? theme.colors.surface.selected : theme.colors.surface.base,
+    },
+    // An inner pill, not the row border: the 2px border already carries selection, and a full-height
+    // edge would fight the rounded first/last corners. Insets scale with the row's density.
+    appearanceStripe: {
+        position: 'absolute',
+        left: 3,
+        top: '28%',
+        bottom: '28%',
+        width: 3,
+        borderRadius: 2,
+        // Same hairline the colour swatches use, so pale custom colours stay visible on the row.
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: theme.colors.border.default,
+    },
+    // Minimal rows pad only 8px; hug the row edge and thin the pill so the avatar keeps its breathing room.
+    appearanceStripeMinimal: {
+        left: 0,
+        width: 2,
     },
     sessionTitleSelected: {
         color: theme.colors.text.primary,
@@ -369,6 +396,19 @@ const stylesheet = StyleSheet.create((theme) => ({
         color: theme.colors.text.secondary,
         fontSize: 10,
         ...Typography.default('semiBold'),
+    },
+    reminderIndicator: {
+        width: 20,
+        height: 20,
+        borderRadius: 10,
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: theme.colors.surface.inset,
+    },
+    reminderIndicatorCompact: {
+        width: 18,
+        height: 18,
+        borderRadius: 9,
     },
     draftPreviewText: {
         color: theme.colors.text.secondary,
@@ -588,14 +628,13 @@ const stylesheet = StyleSheet.create((theme) => ({
         gap: 3,
         marginTop: -1,
     },
+    // As wide as the attention indicator's own slot, so the 16 px working spinner keeps the line's
+    // gap to the status text instead of overhanging it.
     secondaryStatusDotContainer: {
         alignItems: 'center',
         justifyContent: 'center',
-        width: 12,
+        width: 16,
         height: 12,
-    },
-    secondaryStatusDotContainerCompact: {
-        width: 11,
     },
     secondaryStatusDotContainerMinimal: {
         width: 10,
@@ -662,6 +701,7 @@ const SessionItemContent = React.memo(
         allKnownTags,
         onSetTags,
         tagsEnabled,
+        onSetSessionAppearance,
         selected,
         isFirst,
         isLast,
@@ -676,18 +716,19 @@ const SessionItemContent = React.memo(
         nativeContextMenuOpen,
         onNativeContextMenuOpenChange,
         folderDepth,
-        folderMoveMenuItems,
         onMoveDown,
         onMoveToFolder,
         onMoveToWorkspaceRoot,
         onMoveUp,
-        onSelectFolderMoveMenuItem,
         forkActionContext,
         sessionStatus,
         sessionNameResolved,
         sessionSubtitle,
         pendingCount,
+        hasUnreadMessages,
         draft,
+        reminder,
+        appearanceColor,
         agentActivityLabel,
         isSessionIdentityLoading,
         activityTimeLabel,
@@ -707,8 +748,6 @@ const SessionItemContent = React.memo(
         // session is held in the working group while its live signals are
         // stale, so animating would misrepresent live activity.
         const attentionIndicatorAnimationEnabled = rowAttentionAnimationEnabled && workingIndicatorPaused !== true;
-        const localDevModeEnabled = useLocalSetting('devModeEnabled');
-        const devModeEnabled = isSessionDebugInformationEnabled(localDevModeEnabled);
         const router = useRouter();
         const agentSwitchingEnabled = useFeatureEnabled('sessions.agentSwitching', {
             scopeKind: 'spawn',
@@ -785,23 +824,7 @@ const SessionItemContent = React.memo(
         const rowActionIconColor = theme.colors.text.secondary;
         const resolveSessionDebugInformation = React.useCallback(() => {
             const fullSession = storage.getState().sessions[resolvedSession.id];
-            const debugSession = fullSession ?? resolvedSession;
-            const debugMetadata = debugSession.metadata ?? resolvedSession.metadata;
-            const debugAgentId = resolveAgentIdFromSessionMetadata(debugMetadata)
-                ?? resolveAgentIdFromFlavor(debugMetadata?.flavor)
-                ?? resolveAgentIdFromSessionMetadata(resolvedSession.metadata)
-                ?? resolveAgentIdFromFlavor(resolvedSession.metadata?.flavor)
-                ?? DEFAULT_AGENT_ID;
-            const debugAgentCore = getAgentCore(debugAgentId);
-            const providerSessionId = resolveProviderSessionIdForDebug({
-                metadata: debugMetadata,
-                vendorResumeIdField: debugAgentCore.resume.vendorResumeIdField,
-            });
-            return buildSessionDebugInformation({
-                session: debugSession,
-                providerDisplayName: t(debugAgentCore.displayNameKey),
-                providerSessionId,
-            });
+            return buildSessionDebugInformationForSession(fullSession?.metadata ? fullSession : resolvedSession);
         }, [resolvedSession]);
         const confirmDeleteDraft = React.useCallback(async () => {
             if (!draft || !onDeleteDraft) return;
@@ -827,37 +850,33 @@ const SessionItemContent = React.memo(
             agentSwitchingEnabled,
         });
         const openForkFlow = React.useCallback(() => {
-            deferOnWeb(() => {
-                fireAndForget((async () => {
-                    const { openSessionForkStrategyFlow } = await import(
-                        '@/components/sessions/fork/openSessionForkStrategyFlow'
-                    );
-                    const currentSession = storage.getState().sessions[resolvedSession.id] ?? resolvedSession;
-                    const reachableMachineTarget = resolveMachineTargetForSessionFromState(
-                        storage.getState(),
-                        resolvedSession.id,
-                    );
-                    openSessionForkStrategyFlow({
-                        sessionId: resolvedSession.id,
-                        forkSupportSource: currentSession,
-                        serverId: serverId ?? null,
-                        machineId: reachableMachineTarget?.machineId ?? currentSession.metadata?.machineId ?? null,
-                        forkPoint: { type: 'latest' },
-                        settings: forkActionContext?.settings ?? null,
-                        replayEnabled: forkActionContext?.replayEnabled === true,
-                        executionRunsEnabled: forkActionContext?.executionRunsEnabled === true,
-                        agentSwitchingEnabled,
-                        navigateToSession: (childSessionId, options) => {
-                            void navigateToSession(childSessionId, {
-                                serverId: options?.serverId ?? serverId ?? null,
-                            });
-                        },
-                        navigateToNewSession: (route) => {
-                            router.push(route as any);
-                        },
-                    });
-                })(), { tag: 'SessionItem.openSessionForkStrategyFlow' });
-            });
+            fireAndForget((async () => {
+                const { openSessionForkStrategyFlow } = await loadSessionForkStrategyFlowModule();
+                const currentSession = storage.getState().sessions[resolvedSession.id] ?? resolvedSession;
+                const reachableMachineTarget = resolveMachineTargetForSessionFromState(
+                    storage.getState(),
+                    resolvedSession.id,
+                );
+                openSessionForkStrategyFlow({
+                    sessionId: resolvedSession.id,
+                    forkSupportSource: currentSession,
+                    serverId: serverId ?? null,
+                    machineId: reachableMachineTarget?.machineId ?? currentSession.metadata?.machineId ?? null,
+                    forkPoint: { type: 'latest' },
+                    settings: storage.getState().settings,
+                    replayEnabled: forkActionContext?.replayEnabled === true,
+                    executionRunsEnabled: forkActionContext?.executionRunsEnabled === true,
+                    agentSwitchingEnabled,
+                    navigateToSession: (childSessionId, options) => {
+                        void navigateToSession(childSessionId, {
+                            serverId: options?.serverId ?? serverId ?? null,
+                        });
+                    },
+                    navigateToNewSession: (route) => {
+                        router.push(route as any);
+                    },
+                });
+            })(), { tag: 'SessionItem.openSessionForkStrategyFlow' });
         }, [
             agentSwitchingEnabled,
             forkActionContext,
@@ -875,9 +894,6 @@ const SessionItemContent = React.memo(
                     icon: <Icon name="trash" size={16} color={rowActionIconColor} />,
                 });
             }
-            if (devModeEnabled) {
-                items.push(createCopySessionDebugInformationMenuItem({ iconColor: rowActionIconColor }));
-            }
             if (showForkAction) {
                 items.push({
                     id: 'session.fork',
@@ -887,8 +903,8 @@ const SessionItemContent = React.memo(
                 });
             }
             return items;
-        }, [devModeEnabled, draft, onDeleteDraft, rowActionIconColor, showForkAction]);
-        const handleSelectLeadingMenuItem = React.useCallback(async (itemId: string) => {
+        }, [draft, onDeleteDraft, rowActionIconColor, showForkAction]);
+        const handleSelectCustomMenuItem = React.useCallback(async (itemId: string) => {
             if (itemId === SESSION_DELETE_DRAFT_MENU_ITEM_ID) {
                 await confirmDeleteDraft();
                 return;
@@ -897,8 +913,8 @@ const SessionItemContent = React.memo(
                 openForkFlow();
                 return;
             }
-            if (itemId !== SESSION_COPY_DEBUG_INFORMATION_MENU_ITEM_ID) return;
-            const copied = await copySessionDebugInformationToClipboard(resolveSessionDebugInformation());
+            if (!isSessionCopyActionId(itemId)) return;
+            const copied = await copySessionDebugInformationToClipboard(resolveSessionDebugInformation(), itemId);
             if (copied) {
                 copyFeedback.markCopied(resolvedSession.id);
             }
@@ -927,6 +943,10 @@ const SessionItemContent = React.memo(
         const [uncontrolledContextMenuOpen, setUncontrolledContextMenuOpen] = React.useState(false);
         const contextMenuOpen = nativeContextMenuOpen ?? uncontrolledContextMenuOpen;
         const setContextMenuOpen = onNativeContextMenuOpenChange ?? setUncontrolledContextMenuOpen;
+        const trailingMenuItems = React.useMemo(() => (contextMenuOpen || moreMenuOpen) ? [createSessionCopyMenuItem({
+            iconColor: rowActionIconColor,
+            information: resolveSessionDebugInformation(),
+        })] : [], [contextMenuOpen, moreMenuOpen, resolveSessionDebugInformation, rowActionIconColor]);
         const suppressNextPressRef = React.useRef(false);
         const contextMenuWasOpenRef = React.useRef(false);
         const clearSuppressionTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -976,8 +996,11 @@ const SessionItemContent = React.memo(
             isBeingDraggedRef.current = isBeingDragged === true;
         }, [isBeingDragged]);
         const handleRowPointerEnter = React.useCallback(() => {
+            if (showForkAction) {
+                preloadSessionForkStrategyFlowModule();
+            }
             setIsRowHovered(true);
-        }, []);
+        }, [showForkAction]);
 
         const handleRowPointerLeave = React.useCallback(() => {
             setIsRowHovered(false);
@@ -1069,6 +1092,20 @@ const SessionItemContent = React.memo(
             stopRowPressPropagation,
         ]);
 
+        const appearanceMenu = useSessionRowAppearanceMenu({
+            enabled: moreMenuOpen || contextMenuOpen,
+            serverId: serverId ?? null,
+            sessionId: resolvedSession.id,
+            theme,
+            effectiveColor: appearanceColor,
+            onSetSessionAppearance,
+        });
+        const appearanceStripeColor = resolveSessionAppearanceColor(appearanceColor, theme);
+        const closeRowMenus = React.useCallback(() => {
+            setMoreMenuOpen(false);
+            setContextMenuOpen(false);
+        }, [setContextMenuOpen]);
+
         const {
             tagMenuItems,
             handleTagMenuSelect,
@@ -1088,11 +1125,10 @@ const SessionItemContent = React.memo(
             tagsEnabled: tagsEnabled === true,
             onSetTags,
             onTogglePinned,
-            folderMoveMenuItems,
             onMoveToFolder,
-            onSelectFolderMoveMenuItem,
             leadingMenuItems,
-            onSelectLeadingMenuItem: handleSelectLeadingMenuItem,
+            trailingMenuItems,
+            onSelectCustomMenuItem: handleSelectCustomMenuItem,
             selectionModeAvailable: Boolean(resolvedSelectionKey),
             selectionModeActive: rowSelection.isSelectionMode,
             onEnterSelectionMode: handleEnterSelectionMode,
@@ -1102,7 +1138,10 @@ const SessionItemContent = React.memo(
                 setTagMenuEverOpened(true);
                 setTagMenuOpen(true);
             },
-            deferredContextActionDelayMs: CONTEXT_MENU_DEFERRED_ACTION_DELAY_MS,
+            reminder,
+            archiving: sessionStatus.state === 'archiving',
+            appearance: appearanceMenu,
+            closeMenus: closeRowMenus,
         });
 
         const handleSwipeAction = React.useCallback(async () => {
@@ -1140,9 +1179,6 @@ const SessionItemContent = React.memo(
             }
         }, [confirmDeleteDraft, onMoveDown, onMoveToFolder, onMoveToWorkspaceRoot, onMoveUp]);
 
-        const avatarId = React.useMemo(() => {
-            return getSessionAvatarId(resolvedSession);
-        }, [resolvedSession]);
         const pendingBadge = formatPendingCountBadge(pendingCount);
         const tagChipDensity: 'default' | 'compact' | 'minimal' = isMinimal ? 'minimal' : compact ? 'compact' : 'default';
         const sourceTagChips = React.useMemo(() => {
@@ -1158,9 +1194,11 @@ const SessionItemContent = React.memo(
         const rowStatusColor = rowPresentation.backgroundActivityStatusLine === true
             ? theme.colors.text.secondary
             : resolveSessionRowAttentionStateColor(rowAttentionState, theme);
-        const rowAttentionAccessibilityLabel =
+        const primaryAttentionAccessibilityLabel =
             rowAttentionState === 'failed'
                 ? t('status.error')
+                : rowPresentation.attentionIndicator === 'unread'
+                ? t('settingsNotifications.badges.unreadTitle')
                 : rowPresentation.attentionIndicator === 'working'
                 || rowPresentation.attentionIndicator === 'permission'
                 || rowPresentation.attentionIndicator === 'action'
@@ -1168,6 +1206,11 @@ const SessionItemContent = React.memo(
                 : rowPresentation.statusTextKey
                     ? statusLineText
                     : undefined;
+        const announcesUnreadAndWork = (rowPresentation.attentionIndicator === 'working' && hasUnreadMessages)
+            || (rowPresentation.attentionIndicator === 'unread' && sessionStatus.state === 'background_active');
+        const rowAttentionAccessibilityLabel = announcesUnreadAndWork
+            ? `${statusLineText}, ${t('settingsNotifications.badges.unreadTitle')}`
+            : primaryAttentionAccessibilityLabel;
         const shouldShowStatusSecondaryLine = rowPresentation.secondaryLine === 'status' && statusLineText.trim().length > 0;
         const shouldShowPathSecondaryLine = rowPresentation.secondaryLine === 'path' && Boolean(sessionSubtitle);
         const shouldUsePathSubtitleStartEllipsis = shouldShowPathSecondaryLine && effectiveSubtitleEllipsizeMode === 'head';
@@ -1208,7 +1251,7 @@ const SessionItemContent = React.memo(
         const showInlineTagChips = showTagChips && tagDisplayPlan.placement === 'inline';
         const showBelowTagChips = showTagChips && tagDisplayPlan.placement === 'below';
         const enableLongPressContextMenu =
-            Platform.OS === 'ios'
+            isNativeMobile
             && nativeInlineDragEnabled !== true
             && contextMenuItems.length > 0;
         const openContextMenuFromLongPress = React.useCallback(() => {
@@ -1225,7 +1268,6 @@ const SessionItemContent = React.memo(
         });
         const avatarSize = identityMetrics.slotSize;
         const agentLogoSize = identityMetrics.agentLogoSize;
-        const agentLogoId = resolveAgentIdFromFlavor(resolvedSession.metadata?.flavor) ?? DEFAULT_AGENT_ID;
         const normalizedFolderDepth = typeof folderDepth === 'number' && Number.isFinite(folderDepth)
             ? Math.max(0, Math.min(SESSION_FOLDER_ROW_INDENT_CAP, Math.trunc(folderDepth)))
             : 0;
@@ -1318,6 +1360,19 @@ const SessionItemContent = React.memo(
                 onPressOut={enableLongPressContextMenu ? clearContextMenuPressInTimer : undefined}
                 onLongPress={enableLongPressContextMenu ? openContextMenuFromLongPress : undefined}
             >
+                {appearanceStripeColor ? (
+                    <View
+                        testID={`session-item-appearance-stripe:${resolvedSession.id}`}
+                        pointerEvents="none"
+                        accessible={false}
+                        importantForAccessibility="no-hide-descendants"
+                        style={[
+                            styles.appearanceStripe,
+                            isMinimal ? styles.appearanceStripeMinimal : null,
+                            { backgroundColor: appearanceStripeColor },
+                        ]}
+                    />
+                ) : null}
                 {shouldRenderSessionListIdentity || shouldRenderSelectionCheckbox ? (
                     <View
                         style={[
@@ -1353,21 +1408,14 @@ const SessionItemContent = React.memo(
                                     { opacity: identitySkeletonOpacity },
                                 ]}
                             />
-                        ) : shouldRenderSessionListAvatar ? (
-                            <Avatar
-                                id={avatarId}
-                                size={avatarSize}
-                                monochrome={shouldRenderAvatarMonochrome}
-                                flavor={resolvedSession.metadata?.flavor}
-                                hasUnreadMessages={false}
-                            />
                         ) : (
-                            <AgentIcon
-                                agentId={agentLogoId}
-                                size={agentLogoSize}
+                            <SessionListIdentity
+                                session={resolvedSession}
+                                display={resolvedSessionListIdentityDisplay}
+                                avatarSize={avatarSize}
+                                agentLogoSize={agentLogoSize}
+                                monochrome={shouldRenderAvatarMonochrome}
                                 color={sessionTitleColor}
-                                style={{ transform: [{ scale: getAgentPickerIconScale(agentLogoId) }] }}
-                                testID={`session-list-agent-logo-${resolvedSession.id}`}
                             />
                         )}
                         {!isMinimal && shouldRenderSessionListAvatar && pendingBadge ? (
@@ -1437,6 +1485,24 @@ const SessionItemContent = React.memo(
                                 ) : null}
                             </View>
                         ) : null}
+                        {reminder ? (
+                            <View
+                                testID={`session-list-reminder-indicator:${resolvedSession.id}`}
+                                accessible={true}
+                                accessibilityRole="text"
+                                accessibilityLabel={`${t(reminder.state === 'due' ? 'sessionsList.reminders.due' : 'sessionsList.reminders.title')}, ${formatSessionAttentionReminderDateTime(reminder.remindAt, Date.now())}`}
+                                style={[
+                                    styles.reminderIndicator,
+                                    compact ? styles.reminderIndicatorCompact : null,
+                                ]}
+                            >
+                                <Icon
+                                    name="clock"
+                                    size={compact ? 11 : 12}
+                                    color={reminder.state === 'due' ? theme.colors.accent.orange : theme.colors.text.secondary}
+                                />
+                            </View>
+                        ) : null}
                     </View>
 
                     {draft && !compact && draft.preview ? (
@@ -1461,18 +1527,14 @@ const SessionItemContent = React.memo(
                                 testID={`session-list-status-subtitle-${resolvedSession.id}-${rowAttentionState}`}
                                 style={styles.secondaryLineRow}
                             >
-                                <View
-                                    style={[
-                                        styles.secondaryStatusDotContainer,
-                                        compact ? styles.secondaryStatusDotContainerCompact : null,
-                                    ]}
-                                >
+                                <View style={styles.secondaryStatusDotContainer}>
                                     {rowPresentation.attentionIndicator !== 'none' ? (
                                         <SessionRowAttentionIndicator
                                             indicator={rowPresentation.attentionIndicator}
                                             sessionId={`${resolvedSession.id}-secondary`}
                                             attentionState={rowAttentionState}
                                             accessibilityLabel={rowAttentionAccessibilityLabel}
+                                            hasUnreadMessages={hasUnreadMessages}
                                             workingMode={workingIndicatorMode}
                                             animationEnabled={attentionIndicatorAnimationEnabled}
                                         />
@@ -1675,6 +1737,7 @@ const SessionItemContent = React.memo(
                                     sessionId={`${resolvedSession.id}-trailing`}
                                     attentionState={rowAttentionState}
                                     accessibilityLabel={rowAttentionAccessibilityLabel}
+                                    hasUnreadMessages={hasUnreadMessages}
                                     workingMode={workingIndicatorMode}
                                     workingSpinnerTone="neutral"
                                     animationEnabled={attentionIndicatorAnimationEnabled}
@@ -1844,7 +1907,10 @@ function SessionItemFromRowModel(props: SessionItemProps & { rowModel: SessionLi
             sessionNameResolved={rowModel.title}
             sessionSubtitle={itemProps.subtitleOverride ?? rowModel.subtitle}
             pendingCount={rowModel.pendingCount}
+            hasUnreadMessages={rowModel.hasUnreadMessages}
             draft={rowModel.draft}
+            reminder={rowModel.reminder}
+            appearanceColor={rowModel.appearanceColor}
             agentActivityLabel={rowModel.agentActivityLabel}
             isSessionIdentityLoading={rowModel.isIdentityLoading}
             activityTimeLabel={rowModel.activity.label}
@@ -1853,7 +1919,7 @@ function SessionItemFromRowModel(props: SessionItemProps & { rowModel: SessionLi
             workingIndicatorMode={rowModel.workingIndicatorMode}
             workingIndicatorPaused={rowModel.workingIndicatorPaused}
             rowAttentionAnimationEnabled={itemProps.rowAttentionAnimationEnabled !== false}
-            sessionListIdentityDisplay={normalizeSessionItemIdentityDisplay(rowModel.identityDisplay)}
+            sessionListIdentityDisplay={normalizeSessionListIdentityDisplay(rowModel.identityDisplay)}
             sessionListActiveColorMode={normalizeSessionItemActiveColorMode(rowModel.activeColorMode)}
             hideInactiveSessions={itemProps.hideInactiveSessions ?? rowModel.hideInactiveSessions}
         />

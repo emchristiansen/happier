@@ -26,6 +26,7 @@ import {
     buildBackendTargetKey,
     ConnectedServicesProviderStateSharingSettingsV1Schema,
     type ConnectedServicesDefaultAuthByAgentIdV1,
+    buildConnectedServicesDefaultAuthSettingsPatch,
     type ConnectedServicesProviderStateSharingSettingsV1,
 } from '@happier-dev/protocol';
 import { getAgentSessionModeDescriptor, getAgentStaticModels, getProviderCliRuntimeSpec, isAgentAuthProbeSafeForBackgroundChecks } from '@happier-dev/agents';
@@ -171,9 +172,7 @@ const ProviderSettingsScreenInner = React.memo(function ProviderSettingsScreenIn
         });
     };
     const setDefaultAuthSettings = React.useCallback((next: ConnectedServicesDefaultAuthByAgentIdV1) => {
-        applySettings({
-            connectedServicesDefaultAuthByAgentIdV1: next,
-        } as Partial<typeof settings>);
+        applySettings(buildConnectedServicesDefaultAuthSettingsPatch(next));
     }, [applySettings]);
     const dismissPoolAdoptionSuggestion = React.useCallback((key: string) => {
         applySettings({
@@ -536,6 +535,7 @@ const ProviderSettingsScreenInner = React.memo(function ProviderSettingsScreenIn
                                 connectedServicesProfileLabelByKey: settings.connectedServicesProfileLabelByKey ?? {},
                                 connectedServicesDefaultProfileByServiceId: settings.connectedServicesDefaultProfileByServiceId ?? {},
                                 connectedServicesDefaultAuthByAgentIdV1: settings.connectedServicesDefaultAuthByAgentIdV1,
+                                connectedServicesAdditionalDefaultAuthByAgentIdV1: settings.connectedServicesAdditionalDefaultAuthByAgentIdV1,
                             }}
                             setDefaultAuthSettings={setDefaultAuthSettings}
                             onOpenConnectedServiceSettings={(serviceId) => router.push({

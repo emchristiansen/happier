@@ -6,8 +6,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const SELF_HOST_INSTALL_TIMEOUT_MS = 420_000;
-const SELF_HOST_ARTIFACT_BUILD_TIMEOUT_MS = 12 * 60_000;
-const SELF_HOST_TEST_TIMEOUT_MS = 30 * 60_000;
+const SELF_HOST_TEST_TIMEOUT_MS = 15 * 60_000;
 
 import { commandExists, extractBinaryFromArtifact, reserveLocalhostPort, run, waitForHealth } from './self_host_service_e2e_harness.mjs';
 
@@ -27,6 +26,7 @@ test(
   'compiled hstack self-host install/uninstall works on macOS launchd host without repo checkout',
   { timeout: SELF_HOST_TEST_TIMEOUT_MS },
   async (t) => {
+    const deadlineAtMs = Date.now() + SELF_HOST_TEST_TIMEOUT_MS;
     if (process.platform !== 'darwin') {
       t.skip(`macos-only test (current: ${process.platform})`);
       return;
@@ -60,7 +60,7 @@ test(
         label: 'self-host-launchd',
         cwd: repoRoot,
         env: { ...process.env },
-        timeoutMs: SELF_HOST_ARTIFACT_BUILD_TIMEOUT_MS,
+        deadlineAtMs,
       }
     );
     run(
@@ -75,7 +75,7 @@ test(
         label: 'self-host-launchd',
         cwd: repoRoot,
         env: { ...process.env },
-        timeoutMs: SELF_HOST_ARTIFACT_BUILD_TIMEOUT_MS,
+        deadlineAtMs,
       }
     );
 

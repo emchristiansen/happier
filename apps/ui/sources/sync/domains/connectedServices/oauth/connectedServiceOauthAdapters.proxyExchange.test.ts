@@ -1,32 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { decodeBase64, encodeBase64, sealBoxBundle } from '@happier-dev/protocol';
-
-vi.mock('@/utils/timing/time', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/utils/timing/time')>();
-  const immediate = async <T,>(callback: () => Promise<T>): Promise<T> => await callback();
-  return {
-    ...actual,
-    backoff: immediate,
-    backoffForever: immediate,
-  };
-});
+import { ConnectedServiceIdSchema, decodeBase64, encodeBase64, sealBoxBundle } from '@happier-dev/protocol';
+import { createRootLayoutFeaturesResponse } from '@/dev/testkit/fixtures/featureFixtures';
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.resetModules();
 });
-
-function mockServerConfig() {
-  vi.doMock('@/sync/domains/server/serverRuntime', () => ({
-    getActiveServerSnapshot: () => ({
-      serverId: 'test',
-      serverUrl: 'https://api.example.test',
-      kind: 'custom',
-      generation: 1,
-    }),
-  }));
-}
 
 const credentials = { token: 't', secret: 's' };
 
@@ -42,11 +22,58 @@ function buildBundle(params: Readonly<{ publicKeyB64Url: string; payload: unknow
 }
 
 describe('ConnectedServiceOauthAdapters (proxy exchange)', () => {
+  it('uses Antigravity OAuth without borrowing the Gemini client or account identity', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input)).pathname;
+      if (url === '/v1/features') return new Response(JSON.stringify(createRootLayoutFeaturesResponse({ capabilities: { connectedServices: { credentialDelete: { revisionGuard: false }, credentialWrite: { revisionGuard: false }, supportedServiceIds: [...ConnectedServiceIdSchema.options] } } })), { status: 200, headers: { 'content-type': 'application/json' } });
+      if (url.endsWith('/health') || url.endsWith('/v1/auth/ping')) return new Response('', { status: 200 });
+      if (url.endsWith('/v2/connect/antigravity/oauth/exchange') && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body));
+        return new Response(JSON.stringify({ bundle: buildBundle({
+          publicKeyB64Url: body.publicKey,
+          payload: {
+            serviceId: 'antigravity', accessToken: 'agy-access', refreshToken: 'agy-refresh',
+            idToken: null, scope: 'email', tokenType: 'Bearer', providerEmail: 'selected@example.test',
+            providerAccountId: 'selected-google-id', expiresAt: 1234, raw: null,
+          },
+        }) }), { status: 200 });
+      }
+      return new Response('', { status: 500 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { getServerFeaturesSnapshot, resetServerFeaturesClientForTests } = await import('@/sync/api/capabilities/serverFeaturesClient');
+    resetServerFeaturesClientForTests();
+    const supported = await getServerFeaturesSnapshot({ force: true });
+    expect(supported.status).toBe('ready');
+    const { getConnectedServiceOauthAdapter } = await import('./connectedServiceOauthAdapters');
+    const adapter = getConnectedServiceOauthAdapter('antigravity');
+    expect(adapter).not.toBeNull();
+    const gemini = getConnectedServiceOauthAdapter('gemini')!;
+    const authorization = new URL(adapter!.buildAuthorizationUrl({
+      redirectUri: adapter!.defaultRedirectUri, state: 'attempt', challenge: 'proof',
+    }));
+    expect(adapter!.defaultRedirectUri).toBe('https://antigravity.google/oauth-callback');
+    expect(authorization.searchParams.get('client_id')).not.toBe(new URL(gemini.buildAuthorizationUrl({
+      redirectUri: gemini.defaultRedirectUri, state: 'attempt', challenge: 'proof',
+    })).searchParams.get('client_id'));
+    expect(authorization.searchParams.get('scope')?.split(' ')).toContain('https://www.googleapis.com/auth/aicode');
+    expect(authorization.searchParams.get('state')).toBe('attempt');
+    expect(authorization.searchParams.get('code_challenge')).toBe('proof');
+    const record = await adapter!.exchangeAuthorizationCodeForRecord({
+      credentials, profileId: 'personal', code: 'code', verifier: 'verifier',
+      redirectUri: adapter!.defaultRedirectUri, state: 'attempt', now: 1,
+    });
+    expect(record).toMatchObject({
+      serviceId: 'antigravity', profileId: 'personal', kind: 'oauth',
+      oauth: { accessToken: 'agy-access', refreshToken: 'agy-refresh',
+        providerEmail: 'selected@example.test', providerAccountId: 'selected-google-id' },
+    });
+  });
   it('exchanges openai-codex codes via proxy and returns an oauth record', async () => {
-    mockServerConfig();
 
     const fetchMock = vi.fn(async (input: any, init?: any) => {
-      const url = String(input);
+      const url = new URL(String(input)).pathname;
+      if (url === '/v1/features') return new Response(JSON.stringify(createRootLayoutFeaturesResponse({ capabilities: { connectedServices: { credentialDelete: { revisionGuard: false }, credentialWrite: { revisionGuard: false }, supportedServiceIds: [...ConnectedServiceIdSchema.options] } } })), { status: 200, headers: { 'content-type': 'application/json' } });
       const method = String(init?.method ?? 'GET').toUpperCase();
       if (url.endsWith('/health') && method === 'GET') {
         return new Response('', { status: 200 });
@@ -77,6 +104,10 @@ describe('ConnectedServiceOauthAdapters (proxy exchange)', () => {
     });
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 
+    const { getServerFeaturesSnapshot, resetServerFeaturesClientForTests } = await import('@/sync/api/capabilities/serverFeaturesClient');
+    resetServerFeaturesClientForTests();
+    const supported = await getServerFeaturesSnapshot({ force: true });
+    expect(supported.status).toBe('ready');
     const { getConnectedServiceOauthAdapter } = await import('./connectedServiceOauthAdapters');
     const adapter = getConnectedServiceOauthAdapter('openai-codex');
     expect(adapter).not.toBeNull();
@@ -104,10 +135,10 @@ describe('ConnectedServiceOauthAdapters (proxy exchange)', () => {
   });
 
   it('exchanges gemini codes via proxy and returns an oauth record', async () => {
-    mockServerConfig();
 
     const fetchMock = vi.fn(async (input: any, init?: any) => {
-      const url = String(input);
+      const url = new URL(String(input)).pathname;
+      if (url === '/v1/features') return new Response(JSON.stringify(createRootLayoutFeaturesResponse({ capabilities: { connectedServices: { credentialDelete: { revisionGuard: false }, credentialWrite: { revisionGuard: false }, supportedServiceIds: [...ConnectedServiceIdSchema.options] } } })), { status: 200, headers: { 'content-type': 'application/json' } });
       const method = String(init?.method ?? 'GET').toUpperCase();
       if (url.endsWith('/health') && method === 'GET') {
         return new Response('', { status: 200 });
@@ -138,6 +169,10 @@ describe('ConnectedServiceOauthAdapters (proxy exchange)', () => {
     });
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 
+    const { getServerFeaturesSnapshot, resetServerFeaturesClientForTests } = await import('@/sync/api/capabilities/serverFeaturesClient');
+    resetServerFeaturesClientForTests();
+    const supported = await getServerFeaturesSnapshot({ force: true });
+    expect(supported.status).toBe('ready');
     const { getConnectedServiceOauthAdapter } = await import('./connectedServiceOauthAdapters');
     const adapter = getConnectedServiceOauthAdapter('gemini');
     expect(adapter).not.toBeNull();

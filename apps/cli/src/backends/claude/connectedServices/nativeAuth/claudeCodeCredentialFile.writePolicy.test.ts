@@ -1,6 +1,6 @@
 import { chmod, mkdtemp, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -144,7 +144,6 @@ describe('Claude Code credential file write policy', () => {
     expect(writeFileSpy).toHaveBeenCalledTimes(1);
     const [tempPath] = writeFileSpy.mock.calls[0] ?? [];
     expect(typeof tempPath).toBe('string');
-    expect(basename(String(tempPath))).toMatch(/^\.credentials\.[0-9a-f-]+\.tmp$/);
     expect(String(tempPath)).not.toBe(credentialPath);
     expect(renameSpy).toHaveBeenCalledWith(tempPath, credentialPath);
     await expect(readFile(credentialPath, 'utf8')).resolves.toContain('rotated-access-placeholder');

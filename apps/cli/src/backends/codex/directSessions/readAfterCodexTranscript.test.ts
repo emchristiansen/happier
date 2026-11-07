@@ -192,6 +192,52 @@ describe('readAfterCodexTranscript', () => {
     expect(secondPoll.nextCursor).toBe(firstPoll.nextCursor);
   });
 
+  it('reports a raw JSONL page bound when non-renderable rows precede a visible item', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-tail-raw-page-limit-'));
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+
+    const sessionId = 'raw-page-limit-session';
+    const filePath = join(sessionsDir, `rollout-2026-01-02T00-00-00-${sessionId}.jsonl`);
+    const params = {
+      source: { kind: 'codexHome' as const, home: 'user' as const },
+      env: { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      activeServerDir: join(root, 'servers', 'cloud'),
+      remoteSessionId: sessionId,
+      maxBytes: 1024 * 1024,
+      maxItems: 1,
+    };
+    await writeFile(
+      filePath,
+      sessionMetaLine({ id: sessionId, timestamp: '2026-01-02T00:00:00.000Z', cwd: '/repo/raw-page-limit' }),
+      'utf8',
+    );
+    const tail = await readAfterCodexTranscript({ ...params, cursor: 'tail' });
+
+    await appendFile(
+      filePath,
+      sessionMetaLine({ id: sessionId, timestamp: '2026-01-02T00:00:01.000Z', cwd: '/repo/raw-page-limit' })
+        + sessionMetaLine({ id: sessionId, timestamp: '2026-01-02T00:00:02.000Z', cwd: '/repo/raw-page-limit' })
+        + sessionMetaLine({ id: sessionId, timestamp: '2026-01-02T00:00:03.000Z', cwd: '/repo/raw-page-limit' })
+        + responseItemLine({
+          timestamp: '2026-01-02T00:00:04.000Z',
+          payload: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'visible after bounded metadata' }] },
+        }),
+      'utf8',
+    );
+
+    const bounded = await readAfterCodexTranscript({ ...params, cursor: tail.nextCursor! });
+    expect(bounded.items).toEqual([]);
+    expect(bounded).toMatchObject({ truncated: true, truncationReason: 'page_limit' });
+    expect(bounded.nextCursor).toBeTruthy();
+
+    const resumed = await readAfterCodexTranscript({ ...params, cursor: bounded.nextCursor! });
+    expect(resumed.items).toHaveLength(1);
+    expect(JSON.stringify(resumed.items[0] ?? null)).toContain('visible after bounded metadata');
+    expect(resumed.truncated).toBe(false);
+  });
+
   it('continues from the last delivered unread line when maxItems truncates a readAfter batch', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-tail-batch-progress-'));
     const codexHome = join(root, 'codex-home');
@@ -246,6 +292,7 @@ describe('readAfterCodexTranscript', () => {
     expect(firstBatch.items).toHaveLength(1);
     expect(JSON.stringify(firstBatch.items[0] ?? null)).toContain('first unread item');
     expect(firstBatch.truncated).toBe(true);
+    expect(firstBatch).toMatchObject({ truncationReason: 'page_limit' });
     expect(firstBatch.nextCursor).toBeTruthy();
 
     const secondBatch = await readAfterCodexTranscript({
@@ -364,16 +411,19 @@ describe('readAfterCodexTranscript', () => {
     expect(secondBatch.nextCursor).toBeTruthy();
   });
 
-  it('keeps polling app-server-linked sessions when rollout files are missing, then forces a refresh when one appears', async () => {
+  it('keeps native follow on its selected source when a legacy rollout appears', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-tail-app-server-'));
     const codexHome = join(root, 'codex-home');
     const sessionsDir = join(codexHome, 'sessions');
     await mkdir(codexHome, { recursive: true });
 
     const sessionId = 'remote_app_server';
+    const nativeItemsPath = join(root, 'native-items.json');
+    await writeFile(nativeItemsPath, '[]');
     const fakeAppServer = await writeFakeCodexAppServerThreadListScript({
       dir: root,
       initializeName: 'fake',
+      nativeItemsPath,
       nonArchivedThreads: [{
         id: sessionId,
         name: 'App server tail preview',
@@ -434,7 +484,7 @@ describe('readAfterCodexTranscript', () => {
     });
 
     expect(afterRolloutAppears.items).toHaveLength(0);
-    expect(afterRolloutAppears.truncated).toBe(true);
+    expect(afterRolloutAppears.truncated).toBe(false);
     expect(afterRolloutAppears.nextCursor).toBeTruthy();
   });
 

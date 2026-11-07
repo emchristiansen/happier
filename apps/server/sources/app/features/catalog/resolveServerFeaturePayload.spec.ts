@@ -4,6 +4,7 @@ import { resolveMachineTransferFeature } from "../machineTransferFeature";
 import { resolveChannelBridgesFeature } from "../channelBridgesFeature";
 import { resolveSessionHandoffFeature } from "../sessionHandoffFeature";
 import { resolveTerminalFeature } from "../terminalFeature";
+import { resolveConnectedServicesFeature } from "../connectedServicesFeature";
 import { resolveServerFeaturePayload } from "./resolveServerFeaturePayload";
 import { resolveServerFeatureBuildPolicy } from "./serverFeatureBuildPolicy";
 import { serverFeatureRegistry, type ServerFeatureResolver } from "./serverFeatureRegistry";
@@ -15,6 +16,17 @@ function fromPartial(partial: FeaturesPayloadDelta): ServerFeatureResolver {
 }
 
 describe("resolveServerFeaturePayload", () => {
+    it("advertises recovery details only when quota dependencies and build policy allow them", () => {
+        const featureId = "quotaRecoveryCreditDetails";
+        expect(resolveServerFeaturePayload({}, [resolveConnectedServicesFeature]).features.connectedServices[featureId].enabled).toBe(true);
+        for (const env of [
+            { HAPPIER_FEATURE_CONNECTED_SERVICES_QUOTAS__ENABLED: "false" },
+            { HAPPIER_FEATURE_CONNECTED_SERVICES__ENABLED: "false" },
+            { HAPPIER_BUILD_FEATURES_DENY: "connectedServices.quotaRecoveryCreditDetails" },
+        ]) {
+            expect(resolveServerFeaturePayload(env, [resolveConnectedServicesFeature]).features.connectedServices[featureId].enabled).toBe(false);
+        }
+    });
     it("throws when resolvers list is empty", () => {
         expect(() => resolveServerFeaturePayload({} as NodeJS.ProcessEnv, [])).toThrow(/resolvers/i);
     });

@@ -14,6 +14,8 @@ import {
 } from '@/daemon/startupWaitDefaults';
 import { waitForDaemonRunningWithinBudget } from '@/daemon/waitForDaemonRunningWithinBudget';
 import { readPositiveIntEnv } from '@/utils/readPositiveIntEnv';
+import { isPidAliveBySignal } from './processRunState';
+import { logger } from '@/ui/logger';
 
 const DEFAULT_DAEMON_RESTART_STABILITY_TIMEOUT_MS = 2_000;
 
@@ -81,16 +83,6 @@ function restartFailed(): RestartDaemonAndWaitResult {
   return { ok: false };
 }
 
-function isPidAlive(pid: number | null | undefined): boolean {
-  if (!pid || !Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function isStartingInspectionForNewDaemon(
   inspection: DaemonRunningInspection,
   previousIdentityFingerprint: DaemonIdentityFingerprint | null,
@@ -131,8 +123,8 @@ export async function restartDaemonAndWait(params: RestartDaemonAndWaitParams = 
 
   try {
     await stopDaemon({ stopSessions: params.stopSessions });
-  } catch {
-    // best-effort; restart should still attempt to start even if the daemon wasn't running
+  } catch (error) {
+    logger.infoFile('[DAEMON RESTART] Stop was incomplete; attempting replacement and requiring a distinct running identity', error);
   }
 
   const child = await spawnDetachedDaemonStartSync({
@@ -171,7 +163,7 @@ export async function restartDaemonAndWait(params: RestartDaemonAndWaitParams = 
     const postTimeoutInspection = await inspectDaemonRunningStateAndCleanupStaleState().catch(() => null);
     if (
       (postTimeoutInspection && isStartingInspectionForNewDaemon(postTimeoutInspection, previousIdentityFingerprint))
-      || isPidAlive(child.pid)
+      || (child.pid !== undefined && isPidAliveBySignal(child.pid))
     ) {
       return {
         ok: true,

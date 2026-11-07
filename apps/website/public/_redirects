@@ -54,13 +54,20 @@
 /docs/*      https://docs.happier.dev/:splat                                301
 /guides      https://guides.happier.dev/                                    301
 /guides/*    https://guides.happier.dev/:splat                              301
-/app         https://app.happier.dev/                                       301
+/app         https://cloud.happier.dev/                                       301
 /github      https://github.com/happier-dev/happier                         301
 /discord     https://discord.gg/W6Pb8KuHfg                                  301
 /releases    https://github.com/happier-dev/happier/releases                301
 /license     https://github.com/happier-dev/happier/blob/main/LICENCE       301
-/security    https://github.com/happier-dev/happier/security/policy         301
+# /security is a prerendered page (src/routes.tsx) — do not redirect it away.
+# The GitHub security policy is linked from that page instead.
 /self-host   https://docs.happier.dev/deployment/self-host-runtime          301
+# The QR codes printed on the DMG and on marketing assets point here — deleting
+# either line breaks codes that are already in the world. Targets must match
+# appStoreUrl / androidPlayUrl in src/data/downloads.json.
+/appstore    https://apps.apple.com/app/happier-claude-codex-opencode/id6758554297  301
+/playstore   https://play.google.com/store/apps/details?id=dev.happier.app          301
+/apk         https://github.com/happier-dev/happier/releases/download/ui-mobile-stable/happier-android.apk  301
 
 # ---------------------------------------------------------------------------
 # Aliases for real pages. These are shapes people (and competitors' sitemaps)

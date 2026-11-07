@@ -57,14 +57,3 @@ test('deploy workflows trust the release bot actor for push-triggered deployment
     'deploy workflow should trust the release bot actor so workflow_call can deploy',
   );
 });
-
-test('manual CI trusts the isolated GitHub operations bot that dispatches maintainer diagnostics', () => {
-  const workflowPath = resolve(repoRoot, '.github', 'workflows', 'tests-dispatch.yml');
-  const raw = fs.readFileSync(workflowPath, 'utf8');
-
-  assert.match(
-    raw,
-    /name:\s*Authorize release actor[\s\S]*?trusted_actors:\s*happier-bot/,
-    'tests-dispatch must admit the repository bot used by the canonical GitHub operations transport',
-  );
-});

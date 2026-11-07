@@ -1,9 +1,40 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActionsSettingsV1Schema } from '@happier-dev/protocol';
 
 import { registerHappierMcpBuiltInTools } from './registerHappierMcpBuiltInTools';
 
 describe('registerHappierMcpBuiltInTools', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('projects canonical read annotations only onto concrete action tools', () => {
+    const registrations = new Map<string, Record<string, unknown>>();
+
+    registerHappierMcpBuiltInTools({
+      registerTool: (name, meta) => registrations.set(name, meta as Record<string, unknown>),
+    }, {
+      sessionId: 'sess-current',
+      surface: 'session_agent',
+      actionsSettings: ActionsSettingsV1Schema.parse({ v: 1, actions: {} }),
+      deps: {
+        changeTitle: async () => ({ success: true }),
+        startExecutionRun: async () => ({ ok: false as const, errorCode: 'unsupported', error: 'unsupported' }),
+        executeActionByToolName: async () => ({ ok: true as const, result: {} }),
+      },
+    });
+
+    expect(registrations.get('execution_run_wait')?.annotations).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+    });
+    expect(registrations.get('execution_run_get')?.annotations).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+    });
+    expect(registrations.get('action_execute')).not.toHaveProperty('annotations');
+  });
+
   it('projects declared contextual fields as optional only when trusted context is available', () => {
     const registrations = new Map<string, { inputSchema?: { safeParse?: (value: unknown) => { success: boolean } } }>();
 
@@ -36,6 +67,13 @@ describe('registerHappierMcpBuiltInTools', () => {
     }).success).toBe(true);
     expect(memoryWindowSchema?.safeParse?.({ seqFrom: 1, seqTo: 2 }).success).toBe(false);
     expect(memoryWindowSchema?.safeParse?.({ sessionId: 'historical', seqFrom: 1, seqTo: 2 }).success).toBe(true);
+    expect(registrations.get('session_goal_get')?.inputSchema?.safeParse?.({}).success).toBe(true);
+    expect(registrations.get('session_goal_clear')?.inputSchema?.safeParse?.({}).success).toBe(true);
+    const goalSetSchema = registrations.get('session_goal_set')?.inputSchema;
+    expect(goalSetSchema?.safeParse?.({ objective: 'Replace blocked goal' }).success).toBe(true);
+    expect(goalSetSchema?.safeParse?.({ status: 'paused' }).success).toBe(true);
+    expect(goalSetSchema?.safeParse?.({ tokenBudget: null }).success).toBe(true);
+    expect(goalSetSchema?.safeParse?.({}).success).toBe(false);
   });
 
   it('derives approval origin metadata from MCP tool call context for session-agent tools', async () => {
@@ -83,5 +121,58 @@ describe('registerHappierMcpBuiltInTools', () => {
         },
       },
     );
+  });
+
+  it('keeps an active tool call alive with requested MCP progress notifications', async () => {
+    vi.useFakeTimers();
+    const handlers = new Map<string, (args: unknown, extra?: unknown) => Promise<unknown>>();
+    let completeAction!: (value: { ok: true; result: Record<string, never> }) => void;
+    const executeActionByToolName = vi.fn(() => new Promise<{ ok: true; result: Record<string, never> }>((resolve) => {
+      completeAction = resolve;
+    }));
+
+    registerHappierMcpBuiltInTools({
+      registerTool: (name, _meta, handler) => {
+        handlers.set(name, handler as (args: unknown, extra?: unknown) => Promise<unknown>);
+      },
+    }, {
+      sessionId: 'sess-1',
+      surface: 'session_agent',
+      actionsSettings: ActionsSettingsV1Schema.parse({
+        v: 1,
+        actions: {
+          'session.list': { toolExposureModes: { session_agent: 'direct' } },
+        },
+      }),
+      deps: {
+        changeTitle: async () => ({ success: true }),
+        startExecutionRun: async () => ({ ok: false as const, errorCode: 'unsupported', error: 'unsupported' }),
+        executeActionByToolName,
+      },
+    });
+
+    const handler = handlers.get('session_list');
+    if (!handler) throw new Error('Expected session_list to be registered');
+    const sendNotification = vi.fn(async () => undefined);
+    const call = handler({}, {
+      _meta: { progressToken: 'progress-1' },
+      sendNotification,
+    });
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    const notificationsAfterKeepaliveInterval = [...sendNotification.mock.calls];
+    completeAction({ ok: true, result: {} });
+    await call;
+
+    expect(notificationsAfterKeepaliveInterval).toContainEqual([{
+      method: 'notifications/progress',
+      params: {
+        progressToken: 'progress-1',
+        progress: 1,
+      },
+    }]);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(sendNotification).toHaveBeenCalledTimes(1);
   });
 });

@@ -12,6 +12,7 @@ import { SERVICE_SUPPORT } from './data/usageLimits';
 import { AgentDetail } from './pages/AgentDetail';
 import { AgentsIndex } from './pages/AgentsIndex';
 import { CodexRemotePage } from './pages/CodexRemotePage';
+import { DownloadPage } from './pages/DownloadPage';
 import { EnterprisePage } from './pages/EnterprisePage';
 import { Home } from './pages/Home';
 import { SecurityPage } from './pages/SecurityPage';
@@ -123,7 +124,7 @@ const HOME: Route = {
         'Claude Code, Codex, OpenCode, Cursor and 9 more — in one end-to-end encrypted app, on every device, on your own subscriptions. Open-source and self-hostable.',
     ogImage: '/images/og.png',
     ogImageAlt:
-        'The Happier wordmark over the words: One client for every AI coding agent. Claude Code, Codex, OpenCode, Cursor, Gemini, Copilot and 7 more.',
+        'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
     jsonLd: [
         webPage('/', 'webpage', 'Happier — open-source app for Claude Code, Codex & 11 more', {
             primaryImageOfPage: `${SITE}/images/og.png`,
@@ -141,7 +142,7 @@ const AGENTS_INDEX: Route = {
     ogDescription:
         'Thirteen command-line coding agents, one app on your phone, browser and desktop. Each runs on your own computer, under your own subscription or API key.',
     ogImage: '/images/og.png',
-    ogImageAlt: 'The Happier wordmark over the words: One client for every AI coding agent.',
+    ogImageAlt: 'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
     jsonLd: [
         webPage('/agents', 'webpage', 'Every AI coding agent Happier runs'),
         {
@@ -174,7 +175,7 @@ const AGENT_ROUTES: Route[] = AGENTS.map((agent) => {
         ogTitle: agent.h1,
         ogDescription: agent.standfirst,
         ogImage: '/images/og.png',
-        ogImageAlt: 'The Happier wordmark over the words: One client for every AI coding agent.',
+        ogImageAlt: 'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
         // One WebPage node and nothing else. The capability ItemList that used
         // to be here was generated from the nine-column matrix and went with it.
         //
@@ -226,7 +227,7 @@ const VS_REMOTE_CONTROL: Route = {
     ogDescription:
         'What Anthropic’s own remote does well, the five situations it turns itself off in, and what one client for thirteen agents does instead.',
     ogImage: '/images/og.png',
-    ogImageAlt: 'The Happier wordmark over the words: One client for every AI coding agent.',
+    ogImageAlt: 'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
     jsonLd: [
         webPage('/vs/claude-code-remote-control', 'webpage', 'Claude Code Remote Control vs Happier'),
         {
@@ -284,7 +285,7 @@ const VS_CODEX_REMOTE: Route = {
     ogDescription:
         'What OpenAI’s own remote does well, the five conditions it runs under, and what one client for every coding agent does instead.',
     ogImage: '/images/og.png',
-    ogImageAlt: 'The Happier wordmark over the words: One client for every AI coding agent.',
+    ogImageAlt: 'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
     jsonLd: [
         webPage('/vs/codex-remote', 'webpage', 'Codex Remote compared with Happier'),
         {
@@ -351,7 +352,7 @@ const USAGE_LIMITS: Route = {
     ogDescription:
         'The session holds its place through a usage limit, waits out the reset and picks the work back up — on one account, or across the accounts you pool.',
     ogImage: '/images/og.png',
-    ogImageAlt: 'The Happier wordmark over the words: One client for every AI coding agent.',
+    ogImageAlt: 'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
     jsonLd: [
         webPage('/features/usage-limits', 'webpage', 'Usage limits and account pooling in Happier'),
         {
@@ -384,7 +385,7 @@ const TERMINAL: Route = {
     ogDescription:
         'One session, two front ends: the provider’s own TUI in your shell and Happier on your phone. Same session id, same transcript, same queue on both sides of the switch.',
     ogImage: '/images/og.png',
-    ogImageAlt: 'The Happier wordmark over the words: One client for every AI coding agent.',
+    ogImageAlt: 'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
     jsonLd: [
         webPage('/features/terminal', 'webpage', 'Terminal and TUI control in Happier'),
         {
@@ -421,7 +422,7 @@ const ENTERPRISE: Route = {
     ogDescription:
         'A relay you host, locked to your GitHub org or OIDC groups, with client certificates, offboarding re-checks and a storage policy you choose. MIT-licensed, all of it.',
     ogImage: '/images/og.png',
-    ogImageAlt: 'The Happier wordmark over the words: One client for every AI coding agent.',
+    ogImageAlt: 'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
     jsonLd: [
         webPage('/enterprise', 'webpage', 'Self-hosting Happier for an organisation'),
         {
@@ -473,7 +474,7 @@ const SECURITY: Route = {
     ogDescription:
         'Your session is encrypted under a per-session key on the device that made it, and the relay is handed a sealed copy it has nothing to open. Here is what it can still see — named, not glossed.',
     ogImage: '/images/og.png',
-    ogImageAlt: 'The Happier wordmark over the words: One client for every AI coding agent.',
+    ogImageAlt: 'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
     jsonLd: [
         webPage('/security', 'webpage', 'Encryption and the Happier relay'),
         {
@@ -511,6 +512,32 @@ const SECURITY: Route = {
 };
 
 /**
+ * /download is the URL that gets said out loud and printed on things — the QR
+ * codes on the DMG and marketing assets resolve through /appstore and
+ * /playstore (public/_redirects), and this page is the one address that covers
+ * "…and everything else". It auto-starts the right desktop download when the
+ * platform is certain; src/components/DownloadHub.tsx holds that reasoning.
+ *
+ * It follows the same all-locale contract as every other public route. The
+ * footer switcher assumes those files exist, and the prerender manifest is the
+ * owner that turns the route's locale list into real output files.
+ */
+const DOWNLOAD: Route = {
+    path: '/download',
+    title: 'Download Happier — desktop, mobile and the CLI',
+    description:
+        'Get Happier for macOS on Apple Silicon or Intel, Windows and Linux, the iOS and Android apps, the APK, or the one-line CLI installer — in one place.',
+    ogTitle: 'Download Happier for every device',
+    ogDescription:
+        'The desktop app for macOS, Windows and Linux, the mobile apps for iOS and Android, and the CLI that runs the agents on your own computer. One page, every build.',
+    ogImage: '/images/og.png',
+    ogImageAlt: 'Happier: Start coding anywhere. Continue everywhere. The Happier desktop app with three phones showing the same coding sessions.',
+    i18n: ROUTE_META_I18N['/download'],
+    jsonLd: [webPage('/download', 'webpage', 'Download Happier')],
+    render: () => <DownloadPage />,
+};
+
+/**
  * Every page below ships in every language the site has.
  *
  * Applied here rather than repeated on 21 route objects, and applied as a
@@ -536,6 +563,7 @@ export const ROUTES: ReadonlyArray<Route> = [
     TERMINAL,
     SECURITY,
     ENTERPRISE,
+    DOWNLOAD,
 ].map((route) => ({ locales: LOCALES, ...route }));
 
 export function findRoute(pathname: string): Route | undefined {
@@ -583,6 +611,20 @@ export function localesFor(route: Route): readonly Locale[] {
 }
 
 /**
+ * The site-scoped graph nodes declared once in index.html and shared by every
+ * page in every language. They sit at `${SITE}/#…`, which is also where the
+ * homepage's own `#webpage` lives, so they have to be named to be told apart.
+ */
+export const SITE_SCOPED_JSON_LD_IDS: readonly string[] = [
+    'org',
+    'site',
+    'app',
+    'app-ios',
+    'app-android',
+    'source',
+].map((fragment) => `${SITE}/#${fragment}`);
+
+/**
  * Re-point a page-scoped JSON-LD node at the locale's own URL.
  *
  * `webPage()` mints `@id` and `url` from the English path, which is right for
@@ -591,8 +633,12 @@ export function localesFor(route: Route): readonly Locale[] {
  * what hreflang exists to deny. `inLanguage` moves for the same reason — a
  * Chinese page describing itself as `en` contradicts its own `<html lang>`.
  *
- * Only the prefix is rewritten, so `#webpage` and any `#agent-list` fragment
- * survive and stay unique per URL.
+ * Only page-local references move: the page URL itself, its own `#fragment`
+ * ids (`#webpage`, `#agent-list`), and for non-home pages the URLs beneath it
+ * (`/agents/<slug>`). A bare prefix match is not enough, because the homepage
+ * prefix is the whole origin: it would turn `/images/og.png` into
+ * `/frimages/og.png` and re-point the shared `/#site` and `/#app` identities at
+ * `/fr#site` and `/fr#app`, nodes that no document declares.
  */
 function localizeJsonLd(
     node: Record<string, unknown>,
@@ -602,9 +648,16 @@ function localizeJsonLd(
     if (locale === DEFAULT_LOCALE) return node;
     const englishUrl = `${SITE}${routePath}`;
     const localised = localeUrl(locale, routePath);
+    const isPageLocal = (value: string): boolean => {
+        if (value === englishUrl) return true;
+        if (SITE_SCOPED_JSON_LD_IDS.includes(value)) return false;
+        if (value.startsWith(`${englishUrl}#`)) return true;
+        // Under `/` every URL on the site is a "sub-path", assets included.
+        return routePath !== '/' && value.startsWith(`${englishUrl}/`);
+    };
     const rewrite = (value: unknown): unknown => {
         if (typeof value === 'string') {
-            return value.startsWith(englishUrl) ? localised + value.slice(englishUrl.length) : value;
+            return isPageLocal(value) ? localised + value.slice(englishUrl.length) : value;
         }
         if (Array.isArray(value)) return value.map(rewrite);
         if (typeof value === 'object' && value !== null) {

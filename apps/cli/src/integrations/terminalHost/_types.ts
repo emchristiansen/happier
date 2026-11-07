@@ -8,6 +8,7 @@ import type {
   TerminalPromptWriteBoundaryV1,
 } from '@happier-dev/agents';
 import type { AttachSurfaceStaticMetadataV1 } from '@happier-dev/protocol';
+import type { PreparedTerminalSpawn } from '@/terminal/runtime/terminalLaunchSpec';
 
 export type {
   TerminalHostKind,
@@ -19,6 +20,12 @@ export type {
 } from '@happier-dev/agents';
 
 export type TerminalHostPreference = 'auto' | TerminalHostKind;
+
+/** Failed launch admission, independent of whether host-artifact cleanup settled. */
+export type TerminalHostLaunchFailure = Readonly<{
+  launchDisposition: 'not_started' | 'stopped' | 'unconfirmed';
+  cleanupIncomplete: boolean;
+}>;
 
 declare const terminalAttachmentIdBrand: unique symbol;
 
@@ -36,16 +43,24 @@ export type TerminalHostHandle = Readonly<{
   sessionName: string;
   paneId?: string;
   socketDir?: string;
+  socketPath?: string;
+  terminalId?: string;
   expectedCommandFragments?: readonly string[];
   attachMetadata: TerminalHostAttachMetadata;
 }>;
 
 export type TerminalHostCreateOrAttachOptions = Readonly<{
+  /** Host namespace, distinct from a pane's display label. */
   sessionName: string;
+  label?: string;
   workingDirectory: string;
   spawnArgv: readonly string[];
   spawnEnv: Readonly<Record<string, string>>;
   isolatedEnv: boolean;
+  /** Optional client presentations own their pane/window, never an existing host namespace. */
+  topology?: 'shared' | 'exclusive';
+  /** A native invocation already owns its one-shot handoff; adapters must not wrap it again. */
+  preparedLaunch?: PreparedTerminalSpawn;
 }>;
 
 export type TerminalHostLiveness = Readonly<{

@@ -31,6 +31,7 @@ import { useSessionCockpitBottomChromeHeight } from '@/components/workspaceCockp
 import { useReducedMotionPreference } from '@/hooks/ui/useReducedMotionPreference';
 import { Modal } from '@/modal';
 import { t } from '@/text';
+import { useSetting } from '@/sync/domains/state/storage';
 import {
     useOptionalSessionListSelectionActions,
     useOptionalSessionListSelectionState,
@@ -281,6 +282,7 @@ const stylesheet = StyleSheet.create((theme) => ({
 }));
 
 export function SessionListSelectionActionBarHost(props: SessionListSelectionActionBarHostProps = {}): React.ReactElement | null {
+    const actionsSettings = useSetting('actionsSettingsV1');
     const styles = stylesheet;
     const { theme } = useUnistyles();
     const safeAreaInsets = React.useContext(SafeAreaInsetsContext) ?? ZERO_SAFE_AREA_INSETS;
@@ -311,7 +313,8 @@ export function SessionListSelectionActionBarHost(props: SessionListSelectionAct
         targets: selectedTargets,
         tagsEnabled: props.tagsEnabled === true,
         moveEnabled: typeof props.onRequestMoveToFolder === 'function',
-    }), [props.onRequestMoveToFolder, props.tagsEnabled, selectedTargets]);
+        actionsSettings,
+    }), [actionsSettings, props.onRequestMoveToFolder, props.tagsEnabled, selectedTargets]);
     const visible = selection.isSelectionMode || runningAction !== null || result !== null || confirmAction !== null;
     const presence = useOverlayPresence(
         visible,
@@ -419,7 +422,13 @@ export function SessionListSelectionActionBarHost(props: SessionListSelectionAct
 
     const handleActionPress = React.useCallback(async (descriptor: SessionBulkActionDescriptor) => {
         if (runningAction) return;
-        const request = await resolveActionRequest(descriptor.id);
+        let request: SessionBulkActionRequest | null;
+        try {
+            request = await resolveActionRequest(descriptor.id);
+        } catch (error) {
+            setResult(buildFailureResult({ actionId: descriptor.id, targets: selectedTargets, reason: reasonFromUnknown(error) }));
+            return;
+        }
         if (!request) return;
         if (descriptor.requiresConfirmation) {
             setResult(null);

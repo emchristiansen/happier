@@ -76,6 +76,31 @@ test('prepare-local-monorepo commits applied diffs so downstream clones include 
   assert.equal(fs.existsSync(join(clone, 'ignored.txt')), false);
 });
 
+test('prepare-local-monorepo preserves staged and unstaged edits to the same tracked line', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'happier-prepare-local-monorepo-overlap-'));
+  const src = join(tmp, 'src');
+  const dst = join(tmp, 'dst');
+  const clone = join(tmp, 'clone');
+
+  fs.mkdirSync(src, { recursive: true });
+  run('git', ['init', '-q'], { cwd: src });
+  fs.writeFileSync(join(src, 'a.txt'), 'one\n', 'utf8');
+  run('git', ['add', 'a.txt'], { cwd: src });
+  run('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init', '-q'], { cwd: src });
+
+  fs.writeFileSync(join(src, 'a.txt'), 'two\n', 'utf8');
+  run('git', ['add', 'a.txt'], { cwd: src });
+  fs.writeFileSync(join(src, 'a.txt'), 'three\n', 'utf8');
+
+  const res = spawnSync(process.execPath, [prepareScript, '--src', src, '--dst', dst], { encoding: 'utf8' });
+  assert.equal(res.status, 0, res.stderr || res.stdout);
+  run('git', ['clone', '--quiet', dst, clone], { cwd: tmp });
+  assert.equal(fs.readFileSync(join(clone, 'a.txt'), 'utf8'), 'three\n');
+  assert.equal(run('git', ['show', 'HEAD:a.txt'], { cwd: src }).stdout, 'one\n');
+  assert.equal(run('git', ['show', ':a.txt'], { cwd: src }).stdout, 'two\n');
+  assert.equal(fs.readFileSync(join(src, 'a.txt'), 'utf8'), 'three\n');
+});
+
 test('prepare-local-monorepo preserves the source origin remote so release dry-runs can fetch refs', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'happier-prepare-local-monorepo-origin-'));
   const remote = join(tmp, 'remote.git');

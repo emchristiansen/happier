@@ -14,7 +14,7 @@ rather than the state of things whenever someone last updated a wiki page. A
 dash means the agent does not support that capability, not that Happier has not
 got to it yet.
 
-3 of the 14 agents are marked Stable: Claude, Codex, OpenCode.
+3 of the 19 agents are marked Stable: Claude, Codex, OpenCode.
 The rest are Experimental — they work, and people use them daily, but their
 integration is younger and more likely to change. Availability of an agent is
 separate from availability of a feature; see
@@ -29,15 +29,20 @@ separate from availability of a feature; see
 | **OpenCode** | `happier opencode` | Stable | Queried from the agent, custom ids allowed | `opencode-ai` |
 | **Gemini** | `happier gemini` | Experimental | Queried from the agent, custom ids allowed | `@google/gemini-cli` |
 | **Auggie** | `happier auggie` | Experimental | Queried from the agent | `@augmentcode/auggie` |
-| **Qwen Code** | `happier qwen` | Experimental | Fixed list | `@qwen-code/qwen-code` |
+| **Qwen Code** | `happier qwen` | Experimental | Queried from the agent | `@qwen-code/qwen-code` |
 | **Kimi** | `happier kimi` | Experimental | Queried from the agent | Vendor recipe |
-| **Kilo** | `happier kilo` | Experimental | Queried from the agent, custom ids allowed | `@kilocode/cli` |
+| **Kilo** | `happier kilo` | Experimental | Queried from the agent | `@kilocode/cli` |
 | **Kiro** | `happier kiro` | Experimental | Fixed list, custom ids allowed | Vendor's own installer |
+| **Devin** | `happier devin` | Experimental | Queried from the agent | Vendor's own installer |
 | **Custom ACP** | `happier customAcp` | Experimental | Queried from the agent, custom ids allowed | Vendor recipe |
 | **Pi** | `happier pi` | Experimental | Queried from the agent, custom ids allowed | `@earendil-works/pi-coding-agent` |
 | **Copilot** | `happier copilot` | Experimental | Queried from the agent | `@github/copilot` |
 | **Cursor** | `happier cursor` | Experimental | Queried from the agent | Vendor recipe |
 | **Grok** | `happier grok` | Experimental | Queried from the agent | Vendor recipe |
+| **Antigravity** | `happier agy` | Experimental | Queried from the agent, custom ids allowed | Vendor recipe |
+| **FX** | `happier fx` | Experimental | Queried from the agent | Vendor recipe |
+| **Factory Droid** | `happier droid` | Experimental | Queried from the agent | Vendor recipe |
+| **CodeBuddy** | `happier codebuddy` | Experimental | Queried from the agent | `@tencent-ai/codebuddy-code` |
 
 Where the managed-install column names a package, Happier can install the agent
 for you from the machine's detail screen. Where it says the vendor's own
@@ -48,59 +53,75 @@ that speaks the Agent Client Protocol, so its row describes the adapter rather
 than a particular vendor. See [Custom ACP](/agents/custom-acp).
 
 Several subcommands accept aliases, so the name you already have in your fingers
-usually works: `codex` also answers to `codex-acp`, `codex-mcp`, `openai`, `gpt`; `opencode` also answers to `open-code`; `qwen` also answers to `qwen-code`; `kimi` also answers to `kimi-cli`; `kilo` also answers to `kilocode`; `kiro` also answers to `kiro-cli`; `customAcp` also answers to `custom-acp`; `pi` also answers to `pi-coding-agent`; `copilot` also answers to `github-copilot`, `copilot-cli`; `cursor` also answers to `cursor-agent`; `grok` also answers to `grok-build`, `grok-cli`.
+usually works: `codex` also answers to `codex-acp`, `codex-mcp`, `openai`, `gpt`; `opencode` also answers to `open-code`; `qwen` also answers to `qwen-code`; `kimi` also answers to `kimi-cli`; `kilo` also answers to `kilocode`; `kiro` also answers to `kiro-cli`; `devin` also answers to `devin-cli`; `customAcp` also answers to `custom-acp`; `pi` also answers to `pi-coding-agent`; `copilot` also answers to `github-copilot`, `copilot-cli`; `cursor` also answers to `cursor-agent`; `grok` also answers to `grok-build`, `grok-cli`; `droid` also answers to `factory-droid`; `codebuddy` also answers to `codebuddy-code`.
 
 ## Sessions
 
 Resume, browse, fork and roll back are the four things people most often assume
 work everywhere. They do not.
 
-| Agent | Resume its own sessions | Fork a conversation | Fork from a message | Roll back | Declares session listing |
+| Agent | Resume by agent session ID | Fork a conversation | Fork from a message | Roll back | Browse resume candidates |
 | --- | --- | --- | --- | --- | --- |
 | **Claude** | Yes | — | — | — | Yes |
 | **Codex** | Experimental | Yes | — | Yes | Yes |
 | **OpenCode** | Yes | Yes | Yes | — | Yes |
 | **Gemini** | Yes | — | — | — | — |
-| **Auggie** | Yes | — | — | — | — |
-| **Qwen Code** | Yes | — | — | — | — |
-| **Kimi** | Yes | — | — | — | — |
-| **Kilo** | Yes | — | — | — | — |
+| **Auggie** | Yes | — | — | — | Yes |
+| **Qwen Code** | Yes | — | — | — | Yes |
+| **Kimi** | Yes | Yes | — | — | Yes |
+| **Kilo** | Yes | — | — | — | Yes |
 | **Kiro** | Experimental | — | — | — | — |
+| **Devin** | Yes | — | — | — | Yes |
 | **Custom ACP** | — | — | — | — | — |
 | **Pi** | Yes | — | — | — | — |
-| **Copilot** | Yes | — | — | — | — |
+| **Copilot** | Yes | — | — | — | Yes |
 | **Cursor** | Experimental | — | — | — | — |
 | **Grok** | Experimental | — | — | — | — |
+| **Antigravity** | Yes | — | — | — | — |
+| **FX** | Yes | — | — | — | Yes |
+| **Factory Droid** | Yes | — | — | — | — |
+| **CodeBuddy** | Yes | — | — | — | — |
 
-"Resume its own sessions" means Happier can reattach to a conversation the agent
-started outside Happier. "Fork" means the agent's own runtime can branch a
+"Resume by agent session ID" means Happier can pass a saved agent-owned ID back
+to that agent. It does not establish that the interactive terminal and ACP use
+the same session IDs. "Fork" means the agent's own runtime can branch a
 conversation; where it cannot, Happier's replay fork still works, because that
 is Happier's own mechanism rather than the agent's. See
 [Session forking](/sessions/session-forking).
 
-The last column is a declaration rather than a gate — nothing currently reads
-it, so it does not decide whether you can browse an agent's own sessions. What
-you can actually browse and import is described in
-[Continuing a session](/sessions/continuing-a-session).
+The last column means Happier offers a browser for the agent's resume
+candidates. FX and Kimi use the shared ACP `session/list` source; agents with
+dedicated session integrations use their own established sources. An ACP-listed
+result only starts a Happier-controlled resume, and the live handshake still
+decides whether the installed agent can list sessions. Listing does not
+establish terminal/ACP identity, live takeover, writer safety, transcript
+following, transcript import, or terminal attachment. See
+[Continuing a session](/sessions/continuing-a-session) for the distinct session
+continuation paths.
 
 ## Running a turn
 
 | Agent | Steer a running turn | Session modes | Dedicated plan control | Accept edits |
 | --- | --- | --- | --- | --- |
 | **Claude** | Yes | Agent modes, built in | Yes | Yes |
-| **Codex** | — | Policy presets, from the agent | — | — |
-| **OpenCode** | — | Agent modes, from the agent | Yes | — |
+| **Codex** | — | Policy presets, from the agent | Runtime-dependent | — |
+| **OpenCode** | — | Agent modes, from the agent | Runtime-dependent | — |
 | **Gemini** | — | — | — | — |
 | **Auggie** | — | — | — | — |
-| **Qwen Code** | — | — | — | — |
+| **Qwen Code** | — | Agent modes, from the agent | Runtime-dependent | — |
 | **Kimi** | — | — | — | — |
-| **Kilo** | — | Agent modes, from the agent | Yes | — |
-| **Kiro** | — | Agent modes, from the agent | Yes | — |
-| **Custom ACP** | — | Agent modes, from the agent | Yes | — |
+| **Kilo** | — | Agent modes, from the agent | Runtime-dependent | — |
+| **Kiro** | — | Agent modes, from the agent | Runtime-dependent | — |
+| **Devin** | — | Agent modes, from the agent | Runtime-dependent | — |
+| **Custom ACP** | — | Agent modes, from the agent | Runtime-dependent | — |
 | **Pi** | Yes | — | — | — |
-| **Copilot** | — | Agent modes, from the agent | Yes | — |
-| **Cursor** | — | Agent modes, from the agent | Yes | — |
+| **Copilot** | — | Agent modes, from the agent | Runtime-dependent | — |
+| **Cursor** | — | Agent modes, from the agent | Runtime-dependent | — |
 | **Grok** | Yes | — | — | — |
+| **Antigravity** | — | Agent modes, from the agent | Runtime-dependent | — |
+| **FX** | — | Agent modes, from the agent | Runtime-dependent | — |
+| **Factory Droid** | — | Agent modes, from the agent | Runtime-dependent | — |
+| **CodeBuddy** | — | Agent modes, from the agent | Runtime-dependent | — |
 
 Steering is what lets you add a correction to a turn already in flight instead
 of interrupting it. Where an agent cannot steer, Happier interrupts and resends,
@@ -109,9 +130,10 @@ which is slower and loses less than it sounds — see [Steering](/sessions/steer
 **Session modes are not permission modes.** Where the list comes *from the
 agent*, Happier shows whichever modes that build advertises for the session, so
 the choices can differ between versions and the Mode control is hidden when the
-runtime offers none. A dash under "Dedicated plan control" means Happier has no
-plan-specific affordance for that agent — **not** that the agent lacks a plan
-mode. Codex, for instance, reaches `plan` through the Mode control.
+runtime offers none. "Runtime-dependent" under "Dedicated plan control" means
+Plan is available only when the session advertises a `plan` mode or policy
+preset. Codex, for instance, reaches `plan` through the Mode control. A dash
+means Happier declares no plan-specific affordance for that agent.
 
 ## Media and tools
 
@@ -121,16 +143,21 @@ mode. Codex, for instance, reaches `plan` through the Mode control.
 | **Codex** | Yes | Yes | Yes | Yes (`native_mcp`) | `openai-codex`, `openai` |
 | **OpenCode** | Yes | Experimental | — | Yes (`native_mcp`) | `openai-codex`, `openai`, `claude-subscription`, `anthropic` |
 | **Gemini** | — | Yes | — | Yes (`native_mcp`) | `gemini` |
-| **Auggie** | Experimental | Experimental | — | — | — |
-| **Qwen Code** | Yes | Experimental | — | — | — |
-| **Kimi** | Yes | Experimental | — | — | — |
-| **Kilo** | Yes | Experimental | — | — | — |
+| **Auggie** | Experimental | Experimental | — | Experimental (`native_mcp`) | — |
+| **Qwen Code** | Yes | Experimental | — | Experimental (`native_mcp`) | — |
+| **Kimi** | Yes | Experimental | — | Experimental (`native_mcp`) | — |
+| **Kilo** | Yes | Experimental | — | Experimental (`native_mcp`) | — |
 | **Kiro** | Yes | Experimental | — | Yes (`native_mcp`) | — |
+| **Devin** | Yes | Experimental | — | Yes (`native_mcp`) | — |
 | **Custom ACP** | Yes | Experimental | — | Yes (`native_mcp`) | — |
-| **Pi** | Experimental | Experimental | — | — | `openai-codex`, `openai`, `claude-subscription`, `anthropic` |
-| **Copilot** | Yes | Experimental | — | — | — |
-| **Cursor** | Yes | — | Yes | — | — |
-| **Grok** | — | — | — | — | — |
+| **Pi** | Experimental | Experimental | — | Experimental (`shell_bridge`) | `openai-codex`, `openai`, `claude-subscription`, `anthropic` |
+| **Copilot** | Yes | Experimental | — | Experimental (`native_mcp`) | — |
+| **Cursor** | Yes | — | Yes | Experimental (`native_mcp`) | — |
+| **Grok** | — | — | — | Experimental (`native_mcp`) | — |
+| **Antigravity** | Yes | Experimental | — | Yes (`native_mcp`) | `antigravity` |
+| **FX** | Yes | Yes | — | Yes (`native_mcp`) | — |
+| **Factory Droid** | Yes | Experimental | — | Yes (`native_mcp`) | — |
+| **CodeBuddy** | Yes | Experimental | — | Experimental (`native_mcp`) | — |
 
 Two of these columns describe what an integration **declares**, not what Happier
 enforces, and the distinction matters if you are deciding whether to attach a
@@ -161,15 +188,21 @@ some declarations to lag the runtime.
 | **Kimi** | Agent-managed | Automatic |
 | **Kilo** | Agent-managed | Automatic |
 | **Kiro** | Agent-managed | Manual only |
+| **Devin** | Agent-managed | Manual only |
 | **Custom ACP** | Agent-managed | Manual only |
 | **Pi** | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` | Automatic |
 | **Copilot** | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | Automatic |
 | **Cursor** | `CURSOR_API_KEY` | Automatic |
 | **Grok** | `XAI_API_KEY` | Automatic |
+| **Antigravity** | Agent-managed | Manual only |
+| **FX** | `VERCEL_OIDC_TOKEN`, `AI_GATEWAY_API_KEY` | Manual only |
+| **Factory Droid** | `FACTORY_API_KEY` | Manual only |
+| **CodeBuddy** | `CODEBUDDY_API_KEY` | Manual only |
 
-Agents whose background checks are manual only will not be re-probed on a timer;
-their status refreshes when you open the backend's settings screen or start a
-session. See [Agent authentication](/agents/provider-authentication).
+Agents whose background checks are manual only are not re-probed on a timer.
+Whether a manual refresh can resolve a status depends on the agent's configured
+status check; an agent-managed row may remain **Unknown** even when Happier can
+open its login flow. See [Agent authentication](/agents/provider-authentication).
 
 ## Related
 

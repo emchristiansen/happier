@@ -6,9 +6,10 @@ import { mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { readPrismaSqliteConnectionParams } from "@happier-dev/cli-common/firstPartyRuntime";
 import { resolveLightDataDir, resolveLightDatabaseDir } from "@/flavors/light/env";
 import { resolveLightSqliteBusyTimeoutMsFromEnv } from "@/flavors/light/sqliteConnectionConfig";
-import { log } from "@/utils/logging/log";
+import { log, warn } from "@/utils/logging/log";
 import { acquirePgliteDirLock } from "./locks/pgliteLock";
 import {
     renderSqliteReadPoolDatabaseUrl,
@@ -54,8 +55,11 @@ function loadDefaultPrismaClientModule(): typeof import("@prisma/client") {
  * Runtime callers must use this sidecar-aware CommonJS loader instead of a
  * named ESM import from `@prisma/client`; packaged server builds externalize
  * Prisma and cannot rely on named-import interop from its generated module.
+ * Generated providers own their null sentinels, so initialization updates this
+ * live binding together with the active client.
  */
-export const prismaRuntime: typeof import("@prisma/client").Prisma = loadDefaultPrismaClientModule().Prisma;
+const defaultPrismaRuntime = loadDefaultPrismaClientModule().Prisma;
+export let prismaRuntime: typeof import("@prisma/client").Prisma = defaultPrismaRuntime;
 
 function createDefaultPrismaClient(): PrismaClientType {
     const { PrismaClient } = loadDefaultPrismaClientModule();
@@ -196,13 +200,13 @@ async function initDbFromGeneratedClient(provider: "mysql" | "sqlite"): Promise<
         throw new Error("Database client is already initialized.");
     }
     _provider = provider;
-    _db = await createGeneratedPrismaClient(provider);
+    const mod = await loadGeneratedPrismaClientModule(provider);
+    const client = new mod.PrismaClient();
+    prismaRuntime = mod.Prisma;
+    _db = client;
 }
 
-async function createGeneratedPrismaClient(
-    provider: "mysql" | "sqlite",
-    databaseUrl?: string,
-): Promise<PrismaClientType> {
+async function loadGeneratedPrismaClientModule(provider: "mysql" | "sqlite"): Promise<Pick<typeof import("@prisma/client"), "Prisma" | "PrismaClient">> {
     const entrypoint =
         provider === "mysql"
             ? resolveGeneratedClientEntrypoint("../../generated/mysql-client")
@@ -221,16 +225,25 @@ async function createGeneratedPrismaClient(
         }
         throw err;
     }
-    if (!mod?.PrismaClient) {
+    if (!mod?.PrismaClient || !mod?.Prisma) {
         throw new Error(`Invalid generated Prisma client module: ${entrypoint}`);
     }
+    return mod;
+}
+
+async function createGeneratedPrismaClient(
+    provider: "mysql" | "sqlite",
+    databaseUrl?: string,
+): Promise<PrismaClientType> {
+    const mod = await loadGeneratedPrismaClientModule(provider);
     return (databaseUrl === undefined
         ? new mod.PrismaClient()
         : new mod.PrismaClient({ datasources: { db: { url: databaseUrl } } })) as PrismaClientType;
 }
 
 export async function createDbSqliteMaintenanceClient(): Promise<PrismaClientType> {
-    return createGeneratedPrismaClient("sqlite");
+    const mod = await loadGeneratedPrismaClientModule("sqlite");
+    return new mod.PrismaClient();
 }
 
 export async function initDbMysql(): Promise<void> {
@@ -255,10 +268,22 @@ export async function initDbSqlite(): Promise<void> {
             renderSqliteReadPoolDatabaseUrl(databaseUrl, readPool.connectionLimit),
         );
     }
+    const diagnostics = resolveSqliteStartupDiagnosticsFromEnv(process.env);
     log(
-        { module: "storage", event: "sqlite-startup-diagnostics", sqlite: resolveSqliteStartupDiagnosticsFromEnv(process.env) },
+        { module: "storage", event: "sqlite-startup-diagnostics", sqlite: diagnostics },
         "SQLite startup diagnostics",
     );
+    if (diagnostics.ignoredDatabaseUrlQueryParameters.length > 0) {
+        warn(
+            {
+                module: "storage",
+                event: "sqlite-unsupported-url-query-parameters",
+                ignoredDatabaseUrlQueryParameters: diagnostics.ignoredDatabaseUrlQueryParameters,
+                databaseUrlPoolAcquisitionTimeoutStatus: diagnostics.databaseUrlPoolAcquisitionTimeoutStatus,
+            },
+            "SQLite ignores unsupported database URL query parameters; pool acquisition remains unbounded",
+        );
+    }
 }
 
 function resolveLightPgliteDirFromEnv(env: NodeJS.ProcessEnv): string {
@@ -366,6 +391,8 @@ export type SqliteStartupDiagnostics = Readonly<{
     databaseUrlConnectionLimitStatus: SqliteDatabaseUrlConnectionLimitStatus;
     /** Connections in the optional read pool, or null when there is none (the default). */
     readPoolConnectionLimit: number | null;
+    databaseUrlPoolAcquisitionTimeoutStatus: "unbounded";
+    ignoredDatabaseUrlQueryParameters: readonly string[];
 }>;
 
 // Cap the WAL file retained after a checkpoint. SQLite's default (-1) means "no limit",
@@ -437,11 +464,7 @@ function parsePositiveInteger(value: string | null): number | null {
 function readSqliteDatabaseUrlSearchParam(env: NodeJS.ProcessEnv, key: string): string | null {
     const rawUrl = String(env.DATABASE_URL ?? "").trim();
     if (!rawUrl) return null;
-    try {
-        return new URL(rawUrl).searchParams.get(key);
-    } catch {
-        return null;
-    }
+    return readPrismaSqliteConnectionParams(rawUrl).get(key);
 }
 
 export function resolveSqliteStartupDiagnosticsFromEnv(env: NodeJS.ProcessEnv): SqliteStartupDiagnostics {
@@ -451,6 +474,9 @@ export function resolveSqliteStartupDiagnosticsFromEnv(env: NodeJS.ProcessEnv): 
     const databaseUrlConnectionLimit = parsePositiveInteger(rawConnectionLimit);
     const databaseUrlConnectionLimitStatus: SqliteDatabaseUrlConnectionLimitStatus =
         rawConnectionLimit === null ? "missing" : databaseUrlConnectionLimit === null ? "invalid" : "configured";
+    const ignoredDatabaseUrlQueryParameters = [
+        ...(readSqliteDatabaseUrlSearchParam(env, "pool_timeout") !== null ? ["pool_timeout"] : []),
+    ];
 
     return {
         provider: "sqlite",
@@ -462,6 +488,8 @@ export function resolveSqliteStartupDiagnosticsFromEnv(env: NodeJS.ProcessEnv): 
         databaseUrlConnectionLimit,
         databaseUrlConnectionLimitStatus,
         readPoolConnectionLimit: readPool.kind === "enabled" ? readPool.connectionLimit : null,
+        databaseUrlPoolAcquisitionTimeoutStatus: "unbounded",
+        ignoredDatabaseUrlQueryParameters,
     };
 }
 
@@ -484,6 +512,7 @@ export async function shutdownDbClient(): Promise<void> {
     _db = null;
     _readDb = null;
     _provider = null;
+    prismaRuntime = defaultPrismaRuntime;
     try {
         if (readClient) {
             await readClient.$disconnect();
@@ -502,6 +531,7 @@ export async function shutdownDbPglite(): Promise<void> {
     const client = _db;
     _db = null;
     _provider = null;
+    prismaRuntime = defaultPrismaRuntime;
     if (client) {
         await client.$disconnect();
     }

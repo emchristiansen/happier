@@ -70,6 +70,7 @@ export type ConnectedServicesProviderMaterializerInput = Readonly<{
   activeServerDir: string;
   rootDir: string;
   previousMaterializedRoot?: string | null;
+  existingSessionMetadata?: unknown;
   sessionDirectory?: string | null;
   recordsByServiceId: ReadonlyMap<ConnectedServiceId, ConnectedServiceCredentialRecordV1>;
   selectionsByServiceId?: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedSelection>;
@@ -77,7 +78,13 @@ export type ConnectedServicesProviderMaterializerInput = Readonly<{
   processEnv?: NodeJS.ProcessEnv;
   vendorResumeId?: string | null;
   candidatePersistedSessionFile?: string | null;
+  /** Existing-state handoff publishes credentials without copying or reconciling provider state. */
+  sessionStateMode?: 'existing';
+  /** Discovery owns a disposable home, never an account's durable conversation store. */
+  materializationPurpose?: 'probe';
   cleanupRoot: () => void;
+  /** Retain only owned filesystem work, never credential HTTP or provider callbacks. */
+  writeArtifacts?: <T>(write: () => Promise<T>) => Promise<T>;
   validateGroupMutationCurrentness?: (
     input: ConnectedServiceGroupMutationTarget,
   ) => Promise<ConnectedServiceSharedGenerationMutationCurrentness>;

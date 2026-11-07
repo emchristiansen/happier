@@ -119,7 +119,7 @@ describe('readExpoPushToken', () => {
         expect(outcome).toEqual({ ok: true, token: 'ExponentPushToken[abc]' });
     });
 
-    it('reports token_unavailable when the device cannot mint a token', async () => {
+    it('preserves the native token failure for troubleshooting when the device cannot mint a token', async () => {
         const outcome = await readExpoPushToken({
             loadModule: moduleWith({
                 getExpoPushTokenAsync: async () => {
@@ -128,7 +128,11 @@ describe('readExpoPushToken', () => {
             }),
         });
 
-        expect(outcome).toEqual({ ok: false, reason: 'token_unavailable' });
+        expect(outcome).toEqual({
+            ok: false,
+            reason: 'token_unavailable',
+            message: 'no valid "aps-environment" entitlement string found',
+        });
     });
 
     it('reports token_unavailable when the runtime returns an empty token', async () => {

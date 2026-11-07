@@ -7,11 +7,13 @@ export async function extractReleasePayloadRootFromArchive(params: Readonly<{
   archivePath: string;
   archiveName: string;
   extractDir: string;
+  signal?: AbortSignal;
 }>): Promise<string> {
   await extractFirstPartyReleaseArchiveToDirectory({
     archiveName: params.archiveName,
     archivePath: params.archivePath,
     extractDir: params.extractDir,
+    signal: params.signal,
   });
 
   const entries = (await readdir(params.extractDir)).filter((entry) => !entry.startsWith('.'));

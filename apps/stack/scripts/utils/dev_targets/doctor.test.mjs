@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { runDevTargetsDoctor } from './doctor.mjs';
+import { fileURLToPath } from 'node:url';
+import { loadSiblingMutagenOwner } from './mutagen_project.mjs';
 
 const targets = [
   {
@@ -24,6 +26,8 @@ const targets = [
 ];
 
 test('dev-target doctor checks Mutagen and each target through passwordless SSH', async () => {
+  const sourceDir = fileURLToPath(new URL('../../../../../', import.meta.url));
+  const siblingOwner = await loadSiblingMutagenOwner(sourceDir);
   const calls = [];
   const result = await runDevTargetsDoctor(
     { targets, env: { PATH: '/test/bin' } },
@@ -48,7 +52,7 @@ test('dev-target doctor checks Mutagen and each target through passwordless SSH'
     label: 'mutagen',
     command: 'mutagen',
     args: ['version'],
-    env: { PATH: '/test/bin' },
+    env: siblingOwner?.resolveRuntime({ stackBaseDir: '/unused', sourceDir, env: { PATH: '/test/bin' } }).env ?? { PATH: '/test/bin' },
   });
   assert.deepEqual(calls[1].args.slice(0, 7), [
     '-F',

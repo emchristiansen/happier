@@ -9,11 +9,9 @@ const resolveWindowsCommandInvocationMock = vi.fn((
   command,
   args: [...args],
 }));
-const requireProviderCliLaunchSpecMock = vi.fn(() => ({ command: 'opencode', args: [] }));
-const resolveOpenCodeServerAuthHeadersFromEnvMock = vi.fn(() => ({}));
+const resolveOpenCodeCliLaunchSpecMock = vi.fn(() => ({ command: 'opencode', args: [], apiGeneration: 'auto' as const }));
 const resolveOpenCodeManagedServerChildEnvMock = vi.fn(() => ({ PATH: process.env.PATH ?? '' }));
 const resolveOpenCodeManagedServerTrackedPidMock = vi.fn(async ({ spawnPid }: { spawnPid: number }) => spawnPid);
-const terminateManagedOpenCodeServerPidBestEffortMock = vi.fn();
 const waitForOpenCodeServerHealthMock = vi.fn(async () => {});
 const MOCK_LOG_PATH = '/tmp/happier-fake-managed-server.log';
 const logCaptureCloseMock = vi.fn(async () => {});
@@ -38,12 +36,8 @@ vi.mock('@happier-dev/cli-common/process', () => ({
   resolveWindowsCommandInvocation: resolveWindowsCommandInvocationMock,
 }));
 
-vi.mock('@/runtime/managedTools/requireProviderCliLaunchSpec', () => ({
-  requireProviderCliLaunchSpec: requireProviderCliLaunchSpecMock,
-}));
-
-vi.mock('./openCodeServerAuth', () => ({
-  resolveOpenCodeServerAuthHeadersFromEnv: resolveOpenCodeServerAuthHeadersFromEnvMock,
+vi.mock('@/backends/opencode/utils/resolveOpenCodeCliCommand', () => ({
+  resolveOpenCodeCliLaunchSpec: resolveOpenCodeCliLaunchSpecMock,
 }));
 
 vi.mock('./openCodeManagedServerEnv', async (importOriginal) => ({
@@ -53,10 +47,6 @@ vi.mock('./openCodeManagedServerEnv', async (importOriginal) => ({
 
 vi.mock('./resolveOpenCodeManagedServerTrackedPid', () => ({
   resolveOpenCodeManagedServerTrackedPid: resolveOpenCodeManagedServerTrackedPidMock,
-}));
-
-vi.mock('./terminateManagedOpenCodeServerPidBestEffort', () => ({
-  terminateManagedOpenCodeServerPidBestEffort: terminateManagedOpenCodeServerPidBestEffortMock,
 }));
 
 vi.mock('./waitForOpenCodeServerHealth', () => ({
@@ -99,8 +89,9 @@ function createManagedServerProcessHarness(): {
   return { proc };
 }
 
-describe('startManagedOpenCodeServer close fallback', () => {
+describe('startManagedOpenCodeServer Windows launch cleanup', () => {
   afterEach(() => {
+    vi.restoreAllMocks();
     spawnMock.mockReset();
     resolveWindowsCommandInvocationMock.mockReset();
     resolveWindowsCommandInvocationMock.mockImplementation((
@@ -109,34 +100,27 @@ describe('startManagedOpenCodeServer close fallback', () => {
       command,
       args: [...args],
     }));
-    requireProviderCliLaunchSpecMock.mockClear();
-    resolveOpenCodeServerAuthHeadersFromEnvMock.mockClear();
+    resolveOpenCodeCliLaunchSpecMock.mockClear();
     resolveOpenCodeManagedServerChildEnvMock.mockClear();
     resolveOpenCodeManagedServerTrackedPidMock.mockReset();
     resolveOpenCodeManagedServerTrackedPidMock.mockImplementation(async ({ spawnPid }: { spawnPid: number }) => spawnPid);
-    terminateManagedOpenCodeServerPidBestEffortMock.mockReset();
     waitForOpenCodeServerHealthMock.mockReset();
     waitForOpenCodeServerHealthMock.mockResolvedValue(undefined);
-  });
-
-  it('falls back to proc.kill when pid termination throws', async () => {
-    const { proc } = createManagedServerProcessHarness();
-    spawnMock.mockReturnValue(proc);
-    terminateManagedOpenCodeServerPidBestEffortMock.mockRejectedValue(new Error('terminate failed'));
-
-    const { startManagedOpenCodeServer } = await import('./openCodeManagedServer');
-    const started = await startManagedOpenCodeServer({ port: 43111, timeoutMs: 25 });
-
-    await started.close();
-
-    expect(terminateManagedOpenCodeServerPidBestEffortMock).toHaveBeenCalledWith(43111);
-    expect(proc.kill).toHaveBeenCalledTimes(1);
   });
 
   it('wraps Windows shell shims before spawning the managed server and tracks the real server pid', async () => {
     const { proc } = createManagedServerProcessHarness();
     spawnMock.mockReturnValue(proc);
     const callOrder: string[] = [];
+    let trackedPidAlive = true;
+    const realKill = process.kill.bind(process);
+    // The OS boundary models the tracked native PID; the termination owner stays real.
+    vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (Math.abs(pid) !== 48123) return realKill(pid, signal);
+      if (signal === 0 && !trackedPidAlive) throw Object.assign(new Error('Process exited'), { code: 'ESRCH' });
+      if (signal !== 0) trackedPidAlive = false;
+      return true;
+    });
     resolveOpenCodeManagedServerTrackedPidMock.mockResolvedValue(48123);
     resolveOpenCodeManagedServerTrackedPidMock.mockImplementation(async ({ spawnPid }: { spawnPid: number }) => {
       callOrder.push('resolveTrackedPid');
@@ -145,9 +129,10 @@ describe('startManagedOpenCodeServer close fallback', () => {
     waitForOpenCodeServerHealthMock.mockImplementation(async () => {
       callOrder.push('health');
     });
-    requireProviderCliLaunchSpecMock.mockReturnValue({
+    resolveOpenCodeCliLaunchSpecMock.mockReturnValue({
       command: 'C:\\Users\\natan\\AppData\\Roaming\\npm\\opencode.CMD',
       args: [],
+      apiGeneration: 'auto',
     });
     resolveWindowsCommandInvocationMock.mockReturnValue({
       command: 'C:\\Windows\\System32\\cmd.exe',
@@ -177,10 +162,15 @@ describe('startManagedOpenCodeServer close fallback', () => {
     );
     expect(started.pid).toBe(48123);
     expect(started.logPath).toBe(MOCK_LOG_PATH);
-    expect(onSpawned).toHaveBeenCalledWith({ baseUrl: 'http://127.0.0.1:43111', pid: 48123, logPath: MOCK_LOG_PATH });
+    expect(onSpawned).toHaveBeenCalledWith(expect.objectContaining({
+      baseUrl: 'http://127.0.0.1:43111',
+      pid: 48123,
+      logPath: MOCK_LOG_PATH,
+      apiGeneration: 'auto',
+    }));
     expect(callOrder).toEqual(['health', 'resolveTrackedPid', 'onSpawned']);
 
     await started.close();
-    expect(terminateManagedOpenCodeServerPidBestEffortMock).toHaveBeenCalledWith(48123);
+    expect(trackedPidAlive).toBe(false);
   });
 });

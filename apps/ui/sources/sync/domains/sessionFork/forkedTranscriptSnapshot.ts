@@ -11,6 +11,8 @@ export type ForkedTranscriptSegment = Readonly<{
    * `null` means "no cutoff" (current session).
    */
   cutoffSeqInclusive: number | null;
+  /** Sync has reached this segment's history start, even if initial records render no rows. */
+  isHistoryStartLoaded?: boolean;
   messageIdsOldestFirst: readonly string[];
 }>;
 
@@ -22,7 +24,8 @@ export type ForkedTranscriptSnapshot = Readonly<{
   isLoaded: boolean;
 }>;
 
-type MinimalState = Pick<StorageState, 'sessions' | 'sessionMessages'>;
+type MinimalState = Pick<StorageState, 'sessions' | 'sessionMessages'>
+  & Partial<Pick<StorageState, 'sessionMessagesHistoryStartLoaded'>>;
 
 type CacheEntry = Readonly<{
   key: string;
@@ -99,7 +102,8 @@ export function getForkedTranscriptSnapshotCached(state: MinimalState, childSess
     const sessionMessages = state.sessionMessages[seg.sessionId];
     const version = sessionMessages?.messagesVersion ?? 0;
     const idsLen = sessionMessages?.messageIdsOldestFirst?.length ?? 0;
-    keyParts.push(`${seg.sessionId}:${seg.cutoffSeqInclusive ?? 'full'}:${version}:${idsLen}`);
+    const historyStartLoaded = state.sessionMessagesHistoryStartLoaded?.[seg.sessionId] === true;
+    keyParts.push(`${seg.sessionId}:${seg.cutoffSeqInclusive ?? 'full'}:${version}:${idsLen}:${historyStartLoaded}:${sessionMessages?.isLoaded === true}`);
   }
   const key = keyParts.join('|');
 
@@ -141,7 +145,20 @@ export function getForkedTranscriptSnapshotCached(state: MinimalState, childSess
     });
   }
 
-  // De-duplicate message ids across segments by preferring the earliest (ancestor) segment.
+  // Cached ancestry is not adjacent to a child window whose start has not been reached.
+  // Keep the lineage for paging, but project only the reachable suffix. Do this before
+  // deduplication so hidden native-fork copies cannot claim a visible child's message id.
+  let firstVisibleSegmentIndex = segmentDrafts.length - 1;
+  while (firstVisibleSegmentIndex > 0) {
+    const segment = segmentDrafts[firstVisibleSegmentIndex]!;
+    if (segment.cutoffSeqInclusive !== 0 && state.sessionMessagesHistoryStartLoaded?.[segment.sessionId] !== true) break;
+    firstVisibleSegmentIndex -= 1;
+  }
+  for (let index = 0; index < firstVisibleSegmentIndex; index += 1) {
+    segmentDrafts[index]!.messageIdsOldestFirst = [];
+  }
+
+  // De-duplicate message ids across visible segments by preferring the earliest (ancestor) segment.
   // This matters for provider-native forks where the provider may reuse message ids across forked sessions,
   // which would otherwise render duplicate rows in the forked transcript view.
   const seenAcrossSegments = new Set<string>();
@@ -165,6 +182,7 @@ export function getForkedTranscriptSnapshotCached(state: MinimalState, childSess
       sessionId: seg.sessionId,
       isReadOnlyContext: seg.isReadOnlyContext,
       cutoffSeqInclusive: seg.cutoffSeqInclusive,
+      isHistoryStartLoaded: seg.cutoffSeqInclusive === 0 || state.sessionMessagesHistoryStartLoaded?.[seg.sessionId] === true,
       messageIdsOldestFirst: seg.messageIdsOldestFirst,
     });
 

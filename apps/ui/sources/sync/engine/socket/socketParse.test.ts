@@ -225,12 +225,14 @@ describe('socketParse', () => {
             fromCursor: 'tail-cursor-0',
             nextCursor: 'tail-cursor-1',
             truncated: false,
+            truncationReason: 'page_limit',
         });
 
         expect(res).not.toBeNull();
         expect(res?.type).toBe('direct-session-transcript-delta');
         expect((res as any)?.fromCursor).toBe('tail-cursor-0');
         expect((res as any)?.nextCursor).toBe('tail-cursor-1');
+        expect((res as any)?.truncationReason).toBe('page_limit');
     });
 
     it('rejects non-truncated direct-session cursor advancement without fromCursor', () => {
@@ -241,6 +243,37 @@ describe('socketParse', () => {
             items: [],
             nextCursor: 'tail-cursor-1',
             truncated: false,
+        });
+
+        expect(res).toBeNull();
+        consoleErrorSpy.mockRestore();
+    });
+
+    it('rejects unknown direct-session transcript truncation reasons in the compatibility parser', () => {
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const res = parseEphemeralUpdate({
+            type: 'direct-session-transcript-delta',
+            sessionId: 's1',
+            items: [],
+            fromCursor: 'tail-cursor-0',
+            nextCursor: 'tail-cursor-1',
+            truncated: true,
+            truncationReason: 'cursor_maybe_changed',
+        });
+
+        expect(res).toBeNull();
+        consoleErrorSpy.mockRestore();
+    });
+
+    it('rejects unanchored page-limit cursor advancement in the compatibility parser', () => {
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const res = parseEphemeralUpdate({
+            type: 'direct-session-transcript-delta',
+            sessionId: 's1',
+            items: [],
+            nextCursor: 'tail-cursor-1',
+            truncated: true,
+            truncationReason: 'page_limit',
         });
 
         expect(res).toBeNull();

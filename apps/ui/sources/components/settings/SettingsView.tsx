@@ -1,4 +1,5 @@
 import { View, Pressable, Platform, Linking, useWindowDimensions } from 'react-native';
+import { useOpenExternalUrl } from '@/hooks/ui/useOpenExternalUrl';
 import { Image } from 'expo-image';
 import * as React from 'react';
 import { Text } from '@/components/ui/text/Text';
@@ -42,6 +43,8 @@ import { DesktopSettingsSection } from '@/components/settings/desktop/DesktopSet
 import { SettingsBelowFoldSections } from '@/components/settings/SettingsBelowFoldSections';
 import { runAfterInteractionsWithFallback } from '@/utils/timing/runAfterInteractionsWithFallback';
 import { Icon } from '@/components/ui/icons/Icon';
+import { describeUpdatesSettingsSubtitle } from '@/components/updates/describeUpdatesSummary';
+import { useSharedUpdatesSummary } from '@/updates/useUpdatesSummary';
 
 const DEFER_BELOW_FOLD_SETTINGS_SECTIONS_DELAY_MS = 0;
 const DEFER_BELOW_FOLD_SETTINGS_STAGE_DELAY_MS = 16;
@@ -78,6 +81,7 @@ export const SettingsView = React.memo(function SettingsView() {
     const displayName = getDisplayName(profile);
     const avatarUrl = getAvatarUrl(profile);
     const bio = getBio(profile);
+    const updatesSubtitle = describeUpdatesSettingsSubtitle(useSharedUpdatesSummary());
     const pushRoute = React.useCallback((route: Parameters<typeof router.push>[0]) => {
         deferOnWeb(() => {
             navigateWithBlurOnWeb(() => {
@@ -154,15 +158,9 @@ export const SettingsView = React.memo(function SettingsView() {
         };
     }, []);
 
-    const handleGitHub = async () => {
-        const url = 'https://github.com/happier-dev/happier';
-        const supported = await Linking.canOpenURL(url);
-        if (supported) {
-            await Linking.openURL(url);
-        }
-    };
+    const [, handleGitHub] = useOpenExternalUrl('https://github.com/happier-dev/happier');
 
-    const handleReportIssue = async () => {
+    const [, handleReportIssue] = useHappyAction(async () => {
         recordBugReportUserAction('settings.report_issue_open');
         const overrideUrl = String(process.env.EXPO_PUBLIC_HAPPIER_REPORT_ISSUE_URL ?? '').trim();
         if (overrideUrl.length > 0) {
@@ -173,7 +171,7 @@ export const SettingsView = React.memo(function SettingsView() {
             }
         }
         pushRoute('/settings/report-issue');
-    };
+    });
 
     const handleSubscribe = async () => {
         trackPaywallButtonClicked();
@@ -260,6 +258,13 @@ export const SettingsView = React.memo(function SettingsView() {
     const generalSection = React.useMemo(() => (
         <ItemGroup title={t('settings.general')}>
             <Item
+                testID="settings-updates-row"
+                title={t('updates.title')}
+                subtitle={updatesSubtitle}
+                icon={<Icon name="hard-drive-download" size={29} color={theme.colors.accent.blue} />}
+                onPress={() => pushRoute('/settings/updates')}
+            />
+            <Item
                 title={t('settings.appearance')}
                 subtitle={t('settings.appearanceSubtitle')}
                 icon={<Icon name="palette" size={29} color={theme.colors.accent.indigo} />}
@@ -289,6 +294,7 @@ export const SettingsView = React.memo(function SettingsView() {
             ) : null}
         </ItemGroup>
     ), [
+        updatesSubtitle,
         petsCompanionEnabled,
         petsSyncEnabled,
         pushRoute,

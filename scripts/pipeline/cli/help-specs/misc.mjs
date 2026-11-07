@@ -29,6 +29,7 @@ export const COMMAND_HELP_MISC = {
     ],
     bullets: [
       'Merges/upserts keys into the existing Keychain JSON bundle; it does not delete keys missing from input.',
+      'Explicit file lists import only those files. Standard overlay basenames select their environment bundles; --env must match the supplied overlays.',
       'Never prints secret values (only counts and optional key names).',
     ],
     examples: [

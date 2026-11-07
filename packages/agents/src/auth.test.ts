@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { AGENT_IDS } from './types.js';
 import type { AgentId } from './types.js';
 import { AGENT_AUTH_PROBE_CONFIG, getAgentAuthProbeConfig } from './auth.js';
-import { getProviderCliRuntimeSpec } from './providers/providerCliRuntime.js';
+import { getProviderCliBinaryNames } from './providers/providerCliRuntime.js';
 
 const cursorAgentId = 'cursor' as AgentId;
 
@@ -27,6 +27,16 @@ describe('AGENT_AUTH_PROBE_CONFIG', () => {
       agentId: 'customAcp',
       statusCommand: null,
       parser: 'unknown',
+      backgroundChecks: 'manual_only',
+    });
+  });
+
+  it('defines Devin auth probing through its non-interactive status command', () => {
+    expect(getAgentAuthProbeConfig('devin')).toMatchObject({
+      agentId: 'devin',
+      binaryNames: ['devin'],
+      statusCommand: ['auth', 'status'],
+      parser: 'devinAuthStatus',
       backgroundChecks: 'manual_only',
     });
   });
@@ -76,11 +86,9 @@ describe('AGENT_AUTH_PROBE_CONFIG', () => {
 
   it('derives auth probe binary names from the provider runtime catalog', () => {
     for (const agentId of AGENT_IDS) {
-      const runtimeSpec = getProviderCliRuntimeSpec(agentId);
-      const expected = agentId === 'cursor'
-        ? [runtimeSpec.binaryName, ...(runtimeSpec.alternativeBinaryNames ?? [])]
-        : [runtimeSpec.binaryName];
-      expect(getAgentAuthProbeConfig(agentId).binaryNames).toEqual(expected);
+      expect(getAgentAuthProbeConfig(agentId).binaryNames).toEqual(
+        getProviderCliBinaryNames(agentId, {}),
+      );
     }
   });
 });

@@ -17,6 +17,37 @@ describe('executionRunBackendFactory (codex)', () => {
     probeCodexAppServerExecutionRunAvailabilityMock.mockImplementation(() => true);
   });
 
+  it('inherits the parent process environment when execution-run isolation is absent', async () => {
+    const appServerCalls: Array<Record<string, unknown>> = [];
+
+    vi.stubEnv('PATH', 'C:\\Users\\alice\\AppData\\Roaming\\npm;C:\\Windows\\System32');
+    vi.stubEnv('PATHEXT', '.COM;.EXE;.CMD');
+    vi.stubEnv('HAPPIER_CODEX_PARENT_SENTINEL', 'inherited');
+    vi.stubEnv('HAPPIER_CODEX_EXECUTION_RUN_TRANSPORT', 'appServer');
+
+    vi.doMock('./createCodexAppServerExecutionRunBackend', () => ({
+      createCodexAppServerExecutionRunBackend: (options: Record<string, unknown>) => {
+        appServerCalls.push(options);
+        return { dispose: async () => undefined };
+      },
+    }));
+
+    const { executionRunBackendFactory } = await import('./executionRunBackendFactory');
+
+    executionRunBackendFactory({
+      cwd: '/tmp/happier-worktree',
+      backendId: 'codex',
+      permissionMode: 'read_only',
+    } as any);
+
+    expect(appServerCalls).toHaveLength(1);
+    expect(appServerCalls[0]?.env).toMatchObject({
+      PATH: `${resolve('/tmp/happier-worktree', 'scripts', 'shims')}${delimiter}C:\\Users\\alice\\AppData\\Roaming\\npm;C:\\Windows\\System32`,
+      PATHEXT: '.COM;.EXE;.CMD',
+      HAPPIER_CODEX_PARENT_SENTINEL: 'inherited',
+    });
+  });
+
   it('scrubs Codex session attach env while preserving isolated execution-run env', async () => {
     const captured: Array<Record<string, unknown>> = [];
 
@@ -227,6 +258,7 @@ describe('executionRunBackendFactory (codex)', () => {
     vi.stubEnv('HAPPIER_CODEX_APP_SERVER_BIN', '/tmp/fake-codex-app-server');
     vi.stubEnv('HAPPIER_CODEX_EXECUTION_RUN_TRANSPORT', 'appServer');
     vi.stubEnv('HAPPIER_CODEX_APP_SERVER_RPC_TIMEOUT_MS', '1234');
+    vi.stubEnv('HAPPIER_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS', '7230500');
 
     vi.doMock('./createCodexAppServerExecutionRunBackend', () => ({
       createCodexAppServerExecutionRunBackend: (options: Record<string, unknown>) => {
@@ -258,6 +290,7 @@ describe('executionRunBackendFactory (codex)', () => {
       HAPPIER_CODEX_APP_SERVER_BIN: '/tmp/fake-codex-app-server',
       HAPPIER_CODEX_EXECUTION_RUN_TRANSPORT: 'appServer',
       HAPPIER_CODEX_APP_SERVER_RPC_TIMEOUT_MS: '1234',
+      HAPPIER_CODEX_HAPPIER_MCP_TOOL_CALL_TIMEOUT_MS: '7230500',
       XDG_STATE_HOME: '/tmp/state',
       PATH: `${resolve('/tmp/happier-worktree', 'scripts', 'shims')}${delimiter}/tmp/isolated-bin:/usr/bin`,
     });

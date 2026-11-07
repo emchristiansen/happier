@@ -14,6 +14,9 @@ export function buildLaunchAgentPlistXml(params: Readonly<{
   stderrPath: string;
   workingDirectory?: string | null;
   abandonProcessGroup?: boolean;
+  runAtLoad?: boolean;
+  keepAliveOnFailure?: boolean;
+  associatedBundleIdentifiers?: readonly string[];
 }>): string {
   const workingDirectory = String(params.workingDirectory ?? '').trim();
   return buildLaunchdPlistXml({
@@ -24,5 +27,8 @@ export function buildLaunchAgentPlistXml(params: Readonly<{
     stderrPath: params.stderrPath,
     workingDirectory: workingDirectory || undefined,
     abandonProcessGroup: params.abandonProcessGroup,
+    runAtLoad: params.runAtLoad,
+    keepAliveOnFailure: params.keepAliveOnFailure,
+    associatedBundleIdentifiers: params.associatedBundleIdentifiers,
   });
 }

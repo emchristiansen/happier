@@ -1,6 +1,13 @@
 import { randomUUID } from 'node:crypto';
 
 let runnerPublisherIncarnationId: string | undefined;
+let nativeProviderObservationSequence = 0n;
+
+/** Event ordering within this publisher, reused unchanged by a transport retry. */
+export function nextNativeProviderObservationSequence(): string {
+    nativeProviderObservationSequence += 1n;
+    return nativeProviderObservationSequence.toString();
+}
 
 /**
  * Identity of this runner process as a session publisher. It is sent in the session-scoped socket

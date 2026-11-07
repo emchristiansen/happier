@@ -1,5 +1,6 @@
 import {
     readConnectedServiceLimitCategoryV1,
+    type ConnectedServiceAuthGroupQuotaLimitSelectionV1,
     type ConnectedServiceQuotaMeterV1,
     type ConnectedServiceQuotaRecoveryCreditsV1,
     type ConnectedServiceQuotaSnapshotV1,
@@ -10,7 +11,7 @@ import { getAgentCore, resolveAgentIdFromFlavor } from '@/agents/registry/regist
 
 import type { MeterTone } from '@/components/ui/lists/MeterBar';
 
-import { clampQuotaPct, deriveQuotaUtilizationPct } from './deriveQuotaUtilizationPct';
+import { clampQuotaPct, deriveQuotaMeterValues, deriveQuotaUtilizationPct } from './deriveQuotaUtilizationPct';
 import {
     summarizeConnectedServiceQuotaRecoveryCredits,
     type ConnectedServiceQuotaRecoveryCreditSummary,
@@ -19,21 +20,31 @@ import { formatResetCountdown, isResetCountdownOutdated } from './formatResetCou
 import { resolveQuotaTone } from './resolveQuotaTone';
 import { resolveSubscriptionEndTime } from './resolveSubscriptionEndTime';
 
-export type ConnectedServiceQuotaGaugeWindowMode =
-    | 'most_constrained'
-    | 'daily'
-    | 'weekly'
-    | 'primary'
-    | 'secondary'
-    | 'session';
+import { resolveQuotaGaugeWindowModes, type ConnectedServiceQuotaGaugeWindowMode } from './quotaGaugeWindows';
+import { projectConnectedServiceQuotaSnapshotForLimitSelection } from './projectConnectedServiceQuotaSnapshotForLimitSelection';
+
+export type { ConnectedServiceQuotaGaugeWindowMode } from './quotaGaugeWindows';
 
 export type ConnectedServiceQuotaGaugeTone = 'neutral' | 'warning' | 'critical';
+
+type ConnectedServiceQuotaGaugeWindow = 'session' | 'daily' | 'weekly';
+
+/** One composer ring. Its number is the remaining percent, like the main gauge. */
+export type ConnectedServiceQuotaGaugeRing = Readonly<{
+    meterId: string;
+    label: string;
+    usedPct: number;
+    ringValueLabel: string;
+    /** Remaining-first value text, e.g. "18% left". */
+    valueLabel: string;
+    tone: ConnectedServiceQuotaGaugeTone;
+}>;
 
 export type ConnectedServiceQuotaGaugeMeterRow = Readonly<{
     meterId: string;
     label: string;
-    remainingPct: number;
-    usedPct: number;
+    remainingPct: number | null;
+    usedPct: number | null;
     detailRightSemantics: 'remaining';
     detailRightLabel: string;
     usedLimitSemantics: 'used' | null;
@@ -43,6 +54,7 @@ export type ConnectedServiceQuotaGaugeMeterRow = Readonly<{
 }>;
 
 export type ConnectedServiceQuotaGaugeLabelFormatter = Readonly<{
+    unavailable: () => string;
     remaining: (params: Readonly<{ percent: string }>) => string;
     remainingWithReset: (params: Readonly<{ percent: string; reset: string }>) => string;
     used: (params: Readonly<{ used: string; limit: string }>) => string;
@@ -87,6 +99,8 @@ export type ConnectedServiceQuotaGaugeViewModel = Readonly<{
     recoveryCreditSummary: ConnectedServiceQuotaRecoveryCreditSummary | null;
     effectiveMeter: ConnectedServiceQuotaMeterV1;
     allMeterRows: readonly ConnectedServiceQuotaGaugeMeterRow[];
+    /** Global windows followed by reliable favorites of the active account. */
+    usageRings: readonly ConnectedServiceQuotaGaugeRing[];
 }>;
 
 export type ConnectedServiceQuotaGaugeSourceKind =
@@ -142,12 +156,36 @@ function readPublicLimitCategory(meter: ConnectedServiceQuotaMeterV1): ReturnTyp
     );
 }
 
-export function resolveConnectedServiceQuotaMeterScopePrefix(
-    meter: Pick<ConnectedServiceQuotaMeterV1, 'meterId' | 'label'>,
-): string | null {
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The usage window a meter measures: from its reported duration when present (Codex), otherwise
+ * from its name (Claude `five_hour` / `seven_day_*`). Weekly names are checked before daily ones
+ * because `seven_day` also carries a `day` token.
+ */
+function resolveConnectedServiceQuotaMeterWindow(
+    meter: Pick<ConnectedServiceQuotaMeterV1, 'meterId' | 'label' | 'windowDurationMs'>,
+): ConnectedServiceQuotaGaugeWindow | null {
+    const durationMs = meter.windowDurationMs;
+    if (typeof durationMs === 'number' && durationMs > 0) {
+        if (durationMs < DAY_MS) return 'session';
+        if (durationMs < 2 * DAY_MS) return 'daily';
+        if (durationMs < 8 * DAY_MS) return 'weekly';
+        return null;
+    }
     const tokens = meterNameTokens(meter);
-    if (tokens.has('daily') || tokens.has('day')) return 'd.';
-    if (tokens.has('weekly') || tokens.has('week')) return 'w.';
+    if (tokens.has('weekly') || tokens.has('week') || tokens.has('seven')) return 'weekly';
+    if (tokens.has('daily') || tokens.has('day')) return 'daily';
+    if (tokens.has('session') || tokens.has('hour') || tokens.has('5h')) return 'session';
+    return null;
+}
+
+export function resolveConnectedServiceQuotaMeterScopePrefix(
+    meter: Pick<ConnectedServiceQuotaMeterV1, 'meterId' | 'label' | 'windowDurationMs'>,
+): string | null {
+    const window = resolveConnectedServiceQuotaMeterWindow(meter);
+    if (window === 'daily') return 'd.';
+    if (window === 'weekly') return 'w.';
     return null;
 }
 
@@ -156,10 +194,10 @@ function meterMatchesWindowMode(
     windowMode: ConnectedServiceQuotaGaugeWindowMode,
 ): boolean {
     if (windowMode === 'most_constrained') return true;
-    const tokens = meterNameTokens(meter);
-    if (windowMode === 'daily') return tokens.has('daily') || tokens.has('day');
-    if (windowMode === 'weekly') return tokens.has('weekly') || tokens.has('week');
-    return tokens.has(windowMode) || meter.meterId.toLowerCase() === windowMode;
+    if (windowMode === 'daily' || windowMode === 'weekly' || windowMode === 'session') {
+        return resolveConnectedServiceQuotaMeterWindow(meter) === windowMode;
+    }
+    return meterNameTokens(meter).has(windowMode) || meter.meterId.toLowerCase() === windowMode;
 }
 
 export function isConnectedServiceQuotaMeterPercentRankable(meter: ConnectedServiceQuotaMeterV1): boolean {
@@ -255,7 +293,7 @@ function mapMeterToneToGaugeTone(tone: MeterTone): ConnectedServiceQuotaGaugeTon
     return 'neutral';
 }
 
-function resolveTone(remainingPct: number): ConnectedServiceQuotaGaugeTone {
+function resolveTone(remainingPct: number | null): ConnectedServiceQuotaGaugeTone {
     return mapMeterToneToGaugeTone(resolveQuotaTone(remainingPct));
 }
 
@@ -263,15 +301,9 @@ function buildMeterRow(
     meter: ConnectedServiceQuotaMeterV1,
     nowMs: number,
     formatter: ConnectedServiceQuotaGaugeLabelFormatter,
-): ConnectedServiceQuotaGaugeMeterRow | null {
-    const usedPct = deriveQuotaUtilizationPct(meter);
-    if (usedPct === null) return null;
-
-    const remainingPct = typeof meter.remainingPct === 'number' && Number.isFinite(meter.remainingPct)
-        ? clampQuotaPct(meter.remainingPct)
-        : clampQuotaPct(100 - usedPct);
-    const roundedRemaining = Math.round(remainingPct);
-    const remainingLabel = `${roundedRemaining}%`;
+): ConnectedServiceQuotaGaugeMeterRow {
+    const { usedPct, remainingPct, used, limit } = deriveQuotaMeterValues(meter);
+    const remainingLabel = remainingPct === null ? '—' : `${Math.round(remainingPct)}%`;
     // An elapsed reset boundary means the snapshot predates its own reset — fall back to the plain
     // remaining label instead of composing the nonsense phrase "resets in outdated".
     const resetLabel = isResetCountdownOutdated(nowMs, meter.resetAtMs ?? meter.resetsAt)
@@ -283,58 +315,120 @@ function buildMeterRow(
         remainingPct,
         usedPct,
         detailRightSemantics: 'remaining',
-        detailRightLabel: resetLabel
+        detailRightLabel: remainingPct === null && resetLabel === null
+            ? formatter.unavailable()
+            : resetLabel
             ? formatter.remainingWithReset({ percent: remainingLabel, reset: resetLabel })
             : formatter.remaining({ percent: remainingLabel }),
-        usedLimitSemantics: typeof meter.used === 'number' && typeof meter.limit === 'number'
+        usedLimitSemantics: typeof used === 'number' && typeof limit === 'number'
             ? 'used'
             : null,
-        usedLimitLabel: typeof meter.used === 'number' && typeof meter.limit === 'number'
-            ? formatter.used({ used: formatNumber(meter.used), limit: formatNumber(meter.limit) })
+        usedLimitLabel: typeof used === 'number' && typeof limit === 'number'
+            ? formatter.used({ used: formatNumber(used), limit: formatNumber(limit) })
             : null,
         resetLabel,
         tone: resolveTone(remainingPct),
     };
 }
 
+export function buildConnectedServiceQuotaGaugeMeterRows(
+    meters: readonly ConnectedServiceQuotaMeterV1[],
+    nowMs: number,
+    formatter: ConnectedServiceQuotaGaugeLabelFormatter,
+    pinnedMeterIds: readonly string[] = [],
+): ConnectedServiceQuotaGaugeMeterRow[] {
+    const rows: ConnectedServiceQuotaGaugeMeterRow[] = [];
+    for (const meter of meters) {
+        const category = readPublicLimitCategory(meter);
+        if ((category && !['usage_limit', 'rate_limit'].includes(category))
+            || rows.some((row) => row.meterId === meter.meterId)) continue;
+        const row = buildMeterRow(meter, nowMs, formatter);
+        // Provider adapters may emit empty placeholders for known windows. Keep
+        // useful facts and user-pinned windows, without changing the snapshot.
+        if (row.remainingPct !== null || row.usedLimitLabel !== null || row.resetLabel !== null
+            || pinnedMeterIds.includes(row.meterId)) rows.push(row);
+    }
+    return rows;
+}
+
 export function computeConnectedServiceQuotaGaugeViewModel(_params: Readonly<{
     snapshot: ConnectedServiceQuotaSnapshotV1 | null;
     windowMode: ConnectedServiceQuotaGaugeWindowMode;
+    windowModes?: readonly ConnectedServiceQuotaGaugeWindowMode[] | null;
+    /** Extra favorites from the account currently used by the session. */
+    additionalMeterIds?: readonly string[];
+    /** Null means the bound pool policy has not been read yet. */
+    quotaLimitSelection?: ConnectedServiceAuthGroupQuotaLimitSelectionV1 | null;
     nowMs: number;
     formatter: ConnectedServiceQuotaGaugeLabelFormatter;
     providerDisplayName?: string | null;
     activeAccountDisplayLabel?: string | null;
+    activeModelId?: string | null;
 }>): ConnectedServiceQuotaGaugeViewModel | null {
-    const params = _params;
-    if (!params.snapshot) return null;
+    if (_params.quotaLimitSelection === null) return null;
+    const selectedSnapshot = projectConnectedServiceQuotaSnapshotForLimitSelection(_params.snapshot, _params.quotaLimitSelection);
+    if (!selectedSnapshot) return null;
+    // Account windows remain account facts. A model reading is eligible only for
+    // its exact active identity; labels and provider limit ids imply no membership.
+    const activeModelId = _params.activeModelId?.trim();
+    const snapshot = _params.activeModelId === undefined ? selectedSnapshot : {
+        ...selectedSnapshot,
+        meters: selectedSnapshot.meters.filter(meter => meter.modelId
+            ? meter.modelId === activeModelId
+            : meter.scope !== 'model' && meter.limitScope !== 'model'),
+    };
+    const params = { ..._params, snapshot };
 
     const rankableMeters = selectComparableConnectedServiceQuotaMeters(params.snapshot.meters);
-    const allMeterRows = rankableMeters
-        .map((meter) => buildMeterRow(meter, params.nowMs, params.formatter))
-        .filter((row): row is ConnectedServiceQuotaGaugeMeterRow => row !== null);
+    const allMeterRows = buildConnectedServiceQuotaGaugeMeterRows(
+        [...rankableMeters, ...params.snapshot.meters], params.nowMs, params.formatter, params.additionalMeterIds,
+    );
     if (allMeterRows.length === 0) return null;
 
-    const selectedCandidates = rankableMeters.filter((meter) => meterMatchesWindowMode(meter, params.windowMode));
-    const candidates = selectedCandidates.length > 0 ? selectedCandidates : rankableMeters;
-    let effectiveMeter: ConnectedServiceQuotaMeterV1 | null = null;
-    let effectiveRemainingPct = Number.POSITIVE_INFINITY;
-    for (const meter of candidates) {
-        const usedPct = deriveQuotaUtilizationPct(meter);
-        if (usedPct === null) continue;
-        const remainingPct = typeof meter.remainingPct === 'number' && Number.isFinite(meter.remainingPct)
-            ? clampQuotaPct(meter.remainingPct)
-            : clampQuotaPct(100 - usedPct);
-        if (remainingPct < effectiveRemainingPct) {
-            effectiveRemainingPct = remainingPct;
-            effectiveMeter = meter;
+    const windowModes = resolveQuotaGaugeWindowModes(params.windowModes, params.windowMode);
+    const selectedMeters = windowModes.flatMap((mode) => {
+        const matching = rankableMeters.filter((meter) => meterMatchesWindowMode(meter, mode));
+        // Preserve the predecessor single-window fallback; explicit multi-selections omit missing windows.
+        const candidates = matching.length || params.windowModes?.length ? matching : rankableMeters;
+        let selected: ConnectedServiceQuotaMeterV1 | null = null;
+        let leastRemaining = Number.POSITIVE_INFINITY;
+        for (const meter of candidates) {
+            const usedPct = deriveQuotaUtilizationPct(meter);
+            if (usedPct === null) continue;
+            const remaining = typeof meter.remainingPct === 'number' && Number.isFinite(meter.remainingPct)
+                ? clampQuotaPct(meter.remainingPct) : clampQuotaPct(100 - usedPct);
+            if (remaining < leastRemaining) {
+                selected = meter;
+                leastRemaining = remaining;
+            }
+        }
+        return selected ? [{ meter: selected, remainingPct: leastRemaining }] : [];
+    });
+    // Favorites append to global windows after Pool filtering; dedupe shared meters.
+    for (const meterId of params.additionalMeterIds ?? []) {
+        if (selectedMeters.some(({ meter }) => meter.meterId === meterId)) continue;
+        const meter = params.snapshot.meters.find((candidate) => candidate.meterId === meterId
+            && isConnectedServiceQuotaMeterPercentRankable(candidate));
+        const row = meter ? buildMeterRow(meter, params.nowMs, params.formatter) : null;
+        if (meter && row?.usedPct !== null && row?.remainingPct != null) {
+            selectedMeters.push({ meter, remainingPct: row.remainingPct });
         }
     }
-    if (!effectiveMeter || !Number.isFinite(effectiveRemainingPct)) return null;
+    const effectiveMeter = selectedMeters[0]?.meter;
+    const effectiveRemainingPct = selectedMeters[0]?.remainingPct;
+    if (!effectiveMeter || effectiveRemainingPct === undefined) return null;
 
     const selectedRow = buildMeterRow(effectiveMeter, params.nowMs, params.formatter);
-    if (!selectedRow) return null;
+    if (selectedRow.usedPct === null) return null;
 
-    const selectedWindowPrefix = params.windowMode === 'most_constrained'
+    const displayedMeterRows = [...new Set(selectedMeters.map(({ meter }) => meter.meterId))].flatMap((meterId) => {
+        const meter = params.snapshot?.meters.find((candidate) => candidate.meterId === meterId
+            && isConnectedServiceQuotaMeterPercentRankable(candidate));
+        const row = meter ? buildMeterRow(meter, params.nowMs, params.formatter) : null;
+        return row && meter && row.usedPct !== null && row.remainingPct !== null
+            ? [{ meter, row: { ...row, usedPct: row.usedPct, remainingPct: row.remainingPct } }] : [];
+    });
+    const selectedWindowPrefix = windowModes[0] === 'most_constrained'
         ? null
         : resolveConnectedServiceQuotaMeterScopePrefix(effectiveMeter);
     const roundedRemaining = Math.round(effectiveRemainingPct);
@@ -390,6 +484,17 @@ export function computeConnectedServiceQuotaGaugeViewModel(_params: Readonly<{
         recoveryCreditSummary: summarizeConnectedServiceQuotaRecoveryCredits(params.snapshot.recoveryCredits, params.nowMs),
         effectiveMeter,
         allMeterRows,
+        usageRings: displayedMeterRows.map(({ meter, row }) => {
+            const ringRemaining = Math.round(row.remainingPct);
+            return {
+                meterId: meter.meterId,
+                label: row.label,
+                usedPct: row.usedPct,
+                ringValueLabel: String(ringRemaining),
+                valueLabel: params.formatter.remaining({ percent: `${ringRemaining}%` }),
+                tone: row.tone,
+            };
+        }),
     };
 }
 

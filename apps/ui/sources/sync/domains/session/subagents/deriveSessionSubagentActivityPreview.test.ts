@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { SessionSubagent } from './types';
-import { deriveSessionSubagentActivityPreview } from './deriveSessionSubagentActivityPreview';
+import { deriveSessionSubagentActivityPreview, deriveSessionSubagentLastActivityAtMs } from './deriveSessionSubagentActivityPreview';
 
 const baseSubagent: SessionSubagent = {
     id: 'agent_team_member:qa:beta@qa',
@@ -15,6 +15,18 @@ const baseSubagent: SessionSubagent = {
 };
 
 describe('deriveSessionSubagentActivityPreview', () => {
+    it('keeps an opaque child identity when looking up output and its observation time', () => {
+        const params = {
+            subagent: { ...baseSubagent, transcript: { sidechainId: ' child ' } },
+            reducerState: { sidechains: new Map([
+                ['child', [{ text: 'Another child', createdAt: 100 }]],
+                [' child ', [{ text: 'Native child output', createdAt: 200 }]],
+            ]) },
+        };
+        expect(deriveSessionSubagentActivityPreview(params)).toBe('Native child output');
+        expect(deriveSessionSubagentLastActivityAtMs(params)).toBe(200);
+    });
+
     it('returns the latest normal text preview for standard subagent transcripts', () => {
         const preview = deriveSessionSubagentActivityPreview({
             subagent: {

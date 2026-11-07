@@ -1,4 +1,6 @@
 import {
+    CLI_ACQUISITION_PROGRESS_EVENT,
+    parseCliAcquisitionProgress,
     SystemTaskEventSchema,
     SystemTaskResultSchema,
     SystemTaskSpecSchema,
@@ -47,12 +49,25 @@ function insertEventInChronologicalOrder(
 
     const nextEvents = [...events];
     const insertIndex = nextEvents.findIndex((event) => nextEvent.tsMs < event.tsMs);
-    if (insertIndex === -1) {
-        nextEvents.push(nextEvent);
-        return nextEvents;
+    nextEvents.splice(insertIndex === -1 ? nextEvents.length : insertIndex, 0, nextEvent);
+    // Progress samples replace one another within a phase. Milestones and prompts remain in
+    // chronological order, including when a bridge replays older samples after live delivery.
+    const retained: SystemTaskEvent[] = [];
+    let previousProgress: SystemTaskEvent | null = null;
+    for (const event of nextEvents) {
+        const progress = event.type === CLI_ACQUISITION_PROGRESS_EVENT ? parseCliAcquisitionProgress(event.data) : null;
+        if (progress) {
+            const previous = previousProgress ? parseCliAcquisitionProgress(previousProgress.data) : null;
+            if (previousProgress && previous?.phase === progress.phase && !previous.failure && !progress.failure
+                && previous.receivedBytes !== undefined && progress.receivedBytes !== undefined
+                && previousProgress.stepId === event.stepId) {
+                retained.splice(retained.indexOf(previousProgress), 1);
+            }
+            previousProgress = event;
+        }
+        retained.push(event);
     }
-    nextEvents.splice(insertIndex, 0, nextEvent);
-    return nextEvents;
+    return retained;
 }
 
 function createInitialTaskState(taskId: string): SystemTaskRunState {
@@ -187,7 +202,7 @@ export function createSystemTaskRunner(options: Readonly<{
                 unlistenBridge: null,
             };
             tasks.set(taskId, record);
-            record.unlistenBridge = await options.bridge.subscribe(taskId, {
+            const unlistenBridge = await options.bridge.subscribe(taskId, {
                 onEvent: (payload) => {
                     applyEvent(taskId, payload);
                 },
@@ -195,6 +210,8 @@ export function createSystemTaskRunner(options: Readonly<{
                     applyResult(taskId, payload);
                 },
             } satisfies SystemTaskBridgeListenerSet);
+            if (record.state.result) unlistenBridge();
+            else record.unlistenBridge = unlistenBridge;
             notifyTask(taskId);
             return taskId;
         },
@@ -231,17 +248,20 @@ export function createSystemTaskRunner(options: Readonly<{
             }
             if (typeof onResult === 'function') {
                 const onEvent = listenerOrOnEvent as ((event: SystemTaskEvent) => void) | undefined;
-                const seenEventSignatures = new Set<string>();
+                let seenEventSignatures = new Set<string>();
                 let sawResult = false;
                 const replay = () => {
                     const snapshot = record.state;
                     if (onEvent) {
+                        const previousSignatures = seenEventSignatures;
+                        // Update before callbacks: a prompt callback can synchronously notify
+                        // the runner again. Retain only signatures still in the current history.
+                        seenEventSignatures = new Set(snapshot.events.map(getEventSignature));
                         for (const event of snapshot.events) {
                             const signature = getEventSignature(event);
-                            if (seenEventSignatures.has(signature)) {
+                            if (previousSignatures.has(signature)) {
                                 continue;
                             }
-                            seenEventSignatures.add(signature);
                             onEvent(event);
                         }
                     }

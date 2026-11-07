@@ -70,7 +70,7 @@ describe('configuration env url fallback', () => {
       const configMod = await import('./configuration');
       configMod.reloadConfiguration();
       expect(configMod.configuration.serverUrl).toBe('https://api.happier.dev');
-      expect(configMod.configuration.webappUrl).toBe('https://app.happier.dev');
+      expect(configMod.configuration.webappUrl).toBe('https://cloud.happier.dev');
     } finally {
       output.restore();
     }

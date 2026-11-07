@@ -19,9 +19,17 @@ function openDatabase(): Promise<IDBDatabase> {
         request.onblocked = () => reject(new Error('Browser storage upgrade is blocked by another tab.'));
         request.onsuccess = () => {
             const database = request.result;
+            const openedConnection = connection;
+            const invalidateConnection = () => {
+                if (connection === openedConnection) connection = undefined;
+            };
+            database.onclose = () => {
+                invalidateConnection();
+                console.warn('Browser record storage connection closed unexpectedly; the next operation will reopen it.');
+            };
             database.onversionchange = () => {
                 database.close();
-                connection = undefined;
+                invalidateConnection();
             };
             resolve(database);
         };

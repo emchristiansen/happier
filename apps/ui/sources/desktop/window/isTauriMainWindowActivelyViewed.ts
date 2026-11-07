@@ -1,3 +1,4 @@
+import { readHostWindowFocus } from '@/utils/runtime/readHostWindowFocus';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 
 export function isTauriMainWindowActivelyViewed(): boolean {
@@ -16,9 +17,5 @@ export function isTauriMainWindowActivelyViewed(): boolean {
         return false;
     }
 
-    if (typeof doc?.hasFocus === 'function') {
-        return doc.hasFocus();
-    }
-
-    return true;
+    return readHostWindowFocus() ?? true;
 }

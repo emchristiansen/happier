@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Linking, Pressable, View } from 'react-native';
+import { Pressable, View } from 'react-native';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
 import { Text } from '@/components/ui/text/Text';
@@ -7,34 +7,16 @@ import { Typography } from '@/constants/Typography';
 import { useActiveServerSnapshot } from '@/hooks/server/useActiveServerSnapshot';
 import { HAPPIER_CLOUD_SERVER_URL } from '@/sync/domains/server/serverProfiles';
 import { createServerUrlComparableKey } from '@/sync/domains/server/url/serverUrlCanonical';
+import { derivePresentableRelayHost } from '@/sync/domains/server/url/serverUrlDisplay';
 import { t } from '@/text';
 import { Icon } from '@/components/ui/icons/Icon';
+import { useOpenExternalUrl } from '@/hooks/ui/useOpenExternalUrl';
 
 const DOCS_URL = 'https://docs.happier.dev';
 const GITHUB_URL = 'https://github.com/happier-dev/happier';
 const DISCORD_URL = 'https://discord.gg/W6Pb8KuHfg';
 
 const HAPPIER_CLOUD_COMPARABLE_KEY = createServerUrlComparableKey(HAPPIER_CLOUD_SERVER_URL);
-
-/**
- * Builds the host[:port] string we show in the footer when the user has
- * selected a custom relay. We hide the default scheme ports (443 for https,
- * 80 for http) because they're implied and only clutter the chip.
- * Returns null if the URL is unparseable — caller falls back to the raw URL.
- */
-function derivePresentableRelayHost(serverUrl: string): string | null {
-    try {
-        const parsed = new URL(serverUrl);
-        const host = parsed.hostname;
-        const port = parsed.port;
-        const isDefaultPort = !port
-            || (parsed.protocol === 'https:' && port === '443')
-            || (parsed.protocol === 'http:' && port === '80');
-        return isDefaultPort ? host : `${host}:${port}`;
-    } catch {
-        return null;
-    }
-}
 
 export type WelcomeFooterLinksProps = Readonly<{
     variant: 'desktop' | 'mobile';
@@ -57,9 +39,9 @@ export const WelcomeFooterLinks = React.memo(function WelcomeFooterLinks(props: 
     const { theme } = useUnistyles();
     const styles = stylesheet;
 
-    const openDocs = React.useCallback(() => { void Linking.openURL(DOCS_URL); }, []);
-    const openGithub = React.useCallback(() => { void Linking.openURL(GITHUB_URL); }, []);
-    const openDiscord = React.useCallback(() => { void Linking.openURL(DISCORD_URL); }, []);
+    const [, openDocs] = useOpenExternalUrl(DOCS_URL);
+    const [, openGithub] = useOpenExternalUrl(GITHUB_URL);
+    const [, openDiscord] = useOpenExternalUrl(DISCORD_URL);
 
     const labelColor = { color: theme.colors.text.secondary };
     const actionColor = { color: theme.colors.text.primary };

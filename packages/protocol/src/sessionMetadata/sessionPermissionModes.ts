@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { lazySchema } from '../lazySchema.js';
 
 export const SESSION_PERMISSION_MODES = [
   'default',
@@ -11,6 +12,20 @@ export const SESSION_PERMISSION_MODES = [
 ] as const;
 
 export type SessionPermissionMode = (typeof SESSION_PERMISSION_MODES)[number];
+
+/**
+ * Provider-neutral permission names presented at user/action input boundaries.
+ *
+ * Readers and persisted session metadata retain the older `read-only` / `safe-yolo`
+ * spellings for mixed-version compatibility. {@link parseSessionPermissionModeAlias}
+ * translates these names and supported legacy aliases into that wire representation.
+ */
+export const SESSION_PERMISSION_INTENT_INPUTS = [
+  'read_only',
+  'default',
+  'auto',
+  'yolo',
+] as const;
 
 const SESSION_PERMISSION_MODE_SET = new Set<string>(SESSION_PERMISSION_MODES);
 
@@ -87,7 +102,7 @@ export function createSessionPermissionModeInputSchema(zod: typeof z) {
   );
 }
 
-export const SessionPermissionModeInputSchema = createSessionPermissionModeInputSchema(z);
+export const SessionPermissionModeInputSchema = lazySchema(() => createSessionPermissionModeInputSchema(z));
 
 /**
  * Parse behavior:
@@ -98,4 +113,4 @@ export function createSessionPermissionModeSchema(zod: typeof z) {
   return zod.enum(SESSION_PERMISSION_MODES).catch('default');
 }
 
-export const SessionPermissionModeSchema = createSessionPermissionModeSchema(z);
+export const SessionPermissionModeSchema = lazySchema(() => createSessionPermissionModeSchema(z));

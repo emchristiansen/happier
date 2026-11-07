@@ -1,11 +1,39 @@
 import { describe, expect, it } from 'vitest';
 
 import { settingsParse } from '@/sync/domains/settings/settings';
+import { buildClaudeRemoteOutgoingMessageMetaExtras } from '@happier-dev/agents';
 
 describe('settingsParse provider plugin defaults', () => {
+    it('preserves a legacy Claude bridge opt-out through parsing and outgoing metadata', () => {
+        const settings = settingsParse({ claudeLocalPermissionBridgeEnabled: false });
+        expect(buildClaudeRemoteOutgoingMessageMetaExtras(settings)).toMatchObject({
+            claudeUnifiedTerminalQuestionResponseLocation: 'terminal_only',
+            claudeUnifiedTerminalPermissionResponseLocation: 'terminal_only',
+            claudeLocalPermissionBridgeEnabled: false,
+        });
+    });
+
+    it('retains explicit independent Claude response locations while defaulting missing preferences', () => {
+        expect(settingsParse({})).toMatchObject({
+            claudeUnifiedTerminalQuestionResponseLocation: 'app_and_terminal',
+            claudeUnifiedTerminalPermissionResponseLocation: 'app_and_terminal',
+        });
+        const settings = settingsParse({
+            claudeLocalPermissionBridgeEnabled: false,
+            claudeUnifiedTerminalQuestionResponseLocation: 'app_only',
+            claudeUnifiedTerminalPermissionResponseLocation: 'app_and_terminal',
+        });
+        expect(buildClaudeRemoteOutgoingMessageMetaExtras(settings)).toMatchObject({
+            claudeUnifiedTerminalQuestionResponseLocation: 'app_only',
+            claudeUnifiedTerminalPermissionResponseLocation: 'app_and_terminal',
+        });
+        expect(settingsParse(settings)).toEqual(settings);
+    });
+
     it('includes Claude provider defaults when no settings are persisted', () => {
         const settings = settingsParse({});
 
+        expect((settings as any).claudeDynamicModelProbeEnabled).toBe(true);
         expect((settings as any).claudeRemoteAgentSdkEnabled).toBe(true);
         expect((settings as any).claudeRemoteSettingSources).toBe('user_project');
         expect((settings as any).claudeRemoteSettingSourcesV2).toEqual(['user', 'project', 'local']);
@@ -55,6 +83,14 @@ describe('settingsParse provider plugin defaults', () => {
         } as any);
 
         expect((settings as any).claudeRemoteAgentSdkEnabled).toBe(false);
+    });
+
+    it('respects the Claude dynamic model discovery opt-out', () => {
+        const settings = settingsParse({
+            claudeDynamicModelProbeEnabled: false,
+        } as any);
+
+        expect((settings as any).claudeDynamicModelProbeEnabled).toBe(false);
     });
 
     it('rejects invalid JSON payloads for JSON provider setting fields', () => {

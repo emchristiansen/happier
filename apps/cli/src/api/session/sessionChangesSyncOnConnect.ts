@@ -55,6 +55,7 @@ export async function runSessionChangesSyncOnConnect(params: {
     connectionSupervisor?: ManagedConnectionSupervisor | null;
     onDebug: (message: string, data?: unknown) => void;
 }): Promise<void> {
+    const probeReportScope = params.connectionSupervisor?.captureProbeReportScope?.();
     const accountId = await params.getAccountId();
     if (!accountId) return;
 
@@ -92,6 +93,7 @@ export async function runSessionChangesSyncOnConnect(params: {
             supervisor: params.connectionSupervisor,
             error: result.error,
             hadAuth: true,
+            probeReportScope,
         })) {
             return;
         }

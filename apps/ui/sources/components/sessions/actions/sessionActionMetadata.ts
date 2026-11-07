@@ -1,4 +1,5 @@
 import type * as React from 'react';
+import { isActionEnabledByActionsSettings, isApprovalRequiredByActionsSettings, type ActionsSettingsV1 } from '@happier-dev/protocol';
 
 import type { TranslationKeyNoParams } from '@/text';
 
@@ -13,6 +14,7 @@ import {
     SESSION_ACTION_PIN_ID,
     SESSION_ACTION_RENAME_ID,
     SESSION_ACTION_RESUME_ID,
+    SESSION_ACTION_SET_APPEARANCE_COLOR_ID,
     SESSION_ACTION_SET_ATTENTION_STANDING_ID,
     SESSION_ACTION_STOP_ID,
     SESSION_ACTION_UNARCHIVE_ID,
@@ -63,8 +65,7 @@ const METADATA_BY_ACTION_ID: Readonly<Record<string, SessionActionMetadata>> = {
         titleKey: 'sessionInfo.archiveSession',
         subtitleKey: 'sessionInfo.archiveSessionSubtitle',
         icon: 'archive',
-        destructive: true,
-        requiresConfirmation: true,
+        destructive: false,
     },
     [SESSION_ACTION_UNARCHIVE_ID]: {
         titleKey: 'sessionInfo.unarchiveSession',
@@ -94,6 +95,10 @@ const METADATA_BY_ACTION_ID: Readonly<Record<string, SessionActionMetadata>> = {
         titleKey: 'sessionsList.moveToFolder',
         icon: 'folder',
     },
+    [SESSION_ACTION_SET_APPEARANCE_COLOR_ID]: {
+        titleKey: 'sessionsList.appearance.setColor',
+        icon: 'palette',
+    },
     [SESSION_ACTION_SET_ATTENTION_STANDING_ID]: {
         titleKey: 'sessionInfo.keepInAttention',
         subtitleKey: 'sessionInfo.keepInAttentionSubtitle',
@@ -120,4 +125,19 @@ const METADATA_BY_ACTION_ID: Readonly<Record<string, SessionActionMetadata>> = {
 
 export function getSessionActionMetadata(actionId: string): SessionActionMetadata | null {
     return METADATA_BY_ACTION_ID[actionId] ?? null;
+}
+
+/** Single and bulk archive controls consume the same persisted UI Action policy. */
+export function resolveSessionArchiveActionPolicy(params: Readonly<{
+    actionId: typeof SESSION_ACTION_ARCHIVE_ID | typeof SESSION_ACTION_UNARCHIVE_ID;
+    settings: ActionsSettingsV1;
+    requiresStop?: boolean;
+}>): Readonly<{ enabled: boolean; requiresConfirmation: boolean; destructive: false }> {
+    const actionId = params.actionId === SESSION_ACTION_ARCHIVE_ID ? 'session.archive' : 'session.unarchive';
+    const context = { surface: 'ui_button' } as const;
+    return {
+        enabled: isActionEnabledByActionsSettings(actionId, params.settings, context),
+        requiresConfirmation: params.requiresStop === true || isApprovalRequiredByActionsSettings(actionId, params.settings, context),
+        destructive: false,
+    };
 }

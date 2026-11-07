@@ -1,4 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
+import axios, { AxiosHeaders } from 'axios';
+import { withConfiguredDaemonTestHome } from '../testkit/fakeDaemonLifecycle.testkit';
+import { readTerminalAttachmentInfo, writeTerminalAttachmentInfo } from '@/terminal/attachment/terminalAttachmentInfo';
+import { createSessionRecordFixture } from '@/testkit/backends/sessionFixtures';
+import { retireExactTerminalControlServiceability } from './retireTerminalControlServiceability';
+
+// Socket.IO is an external network boundary. A superseded projection must not write to it.
+vi.mock('socket.io-client', async (importOriginal) => ({
+  ...await importOriginal<typeof import('socket.io-client')>(),
+  io: () => { throw new Error('unexpected_projection_write'); },
+}));
 
 import type { TerminalHostAdapter, TerminalHostHandle } from '@/integrations/terminalHost/_types';
 import { resolveZellijSocketDir } from '@/integrations/zellij/socketDir';
@@ -519,50 +530,56 @@ describe('claude endpoint recovery respawn options', () => {
     expect(retirementOrder).toEqual(['remote-serviceability']);
   });
 
-  it('fences fresh respawn and retains local evidence when serviceability retirement is superseded', async () => {
-    const attachmentId = 'attachment-dead-superseded' as NonNullable<TerminalHostHandle['attachmentId']>;
-    const boundHandle: TerminalHostHandle & { attachmentId: NonNullable<TerminalHostHandle['attachmentId']> } = {
-      ...handle,
-      attachmentId,
-    };
-    const boundAttachment: TerminalAttachmentInfo = {
-      version: 2,
-      attachmentId,
-      sessionId: 'sess-claude',
-      handle: boundHandle,
-      terminal: attachment.terminal,
-      updatedAt: 1,
-    };
-    const removeTerminalAttachmentInfo = vi.fn(async () => true);
-    const adapter: TerminalHostAdapter = {
-      kind: 'tmux',
-      createOrAttachHost: vi.fn(),
-      injectUserPrompt: vi.fn(),
-      interruptTurn: vi.fn(),
-      evaluateLiveness: vi.fn(async () => ({ paneAlive: false, paneDead: true, observedAt: 1 })),
-      dispose: vi.fn(async () => undefined),
-    };
-    const defaultOptions: SpawnSessionOptions = {
-      directory: '/workspace/project',
-      backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
-      existingSessionId: 'sess-claude',
-    };
+  it('resumes after positive old-host retirement without changing a newer remote projection', async () => {
+    await withConfiguredDaemonTestHome({ prefix: 'claude-retirement-superseded-' }, async ({ homeDir }) => {
+      const attachmentId = 'attachment-dead-superseded' as NonNullable<TerminalHostHandle['attachmentId']>;
+      const boundHandle: TerminalHostHandle & { attachmentId: NonNullable<TerminalHostHandle['attachmentId']> } = {
+        ...handle,
+        attachmentId,
+      };
+      await writeTerminalAttachmentInfo({ happyHomeDir: homeDir, sessionId: 'sess-claude', attachmentId, handle: boundHandle, terminal: attachment.terminal });
+      const metadata = JSON.stringify({
+        terminal: { mode: 'tmux', controlServiceabilityV1: {
+          v: 1, attachmentId: 'replacement-attachment', state: 'servable', observedAt: 20,
+        } },
+        unrelated: 'retained',
+      });
+      const raw = createSessionRecordFixture({ id: 'sess-claude', encryptionMode: 'plain', metadata });
+      const get = vi.spyOn(axios, 'get').mockResolvedValue({
+        status: 200, statusText: 'OK', headers: {}, config: { headers: new AxiosHeaders() }, data: { session: raw },
+      });
+      try {
+        const adapter: TerminalHostAdapter = {
+          kind: 'tmux',
+          createOrAttachHost: vi.fn(),
+          injectUserPrompt: vi.fn(),
+          interruptTurn: vi.fn(),
+          evaluateLiveness: vi.fn(async () => ({ paneAlive: false, paneDead: true, observedAt: 1 })),
+          dispose: vi.fn(async () => undefined),
+        };
+        const defaultOptions: SpawnSessionOptions = {
+          directory: '/workspace/project',
+          backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+          existingSessionId: 'sess-claude',
+        };
 
-    await expect(resolveClaudeEndpointRecoverySpawnOptions({
-      previousPid: 111,
-      sessionId: 'sess-claude',
-      defaultOptions,
-      readSessionMarkerForPid: async () => marker,
-      readTerminalAttachmentInfo: async () => boundAttachment,
-      removeTerminalAttachmentInfo,
-      retireExactTerminalControlServiceability: async () => 'superseded',
-      terminalHostAdapters: { tmux: adapter },
-    })).rejects.toMatchObject({
-      name: 'ClaudeEndpointRecoveryFenceError',
-      reason: 'serviceability_retirement_failed',
+        await expect(resolveClaudeEndpointRecoverySpawnOptions({
+          happyHomeDir: homeDir,
+          sessionId: 'sess-claude',
+          defaultOptions,
+          retireExactTerminalControlServiceability: async ({ attachmentInfo }) => await retireExactTerminalControlServiceability({
+            credentials: { token: 'test-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } },
+            sessionId: 'sess-claude', attachmentId: attachmentInfo.attachmentId, terminalMode: attachmentInfo.terminal.mode,
+          }),
+          onExactTerminalAttachmentRetired: async () => undefined,
+          terminalHostAdapters: { tmux: adapter },
+        })).resolves.toBe(defaultOptions);
+
+        expect(adapter.dispose).not.toHaveBeenCalled();
+        expect(raw.metadata).toBe(metadata);
+        await expect(readTerminalAttachmentInfo({ happyHomeDir: homeDir, sessionId: 'sess-claude' })).resolves.toBeNull();
+      } finally { get.mockRestore(); }
     });
-
-    expect(removeTerminalAttachmentInfo).not.toHaveBeenCalled();
   });
 
   it('retains the durable attachment when endpoint recovery probes remain inconclusive', async () => {

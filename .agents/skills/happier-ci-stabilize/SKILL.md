@@ -20,7 +20,7 @@ Read [failure-collection.md](references/failure-collection.md) for a failing run
 
 1. **Bind the attempt.** Record repository, workflow, run ID, attempt, event, head SHA, branch, and status. Never diagnose “latest” after a branch moves.
 2. **Collect once.** Let independent safe jobs reach terminal state. Then run `scripts/collect-actions-failures.mjs`; retain complete failed-job logs under `/tmp` and use its compact summary. Stop early only for an unsafe mutation, conflicting publisher, or proven wedge blocking a corrected run.
-3. **Cluster causes.** Collapse aggregators and repeated symptoms into the earliest causal signature and canonical owner. Classify each cluster as product, test, harness/mock, release control/configuration, external contract, infrastructure/resource, or inconclusive. A timeout is only a symptom.
+3. **Cluster causes.** Collapse aggregators and repeated symptoms into the earliest causal signature and canonical owner. Use the shared testing taxonomy: production defect, stale test/expectation, harness/mock defect, release-control/setup defect, external service/configuration defect, resource/timeout defect, or inconclusive. Record dependent symptoms separately from the earliest cause. A timeout is only a symptom.
 4. **Correct one batch.** Reproduce every deterministic cluster that can be exercised locally. For each behavior change, prove the smallest meaningful RED, fix the canonical owner, and remove or update only coverage invalidated by that cause. Run all focused fixes together, then each affected lane.
 5. **Run canonical CI once.** Use the exact coherent SHA. The manual Blacksmith runner-pool input may accelerate approved non-secret Linux lanes; it selects a backend for the same reusable workflow and must not create a copied CI graph.
 6. **Recover the cheapest safe way.** Choose a native failed-job rerun, immutable-candidate resume, or fresh release using [nightly-recovery.md](references/nightly-recovery.md). Preserve successful sibling candidates when their source and packaging identity remain valid.
@@ -38,6 +38,35 @@ Do not enqueue the entire graph after every correction. After one complete failu
 5. after the correction batch is coherent, run the required full/release profile once on the exact final SHA.
 
 A GitHub native failed-job rerun is for the same SHA after a safe transient failure. It cannot validate code that exists only in a newer SHA. A custom dispatch on a corrected SHA is fast diagnostic evidence; it does not replace the final exact-SHA profile required by release policy.
+
+Use this exact 0.2 manual-dispatch shape for a focused hosted diagnostic, replacing only the check list and optional UI E2E spec list with values accepted by the current workflow:
+
+```bash
+gh workflow run tests-dispatch.yml \
+  --repo happier-dev/happier \
+  --ref dev \
+  -f profile=custom \
+  -f runner_pool=github \
+  -f custom_checks=release_contracts \
+  -f installers_channel=stable \
+  -f providers_preset=all \
+  -f providers_tier=smoke
+```
+
+`--ref` selects the workflow ref, not an arbitrary checkout SHA. Immediately bind the created run ID and prove its `headSha` equals the intended 40-character commit before using the run as exact-SHA evidence:
+
+```bash
+gh run view <run-id> --repo happier-dev/happier \
+  --json databaseId,attempt,event,headBranch,headSha,status,conclusion,workflowName,url
+```
+
+For a same-workflow-SHA safe transient, retain successful jobs and rerun only failures and their dependents:
+
+```bash
+gh run rerun <run-id> --repo happier-dev/happier --failed
+```
+
+Blacksmith never fails over automatically. If an explicitly approved Blacksmith run is unavailable or exhausted, start a new manual dispatch with the same profile/check/spec inputs and `runner_pool=github`; do not claim that the original run migrated pools. Blacksmith is never the pool for macOS, Windows, self-hosted, secret-bearing, or release-mutation jobs.
 
 ## Keep source CI and release admission separate
 

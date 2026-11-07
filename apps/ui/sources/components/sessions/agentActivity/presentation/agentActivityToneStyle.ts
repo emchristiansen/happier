@@ -63,6 +63,7 @@ const STATUS_LABEL_KEYS = {
     unknown: 'session.agentActivity.status.unknown',
 } as const satisfies Record<AgentActivityStatusV1, string>;
 
-export function resolveAgentActivityStatusWord(status: AgentActivityStatusV1): string {
+export function resolveAgentActivityStatusWord(status: AgentActivityStatusV1, isActive?: boolean): string {
+    if (status === 'running' && isActive === false) return t('diagnosis.machineRuns.idle');
     return t(STATUS_LABEL_KEYS[status]);
 }

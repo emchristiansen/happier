@@ -1,8 +1,9 @@
 import * as React from 'react';
 import type { ReactTestInstance } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AppPaneProvider } from '@/components/appShell/panes/AppPaneProvider';
+import { AppPaneProvider, useAppPaneContext } from '@/components/appShell/panes/AppPaneProvider';
 import { pressTestInstance, renderScreen, standardCleanup, type RenderScreenResult } from '@/dev/testkit';
+import { createToolCallMessageFixture } from '@/dev/testkit/fixtures/transcriptFixtures';
 import { installSessionShellCommonModuleMocks } from './sessionShellTestHelpers';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -65,6 +66,7 @@ const mobileWorkspaceExperienceState = vi.hoisted(() => ({
 const cockpitRegistrationState = vi.hoisted(() => ({
   registration: null as null | Readonly<{
     sessionId: string;
+    terminalTabAvailable?: boolean;
     switchSurface: (surface: 'chat' | 'browse' | 'git' | 'navigation' | 'tabs' | 'terminal') => void;
   }>,
 }));
@@ -164,9 +166,6 @@ vi.mock('@/components/sessions/attachments/AttachmentFilePicker', () => ({
   AttachmentFilePicker: () => null,
 }));
 
-vi.mock('@/hooks/server/useFeatureEnabled', () => ({
-  useFeatureEnabled: () => executionRunsFeatureState.enabled,
-}));
 vi.mock('@/hooks/server/useSessionExecutionRunsSupported', () => ({
   useSessionExecutionRunsSupported: (_sessionId: string, scope?: { serverId?: string | null }) =>
     sessionExecutionRunsSupportedState.supported
@@ -255,6 +254,7 @@ vi.mock('@/utils/system/versionUtils', () => ({
 }));
 
 installSessionShellCommonModuleMocks({
+  featureEnabled: async () => ({ useFeatureEnabled: () => executionRunsFeatureState.enabled }),
   reactNative: async () => {
     const { createReactNativeWebMock } = await import('@/dev/testkit/mocks/reactNative');
     const module = await createReactNativeWebMock({
@@ -338,7 +338,7 @@ installSessionShellCommonModuleMocks({
     const getStorageStateForTest = () => ({
       sessions: { s1: sessionState.session },
       settings: {},
-      sessionListViewDataByServerId: {},
+      sessionListRenderables: {}, sessionListViewDataByServerId: {},
     });
     return createStorageModuleStub({
       storage: Object.assign(
@@ -395,10 +395,9 @@ installSessionShellCommonModuleMocks({
   },
 });
 
-vi.mock('@/sync/domains/session/control/localControlSwitch', () => ({
+vi.mock('@/sync/domains/session/control/localControlSwitch', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/sync/domains/session/control/localControlSwitch')>()),
   shouldRenderChatTimelineForSession: () => true,
-  shouldRequestRemoteControl: () => false,
-  shouldRequestRemoteControlAfterPendingEnqueue: () => false,
 }));
 
 vi.mock('@/sync/domains/input/slashCommands/resolveSessionComposerSend', () => ({
@@ -411,8 +410,14 @@ vi.mock('@/utils/system/fireAndForget', () => ({
 
 const { SessionView } = await import('./SessionView');
 
+function RegisterRailDriver() {
+  const { registerDriver } = useAppPaneContext();
+  React.useEffect(() => registerDriver({ scopeId: 'pane-scope-test', renderActionRail: () => null }), [registerDriver]);
+  return null;
+}
+
 const AppPaneProviderWrapper = ({ children }: { children?: React.ReactNode }) => (
-  <AppPaneProvider>{children ?? null}</AppPaneProvider>
+  <AppPaneProvider><RegisterRailDriver />{children ?? null}</AppPaneProvider>
 );
 
 function findPressableByAccessibilityLabel(screen: RenderScreenResult, label: string) {
@@ -741,6 +746,20 @@ describe('SessionView header action menu visibility', () => {
     expect(routerPushSpy).toHaveBeenCalledWith('/session/s1/automations?serverId=server-1');
   });
 
+  it('uses a non-overlapping 48dp automations target on Android', async () => {
+    platformState.os = 'android';
+    responsiveState.deviceType = 'tablet';
+    windowDimensionsState.width = 800;
+    automationsSupportState.enabled = true;
+    automationsEnabledCountState.count = 2;
+
+    const screen = await renderSessionView();
+    const button = findPressableByAccessibilityLabel(screen, 'session.openAutomations');
+    if (!button || typeof button.props.style !== 'function') throw new Error('Expected automations Pressable');
+    expect(button.props.style({ pressed: false })).toMatchObject({ width: 48, height: 48 });
+    expect(button.props.hitSlop).toBeUndefined();
+  });
+
   it('shows automations for the viewed session server even when the active server differs', async () => {
     platformState.os = 'web';
     responsiveState.deviceType = 'phone';
@@ -790,9 +809,9 @@ describe('SessionView header action menu visibility', () => {
     expect(extraIds).toContain('header.openTranscriptNavigation');
   });
 
-  it('renders a direct transcript navigation header button when header actions are not folded', async () => {
+  it.each(['phone', 'tablet'] as const)('keeps navigation in the header only without the rail (%s)', async (deviceType) => {
     platformState.os = 'web';
-    responsiveState.deviceType = 'phone';
+    responsiveState.deviceType = deviceType;
     responsiveState.isLandscape = false;
     windowDimensionsState.width = 800;
     multiPaneSettingState.enabled = true;
@@ -800,7 +819,7 @@ describe('SessionView header action menu visibility', () => {
     const screen = await renderSessionView();
     const openNavigationButton = findPressableByAccessibilityLabel(screen, 'session.openTranscriptNavigation');
 
-    expect(openNavigationButton).toBeDefined();
+    expect(Boolean(openNavigationButton)).toBe(deviceType === 'phone');
   });
 
   it('opens the navigation right-panel tab from the folded header action menu', async () => {
@@ -926,10 +945,12 @@ describe('SessionView header action menu visibility', () => {
     sessionExecutionRunsSupportedState.supported = true;
     executionRunsBackendsState.backends = null;
     sessionMessagesState.messages = [
-      {
-        kind: 'tool-call',
-        tool: { name: 'SubAgentRun', input: { runId: 'run_1' }, result: { runId: 'run_1' } },
-      },
+      createToolCallMessageFixture({
+        tool: {
+          name: 'SubAgentRun', input: { runId: 'run_1' }, result: { runId: 'run_1' },
+          state: 'completed', createdAt: 1, startedAt: 1, completedAt: 2, description: null,
+        },
+      }),
     ];
 
     await renderSessionView();
@@ -939,32 +960,36 @@ describe('SessionView header action menu visibility', () => {
     expect(getHeaderExtraItemIds(getLastHeaderActionMenuProps())).toContain('header.openRuns');
   });
 
-  it('renders a header subagents button when the transcript contains subagent activity', async () => {
+  it.each(['phone', 'tablet'] as const)('keeps active agents in the header only without the rail (%s)', async (deviceType) => {
     platformState.os = 'web';
-    responsiveState.deviceType = 'phone';
+    responsiveState.deviceType = deviceType;
+    multiPaneSettingState.enabled = true;
     responsiveState.isLandscape = false;
     executionRunsFeatureState.enabled = false;
     sessionExecutionRunsSupportedState.supported = false;
     executionRunsBackendsState.backends = null;
     sessionMessagesState.messages = [
-      {
+      createToolCallMessageFixture({
         id: 'tool-msg-1',
         kind: 'tool-call',
         createdAt: 1,
         tool: {
           name: 'Task',
-          id: 'toolu_task_1',
           input: { name: 'Investigate regression', team_name: 'qa-team', agent_id: 'alpha@qa-team' },
           result: { tool_use_result: { team_name: 'qa-team', agent_id: 'alpha@qa-team', name: 'alpha' } },
           state: 'running',
+          createdAt: 1,
+          startedAt: 1,
+          completedAt: null,
+          description: null,
         },
-      },
+      }),
     ];
 
     const screen = await renderSessionView();
     const openSubagentsButton = findPressableByAccessibilityLabel(screen, 'session.openSubagents');
 
-    expect(openSubagentsButton).toBeDefined();
+    expect(Boolean(openSubagentsButton)).toBe(deviceType === 'phone');
   });
 
   it('withholds the header subagents indicator before any agent is active while still offering the destination', async () => {
@@ -1005,6 +1030,18 @@ describe('SessionView header action menu visibility', () => {
     await renderSessionView();
 
     expect(headerActionMenuSpy).toHaveBeenCalled();
+  });
+
+
+  it.each(['rail', 'cockpit', 'classic'] as const)('keeps the terminal header shortcut only without another navigation surface (%s)', async (surface) => {
+    responsiveState.deviceType = surface === 'rail' ? 'tablet' : 'phone';
+    multiPaneSettingState.enabled = true;
+    executionRunsFeatureState.enabled = true;
+    if (surface === 'cockpit') {
+      cockpitRegistrationState.registration = { sessionId: 's1', terminalTabAvailable: true, switchSurface: vi.fn() };
+    }
+    const screen = await renderSessionView();
+    expect(Boolean(findPressableByAccessibilityLabel(screen, 'settings.terminal'))).toBe(surface === 'classic');
   });
 
   it('offers and handles the attached Claude terminal action when supported', async () => {

@@ -4,6 +4,8 @@ import {
     decodeV2SessionListCursorV1,
     decodeV2SessionListCursorV2,
     encodeV2SessionListCursorV2,
+    readConnectedServiceReaderSupport,
+    type ConnectedServiceId,
 } from "@happier-dev/protocol";
 import { db } from "@/storage/db";
 import {
@@ -11,8 +13,10 @@ import {
     createV2SessionListVisibilityWhere,
     createV2SessionListLegacyRowSelect,
     createV2SessionListRowSelect,
+    createV2SessionRowByIdSelect,
     getV2SessionListEffectiveActivityAt,
     mapV2SessionListRow,
+    projectSessionRowsForReader,
     SESSION_LIST_PROJECTION_FALLBACK_COLUMNS,
     type V2SessionListRowCompat,
 } from "./v2SessionListRows";
@@ -140,7 +144,7 @@ export async function findV2SessionListRowById(params: Readonly<{
             userId,
             sessionId,
             visibilityWhere,
-            select: createV2SessionListRowSelect({ userId }),
+            select: createV2SessionRowByIdSelect({ userId }),
         }),
         () => findV2SessionListRowByIdWithSelect({
             userId,
@@ -335,11 +339,13 @@ export function createV2SessionListPage(params: Readonly<{
     rows: ReadonlyArray<V2SessionListRowCompat>;
     userId: string;
     limit: number;
+    supportedConnectedServiceIds?: readonly ConnectedServiceId[];
 }>) {
     const { resultRows, nextCursor, hasNext } = resolveV2SessionListPageBounds(params);
 
     return {
-        sessions: mapV2SessionListRows({ rows: resultRows, userId: params.userId }),
+        sessions: projectSessionRowsForReader(mapV2SessionListRows({ rows: resultRows, userId: params.userId }),
+            params.supportedConnectedServiceIds ?? readConnectedServiceReaderSupport(undefined)),
         nextCursor,
         hasNext,
     };

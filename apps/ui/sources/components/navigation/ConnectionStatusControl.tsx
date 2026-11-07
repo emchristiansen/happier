@@ -28,7 +28,6 @@ import {
     listServerProfileScopeIds,
     normalizeServerSelectionSettingsForProfileScopeIds,
 } from '@/sync/domains/server/selection/serverSelectionProfileScopeIds';
-import { writeServerSelectionActiveTargetToServer } from '@/sync/domains/server/selection/serverSelectionActiveTarget';
 import { toServerUrlDisplay } from '@/sync/domains/server/url/serverUrlDisplay';
 import { useConnectionTargetActions } from '@/components/navigation/connection/useConnectionTargetActions';
 import { promptSignedOutServerSwitchConfirmation } from '@/components/settings/server/modals/ServerSwitchAuthPrompt';
@@ -36,14 +35,18 @@ import { Text } from '@/components/ui/text/Text';
 import { useConnectionHealth } from '@/components/navigation/connectionStatus/useConnectionHealth';
 import { selectSyncErrorForServer } from '@/sync/runtime/connectivity/syncErrorScope';
 import { setPendingSetupIntent } from '@/sync/domains/pending/pendingSetupIntent';
+import { selectRelayDirectly } from '@/setup/directRelaySelectionIntent';
 import { isTauriDesktop } from '@/utils/platform/tauri';
 import { DropdownMenu, type DropdownMenuItem } from '@/components/ui/forms/dropdown/DropdownMenu';
 import { runGuardedNavigation } from '@/utils/navigation/runGuardedNavigation';
 import { ActionListSection } from '@/components/ui/lists/ActionListSection';
 import { sync } from '@/sync/sync';
 import type { ConnectionHealthPresentation } from './connectionStatus/connectionHealthTypes';
+import { ThisComputerStatusRow } from './connectionStatus/ThisComputerStatusRow';
 import { isAccountSettingsSyncAttentionStatus } from '@/sync/domains/settings/accountSettingsSyncStatus';
 import { Icon } from '@/components/ui/icons/Icon';
+import { IconAction } from '@/components/ui/buttons/IconAction';
+import { ActivitySpinner } from '@/components/ui/feedback/ActivitySpinner';
 
 type Variant = 'sidebar' | 'header';
 const RELAY_SETTINGS_ROUTE = '/settings/server';
@@ -133,12 +136,9 @@ const stylesheet = StyleSheet.create((theme) => ({
         gap: 6,
         flexShrink: 0,
     },
-    popoverRetryButton: {
-        width: 24,
-        height: 24,
-        borderRadius: 12,
-        alignItems: 'center',
-        justifyContent: 'center',
+    popoverRetryBusy: {
+        // An active operation still needs full-contrast feedback while its action is disabled.
+        opacity: 1,
     },
     popoverSection: {
         paddingHorizontal: 16,
@@ -360,11 +360,16 @@ export const ConnectionStatusControl = React.memo(function ConnectionStatusContr
             if (!server) return;
             const shouldSwitch = await confirmSignedOutSwitch(server.id);
             if (!shouldSwitch) return;
-            writeServerSelectionActiveTargetToServer({
-                setServerSelectionActiveTargetKind,
-                setServerSelectionActiveTargetId,
-            }, target.serverId);
-            await switchServer(target.serverId, 'device');
+            // R8/INV7 — the direct Relay/Home pick: the one direct-selection operation arms the
+            // intent the setup gate spends to offer moving this computer's background service,
+            // then switches. The group branch below records nothing: a group names several relays
+            // and cannot name one daemon target (B2).
+            await selectRelayDirectly({
+                serverId: target.serverId,
+                selectionTarget: { setServerSelectionActiveTargetKind, setServerSelectionActiveTargetId },
+                refreshAuth: auth.refreshFromActiveServer,
+            });
+            setOpen(false);
             if ((authStatusByServerId[target.serverId] ?? 'unknown') === 'signedOut') {
                 markTauriSignedOutServerSwitchForAuth(server.serverUrl);
                 router.replace('/');
@@ -393,6 +398,7 @@ export const ConnectionStatusControl = React.memo(function ConnectionStatusContr
         setOpen(false);
     }, [
         activeServerId,
+        auth,
         authStatusByServerId,
         router,
         setServerSelectionActiveTargetId,
@@ -427,7 +433,10 @@ export const ConnectionStatusControl = React.memo(function ConnectionStatusContr
     const canRetryServerConnection =
         connectionHealth.kind === 'connecting'
         || connectionHealth.kind === 'server_unreachable'
-        || connectionHealth.kind === 'server_error';
+        || connectionHealth.kind === 'server_error'
+        || connectionHealth.kind === 'server_restarting';
+    const isRetrying = connectionHealth.endpointStatus === 'connecting' || socketStatus.status === 'connecting';
+    const nextRetryAt = connectionHealth.nextRetryAt ?? primarySyncIssue?.nextRetryAt;
     const handleRetryConnection = React.useCallback(() => {
         sync.retryNow();
     }, []);
@@ -515,20 +524,31 @@ export const ConnectionStatusControl = React.memo(function ConnectionStatusContr
                                     <Text style={styles.popoverLabel}>{t('profile.status')}</Text>
                                     <View style={styles.popoverStatusActions}>
                                         {canRetryServerConnection ? (
-                                            <Pressable
+                                            <IconAction
                                                 testID="connection-popover-retry"
                                                 accessibilityRole="button"
-                                                accessibilityLabel={t('common.retry')}
-                                                hitSlop={8}
+                                                accessibilityLabel={t(isRetrying ? 'status.connecting' : 'common.retry')}
+                                                accessibilityState={{ busy: isRetrying, disabled: isRetrying }}
+                                                disabled={isRetrying}
+                                                style={isRetrying ? styles.popoverRetryBusy : undefined}
+                                                size="sm"
+                                                hitSlop={10}
                                                 onPress={handleRetryConnection}
-                                                style={styles.popoverRetryButton}
                                             >
-                                                <Icon
-                                                    name="arrow-clockwise"
-                                                    size={16}
-                                                    color={theme.colors.text.secondary}
-                                                />
-                                            </Pressable>
+                                                {isRetrying ? (
+                                                    <ActivitySpinner
+                                                        testID="connection-popover-retry-progress"
+                                                        size={16}
+                                                        color={theme.colors.text.secondary}
+                                                    />
+                                                ) : (
+                                                    <Icon
+                                                        name="arrow-clockwise"
+                                                        size={16}
+                                                        color={theme.colors.text.secondary}
+                                                    />
+                                                )}
+                                            </IconAction>
                                         ) : null}
                                         <StatusPill
                                             testID="connection-popover-health-status"
@@ -543,6 +563,15 @@ export const ConnectionStatusControl = React.memo(function ConnectionStatusContr
                                     <Text style={styles.popoverLabel}>{t('settings.machines')}</Text>
                                     <Text style={styles.popoverValue}>{t(connectionHealth.machineLabelKey)}</Text>
                                 </View>
+
+                                {isTauriDesktop() ? (
+                                    <ThisComputerStatusRow
+                                        rowStyle={styles.popoverRow}
+                                        labelStyle={styles.popoverLabel}
+                                        valueStyle={styles.popoverValue}
+                                        actionListStyle={styles.popoverRelayActionList}
+                                    />
+                                ) : null}
 
                                 <View style={styles.popoverRow}>
                                     <Text style={styles.popoverLabel}>{t('connectionStatus.labels.server')}</Text>
@@ -564,11 +593,11 @@ export const ConnectionStatusControl = React.memo(function ConnectionStatusContr
                                     <Text style={styles.popoverValue}>{formatTime(lastSyncAt)}</Text>
                                 </View>
 
-                                {primarySyncIssue?.nextRetryAt ? (
+                                {nextRetryAt ? (
                                     <View style={styles.popoverRow}>
                                         <Text style={styles.popoverLabel}>{t('connectionStatus.labels.nextRetry')}</Text>
-                                        <Text style={styles.popoverValue}>
-                                            {formatTime(primarySyncIssue.nextRetryAt)}
+                                        <Text testID="connection-popover-next-retry" style={styles.popoverValue}>
+                                            {formatTime(nextRetryAt)}
                                         </Text>
                                     </View>
                                 ) : null}

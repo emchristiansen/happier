@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   agentEventAttentionImpact,
+  isConnectedServiceRuntimeAuthRecoveryCancellation,
   agentEventLocalIdAttentionImpact,
   TranscriptRawAgentEventV1Schema,
   TranscriptRawRecordV1Schema,
@@ -18,6 +19,13 @@ import {
 } from '../sessionAgentTransitionDivider.js';
 
 describe('TranscriptRawRecordV1Schema', () => {
+  it('preserves explicit cancellation separately from non-retrying recovery decisions in the released carrier', () => {
+    expect(isConnectedServiceRuntimeAuthRecoveryCancellation(null)).toBe(true);
+    expect(isConnectedServiceRuntimeAuthRecoveryCancellation('usage_limit_recovery_cancelled')).toBe(true);
+    expect(isConnectedServiceRuntimeAuthRecoveryCancellation('runtime_auth_recovery_cancelled')).toBe(true);
+    expect(isConnectedServiceRuntimeAuthRecoveryCancellation('switch_reason_disabled')).toBe(false);
+    expect(isConnectedServiceRuntimeAuthRecoveryCancellation('degraded_recovery_attempts_exhausted')).toBe(false);
+  });
   it('parses user text records with extra fields', () => {
     const parsed = TranscriptRawRecordV1Schema.safeParse({
       role: 'user',

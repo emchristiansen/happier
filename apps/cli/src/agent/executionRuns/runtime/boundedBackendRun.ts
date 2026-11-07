@@ -2,11 +2,12 @@ import { resolveExecutionRunIntentProfile } from '@/agent/executionRuns/profiles
 import type { ACPProvider } from '@/api/session/sessionMessageTypes';
 import type { AcpSendFn } from '@/agent/acp/bridge/acpSessionForwarding';
 import type { ExecutionRunManagerStartParams } from '@/agent/executionRuns/runtime/executionRunTypes';
-import type { ExecutionRunController, ExecutionRunBackendController } from '@/agent/executionRuns/controllers/types';
+import { resetExecutionRunBackendOutput, type ExecutionRunController, type ExecutionRunBackendController } from '@/agent/executionRuns/controllers/types';
 import type { FinishExecutionRun } from '@/agent/executionRuns/runtime/executionRunFinishRun';
 import { isAbortLikeError, normalizeExecutionRunSendDelivery, resolveInFlightDeliveryAction } from '@/agent/executionRuns/runtime/turnDelivery';
 import { resolveExecutionRunRuntimeBackendId } from '@/agent/executionRuns/runtime/backendTargets';
 import {
+  createExecutionRunSendOutcomeUnknownError,
   createExecutionRunTimeoutError,
   isExecutionRunTimeoutError,
   readExecutionRunErrorCode,
@@ -14,6 +15,8 @@ import {
 } from '@/agent/executionRuns/runtime/executionRunErrors';
 import { buildReviewGuidanceBlock } from '@/agent/reviews/prompt/buildStandardReviewPrompt';
 import { logger } from '@/ui/logger';
+import { disposeExecutionRunBackendController, settleExecutionRunControllerOccurrence } from './settleExecutionRunControllerOccurrence';
+import { recoverFailedExecutionRunTurn, readExecutionRunFailureClassification, type ExecutionRunRecoveryContext } from './recoverFailedTurn';
 
 function stripTrailingJsonObjectFromText(text: string): string {
   const trimmed = String(text ?? '');
@@ -42,13 +45,13 @@ export async function executeBoundedBackendRun(args: Readonly<{
   sidechainId: string;
   startedAtMs: number;
   params: ExecutionRunManagerStartParams;
-  controllers: ReadonlyMap<string, ExecutionRunController>;
+  controllers: Map<string, ExecutionRunController>;
   sendAcp: AcpSendFn;
   parentProvider: ACPProvider;
   getNowMs: () => number;
   boundedTimeoutMs: number | null;
   finishRun: FinishExecutionRun;
-}>): Promise<void> {
+}> & ExecutionRunRecoveryContext): Promise<void> {
   const { runId, callId, sidechainId, startedAtMs, params } = args;
   const profile = resolveExecutionRunIntentProfile(params.intent);
   const shouldMaterializeInTranscript = profile.transcriptMaterialization !== 'none';
@@ -80,6 +83,7 @@ export async function executeBoundedBackendRun(args: Readonly<{
     } as const;
     let effectiveInstructions = start.instructions;
     const prompt = profile.buildPrompt({ ...start, instructions: effectiveInstructions });
+    let activeTurnPrompt = prompt;
 
     function waitForExternalMessage(): Promise<void> {
       if (backendCtrl.pendingExternalMessages.length > 0) return Promise.resolve();
@@ -94,12 +98,11 @@ export async function executeBoundedBackendRun(args: Readonly<{
     }
 
     function sendTurnPrompt(turnPrompt: string): Promise<void> {
+      activeTurnPrompt = turnPrompt;
       backendCtrl.turnCount += 1;
       backendCtrl.turnEpoch += 1;
       backendCtrl.turnInFlight = true;
-      backendCtrl.buffer = '';
-      backendCtrl.sidechainStreamBuffer = '';
-      backendCtrl.sidechainStreamKey = '';
+      resetExecutionRunBackendOutput(backendCtrl);
       return backendCtrl.backend.sendPrompt(backendCtrl.childSessionId!, turnPrompt);
     }
 
@@ -113,6 +116,13 @@ export async function executeBoundedBackendRun(args: Readonly<{
     async function runTurnWithExternalMessages(turnPrompt: string): Promise<void> {
       backendCtrl.turnCancelReason = null;
       backendCtrl.turnCancelEpoch = null;
+      // Provider completion and external-send admission mutate this state across awaited
+      // boundaries. Read it through one live accessor so neither the compiler nor this loop treats
+      // a pre-await narrowing as current evidence.
+      const readTurnCancellation = () => ({
+        reason: backendCtrl.turnCancelReason,
+        epoch: backendCtrl.turnCancelEpoch,
+      });
       const sendPromptPromise = sendTurnPrompt(turnPrompt);
       let activeEpoch = backendCtrl.turnEpoch;
       let completionPromise: Promise<void> = waitForTurnComplete(sendPromptPromise);
@@ -127,9 +137,10 @@ export async function executeBoundedBackendRun(args: Readonly<{
         if (raced.t === 'complete') break;
         if (raced.t === 'error') {
           const e = raced.e;
+          const cancellation = readTurnCancellation();
           if (
-            backendCtrl.turnCancelReason === 'steer'
-            && backendCtrl.turnCancelEpoch === activeEpoch
+            cancellation.reason === 'steer'
+            && cancellation.epoch === activeEpoch
             && isAbortLikeError(e)
           ) {
             backendCtrl.turnCancelReason = null;
@@ -156,8 +167,14 @@ export async function executeBoundedBackendRun(args: Readonly<{
           try {
             await backendCtrl.backend.sendSteerPrompt!(backendCtrl.childSessionId!, next.message);
             next.resolve();
-          } catch (e: any) {
-            next.reject(e instanceof Error ? e : new Error('Steer failed'));
+          } catch {
+            // The provider operation was invoked, so a rejection alone cannot prove the steer was
+            // refused before effect. Preserve exclusive custody and tell the caller not to retry.
+            if (backendCtrl.turnEpoch === activeEpoch) {
+              backendCtrl.turnCancelReason = 'outcome_unknown';
+              backendCtrl.turnCancelEpoch = activeEpoch;
+            }
+            next.reject(createExecutionRunSendOutcomeUnknownError());
           }
           continue;
         }
@@ -199,7 +216,30 @@ export async function executeBoundedBackendRun(args: Readonly<{
       await backendCtrl.streamWriter?.flushAll({ reason: 'turn-end' });
     }
 
-    const runPromise = runTurnWithExternalMessages(prompt);
+    async function runTurnWithRecovery(initialPrompt: string): Promise<void> {
+      let turnPrompt = initialPrompt;
+      let attemptCount = 0;
+      while (!backendCtrl.cancelled) {
+        try {
+          await runTurnWithExternalMessages(turnPrompt);
+          return;
+        } catch (error) {
+          const failedEpoch = backendCtrl.turnEpoch;
+          const retryPrompt = await recoverFailedExecutionRunTurn({
+            ...args, controller: backendCtrl, error, originalPrompt: activeTurnPrompt, attemptCount,
+            isCurrentTurn: () => args.controllers.get(runId) === backendCtrl && backendCtrl.turnEpoch === failedEpoch,
+            registration: params.connectedServicesRegistration,
+            accountSettings: params.accountSettings,
+            announceWaiting: (message) => args.sendAcp(args.parentProvider, { type: 'message', message, sidechainId }),
+          });
+          if (retryPrompt === null) throw error;
+          turnPrompt = retryPrompt;
+          attemptCount += 1;
+        }
+      }
+    }
+
+    const runPromise = runTurnWithRecovery(prompt);
 
     async function probeTurnLiveness(): Promise<unknown> {
       if (!backendCtrl.childSessionId || typeof backendCtrl.backend.probeTurnLiveness !== 'function') {
@@ -213,7 +253,7 @@ export async function executeBoundedBackendRun(args: Readonly<{
       }
     }
 
-    async function waitForRunPromise(): Promise<void> {
+    async function waitForRunPromise(runPromise: Promise<void>): Promise<void> {
       const timeoutMs = args.boundedTimeoutMs;
       if (typeof timeoutMs !== 'number') {
         await runPromise;
@@ -285,7 +325,7 @@ export async function executeBoundedBackendRun(args: Readonly<{
       }
     }
 
-    await waitForRunPromise();
+    await waitForRunPromise(runPromise);
 
     if (backendCtrl.cancelled) {
       return;
@@ -356,12 +396,10 @@ export async function executeBoundedBackendRun(args: Readonly<{
       })();
 
       // Reset buffers so the second pass is parsed deterministically.
-      backendCtrl.buffer = '';
-      backendCtrl.sidechainStreamBuffer = '';
-      backendCtrl.sidechainStreamKey = '';
+      resetExecutionRunBackendOutput(backendCtrl);
       backendCtrl.turnInFlight = false;
 
-      await runTurnWithExternalMessages(repairPrompt);
+      await waitForRunPromise(runTurnWithRecovery(repairPrompt));
 
       const repairedRawText = backendCtrl.buffer.trim();
       completion = profile.onBoundedComplete({
@@ -412,8 +450,10 @@ export async function executeBoundedBackendRun(args: Readonly<{
   } catch (e: any) {
     if (backendCtrl.cancelled) return;
     const message = e instanceof Error ? e.message : 'Execution failed';
-    const executionRunErrorCode = readExecutionRunErrorCode(e) ?? 'execution_run_failed';
+    const executionRunErrorCode = readExecutionRunErrorCode(e) ?? readExecutionRunFailureClassification(e)?.kind ?? 'execution_run_failed';
     if (isExecutionRunTimeoutError(e)) {
+      backendCtrl.cancelled = true;
+      backendCtrl.recoveryAbortController?.abort();
       try {
         if (backendCtrl.childSessionId) await backendCtrl.backend.cancel(backendCtrl.childSessionId);
       } catch {
@@ -463,7 +503,7 @@ export async function executeBoundedBackendRun(args: Readonly<{
     );
   } finally {
     try {
-      await backendCtrl.backend.dispose();
+      await disposeExecutionRunBackendController(backendCtrl);
     } catch {
       // ignore
     }
@@ -472,6 +512,6 @@ export async function executeBoundedBackendRun(args: Readonly<{
     } catch {
       // ignore
     }
-    backendCtrl.resolveTerminal();
+    settleExecutionRunControllerOccurrence(args.controllers, runId, backendCtrl);
   }
 }

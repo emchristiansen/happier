@@ -5,9 +5,11 @@ import { buildReadyNotificationContent, type AccountSettings } from '@happier-de
 import { dispatchActivityNotificationAsync } from '@/activity/notifications/dispatchActivityNotification'
 import { getActiveAccountSettingsSnapshot } from '@/settings/accountSettings/activeAccountSettingsSnapshot'
 
+import type { ExpoPushActivityNotificationOptions } from '@/activity/notifications/sendExpoPushActivityNotification'
+
 type PushSender = {
-  sendToAllDevices?: (title: string, body: string, opts: { sessionId: string }) => void
-  sendToAllDevicesAsync?: (title: string, body: string, data: Record<string, unknown>) => Promise<void>
+  sendToAllDevices?: (title: string, body: string, opts: { sessionId: string }, delivery?: ExpoPushActivityNotificationOptions) => void
+  sendToAllDevicesAsync?: (title: string, body: string, data: Record<string, unknown>, delivery?: ExpoPushActivityNotificationOptions) => Promise<void>
 }
 
 function resolveReadyNotificationSettingsContext(opts: Readonly<{
@@ -58,9 +60,9 @@ export function sendReadyWithPushNotification(opts: {
         }
         : opts.pushSender?.sendToAllDevices
           ? {
-            sendToAllDevicesAsync: async (title: string, body: string, data: Record<string, unknown>) => {
+            sendToAllDevicesAsync: async (title: string, body: string, data: Record<string, unknown>, delivery?: ExpoPushActivityNotificationOptions) => {
               const sessionId = typeof data.sessionId === 'string' ? data.sessionId : opts.session.sessionId
-              opts.pushSender?.sendToAllDevices?.(title, body, { sessionId })
+              opts.pushSender?.sendToAllDevices?.(title, body, { sessionId }, delivery)
             },
           }
           : null

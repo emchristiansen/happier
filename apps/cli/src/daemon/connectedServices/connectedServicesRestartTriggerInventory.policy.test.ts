@@ -57,7 +57,9 @@ import { readdir, readFile } from 'node:fs/promises';
 import { sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { RuntimeAuthRecoveryScheduler, type RuntimeAuthRecoveryIntent } from './runtimeAuth/RuntimeAuthRecoveryScheduler';
+import type { TransactionalRecoveryStore } from './recoveryScheduler/DurableBackoffRecoveryScheduler';
 
 // ---------------------------------------------------------------------------
 // Roots to scan for triggers
@@ -142,13 +144,6 @@ const DURABLE_CONNECTED_SERVICE_RESTART_INTENT_PATTERN =
 
 const DURABLE_CONNECTED_SERVICE_RESTART_INTENT_DEFINITION_BASENAMES: ReadonlySet<string> = new Set([
   'sessionRegistry.ts',
-]);
-
-const EFFECTFUL_RUNTIME_AUTH_RECOVERY_REPLAY_PATTERN =
-  /\bruntimeAuthRecoveryScheduler\.hydrate\s*\(\s*\)/;
-
-const EFFECTFUL_RUNTIME_AUTH_RECOVERY_REPLAY_DEFINITION_BASENAMES: ReadonlySet<string> = new Set([
-  'runtimeAuthFailureReportOutboxDrain.ts',
 ]);
 
 const MARKER_DERIVED_STARTUP_RESTART_REPLAY_PATTERN =
@@ -311,27 +306,6 @@ async function collectDurableConnectedServiceRestartIntentRuntimeSites(): Promis
   return findings;
 }
 
-async function collectEffectfulRuntimeAuthRecoveryReplaySites(): Promise<string[]> {
-  const [daemonFiles, backendFiles, sessionFiles, agentFiles, rpcFiles] = await Promise.all([
-    listSourceFiles(daemonDir),
-    listSourceFiles(backendsDir),
-    listSourceFiles(sessionDir),
-    listSourceFiles(agentDir),
-    listSourceFiles(rpcDir),
-  ]);
-  const findings: string[] = [];
-  for (const file of [...daemonFiles, ...backendFiles, ...sessionFiles, ...agentFiles, ...rpcFiles]) {
-    if (EFFECTFUL_RUNTIME_AUTH_RECOVERY_REPLAY_DEFINITION_BASENAMES.has(basename(file))) continue;
-    const source = await readFile(file, 'utf8');
-    const lines = source.split('\n');
-    for (let index = 0; index < lines.length; index += 1) {
-      if (!EFFECTFUL_RUNTIME_AUTH_RECOVERY_REPLAY_PATTERN.test(lines[index] ?? '')) continue;
-      findings.push(`${scopedPathOf(file)}:${index + 1}`);
-    }
-  }
-  return findings;
-}
-
 async function collectMarkerDerivedStartupRestartReplaySites(): Promise<string[]> {
   const daemonFiles = await listSourceFiles(daemonDir);
   const findings: string[] = [];
@@ -428,15 +402,52 @@ describe('connected-services restart/switch trigger inventory (K5 bypass guard)'
     ).toEqual([]);
   });
 
-  it('does not automatically re-drive passively hydrated runtime-auth recovery after daemon replacement', async () => {
-    const findings = await collectEffectfulRuntimeAuthRecoveryReplaySites();
-
-    expect(
-      findings,
-      `Runtime-auth recovery may reconstruct durable state after daemon replacement, but startup must remain passive.\n`
-      + `Do not call the effectful hydrate() path from product runtime startup; only hydratePassive() is permitted.\n`
-      + `Runtime references:\n${findings.map((finding) => `  ${finding}`).join('\n')}`,
-    ).toEqual([]);
+  it('permits restoring retry timers but forbids synchronous runtime-auth recovery during hydration', async () => {
+    // 0646eaa5b5 forbids effectful startup replay, not restoring a deadline whose
+    // callback re-enters the normal liveness/authorization owner after startup.
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const intents = new Map<string, RuntimeAuthRecoveryIntent>();
+    const claims = new Map<string, string>();
+    const recover = vi.fn(async () => ({ status: 'session_not_found' as const }));
+    // The fork's scheduler requires a transactional store (claims and intents commit together).
+    const durableStore: TransactionalRecoveryStore<RuntimeAuthRecoveryIntent> = {
+      read: (key: string) => intents.get(key) ?? null,
+      readAll: () => [...intents.entries()],
+      write: (key: string, intent: RuntimeAuthRecoveryIntent) => { intents.set(key, intent); },
+      transact: (key, transaction) => {
+        const next = transaction({ intent: intents.get(key) ?? null, effectClaimToken: claims.get(key) ?? null });
+        if (next.intent === null) { intents.delete(key); claims.delete(key); } else {
+          intents.set(key, next.intent);
+          if (next.effectClaimToken === null) claims.delete(key); else claims.set(key, next.effectClaimToken);
+        }
+        return next.result;
+      },
+    };
+    const deps = { nowMs: () => Date.now(), recover, durableStore };
+    const previous = new RuntimeAuthRecoveryScheduler(deps);
+    let replacement: RuntimeAuthRecoveryScheduler | undefined;
+    try {
+      await previous.enqueueHandlerFailure({
+        sessionId: 'policy-waiting-session', switchesThisTurn: 0,
+        classification: {
+          kind: 'usage_limit', serviceId: 'openai-codex', profileId: null, groupId: null,
+          resetsAtMs: null, planType: null, rateLimits: null, source: 'structured_provider_error',
+        },
+        error: Object.assign(new Error('transport unavailable'), { code: 'ECONNRESET' }),
+      });
+      previous.dispose();
+      vi.setSystemTime(Math.max(...[...intents.values()].map((intent) => intent.nextRetryAtMs ?? 0)));
+      replacement = new RuntimeAuthRecoveryScheduler(deps);
+      replacement.hydrate();
+      expect(recover).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(recover).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ source: 'scheduler_retry' }));
+    } finally {
+      previous.dispose();
+      replacement?.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it('does not reintroduce marker-derived startup restart replay', async () => {

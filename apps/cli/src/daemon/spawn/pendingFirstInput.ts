@@ -5,6 +5,7 @@ import {
 } from '@happier-dev/protocol';
 
 import type { ApiSessionClient } from '@/api/session/sessionClient';
+import { resolveSessionUserMessageRequestedAction } from '@/session/services/resolveSessionUserMessageRequestedAction';
 
 export const HAPPIER_DAEMON_PENDING_FIRST_INPUT_ENV_KEY = 'HAPPIER_DAEMON_PENDING_FIRST_INPUT';
 
@@ -81,6 +82,7 @@ export function createPendingFirstInputCommitter(
           text: pendingFirstInput.text,
           localId: pendingFirstInput.localId,
           meta: { ...pendingFirstInput.meta, source: 'ui', sentFrom: 'cli' },
+          requestedAction: resolveSessionUserMessageRequestedAction({ deliveryIntent: 'runtime_bootstrap' }),
         });
         if (result?.recoveryBlocked) {
           throw new Error(`Pending first input was blocked: ${result.recoveryBlocked.status}`);
