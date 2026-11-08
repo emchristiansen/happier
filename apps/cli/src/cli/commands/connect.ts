@@ -18,6 +18,13 @@ import { runConnectedServiceImport } from '@/cloud/connectedServices/connectedSe
 import { observeServerFeaturesSnapshot } from '@/features/serverFeaturesClient';
 import { resolveServerHttpBaseUrl } from '@/api/client/serverHttpBaseUrl';
 import { fail, info, neutral, ok, sectionTitle, warn } from '@happier-dev/cli-common/output';
+import { listDirectCliConnectedServicesInventory } from '@/cli/connectedServices/resolveDirectCliConnectedServiceBindings';
+import {
+  NativeConnectedServicesError,
+  materializeClaudeProfileForNativeProcess,
+  parseConnectNativeArgs,
+  releaseClaudeProfileForNativeProcess,
+} from './connect/nativeConnectedServices';
 
 /**
  * Handle connect subcommand.
@@ -28,6 +35,10 @@ import { fail, info, neutral, ok, sectionTitle, warn } from '@happier-dev/cli-co
  * - connect gemini: Store Gemini OAuth (gemini)
  */
 export async function handleConnectCommand(args: string[]): Promise<void> {
+    if (args[0] === 'materialize' || args[0] === 'release') {
+      await handleConnectNativeCommand(args);
+      return;
+    }
     const { includeExperimental, subcommand, profileFlag, options } = parseConnectArgs(args);
 
     const allTargets = await loadConnectTargets({ includeExperimental: true });
@@ -93,6 +104,9 @@ ${chalk.bold('Usage:')}
 ${targetLines}
   happier connect status       Show every stored profile and its health, per vendor
   happier connect status --profile <id>        Show only profiles with this id
+  happier connect materialize claude --profile <id> --expect-config-dir <path> [--json]
+                               Prepare a Claude subscription home for a native claude run outside Happier
+  happier connect release --materialization-key <key>  Release what materialize prepared
   happier connect help         Show this help message
   happier connect --all ...    Include experimental providers
   happier connect <target> --profile <id>      Store under a specific profile (default: default)
@@ -128,6 +142,31 @@ ${chalk.bold('Notes:')}
 function formatTargetLine(target: CloudConnectTarget): string {
   const statusSuffix = target.status === 'wired' ? '' : chalk.gray(' (experimental)');
   return `  happier connect ${target.id.padEnd(12)} ${target.vendorDisplayName}${statusSuffix}`;
+}
+
+/**
+ * `connect materialize claude` / `connect release`: the daemon prepares, and later releases, one Claude
+ * subscription profile for a native claude process. Only non-secret readiness is printed.
+ */
+async function handleConnectNativeCommand(args: ReadonlyArray<string>): Promise<void> {
+    const command = parseConnectNativeArgs(args);
+    if (command.kind === 'release') {
+      await releaseClaudeProfileForNativeProcess({ materializationKey: command.materializationKey });
+      console.log(ok(`Released ${command.materializationKey}`));
+      return;
+    }
+    const credentials = await readCredentials();
+    if (!credentials) {
+      throw new NativeConnectedServicesError(
+        'native_connected_services_inventory_unavailable',
+        'not authenticated with Happier (run "happier auth login")',
+      );
+    }
+    const readiness = await materializeClaudeProfileForNativeProcess(
+      { profileId: command.profileId, expectedConfigDir: command.expectedConfigDir, cwd: process.cwd() },
+      { listInventory: async () => await listDirectCliConnectedServicesInventory({ agentId: 'claude', credentials }) },
+    );
+    console.log(command.json ? JSON.stringify(readiness) : ok(`Ready ${readiness.materializationKey}`));
 }
 
 async function handleConnectVendor(target: CloudConnectTarget, options: ConnectParsedOptions): Promise<void> {

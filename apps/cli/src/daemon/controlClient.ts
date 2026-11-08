@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { lazySchema } from '@happier-dev/protocol';
 import type { SessionPendingQueueWakeDiagnostic } from './sessions/pendingQueueWake';
 import { logger } from '@/ui/logger';
-import { readDaemonState, reclaimDeadDaemonPublication } from '@/persistence';
+import { readDaemonState, reclaimDeadDaemonPublication, type DaemonLocallyPersistedState } from '@/persistence';
 import { Metadata } from '@/api/types';
 import { projectPath } from '@/projectPath';
 import { existsSync, readFileSync, statSync } from 'fs';
@@ -115,6 +115,12 @@ export type DaemonControlRequestOptions = {
   /** `null` leaves a local control request owned by caller/daemon lifecycle. */
   timeoutMs?: number | null;
   signal?: AbortSignal;
+  /**
+   * Send to exactly this daemon publication (pid, endpoint and control token) instead of whatever is
+   * published when the request starts. Every daemon start mints a fresh control token, so a daemon
+   * that replaced this one rejects the request rather than serving it.
+   */
+  daemonPublication?: DaemonLocallyPersistedState;
 };
 
 type DaemonPostAuthScope = 'daemon-control' | 'connected-service-broker-refresh' | 'connected-service-run-materialize';
@@ -444,7 +450,7 @@ async function daemonPost(path: string, body?: any, options: DaemonPostOptions =
     : timeoutSignal;
   let state: Awaited<ReturnType<typeof readDaemonState>>;
   try {
-    state = await settleUnlessAborted(readDaemonState(), signal);
+    state = options.daemonPublication ?? await settleUnlessAborted(readDaemonState(), signal);
   } catch (error) {
     if (!signal?.aborted) throw error;
     const errorMessage = `Request failed: ${path}, ${error instanceof Error ? error.message : 'Unknown error'}`;

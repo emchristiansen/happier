@@ -242,7 +242,19 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
   /** Runner credentials — required for account-default resolution (the session owner bootstraps settings). */
   credentials: Credentials | null;
   cwd: string;
-  sessionId: string;
+  /** The hosting Happier session; absent for a native process prepared outside any session. */
+  sessionId?: string;
+  /**
+   * The pid the daemon registration is anchored to; defaults to this runner, a daemon-tracked child
+   * whose exit prunes it. A caller that is not a tracked child passes a pid that cannot name another
+   * process while the registration stands.
+   */
+  registrationPid?: number;
+  /**
+   * Where the run-start decision lines go; defaults to the logger's console and file. A command whose
+   * stdout carries a machine-read result passes file-only writers.
+   */
+  decisionLog?: Pick<typeof logger, 'info' | 'warn'>;
   previousMaterializedRoot?: string;
   /** Boundary injection points; default to the canonical control client + session defaulting owner. */
   materializeViaDaemon?: MaterializeViaDaemon;
@@ -251,6 +263,7 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
   resolvePerServiceDefaults?: ResolvePerServiceConnectedServicesDefaults;
 }>): Promise<PreparedExecutionRunConnectedServices | null> {
   if (params.backendTarget.kind !== 'builtInAgent') return null;
+  const decisionLog = params.decisionLog ?? logger;
   const backendTarget = params.backendTarget;
   const agentId = backendTarget.agentId;
 
@@ -267,7 +280,7 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
   if (!selection) {
     // QA2-F03: the one decision line for the native path — a run silently starting on the
     // runner-inherited account must always be diagnosable from the log.
-    logger.info('[EXECUTION RUN] connected services: no selection resolved; proceeding native', {
+    decisionLog.info('[EXECUTION RUN] connected services: no selection resolved; proceeding native', {
       agentId,
       hadExplicitSelection: params.connectedServices !== undefined && params.connectedServices !== null,
       hadCredentials: params.credentials !== null,
@@ -283,13 +296,14 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
   // Run-scoped materialization key. The manager allocates the public runId later; the key only needs
   // to be run-unique and stable between materialize and release, so it carries its own id.
   const materializationKey = `execution_run:${randomUUID()}`;
+  const pid = params.registrationPid ?? process.pid;
 
   let cleanupPromise: Promise<void> | null = null;
   const cleanup = (): Promise<void> => {
     if (!cleanupPromise) {
       cleanupPromise = (async () => {
         try {
-          await release({ runId: materializationKey, pid: process.pid, materializationKey });
+          await release({ runId: materializationKey, pid, materializationKey });
         } catch (error) {
           // Best-effort: a failed release must not fail run teardown.
           logger.debug('[EXECUTION RUN] Connected-services release failed (non-fatal)', error);
@@ -304,15 +318,15 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
     materialized = await materialize({
       runId: materializationKey,
       agentId,
-      pid: process.pid,
+      pid,
       materializationKey,
       connectedServicesBindingsRaw: selection.bindings,
       sessionDirectory: params.cwd,
-      sessionId: params.sessionId,
+      ...(params.sessionId ? { sessionId: params.sessionId } : {}),
       ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
     });
   } catch (error) {
-    logger.warn('[EXECUTION RUN] connected services: materialization FAILED; failing run start closed', {
+    decisionLog.warn('[EXECUTION RUN] connected services: materialization FAILED; failing run start closed', {
       agentId,
       source: selection.source,
       materializationKey,
@@ -355,7 +369,7 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
     // provider-owned environment is the minimum materialization proof; accepting an empty result
     // would execute under ambient credentials after the user selected a connected identity.
     await cleanup();
-    logger.warn('[EXECUTION RUN] connected services: bridge returned no materialization proof; failing run start closed', {
+    decisionLog.warn('[EXECUTION RUN] connected services: bridge returned no materialization proof; failing run start closed', {
       agentId,
       source: selection.source,
       materializationKey,
@@ -368,7 +382,7 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
 
   // QA2-F03: the one decision line for the materialized path. Env key NAMES only — values are paths
   // into the materialized root and stay out of logs anyway; tokens never appear in env at all.
-  logger.info('[EXECUTION RUN] connected services: materialized', {
+  decisionLog.info('[EXECUTION RUN] connected services: materialized', {
     agentId,
     source: selection.source,
     materializationKey,
