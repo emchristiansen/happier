@@ -199,7 +199,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     await mkdir(projectDir, { recursive: true });
     await mkdir(otherProjectDir, { recursive: true });
     await writeFile(
-      join(homeDir, '.claude.json'),
+      join(sourceClaudeConfigDir, '.claude.json'),
       `${JSON.stringify({
         oauthAccount: { accessToken: 'ambient-root-access-must-not-copy' },
         projects: {
@@ -810,7 +810,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     })}\n`);
     await writeFile(join(existingTargetDir, 'settings.json'), '{"theme":"stale-target"}\n');
     await writeFile(join(sourceClaudeConfigDir, 'settings.json'), '{"theme":"source"}\n');
-    await writeFile(join(homeDir, '.claude.json'), `${JSON.stringify({
+    await writeFile(join(sourceClaudeConfigDir, '.claude.json'), `${JSON.stringify({
       oauthAccount: {
         emailAddress: 'probe@example.test',
         displayName: 'Probe User',
@@ -1042,7 +1042,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     expect(JSON.parse(await readFile(join(existingTargetDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
   });
 
-  it('falls back to the real HOME-based Claude source when the ambient CLAUDE_CONFIG_DIR already points at the managed target home', async () => {
+  it('does not fall back to the ambient HOME Claude source when CLAUDE_CONFIG_DIR already points at the managed target home', async () => {
     const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-claude-materializer-server-'));
     const rootDir = await mkdtemp(join(tmpdir(), 'happier-claude-materializer-root-'));
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-materializer-home-'));
@@ -1119,13 +1119,25 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     });
 
     expect(result).not.toBeNull();
-    expect(JSON.parse(await readFile(join(existingTargetDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'home-source', cleanupPeriodDays: CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS });
+    // A managed home is not a permitted configuration source, and the ambient HOME is never
+    // substituted: the target keeps its own state, and default shared state fails closed.
+    expect(result!.diagnostics).toContainEqual(expect.objectContaining({
+      code: 'claude_shared_state_link_unavailable',
+      severity: 'blocking',
+    }));
+    expect(JSON.parse(await readFile(join(existingTargetDir, 'settings.json'), 'utf8'))).toEqual({ theme: 'stale-target' });
     const targetConfig = JSON.parse(await readFile(join(existingTargetDir, '.claude.json'), 'utf8'));
     expect(targetConfig).not.toHaveProperty('oauthAccount');
+    expect(targetConfig.projects).toEqual({
+      '/Users/leeroy/Documents/Development/happier/remote-dev': {
+        hasTrustDialogAccepted: true,
+      },
+    });
   });
 
   it('preserves credentials when the source and target Claude config dirs are the same', async () => {
     const claudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-same-config-'));
+    const nativeStateSourceDir = await mkdtemp(join(tmpdir(), 'happier-claude-same-config-native-store-'));
     await writeFile(
       join(claudeConfigDir, '.credentials.json'),
       JSON.stringify({
@@ -1144,6 +1156,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
         HOME: tmpdir(),
       },
       targetDir: claudeConfigDir,
+      ambientStateSourceDir: nativeStateSourceDir,
     })).resolves.toEqual({
       providerId: 'claude',
       requestedStateMode: 'shared',

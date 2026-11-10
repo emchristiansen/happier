@@ -142,6 +142,12 @@ and [encryption](encryption.md) for the owning wire and privacy boundaries.
 - `DELETE /v1/connect/:vendor`
 - `GET /v1/connect/tokens`
 
+Connected services in 0.2 development also expose
+`GET /v3/connect/:serviceId/profiles/:profileId/credential/health`, one
+profile's credential status read by its exact key. Daemon pre-access checks use
+it instead of the service-wide profile list; see
+[exact-profile credential health](compatibility.md#exact-profile-credential-health-02-development).
+
 ### Users, friends, feed
 - `GET /v1/user/:id`
 - `GET /v1/user/search?query=...`

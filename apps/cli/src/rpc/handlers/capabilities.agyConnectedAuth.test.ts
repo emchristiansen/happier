@@ -42,7 +42,7 @@ describe('selected AGY discovery process and temporary-state custody', () => {
         } }, version: 1 }
           : path === '/v1/account/encryption' ? { mode: 'plain', updatedAt: 0 }
           : path === '/v3/connect/antigravity/profiles/a/credential' ? { content: { t: 'plain', v: record }, credentialRevision: 'csr_1123456789ABCDEFGHJKMNPQRS' }
-          : path === '/v2/connect/antigravity/profiles' ? { serviceId: 'antigravity', profiles: [] } : null;
+          : path === '/v3/connect/antigravity/profiles/a/credential/health' ? { profileId: 'a', status: 'connected', health: null } : null;
         if (!data) throw new Error(`Unexpected HTTP fixture: ${path}`);
         return { config, status: 200, statusText: 'OK', headers: {}, data };
       };

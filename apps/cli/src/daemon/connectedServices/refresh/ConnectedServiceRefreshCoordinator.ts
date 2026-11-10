@@ -32,7 +32,10 @@ import { computeConnectedServiceAccessTokenFingerprint } from './credentialFresh
 import { resolveConnectedServiceCredentialsWithRevisions } from '@/cloud/connectedServices/resolveConnectedServiceCredentials';
 import { materializeConnectedServicesForSpawn } from '../materialize/materializeConnectedServicesForSpawn';
 import { createConnectedServiceGroupMutationCurrentnessValidator } from '../credentials/createConnectedServiceGroupMutationCurrentnessValidator';
-import { collectBlockingConnectedServicesMaterializationDiagnostics } from '../materialize/providerMaterializerTypes';
+import {
+  collectBlockingConnectedServicesMaterializationDiagnostics,
+  type ConnectedServicesMaterializationDiagnostic,
+} from '../materialize/providerMaterializerTypes';
 import { buildRefreshAbortSignal, refreshConnectedAccountOauthTokens } from './serviceRefreshers';
 import {
   getConnectedAccountDescriptor,
@@ -66,8 +69,9 @@ import {
   canReprobeCredentialHealth,
   credentialHealthReprobeDelayMs,
   isReconnectRequiredProfileStatus,
-  readCredentialHealthStatusForRefresh,
+  readCredentialHealthForRefresh,
   shouldBlockRefreshForCredentialHealth,
+  type CredentialHealthForRefresh,
   type CredentialHealthReprobeState,
 } from './credentialHealthReprobe';
 import {
@@ -226,6 +230,87 @@ export class ConnectedServiceCredentialRefreshError extends Error {
     this.name = 'ConnectedServiceCredentialRefreshError';
     this.diagnostic = diagnostic;
   }
+}
+
+/**
+ * What the caller of a rematerialization established about the binding whose distribution started
+ * it. Only evidence produced in the same operation may stand in for reading that binding's health
+ * here; without it, rematerialization reads the health itself.
+ */
+type DistributedBindingHealthBasis =
+  /** No caller evidence, as for an external projected revision: read exact health here. */
+  | Readonly<{ kind: 'read_at_rematerialization' }>
+  /** A provider rotation of this binding succeeded in this operation and produced this revision. */
+  | Readonly<{ kind: 'provider_rotation'; credentialRevision: ConnectedServiceCredentialRevisionV1 }>
+  /**
+   * The caller read this binding's exact health and decided to serve its current credential, which
+   * includes the legitimate forced adoption of a token newer than the one that failed.
+   */
+  | Readonly<{ kind: 'caller_read_health'; health: Extract<CredentialHealthForRefresh, { kind: 'read' }> }>;
+
+/** Health evidence a caller produced for the distributed binding in the same operation. */
+type SameOperationDistributedBindingHealth = Exclude<DistributedBindingHealthBasis, { kind: 'read_at_rematerialization' }>;
+
+const READ_HEALTH_AT_REMATERIALIZATION: DistributedBindingHealthBasis = { kind: 'read_at_rematerialization' };
+
+const CREDENTIAL_HEALTH_REFUSAL_CODES: ReadonlySet<string> = new Set([
+  'connected_service_credential_health_unavailable',
+  'connected_service_credential_health_reconnect_required',
+]);
+
+/**
+ * An external projected credential revision was not applied because exact health refused a binding
+ * it would have written. Throwing keeps the revision unacknowledged, so its producer retries it.
+ */
+export class ConnectedServiceExternalCredentialUpdateRefusedError extends Error {
+  readonly failures: ReadonlyArray<RematerializedTargetFailure>;
+
+  constructor(binding: BoundProfile, failures: ReadonlyArray<RematerializedTargetFailure>) {
+    super(`Connected service external credential update refused by credential health: ${binding.serviceId}/${binding.profileId}`);
+    this.name = 'ConnectedServiceExternalCredentialUpdateRefusedError';
+    this.failures = failures;
+  }
+}
+
+/**
+ * The exact-health prerequisite for rematerializing one target. Rematerialization writes every
+ * binding of the target, after group selections are canonicalized, so a group's current member may
+ * differ from the binding whose distribution started this work. Every binding written here must
+ * have exact health read now and not require reconnecting, except the distributed binding when its
+ * caller supplies evidence from the same operation. Unread health is never permission, and a setup
+ * token has no refresh that could check it later.
+ */
+async function findRematerializationCredentialHealthRefusal(input: Readonly<{
+  target: SpawnTarget;
+  distributedBinding: BoundProfile;
+  distributedBindingHealth: DistributedBindingHealthBasis;
+  readHealth: (binding: BoundProfile) => Promise<CredentialHealthForRefresh>;
+}>): Promise<Readonly<{ binding: BoundProfile; diagnostic: ConnectedServicesMaterializationDiagnostic }> | null> {
+  for (const candidate of input.target.bindings) {
+    if (
+      input.distributedBindingHealth.kind !== 'read_at_rematerialization'
+      && candidate.serviceId === input.distributedBinding.serviceId
+      && candidate.profileId === input.distributedBinding.profileId
+    ) continue;
+    const health = await input.readHealth(candidate);
+    const refusal = health.kind === 'unavailable'
+      ? { code: 'connected_service_credential_health_unavailable', reason: 'credential_health_unavailable' }
+      : isReconnectRequiredProfileStatus(health.status)
+        ? { code: 'connected_service_credential_health_reconnect_required', reason: 'blocked_by_credential_health' }
+        : null;
+    if (!refusal) continue;
+    return {
+      binding: { serviceId: candidate.serviceId, profileId: candidate.profileId },
+      diagnostic: {
+        code: refusal.code,
+        providerId: input.target.agentId,
+        severity: 'blocking',
+        serviceId: candidate.serviceId,
+        reason: refusal.reason,
+      },
+    };
+  }
+  return null;
 }
 
 export class ConnectedServiceRefreshCoordinator {
@@ -593,8 +678,36 @@ export class ConnectedServiceRefreshCoordinator {
     const profileId = input.hooks.resolveProfileId(selection);
     const binding = { serviceId: input.serviceId, profileId };
 
+    // Every arm below serves or materializes a credential, so the selected profile's exact health is
+    // acquired first. Unread health is never permission; a non-refreshable token or a forced
+    // adopt-current decision does not replace it.
+    const credentialHealth = await readCredentialHealthForRefresh({
+      api: this.params.api,
+      binding,
+    });
+    if (credentialHealth.kind === 'unavailable') {
+      throw new ConnectedServiceCredentialRefreshError(buildRefreshDiagnostic({
+        binding,
+        reason: 'provider_auth_bridge',
+        status: 'credential_health_unavailable',
+        now: this.params.now(),
+        refreshWindowMs: this.params.refreshWindowMs,
+      }));
+    }
+    const credentialHealthAllowsAdoption = !isReconnectRequiredProfileStatus(credentialHealth.status);
+
     const probe = await input.hooks.probeCurrentToken(binding);
     if (probe.kind === 'non_refreshable') {
+      if (!credentialHealthAllowsAdoption) {
+        // A setup token cannot be rotated, so there is no reprobe: reconnect-required health refuses it.
+        throw new ConnectedServiceCredentialRefreshError(buildRefreshDiagnostic({
+          binding,
+          reason: 'provider_auth_bridge',
+          status: 'blocked_by_credential_health',
+          now: this.params.now(),
+          refreshWindowMs: this.params.refreshWindowMs,
+        }));
+      }
       this.logBridgeCurrentTokenAdoptionDiagnostic({
         serviceId: input.serviceId,
         profileId,
@@ -604,14 +717,11 @@ export class ConnectedServiceRefreshCoordinator {
       return probe.response;
     }
     // F6: return the CURRENT access token if still valid + not forced (avoid rotating on every cold
-    // broker cache-miss). The broker forces a rotation ONLY on its 401-retry path.
+    // broker cache-miss). The broker forces a rotation ONLY on its 401-retry path; there, a current
+    // token newer than the failing one is adopted even when the read health reflects that
+    // predecessor's failure. Otherwise reconnect-required health falls through to the health-gated
+    // refresh, which owns the legitimate reprobe.
     if (probe.kind === 'adoptable') {
-      const credentialHealthAllowsAdoption = !isReconnectRequiredProfileStatus(
-        await readCredentialHealthStatusForRefresh({
-          api: this.params.api,
-          binding,
-        }),
-      );
       const forceDecision = resolveForcedRefreshFreshnessDecision({
         force: input.forceRefresh === true,
         currentAccessToken: probe.accessToken,
@@ -620,10 +730,10 @@ export class ConnectedServiceRefreshCoordinator {
       });
       if (
         (input.forceRefresh === true && forceDecision.kind === 'adopt_current')
-        || (credentialHealthAllowsAdoption && input.forceRefresh !== true)
+        || (input.forceRefresh !== true && credentialHealthAllowsAdoption)
       ) {
         if (input.forceRefresh === true) {
-          await this.distributeRefreshedBinding(binding);
+          await this.distributeRefreshedBinding(binding, { kind: 'caller_read_health', health: credentialHealth });
         }
         this.logBridgeCurrentTokenAdoptionDiagnostic({
           serviceId: input.serviceId,
@@ -670,8 +780,11 @@ export class ConnectedServiceRefreshCoordinator {
       }),
       isOauthSourceStillValid: (source) => this.isOauthSourceStillValidForBridge(source),
       resolveSourceExpiresAt: (source) => this.resolveExpiresAtForSource(source),
-      rematerializeTargets: async (binding) => {
-        const targets = await this.rematerializeTargetsForBinding(binding);
+      rematerializeTargets: async (binding, rotation) => {
+        const targets = await this.rematerializeTargetsForBinding(binding, {
+          kind: 'provider_rotation',
+          credentialRevision: ConnectedServiceCredentialRevisionV1Schema.parse(rotation.credentialRevision),
+        });
         // Initial bridge authorization is anchored to a live target. If none remains writable,
         // a cutover or release has removed authority to return this captured credential as current.
         if (targets.length === 0) throw new ConnectedServiceBridgeSelectionAuthorizationError();
@@ -832,7 +945,10 @@ export class ConnectedServiceRefreshCoordinator {
     // An adopted rotation has not recorded its distribution yet; the recorded one is older.
     const rematerialization = (
       outcome.distribution === 'settled' ? this.lastRefreshedDistributionByKey.get(bindingKey(binding)) : undefined
-    ) ?? await this.rematerializeTargetsForBindingAfterRefresh(binding);
+    ) ?? await this.rematerializeTargetsForBindingAfterRefresh(binding, {
+      kind: 'provider_rotation',
+      credentialRevision: ConnectedServiceCredentialRevisionV1Schema.parse(result.credentialRevision),
+    });
     const targetFailures = resolveRuntimeAuthRematerializationFailures({
       result: rematerialization,
       sessionId: input.sessionId ?? null,
@@ -956,23 +1072,32 @@ export class ConnectedServiceRefreshCoordinator {
       });
       return;
     }
-    const affectedTargets = await this.rematerializeTargetsForBinding(binding);
-    if (affectedTargets.length === 0) return;
-    await this.params.onAuthUpdated?.({
-      binding,
-      affectedTargets,
-      credentialRevision: input.credentialBoundary.credentialRevision,
-      mutation: 'replaced',
-      trigger: 'reconnect_propagation',
-    });
+    // A projected revision carries no health evidence, so rematerialization reads exact health for
+    // every binding it writes, this one included.
+    const rematerialization = await this.rematerializeTargetsForBindingDetailed(binding, READ_HEALTH_AT_REMATERIALIZATION);
+    const affectedTargets = rematerialization.rematerializedTargets;
+    if (affectedTargets.length > 0) {
+      await this.params.onAuthUpdated?.({
+        binding,
+        affectedTargets,
+        credentialRevision: input.credentialBoundary.credentialRevision,
+        mutation: 'replaced',
+        trigger: 'reconnect_propagation',
+      });
+    }
+    const healthRefusals = rematerialization.failedTargets.filter((failure) => (
+      CREDENTIAL_HEALTH_REFUSAL_CODES.has(failure.diagnostic.code)
+    ));
+    if (healthRefusals.length > 0) throw new ConnectedServiceExternalCredentialUpdateRefusedError(binding, healthRefusals);
   }
 
   private async distributeRefreshedBinding(
     binding: BoundProfile,
+    health: SameOperationDistributedBindingHealth,
     credentialRevision: ConnectedServiceCredentialRevisionV1 | null = null,
   ): Promise<RefreshedBindingDistributionResult> {
     this.observeScheduledStage(binding, 'credential_distribution');
-    const rematerialization = await this.rematerializeTargetsForBindingAfterRefresh(binding);
+    const rematerialization = await this.rematerializeTargetsForBindingAfterRefresh(binding, health);
     const application = rematerialization.rematerializedTargets.length > 0
       ? await this.notifyAuthUpdatedForRefreshedBinding(
         binding,
@@ -992,7 +1117,7 @@ export class ConnectedServiceRefreshCoordinator {
       const plan = this.captureHomePlan(binding);
       const repair = await this.withHomeOwnership(binding, plan, async () => {
         if (!await this.hasStaleMaterializedHomeForBinding(binding, result, this.params.now(), plan.targets)) return null;
-        return await this.rematerializeTargetsForPlan(binding, plan.targets);
+        return await this.rematerializeTargetsForPlan(binding, plan.targets, READ_HEALTH_AT_REMATERIALIZATION);
       });
       // Callbacks may join a rotation or start a respawn. Release home ownership
       // first so they cannot create a home -> rotation lock-order inversion.
@@ -1220,7 +1345,11 @@ export class ConnectedServiceRefreshCoordinator {
       if (!this.distributingRefreshedBindings.has(distributionKey)) {
         this.distributingRefreshedBindings.add(distributionKey);
         try {
-          const distribution = await this.distributeRefreshedBinding(binding, credentialRevision);
+          const distribution = await this.distributeRefreshedBinding(
+            binding,
+            { kind: 'provider_rotation', credentialRevision },
+            credentialRevision,
+          );
           this.lastRefreshedDistributionByKey.set(distributionKey, distribution);
           const appliedRuntimeIdentityKeys = distribution.appliedRuntimeIdentityKeys;
           if (appliedRuntimeIdentityKeys.size > 0) {
@@ -1389,13 +1518,25 @@ export class ConnectedServiceRefreshCoordinator {
     const expiresAt = source.mode === 'plain' ? record.expiresAt : source.metadata.expiresAt ?? record.expiresAt;
     let isCredentialHealthReprobe = false;
     this.observeScheduledStage(binding, 'credential_health_read');
-    if (
-      shouldBlockRefreshForCredentialHealth(options.reason)
-      && isReconnectRequiredProfileStatus(await readCredentialHealthStatusForRefresh({
-        api: this.params.api,
-        binding,
-      }))
-    ) {
+    const credentialHealth = shouldBlockRefreshForCredentialHealth(options.reason)
+      ? await readCredentialHealthForRefresh({ api: this.params.api, binding })
+      : null;
+    if (credentialHealth?.kind === 'unavailable') {
+      // Unread health is not permission: no expiry shortcut, lease or provider call proceeds.
+      return {
+        status: 'credential_health_unavailable',
+        credential: null,
+        diagnostic: buildRefreshDiagnostic({
+          binding,
+          reason: options.reason,
+          status: 'credential_health_unavailable',
+          expiresAt,
+          now,
+          refreshWindowMs: this.params.refreshWindowMs,
+        }),
+      };
+    }
+    if (credentialHealth?.kind === 'read' && isReconnectRequiredProfileStatus(credentialHealth.status)) {
       if (this.shouldDeferCredentialHealthReprobe(binding, now, options)) {
         return {
           status: 'blocked_by_credential_health',
@@ -1896,16 +2037,27 @@ export class ConnectedServiceRefreshCoordinator {
     };
   }
 
-  private async rematerializeTargetsForBinding(binding: BoundProfile): Promise<ReadonlyArray<SpawnTarget>> {
-    return (await this.rematerializeTargetsForBindingDetailed(binding)).rematerializedTargets;
+  private async rematerializeTargetsForBinding(
+    binding: BoundProfile,
+    health: DistributedBindingHealthBasis,
+  ): Promise<ReadonlyArray<SpawnTarget>> {
+    return (await this.rematerializeTargetsForBindingDetailed(binding, health)).rematerializedTargets;
   }
 
-  private async rematerializeTargetsForBindingAfterRefresh(binding: BoundProfile): Promise<RematerializedTargetsResult> {
+  /**
+   * Single-flight distribution after a rotation or adoption. Every caller supplies same-operation
+   * health evidence for the binding, so a caller joining an in-flight distribution adopts one that
+   * was itself started with such evidence.
+   */
+  private async rematerializeTargetsForBindingAfterRefresh(
+    binding: BoundProfile,
+    health: SameOperationDistributedBindingHealth,
+  ): Promise<RematerializedTargetsResult> {
     const key = bindingKey(binding);
     const existing = this.inFlightRefreshRematerializations.get(key);
     if (existing) return await existing;
 
-    const promise = this.rematerializeTargetsForBindingDetailed(binding);
+    const promise = this.rematerializeTargetsForBindingDetailed(binding, health);
     this.inFlightRefreshRematerializations.set(key, promise);
     try {
       return await promise;
@@ -2010,14 +2162,18 @@ export class ConnectedServiceRefreshCoordinator {
     }
   }
 
-  private async rematerializeTargetsForBindingDetailed(binding: BoundProfile): Promise<RematerializedTargetsResult> {
+  private async rematerializeTargetsForBindingDetailed(
+    binding: BoundProfile,
+    health: DistributedBindingHealthBasis,
+  ): Promise<RematerializedTargetsResult> {
     const plan = this.captureHomePlan(binding);
-    return await this.withHomeOwnership(binding, plan, () => this.rematerializeTargetsForPlan(binding, plan.targets));
+    return await this.withHomeOwnership(binding, plan, () => this.rematerializeTargetsForPlan(binding, plan.targets, health));
   }
 
   private async rematerializeTargetsForPlan(
     binding: BoundProfile,
     affected: ReadonlyArray<SpawnTarget>,
+    distributedBindingHealth: DistributedBindingHealthBasis,
   ): Promise<RematerializedTargetsResult> {
     const rematerialized: SpawnTarget[] = [];
     const failed: RematerializedTargetFailure[] = [];
@@ -2025,6 +2181,16 @@ export class ConnectedServiceRefreshCoordinator {
       string,
       Promise<Readonly<{ activeProfileId: string | null; generation: number }> | null>
     >();
+    const credentialHealthReads = new Map<string, Promise<CredentialHealthForRefresh>>();
+    const readHealth = (candidate: BoundProfile): Promise<CredentialHealthForRefresh> => {
+      const key = JSON.stringify([candidate.serviceId, candidate.profileId]);
+      let read = credentialHealthReads.get(key);
+      if (!read) {
+        read = readCredentialHealthForRefresh({ api: this.params.api, binding: candidate });
+        credentialHealthReads.set(key, read);
+      }
+      return read;
+    };
     for (const rawTarget of affected) {
       // SHARED group homes are owned by the group's CURRENT canonical active profile. Rewrite them
       // from canonical state only — a spawn-time selection snapshot may be stale (deferred switch,
@@ -2063,6 +2229,22 @@ export class ConnectedServiceRefreshCoordinator {
           profileId: binding.profileId,
           agentId: rawTarget.agentId,
           pid: rawTarget.pid,
+        });
+        continue;
+      }
+      const healthRefusal = await findRematerializationCredentialHealthRefusal({
+        target,
+        distributedBinding: binding,
+        distributedBindingHealth,
+        readHealth,
+      });
+      if (healthRefusal) {
+        failed.push({ target, binding: healthRefusal.binding, diagnostic: healthRefusal.diagnostic });
+        logger.warn('[DAEMON RUN] Connected-service rematerialization refused; credential health does not permit it', {
+          serviceId: healthRefusal.binding.serviceId,
+          profileId: healthRefusal.binding.profileId,
+          agentId: target.agentId,
+          reason: healthRefusal.diagnostic.reason ?? null,
         });
         continue;
       }

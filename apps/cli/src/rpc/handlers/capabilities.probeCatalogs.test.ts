@@ -87,7 +87,8 @@ describe('capabilities.invoke pre-session catalogs', () => {
           : path === '/v1/account/encryption' ? { mode: 'plain', updatedAt: 0 }
           : path === '/v3/connect/openai-codex/profiles/work/credential'
             ? { content: { t: 'plain', v: record }, credentialRevision: 'csr_1123456789ABCDEFGHJKMNPQRS' }
-          : path === '/v2/connect/openai-codex/profiles' ? { serviceId: 'openai-codex', profiles: [] }
+          : path === '/v3/connect/openai-codex/profiles/work/credential/health'
+            ? { profileId: 'work', status: 'connected', health: null }
           : null;
         if (!data) throw new Error(`Unexpected fixture HTTP request: ${path}`);
         return { config, status: 200, statusText: 'OK', headers: {}, data };
@@ -143,6 +144,7 @@ describe('capabilities.invoke pre-session catalogs', () => {
           },
         } });
         expect(warm, JSON.stringify({ warm, requests })).toMatchObject({ ok: true });
+        expect(requests).not.toContain('/v2/connect/openai-codex/profiles');
         armed = true;
         pending = call(RPC_METHODS.CAPABILITIES_INVOKE, { id: 'cli.codex', method: 'probeCatalogs', params: {
           cwd, timeoutMs: 1_000, runtimeKindOverride: 'appServer',

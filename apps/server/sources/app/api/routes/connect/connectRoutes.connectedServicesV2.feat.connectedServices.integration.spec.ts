@@ -1086,6 +1086,124 @@ describe("connectRoutes (connected services v2) sealed credential endpoints (int
         expect(JSON.stringify(json)).not.toContain("c2VhbGVk");
     });
 
+    it("reads one profile's credential health by its exact key without reading any other profile", async () => {
+        const user = await db.account.create({ data: { publicKey: "pk-csv2-health-read" }, select: { id: true } });
+        const otherUser = await db.account.create({ data: { publicKey: "pk-csv2-health-read-other" }, select: { id: true } });
+
+        const app = createTestApp();
+        connectRoutes(app as any);
+        await app.ready();
+
+        const register = async (userId: string, profileId: string, providerEmail: string, ciphertext: string) => {
+            const res = await app.inject({
+                method: "POST",
+                url: `/v2/connect/claude-subscription/profiles/${profileId}/credential`,
+                headers: { "content-type": "application/json", "x-test-user-id": userId },
+                payload: {
+                    sealed: { format: "account_scoped_v1", ciphertext },
+                    metadata: { kind: "oauth", providerEmail, providerAccountId: `acct-${profileId}` },
+                },
+            });
+            expect(res.statusCode).toBe(200);
+        };
+        await register(user.id, "work", "selected@example.com", "c2VsZWN0ZWQ=");
+        await register(user.id, "excluded", "excluded@example.com", "ZXhjbHVkZWQ=");
+        await register(otherUser.id, "foreign", "foreign@example.com", "Zm9yZWlnbg==");
+
+        const healthy = await app.inject({
+            method: "GET",
+            url: "/v3/connect/claude-subscription/profiles/work/credential/health",
+            headers: { "x-test-user-id": user.id },
+        });
+        expect(healthy.statusCode).toBe(200);
+        expect(healthy.json()).toEqual({ profileId: "work", status: "connected", health: null });
+
+        const update = await app.inject({
+            method: "PATCH",
+            url: "/v3/connect/claude-subscription/profiles/work/credential/health",
+            headers: { "content-type": "application/json", "x-test-user-id": user.id },
+            payload: {
+                health: {
+                    v: 1,
+                    status: "refresh_failed_retryable",
+                    reconnectRequired: true,
+                    lastRefreshFailureAt: 2_000,
+                    lastRefreshFailureKind: "invalid_grant",
+                    providerHttpStatus: 400,
+                },
+            },
+        });
+        expect(update.statusCode).toBe(200);
+
+        // Prisma delegates do not call through a plain spy, so each spy forwards to the bound original.
+        const delegate = db.serviceAccountToken;
+        const originalFindMany = delegate.findMany.bind(delegate);
+        const originalFindFirst = delegate.findFirst.bind(delegate);
+        const originalFindUnique = delegate.findUnique.bind(delegate);
+        const findMany = vi.spyOn(delegate, "findMany").mockImplementation(((args: any) => originalFindMany(args)) as any);
+        const findFirst = vi.spyOn(delegate, "findFirst").mockImplementation(((args: any) => originalFindFirst(args)) as any);
+        const findUnique = vi.spyOn(delegate, "findUnique").mockImplementation(((args: any) => originalFindUnique(args)) as any);
+        try {
+
+            const read = await app.inject({
+                method: "GET",
+                url: "/v3/connect/claude-subscription/profiles/work/credential/health",
+                headers: { "x-test-user-id": user.id },
+            });
+            expect(read.statusCode).toBe(200);
+            // The canonical status owner maps reconnectRequired to needs_reauth.
+            expect(read.json()).toEqual({
+                profileId: "work",
+                status: "needs_reauth",
+                health: {
+                    v: 1,
+                    status: "refresh_failed_retryable",
+                    reconnectRequired: true,
+                    lastRefreshFailureAt: 2_000,
+                    lastRefreshFailureKind: "invalid_grant",
+                    providerHttpStatus: 400,
+                },
+            });
+            expect(read.body).not.toContain("excluded");
+            expect(read.body).not.toContain("c2VsZWN0ZWQ=");
+            expect(read.body).not.toContain("selected@example.com");
+
+            // Access is keyed to the one profile before any row is read: no service-wide query runs.
+            expect(findMany).not.toHaveBeenCalled();
+            expect(findFirst).not.toHaveBeenCalled();
+            expect(findUnique).toHaveBeenCalledTimes(1);
+            expect(findUnique.mock.calls[0]?.[0]).toEqual({
+                where: { accountId_vendor_profileId: { accountId: user.id, vendor: "claude-subscription", profileId: "work" } },
+                select: { metadata: true },
+            });
+
+            const missing = await app.inject({
+                method: "GET",
+                url: "/v3/connect/claude-subscription/profiles/absent/credential/health",
+                headers: { "x-test-user-id": user.id },
+            });
+            expect(missing.statusCode).toBe(404);
+            expect(missing.json()).toEqual({ error: "connect_credential_not_found" });
+
+            const foreign = await app.inject({
+                method: "GET",
+                url: "/v3/connect/claude-subscription/profiles/foreign/credential/health",
+                headers: { "x-test-user-id": user.id },
+            });
+            expect(foreign.statusCode).toBe(404);
+            expect(foreign.json()).toEqual({ error: "connect_credential_not_found" });
+            expect(findMany).not.toHaveBeenCalled();
+        } finally {
+            findMany.mockRestore();
+            findFirst.mockRestore();
+            findUnique.mockRestore();
+            // Prisma delegates synthesize methods through a Proxy; spy restoration otherwise deletes them.
+            delegate.findMany = originalFindMany as typeof delegate.findMany;
+            delegate.findFirst = originalFindFirst as typeof delegate.findFirst;
+            delegate.findUnique = originalFindUnique as typeof delegate.findUnique;
+        }
+    });
+
     it("does not apply stale credential health to a newer reconnect revision", async () => {
         const user = await db.account.create({ data: { publicKey: "pk-csv2-health-revision" }, select: { id: true } });
         const app = createTestApp();

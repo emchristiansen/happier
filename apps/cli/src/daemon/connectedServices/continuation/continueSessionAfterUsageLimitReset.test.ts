@@ -131,6 +131,9 @@ describe('continueSessionAfterUsageLimitReset', () => {
         runtime = { ...runtime, credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb' };
         return { success: true, credentialRevision: runtime.credentialRevision };
       },
+      // Refresh is health-gated: the selected profile's exact health is read as connected.
+      readConnectedServiceCredentialHealth: async (input: Readonly<{ serviceId: string; profileId: string }>) => (input.serviceId === serviceId && input.profileId === 'B'
+        ? { kind: 'found' as const, status: 'connected' as const, health: null } : { kind: 'not_found' as const }),
       updateConnectedServiceCredentialHealth: async () => {},
       getConnectedServiceAuthGroup: async () => ({ v: 1, serviceId, groupId: 'pool', displayName: 'Pool', activeProfileId: 'B',
         generation: 2, runtimeStateRevision: 0, policy: state.policy, state: { v: 1 },
@@ -166,7 +169,8 @@ describe('continueSessionAfterUsageLimitReset', () => {
       applyGeneration: async () => {
         applications++;
         const result = await switchSessionConnectedServiceAuth({ core, switchReason: 'automatic_runtime_failure',
-          api: { listConnectedServiceProfiles: async () => ({ serviceId, profiles: [{ profileId: 'B', status: 'connected' as const }] }),
+          api: { readConnectedServiceCredentialHealth: async (input: Readonly<{ serviceId: string; profileId: string }>) => (input.serviceId === serviceId && input.profileId === 'B'
+            ? { kind: 'found' as const, status: 'connected' as const, health: null } : { kind: 'not_found' as const }),
             getConnectedServiceAuthGroup: async () => ({ v: 1, serviceId, groupId: 'pool', displayName: 'Pool',
               activeProfileId: 'B', generation: 2, runtimeStateRevision: 0, policy: ConnectedServiceAuthGroupPolicyV1Schema.parse(state.policy),
               state: { v: 1 }, members: [{ v: 1, serviceId, groupId: 'pool', profileId: 'B', priority: 0, enabled: true,
@@ -590,7 +594,8 @@ describe('continueSessionAfterUsageLimitReset', () => {
       applyGeneration: async (generation) => {
         const result = await switchSessionConnectedServiceAuth({ core, switchReason: 'automatic_runtime_failure',
           groupSwitchTriggerReason: 'usage_limit', getChildren: () => [tracked],
-          api: { listConnectedServiceProfiles: async () => ({ serviceId, profiles: ['A', 'B'].map(profileId => ({ profileId, status: 'connected' as const })) }),
+          api: { readConnectedServiceCredentialHealth: async (input: Readonly<{ serviceId: string; profileId: string }>) => (input.serviceId === serviceId && ['A', 'B'].includes(input.profileId)
+            ? { kind: 'found' as const, status: 'connected' as const, health: null } : { kind: 'not_found' as const }),
             getConnectedServiceAuthGroup: async () => ({ v: 1, serviceId, groupId: 'pool', displayName: 'Pool',
               activeProfileId: state.activeProfileId, generation: state.generation, runtimeStateRevision: 0,
               policy: ConnectedServiceAuthGroupPolicyV1Schema.parse(state.policy), state: { v: 1 },

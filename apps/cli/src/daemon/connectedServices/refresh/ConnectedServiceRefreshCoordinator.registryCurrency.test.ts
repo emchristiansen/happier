@@ -15,6 +15,13 @@ import {
 import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
 import { ConnectedServiceRefreshCoordinator } from './ConnectedServiceRefreshCoordinator';
 
+/** Credential health actually read as connected; refresh behavior under unread health is tested separately. */
+function readConnectedCredentialHealth() {
+  return {
+    readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'connected' as const, health: null })),
+  };
+}
+
 const sourceRevision = ConnectedServiceCredentialRevisionV1Schema.parse('csr_aaaaaaaaaaaaaaaaaaaaaa');
 const refreshedRevision = ConnectedServiceCredentialRevisionV1Schema.parse('csr_bbbbbbbbbbbbbbbbbbbbbb');
 
@@ -65,6 +72,7 @@ describe('ConnectedServiceRefreshCoordinator runtime-registry currency', () => {
       },
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         revisionSemantics: 'revisioned' as const,
@@ -236,6 +244,7 @@ describe('ConnectedServiceRefreshCoordinator runtime-registry currency', () => {
       },
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         revisionSemantics: 'revisioned' as const,
@@ -360,6 +369,7 @@ describe('ConnectedServiceRefreshCoordinator runtime-registry currency', () => {
       },
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         revisionSemantics: 'revisioned' as const,

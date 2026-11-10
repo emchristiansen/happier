@@ -14,6 +14,7 @@ import { ConnectedServiceCredentialRecordV1Schema } from '@happier-dev/protocol'
 
 import type { Credentials } from '@/persistence';
 import type { ApiClient } from '@/api/api';
+import { ConnectedServiceCredentialHealthReadUnavailableError } from '@/api/connectedServices/connectedServiceCredentialApi';
 import { logger } from '@/ui/logger';
 import { buildConnectedServiceCredentialRecord } from '@happier-dev/protocol';
 import { writeClaudeCodeCredentialsFile } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialFile';
@@ -33,6 +34,13 @@ import { ConnectedServiceSessionAuthSwitchLockRegistry } from '../runtimeAuth/co
 import { resolveConnectedServiceCredentialLifecycleDescriptor } from '@/backends/catalog';
 import { computeConnectedServiceAccessTokenFingerprint } from './credentialFreshness/tokenFingerprint';
 import { ConnectedServiceQuotasCoordinator } from '../quotas/ConnectedServiceQuotasCoordinator';
+
+/** Credential health actually read as connected; refresh behavior under unread health is tested separately. */
+function readConnectedCredentialHealth() {
+  return {
+    readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'connected' as const, health: null })),
+  };
+}
 
 const { spawnSpy } = vi.hoisted(() => ({
   spawnSpy: vi.fn(),
@@ -193,6 +201,7 @@ afterEach(() => {
     });
     const reads: string[] = [];
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async (input: { profileId: string }) => {
         reads.push(input.profileId);
         return input.profileId === 'pending' ? await pendingRead : null;
@@ -333,6 +342,7 @@ afterEach(() => {
     });
 
 	    const api = {
+	      ...readConnectedCredentialHealth(),
 	      getConnectedServiceCredentialSealed: vi.fn(async () => ({
 	        sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
 	        metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 30_000 },
@@ -429,6 +439,7 @@ afterEach(() => {
     });
     let credentialRevision = 'csr_abcdefghijklmnopqrstuv';
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({ credentialRevision, content: { t: 'plain' as const, v: storedRecord } })),
       getConnectedServiceCredentialSealed: vi.fn(async () => null),
@@ -515,6 +526,7 @@ afterEach(() => {
     });
     const acquireConnectedServiceRefreshLease = vi.fn();
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         revisionSemantics: 'legacy_unfenced' as const,
@@ -582,6 +594,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => {
         throw new Error('mode probe failed');
       }),
@@ -683,6 +696,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => {
         throw new Error('mode probe failed');
       }),
@@ -796,6 +810,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 30_000 },
@@ -913,6 +928,7 @@ afterEach(() => {
     });
 
 	    const api = {
+	      ...readConnectedCredentialHealth(),
 	      getConnectedServiceCredentialSealed: vi.fn(async () => ({
 	        sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
 	        metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 30_000 },
@@ -1002,6 +1018,7 @@ afterEach(() => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: {
@@ -1064,6 +1081,7 @@ afterEach(() => {
       encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
     } satisfies Credentials;
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => {
         throw new Error('deleted credential must not be resolved');
       }),
@@ -1140,6 +1158,7 @@ afterEach(() => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         credentialRevision: `csr_${'a'.repeat(22)}`,
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
@@ -1219,6 +1238,7 @@ afterEach(() => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: {
@@ -1313,6 +1333,7 @@ afterEach(() => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: {
@@ -1408,6 +1429,7 @@ afterEach(() => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: {
@@ -1524,6 +1546,7 @@ afterEach(() => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: {
@@ -1647,6 +1670,7 @@ afterEach(() => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: 'user@example.com', providerAccountId: 'acct', expiresAt: now + 10 * 60_000 },
@@ -1763,6 +1787,7 @@ afterEach(() => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: {
@@ -1902,6 +1927,7 @@ afterEach(() => {
     let canonicalActiveProfileId = 'workA';
     let canonicalGeneration = 4;
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async (input: { profileId: string }) => {
         const ciphertext = sealedByProfileId.get(input.profileId);
         if (!ciphertext) return null;
@@ -2632,12 +2658,12 @@ afterEach(() => {
       rematerializeTargetsForBindingDetailed(binding: Readonly<{
         serviceId: 'claude-subscription';
         profileId: string;
-      }>): Promise<unknown>;
+      }>, health: Readonly<{ kind: 'read_at_rematerialization' }>): Promise<unknown>;
     };
     await rematerialize.rematerializeTargetsForBindingDetailed({
       serviceId: 'claude-subscription',
       profileId: 'workB',
-    });
+    }, { kind: 'read_at_rematerialization' });
 
     const credential = JSON.parse(await readFile(join(harness.groupConfigDir, '.credentials.json'), 'utf8'));
     expect(credential.claudeAiOauth.accessToken).toBe('active-access');
@@ -2657,7 +2683,7 @@ afterEach(() => {
       rematerializeTargetsForBindingDetailed(binding: Readonly<{
         serviceId: 'claude-subscription';
         profileId: string;
-      }>): Promise<unknown>;
+      }>, health: Readonly<{ kind: 'read_at_rematerialization' }>): Promise<unknown>;
     };
 
     await coordinatorInternals.resolveCanonicalGroupStateForRefresh({
@@ -2670,7 +2696,7 @@ afterEach(() => {
     await coordinatorInternals.rematerializeTargetsForBindingDetailed({
       serviceId: 'claude-subscription',
       profileId: 'workA',
-    });
+    }, { kind: 'read_at_rematerialization' });
 
     const credential = JSON.parse(await readFile(join(harness.groupConfigDir, '.credentials.json'), 'utf8'));
     expect(credential.claudeAiOauth.accessToken).toBe('member-access');
@@ -2705,9 +2731,12 @@ afterEach(() => {
     const rematerialize = harness.coordinator as unknown as {
       rematerializeTargetsForBindingDetailed(binding: Readonly<{
         serviceId: 'claude-subscription'; profileId: string;
-      }>): Promise<unknown>;
+      }>, health: Readonly<{ kind: 'read_at_rematerialization' }>): Promise<unknown>;
     };
-    await rematerialize.rematerializeTargetsForBindingDetailed({ serviceId: 'claude-subscription', profileId: 'workA' });
+    await rematerialize.rematerializeTargetsForBindingDetailed(
+      { serviceId: 'claude-subscription', profileId: 'workA' },
+      { kind: 'read_at_rematerialization' },
+    );
     const credential = JSON.parse(await readFile(join(harness.groupConfigDir, '.credentials.json'), 'utf8'));
     expect(credential.claudeAiOauth.accessToken).toBe('member-access');
   });
@@ -2749,6 +2778,7 @@ afterEach(() => {
     });
     const updateConnectedServiceCredentialHealth = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: {
@@ -2875,6 +2905,7 @@ afterEach(() => {
     });
     const updateConnectedServiceCredentialHealth = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: {
@@ -2998,6 +3029,7 @@ afterEach(() => {
     });
     const updateConnectedServiceCredentialHealth = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: {
@@ -3131,6 +3163,7 @@ afterEach(() => {
     ]);
     const updateConnectedServiceCredentialHealth = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async (params: { serviceId: string; profileId: string }) => {
         const ciphertext = ciphertextByKey.get(`${params.serviceId}/${params.profileId}`);
         if (!ciphertext) return null;
@@ -3239,6 +3272,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: 'known-user@example.test', providerAccountId: 'acct', expiresAt: now + 30_000 },
@@ -3337,6 +3371,7 @@ afterEach(() => {
     let superseded = false;
     const codexHome = resolveCodexHomeForMaterialization(activeServerDir, { kind: 'group', groupId: 'main' });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => {
         if (cutover && !superseded && groupReads >= 3) {
           // Real Account HTTP response boundary: the bridge's post-rotation distribution captured
@@ -3505,6 +3540,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: 'alice@example.com', providerAccountId: 'chatgpt-account', expiresAt: now + 90_000 },
@@ -3613,6 +3649,7 @@ afterEach(() => {
     const acquireLease = vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 }));
     const registerSealed = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealed },
         metadata: { kind: 'oauth', providerEmail: 'alice@example.com', providerAccountId: 'chatgpt-account', expiresAt: now + 60 * 60_000 },
@@ -3704,10 +3741,10 @@ afterEach(() => {
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: 'alice@example.com', providerAccountId: 'chatgpt-account', expiresAt: now + 60 * 60_000 },
       })),
-      listConnectedServiceProfiles: vi.fn(async () => ({
-        serviceId: 'openai-codex',
-        profiles: [{ profileId: 'work', status: 'needs_reauth' as const }],
-      })),
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'needs_reauth' as const, health: null })),
+      listConnectedServiceProfiles: vi.fn(async () => {
+        throw new Error('refresh must not read the service-wide profile list');
+      }),
       acquireConnectedServiceRefreshLease: vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 })),
       registerConnectedServiceCredentialSealed: vi.fn(async (params: { sealed: { ciphertext: string } }) => {
         sealedCiphertext = params.sealed.ciphertext;
@@ -3800,10 +3837,10 @@ afterEach(() => {
         sealed: { format: 'account_scoped_v1' as const, ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: 'alice@example.com', providerAccountId: 'chatgpt-account', expiresAt: now + 60 * 60_000 },
       })),
-      listConnectedServiceProfiles: vi.fn(async () => ({
-        serviceId: 'openai-codex',
-        profiles: [{ profileId: 'work', status: 'needs_reauth' as const }],
-      })),
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'needs_reauth' as const, health: null })),
+      listConnectedServiceProfiles: vi.fn(async () => {
+        throw new Error('refresh must not read the service-wide profile list');
+      }),
       acquireConnectedServiceRefreshLease: vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 })),
       registerConnectedServiceCredentialSealed: vi.fn(async () => {}),
       updateConnectedServiceCredentialHealth: vi.fn(async () => {}),
@@ -3889,6 +3926,7 @@ afterEach(() => {
       };
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: getSealed,
       acquireConnectedServiceRefreshLease: vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 })),
       registerConnectedServiceCredentialSealed: vi.fn(async () => {}),
@@ -3972,6 +4010,7 @@ afterEach(() => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealed },
         metadata: { kind: 'oauth', providerEmail: 'owner@example.com', providerAccountId: 'chatgpt-owner', expiresAt: now + 60 * 60_000 },
@@ -4033,6 +4072,7 @@ afterEach(() => {
     if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
     const now = 1_000_000;
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => {
         throw new Error('must not read credentials for unknown bridge sessions');
       }),
@@ -4120,6 +4160,7 @@ afterEach(() => {
 
     let credentialReads = 0;
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => {
         credentialReads += 1;
         const ciphertext = credentialReads === 1 ? staleCiphertext : refreshedCiphertext;
@@ -4237,6 +4278,7 @@ afterEach(() => {
       });
       let credentialReads = 0;
       const api = {
+        ...readConnectedCredentialHealth(),
         getConnectedServiceCredentialSealed: vi.fn(async () => {
           credentialReads += 1;
           const record = credentialReads === 1 ? staleRecord : candidateRecord;
@@ -4322,6 +4364,7 @@ afterEach(() => {
     });
     const updateConnectedServiceCredentialHealth = vi.fn(async (_params: unknown) => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         credentialRevision,
@@ -4455,6 +4498,7 @@ afterEach(() => {
     let credentialReads = 0;
     const updateConnectedServiceCredentialHealth = vi.fn(async () => ({ success: true as const, credentialRevision: supersedingRevision }));
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => {
         credentialReads += 1;
@@ -4551,6 +4595,7 @@ afterEach(() => {
     });
     let credentialReads = 0;
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => {
         credentialReads += 1;
@@ -4643,6 +4688,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 30_000 },
@@ -4734,6 +4780,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 30_000 },
@@ -4839,6 +4886,7 @@ afterEach(() => {
       observeHealthSettlementStarted = resolve;
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 30_000 },
@@ -4939,6 +4987,7 @@ afterEach(() => {
       resolveCredentialReadStarted = resolve;
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => {
         resolveCredentialReadStarted();
         await credentialReadReleased;
@@ -5038,6 +5087,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 10_000 },
@@ -5150,6 +5200,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 10 * 60_000 },
@@ -5241,6 +5292,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 10_000 },
@@ -5341,6 +5393,7 @@ afterEach(() => {
     let concurrentReads = 0;
     let maxConcurrentReads = 0;
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async (params: { profileId: string }) => {
         concurrentReads += 1;
         maxConcurrentReads = Math.max(maxConcurrentReads, concurrentReads);
@@ -5421,6 +5474,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => {
         await new Promise((resolve) => setTimeout(resolve, 10));
         throw new Error('credential read exploded');
@@ -5482,6 +5536,7 @@ afterEach(() => {
     }));
     const onCredentialHealthNotification = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         credentialRevision: leasedRevision,
@@ -5562,6 +5617,7 @@ afterEach(() => {
 
     const updateConnectedServiceCredentialHealth = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 10 * 60_000 },
@@ -5759,6 +5815,7 @@ afterEach(() => {
 
     const updateConnectedServiceCredentialHealth = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: {
@@ -5878,6 +5935,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 10 * 60_000 },
@@ -5987,17 +6045,10 @@ afterEach(() => {
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 30_000 },
       })),
-      listConnectedServiceProfiles: vi.fn(async () => ({
-        serviceId: 'openai-codex',
-        profiles: [{
-          profileId: 'work',
-          status: 'needs_reauth' as const,
-          kind: 'oauth' as const,
-          providerEmail: null,
-          providerAccountId: 'acct',
-          expiresAt: now + 30_000,
-        }],
-      })),
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'needs_reauth' as const, health: null })),
+      listConnectedServiceProfiles: vi.fn(async () => {
+        throw new Error('refresh must not read the service-wide profile list');
+      }),
       acquireConnectedServiceRefreshLease: vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 })),
       registerConnectedServiceCredentialSealed: vi.fn(async () => {}),
       updateConnectedServiceCredentialHealth: vi.fn(async () => {}),
@@ -6037,7 +6088,8 @@ afterEach(() => {
 
     await expect(coordinator.tickOnce()).resolves.toBeUndefined();
 
-    expect(api.listConnectedServiceProfiles).toHaveBeenCalledWith({ serviceId: 'openai-codex' });
+    expect(api.readConnectedServiceCredentialHealth).toHaveBeenCalledWith({ serviceId: 'openai-codex', profileId: 'work' });
+    expect(api.listConnectedServiceProfiles).not.toHaveBeenCalled();
     expect(api.acquireConnectedServiceRefreshLease).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(api.updateConnectedServiceCredentialHealth).toHaveBeenCalledWith({
@@ -6094,17 +6146,10 @@ afterEach(() => {
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 30_000 },
       })),
-      listConnectedServiceProfiles: vi.fn(async () => ({
-        serviceId: 'openai-codex',
-        profiles: [{
-          profileId: 'work',
-          status: 'needs_reauth' as const,
-          kind: 'oauth' as const,
-          providerEmail: null,
-          providerAccountId: 'acct',
-          expiresAt: now + 30_000,
-        }],
-      })),
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'needs_reauth' as const, health: null })),
+      listConnectedServiceProfiles: vi.fn(async () => {
+        throw new Error('refresh must not read the service-wide profile list');
+      }),
       acquireConnectedServiceRefreshLease: vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 })),
       registerConnectedServiceCredentialSealed: vi.fn(async () => {}),
       updateConnectedServiceCredentialHealth: vi.fn(async () => {}),
@@ -6203,17 +6248,10 @@ afterEach(() => {
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 10 * 60_000 },
       })),
-      listConnectedServiceProfiles: vi.fn(async () => ({
-        serviceId: 'openai-codex',
-        profiles: [{
-          profileId: 'work',
-          status: 'needs_reauth' as const,
-          kind: 'oauth' as const,
-          providerEmail: null,
-          providerAccountId: 'acct',
-          expiresAt: now + 10 * 60_000,
-        }],
-      })),
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'needs_reauth' as const, health: null })),
+      listConnectedServiceProfiles: vi.fn(async () => {
+        throw new Error('refresh must not read the service-wide profile list');
+      }),
       acquireConnectedServiceRefreshLease: vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 })),
       registerConnectedServiceCredentialSealed: vi.fn(async () => {}),
       updateConnectedServiceCredentialHealth: vi.fn(async () => {}),
@@ -6249,7 +6287,8 @@ afterEach(() => {
       expiresAt: now + 10 * 60_000,
     }));
     expect(result.diagnostic.category).toBeUndefined();
-    expect(api.listConnectedServiceProfiles).toHaveBeenCalledWith({ serviceId: 'openai-codex' });
+    expect(api.readConnectedServiceCredentialHealth).toHaveBeenCalledWith({ serviceId: 'openai-codex', profileId: 'work' });
+    expect(api.listConnectedServiceProfiles).not.toHaveBeenCalled();
     expect(api.acquireConnectedServiceRefreshLease).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(api.updateConnectedServiceCredentialHealth).not.toHaveBeenCalled();
@@ -6289,6 +6328,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: {
@@ -6393,10 +6433,10 @@ afterEach(() => {
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 10 * 60_000 },
       })),
-      listConnectedServiceProfiles: vi.fn(async () => {
+      readConnectedServiceCredentialHealth: vi.fn(async () => {
         throw new AxiosError('Request failed with Authorization: Bearer MESSAGE_SECRET', 'ERR_BAD_RESPONSE', {
           method: 'get',
-          url: 'https://api.example.test/v3/connect/openai-codex/profiles?token=QUERY_SECRET',
+          url: 'https://api.example.test/v3/connect/openai-codex/profiles/work/credential/health?token=QUERY_SECRET',
           headers: new AxiosHeaders({ Authorization: 'Bearer HEADER_SECRET' }),
           data: { access_token: 'BODY_SECRET' },
         });
@@ -6418,19 +6458,133 @@ afterEach(() => {
       now: () => now,
     });
 
+    // Unread health refuses explicitly; it is never treated as permission to skip the health gate.
     await expect(coordinator.refreshConnectedServiceCredentialForSpawnPreflight({
       serviceId: 'openai-codex',
       profileId: 'work',
-    })).resolves.toEqual(expect.objectContaining({ status: 'not_needed' }));
+    })).resolves.toEqual(expect.objectContaining({ status: 'credential_health_unavailable' }));
+    expect(api.acquireConnectedServiceRefreshLease).not.toHaveBeenCalled();
 
     const payload = JSON.stringify(warnSpy.mock.calls.at(-1)?.[1]);
-    expect(payload).toContain('https://api.example.test/v3/connect/openai-codex/profiles');
+    expect(payload).toContain('https://api.example.test/v3/connect/openai-codex/profiles/work/credential/health');
     expect(payload).not.toContain('MESSAGE_SECRET');
     expect(payload).not.toContain('QUERY_SECRET');
     expect(payload).not.toContain('HEADER_SECRET');
     expect(payload).not.toContain('BODY_SECRET');
     expect(payload).not.toContain('"headers"');
     expect(payload).not.toContain('"data"');
+  });
+
+  describe('refuses health-gated refresh when the exact credential health cannot be read', () => {
+    const unreadHealthCases = [
+      {
+        name: 'the server has no exact health route',
+        reader: async () => { throw new ConnectedServiceCredentialHealthReadUnavailableError('openai-codex', 'work'); },
+      },
+      {
+        name: 'the health response is malformed',
+        reader: async () => { throw new Error('Invalid connected service credential health response'); },
+      },
+      {
+        name: 'the health request fails in transport',
+        reader: async () => { throw new AxiosError('socket hang up', 'ECONNRESET'); },
+      },
+      {
+        name: 'the profile is absent after its credential was read',
+        reader: async () => ({ kind: 'not_found' as const }),
+      },
+      { name: 'the client has no exact health reader', reader: null },
+    ] as const;
+    const entries = ['spawn_preflight', 'quota_bridge'] as const;
+    const expiries = [
+      { name: 'an unexpired credential', expiresInMs: 10 * 60_000 },
+      { name: 'a credential inside the refresh window', expiresInMs: 30_000 },
+    ] as const;
+
+    for (const healthCase of unreadHealthCases) {
+      for (const entry of entries) {
+        for (const expiry of expiries) {
+          it(`${entry}: ${healthCase.name}, with ${expiry.name}`, async () => {
+            const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-unread-health-'));
+            const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-unread-health-'));
+            const credentials = {
+              token: 'happy-token',
+              encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) },
+            } satisfies Credentials;
+            if (credentials.encryption.type !== 'legacy') throw new Error('fixture');
+            const now = 1_000_000;
+            const expiresAt = now + expiry.expiresInMs;
+            const record = buildConnectedServiceCredentialRecord({
+              now,
+              serviceId: 'openai-codex',
+              profileId: 'work',
+              kind: 'oauth',
+              expiresAt,
+              oauth: {
+                accessToken: 'synthetic-access',
+                refreshToken: 'synthetic-refresh',
+                idToken: null,
+                scope: null,
+                tokenType: null,
+                providerAccountId: 'acct',
+                providerEmail: null,
+              },
+            });
+            const sealedCiphertext = sealAccountScopedBlobCiphertext({
+              kind: 'connected_service_credential',
+              material: { type: 'legacy', secret: credentials.encryption.secret },
+              payload: record,
+              randomBytes: (length) => randomBytes(length),
+            });
+            vi.spyOn(logger, 'warn').mockImplementation(() => {});
+            const acquireLease = vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 }));
+            const registerSealed = vi.fn(async () => {});
+            const updateHealth = vi.fn(async () => {});
+            const api = {
+              getConnectedServiceCredentialSealed: vi.fn(async () => ({
+                sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
+                metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt },
+              })),
+              ...(healthCase.reader ? { readConnectedServiceCredentialHealth: vi.fn(healthCase.reader) } : {}),
+              acquireConnectedServiceRefreshLease: acquireLease,
+              registerConnectedServiceCredentialSealed: registerSealed,
+              updateConnectedServiceCredentialHealth: updateHealth,
+            } as unknown as ApiClient;
+            completeCredentialAuthorityBoundaryFixture(api);
+            const coordinator = new ConnectedServiceRefreshCoordinator({
+              api,
+              credentials,
+              machineIdProvider: () => 'machine-1',
+              activeServerDir,
+              baseDir,
+              refreshWindowMs: 60_000,
+              refreshLeaseMs: 30_000,
+              now: () => now,
+            });
+
+            if (entry === 'spawn_preflight') {
+              await expect(coordinator.refreshConnectedServiceCredentialForSpawnPreflight({
+                serviceId: 'openai-codex',
+                profileId: 'work',
+              })).resolves.toEqual(expect.objectContaining({
+                status: 'credential_health_unavailable',
+                credential: null,
+              }));
+            } else {
+              await expect(coordinator.refreshConnectedServiceCredentialForQuota({
+                serviceId: 'openai-codex',
+                profileId: 'work',
+                force: false,
+              })).resolves.toEqual({ record: null, reauthRequired: false });
+            }
+            // No lease, provider rotation, credential write or fabricated health record follows.
+            expect(acquireLease).not.toHaveBeenCalled();
+            expect(registerSealed).not.toHaveBeenCalled();
+            expect(updateHealth).not.toHaveBeenCalled();
+          });
+        }
+      }
+    }
   });
 
   it('lets forced quota-bridge refresh bypass reconnect-required backoff and clear health', async () => {
@@ -6473,17 +6627,10 @@ afterEach(() => {
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now + 10 * 60_000 },
       })),
-      listConnectedServiceProfiles: vi.fn(async () => ({
-        serviceId: 'openai-codex',
-        profiles: [{
-          profileId: 'work',
-          status: 'needs_reauth' as const,
-          kind: 'oauth' as const,
-          providerEmail: null,
-          providerAccountId: 'acct',
-          expiresAt: now + 10 * 60_000,
-        }],
-      })),
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'needs_reauth' as const, health: null })),
+      listConnectedServiceProfiles: vi.fn(async () => {
+        throw new Error('refresh must not read the service-wide profile list');
+      }),
       acquireConnectedServiceRefreshLease: vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 })),
       registerConnectedServiceCredentialSealed: vi.fn(async () => {}),
       updateConnectedServiceCredentialHealth: vi.fn(async () => {}),
@@ -6520,7 +6667,8 @@ afterEach(() => {
       reauthRequired: false,
     }));
 
-    expect(api.listConnectedServiceProfiles).toHaveBeenCalledWith({ serviceId: 'openai-codex' });
+    expect(api.readConnectedServiceCredentialHealth).toHaveBeenCalledWith({ serviceId: 'openai-codex', profileId: 'work' });
+    expect(api.listConnectedServiceProfiles).not.toHaveBeenCalled();
     expect(api.acquireConnectedServiceRefreshLease).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(api.updateConnectedServiceCredentialHealth).toHaveBeenCalledWith({
@@ -6573,6 +6721,7 @@ afterEach(() => {
     });
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async (params: { serviceId: string; profileId: string }) => {
         if (params.serviceId !== 'openai-codex' || params.profileId !== 'backup') {
           return null;
@@ -6726,6 +6875,7 @@ afterEach(() => {
     }));
 
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async (params: { serviceId: string }) => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedByServiceId.get(params.serviceId)! },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: null, expiresAt: now + 30_000 },
@@ -6865,6 +7015,7 @@ afterEach(() => {
       const healthBoundary = vi.fn(async () => ({ success: true as const }));
       // The API persistence/lease transport is the genuine boundary; all refresh logic stays real.
       const api = {
+        ...readConnectedCredentialHealth(),
         getAccountEncryptionMode: async () => 'plain' as const,
         getConnectedServiceCredentialPlain: readBoundary,
         acquireConnectedServiceRefreshLease: async () => ({
@@ -6971,6 +7122,7 @@ afterEach(() => {
     });
     let credentialRevision = 'csr_abcdefghijklmnopqrstuv';
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         credentialRevision,
@@ -7055,6 +7207,7 @@ afterEach(() => {
       },
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({ content: { t: 'plain' as const, v: storedRecord } })),
       getConnectedServiceCredentialSealed: vi.fn(async () => null),

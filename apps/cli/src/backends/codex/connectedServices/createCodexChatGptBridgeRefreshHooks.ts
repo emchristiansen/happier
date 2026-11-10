@@ -75,7 +75,7 @@ export function createCodexChatGptBridgeRefreshHooks(input: Readonly<{
       await capabilities.rematerializeTargets({
         serviceId: 'openai-codex',
         profileId,
-      });
+      }, { credentialRevision });
       // The bridge is authorized by a live registry target. An empty distribution may mean that
       // current group truth rejected this captured selection; it never authorizes another writer.
       return {
