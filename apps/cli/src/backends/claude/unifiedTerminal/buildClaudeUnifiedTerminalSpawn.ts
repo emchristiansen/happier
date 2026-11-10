@@ -33,6 +33,14 @@ import {
   resolveClaudeTerminalCliOptions,
   type ClaudeTerminalCliOptionsDiagnostic,
 } from '../cli/terminalOptions';
+import {
+  readClaudeModelFlag,
+  selectClaudeModelResolutionArgs,
+  splitClaudeLaunchArgs,
+  withoutClaudeFlag,
+} from '../cli/claudeLaunchFlagGroups';
+import { qualifyClaudeTerminalLaunchModelEffortPin } from '../utils/claudeModelEffortPinBridge';
+import { createClaudeAppliedSettingsReader } from '../utils/readClaudeAppliedSettings';
 import { claudeCliFlagCanConsumeNextArg } from '../cli/flagArity';
 import {
   buildClaudePermissionModeLaunchSettings,
@@ -104,6 +112,8 @@ type ClaudeUnifiedTerminalSpawnDeps = Readonly<{
     args: readonly string[];
     env: NodeJS.ProcessEnv;
   }>) => CommandInvocation;
+  /** Reads Claude Code's applied settings before launch (the native stream-json enquiry). */
+  createAppliedSettingsReader: typeof createClaudeAppliedSettingsReader;
 }>;
 
 type ClaudeUnifiedTerminalSpawnInput<Mode extends EnhancedMode = EnhancedMode> = Readonly<{
@@ -277,7 +287,7 @@ function buildClaudeArgs<Mode extends EnhancedMode>(
   const settingsOverlay = resolveClaudeLaunchSettingsOverlayArg({
     settingsPath: input.hookSettingsPath,
     launchSettings: {
-      ...(terminalOptions.ultracodeEnabled ? { ultracode: true } : {}),
+      ...(terminalOptions.ultracodeSetting === null ? {} : { ultracode: terminalOptions.ultracodeSetting }),
       ...(statuslineSettings ? { statusLine: statuslineSettings } : {}),
       ...buildClaudePermissionModeLaunchSettings(permissionMode),
     },
@@ -399,6 +409,7 @@ function defaultDeps(inputDeps: Partial<ClaudeUnifiedTerminalSpawnDeps> | undefi
     resolveStatuslineNodeExecutable:
       inputDeps?.resolveStatuslineNodeExecutable
       ?? (() => resolveJavaScriptRuntimeExecutable({ isBunRuntime: isBun() })),
+    createAppliedSettingsReader: inputDeps?.createAppliedSettingsReader ?? createClaudeAppliedSettingsReader,
     resolveCommandInvocation:
       inputDeps?.resolveCommandInvocation
       ?? ((params) => resolveWindowsCommandInvocation({
@@ -406,6 +417,47 @@ function defaultDeps(inputDeps: Partial<ClaudeUnifiedTerminalSpawnDeps> | undefi
         args: [...params.args],
         env: params.env,
       })),
+  };
+}
+
+/**
+ * The terminal offers no control channel before its first prompt, so a model Claude Code would
+ * resolve itself (no `--model`, or an alias) is qualified first, from the arguments the terminal
+ * would get. A pinned result launches that exact model, which carries its pinned effort and
+ * ultracode off through the terminal options. Throws (no launch) when it cannot be qualified.
+ */
+async function pinTerminalLaunchModel<Mode extends EnhancedMode>(params: Readonly<{
+  input: ClaudeUnifiedTerminalSpawnInput<Mode>;
+  deps: ClaudeUnifiedTerminalSpawnDeps;
+  env: Record<string, string>;
+  claudeCliPath: string;
+  statuslineSettings: ClaudeStatuslineOverlaySettings | undefined;
+}>): Promise<ClaudeUnifiedTerminalSpawnInput<Mode>> {
+  const { input, deps } = params;
+  const groups = splitClaudeLaunchArgs(buildClaudeArgs(input, params.statuslineSettings, params.env)).flagGroups;
+  const pin = await qualifyClaudeTerminalLaunchModelEffortPin({
+    explicitModel: readClaudeModelFlag(groups),
+    modelResolutionArgs: selectClaudeModelResolutionArgs(groups),
+    readSettings: async (modelResolutionArgs) => deps.createAppliedSettingsReader({
+      cwd: input.path,
+      claudeCliPath: params.claudeCliPath,
+      javaScriptRuntime: deps.isClaudeCliJavaScriptFile(params.claudeCliPath)
+        ? await deps.ensureClaudeJsRuntimeExecutable()
+        : null,
+      envOverlay: params.env,
+    })(modelResolutionArgs),
+  });
+  if (pin.kind === 'unchanged') return input;
+  // The user's `--model` would outrank the session model in the terminal options.
+  const userArgs = splitClaudeLaunchArgs(input.claudeArgs ?? []);
+  return {
+    ...input,
+    first: { ...input.first, mode: { ...input.first.mode, model: pin.model } },
+    claudeArgs: [
+      ...withoutClaudeFlag(userArgs.flagGroups, '--model').flat(),
+      ...(userArgs.hasExplicitPositionalDelimiter ? ['--'] : []),
+      ...userArgs.positionalArgs,
+    ],
   };
 }
 
@@ -423,8 +475,9 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
     ...resolveClaudeSessionEnvOverlay({ claudeCodeIncludeInNativeHistory: input.first.mode.claudeCodeIncludeInNativeHistory }),
   }), happierSessionId ?? '');
   const statuslineSettings = resolveStatuslineOverlaySettings({ input, deps, env });
+  const launchInput = await pinTerminalLaunchModel({ input, deps, env, claudeCliPath: resolvedClaudeCliPath, statuslineSettings });
   const materializedMcpConfig = await materializeClaudeMcpConfigArgsForSpawn(
-    buildClaudeArgs(input, statuslineSettings, env),
+    buildClaudeArgs(launchInput, statuslineSettings, env),
   );
   let materializedSystemPrompt: MaterializedClaudeSystemPromptArgs | null = null;
   // Retire both private artifacts even when one cleanup fails; surface every failure.

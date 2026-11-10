@@ -1,9 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { reloadConfiguration } from '@/configuration';
 
 import {
   buildClaudeEffortCliArgs,
   resolveClaudeDefaultEffortForModel,
   resolveClaudeUltracodeForModel,
+  resolveClaudeUltracodeLaunchSetting,
   resolveModeEffortLevelsForModel,
 } from './claudeEffort';
 
@@ -168,5 +171,62 @@ describe('resolveClaudeDefaultEffortForModel', () => {
     expect(resolveClaudeDefaultEffortForModel('opus')).toBe('medium');
     expect(resolveClaudeDefaultEffortForModel('claude-opus-4-7[1m]')).toBe('xhigh');
     expect(resolveClaudeDefaultEffortForModel('claude-haiku-4-5')).toBeNull();
+  });
+});
+
+describe('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', () => {
+  // The policy is parsed once when configuration loads, as in a runner process.
+  const configurePolicy = (raw: string) => {
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', raw);
+    reloadConfiguration();
+  };
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    reloadConfiguration();
+  });
+
+  it('pins the configured model over launch, message and metadata selections, including no selection', () => {
+    configurePolicy('{"claude-opus-5-5":"medium"}');
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: 'high' })).toEqual(['--effort', 'medium']);
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: 'low' })).toEqual(['--effort', 'medium']);
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: undefined })).toEqual(['--effort', 'medium']);
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5[1m]', effort: 'high' })).toEqual(['--effort', 'medium']);
+  });
+
+  it('leaves other models and unpinned processes unchanged', () => {
+    configurePolicy('{"claude-opus-5-5":"medium"}');
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-fable-5', effort: 'high' })).toEqual(['--effort', 'high']);
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-sonnet-4-6', effort: undefined })).toEqual([]);
+    // No explicit model: the CLI picks its own model, which cannot be matched.
+    expect(buildClaudeEffortCliArgs({ modelId: undefined, effort: 'high' })).toEqual([]);
+
+    configurePolicy('');
+    expect(buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: 'high' })).toEqual(['--effort', 'high']);
+  });
+
+  it('turns ultracode explicitly off for a pinned model and leaves other models and reversal alone', () => {
+    configurePolicy('{"claude-opus-5-5":"medium"}');
+    expect(resolveClaudeUltracodeForModel({ modelId: 'claude-opus-5-5', ultracode: true })).toBe(false);
+    // Explicit off, not omission: Claude Code may have saved ultracode as its default.
+    expect(resolveClaudeUltracodeLaunchSetting({ modelId: 'claude-opus-5-5', ultracode: true })).toBe(false);
+    expect(resolveClaudeUltracodeLaunchSetting({ modelId: 'claude-opus-5-5', ultracode: undefined })).toBe(false);
+    expect(resolveClaudeUltracodeLaunchSetting({ modelId: 'claude-fable-5', ultracode: true })).toBe(true);
+    expect(resolveClaudeUltracodeLaunchSetting({ modelId: 'claude-fable-5', ultracode: undefined })).toBeNull();
+
+    configurePolicy('');
+    expect(resolveClaudeUltracodeLaunchSetting({ modelId: 'claude-opus-5-5', ultracode: true })).toBe(true);
+    expect(resolveClaudeUltracodeLaunchSetting({ modelId: 'claude-opus-5-5', ultracode: undefined })).toBeNull();
+  });
+
+  it.each([
+    ['not json', '{claude-opus-5-5:medium}'],
+    ['not an object', '["medium"]'],
+    ['unknown effort', '{"claude-opus-5-5":"turbo"}'],
+    ['empty model id', '{" ":"medium"}'],
+  ])('rejects a malformed policy loudly (%s)', (_label, raw) => {
+    configurePolicy(raw);
+    expect(() => buildClaudeEffortCliArgs({ modelId: 'claude-opus-5-5', effort: 'high' }))
+      .toThrow(/HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES/);
   });
 });

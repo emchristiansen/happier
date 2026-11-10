@@ -477,6 +477,38 @@ export const SessionStatusResultSchema = lazySchema(() => z.object({
     z.object({ state: z.literal('unreadable'), metadataVersion: z.number().int().nonnegative() }).strict(),
     z.object({ state: z.literal('unsupported') }).strict(),
   ]).default({ state: 'unsupported' }),
+  // Model and reasoning-effort readback from held metadata. `desired` is the session's persisted
+  // selection; `reported` is the newest valid model state the runner published. Neither proves
+  // what a provider turn was served at. Older producers omit this field; omission is not absence.
+  runtimeConfig: z.discriminatedUnion('state', [
+    z.object({
+      state: z.literal('present'),
+      metadataVersion: z.number().int().nonnegative(),
+      desired: z.object({
+        model: z.object({ modelId: z.string(), updatedAt: z.number() }).strict().optional(),
+        // An invalid selection is reported without its value.
+        reasoningEffort: z.discriminatedUnion('state', [
+          z.object({ state: z.literal('present'), value: z.string(), updatedAt: z.number() }).strict(),
+          z.object({ state: z.literal('invalid'), updatedAt: z.number() }).strict(),
+        ]).optional(),
+      }).strict(),
+      reported: z.discriminatedUnion('state', [
+        z.object({
+          state: z.literal('present'),
+          provider: z.string(),
+          currentModelId: z.string(),
+          reasoningEffort: z.string().optional(),
+          updatedAt: z.number(),
+        }).strict(),
+        z.object({ state: z.literal('absent') }).strict(),
+        // Published but not a valid supported model state.
+        z.object({ state: z.literal('invalid') }).strict(),
+      ]),
+    }).strict(),
+    z.object({ state: z.literal('malformed'), metadataVersion: z.number().int().nonnegative() }).strict(),
+    z.object({ state: z.literal('unreadable'), metadataVersion: z.number().int().nonnegative() }).strict(),
+    z.object({ state: z.literal('unsupported') }).strict(),
+  ]).default({ state: 'unsupported' }),
   agentState: z.object({
     controlledByUser: z.boolean().optional(),
     pendingRequestsCount: z.number().int().nonnegative(),

@@ -154,7 +154,8 @@ describe('buildClaudeUnifiedTerminalSpawn', () => {
     { model: 'claude-opus-5-5', current: 'medium', currentUpdatedAt: 30, supportsEffort: true, cliEffort: undefined, expected: 'medium' },
     { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: undefined, expected: 'low' },
     { model: 'claude-sonnet-5', current: 'high', currentUpdatedAt: 30, supportsEffort: true, cliEffort: undefined, expected: 'high' },
-    { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: 'medium', expected: 'medium' },
+    // runClaude seeds a launch --effort into session state; the spawn reads that state, not the raw flag.
+    { model: 'claude-sonnet-5', current: 'medium', currentUpdatedAt: 30, supportsEffort: true, cliEffort: 'high', expected: 'medium' },
     { model: 'claude-haiku-4-5', current: undefined, currentUpdatedAt: 0, supportsEffort: true, cliEffort: undefined, expected: undefined },
     { model: 'claude-sonnet-5', current: undefined, currentUpdatedAt: 0, supportsEffort: false, cliEffort: undefined, expected: undefined },
   ])('prepares empty resumed native launch with persisted effort and precedence ($model/$current/$cliEffort/$supportsEffort)', async (input) => {
@@ -544,6 +545,161 @@ async function readOverlayFromArgs(args: readonly string[], hookSettingsPath: st
     } finally {
       await rm(settingsDir, { recursive: true, force: true });
     }
+  });
+
+  it('launches a pinned model at its pinned effort with ultracode explicitly off', async () => {
+    const { mkdtemp, writeFile } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const settingsDir = await mkdtemp(join(tmpdir(), 'happier-pinned-effort-settings-'));
+    const hookSettingsPath = join(settingsDir, 'settings.json');
+    await writeFile(hookSettingsPath, JSON.stringify({ permissions: { allow: ['mcp__happier__change_title'] } }));
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+    (await import('@/configuration')).reloadConfiguration();
+
+    try {
+      const spawn = await buildClaudeUnifiedTerminalSpawn({
+        path: '/workspace/project',
+        first: {
+          message: 'hello',
+          mode: { permissionMode: 'default', model: 'claude-opus-5-5', reasoningEffort: 'high', ultracode: true },
+        },
+        claudeArgs: ['--effort', 'high'],
+        hookSettingsPath,
+        deps: {
+          resolveClaudeCliPath: () => '/opt/claude/cli.js',
+          isClaudeCliJavaScriptFile: () => true,
+          ensureClaudeJsRuntimeExecutable: async () => '/managed/node',
+          claudeLocalLauncherPath: '/happier/scripts/claude_local_launcher.cjs',
+          terminalLaunchSpecRunnerPath: '/happier/scripts/terminal_launch_spec_runner.cjs',
+          resolveCommandInvocation: ({ command, args }) => ({ command, args: [...args] }),
+        },
+      });
+
+      const args = (await readLaunchSpecFromSpawn(spawn)).args ?? [];
+      expect(args.flatMap((arg, index) => arg === '--effort' ? [args[index + 1]] : [])).toEqual(['medium']);
+      const overlay = await readOverlayFromArgs(args, hookSettingsPath);
+      expect(overlay.ultracode).toBe(false);
+      expect(overlay.permissions).toEqual({ allow: ['mcp__happier__change_title'] });
+    } finally {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+      await rm(settingsDir, { recursive: true, force: true });
+    }
+  });
+
+  describe('a model Claude Code resolves itself, under an effort pin', () => {
+    // The applied-settings reader stands in for the native Claude process; its own wire behavior
+    // is covered by readClaudeAppliedSettings.test.ts. It records what it was asked and when.
+    function nativeReader(applied: { model: string; effort: string } | Error) {
+      const calls: Array<{ args: readonly string[]; cwd: string; javaScriptRuntime: string | null }> = [];
+      const createAppliedSettingsReader = (params: Readonly<{ cwd: string; javaScriptRuntime: string | null }>) =>
+        async (args: readonly string[]) => {
+          calls.push({ args, cwd: params.cwd, javaScriptRuntime: params.javaScriptRuntime });
+          if (applied instanceof Error) throw applied;
+          return { applied: { ...applied, advisor: null, ultracode: false }, effective: {}, sources: [] };
+        };
+      return { calls, createAppliedSettingsReader };
+    }
+
+    async function spawnWith(params: Readonly<{
+      mode: EnhancedMode;
+      claudeArgs?: string[];
+      native: ReturnType<typeof nativeReader>;
+    }>): Promise<{ args: string[]; overlay: Record<string, unknown> }> {
+      const settingsDir = await mkdtemp(join(tmpdir(), 'happier-pinned-default-settings-'));
+      tempDirs.push(settingsDir);
+      const hookSettingsPath = join(settingsDir, 'settings.json');
+      await writeFile(hookSettingsPath, JSON.stringify({}));
+      const spawn = await buildClaudeUnifiedTerminalSpawn({
+        path: '/workspace/project',
+        first: { message: 'hello', mode: params.mode },
+        claudeArgs: params.claudeArgs ?? [],
+        hookSettingsPath,
+        deps: {
+          resolveClaudeCliPath: () => '/opt/claude/cli.js',
+          isClaudeCliJavaScriptFile: () => true,
+          ensureClaudeJsRuntimeExecutable: async () => '/managed/node',
+          claudeLocalLauncherPath: '/happier/scripts/claude_local_launcher.cjs',
+          terminalLaunchSpecRunnerPath: '/happier/scripts/terminal_launch_spec_runner.cjs',
+          resolveCommandInvocation: ({ command, args }) => ({ command, args: [...args] }),
+          createAppliedSettingsReader: params.native.createAppliedSettingsReader as never,
+        },
+      });
+      const args = (await readLaunchSpecFromSpawn(spawn)).args ?? [];
+      const settingsArg = args[args.indexOf('--settings') + 1]!;
+      return { args, overlay: JSON.parse(await readFile(settingsArg, 'utf8')) as Record<string, unknown> };
+    }
+
+    const modelAndEffort = (args: readonly string[]) => ({
+      models: args.flatMap((arg, index) => arg === '--model' ? [args[index + 1]] : []),
+      efforts: args.flatMap((arg, index) => arg === '--effort' ? [args[index + 1]] : []),
+    });
+
+    afterEach(async () => {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+    });
+
+    async function pinOpusMedium(): Promise<void> {
+      vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+      (await import('@/configuration')).reloadConfiguration();
+    }
+
+    it('launches the qualified default model at its pinned effort with ultracode off', async () => {
+      await pinOpusMedium();
+      const native = nativeReader({ model: 'claude-opus-5-5[1m]', effort: 'high' });
+
+      const { args, overlay } = await spawnWith({
+        mode: { permissionMode: 'default', reasoningEffort: 'high', ultracode: true },
+        claudeArgs: ['--agent', 'reviewer', '--effort', 'high'],
+        native,
+      });
+
+      expect(native.calls).toHaveLength(1);
+      expect(native.calls[0]).toMatchObject({ cwd: '/workspace/project', javaScriptRuntime: '/managed/node' });
+      // Only the flags that decide the model, as the terminal would get them.
+      expect(native.calls[0]!.args).toEqual(['--agent', 'reviewer', '--settings', expect.stringMatching(/settings\.json$/)]);
+      expect(modelAndEffort(args)).toEqual({ models: ['claude-opus-5-5[1m]'], efforts: ['medium'] });
+      expect(overlay.ultracode).toBe(false);
+    });
+
+    it('leaves an alias that resolves to an unpinned model untouched', async () => {
+      await pinOpusMedium();
+      const native = nativeReader({ model: 'claude-sonnet-5', effort: 'high' });
+
+      const { args } = await spawnWith({
+        mode: { permissionMode: 'default', model: 'sonnet', reasoningEffort: 'high' },
+        native,
+      });
+
+      expect(native.calls).toHaveLength(1);
+      expect(modelAndEffort(args).models).toEqual(['sonnet']);
+      expect(modelAndEffort(args).efforts).not.toContain('medium');
+    });
+
+    it('does not launch when the model cannot be qualified', async () => {
+      await pinOpusMedium();
+      const native = nativeReader(new Error('Unsupported control request subtype: get_settings'));
+
+      await expect(spawnWith({ mode: { permissionMode: 'default' }, native }))
+        .rejects.toThrow(/Cannot start Claude: .*Unsupported control request subtype: get_settings/);
+    });
+
+    it('keeps an explicit pinned model whose later option value names another model', async () => {
+      await pinOpusMedium();
+      const native = nativeReader({ model: 'claude-sonnet-4-6', effort: 'high' });
+
+      const { args } = await spawnWith({
+        mode: { permissionMode: 'default' },
+        claudeArgs: ['--model', 'claude-opus-5-5', '--name', '--model=claude-sonnet-4-6', '--effort', 'high'],
+        native,
+      });
+
+      expect(native.calls).toEqual([]);
+      expect(modelAndEffort(args)).toEqual({ models: ['claude-opus-5-5'], efforts: ['medium'] });
+      expect(args.slice(args.indexOf('--name'), args.indexOf('--name') + 2)).toEqual(['--name', '--model=claude-sonnet-4-6']);
+    });
   });
 
   it('merges yolo acknowledgement into the trusted launch overlay without changing the source settings', async () => {

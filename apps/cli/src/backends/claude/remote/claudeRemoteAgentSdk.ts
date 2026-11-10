@@ -38,7 +38,7 @@ import {
     resolveModeEffortLevelsForModel,
     buildClaudeUltracodeSettingsJson,
     resolveClaudeEffortForModel,
-    resolveClaudeUltracodeForModel,
+    resolveClaudeUltracodeLaunchSetting,
 } from '@/backends/claude/utils/claudeEffort';
 import { withCurrentHappierSessionId } from '@/agent/runtime/session/currentSessionIdEnv';
 
@@ -68,6 +68,7 @@ import {
     type ClaudeRuntimeActivityEvidence,
 } from './runtimeActivityEvidence';
 import { repairClaudeTranscriptAfterInterrupt } from './agentSdk/repairClaudeTranscriptAfterInterrupt';
+import { enforceClaudeModelEffortPinBeforePrompt } from '../utils/claudeModelEffortPinBridge';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { parseCheckpointsCommand, parseRewindCommand } from './agentSdk/claudeAgentSdkSlashCommands';
 import {
@@ -558,6 +559,17 @@ export async function claudeRemoteAgentSdk(opts: {
         return update;
     };
 
+    // Agent SDK 0.2.123 implements Query.getSettings() (`get_settings`) without declaring it.
+    const enforceEffortPinBeforePrompt = () => {
+        const query = response as (AgentSdkQueryType & { getSettings?: () => Promise<unknown> }) | undefined;
+        return enforceClaudeModelEffortPinBeforePrompt({
+            getSettings: typeof query?.getSettings === 'function' ? () => query.getSettings!() : undefined,
+            applyFlagSettings: typeof query?.applyFlagSettings === 'function'
+                ? (settings) => query.applyFlagSettings(settings)
+                : undefined,
+        });
+    };
+
     const reportRuntimeSettingsFailure = (error: unknown, messageWasHeld: boolean): void => {
         const reason = redactBugReportSensitiveText(error instanceof Error ? error.message : String(error));
         const message = `Failed to update Claude runtime settings: ${reason}
@@ -711,13 +723,13 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
         const effortSupportedLevels = resolveModeEffortLevelsForModel(mode, effortModelId);
         const resolvedEffort = resolveClaudeEffortForModel({
             modelId: effortModelId,
-            effort: argOverrides.effort ?? mode.reasoningEffort,
+            effort: mode.reasoningEffort,
             supportedLevels: effortSupportedLevels,
         });
         // Ultracode is a session-only SETTING, not an effort level. The vendored Agent SDK
         // (0.2.123) has no typed `ultracode` option yet, so it rides the spawned CLI's
         // `--settings` overlay via extraArgs. Revisit on SDK bump (typed control request).
-        const resolvedUltracode = resolveClaudeUltracodeForModel({
+        const ultracodeSetting = resolveClaudeUltracodeLaunchSetting({
             modelId: effortModelId,
             ultracode: mode.ultracode,
             supportedLevels: effortSupportedLevels,
@@ -728,7 +740,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
             out['replay-user-messages'] = null;
             if (debugEnabled) out.debug = debugCategories.length > 0 ? debugCategories.join(',') : null;
             if (verboseEnabled) out.verbose = null;
-            if (resolvedUltracode) out.settings = buildClaudeUltracodeSettingsJson();
+            if (ultracodeSetting !== null) out.settings = buildClaudeUltracodeSettingsJson(ultracodeSetting);
             return Object.keys(out).length > 0 ? out : undefined;
         })();
         const claudeSubprocessEnv = withCurrentHappierSessionId({
@@ -1057,6 +1069,16 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
         });
         opts.onWorkflowActivityObserverReady?.();
         await opts.runtimeActivityAdapter?.activateObservation('claude-agent-sdk-provider-observer-installed');
+        try {
+            await enforceEffortPinBeforePrompt();
+        } catch (error) {
+            // Never let the first prompt run at an unverified effort. The next prompt starts a
+            // fresh query, which repeats the check.
+            reportRuntimeSettingsFailure(error, true);
+            promptSettlements.rejectBeforeEffect(initial);
+            messages.end();
+            return;
+        }
         opts.setUserMessageSender?.((message: SDKUserMessage) => messages.push(message));
         messages.push({
             type: 'user',
@@ -1073,8 +1095,12 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
         let detachedTaskInterruptId: string | null = null;
         let foregroundTurnInterruptActive = true;
         let deferredInterruptedReason: string | null = null;
+        // The accepted next message while its runtime settings and pinned effort are checked: not
+        // yet sent, so a turn interrupt in that window cancels it instead of a provider turn.
+        let qualifyingPrompt: { cancelled: boolean } | null = null;
 
 	        const interruptTurn = async (): Promise<void> => {
+                if (qualifyingPrompt) qualifyingPrompt.cancelled = true;
                 let stopTaskSucceeded = false;
 	            try {
                     const stopTask = (response as any)?.stopTask;
@@ -1604,10 +1630,21 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                         mode = next.mode;
                         lastTurnFlushSummary = null;
 
+                        const qualifying = { cancelled: false };
+                        qualifyingPrompt = qualifying;
                         try {
                             await applyRuntimeSettingsUpdatesIfNeeded(resolveDesiredRuntimeSettingsSnapshot(mode));
+                            await enforceEffortPinBeforePrompt();
                         } catch (error) {
                             reportRuntimeSettingsFailure(error, true);
+                            promptSettlements.rejectBeforeEffect(next);
+                            continue;
+                        } finally {
+                            qualifyingPrompt = null;
+                        }
+                        if (qualifying.cancelled) {
+                            // Interrupted before it was sent: it is reported unsent, never delivered late.
+                            logger.debug('[claudeRemoteAgentSdk] Message cancelled before it was sent');
                             promptSettlements.rejectBeforeEffect(next);
                             continue;
                         }
@@ -1795,7 +1832,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
             })();
         }
 
-        let unpublishedLaunchEffort = resolvedUltracode ? 'xhigh' : queryOptions.effort;
+        let unpublishedLaunchEffort = ultracodeSetting === true ? 'xhigh' : queryOptions.effort;
         for await (const message of response as any) {
             const observedModelId = isReplaySdkMessage(message) ? null : readClaudeMainChainAssistantModelId(message);
             if (observedModelId) {

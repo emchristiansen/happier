@@ -1,7 +1,7 @@
 import type { EnhancedMode } from '@/backends/claude/loop';
 import {
     buildClaudeEffortCliArgs,
-    resolveClaudeUltracodeForModel,
+    resolveClaudeUltracodeLaunchSetting,
     resolveModeEffortLevelsForModel,
 } from '@/backends/claude/utils/claudeEffort';
 import { getClaudeRemoteSystemPrompt } from '@/backends/claude/utils/remoteSystemPrompt';
@@ -29,7 +29,8 @@ export type ClaudeTerminalCliOptions = Readonly<{
      * Not emitted as a CLI arg here: ultracode must ride the single `--settings` overlay,
      * which the spawn builder owns (it merges this into the hook settings overlay).
      */
-    ultracodeEnabled: boolean;
+    /** `ultracode` for the launch settings overlay; null leaves Claude Code's own setting. */
+    ultracodeSetting: boolean | null;
     diagnostics: readonly ClaudeTerminalCliOptionsDiagnostic[];
 }>;
 
@@ -195,7 +196,7 @@ export function resolveClaudeTerminalCliOptions(params: Readonly<{
 
     extraArgs.push(...buildClaudeEffortCliArgs({
         modelId: effectiveModel,
-        effort: argOverrides.effort ?? params.mode.reasoningEffort,
+        effort: params.mode.reasoningEffort,
         supportedLevels: resolveModeEffortLevelsForModel(params.mode, effectiveModel),
     }));
     if (effectiveModel) {
@@ -235,7 +236,7 @@ export function resolveClaudeTerminalCliOptions(params: Readonly<{
         extraArgs: Object.freeze([...extraArgs]),
         customSystemPrompt,
         appendSystemPrompt,
-        ultracodeEnabled: resolveClaudeUltracodeForModel({
+        ultracodeSetting: resolveClaudeUltracodeLaunchSetting({
             modelId: effectiveModel,
             ultracode: params.mode.ultracode,
             supportedLevels: resolveModeEffortLevelsForModel(params.mode, effectiveModel),

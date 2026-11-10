@@ -79,15 +79,15 @@ describe('resolveClaudeTerminalCliOptions', () => {
     it('resolves ultracode only for xhigh-capable models', () => {
         expect(resolveClaudeTerminalCliOptions({
             mode: makeMode({ model: 'claude-fable-5', ultracode: true }),
-        }).ultracodeEnabled).toBe(true);
+        }).ultracodeSetting).toBe(true);
 
         expect(resolveClaudeTerminalCliOptions({
             mode: makeMode({ model: 'claude-sonnet-4-6', ultracode: true }),
-        }).ultracodeEnabled).toBe(false);
+        }).ultracodeSetting).toBeNull();
 
         expect(resolveClaudeTerminalCliOptions({
             mode: makeMode({ model: 'claude-fable-5' }),
-        }).ultracodeEnabled).toBe(false);
+        }).ultracodeSetting).toBeNull();
     });
 
     it('keeps a [1m]-suffixed model id unmutated while still resolving effort', () => {
@@ -99,6 +99,16 @@ describe('resolveClaudeTerminalCliOptions', () => {
         expect(resolved.extraArgs[resolved.extraArgs.indexOf('--model') + 1]).toBe('claude-sonnet-4-6[1m]');
         expect(resolved.extraArgs).toContain('--effort');
         expect(resolved.extraArgs[resolved.extraArgs.indexOf('--effort') + 1]).toBe('low');
+    });
+
+    it('uses the session effort instead of a stale launch --effort flag', () => {
+        const resolved = resolveClaudeTerminalCliOptions({
+            mode: makeMode({ model: 'claude-opus-5-5', reasoningEffort: 'medium' }),
+            claudeArgs: ['--effort', 'high'],
+        });
+
+        expect(resolved.extraArgs.flatMap((arg, index) => arg === '--effort' ? [resolved.extraArgs[index + 1]] : []))
+            .toEqual(['medium']);
     });
 
     it('maps terminal-compatible advanced option JSON to CLI args', () => {

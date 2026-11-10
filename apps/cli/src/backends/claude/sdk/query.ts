@@ -14,6 +14,8 @@ import {
     type ControlResponseHandler,
     type SDKControlRequest,
     type ControlRequest,
+    type GetSettingsRequest,
+    type ApplyFlagSettingsRequest,
     type SDKControlResponse,
     type CanCallToolCallback,
     type CanUseToolControlRequest,
@@ -119,6 +121,7 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
                             const controlResponse = message as SDKControlResponse
                             const handler = this.pendingControlResponses.get(controlResponse.response.request_id)
                             if (handler) {
+                                this.pendingControlResponses.delete(controlResponse.response.request_id)
                                 handler(controlResponse.response)
                             }
                             continue
@@ -159,6 +162,11 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
         } finally {
             this.inputStream.done()
             this.cleanupControllers()
+            // No answer can arrive once stdout ends; settle outstanding control requests.
+            for (const [requestId, handler] of this.pendingControlResponses) {
+                handler({ request_id: requestId, subtype: 'error', error: 'Claude Code stopped before answering the control request' })
+            }
+            this.pendingControlResponses.clear()
             rl.close()
         }
     }
@@ -183,6 +191,24 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
         await this.request({
             subtype: 'interrupt'
         }, this.childStdin)
+    }
+
+    /** Read the session's settings (`get_settings`); the payload includes the applied model and effort. */
+    async getSettings(): Promise<unknown> {
+        if (!this.childStdin) {
+            throw new Error('Reading settings requires --input-format stream-json')
+        }
+        const request: GetSettingsRequest = { subtype: 'get_settings' }
+        return (await this.request(request, this.childStdin)).response
+    }
+
+    /** Merge settings into the session's flag settings layer (`apply_flag_settings`). */
+    async applyFlagSettings(settings: Record<string, unknown>): Promise<void> {
+        if (!this.childStdin) {
+            throw new Error('Applying settings requires --input-format stream-json')
+        }
+        const request: ApplyFlagSettingsRequest = { subtype: 'apply_flag_settings', settings }
+        await this.request(request, this.childStdin)
     }
 
     /**

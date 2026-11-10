@@ -7,6 +7,7 @@ import type {
 import type { InFlightConfigApplyOutcome } from '@/agent/runtime/permission/bindPermissionModeQueue';
 import {
   resolveClaudeEffortForModel,
+  isClaudeModelEffortPinned,
   resolveClaudeUltracodeForModel,
   resolveModeEffortLevelsForModel,
 } from '@/backends/claude/utils/claudeEffort';
@@ -183,7 +184,8 @@ export function mapEnhancedModeToDesiredRuntimeConfig(mode: EnhancedMode): Claud
   if (typeof mode.claudeRemoteMaxThinkingTokens === 'number') {
     desired.maxThinkingTokens = mode.claudeRemoteMaxThinkingTokens;
   }
-  if (typeof mode.ultracode === 'boolean') {
+  // A pinned model always desires ultracode off, which also clears an ultracode Claude Code saved.
+  if (typeof mode.ultracode === 'boolean' || isClaudeModelEffortPinned(mode.model)) {
     // Capability-gate here so the controller never types `/effort ultracode` at a model
     // that does not offer it (conservative: an unhonorable request resolves to off).
     desired.ultracode = resolveClaudeUltracodeForModel({
