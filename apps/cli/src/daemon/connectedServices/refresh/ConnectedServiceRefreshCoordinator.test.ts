@@ -26,6 +26,7 @@ import {
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServiceChildEnvironment';
 import { normalizeMaterializationKeyForPath } from '../materialize/normalizeMaterializationKeyForPath';
 import { resolveConnectedServiceSelectionHomeDir, type ConnectedServiceHomeSelection } from '../homes/resolveConnectedServiceHomeDir';
+import { writeConnectedServiceStateSharingManifest } from '../stateSharing/connectedServiceStateSharingManifest';
 import { buildDefaultConnectedServiceCredentialLifecycleDescriptor } from '../credentials/lifecycleTypes';
 import { createConnectedServiceSessionAuthSwitchCore } from '../runtimeAuth/connectedServiceSessionAuthSwitchCore';
 import { createRefreshedConnectedServiceAuthUpdatedHandler } from './createRefreshedConnectedServiceAuthUpdatedHandler';
@@ -61,6 +62,23 @@ function resolveCodexHomeForMaterialization(
   return join(resolveConnectedServiceSelectionHomeDir({
     activeServerDir, serviceId: 'openai-codex', agentId: 'codex', fallbackProfileId: 'work', selection,
   }), 'codex-home');
+}
+
+/**
+ * In production every Codex home is produced (and its admitted native source recorded) by a spawn or
+ * direct caller before the daemon rematerializes it; `registerSpawnTarget` skips that production, so
+ * fixtures record an admitted source for the selection home they register.
+ */
+async function seedAdmittedCodexHomeSource(
+  activeServerDir: string,
+  selection: ConnectedServiceHomeSelection = { kind: 'profile', profileId: 'work' },
+): Promise<void> {
+  const source = await mkdtemp(join(tmpdir(), 'happier-admitted-codex-source-'));
+  await writeConnectedServiceStateSharingManifest(resolveCodexHomeForMaterialization(activeServerDir, selection), {
+    v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+    configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+    nativeSourceEnv: { CODEX_HOME: source, CODEX_SQLITE_HOME: source },
+  });
 }
 
 type ExternalCredentialUpdateInput = Parameters<
@@ -388,6 +406,7 @@ afterEach(() => {
       },
       materializationKey: 'session-1',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     await coordinator.tickOnce();
 
@@ -484,6 +503,7 @@ afterEach(() => {
       },
       materializationKey: 'session-plain',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     await coordinator.tickOnce();
 
@@ -639,6 +659,7 @@ afterEach(() => {
       },
       materializationKey: 'session-plain-fallback',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     await coordinator.tickOnce();
 
@@ -752,6 +773,7 @@ afterEach(() => {
       },
       materializationKey: 'session-sealed-fallback',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     await coordinator.tickOnce();
 
@@ -876,6 +898,7 @@ afterEach(() => {
         },
         materializationKey: 'session-1',
       });
+      await seedAdmittedCodexHomeSource(activeServerDir);
 
       await coordinator.tickOnce();
 
@@ -1053,6 +1076,7 @@ afterEach(() => {
       },
       materializationKey: 'session-openai',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     const externalUpdate = coordinator as unknown as {
       handleExternalCredentialUpdate?: (input: Readonly<{ serviceId: 'openai-codex'; profileId: string }>) => Promise<void>;
@@ -1192,6 +1216,7 @@ afterEach(() => {
       },
       materializationKey: 'session-openai',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     await coordinator.handleExternalCredentialUpdate(
       revisionedExternalCredentialUpdate('openai-codex', 'work'),
@@ -1273,6 +1298,7 @@ afterEach(() => {
       },
       materializationKey: identityId,
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     const externalUpdate = coordinator as unknown as {
       handleExternalCredentialUpdate?: (input: Readonly<{ serviceId: 'openai-codex'; profileId: string }>) => Promise<void>;
@@ -2955,6 +2981,7 @@ afterEach(() => {
       },
       materializationKey: 'session-codex-runtime-refresh',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir, { kind: 'profile', profileId: 'primary' });
 
     const result = await coordinator.refreshConnectedServiceCredentialForRuntimeAuthFailure({
       serviceId: 'openai-codex',
@@ -3314,6 +3341,7 @@ afterEach(() => {
       },
       materializationKey: 'session-1',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     await coordinator.tickOnce();
 
@@ -3455,6 +3483,7 @@ afterEach(() => {
       },
       materializationKey: 'openai-codex-refresh-backup',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir, { kind: 'group', groupId: 'main' });
     const request = {
       sessionId: 'happy-session-bridge-group',
       selection,
@@ -3585,6 +3614,7 @@ afterEach(() => {
       },
       materializationKey: 'session-bridge',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     const request = {
       sessionId: 'happy-session-bridge',
@@ -3782,6 +3812,7 @@ afterEach(() => {
       },
       materializationKey: 'happy-session-bridge-health-gate',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     const result = await coordinator.refreshOpenAiCodexChatGptTokensForBridge({
       sessionId: 'happy-session-bridge-health-gate',
@@ -5033,6 +5064,7 @@ afterEach(() => {
       },
       materializationKey: 'session-1',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     const nonForced = coordinator.tickOnce();
     await credentialReadStarted;
@@ -6085,6 +6117,7 @@ afterEach(() => {
       },
       materializationKey: 'session-1',
     });
+    await seedAdmittedCodexHomeSource(activeServerDir);
 
     await expect(coordinator.tickOnce()).resolves.toBeUndefined();
 
@@ -6802,6 +6835,7 @@ afterEach(() => {
     };
 
     coordinator.registerSpawnTarget(targetRegistration);
+    await seedAdmittedCodexHomeSource(activeServerDir, { kind: 'group', groupId: 'main' });
 
     await coordinator.tickOnce();
 

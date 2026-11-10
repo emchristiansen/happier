@@ -60,6 +60,7 @@ export function createCodexConnectedServicesMaterializer(): ConnectedServicesPro
         record: codex,
         accountSettings: params.accountSettings ?? null,
         processEnv: params.processEnv ?? process.env,
+        nativeSourceAuthority: params.nativeSourceAuthority,
         sessionStateMode: params.sessionStateMode,
         validateCurrentBeforeMutation: selection?.kind === 'group' && validateGroupMutationCurrentness
           ? () => validateGroupMutationCurrentness({

@@ -178,6 +178,7 @@ describe('Claude connected-service configuration source pre-access contract', ()
     accessedPaths.length = 0;
     accessedOperations.length = 0;
     const result = await createClaudeConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -208,6 +209,7 @@ describe('Claude connected-service configuration source pre-access contract', ()
     accessedPaths.length = 0;
     accessedOperations.length = 0;
     const result = await createClaudeConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -233,6 +235,7 @@ describe('Claude connected-service configuration source pre-access contract', ()
     accessedPaths.length = 0;
     accessedOperations.length = 0;
     const result = await createClaudeConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -262,6 +265,7 @@ describe('Claude connected-service configuration source pre-access contract', ()
     accessedPaths.length = 0;
     accessedOperations.length = 0;
     const result = await createClaudeConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -293,6 +297,7 @@ describe('Claude connected-service configuration source pre-access contract', ()
     accessedPaths.length = 0;
     accessedOperations.length = 0;
     const result = await createClaudeConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -332,6 +337,7 @@ describe('Claude connected-service configuration source pre-access contract', ()
     accessedPaths.length = 0;
     accessedOperations.length = 0;
     const result = await createClaudeConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -358,6 +364,7 @@ describe('Claude connected-service configuration source pre-access contract', ()
     accessedPaths.length = 0;
     accessedOperations.length = 0;
     const result = await createClaudeConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -385,6 +392,7 @@ describe('Claude connected-service configuration source pre-access contract', ()
       const rootDir = await mkdtemp(join(tmpdir(), 'happier-claude-preaccess-root-'));
       const record = syntheticSelectedRecord();
       return await createClaudeConnectedServicesMaterializer()({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'claude',
         activeServerDir: params.activeServerDir,
         rootDir,

@@ -24,6 +24,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
       await writeFile(join(native, 'config', 'skills', 'SKILL.md'), 'native skill');
       await writeFile(join(native, 'antigravity-acp', 'trusted_workspaces.json'), '{}');
       const materialize = (key: string) => materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: key, activeServerDir: cwd,
         baseDir: join(cwd, 'materialized'), sessionDirectory: cwd,
         processEnv: { HOME: cwd, GEMINI_HOME: native }, recordsByServiceId: new Map([['antigravity', record]]),
@@ -56,6 +57,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
       await mkdir(join(native, 'antigravity-acp'), { recursive: true });
       await writeFile(join(native, 'antigravity-acp', 'acp_token.json'), 'native credential');
       const materialize = (key: string, stateMode: 'isolated' | 'shared') => materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: key, activeServerDir: cwd,
         baseDir: join(cwd, 'materialized'), sessionDirectory: cwd,
         processEnv: { HOME: cwd, GEMINI_HOME: native }, recordsByServiceId: new Map([['antigravity', record]]),
@@ -105,6 +107,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
       // Only the remote API boundary is replaced; the authoritative validator remains real.
       const api = { getConnectedServiceAuthGroup: async () => null } as unknown as ApiClient;
       const result = await materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: 'stale-group', activeServerDir: cwd,
         baseDir: join(cwd, 'materialized'), sessionDirectory: cwd, processEnv: { HOME: cwd },
         recordsByServiceId: new Map([['antigravity', record]]),
@@ -123,6 +126,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
   it('reuses the selected account home and preserves its private history and discovered project on restart', async () => {
     await withTempDir('agy-durable-account-', async cwd => {
       const materialize = (key: string) => materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: key, activeServerDir: cwd, baseDir: join(cwd, 'materialized'), sessionDirectory: cwd,
         processEnv: { HOME: cwd }, recordsByServiceId: new Map([['antigravity', record]]),
         accountSettings: { connectedServicesProviderStateSharingSettingsV1: { v: 1, defaults: { configMode: 'isolated', stateMode: 'isolated' }, byAgentId: {} } },
@@ -152,6 +156,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
       await mkdir(join(native, 'antigravity-acp', 'conversations'), { recursive: true });
       await writeFile(join(native, 'antigravity-acp', 'conversations', 'native.db'), 'native conversation');
       const materialize = (key: string, selected: ConnectedServiceCredentialRecordV1, previousMaterializedRoot?: string) => materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: key, activeServerDir: cwd,
         baseDir: join(cwd, 'materialized'), sessionDirectory: cwd, previousMaterializedRoot,
         processEnv: { HOME: cwd, GEMINI_HOME: native }, recordsByServiceId: new Map([['antigravity', selected]]),
@@ -194,6 +199,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
       const durable = resolveConnectedServiceHomeDir({ activeServerDir: cwd, serviceId: 'antigravity', profileId: 'a', agentId: 'agy' });
       const selected: ConnectedServiceCredentialRecordV1 = { ...record, oauth: { ...record.oauth, scope: 'cloud-platform userinfo.email' } };
       const probe = await materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: 'probe', materializationPurpose: 'probe', activeServerDir: cwd,
         baseDir: join(cwd, 'probes'), sessionDirectory: cwd, processEnv: { HOME: cwd },
         recordsByServiceId: new Map([['antigravity', selected]]),
@@ -206,6 +212,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
       expect(JSON.parse(await readFile(join(probe!.env.GEMINI_HOME, 'antigravity-acp', 'acp_token.json'), 'utf8'))).toMatchObject({ scopes: ['cloud-platform', 'userinfo.email'] });
       await expect(lstat(durable)).rejects.toMatchObject({ code: 'ENOENT' });
       const unknown = await materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: 'unknown', activeServerDir: cwd, baseDir: join(cwd, 'materialized'), sessionDirectory: cwd,
         processEnv: { HOME: cwd }, recordsByServiceId: new Map([['antigravity', record]]),
       });
@@ -221,6 +228,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
         refresh_token: 'previous-grant', project_id: 'previous-project',
       }));
       const result = await materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: 'replace', activeServerDir: cwd, baseDir: join(cwd, 'materialized'), sessionDirectory: cwd,
         processEnv: { HOME: cwd }, recordsByServiceId: new Map([['antigravity', record]]),
       });
@@ -230,6 +238,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
   it('keeps the registered OAuth issuer despite unrelated machine environment overrides', async () => {
     await withTempDir('agy-configured-issuer-', async cwd => {
       const result = await materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: 'issuer', activeServerDir: cwd, baseDir: join(cwd, 'materialized'), sessionDirectory: cwd,
         processEnv: { HOME: cwd,
           HAPPIER_CONNECTED_SERVICES_ANTIGRAVITY_OAUTH_CLIENT_ID: 'fixture-client',
@@ -246,6 +255,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
     await withTempDir('agy-selected-project-', async cwd => {
       const selected: ConnectedServiceCredentialRecordV1 = { ...record, oauth: { ...record.oauth, raw: { project_id: 'selected-consumer-project' } } };
       const result = await materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: 'project', activeServerDir: cwd, baseDir: join(cwd, 'materialized'), sessionDirectory: cwd,
         processEnv: { HOME: cwd }, recordsByServiceId: new Map([['antigravity', selected]]),
         accountSettings: { connectedServicesProviderStateSharingSettingsV1: { v: 1, defaults: { configMode: 'isolated', stateMode: 'isolated' }, byAgentId: {} } },
@@ -258,6 +268,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
     await withTempDir('agy-first-shared-', async cwd => {
       const native = join(cwd, 'native');
       const result = await materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: 'first', activeServerDir: cwd, baseDir: join(cwd, 'materialized'), sessionDirectory: cwd,
         processEnv: { HOME: cwd, GEMINI_HOME: native }, recordsByServiceId: new Map([['antigravity', record]]),
       });
@@ -277,6 +288,7 @@ describe('Antigravity connected-service materialization through the catalog', ()
       await writeFile(join(native, 'antigravity-acp', 'trusted_workspaces.json'), '{}');
       await writeFile(join(native, 'antigravity-acp', 'conversations', 'session-a.db-wal'), 'wal');
       const materialize = (key: string, profileId: string) => materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'agy', materializationKey: key, activeServerDir: cwd, baseDir: join(cwd, 'materialized'), sessionDirectory: cwd,
         processEnv: { HOME: cwd, GEMINI_HOME: native }, recordsByServiceId: new Map([['antigravity', { ...record, profileId }]]),
       });

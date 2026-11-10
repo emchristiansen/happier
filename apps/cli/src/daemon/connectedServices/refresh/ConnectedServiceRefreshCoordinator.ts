@@ -34,6 +34,7 @@ import { materializeConnectedServicesForSpawn } from '../materialize/materialize
 import { createConnectedServiceGroupMutationCurrentnessValidator } from '../credentials/createConnectedServiceGroupMutationCurrentnessValidator';
 import {
   collectBlockingConnectedServicesMaterializationDiagnostics,
+  ConnectedServiceNativeSourceProvenanceError,
   type ConnectedServicesMaterializationDiagnostic,
 } from '../materialize/providerMaterializerTypes';
 import { buildRefreshAbortSignal, refreshConnectedAccountOauthTokens } from './serviceRefreshers';
@@ -258,6 +259,22 @@ const CREDENTIAL_HEALTH_REFUSAL_CODES: ReadonlySet<string> = new Set([
   'connected_service_credential_health_reconnect_required',
 ]);
 
+/** Provenance refusals also keep an external revision unacknowledged; they never touch health. */
+const NATIVE_SOURCE_REFUSAL_CODES: ReadonlySet<string> = new Set<ConnectedServiceNativeSourceProvenanceError['code']>([
+  'connected_service_native_source_unrecorded',
+  'connected_service_native_source_conflict',
+  'connected_service_native_source_invalid',
+]);
+
+/**
+ * A target that is live, canonically current and health-qualified, but whose home was left
+ * unwritten because its admitted native source is unrecorded, conflicting or invalid. That is a local
+ * distribution outcome, not a credential failure: the credential operation itself succeeded.
+ */
+function isNativeSourceProvenanceRefusal(failure: RematerializedTargetFailure): boolean {
+  return NATIVE_SOURCE_REFUSAL_CODES.has(failure.diagnostic.code);
+}
+
 /**
  * An external projected credential revision was not applied because exact health refused a binding
  * it would have written. Throwing keeps the revision unacknowledged, so its producer retries it.
@@ -266,7 +283,7 @@ export class ConnectedServiceExternalCredentialUpdateRefusedError extends Error 
   readonly failures: ReadonlyArray<RematerializedTargetFailure>;
 
   constructor(binding: BoundProfile, failures: ReadonlyArray<RematerializedTargetFailure>) {
-    super(`Connected service external credential update refused by credential health: ${binding.serviceId}/${binding.profileId}`);
+    super(`Connected service external credential update refused (${failures.map((failure) => failure.diagnostic.code).join(', ')}): ${binding.serviceId}/${binding.profileId}`);
     this.name = 'ConnectedServiceExternalCredentialUpdateRefusedError';
     this.failures = failures;
   }
@@ -312,6 +329,15 @@ async function findRematerializationCredentialHealthRefusal(input: Readonly<{
   }
   return null;
 }
+
+type BridgeTokenRequest<TResponse> = Readonly<{
+  serviceId: ConnectedServiceId;
+  sessionId?: string | null;
+  brokerSelectionIdentity?: string | null;
+  forceRefresh?: boolean;
+  failingAccessTokenFingerprint?: string | null;
+  hooks: ConnectedServiceBridgeRefreshProfileHooks<TResponse>;
+}>;
 
 export class ConnectedServiceRefreshCoordinator {
   private readonly scheduledBindingTasks = new Map<string, {
@@ -662,20 +688,31 @@ export class ConnectedServiceRefreshCoordinator {
    * refreshed-response shaping incl. any post-rotation materialization) to the provider's bridge hook.
    * A new provider adds a hook module and a thin typed adapter above; the skeleton never changes.
    */
-  private async refreshServiceTokensForBridge<TResponse>(input: Readonly<{
-    serviceId: ConnectedServiceId;
-    sessionId?: string | null;
-    brokerSelectionIdentity?: string | null;
-    forceRefresh?: boolean;
-    failingAccessTokenFingerprint?: string | null;
-    hooks: ConnectedServiceBridgeRefreshProfileHooks<TResponse>;
-  }>): Promise<TResponse> {
-    const selection = this.resolveAuthorizedBridgeSelectionForBridge({
+  private async refreshServiceTokensForBridge<TResponse>(input: BridgeTokenRequest<TResponse>): Promise<TResponse> {
+    const caller = {
       sessionId: input.sessionId,
       brokerSelectionIdentity: input.brokerSelectionIdentity,
       serviceId: input.serviceId,
-    });
+    };
+    const selection = this.resolveAuthorizedBridgeSelectionForBridge(caller);
     const profileId = input.hooks.resolveProfileId(selection);
+    const response = await this.serveBridgeTokensForSelection(input, selection, profileId);
+    // Every arm awaits health, provider or distribution work. Authority to receive the token is the
+    // caller's live registration, not the selection captured at entry: a caller released, or cut over
+    // to another profile, meanwhile receives nothing. A rotation that persisted stays persisted, with
+    // its truthful health; only the delivery is refused.
+    const current = this.resolveAuthorizedBridgeSelectionForBridge(caller);
+    if (input.hooks.resolveProfileId(current) !== profileId) {
+      throw new ConnectedServiceBridgeSelectionAuthorizationError();
+    }
+    return response;
+  }
+
+  private async serveBridgeTokensForSelection<TResponse>(
+    input: BridgeTokenRequest<TResponse>,
+    selection: ConnectedServiceChildSelection,
+    profileId: string,
+  ): Promise<TResponse> {
     const binding = { serviceId: input.serviceId, profileId };
 
     // Every arm below serves or materializes a credential, so the selected profile's exact health is
@@ -781,14 +818,22 @@ export class ConnectedServiceRefreshCoordinator {
       isOauthSourceStillValid: (source) => this.isOauthSourceStillValidForBridge(source),
       resolveSourceExpiresAt: (source) => this.resolveExpiresAtForSource(source),
       rematerializeTargets: async (binding, rotation) => {
-        const targets = await this.rematerializeTargetsForBinding(binding, {
+        const distribution = await this.rematerializeTargetsForBindingDetailed(binding, {
           kind: 'provider_rotation',
           credentialRevision: ConnectedServiceCredentialRevisionV1Schema.parse(rotation.credentialRevision),
         });
-        // Initial bridge authorization is anchored to a live target. If none remains writable,
+        // Initial bridge authorization is anchored to a live target. If none remains current,
         // a cutover or release has removed authority to return this captured credential as current.
-        if (targets.length === 0) throw new ConnectedServiceBridgeSelectionAuthorizationError();
-        return targets;
+        // A live target refused only for native-source provenance is still current and qualified:
+        // its home stays unwritten, but its running process may receive the token in-process.
+        // Targets come from a plan captured before awaited work, so each must still be registered
+        // and bound to this profile now.
+        const authorized = [
+          ...distribution.rematerializedTargets,
+          ...distribution.failedTargets.filter(isNativeSourceProvenanceRefusal).map((failure) => failure.target),
+        ].filter((target) => this.isRefreshTargetStillBound(target, binding));
+        if (authorized.length === 0) throw new ConnectedServiceBridgeSelectionAuthorizationError();
+        return distribution.rematerializedTargets;
       },
     };
   }
@@ -1087,6 +1132,7 @@ export class ConnectedServiceRefreshCoordinator {
     }
     const healthRefusals = rematerialization.failedTargets.filter((failure) => (
       CREDENTIAL_HEALTH_REFUSAL_CODES.has(failure.diagnostic.code)
+      || isNativeSourceProvenanceRefusal(failure)
     ));
     if (healthRefusals.length > 0) throw new ConnectedServiceExternalCredentialUpdateRefusedError(binding, healthRefusals);
   }
@@ -1360,7 +1406,19 @@ export class ConnectedServiceRefreshCoordinator {
               runtimeIdentityKeys: appliedRuntimeIdentityKeys,
             });
           }
-          const failedTarget = distribution.failedTargets[0] ?? null;
+          // A persisted rotation stays a successful credential operation when targets were left
+          // unwritten only for native-source provenance; those targets keep their previous revision
+          // and receive no auth update. Any other distribution failure keeps the typed non-success.
+          const provenanceRefusals = distribution.failedTargets.filter(isNativeSourceProvenanceRefusal);
+          if (provenanceRefusals.length > 0) {
+            logger.warn('[DAEMON RUN] Connected-service rotation persisted; targets left undistributed for native source provenance', {
+              serviceId: binding.serviceId,
+              profileId: binding.profileId,
+              undistributedTargetCount: provenanceRefusals.length,
+              codes: provenanceRefusals.map((failure) => failure.diagnostic.code),
+            });
+          }
+          const failedTarget = distribution.failedTargets.find((failure) => !isNativeSourceProvenanceRefusal(failure)) ?? null;
           if (failedTarget) {
             finalizedResult = buildMaterializationFailureRefreshResult({
               sourceResult: result,
@@ -2100,6 +2158,17 @@ export class ConnectedServiceRefreshCoordinator {
     }
   }
 
+  /**
+   * True when a live target for this materialization (the same session's home, possibly served by a
+   * replacement process) is still registered and still bound to `binding`'s profile.
+   */
+  private isRefreshTargetStillBound(target: SpawnTarget, binding: BoundProfile): boolean {
+    return this.runtimeRegistry.listRefreshTargets().some((current) =>
+      current.materializationKey === target.materializationKey
+      && current.bindings.some((b) => b.serviceId === binding.serviceId && b.profileId === binding.profileId),
+    );
+  }
+
   private captureHomePlan(binding: BoundProfile): Readonly<{
     targets: ReadonlyArray<SpawnTarget>;
     homeIdentities: ReadonlyArray<string>;
@@ -2254,6 +2323,8 @@ export class ConnectedServiceRefreshCoordinator {
         bindings: target.bindings,
       });
       const records = new Map(Array.from(resolvedCredentials, ([serviceId, resolved]) => [serviceId, resolved.record] as const));
+      // A target whose admitted native source is unrecorded or conflicting is refused before any
+      // source traversal or credential publication. It is not a credential failure: health is untouched.
       const materialized = await materializeConnectedServicesForSpawn({
         agentId: target.agentId,
         materializationKey: target.materializationKey,
@@ -2269,6 +2340,9 @@ export class ConnectedServiceRefreshCoordinator {
         recordsByServiceId: records,
         accountSettings: this.params.accountSettingsProvider?.() ?? null,
         processEnv: this.params.processEnv ?? process.env,
+        // The daemon did not produce this target: only the source the target recorded at production
+        // may be read or linked, never the daemon's own environment.
+        nativeSourceAuthority: 'recorded',
         validateGroupMutationCurrentness: createConnectedServiceGroupMutationCurrentnessValidator({
           api: this.params.api,
           credentials: this.params.credentials,
@@ -2276,7 +2350,32 @@ export class ConnectedServiceRefreshCoordinator {
         ...(target.selectionsByServiceId.size > 0
           ? { selectionsByServiceId: buildResolvedSelectionsForTarget(target, resolvedCredentials) }
           : {}),
+      }).catch((error: unknown) => {
+        if (error instanceof ConnectedServiceNativeSourceProvenanceError) return error;
+        throw error;
       });
+      if (materialized instanceof ConnectedServiceNativeSourceProvenanceError) {
+        failed.push({
+          target,
+          binding,
+          diagnostic: {
+            code: materialized.code,
+            providerId: target.agentId,
+            severity: 'blocking',
+            serviceId: binding.serviceId,
+            reason: materialized.message,
+            credentialRefreshFailure: { category: 'unknown', providerErrorCode: materialized.code },
+          },
+        });
+        logger.warn('[DAEMON RUN] Connected-service rematerialization refused; native source provenance unavailable', {
+          serviceId: binding.serviceId,
+          profileId: binding.profileId,
+          agentId: target.agentId,
+          code: materialized.code,
+          targetRoot: materialized.targetRoot,
+        });
+        continue;
+      }
       const blockingDiagnostics = collectBlockingConnectedServicesMaterializationDiagnostics(materialized?.diagnostics);
       if (blockingDiagnostics.length > 0) {
         const primaryDiagnostic = blockingDiagnostics[0]!;

@@ -35,6 +35,8 @@ import { createDaemonControlApp } from '@/daemon/controlServer';
 import { SPAWN_SESSION_ERROR_CODES } from '@happier-dev/protocol';
 import type { ApiClient } from '@/api/api';
 import { ConnectedServiceRefreshCoordinator } from '../refresh/ConnectedServiceRefreshCoordinator';
+import { resolveConnectedServiceSelectionHomeDir } from '../homes/resolveConnectedServiceHomeDir';
+import { writeConnectedServiceStateSharingManifest } from '../stateSharing/connectedServiceStateSharingManifest';
 import { classifyCodexConnectedServiceAuthFailure } from '@/backends/codex/connectedServices/classifyCodexConnectedServiceAuthFailure';
 import { buildObservedFailureMemberRuntimeState } from '../accountGroups/memberRuntimeState';
 import { resolveConnectedServiceRuntimeAuthFailureStatusMessage } from '../runtimeAuth/resolveConnectedServiceRuntimeAuthFailureStatusMessage';
@@ -145,6 +147,18 @@ describe('continueSessionAfterUsageLimitReset', () => {
       refreshWindowMs: 60_000, refreshLeaseMs: 30_000, now: () => now }) : undefined;
     refreshCoordinator?.registerSpawnTarget({ pid: tracked.pid, sessionId, agentId: 'codex', materializationKey: sessionId,
       connectedServicesBindingsRaw: bindings });
+    // In production the tracked session's spawn produced (and recorded the admitted source of) the
+    // Codex home its target materializes into (the bound profile's home: the target carries no group
+    // selection env) before the daemon rematerializes it; registering the target directly skips that.
+    if (refreshCoordinator) {
+      const admittedSource = await mkdtemp(join(tmpdir(), 'happier-admitted-codex-source-'));
+      await writeConnectedServiceStateSharingManifest(join(resolveConnectedServiceSelectionHomeDir({ activeServerDir: directory,
+        serviceId, agentId: 'codex', fallbackProfileId: 'B', selection: { kind: 'profile', profileId: 'B' } }), 'codex-home'), {
+        v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+        configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+        nativeSourceEnv: { CODEX_HOME: admittedSource, CODEX_SQLITE_HOME: admittedSource },
+      });
+    }
     const providerFetch = immediateRefresh ? vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
       refreshes++;
       return new Response(JSON.stringify({ access_token: 'synthetic-refreshed-access', refresh_token: 'synthetic-refresh', expires_in: 3600 }),

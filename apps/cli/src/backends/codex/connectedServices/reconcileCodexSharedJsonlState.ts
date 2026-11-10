@@ -101,13 +101,13 @@ export async function reconcileCodexSharedJsonlState(params: Readonly<{
   }
   for (const file of CODEX_JSONL_STATE_FILES) {
     const incomingPath = join(params.previousCodexHome, file.name);
-    if (params.localStateOnly) {
-      try {
-        if ((await lstat(incomingPath)).isSymbolicLink()) continue;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        throw error;
-      }
+    // Only a home's own local JSONL is its state. A symlinked entry is a link into some native store,
+    // possibly another (non-admitted) source; it is never followed or merged into this source.
+    try {
+      if ((await lstat(incomingPath)).isSymbolicLink()) continue;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
     }
     const incoming = await readOptionalFile(incomingPath);
     if (incoming === null) continue;

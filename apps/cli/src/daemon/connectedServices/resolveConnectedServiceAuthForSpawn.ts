@@ -1188,6 +1188,8 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   const materialized = await materializeConnectedServicesForSpawn({
     agentId: params.agentId,
     materializationPurpose: params.materializationPurpose,
+    // The spawning caller (direct launch or daemon spawn) produces this home from its own source.
+    nativeSourceAuthority: 'caller_env',
     materializationKey: params.materializationKey,
     connectedServiceMaterializationIdentityV1: params.connectedServiceMaterializationIdentityV1,
     activeServerDir: params.activeServerDir,

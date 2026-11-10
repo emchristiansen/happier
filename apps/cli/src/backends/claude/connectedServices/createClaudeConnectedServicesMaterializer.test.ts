@@ -148,6 +148,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
 
     const materializer = createClaudeConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -240,6 +241,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
 
     const materializer = createClaudeConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -287,6 +289,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
 
     const materializer = createClaudeConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -334,6 +337,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     const validateGroupMutationCurrentness = vi.fn(async () => ({ current: false as const }));
 
     const result = await createClaudeConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -417,6 +421,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     });
 
     const result = await createClaudeConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -469,6 +474,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
       const record = buildClaudeSubscriptionRecord();
       const materializer = createClaudeConnectedServicesMaterializer();
       const materialize = async () => await materializer({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'claude',
         activeServerDir,
         rootDir,
@@ -602,6 +608,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
       await writeFile(join(sourceClaudeConfigDir, 'settings.json'), '{"theme":"source"}\n');
 
       await expect(createClaudeConnectedServicesMaterializer()({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'claude',
         activeServerDir,
         rootDir,
@@ -660,6 +667,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
       const materializer = createClaudeConnectedServicesMaterializer();
 
       const first = await materializer({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'claude',
         activeServerDir,
         rootDir,
@@ -679,6 +687,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
       spawnSpy.mockClear();
 
       const second = await materializer({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'claude',
         activeServerDir,
         rootDir,
@@ -749,6 +758,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     });
 
     const first = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -764,6 +774,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
     expect(await readFile(credentialPath, 'utf8')).toContain('stable-access-placeholder');
 
     const second = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -842,6 +853,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
 
     const materializer = createClaudeConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -939,6 +951,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
 
     const materializer = createClaudeConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -1024,6 +1037,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
 
     const materializer = createClaudeConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,
@@ -1106,6 +1120,7 @@ describe('createClaudeConnectedServicesMaterializer', () => {
 
     const materializer = createClaudeConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       activeServerDir,
       rootDir,

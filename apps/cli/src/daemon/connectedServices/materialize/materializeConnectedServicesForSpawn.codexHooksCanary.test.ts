@@ -29,6 +29,7 @@ it('reports malformed native TOML without exposing config content or replacing t
         scope: null, tokenType: null, providerAccountId: 'synthetic-account', providerEmail: null },
     });
     const materialize = async () => await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex', materializationKey: 'invalid-config', activeServerDir: join(root, 'server'), baseDir: join(root, 'profiles'),
       recordsByServiceId: new Map([['openai-codex', record]]),
       accountSettings: { connectedServicesProviderStateSharingSettingsV1: {
@@ -67,6 +68,7 @@ it.each([true, false])('rebuilds malformed profile TOML and permits later spawns
         scope: null, tokenType: null, providerAccountId: 'synthetic-account', providerEmail: null },
     });
     const materialize = () => materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex', materializationKey: 'profile-recovery', activeServerDir: join(root, 'server'), baseDir: join(root, 'profiles'),
       recordsByServiceId: new Map([['openai-codex', record]]),
       accountSettings: { connectedServicesProviderStateSharingSettingsV1: {
@@ -160,6 +162,7 @@ it('migrates linked hooks and preserves profile hook state through repeated stag
       },
     };
     const materialize = async () => await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey,
       activeServerDir,

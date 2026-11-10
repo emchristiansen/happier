@@ -64,6 +64,7 @@ describe('materializeConnectedServicesForSpawn — Pi shared-state resume lifecy
     await writeFile(join(nativeSessionsDir, fileName), '{"id":"native-rollout"}\n');
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'pi',
       materializationKey: 'session-pi-resume-present',
       activeServerDir,
@@ -117,6 +118,7 @@ describe('materializeConnectedServicesForSpawn — Pi shared-state resume lifecy
     await writeFile(join(nativeSessionsDir, `2026-05-27T12-32-01-297Z_${presentId}.jsonl`), '{"id":"other"}\n');
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'pi',
       materializationKey: 'session-pi-resume-absent',
       activeServerDir,

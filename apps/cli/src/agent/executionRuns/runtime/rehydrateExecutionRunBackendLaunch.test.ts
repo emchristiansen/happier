@@ -147,6 +147,7 @@ describe('resolveExecutionRunResumeBackendOptions', () => {
         runtimeRegistry: null,
         resolveAuthForSpawn: async (params) => {
           const materialized = await materializeConnectedServicesForSpawn({
+            nativeSourceAuthority: 'caller_env',
             agentId: 'codex', materializationKey: params.materializationKey,
             activeServerDir: join(sandbox, 'server'), baseDir: join(sandbox, 'materialized'),
             previousMaterializedRoot: params.previousMaterializedRoot,

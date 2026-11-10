@@ -42,6 +42,7 @@ describe('createPiConnectedServicesMaterializer', () => {
 
     const materializer = createPiConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'pi',
       activeServerDir,
       rootDir,
@@ -111,6 +112,7 @@ describe('createPiConnectedServicesMaterializer', () => {
 
     const materializer = createPiConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'pi',
       activeServerDir,
       rootDir,
@@ -188,6 +190,7 @@ describe('createPiConnectedServicesMaterializer', () => {
 
     const materializer = createPiConnectedServicesMaterializer();
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'pi',
       activeServerDir,
       rootDir,
@@ -259,6 +262,7 @@ describe('createPiConnectedServicesMaterializer', () => {
 
     const materializer = createPiConnectedServicesMaterializer();
     const run = () => materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'pi',
       activeServerDir,
       rootDir,
