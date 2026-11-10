@@ -11,6 +11,8 @@ import type { AgentState, Metadata } from '@/api/types';
 import type {
   MaterializeNextPendingOptions,
   MaterializeNextPendingResult,
+  PendingInputSteerNowAdmission,
+  ProviderInputTerminalOutcome,
   SessionClientPort,
 } from '@/api/session/sessionClientPort';
 import type { SessionProviderInputOutcomeObserver, SessionProviderInputOutcomeProducer } from '@/api/session/sessionClient';
@@ -42,6 +44,8 @@ export type DeferredApiSessionTarget = Readonly<{
     producer: SessionProviderInputOutcomeProducer,
   ) => SessionProviderInputOutcomeObserver;
   hasPendingProviderInputAcceptance?: SessionClientPort['hasPendingProviderInputAcceptance'];
+  requestPendingInputSendNow?: SessionClientPort['requestPendingInputSendNow'];
+  waitForProviderInputTerminalOutcome?: SessionClientPort['waitForProviderInputTerminalOutcome'];
   hasCanonicalPendingProviderInputDelivery?: SessionClientPort['hasCanonicalPendingProviderInputDelivery'];
   blockPendingMessageDelivery?: SessionClientPort['blockPendingMessageDelivery'];
   hasOnlyBlockedPendingWork?: SessionClientPort['hasOnlyBlockedPendingWork'];
@@ -77,7 +81,7 @@ export type DeferredApiSessionTarget = Readonly<{
   waitForMetadataUpdate: (abortSignal?: AbortSignal) => Promise<boolean>;
   waitForProviderInputAdmission?: (abortSignal: AbortSignal) => Promise<boolean>;
   waitForPendingEligibilityUpdate?: (abortSignal?: AbortSignal) => Promise<boolean>;
-  shouldAttemptPendingMaterialization?: () => boolean;
+  shouldAttemptPendingMaterialization?: SessionClientPort['shouldAttemptPendingMaterialization'];
   reconcilePendingQueueState?: (opts?: { force?: boolean }) => Promise<boolean>;
   materializeNextPendingMessageSafely?: (opts?: MaterializeNextPendingOptions) => Promise<MaterializeNextPendingResult>;
   wakePendingMaterialization?: () => void;
@@ -254,6 +258,31 @@ export class DeferredApiSessionClient {
 
   hasPendingProviderInputAcceptance(localId: string): boolean {
     return this.target?.hasPendingProviderInputAcceptance?.(localId) ?? false;
+  }
+
+  /**
+   * Without an attached target able to mark the exact row, nothing was sent: report it as not
+   * admitted rather than guessing. Calls racing attach run in call order once the flush completes.
+   */
+  async requestPendingInputSendNow(localId: string): Promise<PendingInputSteerNowAdmission> {
+    const unsupported: PendingInputSteerNowAdmission = { kind: 'not_admitted', reason: 'unsupported' };
+    return await this.withAttachedTarget(
+      (t) => t.requestPendingInputSendNow?.(localId) ?? unsupported,
+      unsupported,
+    );
+  }
+
+  /** Without an attached target that observes outcomes, the exact row's outcome stays unobserved. */
+  async waitForProviderInputTerminalOutcome(
+    localId: string,
+    timeoutMs?: number,
+    abortSignal?: AbortSignal,
+  ): Promise<ProviderInputTerminalOutcome> {
+    const unobserved: ProviderInputTerminalOutcome = { kind: 'pending' };
+    return await this.withAttachedTarget(
+      (t) => t.waitForProviderInputTerminalOutcome?.(localId, timeoutMs, abortSignal) ?? unobserved,
+      unobserved,
+    );
   }
 
   subscribeToSessionConnectionState(
@@ -631,10 +660,14 @@ export class DeferredApiSessionClient {
     );
   }
 
-  shouldAttemptPendingMaterialization(): boolean {
+  shouldAttemptPendingMaterialization(
+    opts?: Parameters<NonNullable<SessionClientPort['shouldAttemptPendingMaterialization']>>[0],
+  ): boolean {
     const target = this.target;
     if (!target || this.flushInFlight) return false;
-    return target.shouldAttemptPendingMaterialization?.() ?? true;
+    // Forward the options unchanged: an exact requestedLocalId must not degrade to the generic
+    // predicate, where another row's unresolved custody would veto it.
+    return target.shouldAttemptPendingMaterialization?.(opts) ?? true;
   }
 
   async reconcilePendingQueueState(opts?: { force?: boolean }): Promise<boolean> {
@@ -879,8 +912,9 @@ export class DeferredApiSessionClient {
       }
     }
 
+    // A call that waited for attach must not start its effect once the facade was cancelled meanwhile.
     const after = this.target;
-    if (!after) return fallback;
+    if (!after || this.cancelled) return fallback;
     return await Promise.resolve(fn(after));
   }
 

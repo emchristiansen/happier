@@ -1697,6 +1697,52 @@ describe("pendingMessageService (shared sessions)", () => {
         await expect(db.sessionPendingMessage.findUniqueOrThrow({ where: { sessionId_localId: { sessionId: session.id, localId } }, select: { requestedAction: true, providerAction: true } })).resolves.toEqual({ requestedAction, providerAction: "steer" });
     });
 
+    it.each([
+        ["claimed", "active_steerable", "interrupt_and_send"],
+        ["held", "active_unsteerable", "interrupt_and_send"],
+        ["claimed", "ready", "send"],
+    ] as const)("[exact-send-now] selects exactly the send_now row past an unresolved %s earlier one (foreground %s)", async (
+        earlierState, foregroundState, providerAction,
+    ) => {
+        const owner = await createAccount("exact-send-now-owner");
+        const session = await createSession(owner.id);
+        await createCurrentPendingEvidencePublisher({ accountId: owner.id, sessionId: session.id });
+        const earlier = `A-${randomUUID()}`;
+        const localId = ` B-${randomUUID()} `;
+        const later = `C-${randomUUID()}`;
+        await enqueuePendingMessage({ actorUserId: owner.id, sessionId: session.id, localId: earlier, ciphertext: "A", requestedAction: { v: 1, kind: "steer_now" } });
+        await enqueuePendingMessage({ actorUserId: owner.id, sessionId: session.id, localId, ciphertext: "B", requestedAction: { v: 1, kind: "enqueue" } });
+        await enqueuePendingMessage({ actorUserId: owner.id, sessionId: session.id, localId: later, ciphertext: "C", requestedAction: { v: 1, kind: "send_now" } });
+        // A is unresolved: claimed (its provider outcome not yet settled), or held by this client.
+        await db.sessionPendingMessage.update({ where: { sessionId_localId: { sessionId: session.id, localId: earlier } },
+            data: { deliveryState: "delivering", providerAction: "steer" } });
+        await expect(updatePendingRequestedAction({ actorUserId: owner.id, sessionId: session.id, localId,
+            requestedAction: { v: 1, kind: "send_now" } })).resolves.toMatchObject({ ok: true, didUpdate: true });
+        await expect(materializeNextPendingMessage({ actorUserId: owner.id, sessionId: session.id, requestedLocalId: localId,
+            heldLocalIds: earlierState === "held" ? [earlier] : [], deliveryState: "provider", foregroundState })).resolves.toMatchObject({
+            ok: true, didMaterialize: true,
+            message: { localId, requestedAction: { v: 1, kind: "send_now" }, providerAction, content: { t: "encrypted", c: "B" } },
+        });
+        await expect(db.sessionPendingMessage.findMany({ where: { sessionId: session.id }, orderBy: [{ position: "asc" }],
+            select: { localId: true, deliveryState: true, providerAction: true } })).resolves.toEqual([
+            { localId: earlier, deliveryState: "delivering", providerAction: "steer" },
+            { localId, deliveryState: "delivering", providerAction },
+            { localId: later, deliveryState: null, providerAction: null },
+        ]);
+    });
+
+    // `steer_if_active` while steerable is the case the generic selector WOULD take, so only the
+    // exact-request clause refuses it.
+    it.each(["enqueue", "steer_if_active"] as const)("[exact-send-now] an exact request still refuses a %s row, whose action does not ask to run now", async (kind) => {
+        const owner = await createAccount("exact-enqueue-owner");
+        const session = await createSession(owner.id);
+        const localId = `queued-${randomUUID()}`;
+        await enqueuePendingMessage({ actorUserId: owner.id, sessionId: session.id, localId, ciphertext: "Q", requestedAction: { v: 1, kind } });
+        await expect(materializeNextPendingMessage({ actorUserId: owner.id, sessionId: session.id, requestedLocalId: localId,
+            deliveryState: "provider", foregroundState: "active_steerable" })).resolves.toMatchObject({
+            ok: true, didMaterialize: false, deferredReason: "requested_local_id_unavailable" });
+    });
+
     it("does not fall back to another urgent row when an exact steer target is unavailable", async () => {
         const owner = await createAccount("missing-exact-steer-target-owner");
         const session = await createSession(owner.id);
