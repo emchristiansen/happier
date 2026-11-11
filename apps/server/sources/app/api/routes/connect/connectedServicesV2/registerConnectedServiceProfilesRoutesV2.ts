@@ -8,15 +8,8 @@ import {
   type ConnectedServiceId,
 } from "@happier-dev/protocol";
 
-import {
-  isConnectedServiceCredentialMetadataV2,
-  normalizeConnectedServiceCredentialMetadataV2,
-} from "./credentialMetadataV2";
-import {
-  isConnectedServiceCredentialMetadataV3,
-  normalizeConnectedServiceCredentialMetadataV3,
-} from "../connectedServicesV3/credentialMetadataV3";
 import { deriveConnectedServiceCredentialStatus } from "../credentialHealthMetadata";
+import { readStoredConnectedServiceCredentialMetadata } from "../readStoredConnectedServiceCredentialMetadata";
 
 export function registerConnectedServiceProfilesRoutesV2(app: Fastify): void {
   app.get("/v2/connect/:serviceId/profiles", {
@@ -50,13 +43,7 @@ export function registerConnectedServiceProfilesRoutesV2(app: Fastify): void {
     });
 
     const profiles = rows.map((row) => {
-      const meta = isConnectedServiceCredentialMetadataV2(row.metadata)
-        ? normalizeConnectedServiceCredentialMetadataV2(row.metadata)
-        : null;
-      const metaV3 = !meta && isConnectedServiceCredentialMetadataV3(row.metadata)
-        ? normalizeConnectedServiceCredentialMetadataV3(row.metadata)
-        : null;
-      const metadata = meta ?? metaV3;
+      const metadata = readStoredConnectedServiceCredentialMetadata(row.metadata);
       return {
         profileId: row.profileId,
         status: deriveConnectedServiceCredentialStatus(metadata),

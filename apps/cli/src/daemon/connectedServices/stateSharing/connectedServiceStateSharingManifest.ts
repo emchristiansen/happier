@@ -1,4 +1,4 @@
-import { readFile, rm } from 'node:fs/promises';
+import { lstat, readdir, readFile, rm } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 
 import type { ConnectedServicesMaterializationDiagnostic } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
@@ -23,6 +23,12 @@ export type ConnectedServiceStateSharingManifestV1 = Readonly<{
   stateEntries: readonly string[];
   sessionFileMappings: readonly ConnectedServiceStateSharingSessionFileMappingV1[];
   diagnostics: readonly ConnectedServicesMaterializationDiagnostic[];
+  /**
+   * The provider-native source locations admitted by the caller that produced this target, as the
+   * exact source-location environment values its materializer resolved (never the whole caller
+   * environment). Absent for targets synced before provenance was recorded.
+   */
+  nativeSourceEnv?: Readonly<Record<string, string>>;
 }>;
 
 const EMPTY_MANIFEST: ConnectedServiceStateSharingManifestV1 = Object.freeze({
@@ -99,6 +105,18 @@ function parseSessionFileMappings(value: unknown): readonly ConnectedServiceStat
   return mappings;
 }
 
+function parseNativeSourceEnv(value: unknown): Readonly<Record<string, string>> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return null;
+  const env: Record<string, string> = {};
+  for (const [key, entry] of entries) {
+    if (typeof entry !== 'string' || entry.length === 0 || !isAbsolute(entry)) return null;
+    env[key] = entry;
+  }
+  return env;
+}
+
 function parseManifest(value: unknown): ConnectedServiceStateSharingManifestV1 {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return EMPTY_MANIFEST;
   const record = value as Record<string, unknown>;
@@ -116,6 +134,10 @@ function parseManifest(value: unknown): ConnectedServiceStateSharingManifestV1 {
       : [],
     sessionFileMappings: parseSessionFileMappings(record.sessionFileMappings),
     diagnostics: parseDiagnostics(record.diagnostics),
+    ...(() => {
+      const nativeSourceEnv = parseNativeSourceEnv(record.nativeSourceEnv);
+      return nativeSourceEnv ? { nativeSourceEnv } : {};
+    })(),
   };
 }
 
@@ -141,6 +163,87 @@ export async function readConnectedServiceStateSharingManifest(
   const legacy = await tryReadParsedManifest(resolveManifestPath(destinationHome, LEGACY_CODEX_MANIFEST_NAME));
   if (legacy) return legacy;
   return EMPTY_MANIFEST;
+}
+
+/**
+ * What a target's state-sharing manifest says about its admitted native source, without the generic
+ * reader's normalization. The generic reader turns an unreadable file, invalid JSON, an unsupported
+ * version and a malformed `nativeSourceEnv` into "no record"; provenance consumers must not, because
+ * an occupied target with an untrustworthy record is not a fresh target.
+ *
+ * - `absent`: a never-produced target: no manifest entry, and the target is missing or empty.
+ * - `unrecorded`: an occupied target without a provenance record: a valid manifest written before
+ *   provenance was recorded, or content with no manifest entry at all.
+ * - `recorded`: a valid, well-formed record (every value an absolute path).
+ * - `invalid`: a manifest entry exists but cannot be read or trusted (including a dangling link), or
+ *   the target itself cannot be inspected.
+ *
+ * Freshness is never inferred from a failed read alone: only a missing entry plus a missing or empty
+ * target is `absent`.
+ */
+export type ConnectedServiceStateSharingNativeSourceRecord =
+  | Readonly<{ kind: 'absent' }>
+  | Readonly<{ kind: 'unrecorded' }>
+  | Readonly<{ kind: 'recorded'; nativeSourceEnv: Readonly<Record<string, string>> }>
+  | Readonly<{ kind: 'invalid'; manifestPath: string; reason: string }>;
+
+export async function readConnectedServiceStateSharingNativeSourceRecord(
+  destinationHome: string,
+): Promise<ConnectedServiceStateSharingNativeSourceRecord> {
+  // Same file precedence as the generic reader: the current manifest, else the legacy Codex one.
+  for (const manifestName of [DEFAULT_MANIFEST_NAME, LEGACY_CODEX_MANIFEST_NAME]) {
+    const manifestPath = resolveManifestPath(destinationHome, manifestName);
+    let content: string;
+    try {
+      content = await readFile(manifestPath, 'utf8');
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code === 'ENOENT') {
+        const entry = await inspectPathEntry(manifestPath);
+        if (entry === 'missing') continue;
+        return { kind: 'invalid', manifestPath, reason: entry === 'present' ? 'dangling link' : entry.reason };
+      }
+      return { kind: 'invalid', manifestPath, reason: `unreadable (${code ?? 'unknown error'})` };
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(content);
+    } catch {
+      return { kind: 'invalid', manifestPath, reason: 'invalid JSON' };
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { kind: 'invalid', manifestPath, reason: 'not a JSON object' };
+    }
+    const record = value as Record<string, unknown>;
+    if (record.v !== 1) return { kind: 'invalid', manifestPath, reason: 'unsupported manifest version' };
+    if (!Object.prototype.hasOwnProperty.call(record, 'nativeSourceEnv')) return { kind: 'unrecorded' };
+    const nativeSourceEnv = parseNativeSourceEnv(record.nativeSourceEnv);
+    return nativeSourceEnv
+      ? { kind: 'recorded', nativeSourceEnv }
+      : { kind: 'invalid', manifestPath, reason: 'malformed nativeSourceEnv' };
+  }
+  // No manifest entry at all. Only a missing or empty target is never-produced; anything already in
+  // it has unknown provenance.
+  let entries: string[];
+  try {
+    entries = await readdir(destinationHome);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') return { kind: 'absent' };
+    return { kind: 'invalid', manifestPath: destinationHome, reason: `target unreadable (${code ?? 'unknown error'})` };
+  }
+  return entries.length === 0 ? { kind: 'absent' } : { kind: 'unrecorded' };
+}
+
+/** Whether a path names a directory entry, without following a final symlink. */
+async function inspectPathEntry(path: string): Promise<'missing' | 'present' | Readonly<{ reason: string }>> {
+  try {
+    await lstat(path);
+    return 'present';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    return code === 'ENOENT' ? 'missing' : { reason: `uninspectable (${code ?? 'unknown error'})` };
+  }
 }
 
 export async function removeLegacyConnectedServiceStateSharingManifest(destinationHome: string): Promise<void> {

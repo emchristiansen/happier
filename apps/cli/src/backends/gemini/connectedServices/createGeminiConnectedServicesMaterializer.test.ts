@@ -60,6 +60,7 @@ function buildMaterializerInput(params: Readonly<{
 }>) {
   return {
     agentId: 'gemini' as const,
+    nativeSourceAuthority: 'caller_env' as const,
     activeServerDir: params.rootDir,
     rootDir: params.rootDir,
     sessionDirectory: params.cwd,

@@ -18,6 +18,7 @@ import { createTestMetadata } from '@/testkit/backends/sessionMetadata';
 import * as appServerControl from '../appServer/control/withCodexAppServerControlClient';
 import { materializeCodexConnectedServiceRuntimeAuthSelection } from './materializeCodexConnectedServiceRuntimeAuthSelection';
 import { resolveConnectedServiceHomeDir } from '@/daemon/connectedServices/homes/resolveConnectedServiceHomeDir';
+import { syncCodexConnectedServiceHome } from './syncCodexConnectedServiceHome';
 
 const { io } = vi.hoisted(() => ({ io: vi.fn() }));
 vi.mock('socket.io-client', async (importOriginal) => ({
@@ -40,6 +41,14 @@ describe('materializeCodexConnectedServiceRuntimeAuthSelection', () => {
     const oldHome = join(resolveConnectedServiceHomeDir({ activeServerDir, serviceId: 'openai-codex', profileId: 'old', agentId: 'codex' }), 'codex-home');
     await mkdir(join(oldHome, 'sessions'), { recursive: true });
     await writeFile(join(oldHome, 'sessions', 'private.jsonl'), 'private-history\n');
+    // The daemon spawned this session from its environment, which its current home recorded; a
+    // switch uses only that record.
+    await syncCodexConnectedServiceHome({
+      destinationCodexHome: oldHome,
+      processEnv: { HOME: root, CODEX_HOME: join(root, 'native') },
+      accountSettings: AccountSettingsSchema.parse({ connectedServicesProviderStateSharingSettingsV1: { byAgentId: { codex: { stateMode: 'isolated' } } } }),
+      nativeSourceAuthority: 'caller_env',
+    });
     const remoteSession = createSessionRecordFixture({ id: 'sess_1', encryptionMode: 'plain' });
     const relay = Fastify();
     relay.get('/v2/sessions/sess_1', async (request) => {

@@ -87,6 +87,7 @@ describe('materializeConnectedServicesForSpawn', () => {
       oauth: { accessToken: 'access', refreshToken: 'refresh', idToken: 'id', scope: null, tokenType: null, providerAccountId: 'acct', providerEmail: null },
     });
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex', materializationKey: 'handoff', activeServerDir, baseDir,
       recordsByServiceId: new Map([['openai-codex', record]]),
       selectionsByServiceId: new Map([['openai-codex', selectionKind === 'group'
@@ -121,6 +122,7 @@ describe('materializeConnectedServicesForSpawn', () => {
       oauth: { accessToken: 'access', refreshToken: 'refresh', idToken: null, scope: CLAUDE_SUBSCRIPTION_OAUTH_SCOPE, tokenType: 'Bearer', providerAccountId: null, providerEmail: null },
     });
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude', materializationKey: 'handoff', activeServerDir, baseDir,
       recordsByServiceId: new Map([['claude-subscription', record]]),
       processEnv: { CLAUDE_CONFIG_DIR: sourceHome }, sessionStateMode: 'existing',
@@ -168,6 +170,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'session-1',
       activeServerDir,
@@ -265,6 +268,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'session-1',
       activeServerDir,
@@ -332,6 +336,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const first = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'session-1',
       activeServerDir,
@@ -384,6 +389,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const second = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'session-1',
       activeServerDir,
@@ -435,6 +441,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'session-openai-token',
       activeServerDir,
@@ -468,6 +475,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'session-1',
       activeServerDir,
@@ -533,6 +541,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: '../evil/../../key',
       activeServerDir,
@@ -582,6 +591,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'opencode',
       materializationKey: 'session-2',
       activeServerDir,
@@ -645,6 +655,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'opencode',
       materializationKey: 'session-2-openai',
       activeServerDir,
@@ -698,6 +709,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'opencode',
       materializationKey: 'session-2-stale',
       activeServerDir,
@@ -748,6 +760,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     // Assert the rejection's structural shape (token-record requirement, anthropic service) rather
     // than exact wording.
     const rejection = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'opencode',
       materializationKey: 'session-2b',
       activeServerDir,
@@ -792,6 +805,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'pi',
       materializationKey: 'session-3',
       activeServerDir,
@@ -844,6 +858,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'pi',
       materializationKey: 'session-3-openai',
       activeServerDir,
@@ -882,6 +897,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'pi',
       materializationKey: 'session-3-openai',
       activeServerDir,
@@ -931,6 +947,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'gemini',
       materializationKey: 'session-4',
       activeServerDir,
@@ -972,6 +989,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     await expect(materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       materializationKey: 'session-5',
       activeServerDir,
@@ -998,6 +1016,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       materializationKey: 'session-6a',
       activeServerDir,
@@ -1069,6 +1088,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       materializationKey: 'session-6b',
       activeServerDir,
@@ -1165,6 +1185,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     const refreshCredentialForMaterialization = vi.fn(async () => fresh);
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       materializationKey: 'session-refresh-before-materialize',
       activeServerDir,
@@ -1203,6 +1224,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       materializationKey: 'session-6',
       activeServerDir,
@@ -1248,6 +1270,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       materializationKey: 'session-explicit-workspace-trust',
       activeServerDir,
@@ -1289,6 +1312,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     });
 
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'claude',
       materializationKey: 'session-6c',
       activeServerDir,
@@ -1364,6 +1388,7 @@ describe('materializeConnectedServicesForSpawn', () => {
     const { materializeConnectedServicesForSpawn: materializeForSpawn } = await import('./materializeConnectedServicesForSpawn');
 
     const result = await materializeForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'session-1',
       activeServerDir,
@@ -1420,6 +1445,7 @@ describe('Codex home materialization preserves runtime custody', () => {
     });
     const params = {
       agentId: 'codex' as const, materializationKey: 'runtime-session', activeServerDir, baseDir,
+      nativeSourceAuthority: 'caller_env' as const,
       ...(purpose === 'probe' ? {
         materializationPurpose: 'probe' as const,
         connectedServiceMaterializationIdentityV1: { v: 1 as const, id: 'csm_runtime_probe', createdAtMs: 1 },
@@ -1477,6 +1503,7 @@ describe('credential retirement retry custody', () => {
       oauth: { accessToken: 'synthetic-access', refreshToken: 'synthetic-refresh', idToken: null, scope: null, tokenType: null, providerAccountId: null, providerEmail: null },
     });
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex', materializationKey: 'retry-test', materializationPurpose: 'probe',
       baseDir: join(root, 'materialized'), activeServerDir: join(root, 'server'),
       recordsByServiceId: new Map([['openai-codex', record]]), processEnv: { HOME: root, CODEX_HOME: join(root, 'source') },

@@ -1,9 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
+
+import { AxiosError } from 'axios';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -15,6 +17,7 @@ import {
 
 import type { Credentials } from '@/persistence';
 import type { ApiClient } from '@/api/api';
+import { ConnectedServiceCredentialHealthReadUnavailableError } from '@/api/connectedServices/connectedServiceCredentialApi';
 
 const { spawnSpy } = vi.hoisted(() => ({
   spawnSpy: vi.fn(),
@@ -32,6 +35,13 @@ import { ConnectedServiceRefreshCoordinator } from './ConnectedServiceRefreshCoo
 import { invalidateConnectedServiceAccountMode } from '@/cloud/connectedServices/resolveConnectedServiceAccountMode';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServiceChildEnvironment';
 import { computeClaudeCodeCredentialSafeTokenFingerprint } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialFile';
+
+/** Credential health actually read as connected; refresh behavior under unread health is tested separately. */
+function readConnectedCredentialHealth() {
+  return {
+    readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'connected' as const, health: null })),
+  };
+}
 
 const credentials = {
   token: 'happy-token',
@@ -92,6 +102,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
     const fetchMock = vi.fn(async () => { throw new Error('must not refresh a setup-token'); });
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealed },
         metadata: { kind: 'token', providerEmail: null, providerAccountId: 'anthropic-acct', expiresAt: null },
@@ -176,6 +187,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
     ));
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: 'claude@example.com', providerAccountId: 'anthropic-acct', expiresAt: now + 60_000 },
@@ -268,6 +280,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
     const acquireLease = vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 }));
     const registerSealed = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealed },
         metadata: { kind: 'oauth', providerEmail: 'claude@example.com', providerAccountId: 'anthropic-acct', expiresAt: now + 60 * 60_000 },
@@ -345,6 +358,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
     const registerSealed = vi.fn(async () => {});
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealed },
         metadata: { kind: 'oauth', providerEmail: 'claude@example.com', providerAccountId: 'anthropic-acct', expiresAt: now + 60 * 60_000 },
@@ -447,6 +461,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
     ));
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealedCiphertext },
         metadata: { kind: 'oauth', providerEmail: 'claude@example.com', providerAccountId: 'anthropic-acct', expiresAt: now + 60 * 60_000 },
@@ -526,7 +541,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
         metadata: { kind: 'token', providerEmail: null, providerAccountId: 'anthropic-owner', expiresAt: null },
       };
     });
-    const api = { getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
+    const api = { ...readConnectedCredentialHealth(), getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
     const coordinator = new ConnectedServiceRefreshCoordinator({
       api,
       credentials,
@@ -560,6 +575,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
   it('rejects Claude bridge requests whose identity maps to no live runtime target (fail-closed)', async () => {
     const now = 6_050_000;
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => {
         throw new Error('must not read credentials for an unauthorized bridge call');
       }),
@@ -598,6 +614,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext: sealed },
         metadata: { kind: 'token', providerEmail: null, providerAccountId: 'anthropic-active', expiresAt: null },
@@ -678,7 +695,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
         metadata: { kind: 'token', providerEmail: null, providerAccountId: 'anthropic-new', expiresAt: null },
       };
     });
-    const api = { getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
+    const api = { ...readConnectedCredentialHealth(), getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
     const coordinator = new ConnectedServiceRefreshCoordinator({
       api,
       credentials,
@@ -756,7 +773,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
         metadata: { kind: 'token', providerEmail: null, providerAccountId: 'anthropic-broker', expiresAt: null },
       };
     });
-    const api = { getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
+    const api = { ...readConnectedCredentialHealth(), getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
     const coordinator = new ConnectedServiceRefreshCoordinator({
       api,
       credentials,
@@ -794,6 +811,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
   it('R3-6: rejects a broker bridge call whose selection identity matches no live runtime target', async () => {
     const now = 6_350_000;
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => {
         throw new Error('must not read credentials for an unmatched broker identity');
       }),
@@ -842,7 +860,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
       sealed: { format: 'account_scoped_v1', ciphertext: victimSealed },
       metadata: { kind: 'token', providerEmail: null, providerAccountId: 'anthropic-victim', expiresAt: null },
     }));
-    const api = { getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
+    const api = { ...readConnectedCredentialHealth(), getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
     const coordinator = new ConnectedServiceRefreshCoordinator({
       api,
       credentials,
@@ -895,7 +913,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
     const getSealed = vi.fn(async () => {
       throw new Error('must not read credentials when the broker identity does not match');
     });
-    const api = { getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
+    const api = { ...readConnectedCredentialHealth(), getConnectedServiceCredentialSealed: getSealed } as unknown as ApiClient;
     const coordinator = new ConnectedServiceRefreshCoordinator({
       api,
       credentials,
@@ -928,6 +946,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
   it('rejects Claude bridge requests with a stale group generation for the session', async () => {
     const now = 6_200_000;
     const api = {
+      ...readConnectedCredentialHealth(),
       getConnectedServiceCredentialSealed: vi.fn(async () => {
         throw new Error('must not read credentials for stale bridge selections');
       }),
@@ -981,5 +1000,190 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
     await expect(coordinator.refreshClaudeSubscriptionTokensForBridge(unauthorizedRequest))
       .rejects.toThrow('connected_service_bridge_selection_not_authorized');
     expect(api.getConnectedServiceCredentialSealed).not.toHaveBeenCalled();
+  });
+
+  describe('refuses every credential-serving bridge arm when the exact credential health cannot be read', () => {
+    const unreadHealthCases = [
+      {
+        name: 'the server has no exact health route',
+        reader: async () => { throw new ConnectedServiceCredentialHealthReadUnavailableError('claude-subscription', 'claude-unread'); },
+      },
+      {
+        name: 'the health response is malformed',
+        reader: async () => { throw new Error('Invalid connected service credential health response'); },
+      },
+      {
+        name: 'the health request fails in transport',
+        reader: async () => { throw new AxiosError('socket hang up', 'ECONNRESET'); },
+      },
+      {
+        name: 'the selected profile has no health row',
+        reader: async () => ({ kind: 'not_found' as const }),
+      },
+      { name: 'the client has no exact health reader', reader: null },
+    ] as const;
+    const arms = [
+      { name: 'setup token', kind: 'token' as const },
+      { name: 'forced adopt-current', kind: 'oauth' as const },
+    ] as const;
+
+    it.each(arms.flatMap((arm) => unreadHealthCases.map((healthCase) => ({ arm, healthCase }))))(
+      'returns no $arm.name credential when $healthCase.name',
+      async ({ arm, healthCase }) => {
+        const now = 6_000_000;
+        mockMissingKeychainWithSuccessfulWrites();
+        const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-claude-bridge-unread-server-'));
+        const baseDir = await mkdtemp(join(tmpdir(), 'happier-claude-bridge-unread-base-'));
+        const sourceHomeDir = await mkdtemp(join(tmpdir(), 'happier-claude-bridge-unread-home-'));
+        const record = arm.kind === 'token'
+          ? buildConnectedServiceCredentialRecord({
+              now,
+              serviceId: 'claude-subscription',
+              profileId: 'claude-unread',
+              kind: 'token',
+              token: { token: 'sk-ant-oat01-unread-setup', providerAccountId: 'anthropic-acct', providerEmail: null },
+            })
+          : buildConnectedServiceCredentialRecord({
+              now,
+              serviceId: 'claude-subscription',
+              profileId: 'claude-unread',
+              kind: 'oauth',
+              expiresAt: now + 60 * 60_000,
+              oauth: {
+                accessToken: 'unread-current-access',
+                refreshToken: 'unread-current-refresh',
+                idToken: null,
+                scope: 'user:inference user:profile user:sessions:claude_code',
+                tokenType: 'Bearer',
+                providerAccountId: 'anthropic-acct',
+                providerEmail: 'claude@example.com',
+              },
+            });
+        const sealed = sealAccountScopedBlobCiphertext({
+          kind: 'connected_service_credential',
+          material: { type: 'legacy', secret: legacySecret() },
+          payload: record,
+          randomBytes: (length) => randomBytes(length),
+        });
+        const fetchMock = vi.fn(async () => { throw new Error('unread health must not reach the provider'); });
+        vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+        const acquireLease = vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 }));
+        const registerSealed = vi.fn(async () => {});
+        const updateHealth = vi.fn(async () => {});
+        const api = {
+          ...(healthCase.reader ? { readConnectedServiceCredentialHealth: vi.fn(healthCase.reader) } : {}),
+          getConnectedServiceCredentialSealed: vi.fn(async () => ({
+            sealed: { format: 'account_scoped_v1', ciphertext: sealed },
+            metadata: arm.kind === 'token'
+              ? { kind: 'token', providerEmail: null, providerAccountId: 'anthropic-acct', expiresAt: null }
+              : { kind: 'oauth', providerEmail: 'claude@example.com', providerAccountId: 'anthropic-acct', expiresAt: now + 60 * 60_000 },
+          })),
+          acquireConnectedServiceRefreshLease: acquireLease,
+          registerConnectedServiceCredentialSealed: registerSealed,
+          updateConnectedServiceCredentialHealth: updateHealth,
+        } as unknown as ApiClient;
+        const coordinator = new ConnectedServiceRefreshCoordinator({
+          api,
+          credentials,
+          machineIdProvider: () => 'm1',
+          ownerIdProvider: () => 'm1:d',
+          activeServerDir,
+          baseDir,
+          refreshWindowMs: 5 * 60_000,
+          refreshLeaseMs: 30_000,
+          now: () => now,
+          processEnv: { HOME: sourceHomeDir },
+        });
+        coordinator.registerSpawnTarget({
+          pid: 17,
+          agentId: 'claude',
+          sessionId: 'sess-claude-unread',
+          connectedServicesBindingsRaw: {
+            v: 1,
+            bindingsByServiceId: { 'claude-subscription': { source: 'connected', profileId: 'claude-unread' } },
+          },
+          materializationKey: 'sess-claude-unread',
+        });
+
+        await expect(coordinator.refreshClaudeSubscriptionTokensForBridge({
+          sessionId: 'sess-claude-unread',
+          selection: { kind: 'profile', serviceId: 'claude-subscription', profileId: 'claude-unread' },
+          ...(arm.kind === 'oauth'
+            ? {
+                forceRefresh: true,
+                failingAccessTokenFingerprint: computeClaudeCodeCredentialSafeTokenFingerprint('older-dead-home-access'),
+              }
+            : {}),
+        })).rejects.toMatchObject({
+          name: 'ConnectedServiceCredentialRefreshError',
+          diagnostic: { status: 'credential_health_unavailable', reason: 'provider_auth_bridge' },
+        });
+
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(acquireLease).not.toHaveBeenCalled();
+        expect(registerSealed).not.toHaveBeenCalled();
+        expect(updateHealth).not.toHaveBeenCalled();
+        expect(await readdir(activeServerDir)).toEqual([]);
+        expect(await readdir(baseDir)).toEqual([]);
+      },
+    );
+
+    it('refuses a setup token whose read health requires reconnecting, without rotating it', async () => {
+      const now = 6_100_000;
+      const record = buildConnectedServiceCredentialRecord({
+        now,
+        serviceId: 'claude-subscription',
+        profileId: 'claude-reauth',
+        kind: 'token',
+        token: { token: 'sk-ant-oat01-reauth-setup', providerAccountId: 'anthropic-acct', providerEmail: null },
+      });
+      const sealed = sealAccountScopedBlobCiphertext({
+        kind: 'connected_service_credential',
+        material: { type: 'legacy', secret: legacySecret() },
+        payload: record,
+        randomBytes: (length) => randomBytes(length),
+      });
+      const fetchMock = vi.fn(async () => { throw new Error('a setup token is never rotated'); });
+      vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+      const acquireLease = vi.fn(async () => ({ acquired: true, leaseUntil: now + 60_000 }));
+      const api = {
+        readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'needs_reauth' as const, health: null })),
+        getConnectedServiceCredentialSealed: vi.fn(async () => ({
+          sealed: { format: 'account_scoped_v1', ciphertext: sealed },
+          metadata: { kind: 'token', providerEmail: null, providerAccountId: 'anthropic-acct', expiresAt: null },
+        })),
+        acquireConnectedServiceRefreshLease: acquireLease,
+      } as unknown as ApiClient;
+      const coordinator = new ConnectedServiceRefreshCoordinator({
+        api,
+        credentials,
+        machineIdProvider: () => 'm1',
+        ownerIdProvider: () => 'm1:d',
+        activeServerDir: '/tmp/x',
+        baseDir: '/tmp/y',
+        refreshWindowMs: 60_000,
+        refreshLeaseMs: 30_000,
+        now: () => now,
+      });
+      coordinator.registerSpawnTarget({
+        pid: 18,
+        agentId: 'claude',
+        sessionId: 'sess-claude-reauth',
+        connectedServicesBindingsRaw: {
+          v: 1,
+          bindingsByServiceId: { 'claude-subscription': { source: 'connected', profileId: 'claude-reauth' } },
+        },
+        materializationKey: 'sess-claude-reauth',
+      });
+
+      await expect(coordinator.refreshClaudeSubscriptionTokensForBridge({
+        sessionId: 'sess-claude-reauth',
+        selection: { kind: 'profile', serviceId: 'claude-subscription', profileId: 'claude-reauth' },
+      })).rejects.toMatchObject({
+        diagnostic: { status: 'blocked_by_credential_health', reason: 'provider_auth_bridge' },
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(acquireLease).not.toHaveBeenCalled();
+    });
   });
 });

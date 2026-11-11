@@ -357,6 +357,17 @@ Credentials and account metadata remain separate from configuration sharing.
 Session-history sharing follows its own setting; changing configuration sharing
 does not opt in to workspace trust or change that history policy.
 
+Happier reads Claude configuration and workspace trust from one source only:
+`CLAUDE_CONFIG_DIR` (or `HAPPIER_CLAUDE_CONFIG_DIR`) when set, otherwise
+`~/.claude.json` and `~/.claude`. With a custom directory, `~/.claude.json` is
+not consulted, even when the custom directory says nothing about a workspace.
+If the configured directory is itself a Happier-managed account home, for
+example because the daemon started inside a managed session, Happier uses
+`HAPPIER_CLAUDE_CONFIG_DIR` when it names another directory. Otherwise it
+imports nothing, keeps the managed home's own settings and trust, and refuses
+shared session history with `claude_shared_state_link_unavailable` instead of
+falling back to your home directory.
+
 ### Instructions, plugins, and hook trust in development builds
 
 The development correction for missing configuration also includes Claude's

@@ -4,7 +4,6 @@ import {
   type ConnectedServiceAuthGroupV1,
   type ConnectedServiceCredentialRecordV1,
   type ConnectedServiceCredentialRevisionV1,
-  type ConnectedServiceCredentialHealthStatusV1,
   type ConnectedServiceId,
   type ConnectedServiceMaterializationIdentityV1,
 } from '@happier-dev/protocol';
@@ -68,16 +67,6 @@ type ConnectedServiceAuthGroupApi = Readonly<{
     serviceId: ConnectedServiceId;
     groupId: string;
   }>) => Promise<ConnectedServiceAuthGroupResponse | null>;
-}>;
-
-type ConnectedServiceProfilesHealthApi = Readonly<{
-  listConnectedServiceProfiles?: (params: Readonly<{ serviceId: ConnectedServiceId }>) => Promise<Readonly<{
-    serviceId: ConnectedServiceId;
-    profiles: ReadonlyArray<Readonly<{
-      profileId: string;
-      status: ConnectedServiceCredentialHealthStatusV1;
-    }>>;
-  }>>;
 }>;
 
 type ConnectedServiceAuthGroupPreTurnSwitchCoordinator = Readonly<{
@@ -453,6 +442,14 @@ async function resolveSpawnRefreshOutcome(params: Readonly<{
       diagnostic: result.diagnostic,
     });
   }
+  if (result.status === 'credential_health_unavailable') {
+    // The refresh coordinator could not read the selected profile's health; never treat that as
+    // healthy, even while the current record is still clock-valid.
+    throw new ConnectedServiceSpawnCredentialRefreshError({
+      kind: 'transient_refresh_failed',
+      diagnostic: result.diagnostic,
+    });
+  }
   if (result.status === 'lease_not_acquired') {
     if (isRecordStillUsableForSpawn(record, clock())) return current;
     throw new ConnectedServiceSpawnCredentialRefreshError({
@@ -469,45 +466,53 @@ function isRecordStillUsableForSpawn(record: ConnectedServiceCredentialRecordV1,
     || record.expiresAt > nowMs;
 }
 
+/**
+ * Refuses a spawn whose selected credential is known to need reconnecting, or whose profile the
+ * server no longer has (deleted after its credential was read). Health is read per selected
+ * profile through the exact-profile route, so no other profile of the service is ever read; a
+ * server without that route fails the spawn rather than falling back to the service-wide list.
+ */
 async function assertCredentialHealthAllowsSpawn(params: Readonly<{
-  api: ApiClient;
+  api: Pick<ApiClient, 'readConnectedServiceCredentialHealth'>;
   credentialBindings: ReadonlyArray<{ serviceId: ConnectedServiceId; profileId: string }>;
 }>): Promise<void> {
-  const profilesApi = params.api as ConnectedServiceProfilesHealthApi;
-  if (typeof profilesApi.listConnectedServiceProfiles !== 'function') return;
-
-  const bindingsByServiceId = new Map<ConnectedServiceId, Set<string>>();
+  const selectedProfileKeys = new Set<string>();
   for (const binding of params.credentialBindings) {
     const profileId = String(binding.profileId ?? '').trim();
     if (!profileId) continue;
-    const existing = bindingsByServiceId.get(binding.serviceId);
-    if (existing) {
-      existing.add(profileId);
-    } else {
-      bindingsByServiceId.set(binding.serviceId, new Set([profileId]));
-    }
-  }
+    const key = JSON.stringify([binding.serviceId, profileId]);
+    if (selectedProfileKeys.has(key)) continue;
+    selectedProfileKeys.add(key);
 
-  for (const [serviceId, profileIds] of bindingsByServiceId.entries()) {
-    const result = await profilesApi.listConnectedServiceProfiles({ serviceId });
-    const profiles = Array.isArray(result?.profiles) ? result.profiles : [];
-    for (const profile of profiles) {
-      if (!profileIds.has(profile.profileId)) continue;
-      if (profile.status !== 'needs_reauth') continue;
+    const health = await params.api.readConnectedServiceCredentialHealth({ serviceId: binding.serviceId, profileId });
+    if (health.kind === 'not_found') {
       throw new ConnectedServiceSpawnCredentialRefreshError({
         kind: 'reconnect_required',
         diagnostic: {
-          serviceId,
-          profileId: profile.profileId,
+          serviceId: binding.serviceId,
+          profileId,
           reason: 'spawn_preflight',
-          status: 'refresh_failed',
-          category: 'invalid_grant',
+          status: 'credential_missing',
           expiresAt: null,
           expiryAgeMs: null,
           refreshWindowMs: 0,
         },
       });
     }
+    if (health.status !== 'needs_reauth') continue;
+    throw new ConnectedServiceSpawnCredentialRefreshError({
+      kind: 'reconnect_required',
+      diagnostic: {
+        serviceId: binding.serviceId,
+        profileId,
+        reason: 'spawn_preflight',
+        status: 'refresh_failed',
+        category: 'invalid_grant',
+        expiresAt: null,
+        expiryAgeMs: null,
+        refreshWindowMs: 0,
+      },
+    });
   }
 }
 
@@ -1183,6 +1188,8 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   const materialized = await materializeConnectedServicesForSpawn({
     agentId: params.agentId,
     materializationPurpose: params.materializationPurpose,
+    // The spawning caller (direct launch or daemon spawn) produces this home from its own source.
+    nativeSourceAuthority: 'caller_env',
     materializationKey: params.materializationKey,
     connectedServiceMaterializationIdentityV1: params.connectedServiceMaterializationIdentityV1,
     activeServerDir: params.activeServerDir,
@@ -1453,6 +1460,15 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
         nowMs,
       });
       if (!switched) throw error;
+      // The switch reselected the group's member and reloaded its credential. Group authority and the
+      // current generation are not health permission: the newly current binding must pass the same
+      // exact-health gate as the preflight before its credential is materialized or returned. This
+      // matters most for a setup token, which no refresh would otherwise check.
+      await assertCredentialHealthAllowsSpawn({
+        api: params.api,
+        credentialBindings: buildCurrentSpawnCredentialBindings({ selections, groupSelections }),
+      });
+      params.signal?.throwIfAborted();
     }
   }
 

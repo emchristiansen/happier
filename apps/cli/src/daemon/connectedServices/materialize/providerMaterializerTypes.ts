@@ -28,6 +28,37 @@ export type ConnectedServicesMaterializationDiagnostic = Readonly<{
   }>;
 }>;
 
+/**
+ * Who names the provider-native configuration/state source a materialization reads and links.
+ *
+ * - `caller_env`: the producing caller (a direct launch or a daemon spawn) admits the source named by
+ *   its own environment. A target that already records a different admitted source is a conflict.
+ * - `recorded`: a rematerializer that did not produce the target (the daemon's refresh/external
+ *   revision distribution) may use only the source the target recorded when it was produced; its own
+ *   environment never names a source.
+ */
+export type ConnectedServiceNativeSourceAuthority = 'caller_env' | 'recorded';
+
+/**
+ * A materialization was refused, before any source traversal or target write, because the target's
+ * admitted native source is unrecorded (for a `recorded` rematerializer), conflicts with the one
+ * requested, or is recorded in a manifest that cannot be read or trusted. Distinct from credential
+ * failures: it says nothing about the credential's health.
+ */
+export class ConnectedServiceNativeSourceProvenanceError extends Error {
+  constructor(
+    readonly code:
+      | 'connected_service_native_source_unrecorded'
+      | 'connected_service_native_source_conflict'
+      | 'connected_service_native_source_invalid',
+    readonly targetRoot: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ConnectedServiceNativeSourceProvenanceError';
+  }
+}
+
 export const CONNECTED_SERVICE_MATERIALIZATION_REASONS = Object.freeze({
   authoritativeGroupTargetSuperseded: 'authoritative_group_target_changed_before_materialization',
 } as const);
@@ -76,6 +107,7 @@ export type ConnectedServicesProviderMaterializerInput = Readonly<{
   selectionsByServiceId?: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedSelection>;
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv?: NodeJS.ProcessEnv;
+  nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
   vendorResumeId?: string | null;
   candidatePersistedSessionFile?: string | null;
   /** Existing-state handoff publishes credentials without copying or reconciling provider state. */

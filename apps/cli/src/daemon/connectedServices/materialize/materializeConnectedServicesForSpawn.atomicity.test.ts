@@ -41,6 +41,7 @@ describe('materializeConnectedServicesForSpawn atomicity', () => {
     });
 
     await expect(materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'session-live',
       activeServerDir,
@@ -105,12 +106,14 @@ describe('materializeConnectedServicesForSpawn atomicity', () => {
     };
 
     const first = materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       ...common,
       processEnv: { HAPPIER_TEST_MATERIALIZATION_LABEL: 'A' },
     });
     await firstEntered;
 
     const second = materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       ...common,
       processEnv: { HAPPIER_TEST_MATERIALIZATION_LABEL: 'B' },
     });
@@ -199,12 +202,14 @@ describe('materializeConnectedServicesForSpawn atomicity', () => {
     };
 
     const first = materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       ...common,
       processEnv: { HAPPIER_TEST_MATERIALIZATION_LABEL: 'A' },
     });
     await firstReachedPromotion;
 
     const second = materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       ...common,
       processEnv: { HAPPIER_TEST_MATERIALIZATION_LABEL: 'B' },
     });

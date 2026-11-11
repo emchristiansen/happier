@@ -49,9 +49,12 @@ function fixture() {
   const persist = vi.fn(async () => {});
   const execute = (quotaRecoveryGuard: QuotaRecoveryGuard) => switchSessionConnectedServiceAuth({
     core, quotaRecoveryGuard, getChildren: () => [tracked],
-    api: { listConnectedServiceProfiles: async () => ({ serviceId: 'openai-codex', profiles: [
-      { profileId: 'next', status: 'connected' },
-    ] }), getConnectedServiceAuthGroup: async () => null },
+    api: {
+      readConnectedServiceCredentialHealth: async ({ profileId }) => (profileId === 'next'
+        ? { kind: 'found', status: 'connected', health: null }
+        : { kind: 'not_found' }),
+      getConnectedServiceAuthGroup: async () => null,
+    },
     resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
     restartSession: restart, persistSessionBindings: persist,
     hotApply: async () => ({ ok: true }), registerHotApplyTargets: () => {}, emitSessionEvent: () => {},

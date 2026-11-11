@@ -5,6 +5,8 @@ import {
   ConnectedServiceMaterializationIdentityV1Schema,
   type ConnectedServiceAuthGroupV1,
   type ConnectedServiceBindingsV1,
+  type ConnectedServiceCredentialHealthStatusV1,
+  type ConnectedServiceId,
 } from '@happier-dev/protocol';
 
 import type { TrackedSession } from '@/daemon/types';
@@ -20,6 +22,35 @@ import { createQuotaRecoveryGuard } from './quotaRecoveryGuard';
 import type { RuntimeAuthRecoveryIntent } from '../runtimeAuth/RuntimeAuthRecoveryScheduler';
 
 const credentialRevision = 'csr_abcdefghijklmnopqrstuv';
+
+type ProfilesFixture = (input: Readonly<{ serviceId: ConnectedServiceId }>) => Promise<Readonly<{
+  serviceId: ConnectedServiceId;
+  profiles: ReadonlyArray<Readonly<{ profileId: string; status: ConnectedServiceCredentialHealthStatusV1 }>>;
+}>>;
+
+/**
+ * Serves each switch fixture's profile rows only through the exact-profile credential-health read.
+ * The service-wide list throws, so any switch path that reads unselected profiles fails its test.
+ */
+function exactProfileHealthApi(fixture: Readonly<{
+  profiles: ProfilesFixture;
+  getConnectedServiceAuthGroup: SwitchSessionConnectedServiceAuthInput['api']['getConnectedServiceAuthGroup'];
+}>) {
+  const { profiles, getConnectedServiceAuthGroup } = fixture;
+  return {
+    getConnectedServiceAuthGroup,
+    readConnectedServiceCredentialHealth: vi.fn(async (input: Readonly<{ serviceId: ConnectedServiceId; profileId: string }>) => {
+      const row = (await profiles({ serviceId: input.serviceId })).profiles
+        .find((candidate) => candidate.profileId === input.profileId);
+      return row
+        ? { kind: 'found' as const, status: row.status, health: null }
+        : { kind: 'not_found' as const };
+    }),
+    listConnectedServiceProfiles: async (): Promise<never> => {
+      throw new Error('auth switch must not read the service-wide connected-service profile list');
+    },
+  };
+}
 afterEach(() => vi.restoreAllMocks());
 
 function trackedSession(overrides: Partial<TrackedSession> = {}): TrackedSession {
@@ -228,14 +259,14 @@ describe('switchSessionConnectedServiceAuth', () => {
       const before = structuredClone(tracked.spawnOptions);
       const restartSession = vi.fn();
       const persistSessionBindings = vi.fn();
-      const listConnectedServiceProfiles = vi.fn(async () => {
+      const profileRows = vi.fn(async () => {
         turnInFlight = true;
         return { serviceId: 'anthropic' as const, profiles: [{ profileId: 'new-profile', status: 'connected' as const }] };
       });
       await expect(switchSessionConnectedServiceAuth(Object.assign({
         core: createCore(), getChildren: () => [tracked],
         postSwitchVerificationMode: { kind: 'disabled_for_test_only' as const, reason: 'negative guard fixture; no provider operation permitted' },
-        api: { listConnectedServiceProfiles, getConnectedServiceAuthGroup: async () => null },
+        api: exactProfileHealthApi({ profiles: profileRows, getConnectedServiceAuthGroup: async () => null }),
         resolveContinuity: async () => ({ mode: 'restart_rematerialize' as const }),
         restartSession, persistSessionBindings, hotApply: async () => ({ ok: true as const }),
         registerHotApplyTargets: () => {}, emitSessionEvent: () => {},
@@ -244,7 +275,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       expect(tracked.spawnOptions).toEqual(before);
       expect(persistSessionBindings).not.toHaveBeenCalled();
       expect(restartSession).not.toHaveBeenCalled();
-      expect(listConnectedServiceProfiles).toHaveBeenCalledTimes(schedule === 'during_profile_read' ? 1 : 0);
+      expect(profileRows).toHaveBeenCalledTimes(schedule === 'during_profile_read' ? 1 : 0);
     },
   );
 
@@ -258,10 +289,10 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [],
-      api: {
-        listConnectedServiceProfiles: async () => ({ serviceId: 'anthropic', profiles: [] }),
+      api: exactProfileHealthApi({
+        profiles: async () => ({ serviceId: 'anthropic', profiles: [] }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -304,13 +335,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'agent resolution regression only',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex' as const,
           profiles: [{ profileId: 'codex-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -383,8 +414,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'binding policy test does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic' as const,
           profiles: [
             { profileId: 'remembered-member', status: 'connected' as const },
@@ -392,7 +423,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           ],
         }),
         getConnectedServiceAuthGroup: async () => workGroup,
-      },
+      }),
       resolveContinuity,
       restartSession: vi.fn(async () => {}),
       hotApply: async () => ({ ok: true }),
@@ -466,13 +497,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'restart ordering test does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic' as const,
           profiles: [{ profileId, status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       materializeRuntimeAuthSelection,
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' as const }),
       restartSession,
@@ -533,10 +564,10 @@ describe('switchSessionConnectedServiceAuth', () => {
     const switched = switchSessionConnectedServiceAuth({
       core: createConnectedServiceSessionAuthSwitchCore({ locks }),
       getChildren: () => [trackedSession()],
-      api: {
-        listConnectedServiceProfiles: () => { normalizing.resolve(); return normalize.promise; },
+      api: exactProfileHealthApi({
+        profiles: () => { normalizing.resolve(); return normalize.promise; },
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'unsupported', errorCode: 'continuity_unsupported' }),
       restartSession: async () => {},
       hotApply: async () => ({ ok: true }),
@@ -587,13 +618,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'startup execution-authority policy fails before provider verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic' as const,
           profiles: [{ profileId: 'new-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' as const }),
       restartSession,
       hotApply: async () => ({ ok: false, errorCode: 'hot_apply_restart_required' }),
@@ -633,13 +664,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         connectedServiceMaterializationIdentityV1: materializationIdentity,
         vendorResumeId: 'vendor-inactive-1',
       }),
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity,
       restartSession,
       hotApply: async () => {
@@ -708,13 +739,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         cwd: '/tmp/inactive-repo',
         candidatePersistedSessionFile: '/tmp/inactive-repo/.pi/agent/sessions/--tmp-inactive-repo--/s.jsonl',
       }),
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity,
       restartSession: vi.fn(),
       hotApply: async () => {
@@ -755,13 +786,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         agentId: 'codex',
         connectedServices: codexBindings('old-codex-profile'),
       }),
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'new-codex-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async ({ tracked, sessionId, previous, next }) => {
         expect(tracked).toBeNull();
         expect(sessionId).toBe('sess_inactive_codex');
@@ -843,13 +874,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -928,13 +959,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity,
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -1009,13 +1040,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'old-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       materializeRuntimeAuthSelection,
       resolveContinuity,
       restartSession: vi.fn(),
@@ -1079,13 +1110,13 @@ describe('switchSessionConnectedServiceAuth', () => {
           reason: 'materialization diagnostics stop before provider adoption verification',
         },
         getChildren: () => [tracked],
-        api: {
-          listConnectedServiceProfiles: async () => ({
+        api: exactProfileHealthApi({
+          profiles: async () => ({
             serviceId: 'claude-subscription',
             profiles: [{ profileId: 'new-subscription', status: 'connected' }],
           }),
           getConnectedServiceAuthGroup: async () => null,
-        },
+        }),
         materializeRuntimeAuthSelection: async () => ({
           record: buildConnectedServiceCredentialRecord({
             now: 1,
@@ -1264,8 +1295,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'the test isolates pre-effect group supersession convergence',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'claude-subscription',
           profiles: [
             { profileId: 'first-active', status: 'connected' },
@@ -1273,7 +1304,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           ],
         }),
         getConnectedServiceAuthGroup,
-      },
+      }),
       materializeRuntimeAuthSelection,
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession,
@@ -1337,13 +1368,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'runtime recovery restart is scheduled by the recovery owner',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({
         mode: 'restart_rematerialize',
         // INC-6: the proven continuity context must surface on the success result so switch
@@ -1440,13 +1471,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'old-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async ({ previous, next }) => {
         expect(previous).toEqual(expect.objectContaining({
           serviceId: 'anthropic',
@@ -1508,13 +1539,13 @@ describe('switchSessionConnectedServiceAuth', () => {
     const result = await switchSessionConnectedServiceAuth({
       core: createCore(),
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'old-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession,
       hotApply,
@@ -1572,13 +1603,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'the direct-live policy rejects restart before provider verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'codex3', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       runtimeAuthApplyCapabilityResolver: () => ({
         directLiveHotAuth: {
@@ -1653,8 +1684,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'group-active', status: 'connected' }],
         }),
@@ -1662,7 +1693,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           activeProfileId: 'group-active',
           generation: 67,
         }),
-      },
+      }),
       resolveContinuity: async ({ previous, next }) => {
         expect(previous).toEqual(expect.objectContaining({
           serviceId: 'anthropic',
@@ -1771,8 +1802,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'this test isolates current-credential application',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'group-active', status: 'connected' }],
         }),
@@ -1780,7 +1811,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           activeProfileId: 'group-active',
           generation: 67,
         }),
-      },
+      }),
       expectedCredentialRevisionByServiceId: {
         anthropic: desiredRevision,
       },
@@ -1860,8 +1891,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'pre-turn restart fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'group-active', status: 'connected' }],
         }),
@@ -1869,7 +1900,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           activeProfileId: 'group-active',
           generation: 67,
         }),
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       materializeRuntimeAuthSelection: async () => ({ kind: 'materialized' }),
       restartSession,
@@ -1926,13 +1957,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'predictive gate fixture never reaches provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -1989,8 +2020,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'predictive gate fixture never reaches provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'group-active', status: 'connected' }],
         }),
@@ -1998,7 +2029,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           activeProfileId: 'group-active',
           generation: 67,
         }),
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       materializeRuntimeAuthSelection: async () => ({ kind: 'materialized' }),
       restartSession,
@@ -2048,13 +2079,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'soft-threshold maintenance rows are filtered before transcript commit',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -2121,8 +2152,8 @@ describe('switchSessionConnectedServiceAuth', () => {
     const result = await switchSessionConnectedServiceAuth({
       core: createCore(),
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'group-active', status: 'connected' }],
         }),
@@ -2130,7 +2161,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           activeProfileId: 'group-active',
           generation: 67,
         }),
-      },
+      }),
       resolveContinuity,
       materializeRuntimeAuthSelection,
       restartSession: vi.fn(),
@@ -2261,8 +2292,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'same-account fanout fixture asserts provider apply dispatch only',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'backup', status: 'connected' }],
         }),
@@ -2286,7 +2317,7 @@ describe('switchSessionConnectedServiceAuth', () => {
             updatedAt: 1,
           }],
         }),
-      },
+      }),
       resolveContinuity,
       materializeRuntimeAuthSelection,
       restartSession: vi.fn(),
@@ -2372,8 +2403,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'leeroy', status: 'connected' }],
         }),
@@ -2382,7 +2413,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           activeProfileId: 'leeroy',
           generation: 68,
         }),
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       materializeRuntimeAuthSelection: async () => ({ kind: 'materialized' }),
       restartSession,
@@ -2462,8 +2493,8 @@ describe('switchSessionConnectedServiceAuth', () => {
 	        reason: 'existing switch fixture does not exercise provider adoption verification',
 	      },
 	      getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async ({ serviceId }) => ({
+      api: exactProfileHealthApi({
+        profiles: async ({ serviceId }) => ({
           serviceId,
           profiles: [
             {
@@ -2473,7 +2504,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           ],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async ({ connectedServiceMaterializationIdentityV1, vendorResumeId }) => {
         expectMaterializationIdentity(connectedServiceMaterializationIdentityV1);
         expect(vendorResumeId).toBe('spawn-resume-1');
@@ -2534,13 +2565,13 @@ describe('switchSessionConnectedServiceAuth', () => {
           },
         },
       }),
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async ({ connectedServiceMaterializationIdentityV1 }) => {
         expectMaterializationIdentity(connectedServiceMaterializationIdentityV1);
         return { mode: 'restart_rematerialize' };
@@ -2600,13 +2631,13 @@ describe('switchSessionConnectedServiceAuth', () => {
           },
         },
       }),
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession: async () => {
         throw new Error('Inactive sessions should not restart');
@@ -2656,13 +2687,13 @@ describe('switchSessionConnectedServiceAuth', () => {
           },
         },
       }),
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession: async () => {
         throw new Error('Inactive sessions should not restart');
@@ -2701,13 +2732,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'refresh_failed_retryable' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -2738,13 +2769,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'needs_reauth' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => {
         throw new Error('Reconnect-required profiles should not resolve continuity');
       },
@@ -2788,13 +2819,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -2837,13 +2868,13 @@ describe('switchSessionConnectedServiceAuth', () => {
       },
 	      switchReason: 'automatic_runtime_failure',
 	      getChildren: () => [tracked],
-	      api: {
-	        listConnectedServiceProfiles: async () => ({
+	      api: exactProfileHealthApi({
+	        profiles: async () => ({
 	          serviceId: 'anthropic',
 	          profiles: [{ profileId: 'new-profile', status: 'connected' }],
 	        }),
 	        getConnectedServiceAuthGroup: async () => null,
-	      },
+	      }),
 	      resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
 	      restartSession: vi.fn(),
 	      hotApply: async () => ({ ok: true }),
@@ -2882,13 +2913,13 @@ describe('switchSessionConnectedServiceAuth', () => {
       },
 	      switchReason: 'pre_turn_group_policy',
 	      getChildren: () => [tracked],
-	      api: {
-	        listConnectedServiceProfiles: async () => ({
+	      api: exactProfileHealthApi({
+	        profiles: async () => ({
 	          serviceId: 'anthropic',
 	          profiles: [{ profileId: 'new-profile', status: 'connected' }],
 	        }),
 	        getConnectedServiceAuthGroup: async () => null,
-	      },
+	      }),
 	      resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
 	      restartSession: vi.fn(),
 	      hotApply: async () => ({ ok: true }),
@@ -2933,13 +2964,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'pre-turn switches should never drive continuation replay',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: continuityMode }),
       restartSession: vi.fn(async () => {}),
       hotApply: async () => ({ ok: true as const }),
@@ -2990,13 +3021,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async ({ next }) => {
         expect(next).toMatchObject({
           source: 'native',
@@ -3038,7 +3069,7 @@ describe('switchSessionConnectedServiceAuth', () => {
 
   it('rejects connected-service bindings unsupported by the target agent before profile lookup', async () => {
     const tracked = trackedSession();
-    const listConnectedServiceProfiles = vi.fn(async () => ({
+    const profileRows = vi.fn(async () => ({
       serviceId: 'openai-codex' as const,
       profiles: [{ profileId: 'codex-profile', status: 'connected' as const }],
     }));
@@ -3052,10 +3083,10 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles,
+      api: exactProfileHealthApi({
+        profiles: profileRows,
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity,
       restartSession: async () => {
         throw new Error('restart should not run');
@@ -3083,7 +3114,7 @@ describe('switchSessionConnectedServiceAuth', () => {
       serviceId: 'openai-codex',
     });
 
-    expect(listConnectedServiceProfiles).not.toHaveBeenCalled();
+    expect(profileRows).not.toHaveBeenCalled();
     expect(resolveContinuity).not.toHaveBeenCalled();
     expect(tracked.spawnOptions?.connectedServices).toEqual(bindings('old-profile'));
     expect(emitSessionEvent).toHaveBeenCalledWith('sess_1', expect.objectContaining({
@@ -3132,13 +3163,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'group-active', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => group({ generation: 5 }),
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       materializeRuntimeAuthSelection: async () => ({ credentialRevision }),
       restartSession,
@@ -3183,10 +3214,10 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({ serviceId: 'anthropic', profiles: [] }),
+      api: exactProfileHealthApi({
+        profiles: async () => ({ serviceId: 'anthropic', profiles: [] }),
         getConnectedServiceAuthGroup: async () => group({ generation: 5 }),
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession: async () => {},
       hotApply: async () => ({ ok: true }),
@@ -3248,8 +3279,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [
             { profileId: 'group-active', status: 'connected' },
@@ -3284,7 +3315,7 @@ describe('switchSessionConnectedServiceAuth', () => {
             },
           ],
         }),
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       materializeRuntimeAuthSelection: async () => ({ credentialRevision }),
       restartSession,
@@ -3326,8 +3357,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [
             { profileId: 'group-active', status: 'connected' },
@@ -3361,7 +3392,7 @@ describe('switchSessionConnectedServiceAuth', () => {
             },
           ],
         }),
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -3411,13 +3442,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({
         mode: 'unsupported',
         errorCode: 'provider_state_sharing_required',
@@ -3466,13 +3497,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({
         mode: 'unsupported',
         errorCode: 'provider_session_state_unavailable_for_resume',
@@ -3537,13 +3568,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({
         mode: 'unsupported',
         errorCode: 'provider_session_state_unavailable_for_resume',
@@ -3616,13 +3647,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession: async () => {
         throw new Error('restart failed');
@@ -3673,13 +3704,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession: async () => {
         throw staleProcessError;
@@ -3732,13 +3763,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       materializeRuntimeAuthSelection: async () => runtimeAuthSelection,
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
@@ -3780,13 +3811,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' as const }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true as const }),
@@ -3842,13 +3873,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -3911,13 +3942,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -3989,13 +4020,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'leeroy', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -4055,13 +4086,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -4110,13 +4141,13 @@ describe('switchSessionConnectedServiceAuth', () => {
     await expect(switchSessionConnectedServiceAuth({
       core: createCore(),
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession,
       hotApply: async () => ({ ok: true }),
@@ -4170,13 +4201,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -4226,13 +4257,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -4302,13 +4333,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -4349,13 +4380,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({
@@ -4416,13 +4447,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({
@@ -4471,13 +4502,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -4527,13 +4558,13 @@ describe('switchSessionConnectedServiceAuth', () => {
     await expect(switchSessionConnectedServiceAuth({
       core: createCore(),
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({
@@ -4606,8 +4637,8 @@ describe('switchSessionConnectedServiceAuth', () => {
     await expect(switchSessionConnectedServiceAuth({
       core: createCore(),
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'claude-subscription',
           profiles: [{ profileId: 'subscription-new', status: 'connected' }],
         }),
@@ -4642,7 +4673,7 @@ describe('switchSessionConnectedServiceAuth', () => {
             },
           ],
         }),
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({
@@ -4715,13 +4746,13 @@ describe('switchSessionConnectedServiceAuth', () => {
     await expect(switchSessionConnectedServiceAuth({
       core: createCore(),
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({
@@ -4788,13 +4819,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'bot', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       runtimeAuthApplyCapabilityResolver: () => ({
         directLiveHotAuth: {
@@ -4850,13 +4881,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'the provider continuity declaration is the canonical apply policy',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply: async () => ({ ok: false, errorCode: 'hot_apply_failed' }),
@@ -4896,13 +4927,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'same-account fanout must never restart healthy siblings',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'new-codex-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply: async () => ({
@@ -4940,13 +4971,13 @@ describe('switchSessionConnectedServiceAuth', () => {
 	    await expect(switchSessionConnectedServiceAuth({
 	      core: createCore(),
 	      getChildren: () => [tracked],
-	      api: {
-	        listConnectedServiceProfiles: async () => ({
+	      api: exactProfileHealthApi({
+	        profiles: async () => ({
 	          serviceId: 'anthropic',
 	          profiles: [{ profileId: 'new-profile', status: 'connected' }],
 	        }),
 	        getConnectedServiceAuthGroup: async () => null,
-	      },
+	      }),
 	      resolveContinuity: async () => ({ mode: 'hot_apply' }),
 	      restartSession: vi.fn(),
 	      hotApply: async () => ({ ok: true }),
@@ -4995,13 +5026,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' as const }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true as const }),
@@ -5071,13 +5102,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' as const }),
       restartSession,
       hotApply: async () => ({ ok: true as const }),
@@ -5125,13 +5156,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' as const }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true as const }),
@@ -5178,13 +5209,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -5242,13 +5273,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -5287,13 +5318,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply,
@@ -5385,13 +5416,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex' as const,
           profiles: [{ profileId: 'new-codex-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       materializeRuntimeAuthSelection,
       resolveContinuity: async (input: RuntimeAuthSelectionContinuityInput) => {
         expect(input.runtimeAuthSelection).toBe(runtimeAuthSelection);
@@ -5470,13 +5501,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'this test isolates current-credential application',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex' as const,
           profiles: [{ profileId: 'new-codex-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       expectedCredentialRevisionByServiceId: {
         'openai-codex': desiredRevision,
       },
@@ -5561,13 +5592,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex' as const,
           profiles: [{ profileId: 'new-codex-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       runtimeAuthApplyCapabilityResolver: () => ({
         directLiveHotAuth: {
           supportsInTurnApply: true,
@@ -5676,13 +5707,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'dry-run preflight does not perform post-switch verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex' as const,
           profiles: [{ profileId: 'new-codex-profile', status: 'connected' as const }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       materializeRuntimeAuthSelection,
       resolveContinuity,
       restartSession,
@@ -5790,8 +5821,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'dry-run preflight does not perform post-switch verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex' as const,
           profiles: [
             { profileId: 'work', status: 'connected' as const },
@@ -5835,7 +5866,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           createdAt: 1,
           updatedAt: 1,
         }),
-      },
+      }),
       materializeRuntimeAuthSelection,
       resolveContinuity,
       restartSession,
@@ -5901,13 +5932,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'openai-codex',
           profiles: [{ profileId: 'happier', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity,
       restartSession: vi.fn(),
       hotApply: async () => ({ ok: true }),
@@ -5950,13 +5981,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply: async () => ({ ok: false, errorCode: 'hot_apply_failed' }),
@@ -5999,13 +6030,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply: async () => ({ ok: false, errorCode: 'hot_apply_unavailable' }),
@@ -6046,13 +6077,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply: async () => {
@@ -6096,13 +6127,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession,
       hotApply: async () => ({
@@ -6153,13 +6184,13 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async () => ({
+      api: exactProfileHealthApi({
+        profiles: async () => ({
           serviceId: 'anthropic',
           profiles: [{ profileId: 'new-profile', status: 'connected' }],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({
@@ -6212,8 +6243,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async ({ serviceId }) => ({
+      api: exactProfileHealthApi({
+        profiles: async ({ serviceId }) => ({
           serviceId,
           profiles: [
             { profileId: 'new-anthropic', status: 'connected' },
@@ -6221,7 +6252,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           ],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async ({ serviceId }) => (
         serviceId === 'anthropic'
           ? { mode: 'hot_apply' }
@@ -6271,8 +6302,8 @@ describe('switchSessionConnectedServiceAuth', () => {
         reason: 'existing switch fixture does not exercise provider adoption verification',
       },
       getChildren: () => [tracked],
-      api: {
-        listConnectedServiceProfiles: async ({ serviceId }) => ({
+      api: exactProfileHealthApi({
+        profiles: async ({ serviceId }) => ({
           serviceId,
           profiles: [
             { profileId: 'new-anthropic', status: 'connected' },
@@ -6280,7 +6311,7 @@ describe('switchSessionConnectedServiceAuth', () => {
           ],
         }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession: vi.fn(),
       hotApply: async () => ({
@@ -6339,10 +6370,10 @@ describe('switchSessionConnectedServiceAuth', () => {
     const result = await switchSessionConnectedServiceAuth({
       core: createCore(), getChildren: () => [tracked],
       executionPolicy: { allowRestartResume: false, allowContinuation: false, source: 'startup_reconciliation' },
-      api: {
-        listConnectedServiceProfiles: async () => ({ serviceId: 'anthropic', profiles: [{ profileId, status: 'connected' }] }),
+      api: exactProfileHealthApi({
+        profiles: async () => ({ serviceId: 'anthropic', profiles: [{ profileId, status: 'connected' }] }),
         getConnectedServiceAuthGroup: async () => null,
-      },
+      }),
       materializeRuntimeAuthSelection,
       resolveContinuity: async () => ({ mode: 'hot_apply' }),
       restartSession, hotApply, continueAfterRuntimeAuthSwitch, verifyProviderAccountAdoption,

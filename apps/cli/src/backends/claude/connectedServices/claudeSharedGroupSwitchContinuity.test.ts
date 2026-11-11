@@ -99,8 +99,9 @@ describe('Claude shared-group switch continuity', () => {
     });
     const credentials = { token: 'synthetic-account-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } } satisfies Credentials;
     const api = { getConnectedServiceAuthGroup: async () => null,
-      listConnectedServiceProfiles: async () => ({ serviceId: 'claude-subscription' as const,
-      profiles: [{ profileId: 'next', status: 'connected' as const }] }) };
+      readConnectedServiceCredentialHealth: async ({ profileId }: Readonly<{ profileId: string }>) => (profileId === 'next'
+        ? { kind: 'found' as const, status: 'connected' as const, health: null }
+        : { kind: 'not_found' as const }) };
     const result = await switchSessionConnectedServiceAuth({
       dryRun,
       core: createConnectedServiceSessionAuthSwitchCore({ locks: new ConnectedServiceSessionAuthSwitchLockRegistry() }),
@@ -204,10 +205,9 @@ describe('Claude shared-group switch continuity', () => {
         credentialRevision: NEW_CREDENTIAL_REVISION,
       }),
       getConnectedServiceCredentialSealed: async () => null,
-      listConnectedServiceProfiles: async () => ({
-        serviceId: 'claude-subscription' as const,
-        profiles: [{ profileId: 'lb_bat', status: 'connected' as const }],
-      }),
+      readConnectedServiceCredentialHealth: async ({ profileId }: Readonly<{ profileId: string }>) => (profileId === 'lb_bat'
+        ? { kind: 'found' as const, status: 'connected' as const, health: null }
+        : { kind: 'not_found' as const }),
       getConnectedServiceAuthGroup: async () => ({
         v: 1 as const,
         serviceId: 'claude-subscription' as const,

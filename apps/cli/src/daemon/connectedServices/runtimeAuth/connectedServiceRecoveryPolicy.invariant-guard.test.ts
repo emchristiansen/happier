@@ -156,9 +156,10 @@ describe('connected service recovery invariant guard', () => {
         createdAt: 1,
         updatedAt: 1,
       })),
-      listConnectedServiceProfiles: vi.fn(async () => ({
-        serviceId: 'openai-codex',
-        profiles: [{ profileId: 'primary', status: 'needs_reauth' as const }],
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({
+        kind: 'found' as const,
+        status: 'needs_reauth' as const,
+        health: null,
       })),
     } as unknown as ApiClient;
     const credentials: Credentials = {

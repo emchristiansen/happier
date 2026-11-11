@@ -9,12 +9,17 @@ import {
   ConnectedServiceAuthGroupErrorResponseV1Schema,
   ConnectedServiceAuthGroupListResponseV1Schema,
   ConnectedServiceAuthGroupResponseV1Schema,
+  ConnectedServiceCredentialHealthStatusV1Schema,
+  ConnectedServiceCredentialHealthV1Schema,
   ConnectedServiceCredentialRecordV1Schema,
   SealedConnectedServiceCredentialV1Schema,
   StoredJsonContentEnvelopeSchema,
   assertConnectedServiceCredentialRecordBinding,
+  lazySchema,
   readConnectedServiceCredentialRevisionBoundaryV1,
   type ConnectedServiceAuthGroupV1,
+  type ConnectedServiceCredentialHealthStatusV1,
+  type ConnectedServiceCredentialHealthV1,
   type ConnectedServiceCredentialRecordV1,
   type ConnectedServiceCredentialRevisionBoundaryV1,
   type ConnectedServiceId,
@@ -64,6 +69,40 @@ export class ConnectedServiceCredentialUnsupportedFormatError extends Error {
   }
 }
 
+export const connectedServiceCredentialHealthReadUnavailableCode = 'connected_service_credential_health_read_unavailable';
+
+/**
+ * The server has no exact-profile credential-health read (an older server, or connected services
+ * disabled). Callers fail closed on it: the service-wide profile list is not a substitute, because
+ * reading it exposes every other profile of the service.
+ */
+export class ConnectedServiceCredentialHealthReadUnavailableError extends Error {
+  readonly code = connectedServiceCredentialHealthReadUnavailableCode;
+  readonly serviceId: ConnectedServiceId;
+  readonly profileId: string;
+
+  constructor(serviceId: ConnectedServiceId, profileId: string) {
+    super(`The Happier server cannot read one connected-service profile's credential health (${serviceId}/${profileId}). Update the server.`);
+    this.name = 'ConnectedServiceCredentialHealthReadUnavailableError';
+    this.serviceId = serviceId;
+    this.profileId = profileId;
+  }
+}
+
+/**
+ * One profile's canonical credential status and stored health. A stored health shape this client
+ * does not know (a newer server may add a failure kind) never hides the status: it is reported as
+ * `healthUnrecognised` instead of a health value.
+ */
+export type ConnectedServiceCredentialHealthRead =
+  | Readonly<{
+    kind: 'found';
+    status: ConnectedServiceCredentialHealthStatusV1;
+    health: ConnectedServiceCredentialHealthV1 | null;
+    healthUnrecognised?: true;
+  }>
+  | Readonly<{ kind: 'not_found' }>;
+
 /**
  * The compatible credential responses below adapt exact server-v0.2.1 at
  * 4913c1e533c872a0712ba1c25b3104fd470aacc2, which omitted credential revisions.
@@ -100,6 +139,15 @@ export type ConnectedServiceCredentialApi = Readonly<{
     profileId: string;
     signal?: AbortSignal;
   }) => Promise<ConnectedServiceCredentialPlainResponse | null>;
+}>;
+
+/** Exact-key credential-health read for one selected profile; never lists the service's profiles. */
+export type ConnectedServiceCredentialHealthApi = Readonly<{
+  readConnectedServiceCredentialHealth: (params: {
+    serviceId: ConnectedServiceId;
+    profileId: string;
+    signal?: AbortSignal;
+  }) => Promise<ConnectedServiceCredentialHealthRead>;
 }>;
 
 export type ConnectedServiceAuthGroupApi = Readonly<{
@@ -152,7 +200,7 @@ function createCausePreservingError(message: string, cause: unknown): Error {
 
 export function createConnectedServiceCredentialApi(
   credentials: Credentials,
-): ConnectedServiceCredentialApi & ConnectedServiceAuthGroupApi {
+): ConnectedServiceCredentialApi & ConnectedServiceCredentialHealthApi & ConnectedServiceAuthGroupApi {
   const token = credentials.token;
 
   return {
@@ -162,6 +210,7 @@ export function createConnectedServiceCredentialApi(
     }),
     getConnectedServiceCredentialSealed: async (params) => getConnectedServiceCredentialSealed({ token, ...params }),
     getConnectedServiceCredentialPlain: async (params) => getConnectedServiceCredentialPlain({ token, ...params }),
+    readConnectedServiceCredentialHealth: async (params) => readConnectedServiceCredentialHealth({ token, ...params }),
     listConnectedServiceAuthGroups: async (params) => listConnectedServiceAuthGroups({ token, ...params }),
     getConnectedServiceAuthGroup: async (params) => getConnectedServiceAuthGroup({ token, ...params }),
   };
@@ -197,6 +246,68 @@ export async function getAccountEncryptionMode(params: Readonly<{
       error,
     });
     return 'unknown';
+  }
+}
+
+const ConnectedServiceCredentialHealthReadResponseSchema = lazySchema(() => z.object({
+  profileId: z.string(),
+  status: ConnectedServiceCredentialHealthStatusV1Schema,
+  health: z.unknown(),
+}));
+
+/**
+ * Reads one profile's credential health through the exact-profile route, which the server keys
+ * by (account, service, profile) before reading any row. 404 with the route's own
+ * `connect_credential_not_found` is an absent profile; any other 404 means the server has no
+ * such route and raises {@link ConnectedServiceCredentialHealthReadUnavailableError}.
+ */
+export async function readConnectedServiceCredentialHealth(params: Readonly<{
+  token: string;
+  serviceId: ConnectedServiceId;
+  profileId: string;
+  signal?: AbortSignal;
+}>): Promise<ConnectedServiceCredentialHealthRead> {
+  const serverUrl = resolveServerHttpBaseUrl();
+  const serviceId = encodeURIComponent(params.serviceId);
+  const profileId = encodeURIComponent(params.profileId);
+
+  try {
+    const response = await axios.get(
+      `${serverUrl}/v3/connect/${serviceId}/profiles/${profileId}/credential/health`,
+      {
+        headers: authHeaders(params.token),
+        timeout: resolveConnectedServicesServerApiTimeoutMs(),
+        signal: params.signal,
+      },
+    );
+    if (response.status !== 200) {
+      throw new Error(`Server returned status ${response.status}`);
+    }
+    const parsed = ConnectedServiceCredentialHealthReadResponseSchema.safeParse(response.data);
+    if (!parsed.success || parsed.data.profileId !== params.profileId) {
+      throw new Error('Invalid connected service credential health response');
+    }
+    if (parsed.data.health === null || parsed.data.health === undefined) {
+      return { kind: 'found', status: parsed.data.status, health: null };
+    }
+    const health = ConnectedServiceCredentialHealthV1Schema.safeParse(parsed.data.health);
+    return health.success
+      ? { kind: 'found', status: parsed.data.status, health: health.data }
+      : { kind: 'found', status: parsed.data.status, health: null, healthUnrecognised: true };
+  } catch (error: unknown) {
+    if (readAxiosStatus(error) === 404) {
+      if (readAxiosErrorCode(error) === 'connect_credential_not_found') return { kind: 'not_found' };
+      throw new ConnectedServiceCredentialHealthReadUnavailableError(params.serviceId, params.profileId);
+    }
+    logServerEndpointFailure({
+      logger,
+      operation: 'Failed to read connected service credential health',
+      error,
+    });
+    throw createCausePreservingError(
+      `Failed to read connected service credential health: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      error,
+    );
   }
 }
 

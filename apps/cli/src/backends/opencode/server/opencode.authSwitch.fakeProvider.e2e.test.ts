@@ -508,13 +508,11 @@ describe('OpenCode auth-switch fake-provider e2e', () => {
       },
       getChildren: () => [tracked],
       api: {
-        listConnectedServiceProfiles: async () => ({
-          serviceId: 'openai-codex',
-          profiles: [
-            { profileId: 'profile-old', status: 'connected' },
-            { profileId: 'profile-new', status: 'connected' },
-          ],
-        }),
+        readConnectedServiceCredentialHealth: async ({ serviceId, profileId }) => (
+          serviceId === 'openai-codex' && (profileId === 'profile-old' || profileId === 'profile-new')
+            ? { kind: 'found', status: 'connected', health: null }
+            : { kind: 'not_found' }
+        ),
         getConnectedServiceAuthGroup: async () => ({
           v: 1,
           serviceId: 'openai-codex',

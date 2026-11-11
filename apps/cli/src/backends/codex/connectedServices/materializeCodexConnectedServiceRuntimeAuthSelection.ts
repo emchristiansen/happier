@@ -69,6 +69,11 @@ export const materializeCodexConnectedServiceRuntimeAuthSelection: ConnectedServ
       recordsByServiceId: new Map([['openai-codex', record.data]]),
       selectionsByServiceId: new Map([['openai-codex', selection]]),
       accountSettings: params.accountSettings, processEnv: params.processEnv,
+      // A switch never produces a source: whoever launched the session (a terminal, or the daemon with
+      // its then-current environment) admitted one, recorded in the session's current home. Respawn
+      // options and the daemon's current environment are not source authority; without a record the
+      // switch is refused.
+      nativeSourceAuthority: 'recorded',
       validateGroupMutationCurrentness: createConnectedServiceGroupMutationCurrentnessValidator({
         api: params.api, credentials: params.credentials,
       }),
