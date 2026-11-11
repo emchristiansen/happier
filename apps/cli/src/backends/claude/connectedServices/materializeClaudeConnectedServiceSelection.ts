@@ -6,10 +6,11 @@ import type {
   ConnectedServiceId,
 } from '@happier-dev/protocol';
 
-import type {
-  ConnectedServiceNativeSourceAuthority,
-  ConnectedServicesMaterializationDiagnostic,
-  ConnectedServicesProviderMaterializerInput,
+import {
+  ConnectedServiceNativeSourceProvenanceError,
+  type ConnectedServiceNativeSourceAuthority,
+  type ConnectedServicesMaterializationDiagnostic,
+  type ConnectedServicesProviderMaterializerInput,
 } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import type { ConnectedServiceResolvedSelection } from '@/daemon/connectedServices/materialize/materializeConnectedServicesForSpawn';
 
@@ -303,8 +304,10 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
           sessionStateMode: params.sessionStateMode,
         });
         const groupNativeSource = await resolveClaudeMemberOrigin(profileSource.nativeSource, profileClaudeConfigDir);
+        // The group home is admitted on its own record, before either home is written. Its record
+        // is read (an invalid one refuses) whatever the member's admission was.
+        const groupProvenance = await readClaudeHomeProvenance(claudeConfigDir);
         if (groupNativeSource) {
-          const groupProvenance = await readClaudeHomeProvenance(claudeConfigDir);
           await assertClaudeHomeSourceAgrees({
             claudeConfigDir,
             provenance: groupProvenance.kind === 'recorded' && isClaudeSelfSource(groupProvenance.source, claudeConfigDir)
@@ -312,6 +315,15 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
               : groupProvenance,
             source: groupNativeSource,
           });
+        } else if (!profileSource.checksSourceScope && groupProvenance.kind === 'absent') {
+          // A credential-only member names no source, so it gives a never-produced group home none to
+          // inherit: that home is refused exactly as its own admission would refuse it.
+          throw new ConnectedServiceNativeSourceProvenanceError(
+            'connected_service_native_source_unrecorded',
+            claudeConfigDir,
+            `Claude connected-service group home ${claudeConfigDir} records no admitted native source and its `
+              + 'member home records none to inherit; refusing to produce it',
+          );
         }
         const profileSourceEnv = profileSource.env;
         const profileSourceViolation = profileSource.checksSourceScope ? await findClaudeConfigurationSourceScopeViolation({
@@ -352,7 +364,11 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
         // A member whose source is unknown (credential-only) leaves the group home credential-only too.
         groupSource = {
           env: { ...params.processEnv, ...canonicalProfileMaterialized.env },
-          originSourceEnv: profileSourceEnv,
+          // The native source behind the member, which the member's retained links point into: for a
+          // member that is its own source, the origin it records rather than the member home.
+          originSourceEnv: groupNativeSource && groupNativeSource !== profileSource.nativeSource
+            ? claudeNativeSourceEnv(groupNativeSource, params.processEnv)
+            : profileSourceEnv,
           nativeSource: groupNativeSource,
           sessionStateMode: profileSource.sessionStateMode,
           checksSourceScope: profileSource.checksSourceScope,

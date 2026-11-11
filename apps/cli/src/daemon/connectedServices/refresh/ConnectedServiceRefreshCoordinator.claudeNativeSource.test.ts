@@ -650,6 +650,46 @@ describe('Claude connected-service homes keep their admitted native source', () 
     await fixture.dispose();
   });
 
+  it('refuses a switch into a malformed group home whose legacy member names no source, before publishing credentials', async () => {
+    const fixture = await createComposedFixture({ profileId: 'claude-group-malformed-primary', sentinelMode: 'readable' });
+    expect((await fixture.directLaunch({ sessionId: 'session-claude-group-malformed', source: fixture.callerSource })).launched.kind).toBe('applied');
+    const groupHome = await produceGroup(fixture, 'claude-group-malformed', 'claude-group-malformed-member', fixture.callerSource);
+    const member = profileHome('claude-group-malformed-member');
+    const { nativeSourceEnv: _recorded, ...legacy } = await readConnectedServiceStateSharingManifest(member);
+    await writeConnectedServiceStateSharingManifest(member, legacy);
+    await writeFile(join(groupHome, DEFAULT_MANIFEST_NAME), 'malformed');
+    const before = {
+      group: await readFile(join(groupHome, '.credentials.json'), 'utf8'),
+      member: await readFile(join(member, '.credentials.json'), 'utf8'),
+    };
+
+    const switched = await switchToGroup(fixture, 'claude-group-malformed', 'claude-group-malformed-member');
+    expect(switched).toMatchObject({ kind: 'failed', error: { code: 'connected_service_native_source_invalid' } });
+    expect({
+      group: await readFile(join(groupHome, '.credentials.json'), 'utf8'),
+      member: await readFile(join(member, '.credentials.json'), 'utf8'),
+    }).toEqual(before);
+    await fixture.dispose();
+  });
+
+  it('control: a legacy member into a legacy group home switches credential-only, keeping its links', async () => {
+    const fixture = await createComposedFixture({ profileId: 'claude-group-legacy-primary', sentinelMode: 'readable' });
+    expect((await fixture.directLaunch({ sessionId: 'session-claude-group-legacy', source: fixture.callerSource })).launched.kind).toBe('applied');
+    const groupHome = await produceGroup(fixture, 'claude-group-legacy', 'claude-group-legacy-member', fixture.callerSource);
+    for (const home of [profileHome('claude-group-legacy-member'), groupHome]) {
+      const { nativeSourceEnv: _recorded, ...legacy } = await readConnectedServiceStateSharingManifest(home);
+      await writeConnectedServiceStateSharingManifest(home, legacy);
+    }
+
+    const switched = await switchToGroup(fixture, 'claude-group-legacy', 'claude-group-legacy-member');
+    expect(switched).toMatchObject({ kind: 'applied' });
+    expect(await mcpServerNames(groupHome)).toEqual(['caller-mcp']);
+    expect((await readConnectedServiceStateSharingManifest(groupHome)).nativeSourceEnv).toBeUndefined();
+    expect(JSON.parse(await readFile(join(groupHome, '.credentials.json'), 'utf8')).claudeAiOauth.accessToken)
+      .toBe('claude-group-legacy-access-2');
+    await fixture.dispose();
+  });
+
   it('switches a session into an existing group produced from its own source', async () => {
     const fixture = await createComposedFixture({ profileId: 'claude-group-same-primary', sentinelMode: 'readable' });
     expect((await fixture.directLaunch({ sessionId: 'session-claude-group-same', source: fixture.callerSource })).launched.kind).toBe('applied');

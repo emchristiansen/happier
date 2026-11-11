@@ -13,6 +13,14 @@ import { parseConnectArgs, type ConnectParsedOptions } from './connect/parseConn
 import { formatConnectStatusLines, type ConnectStatusServiceListing, type ConnectStatusVendor } from './connect/formatConnectStatus';
 import { resolveConnectAuthIntent } from './connect/resolveConnectAuthIntent';
 import { resolveConnectTargetServiceIds } from './connect/resolveConnectTargetServiceIds';
+import {
+  CONNECT_QUOTA_SUBCOMMANDS,
+  connectQuotaExitCode,
+  formatConnectQuotaResultJson,
+  formatConnectQuotaResultLines,
+  parseConnectQuotaArgs,
+  runConnectQuotaOperation,
+} from './connect/connectQuotaRefresh';
 import { storeConnectedServiceCredentialForAccount } from '@/cloud/connectedServices/storeConnectedServiceCredentialForAccount';
 import { runConnectedServiceImport } from '@/cloud/connectedServices/connectedServiceImport';
 import { observeServerFeaturesSnapshot } from '@/features/serverFeaturesClient';
@@ -28,6 +36,12 @@ import { fail, info, neutral, ok, sectionTitle, warn } from '@happier-dev/cli-co
  * - connect gemini: Store Gemini OAuth (gemini)
  */
 export async function handleConnectCommand(args: string[]): Promise<void> {
+    const quotaSubcommand = args[0]?.toLowerCase();
+    if (quotaSubcommand !== undefined && Object.hasOwn(CONNECT_QUOTA_SUBCOMMANDS, quotaSubcommand)) {
+      await handleConnectQuota(quotaSubcommand, args.slice(1));
+      return;
+    }
+
     const { includeExperimental, subcommand, profileFlag, options } = parseConnectArgs(args);
 
     const allTargets = await loadConnectTargets({ includeExperimental: true });
@@ -93,6 +107,10 @@ ${chalk.bold('Usage:')}
 ${targetLines}
   happier connect status       Show every stored profile and its health, per vendor
   happier connect status --profile <id>        Show only profiles with this id
+  happier connect quota-refresh --service <id> --profile <id> [--json]
+                               Ask the refresher to fetch this profile's quota now
+  happier connect quota-status --service <id> --profile <id> [--json]
+                               Show whether that request is pending, fetched or failed
   happier connect help         Show this help message
   happier connect --all ...    Include experimental providers
   happier connect <target> --profile <id>      Store under a specific profile (default: default)
@@ -295,6 +313,26 @@ async function handleConnectStatus(
     console.log(chalk.gray('To connect a vendor, run: happier connect <vendor>'));
     console.log(chalk.gray('Example: happier connect gemini'));
     console.log('');
+}
+
+/**
+ * Request or observe the quota refresh of one exact profile; see `connectQuotaRefresh.ts`. The exit
+ * status is 0 when a state was reported (whatever the state) and 2 when the request was refused or
+ * the refresh route answered `connect_quotas_not_found`.
+ */
+async function handleConnectQuota(subcommand: string, args: ReadonlyArray<string>): Promise<void> {
+    const parsed = parseConnectQuotaArgs(subcommand, args);
+    const credentials = await readCredentials();
+    if (!credentials) {
+        console.error(warn('Not authenticated with Happier'));
+        console.error(chalk.gray('  Please run "happier auth login" first'));
+        process.exit(1);
+    }
+    const api = await ApiClient.create(credentials);
+    const result = await runConnectQuotaOperation(api, parsed);
+    const lines = parsed.json ? [formatConnectQuotaResultJson(parsed, result)] : formatConnectQuotaResultLines(parsed, result);
+    for (const line of lines) console.log(line);
+    process.exit(connectQuotaExitCode(result));
 }
 
 export async function handleConnectCliCommand(context: CommandContext): Promise<void> {

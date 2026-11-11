@@ -3621,31 +3621,33 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
               let sessionAttachPayload: import('@/agent/runtime/sessionAttachPayload').SessionAttachFilePayload | null = null;
               let existingSessionPersistedMetadata: Record<string, unknown> | null = null;
-              // The daemon's own authenticated read of the resumed session; a caller-supplied attach
-              // payload is not one.
+              // The daemon's own authenticated read of the resumed session. It is made for every
+              // existing session, so the session's persisted options, materialization identity and
+              // connected-service source authority always come from it. A caller-supplied attach
+              // payload only names the attach file; it is never that read and never skips it.
               let existingSessionAttachContext: ExistingSessionAttachContext | null = null;
               if (normalizedExistingSessionId) {
+                const storedCredentials = await readCredentials().catch(() => null);
+                const effectiveCredentials = storedCredentials ?? credentials;
+                const tokenForFetch = effectiveCredentials?.token ?? '';
+
+                const attachContext = await resolveExistingSessionAttachContext({
+                  token: tokenForFetch,
+                  sessionId: normalizedExistingSessionId,
+                  backendTarget: backendTarget ?? { kind: 'builtInAgent', agentId: catalogAgentId },
+                  credentials: effectiveCredentials,
+                });
+
+                if (!attachContext.ok) {
+                  return mapExistingSessionAttachFailureToSpawnError(attachContext.reason);
+                }
+
+                existingSessionAttachContext = attachContext;
+                existingSessionPersistedMetadata = attachContext.metadata;
                 if (existingSessionAttachPayload) {
                   sessionAttachPayload = existingSessionAttachPayload;
                 } else {
-                  const storedCredentials = await readCredentials().catch(() => null);
-                  const effectiveCredentials = storedCredentials ?? credentials;
-                  const tokenForFetch = effectiveCredentials?.token ?? '';
-
-                  const attachContext = await resolveExistingSessionAttachContext({
-                    token: tokenForFetch,
-                    sessionId: normalizedExistingSessionId,
-                    backendTarget: backendTarget ?? { kind: 'builtInAgent', agentId: catalogAgentId },
-                    credentials: effectiveCredentials,
-                  });
-
-                  if (!attachContext.ok) {
-                    return mapExistingSessionAttachFailureToSpawnError(attachContext.reason);
-                  }
-
                   sessionAttachPayload = attachContext.attachPayload;
-                  existingSessionAttachContext = attachContext;
-                  existingSessionPersistedMetadata = attachContext.metadata;
                   if (!effectiveResume) {
                     const derivedResume = typeof attachContext.vendorResumeId === 'string' ? attachContext.vendorResumeId.trim() : '';
                     if (derivedResume) {

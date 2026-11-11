@@ -216,11 +216,22 @@ export function createConnectedServiceCredentialApi(
   };
 }
 
-export async function getAccountEncryptionMode(params: Readonly<{
+/**
+ * What the server said about the account's encryption mode: `confirmed` only for a well-formed 200
+ * answer; `endpoint_absent` for a 404 (servers predating the endpoint, whose accounts were all
+ * end-to-end encrypted, answer that way, as does any server without the route); `unknown` for
+ * anything else.
+ */
+type AccountEncryptionModeRead =
+  | Readonly<{ kind: 'confirmed'; mode: 'e2ee' | 'plain' }>
+  | Readonly<{ kind: 'endpoint_absent' }>
+  | Readonly<{ kind: 'unknown' }>;
+
+async function readAccountEncryptionMode(params: Readonly<{
   token: string;
   signal?: AbortSignal;
   timeoutMs?: number;
-}>): Promise<'e2ee' | 'plain' | 'unknown'> {
+}>): Promise<AccountEncryptionModeRead> {
   const serverUrl = resolveServerHttpBaseUrl();
   try {
     const response = await axios.get(
@@ -231,22 +242,50 @@ export async function getAccountEncryptionMode(params: Readonly<{
         signal: params.signal,
       },
     );
-    if (response.status === 404) return 'e2ee';
-    if (response.status !== 200) return 'unknown';
+    if (response.status === 404) return { kind: 'endpoint_absent' };
+    if (response.status !== 200) return { kind: 'unknown' };
     const parsed = AccountEncryptionModeResponseSchema.safeParse(response.data);
-    if (!parsed.success) return 'unknown';
-    return parsed.data.mode === 'plain' ? 'plain' : 'e2ee';
+    if (!parsed.success) return { kind: 'unknown' };
+    return { kind: 'confirmed', mode: parsed.data.mode === 'plain' ? 'plain' : 'e2ee' };
   } catch (error: unknown) {
     throwConnectedServiceGroupGenerationConflictIfPresent(error);
     const status = readAxiosStatus(error);
-    if (status === 404) return 'e2ee';
+    if (status === 404) return { kind: 'endpoint_absent' };
     logServerEndpointFailure({
       logger,
       operation: 'Failed to get account encryption mode',
       error,
     });
-    return 'unknown';
+    return { kind: 'unknown' };
   }
+}
+
+/**
+ * The account's encryption mode for compatibility readers: an absent endpoint is taken as `e2ee`,
+ * the mode of every account on servers that predate it.
+ */
+export async function getAccountEncryptionMode(params: Readonly<{
+  token: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}>): Promise<'e2ee' | 'plain' | 'unknown'> {
+  const read = await readAccountEncryptionMode(params);
+  if (read.kind === 'confirmed') return read.mode;
+  return read.kind === 'endpoint_absent' ? 'e2ee' : 'unknown';
+}
+
+/**
+ * The account's encryption mode only as the server stated it. Any 404 is `unknown`: it cannot tell an
+ * old e2ee-only server from a server without the route, so an operation that writes through a
+ * mode-specific route must not guess.
+ */
+export async function getConfirmedAccountEncryptionMode(params: Readonly<{
+  token: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}>): Promise<'e2ee' | 'plain' | 'unknown'> {
+  const read = await readAccountEncryptionMode(params);
+  return read.kind === 'confirmed' ? read.mode : 'unknown';
 }
 
 const ConnectedServiceCredentialHealthReadResponseSchema = lazySchema(() => z.object({

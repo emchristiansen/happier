@@ -5729,15 +5729,17 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
   });
 
-  it('spawns an existing session without re-fetching its attach payload when it was pre-resolved', async () => {
+  it('uses a pre-resolved attach payload as the attach file, still reading the session itself', async () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     const refreshEnvOriginal = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
     process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = 'false';
     vi.mocked(waitForSessionWebhook).mockImplementationOnce((params) => completeReportedSession(params, 'sess-pre-resolved-1'));
-    vi.mocked(fetchSessionByIdCompat).mockRejectedValue(new Error('fetch should not be needed when the attach payload is pre-resolved'));
+    vi.mocked(fetchSessionByIdCompat).mockClear();
+    const { createSessionAttachFile } = await import('./sessionAttachFile');
+    vi.mocked(createSessionAttachFile).mockClear();
+    const suppliedPayload = { v: 2, encryptionMode: 'plain', lastObservedMessageSeq: 7 } as const;
 
     let run: Promise<void> | null = null;
-    let shutdownRequested = false;
     try {
       const { startDaemon } = await import('./startDaemon');
       run = startDaemon();
@@ -5750,7 +5752,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
           directory: '/tmp/workspace-pre-resolved',
           backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
           existingSessionId: 'sess-pre-resolved-1',
-          existingSessionAttachPayload: { v: 2, encryptionMode: 'plain' } as any,
+          existingSessionAttachPayload: suppliedPayload as any,
         }),
       ).resolves.toEqual({
         type: 'success',
@@ -5758,7 +5760,9 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         runnerAcceptance: 'newly_accepted',
       });
 
-      expect(fetchSessionByIdCompat).not.toHaveBeenCalled();
+      // The daemon's own authenticated read still happens; the supplied payload is the attach file.
+      expect(vi.mocked(fetchSessionByIdCompat).mock.calls.map(([params]) => params.sessionId)).toContain('sess-pre-resolved-1');
+      expect(vi.mocked(createSessionAttachFile).mock.calls.at(-1)?.[0]).toMatchObject({ payload: suppliedPayload });
       expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
       expect(spawnHappyCLI.mock.calls[0]?.[0]).toEqual(
         expect.arrayContaining([
@@ -5771,6 +5775,42 @@ describe('startDaemon spawn resume wiring (integration)', () => {
           'sess-pre-resolved-1',
         ]),
       );
+
+      harness.requestShutdown('happier-cli');
+      await run;
+    } finally {
+      if (refreshEnvOriginal === undefined) {
+        delete process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
+      } else {
+        process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = refreshEnvOriginal;
+      }
+      await restoreDaemonExitBoundary(exitSpy);
+    }
+  });
+
+  it('refuses a pre-resolved attach payload when the daemon cannot read the session itself', async () => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const refreshEnvOriginal = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
+    process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = 'false';
+    vi.mocked(fetchSessionByIdCompat).mockResolvedValueOnce(null as any);
+
+    let run: Promise<void> | null = null;
+    try {
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const spawnSession = await waitForSpawnSessionRegistration();
+
+      await expect(
+        spawnSession({
+          directory: '/tmp/workspace-pre-resolved-unreadable',
+          backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+          existingSessionId: 'sess-pre-resolved-unreadable',
+          existingSessionAttachPayload: { v: 2, encryptionMode: 'plain' } as any,
+        }),
+      ).resolves.toMatchObject({ type: 'error' });
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
 
       harness.requestShutdown('happier-cli');
       await run;
@@ -9077,6 +9117,131 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = refreshEnvOriginal;
       }
       await restoreDaemonExitBoundary(exitSpy);
+    }
+  });
+
+  // An existing session's connected-service source authority and materialization identity come only
+  // from the daemon's own authenticated read of that session, whether or not the request carries a
+  // pre-resolved attach payload. Real direct producer, spawn resolver and Claude materializer on
+  // synthetic homes; the session read and process launch are the file's fixture substitutes.
+  it.each([
+    { label: 'ordinary continuation keeps source A under daemon B', supplied: false, otherIdentity: false, fresh: false },
+    { label: 'pre-resolved attach payload continuation keeps source A under daemon B', supplied: true, otherIdentity: false, fresh: false },
+    { label: 'pre-resolved attach payload cannot materialize under a different identity', supplied: true, otherIdentity: true, fresh: false },
+    { label: 'ordinary different identity is normalized to the persisted one', supplied: false, otherIdentity: true, fresh: false },
+    { label: 'a fresh daemon-B caller into source A\'s home conflicts', supplied: false, otherIdentity: false, fresh: true },
+  ])('connected-service continuation authority: $label', async ({ supplied, otherIdentity, fresh }) => {
+    const { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } = await import('@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialScopes');
+    if (ORIGINAL_PLATFORM_DESCRIPTOR) Object.defineProperty(process, 'platform', ORIGINAL_PLATFORM_DESCRIPTOR);
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const originalEnv = {
+      HOME: process.env.HOME,
+      CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+      REFRESH: process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED,
+    };
+    process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = 'false';
+    let run: Promise<void> | null = null;
+    const root = await mkdtemp(join(tmpdir(), 'happier-continuation-authority-'));
+    const { buildConnectedServiceCredentialRecord } = await import('@happier-dev/protocol');
+    const { createConnectedServiceMaterializationIdentity } = await import('./connectedServices/materialize/createConnectedServiceMaterializationIdentity');
+    const { resolveDirectConnectedServiceEnvironment } = await import('@/cli/connectedServices/resolveDirectConnectedServiceEnvironment');
+    const resolver = await vi.importActual<typeof import('./connectedServices/resolveConnectedServiceAuthForSpawn')>('./connectedServices/resolveConnectedServiceAuthForSpawn');
+    const { ApiClient } = await import('@/api/api');
+    const identity = createConnectedServiceMaterializationIdentity();
+    const requestedIdentity = otherIdentity ? createConnectedServiceMaterializationIdentity() : identity;
+    const profileId = `p-${randomUUID()}`;
+    const bindings = { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'profile', profileId } } } as const;
+    const settings = accountSettingsParse({
+      connectedServicesProviderStateSharingSettingsV1: { v: 1, defaults: { configMode: 'linked', stateMode: 'isolated' }, byAgentId: {} },
+    });
+    const sourceA = join(root, 'A');
+    const sourceB = join(root, 'B');
+    for (const [source, name] of [[sourceA, 'A'], [sourceB, 'B']] as const) {
+      await mkdir(join(source, 'projects'), { recursive: true });
+      await writeFile(join(source, 'settings.json'), JSON.stringify({ mcpServers: { [name]: { command: `/${name}` } } }));
+    }
+    let currentToken = 'before';
+    const api = {
+      machineSyncClient: () => harness.apiMachine,
+      getAccountEncryptionMode: async () => 'plain',
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found', status: 'connected', health: null })),
+      getConnectedServiceCredentialPlain: vi.fn(async () => ({
+        revisionSemantics: 'revisioned',
+        credentialRevision: `csr_${'a'.repeat(22)}`,
+        content: { t: 'plain', v: buildConnectedServiceCredentialRecord({
+          now: Date.now(), serviceId: 'claude-subscription', profileId, kind: 'oauth', expiresAt: Date.now() + 3_600_000,
+          oauth: { accessToken: currentToken, refreshToken: 'refresh', idToken: null, scope: CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE, tokenType: 'Bearer', providerAccountId: 'acct', providerEmail: null },
+        }) },
+      })),
+      getConnectedServiceCredentialSealed: async () => null,
+      updateConnectedServiceCredentialHealth: vi.fn(async () => {}),
+    };
+    vi.mocked(ApiClient.create).mockResolvedValue(api as any);
+    resolveConnectedServiceAuthForSpawnMock.mockReset();
+    const boundaries: Array<{ nativeSourceKind: string; identityId: string | undefined }> = [];
+    resolveConnectedServiceAuthForSpawnMock.mockImplementation((async (input: any) => {
+      boundaries.push({ nativeSourceKind: input.nativeSource?.kind, identityId: input.connectedServiceMaterializationIdentityV1?.id });
+      return await resolver.resolveConnectedServiceAuthForSpawn(input);
+    }) as any);
+    setActiveAccountSettingsSnapshot({ source: 'network', settingsVersion: 1, loadedAtMs: Date.now(), settingsSecretsReadKeys: [], settings });
+    vi.mocked(fetchSessionByIdCompat).mockClear();
+    vi.mocked(fetchSessionByIdCompat).mockResolvedValue(createSessionRecordFixture({
+      id: 'sess_plain', active: false, encryptionMode: 'plain', dataEncryptionKey: null,
+      metadata: JSON.stringify({ flavor: 'claude', path: root, connectedServices: bindings, connectedServiceMaterializationIdentityV1: identity }),
+    }));
+    try {
+      process.env.HOME = root;
+      process.env.CLAUDE_CONFIG_DIR = sourceA;
+      const direct = await resolveDirectConnectedServiceEnvironment({
+        agentId: 'claude', directory: root, sessionId: 'sess_plain',
+        credentials: { token: 'synthetic', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) } },
+        accountSettings: settings, connectedServices: bindings,
+        sessionMetadata: { connectedServiceMaterializationIdentityV1: identity },
+      });
+      const producedHome = direct!.env.CLAUDE_CONFIG_DIR!;
+      const before = await readFile(join(producedHome, '.credentials.json'), 'utf8');
+      // Observe only the daemon's spawn resolution, not the direct production above.
+      boundaries.length = 0;
+      currentToken = 'after';
+      // The different-identity cases keep the daemon on source A, so only identity qualification can refuse them.
+      process.env.CLAUDE_CONFIG_DIR = otherIdentity ? sourceA : sourceB;
+      run = daemonStartupOwner.startDaemon();
+      const spawnSession = await harness.waitForSpawnSessionRegistration();
+      const result = await spawnSession({
+        directory: root,
+        backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+        connectedServices: bindings,
+        connectedServiceMaterializationIdentityV1: requestedIdentity,
+        ...(!fresh ? { existingSessionId: 'sess_plain' } : {}),
+        ...(supplied ? { existingSessionAttachPayload: { v: 2, encryptionMode: 'plain' } } : {}),
+        token: 't',
+      } as any);
+      const after = await readFile(join(producedHome, '.credentials.json'), 'utf8');
+      const homeSettings = JSON.parse(await readFile(join(producedHome, 'settings.json'), 'utf8'));
+      if (fresh) {
+        expect(result.type).toBe('error');
+        expect(after).toBe(before);
+        expect(boundaries.map((boundary) => boundary.nativeSourceKind)).toEqual(['new_caller']);
+      } else {
+        expect(result.type).toBe('success');
+        expect(vi.mocked(fetchSessionByIdCompat).mock.calls.length).toBeGreaterThan(0);
+        expect(boundaries.length).toBeGreaterThan(0);
+        for (const boundary of boundaries) {
+          expect(boundary).toEqual({ nativeSourceKind: 'session_continuation', identityId: identity.id });
+        }
+        expect(homeSettings.mcpServers).toEqual({ A: { command: '/A' } });
+        expect(after).not.toBe(before);
+      }
+    } finally {
+      if (run) {
+        harness.requestShutdown('happier-cli');
+        await run.catch(() => {});
+      }
+      for (const [key, value] of [['HOME', originalEnv.HOME], ['CLAUDE_CONFIG_DIR', originalEnv.CLAUDE_CONFIG_DIR], ['HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED', originalEnv.REFRESH]] as const) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      await restoreDaemonExitBoundary(exitSpy);
+      await rm(root, { recursive: true, force: true });
     }
   });
 
