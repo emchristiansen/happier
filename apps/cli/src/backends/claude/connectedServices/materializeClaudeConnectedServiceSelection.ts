@@ -6,13 +6,25 @@ import type {
   ConnectedServiceId,
 } from '@happier-dev/protocol';
 
-import type { ConnectedServicesMaterializationDiagnostic } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
-import type { ConnectedServicesProviderMaterializerInput } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
+import type {
+  ConnectedServiceNativeSourceAuthority,
+  ConnectedServicesMaterializationDiagnostic,
+  ConnectedServicesProviderMaterializerInput,
+} from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import type { ConnectedServiceResolvedSelection } from '@/daemon/connectedServices/materialize/materializeConnectedServicesForSpawn';
 
 import { resolveClaudeConfigDirOverride } from '@/backends/claude/utils/resolveClaudeConfigDirOverride';
 import { resolveConfiguredClaudeConfigDir } from '@/backends/claude/utils/resolveConfiguredClaudeConfigDir';
 import { findClaudeConfigurationSourceScopeViolation, isPathWithinDirectory } from './claudeConfigurationSourceScope';
+import {
+  admitClaudeNativeSource,
+  assertClaudeHomeSourceAgrees,
+  claudeNativeSourceEnv,
+  claudeNativeSourceFromEnv,
+  isClaudeSelfSource,
+  readClaudeHomeProvenance,
+  type ClaudeAdmittedNativeSource,
+} from './claudeHomeNativeSource';
 import { materializeClaudeAnthropicApiKeyAuth } from './materializeClaudeAnthropicApiKeyAuth';
 import {
   materializeClaudeSubscriptionNativeAuthHome,
@@ -68,6 +80,72 @@ function sourceScopeRefusal(params: Readonly<{
     env: { CLAUDE_CONFIG_DIR: params.claudeConfigDir },
     targetMaterializedRoot: params.claudeConfigDir,
     diagnostics: [params.diagnostic],
+  };
+}
+
+/**
+ * The native source a group home takes through its member home: the member's admitted source or, for
+ * a member that is its own source, the origin the member records (else the member home itself). A
+ * member's recorded origin is never dropped when the member becomes another home's content.
+ */
+async function resolveClaudeMemberOrigin(
+  memberSource: ClaudeAdmittedNativeSource | undefined,
+  memberClaudeConfigDir: string,
+): Promise<ClaudeAdmittedNativeSource | undefined> {
+  if (!memberSource || !isClaudeSelfSource(memberSource, memberClaudeConfigDir)) return memberSource;
+  const provenance = await readClaudeHomeProvenance(memberClaudeConfigDir);
+  return provenance.kind === 'recorded' && !isClaudeSelfSource(provenance.source, memberClaudeConfigDir)
+    ? provenance.source
+    : memberSource;
+}
+
+type AdmittedClaudeSource = Readonly<{
+  /** The environment the materialization reads its source through. */
+  env: NodeJS.ProcessEnv;
+  /** The admitted native source, recorded by the sync; absent when nothing is read. */
+  nativeSource?: ClaudeAdmittedNativeSource;
+  /**
+   * `existing` when only credentials may be published: a requested credential-only handoff, or a
+   * rematerialization of a home whose source was never recorded (nothing is read, linked or recorded).
+   */
+  sessionStateMode?: 'existing';
+  /** Whether the source scope check applies (it is skipped only when admission reads nothing). */
+  checksSourceScope: boolean;
+}>;
+
+/**
+ * Admits the source a home is materialized from (`admitClaudeNativeSource`) before any scope check,
+ * lock or read. `requestedEnv` is the caller's own source, used only under `caller_env`. A requested
+ * credential-only handoff (`existing`) keeps its existing behavior and admits nothing.
+ */
+async function admitClaudeSource(params: Readonly<{
+  nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
+  claudeConfigDir: string;
+  previousClaudeConfigDir: string | null;
+  requestedEnv: NodeJS.ProcessEnv;
+  processEnv: NodeJS.ProcessEnv;
+  sessionStateMode?: 'existing';
+}>): Promise<AdmittedClaudeSource> {
+  if (params.sessionStateMode === 'existing') {
+    return { env: params.requestedEnv, sessionStateMode: 'existing', checksSourceScope: true };
+  }
+  const admission = await admitClaudeNativeSource({
+    nativeSourceAuthority: params.nativeSourceAuthority,
+    claudeConfigDir: params.claudeConfigDir,
+    previousClaudeConfigDir: params.previousClaudeConfigDir,
+    requested: claudeNativeSourceFromEnv(params.requestedEnv),
+  });
+  if (admission.kind === 'credential_only') {
+    return {
+      env: { ...withoutClaudeConfigDirOverrides(params.processEnv), CLAUDE_CONFIG_DIR: params.claudeConfigDir },
+      sessionStateMode: 'existing',
+      checksSourceScope: false,
+    };
+  }
+  return {
+    env: claudeNativeSourceEnv(admission.source, params.processEnv),
+    nativeSource: admission.source,
+    checksSourceScope: true,
   };
 }
 
@@ -161,6 +239,13 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
   fallbackProfileId: string;
   selection?: ConnectedServiceResolvedSelection | null | undefined;
   processEnv: NodeJS.ProcessEnv;
+  /**
+   * Who may name the native source: the producing caller's `processEnv`, or only the home's record
+   * (rematerialization and account switch; `processEnv` is then never a source).
+   */
+  nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
+  /** The session's current home, whose record a never-produced home inherits under `recorded`. */
+  previousClaudeConfigDir?: string | null;
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   sessionDirectory?: string | null;
   vendorResumeId?: string | null;
@@ -181,7 +266,7 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
       fallbackProfileId: params.fallbackProfileId,
       selection: params.selection ?? null,
     });
-    let groupSource: Readonly<{ env: NodeJS.ProcessEnv; originSourceEnv: NodeJS.ProcessEnv }> | null = null;
+    let groupSource: (AdmittedClaudeSource & Readonly<{ originSourceEnv: NodeJS.ProcessEnv }>) | null = null;
     let groupSourceDiagnostics: readonly ConnectedServicesMaterializationDiagnostic[] = [];
     if (selectionDescriptor.kind === 'group' && !params.probeConfigDir) {
       const profileClaudeConfigDir = resolveClaudeConnectedServiceStableConfigDir({
@@ -201,18 +286,41 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
           serviceId: 'claude-subscription' as const,
           profileId: selectionDescriptor.activeProfileId,
         };
-        const profileSourceEnv = resolveClaudeConfigurationSourceEnv({
-          activeServerDir: params.activeServerDir,
+        // The canonical member home carries the group's native source. A member home not yet produced
+        // (a new active member) inherits the session's previous home when the caller names one (a
+        // switch), else the group home's record. The group home must agree before either home is
+        // read or written.
+        const profileSource = await admitClaudeSource({
+          nativeSourceAuthority: params.nativeSourceAuthority,
+          claudeConfigDir: profileClaudeConfigDir,
+          previousClaudeConfigDir: params.previousClaudeConfigDir ?? claudeConfigDir,
+          requestedEnv: resolveClaudeConfigurationSourceEnv({
+            activeServerDir: params.activeServerDir,
+            processEnv: params.processEnv,
+            targetClaudeConfigDir: profileClaudeConfigDir,
+          }),
           processEnv: params.processEnv,
-          targetClaudeConfigDir: profileClaudeConfigDir,
+          sessionStateMode: params.sessionStateMode,
         });
-        const profileSourceViolation = await findClaudeConfigurationSourceScopeViolation({
+        const groupNativeSource = await resolveClaudeMemberOrigin(profileSource.nativeSource, profileClaudeConfigDir);
+        if (groupNativeSource) {
+          const groupProvenance = await readClaudeHomeProvenance(claudeConfigDir);
+          await assertClaudeHomeSourceAgrees({
+            claudeConfigDir,
+            provenance: groupProvenance.kind === 'recorded' && isClaudeSelfSource(groupProvenance.source, claudeConfigDir)
+              ? null
+              : groupProvenance,
+            source: groupNativeSource,
+          });
+        }
+        const profileSourceEnv = profileSource.env;
+        const profileSourceViolation = profileSource.checksSourceScope ? await findClaudeConfigurationSourceScopeViolation({
           sourceEnv: profileSourceEnv,
           targetDir: profileClaudeConfigDir,
           managedHomesRoot: resolveConnectedServiceManagedHomesRoot(params.activeServerDir),
           permittedManagedHome: null,
           serviceId: params.serviceId,
-        });
+        }) : null;
         if (profileSourceViolation) {
           return sourceScopeRefusal({ claudeConfigDir, diagnostic: profileSourceViolation });
         }
@@ -220,11 +328,12 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
           record: params.record,
           targetClaudeConfigDir: profileClaudeConfigDir,
           sourceEnv: profileSourceEnv,
+          nativeSource: profileSource.nativeSource,
           accountSettings: params.accountSettings ?? null,
           sessionDirectory: params.sessionDirectory ?? null,
           vendorResumeId: params.vendorResumeId ?? null,
           candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
-          sessionStateMode: params.sessionStateMode,
+          sessionStateMode: profileSource.sessionStateMode,
           selectionDescriptor: canonicalProfileSelectionDescriptor,
           validateGroupMutationCurrentness: params.validateGroupMutationCurrentness,
         });
@@ -240,18 +349,30 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
             identityDiagnostic: canonicalProfileMaterialized.identityDiagnostic,
           };
         }
+        // A member whose source is unknown (credential-only) leaves the group home credential-only too.
         groupSource = {
           env: { ...params.processEnv, ...canonicalProfileMaterialized.env },
           originSourceEnv: profileSourceEnv,
+          nativeSource: groupNativeSource,
+          sessionStateMode: profileSource.sessionStateMode,
+          checksSourceScope: profileSource.checksSourceScope,
         };
       }
     }
-    const sourceEnv = groupSource?.env ?? resolveClaudeConfigurationSourceEnv({
-      activeServerDir: params.activeServerDir,
+    const homeSource: AdmittedClaudeSource = groupSource ?? await admitClaudeSource({
+      nativeSourceAuthority: params.nativeSourceAuthority,
+      claudeConfigDir,
+      previousClaudeConfigDir: params.previousClaudeConfigDir ?? null,
+      requestedEnv: resolveClaudeConfigurationSourceEnv({
+        activeServerDir: params.activeServerDir,
+        processEnv: params.processEnv,
+        targetClaudeConfigDir: claudeConfigDir,
+      }),
       processEnv: params.processEnv,
-      targetClaudeConfigDir: claudeConfigDir,
+      sessionStateMode: params.sessionStateMode,
     });
-    const sourceViolation = await findClaudeConfigurationSourceScopeViolation({
+    const sourceEnv = homeSource.env;
+    const sourceViolation = homeSource.checksSourceScope && await findClaudeConfigurationSourceScopeViolation({
       sourceEnv,
       targetDir: claudeConfigDir,
       managedHomesRoot: resolveConnectedServiceManagedHomesRoot(params.activeServerDir),
@@ -268,11 +389,13 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
       record: params.record,
       targetClaudeConfigDir: claudeConfigDir,
       sourceEnv,
+      // A group home reads through its member home but records the native source behind it.
+      nativeSource: homeSource.nativeSource,
       accountSettings: params.accountSettings ?? null,
       sessionDirectory: params.sessionDirectory ?? null,
       vendorResumeId: params.vendorResumeId ?? null,
       candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
-      sessionStateMode: params.sessionStateMode,
+      sessionStateMode: homeSource.sessionStateMode,
       selectionDescriptor,
       validateGroupMutationCurrentness: params.validateGroupMutationCurrentness,
     });
@@ -284,25 +407,34 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
     };
   }
 
-  if (params.sessionStateMode !== 'existing') {
+  // This path has always imported from the configured dir as given, including a managed home it
+  // names directly.
+  const apiKeySource = await admitClaudeSource({
+    nativeSourceAuthority: params.nativeSourceAuthority,
+    claudeConfigDir,
+    previousClaudeConfigDir: params.previousClaudeConfigDir ?? null,
+    requestedEnv: params.processEnv,
+    processEnv: params.processEnv,
+    sessionStateMode: params.sessionStateMode,
+  });
+  if (apiKeySource.sessionStateMode !== 'existing') {
     const managedHomesRoot = resolveConnectedServiceManagedHomesRoot(params.activeServerDir);
+    const configuredSourceDir = resolveConfiguredClaudeConfigDir({ env: apiKeySource.env });
     const sourceViolation = await findClaudeConfigurationSourceScopeViolation({
-      sourceEnv: params.processEnv,
+      sourceEnv: apiKeySource.env,
       targetDir: claudeConfigDir,
       managedHomesRoot,
-      // This path has always imported from the configured dir as given, including a managed home it
-      // names directly; only entries that resolve elsewhere than they appear are refused here.
-      permittedManagedHome: isWithinDir(resolveConfiguredClaudeConfigDir({ env: params.processEnv }), managedHomesRoot)
-        ? resolveConfiguredClaudeConfigDir({ env: params.processEnv })
-        : null,
+      // Only entries that resolve elsewhere than they appear are refused here.
+      permittedManagedHome: isWithinDir(configuredSourceDir, managedHomesRoot) ? configuredSourceDir : null,
       serviceId: params.serviceId,
     });
     if (sourceViolation) {
       return sourceScopeRefusal({ claudeConfigDir, diagnostic: sourceViolation });
     }
   }
-  const diagnostics = params.sessionStateMode === 'existing' ? [] : (await syncClaudeConnectedServiceHome({
-    sourceEnv: params.processEnv,
+  const diagnostics = apiKeySource.sessionStateMode === 'existing' ? [] : (await syncClaudeConnectedServiceHome({
+    sourceEnv: apiKeySource.env,
+    nativeSource: apiKeySource.nativeSource,
     targetDir: claudeConfigDir,
     accountSettings: params.accountSettings ?? null,
     sessionDirectory: params.sessionDirectory ?? null,

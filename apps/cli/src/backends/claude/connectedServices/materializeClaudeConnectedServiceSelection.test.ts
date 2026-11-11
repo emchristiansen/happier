@@ -48,7 +48,7 @@ describe('Claude selection configuration sharing', () => {
           kind, serviceId: 'claude-subscription', groupId: 'pool', activeProfileId: 'work',
           fallbackProfileId: 'work', generation: 1, policy: {}, record: incomingRecord,
         } : { kind, serviceId: 'claude-subscription', profileId: 'work', record: incomingRecord },
-        processEnv: { HOME: root, CLAUDE_CONFIG_DIR: source },
+        processEnv: { HOME: root, CLAUDE_CONFIG_DIR: source }, nativeSourceAuthority: 'caller_env',
         ...(configMode ? { accountSettings: {
           connectedServicesProviderStateSharingSettingsV1: {
             v: 1, defaults: { configMode, stateMode },

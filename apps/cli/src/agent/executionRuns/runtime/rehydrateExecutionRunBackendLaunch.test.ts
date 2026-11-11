@@ -15,6 +15,7 @@ import { createExecutionRunConnectedServicesBridge } from '@/daemon/connectedSer
 import { ExecutionRunConnectedServiceMaterializeRequestSchema } from '@/daemon/connectedServices/runsBridge/contract';
 import { resolveConnectedServiceMaterializedRootDir } from '@/daemon/connectedServices/materialize/resolveConnectedServiceMaterializedRootDir';
 import { resolveConnectedServiceAuthForSpawn } from '@/daemon/connectedServices/resolveConnectedServiceAuthForSpawn';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 
 const CONNECTED_SELECTION: ConnectedServiceBindingsV1 = {
   v: 1,
@@ -78,6 +79,7 @@ describe('resolveExecutionRunResumeBackendOptions', () => {
     const bridge = createExecutionRunConnectedServicesBridge({
       runtimeRegistry: null,
       resolveAuthForSpawn: (params) => resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         ...params, activeServerDir: join(sandbox, 'server'), baseDir: join(sandbox, 'materialized'),
         credentials: { token: 'fixture-server-token', encryption: null },
         // ApiClient includes unrelated network operations this bounded transport fixture does not exercise.

@@ -50,6 +50,7 @@ import { join } from 'node:path';
 import { configuration } from '@/configuration';
 import { createConnectedServiceMaterializationIdentity } from '@/daemon/connectedServices/materialize/createConnectedServiceMaterializationIdentity';
 import { resolveConnectedServiceAuthForSpawn } from '@/daemon/connectedServices/resolveConnectedServiceAuthForSpawn';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import { buildProfileEnvOverlay } from '@/settings/profiles/buildProfileEnvOverlay';
 import { readProfilesFromAccountSettings } from '@/settings/profiles/readProfilesFromAccountSettings';
@@ -296,6 +297,7 @@ async function resolveConnectedServiceProbeEnvironment(params: Readonly<{
         api: await (await import('@/api/api')).ApiClient.create(params.credentials),
         accountSettings: params.accountSettings,
         processEnv: params.processEnv,
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         // A model/control probe observes current group authority but must never mutate the selected
         // group or trigger credential refresh. Actual spawn owns those lifecycle transitions.
         authGroupSwitchCoordinator: null,

@@ -26,6 +26,13 @@ import type {
 import { importConnectedServiceSessionFiles } from '@/daemon/connectedServices/stateSharing/importConnectedServiceSessionFiles';
 
 import { claudeConnectedServiceStateSharingDescriptor } from './claudeConnectedServiceStateSharingDescriptor';
+import {
+  assertClaudeHomeSourceAgrees,
+  claudeNativeSourceRecordEnv,
+  isClaudeSelfSource,
+  readClaudeHomeProvenance,
+  type ClaudeAdmittedNativeSource,
+} from './claudeHomeNativeSource';
 import { materializeClaudeWorkspaceTrust } from './materializeClaudeWorkspaceTrust';
 import { CLAUDE_CREDENTIAL_HOME_ENTRIES } from './claudeConnectedServiceCredentialStorageCleanup';
 import {
@@ -419,13 +426,33 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
    */
   ambientStateSourceDir?: string | null | undefined;
   destinationLockAlreadyHeld?: boolean | undefined;
+  /**
+   * The native source admitted for this home (`admitClaudeNativeSource`); `sourceEnv` must name it.
+   * It is re-checked under the destination lock and recorded in the manifest. Without it the home's
+   * existing record is kept as it is.
+   */
+  nativeSource?: ClaudeAdmittedNativeSource | undefined;
 }>): Promise<SyncClaudeConnectedServiceHomeResult> {
   const sync = async (): Promise<SyncClaudeConnectedServiceHomeResult> => {
     const settings = params.sharingPolicyOverride ?? resolveClaudeHomeSharingSettings(params.accountSettings ?? null);
     const sourceDir = resolveConfiguredClaudeConfigDir({ env: params.sourceEnv });
+    // Re-check under the home lock: another producer may have recorded a source since admission.
+    const recorded = params.nativeSource ? await readClaudeHomeProvenance(params.targetDir) : null;
+    const recordedNativeSource = recorded?.kind === 'recorded' && !isClaudeSelfSource(recorded.source, params.targetDir)
+      ? recorded
+      : null;
+    if (params.nativeSource && !isClaudeSelfSource(params.nativeSource, params.targetDir)) {
+      await assertClaudeHomeSourceAgrees({ claudeConfigDir: params.targetDir, provenance: recordedNativeSource, source: params.nativeSource });
+    }
     await mkdir(params.targetDir, { recursive: true });
 
     const existingManifest = await readConnectedServiceStateSharingManifest(params.targetDir);
+    // A home materialized as its own source keeps a native source it already records.
+    const nativeSourceEnv = params.nativeSource && !(recordedNativeSource && isClaudeSelfSource(params.nativeSource, params.targetDir))
+      ? claudeNativeSourceRecordEnv(params.nativeSource)
+      : existingManifest.nativeSourceEnv;
+    const withNativeSource = (manifest: ConnectedServiceStateSharingManifestV1): ConnectedServiceStateSharingManifestV1 =>
+      nativeSourceEnv ? { ...manifest, nativeSourceEnv } : manifest;
 
     if (resolve(sourceDir) === resolve(params.targetDir)) {
       const reconciliation = await reconcileSelfSourceClaudeProjectsStateMode({
@@ -442,7 +469,7 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
         : [];
       await writeConnectedServiceStateSharingManifest(
         params.targetDir,
-        buildSelfSourceManifest({
+        withNativeSource(buildSelfSourceManifest({
           existingManifest,
           requestedStateMode: settings.stateMode,
           effectiveStateMode: reconciliation.effectiveStateMode,
@@ -452,7 +479,7 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
             previousMappings: existingManifest.sessionFileMappings,
             nextMappings: importedSessionFileMappings,
           }),
-        }),
+        })),
       );
       return {
         providerId: 'claude',
@@ -533,13 +560,13 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
       sessionDirectory: params.sessionDirectory ?? process.cwd(),
       preserveExistingOauthAccountProjection: params.preserveNativeAuthFiles === true,
     });
-    await writeConnectedServiceStateSharingManifest(params.targetDir, {
+    await writeConnectedServiceStateSharingManifest(params.targetDir, withNativeSource({
       ...applyResult.manifest,
       sessionFileMappings: await mergeClaudeSessionFileMappings({
         previousMappings: candidateSessionFileMappings,
         nextMappings: applyResult.manifest.sessionFileMappings,
       }),
-    });
+    }));
 
     return {
       providerId: 'claude',

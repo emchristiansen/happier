@@ -15,6 +15,7 @@ import { ConnectedServiceCredentialHealthReadUnavailableError } from '@/api/conn
 import type { Credentials } from '@/persistence';
 
 import { resolveConnectedServiceAuthForSpawn } from '../resolveConnectedServiceAuthForSpawn';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 import { ConnectedServiceRefreshCoordinator } from './ConnectedServiceRefreshCoordinator';
 import { computeConnectedServiceAccessTokenFingerprint } from './credentialFreshness/tokenFingerprint';
 
@@ -140,6 +141,7 @@ async function forcedRetryAfterCanonicalAdvance(params: Readonly<{
     bindingsByServiceId: { [SERVICE_ID]: { source: 'connected', selection: 'group', groupId: 'g', profileId: 'A' } },
   };
   const auth = await resolveConnectedServiceAuthForSpawn({
+    nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
     agentId: 'claude',
     credentialRefreshService: coordinator,
     connectedServicesBindingsRaw: bindings,

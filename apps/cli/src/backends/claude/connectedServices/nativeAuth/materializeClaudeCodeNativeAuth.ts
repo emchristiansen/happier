@@ -43,6 +43,7 @@ import {
   type ClaudeCodeCredentialHealthStatus,
 } from './claudeCodeCredentialHealth';
 import { readClaudeSubscriptionCredentialIdentity } from './claudeSubscriptionCredentialIdentity';
+import type { ClaudeAdmittedNativeSource } from '../claudeHomeNativeSource';
 
 const CLAUDE_CODE_KEYCHAIN_STALE_SWEEP_DEFER_MS = 30_000;
 
@@ -435,6 +436,8 @@ export async function materializeClaudeSubscriptionNativeAuthHome(params: Readon
   sessionStateMode?: 'existing';
   /** Ambient native store root for self-source sharing-policy reconciliation (RD-MAT-2). */
   ambientStateSourceDir?: string | null;
+  /** The admitted native source `sourceEnv` names; recorded by the sync (see `syncClaudeConnectedServiceHome`). */
+  nativeSource?: ClaudeAdmittedNativeSource;
   selectionDescriptor: ClaudeSubscriptionNativeAuthSelectionDescriptor;
   validateGroupMutationCurrentness?: (
     input: Readonly<{
@@ -560,6 +563,7 @@ export async function materializeClaudeSubscriptionNativeAuthHome(params: Readon
       candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
       ambientStateSourceDir: params.ambientStateSourceDir ?? null,
       destinationLockAlreadyHeld: true,
+      nativeSource: params.nativeSource,
     })).diagnostics;
     await mkdir(params.targetClaudeConfigDir, { recursive: true });
     if (params.sessionStateMode !== 'existing') await materializeClaudeWorkspaceTrust({

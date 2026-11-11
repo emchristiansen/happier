@@ -23,6 +23,7 @@ import {
   type SwitchSessionConnectedServiceAuthInput,
 } from '@/daemon/connectedServices/sessionAuthSwitch/switchSessionConnectedServiceAuth';
 import type { Credentials } from '@/persistence';
+import { writeConnectedServiceStateSharingManifest } from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingManifest';
 
 import { createClaudeConnectedServiceRuntimeAuthAdapter } from './createClaudeConnectedServiceRuntimeAuthAdapter';
 import { materializeClaudeConnectedServiceRuntimeAuthSelection } from './materializeClaudeConnectedServiceRuntimeAuthSelection';
@@ -39,6 +40,23 @@ const mockFetchSessionByIdCompat = vi.hoisted(() => vi.fn(async (): Promise<unkn
 vi.mock('@/session/transport/http/sessionsHttp', () => ({
   fetchSessionByIdCompat: mockFetchSessionByIdCompat,
 }));
+
+/**
+ * In production every Claude home is produced (and its admitted native source recorded) by a spawn
+ * before an account switch rematerializes it; these fixtures skip that production, so they record,
+ * for each Claude home they expect materialized, the source their `processEnv` names.
+ */
+async function seedAdmittedClaudeHomeSource(
+  claudeConfigDir: string | null,
+  nativeSourceEnv: Readonly<Record<string, string>>,
+): Promise<void> {
+  if (!claudeConfigDir) throw new Error('fixture: Claude config dir must resolve');
+  await writeConnectedServiceStateSharingManifest(claudeConfigDir, {
+    v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+    configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+    nativeSourceEnv,
+  });
+}
 
 const NEW_CREDENTIAL_REVISION = 'csr_bcdefghijklmnopqrstuvw';
 
@@ -102,6 +120,13 @@ describe('Claude shared-group switch continuity', () => {
       readConnectedServiceCredentialHealth: async ({ profileId }: Readonly<{ profileId: string }>) => (profileId === 'next'
         ? { kind: 'found' as const, status: 'connected' as const, health: null }
         : { kind: 'not_found' as const }) };
+    // A dry run must not write the server dir at all, so only the applied switch is seeded.
+    if (!dryRun) {
+      await seedAdmittedClaudeHomeSource(resolveClaudeConnectedServiceStableConfigDir({
+        activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: 'next',
+        selection: { kind: 'profile', profileId: 'next' },
+      }), { CLAUDE_CONFIG_DIR: join(homeDir, '.claude'), HOME: homeDir });
+    }
     const result = await switchSessionConnectedServiceAuth({
       dryRun,
       core: createConnectedServiceSessionAuthSwitchCore({ locks: new ConnectedServiceSessionAuthSwitchLockRegistry() }),
@@ -177,6 +202,12 @@ describe('Claude shared-group switch continuity', () => {
       },
     });
     if (!groupClaudeConfigDir) throw new Error('expected deterministic Claude shared group home');
+    const admittedSourceEnv = { CLAUDE_CONFIG_DIR: join(homeDir, '.claude'), HOME: homeDir };
+    await seedAdmittedClaudeHomeSource(groupClaudeConfigDir, admittedSourceEnv);
+    await seedAdmittedClaudeHomeSource(resolveClaudeConnectedServiceStableConfigDir({
+      activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: 'lb_bat',
+      selection: { kind: 'profile', profileId: 'lb_bat' },
+    }), admittedSourceEnv);
 
     const previousBindings = groupBindings(previousProfileId);
     const nextBindings = groupBindings('lb_bat');

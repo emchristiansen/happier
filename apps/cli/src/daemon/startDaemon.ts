@@ -267,7 +267,14 @@ import { createDefaultTerminalHostRegistry } from '@/integrations/terminalHost/d
 import { resolveLiveRunnerSnapshotFingerprints } from './sessionRunnerRuntime/resolveLiveRunnerSnapshotFingerprints';
 import { buildHappySessionControlArgs } from './sessionSpawnArgs';
 import { serializeDaemonInitialGoalForEnv, HAPPIER_DAEMON_INITIAL_GOAL_ENV_KEY } from '@/agent/runtime/sessionInitialGoal';
-import { resolveExistingSessionAttachContext } from './sessionEncryption/resolveExistingSessionAttachContext';
+import {
+  resolveExistingSessionAttachContext,
+  type ExistingSessionAttachContext,
+} from './sessionEncryption/resolveExistingSessionAttachContext';
+import {
+  NEW_CALLER_SPAWN_NATIVE_SOURCE,
+  resolveExistingSessionSpawnNativeSource,
+} from './connectedServices/connectedServiceSpawnNativeSource';
 import { resolveWaitForAuthConfig } from './startup/waitForAuthConfig';
 import { ensureSessionDirectory } from './startup/ensureSessionDirectory';
 import { waitForInitialCredentials } from './startup/waitForInitialCredentials';
@@ -3614,6 +3621,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
               let sessionAttachPayload: import('@/agent/runtime/sessionAttachPayload').SessionAttachFilePayload | null = null;
               let existingSessionPersistedMetadata: Record<string, unknown> | null = null;
+              // The daemon's own authenticated read of the resumed session; a caller-supplied attach
+              // payload is not one.
+              let existingSessionAttachContext: ExistingSessionAttachContext | null = null;
               if (normalizedExistingSessionId) {
                 if (existingSessionAttachPayload) {
                   sessionAttachPayload = existingSessionAttachPayload;
@@ -3634,6 +3644,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   }
 
                   sessionAttachPayload = attachContext.attachPayload;
+                  existingSessionAttachContext = attachContext;
                   existingSessionPersistedMetadata = attachContext.metadata;
                   if (!effectiveResume) {
                     const derivedResume = typeof attachContext.vendorResumeId === 'string' ? attachContext.vendorResumeId.trim() : '';
@@ -4011,6 +4022,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       quotaProbeDeadlineAtMs: connectedServiceSpawnQuotaProbeDeadlineAtMs,
                       accountSettings: activeAccountSettings?.settings ?? null,
                       processEnv: process.env,
+                      nativeSource: normalizedExistingSessionId && existingSessionAttachContext
+                        ? resolveExistingSessionSpawnNativeSource({
+                            existingSessionId: normalizedExistingSessionId,
+                            attachContext: existingSessionAttachContext,
+                            materializationIdentity: connectedServiceMaterializationIdentityV1,
+                          })
+                        : NEW_CALLER_SPAWN_NATIVE_SOURCE,
                       credentialRefreshService: connectedServiceRefreshCoordinator,
                       vendorResumeId: effectiveResume || null,
                       existingSessionMetadata: existingSessionPersistedMetadata,
@@ -7169,6 +7187,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         ...(params.sessionId ? { sessionId: params.sessionId } : {}),
         accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
         processEnv: process.env,
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         credentialRefreshService: connectedServiceRefreshCoordinator,
       }),
       runtimeRegistry: connectedServiceRuntimeRegistry,
@@ -9205,6 +9224,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     sessionId,
                     accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
                     processEnv: process.env,
+                    nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
                     credentialRefreshService: connectedServiceRefreshCoordinator,
                     sessionStateMode: 'existing',
                     existingSessionMetadata: metadata,

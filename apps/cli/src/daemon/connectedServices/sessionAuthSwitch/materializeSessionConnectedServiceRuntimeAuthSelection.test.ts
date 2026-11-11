@@ -13,6 +13,8 @@ import type { Credentials } from '@/persistence';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialScopes';
 import { materializeSessionConnectedServiceRuntimeAuthSelection } from './materializeSessionConnectedServiceRuntimeAuthSelection';
+import { resolveClaudeConnectedServiceStableConfigDir } from '@/backends/claude/connectedServices/resolveClaudeConnectedServiceStableAuthDir';
+import { writeConnectedServiceStateSharingManifest } from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingManifest';
 
 const { spawnSpy } = vi.hoisted(() => ({
   spawnSpy: vi.fn(),
@@ -25,6 +27,35 @@ vi.mock('node:child_process', async (importOriginal) => {
     spawn: spawnSpy,
   };
 });
+
+/**
+ * In production every Claude home is produced (and its admitted native source recorded) by a spawn
+ * before an account switch rematerializes it; these fixtures skip that production, so they record,
+ * for the `work` group home and its active `backup` profile home, the source their `processEnv` names.
+ */
+async function seedAdmittedClaudeGroupHomeSources(
+  activeServerDir: string,
+  nativeSourceEnv: Readonly<Record<string, string>>,
+): Promise<void> {
+  const homes = [
+    resolveClaudeConnectedServiceStableConfigDir({
+      activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: 'backup',
+      selection: { kind: 'group', groupId: 'work' },
+    }),
+    resolveClaudeConnectedServiceStableConfigDir({
+      activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: 'backup',
+      selection: { kind: 'profile', profileId: 'backup' },
+    }),
+  ];
+  for (const home of homes) {
+    if (!home) throw new Error('fixture: Claude config dir must resolve');
+    await writeConnectedServiceStateSharingManifest(home, {
+      v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+      configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+      nativeSourceEnv,
+    });
+  }
+}
 
 describe('materializeSessionConnectedServiceRuntimeAuthSelection', () => {
   beforeEach(() => {
@@ -531,6 +562,7 @@ describe('materializeSessionConnectedServiceRuntimeAuthSelection', () => {
       },
     } as const;
 
+    await seedAdmittedClaudeGroupHomeSources(activeServerDir, { HOME: tmpdir() });
     const materialization = materializeSessionConnectedServiceRuntimeAuthSelection({
       credentials: {
         token: 'token',
@@ -833,6 +865,7 @@ describe('materializeSessionConnectedServiceRuntimeAuthSelection', () => {
       },
     };
 
+    await seedAdmittedClaudeGroupHomeSources(activeServerDir, { HOME: tmpdir() });
     const result = await materializeSessionConnectedServiceRuntimeAuthSelection({
       credentials,
       api: api as unknown as ApiClient,

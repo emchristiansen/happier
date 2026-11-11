@@ -19,6 +19,7 @@ import { logger } from '@/ui/logger';
 import { buildConnectedServiceCredentialRecord } from '@happier-dev/protocol';
 import { writeClaudeCodeCredentialsFile } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialFile';
 import { resolveClaudeConnectedServiceStableConfigDir } from '@/backends/claude/connectedServices/resolveClaudeConnectedServiceStableAuthDir';
+import { claudeNativeSourceFromEnv, claudeNativeSourceRecordEnv } from '@/backends/claude/connectedServices/claudeHomeNativeSource';
 import {
   classifyConnectedServiceMaterializationDiagnosticForCredentialRefresh,
   ConnectedServiceRefreshCoordinator,
@@ -79,6 +80,29 @@ async function seedAdmittedCodexHomeSource(
     configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
     nativeSourceEnv: { CODEX_HOME: source, CODEX_SQLITE_HOME: source },
   });
+}
+
+/**
+ * In production every Claude home is produced (and its admitted native source recorded) by a spawn
+ * before the daemon rematerializes it; `registerSpawnTarget` skips that production, so fixtures
+ * record, for the Claude home they expect materialized, the same source their `processEnv` names.
+ */
+async function seedAdmittedClaudeHomeSource(
+  claudeConfigDir: string,
+  nativeSourceEnv: Readonly<Record<string, string>>,
+): Promise<void> {
+  await writeConnectedServiceStateSharingManifest(claudeConfigDir, {
+    v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+    configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+    nativeSourceEnv,
+  });
+}
+
+function resolveClaudeProfileConfigDir(activeServerDir: string, profileId: string): string {
+  return resolveClaudeConnectedServiceStableConfigDir({
+    activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: profileId,
+    selection: { kind: 'profile', profileId },
+  })!;
 }
 
 type ExternalCredentialUpdateInput = Parameters<
@@ -1384,6 +1408,7 @@ afterEach(() => {
       processEnv: { HOME: sourceHomeDir },
     });
 
+    await seedAdmittedClaudeHomeSource(resolveClaudeProfileConfigDir(activeServerDir, 'work'), { HOME: sourceHomeDir });
     coordinator.registerSpawnTarget({
       pid: 125,
       agentId: 'claude',
@@ -1496,6 +1521,7 @@ afterEach(() => {
       onAuthUpdated,
     });
 
+    await seedAdmittedClaudeHomeSource(resolveClaudeProfileConfigDir(activeServerDir, 'work'), { HOME: sourceHomeDir });
     coordinator.registerSpawnTarget({
       pid: 125,
       agentId: 'claude',
@@ -1604,6 +1630,7 @@ afterEach(() => {
       processEnv: { HOME: sourceHomeDir },
       onAuthUpdated,
     });
+    await seedAdmittedClaudeHomeSource(resolveClaudeProfileConfigDir(activeServerDir, 'work'), { HOME: sourceHomeDir });
     coordinator.registerSpawnTarget({
       pid: 125,
       agentId: 'claude',
@@ -1732,6 +1759,7 @@ afterEach(() => {
       onAuthUpdated,
       resolveLifecycleDescriptor: resolveLifecycleDescriptor as never,
     });
+    await seedAdmittedClaudeHomeSource(resolveClaudeProfileConfigDir(activeServerDir, 'work'), { HOME: sourceHomeDir });
     coordinator.registerSpawnTarget({
       pid: 127,
       agentId: 'claude',
@@ -1845,6 +1873,7 @@ afterEach(() => {
       processEnv: { HOME: sourceHomeDir },
       onAuthUpdated,
     });
+    await seedAdmittedClaudeHomeSource(resolveClaudeProfileConfigDir(activeServerDir, 'work'), { HOME: sourceHomeDir });
     coordinator.registerSpawnTarget({
       pid: 126,
       agentId: 'claude',
@@ -2072,6 +2101,7 @@ afterEach(() => {
       selection: { ...selectionA, record: null as never, policy: null },
     });
     if (!groupConfigDir) throw new Error('fixture: group config dir must resolve');
+    await seedAdmittedClaudeHomeSource(groupConfigDir, { HOME: sourceHomeDir });
 
     return {
       coordinator,
@@ -2850,6 +2880,7 @@ afterEach(() => {
       runtimeRegistry,
     });
 
+    await seedAdmittedClaudeHomeSource(resolveClaudeProfileConfigDir(activeServerDir, 'work'), { HOME: sourceHomeDir });
     coordinator.registerSpawnTarget({
       pid: 125,
       agentId: 'claude',
@@ -3083,6 +3114,7 @@ afterEach(() => {
       onAuthUpdated,
     });
 
+    await seedAdmittedClaudeHomeSource(resolveClaudeProfileConfigDir(activeServerDir, 'work'), claudeNativeSourceRecordEnv(claudeNativeSourceFromEnv(process.env)));
     coordinator.registerSpawnTarget({
       pid: 123,
       agentId: 'claude',
@@ -3222,6 +3254,8 @@ afterEach(() => {
       onAuthUpdated,
     });
 
+    await seedAdmittedCodexHomeSource(activeServerDir);
+    await seedAdmittedClaudeHomeSource(resolveClaudeProfileConfigDir(activeServerDir, 'claude-work'), claudeNativeSourceRecordEnv(claudeNativeSourceFromEnv(process.env)));
     coordinator.registerSpawnTarget({
       pid: 123,
       agentId: 'claude',
@@ -5167,6 +5201,7 @@ afterEach(() => {
       now: () => now,
     });
 
+    await seedAdmittedClaudeHomeSource(resolveClaudeProfileConfigDir(activeServerDir, 'work'), claudeNativeSourceRecordEnv(claudeNativeSourceFromEnv(process.env)));
     coordinator.registerSpawnTarget({
       pid: 123,
       agentId: 'claude',
