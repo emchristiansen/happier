@@ -1977,6 +1977,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
 
             await claudeRemoteAgentSdk({
                 sessionId: 'session-1',
+                happySessionId: 'happier-session-1',
                 transcriptPath,
                 path: '/tmp',
                 claudeArgs: [],
@@ -2071,6 +2072,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         try {
             await claudeRemoteAgentSdk({
                 sessionId: 'session-1',
+                happySessionId: 'happier-session-1',
                 transcriptPath,
                 path: '/tmp',
                 claudeArgs: [],
@@ -2096,7 +2098,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             expect(typeof capturedOptions.getOAuthToken).toBe('function');
             await expect(capturedOptions.getOAuthToken({ signal: new AbortController().signal })).resolves.toBe('fresh-claude-access');
             expect(refreshDaemonClaudeSubscriptionAnthropicAuthTokensForBridgeMock).toHaveBeenCalledWith({
-                sessionId: 'session-1',
+                sessionId: 'happier-session-1',
                 selection: {
                     kind: 'group',
                     serviceId: 'claude-subscription',
@@ -2151,6 +2153,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         try {
             await claudeRemoteAgentSdk({
                 sessionId: 'session-explicit-binding',
+                happySessionId: 'happier-session-explicit-binding',
                 transcriptPath,
                 path: '/tmp',
                 claudeArgs: [],
@@ -2172,7 +2175,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             expect(typeof capturedOptions?.getOAuthToken).toBe('function');
             await expect(capturedOptions.getOAuthToken({ signal: new AbortController().signal })).resolves.toBe('fresh-claude-access');
             expect(refreshDaemonClaudeSubscriptionAnthropicAuthTokensForBridgeMock).toHaveBeenCalledWith({
-                sessionId: 'session-explicit-binding',
+                sessionId: 'happier-session-explicit-binding',
                 selection: {
                     kind: 'profile',
                     serviceId: 'claude-subscription',

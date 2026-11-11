@@ -742,7 +742,10 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
             childEnv: claudeSubprocessEnv,
         });
         const claudeSubscriptionRefreshSelection = opts.claudeSubscriptionAccessTokenRefreshSelection ?? null;
-        const daemonRefreshSessionId = opts.sessionId?.trim() || 'unknown';
+        // The daemon registers this session's connected-service target under its Happier session id,
+        // never the native Claude session id (null for a fresh session), so the refresh bridge is
+        // addressed by the Happier id. Without one the bridge refuses the request.
+        const daemonRefreshSessionId = opts.happySessionId?.trim() || 'unknown';
         const queryOptions: Record<string, unknown> = {
             abortController,
             cwd: opts.path,
