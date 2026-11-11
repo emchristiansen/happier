@@ -1,36 +1,24 @@
 import axios from 'axios';
 import { randomUUID } from 'node:crypto';
 
-import {
-  ApprovalRequestV1Schema,
-  openEncryptedDataKeyEnvelopeV1,
-  sealEncryptedDataKeyEnvelopeV1,
-  type ApprovalRequestV1,
-} from '@happier-dev/protocol';
+import { ApprovalRequestV1Schema, type ApprovalRequestV1 } from '@happier-dev/protocol';
 
-import { requireEncryptionCredentials, type Credentials } from '@/persistence';
+import type { Credentials } from '@/persistence';
+import {
+  fetchArtifactRecord,
+  openArtifactDataEncryptionKey,
+  sealArtifactDataEncryptionKey,
+  updateArtifactRecord,
+  type ArtifactFullRecord,
+} from '@/api/artifacts/artifactRecords';
 import {
   decodeBase64,
   decryptWithDataKey,
   encodeBase64,
   encryptWithDataKey,
   getRandomBytes,
-  libsodiumPublicKeyFromSecretKey,
 } from '@/api/encryption';
 import { resolveServerHttpBaseUrl } from '@/api/client/serverHttpBaseUrl';
-import { deriveKey } from '@/utils/deriveKey';
-
-type ArtifactFullRecord = Readonly<{
-  id: string;
-  header: string;
-  headerVersion: number;
-  body: string;
-  bodyVersion: number;
-  dataEncryptionKey: string;
-  seq: number;
-  createdAt: number;
-  updatedAt: number;
-}>;
 
 type ArtifactCreateRequest = Readonly<{
   id: string;
@@ -38,49 +26,6 @@ type ArtifactCreateRequest = Readonly<{
   body: string;
   dataEncryptionKey: string;
 }>;
-
-type ArtifactUpdateRequest = Readonly<{
-  header: string;
-  expectedHeaderVersion: number;
-  body: string;
-  expectedBodyVersion: number;
-}>;
-
-async function resolveRecipientSecretKeyOrSeed(credentials: Credentials): Promise<Uint8Array> {
-  requireEncryptionCredentials(credentials);
-  if (credentials.encryption.type === 'dataKey') return credentials.encryption.machineKey;
-  return await deriveKey(credentials.encryption.secret, 'Happy EnCoder', ['content']);
-}
-
-async function resolveRecipientPublicKey(credentials: Credentials): Promise<Uint8Array> {
-  requireEncryptionCredentials(credentials);
-  if (credentials.encryption.type === 'dataKey') return credentials.encryption.publicKey;
-  return libsodiumPublicKeyFromSecretKey(await resolveRecipientSecretKeyOrSeed(credentials));
-}
-
-async function openArtifactDataEncryptionKey(params: Readonly<{
-  credentials: Credentials;
-  encryptedDataEncryptionKeyBase64: string;
-}>): Promise<Uint8Array | null> {
-  const recipientSecretKeyOrSeed = await resolveRecipientSecretKeyOrSeed(params.credentials);
-  return openEncryptedDataKeyEnvelopeV1({
-    envelope: decodeBase64(params.encryptedDataEncryptionKeyBase64),
-    recipientSecretKeyOrSeed,
-  });
-}
-
-async function sealArtifactDataEncryptionKey(params: Readonly<{
-  credentials: Credentials;
-  dataEncryptionKey: Uint8Array;
-}>): Promise<string> {
-  const recipientPublicKey = await resolveRecipientPublicKey(params.credentials);
-  const envelope = sealEncryptedDataKeyEnvelopeV1({
-    dataKey: params.dataEncryptionKey,
-    recipientPublicKey,
-    randomBytes: getRandomBytes,
-  });
-  return encodeBase64(envelope, 'base64');
-}
 
 function buildApprovalArtifactHeader(request: ApprovalRequestV1): Record<string, unknown> {
   const sessionId = typeof request.createdBy.sessionId === 'string' ? request.createdBy.sessionId.trim() : '';
@@ -94,39 +39,15 @@ function buildApprovalArtifactHeader(request: ApprovalRequestV1): Record<string,
   };
 }
 
-async function fetchArtifactFullRecord(params: Readonly<{
+// Approvals keep their established collapse: an unreadable record reads as absent; a transport failure propagates.
+async function fetchApprovalArtifactRecord(params: Readonly<{
   credentials: Credentials;
   artifactId: string;
 }>): Promise<ArtifactFullRecord | null> {
-  const response = await axios.get(`${resolveServerHttpBaseUrl()}/v1/artifacts/${encodeURIComponent(params.artifactId)}`, {
-    headers: {
-      Authorization: `Bearer ${params.credentials.token}`,
-      'Content-Type': 'application/json',
-    },
-    timeout: 15_000,
-    validateStatus: () => true,
-  });
-
-  if (response.status === 404) return null;
-  if (response.status < 200 || response.status >= 300) return null;
-
-  const record = response.data as Record<string, unknown>;
-  if (typeof record.id !== 'string') return null;
-  if (typeof record.header !== 'string') return null;
-  if (typeof record.body !== 'string') return null;
-  if (typeof record.dataEncryptionKey !== 'string') return null;
-
-  return {
-    id: record.id,
-    header: record.header,
-    headerVersion: Number((record as any).headerVersion),
-    body: record.body,
-    bodyVersion: Number((record as any).bodyVersion),
-    dataEncryptionKey: record.dataEncryptionKey,
-    seq: Number((record as any).seq),
-    createdAt: Number((record as any).createdAt),
-    updatedAt: Number((record as any).updatedAt),
-  };
+  const fetched = await fetchArtifactRecord(params);
+  if (fetched.ok) return fetched.record;
+  if (fetched.error.code === 'network') throw fetched.error.cause;
+  return null;
 }
 
 async function createArtifact(params: Readonly<{
@@ -146,34 +67,6 @@ async function createArtifact(params: Readonly<{
   const record = response.data as Record<string, unknown>;
   const id = typeof record.id === 'string' ? record.id : params.request.id;
   return { ok: true, artifactId: id };
-}
-
-async function updateArtifact(params: Readonly<{
-  credentials: Credentials;
-  artifactId: string;
-  request: ArtifactUpdateRequest;
-}>): Promise<
-  | { ok: true }
-  | { ok: false; errorCode: 'not_found' | 'version_mismatch' | 'update_failed'; error: string }
-> {
-  const response = await axios.post(`${resolveServerHttpBaseUrl()}/v1/artifacts/${encodeURIComponent(params.artifactId)}`, params.request, {
-    headers: {
-      Authorization: `Bearer ${params.credentials.token}`,
-      'Content-Type': 'application/json',
-    },
-    timeout: 15_000,
-    validateStatus: () => true,
-  });
-
-  if (response.status === 404) return { ok: false, errorCode: 'not_found', error: 'artifact_not_found' };
-  if (response.status < 200 || response.status >= 300) return { ok: false, errorCode: 'update_failed', error: 'artifact_update_failed' };
-
-  const parsed = response.data as any;
-  if (parsed && parsed.success === true) return { ok: true };
-  if (parsed && parsed.success === false && parsed.error === 'version-mismatch') {
-    return { ok: false, errorCode: 'version_mismatch', error: 'artifact_version_mismatch' };
-  }
-  return { ok: false, errorCode: 'update_failed', error: 'artifact_update_failed' };
 }
 
 export function createCliApprovalsArtifactStore(params: Readonly<{ credentials: Credentials }>): Readonly<{
@@ -210,7 +103,7 @@ export function createCliApprovalsArtifactStore(params: Readonly<{ credentials: 
     },
 
     approvalsGet: async ({ artifactId }) => {
-      const artifact = await fetchArtifactFullRecord({ credentials: params.credentials, artifactId });
+      const artifact = await fetchApprovalArtifactRecord({ credentials: params.credentials, artifactId });
       if (!artifact) return null;
 
       const dataEncryptionKey = await openArtifactDataEncryptionKey({
@@ -232,7 +125,7 @@ export function createCliApprovalsArtifactStore(params: Readonly<{ credentials: 
     },
 
     approvalsUpdate: async ({ artifactId, request, serverId }) => {
-      const artifact = await fetchArtifactFullRecord({ credentials: params.credentials, artifactId });
+      const artifact = await fetchApprovalArtifactRecord({ credentials: params.credentials, artifactId });
       if (!artifact) return { ok: false, errorCode: 'not_found', error: 'artifact_not_found' };
 
       const dataEncryptionKey = await openArtifactDataEncryptionKey({
@@ -248,7 +141,7 @@ export function createCliApprovalsArtifactStore(params: Readonly<{ credentials: 
       const encryptedHeader = encodeBase64(encryptWithDataKey(header, dataEncryptionKey), 'base64');
       const encryptedBody = encodeBase64(encryptWithDataKey({ body: JSON.stringify(request) }, dataEncryptionKey), 'base64');
 
-      const updated = await updateArtifact({
+      const updated = await updateArtifactRecord({
         credentials: params.credentials,
         artifactId,
         request: {
@@ -260,7 +153,16 @@ export function createCliApprovalsArtifactStore(params: Readonly<{ credentials: 
       });
 
       if (updated.ok) return { ok: true };
-      return { ok: false, errorCode: updated.errorCode, error: updated.error };
+      switch (updated.error.code) {
+        case 'network':
+          throw updated.error.cause;
+        case 'not_found':
+          return { ok: false, errorCode: 'not_found', error: 'artifact_not_found' };
+        case 'version_mismatch':
+          return { ok: false, errorCode: 'version_mismatch', error: 'artifact_version_mismatch' };
+        default:
+          return { ok: false, errorCode: 'update_failed', error: 'artifact_update_failed' };
+      }
     },
   };
 }
