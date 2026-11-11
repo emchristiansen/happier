@@ -346,6 +346,7 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
           vendorResumeId: params.vendorResumeId ?? null,
           candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
           sessionStateMode: profileSource.sessionStateMode,
+          managedHomesRoot: resolveConnectedServiceManagedHomesRoot(params.activeServerDir),
           selectionDescriptor: canonicalProfileSelectionDescriptor,
           validateGroupMutationCurrentness: params.validateGroupMutationCurrentness,
         });
@@ -412,6 +413,7 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
       vendorResumeId: params.vendorResumeId ?? null,
       candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
       sessionStateMode: homeSource.sessionStateMode,
+      managedHomesRoot: resolveConnectedServiceManagedHomesRoot(params.activeServerDir),
       selectionDescriptor,
       validateGroupMutationCurrentness: params.validateGroupMutationCurrentness,
     });
@@ -454,6 +456,7 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
     targetDir: claudeConfigDir,
     accountSettings: params.accountSettings ?? null,
     sessionDirectory: params.sessionDirectory ?? null,
+    managedHomesRoot: resolveConnectedServiceManagedHomesRoot(params.activeServerDir),
   })).diagnostics;
   const materialized = materializeClaudeAnthropicApiKeyAuth({ record: params.record });
   return {
