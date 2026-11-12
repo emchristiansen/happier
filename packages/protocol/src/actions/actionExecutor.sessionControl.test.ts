@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { RpcError } from '../rpcErrors.js';
+import { buildUnsupportedSessionPendingInputInterruptAndRunResult } from '../sessionControl/sessionPendingInputInterruptAndRunV1.js';
 import { createActionExecutor, type ActionExecutorDeps } from './actionExecutor.js';
 
 function createExecutor(overrides: Partial<ActionExecutorDeps> = {}) {
@@ -65,6 +66,21 @@ describe('createActionExecutor (session control)', () => {
       .resolves.toMatchObject({ ok: true, result: { localId: ' x ' } });
     expect(rows.get('x')?.selected).toBe(false);
     expect(rows.get(' x ')?.selected).toBe(true);
+  });
+
+  it('reports the runtime refusal of interruptAndRun as the action failure, never ok:true', async () => {
+    const unsupported = buildUnsupportedSessionPendingInputInterruptAndRunResult(
+      's1', 'p1', 'session.pendingInput.interruptAndRun');
+    const stale = { ok: false, status: 'stale_state', sessionId: 's1', localId: 'p1' };
+    for (const [res, errorCode, error] of [
+      [unsupported, 'unsupported_session_runtime_method', 'unsupported_session_runtime_method:session.pendingInput.interruptAndRun'],
+      [stale, 'stale_state', 'stale_state'],
+    ] as const) {
+      const executor = createExecutor({ sessionPendingInputInterruptAndRun: async () => res });
+      expect(await executor.execute('session.pendingInput.interruptAndRun',
+        { sessionId: 's1', localId: 'p1' }, { surface: 'cli' }))
+        .toEqual({ ok: false, errorCode, error, details: res });
+    }
   });
 
   it.each(['', ' ', '\t\n'])('[opaque-pending-id] rejects blank identity %j before dispatch', async (localId) => {

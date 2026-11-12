@@ -5,6 +5,11 @@ import { readFileSync } from 'node:fs';
 
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import { createSessionProviderInputConsumer } from '@/agent/runtime/sessionInput/SessionProviderInputConsumer';
+import { DeferredApiSessionClient, type DeferredApiSessionTarget } from '@/agent/runtime/startup/DeferredApiSessionClient';
+import {
+  createClaudeAgentSdkInterruptObservations,
+  createClaudeAgentSdkPendingInputInterruptAndRunControl,
+} from '@/backends/claude/remote/createClaudeAgentSdkPendingInputInterruptAndRunControl';
 import { createClaudeUnifiedInputArbiter } from '@/backends/claude/unifiedTerminal/createClaudeUnifiedInputArbiter';
 import { createClaudeUnifiedPendingQueuePump } from '@/backends/claude/unifiedTerminal/createClaudeUnifiedPendingQueuePump';
 import { createDeferred } from '@/testkit/async/deferred';
@@ -4851,6 +4856,114 @@ describe('ApiSessionClient pending-queue turn-end drain', () => {
     await expect(client.materializeNextPendingMessageSafely({ requestedLocalId: ' B ' })).resolves.toEqual({ type: 'no_pending' });
     expect(materializeNextMock).toHaveBeenCalledTimes(2);
   });
+
+  it('[startup-wrapper] runs exact B past unresolved A through the Claude startup wrapper, consumer and interrupt-and-run RPC', async () => {
+    // Normal Claude startup hands the launcher a DeferredApiSessionClient, never the client itself.
+    const deferred = new DeferredApiSessionClient({ placeholderSessionId: 'PID-startup', limits: { maxEntries: 10, maxBytes: 10_000 } });
+    const inputConsumer = createSessionProviderInputConsumer({
+      session: deferred,
+      messageQueue: new MessageQueue2<{ id: string }>(() => 'mode'),
+      activeTurnSteerability: 'unsteerable',
+    });
+    // Registered as the launcher registers it: capability and identity read from the wrapper.
+    const requestPendingInputSendNow = deferred.requestPendingInputSendNow?.bind(deferred);
+    const waitForProviderInputTerminalOutcome = deferred.waitForProviderInputTerminalOutcome?.bind(deferred);
+    expect(requestPendingInputSendNow).toBeTypeOf('function');
+    expect(waitForProviderInputTerminalOutcome).toBeTypeOf('function');
+    let turnActive = true;
+    const dispose = deferred.registerSessionRuntimeControls({
+      interruptPendingInputAndRun: createClaudeAgentSdkPendingInputInterruptAndRunControl({
+        session: {
+          get sessionId() { return deferred.sessionId; },
+          requestPendingInputSendNow: requestPendingInputSendNow!,
+          waitForProviderInputTerminalOutcome: waitForProviderInputTerminalOutcome!,
+        },
+        inputConsumer,
+        isRunnerLive: () => true,
+        isTurnActive: () => turnActive,
+        interrupts: createClaudeAgentSdkInterruptObservations(),
+      }),
+    });
+
+    const client = await createClient({ latestTurnStatus: 'in_progress', pendingCount: 1, pendingVersion: 1 });
+    await waitForCurrentPendingInputContract(client);
+    // Same structural handoff as runClaude's wireServerSession.
+    await deferred.attach(client as unknown as DeferredApiSessionTarget);
+    expect(deferred.sessionId).toBe('s1');
+    const patch = vi.spyOn(axios, 'patch');
+    // The modelled provider never reports A's outcome and accepts B when the client delivers it.
+    const delivered: string[] = [];
+    client.onUserMessage((message) => {
+      if (message.localId) delivered.push(message.localId);
+      if (message.localId === ' B ') confirmProviderInputAccepted(client, message.localId);
+    });
+    const invoke = (request: Readonly<{ sessionId: string; localId: string }>) => client.rpcHandlerManager.invokeLocal(
+      SESSION_RPC_METHODS.SESSION_PENDING_INPUT_INTERRUPT_AND_RUN, request);
+
+    // A is delivered to the provider but its outcome stays unknown, so it holds generic delivery.
+    materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult('held-A', 2));
+    await client.materializeNextPendingMessageSafely();
+    expect(client.hasCanonicalPendingProviderInputDelivery('held-A')).toBe(true);
+    await expect(inputConsumer.drainPending()).resolves.toMatchObject({ materialized: 0 });
+    expect(materializeNextMock).toHaveBeenCalledTimes(1);
+
+    // Exact A is refused before any effect; a stale identity is refused before any effect.
+    await expect(invoke({ sessionId: 's1', localId: 'held-A' })).resolves.toMatchObject({
+      ok: false, status: 'interrupt_failed', localId: 'held-A', errorCode: 'pending_input_send_now_unavailable',
+    });
+    await expect(invoke({ sessionId: 'PID-startup', localId: ' B ' })).resolves.toMatchObject({ ok: false, status: 'stale_state' });
+    expect(patch).not.toHaveBeenCalled();
+
+    // Exact B (whitespace is part of its id) is marked, materialized past A and accepted.
+    patch.mockImplementationOnce(async (_url, body) => (
+      { data: { ok: true, didUpdate: true, requestedAction: (body as { requestedAction: unknown }).requestedAction } }));
+    materializeNextMock.mockResolvedValueOnce(createProviderDeliveryMaterializeResult(' B ', 3));
+    await expect(invoke({ sessionId: 's1', localId: ' B ' })).resolves.toEqual({
+      ok: true, status: 'admitted_and_queued_until_boundary', sessionId: 's1', localId: ' B ',
+    });
+    expect(patch).toHaveBeenCalledOnce();
+    expect(patch.mock.calls[0]?.[0]).toMatch(/\/v2\/sessions\/s1\/pending\/%20B%20\/action$/);
+    expect(patch.mock.calls[0]?.[1]).toEqual({ requestedAction: { v: 1, kind: 'send_now' } });
+    expect(materializeNextMock).toHaveBeenCalledTimes(2);
+    expect(materializeNextMock.mock.calls[1]?.[0]).toMatchObject({ requestedLocalId: ' B ', heldLocalIds: ['held-A'] });
+    expect(delivered).toEqual(['held-A', ' B ']);
+    expect(client.hasPendingProviderInputAcceptance(' B ')).toBe(true);
+    expect(client.hasCanonicalPendingProviderInputDelivery('held-A')).toBe(true);
+
+    // No foreground turn: refused before effect. Disposed registration: the method is unsupported again.
+    turnActive = false;
+    await expect(invoke({ sessionId: 's1', localId: 'C' })).resolves.toMatchObject({ ok: false, status: 'not_safe', errorCode: 'no_active_turn' });
+    dispose();
+    await expect(invoke({ sessionId: 's1', localId: 'C' })).resolves.toMatchObject({ ok: false, status: 'unsupported' });
+    expect(patch).toHaveBeenCalledOnce();
+  });
+
+  it.each(['cancel', 'beginRuntimeTermination'] as const)(
+    '[startup-wrapper] an exact action still waiting for attach obeys %s before its HTTP effect',
+    async (operation) => {
+      const client = await createClient({ latestTurnStatus: 'in_progress', pendingCount: 1, pendingVersion: 1 });
+      await waitForCurrentPendingInputContract(client);
+      const deferred = new DeferredApiSessionClient({ placeholderSessionId: 'PID-cancel', limits: { maxEntries: 10, maxBytes: 10_000 } });
+      // A buffered durable write holds the attach flush, so the exact action waits for attach.
+      const flushHeld = createDeferred<void>();
+      vi.spyOn(client, 'updateAgentStateRequestSettlement').mockImplementationOnce(() => flushHeld.promise);
+      const buffered = deferred.updateAgentStateRequestSettlement((state) => state);
+      const attaching = deferred.attach(client as unknown as DeferredApiSessionTarget);
+      const patch = vi.spyOn(axios, 'patch').mockImplementation(async (_url, body) => (
+        { data: { ok: true, didUpdate: true, requestedAction: (body as { requestedAction: unknown }).requestedAction } }));
+      const requested = deferred.requestPendingInputSendNow(' B ');
+      await Promise.resolve();
+      expect(patch).not.toHaveBeenCalled();
+
+      deferred[operation]();
+      flushHeld.resolve();
+      await attaching;
+      await buffered;
+
+      await expect(requested).resolves.toEqual({ kind: 'not_admitted', reason: 'unsupported' });
+      expect(patch).not.toHaveBeenCalled();
+    },
+  );
 
   it('keeps accepted custody non-blocking while its settlement is still in flight', async () => {
     const client = await createClient({ latestTurnStatus: 'completed', pendingCount: 2, pendingVersion: 1 });

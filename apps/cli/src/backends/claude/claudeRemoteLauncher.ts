@@ -71,6 +71,11 @@ import { resolveClaudeSdkPermissionModeFromEnhancedMode } from "./utils/permissi
 import { readClaudeActiveTerminalMode } from './utils/readClaudeActiveTerminalMode';
 import { formatErrorForUi } from '@/ui/formatErrorForUi';
 import { createClaudePendingAwareInputConsumer } from './createClaudePendingAwareInputConsumer';
+import {
+    createClaudeAgentSdkInterruptObservations,
+    createClaudeAgentSdkPendingInputInterruptAndRunControl,
+    type PendingInterruptAndSendEvidence,
+} from './remote/createClaudeAgentSdkPendingInputInterruptAndRunControl';
 import type { MessageBatch } from '@/agent/runtime/sessionInput/types';
 import { readDaemonInitialGoalFromEnv } from '@/agent/runtime/sessionInitialGoal';
 import { resolveClaudeQueuedPromptForDispatch } from '@/backends/claude/runtime/resolveClaudeQueuedPromptForDispatch';
@@ -1260,6 +1265,14 @@ export async function claudeRemoteLauncher(
         publisher: ReturnType<typeof createClaudeInFlightSteerCapabilityPublisher> | null,
     ) => publisher?.dispose();
     let refreshInFlightSteerAvailability: (() => Promise<ClaudeInFlightSteerAvailabilitySnapshot>) | null = null;
+    let disposeAgentSdkInterruptAndRunControl: (() => void) | null = null;
+    // Withdraws the current SDK runner's interrupt-and-run registration, once, from the session.
+    const withdrawAgentSdkInterruptAndRunControl = () => {
+        const dispose = disposeAgentSdkInterruptAndRunControl;
+        disposeAgentSdkInterruptAndRunControl = null;
+        dispose?.();
+    };
+    const agentSdkInterruptObservations = createClaudeAgentSdkInterruptObservations();
     let applyActiveLaunchPermissionMetadata: ReturnType<typeof createClaudeUnifiedTerminalMetadataModeApplier> | null = null;
     let applyAgentSdkPermissionMode: ((permissionMode: PermissionMode) => Promise<void>) | null = null;
     const inputConsumer = createClaudePendingAwareInputConsumer(session, {
@@ -2028,6 +2041,10 @@ export async function claudeRemoteLauncher(
                         inFlightSteerAvailabilitySnapshot = snapshot;
                         agentSdkInFlightSteerCapabilityPublisher?.publish(snapshot);
                     },
+                    onPendingInterruptAndSendEvidence: (userMessageLocalIds: readonly string[], evidence: PendingInterruptAndSendEvidence) => {
+                        if (activeRemoteRunnerKind !== 'agentSdk') return;
+                        agentSdkInterruptObservations.recordEvidence(userMessageLocalIds, evidence);
+                    },
                     onProviderPromptStarted: () => {
                         if (isUnifiedTerminalTranscriptActive()) {
                             return unifiedBinding.sessionOptions.onProviderPromptStarted?.();
@@ -2045,6 +2062,7 @@ export async function claudeRemoteLauncher(
                         activeRemoteRunnerKind = runner;
                         disposeAgentSdkInFlightSteerCapabilityPublisher(agentSdkInFlightSteerCapabilityPublisher);
                         agentSdkInFlightSteerCapabilityPublisher = null;
+                        withdrawAgentSdkInterruptAndRunControl();
                         inFlightSteerAvailabilitySnapshot = { available: false, reason: 'unsafe_window' };
                         if (runner === 'agentSdk') {
                             agentSdkInFlightSteerCapabilityPublisher = createClaudeInFlightSteerCapabilityPublisher({
@@ -2053,6 +2071,27 @@ export async function claudeRemoteLauncher(
                                 terminalComposerControls: false,
                             });
                             agentSdkInFlightSteerCapabilityPublisher.publish(inFlightSteerAvailabilitySnapshot);
+                            // The SDK runner interrupts the active turn for an exact `interrupt_and_send`
+                            // row; this control selects that row for `session.pendingInput.interruptAndRun`.
+                            const client = session.client;
+                            const requestPendingInputSendNow = client.requestPendingInputSendNow?.bind(client);
+                            const waitForProviderInputTerminalOutcome = client.waitForProviderInputTerminalOutcome?.bind(client);
+                            if (requestPendingInputSendNow && waitForProviderInputTerminalOutcome) {
+                                disposeAgentSdkInterruptAndRunControl = client.registerSessionRuntimeControls?.({
+                                    interruptPendingInputAndRun: createClaudeAgentSdkPendingInputInterruptAndRunControl({
+                                        session: {
+                                            // Read at request time: a startup wrapper adopts the real session id on attach.
+                                            get sessionId() { return client.sessionId; },
+                                            requestPendingInputSendNow,
+                                            waitForProviderInputTerminalOutcome,
+                                        },
+                                        inputConsumer,
+                                        isRunnerLive: () => activeRemoteRunnerKind === 'agentSdk' && !launchAbortSignal.aborted,
+                                        isTurnActive: () => client.hasActiveCanonicalTurn?.() === true,
+                                        interrupts: agentSdkInterruptObservations,
+                                    }),
+                                }) ?? null;
+                            }
                         }
                         if (runner === 'legacy') {
                             publishClaudeInFlightSteerBackendUnsupported({ session: session.client });
@@ -2421,6 +2460,9 @@ export async function claudeRemoteLauncher(
                 controller.abort('claude-remote-provider-launch-finished');
                 disposeAgentSdkInFlightSteerCapabilityPublisher(agentSdkInFlightSteerCapabilityPublisher);
                 agentSdkInFlightSteerCapabilityPublisher = null;
+                // This launch's SDK runner is gone: its interrupt-and-run control must not outlive it
+                // in the session's registered controls (the next launch registers its own).
+                withdrawAgentSdkInterruptAndRunControl();
                 refreshInFlightSteerAvailability = null;
                 applyAgentSdkPermissionMode = null;
                 inFlightSteerAvailabilitySnapshot = { available: false, reason: 'unsafe_window' };

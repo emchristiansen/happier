@@ -2523,6 +2523,17 @@ export function createActionExecutor(deps: ActionExecutorDeps): Readonly<{
             ...(typeof expectedStateAtMs === 'number' ? { expectedStateAtMs } : {}),
             ...(serverId ? { serverId } : {}),
           });
+          // The runtime answers inside a successful RPC: its refusal (`unsupported`, `stale_state`,
+          // `not_safe`, ...) is this action's failure, never `ok: true`. The runtime's status names it
+          // when it sets no more specific errorCode.
+          const failure = readActionExecuteFailure(res);
+          if (failure) {
+            const status = (res as Readonly<{ status?: unknown }>).status;
+            const errorCode = failure.errorCode === 'action_failed' && typeof status === 'string' && status.trim()
+              ? status
+              : failure.errorCode;
+            return { ok: false, errorCode, error: failure.error === 'action_failed' ? errorCode : failure.error, details: res };
+          }
           return { ok: true, result: res };
         }
 

@@ -373,6 +373,8 @@ describe('claudeRemoteAgentSdk stream events', () => {
                     subtype: 'error_during_execution',
                     is_error: true,
                     result: 'Request interrupted by user',
+                    // The CLI reports why an interrupted turn ended.
+                    terminal_reason: 'aborted_streaming',
                 } as any;
                 yield { type: 'result' } as any;
             },

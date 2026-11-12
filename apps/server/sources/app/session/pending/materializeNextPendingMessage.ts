@@ -467,7 +467,10 @@ async function materializeNextPendingMessageInTx(
                 if (row.deliveryState !== null) return false;
                 const action = PendingRequestedActionV1Schema.safeParse(row.requestedAction);
                 if (!action.success) return false;
-                if (requestedLocalId !== undefined && action.data.kind !== "steer_now" && action.data.kind !== "steer_now_bound") return false;
+                // An exact request selects only a row whose explicit action asks to run now: a steer, or
+                // `send_now` (interrupt-and-run of that exact row; `interrupt_and_send` while the turn is busy).
+                if (requestedLocalId !== undefined && action.data.kind !== "steer_now" && action.data.kind !== "steer_now_bound"
+                    && action.data.kind !== "send_now") return false;
                 return action.data.kind === "send_now"
                     || action.data.kind === "steer_now"
                     || action.data.kind === "steer_now_bound"

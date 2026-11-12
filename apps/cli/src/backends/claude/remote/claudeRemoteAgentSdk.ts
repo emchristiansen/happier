@@ -125,6 +125,38 @@ type AgentSdkQueryFactory = (params: {
     options?: Record<string, unknown>;
 }) => AgentSdkQueryType;
 
+/**
+ * How one foreground turn ended: `interrupted` only when its own result proves the abort this runner
+ * requested (an execution error whose terminal reason is an abort); `not_interrupted` for every other
+ * end, including a failure, a compaction and an interruption the result does not prove.
+ */
+type ForegroundTurnEndKind = 'interrupted' | 'not_interrupted';
+
+/** What the runner learned about one `interrupt_and_send` row's interrupt (`onPendingInterruptAndSendEvidence`). */
+export type PendingInterruptAndSendEvidence = 'target_interrupted' | 'interrupt_refused';
+
+/** One foreground turn, settled once with how it ended. */
+type ForegroundTurnEnd = Readonly<{
+    ended: Promise<ForegroundTurnEndKind>;
+    end: (kind: ForegroundTurnEndKind) => void;
+    hasEnded: () => boolean;
+}>;
+
+function createForegroundTurnEnd(): ForegroundTurnEnd {
+    let kind: ForegroundTurnEndKind | null = null;
+    let resolve!: (kind: ForegroundTurnEndKind) => void;
+    const ended = new Promise<ForegroundTurnEndKind>((r) => { resolve = r; });
+    return Object.freeze({
+        ended,
+        end: (how: ForegroundTurnEndKind) => {
+            if (kind !== null) return;
+            kind = how;
+            resolve(how);
+        },
+        hasEnded: () => kind !== null,
+    });
+}
+
 function argsContainMcpConfigFlag(args?: string[] | null): boolean {
     const input = args ?? [];
     for (const arg of input) {
@@ -196,6 +228,17 @@ export async function claudeRemoteAgentSdk(opts: {
     onPromptTransportFailure?: ClaudeRemoteProviderPromptTransportFailureHandler | null;
     /** Exact availability of the SDK streaming-input boundary for the active foreground turn. */
     onInFlightSteerAvailabilityChange?: ((available: boolean) => void) | null;
+    /**
+     * A fact about the interrupt the runner sent for the exact rows (provider action
+     * `interrupt_and_send`) of a foreground turn active when they reached it: `target_interrupted`
+     * when that turn's own result proves the requested abort, `interrupt_refused` when the provider
+     * refused the row's own interrupt. Facts arrive in either order; the consumer decides from both.
+     * Nothing is reported for a row that arrives after its turn ended or without that action.
+     */
+    onPendingInterruptAndSendEvidence?: ((
+        userMessageLocalIds: readonly string[],
+        evidence: PendingInterruptAndSendEvidence,
+    ) => void) | null;
     /**
      * Registers a best-effort interrupt handler that can stop the current turn without
      * terminating the underlying Claude Code subprocess.
@@ -489,6 +532,9 @@ export async function claudeRemoteAgentSdk(opts: {
             .at(-1)?.taskId
         ?? null
     );
+    const isProviderTaskActive = (taskId: string): boolean => providerActivityLedger
+        .getActiveProviderTaskBlockers()
+        .some((blocker) => blocker.taskId === taskId);
     const runtimeActivityEffectParams = {
         evidence: providerRuntimeActivityEvidence,
         logger,
@@ -961,7 +1007,18 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
 	    };
 
 	    let didRequestTurnInterrupt = false;
-	    let awaitingRequestedTurnInterruptResult = false;
+	    // Interrupt requests the provider has not refused, each bound to the foreground turn that was current
+	    // when it was made. A result counts only the requests bound to the turn it ends. A request made after
+	    // that turn's result (stopping a background task it left behind) is bound to an ended turn, which no
+	    // later result ends, so it never excuses a later turn's abort. Each request withdraws only itself on
+	    // refusal, so one refused interrupt never erases another still standing; a result retires every
+	    // request outstanding then, so a refusal arriving after it changes nothing.
+	    const unrefusedInterruptRequests = new Set<Readonly<{ turn: ForegroundTurnEnd }>>();
+	    const recordInterruptRequest = (turn: ForegroundTurnEnd): (() => void) => {
+	        const request = { turn };
+	        unrefusedInterruptRequests.add(request);
+	        return () => { unrefusedInterruptRequests.delete(request); };
+	    };
 	    const repairTranscriptAfterAbort = async () => {
 	        if (!didRequestTurnInterrupt && !abortSignal.aborted) return;
 	        try {
@@ -1073,25 +1130,51 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
         let detachedTaskInterruptId: string | null = null;
         let foregroundTurnInterruptActive = true;
         let deferredInterruptedReason: string | null = null;
+        // The exact foreground turn in progress, settled once with how it ended, as soon as its result
+        // or finalization is seen. An `interrupt_and_send` row correlates with this record (not a later
+        // busy flag, which may already describe a newer turn) to learn whether it interrupted that turn.
+        let foregroundTurn = createForegroundTurnEnd();
+        const beginForegroundTurnIfEnded = () => {
+            if (foregroundTurn.hasEnded()) foregroundTurn = createForegroundTurnEnd();
+        };
 
 	        const interruptTurn = async (): Promise<void> => {
-                let stopTaskSucceeded = false;
+                // What this interrupt was asked to stop. A stopTask refusal, its fallback and the cleanup
+                // below may arrive after that turn ended and a newer one began; they must not touch it.
+                const target = foregroundTurn;
+                const targetWasRunning = foregroundTurnInterruptActive && !target.hasEnded();
+                const noNewerTurn = () => foregroundTurn === target;
+                // The background task chosen while no foreground turn runs; it must still be running for
+                // a refused stop to fall back, or for this interrupt's abort cleanup.
+                let detachedTarget: string | null = null;
+                const targetStillToStop = () => noNewerTurn() && (targetWasRunning
+                    ? !target.hasEnded()
+                    : detachedTarget === null || isProviderTaskActive(detachedTarget));
+                // Set once the stop itself settles this interrupt: the task stopped, or its refusal came
+                // after what it targeted had already ended. Neither leaves anything to abort.
+                let stopSettled = false;
 	            try {
                     const stopTask = (response as any)?.stopTask;
                     if (typeof stopTask === 'function') {
                         const taskId = foregroundTaskInterruptId
                             ?? (foregroundTurnInterruptActive ? null : detachedTaskInterruptId);
                         if (typeof taskId === 'string' && taskId.trim().length > 0) {
+                            if (taskId !== foregroundTaskInterruptId) detachedTarget = taskId;
                             didRequestTurnInterrupt = true;
                             deferredInterruptedReason = deferredInterruptedReason ?? 'turn-interrupt';
-                            awaitingRequestedTurnInterruptResult = true;
+                            const withdrawStopTask = recordInterruptRequest(target);
                             try {
                                 await stopTask.call(response, taskId);
-                                stopTaskSucceeded = true;
+                                stopSettled = true;
                                 return;
                             } catch {
-                                awaitingRequestedTurnInterruptResult = false;
-                                // Best-effort: if stopTask fails, fall back to interrupt().
+                                withdrawStopTask();
+                                // Best-effort: if stopTask fails, fall back to interrupt(), but only
+                                // while what it was meant to stop is still running.
+                                if (!targetStillToStop()) {
+                                    stopSettled = true;
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1100,22 +1183,29 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
 	                if (typeof interrupt === 'function') {
 	                    didRequestTurnInterrupt = true;
                         deferredInterruptedReason = deferredInterruptedReason ?? 'turn-interrupt';
-	                    awaitingRequestedTurnInterruptResult = true;
-	                    await interrupt.call(response);
+	                    const withdrawInterrupt = recordInterruptRequest(target);
+	                    try {
+	                        await interrupt.call(response);
+	                    } catch (error) {
+	                        withdrawInterrupt();
+	                        throw error;
+	                    }
 	                }
 	            } catch {
-	                awaitingRequestedTurnInterruptResult = false;
 	                // Best-effort: interrupt is optional and should not crash cancellation.
 	            } finally {
+                    if (noNewerTurn()) {
 	                // Ensure UI thinking state is released even if Claude does not emit a clean result.
 	                updateThinking(false);
-                    if (!stopTaskSucceeded) {
+                    // No abort cleanup once the stop settled this interrupt; an interrupt actually sent still gets it.
+                    if (!stopSettled) {
                         try {
                             cleanupBufferedAssistantMessages?.(null);
                         } catch {
                             // ignore
                         }
 	                    await flushStreamedTranscriptWriter('abort', 'turn-interrupt');
+                    }
                     }
 	            }
 	        };
@@ -1624,25 +1714,58 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                                 promptSettlements.rejectBeforeEffect(next);
                                 continue;
                             }
-                            opts.onInFlightSteerAvailabilityChange?.(false);
-                            try {
+                            // The row may arrive after its turn already ended; then there is nothing to
+                            // interrupt and it simply runs as the next turn.
+                            const targetTurn = foregroundTurnInterruptActive && !foregroundTurn.hasEnded()
+                                ? foregroundTurn
+                                : null;
+                            if (targetTurn) {
+                                opts.onInFlightSteerAvailabilityChange?.(false);
+                                // The SDK writes the interrupt request to its transport synchronously, before
+                                // this row's input, so the provider sees the interrupt first. Its control
+                                // response can come late or never, so neither this row nor any later row
+                                // waits for it: an unanswered interrupt must not strand later input.
+                                let acknowledgement: Promise<unknown>;
+                                try {
+                                    acknowledgement = Promise.resolve(interrupt.call(response));
+                                } catch {
+                                    // Refused before any request was written: nothing of this row reached the provider.
+                                    promptSettlements.rejectBeforeEffect(next);
+                                    opts.onInFlightSteerAvailabilityChange?.(true);
+                                    continue;
+                                }
                                 didRequestTurnInterrupt = true;
                                 deferredInterruptedReason = deferredInterruptedReason ?? 'pending-interrupt-and-send';
-                                awaitingRequestedTurnInterruptResult = true;
-                                await interrupt.call(response);
-                                cleanupBufferedAssistantMessages?.(null);
-                                await flushStreamedTranscriptWriter('abort', 'pending-interrupt-and-send');
-                            } catch {
-                                awaitingRequestedTurnInterruptResult = false;
-                                promptSettlements.rejectBeforeEffect(next);
-                                opts.onInFlightSteerAvailabilityChange?.(true);
-                                continue;
+                                const withdrawInterrupt = recordInterruptRequest(targetTurn);
+                                const interruptedIds = next.userMessageLocalIds ?? [];
+                                void acknowledgement.then(async () => {
+                                    // Once its own result was seen the target turn is already flushed.
+                                    if (targetTurn.hasEnded()) return;
+                                    cleanupBufferedAssistantMessages?.(null);
+                                    await flushStreamedTranscriptWriter('abort', 'pending-interrupt-and-send');
+                                }, () => {
+                                    // A refused interrupt leaves the target turn running; this row, already
+                                    // input, runs at its boundary. Another row's interrupt may still stop it.
+                                    withdrawInterrupt();
+                                    opts.onPendingInterruptAndSendEvidence?.(interruptedIds, 'interrupt_refused');
+                                }).catch((error) => {
+                                    logger.debug('[claudeRemoteAgentSdk] Interrupt acknowledgement handling failed', {
+                                        errorName: error instanceof Error ? error.name : typeof error,
+                                    });
+                                });
+                                // The target turn's own result proving the requested abort precedes this row's
+                                // acceptance in the provider stream; a refusal of this row's interrupt may come
+                                // before or after it.
+                                void targetTurn.ended.then((how) => {
+                                    if (how === 'interrupted') opts.onPendingInterruptAndSendEvidence?.(interruptedIds, 'target_interrupted');
+                                });
                             }
                         }
 
                         if (pendingProviderAction !== 'steer') {
                             resetForegroundTurn();
                         }
+                        beginForegroundTurnIfEnded();
                         foregroundTurnInterruptActive = true;
                         messages.push({
                             type: 'user',
@@ -1667,6 +1790,8 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
         const finalizeCurrentTurn = async (params?: { completionEvent?: ClaudeCompletionEvent }) => {
             if (didFinalizeTurn) return;
             didFinalizeTurn = true;
+            // The turn is over now; a row arriving during the awaits below belongs to the next turn.
+            foregroundTurn.end('not_interrupted');
             awaitingNextTurnStart = true;
             foregroundTurnInterruptActive = false;
             opts.onInFlightSteerAvailabilityChange?.(false);
@@ -1722,9 +1847,12 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
             resetTurnDiagnostics();
         };
 
-        const releaseCurrentTurnForResult = async () => {
+        const releaseCurrentTurnForResult = async (how: ForegroundTurnEndKind = 'not_interrupted') => {
             if (didFinalizeTurn || didReleaseTurnForResult) return;
             didReleaseTurnForResult = true;
+            // Settle this result's own turn before any await: a row arriving while readiness is
+            // pending starts a new turn and must never be settled by this older result.
+            foregroundTurn.end(how);
             await reconcileRuntimeActivityForResult();
             await opts.onReady();
             scheduleNextMessagePump();
@@ -1867,6 +1995,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                     awaitingNextTurnStart = false;
                     didFinalizeTurn = false;
                     resetForegroundTurn();
+                    beginForegroundTurnIfEnded();
                     foregroundTurnInterruptActive = true;
                     await opts.onProviderPromptStarted?.();
                     updateThinking(true);
@@ -2309,18 +2438,26 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                         ? { transcript_path: latestTranscriptPath, transcriptPath: latestTranscriptPath }
                         : undefined);
                 }
-                const didRequestThisResult = awaitingRequestedTurnInterruptResult;
-                awaitingRequestedTurnInterruptResult = false;
+                // This result ends `foregroundTurn`; only requests aimed at that turn requested it.
+                const endingTurn = foregroundTurn;
+                const didRequestThisResult = [...unrefusedInterruptRequests].some((request) => request.turn === endingTurn);
+                unrefusedInterruptRequests.clear();
                 const failure = readAgentSdkResultFailure(message);
                 const retainForeground = promptSettlements.shouldRetainForegroundForResult(message);
-                const isRequestedExecutionInterrupt = didRequestThisResult && message.subtype === 'error_during_execution';
+                // A requested interrupt does not turn an execution error into one: only an abort terminal
+                // reason proves it. An absent or unknown reason proves nothing, so the error stays a failure.
+                const terminalReason = message.subtype === 'error_during_execution' ? message.terminal_reason : undefined;
+                const isAbortTerminalReason = terminalReason === 'aborted_streaming' || terminalReason === 'aborted_tools';
+                const isRequestedExecutionInterrupt = didRequestThisResult && isAbortTerminalReason;
+                const resultTurnEnd: ForegroundTurnEndKind = isRequestedExecutionInterrupt ? 'interrupted' : 'not_interrupted';
                 if (failure && !retainForeground) {
                     if (isRequestedExecutionInterrupt) {
                         if (!didFinalizeTurn) {
-                            await releaseCurrentTurnForResult();
+                            await releaseCurrentTurnForResult(resultTurnEnd);
                         }
                         continue;
                     }
+                    foregroundTurn.end('not_interrupted');
                     await reconcileRuntimeActivityForResult();
                     throw new Error(failure);
                 }
@@ -2340,6 +2477,9 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                 }
 
                 if (retainForeground) {
+                    // This result still ends its own turn; the foreground continues as a new one.
+                    foregroundTurn.end(resultTurnEnd);
+                    beginForegroundTurnIfEnded();
                     // Preserve output from earlier or partially answered work until the submitted
                     // prompts have outcomes. Session backlog alone does not identify those prompts.
                     lastTurnFlushSummary = await flushStreamedTranscriptWriter('turn-end');

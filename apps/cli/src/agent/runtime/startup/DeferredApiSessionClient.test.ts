@@ -1127,4 +1127,116 @@ describe('DeferredApiSessionClient', () => {
       await expect(promise).resolves.toBeUndefined();
     });
   });
+
+  describe('exact pending interrupt-and-run forwarding', () => {
+    function createTarget(overrides: Partial<Record<string, unknown>> = {}) {
+      return {
+        sessionId: 'sess-irun',
+        rpcHandlerManager: { registerHandler: vi.fn(), invokeLocal: vi.fn(async () => ({})) },
+        sendSessionEvent: vi.fn(), sendClaudeSessionMessage: vi.fn(), sendAgentMessage: vi.fn(),
+        sendAgentMessageCommitted: vi.fn(async () => {}), sendCodexMessage: vi.fn(), sendUserTextMessage: vi.fn(),
+        updateMetadata: vi.fn(), updateAgentStateRequestSettlement: vi.fn(async () => {}),
+        updateAgentState: vi.fn(), keepAlive: vi.fn(),
+        getMetadataSnapshot: vi.fn(() => createMetadataStub()), waitForMetadataUpdate: vi.fn(async () => true),
+        popPendingMessage: vi.fn(async () => false), peekActionablePendingMessageQueueV2Count: vi.fn(async () => 0),
+        discardPendingMessageQueueV2All: vi.fn(async () => 0), discardCommittedMessageLocalIds: vi.fn(async () => 0),
+        sendSessionDeath: vi.fn(), flush: vi.fn(async () => {}), close: vi.fn(async () => {}),
+        ...overrides,
+      } as unknown as DeferredApiSessionTarget;
+    }
+
+    it('exposes the capability before attach without inventing admission, an outcome or an exact selection', async () => {
+      const deferred = new DeferredApiSessionClient({ placeholderSessionId: 'PID-irun', limits: { maxEntries: 10, maxBytes: 10_000 } });
+      // The launcher decides registration from these members on the startup wrapper itself.
+      expect(typeof deferred.requestPendingInputSendNow).toBe('function');
+      expect(typeof deferred.waitForProviderInputTerminalOutcome).toBe('function');
+      await expect(deferred.requestPendingInputSendNow('B')).resolves.toEqual({ kind: 'not_admitted', reason: 'unsupported' });
+      await expect(deferred.waitForProviderInputTerminalOutcome('B', 5, new AbortController().signal)).resolves.toEqual({ kind: 'pending' });
+      expect(deferred.shouldAttemptPendingMaterialization({ requestedLocalId: 'B' })).toBe(false);
+    });
+
+    it('forwards exact IDs, timeout, abort signal and selection options to the attached target, including calls racing attach', async () => {
+      const deferred = new DeferredApiSessionClient({ placeholderSessionId: 'PID-irun', limits: { maxEntries: 10, maxBytes: 10_000 } });
+      const order: string[] = [];
+      const requestPendingInputSendNow = vi.fn(async (localId: string) => { order.push(`request:${localId}`); return { kind: 'admitted' as const }; });
+      const waitForProviderInputTerminalOutcome = vi.fn(async (localId: string, _timeoutMs?: number, _signal?: AbortSignal) => {
+        order.push(`wait:${localId}`);
+        return { kind: 'accepted' as const, providerTurnId: 'turn-B' };
+      });
+      const shouldAttemptPendingMaterialization = vi.fn((opts?: { requestedLocalId?: string }) => opts?.requestedLocalId === ' B ');
+      const flushGate = createDeferred<void>();
+      const target = createTarget({
+        sessionId: 'sess-real',
+        requestPendingInputSendNow, waitForProviderInputTerminalOutcome, shouldAttemptPendingMaterialization,
+        updateAgentStateRequestSettlement: vi.fn(() => flushGate.promise),
+      });
+      const buffered = deferred.updateAgentStateRequestSettlement((state) => state);
+      const attaching = deferred.attach(target);
+      expect(deferred.sessionId).toBe('sess-real');
+      const signal = new AbortController().signal;
+      // The control observes the outcome before it asks the server to run the row.
+      const outcome = deferred.waitForProviderInputTerminalOutcome(' B ', 7, signal);
+      const admission = deferred.requestPendingInputSendNow(' B ');
+      await Promise.resolve();
+      expect(order).toEqual([]);
+      flushGate.resolve();
+      await attaching;
+      await buffered;
+      await expect(outcome).resolves.toEqual({ kind: 'accepted', providerTurnId: 'turn-B' });
+      await expect(admission).resolves.toEqual({ kind: 'admitted' });
+      expect(order).toEqual(['wait: B ', 'request: B ']);
+      expect(waitForProviderInputTerminalOutcome).toHaveBeenCalledExactlyOnceWith(' B ', 7, signal);
+      expect(waitForProviderInputTerminalOutcome.mock.calls[0]?.[2]).toBe(signal);
+      expect(requestPendingInputSendNow).toHaveBeenCalledExactlyOnceWith(' B ');
+
+      const exact = { requestedLocalId: ' B ', activeTurnSteerability: 'unsteerable' as const };
+      expect(deferred.shouldAttemptPendingMaterialization(exact)).toBe(true);
+      expect(shouldAttemptPendingMaterialization).toHaveBeenLastCalledWith(exact);
+      expect(deferred.shouldAttemptPendingMaterialization({ requestedLocalId: 'B' })).toBe(false);
+      expect(shouldAttemptPendingMaterialization).toHaveBeenLastCalledWith({ requestedLocalId: 'B' });
+      expect(deferred.shouldAttemptPendingMaterialization()).toBe(false);
+      expect(shouldAttemptPendingMaterialization).toHaveBeenLastCalledWith(undefined);
+    });
+
+    it('starts neither exact operation when cancellation lands while the call waits for attach', async () => {
+      const deferred = new DeferredApiSessionClient({ placeholderSessionId: 'PID-irun-cancel', limits: { maxEntries: 10, maxBytes: 10_000 } });
+      const requestPendingInputSendNow = vi.fn(async () => ({ kind: 'admitted' as const }));
+      const waitForProviderInputTerminalOutcome = vi.fn(async () => ({ kind: 'accepted' as const, providerTurnId: 'turn-B' }));
+      const flushGate = createDeferred<void>();
+      const target = createTarget({
+        requestPendingInputSendNow, waitForProviderInputTerminalOutcome,
+        updateAgentStateRequestSettlement: vi.fn(() => flushGate.promise),
+      });
+      const buffered = deferred.updateAgentStateRequestSettlement((state) => state);
+      const attaching = deferred.attach(target);
+      const outcome = deferred.waitForProviderInputTerminalOutcome(' B ', 7, new AbortController().signal);
+      const admission = deferred.requestPendingInputSendNow(' B ');
+      await Promise.resolve();
+      deferred.cancel();
+      flushGate.resolve();
+      await attaching;
+      await buffered;
+      await expect(admission).resolves.toEqual({ kind: 'not_admitted', reason: 'unsupported' });
+      await expect(outcome).resolves.toEqual({ kind: 'pending' });
+      expect(requestPendingInputSendNow).not.toHaveBeenCalled();
+      expect(waitForProviderInputTerminalOutcome).not.toHaveBeenCalled();
+    });
+
+    it('refuses before effect through a target without the capability and after startup cancellation', async () => {
+      const legacy = new DeferredApiSessionClient({ placeholderSessionId: 'PID-irun-legacy', limits: { maxEntries: 10, maxBytes: 10_000 } });
+      await legacy.attach(createTarget());
+      await expect(legacy.requestPendingInputSendNow('B')).resolves.toEqual({ kind: 'not_admitted', reason: 'unsupported' });
+      await expect(legacy.waitForProviderInputTerminalOutcome('B')).resolves.toEqual({ kind: 'pending' });
+
+      const cancelled = new DeferredApiSessionClient({ placeholderSessionId: 'PID-irun-cancel', limits: { maxEntries: 10, maxBytes: 10_000 } });
+      const requestPendingInputSendNow = vi.fn(async () => ({ kind: 'admitted' as const }));
+      const waitForProviderInputTerminalOutcome = vi.fn(async () => ({ kind: 'accepted' as const }));
+      cancelled.cancel();
+      await cancelled.attach(createTarget({ requestPendingInputSendNow, waitForProviderInputTerminalOutcome }));
+      await expect(cancelled.requestPendingInputSendNow('B')).resolves.toEqual({ kind: 'not_admitted', reason: 'unsupported' });
+      await expect(cancelled.waitForProviderInputTerminalOutcome('B')).resolves.toEqual({ kind: 'pending' });
+      expect(requestPendingInputSendNow).not.toHaveBeenCalled();
+      expect(waitForProviderInputTerminalOutcome).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -77,6 +77,12 @@ export type MaterializeNextPendingOptions = {
   onDiagnosticPhase?: (phase: PendingMaterializationDiagnosticPhase) => void;
 };
 
+export type ProviderInputTerminalOutcome = Readonly<{
+  kind: 'accepted' | 'rejected_before_effect' | 'pending';
+  providerTurnId?: string;
+  reason?: string;
+}>;
+
 export type PendingInputSteerNowAdmission =
   | Readonly<{ kind: 'admitted' }>
   | Readonly<{ kind: 'admission_uncertain' }>
@@ -179,6 +185,13 @@ export interface SessionClientPort {
 
   getMetadataSnapshot(): Metadata | null;
   hasPendingProviderInputAcceptance?(localId: string): boolean;
+  /** Ask the server to run this exact Pending row now, interrupting a busy foreground turn. */
+  requestPendingInputSendNow?(localId: string): Promise<PendingInputSteerNowAdmission>;
+  waitForProviderInputTerminalOutcome?(
+    localId: string,
+    timeoutMs?: number,
+    abortSignal?: AbortSignal,
+  ): Promise<ProviderInputTerminalOutcome>;
   hasCanonicalPendingProviderInputDelivery?(localId: string): boolean;
   blockPendingMessageDelivery?(params: Readonly<{
     localIds: readonly string[] | null | undefined;

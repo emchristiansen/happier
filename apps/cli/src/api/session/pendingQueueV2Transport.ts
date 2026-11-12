@@ -1590,8 +1590,21 @@ export async function requestPendingQueueV2SteerNow(params: {
     localId: string;
     bindingId: string;
 }): Promise<Readonly<{ didUpdate: boolean }>> {
+    return await requestPendingQueueV2Action({
+        ...params,
+        requestedAction: { v: 1, kind: 'steer_now_bound', bindingId: params.bindingId },
+    });
+}
+
+/** Persist one exact Pending row's requested action and require the server to acknowledge exactly it. */
+export async function requestPendingQueueV2Action(params: {
+    token: string;
+    sessionId: string;
+    localId: string;
+    requestedAction: PendingRequestedActionV1;
+}): Promise<Readonly<{ didUpdate: boolean }>> {
     const localId = requirePendingLocalId(params.localId);
-    const requestedAction = PendingRequestedActionV1Schema.parse({ v: 1, kind: 'steer_now_bound', bindingId: params.bindingId });
+    const requestedAction = PendingRequestedActionV1Schema.parse(params.requestedAction);
     const serverUrl = resolveServerHttpBaseUrl();
     const response = await axios.patch(
         `${serverUrl}/v2/sessions/${encodeURIComponent(params.sessionId)}/pending/${encodeURIComponent(localId)}/action`,
@@ -1603,7 +1616,7 @@ export async function requestPendingQueueV2SteerNow(params: {
     );
     const data = response?.data;
     if (!data || typeof data !== 'object' || (data as Record<string, unknown>).ok !== true) {
-        throw new Error('Invalid pending queue steer-now response');
+        throw new Error('Invalid pending queue action response');
     }
     const record = data as Record<string, unknown>;
     if (
@@ -1612,7 +1625,7 @@ export async function requestPendingQueueV2SteerNow(params: {
         || JSON.stringify(PendingRequestedActionV1Schema.parse(record.requestedAction)) !== JSON.stringify(requestedAction)
         || typeof record.didUpdate !== 'boolean'
     ) {
-        throw new Error('Invalid pending queue steer-now acknowledgement');
+        throw new Error('Invalid pending queue action acknowledgement');
     }
     return { didUpdate: record.didUpdate };
 }

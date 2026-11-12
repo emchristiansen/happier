@@ -541,7 +541,8 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
                 if (replacement.done) throw new Error('Expected replacement prompt');
                 // This older result's queue snapshot predates the replacement's submission.
                 yield { type: 'result', subtype: 'error_during_execution', session_id: 'interrupted-session',
-                    errors: ['Interrupted by user'], user_message_uuid: first.value.uuid, queued_turn_count: 0 };
+                    errors: ['Interrupted by user'], terminal_reason: 'aborted_streaming',
+                    user_message_uuid: first.value.uuid, queued_turn_count: 0 };
                 reachedInterruptedResult = true;
                 await replacementResultReady;
                 yield { type: 'result', subtype: 'success', session_id: 'interrupted-session',

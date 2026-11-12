@@ -11,6 +11,7 @@ import psList from 'ps-list';
 import { MessageQueue2 } from '@/agent/runtime/modeMessageQueue';
 import type { RpcHandler } from '@/api/rpc/types';
 import type { SessionClientPort } from '@/api/session/sessionClientPort';
+import { DeferredApiSessionClient, type DeferredApiSessionTarget } from '@/agent/runtime/startup/DeferredApiSessionClient';
 import type { AgentState, Metadata } from '@/api/types';
 import { createSessionRuntimeActivity } from '@/session/runtimeActivity/createSessionRuntimeActivity';
 import type { SessionRuntimeActivityContributionHandle } from '@/session/runtimeActivity/types';
@@ -102,9 +103,14 @@ function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void
   };
 }
 
-function createHarness(providerTasks?: SessionRuntimeActivityContributionHandle, opts?: Readonly<{ providerSessionId: string | null }>): Readonly<{
+function createHarness(providerTasks?: SessionRuntimeActivityContributionHandle, opts?: Readonly<{
+  providerSessionId: string | null;
+  /** Hand the launcher the normal startup wrapper; the caller attaches `target` when it chooses. */
+  startupWrapper?: DeferredApiSessionClient;
+}>): Readonly<{
   session: Session;
   switchHandlerReady: Promise<RpcHandler>;
+  target: SessionClientPort;
 }> {
   const switchDeferred = createDeferred<RpcHandler>();
   let agentState: AgentState = { requests: Object.create(null), completedRequests: Object.create(null) };
@@ -164,7 +170,7 @@ function createHarness(providerTasks?: SessionRuntimeActivityContributionHandle,
   } satisfies SessionClientPort;
 
   const session = new Session({
-    client,
+    client: opts?.startupWrapper ? opts.startupWrapper as unknown as typeof client : client,
     path: '/tmp',
     logPath: '/tmp/claude-remote.log',
     sessionId: opts ? opts.providerSessionId : 'claude-current',
@@ -187,7 +193,7 @@ function createHarness(providerTasks?: SessionRuntimeActivityContributionHandle,
   session.transcriptPath = '/tmp/claude-current.jsonl';
   createdSessions.push(session);
 
-  return { session, switchHandlerReady: switchDeferred.promise };
+  return { session, switchHandlerReady: switchDeferred.promise, target: client };
 }
 
 describe.sequential('claudeRemoteLauncher legacy Runtime Activity subscriber', () => {
@@ -481,9 +487,17 @@ describe.sequential('claudeRemoteLauncher legacy Runtime Activity subscriber', (
 
   it('ends an idle Agent SDK launch and its provider dispatch when runner termination aborts the launcher', async () => {
     const { session } = createHarness(undefined, { providerSessionId: null });
+    const interruptAndRunWithdrawals: Array<ReturnType<typeof vi.fn>> = [];
     Object.assign(session.client, {
       getStoredContentEncryptionContext: () => ({ mode: 'plain' }),
       upsertSessionSystemRecord: async () => {},
+      requestPendingInputSendNow: vi.fn(async () => ({ kind: 'admitted' as const })),
+      waitForProviderInputTerminalOutcome: vi.fn(async () => ({ kind: 'pending' as const })),
+      registerSessionRuntimeControls: vi.fn((controls: Readonly<Record<string, unknown>>) => {
+        const withdrawn = vi.fn();
+        if (typeof controls.interruptPendingInputAndRun === 'function') interruptAndRunWithdrawals.push(withdrawn);
+        return withdrawn;
+      }),
     });
     let queryIdle = false;
     let providerAbortObserved = false;
@@ -526,6 +540,9 @@ describe.sequential('claudeRemoteLauncher legacy Runtime Activity subscriber', (
     expect(settled).toEqual({ reason: 'exit' });
     expect(providerAbortObserved).toBe(true);
     await expect(session.closeProviderInputAdmissionAndWaitForDispatches()).resolves.toBeUndefined();
+    // The terminated launch's interrupt-and-run control does not outlive it.
+    expect(interruptAndRunWithdrawals).toHaveLength(1);
+    expect(interruptAndRunWithdrawals[0]).toHaveBeenCalledOnce();
   });
 
   it.each([false, true])('surfaces idle process cleanup failure and exits without replacement when issue publication fails: %s', async (publicationFails) => {
@@ -1047,6 +1064,239 @@ describe.sequential('claudeRemoteLauncher legacy Runtime Activity subscriber', (
     for (const session of createdSessions.splice(0)) {
       session.client.sessionTurnLifecycle?.dispose();
       session.cleanup();
+    }
+  });
+
+  it('registers exact pending interrupt-and-run for the Agent SDK runner and withdraws it when the runner changes', async () => {
+    const { session, switchHandlerReady } = createHarness();
+    const registered: Array<Readonly<Record<string, unknown>>> = [];
+    const withdrawn = vi.fn();
+    const requestPendingInputSendNow = vi.fn(async () => ({ kind: 'admitted' as const }));
+    Object.assign(session.client, {
+      requestPendingInputSendNow,
+      waitForProviderInputTerminalOutcome: vi.fn(async () => ({ kind: 'pending' as const })),
+      registerSessionRuntimeControls: vi.fn((controls: Readonly<Record<string, unknown>>) => {
+        registered.push(controls);
+        return withdrawn;
+      }),
+    });
+    const atAgentSdk = createDeferred<unknown>();
+    const atLegacy = createDeferred<number>();
+    const finishLegacy = createDeferred<void>();
+    mockClaudeRemoteAgentSdk.mockImplementationOnce(async () => {
+      const control = registered.find((controls) => typeof controls.interruptPendingInputAndRun === 'function')
+        ?.interruptPendingInputAndRun as ((request: { sessionId: string; localId: string }) => Promise<unknown>) | undefined;
+      // No foreground turn is running here, so the registered control refuses before any request.
+      atAgentSdk.resolve(control ? await control({ sessionId: session.client.sessionId, localId: 'p1' }) : 'not registered');
+      throw new Error('API Error: 401 OAuth access token has expired');
+    });
+    mockClaudeRemote.mockImplementationOnce(async () => {
+      atLegacy.resolve(withdrawn.mock.calls.length);
+      await finishLegacy.promise;
+    });
+    session.queue.push('initial prompt', {
+      permissionMode: 'default',
+      claudeRemoteAgentSdkEnabled: true,
+      claudeUnifiedTerminalEnabled: false,
+    }, { userMessageLocalId: 'local-initial' });
+
+    const { claudeRemoteLauncher } = await import('./claudeRemoteLauncher');
+    const launcherPromise = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await expect(atAgentSdk.promise).resolves.toEqual({
+        ok: false, status: 'not_safe', sessionId: session.client.sessionId, localId: 'p1',
+        errorCode: 'no_active_turn', error: expect.any(String),
+      });
+      await expect(atLegacy.promise).resolves.toBeGreaterThanOrEqual(1);
+      expect(requestPendingInputSendNow).not.toHaveBeenCalled();
+    } finally {
+      finishLegacy.resolve(undefined);
+      await Promise.all([
+        Promise.resolve(switchHandler({ to: 'local' })),
+        session.cleanup(),
+        launcherPromise,
+      ]);
+    }
+  });
+
+  it('registers exact interrupt-and-run through the normal startup wrapper and checks the identity attached later', async () => {
+    const startupWrapper = new DeferredApiSessionClient({
+      placeholderSessionId: 'PID-startup', limits: { maxEntries: 1_000, maxBytes: 1_000_000 },
+    });
+    const { session, switchHandlerReady, target } = createHarness(undefined, { providerSessionId: 'claude-current', startupWrapper });
+    const registered: Array<Readonly<Record<string, unknown>>> = [];
+    const withdrawn = vi.fn();
+    const requestPendingInputSendNow = vi.fn(async () => ({ kind: 'admitted' as const }));
+    // The attached client's own surface; the wrapper under test is not augmented.
+    Object.assign(target, {
+      requestPendingInputSendNow,
+      waitForProviderInputTerminalOutcome: vi.fn(async () => ({ kind: 'pending' as const })),
+      hasActiveCanonicalTurn: () => false,
+      registerSessionRuntimeControls: vi.fn((controls: Readonly<Record<string, unknown>>) => {
+        registered.push(controls);
+        return withdrawn;
+      }),
+    });
+    const atAgentSdk = createDeferred<unknown>();
+    const atLegacy = createDeferred<number>();
+    const finishLegacy = createDeferred<void>();
+    mockClaudeRemoteAgentSdk.mockImplementationOnce(async () => {
+      const control = registered.find((controls) => typeof controls.interruptPendingInputAndRun === 'function')
+        ?.interruptPendingInputAndRun as ((request: { sessionId: string; localId: string }) => Promise<unknown>) | undefined;
+      atAgentSdk.resolve(control ? {
+        placeholder: await control({ sessionId: 'PID-startup', localId: 'p1' }),
+        attached: await control({ sessionId: 'happier-session-1', localId: 'p1' }),
+      } : 'not registered');
+      throw new Error('API Error: 401 OAuth access token has expired');
+    });
+    mockClaudeRemote.mockImplementationOnce(async () => {
+      atLegacy.resolve(withdrawn.mock.calls.length);
+      await finishLegacy.promise;
+    });
+    session.queue.push('initial prompt', {
+      permissionMode: 'default',
+      claudeRemoteAgentSdkEnabled: true,
+      claudeUnifiedTerminalEnabled: false,
+    }, { userMessageLocalId: 'local-initial' });
+
+    const { claudeRemoteLauncher } = await import('./claudeRemoteLauncher');
+    const launcherPromise = claudeRemoteLauncher(session);
+    // Startup attaches the real client after the launcher began against the placeholder wrapper.
+    await startupWrapper.attach(target as unknown as DeferredApiSessionTarget);
+    try {
+      await expect(atAgentSdk.promise).resolves.toEqual({
+        placeholder: { ok: false, status: 'stale_state', sessionId: 'PID-startup', localId: 'p1' },
+        // The attached identity passes; no foreground turn, so it refuses before any request.
+        attached: {
+          ok: false, status: 'not_safe', sessionId: 'happier-session-1', localId: 'p1',
+          errorCode: 'no_active_turn', error: expect.any(String),
+        },
+      });
+      await expect(atLegacy.promise).resolves.toBeGreaterThanOrEqual(1);
+      expect(requestPendingInputSendNow).not.toHaveBeenCalled();
+    } finally {
+      finishLegacy.resolve(undefined);
+      const switchHandler = await switchHandlerReady;
+      await Promise.all([
+        Promise.resolve(switchHandler({ to: 'local' })),
+        session.cleanup(),
+        launcherPromise,
+      ]);
+    }
+  });
+
+  it.each(['returns', 'throws'] as const)('withdraws an Agent SDK launch\'s interrupt-and-run when its runner %s, never the next launch\'s', async (exit) => {
+    const { session, switchHandlerReady } = createHarness();
+    const registrations: Array<{ controls: Readonly<Record<string, unknown>>; withdrawn: ReturnType<typeof vi.fn> }> = [];
+    Object.assign(session.client, {
+      requestPendingInputSendNow: vi.fn(async () => ({ kind: 'admitted' as const })),
+      waitForProviderInputTerminalOutcome: vi.fn(async () => ({ kind: 'pending' as const })),
+      registerSessionRuntimeControls: vi.fn((controls: Readonly<Record<string, unknown>>) => {
+        const withdrawn = vi.fn();
+        registrations.push({ controls, withdrawn });
+        return withdrawn;
+      }),
+    });
+    const interruptAndRun = () => registrations.filter((r) => typeof r.controls.interruptPendingInputAndRun === 'function');
+    const atSecondLaunch = createDeferred<Readonly<{ firstWithdrawals: number; secondWithdrawals: number; count: number }>>();
+    const finishSecond = createDeferred<void>();
+    let launchCall = 0;
+    mockClaudeRemoteAgentSdk.mockImplementation(async (opts: Readonly<{ nextMessage: () => Promise<unknown> }>) => {
+      launchCall += 1;
+      if (launchCall === 1) {
+        await opts.nextMessage();
+        if (exit === 'throws') throw new Error('provider stream failed');
+        return;
+      }
+      const [first, second] = interruptAndRun();
+      atSecondLaunch.resolve({
+        firstWithdrawals: first?.withdrawn.mock.calls.length ?? -1,
+        secondWithdrawals: second?.withdrawn.mock.calls.length ?? -1,
+        count: interruptAndRun().length,
+      });
+      await finishSecond.promise;
+    });
+    const mode = { permissionMode: 'default', claudeRemoteAgentSdkEnabled: true, claudeUnifiedTerminalEnabled: false } as const;
+    session.queue.push('initial prompt', mode, { userMessageLocalId: 'local-initial' });
+
+    const { claudeRemoteLauncher } = await import('./claudeRemoteLauncher');
+    const launcherPromise = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await vi.waitFor(() => { expect(launchCall).toBe(1); });
+      session.queue.push('next prompt', mode, { userMessageLocalId: 'local-next' });
+      // The first launch's registration is withdrawn exactly once by its own launch; the second
+      // launch's registration is live while that launch runs.
+      await expect(atSecondLaunch.promise).resolves.toEqual({ firstWithdrawals: 1, secondWithdrawals: 0, count: 2 });
+    } finally {
+      finishSecond.resolve(undefined);
+      await Promise.all([
+        Promise.resolve(switchHandler({ to: 'local' })),
+        session.cleanup(),
+        launcherPromise,
+      ]);
+    }
+    for (const registration of interruptAndRun()) expect(registration.withdrawn).toHaveBeenCalledOnce();
+  }, 30_000);
+
+  it('reports interrupted only for a row the Agent SDK runner says it interrupted an active turn for', async () => {
+    const { session, switchHandlerReady } = createHarness();
+    const registered: Array<Readonly<Record<string, unknown>>> = [];
+    let runnerOptions: {
+      onPendingInterruptAndSendEvidence?: (localIds: readonly string[], evidence: 'target_interrupted' | 'interrupt_refused') => void;
+    } | null = null;
+    Object.assign(session.client, {
+      hasActiveCanonicalTurn: () => true,
+      requestPendingInputSendNow: vi.fn(async () => ({ kind: 'admitted' as const })),
+      // The runner accepts each row; it reports an interrupt only for `interrupted-row`.
+      waitForProviderInputTerminalOutcome: vi.fn(async (localId: string) => {
+        if (localId === 'interrupted-row') runnerOptions?.onPendingInterruptAndSendEvidence?.([localId], 'target_interrupted');
+        return { kind: 'accepted' as const };
+      }),
+      registerSessionRuntimeControls: vi.fn((controls: Readonly<Record<string, unknown>>) => {
+        registered.push(controls);
+        return vi.fn();
+      }),
+    });
+    const results = createDeferred<unknown[]>();
+    const finishLegacy = createDeferred<void>();
+    mockClaudeRemoteAgentSdk.mockImplementationOnce(async (opts: typeof runnerOptions) => {
+      runnerOptions = opts;
+      const control = registered.find((controls) => typeof controls.interruptPendingInputAndRun === 'function')
+        ?.interruptPendingInputAndRun as ((request: { sessionId: string; localId: string }) => Promise<unknown>) | undefined;
+      if (!control) {
+        results.resolve(['not registered']);
+      } else {
+        results.resolve([
+          await control({ sessionId: session.client.sessionId, localId: 'interrupted-row' }),
+          await control({ sessionId: session.client.sessionId, localId: 'boundary-row' }),
+        ]);
+      }
+      throw new Error('API Error: 401 OAuth access token has expired');
+    });
+    mockClaudeRemote.mockImplementationOnce(async () => { await finishLegacy.promise; });
+    session.queue.push('initial prompt', {
+      permissionMode: 'default',
+      claudeRemoteAgentSdkEnabled: true,
+      claudeUnifiedTerminalEnabled: false,
+    }, { userMessageLocalId: 'local-initial' });
+
+    const { claudeRemoteLauncher } = await import('./claudeRemoteLauncher');
+    const launcherPromise = claudeRemoteLauncher(session);
+    const switchHandler = await switchHandlerReady;
+    try {
+      await expect(results.promise).resolves.toEqual([
+        { ok: true, status: 'interrupted', sessionId: session.client.sessionId, localId: 'interrupted-row' },
+        { ok: true, status: 'admitted_and_queued_until_boundary', sessionId: session.client.sessionId, localId: 'boundary-row' },
+      ]);
+    } finally {
+      finishLegacy.resolve(undefined);
+      await Promise.all([
+        Promise.resolve(switchHandler({ to: 'local' })),
+        session.cleanup(),
+        launcherPromise,
+      ]);
     }
   });
 

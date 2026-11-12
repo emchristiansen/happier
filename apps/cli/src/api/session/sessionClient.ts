@@ -63,7 +63,7 @@ import {
     fetchSessionSystemRecordsPage as fetchSessionSystemRecordsPageHttp,
     upsertSessionSystemRecord as upsertSessionSystemRecordHttp,
 } from '@/session/transport/http/sessionSystemRecordsHttp';
-import { requestPendingQueueV2SteerNow } from './pendingQueueV2Transport';
+import { requestPendingQueueV2Action } from './pendingQueueV2Transport';
 import { createExecutionRunBackend } from '@/agent/executionRuns/runtime/createExecutionRunBackend';
 import { CodexLikePermissionHandler } from '@/agent/permissions/CodexLikePermissionHandler';
 import type { PermissionRequestPushSender } from '@/agent/permissions/BasePermissionHandler';
@@ -2015,6 +2015,19 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     async requestPendingInputSteerNow(localId: string, bindingId: string): Promise<PendingInputSteerNowAdmission> {
+        return await this.requestExactPendingInputAction(localId, { v: 1, kind: 'steer_now_bound', bindingId });
+    }
+
+    /** Ask the server to deliver this exact Pending row now, interrupting the active turn
+     *  (`interrupt_and_send` once materialized while the foreground turn is busy). */
+    async requestPendingInputSendNow(localId: string): Promise<PendingInputSteerNowAdmission> {
+        return await this.requestExactPendingInputAction(localId, { v: 1, kind: 'send_now' });
+    }
+
+    private async requestExactPendingInputAction(
+        localId: string,
+        requestedAction: PendingRequestedActionV1,
+    ): Promise<PendingInputSteerNowAdmission> {
         const exactLocalId = readPendingLocalId(localId);
         if (!exactLocalId) return { kind: 'not_admitted', reason: 'invalid_local_id' };
         // A proven refusal is retryable only after its existing durable settlement has
@@ -2048,11 +2061,11 @@ export class ApiSessionClient extends EventEmitter {
             return { kind: 'not_admitted', reason: 'unsupported' };
         }
         try {
-            await requestPendingQueueV2SteerNow({
+            await requestPendingQueueV2Action({
                 token: this.token,
                 sessionId: this.sessionId,
                 localId: exactLocalId,
-                bindingId,
+                requestedAction,
             });
         } catch (error) {
             return isPermanentRequestStatus(readHttpStatus(error))
