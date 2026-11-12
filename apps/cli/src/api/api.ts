@@ -34,7 +34,9 @@ import {
   ConnectedServiceAuthGroupRuntimeStateRevisionConflictError,
   createConnectedServiceCredentialApi,
   type ConnectedServiceAuthGroupApi,
+  type ConnectedServiceCredentialHealthApi,
   type ConnectedServiceCredentialApi,
+  type ConnectedServiceCredentialHealthRead,
   type ConnectedServiceCredentialPlainResponse,
   type ConnectedServiceCredentialSealedResponse,
 } from './connectedServices/connectedServiceCredentialApi';
@@ -106,7 +108,9 @@ import { lazySchema } from '@happier-dev/protocol';
 export {
   ConnectedServiceAuthGroupGenerationConflictError,
   ConnectedServiceAuthGroupRuntimeStateRevisionConflictError,
+  ConnectedServiceCredentialHealthReadUnavailableError,
   ConnectedServiceCredentialUnsupportedFormatError,
+  type ConnectedServiceCredentialHealthRead,
 } from './connectedServices/connectedServiceCredentialApi';
 
 const CONNECTED_SERVICE_PROFILE_LIST_CACHE_TTL_MS = 10_000;
@@ -393,7 +397,9 @@ export class ApiClient {
 
   private readonly credential: Credentials;
   private readonly pushClient: PushNotificationClient;
-  private readonly connectedServiceCredentialApi: ConnectedServiceCredentialApi & ConnectedServiceAuthGroupApi;
+  private readonly connectedServiceCredentialApi: ConnectedServiceCredentialApi
+    & ConnectedServiceCredentialHealthApi
+    & ConnectedServiceAuthGroupApi;
   private readonly connectedServiceProfileListCache = new Map<ConnectedServiceId, ConnectedServiceProfileListCacheEntry>();
   private accountEncryptionModeCache: AccountEncryptionModeCacheEntry | null = null;
 
@@ -930,6 +936,19 @@ export class ApiClient {
     signal?: AbortSignal;
   }): Promise<ConnectedServiceCredentialSealedResponse | null> {
     return await this.connectedServiceCredentialApi.getConnectedServiceCredentialSealed(params);
+  }
+
+  /**
+   * One profile's credential status and stored health, read by its exact key. Use this, not
+   * {@link listConnectedServiceProfiles}, whenever the profile is already known: the list returns
+   * every profile of the service.
+   */
+  async readConnectedServiceCredentialHealth(params: {
+    serviceId: ConnectedServiceId;
+    profileId: string;
+    signal?: AbortSignal;
+  }): Promise<ConnectedServiceCredentialHealthRead> {
+    return await this.connectedServiceCredentialApi.readConnectedServiceCredentialHealth(params);
   }
 
   async listConnectedServiceProfiles(params: {

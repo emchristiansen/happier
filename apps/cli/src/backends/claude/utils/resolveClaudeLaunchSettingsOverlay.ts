@@ -24,8 +24,9 @@ export function buildClaudePermissionModeLaunchSettings(
 /**
  * Resolve Claude's single `--settings` overlay without mutating the generated base settings.
  *
- * Claude keeps only the first `--settings` value. When launch-only settings are needed, merge
- * them into a private sibling file so every launch path presents one authoritative overlay.
+ * Claude uses only one `--settings` value whole (native 2.1.280 keeps the last). When launch-only
+ * settings are needed, merge them into a private sibling file so every launch path presents one
+ * authoritative overlay.
  * Keys listed in `unsafeInlineKeys` are omitted from the argv fallback if the sibling cannot be
  * written (the unified-terminal statusline command contains a path to a private secret file).
  */

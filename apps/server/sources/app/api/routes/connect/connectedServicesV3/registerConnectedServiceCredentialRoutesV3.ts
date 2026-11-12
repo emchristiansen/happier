@@ -5,6 +5,7 @@ import { inTx } from "@/storage/inTx";
 import {
     CONNECTED_SERVICE_ERROR_CODES,
     ConnectedServiceCredentialHealthV1Schema,
+    ConnectedServiceCredentialHealthReadV1Schema,
     ConnectedServiceCredentialMutationGuardV1Schema,
     ConnectedServiceCredentialRevisionV1Schema,
     ConnectedServiceCredentialMutationSuccessV1Schema,
@@ -40,6 +41,8 @@ import {
     mutateConnectedServiceCredentialHealth,
 } from "../credentials/mutation";
 import { resolveConnectedServiceCredentialRevision } from "../credentials/credentialRevision";
+import { deriveConnectedServiceCredentialStatus } from "../credentialHealthMetadata";
+import { readStoredConnectedServiceCredentialMetadata } from "../readStoredConnectedServiceCredentialMetadata";
 
 const MAX_CREDENTIAL_JSON_CHARS = 220_000;
 
@@ -227,6 +230,41 @@ export function registerConnectedServiceCredentialRoutesV3(app: Fastify): void {
         }
 
         return reply.send({ success: true, credentialRevision: result.credentialRevision });
+    });
+
+    /**
+     * Reads one profile's canonical credential status and stored health. The row is looked up
+     * by (account, service, profile) before anything is read, so no other profile's row is
+     * queried or returned. Callers that already know the profile they use (spawn preflight,
+     * refresh, in-place auth switch) read health here instead of the service-wide profile list.
+     */
+    app.get("/v3/connect/:serviceId/profiles/:profileId/credential/health", {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({
+                serviceId: ConnectedServiceIdSchema,
+                profileId: ConnectedServiceProfileIdSchema,
+            }),
+            response: {
+                200: ConnectedServiceCredentialHealthReadV1Schema,
+                404: z.union([NotFoundSchema, z.object({ error: z.literal("connect_credential_not_found") })]),
+            },
+        },
+    }, async (request, reply) => {
+        const serviceId = request.params.serviceId satisfies ConnectedServiceId;
+        const profileId = request.params.profileId;
+        const row = await db.serviceAccountToken.findUnique({
+            where: { accountId_vendor_profileId: { accountId: request.userId, vendor: serviceId, profileId } },
+            select: { metadata: true },
+        });
+        if (!row) return reply.code(404).send({ error: "connect_credential_not_found" });
+
+        const metadata = readStoredConnectedServiceCredentialMetadata(row.metadata);
+        return reply.send({
+            profileId,
+            status: deriveConnectedServiceCredentialStatus(metadata),
+            health: metadata?.health ?? null,
+        });
     });
 
     app.get("/v3/connect/:serviceId/profiles/:profileId/credential", {

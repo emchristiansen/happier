@@ -33,6 +33,7 @@ async function fixture() {
   });
   const params = {
     agentId: 'codex' as const, materializationKey: 'retired-home-custody', materializationPurpose: 'probe' as const,
+    nativeSourceAuthority: 'caller_env' as const,
     baseDir: join(root, 'materialized'), activeServerDir: join(root, 'server'),
     recordsByServiceId: new Map([['openai-codex' as const, record]]),
     processEnv: { HOME: root, CODEX_HOME: join(root, 'native') },

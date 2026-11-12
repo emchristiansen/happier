@@ -43,6 +43,7 @@ describe('createCodexConnectedServicesMaterializer', () => {
     // Only the remote API boundary is replaced; the canonical currentness reader remains real.
     const api = { getConnectedServiceAuthGroup: async () => null } as unknown as ApiClient;
     const result = await createCodexConnectedServicesMaterializer()({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex', activeServerDir, rootDir: join(activeServerDir, 'disposable-attempt'),
       recordsByServiceId: new Map([['openai-codex', record]]),
       selectionsByServiceId: new Map([['openai-codex', selection]]),

@@ -22,6 +22,7 @@ import { logger } from '@/ui/logger';
 
 import type { CatalogAgentId, ConnectedServiceResumeContinuityDiagnostics } from '@/backends/types';
 import type { TrackedSession } from '@/daemon/types';
+import type { ConnectedServiceCredentialHealthRead } from '@/api/connectedServices/connectedServiceCredentialApi';
 import { resolveTrackedSessionCatalogAgentId } from '@/daemon/sessions/resolveTrackedSessionCatalogAgentId';
 import {
   HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY,
@@ -259,13 +260,10 @@ export type SessionConnectedServiceAuthSwitchRequest = Readonly<{
 }>;
 
 type ConnectedServiceProfilesApi = Readonly<{
-  listConnectedServiceProfiles(input: Readonly<{ serviceId: ConnectedServiceId }>): Promise<Readonly<{
+  readConnectedServiceCredentialHealth(input: Readonly<{
     serviceId: ConnectedServiceId;
-    profiles: ReadonlyArray<Readonly<{
-      profileId: string;
-      status: ConnectedServiceCredentialHealthStatusV1;
-    }>>;
-  }>>;
+    profileId: string;
+  }>): Promise<ConnectedServiceCredentialHealthRead>;
   getConnectedServiceAuthGroup(input: Readonly<{
     serviceId: ConnectedServiceId;
     groupId: string;
@@ -739,12 +737,15 @@ async function validateConnectedProfile(input: Readonly<{
   profileId: string;
   diagnosticSource: ConnectedServiceUxDiagnosticV1['source'];
 }>): Promise<SessionConnectedServiceAuthSwitchFailure | null> {
-  const profiles = await input.api.listConnectedServiceProfiles({ serviceId: input.serviceId });
-  const profile = profiles.profiles.find((candidate) => candidate.profileId === input.profileId) ?? null;
-  if (!profile) {
+  // Exact-key read: validating one requested profile must not read the service's other profiles.
+  const health = await input.api.readConnectedServiceCredentialHealth({
+    serviceId: input.serviceId,
+    profileId: input.profileId,
+  });
+  if (health.kind === 'not_found') {
     return { ok: false, errorCode: 'profile_missing', serviceId: input.serviceId };
   }
-  const healthStatus = normalizeConnectedServiceCredentialHealthStatus(profile.status);
+  const healthStatus = normalizeConnectedServiceCredentialHealthStatus(health.status);
   if (isConnectedServiceCredentialHealthStatusReconnectRequired(healthStatus)) {
 	    return failureResult('profile_action_required', {
 	      serviceId: input.serviceId,

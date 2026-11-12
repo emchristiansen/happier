@@ -805,6 +805,66 @@ describe('bootstrapAccountSettingsContext', () => {
     await res.whenRefreshed;
   });
 
+  describe('fast mode background refresh ownership', () => {
+    const disabledClaude = { backendEnabledByTargetKey: { 'agent:claude': false } };
+
+    async function fastBootstrapFromStaleCache(fetched: () => Promise<unknown>) {
+      const nowMs = 1_000_000;
+      return await bootstrapAccountSettingsContext({
+        credentials: createCredentialsStub(),
+        agentId: 'claude',
+        mode: 'fast',
+        refresh: 'auto',
+        nowMs,
+        ttlMs: 60_000,
+        deps: {
+          resolveCachePath: () => '/tmp/server/account.settings.cache.json',
+          readCache: async () => ({
+            version: 2,
+            cachedAt: nowMs - 120_000,
+            settingsContent: { t: 'plain', v: {} },
+            settingsVersion: 9,
+          }),
+          decryptCiphertext: async () => null,
+          fetchFromServer: fetched as never,
+          writeCache: async () => {},
+        },
+      });
+    }
+
+    it('delivers a fetched backend refusal to a caller that awaits the refresh', async () => {
+      const res = await fastBootstrapFromStaleCache(async () => ({ settingsContent: { t: 'plain', v: disabledClaude }, settingsVersion: 12 }));
+
+      expect(res.source).toBe('cache');
+      await expect(res.whenRefreshed).rejects.toMatchObject({ name: 'BackendDisabledByAccountSettingsError' });
+    });
+
+    it('leaves no unhandled rejection when nobody awaits a refused background refresh', async () => {
+      const unhandled: unknown[] = [];
+      const record = (reason: unknown) => {
+        unhandled.push(reason);
+      };
+      process.on('unhandledRejection', record);
+      try {
+        const res = await fastBootstrapFromStaleCache(async () => ({ settingsContent: { t: 'plain', v: disabledClaude }, settingsVersion: 12 }));
+        expect(res.whenRefreshed).toBeTruthy();
+        for (let turn = 0; turn < 5; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        process.off('unhandledRejection', record);
+      }
+
+      expect(unhandled).toEqual([]);
+    });
+
+    it('still falls back to the cache when the background fetch fails in transport', async () => {
+      const res = await fastBootstrapFromStaleCache(async () => {
+        throw new Error('socket hang up');
+      });
+
+      await expect(res.whenRefreshed).resolves.toMatchObject({ source: 'cache', settingsVersion: 9 });
+    });
+  });
+
   it('fast mode with a required minimum version blocks and throws when the version cannot be reached', async () => {
     const nowMs = 1_000_000;
     await expect(bootstrapAccountSettingsContext({

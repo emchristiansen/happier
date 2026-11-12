@@ -2,7 +2,11 @@ import { join } from 'node:path';
 
 import type { AccountSettings, ConnectedServiceCredentialRecordV1 } from '@happier-dev/protocol';
 
-import { CONNECTED_SERVICE_MATERIALIZATION_REASONS, type ConnectedServicesMaterializationDiagnostic } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
+import {
+  CONNECTED_SERVICE_MATERIALIZATION_REASONS,
+  type ConnectedServiceNativeSourceAuthority,
+  type ConnectedServicesMaterializationDiagnostic,
+} from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import type { ConnectedServiceSharedGenerationMutationCurrentness } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 import { syncCodexConnectedServiceHome } from './syncCodexConnectedServiceHome';
 import { writeCodexAuthStoreFile } from './writeCodexAuthStoreFile';
@@ -15,6 +19,7 @@ export async function materializeCodexConnectedServiceAuth(params: Readonly<{
   record: ConnectedServiceCredentialRecordV1;
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv?: NodeJS.ProcessEnv;
+  nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
   sessionStateMode?: 'existing';
   validateCurrentBeforeMutation?: () => Promise<ConnectedServiceSharedGenerationMutationCurrentness>;
 }>): Promise<Readonly<{
@@ -32,6 +37,7 @@ export async function materializeCodexConnectedServiceAuth(params: Readonly<{
     previousCodexHome: params.previousCodexHome ?? null,
     accountSettings: params.accountSettings ?? null,
     processEnv: params.processEnv ?? process.env,
+    nativeSourceAuthority: params.nativeSourceAuthority,
   });
   const current = await writeCodexAuthStoreFile({
     codexHome, record: params.record, validateCurrentBeforeMutation: params.validateCurrentBeforeMutation,

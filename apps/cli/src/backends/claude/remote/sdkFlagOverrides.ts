@@ -1,3 +1,5 @@
+import { claudeCliFlagCanConsumeNextArg } from '../cli/flagArity';
+
 export type ClaudeSdkFlagOverrides = {
   maxTurns?: number;
   strictMcpConfig?: boolean;
@@ -18,11 +20,11 @@ export function parseClaudeSdkFlagOverridesFromArgs(args?: string[]): ClaudeSdkF
   let fallbackModel: string | undefined;
   let effort: string | undefined;
 
+  // Claude Code takes the next token as the value of a flag that requires one, even when it
+  // starts with `-` (an opaque system prompt, say), so values are read by the CLI's flag arity.
   const nextValue = (index: number): string | undefined => {
     const next = index + 1 < input.length ? input[index + 1] : undefined;
-    if (typeof next !== 'string') return undefined;
-    if (next.startsWith('-')) return undefined;
-    return next;
+    return claudeCliFlagCanConsumeNextArg(input[index]!, next) ? next : undefined;
   };
 
   const inlineValue = (arg: string, flag: string): string | undefined => {
@@ -107,6 +109,9 @@ export function parseClaudeSdkFlagOverridesFromArgs(args?: string[]): ClaudeSdkF
       }
       continue;
     }
+
+    // Any other flag's value is opaque: never read it as one of the flags above.
+    if (arg.startsWith('-') && nextValue(i) !== undefined) i++;
   }
 
   return {

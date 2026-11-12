@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { basename, dirname, join } from 'node:path';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
@@ -7,6 +7,7 @@ import { PassThrough } from 'node:stream';
 import { logger } from '@/ui/logger';
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import { claudeLocal } from './claudeLocal';
+import { reloadConfiguration } from '@/configuration';
 
 async function withPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T>): Promise<T> {
     const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
@@ -1161,6 +1162,226 @@ describe('claudeLocal --continue handling', () => {
         const promptIndex = spawnArgs.indexOf('fix the bug in main.ts');
         expect(promptIndex).toBeGreaterThan(-1);
         expect(promptIndex).toBeGreaterThan(effortValueIndex);
+    });
+
+    describe('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', () => {
+        afterEach(() => {
+            vi.unstubAllEnvs();
+            reloadConfiguration();
+        });
+
+        function launchArgs(): string[] {
+            expect(mockSpawn).toHaveBeenCalledTimes(1);
+            return mockSpawn.mock.calls[0][1] as string[];
+        }
+
+        it.each([
+            { title: 'separate flags with a raw effort', args: ['--model', 'claude-opus-5-5', '--effort', 'high'] },
+            { title: 'inline flags with a raw effort', args: ['--model=claude-opus-5-5', '--effort=high'] },
+            { title: 'no effort flag', args: ['--model', 'claude-opus-5-5'] },
+        ])('launches a pinned model at the pinned effort, keeping the hook settings as the only settings ($title)', async ({ args }) => {
+            vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+            reloadConfiguration();
+            mockClaudeFindLastSession.mockReturnValue(null);
+            const dir = mkdtempSync(join(tmpdir(), 'claude-local-pin-'));
+            try {
+                const settingsPath = join(dir, 'settings.json');
+                writeFileSync(settingsPath, JSON.stringify({ hooks: {} }));
+
+                await claudeLocal({
+                    abort: new AbortController().signal,
+                    sessionId: null,
+                    path: '/tmp',
+                    onSessionFound,
+                    hookSettingsPath: settingsPath,
+                    claudeArgs: [...args, 'fix the bug'],
+                });
+
+                const spawnArgs = launchArgs();
+                const effortValues = spawnArgs.flatMap((arg, index) =>
+                    arg === '--effort' ? [spawnArgs[index + 1]] : arg.startsWith('--effort=') ? [arg.slice('--effort='.length)] : []);
+                expect(effortValues).toEqual(['medium']);
+                // The pinned --effort overrides any saved ultracode; no extra overlay is needed.
+                expect(spawnArgs.filter((arg) => arg === '--settings')).toHaveLength(1);
+                expect(spawnArgs[spawnArgs.indexOf('--settings') + 1]).toBe(settingsPath);
+                expect(spawnArgs.indexOf('fix the bug')).toBeGreaterThan(spawnArgs.indexOf('--effort') + 1);
+            } finally {
+                rmSync(dir, { recursive: true, force: true });
+            }
+        });
+
+        it.each([
+            {
+                title: 'keeps an option value that looks like an effort flag',
+                args: ['--model', 'claude-opus-5-5', '--system-prompt', '--effort=high', '--effort', 'high', 'fix the bug'],
+                expected: ['--model', 'claude-opus-5-5', '--system-prompt', '--effort=high', '--effort', 'medium'],
+            },
+            {
+                title: 'does not let an option value hide the pinned model',
+                args: ['--model', 'claude-opus-5-5', '--name', '--model=claude-sonnet-4-6', '--effort', 'high', 'fix the bug'],
+                expected: ['--model', 'claude-opus-5-5', '--name', '--model=claude-sonnet-4-6', '--effort', 'medium'],
+            },
+            {
+                title: 'does not read an option value as the model',
+                args: ['--model', 'claude-sonnet-4-6', '--system-prompt', '--model=claude-opus-5-5', '--effort', 'high', 'fix the bug'],
+                expected: ['--model', 'claude-sonnet-4-6', '--system-prompt', '--model=claude-opus-5-5', '--effort', 'high'],
+            },
+        ])('$title', async ({ args, expected }) => {
+            vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+            reloadConfiguration();
+            mockClaudeFindLastSession.mockReturnValue(null);
+
+            await claudeLocal({
+                abort: new AbortController().signal,
+                sessionId: null,
+                path: '/tmp',
+                onSessionFound,
+                claudeArgs: args,
+            });
+
+            const spawnArgs = launchArgs();
+            const userFlags = spawnArgs.slice(spawnArgs.indexOf('--model'), spawnArgs.indexOf('--model') + expected.length);
+            expect(userFlags).toEqual(expected);
+            expect(spawnArgs.at(-1)).toBe('fix the bug');
+        });
+
+        describe('a model Claude Code resolves itself', () => {
+            // The applied-settings reader stands in for the native Claude process (its own wire
+            // behavior is covered by readClaudeAppliedSettings.test.ts); it records when it was asked.
+            function nativeReader(applied: { model: string; effort: string } | Error) {
+                const calls: Array<{ args: readonly string[]; spawnedBefore: boolean }> = [];
+                const read = async (args: readonly string[]) => {
+                    calls.push({ args, spawnedBefore: mockSpawn.mock.calls.length > 0 });
+                    if (applied instanceof Error) throw applied;
+                    return { applied: { ...applied, advisor: null, ultracode: false }, effective: {}, sources: [] };
+                };
+                return { calls, read };
+            }
+
+            async function launch(claudeArgs: string[], read: (args: readonly string[]) => Promise<unknown>) {
+                await claudeLocal({
+                    abort: new AbortController().signal,
+                    sessionId: null,
+                    path: '/tmp',
+                    onSessionFound,
+                    claudeArgs,
+                    readClaudeAppliedSettings: read,
+                });
+            }
+
+            it('launches the qualified default model at its pinned effort', async () => {
+                vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+                reloadConfiguration();
+                mockClaudeFindLastSession.mockReturnValue(null);
+                const native = nativeReader({ model: 'claude-opus-5-5[1m]', effort: 'high' });
+
+                await launch(['--agent', 'reviewer', '--name', '--model=claude-sonnet-4-6', '--effort', 'high', 'fix the bug'], native.read);
+
+                // Asked before launch, with only the flags that decide the model.
+                expect(native.calls).toEqual([{ args: ['--agent', 'reviewer'], spawnedBefore: false }]);
+                const spawnArgs = launchArgs();
+                expect(spawnArgs.slice(spawnArgs.indexOf('--agent'), spawnArgs.indexOf('--agent') + 8)).toEqual([
+                    '--agent', 'reviewer', '--name', '--model=claude-sonnet-4-6', '--model', 'claude-opus-5-5[1m]', '--effort', 'medium',
+                ]);
+                expect(spawnArgs).not.toContain('--settings');
+                expect(spawnArgs.at(-1)).toBe('fix the bug');
+            });
+
+            it('leaves an alias that resolves to an unpinned model untouched', async () => {
+                vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+                reloadConfiguration();
+                mockClaudeFindLastSession.mockReturnValue(null);
+                const native = nativeReader({ model: 'claude-sonnet-5', effort: 'high' });
+
+                await launch(['--model', 'sonnet', '--effort', 'high', 'fix the bug'], native.read);
+
+                expect(native.calls.map((call) => call.args)).toEqual([['--model', 'sonnet']]);
+                const spawnArgs = launchArgs();
+                expect(spawnArgs.slice(spawnArgs.indexOf('--model'), spawnArgs.indexOf('--model') + 2)).toEqual(['--model', 'sonnet']);
+                expect(spawnArgs.filter((arg) => arg === '--model')).toHaveLength(1);
+                expect(spawnArgs[spawnArgs.indexOf('--effort') + 1]).toBe('high');
+            });
+
+            it('does not start Claude when its model cannot be qualified', async () => {
+                vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+                reloadConfiguration();
+                mockClaudeFindLastSession.mockReturnValue(null);
+                const native = nativeReader(new Error('Unsupported control request subtype: get_settings'));
+
+                await expect(launch(['fix the bug'], native.read)).rejects.toThrow(/Cannot start Claude: .*Unsupported control request subtype: get_settings/);
+                expect(mockSpawn).not.toHaveBeenCalled();
+            });
+
+            it.each([
+                { title: 'the launch names a pinned model', pin: '{"claude-opus-5-5":"medium"}', args: ['--model', 'claude-opus-5-5', 'fix the bug'] },
+                { title: 'no pin is configured', pin: '', args: ['fix the bug'] },
+            ])('asks nothing when $title', async ({ pin, args }) => {
+                vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', pin);
+                reloadConfiguration();
+                mockClaudeFindLastSession.mockReturnValue(null);
+                const native = nativeReader({ model: 'claude-opus-5-5[1m]', effort: 'high' });
+
+                await launch(args, native.read);
+
+                expect(native.calls).toEqual([]);
+                expect(mockSpawn).toHaveBeenCalledTimes(1);
+            });
+        });
+
+        it('keeps a user --settings as the only, unchanged settings of a pinned launch', async () => {
+            // Claude Code applies only the last --settings it is given, so any second settings
+            // flag would discard the user's settings entirely (native 2.1.280).
+            vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+            reloadConfiguration();
+            mockClaudeFindLastSession.mockReturnValue(null);
+            const userSettings = '{"ultracode":true,"env":{"TEST_SETTING":"keep"}}';
+
+            await claudeLocal({
+                abort: new AbortController().signal,
+                sessionId: null,
+                path: '/tmp',
+                onSessionFound,
+                claudeArgs: ['--model', 'claude-opus-5-5', '--settings', userSettings, 'fix the bug'],
+            });
+
+            const spawnArgs = launchArgs();
+            expect(spawnArgs.filter((arg) => arg === '--settings' || arg.startsWith('--settings='))).toEqual(['--settings']);
+            expect(spawnArgs[spawnArgs.indexOf('--settings') + 1]).toBe(userSettings);
+            expect(spawnArgs.flatMap((arg, index) => arg === '--effort' ? [spawnArgs[index + 1]] : [])).toEqual(['medium']);
+        });
+
+        it('leaves an unpinned model and its raw effort unchanged', async () => {
+            vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+            reloadConfiguration();
+            mockClaudeFindLastSession.mockReturnValue(null);
+
+            await claudeLocal({
+                abort: new AbortController().signal,
+                sessionId: null,
+                path: '/tmp',
+                onSessionFound,
+                claudeArgs: ['--model', 'claude-sonnet-4-6', '--effort', 'high', 'fix the bug'],
+            });
+
+            const spawnArgs = launchArgs();
+            expect(spawnArgs[spawnArgs.indexOf('--effort') + 1]).toBe('high');
+            expect(spawnArgs.filter((arg) => arg === '--effort')).toHaveLength(1);
+        });
+
+        it('fails before spawning Claude when the pin is malformed', async () => {
+            vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"loud"}');
+            reloadConfiguration();
+            mockClaudeFindLastSession.mockReturnValue(null);
+
+            await expect(claudeLocal({
+                abort: new AbortController().signal,
+                sessionId: null,
+                path: '/tmp',
+                onSessionFound,
+                claudeArgs: ['--model', 'claude-opus-5-5', 'fix the bug'],
+            })).rejects.toThrow(/HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES/);
+            expect(mockSpawn).not.toHaveBeenCalled();
+        });
     });
 });
 

@@ -1,5 +1,5 @@
-import { copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, unlink } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, unlink } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 
 import { createAbsolutePathSymlink } from '@/utils/fs/createAbsolutePathSymlink';
 
@@ -93,8 +93,10 @@ export async function isConnectedServiceHomeEntryLinkedToSource(
   try {
     const destinationStat = await lstat(destinationPath);
     if (destinationStat.isSymbolicLink()) {
-      const [sourceRealPath, destinationRealPath] = await Promise.all([realpath(sourcePath), realpath(destinationPath)]);
-      return sourceRealPath === destinationRealPath;
+      // Decide from the link itself, never by following it: an existing link may point into another,
+      // non-admitted source root. Only the admitted source path is resolved.
+      const linkTarget = resolve(dirname(destinationPath), await readlink(destinationPath));
+      return linkTarget === resolve(sourcePath) || linkTarget === await realpath(sourcePath);
     }
     if (!destinationStat.isFile()) return false;
     const sourceStat = await stat(sourcePath);

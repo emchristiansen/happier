@@ -29,6 +29,8 @@ export type ConnectedServiceCredentialRefreshStatus =
   | 'lease_not_acquired'
   | 'credential_missing'
   | 'blocked_by_credential_health'
+  /** The profile's credential health could not be read, so a health-gated refresh did not proceed. */
+  | 'credential_health_unavailable'
   | 'refresh_failed';
 
 export type ConnectedServiceCredentialRefreshDiagnostic = Readonly<{

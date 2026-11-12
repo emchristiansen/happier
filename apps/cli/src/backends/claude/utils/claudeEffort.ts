@@ -1,14 +1,15 @@
 import { AGENT_MODEL_CONFIG, providers as agentProviders } from '@happier-dev/agents';
 
-export type ClaudeEffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+import { configuration } from '@/configuration';
 
-const CLAUDE_EFFORT_LEVEL_PRIORITY: readonly ClaudeEffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+import {
+    CLAUDE_EFFORT_LEVEL_PRIORITY,
+    normalizeClaudeEffortLevel,
+    normalizeClaudeModelIdForKnownCheck,
+    type ClaudeEffortLevel,
+} from './claudeEffortLevel';
 
-/** Normalize a Claude model id for the "is this a curated model?" check (strip `[1m]` + dated suffix). */
-function normalizeClaudeModelIdForKnownCheck(raw: unknown): string {
-    const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-    return value.replace(/\[[^\]]*\]$/u, '').replace(/-\d{8}$/u, '');
-}
+export type { ClaudeEffortLevel } from './claudeEffortLevel';
 
 const KNOWN_STATIC_CLAUDE_MODEL_IDS: ReadonlySet<string> = new Set(
     (AGENT_MODEL_CONFIG.claude.staticModels ?? []).map((model) => normalizeClaudeModelIdForKnownCheck(model.id)),
@@ -26,6 +27,15 @@ export function isCuratedClaudeModelId(modelIdRaw: unknown): boolean {
     if (!id) return false;
     if (KNOWN_STATIC_CLAUDE_MODEL_IDS.has(id)) return true;
     return id === 'opus' || id === 'sonnet' || id === 'haiku' || id === 'fable';
+}
+
+/**
+ * True when the id names a concrete model of the static catalog (never a bare alias). Claude Code
+ * launches an explicit `--model` of this kind as that model: it outranks an agent's model, a
+ * settings `model` and ANTHROPIC_MODEL (observed on native 2.1.280).
+ */
+export function isCatalogClaudeModelId(modelIdRaw: unknown): boolean {
+    return KNOWN_STATIC_CLAUDE_MODEL_IDS.has(normalizeClaudeModelIdForKnownCheck(modelIdRaw));
 }
 
 /** Narrow caller-supplied tiers (e.g. from the Anthropic Models API) to known effort levels. */
@@ -59,13 +69,6 @@ export function resolveClaudeEffortLevelsForModel(
     // Curated models own their table, including curated models with no effort support (Haiku),
     // which reported tiers must never override.
     return resolveClaudeEffortLevelsForKnownAliasOrModel(modelIdRaw);
-}
-
-function normalizeClaudeEffortLevel(raw: unknown): ClaudeEffortLevel | null {
-    const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
-    if (!value) return null;
-    if (value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max') return value;
-    return null;
 }
 
 function resolveClaudeEffortLevelsForKnownAliasOrModel(modelIdRaw: unknown): readonly ClaudeEffortLevel[] {
@@ -165,6 +168,22 @@ export function resolveModeEffortLevelsForModel(
     return mode.modelEffortLevelsModelId === normalized ? mode.modelEffortLevels : undefined;
 }
 
+/**
+ * The configured per-model effort pins (see `claudeModelEffortOverrides.ts`), parsed once by
+ * `configuration`. Throws when the configured value is malformed, so no launch proceeds without it.
+ */
+export function requireClaudeModelEffortOverrides(): ReadonlyMap<string, ClaudeEffortLevel> {
+    const config = configuration.claudeModelEffortOverrides;
+    if (!config.ok) throw new Error(config.error);
+    return config.overrides;
+}
+
+/** True when the configured per-model effort policy pins this model. */
+export function isClaudeModelEffortPinned(modelId: unknown): boolean {
+    const normalizedModelId = normalizeClaudeModelIdForKnownCheck(modelId);
+    return normalizedModelId.length > 0 && requireClaudeModelEffortOverrides().has(normalizedModelId);
+}
+
 // Explicit selections must override native saved settings, even at the catalog default.
 // Launch flags, SDK options, runtime controls, and launch hashes share this resolution.
 export function resolveClaudeEffortForModel(params: Readonly<{
@@ -173,11 +192,11 @@ export function resolveClaudeEffortForModel(params: Readonly<{
     /** Effort tiers the model reported (Anthropic Models API). Required for discovered models. */
     supportedLevels?: readonly unknown[];
 }>): ClaudeEffortLevel | null {
-    const effort = normalizeClaudeEffortLevel(params.effort);
-    if (!effort) return null;
     // No explicit model means the CLI picks its own default; forwarding `--effort` would apply a
     // level the user never chose for a model we cannot check support against.
     const normalizedModelId = normalizeClaudeModelIdForKnownCheck(params.modelId);
+    const effort = requireClaudeModelEffortOverrides().get(normalizedModelId) ?? normalizeClaudeEffortLevel(params.effort);
+    if (!effort) return null;
     if (!normalizedModelId || normalizedModelId === 'default') return null;
 
     const supportedLevels = resolveClaudeEffortLevelsForModel(params.modelId, params.supportedLevels);
@@ -219,6 +238,8 @@ export function resolveClaudeUltracodeForModel(params: Readonly<{
     /** Effort tiers the model reported (Anthropic Models API). Required for discovered models. */
     supportedLevels?: readonly unknown[];
 }>): boolean {
+    // Ultracode forces xhigh, which would override a pinned effort.
+    if (isClaudeModelEffortPinned(params.modelId)) return false;
     if (!normalizeUltracodeRequest(params.ultracode)) return false;
 
     const normalizedModelId = normalizeClaudeModelIdForKnownCheck(params.modelId);
@@ -229,7 +250,18 @@ export function resolveClaudeUltracodeForModel(params: Readonly<{
     return resolveClaudeEffortLevelsForModel(params.modelId, params.supportedLevels).includes('xhigh');
 }
 
-/** The `--settings` JSON overlay value that turns ultracode on for a spawned Claude CLI. */
-export function buildClaudeUltracodeSettingsJson(): string {
-    return JSON.stringify({ ultracode: true });
+/**
+ * The `ultracode` value a launch must set, or null to leave Claude Code's own setting alone.
+ *
+ * A pinned model gets an explicit `false` rather than an omitted key: Claude Code can save
+ * ultracode as its default for new sessions, and an omitted key would keep that saved value.
+ */
+export function resolveClaudeUltracodeLaunchSetting(params: Parameters<typeof resolveClaudeUltracodeForModel>[0]): boolean | null {
+    if (isClaudeModelEffortPinned(params.modelId)) return false;
+    return resolveClaudeUltracodeForModel(params) ? true : null;
+}
+
+/** The `--settings` JSON overlay value that sets ultracode for a spawned Claude CLI. */
+export function buildClaudeUltracodeSettingsJson(ultracode: boolean): string {
+    return JSON.stringify({ ultracode });
 }

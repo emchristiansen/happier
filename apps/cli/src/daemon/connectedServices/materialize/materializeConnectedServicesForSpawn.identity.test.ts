@@ -36,6 +36,7 @@ describe('materializeConnectedServicesForSpawn materialization identity', () => 
         scope: null, tokenType: null, providerAccountId: 'next-account', providerEmail: null },
     });
     const result = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex', materializationKey: 'resume-account-change', activeServerDir, baseDir,
       vendorResumeId,
       recordsByServiceId: new Map([['openai-codex', record]]),
@@ -55,6 +56,7 @@ describe('materializeConnectedServicesForSpawn materialization identity', () => 
     await expect(readFile(join(previousHome, 'sessions', rolloutName), 'utf8')).resolves.toBe('private-history\n');
     await expect(readFile(join(previousHome, 'memories', 'private.md'), 'utf8')).resolves.toBe('unrelated memory\n');
     const fresh = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex', materializationKey: 'fresh-account-change', activeServerDir, baseDir,
       recordsByServiceId: new Map([['openai-codex', { ...record, profileId: 'fresh' }]]),
       processEnv: { CODEX_HOME: nativeHome, HOME: baseDir },
@@ -66,6 +68,7 @@ describe('materializeConnectedServicesForSpawn materialization identity', () => 
     await expect(stat(join(fresh!.env.CODEX_HOME!, 'sessions', rolloutName))).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(stat(join(fresh!.env.CODEX_HOME!, 'memories', 'private.md'))).rejects.toMatchObject({ code: 'ENOENT' });
     await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex', materializationKey: 'reject-native-state-hint', activeServerDir, baseDir,
       recordsByServiceId: new Map([['openai-codex', record]]),
       processEnv: { CODEX_HOME: nativeHome, HOME: baseDir },
@@ -83,7 +86,7 @@ describe('materializeConnectedServicesForSpawn materialization identity', () => 
       now: 10, serviceId: 'anthropic', profileId: 'work', kind: 'token',
       token: { token: 'sk-ant-test', providerAccountId: null, providerEmail: null },
     });
-    const probeParams = { materializationPurpose: 'probe' as const,
+    const probeParams = { materializationPurpose: 'probe' as const, nativeSourceAuthority: 'caller_env' as const,
       connectedServiceMaterializationIdentityV1: { v: 1 as const, id: 'csm_claude_probe', createdAtMs: 1 },
       agentId: 'claude' as const, materializationKey: 'probe', activeServerDir, baseDir,
       recordsByServiceId: new Map([['anthropic' as const, record]]), processEnv: { HOME: baseDir },
@@ -120,6 +123,7 @@ describe('materializeConnectedServicesForSpawn materialization identity', () => 
       activeServerDir,
       baseDir,
       recordsByServiceId: new Map([['anthropic', record]]),
+      nativeSourceAuthority: 'caller_env',
     } satisfies Parameters<typeof materializeConnectedServicesForSpawn>[0] & {
       connectedServiceMaterializationIdentityV1: typeof identity;
     };
@@ -179,6 +183,7 @@ describe('materializeConnectedServicesForSpawn materialization identity', () => 
 
     let releaseFirst: (() => Promise<void>) | undefined;
     const first = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'transient-one',
       connectedServiceMaterializationIdentityV1: firstIdentity,
@@ -192,6 +197,7 @@ describe('materializeConnectedServicesForSpawn materialization identity', () => 
       },
     });
     const second = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex',
       materializationKey: 'transient-two',
       connectedServiceMaterializationIdentityV1: secondIdentity,
@@ -229,6 +235,7 @@ describe('materializeConnectedServicesForSpawn materialization identity', () => 
     await releaseFirst?.();
     await expect(readFile(join(second!.env.CODEX_HOME!, 'private-provider-state'), 'utf8')).resolves.toBe('keep');
     const probe = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       ...paramsForProbe(secondRecord),
       activeServerDir,
       baseDir,
@@ -248,6 +255,7 @@ describe('materializeConnectedServicesForSpawn materialization identity', () => 
     await writeFile(join(oldHome, 'sessions', 'private.jsonl'), 'private-history\n');
     await writeFile(join(oldHome, 'memories', 'memory.md'), 'private-memory');
     const resumed = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'codex', materializationKey: 'resume-old', connectedServiceMaterializationIdentityV1: oldIdentity,
       activeServerDir, baseDir, recordsByServiceId: new Map([['openai-codex', isolatedRecord]]),
       processEnv: { CODEX_HOME: sourceCodexHome, HOME: tmpdir() },
