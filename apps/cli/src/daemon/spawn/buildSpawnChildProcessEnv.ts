@@ -9,6 +9,7 @@ import {
 } from '@/utils/env/resolveHappierRuntimeContextEnv';
 import { shouldUseSystemdUserSessionResourceGovernor } from '@/daemon/platform/linux/systemdUserResourceGovernor';
 import { resolveStackProcessKindOverrideForSessionSpawn } from './resolveStackProcessKindOverrideForSessionSpawn';
+import { CLAUDE_MODEL_EFFORT_OVERRIDES_ENV } from '@/backends/claude/utils/claudeModelEffortOverrides';
 
 type ChildServerSelectionEnv = HappierRuntimeServerContext;
 
@@ -27,6 +28,9 @@ export const DAEMON_DECIDED_CHILD_ENV_KEYS = [
   ...HAPPIER_RUNTIME_CONTEXT_ENV_KEYS,
   ...STANDARD_MANAGED_CLI_RELEASE_CHANNEL_ENV_KEYS,
   ...DAEMON_ONLY_ENV_KEYS,
+  // The operator's per-model effort pin follows the daemon's configuration, never a stale
+  // value left in a long-lived tmux server's environment.
+  CLAUDE_MODEL_EFFORT_OVERRIDES_ENV,
 ] as const;
 
 export function buildSpawnChildProcessEnv(params: {

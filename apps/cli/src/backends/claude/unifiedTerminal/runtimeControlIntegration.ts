@@ -7,12 +7,17 @@ import type {
 import type { InFlightConfigApplyOutcome } from '@/agent/runtime/permission/bindPermissionModeQueue';
 import {
   resolveClaudeEffortForModel,
+  isClaudeModelEffortPinned,
   resolveClaudeUltracodeForModel,
   resolveModeEffortLevelsForModel,
 } from '@/backends/claude/utils/claudeEffort';
 
 import type { EnhancedMode } from '../loop';
-import { controlResultToChangeOutcome, isRuntimeConfigChangePromptBlocking } from './tuiControls/outcome';
+import {
+  controlResultToChangeOutcome,
+  isDeferredTiming,
+  isRuntimeConfigChangePromptBlocking,
+} from './tuiControls/outcome';
 import type {
   ClaudeDesiredRuntimeConfig,
   ClaudePromptSubmitMetadata,
@@ -183,7 +188,8 @@ export function mapEnhancedModeToDesiredRuntimeConfig(mode: EnhancedMode): Claud
   if (typeof mode.claudeRemoteMaxThinkingTokens === 'number') {
     desired.maxThinkingTokens = mode.claudeRemoteMaxThinkingTokens;
   }
-  if (typeof mode.ultracode === 'boolean') {
+  // A pinned model always desires ultracode off, which also clears an ultracode Claude Code saved.
+  if (typeof mode.ultracode === 'boolean' || isClaudeModelEffortPinned(mode.model)) {
     // Capability-gate here so the controller never types `/effort ultracode` at a model
     // that does not offer it (conservative: an unhonorable request resolves to off).
     desired.ultracode = resolveClaudeUltracodeForModel({
@@ -302,11 +308,17 @@ function describeGroupEntry(change: ClaudeUnifiedRuntimeConfigOutcomeChange): st
   return `${change.key} → ${String(value)}`;
 }
 
-function describeGroup(status: RuntimeConfigOutcomeStatusV1, changes: readonly ClaudeUnifiedRuntimeConfigOutcomeChange[]): string {
+function describeGroup(
+  status: RuntimeConfigOutcomeStatusV1,
+  changes: readonly ClaudeUnifiedRuntimeConfigOutcomeChange[],
+  awaitingConfirmation = false,
+): string {
   const joined = changes.map(describeGroupEntry).join(', ');
   switch (status) {
     case 'applied':
-      return `Applied Claude Unified runtime controls: ${joined}.`;
+      return awaitingConfirmation
+        ? `Requested Claude Unified runtime controls, awaiting confirmation: ${joined}.`
+        : `Applied Claude Unified runtime controls: ${joined}.`;
     case 'requires_restart':
       return `Claude Unified runtime changes require a session restart: ${joined}.`;
     case 'requires_interactive_control':
@@ -317,6 +329,38 @@ function describeGroup(status: RuntimeConfigOutcomeStatusV1, changes: readonly C
       return `Failed to apply Claude Unified runtime controls: ${joined}.`;
   }
 }
+
+/**
+ * An `applied` change that Claude has not yet confirmed: the command was delivered (or queued for a
+ * safe window) but the effective value is still unknown, so it must not be reported as applied.
+ */
+function isAwaitingConfirmation(change: RuntimeConfigChangeOutcome): boolean {
+  return change.status === 'applied'
+    && (isDeferredTiming(change.timing) || change.reason === 'delivered_unverified');
+}
+
+/**
+ * A configured per-model effort pin (`HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES`) is a requirement, not an
+ * ambient preference: the effort it resolves to, or null when the desired model is not pinned.
+ */
+function resolveConfiguredEffortPin(desired: ClaudeDesiredRuntimeConfig): string | null {
+  if (desired.reasoningEffort === undefined || !isClaudeModelEffortPinned(desired.model)) return null;
+  return desired.reasoningEffort;
+}
+
+/** Re-select the pinned effort (and its ultracode-off companion) even when the baseline already holds it. */
+function withConfiguredEffortPin(
+  delta: ClaudeDesiredRuntimeConfig,
+  desired: ClaudeDesiredRuntimeConfig,
+): ClaudeDesiredRuntimeConfig {
+  return {
+    ...delta,
+    reasoningEffort: desired.reasoningEffort,
+    ...(desired.ultracode !== undefined ? { ultracode: desired.ultracode } : {}),
+  };
+}
+
+const CONFIGURED_EFFORT_PIN_UNVERIFIED_REASON = 'configured_effort_pin_unverified';
 
 function addChange(
   target: RuntimeConfigChangeOutcome[],
@@ -536,13 +580,17 @@ export function createClaudeUnifiedRuntimeControlBridge(
     // Group changes by their per-change public status so each event's single status is accurate
     // (the protocol change shape carries only key/scalars, not per-change status). Mirrors the
     // existing launcher split of restart-only vs unsupported notices.
-    const grouped = new Map<RuntimeConfigOutcomeStatusV1, RuntimeConfigChangeOutcome[]>();
+    // Unconfirmed `applied` changes form their own group so the message never claims they took effect.
+    const grouped = new Map<string, RuntimeConfigChangeOutcome[]>();
     for (const change of transitionedChanges) {
-      const list = grouped.get(change.status) ?? [];
+      const groupKey = `${change.status}|${isAwaitingConfirmation(change) ? 'awaiting' : 'settled'}`;
+      const list = grouped.get(groupKey) ?? [];
       list.push(change);
-      grouped.set(change.status, list);
+      grouped.set(groupKey, list);
     }
-    for (const [status, changes] of grouped) {
+    for (const changes of grouped.values()) {
+      const status = changes[0].status;
+      const awaitingConfirmation = isAwaitingConfirmation(changes[0]);
       const timings = new Set(changes.map((c) => c.timing));
       const sharedTiming = timings.size === 1 ? changes[0].timing : undefined;
       const emittedChanges: ClaudeUnifiedRuntimeConfigOutcomeChange[] = changes.map((change) => {
@@ -559,10 +607,16 @@ export function createClaudeUnifiedRuntimeControlBridge(
       emitRuntimeConfigOutcome({
         status,
         ...(sharedTiming !== undefined ? { timing: sharedTiming } : {}),
-        message: describeGroup(status, emittedChanges),
+        message: describeGroup(status, emittedChanges, awaitingConfirmation),
         changes: emittedChanges,
       });
     }
+  }
+
+  /** The pin is satisfied only by Claude's verified effective effort, never by the committed baseline. */
+  function isConfiguredEffortPinVerified(pin: string): boolean {
+    const verified = controller.getLastVerifiedRuntimeConfig().reasoningEffort;
+    return typeof verified === 'string' && verified.toLowerCase() === pin.toLowerCase();
   }
 
   function resolveBlockedApplyReason(outcome: RuntimeConfigApplyOutcome): string | undefined {
@@ -581,13 +635,19 @@ export function createClaudeUnifiedRuntimeControlBridge(
   ): Promise<ClaudeUnifiedRuntimeControlApplyResult> {
     const desired = mapEnhancedModeToDesiredRuntimeConfig(mode);
     // Before a prompt, current intent supersedes a previously submitted but unverified control.
-    const delta = computeDesiredDelta(desired, committed,
+    let delta = computeDesiredDelta(desired, committed,
       reason === 'before_prompt' ? controller.getPendingRuntimeConfig() : undefined);
+    // A configured pin is checked against effective truth: native effort may have drifted (statusline,
+    // `/effort`, ultracode) since the baseline committed it, so restore it before the dependent prompt.
+    const pin = reason === 'before_prompt' ? resolveConfiguredEffortPin(desired) : null;
+    if (pin !== null && !isConfiguredEffortPinVerified(pin)) {
+      delta = withConfiguredEffortPin(delta, desired);
+    }
     if (isEmptyDesired(delta)) {
       return { promptMayProceed: true, attempted: false };
     }
     if (reason === 'before_prompt') {
-      return await applyDesiredModeBeforePrompt(desired, delta);
+      return await applyDesiredModeBeforePrompt(desired, delta, pin);
     }
     // F5: the first apply whose desired mode equals the pending startup claim is a VERIFICATION
     // of the launch flag — a confirming already-effective result must stay silent.
@@ -633,6 +693,7 @@ export function createClaudeUnifiedRuntimeControlBridge(
   async function applyDesiredModeBeforePrompt(
     desired: ClaudeDesiredRuntimeConfig,
     delta: ClaudeDesiredRuntimeConfig,
+    pin: string | null,
   ): Promise<ClaudeUnifiedRuntimeControlApplyResult> {
     const dependentDelta = pickDependentRuntimeConfigDelta(delta);
     const ambientDelta = pickAmbientRuntimeConfigDelta(delta);
@@ -655,8 +716,9 @@ export function createClaudeUnifiedRuntimeControlBridge(
       }
     }
 
+    let ambientOutcome: RuntimeConfigApplyOutcome | null = null;
     if (!isEmptyDesired(ambientDelta)) {
-      const ambientOutcome = await applyRuntimeConfigDelta({
+      ambientOutcome = await applyRuntimeConfigDelta({
         delta: ambientDelta,
         reason: 'out_of_band',
       });
@@ -672,6 +734,12 @@ export function createClaudeUnifiedRuntimeControlBridge(
         attempted: true,
         ...(blockedReason ? { blockedReason } : {}),
       };
+    }
+    // Unpinned effort stays ambient; a configured pin must be confirmed before the prompt runs at it.
+    if (pin !== null && !isConfiguredEffortPinVerified(pin)) {
+      const blockedReason = (ambientOutcome !== null ? resolveBlockedApplyReason(ambientOutcome) : undefined)
+        ?? CONFIGURED_EFFORT_PIN_UNVERIFIED_REASON;
+      return { promptMayProceed: false, attempted: true, blockedReason };
     }
     return { promptMayProceed: true, attempted: true };
   }

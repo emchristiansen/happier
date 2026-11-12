@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { EnhancedMode } from '../loop';
 import {
@@ -284,6 +284,60 @@ describe('createClaudeUnifiedRuntimeControlBridge', () => {
     expect(port.sentLiteral).toEqual(['/effort medium']);
     expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
     expect(await bridge.applyBeforePrompt(initial)).toEqual({ attempted: false, promptMayProceed: true });
+  });
+
+  it('re-applies a pinned model effort after native controls switch it to high', async () => {
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+    (await import('@/configuration')).reloadConfiguration();
+    try {
+      const confirmed = ['Set effort level to medium', IDLE].join('\n');
+      const port = createFakeControlPort({ captures: [IDLE, IDLE, confirmed] });
+      const controller = await makeController(port);
+      // A stale HIGH selection reaches the bridge; native /effort high is what the statusline shows.
+      const initial = mode({ model: 'claude-opus-5-5', reasoningEffort: 'high' });
+      const bridge = createClaudeUnifiedRuntimeControlBridge({
+        controller,
+        emitRuntimeConfigOutcome: () => undefined,
+        startupMode: initial,
+      });
+      bridge.reconcileFromStatusline({ model: initial.model, reasoningEffort: 'high' });
+
+      expect(await bridge.applyBeforePrompt(initial)).toMatchObject({ attempted: true, promptMayProceed: true });
+      expect(port.sentLiteral).toEqual(['/effort medium']);
+      expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
+    } finally {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+    }
+  });
+
+  it('desires ultracode off for a pinned model and re-applies the pinned effort over native ultracode', async () => {
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+    (await import('@/configuration')).reloadConfiguration();
+    try {
+      expect(mapEnhancedModeToDesiredRuntimeConfig(
+        mode({ model: 'claude-opus-5-5', reasoningEffort: 'high', ultracode: true }),
+      )).toMatchObject({ reasoningEffort: 'medium', ultracode: false });
+
+      const confirmed = ['Set effort level to medium', IDLE].join('\n');
+      const port = createFakeControlPort({ captures: [IDLE, IDLE, confirmed] });
+      const controller = await makeController(port);
+      // No ultracode selection on the session; Claude Code shows its own saved ultracode.
+      const initial = mode({ model: 'claude-opus-5-5', reasoningEffort: 'high' });
+      const bridge = createClaudeUnifiedRuntimeControlBridge({
+        controller,
+        emitRuntimeConfigOutcome: () => undefined,
+        startupMode: initial,
+      });
+      bridge.reconcileFromStatusline({ model: initial.model, reasoningEffort: 'ultracode' });
+
+      await bridge.applyBeforePrompt(initial);
+      expect(port.sentLiteral).toEqual(['/effort medium']);
+      expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
+    } finally {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+    }
   });
 
   it('preserves enabled ultracode while verifying the selected startup effort', async () => {
@@ -956,5 +1010,145 @@ describe('createClaudeUnifiedRuntimeControlBridge — statusline reconcile (lane
       status: 'applied',
       timing: 'skipped_already_effective',
     });
+  });
+});
+
+describe('configured effort pin before a prompt', () => {
+  const PINNED = mode({ model: 'claude-opus-5-5', reasoningEffort: 'high' });
+  const MEDIUM_SET = ['Set effort level to medium', IDLE].join('\n');
+  const MEDIUM_DIALOG = [
+    '❯ /effort medium',
+    '   Change effort level?',
+    '',
+    '   ❯ 1. Yes, switch to medium',
+    '     2. No, go back',
+  ].join('\n');
+  const KEPT_HIGH = ['❯ /effort medium', '  ⎿  Kept effort level as high', '╭─────╮', '│ >   │', '╰─────╯'].join('\n');
+
+  async function withPin(run: () => Promise<void>): Promise<void> {
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+    (await import('@/configuration')).reloadConfiguration();
+    try {
+      await run();
+    } finally {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+    }
+  }
+
+  /** Later captures become available only after the ones the port has already served. */
+  function replaceRemainingCaptures(captures: string[], port: FakeControlPort, next: readonly string[]): void {
+    captures.length = port.captureCount();
+    captures.fill(IDLE);
+    captures.push(...next);
+  }
+
+  async function makeVerifiedPinnedBridge(captures: string[]) {
+    const port = createFakeControlPort({ captures });
+    const controller = await makeController(port);
+    const events: ClaudeUnifiedRuntimeConfigOutcomeEvent[] = [];
+    const bridge = createClaudeUnifiedRuntimeControlBridge({
+      controller,
+      emitRuntimeConfigOutcome: (event) => events.push(event),
+      startupMode: PINNED,
+    });
+    bridge.reconcileFromStatusline({ model: PINNED.model, reasoningEffort: 'high' });
+    expect(await bridge.applyBeforePrompt(PINNED)).toEqual({ attempted: true, promptMayProceed: true });
+    expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
+    return { port, controller, events, bridge };
+  }
+
+  it.each(['high', 'ultracode'])(
+    'restores and verifies the pin when native effort drifts to %s after it was verified',
+    async (drifted) => withPin(async () => {
+      const captures = [IDLE, IDLE, MEDIUM_SET];
+      const { port, controller, bridge } = await makeVerifiedPinnedBridge(captures);
+
+      bridge.reconcileFromStatusline({ model: PINNED.model, reasoningEffort: drifted });
+      replaceRemainingCaptures(captures, port, [IDLE, IDLE, MEDIUM_SET]);
+
+      expect(await bridge.applyBeforePrompt(PINNED)).toEqual({ attempted: true, promptMayProceed: true });
+      expect(port.sentLiteral).toEqual(['/effort medium', '/effort medium']);
+      expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
+      expect(await bridge.applyBeforePrompt(PINNED)).toEqual({ attempted: false, promptMayProceed: true });
+    }),
+  );
+
+  it('withholds the prompt while a pinned effort is delivered but unconfirmed, then admits it on confirmation', async () => withPin(async () => {
+    const captures = [IDLE];
+    const port = createFakeControlPort({ captures });
+    const controller = await makeController(port);
+    const events: ClaudeUnifiedRuntimeConfigOutcomeEvent[] = [];
+    const bridge = createClaudeUnifiedRuntimeControlBridge({
+      controller,
+      emitRuntimeConfigOutcome: (event) => events.push(event),
+      startupMode: PINNED,
+    });
+    bridge.reconcileFromStatusline({ model: PINNED.model, reasoningEffort: 'high' });
+
+    const held = await bridge.applyBeforePrompt(PINNED);
+    expect(held).toMatchObject({ attempted: true, promptMayProceed: false });
+    expect(held.blockedReason).toEqual(expect.any(String));
+    expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).not.toBe('medium');
+    expect(events).toHaveLength(1);
+    // The pin's ultracode-off companion waits on the same unconfirmed effort command.
+    expect(events[0]).toMatchObject({
+      status: 'applied',
+      changes: [
+        expect.objectContaining({ key: 'reasoningEffort', requested: 'medium', reason: 'delivered_unverified' }),
+        expect.objectContaining({ key: 'launchOption', requested: false, reason: 'effort_control_deferred' }),
+      ],
+    });
+    expect(events[0]?.message).toBe(
+      'Requested Claude Unified runtime controls, awaiting confirmation: reasoningEffort → medium, launchOption → false.',
+    );
+
+    replaceRemainingCaptures(captures, port, [IDLE, IDLE, MEDIUM_SET]);
+    expect(await bridge.applyBeforePrompt(PINNED)).toEqual({ attempted: true, promptMayProceed: true });
+    expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
+    expect(events.at(-1)?.message).toBe('Applied Claude Unified runtime controls: reasoningEffort → medium, launchOption → false.');
+  }));
+
+  it('keeps a pinned prompt held and retryable when Claude explicitly keeps another effort', async () => withPin(async () => {
+    const captures = [IDLE, IDLE, MEDIUM_DIALOG, KEPT_HIGH];
+    const port = createFakeControlPort({ captures });
+    const controller = await makeController(port);
+    const events: ClaudeUnifiedRuntimeConfigOutcomeEvent[] = [];
+    const bridge = createClaudeUnifiedRuntimeControlBridge({
+      controller,
+      emitRuntimeConfigOutcome: (event) => events.push(event),
+      startupMode: PINNED,
+    });
+    bridge.reconcileFromStatusline({ model: PINNED.model, reasoningEffort: 'high' });
+
+    expect(await bridge.applyBeforePrompt(PINNED)).toEqual({
+      attempted: true,
+      promptMayProceed: false,
+      blockedReason: 'effort_change_declined_by_dialog_default',
+    });
+    expect(events.at(-1)).toMatchObject({ status: 'failed' });
+
+    replaceRemainingCaptures(captures, port, [IDLE, IDLE, MEDIUM_SET]);
+    expect(await bridge.applyBeforePrompt(PINNED)).toEqual({ attempted: true, promptMayProceed: true });
+    expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
+  }));
+
+  it('leaves native effort changes ambient for an unpinned model', async () => {
+    const captures = [IDLE, IDLE, MEDIUM_SET];
+    const port = createFakeControlPort({ captures });
+    const controller = await makeController(port);
+    const unpinned = mode({ model: 'claude-opus-5-5', reasoningEffort: 'medium' });
+    const bridge = createClaudeUnifiedRuntimeControlBridge({
+      controller,
+      emitRuntimeConfigOutcome: () => undefined,
+      startupMode: unpinned,
+    });
+    bridge.reconcileFromStatusline({ model: unpinned.model, reasoningEffort: 'high' });
+    expect(await bridge.applyBeforePrompt(unpinned)).toEqual({ attempted: true, promptMayProceed: true });
+
+    bridge.reconcileFromStatusline({ model: unpinned.model, reasoningEffort: 'high' });
+    expect(await bridge.applyBeforePrompt(unpinned)).toEqual({ attempted: false, promptMayProceed: true });
+    expect(port.sentLiteral).toEqual(['/effort medium']);
+    expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('high');
   });
 });

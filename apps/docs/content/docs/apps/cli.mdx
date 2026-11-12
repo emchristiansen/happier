@@ -291,6 +291,42 @@ happier notify -p "Database connection restored" -t "Alert"
 
 `-p` is the message and `-t` an optional title.
 
+## Prompt documents from a script
+
+Read or replace one prompt from your [library](/extending/prompts-and-skills) by its id:
+
+```bash
+happier prompt-doc get <artifact-id> [--json]
+happier prompt-doc update <artifact-id> --expected-body-version <n> --expected-body-sha256 <hex> --markdown-file <path> [--json]
+```
+
+`get` prints the stored markdown exactly, without trimming. With `--json` it
+prints the decrypted header, `headerVersion`, `bodyVersion`, `bodySha256`,
+`bodyBytes`, `seq` and the full document instead. `bodySha256` is the SHA-256 of
+the stored document exactly as it was decrypted.
+
+`update` replaces only the markdown, and only while the prompt is still at the
+body version and `bodySha256` you pass. Take both from `get --json`. If the
+prompt has changed since, including a change that lands while the update is in
+flight, the command fails with `version_mismatch` or `body_sha256_mismatch` and
+writes nothing; read it again and decide what to apply. The file is stored
+exactly as read, including a byte-order mark, line endings and surrounding
+whitespace; it must be valid UTF-8. The title, folder, tags and encryption key
+are kept. On success it prints the previous and new `bodyVersion` and
+`bodySha256`.
+
+Arguments are checked before anything is sent: an unknown or repeated option,
+an extra argument, a value that starts with `-` (write `./-notes.md`) or an id
+such as `..` fails with `invalid_arguments`. A file that cannot be read fails
+with `markdown_file_unreadable`. Redirects are not followed; they fail with
+`http_status`.
+
+Failures are reported by code: `invalid_arguments`, `markdown_file_unreadable`,
+`not_authenticated`, `encryption_key_required`, `not_found`, `http_status`,
+`network`, `invalid_response`, `data_key_unavailable`, `header_decrypt_failed`,
+`header_invalid`, `body_decrypt_failed`, `body_invalid`, `version_mismatch` and
+`body_sha256_mismatch`.
+
 ## Automations
 
 Trigger a saved automation without opening the app:

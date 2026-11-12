@@ -250,7 +250,7 @@ export const materializeClaudeConnectedServiceRuntimeAuthSelection: ConnectedSer
     nativeSourceAuthority: 'recorded',
     previousClaudeConfigDir,
     accountSettings: params.accountSettings ?? null,
-    sessionDirectory: params.input.tracked?.spawnOptions?.directory ?? params.input.cwd ?? null,
+    sessionDirectory: continuityContext.cwd,
     vendorResumeId: continuityContext.vendorResumeId,
     candidatePersistedSessionFile: continuityContext.candidatePersistedSessionFile,
     validateGroupMutationCurrentness: createConnectedServiceGroupMutationCurrentnessValidator({

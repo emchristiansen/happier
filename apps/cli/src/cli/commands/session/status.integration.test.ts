@@ -27,11 +27,30 @@ describe('happier session status (integration)', () => {
   let idleAgentStateCiphertext = '';
   let sessionPendingCount = 0;
   let sessionPendingBlockedCount = 0;
+  // Model/effort metadata for the runtimeConfig readback; each test may replace it before running.
+  let runtimeMetadata: Record<string, unknown> = {};
+  const defaultRuntimeMetadata = (): Record<string, unknown> => ({
+    modelOverrideV1: { v: 1, updatedAt: 40, modelId: 'claude-opus-5-5' },
+    sessionConfigOptionOverridesV1: {
+      v: 1, updatedAt: 50, overrides: { reasoning_effort: { value: 'medium', updatedAt: 50 } },
+    },
+    sessionModelsV1: claudeModelsState({ updatedAt: 60, effort: 'high' }),
+  });
+  function claudeModelsState(params: Readonly<{ updatedAt: number; effort: string }>): Record<string, unknown> {
+    return {
+      v: 1, provider: 'claude', updatedAt: params.updatedAt, currentModelId: 'claude-opus-5-5',
+      availableModels: [{
+        id: 'claude-opus-5-5', name: 'Opus 5.5',
+        modelOptions: [{ id: 'reasoning_effort', name: 'Thinking', type: 'select', currentValue: params.effort }],
+      }],
+    };
+  }
 
   beforeEach(async () => {
     happyHomeDir = await createTempDir('happier-cli-session-status-');
     sessionPendingCount = 0;
     sessionPendingBlockedCount = 0;
+    runtimeMetadata = defaultRuntimeMetadata();
 
     const sessionId = 'sess_integration_status_123';
     const dek = new Uint8Array(32).fill(3);
@@ -44,7 +63,7 @@ describe('happier session status (integration)', () => {
     });
 
     const { encodeBase64: encodeBase64Session, encryptWithDataKey } = await import('@/api/encryption');
-    const metadataCiphertext = encodeBase64Session(
+    const buildMetadataCiphertext = () => encodeBase64Session(
       encryptWithDataKey(
         {
           path: '/tmp/happier-session-control-integration',
@@ -57,6 +76,7 @@ describe('happier session status (integration)', () => {
             nextCheckAtMs: 456, attemptCount: 1, maxAttempts: 3, lastProbeError: null,
             selectedAuth: { kind: 'native' },
           },
+          ...runtimeMetadata,
         },
         dek,
       ),
@@ -98,7 +118,7 @@ describe('happier session status (integration)', () => {
               updatedAt: 2,
               active: false,
               activeAt: 0,
-              metadata: metadataCiphertext,
+              metadata: buildMetadataCiphertext(),
               metadataVersion: 0,
               agentState: agentStateCiphertext,
               agentStateVersion: 0,
@@ -206,6 +226,15 @@ describe('happier session status (integration)', () => {
         recovery: { status: 'waiting', issueFingerprint: 'status-integration-issue', armedAtMs: 123,
           runtimeAuthRecoveryAttemptId: 'status-integration-attempt' },
       });
+      // Desired selections and the runner-reported current model stay separate facts.
+      expect(parsed.data?.runtimeConfig).toEqual({
+        state: 'present', metadataVersion: 0,
+        desired: {
+          model: { modelId: 'claude-opus-5-5', updatedAt: 40 },
+          reasoningEffort: { state: 'present', value: 'medium', updatedAt: 50 },
+        },
+        reported: { state: 'present', provider: 'claude', currentModelId: 'claude-opus-5-5', reasoningEffort: 'high', updatedAt: 60 },
+      });
     } finally {
       output.restore();
     }
@@ -264,5 +293,97 @@ describe('happier session status (integration)', () => {
     } finally {
       output.restore();
     }
+  });
+  async function readRuntimeConfig(): Promise<any> {
+    const { handleSessionCommand } = await import('./index');
+    const output = captureConsoleJsonOutput();
+    try {
+      await handleSessionCommand(['status', 'sess_integration_status_123', '--json'], {
+        readCredentialsFn: async () => ({
+          token: 'token_test',
+          encryption: {
+            type: 'dataKey',
+            publicKey: deriveBoxPublicKeyFromSeed(new Uint8Array(32).fill(8)),
+            machineKey: new Uint8Array(32).fill(8),
+          },
+        }),
+      });
+      const parsed = output.json();
+      expect(parsed).toMatchObject({ ok: true, kind: 'session_status' });
+      // The rest of the status survives whatever the model metadata contains.
+      expect(parsed.data?.session?.id).toBe('sess_integration_status_123');
+      return parsed.data?.runtimeConfig;
+    } finally {
+      output.restore();
+    }
+  }
+
+  it.each([
+    ['model options not an array', { modelOptions: {} }],
+    ['model option missing its name', { modelOptions: [{ id: 'reasoning_effort', type: 'select', currentValue: 'high' }] }],
+  ])('reports invalid model state without failing status (%s)', async (_label, modelPatch) => {
+    const state = claudeModelsState({ updatedAt: 60, effort: 'high' }) as any;
+    state.availableModels = [{ ...state.availableModels[0], ...modelPatch }];
+    runtimeMetadata = { ...defaultRuntimeMetadata(), sessionModelsV1: state };
+
+    const runtimeConfig = await readRuntimeConfig();
+    expect(runtimeConfig.reported).toEqual({ state: 'invalid' });
+    expect(runtimeConfig.desired.reasoningEffort).toEqual({ state: 'present', value: 'medium', updatedAt: 50 });
+  });
+
+  it('does not certify an unsupported model-state version as reported state', async () => {
+    runtimeMetadata = { ...defaultRuntimeMetadata(), sessionModelsV1: { ...claudeModelsState({ updatedAt: 60, effort: 'high' }), v: 99 } };
+    expect((await readRuntimeConfig()).reported).toEqual({ state: 'invalid' });
+  });
+
+  it('reports absent model state when the runner published none', async () => {
+    const { sessionModelsV1: _omitted, ...rest } = defaultRuntimeMetadata();
+    runtimeMetadata = rest;
+    expect((await readRuntimeConfig()).reported).toEqual({ state: 'absent' });
+  });
+
+  it.each([
+    ['legacy only', { acpSessionModelsV1: claudeModelsState({ updatedAt: 20, effort: 'medium' }) }, 'medium', 20],
+    ['newer legacy wins', { sessionModelsV1: claudeModelsState({ updatedAt: 10, effort: 'high' }), acpSessionModelsV1: claudeModelsState({ updatedAt: 20, effort: 'medium' }) }, 'medium', 20],
+    ['newer canonical wins', { sessionModelsV1: claudeModelsState({ updatedAt: 30, effort: 'high' }), acpSessionModelsV1: claudeModelsState({ updatedAt: 20, effort: 'medium' }) }, 'high', 30],
+    ['canonical wins a tie', { sessionModelsV1: claudeModelsState({ updatedAt: 20, effort: 'high' }), acpSessionModelsV1: claudeModelsState({ updatedAt: 20, effort: 'medium' }) }, 'high', 20],
+    ['malformed canonical falls back to valid legacy', { sessionModelsV1: { ...claudeModelsState({ updatedAt: 90, effort: 'high' }), availableModels: {} }, acpSessionModelsV1: claudeModelsState({ updatedAt: 20, effort: 'medium' }) }, 'medium', 20],
+  ])('selects the newest valid reported model state across aliases (%s)', async (_label, models, effort, updatedAt) => {
+    const { sessionModelsV1: _omitted, ...rest } = defaultRuntimeMetadata();
+    runtimeMetadata = { ...rest, ...models };
+    expect((await readRuntimeConfig()).reported).toEqual({
+      state: 'present', provider: 'claude', currentModelId: 'claude-opus-5-5', reasoningEffort: effort, updatedAt,
+    });
+  });
+
+  it('projects only model and reasoning effort, not unrelated config values', async () => {
+    runtimeMetadata = {
+      ...defaultRuntimeMetadata(),
+      sessionConfigOptionOverridesV1: {
+        v: 1, updatedAt: 70,
+        overrides: {
+          reasoning_effort: { value: 'medium', updatedAt: 50 },
+          freeform_setting: { value: 'SYNTHETIC-UNRELATED-CONTENT', updatedAt: 70 },
+        },
+      },
+    };
+    const runtimeConfig = await readRuntimeConfig();
+    expect(runtimeConfig.desired).toEqual({
+      model: { modelId: 'claude-opus-5-5', updatedAt: 40 },
+      reasoningEffort: { state: 'present', value: 'medium', updatedAt: 50 },
+    });
+    expect(JSON.stringify(runtimeConfig)).not.toContain('SYNTHETIC-UNRELATED-CONTENT');
+  });
+
+  it('marks a desired reasoning effort that is not an effort level as invalid without showing it', async () => {
+    runtimeMetadata = {
+      ...defaultRuntimeMetadata(),
+      sessionConfigOptionOverridesV1: {
+        v: 1, updatedAt: 50, overrides: { reasoning_effort: { value: 'synthetic opaque value!', updatedAt: 50 } },
+      },
+    };
+    const runtimeConfig = await readRuntimeConfig();
+    expect(runtimeConfig.desired.reasoningEffort).toEqual({ state: 'invalid', updatedAt: 50 });
+    expect(JSON.stringify(runtimeConfig)).not.toContain('synthetic opaque value!');
   });
 });

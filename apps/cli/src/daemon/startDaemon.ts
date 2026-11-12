@@ -1307,14 +1307,27 @@ export async function resolveSessionConnectedServiceSwitchContinuity(input: Read
       : {}),
     ...(input.runtimeAuthSelection === undefined ? {} : { runtimeAuthSelection: input.runtimeAuthSelection }),
   });
+  // The replacement context this resolution checked (working directory and native resume id)
+  // travels with the result, so a restart relaunches exactly that session instead of resolving it
+  // again from other inputs.
+  const checkedSessionDirectory = input.cwd?.trim() ?? '';
+  const checkedVendorResumeId = input.vendorResumeId?.trim() ?? '';
+  const checkedContext = checkedSessionDirectory || checkedVendorResumeId
+    ? {
+        checkedReplacementContext: {
+          ...(checkedSessionDirectory ? { sessionDirectory: checkedSessionDirectory } : {}),
+          ...(checkedVendorResumeId ? { vendorResumeId: checkedVendorResumeId } : {}),
+        },
+      }
+    : {};
   if (continuity.mode === 'hot_apply') {
-    return { mode: 'hot_apply' as const };
+    return { mode: 'hot_apply' as const, ...checkedContext };
   }
   if (continuity.mode === 'restart_same_home') {
-    return { mode: 'restart_rematerialize' as const };
+    return { mode: 'restart_rematerialize' as const, ...checkedContext };
   }
   if (continuity.mode === 'restart_shared_state_required') {
-    return resolveSharedStateRequiredSwitchContinuity({
+    const sharedStateContinuity = await resolveSharedStateRequiredSwitchContinuity({
       agentId: input.agentId,
       accountSettings: input.accountSettings,
       warnings: continuity.reason ? [continuity.reason] : [],
@@ -1326,6 +1339,9 @@ export async function resolveSessionConnectedServiceSwitchContinuity(input: Read
       cwd: input.cwd ?? null,
       candidatePersistedSessionFile: input.candidatePersistedSessionFile ?? null,
     });
+    return sharedStateContinuity.mode === 'unsupported'
+      ? sharedStateContinuity
+      : { ...sharedStateContinuity, ...checkedContext };
   }
   return {
     mode: 'unsupported' as const,

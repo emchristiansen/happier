@@ -924,6 +924,58 @@ describe('switchSessionConnectedServiceAuth', () => {
     }));
   });
 
+  it('refuses a restart before effects when no native id was checked and the launch and runner disagree', async () => {
+    const tracked = trackedSession({
+      vendorResumeId: '00000000-0000-4000-8000-00000000a11c',
+      spawnOptions: {
+        directory: '/tmp/project',
+        backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+        resume: '00000000-0000-4000-8000-00000000b22c',
+        connectedServices: bindings('old-profile'),
+      },
+    });
+    const previousSpawnOptions = tracked.spawnOptions;
+    const persistSessionBindings = vi.fn(async () => {});
+    const restartSession = vi.fn(async () => {});
+
+    const result = await switchSessionConnectedServiceAuth({
+      core: createCore(),
+      postSwitchVerificationMode: {
+        kind: 'disabled_for_test_only',
+        reason: 'existing switch fixture does not exercise provider adoption verification',
+      },
+      getChildren: () => [tracked],
+      api: exactProfileHealthApi({
+        profiles: async () => ({
+          serviceId: 'anthropic',
+          profiles: [{ profileId: 'new-profile', status: 'connected' }],
+        }),
+        getConnectedServiceAuthGroup: async () => null,
+      }),
+      // A continuity resolution that reports no checked replacement context.
+      resolveContinuity: async () => ({ mode: 'restart_rematerialize' }),
+      restartSession,
+      hotApply: async () => ({ ok: true }),
+      registerHotApplyTargets: () => {},
+      emitSessionEvent: vi.fn(),
+      persistSessionBindings,
+      request: {
+        sessionId: 'sess_1',
+        agentId: 'claude',
+        bindings: bindings('new-profile'),
+      },
+    } as any);
+
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'restart_replacement_unavailable',
+      diagnostics: { failurePhase: 'continuity', attemptedAction: 'restart_requested' },
+    });
+    expect(persistSessionBindings).not.toHaveBeenCalled();
+    expect(restartSession).not.toHaveBeenCalled();
+    expect(tracked.spawnOptions).toBe(previousSpawnOptions);
+  });
+
   it('uses webhook metadata bindings as the previous binding when tracked spawn options no longer carry them', async () => {
     const previousBindings = bindings('old-profile');
     const nextBindings = bindings('new-profile');

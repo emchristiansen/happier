@@ -26,6 +26,11 @@ import {
   type ClientEncryptionRequirement,
 } from '@happier-dev/protocol'
 import packageJson from '../package.json'
+import {
+  CLAUDE_MODEL_EFFORT_OVERRIDES_ENV,
+  parseClaudeModelEffortOverrides,
+  type ClaudeModelEffortOverridesConfig,
+} from '@/backends/claude/utils/claudeModelEffortOverrides'
 import type { PublicReleaseRingId } from '@happier-dev/release-runtime/releaseRings'
 
 export const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS = 100_000_000;
@@ -308,6 +313,8 @@ class Configuration {
 
   // Claude Task tool policy (remote mode).
   public readonly claudeTaskAllowRunInBackground: boolean
+  /** Optional per-model Claude effort pins; enforced by `requireClaudeModelEffortOverrides`. */
+  public readonly claudeModelEffortOverrides: ClaudeModelEffortOverridesConfig
   /**
    * When a user aborts a Claude session, the vendor SDK may surface a cancellation as a process-level
    * unhandledRejection (known "Operation aborted" error). Within this short window after a user abort,
@@ -843,6 +850,7 @@ class Configuration {
       .trim()
       .toLowerCase();
     this.claudeTaskAllowRunInBackground = ['1', 'true', 'yes', 'on'].includes(allowTaskBackgroundRaw);
+    this.claudeModelEffortOverrides = parseClaudeModelEffortOverrides(process.env[CLAUDE_MODEL_EFFORT_OVERRIDES_ENV]);
 
     // Default: 10s. Set to 0 to disable suppression.
     this.claudeAbortUnhandledRejectionIgnoreWindowMs = resolveIntEnvWithBounds(

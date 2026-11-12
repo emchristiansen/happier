@@ -128,7 +128,11 @@ describe('happier session status (action executor)', () => {
       expect(output.json()).toEqual(expect.objectContaining({
         ok: true,
         kind: 'session_status',
-        data: { session: { id: 'sess-1' }, agentState: { provider: 'codex' }, usageLimitRecovery: { state: 'unsupported' } },
+        // An older producer omits both readbacks; omission is reported as unsupported, not absent.
+        data: {
+          session: { id: 'sess-1' }, agentState: { provider: 'codex' },
+          usageLimitRecovery: { state: 'unsupported' }, runtimeConfig: { state: 'unsupported' },
+        },
       }));
     } finally {
       output.restore();
@@ -146,7 +150,24 @@ describe('happier session status (action executor)', () => {
       await handleSessionCommand(['status', 'sess-2', '--json'], {
         readCredentialsFn: async () => ({ token: 'test-token', encryption: null }),
       });
-      expect(output.json().data).toEqual({ session: { id: 'sess-2' }, usageLimitRecovery });
+      expect(output.json().data).toEqual({ session: { id: 'sess-2' }, usageLimitRecovery, runtimeConfig: { state: 'unsupported' } });
+    } finally { output.restore(); }
+  });
+
+  it('keeps the runtime model/effort readback from the action result in CLI JSON', async () => {
+    const runtimeConfig = {
+      state: 'present', metadataVersion: 7,
+      desired: { reasoningEffort: { state: 'present', value: 'medium', updatedAt: 5 } },
+      reported: { state: 'present', provider: 'claude', currentModelId: 'claude-opus-5-5', reasoningEffort: 'medium', updatedAt: 6 },
+    };
+    execute.mockResolvedValueOnce({ ok: true, result: { ok: true, session: { id: 'sess-3' }, runtimeConfig } });
+    const { handleSessionCommand } = await import('./handleSessionCommand');
+    const output = captureConsoleJsonOutput();
+    try {
+      await handleSessionCommand(['status', 'sess-3', '--json'], {
+        readCredentialsFn: async () => ({ token: 'test-token', encryption: null }),
+      });
+      expect(output.json().data).toEqual({ session: { id: 'sess-3' }, usageLimitRecovery: { state: 'unsupported' }, runtimeConfig });
     } finally { output.restore(); }
   });
 });

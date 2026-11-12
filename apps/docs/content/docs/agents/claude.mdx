@@ -266,6 +266,29 @@ For a machine-local opt-out from dynamic Claude model discovery, set
 same static-catalog result as turning off **Discover available models**, and the account setting
 cannot be overridden back on by the environment variable.
 
+To run one Claude model at a fixed thinking effort on a machine, set
+`HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES` in the Happier CLI/daemon environment to a JSON object of
+model id to effort, for example `{"claude-opus-5-5":"medium"}`. Sessions using a listed model run at
+that effort whatever their launch flags or Thinking selection ask for; other models are unaffected.
+Keys match a Claude model id (a `[1m]` or dated suffix is tolerated). When a session names a model
+by alias such as `opus`, or leaves it to Claude Code's default, Happier asks Claude Code which model
+it resolved:
+
+- The Agent SDK, legacy remote and execution-run paths ask before each message. If that model is
+  listed, they apply its effort, turn ultracode off, and send the message only after Claude Code
+  reports the pinned effort back.
+- The unified terminal and local terminal modes ask once before starting Claude Code, without
+  starting a conversation. If that model is listed, they start Claude Code with that exact model
+  and its effort, which also turns ultracode off. In local mode, a `--settings` you pass is kept as given.
+
+If Claude Code cannot answer, the message is not sent, or the terminal does not start, and the
+session shows why. A session that names a specific model from Happier's model list is not asked.
+An invalid value stops the Claude session before it starts. Remove the variable, or change its entry, to go back. A daemon reads it when it starts, and
+passes it to the sessions it starts, including those in tmux.
+
+An `--effort` flag passed when starting a Claude session sets that session's initial Thinking level.
+Choosing a different level later in the app replaces it from the next message.
+
 ## Claude Code session history (development source)
 
 The development source adds **Show sessions in Claude Code** under Claude settings. It is off by default. Turn it on before starting a new session to set `CLAUDE_CODE_ENTRYPOINT=happier` on Happier Claude launches, including Agent SDK, legacy remote, local terminal, unified terminal, and execution runs. Off leaves the provider runtime’s default attribution in place.

@@ -113,6 +113,13 @@ Live status (when supported):
 happier session status <session-id-or-prefix> --live
 ```
 
+The `runtimeConfig` field of `--json` output shows only the session's model and Thinking level.
+`desired.model` and `desired.reasoningEffort` are the selections stored for the session;
+`reported` is the model and Thinking level the agent last published. A selection takes effect
+from the agent's next turn, so the two can differ; `reported` is what the agent published, not a
+record of an individual turn. A stored Thinking level that is not a valid level appears as
+`desired.reasoningEffort.state: "invalid"` without its value.
+
 ## Messaging
 
 Send a user message:

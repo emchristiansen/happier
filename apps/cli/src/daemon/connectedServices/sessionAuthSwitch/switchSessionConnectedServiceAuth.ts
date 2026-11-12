@@ -22,6 +22,9 @@ import { logger } from '@/ui/logger';
 
 import type { CatalogAgentId, ConnectedServiceResumeContinuityDiagnostics } from '@/backends/types';
 import type { TrackedSession } from '@/daemon/types';
+import type { SpawnSessionOptions } from '@/rpc/handlers/registerSessionHandlers';
+import { resolveSessionRunnerReplacementOperand } from '@/daemon/processSupervision/sessionRunnerRespawn';
+import { resolveTrackedSessionBackendTarget } from '@/daemon/sessions/resolveTrackedSessionCatalogAgentId';
 import type { ConnectedServiceCredentialHealthRead } from '@/api/connectedServices/connectedServiceCredentialApi';
 import { resolveTrackedSessionCatalogAgentId } from '@/daemon/sessions/resolveTrackedSessionCatalogAgentId';
 import {
@@ -153,7 +156,10 @@ export type SessionConnectedServiceAuthSwitchErrorCode =
   | 'post_switch_verification_failed'
   | 'profile_action_required'
   | 'hot_apply_restart_required'
-  | 'restart_disallowed_by_execution_policy';
+  | 'restart_disallowed_by_execution_policy'
+  // The runner's restart would retire it with no replacement launch (the respawn owner cannot
+  // relaunch it), so the switch refuses before persisting bindings or signaling.
+  | 'restart_replacement_unavailable';
 
 export type SessionConnectedServiceAuthSwitchServiceResult = Readonly<{
   status: 'applied' | 'failed' | 'not_attempted';
@@ -204,16 +210,27 @@ export type ConnectedServiceResumeContinuityProofDiagnostics = Omit<
   'reachabilityMissReason'
 >;
 
+/**
+ * The session identity a continuity resolution checked: the working directory and the native resume
+ * id it proved. A restart relaunches exactly this session; it never re-resolves either fact.
+ */
+export type ConnectedServiceCheckedReplacementContext = Readonly<{
+  sessionDirectory?: string;
+  vendorResumeId?: string;
+}>;
+
 export type SessionConnectedServiceSwitchContinuity =
   | Readonly<{
       mode: 'restart_rematerialize';
       warnings?: readonly string[];
       diagnostics?: ConnectedServiceResumeContinuityProofDiagnostics;
+      checkedReplacementContext?: ConnectedServiceCheckedReplacementContext;
     }>
   | Readonly<{
       mode: 'hot_apply';
       warnings?: readonly string[];
       diagnostics?: ConnectedServiceResumeContinuityProofDiagnostics;
+      checkedReplacementContext?: ConnectedServiceCheckedReplacementContext;
     }>
   | Readonly<{
       mode: 'unsupported';
@@ -1597,6 +1614,67 @@ function gateRestartResumeBeforeSideEffects(input: Readonly<{
   });
 }
 
+/**
+ * Builds the launch a restart leaves on the tracked session for its replacement from the replacement
+ * context the continuity check proved, and refuses (before any persistence or signal) when the
+ * respawn owner could not relaunch that same session:
+ * - directory and native resume id: exactly the checked ones. A checked resume id overrides a stale
+ *   launch descriptor. Without checked facts the existing launch stays, but a launch resume id that
+ *   contradicts the runner's own id is refused rather than guessed;
+ * - backendTarget: the runner's actual backend (explicit target, else its own session metadata),
+ *   never the catalog default.
+ */
+function prepareRestartReplacementBeforeSideEffects(input: Readonly<{
+  tracked: TrackedSession;
+  checkedContexts: ReadonlyArray<ConnectedServiceCheckedReplacementContext | undefined>;
+  attemptedAction: 'restart_requested' | 'metadata_updated';
+  diagnosticSource: ConnectedServiceUxDiagnosticV1['source'];
+}>): Readonly<{ ok: true; spawnOptions: SpawnSessionOptions }> | Readonly<{ ok: false; failure: SessionConnectedServiceAuthSwitchResult }> {
+  const refuse = (reason: string) => {
+    logger.warn('[ConnectedServices] Refusing connected-service restart: the runner has no replacement launch', {
+      reason,
+      attemptedAction: input.attemptedAction,
+    });
+    return {
+      ok: false as const,
+      failure: failureResult('restart_replacement_unavailable', {
+        failurePhase: 'continuity',
+        attemptedAction: input.attemptedAction,
+        diagnosticSource: input.diagnosticSource,
+      }),
+    };
+  };
+  const checkedDirectories = new Set(
+    input.checkedContexts.map((context) => readNonEmptyString(context?.sessionDirectory)).filter(Boolean),
+  );
+  if (checkedDirectories.size > 1) return refuse('conflicting_session_directory');
+  const checkedNativeIds = new Set(
+    input.checkedContexts.map((context) => readNonEmptyString(context?.vendorResumeId)).filter(Boolean),
+  );
+  if (checkedNativeIds.size > 1) return refuse('conflicting_native_resume_id');
+  const backendTarget = resolveTrackedSessionBackendTarget(input.tracked);
+  if (!backendTarget) return refuse('missing_backend_target');
+  const existing = input.tracked.spawnOptions;
+  const checkedNativeId = [...checkedNativeIds][0];
+  const launchResume = readNonEmptyString(existing?.resume);
+  const runnerResume = readNonEmptyString(input.tracked.vendorResumeId);
+  if (!checkedNativeId && launchResume && runnerResume && launchResume !== runnerResume) {
+    return refuse('unproven_native_resume_id');
+  }
+  const spawnOptions: SpawnSessionOptions = {
+    ...existing,
+    backendTarget,
+    directory: [...checkedDirectories][0] ?? readNonEmptyString(existing?.directory),
+    ...(checkedNativeId ? { resume: checkedNativeId } : {}),
+  };
+  const operand = resolveSessionRunnerReplacementOperand({
+    startedBy: input.tracked.startedBy,
+    spawnOptions,
+    vendorResumeId: input.tracked.vendorResumeId,
+  });
+  return operand.replaceable ? { ok: true, spawnOptions } : refuse(operand.reason);
+}
+
 async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
   request: SessionConnectedServiceAuthSwitchRequest;
   switchReason?: ConnectedServiceSessionAuthSwitchReason;
@@ -1740,6 +1818,17 @@ async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
     });
     if (restartGate) return restartGate;
   }
+  let restartBaseSpawnOptions: SpawnSessionOptions | null = null;
+  if (continuity.mode !== 'hot_apply') {
+    const replacement = prepareRestartReplacementBeforeSideEffects({
+      tracked: input.tracked,
+      checkedContexts: [continuity.checkedReplacementContext],
+      attemptedAction: input.diagnosticSource === 'runtime_auth_recovery' ? 'metadata_updated' : 'restart_requested',
+      diagnosticSource: input.diagnosticSource,
+    });
+    if (!replacement.ok) return replacement.failure;
+    restartBaseSpawnOptions = replacement.spawnOptions;
+  }
 
   if (input.dryRun) {
     return {
@@ -1769,7 +1858,7 @@ async function rematerializeUnchangedConnectedServiceBinding(input: Readonly<{
     groupMetadataByServiceId: input.groupMetadataByServiceId,
   });
   input.tracked.spawnOptions = {
-    ...(input.tracked.spawnOptions ?? { directory: '' }),
+    ...(restartBaseSpawnOptions ?? input.tracked.spawnOptions ?? { directory: '' }),
     connectedServices: input.normalizedBindings,
     connectedServicesUpdatedAt: Date.now(),
     ...(connectedServiceMaterializationIdentityV1
@@ -2186,6 +2275,7 @@ export async function switchSessionConnectedServiceAuth(
       const warnings: string[] = [];
       let allChangedServicesHotApply = true;
       let continuityProofDiagnostics: ConnectedServiceResumeContinuityProofDiagnostics | null = null;
+      const checkedContexts: Array<ConnectedServiceCheckedReplacementContext | undefined> = [];
       const runtimeAuthSelectionsByServiceId = new Map<ConnectedServiceId, unknown>();
       const runtimeAuthApplyByServiceId = new Map<ConnectedServiceId, ConnectedServiceRuntimeAuthApplyCapability | null>();
       const previousSpawnOptions = tracked.spawnOptions;
@@ -2295,6 +2385,7 @@ export async function switchSessionConnectedServiceAuth(
         // INC-6: keep the proven continuity context (single changed service in practice; the first
         // proof wins for multi-service switches) for success-result telemetry.
         continuityProofDiagnostics ??= continuity.diagnostics ?? null;
+        checkedContexts.push(continuity.checkedReplacementContext);
         if (continuity.mode !== 'hot_apply') {
           allChangedServicesHotApply = false;
         }
@@ -2328,6 +2419,19 @@ export async function switchSessionConnectedServiceAuth(
         });
         if (restartGate) return restartGate;
       }
+      // Both restart_requested and metadata_updated lead to a runner restart (the latter by the
+      // runtime-auth recovery owner once this switch commits), so both need a replacement launch.
+      let restartBaseSpawnOptions: SpawnSessionOptions | null = null;
+      if (action !== 'hot_applied') {
+        const replacement = prepareRestartReplacementBeforeSideEffects({
+          tracked,
+          checkedContexts,
+          attemptedAction: action,
+          diagnosticSource,
+        });
+        if (!replacement.ok) return replacement.failure;
+        restartBaseSpawnOptions = replacement.spawnOptions;
+      }
       if (input.dryRun) {
         return {
           ok: true,
@@ -2354,7 +2458,7 @@ export async function switchSessionConnectedServiceAuth(
         groupMetadataByServiceId: normalized.groupMetadataByServiceId,
       });
       const nextSpawnOptions = {
-        ...(tracked.spawnOptions ?? { directory: '' }),
+        ...(restartBaseSpawnOptions ?? tracked.spawnOptions ?? { directory: '' }),
         connectedServices: normalized.normalized,
         connectedServicesUpdatedAt: Date.now(),
         ...(connectedServiceMaterializationIdentityV1
