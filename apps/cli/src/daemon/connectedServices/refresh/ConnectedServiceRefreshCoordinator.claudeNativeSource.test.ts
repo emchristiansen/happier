@@ -116,6 +116,17 @@ const settle = <T>(work: Promise<T>) => work.then(
 );
 
 /**
+ * A runnable stand-in for the provider CLI. The direct producer refuses a launch whose provider CLI
+ * it cannot resolve; naming this file as the exclusive `HAPPIER_<AGENT>_PATH` override keeps that
+ * check satisfied without discovering or running any CLI installed on the host.
+ */
+async function writeProviderCliStub(dir: string): Promise<string> {
+  const stub = join(dir, 'provider-cli-stub');
+  await writeFile(stub, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  return stub;
+}
+
+/**
  * Real direct producer (the caller's CLAUDE_CONFIG_DIR) -> real terminal registration from the
  * session's webhook metadata -> real daemon refresh coordinator whose own environment names a
  * different Claude config dir (a sentinel). Server HTTP is synthetic; filesystem effects are real.
@@ -126,6 +137,7 @@ async function createComposedFixture(params: Readonly<{
 }>) {
   const profileId = params.profileId;
   const dir = await mkdtemp(join(tmpdir(), 'happier-claude-native-source-'));
+  const providerCli = await writeProviderCliStub(dir);
   const callerSource = await nativeClaudeSource(dir, 'caller');
   const daemonSource = await nativeClaudeSource(dir, 'daemon');
   const sentinelEntriesBefore = (await readdir(daemonSource)).sort();
@@ -195,6 +207,7 @@ async function createComposedFixture(params: Readonly<{
   /** The direct producer, run with the caller's own CLAUDE_CONFIG_DIR. */
   const directLaunch = async (input: Readonly<{ sessionId: string; source: string }>) => {
     const identity = resolveDirectConnectedServiceMaterializationIdentity(null);
+    vi.stubEnv('HAPPIER_CLAUDE_PATH', providerCli);
     vi.stubEnv('CLAUDE_CONFIG_DIR', input.source);
     try {
       const launched = await settle(resolveDirectConnectedServiceEnvironment({

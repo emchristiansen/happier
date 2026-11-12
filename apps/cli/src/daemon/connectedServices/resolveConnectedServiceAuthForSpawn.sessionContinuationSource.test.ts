@@ -139,9 +139,21 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => removeTempDir(root)));
 });
 
+/**
+ * A runnable stand-in for the provider CLI. The direct producer refuses a launch whose provider CLI
+ * it cannot resolve; naming this file as the exclusive `HAPPIER_<AGENT>_PATH` override keeps that
+ * check satisfied without discovering or running any CLI installed on the host.
+ */
+async function writeProviderCliStub(dir: string): Promise<string> {
+  const stub = join(dir, 'provider-cli-stub');
+  await writeFile(stub, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  return stub;
+}
+
 async function createFixture(prefix: string) {
   const dir = await mkdtemp(join(tmpdir(), `happier-continuation-source-${prefix}-`));
   roots.push(dir);
+  const providerCli = await writeProviderCliStub(dir);
   const records = new Map<string, ConnectedServiceCredentialRecordV1>();
   const api: Record<string, unknown> = {
     getAccountEncryptionMode: async () => 'plain',
@@ -167,6 +179,7 @@ async function createFixture(prefix: string) {
     identity: ConnectedServiceMaterializationIdentityV1;
     env: Readonly<Record<string, string>>;
   }>) => {
+    vi.stubEnv(input.agentId === 'claude' ? 'HAPPIER_CLAUDE_PATH' : 'HAPPIER_CODEX_PATH', providerCli);
     for (const [key, value] of Object.entries(input.env)) vi.stubEnv(key, value);
     try {
       return await settle(() => resolveDirectConnectedServiceEnvironment({
