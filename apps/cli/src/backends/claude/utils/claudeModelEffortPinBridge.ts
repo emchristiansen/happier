@@ -1,3 +1,4 @@
+import { lazySchema } from '@happier-dev/protocol';
 import { z } from 'zod';
 
 import {
@@ -24,13 +25,13 @@ export type ClaudeModelEffortPinBridgeResult =
 
 // `get_settings` reports the session's resolved model (aliases and the native default included)
 // under `applied`. Only the fields this bridge reads are parsed.
-const AppliedSettingsSchema = z.object({
+const AppliedSettingsSchema = lazySchema(() => z.object({
     applied: z.object({
         model: z.string().min(1),
         effort: z.string().nullish(),
         ultracode: z.boolean().nullish(),
     }),
-});
+}));
 
 type AppliedSettings = z.infer<typeof AppliedSettingsSchema>['applied'];
 
