@@ -19,6 +19,7 @@ import { handleMachineCliCommand } from './commands/machine';
 import { handleMcpCliCommand } from './commands/mcp';
 import { handleNotifyCliCommand } from './commands/notify';
 import { handleProfilesCliCommand } from './commands/profiles';
+import { handlePromptDocCliCommand } from './commands/promptDoc';
 import { handlePluginsCompatibilityCliCommand } from './commands/pluginsCompatibility';
 import { handleRelayCliCommand } from './commands/relay';
 import { handleResumeCliCommand } from './commands/resume';
@@ -79,6 +80,7 @@ export const commandRegistry: Readonly<Record<string, CommandHandler>> = {
   plugins: handlePluginsCompatibilityCliCommand,
   profile: handleProfilesCliCommand,
   profiles: handleProfilesCliCommand,
+  'prompt-doc': handlePromptDocCliCommand,
   relay: handleRelayCliCommand,
   resume: handleResumeCliCommand,
   service: handleServiceCliCommand,
