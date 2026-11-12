@@ -13,8 +13,10 @@ import { isSessionRunnerActive } from './isSessionRunnerActive';
 import { waitForTrackedRunnerProcessesExit } from './waitForTrackedRunnerProcessesExit';
 
 describe('waitForTrackedRunnerProcessesExit', () => {
-  it.skipIf(process.platform === 'win32')('preserves custody for a real paused live child', async () => {
+  it.skipIf(process.platform === 'win32')('preserves custody for a live child whose OS state reports it stopped', async () => {
     // Development-only owned child; the product runtime is not spawned through system Node.
+    // It is never actually suspended: the real run-state reader sees its live signal probe, and
+    // only the OS process-state row reports the stopped state a paused runner would show.
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
     await once(child, 'spawn');
     const pid = child.pid!;
@@ -28,20 +30,22 @@ describe('waitForTrackedRunnerProcessesExit', () => {
       // Marker files are an external persistence boundary; no marker belongs to this synthetic child.
       removeSessionMarkerFn: async () => {},
     });
+    const readRunState = (target: number) => readProcessRunState(target, { readPosixStateOutput: async () => 'T\n' });
     try {
-      expect(child.kill('SIGSTOP')).toBe(true);
-      expect(await readProcessRunState(pid)).toBe('stopped');
-      const request = { runners: [{ pid }], timeoutMs: 0, pollIntervalMs: 0, onExitObserved };
+      expect(await readRunState(pid)).toBe('stopped');
+      const request = { runners: [{ pid }], timeoutMs: 0, pollIntervalMs: 0, onExitObserved, readRunState };
       expect(await waitForTrackedRunnerProcessesExit(request)).toBe(false);
       // Freeze only the clock boundary so a zero-budget old while loop cannot accidentally skip its probe.
       vi.useFakeTimers({ toFake: ['Date'] });
-      expect(await isSessionRunnerActive({ sessionId: `PID-${pid}`, trackedSessions: tracked.values() })).toBe(false);
+      expect(await isSessionRunnerActive({
+        sessionId: `PID-${pid}`, trackedSessions: tracked.values(), readProcessRunState: readRunState,
+      })).toBe(false);
       await waitForExistingSessionExitIfStopRequested({
         sessionId: `PID-${pid}`, pidToTrackedSession: tracked, timeoutMs: 0, pollIntervalMs: 0,
-        onExitObserved,
+        onExitObserved, readRunState,
       });
       expect(tracked.has(pid)).toBe(true);
-      expect(await readProcessRunState(pid)).toBe('stopped');
+      expect(await readRunState(pid)).toBe('stopped');
     } finally {
       vi.useRealTimers();
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');

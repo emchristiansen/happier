@@ -1,3 +1,5 @@
+import type { ChildProcess } from 'node:child_process';
+
 import type { TrackedSession } from '../types';
 import { readProcessRunState as readProcessRunStateDefault, type ProcessRunState } from '../processRunState';
 import { readSessionRunnerLockStatus, type SessionRunnerLockStatus } from '../sessionRunnerLock';
@@ -13,13 +15,14 @@ import {
   processInstanceFingerprintMatches,
   readProcessInstanceFingerprintSync,
 } from '@happier-dev/cli-common/processInstance';
+import { readDaemonOwnedRunnerProcessGroupLeader } from './daemonOwnedRunnerProcessGroup';
 import type { SessionRunnerIncarnation, SessionRunnerServiceability } from './pendingQueueWake';
 
 function normalizeSessionId(raw: unknown): string {
   return String(raw ?? '').trim();
 }
 
-function trackedSessionMatchesSessionId(tracked: TrackedSession, sessionId: string): boolean {
+export function trackedSessionMatchesSessionId(tracked: TrackedSession, sessionId: string): boolean {
   const trackedHappySessionId = typeof tracked.happySessionId === 'string' ? tracked.happySessionId.trim() : '';
   const trackedExistingSessionId =
     tracked.spawnOptions && typeof tracked.spawnOptions.existingSessionId === 'string'
@@ -146,20 +149,32 @@ declare const matchedLostPublisherRunnerBrand: unique symbol;
 /**
  * The exact local runner incarnation that itself reported `publisher_lost`. Only
  * `bindLostPublisherReport` constructs one, after proving the respondent equals the one local process
- * a Stop of the session would signal, so a `replace` decision always carries its matched target.
+ * a Stop of the session would signal and that the daemon's own spawn of it leads its process group,
+ * so a `replace` decision always carries its matched target and that ownership.
  */
-export type MatchedLostPublisherRunner = SessionRunnerIncarnation & Readonly<{ [matchedLostPublisherRunnerBrand]: true }>;
+export type MatchedLostPublisherRunner = SessionRunnerIncarnation & Readonly<{
+  /** The daemon's live ChildProcess for this runner, which leads the runner's process group. */
+  ownedProcessGroupLeader: ChildProcess;
+  [matchedLostPublisherRunnerBrand]: true;
+}>;
 
 /** Runner control state as seen by the daemon, after binding any lost-publisher report to a local process. */
 export type SessionRunnerControl =
   | Exclude<SessionRunnerServiceability, Readonly<{ reason: 'publisher_lost' }>>
   | Readonly<{ state: 'recoverable_unservable'; reason: 'publisher_lost'; target: MatchedLostPublisherRunner }>
   /** The report may be genuine, but no single local process is provably the one Stop would signal. */
-  | Readonly<{ state: 'recoverable_unservable'; reason: 'publisher_lost_target_ambiguous' }>;
+  | Readonly<{ state: 'recoverable_unservable'; reason: 'publisher_lost_target_ambiguous' }>
+  /**
+   * The reporting runner is the local one, but the daemon did not spawn it as its own process-group
+   * leader (or no longer holds that spawn), so replacing it could not stop its whole tree.
+   */
+  | Readonly<{ state: 'recoverable_unservable'; reason: 'publisher_lost_runner_group_unowned' }>;
 
 export type SessionRunnerServiceabilityProbe =
   | Readonly<{ state: 'runner_absent' }>
   | Readonly<{ state: 'runner_unknown'; reason: 'runner_presence_unproven' }>
+  /** No runner is tracked, but members of the previous runner's owned process group outlived its root. */
+  | Readonly<{ state: 'runner_unknown'; reason: 'owned_runner_group_tail_unresolved' }>
   | Readonly<{ state: 'runner_present'; control: SessionRunnerControl }>;
 
 export type SessionRunnerResumeDecision =
@@ -195,13 +210,16 @@ function resolveSoleTrackedRunnerIncarnation(params: Readonly<{
   return { machineId, pid, processInstanceFingerprint };
 }
 
+type LocalRunner = Readonly<{ incarnation: SessionRunnerIncarnation; ownedProcessGroupLeader: ChildProcess | null }>;
+
 function bindLostPublisherReport(
   control: SessionRunnerServiceability,
-  readLocalRunner: () => SessionRunnerIncarnation | null,
+  readLocalRunner: () => LocalRunner | null,
 ): SessionRunnerControl {
   if (control.state !== 'recoverable_unservable' || control.reason !== 'publisher_lost') return control;
-  const local = readLocalRunner();
-  if (!local) return { state: 'recoverable_unservable', reason: 'publisher_lost_target_ambiguous' };
+  const localRunner = readLocalRunner();
+  if (!localRunner) return { state: 'recoverable_unservable', reason: 'publisher_lost_target_ambiguous' };
+  const local = localRunner.incarnation;
   const respondent = control.respondent;
   // Session RPC routes to the account's last registering socket, which may be another runner for
   // this session (another home, same account). Only the exact local incarnation's report counts.
@@ -212,10 +230,15 @@ function bindLostPublisherReport(
   ) {
     return { state: 'recoverable_unservable', reason: 'publisher_lost_respondent_unbound' };
   }
+  // Replacement retires the runner through a guarded Stop that refuses anything short of its whole
+  // tree; refuse here, before any Resume effect, instead of discovering that inside Stop.
+  if (!localRunner.ownedProcessGroupLeader) {
+    return { state: 'recoverable_unservable', reason: 'publisher_lost_runner_group_unowned' };
+  }
   return {
     state: 'recoverable_unservable',
     reason: 'publisher_lost',
-    target: { ...local } as MatchedLostPublisherRunner,
+    target: { ...local, ownedProcessGroupLeader: localRunner.ownedProcessGroupLeader } as MatchedLostPublisherRunner,
   };
 }
 
@@ -318,12 +341,13 @@ export async function probeSessionRunnerServiceability(params: SessionRunnerPres
     ...presence,
     control: bindLostPublisherReport(control, () => {
       if (!tracked || trackedPresence !== 'present') return null;
-      return resolveSoleTrackedRunnerIncarnation({
+      const incarnation = resolveSoleTrackedRunnerIncarnation({
         tracked,
         matchingTrackedCount: matchingTracked.length,
         localMachineId: params.localMachineId,
         getProcessInstanceFingerprint: params.getProcessInstanceFingerprint ?? readProcessInstanceFingerprintSync,
       });
+      return incarnation ? { incarnation, ownedProcessGroupLeader: readDaemonOwnedRunnerProcessGroupLeader(tracked) } : null;
     }),
   };
 }

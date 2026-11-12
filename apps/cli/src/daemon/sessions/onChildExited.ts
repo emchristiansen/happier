@@ -8,6 +8,7 @@ import { cleanupPidSessionResources } from './cleanupPidSessionResources';
 import { isPidPlaceholderSessionId } from './pidPlaceholderSessionId';
 import { stageObservedExit } from './stageObservedExit';
 import { classifyTrackedSessionRunnerPresence } from './isSessionRunnerActive';
+import type { OwnedRunnerGroupTailCustody } from './daemonOwnedRunnerProcessGroup';
 
 export type ChildExit = { reason: string; code: number | null; signal: string | null };
 
@@ -102,6 +103,8 @@ export function createOnChildExited(params: Readonly<{
   removeSessionMarkerFn?: typeof removeSessionMarker;
   updateSessionMarkerActiveTurnFn?: typeof updateSessionMarkerActiveTurn;
   stageObservedExitFn?: typeof stageObservedExit;
+  /** Keeps a daemon-owned runner's surviving process-group members visible after its tracking retires. */
+  ownedRunnerGroupTails?: OwnedRunnerGroupTailCustody;
 }>): (pid: number, exit: ChildExit) => Promise<void> {
   const {
     pidToTrackedSession,
@@ -116,6 +119,7 @@ export function createOnChildExited(params: Readonly<{
     removeSessionMarkerFn = removeSessionMarker,
     updateSessionMarkerActiveTurnFn = updateSessionMarkerActiveTurn,
     stageObservedExitFn = stageObservedExit,
+    ownedRunnerGroupTails,
   } = params;
 
   return async (pid: number, exit: ChildExit) => {
@@ -332,6 +336,20 @@ export function createOnChildExited(params: Readonly<{
       spawnResourceCleanupByPid,
       sessionAttachCleanupByPid,
     });
+    // The daemon spawned this root as the leader of its own process group (`detached: true`). Its
+    // exit does not end that group: a member that outlived it is still the session's runtime, which a
+    // later Resume must not start a second runtime beside. Record it before the tracking disappears.
+    if (
+      tracked?.startedBy === 'daemon'
+      && tracked.childProcess?.pid === pid
+      && process.platform !== 'win32'
+      && ownedRunnerGroupTails?.retainUnlessGroupEmpty({ sessionId: normalizeSessionId(tracked.happySessionId), groupLeaderPid: pid })
+    ) {
+      logger.warn('[DAEMON RUN] Runner root exited while members of its process group remain; Resume stays refused until they exit', {
+        sessionId: tracked.happySessionId,
+        pid,
+      });
+    }
     pidToTrackedSession.delete(pid);
     if (typeof tracked?.stopRequestedAtMs === 'number') {
       logger.infoFile('[DAEMON STOP] Runner exit resources completed', {

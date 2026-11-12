@@ -54,11 +54,13 @@ describe.skipIf(process.platform === 'win32')('readProcessRunState (posix)', () 
     await expect(readProcessRunState(pid)).resolves.toBe('servable');
   });
 
-  it('reports a SIGSTOPped process as stopped (alive but cannot serve)', async () => {
+  // Processes are never actually suspended here: the OS state boundary reports the stopped or
+  // traced state a suspended runner would show, while the live process still answers signals.
+  it.each(['T', 't'])('reports a live process whose OS state is %s as stopped (alive but cannot serve)', async (stateChar) => {
     const pid = spawnSleeper();
-    process.kill(pid, 'SIGSTOP');
-    await waitFor(async () => (await readProcessRunState(pid)) === 'stopped');
-    await expect(readProcessRunState(pid)).resolves.toBe('stopped');
+    const readPosixStateOutput = vi.fn(async () => `${stateChar}\n`);
+    await expect(readProcessRunState(pid, { readPosixStateOutput })).resolves.toBe('stopped');
+    expect(readPosixStateOutput).toHaveBeenCalledWith(pid);
   });
 
   it('reports a dead pid as dead', async () => {

@@ -91,7 +91,7 @@ export async function readCodexNativeStartupVersion(
     });
     const cleanUpProbe = async (): Promise<VersionProbeCleanup> => {
       // While the root lives, the tree owner also reaches descendants that left its group.
-      const treeCleanupFailed = await killProcessTree(child).then(() => false, () => true);
+      const treeCleanupFailed = await killProcessTree(child, { processGroup: 'owned' }).then(() => false, () => true);
       const groupSignalFailed = !signalProbeGroup();
       return { outputReleased: await awaitOutputReleased(), treeCleanupFailed, groupSignalFailed };
     };

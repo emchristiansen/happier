@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process';
 import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
 
-import { killProcessTree } from '@/agent/runtime/process/killProcessTree';
+import { killProcessTree, processTreeTerminationProvesTreeStopped } from '@/agent/runtime/process/killProcessTree';
 import { isNativeProcessExited } from '../../../scripts/native_process_exit.cjs';
 
 import { logger } from '@/ui/logger';
@@ -131,7 +131,8 @@ export async function launchOwnedTerminalProcess(params: Readonly<{
     terminate: () => {
       if (!termination) {
         const attempt = Promise.resolve().then(() => terminateProcess(child)).then((result) => {
-          processTreeStopped = result?.rootObservedAlive === true;
+          // A snapshot-only or absent result is no proof; the launcher's nativeExited IPC stays the positive.
+          processTreeStopped = result ? processTreeTerminationProvesTreeStopped(result) : false;
         });
         const guardedAttempt = attempt.catch((error) => {
           if (termination === guardedAttempt) termination = null;

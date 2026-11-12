@@ -49,7 +49,7 @@ import type { JsRuntime } from '@/backends/claude/runClaude';
 import { createSubprocessStderrAppender, resolveSubprocessArtifactsDir } from '@/agent/runtime/subprocessArtifacts';
 import { join } from 'node:path';
 import { ChildProcess, spawn } from 'node:child_process';
-import { killProcessTree } from '@/agent/runtime/process/killProcessTree';
+import { killProcessTree, processTreeTerminationProvesTreeStopped } from '@/agent/runtime/process/killProcessTree';
 import { createEventShapeLoggerForLog } from '@/diagnostics/eventShapeForLog';
 import { readTailTextFile } from '@/utils/fs/readTailTextFile';
 import { observeClaudeSdkProcess } from './agentSdk/observeClaudeSdkProcess';
@@ -2488,7 +2488,9 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
             const child = ownedProcess.child;
             let processTreeStopped = false;
             if (child && child.exitCode === null && child.signalCode === null) {
-                processTreeStopped = (await killProcessTree(child)).rootObservedAlive;
+                // Only whole-group coverage proves the tree stopped; this child owns no group, so a
+                // non-child provider's exit stays unverified unless the provider itself was the child.
+                processTreeStopped = processTreeTerminationProvesTreeStopped(await killProcessTree(child));
             }
             if (ownedProcess.exit && await ownedProcess.exit === 'exited') {
                 if (!ownedProcess.providerIsChild && !processTreeStopped) {
