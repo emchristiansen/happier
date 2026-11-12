@@ -1,15 +1,11 @@
-import axios from 'axios';
-
 import {
   PromptStacksV1Schema,
-  openEncryptedDataKeyEnvelopeV1,
   resolvePromptStackSystemAppendBlocksV1,
 } from '@happier-dev/protocol';
 
-import { resolveServerHttpBaseUrl } from '@/api/client/serverHttpBaseUrl';
+import { fetchArtifactRecord, openArtifactDataEncryptionKey } from '@/api/artifacts/artifactRecords';
 import { decodeBase64, decryptWithDataKey } from '@/api/encryption';
-import { requireEncryptionCredentials, type Credentials } from '@/persistence';
-import { deriveKey } from '@/utils/deriveKey';
+import type { Credentials } from '@/persistence';
 
 export type PromptArtifactRecord = Readonly<{
   id: string;
@@ -19,47 +15,13 @@ export type PromptArtifactRecord = Readonly<{
 
 type FetchPromptArtifactRecord = (artifactId: string) => Promise<PromptArtifactRecord | null>;
 
-async function openPromptArtifactDataEncryptionKey(params: Readonly<{
-  credentials: Credentials;
-  encryptedDataEncryptionKeyBase64: string;
-}>): Promise<Uint8Array | null> {
-  requireEncryptionCredentials(params.credentials);
-  const recipientSecretKeyOrSeed = params.credentials.encryption.type === 'dataKey'
-    ? params.credentials.encryption.machineKey
-    : await deriveKey(params.credentials.encryption.secret, 'Happy EnCoder', ['content']);
-
-  return openEncryptedDataKeyEnvelopeV1({
-    envelope: decodeBase64(params.encryptedDataEncryptionKeyBase64),
-    recipientSecretKeyOrSeed,
-  });
-}
-
+// Prompt stacks degrade an unreadable artifact to a missing block; the session still starts.
 async function fetchPromptArtifactRecordFromApi(params: Readonly<{
   credentials: Credentials;
   artifactId: string;
 }>): Promise<PromptArtifactRecord | null> {
-  try {
-    const response = await axios.get(`${resolveServerHttpBaseUrl()}/v1/artifacts/${encodeURIComponent(params.artifactId)}`, {
-      headers: {
-        Authorization: `Bearer ${params.credentials.token}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: 15_000,
-      validateStatus: () => true,
-    });
-
-    if (response.status === 404) return null;
-    if (response.status < 200 || response.status >= 300) return null;
-
-    const record = response.data as Record<string, unknown>;
-    return {
-      id: typeof record.id === 'string' ? record.id : params.artifactId,
-      body: typeof record.body === 'string' ? record.body : null,
-      dataEncryptionKey: typeof record.dataEncryptionKey === 'string' ? record.dataEncryptionKey : '',
-    };
-  } catch {
-    return null;
-  }
+  const fetched = await fetchArtifactRecord(params);
+  return fetched.ok ? fetched.record : null;
 }
 
 export async function resolveCliPromptStackSystemAppendBlocks(args: Readonly<{
@@ -95,7 +57,7 @@ export async function resolveCliPromptStackSystemAppendBlocks(args: Readonly<{
         return null;
       }
 
-      const dataEncryptionKey = await openPromptArtifactDataEncryptionKey({
+      const dataEncryptionKey = await openArtifactDataEncryptionKey({
         credentials: args.credentials,
         encryptedDataEncryptionKeyBase64: artifact.dataEncryptionKey,
       });

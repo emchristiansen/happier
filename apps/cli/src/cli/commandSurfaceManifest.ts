@@ -71,6 +71,11 @@ const COMMAND_SURFACE_MANIFEST: readonly CliCommandSurfaceEntry[] = [
     allowTmux: false,
   },
   {
+    // Scripting command for one prompt document; documented in the CLI guide, not listed in root help.
+    command: 'prompt-doc',
+    allowTmux: false,
+  },
+  {
     command: 'install',
     rootHelpLabel: 'happier install',
     rootHelpDescription: 'Install provider CLIs and helpers',
