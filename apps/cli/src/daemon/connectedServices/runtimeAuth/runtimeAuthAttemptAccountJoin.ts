@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
+import { lazySchema } from '@happier-dev/protocol';
 
 /**
  * Join of each ordinary-group runtime-auth recovery attempt (`runtime-auth-attempt:*`) to the
@@ -33,9 +34,9 @@ import { z } from 'zod';
 
 export const RUNTIME_AUTH_ATTEMPT_ACCOUNT_JOIN_EVENT_VERSION = 1;
 
-const NullableString = z.string().min(1).nullable();
+const NullableString = lazySchema(() => z.string().min(1).nullable());
 
-const AttemptTransitionEventSchema = z.object({
+const AttemptTransitionEventSchema = lazySchema(() => z.object({
   v: z.literal(1),
   kind: z.literal('attempt_transition'),
   attemptId: z.string().min(1),
@@ -57,17 +58,17 @@ const AttemptTransitionEventSchema = z.object({
   terminalReason: NullableString,
   /** Daemon wall-clock taken after this transition was durably persisted; not an effect time. */
   persistedAtMs: z.number().int().nonnegative(),
-}).strict();
+}).strict());
 
-const ProviderAccountResolutionSchema = z.discriminatedUnion('kind', [
+const ProviderAccountResolutionSchema = lazySchema(() => z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('unique_member'), profileId: z.string().min(1) }).strict(),
   z.object({ kind: z.literal('ambiguous'), matchingProfileIds: z.array(z.string().min(1)) }).strict(),
   z.object({ kind: z.literal('unproven'), reason: z.string().min(1) }).strict(),
-]);
+]));
 
 export type ProviderAccountResolution = z.infer<typeof ProviderAccountResolutionSchema>;
 
-const ProviderAccountObservedEventSchema = z.object({
+const ProviderAccountObservedEventSchema = lazySchema(() => z.object({
   v: z.literal(1),
   kind: z.literal('provider_account_observed'),
   sessionId: z.string().min(1),
@@ -80,9 +81,9 @@ const ProviderAccountObservedEventSchema = z.object({
   /** The application owner's decision after its currentness recheck; only `adopted` can count. */
   adoption: z.enum(['adopted', 'not_unique_member', 'rejected_not_current', 'rejected_by_registry']),
   observedAtMs: z.number().int().nonnegative(),
-}).strict();
+}).strict());
 
-const ProviderOutcomeProofEventSchema = z.object({
+const ProviderOutcomeProofEventSchema = lazySchema(() => z.object({
   v: z.literal(1),
   kind: z.literal('provider_outcome_proof'),
   sessionId: z.string().min(1),
@@ -103,13 +104,13 @@ const ProviderOutcomeProofEventSchema = z.object({
   statusAfter: NullableString,
   attemptIdAfter: NullableString,
   persistedAtMs: z.number().int().nonnegative(),
-}).strict();
+}).strict());
 
-export const RuntimeAuthAttemptAccountJoinEventSchema = z.discriminatedUnion('kind', [
+export const RuntimeAuthAttemptAccountJoinEventSchema = lazySchema(() => z.discriminatedUnion('kind', [
   AttemptTransitionEventSchema,
   ProviderAccountObservedEventSchema,
   ProviderOutcomeProofEventSchema,
-]);
+]));
 
 export type RuntimeAuthAttemptTransitionEvent = z.infer<typeof AttemptTransitionEventSchema>;
 export type ProviderAccountObservedEvent = z.infer<typeof ProviderAccountObservedEventSchema>;
