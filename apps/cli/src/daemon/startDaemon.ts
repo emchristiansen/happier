@@ -561,6 +561,7 @@ import {
 } from './connectedServices/accountGroups/perSession/PerSessionFailoverCoordinator';
 import { buildPerSessionGroupSwitchState } from './connectedServices/accountGroups/perSession/buildPerSessionGroupSwitchState';
 import { readPerSessionSessionBinding } from './connectedServices/accountGroups/perSession/readPerSessionSessionBinding';
+import { restoreConnectedServicePerSessionAssignmentFromPersisted } from './connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 import {
   createConnectedServiceMaterializationIdentity,
   readConnectedServiceMaterializationIdentityV1,
@@ -3754,6 +3755,16 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   ...runtimeSnapshot.spawnOptions,
                   ...(requestExecutionAuthorization ? { executionAuthorization: requestExecutionAuthorization } : {}),
                 };
+                if (normalizedOptions.connectedServices) {
+                  // Resume keeps only this session's own per-session assignment, from its persisted record.
+                  normalizedOptions = {
+                    ...normalizedOptions,
+                    connectedServices: restoreConnectedServicePerSessionAssignmentFromPersisted(
+                      normalizedOptions.connectedServices,
+                      existingSessionPersistedMetadata?.connectedServices,
+                    ),
+                  };
+                }
                 resume = normalizedOptions.resume;
                 permissionMode = normalizedOptions.permissionMode;
                 permissionModeUpdatedAt = normalizedOptions.permissionModeUpdatedAt;

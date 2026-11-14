@@ -139,6 +139,7 @@ import {
   type SessionStartedRunnerReport,
 } from './sessionStartedReadiness';
 import { lazySchema } from '@happier-dev/protocol';
+import { rejectConnectedServiceInternalAssignmentInput } from './connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
 const DEFAULT_DAEMON_CONTROL_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 const DAEMON_CONTROL_BODY_LIMIT_BYTES_ENV_KEY = 'HAPPIER_DAEMON_CONTROL_BODY_LIMIT_BYTES';
@@ -1088,6 +1089,10 @@ export function createDaemonControlApp({
         errorCode: 'connected_service_auth_switch_handler_unavailable' as const,
       };
     }
+    const forgedSwitchAssignment = rejectConnectedServiceInternalAssignmentInput(request.body.bindings);
+    if (forgedSwitchAssignment) {
+      return { ok: true as const, result: { ok: false, errorCode: forgedSwitchAssignment.errorCode, fields: forgedSwitchAssignment.fields } };
+    }
     const result = await handleSessionConnectedServiceAuthSwitch(request.body);
     return { ok: true as const, result };
   });
@@ -1928,6 +1933,14 @@ export function createDaemonControlApp({
           status: z.literal('pending'),
           errorCode: z.literal(SPAWN_SESSION_ERROR_CODES.SESSION_WEBHOOK_TIMEOUT),
         }),
+        400: z.object({
+          success: z.boolean().optional(),
+          error: z.string().optional(),
+          errorCode: z.string().optional(),
+          message: z.string().optional(),
+          statusCode: z.number().optional(),
+          code: z.string().optional(),
+        }),
         401: authSchema401,
         409: z.object({
           success: z.boolean(),
@@ -1946,6 +1959,15 @@ export function createDaemonControlApp({
     preHandler: requireAuth,
   }, async (request, reply) => {
     const { directory, sessionId, existingSessionId } = request.body;
+    // Spec A.1: a new spawn may request `initialProfileId` but never carry assignment state; a
+    // resume's own state is restored from the session record by the spawn path.
+    const forgedAssignment = typeof existingSessionId === 'string' && existingSessionId.trim().length > 0
+      ? null
+      : rejectConnectedServiceInternalAssignmentInput((request.body as { connectedServices?: unknown }).connectedServices);
+    if (forgedAssignment) {
+      reply.code(400);
+      return { success: false, error: forgedAssignment.message, errorCode: forgedAssignment.errorCode };
+    }
     const spawnNonce = typeof request.body.spawnNonce === 'string' ? request.body.spawnNonce.trim() : '';
     const normalizedDirectory = normalizeSpawnSessionDirectory(directory, process.env);
 

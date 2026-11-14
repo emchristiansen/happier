@@ -23,6 +23,7 @@ import { logger } from '@/ui/logger';
 import {
   readConnectedServiceChildSelectionsFromEnv,
 } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
+import { stripConnectedServicePerSessionAssignmentForInheritance } from '@/daemon/connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
 /**
  * Runner-side owner of the ER-CS start flow: resolve the run's effective connected-services selection
@@ -225,7 +226,8 @@ async function resolveRunSelection(params: Readonly<{
     credentials: params.credentials,
   });
   if (!resolved) return null;
-  return { bindings: resolved.connectedServices, source: 'session_default' };
+  // A stored default never pins a member; the run makes its own per-session decision (spec A.1).
+  return { bindings: stripConnectedServicePerSessionAssignmentForInheritance(resolved.connectedServices), source: 'session_default' };
 }
 
 export async function prepareExecutionRunConnectedServices(params: Readonly<{

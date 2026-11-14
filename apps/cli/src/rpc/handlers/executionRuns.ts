@@ -46,6 +46,7 @@ import { readCredentials } from '@/persistence';
 import { configuration } from '@/configuration';
 import { resolveReplaySeedDraft, type ReplaySeedDraftResolution } from '@/session/replay/resolveReplaySeedDraft';
 import { fingerprintExecutionRunStartRequest } from '@/agent/executionRuns/executionRunStartFingerprint';
+import { rejectConnectedServiceInternalAssignmentInput } from '@/daemon/connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
 function invalidParams(): { ok: false; error: string; errorCode: string } {
   return { ok: false, error: 'Invalid params', errorCode: 'execution_run_invalid_action_input' };
@@ -306,6 +307,13 @@ export function registerExecutionRunHandlers(
       // and materialize it via the daemon bridge. Fail-closed: a run WITH a selection either starts on
       // the materialized account or does not start at all.
       let preparedConnectedServices: Awaited<ReturnType<typeof prepareExecutionRunConnectedServices>> = null;
+      // Spec A.1: a run names its group/source; per-session assignment state is daemon-owned.
+      const forgedAssignment = rejectConnectedServiceInternalAssignmentInput(
+        (parsed.data as { connectedServices?: unknown }).connectedServices,
+      );
+      if (forgedAssignment) {
+        return { ok: false, error: forgedAssignment.message, errorCode: forgedAssignment.errorCode };
+      }
       try {
         preparedConnectedServices = await prepareExecutionRunConnectedServices({
           backendTarget: parsed.data.backendTarget,

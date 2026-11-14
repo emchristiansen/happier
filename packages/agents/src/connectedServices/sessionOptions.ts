@@ -69,6 +69,10 @@ export type ConnectedServicesAccountGroupOption = Readonly<{
     /** Null means the authoritative V3 policy could not be established. */
     autoSwitch: boolean | null;
     status: ConnectedServicesAccountGroupReadiness;
+    /** Group strategy, when the authoritative policy is known. */
+    strategy?: string;
+    /** `per_session` groups choose a member for each session; others share one pointer. */
+    assignment?: 'shared' | 'per_session';
 }>;
 
 export type ConnectedServicesAccountGroupOptionsByServiceId = Readonly<Record<string, ConnectedServicesAccountGroupOption[]>>;
@@ -78,6 +82,8 @@ export type ConnectedServicesBindingOptionInput = Readonly<{
     selection?: string;
     profileId?: string;
     groupId?: string;
+    /** Explicit named start for a per_session_softmax group (spec A.1). */
+    initialProfileId?: string;
 }>;
 
 export function connectedServiceProfileKey(params: Readonly<{ serviceId: string; profileId: string }>): string {
@@ -313,6 +319,13 @@ export function buildConnectedServiceAccountGroupOptionsByServiceId(params: Read
                 ...(generation === null ? {} : { generation }),
                 enabledMemberCount,
                 autoSwitch: authoritativeGroups ? readGroupAutoSwitch(group) : null,
+                ...(() => {
+                    if (!authoritativeGroups) return {};
+                    const strategy = readString((group.policy as { strategy?: unknown } | undefined)?.strategy);
+                    return strategy
+                        ? { strategy, assignment: strategy === 'per_session_softmax' ? 'per_session' as const : 'shared' as const }
+                        : {};
+                })(),
                 status: enabledMemberCount <= 0
                     ? 'needs_members'
                     : readGroupStatus(group),
@@ -374,10 +387,13 @@ export function buildConnectedServicesBindingsPayload(params: Readonly<{
                 ? readString(binding.groupId)
                 : '';
             if (explicitGroupId) {
+                // An explicit per-session named start is the only caller field a group binding adds.
+                const initialProfileId = readString(binding?.initialProfileId);
                 bindingsByServiceId[serviceId] = {
                     source: 'connected',
                     selection: 'group',
                     groupId: explicitGroupId,
+                    ...(initialProfileId ? { initialProfileId } : {}),
                 };
                 connectedCount += 1;
                 continue;
