@@ -545,7 +545,16 @@ import {
 import { materializeSessionConnectedServiceRuntimeAuthSelection } from './connectedServices/sessionAuthSwitch/materializeSessionConnectedServiceRuntimeAuthSelection';
 import { resolveTrackedConnectedServiceSwitchContinuityContext, resolveTrackedConnectedServiceVendorResumeId } from './connectedServices/sessionAuthSwitch/resolveTrackedConnectedServiceSwitchContinuityContext';
 import { handleProviderObservedSessionAccount } from './connectedServices/sessionAuthSwitch/reconcileProviderObservedSessionAccount';
-import { projectProviderObservedAccountMetadata } from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
+import {
+  projectProviderObservedAccountMetadata,
+  resolveAdoptedPerSessionDecisionId,
+} from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
+import {
+  PerSessionAssignmentLedger,
+  resolvePerSessionAssignmentLedgerPath,
+} from './connectedServices/accountGroups/perSession/PerSessionAssignmentLedger';
+import { PerSessionAssignmentRuntime } from './connectedServices/accountGroups/perSession/PerSessionAssignmentRuntime';
+import { collectPerSessionLiveDecisions } from './connectedServices/accountGroups/perSession/collectPerSessionLiveDecisions';
 import {
   createConnectedServiceMaterializationIdentity,
   readConnectedServiceMaterializationIdentityV1,
@@ -970,7 +979,8 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     providerObservedAccount: Readonly<{ serviceId: ConnectedServiceId; groupId: string; profileId: string }>;
     isCurrent: () => boolean;
   }>
-)): Promise<void> {
+)): Promise<Readonly<{ adoptedPerSessionDecisionId: string | null }>> {
+  let adoptedPerSessionDecisionId: string | null = null;
   const rawSession = await fetchSessionByIdCompat({
     token: params.credentials.token,
     sessionId: params.sessionId,
@@ -984,11 +994,15 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     sessionId: params.sessionId,
     rawSession,
     updater: (metadata) => {
+      adoptedPerSessionDecisionId = null;
       if (params.isCurrent && !params.isCurrent()) return metadata;
       const projected = params.providerObservedAccount
         ? projectProviderObservedAccountMetadata(metadata, params.providerObservedAccount)
         : { ...metadata, connectedServices: params.normalizedBindings };
       if (projected === metadata) return metadata;
+      adoptedPerSessionDecisionId = params.providerObservedAccount
+        ? resolveAdoptedPerSessionDecisionId(metadata, projected, params.providerObservedAccount.serviceId)
+        : null;
       const existingUpdatedAt = typeof metadata.connectedServicesUpdatedAt === 'number'
         && Number.isFinite(metadata.connectedServicesUpdatedAt)
         ? metadata.connectedServicesUpdatedAt
@@ -1008,6 +1022,7 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     },
     maxAttempts: 6,
   });
+  return { adoptedPerSessionDecisionId };
 }
 
 let lastTerminalControlServiceabilityObservation = 0;
@@ -1968,6 +1983,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       const connectedServiceRuntimeRegistry = new ConnectedServiceRuntimeRegistry();
       const connectedServiceRuntimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
       const providerAccountUsageStore = createProviderAccountUsageStore();
+      // per_session_softmax groups (spec A.3–A.5): this daemon's decision ledger and reservation leases.
+      const perSessionAssignmentRuntime = new PerSessionAssignmentRuntime({
+        ledger: new PerSessionAssignmentLedger(resolvePerSessionAssignmentLedgerPath(configuration.activeServerDir)),
+        ownerMachineId: machineId,
+        reservationApi: api.connectedServiceAssignmentReservations,
+        nowMs: () => Date.now(),
+        listLiveDecisions: () => collectPerSessionLiveDecisions(pidToTrackedSession.values()),
+        log: (event, detail) => logger.debug(`[ConnectedServices] ${event}`, detail),
+      });
       const connectedServiceContinuationApplicationCorrelation =
         createConnectedServiceContinuationApplicationCorrelation<
           Readonly<{
@@ -4073,6 +4097,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       sessionId: connectedServiceAuthSessionId,
                       authGroupSwitchCoordinator: preTurnSwitchCoordinator,
                       quotaProbeDeadlineAtMs: connectedServiceSpawnQuotaProbeDeadlineAtMs,
+                      perSessionAssignment: perSessionAssignmentRuntime.spawnDeps,
                       accountSettings: activeAccountSettings?.settings ?? null,
                       processEnv: process.env,
                       nativeSource: normalizedExistingSessionId && existingSessionAttachContext
@@ -7243,6 +7268,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         processEnv: process.env,
         nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         credentialRefreshService: connectedServiceRefreshCoordinator,
+        perSessionAssignment: perSessionAssignmentRuntime.spawnDeps,
       }),
       runtimeRegistry: connectedServiceRuntimeRegistry,
       createAdoptedRootCleanup: ({ materializedRoot, materializationKey, agentId, retentionPolicy }) => {
@@ -7766,12 +7792,22 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 const binding = target.activeBindings.find((candidate) => (
                   candidate.serviceId === observation.serviceId && candidate.groupId === observation.groupId
                 ));
-                if (binding) await persistSessionConnectedServiceBindings({
+                if (!binding) return;
+                const published = await persistSessionConnectedServiceBindings({
                   credentials, sessionId: input.sessionId,
                   providerObservedAccount: { serviceId: binding.serviceId, groupId: observation.groupId, profileId: binding.profileId },
                   isCurrent: () => connectedServiceRuntimeRegistry.getBySessionId(input.sessionId) === target
                     && getCurrentProviderSessionId() === observation.sourceSessionId,
                 });
+                if (published.adoptedPerSessionDecisionId) {
+                  // Provider-observed adoption proved the pending per-session target (spec A.5 C5).
+                  await perSessionAssignmentRuntime.markAdopted({
+                    serviceId: binding.serviceId,
+                    groupId: observation.groupId,
+                    decisionId: published.adoptedPerSessionDecisionId,
+                    profileId: binding.profileId,
+                  }).catch((error) => logger.warn('[ConnectedServices] Per-session adoption settlement failed; renewal will retry', error));
+                }
               },
               reconcileGeneration: async (target) => {
                 await enqueueConnectedServiceRuntimeTargetRegistrationReconciliation({
@@ -8302,6 +8338,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       });
       connectedServiceRefreshCoordinator = refreshStartup.coordinator;
       connectedServiceRefreshLoopHandle = refreshStartup.loopHandle;
+      perSessionAssignmentRuntime.start();
 
       const connectedServicesQuotasEnabled = await resolveConnectedServicesQuotasDaemonEnabled({
         env: process.env,
@@ -9282,6 +9319,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     credentialRefreshService: connectedServiceRefreshCoordinator,
                     sessionStateMode: 'existing',
                     existingSessionMetadata: metadata,
+                    perSessionAssignment: perSessionAssignmentRuntime.spawnDeps,
                   });
                   return { ...process.env, ...materialized?.env };
                 },
@@ -9735,6 +9773,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         connectedServiceRefreshLoopHandle.stop();
         connectedServiceRefreshLoopHandle = null;
       }
+      perSessionAssignmentRuntime.stop();
       if (connectedServiceQuotasLoopHandle) {
         await connectedServiceQuotasLoopHandle.stop();
         connectedServiceQuotasLoopHandle = null;

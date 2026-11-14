@@ -29,6 +29,7 @@ export class ConnectedServicePerSessionSpawnError extends Error {
       | 'connect_group_strategy_unsupported_for_service'
       | 'per_session_assignment_host_unsupported'
       | 'per_session_assignment_session_required'
+      | 'initial_profile_requires_per_session_group'
       | 'initial_profile_not_member'
       | 'initial_profile_disabled'
       | 'no_eligible_member',
@@ -129,9 +130,10 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
 
   // Replay of an unadopted spawn decision for this session and group.
   const replay = deps.ledger.list().find((entry) => entry.origin === 'spawn' && entry.sessionId === sessionId
-    && entry.serviceId === input.serviceId && entry.groupId === input.groupId && entry.state === 'pending'
-    && entry.proposal.custody !== 'proposed');
-  if (!ownTarget && replay && isMemberEligibleForSpawn(input.state, replay.proposal.profileId, nowMs, input.quotaFreshnessMs)) {
+    && entry.serviceId === input.serviceId && entry.groupId === input.groupId && entry.state === 'pending');
+  const replayEligible = !ownTarget && replay
+    && isMemberEligibleForSpawn(input.state, replay.proposal.profileId, nowMs, input.quotaFreshnessMs);
+  if (replayEligible && replay.proposal.custody !== 'proposed') {
     return {
       profileId: replay.proposal.profileId,
       decisionId: replay.decisionId,
@@ -139,7 +141,18 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
     };
   }
 
-  const decisionId = `spawn-${sessionId}-${nowMs.toString(36)}`;
+  // A durable C1 proposal resumes at C2 under its own ID; otherwise this is a new decision.
+  const resumeProposal = replayEligible && replay.proposal.custody === 'proposed' ? replay.proposal : null;
+  if (replay && !replayEligible && !ownTarget) {
+    // Actual target ineligibility supersedes the unadopted decision; release its reservation.
+    await deps.ledger.remove(replay.decisionId);
+    if (deps.reservationApi) {
+      await deps.reservationApi.deleteAssignmentReservation({
+        serviceId: input.serviceId, groupId: input.groupId, decisionId: replay.decisionId,
+      });
+    }
+  }
+  const decisionId = resumeProposal?.decisionId ?? `spawn-${sessionId}-${nowMs.toString(36)}`;
   const decision = await decidePerSessionGroupMember({
     serviceId: input.serviceId,
     groupId: input.groupId,
@@ -154,6 +167,7 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
     currentProfileId: ownTarget,
     initialProfileId: ownTarget ? null : (input.selection.initialProfileId ?? null),
     reservationApi: deps.reservationApi,
+    resumeProposal,
     localReservationCountsByProfileId: () => deps.ledger.localCounts(input.serviceId, input.groupId, decisionId),
     uniformSample: deps.uniformSample ?? createCryptoUniformSample,
     persistProposal: async (proposal) => {

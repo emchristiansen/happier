@@ -71,6 +71,11 @@ export type DecidePerSessionGroupMemberInput = Readonly<{
   uniformSample: () => number;
   /** Durable C1/C2 write; must complete before this function proceeds. */
   persistProposal: (proposal: PerSessionAssignmentProposal) => Promise<void>;
+  /**
+   * A durable C1 proposal (custody `proposed`) found on replay: resume that exact proposal at C2
+   * with the identical decision ID and target instead of drawing again.
+   */
+  resumeProposal?: PerSessionAssignmentProposal | null;
   /** Caller's existing spawn/recovery deadline; conflicts retry until it passes. */
   deadlineAtMs: number;
   /** Optional log sink for `assignment_reservation_unavailable` and similar events. */
@@ -209,12 +214,23 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
     ? countLiveReservations(current.reservations, input.nowMs(), input.decisionId)
     : new Map(input.localReservationCountsByProfileId()));
 
-  const first = choose(countsFor(snapshot), degraded);
+  const resume = input.resumeProposal?.custody === 'proposed' && input.resumeProposal.decisionId === input.decisionId
+    ? input.resumeProposal
+    : null;
+  const first: Choice | ConnectedServiceAuthGroupCandidateSelection = resume
+    ? {
+      profileId: resume.profileId,
+      reason: resume.reason,
+      probability: resume.probability,
+      temperature: resume.temperature,
+      offsetPercent: resume.offsetPercent,
+    }
+    : choose(countsFor(snapshot), degraded);
   if (!isChoice(first)) return { kind: 'no_candidate', selection: first };
   let choice: Choice = first;
 
-  let proposalRevision = 1;
-  const decidedAtMs = input.nowMs();
+  let proposalRevision = resume?.proposalRevision ?? 1;
+  const decidedAtMs = resume?.decidedAtMs ?? input.nowMs();
   const proposalFor = (current: Choice, custody: PerSessionAssignmentProposal['custody']): PerSessionAssignmentProposal => ({
     decisionId: input.decisionId,
     proposalRevision,
@@ -229,14 +245,21 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
     observedReservationRevision: snapshot?.reservationRevision ?? null,
   });
 
+  if (resume && (!input.reservationApi || !snapshot)) {
+    // R4: a resumed proposal may already have committed; proceed only on the same ID and target.
+    const proposal = proposalFor(choice, 'reservation_uncertain');
+    await input.persistProposal(proposal);
+    return { kind: 'assigned', proposal: { ...proposal, custody: 'reservation_uncertain' } };
+  }
+
   if (degraded || !input.reservationApi || !snapshot) {
     const proposal = proposalFor(choice, 'local_degraded');
     await input.persistProposal(proposal);
     return { kind: 'assigned', proposal: { ...proposal, custody: 'local_degraded' } };
   }
 
-  // C1: durable proposal before any reservation mutation or effect.
-  await input.persistProposal(proposalFor(choice, 'proposed'));
+  // C1: durable proposal before any reservation mutation or effect (already durable on resume).
+  if (!resume) await input.persistProposal(proposalFor(choice, 'proposed'));
 
   for (;;) {
     const current = choice;

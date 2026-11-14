@@ -45,6 +45,7 @@ import type { RuntimeAccountIdentitySelectionInput } from './quotas/identity/run
 import { selectConnectedServiceAuthGroupCandidate } from './accountGroups/selection/selectConnectedServiceAuthGroupCandidate';
 import { resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds } from './accountGroups/selection/resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds';
 import {
+  buildConnectedServiceAuthGroupSwitchState,
   buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState,
 } from './accountGroups/switching/buildConnectedServiceAuthGroupSwitchState';
 import {
@@ -58,6 +59,7 @@ import { persistCredentialHealthForMaterializationFailure } from './refresh/refr
 import { verifySpawnResumeReachability } from './verifySpawnResumeReachability';
 import { DEFAULT_SWITCH_LEASE_TIMEOUT_MS } from './accountGroups/switching/pipeline/switchPipeline';
 import {
+  ConnectedServicePerSessionSpawnError,
   resolvePerSessionGroupMemberForSpawn,
   type PerSessionSpawnAssignment,
   type PerSessionSpawnAssignmentDeps,
@@ -575,6 +577,34 @@ function buildSpawnSwitchState(params: Readonly<{
   });
 }
 
+/**
+ * Score state for a per-session draw. It names no shared pointer, so it may use the daemon's
+ * runtime quota snapshots when account usage is not yet source-backed (cold store); without
+ * either, members carry only persisted state and an initial draw refuses rather than imputing.
+ */
+function buildPerSessionSpawnSwitchState(params: Readonly<{
+  group: ConnectedServiceAuthGroupV1;
+  accountUsageStore: AccountUsageStoreForAuthGroupSwitchState | null;
+  runtimeQuotaSnapshots: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore | null;
+  nowMs: number;
+}>): ConnectedServiceAuthGroupSwitchState {
+  if (params.accountUsageStore) {
+    const accountUsageSwitchState = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
+      group: params.group,
+      accountUsageStore: params.accountUsageStore,
+    });
+    if (accountUsageSwitchState.kind === 'source_backed') return accountUsageSwitchState.state;
+  }
+  if (params.runtimeQuotaSnapshots) {
+    return buildConnectedServiceAuthGroupSwitchState({
+      group: params.group,
+      runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
+      nowMs: params.nowMs,
+    });
+  }
+  return buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group: params.group });
+}
+
 async function resolveAuthoritativeGroupAfterSpawnSwitchResult(params: Readonly<{
   group: ConnectedServiceAuthGroupResponse;
   serviceId: ConnectedServiceId;
@@ -793,6 +823,8 @@ async function resolveCredentialBindings(params: Readonly<{
   predictiveSoftSwitchMode: 'supported' | 'unsupported';
   quotaProbeDeadlineAtMs?: number;
   perSessionAssignment: PerSessionSpawnAssignmentDeps | null;
+  perSessionSubjectId: string | undefined;
+  clock: () => number;
   perSessionDeadlineAtMs: number;
 }>): Promise<Readonly<{
   credentialBindings: ReadonlyArray<{ serviceId: ConnectedServiceId; profileId: string }>;
@@ -823,7 +855,7 @@ async function resolveCredentialBindings(params: Readonly<{
     if (groupPolicy?.strategy === 'per_session_softmax') {
       // Per-session assignment: never read or move the group's shared pointer (spec A.4).
       const state = isFullAuthGroup(group)
-        ? buildSpawnSwitchState({
+        ? buildPerSessionSpawnSwitchState({
           group,
           accountUsageStore: params.accountUsageStore,
           runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
@@ -838,9 +870,9 @@ async function resolveCredentialBindings(params: Readonly<{
         groupId: selection.groupId,
         selection,
         state,
-        sessionId: params.sessionId,
+        sessionId: params.perSessionSubjectId,
         quotaFreshnessMs: params.quotaFreshnessMs,
-        nowMs: () => Date.now(),
+        nowMs: params.clock,
         deadlineAtMs: params.perSessionDeadlineAtMs,
         deps: params.perSessionAssignment,
       });
@@ -856,6 +888,10 @@ async function resolveCredentialBindings(params: Readonly<{
         perSession: assignment,
       });
       continue;
+    }
+    if (selection.initialProfileId) {
+      throw new ConnectedServicePerSessionSpawnError('initial_profile_requires_per_session_group',
+        `initialProfileId applies only to per_session_softmax groups (${selection.serviceId}/${selection.groupId})`);
     }
     const selectedGroup = await maybeSelectGroupActiveProfileForSpawn({
       group,
@@ -1431,6 +1467,9 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
     predictiveSoftSwitchMode: credentialLifecycleDescriptor.predictiveSoftSwitch.mode,
     quotaProbeDeadlineAtMs: params.quotaProbeDeadlineAtMs,
     perSessionAssignment: params.perSessionAssignment ?? null,
+    // A new spawn has no session id yet; its stable per-session materialization identity keys the decision.
+    perSessionSubjectId: params.connectedServiceMaterializationIdentityV1?.id ?? params.sessionId ?? params.materializationKey,
+    clock,
     // The caller's existing spawn deadline; otherwise the existing switch-lease timeout.
     perSessionDeadlineAtMs: params.quotaProbeDeadlineAtMs ?? nowMs + DEFAULT_SWITCH_LEASE_TIMEOUT_MS,
   });
