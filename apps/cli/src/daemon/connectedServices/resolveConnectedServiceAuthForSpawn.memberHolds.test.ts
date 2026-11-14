@@ -14,6 +14,7 @@ import {
   type ConnectedServiceMemberHoldView,
 } from './accountGroups/holds/connectedServiceMemberHolds';
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from './accountGroups/quotas/ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from './connectedServiceSpawnNativeSource';
 import { resolveConnectedServiceAuthForSpawn } from './resolveConnectedServiceAuthForSpawn';
 import { createDaemonConnectedServiceAuthGroupSwitchCoordinator } from './runtimeAuth/createDaemonConnectedServiceAuthGroupSwitchCoordinator';
 
@@ -104,6 +105,7 @@ async function spawnWith(input: Readonly<{
       },
     },
     materializationKey: 'holds',
+    nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
     activeServerDir: join(dir, 'server'),
     baseDir: join(dir, 'base'),
     credentials,

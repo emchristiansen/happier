@@ -34,6 +34,11 @@ import {
   type ConnectedServicesMaterializeResult,
 } from './materialize/providerMaterializerTypes';
 import { resolveConnectedServiceTargetMaterializedRoot } from './materialize/resolveConnectedServiceTargetMaterializedRoot';
+import {
+  ConnectedServiceSpawnContinuationIdentityError,
+  connectedServiceSpawnNativeSourceAuthority,
+  type ConnectedServiceSpawnNativeSource,
+} from './connectedServiceSpawnNativeSource';
 import type { ConnectedServiceCredentialRefreshResult } from './refresh/ConnectedServiceRefreshCoordinator';
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from './accountGroups/quotas/ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
 import type { RuntimeAccountIdentitySelectionInput } from './quotas/identity/runtimeAccountIdentityTypes';
@@ -1208,6 +1213,7 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   selectionsByServiceId: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedSelection>;
   accountSettings: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv: NodeJS.ProcessEnv;
+  nativeSource: ConnectedServiceSpawnNativeSource;
   previousMaterializedRoot?: string | null;
   existingSessionMetadata?: unknown;
   refreshService: ConnectedServiceSpawnCredentialRefreshService | null;
@@ -1229,8 +1235,9 @@ async function materializeAndVerifyConnectedServiceAuthForSpawn(params: Readonly
   const materialized = await materializeConnectedServicesForSpawn({
     agentId: params.agentId,
     materializationPurpose: params.materializationPurpose,
-    // The spawning caller (direct launch or daemon spawn) produces this home from its own source.
-    nativeSourceAuthority: 'caller_env',
+    // A new caller produces its homes from its own environment; a continuation of an existing
+    // session keeps the source its homes recorded.
+    nativeSourceAuthority: connectedServiceSpawnNativeSourceAuthority(params.nativeSource),
     materializationKey: params.materializationKey,
     connectedServiceMaterializationIdentityV1: params.connectedServiceMaterializationIdentityV1,
     activeServerDir: params.activeServerDir,
@@ -1315,6 +1322,11 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
   quotaProbeDeadlineAtMs?: number;
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv?: NodeJS.ProcessEnv;
+  /**
+   * Who names the native source: `NEW_CALLER_SPAWN_NATIVE_SOURCE`, or the continuation that
+   * `resolveExistingSessionSpawnNativeSource` derives from the daemon's authenticated session read.
+   */
+  nativeSource: ConnectedServiceSpawnNativeSource;
   previousMaterializedRoot?: string | null;
   existingSessionMetadata?: unknown;
   credentialRefreshService?: ConnectedServiceSpawnCredentialRefreshService | null;
@@ -1352,6 +1364,14 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
   diagnostics?: readonly ConnectedServicesMaterializationDiagnostic[];
 }> | null> {
   params.signal?.throwIfAborted();
+  if (params.nativeSource.kind === 'session_continuation'
+    && params.connectedServiceMaterializationIdentityV1?.id !== params.nativeSource.materializationIdentityId) {
+    throw new ConnectedServiceSpawnContinuationIdentityError(
+      params.nativeSource.sessionId,
+      params.nativeSource.materializationIdentityId,
+      params.connectedServiceMaterializationIdentityV1?.id ?? null,
+    );
+  }
   const selections = parseConnectedServiceBindingSelections(params.connectedServicesBindingsRaw);
   if (selections.length === 0) return null;
   const clock = params.nowMs ?? (() => Date.now());
@@ -1461,6 +1481,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
         selectionsByServiceId,
         accountSettings: params.accountSettings ?? null,
         processEnv: params.processEnv ?? process.env,
+        nativeSource: params.nativeSource,
         previousMaterializedRoot: params.previousMaterializedRoot,
         existingSessionMetadata: params.existingSessionMetadata,
         refreshService: params.credentialRefreshService ?? null,

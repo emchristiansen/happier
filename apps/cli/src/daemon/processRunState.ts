@@ -35,13 +35,23 @@ function classifyPosixStateChar(stateOutput: string): ProcessRunState | null {
  * be inspected (ps failure, unsupported platform), it is reported `servable` so callers keep the
  * existing duplicate-spawn protection. Windows has no SIGSTOP/zombie semantics → alive = servable.
  */
+async function readPosixStateOutput(pid: number): Promise<string> {
+  const { stdout } = await execFileAsync('ps', ['-p', String(Math.floor(pid)), '-o', 'state='], {
+    timeout: 5_000,
+  });
+  return stdout;
+}
+
 export async function readProcessRunState(pid: number, deps?: Readonly<{
   isPidAlive?: (pid: number) => boolean;
   platform?: NodeJS.Platform;
+  /** The OS process-state boundary (`ps -o state=` output); rejects when the pid has no row. */
+  readPosixStateOutput?: (pid: number) => Promise<string>;
 }>): Promise<ProcessRunState> {
   if (!Number.isFinite(pid) || pid <= 0) return 'dead';
   const isPidAlive = deps?.isPidAlive ?? isPidAliveBySignal;
   const platform = deps?.platform ?? process.platform;
+  const readStateOutput = deps?.readPosixStateOutput ?? readPosixStateOutput;
   const alive = isPidAlive(pid);
 
   if (platform === 'win32') {
@@ -49,10 +59,7 @@ export async function readProcessRunState(pid: number, deps?: Readonly<{
   }
 
   try {
-    const { stdout } = await execFileAsync('ps', ['-p', String(Math.floor(pid)), '-o', 'state='], {
-      timeout: 5_000,
-    });
-    const classified = classifyPosixStateChar(stdout);
+    const classified = classifyPosixStateChar(await readStateOutput(pid));
     if (classified) return classified;
   } catch {
     // ps exits non-zero when the pid does not exist; fall through to the signal probe.

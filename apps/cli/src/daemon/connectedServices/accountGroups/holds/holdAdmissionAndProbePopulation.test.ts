@@ -20,6 +20,7 @@ import {
   InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry,
 } from '../switching/ConnectedServiceAuthGroupSwitchCoordinator';
 import type { ConnectedServiceAuthGroupSwitchState } from '../switching/pipeline/switchPipeline';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '../../connectedServiceSpawnNativeSource';
 import { resolveConnectedServiceAuthForSpawn } from '../../resolveConnectedServiceAuthForSpawn';
 import { createDaemonConnectedServiceAuthGroupSwitchCoordinator } from '../../runtimeAuth/createDaemonConnectedServiceAuthGroupSwitchCoordinator';
 
@@ -188,6 +189,7 @@ describe('member holds at switch admission (HOLD-01)', () => {
         bindingsByServiceId: { [SERVICE_ID]: { source: 'connected', selection: 'group', groupId: 'g', profileId: 'A' } },
       },
       materializationKey: 'holds',
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       activeServerDir: join(f.dir, 'server'),
       baseDir: join(f.dir, 'base'),
       credentials: { token: 'synthetic', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(3) } },

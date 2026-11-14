@@ -35,12 +35,32 @@ import { ConnectedServiceRefreshCoordinator } from './ConnectedServiceRefreshCoo
 import { invalidateConnectedServiceAccountMode } from '@/cloud/connectedServices/resolveConnectedServiceAccountMode';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServiceChildEnvironment';
 import { computeClaudeCodeCredentialSafeTokenFingerprint } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialFile';
+import { resolveClaudeConnectedServiceStableConfigDir } from '@/backends/claude/connectedServices/resolveClaudeConnectedServiceStableAuthDir';
+import { writeConnectedServiceStateSharingManifest } from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingManifest';
 
 /** Credential health actually read as connected; refresh behavior under unread health is tested separately. */
 function readConnectedCredentialHealth() {
   return {
     readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'connected' as const, health: null })),
   };
+}
+
+/**
+ * In production every Claude home is produced (and its admitted native source recorded) by a spawn
+ * before the daemon rematerializes it; `registerSpawnTarget` skips that production, so fixtures
+ * record, for the profile home they expect materialized, the same HOME their `processEnv` names.
+ */
+async function seedAdmittedClaudeProfileHomeSource(activeServerDir: string, profileId: string, home: string): Promise<void> {
+  const claudeConfigDir = resolveClaudeConnectedServiceStableConfigDir({
+    activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: profileId,
+    selection: { kind: 'profile', profileId },
+  });
+  if (!claudeConfigDir) throw new Error('fixture: Claude config dir must resolve');
+  await writeConnectedServiceStateSharingManifest(claudeConfigDir, {
+    v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+    configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+    nativeSourceEnv: { HOME: home },
+  });
 }
 
 const credentials = {
@@ -378,6 +398,7 @@ describe('ConnectedServiceRefreshCoordinator.refreshClaudeSubscriptionTokensForB
       now: () => now,
       processEnv: { HOME: sourceHomeDir },
     });
+    await seedAdmittedClaudeProfileHomeSource(activeServerDir, 'claude-oauth', sourceHomeDir);
     coordinator.registerSpawnTarget({
       pid: 13,
       agentId: 'claude',

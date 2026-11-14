@@ -26,7 +26,15 @@ import type {
 import { importConnectedServiceSessionFiles } from '@/daemon/connectedServices/stateSharing/importConnectedServiceSessionFiles';
 
 import { claudeConnectedServiceStateSharingDescriptor } from './claudeConnectedServiceStateSharingDescriptor';
+import {
+  assertClaudeHomeSourceAgrees,
+  claudeNativeSourceRecordEnv,
+  isClaudeSelfSource,
+  readClaudeHomeProvenance,
+  type ClaudeAdmittedNativeSource,
+} from './claudeHomeNativeSource';
 import { materializeClaudeWorkspaceTrust } from './materializeClaudeWorkspaceTrust';
+import { isPathWithinDirectory } from './claudeConfigurationSourceScope';
 import { CLAUDE_CREDENTIAL_HOME_ENTRIES } from './claudeConnectedServiceCredentialStorageCleanup';
 import {
   ensureClaudeHomeTranscriptRetention,
@@ -311,6 +319,33 @@ async function realpathOrNull(path: string): Promise<string | null> {
   }
 }
 
+/**
+ * The store a self-source home's existing `projects` link already shares, when it may be kept.
+ *
+ * With no store named, a self-source home creates no link and substitutes no ambient HOME. A link
+ * its producer already made is kept as it is, the same way a home whose source is unrecorded keeps
+ * its producer's links: nothing is created, removed or read through it. It is kept only when it
+ * resolves to a directory outside the home and outside every managed home; a dangling or
+ * unresolvable link, or one into a managed home, is not kept, and shared state fails closed.
+ */
+async function resolveKeptSelfSourceProjectsLink(params: Readonly<{
+  targetDir: string;
+  targetProjectsRoot: string;
+  managedHomesRoot: string | null;
+}>): Promise<string | null> {
+  if (!params.managedHomesRoot) return null;
+  const [linkedRealPath, targetRealPath, managedHomesRealPath] = await Promise.all([
+    realpathOrNull(params.targetProjectsRoot),
+    realpathOrNull(params.targetDir),
+    realpathOrNull(params.managedHomesRoot),
+  ]);
+  if (!linkedRealPath || !targetRealPath || !managedHomesRealPath) return null;
+  if (isPathWithinDirectory(linkedRealPath, targetRealPath)) return null;
+  if (isPathWithinDirectory(linkedRealPath, managedHomesRealPath)) return null;
+  const linkedStat = await stat(linkedRealPath).catch(() => null);
+  return linkedStat?.isDirectory() ? linkedRealPath : null;
+}
+
 type SelfSourceProjectsReconciliation = Readonly<{
   effectiveStateMode: ClaudeStateMode;
   /** Physical root candidate session imports must land in when shared (the link source). */
@@ -330,6 +365,7 @@ async function reconcileSelfSourceClaudeProjectsStateMode(params: Readonly<{
   targetDir: string;
   requestedStateMode: ClaudeStateMode;
   ambientStateSourceDir: string | null;
+  managedHomesRoot: string | null;
 }>): Promise<SelfSourceProjectsReconciliation> {
   const targetProjectsRoot = join(params.targetDir, 'projects');
   const entryState = await readClaudeProjectsEntryState(targetProjectsRoot);
@@ -348,6 +384,21 @@ async function reconcileSelfSourceClaudeProjectsStateMode(params: Readonly<{
   }
 
   if (!params.ambientStateSourceDir || resolve(params.ambientStateSourceDir) === resolve(params.targetDir)) {
+    const keptLink = entryState === 'symlink'
+      ? await resolveKeptSelfSourceProjectsLink({
+          targetDir: params.targetDir,
+          targetProjectsRoot,
+          managedHomesRoot: params.managedHomesRoot,
+        })
+      : null;
+    if (keptLink) {
+      return {
+        effectiveStateMode: 'shared',
+        sharedProjectsRoot: keptLink,
+        stateEntries: ['projects'],
+        diagnostics: [],
+      };
+    }
     return {
       effectiveStateMode: 'isolated',
       sharedProjectsRoot: null,
@@ -418,20 +469,46 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
    * permitted store to share with, so requested shared state fails closed.
    */
   ambientStateSourceDir?: string | null | undefined;
+  /**
+   * The root of every Happier-managed home. Without it a self-source home keeps no existing
+   * `projects` link (see `resolveKeptSelfSourceProjectsLink`).
+   */
+  managedHomesRoot?: string | null | undefined;
   destinationLockAlreadyHeld?: boolean | undefined;
+  /**
+   * The native source admitted for this home (`admitClaudeNativeSource`); `sourceEnv` must name it.
+   * It is re-checked under the destination lock and recorded in the manifest. Without it the home's
+   * existing record is kept as it is.
+   */
+  nativeSource?: ClaudeAdmittedNativeSource | undefined;
 }>): Promise<SyncClaudeConnectedServiceHomeResult> {
   const sync = async (): Promise<SyncClaudeConnectedServiceHomeResult> => {
     const settings = params.sharingPolicyOverride ?? resolveClaudeHomeSharingSettings(params.accountSettings ?? null);
     const sourceDir = resolveConfiguredClaudeConfigDir({ env: params.sourceEnv });
+    // Re-check under the home lock: another producer may have recorded a source since admission.
+    const recorded = params.nativeSource ? await readClaudeHomeProvenance(params.targetDir) : null;
+    const recordedNativeSource = recorded?.kind === 'recorded' && !isClaudeSelfSource(recorded.source, params.targetDir)
+      ? recorded
+      : null;
+    if (params.nativeSource && !isClaudeSelfSource(params.nativeSource, params.targetDir)) {
+      await assertClaudeHomeSourceAgrees({ claudeConfigDir: params.targetDir, provenance: recordedNativeSource, source: params.nativeSource });
+    }
     await mkdir(params.targetDir, { recursive: true });
 
     const existingManifest = await readConnectedServiceStateSharingManifest(params.targetDir);
+    // A home materialized as its own source keeps a native source it already records.
+    const nativeSourceEnv = params.nativeSource && !(recordedNativeSource && isClaudeSelfSource(params.nativeSource, params.targetDir))
+      ? claudeNativeSourceRecordEnv(params.nativeSource)
+      : existingManifest.nativeSourceEnv;
+    const withNativeSource = (manifest: ConnectedServiceStateSharingManifestV1): ConnectedServiceStateSharingManifestV1 =>
+      nativeSourceEnv ? { ...manifest, nativeSourceEnv } : manifest;
 
     if (resolve(sourceDir) === resolve(params.targetDir)) {
       const reconciliation = await reconcileSelfSourceClaudeProjectsStateMode({
         targetDir: params.targetDir,
         requestedStateMode: settings.stateMode,
         ambientStateSourceDir: resolveAmbientClaudeStateSourceDir(params.ambientStateSourceDir),
+        managedHomesRoot: params.managedHomesRoot ?? null,
       });
       const importedSessionFileMappings = reconciliation.effectiveStateMode === 'shared' && reconciliation.sharedProjectsRoot
         ? await importClaudeCandidatePersistedSessionFile({
@@ -442,7 +519,7 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
         : [];
       await writeConnectedServiceStateSharingManifest(
         params.targetDir,
-        buildSelfSourceManifest({
+        withNativeSource(buildSelfSourceManifest({
           existingManifest,
           requestedStateMode: settings.stateMode,
           effectiveStateMode: reconciliation.effectiveStateMode,
@@ -452,7 +529,7 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
             previousMappings: existingManifest.sessionFileMappings,
             nextMappings: importedSessionFileMappings,
           }),
-        }),
+        })),
       );
       return {
         providerId: 'claude',
@@ -533,13 +610,13 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
       sessionDirectory: params.sessionDirectory ?? process.cwd(),
       preserveExistingOauthAccountProjection: params.preserveNativeAuthFiles === true,
     });
-    await writeConnectedServiceStateSharingManifest(params.targetDir, {
+    await writeConnectedServiceStateSharingManifest(params.targetDir, withNativeSource({
       ...applyResult.manifest,
       sessionFileMappings: await mergeClaudeSessionFileMappings({
         previousMappings: candidateSessionFileMappings,
         nextMappings: applyResult.manifest.sessionFileMappings,
       }),
-    });
+    }));
 
     return {
       providerId: 'claude',

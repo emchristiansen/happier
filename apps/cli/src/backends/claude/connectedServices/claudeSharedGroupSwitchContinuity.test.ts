@@ -28,6 +28,10 @@ import {
   type SwitchSessionConnectedServiceAuthInput,
 } from '@/daemon/connectedServices/sessionAuthSwitch/switchSessionConnectedServiceAuth';
 import type { Credentials } from '@/persistence';
+import {
+  readConnectedServiceStateSharingNativeSourceRecord,
+  writeConnectedServiceStateSharingManifest,
+} from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingManifest';
 
 import { createClaudeConnectedServiceRuntimeAuthAdapter } from './createClaudeConnectedServiceRuntimeAuthAdapter';
 import { materializeClaudeConnectedServiceRuntimeAuthSelection } from './materializeClaudeConnectedServiceRuntimeAuthSelection';
@@ -44,6 +48,23 @@ const mockFetchSessionByIdCompat = vi.hoisted(() => vi.fn(async (): Promise<unkn
 vi.mock('@/session/transport/http/sessionsHttp', () => ({
   fetchSessionByIdCompat: mockFetchSessionByIdCompat,
 }));
+
+/**
+ * In production every Claude home is produced (and its admitted native source recorded) by a spawn
+ * before an account switch rematerializes it; these fixtures skip that production, so they record,
+ * for each Claude home they expect materialized, the source their `processEnv` names.
+ */
+async function seedAdmittedClaudeHomeSource(
+  claudeConfigDir: string | null,
+  nativeSourceEnv: Readonly<Record<string, string>>,
+): Promise<void> {
+  if (!claudeConfigDir) throw new Error('fixture: Claude config dir must resolve');
+  await writeConnectedServiceStateSharingManifest(claudeConfigDir, {
+    v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+    configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+    nativeSourceEnv,
+  });
+}
 
 const NEW_CREDENTIAL_REVISION = 'csr_bcdefghijklmnopqrstuvw';
 
@@ -108,6 +129,13 @@ describe('Claude shared-group switch continuity', () => {
       readConnectedServiceCredentialHealth: async ({ profileId }: Readonly<{ profileId: string }>) => (profileId === 'next'
         ? { kind: 'found' as const, status: 'connected' as const, health: null }
         : { kind: 'not_found' as const }) };
+    // A dry run must not write the server dir at all, so only the applied switch is seeded.
+    if (!dryRun) {
+      await seedAdmittedClaudeHomeSource(resolveClaudeConnectedServiceStableConfigDir({
+        activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: 'next',
+        selection: { kind: 'profile', profileId: 'next' },
+      }), { CLAUDE_CONFIG_DIR: join(homeDir, '.claude'), HOME: homeDir });
+    }
     const result = await switchSessionConnectedServiceAuth({
       dryRun,
       core: createConnectedServiceSessionAuthSwitchCore({ locks: new ConnectedServiceSessionAuthSwitchLockRegistry() }),
@@ -183,6 +211,12 @@ describe('Claude shared-group switch continuity', () => {
       },
     });
     if (!groupClaudeConfigDir) throw new Error('expected deterministic Claude shared group home');
+    const admittedSourceEnv = { CLAUDE_CONFIG_DIR: join(homeDir, '.claude'), HOME: homeDir };
+    await seedAdmittedClaudeHomeSource(groupClaudeConfigDir, admittedSourceEnv);
+    await seedAdmittedClaudeHomeSource(resolveClaudeConnectedServiceStableConfigDir({
+      activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: 'lb_bat',
+      selection: { kind: 'profile', profileId: 'lb_bat' },
+    }), admittedSourceEnv);
 
     const previousBindings = groupBindings(previousProfileId);
     const nextBindings = groupBindings('lb_bat');
@@ -414,6 +448,11 @@ describe('Claude shared-group switch continuity', () => {
        * 'persisted_differs': persisted metadata b22c, runner report a11c, no descriptor.
        */
       nativeSource?: 'matched' | 'stale_descriptor' | 'persisted_differs';
+      /**
+       * The legacy session's own (emc) home as its spawn left it. 'recorded': produced with its admitted
+       * native source recorded. 'unrecorded_legacy': produced before sources were recorded.
+       */
+      memberHomeSource?: 'recorded' | 'unrecorded_legacy';
     }>) {
       const root = await mkdtemp(join(tmpdir(), 'happier-claude-profile-to-group-'));
       temporaryDirectories.push(root);
@@ -470,6 +509,24 @@ describe('Claude shared-group switch continuity', () => {
       // shared state mode materializes it.
       await mkdir(targetClaudeConfigDir, { recursive: true });
       await symlink(sharedProjectsDir, join(targetClaudeConfigDir, 'projects'));
+
+      // In production the session's spawn produced its emc home; these fixtures skip that spawn, so they
+      // leave the home as it would have left it. A dry run must not write the server dir at all.
+      const memberClaudeConfigDir = resolveClaudeConnectedServiceStableConfigDir({
+        activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: 'emc',
+        selection: { kind: 'profile', profileId: 'emc' },
+      });
+      if (input.dryRun !== true) {
+        if ((input.memberHomeSource ?? 'recorded') === 'recorded') {
+          await seedAdmittedClaudeHomeSource(memberClaudeConfigDir, { CLAUDE_CONFIG_DIR: join(homeDir, '.claude'), HOME: homeDir });
+        } else {
+          if (!memberClaudeConfigDir) throw new Error('fixture: Claude config dir must resolve');
+          await writeConnectedServiceStateSharingManifest(memberClaudeConfigDir, {
+            v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+            configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+          });
+        }
+      }
 
       const previousBindings: ConnectedServiceBindingsV1 = {
         v: 1,
@@ -662,7 +719,10 @@ describe('Claude shared-group switch continuity', () => {
             : { expectedGroupGenerationByServiceId: { 'claude-subscription': input.expectedGroupGeneration ?? 2 } }),
         },
       } satisfies SwitchSessionConnectedServiceAuthInput);
-      return { result, daemon, persistSessionBindings, tracked, projectDir, checkedDir, checkedNativeId, nextBindings };
+      return {
+        result, daemon, persistSessionBindings, tracked, projectDir, checkedDir, checkedNativeId, nextBindings,
+        memberClaudeConfigDir,
+      };
     }
 
     async function expectSameSessionReplacement(input: Readonly<{
@@ -772,6 +832,21 @@ describe('Claude shared-group switch continuity', () => {
       expect(daemon.runnerSignals()).toEqual([]);
       expect(daemon.spawnSession).not.toHaveBeenCalled();
       expect(tracked.spawnOptions).toEqual({ directory: '' });
+    });
+
+    it('adopts a session whose home predates source records without reading or recording a source', async () => {
+      const { result, daemon, persistSessionBindings, projectDir, nextBindings, memberClaudeConfigDir } = await runAdoption({
+        nativeSessionFileExists: true,
+        memberHomeSource: 'unrecorded_legacy',
+      });
+
+      expect(result.ok ? null : { errorCode: result.errorCode, diagnostics: result.diagnostics }).toBeNull();
+      expect(result).toMatchObject({ ok: true, action: 'restart_requested' });
+      expect(persistSessionBindings).toHaveBeenCalledOnce();
+      await expectSameSessionReplacement({ daemon, directory: projectDir, bindings: nextBindings, selection: groupSelection });
+      // Credential-only rematerialization: the legacy home's unknown source is neither read nor replaced.
+      if (!memberClaudeConfigDir) throw new Error('fixture: Claude config dir must resolve');
+      expect(await readConnectedServiceStateSharingNativeSourceRecord(memberClaudeConfigDir)).toEqual({ kind: 'unrecorded' });
     });
 
     it.each(['stale_descriptor', 'persisted_differs'] as const)(

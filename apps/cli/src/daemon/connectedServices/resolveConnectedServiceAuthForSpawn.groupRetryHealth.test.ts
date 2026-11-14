@@ -17,6 +17,7 @@ import type { Credentials } from '@/persistence';
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from './accountGroups/quotas/ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
 import { ConnectedServiceRefreshCoordinator } from './refresh/ConnectedServiceRefreshCoordinator';
 import { resolveConnectedServiceAuthForSpawn } from './resolveConnectedServiceAuthForSpawn';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 import { createDaemonConnectedServiceAuthGroupSwitchCoordinator } from './runtimeAuth/createDaemonConnectedServiceAuthGroupSwitchCoordinator';
 
 const NOW = 2_000_000_000_000;
@@ -152,6 +153,7 @@ async function resolveAfterGroupRetry(shape: 'oauth' | 'token', mode: HealthMode
   });
 
   const outcome = await resolveConnectedServiceAuthForSpawn({
+    nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
     agentId: 'claude',
     credentialRefreshService,
     connectedServicesBindingsRaw: {

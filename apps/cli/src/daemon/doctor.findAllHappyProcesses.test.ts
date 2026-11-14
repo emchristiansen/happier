@@ -1,9 +1,42 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { execFileSyncMock, psListMock } = vi.hoisted(() => ({
+const { execFileSyncMock, psListMock, procfsReads, FIXTURE_PID, FIXTURE_COMMAND } = vi.hoisted(() => ({
   execFileSyncMock: vi.fn(() => ''),
   psListMock: vi.fn(),
+  procfsReads: [] as string[],
+  FIXTURE_PID: 123,
+  FIXTURE_COMMAND: '/usr/bin/node /repo/dist/index.mjs daemon start-sync',
 }));
+
+// The listed process's /proc entry is part of the same OS boundary as ps-list: classification
+// prefers a readable /proc/<pid>/cmdline. Answer for the fixture's process so that a real process
+// that happens to hold pid 123 (in a fresh PID namespace, a test worker) is never read.
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  const fixtureEntry = (path: unknown): string | null => (
+    typeof path === 'string' && path.startsWith(`/proc/${FIXTURE_PID}/`) ? path.slice(`/proc/${FIXTURE_PID}/`.length) : null
+  );
+  const absent = (path: string) => Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+  return {
+    ...actual,
+    readFile: (async (path: unknown, ...rest: unknown[]) => {
+      const entry = fixtureEntry(path);
+      if (entry === null) return await (actual.readFile as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+      procfsReads.push(entry);
+      if (entry === 'cmdline') return Buffer.from(`${FIXTURE_COMMAND.split(' ').join('\0')}\0`);
+      // The fixture process exposes no environment.
+      if (entry === 'environ') return Buffer.alloc(0);
+      throw absent(String(path));
+    }) as typeof actual.readFile,
+    readlink: (async (path: unknown, ...rest: unknown[]) => {
+      const entry = fixtureEntry(path);
+      if (entry === null) return await (actual.readlink as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+      procfsReads.push(entry);
+      // Its working directory is not visible.
+      throw absent(String(path));
+    }) as typeof actual.readlink,
+  };
+});
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal<typeof import('node:child_process')>(),
@@ -26,6 +59,7 @@ describe('findAllHappyProcesses', () => {
     vi.resetModules();
     execFileSyncMock.mockReset();
     psListMock.mockReset();
+    procfsReads.length = 0;
     Object.defineProperty(process, 'platform', originalPlatform);
   });
 
@@ -46,18 +80,20 @@ describe('findAllHappyProcesses', () => {
 
     resolveProcessSnapshot([
       {
-        pid: 123,
+        pid: FIXTURE_PID,
         name: 'node',
-        cmd: '/usr/bin/node /repo/dist/index.mjs daemon start-sync',
+        cmd: FIXTURE_COMMAND,
       },
     ]);
 
     const expected = [{
-      pid: 123,
-      command: '/usr/bin/node /repo/dist/index.mjs daemon start-sync',
+      pid: FIXTURE_PID,
+      command: FIXTURE_COMMAND,
       type: 'daemon',
     }];
     await expect(Promise.all([first, second])).resolves.toEqual([expected, expected]);
+    // Classification consulted the fixture's own /proc entry, not a live process.
+    expect(procfsReads).toContain('cmdline');
 
     psListMock.mockResolvedValueOnce([]);
     await expect(findAllHappyProcesses()).resolves.toEqual(expected);

@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { getPriority, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +19,14 @@ const mocks = vi.hoisted(() => ({
 
 import { buildCgroupSelfMigratingHappyCliLaunchSpec } from './buildCgroupSelfMigratingHappyCliLaunchSpec';
 import type { SessionLaunchId } from './sessionLaunchId';
+
+/** The directory that provides `mkdir` on this test process's own declared PATH. */
+function requiredMkdirDirectory(): string {
+  for (const directory of (process.env.PATH ?? '').split(':')) {
+    if (directory && existsSync(join(directory, 'mkdir'))) return directory;
+  }
+  throw new Error('The test PATH provides no mkdir, which the cgroup launch script requires');
+}
 
 const LAUNCH_ID = '5f0e9d8c-7b6a-4954-8372-615049382716' as SessionLaunchId;
 
@@ -52,7 +61,10 @@ describe('buildCgroupSelfMigratingHappyCliLaunchSpec', () => {
     const home = join(sandboxDir, 'home');
     await mkdir(home);
     await writeFile(join(home, '.profile'), 'export PATH=/login-profile-path\nexport HERMES_ROLE=login-profile-role\n');
-    const profilePath = '/selected-profile/bin:/usr/bin:/bin';
+    // The launch script creates the scope directory with `mkdir`, so the selected PATH must provide
+    // it. Take that one directory from the test's own declared PATH: `/usr/bin` and `/bin` need not
+    // hold coreutils (NixOS and the Nix test sandbox), and the failure would be hidden by `|| true`.
+    const profilePath = `/selected-profile/bin:${requiredMkdirDirectory()}:/usr/bin:/bin`;
     const cgroupRootDir = join(sandboxDir, 'cgroup');
     const runnerArgs = ['space and \'quote', '${HOME}', '$(must-not-execute)', '--flag=value'];
 

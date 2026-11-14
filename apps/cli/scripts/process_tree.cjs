@@ -63,90 +63,74 @@ function bestEffortKillPid(pid, signal, onSignalFailure) {
   }
 }
 
-async function waitForAllGone(pids, timeoutMs, isAlive) {
+async function waitForAllGone(pids, timeoutMs, isAlive, othersRemain = () => false) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (pids.every((pid) => !isAlive(pid))) return;
+    if (pids.every((pid) => !isAlive(pid)) && !othersRemain()) return;
     await new Promise((r) => setTimeout(r, 25));
   }
 }
 
-// Roots currently held by the discovery fence below. A stopped process never acts on SIGTERM,
-// so if this owner exits or is signalled mid-discovery the root would stay frozen and orphaned.
-const fencedRoots = new Map();
-let fenceExitGuardInstalled = false;
-const FENCE_TERMINATION_SIGNALS = process.platform === 'win32' ? [] : ['SIGTERM', 'SIGINT', 'SIGHUP'];
+// Discovery never pauses the root: suspending a process (SIGSTOP) is forbidden, and a stopped
+// root would also be left frozen if this owner died mid-cleanup. The root keeps running while
+// descendants are found, so its parent links stay intact: discovery repeats until a fresh
+// snapshot finds nothing new, and continues while the root is shutting down.
+//
+// Coverage is reported, never assumed. A caller that itself spawned the root as the leader of
+// its own process group (POSIX `detached: true`) may declare `processGroup: 'owned'`; root
+// signals then go to that group, which also reaches a member no snapshot listed. Without that
+// declaration, or when the group cannot be validated against the same root at the moment of
+// use, unguarded cleanup is `snapshot` coverage: a child the root forks after the last snapshot
+// can be reparented beyond this owner's knowledge. Guarded cleanup refuses that case instead, as
+// `snapshot_only`, before signalling anything it has not already validated. (The former SIGSTOP fence closed only forks during
+// the snapshot itself; a root could still fork from its own SIGTERM handler after resuming.)
+const MAX_DISCOVERY_ROUNDS = 4;
+const GRACE_REDISCOVERY_INTERVAL_MS = 100;
 
-function releaseFencedRoots() {
-  for (const [proc, readRootIdentity] of fencedRoots) {
-    if (proc.exitCode != null || proc.signalCode != null) continue;
-    // Exit cleanup has no time to retry identity reads. An unreadable guarded
-    // root must remain stopped rather than being resumed by its numeric PID.
-    if (readRootIdentity && readRootIdentity() !== 'same') continue;
-    bestEffortKillPid(proc.pid, 'SIGTERM', () => {});
-    if (readRootIdentity && readRootIdentity() !== 'same') continue;
-    bestEffortKillPid(proc.pid, 'SIGCONT', () => {});
+async function discoverNewDescendants(rootPid, enumerate, known) {
+  const found = [];
+  for (const pid of await resolveDescendantPids(rootPid, enumerate)) {
+    if (known.has(pid)) continue;
+    known.add(pid);
+    found.push(pid);
   }
-  fencedRoots.clear();
-  removeFenceSignalGuards();
+  return found;
 }
 
-function onFenceSignal(signal) {
-  // Listening for a signal replaces its default termination; restore it when no other owner handles it.
-  // The guard is prepended, so every other handler (including one-time handlers) is still registered here.
-  const otherOwnersHandleSignal = process.listenerCount(signal) > 1;
-  // An existing shutdown handler may still await discovery. Keep its ancestry fence
-  // until cleanup resumes normally or the exit guard observes the owner's actual exit.
-  if (otherOwnersHandleSignal) return;
-  releaseFencedRoots();
-  process.kill(process.pid, signal);
-}
-
-function removeFenceSignalGuards() {
-  for (const signal of FENCE_TERMINATION_SIGNALS) process.off(signal, onFenceSignal);
-}
-
-function holdFencedRoot(proc, readRootIdentity) {
-  if (!fenceExitGuardInstalled) {
-    fenceExitGuardInstalled = true;
-    process.on('exit', releaseFencedRoots);
+/**
+ * Whether a declared owned process group may be signalled as `-pid` now. This only vetoes a
+ * declaration; it never promotes an undeclared root. Linux exposes the current group id, which
+ * must still equal the root PID; other POSIX systems rely on the declaration plus the root
+ * identity check made immediately before. Windows has no POSIX process groups.
+ */
+function declaredProcessGroupHolds(pid) {
+  if (process.platform === 'win32') return false;
+  if (process.platform !== 'linux') return true;
+  try {
+    const stat = require('node:fs').readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // Fields after the parenthesised command name: state, ppid, pgrp, ...
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return Number(fields[2]) === pid;
+  } catch {
+    return false;
   }
-  if (fencedRoots.size === 0) {
-    for (const signal of FENCE_TERMINATION_SIGNALS) process.prependListener(signal, onFenceSignal);
-  }
-  fencedRoots.set(proc, readRootIdentity);
-}
-
-function releaseFencedRoot(proc) {
-  fencedRoots.delete(proc);
-  if (fencedRoots.size === 0) removeFenceSignalGuards();
 }
 
 async function terminateProcessTree(proc, opts, enumerate, guard) {
   const pid = proc.pid;
   const rootHasExited = () => proc.exitCode != null || proc.signalCode != null;
-  if (!pid || rootHasExited()) return { rootObservedAlive: false, rootOutcome: 'root_not_same' };
+  if (!pid || rootHasExited()) return { rootObservedAlive: false, rootOutcome: 'root_not_same', coverage: 'snapshot' };
 
   const graceMs = Math.max(1, opts?.graceMs ?? 1000);
   let probeFailed = false;
   let signallingFailed = false;
   let rootOutcome = 'completed';
-  let rootStopped = false;
-  const rootHolds = async () => {
+  const rootHolds = () => {
     if (rootOutcome !== 'completed') return false;
     if (!guard) return !rootHasExited();
-    let identity = guard.readRootIdentity();
-    if (rootStopped) {
-      for (const delayMs of guard.unreadableRetryDelaysMs) {
-        if (identity !== 'unreadable') break;
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        identity = guard.readRootIdentity();
-      }
-    }
+    const identity = guard.readRootIdentity();
     if (identity === 'same' && !rootHasExited()) return true;
-    rootOutcome = identity === 'not_same' || rootHasExited()
-      ? 'root_not_same'
-      : rootStopped ? 'root_unreadable_suspended' : 'root_unreadable';
+    rootOutcome = identity === 'not_same' || rootHasExited() ? 'root_not_same' : 'root_unreadable';
     return false;
   };
   const onSignalFailure = () => { signallingFailed = true; };
@@ -157,83 +141,144 @@ async function terminateProcessTree(proc, opts, enumerate, guard) {
     if (targetPid !== pid || !rootHasExited()) return bestEffortKillPid(targetPid, signal, onSignalFailure);
     return false;
   };
+  // The group is signalled only when the caller declared it owns the root's group, the root is
+  // still that same process (the guard, or the owner's own exit record for a ChildProcess), and
+  // no OS evidence contradicts that group. An unguarded owner otherwise signals only the root PID.
+  // A guarded owner needs whole-tree coverage: without the group it signals nothing further.
+  const groupDeclared = opts?.processGroup === 'owned';
+  const rootIdentityKnown = Boolean(guard) || ('exitCode' in proc && 'signalCode' in proc);
+  const groupHolds = () => groupDeclared && rootIdentityKnown && declaredProcessGroupHolds(pid);
+  const groupRequired = () => {
+    if (groupHolds()) return true;
+    if (rootOutcome === 'completed') rootOutcome = 'snapshot_only';
+    return false;
+  };
+  let coverage = 'snapshot';
+  let rootSignalled = false;
+  // One group observation decides each root signal. A guarded owner that cannot validate the group
+  // at that moment sends nothing and records the refusal; a later successful observation never
+  // stands in for a signal that was not sent.
+  const signalRoot = (signal) => {
+    if (!rootHolds()) return false;
+    const viaGroup = groupHolds();
+    if (guard && !viaGroup) {
+      if (rootOutcome === 'completed') rootOutcome = 'snapshot_only';
+      return false;
+    }
+    // Coverage is the weakest of every root signal actually sent.
+    coverage = viaGroup && (!rootSignalled || coverage === 'process_group') ? 'process_group' : 'snapshot';
+    rootSignalled = true;
+    return viaGroup ? bestEffortKillPid(-pid, signal, onSignalFailure) : kill(pid, signal);
+  };
 
   // Keep child runtimes attached to their owning CLI process tree and explicitly terminate
   // descendants on disposal so provider processes cannot outlive their supervisor.
-  // On POSIX, stop the root before taking the process-tree snapshot. Without this fence, a
-  // freshly spawned descendant can be reported to its parent before it is visible in the
-  // process listing; killing the parent then reparents that descendant and loses the only
-  // relationship that lets this owner find it.
-  if (guard && !await rootHolds()) return { rootObservedAlive: false, rootOutcome };
+  if (guard && (!rootHolds() || !groupRequired())) return { rootObservedAlive: false, rootOutcome, coverage };
   let rootObservedAlive = isAlive(pid);
-  if (process.platform !== 'win32' && rootObservedAlive) {
-    holdFencedRoot(proc, guard?.readRootIdentity);
-    rootStopped = kill(pid, 'SIGSTOP');
-    if (!rootStopped) releaseFencedRoot(proc);
-  }
 
-  let descendants;
+  // After the root has gone, the owner no longer holds its group and must not signal `-pid`. A
+  // group member the snapshots never listed (for example one forked by the root's SIGTERM
+  // handler) can still be running, so termination is not complete while the group the owner
+  // signalled still has members. Signal 0 delivers nothing; it only asks whether the group exists.
+  // A false positive (an unreaped zombie, or a reused group id) yields incomplete, never completed.
+  const groupMembersRemain = () => {
+    if (!(rootSignalled && coverage === 'process_group') || isAlive(pid)) return false;
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      return !(typeof error === 'object' && error !== null && 'code' in error && error.code === 'ESRCH');
+    }
+  };
+  const treeGone = (pids) => pids.every((target) => !isAlive(target)) && !groupMembersRemain();
+
+  const known = new Set();
+  const descendants = [];
   let discoveryFailed = false;
   try {
-    descendants = await resolveDescendantPids(pid, enumerate);
+    for (let round = 0; round < MAX_DISCOVERY_ROUNDS; round += 1) {
+      const found = await discoverNewDescendants(pid, enumerate, known);
+      descendants.push(...found);
+      if (round > 0 && found.length === 0) break;
+      if (rootHasExited()) break;
+    }
   } catch {
     // Process enumeration is an external best-effort boundary. The known root must still be
-    // resumed and terminated when the OS denies or transiently exhausts that boundary; making
-    // every caller fail before that attempt leaves the known root alive. Afterward,
-    // missing discovery remains an unverified cleanup, not successful completion.
+    // terminated when the OS denies or transiently exhausts that boundary; making every caller
+    // fail before that attempt leaves the known root alive. Afterward, missing discovery
+    // remains an unverified cleanup, not successful completion.
     discoveryFailed = true;
-    descendants = [];
   }
   // Discovery yields to the OS: an externally killed root may have lost its descendants.
-  // Retain discovered descendants, but never resume or signal an exited root by its stale PID.
+  // Retain discovered descendants, but never signal an exited root by its stale PID.
   if (rootHasExited()) rootObservedAlive = false;
   // A PID-only descendant snapshot is usable only if the guarded root still
   // names the same process after discovery. Discard it otherwise.
-  if (guard && !await rootHolds()) {
-    releaseFencedRoot(proc);
-    return { rootObservedAlive, rootOutcome };
-  }
-  const all = rootHasExited() ? descendants : [...descendants, pid];
+  if (guard && (!rootHolds() || !groupRequired())) return { rootObservedAlive, rootOutcome, coverage };
+  const all = rootHasExited() ? [...descendants] : [...descendants, pid];
 
   // Try graceful first (children-first).
   for (const targetPid of descendants) kill(targetPid, 'SIGTERM');
-  if (rootStopped && await rootHolds() && kill(pid, 'SIGCONT')) rootStopped = false;
-  if (await rootHolds()) kill(pid, 'SIGTERM');
-  releaseFencedRoot(proc);
-  await waitForAllGone(all, graceMs, isAlive);
+  signalRoot('SIGTERM');
+
+  // While the root is still shutting down it can spawn more children; they stay discoverable
+  // through it until it exits, so keep looking for them during the grace period.
+  const graceStart = Date.now();
+  let lastDiscoveryMs = graceStart;
+  while (Date.now() - graceStart < graceMs) {
+    if (treeGone(all)) break;
+    if (!discoveryFailed && Date.now() - lastDiscoveryMs >= GRACE_REDISCOVERY_INTERVAL_MS && isAlive(pid)) {
+      lastDiscoveryMs = Date.now();
+      try {
+        const found = await discoverNewDescendants(pid, enumerate, known);
+        // Like the first snapshot, a later one is used only while the root still names the same
+        // process; this check must not turn a root's ordinary exit into an identity failure.
+        if (found.length > 0 && !rootHasExited() && (!guard || guard.readRootIdentity() === 'same')) {
+          for (const targetPid of found) kill(targetPid, 'SIGTERM');
+          descendants.push(...found);
+          all.unshift(...found);
+        }
+      } catch {
+        discoveryFailed = true;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
 
   const remaining = all.filter((p) => isAlive(p));
-  if (remaining.length === 0 && !discoveryFailed && !probeFailed && !signallingFailed) return { rootObservedAlive, rootOutcome };
+  if (remaining.length === 0 && !groupMembersRemain() && !discoveryFailed && !probeFailed && !signallingFailed) {
+    return { rootObservedAlive, rootOutcome, coverage };
+  }
 
   for (const targetPid of remaining) {
-    if (targetPid !== pid || await rootHolds()) kill(targetPid, 'SIGKILL');
+    if (targetPid === pid) signalRoot('SIGKILL');
+    else kill(targetPid, 'SIGKILL');
   }
-  await waitForAllGone(remaining, Math.min(250, graceMs), isAlive);
+  await waitForAllGone(remaining, Math.min(250, graceMs), isAlive, groupMembersRemain);
+  const groupMembersRemained = groupMembersRemain();
   // A signalable PID alone may be a defunct child. Preserve the existing reap semantics;
-  // only actual OS failures make this best-effort cleanup explicitly incomplete.
-  if (discoveryFailed || probeFailed || signallingFailed) {
+  // only actual OS failures, or a signalled group that still has members after its root has
+  // gone, make this best-effort cleanup explicitly incomplete.
+  if (discoveryFailed || probeFailed || signallingFailed || groupMembersRemained) {
     throw Object.assign(new Error('Process-tree termination could not be verified'), {
       code: 'process_tree_termination_incomplete',
       // Keep only failure categories: native errors can contain private paths or command lines.
       discoveryFailed,
       probeFailed,
       signallingFailed,
+      groupMembersRemained,
     });
   }
-  return { rootObservedAlive, rootOutcome };
+  return { rootObservedAlive, rootOutcome, coverage };
 }
 
 async function killProcessTree(proc, opts, enumerate = psList) {
-  const { rootObservedAlive } = await terminateProcessTree(proc, opts, enumerate, null);
-  return { rootObservedAlive };
+  const { rootObservedAlive, coverage } = await terminateProcessTree(proc, opts, enumerate, null);
+  return { rootObservedAlive, coverage };
 }
 
 async function killProcessTreeGuarded(proc, opts, enumerate = psList) {
-  const result = await terminateProcessTree(proc, opts, enumerate, {
-    readRootIdentity: opts.readRootIdentity,
-    unreadableRetryDelaysMs: opts.unreadableRetryDelaysMs ?? [10, 25, 50, 100],
-  });
-  return result.rootOutcome;
+  return (await terminateProcessTree(proc, opts, enumerate, { readRootIdentity: opts.readRootIdentity })).rootOutcome;
 }
 
 module.exports = { isPidAliveBySignal, killProcessTree, killProcessTreeGuarded };

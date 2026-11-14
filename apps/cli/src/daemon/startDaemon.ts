@@ -152,6 +152,7 @@ import { resolveRespawnSessionRuntimeSnapshot } from './sessions/runtimeSnapshot
 import { buildInactiveUsageLimitResumeSpawnOptions } from './sessions/runtimeSnapshot/buildInactiveUsageLimitResumeSpawnOptions';
 import { buildHandoffSessionMetadataFromTrackedSession } from './sessions/buildHandoffSessionMetadataFromTrackedSession';
 import { createOnChildExited } from './sessions/onChildExited';
+import { OwnedRunnerGroupTailCustody, readTrackedOwnedRunnerProcessGroupLeaderPid } from './sessions/daemonOwnedRunnerProcessGroup';
 import { publishOrphanedStartupSessionEnds } from './sessions/publishOrphanedStartupSessionEnds';
 import {
   resolveDisconnectedTerminalHostResumeGate,
@@ -189,6 +190,7 @@ import {
   probeSessionRunnerPresence,
   probeSessionRunnerServiceability as probeSessionRunnerServiceabilityInDaemon,
   resolveSessionRunnerResumeDecision,
+  trackedSessionMatchesSessionId as trackedSessionMatchesSessionIdInDaemon,
   type MatchedLostPublisherRunner,
   type SessionRunnerServiceabilityProbe,
 } from './sessions/isSessionRunnerActive';
@@ -272,7 +274,14 @@ import { createDefaultTerminalHostRegistry } from '@/integrations/terminalHost/d
 import { resolveLiveRunnerSnapshotFingerprints } from './sessionRunnerRuntime/resolveLiveRunnerSnapshotFingerprints';
 import { buildHappySessionControlArgs } from './sessionSpawnArgs';
 import { serializeDaemonInitialGoalForEnv, HAPPIER_DAEMON_INITIAL_GOAL_ENV_KEY } from '@/agent/runtime/sessionInitialGoal';
-import { resolveExistingSessionAttachContext } from './sessionEncryption/resolveExistingSessionAttachContext';
+import {
+  resolveExistingSessionAttachContext,
+  type ExistingSessionAttachContext,
+} from './sessionEncryption/resolveExistingSessionAttachContext';
+import {
+  NEW_CALLER_SPAWN_NATIVE_SOURCE,
+  resolveExistingSessionSpawnNativeSource,
+} from './connectedServices/connectedServiceSpawnNativeSource';
 import { resolveWaitForAuthConfig } from './startup/waitForAuthConfig';
 import { ensureSessionDirectory } from './startup/ensureSessionDirectory';
 import { waitForInitialCredentials } from './startup/waitForInitialCredentials';
@@ -808,6 +817,24 @@ function toConnectedServiceSwitchEffectiveBinding(
     groupId: null,
   };
 }
+
+/**
+ * The message a fenced Resume reports. A lost-publisher runner whose process group the daemon does
+ * not own can never be replaced safely, so retrying after connectivity recovers would not help.
+ */
+function describeResumeFence(reason: string): string {
+  if (reason === 'publisher_lost_runner_group_unowned') {
+    return 'The existing session runtime can no longer receive queued messages, and this daemon cannot stop all of its processes to replace it safely. Stop the session, then Resume again.';
+  }
+  if (reason === 'owned_runner_group_tail_unresolved') {
+    return 'Processes from this session\'s previous runtime are still running, and this daemon can no longer stop them safely. Resume again after they exit.';
+  }
+  return 'The existing session runtime could not be verified. Retry resume after connectivity recovers.';
+}
+
+// Members of a retired runner's process group normally finish their own shutdown shortly after its root.
+const OWNED_RUNNER_GROUP_TAIL_RECONCILE_TIMEOUT_MS = 3_000;
+const OWNED_RUNNER_GROUP_TAIL_RECONCILE_POLL_MS = 25;
 
 function resolveConnectedServiceRestartProcessGroupPid(tracked: TrackedSession): number | null {
   return tracked.startedBy === 'daemon' && tracked.childProcess && Number.isInteger(tracked.pid) && tracked.pid > 0
@@ -1910,6 +1937,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
         // Setup state - key by PID
         const pidToTrackedSession = new Map<number, TrackedSession>();
+        const ownedRunnerGroupTails = new OwnedRunnerGroupTailCustody();
         const spawnResourceCleanupByPid = new Map<number, () => void>();
         const sessionAttachCleanupByPid = new Map<number, () => Promise<void>>();
       const connectedServicesMaterializationBaseDir = join(configuration.happyHomeDir, 'daemon', 'connected-services', 'materialized');
@@ -2423,8 +2451,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             trackedSessions: pidToTrackedSession.values(),
           });
         };
-        const probeSessionRunnerServiceability = async (sessionIdRaw: string) => {
-          return await probeSessionRunnerServiceabilityInDaemon({
+        const probeSessionRunnerServiceability = async (sessionIdRaw: string): Promise<SessionRunnerServiceabilityProbe> => {
+          const probe = await probeSessionRunnerServiceabilityInDaemon({
             sessionId: sessionIdRaw,
             trackedSessions: pidToTrackedSession.values(),
             localMachineId: machineId,
@@ -2434,6 +2462,20 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               isShutdownRequested: () => shutdownInitiated,
             }),
           });
+          if (probe.state !== 'runner_absent') return probe;
+          // No runner is present, but the previous runner's owned group may have outlived its root:
+          // while the root's record is still tracked (its exit lifecycle running, or failed) and after.
+          const trackedGroupLeaderPids = Array.from(pidToTrackedSession.values())
+            .filter((tracked) => trackedSessionMatchesSessionIdInDaemon(tracked, sessionIdRaw.trim()))
+            .map(readTrackedOwnedRunnerProcessGroupLeaderPid)
+            .filter((pid): pid is number => pid !== null);
+          const unresolved = await ownedRunnerGroupTails.reconcileSession(sessionIdRaw, trackedGroupLeaderPids, {
+            timeoutMs: OWNED_RUNNER_GROUP_TAIL_RECONCILE_TIMEOUT_MS,
+            pollIntervalMs: OWNED_RUNNER_GROUP_TAIL_RECONCILE_POLL_MS,
+          });
+          if (!unresolved) return probe;
+          logger.warn('[DAEMON RUN] Session runner is absent but its previous process group still has members; refusing to treat it as absent', unresolved);
+          return { state: 'runner_unknown', reason: 'owned_runner_group_tail_unresolved' };
         };
         const publishSessionRunnerControlServiceability = async (
           sessionId: string,
@@ -3449,7 +3491,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 return {
                   type: 'error',
                   errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
-                  errorMessage: 'The existing session runtime could not be verified. Retry resume after connectivity recovers.',
+                  errorMessage: describeResumeFence(initialResumeDecision.reason),
                 };
               }
               if (initialResumeDecision.action === 'wait_for_exit') {
@@ -3485,7 +3527,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   return {
                     type: 'error',
                     errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
-                    errorMessage: 'The existing session runtime could not be verified. Retry resume after connectivity recovers.',
+                    errorMessage: describeResumeFence(resumeDecisionAfterWait.reason),
                   };
                 }
                 if (resumeDecisionAfterWait.action === 'wait_for_exit') {
@@ -3647,27 +3689,33 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
 
               let sessionAttachPayload: import('@/agent/runtime/sessionAttachPayload').SessionAttachFilePayload | null = null;
               let existingSessionPersistedMetadata: Record<string, unknown> | null = null;
+              // The daemon's own authenticated read of the resumed session. It is made for every
+              // existing session, so the session's persisted options, materialization identity and
+              // connected-service source authority always come from it. A caller-supplied attach
+              // payload only names the attach file; it is never that read and never skips it.
+              let existingSessionAttachContext: ExistingSessionAttachContext | null = null;
               if (normalizedExistingSessionId) {
+                const storedCredentials = await readCredentials().catch(() => null);
+                const effectiveCredentials = storedCredentials ?? credentials;
+                const tokenForFetch = effectiveCredentials?.token ?? '';
+
+                const attachContext = await resolveExistingSessionAttachContext({
+                  token: tokenForFetch,
+                  sessionId: normalizedExistingSessionId,
+                  backendTarget: backendTarget ?? { kind: 'builtInAgent', agentId: catalogAgentId },
+                  credentials: effectiveCredentials,
+                });
+
+                if (!attachContext.ok) {
+                  return mapExistingSessionAttachFailureToSpawnError(attachContext.reason);
+                }
+
+                existingSessionAttachContext = attachContext;
+                existingSessionPersistedMetadata = attachContext.metadata;
                 if (existingSessionAttachPayload) {
                   sessionAttachPayload = existingSessionAttachPayload;
                 } else {
-                  const storedCredentials = await readCredentials().catch(() => null);
-                  const effectiveCredentials = storedCredentials ?? credentials;
-                  const tokenForFetch = effectiveCredentials?.token ?? '';
-
-                  const attachContext = await resolveExistingSessionAttachContext({
-                    token: tokenForFetch,
-                    sessionId: normalizedExistingSessionId,
-                    backendTarget: backendTarget ?? { kind: 'builtInAgent', agentId: catalogAgentId },
-                    credentials: effectiveCredentials,
-                  });
-
-                  if (!attachContext.ok) {
-                    return mapExistingSessionAttachFailureToSpawnError(attachContext.reason);
-                  }
-
                   sessionAttachPayload = attachContext.attachPayload;
-                  existingSessionPersistedMetadata = attachContext.metadata;
                   if (!effectiveResume) {
                     const derivedResume = typeof attachContext.vendorResumeId === 'string' ? attachContext.vendorResumeId.trim() : '';
                     if (derivedResume) {
@@ -4044,6 +4092,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       quotaProbeDeadlineAtMs: connectedServiceSpawnQuotaProbeDeadlineAtMs,
                       accountSettings: activeAccountSettings?.settings ?? null,
                       processEnv: process.env,
+                      nativeSource: normalizedExistingSessionId && existingSessionAttachContext
+                        ? resolveExistingSessionSpawnNativeSource({
+                            existingSessionId: normalizedExistingSessionId,
+                            attachContext: existingSessionAttachContext,
+                            materializationIdentity: connectedServiceMaterializationIdentityV1,
+                          })
+                        : NEW_CALLER_SPAWN_NATIVE_SOURCE,
                       credentialRefreshService: connectedServiceRefreshCoordinator,
                       vendorResumeId: effectiveResume || null,
                       existingSessionMetadata: existingSessionPersistedMetadata,
@@ -6042,6 +6097,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             // Handle child process exit
             const onChildExitedBase = createOnChildExited({
               pidToTrackedSession,
+              ownedRunnerGroupTails,
               spawnResourceCleanupByPid,
               sessionAttachCleanupByPid,
               getApiMachineForSessions: () => apiMachineForSessions,
@@ -7228,6 +7284,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         ...(params.sessionId ? { sessionId: params.sessionId } : {}),
         accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
         processEnv: process.env,
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         credentialRefreshService: connectedServiceRefreshCoordinator,
       }),
       runtimeRegistry: connectedServiceRuntimeRegistry,
@@ -9280,6 +9337,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     sessionId,
                     accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
                     processEnv: process.env,
+                    nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
                     credentialRefreshService: connectedServiceRefreshCoordinator,
                     sessionStateMode: 'existing',
                     existingSessionMetadata: metadata,

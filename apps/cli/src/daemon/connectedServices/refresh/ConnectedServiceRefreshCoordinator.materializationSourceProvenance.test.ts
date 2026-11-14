@@ -99,6 +99,17 @@ const settle = <T>(work: Promise<T>) => work.then(
 );
 
 /**
+ * A runnable stand-in for the provider CLI. The direct producer refuses a launch whose provider CLI
+ * it cannot resolve; naming this file as the exclusive `HAPPIER_<AGENT>_PATH` override keeps that
+ * check satisfied without discovering or running any CLI installed on the host.
+ */
+async function writeProviderCliStub(dir: string): Promise<string> {
+  const stub = join(dir, 'provider-cli-stub');
+  await writeFile(stub, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  return stub;
+}
+
+/**
  * Real direct producer (caller environment) -> real terminal registration from the session's
  * webhook metadata -> real daemon refresh coordinator holding a DISTINCT daemon environment whose
  * CODEX_HOME is an excluded sentinel. Server HTTP is synthetic; filesystem effects are real.
@@ -109,6 +120,7 @@ async function createComposedFixture(params: Readonly<{
 }>) {
   const profileId = params.profileId;
   const dir = await mkdtemp(join(tmpdir(), 'happier-materialization-source-'));
+  const providerCli = await writeProviderCliStub(dir);
   const callerSource = join(dir, 'caller-codex-source');
   const callerSqlite = join(dir, 'caller-codex-sqlite');
   const excludedDaemonSource = join(dir, 'daemon-codex-sentinel');
@@ -182,6 +194,7 @@ async function createComposedFixture(params: Readonly<{
   /** The direct producer, run with the caller's own CODEX_HOME / CODEX_SQLITE_HOME. */
   const directLaunch = async (input: Readonly<{ sessionId: string; source: string; sqlite: string }>) => {
     const identity = resolveDirectConnectedServiceMaterializationIdentity(null);
+    vi.stubEnv('HAPPIER_CODEX_PATH', providerCli);
     vi.stubEnv('CODEX_HOME', input.source);
     vi.stubEnv('CODEX_SQLITE_HOME', input.sqlite);
     try {

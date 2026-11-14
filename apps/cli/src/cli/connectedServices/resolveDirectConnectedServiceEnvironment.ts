@@ -19,6 +19,7 @@ import {
 import type { CatalogAgentId } from '@/backends/types';
 import { configuration } from '@/configuration';
 import { resolveConnectedServiceAuthForSpawn } from '@/daemon/connectedServices/resolveConnectedServiceAuthForSpawn';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 import { createConnectedServiceMaterializationIdentity } from '@/daemon/connectedServices/materialize/createConnectedServiceMaterializationIdentity';
 import { shouldResolveConnectedServiceAuthForSpawn } from '@/daemon/connectedServices/shouldResolveConnectedServiceAuthForSpawn';
 import { resolveEffectiveProviderStateMode } from '@/daemon/connectedServices/stateSharing/resolveEffectiveProviderStateMode';
@@ -112,6 +113,8 @@ export async function resolveDirectConnectedServiceEnvironment(params: Readonly<
           sessionId: params.sessionId,
           accountSettings: params.accountSettings,
           processEnv: process.env,
+          // A direct launch, even one resuming its session, produces its homes from its own environment.
+          nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
           existingSessionMetadata: sessionMetadata,
           ...(params.vendorResumeId ? { vendorResumeId: params.vendorResumeId } : {}),
           resumeReachabilityRequired,
