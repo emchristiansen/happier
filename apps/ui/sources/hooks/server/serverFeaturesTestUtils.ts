@@ -101,6 +101,7 @@ export function buildServerFeaturesResponse(overrides: FixtureOverrides = {}): F
                 autoDisablePlanInvalid: { enabled: false },
                 poolQuotaLimitSelection: { enabled: false },
                 poolExpiryFirst: { enabled: false },
+                poolPerSessionSoftmax: { enabled: false },
             },
             channelBridges: {
                 enabled: false,

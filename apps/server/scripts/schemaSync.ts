@@ -117,6 +117,11 @@ function generateProviderSchemaFromPostgres(
         // index cannot fit within MySQL's InnoDB key-size limit.
         body = body.replace(/^\s*@@unique\(\[accountId, providerId, accountSubjectId, quotaScope, quotaScopeIdKey\], map: "paur_identity_key"\)\s*$/m, "");
 
+        // Assignment-reservation decision IDs are protocol-bounded at 200 characters, above MySQL's
+        // default VARCHAR(191).
+        body = body.replace(/^model ConnectedServiceAssignmentReservation\s*\{[\s\S]*?^\}/m, (model) => model
+            .replace(/^(\s*decisionId\s+String\b)(?![^\n]*@db\.)/m, "$1 @db.VarChar(200)"));
+
 	        // MySQL defaults `String` to VARCHAR(191), which is too small for our encrypted state blobs.
 	        body = body.replace(/^(\s*metadata\s+String\b)(?![^\n]*@db\.)/gm, "$1 @db.LongText");
 	        body = body.replace(/^(\s*agentState\s+String\?)(?![^\n]*@db\.)/gm, "$1 @db.LongText");

@@ -1,5 +1,5 @@
 import type { ConnectedServiceCredentialRevisionV1, ConnectedServiceId } from '@happier-dev/protocol';
-import { parseConnectedServiceBindingSelections } from '../../parseConnectedServicesBindings';
+import { isPerSessionOwnedGroupSelection, parseConnectedServiceBindingSelections } from '../../parseConnectedServicesBindings';
 import {
   buildConnectedServiceAuthGroupCommittedGenerationFact,
   buildConnectedServiceAuthGroupTargetEpochIdentity,
@@ -111,14 +111,21 @@ function listRuntimeSessionScopes(
         fromProfileId: binding.profileId,
       }] : [];
     });
-    const discoveredBindings = parseConnectedServiceBindingSelections(target.connectedServicesBindingsRaw)
-      .filter((selection): selection is Extract<typeof selection, { kind: 'group' }> => selection.kind === 'group')
+    const groupSelections = parseConnectedServiceBindingSelections(target.connectedServicesBindingsRaw)
+      .filter((selection): selection is Extract<typeof selection, { kind: 'group' }> => selection.kind === 'group');
+    // Per-session-owned sessions settle against their own member, never the group's shared pointer.
+    const perSessionOwnedScopes = new Set(groupSelections
+      .filter(isPerSessionOwnedGroupSelection)
+      .map((selection) => groupScopeKey(selection)));
+    const discoveredBindings = groupSelections
+      .filter((selection) => !perSessionOwnedScopes.has(groupScopeKey(selection)))
       .map((selection) => ({
         serviceId: selection.serviceId,
         groupId: selection.groupId,
         fromProfileId: selection.fallbackProfileId ?? null,
       }));
     for (const binding of [...discoveredBindings, ...runtimeBindings]) {
+      if (perSessionOwnedScopes.has(groupScopeKey(binding))) continue;
       const key = sessionScopeKey({ sessionId, serviceId: binding.serviceId, groupId: binding.groupId });
       const scope: ConnectedServiceAuthGroupRuntimeScope = {
         sessionId,

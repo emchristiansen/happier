@@ -1,5 +1,6 @@
 import { resolveConnectedServiceDefaultProfileId } from '@/sync/domains/connectedServices/connectedServiceProfilePreferences';
 import type { ConnectedServicesServiceBinding } from '@/sync/domains/connectedServices/connectedServicesAgentOptionStateBindings';
+import { resolveConnectedServiceGroupBindingAppliedProfileId } from '@/sync/domains/connectedServices/resolveConnectedServiceGroupBindingAppliedProfileId';
 import type {
     ConnectedServicesAccountGroupOptionsByServiceId,
     ConnectedServicesProfileOption,
@@ -151,14 +152,15 @@ function resolveConnectedBindingState(
             ? resolveConnectedServiceAccountGroupViableProfileId({ group, connectedProfileIds })
             : null;
         if (group && viableProfileId) {
+            const appliedProfileId = resolveConnectedServiceGroupBindingAppliedProfileId(binding);
             return {
                 requestedSource: 'connected',
                 requestedSelection: 'group',
                 effectiveSource: 'connected',
                 effectiveSelection: 'group',
                 groupId: explicitGroupId,
-                activeProfileId: readOptionalString(binding.appliedProfileId) || readOptionalString(group.activeProfileId) || viableProfileId,
-                profileId: readOptionalString(binding.appliedProfileId) || viableProfileId,
+                activeProfileId: appliedProfileId || readOptionalString(group.activeProfileId) || viableProfileId,
+                profileId: appliedProfileId || viableProfileId,
             };
         }
         return {

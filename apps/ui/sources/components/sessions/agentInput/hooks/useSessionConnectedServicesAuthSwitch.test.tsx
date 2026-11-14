@@ -266,6 +266,36 @@ describe('useSessionConnectedServicesAuthSwitch', () => {
         await hook.unmount();
     });
 
+    it('labels a per-session pool session by its own applied member, never by an unadopted target', async () => {
+        profileState.current.connectedServicesV2[0].profiles.push(
+            { profileId: 'observed', status: 'connected', kind: 'token', providerEmail: 'observed@example.com' },
+            { profileId: 'target', status: 'connected', kind: 'token', providerEmail: 'target@example.com' },
+        );
+        const member = {
+            assignment: 'per_session', profileId: 'observed', decisionId: 'decision-1', reason: 'initial_sampled', appliedAtMs: 1,
+        } as const;
+        const hook = await renderHook((props: Record<string, unknown>) => useSessionConnectedServicesAuthSwitch({
+            sessionId: 'session-1', agentId: 'claude', machineId: 'machine-1',
+            agentCore: { ...AGENTS_CORE.claude, connectedServices: { supportedServiceIds: ['anthropic'] } },
+            sessionMetadata: { connectedServices: { v: 1, bindingsByServiceId: {
+                anthropic: { source: 'connected', selection: 'group', groupId: 'team', ...props },
+            } } },
+            settings: { connectedServicesProfileLabelByKey: {}, connectedServicesDefaultProfileByServiceId: {} },
+            switchingDisabledReason: null,
+        }), { initialProps: { materializedAssignment: { profileId: 'target', decisionId: 'decision-2' } } as Record<string, unknown> });
+        const label = () => hook.getCurrent().connectedServicesAuthChip?.collapsedContentPopover?.label;
+        expect(label()).toContain('work@example.com');
+        expect(label()).not.toContain('target@example.com');
+        await hook.rerender({ member, materializedAssignment: { profileId: 'target', decisionId: 'decision-2' } });
+        expect(label()).toContain('observed@example.com');
+        expect(buildSessionConnectedServicesBindings({ supportedServiceIds: ['anthropic'], bindingsByServiceId: {
+            anthropic: { source: 'connected', selection: 'group', groupId: 'team', appliedProfileId: 'observed', member },
+        } })).toEqual({ v: 1, bindingsByServiceId: {
+            anthropic: { source: 'connected', selection: 'group', groupId: 'team' },
+        } });
+        await hook.unmount();
+    });
+
     it.each(['work', 'missing-profile', null])('previews the armed Agent literal default without offering source auth changes (%s)', async (profileId) => {
         const hook = await renderHook(() => useSessionConnectedServicesAuthSwitch({
             sessionId: 'session-1',

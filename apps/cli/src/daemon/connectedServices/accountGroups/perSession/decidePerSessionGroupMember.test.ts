@@ -147,7 +147,22 @@ describe('decidePerSessionGroupMember', () => {
 
   it('rejects a named member that is not in the group', async () => {
     const { input } = baseInput({ scores: { a: 50 }, initialProfileId: 'zzz' });
-    expect(await decidePerSessionGroupMember(input)).toEqual({ kind: 'initial_profile_invalid', profileId: 'zzz' });
+    expect(await decidePerSessionGroupMember(input)).toMatchObject({
+      kind: 'initial_profile_invalid', profileId: 'zzz', code: 'initial_profile_not_member',
+    });
+  });
+
+  it('rejects a disabled named member as configuration-invalid instead of failing over', async () => {
+    const { input } = baseInput({ scores: { a: 80, b: 60 }, initialProfileId: 'a' });
+    const disabled = { ...input, members: input.members.map((member) => (member.profileId === 'a' ? { ...member, enabled: false } : member)) };
+    expect(await decidePerSessionGroupMember(disabled)).toMatchObject({
+      kind: 'initial_profile_invalid', profileId: 'a', code: 'initial_profile_disabled',
+    });
+  });
+
+  it('starts an eligible named member even when its quota is unknown', async () => {
+    const { input } = baseInput({ scores: { a: null, b: 90 }, initialProfileId: 'a' });
+    expect(await decidePerSessionGroupMember(input)).toMatchObject({ kind: 'assigned', proposal: { profileId: 'a', reason: 'initial_requested' } });
   });
 
   it('recomputes a sampled choice after a definite conflict using the returned reservations', async () => {

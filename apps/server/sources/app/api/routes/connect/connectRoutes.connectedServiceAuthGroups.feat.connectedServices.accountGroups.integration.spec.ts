@@ -3424,10 +3424,10 @@ describe("connectRoutes connected service auth groups (integration)", () => {
             expect(listed.json().reservationRevision).toBe(3);
             expect(listed.json().reservations.map((r: { decisionId: string }) => r.decisionId).sort()).toEqual(["d1", "d2"]);
 
-            const deleted = await app.inject({ method: "DELETE", url: `${base}/d1`, headers: authHeaders(user.id) });
+            const deleted = await app.inject({ method: "DELETE", url: `${base}/d1`, headers: { "x-test-user-id": user.id } });
             expect(deleted.statusCode).toBe(200);
             expect(deleted.json()).toEqual({ reservationRevision: 4, deleted: true });
-            const deletedAgain = await app.inject({ method: "DELETE", url: `${base}/d1`, headers: authHeaders(user.id) });
+            const deletedAgain = await app.inject({ method: "DELETE", url: `${base}/d1`, headers: { "x-test-user-id": user.id } });
             expect(deletedAgain.json()).toEqual({ reservationRevision: 4, deleted: false });
 
             const missingGroup = await app.inject({ method: "GET", url: "/v3/connect/claude-subscription/groups/missing/assignment-reservations", headers: authHeaders(user.id) });

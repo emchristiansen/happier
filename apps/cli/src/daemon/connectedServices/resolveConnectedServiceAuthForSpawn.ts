@@ -56,6 +56,12 @@ import { evaluatePredictiveSoftSwitchPolicy } from './accountGroups/switching/pr
 import type { ConnectedServiceRefreshFailureCategory } from './credentials/lifecycleTypes';
 import { persistCredentialHealthForMaterializationFailure } from './refresh/refreshDiagnostics';
 import { verifySpawnResumeReachability } from './verifySpawnResumeReachability';
+import { DEFAULT_SWITCH_LEASE_TIMEOUT_MS } from './accountGroups/switching/pipeline/switchPipeline';
+import {
+  resolvePerSessionGroupMemberForSpawn,
+  type PerSessionSpawnAssignment,
+  type PerSessionSpawnAssignmentDeps,
+} from './accountGroups/perSession/resolvePerSessionGroupMemberForSpawn';
 
 type ConnectedServiceAuthGroupResponse = Readonly<{
   v?: number;
@@ -786,6 +792,8 @@ async function resolveCredentialBindings(params: Readonly<{
   authGroupSwitchCoordinator?: ConnectedServiceAuthGroupPreTurnSwitchCoordinator | null;
   predictiveSoftSwitchMode: 'supported' | 'unsupported';
   quotaProbeDeadlineAtMs?: number;
+  perSessionAssignment: PerSessionSpawnAssignmentDeps | null;
+  perSessionDeadlineAtMs: number;
 }>): Promise<Readonly<{
   credentialBindings: ReadonlyArray<{ serviceId: ConnectedServiceId; profileId: string }>;
   groupSelections: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedGroupSelection>;
@@ -810,6 +818,44 @@ async function resolveCredentialBindings(params: Readonly<{
     });
     if (!group) {
       throw new Error(`Missing connected service auth group (${selection.serviceId}/${selection.groupId})`);
+    }
+    const groupPolicy = (group as { policy?: { strategy?: unknown } }).policy;
+    if (groupPolicy?.strategy === 'per_session_softmax') {
+      // Per-session assignment: never read or move the group's shared pointer (spec A.4).
+      const state = isFullAuthGroup(group)
+        ? buildSpawnSwitchState({
+          group,
+          accountUsageStore: params.accountUsageStore,
+          runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
+          nowMs: params.nowMs,
+        })
+        : null;
+      if (!state) {
+        throw new Error(`Connected service auth group state unavailable for per-session assignment (${selection.serviceId}/${selection.groupId})`);
+      }
+      const assignment = await resolvePerSessionGroupMemberForSpawn({
+        serviceId: selection.serviceId,
+        groupId: selection.groupId,
+        selection,
+        state,
+        sessionId: params.sessionId,
+        quotaFreshnessMs: params.quotaFreshnessMs,
+        nowMs: () => Date.now(),
+        deadlineAtMs: params.perSessionDeadlineAtMs,
+        deps: params.perSessionAssignment,
+      });
+      credentialBindings.push({ serviceId: selection.serviceId, profileId: assignment.profileId });
+      groupSelections.set(selection.serviceId, {
+        groupId: selection.groupId,
+        activeProfileId: assignment.profileId,
+        fallbackProfileId: assignment.profileId,
+        generation: typeof group.generation === 'number' && Number.isFinite(group.generation) ? group.generation : 0,
+        policy: group.policy ?? null,
+        // One member per decision: spawn retries never move to another member behind the decision.
+        memberCount: 1,
+        perSession: assignment,
+      });
+      continue;
     }
     const selectedGroup = await maybeSelectGroupActiveProfileForSpawn({
       group,
@@ -852,6 +898,8 @@ type ConnectedServiceResolvedGroupSelection = Readonly<{
   generation: number;
   policy: unknown;
   memberCount: number;
+  /** Present for per_session_softmax groups: the session's own member, materialized via its member home. */
+  perSession?: PerSessionSpawnAssignment;
 }>;
 
 function isAuthoritativeGroupActiveProfileEligible(params: Readonly<{
@@ -1079,6 +1127,17 @@ function buildSelectionsByServiceIdForSpawn(params: Readonly<{
     }
     const group = params.groupSelections.get(selection.serviceId);
     if (!group) continue;
+    if (group.perSession) {
+      // The member's own profile home, bypassing the shared group-home writer and verifier.
+      selectionsByServiceId.set(selection.serviceId, {
+        kind: 'profile',
+        serviceId: selection.serviceId,
+        profileId: group.perSession.profileId,
+        credentialRevision: params.credentialRevisionsByServiceId.get(selection.serviceId) ?? null,
+        record,
+      });
+      continue;
+    }
     selectionsByServiceId.set(selection.serviceId, {
       kind: 'group',
       serviceId: selection.serviceId,
@@ -1116,6 +1175,14 @@ function buildCanonicalConnectedServicesBindingsForSpawn(params: Readonly<{
       source: 'connected',
       selection: 'group',
       groupId: group.groupId,
+      ...(selection.initialProfileId ? { initialProfileId: selection.initialProfileId } : {}),
+      ...(group.perSession?.binding.kind === 'member' ? { member: group.perSession.binding.member } : {}),
+      ...(group.perSession?.binding.kind === 'materialized'
+        ? {
+          ...(selection.member ? { member: selection.member } : {}),
+          materializedAssignment: group.perSession.binding.materializedAssignment,
+        }
+        : {}),
     };
   }
 
@@ -1127,8 +1194,21 @@ function buildCanonicalConnectedServicesBindingsForSpawn(params: Readonly<{
 
 function buildRuntimeAccountIdentitySelectionsForSpawn(
   selectionsByServiceId: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedSelection>,
+  groupSelections: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedGroupSelection> = new Map(),
 ): RuntimeAccountIdentitySelectionInput[] {
   return Array.from(selectionsByServiceId.values()).map((selection) => {
+    const perSessionGroup = groupSelections.get(selection.serviceId);
+    if (selection.kind === 'profile' && perSessionGroup?.perSession) {
+      // Group-scoped identity on the session's own member; no shared generation applies.
+      return {
+        serviceId: selection.serviceId,
+        profileId: selection.profileId,
+        groupId: perSessionGroup.groupId,
+        groupGeneration: null,
+        record: selection.record,
+        source: 'spawn_selection',
+      };
+    }
     if (selection.kind === 'group') {
       return {
         serviceId: selection.serviceId,
@@ -1310,6 +1390,8 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
   sessionStateMode?: 'existing';
   signal?: AbortSignal;
   onCleanup?: (cleanup: () => Promise<void>) => void;
+  /** Daemon facilities for per_session_softmax groups; null means this host cannot serve one. */
+  perSessionAssignment?: PerSessionSpawnAssignmentDeps | null;
 }>): Promise<Readonly<{
   env: Record<string, string>;
   materializationRoot?: string | null;
@@ -1348,6 +1430,9 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
     authGroupSwitchCoordinator: params.authGroupSwitchCoordinator ?? null,
     predictiveSoftSwitchMode: credentialLifecycleDescriptor.predictiveSoftSwitch.mode,
     quotaProbeDeadlineAtMs: params.quotaProbeDeadlineAtMs,
+    perSessionAssignment: params.perSessionAssignment ?? null,
+    // The caller's existing spawn deadline; otherwise the existing switch-lease timeout.
+    perSessionDeadlineAtMs: params.quotaProbeDeadlineAtMs ?? nowMs + DEFAULT_SWITCH_LEASE_TIMEOUT_MS,
   });
   params.signal?.throwIfAborted();
 
@@ -1464,7 +1549,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
       return {
         ...materialized,
         connectedServicesBindings,
-        runtimeAccountIdentitySelections: buildRuntimeAccountIdentitySelectionsForSpawn(selectionsByServiceId),
+        runtimeAccountIdentitySelections: buildRuntimeAccountIdentitySelectionsForSpawn(selectionsByServiceId, groupSelections),
       };
     } catch (error) {
       if (!(error instanceof ConnectedServiceSpawnMaterializationError)) throw error;

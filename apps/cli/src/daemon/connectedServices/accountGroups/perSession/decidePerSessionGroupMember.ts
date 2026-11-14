@@ -43,7 +43,7 @@ export type PerSessionAssignmentProposal = Readonly<{
 export type PerSessionAssignmentDecision =
   | Readonly<{ kind: 'assigned'; proposal: PerSessionAssignmentProposal & { custody: PerSessionAssignmentCustody } }>
   | Readonly<{ kind: 'no_candidate'; selection: ConnectedServiceAuthGroupCandidateSelection }>
-  | Readonly<{ kind: 'initial_profile_invalid'; profileId: string }>;
+  | Readonly<{ kind: 'initial_profile_invalid'; profileId: string; code: 'initial_profile_not_member' | 'initial_profile_disabled'; exclusionReason?: string }>;
 
 export type DecidePerSessionGroupMemberInput = Readonly<{
   serviceId: ConnectedServiceId;
@@ -90,9 +90,14 @@ export function countLiveReservations(
   return counts;
 }
 
-function isNamedMemberEligible(input: DecidePerSessionGroupMemberInput, profileId: string): boolean {
+/** Named-member classification: eligible, runtime-unavailable (fail over), or configuration-invalid (reject). */
+function classifyNamedMember(
+  input: DecidePerSessionGroupMemberInput,
+  profileId: string,
+): Readonly<{ kind: 'eligible' } | { kind: 'runtime_unavailable' } | { kind: 'configuration_invalid'; exclusionReason: string }> {
   const member = input.members.find((candidate) => candidate.profileId === profileId);
-  if (!member) return false;
+  if (!member) return { kind: 'configuration_invalid', exclusionReason: 'not_member' };
+  if (!member.enabled) return { kind: 'configuration_invalid', exclusionReason: 'disabled' };
   // Eligibility only: reuse every hard exclusion via a deterministic single-member evaluation.
   const selection = selectConnectedServiceAuthGroupCandidate({
     nowMs: input.nowMs(),
@@ -104,7 +109,12 @@ function isNamedMemberEligible(input: DecidePerSessionGroupMemberInput, profileI
     memberStatesByProfileId: input.memberStatesByProfileId,
     ...(input.requiredModelIds ? { requiredModelIds: input.requiredModelIds } : {}),
   });
-  return selection.selected?.profileId === profileId;
+  if (selection.selected?.profileId === profileId) return { kind: 'eligible' };
+  const exclusion = selection.excluded.find((entry) => entry.profileId === profileId);
+  // Disabled or not entitled is configuration-invalid; every other exclusion is runtime availability.
+  return exclusion?.reason === 'disabled'
+    ? { kind: 'configuration_invalid', exclusionReason: 'disabled' }
+    : { kind: 'runtime_unavailable' };
 }
 
 function drawMember(
@@ -143,10 +153,16 @@ type Choice = Readonly<{
 
 export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMemberInput): Promise<PerSessionAssignmentDecision> {
   const initialProfileId = input.initialProfileId ?? null;
-  if (initialProfileId && !input.members.some((member) => member.profileId === initialProfileId)) {
-    return { kind: 'initial_profile_invalid', profileId: initialProfileId };
+  const named = initialProfileId ? classifyNamedMember(input, initialProfileId) : null;
+  if (initialProfileId && named?.kind === 'configuration_invalid') {
+    return {
+      kind: 'initial_profile_invalid',
+      profileId: initialProfileId,
+      code: named.exclusionReason === 'not_member' ? 'initial_profile_not_member' : 'initial_profile_disabled',
+      exclusionReason: named.exclusionReason,
+    };
   }
-  const namedStartEligible = initialProfileId !== null && isNamedMemberEligible(input, initialProfileId);
+  const namedStartEligible = named?.kind === 'eligible';
   const sampledReason: ConnectedServiceGroupMemberAssignmentReasonV1 = input.switchReason
     ? 'failover'
     : initialProfileId ? 'initial_unavailable_failover' : 'initial_sampled';

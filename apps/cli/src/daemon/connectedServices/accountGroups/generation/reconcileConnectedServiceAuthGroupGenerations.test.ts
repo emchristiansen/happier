@@ -251,6 +251,46 @@ describe('reconcileConnectedServiceAuthGroupGenerations', () => {
     },
   );
 
+  it('T6: leaves per-session-owned sessions on their own member when the group generation moves', async () => {
+    const shared = groupTarget('shared-session');
+    const assigned: ConnectedServiceGenerationRuntimeTarget = {
+      ...groupTarget('assigned-session'),
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: {
+          'openai-codex': {
+            source: 'connected', selection: 'group', groupId: 'team',
+            member: { assignment: 'per_session', profileId: 'old', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 },
+          },
+        },
+      },
+    };
+    const pending: ConnectedServiceGenerationRuntimeTarget = {
+      ...groupTarget('pending-session'),
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: {
+          'openai-codex': {
+            source: 'connected', selection: 'group', groupId: 'team',
+            materializedAssignment: { profileId: 'old', decisionId: 'd2', reason: 'failover', materializedAtMs: 2 },
+          },
+        },
+      },
+    };
+    const { consumer, applyCommittedGeneration } = createConsumer();
+    await reconcileConnectedServiceAuthGroupGenerations({
+      consumer,
+      listCurrentGroups: async () => [group({ generation: 7, activeProfileId: 'backup' })],
+      resolveCredentialRevision: () => credentialRevision,
+      listRuntimeTargets: () => [shared, assigned, pending],
+      executionAuthority: 'passive_projection',
+    });
+    const appliedSessionIds = applyCommittedGeneration.mock.calls.map((call) => call[0].sessionId);
+    expect(appliedSessionIds).toContain('shared-session');
+    expect(appliedSessionIds).not.toContain('assigned-session');
+    expect(appliedSessionIds).not.toContain('pending-session');
+  });
+
   it('does not dispatch a frozen runtime target that is replaced while group truth is loading', async () => {
     const target = groupTarget('same-session');
     let isCurrent = true;

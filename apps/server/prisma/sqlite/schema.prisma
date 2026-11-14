@@ -1105,12 +1105,15 @@ model ConnectedServiceAuthGroup {
     activeProfileId String?
     generation      Int      @default(0)
     runtimeStateRevision Int  @default(0)
+    // Advances on every change to the live assignment-reservation set; independent of generation.
+    reservationRevision  Int  @default(0)
     stateJson       String?
     createdAt       DateTime @default(now())
     updatedAt       DateTime @updatedAt
 
     account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
     members ConnectedServiceAuthGroupMember[]
+    assignmentReservations ConnectedServiceAssignmentReservation[]
 
     @@unique([accountId, vendor, groupId])
     @@index([accountId, vendor])
@@ -1135,6 +1138,24 @@ model ConnectedServiceAuthGroupMember {
     @@unique([accountId, vendor, groupId, profileId], map: "csagm_account_vendor_group_profile_key")
     @@index([groupDbId])
     @@index([accountId, vendor, profileId])
+}
+
+// Shared per-session assignment counts for a per_session_softmax pool (one row per decision).
+// Rows with leaseUntilMs <= now are expired: never counted, and pruned on the next write.
+model ConnectedServiceAssignmentReservation {
+    id             String @id @default(cuid())
+    groupDbId      String
+    decisionId     String
+    profileId      String
+    sessionId      String
+    ownerMachineId String
+    state          String
+    createdAtMs    BigInt
+    leaseUntilMs   BigInt
+
+    group ConnectedServiceAuthGroup @relation(fields: [groupDbId], references: [id], onDelete: Cascade)
+
+    @@unique([groupDbId, decisionId], map: "csar_group_decision_key")
 }
 
 //

@@ -8,6 +8,7 @@ import {
 import { getAgentCore, isAgentId } from '@/agents/catalog/catalog';
 import type { ConnectedServiceQuotaProfileRefProvenance } from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
 import { parseConnectedServicesBindingsByServiceIdFromAgentOptionState } from '@/sync/domains/connectedServices/connectedServicesAgentOptionStateBindings';
+import { resolveConnectedServiceGroupBindingAppliedProfileId } from '@/sync/domains/connectedServices/resolveConnectedServiceGroupBindingAppliedProfileId';
 import { resolveConnectedServiceCredentialHealthStatus } from '@/sync/domains/connectedServices/resolveConnectedServiceCredentialHealthStatus';
 import type { Metadata } from '@/sync/domains/state/storageTypes';
 
@@ -85,6 +86,13 @@ function resolveBindingProfileId(params: Readonly<{
     const groupId =
         readTrimmedString(optionBindingRecord?.groupId)
         ?? readTrimmedString(params.payloadBinding?.groupId);
+    const appliedGroupProfileId = selection === 'group'
+        ? readTrimmedString(resolveConnectedServiceGroupBindingAppliedProfileId(optionBindingRecord))
+            ?? readTrimmedString(resolveConnectedServiceGroupBindingAppliedProfileId(params.payloadBinding))
+        : null;
+    if (appliedGroupProfileId && groupId) {
+        return { profileId: appliedGroupProfileId, selection: 'group', groupId };
+    }
     if (explicitProfileId) {
         return {
             profileId: explicitProfileId,

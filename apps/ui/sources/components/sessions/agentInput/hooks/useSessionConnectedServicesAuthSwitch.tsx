@@ -47,6 +47,10 @@ import {
     resolveNewSessionConnectedServicesBindingsForAgent,
 } from '@/components/sessions/new/modules/connectedServicesNewSessionBindings';
 import { useProfile } from '@/sync/store/hooks';
+import {
+    readConnectedServiceGroupBindingMember,
+    resolveConnectedServiceGroupBindingAppliedProfileId,
+} from '@/sync/domains/connectedServices/resolveConnectedServiceGroupBindingAppliedProfileId';
 import { t } from '@/text';
 import {
     createManualAuthSwitchRestartSignal,
@@ -245,8 +249,9 @@ function readBinding(value: unknown): ConnectedServicesServiceBinding | null {
     if (source === 'native') return { source: 'native' };
     if (selection === 'group' && groupId) {
         const appliedProfileId = typeof raw.appliedProfileId === 'string' ? raw.appliedProfileId.trim() : '';
+        const member = readConnectedServiceGroupBindingMember(raw);
         return { source: 'connected', selection: 'group', groupId, ...(profileId ? { profileId } : {}),
-            ...(appliedProfileId ? { appliedProfileId } : {}) };
+            ...(appliedProfileId ? { appliedProfileId } : {}), ...(member ? { member } : {}) };
     }
     if (profileId) return { source: 'connected', selection: 'profile', profileId };
     return null;
@@ -283,7 +288,8 @@ function areBindingsEqual(
         const rightBinding = right[serviceId];
         if (leftBinding?.source === 'connected' && leftBinding.selection === 'group'
             && rightBinding?.source === 'connected' && rightBinding.selection === 'group'
-            && leftBinding.appliedProfileId !== rightBinding.appliedProfileId) return false;
+            && resolveConnectedServiceGroupBindingAppliedProfileId(leftBinding)
+                !== resolveConnectedServiceGroupBindingAppliedProfileId(rightBinding)) return false;
     }
     return true;
 }
@@ -313,7 +319,8 @@ export function buildSessionConnectedServicesBindings(params: Readonly<{
     for (const serviceId of params.supportedServiceIds) {
         const binding = params.bindingsByServiceId[serviceId] ?? { source: 'native' };
         if (binding.source === 'connected' && binding.selection === 'group') {
-            const { appliedProfileId: _appliedProfileId, ...selection } = binding;
+            // Applied identity and the internal per-session assignment are runtime evidence, never switch input.
+            const { appliedProfileId: _appliedProfileId, member: _member, ...selection } = binding;
             bindingsByServiceId[serviceId] = selection;
         } else {
             bindingsByServiceId[serviceId] = binding;

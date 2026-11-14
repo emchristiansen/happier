@@ -7,7 +7,11 @@ import {
   type PerSessionOffsetOddsCandidateInput,
 } from './perSessionOffsetOddsSelection';
 
-const defaults = { temperature: 1.5, offsetPercent: 10, softSwitchRemainingPercent: 15 } as const;
+const defaults: Readonly<{ temperature: number; offsetPercent: number; softSwitchRemainingPercent: number }> = {
+  temperature: 1.5,
+  offsetPercent: 10,
+  softSwitchRemainingPercent: 15,
+};
 
 function unreserved(scores: ReadonlyArray<number>): PerSessionOffsetOddsCandidateInput[] {
   return scores.map((score, index) => ({ profileId: `m${index}`, remainingPercent: score, reservationCount: 0 }));

@@ -1130,7 +1130,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
                             subtitle={fallbackDisabledSubtitle ?? t('connectedServices.detail.groupDetail.softmaxTemperatureSubtitle', {
                                 value: String(resolveConnectedServiceGroupSoftmaxTemperature(group)),
                             })}
-                            icon={<Icon name="thermometer" size={20} color={theme.colors.accent.indigo} />}
+                            icon={<Icon name="flame" size={20} color={theme.colors.accent.indigo} />}
                             disabled={!softmaxControlsEnabled}
                             onPress={softmaxControlsEnabled ? handleEditSoftmaxTemperature : undefined}
                         />
@@ -1140,7 +1140,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
                             subtitle={fallbackDisabledSubtitle ?? t('connectedServices.detail.groupDetail.softmaxOffsetSubtitle', {
                                 value: String(resolveConnectedServiceGroupSoftmaxOffsetPercent(group)),
                             })}
-                            icon={<Icon name="plus-minus" size={20} color={theme.colors.accent.indigo} />}
+                            icon={<Icon name="arrows-left-right" size={20} color={theme.colors.accent.indigo} />}
                             disabled={!softmaxControlsEnabled}
                             onPress={softmaxControlsEnabled ? handleEditSoftmaxOffsetPercent : undefined}
                         />
@@ -1148,7 +1148,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
                             testID="connected-services-pool-detail:softmax-formula"
                             title={t('connectedServices.detail.groupDetail.softmaxFormulaTitle')}
                             subtitle={t('connectedServices.detail.groupDetail.softmaxFormulaBody')}
-                            icon={<Icon name="function" size={20} color={theme.colors.text.secondary} />}
+                            icon={<Icon name="info" size={20} color={theme.colors.text.secondary} />}
                             showChevron={false}
                         />
                     </>
