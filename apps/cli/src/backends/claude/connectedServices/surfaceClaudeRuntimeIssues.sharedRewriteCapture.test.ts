@@ -20,6 +20,8 @@ import { captureClaudeRuntimeAuthRequestIdentity, surfaceClaudeRateLimitRuntimeI
 // application, materializer, credential/root/provenance writers, identity reader, capture and fence
 // are all real. Daemon transport is the only substituted boundary.
 const readGate = vi.hoisted(() => ({ before: null as null | (() => Promise<void>), path: '' }));
+// Publication-failure seam: the real atomic writer's final rename onto one destination path.
+const renameGate = vi.hoisted(() => ({ fail: null as null | NodeJS.ErrnoException, path: '', failures: 0 }));
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return {
@@ -31,6 +33,13 @@ vi.mock('node:fs/promises', async (importOriginal) => {
         await before();
       }
       return await actual.readFile(...args);
+    },
+    rename: async (...args: Parameters<typeof actual.rename>) => {
+      if (renameGate.fail && String(args[1]) === renameGate.path) {
+        renameGate.failures += 1;
+        throw renameGate.fail;
+      }
+      return await actual.rename(...args);
     },
   };
 });
@@ -146,6 +155,8 @@ describe('request identity capture against the real shared group writer', () => 
 
   afterEach(async () => {
     readGate.before = null;
+    renameGate.fail = null;
+    renameGate.failures = 0;
     if (previousSelections === undefined) delete process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
     else process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY] = previousSelections;
     if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
@@ -234,5 +245,43 @@ describe('request identity capture against the real shared group writer', () => 
 
     const reported = await reportedFailure(session as never);
     expect(reported).toMatchObject({ groupGeneration: 4, credentialRevision: revA, sourceProviderAccountId: 'acct-a' });
+  });
+  it.each([
+    { name: 'generation 4 to 5', move: { profileId: 'b', generation: 5, credentialRevision: revB } },
+    { name: 'same-profile same-generation credential revision', move: { profileId: 'a', generation: 4, credentialRevision: revB } },
+  ])('reports the account unproven when a $name rewrite fails at its final provenance publication', async ({ name, move }) => {
+    const fence = new ClaudeConnectedServiceAuthGroupRequestFence();
+    fence.applyCurrentTruth(initialTruth);
+    const session = runnerSession(`partial-${name}`, fence);
+    renameGate.path = join(configDir, '.happier-claude-connected-service-home.json');
+    renameGate.fail = Object.assign(new Error('injected EACCES at provenance publication'), { code: 'EACCES' });
+    const { releaseNotification, consumption } = startSharedConsumer(move, fence, session.client.sessionId);
+    releaseNotification();
+    const outcome = await consumption as { ok?: boolean };
+    renameGate.fail = null;
+
+    // Credentials and root identity moved to B; the provenance publication failed; nothing was
+    // acknowledged and the runner was never told of a new generation.
+    expect(renameGate.failures).toBe(1);
+    expect(outcome.ok).toBe(false);
+    expect(fence.readCurrentTruth()).toEqual(initialTruth);
+    const { readFile } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    expect(JSON.parse(await readFile(join(configDir, '.claude.json'), 'utf8')).oauthAccount.accountUuid).toBe('acct-b');
+    await expect(readFile(renameGate.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await captureClaudeRuntimeAuthRequestIdentity(session);
+    expect(await reportedFailure(session)).toMatchObject({
+      groupGeneration: 4, credentialRevision: revA, sourceProviderAccountId: null, sourceProviderOrganizationId: null,
+    });
+
+    // A later successful publication of the same move restores a coherent, attributable home.
+    await applyDirectly(move);
+    fence.applyCurrentTruth({ ...initialTruth, generation: move.generation, credentialRevision: move.credentialRevision });
+    process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY] = JSON.stringify([{ kind: 'group',
+      serviceId: 'claude-subscription', groupId: 'team-pool', activeProfileId: move.profileId, fallbackProfileId: 'a',
+      generation: move.generation, credentialRevision: move.credentialRevision }]);
+    const recovered = runnerSession(`partial-recovered-${name}`, fence);
+    await captureClaudeRuntimeAuthRequestIdentity(recovered);
+    expect(await reportedFailure(recovered)).toMatchObject({ sourceProviderAccountId: 'acct-b', sourceProviderOrganizationId: 'org-b' });
   });
 });

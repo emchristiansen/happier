@@ -67,6 +67,41 @@ describe('createClaudeRemotePromptSettlementTracker', () => {
     })).toBe(false);
   });
 
+  it('admits a result as the foreground outcome unless it answers only earlier submissions', () => {
+    const tracker = createClaudeRemotePromptSettlementTracker({});
+    const submit = (message: string) => {
+      const prompt = { message, mode: {} as never };
+      tracker.track(prompt);
+      return tracker.submit(prompt);
+    };
+    const a = submit('A');
+    expect(tracker.admitResult({ type: 'result', user_message_uuid: a, queued_turn_count: 0 }))
+      .toMatchObject({ replayed: false, forLatestPrompt: true, retainForeground: false, ownsForeground: true });
+    // Nothing awaits a result now. A provider-injected turn (an id this runner never submitted)
+    // keeps the legacy queue boundary: it is the foreground outcome.
+    expect(tracker.admitResult({ type: 'result', user_message_uuid: 'provider-injected-turn', queued_turn_count: 0 }))
+      .toMatchObject({ forLatestPrompt: false, retainForeground: false, ownsForeground: true });
+    const b = submit('B');
+    // B's own frame (e.g. a retryable auth error) consumes B's pending-result state...
+    expect(tracker.admitResult({ type: 'result', user_message_uuid: b, queued_turn_count: 0 }))
+      .toMatchObject({ forLatestPrompt: true, ownsForeground: true });
+    // ...so retention can no longer tell: a late result for A is still earlier work, never B's outcome.
+    expect(tracker.admitResult({ type: 'result', user_message_uuid: a, queued_turn_count: 0 }))
+      .toMatchObject({ forLatestPrompt: false, retainForeground: false, ownsForeground: false });
+    // B's own later result still owns the foreground.
+    expect(tracker.admitResult({ type: 'result', user_message_uuid: b, queued_turn_count: 0 }))
+      .toMatchObject({ forLatestPrompt: true, ownsForeground: true });
+    // A merged turn naming both earlier and latest prompts is the latest prompt's outcome.
+    const c = submit('C');
+    expect(tracker.admitResult({ type: 'result', user_message_uuids: [b, c], queued_turn_count: 0 }))
+      .toMatchObject({ forLatestPrompt: true, ownsForeground: true });
+    // Unattributed (older native producer) results keep the legacy boundary.
+    expect(tracker.admitResult({ type: 'result', queued_turn_count: 0 })).toMatchObject({ ownsForeground: true });
+    // A replayed result is decided without touching settlement state.
+    expect(tracker.admitResult({ type: 'result', user_message_uuid: c, isReplay: true }))
+      .toMatchObject({ replayed: true, ownsForeground: false });
+  });
+
   it('acknowledges only submitted UUIDs consumed by a result, without confusing idle or backlog with delivery', () => {
     const onAccepted = vi.fn();
     const onTransportFailure = vi.fn();

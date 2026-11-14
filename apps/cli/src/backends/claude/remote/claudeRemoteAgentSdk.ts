@@ -2413,6 +2413,13 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                 if (resultAdmission.replayed) {
                     continue;
                 }
+                // A result that answers only other (earlier) prompts while nothing it could own is
+                // retained is not this turn's outcome. An earlier auth retry may already have consumed
+                // the pending-result state, so `retainForeground` alone cannot tell; ownership decides
+                // every terminal effect below (failure, completion mark, release, interrupt consumption).
+                if (!resultAdmission.ownsForeground && !resultAdmission.retainForeground) {
+                    continue;
+                }
                 const didRequestThisResult = awaitingRequestedTurnInterruptResult;
                 awaitingRequestedTurnInterruptResult = false;
                 const failure = readAgentSdkResultFailure(message);
@@ -2424,6 +2431,9 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                 if (failure && !retainForeground) {
                     if (isRequestedExecutionInterrupt) {
                         if (!didFinalizeTurn) {
+                            // The requested interrupt's own result may arrive before the interrupt
+                            // acknowledgment: it is that turn's cancellation, never its completion.
+                            releaseThinkingWithoutResult('cancelled');
                             await releaseCurrentTurnForResult();
                         }
                         continue;

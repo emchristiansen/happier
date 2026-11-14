@@ -90,11 +90,16 @@ export function reportClaudeRemoteProviderPromptTransportFailure(
     })).catch(() => {});
 }
 
+/** Earlier submissions remembered to recognize a late result for them (native attribution keeps 64). */
+const SUBMITTED_PROMPT_UUID_MEMORY = 64;
+
 /**
  * The ordered result consumer's single ownership decision for one inbound `result` frame.
  * `ownsForeground` is false for a replayed result, a result while a submitted prompt still awaits
- * its own result (retainForeground), and a result whose native attribution names only other
- * prompts. Unattributed (older native producer) results keep their existing queue boundary.
+ * its own result (retainForeground), and a result whose native attribution names only prompts this
+ * runner submitted earlier (not the latest). Unattributed (older native producer) results and
+ * results naming prompts never submitted here (provider-injected turns) keep their existing
+ * queue boundary.
  */
 export type ClaudeRemoteResultAdmission = Readonly<{
     replayed: boolean;
@@ -120,6 +125,10 @@ export function createClaudeRemotePromptSettlementTracker(options: Readonly<{
     const unresolved = new Map<ClaudeRemoteProviderAcceptedPrompt, string | null>();
     const awaitingResultUuids = new Set<string>();
     let latestSubmittedUuid: string | null = null;
+    // Prompts this runner submitted, most recent last (bounded like native result attribution). A
+    // result naming only earlier ones answers earlier work; one naming an id never submitted here
+    // (e.g. a provider-injected task-notification turn) is not evidence of a foreign result.
+    const submittedUuids: string[] = [];
 
     const isResultForLatestSubmittedPrompt = (message: unknown): boolean =>
         latestSubmittedUuid !== null && readClaudeResultUserMessageUuids(message).includes(latestSubmittedUuid);
@@ -165,6 +174,8 @@ export function createClaudeRemotePromptSettlementTracker(options: Readonly<{
             unresolved.set(prompt, uuid);
             awaitingResultUuids.add(uuid);
             latestSubmittedUuid = uuid;
+            submittedUuids.push(uuid);
+            if (submittedUuids.length > SUBMITTED_PROMPT_UUID_MEMORY) submittedUuids.shift();
             return uuid;
         },
         observeProviderMessage(message: unknown): boolean {
@@ -204,13 +215,17 @@ export function createClaudeRemotePromptSettlementTracker(options: Readonly<{
                 return { replayed: true, forLatestPrompt: false, retainForeground: false, ownsForeground: false };
             }
             const forLatestPrompt = isResultForLatestSubmittedPrompt(message);
-            const attributed = readClaudeResultUserMessageUuids(message).length > 0;
+            const answeredUuids = readClaudeResultUserMessageUuids(message);
+            // Earlier work: every prompt it answers was submitted here before, none is the latest.
+            const answersOnlyEarlierSubmissions = answeredUuids.length > 0
+                && !forLatestPrompt
+                && answeredUuids.every((uuid) => submittedUuids.includes(uuid));
             const retainForeground = shouldRetainForegroundForResult(message);
             return {
                 replayed: false,
                 forLatestPrompt,
                 retainForeground,
-                ownsForeground: !retainForeground && (forLatestPrompt || !attributed),
+                ownsForeground: !retainForeground && !answersOnlyEarlierSubmissions,
             };
         },
         /** Commands handled locally have no provider transport to acknowledge. */

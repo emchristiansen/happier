@@ -19,6 +19,7 @@ import {
   isClaudeConnectedServiceHomeGenerationSuperseded,
   matchesClaudeConnectedServiceHomeProvenance,
   readClaudeConnectedServiceHomeProvenance,
+  withdrawClaudeConnectedServiceHomeProvenance,
   writeClaudeConnectedServiceHomeProvenance,
 } from '../claudeConnectedServiceHomeProvenance';
 import {
@@ -222,6 +223,10 @@ export async function materializeClaudeCodeNativeAuth(params: Readonly<{
   }
   let credentialPath: string;
   try {
+    // Every caller that reaches this write republishes the home's provenance only after its
+    // credentials and root identity succeed; withdrawing it first keeps a failed part-way rewrite
+    // from leaving the old record vouching for new bytes. Nothing has mutated if this throws.
+    await withdrawClaudeConnectedServiceHomeProvenance(params.claudeConfigDir);
     credentialPath = await writeClaudeCodeCredentialsFile({
       claudeConfigDir: params.claudeConfigDir,
       payload: built.payload,
