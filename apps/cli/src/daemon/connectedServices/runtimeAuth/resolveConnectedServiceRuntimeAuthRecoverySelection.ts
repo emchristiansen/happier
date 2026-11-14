@@ -98,6 +98,8 @@ export function resolveConnectedServiceRuntimeAuthRecoverySelection(input: Reado
           kind: 'group',
           serviceId: ownedGroup.serviceId,
           groupId: ownedGroup.groupId,
+          // The physical member this runner serves on is the session's active account.
+          activeProfileId: childEnvSelection.profileId,
           fallbackProfileId: reportedProfileId || childEnvSelection.profileId,
         },
         source: 'tracked_spawn_options',

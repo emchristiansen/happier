@@ -20,6 +20,7 @@ import { createCryptoUniformSample } from '../selection/perSessionOffsetOddsSele
 import type { PerSessionAssignmentProposal } from './decidePerSessionGroupMember';
 import { decidePerSessionGroupMemberUntilSettled } from './decidePerSessionGroupMemberUntilSettled';
 import { isPerSessionMemberEligible } from './resolvePerSessionGroupMemberForSpawn';
+import { resolveConnectedServiceMemberHoldApplicationRefusal } from '../holds/connectedServiceMemberHolds';
 import type { PerSessionAssignmentLedger } from './PerSessionAssignmentLedger';
 
 /** The session's current per-session group binding and the subject its decisions are keyed by. */
@@ -62,11 +63,20 @@ type ClassifiedFailureInput = Readonly<{
   sessionSwitchesThisHour?: number;
 }>;
 
+/** Draw → admission rounds before a recovery reports that no application could be admitted. */
+const PER_SESSION_APPLICATION_ATTEMPTS = 3;
+
 const WAITABLE_REASONS: ReadonlySet<string> = new Set(['usage_limit', 'rate_limit', 'temporary_throttle']);
 
-function applyModeOf(action: string | undefined): 'hot_apply' | 'restart_resume' | undefined {
+/**
+ * The switch FSM's action → the recovery result mode, exactly as the shared daemon coordinator maps
+ * it: an automatic runtime-failure switch persists the target (`metadata_updated`) and leaves the
+ * restart to the recovery owner, which requests it for `spawn_next_turn` (deferred, retirement-proved).
+ */
+function applyModeOf(action: string | undefined): 'hot_apply' | 'restart_resume' | 'spawn_next_turn' | undefined {
   if (action === 'restart_requested') return 'restart_resume';
   if (action === 'hot_applied') return 'hot_apply';
+  if (action === 'metadata_updated') return 'spawn_next_turn';
   return undefined;
 }
 
@@ -107,6 +117,8 @@ export class PerSessionFailoverCoordinator {
       binding: PerSessionApplyBinding;
     }>) => Promise<PerSessionApplyResult>;
     ledger: PerSessionAssignmentLedger;
+    /** Releases a recovery decision that was never applied (ledger entry and reservation). */
+    releaseUnappliedDecision: (decisionId: string) => Promise<void>;
     ownerMachineId: string;
     reservationApi: ConnectedServiceAssignmentReservationApi | null;
     quotaFreshnessMs: number;
@@ -229,104 +241,154 @@ export class PerSessionFailoverCoordinator {
         mode: 'restart_resume',
       };
     }
-    const nowMs = this.deps.nowMs();
-    const eligible = (profileId: string) => isPerSessionMemberEligible(
-      state, profileId, nowMs, this.deps.quotaFreshnessMs, state.requiredModelIds ?? [],
-    );
-    // C3 recheck: a reserved decision whose target is no longer eligible is superseded, not applied.
-    const replayUsable = replay && (replay.proposal.custody === 'proposed' || eligible(replay.proposal.profileId)) ? replay : null;
-    const ineligibleReplay = replay && !replayUsable ? replay : null;
-    if (ineligibleReplay) {
-      this.deps.log?.('per_session_replay_target_ineligible', { decisionId: ineligibleReplay.decisionId, profileId: ineligibleReplay.proposal.profileId });
-    }
-
-    // Earlier targets this decision replaces keep custody, untouched, until it is adopted.
-    const replacesDecisionIds = [
-      ...(targetFailed ? [pendingTarget.decisionId] : []),
-      ...(ineligibleReplay ? [ineligibleReplay.decisionId] : []),
-    ];
-    const resumeProposal = replayUsable?.proposal.custody === 'proposed' ? replayUsable.proposal : null;
-    const decisionId = replayUsable?.decisionId ?? `recovery-${binding.subjectId}-${nowMs.toString(36)}`;
-    let proposal: PerSessionAssignmentProposal;
-    if (replayUsable && !resumeProposal) {
-      proposal = replayUsable.proposal;
-    } else {
-      const excluded = new Set<string>([
-        ...(targetFailed ? [pendingTarget.profileId] : []),
-        ...(ineligibleReplay ? [ineligibleReplay.proposal.profileId] : []),
-      ]);
-      const decision = await decidePerSessionGroupMemberUntilSettled({
-        serviceId,
-        groupId: input.groupId,
-        sessionId: binding.subjectId,
-        ownerMachineId: this.deps.ownerMachineId,
-        decisionId,
-        policy: state.policy,
-        members: state.members,
-        memberStatesByProfileId: state.memberStatesByProfileId,
-        memberHolds: state.memberHolds,
-        quotaFreshnessMs: this.deps.quotaFreshnessMs,
-        nowMs: this.deps.nowMs,
-        currentProfileId: failedProfileId,
-        switchReason: input.reason,
-        // The failed account is no longer an enabled member: the session moves because it was revoked (spec A.4).
-        ...(memberRevoked ? { replacementReason: 'member_revoked' as const } : {}),
-        ...(state.requiredModelIds ? { requiredModelIds: state.requiredModelIds } : {}),
-        ...(excluded.size > 0 ? { additionallyExcludedProfileIds: excluded } : {}),
-        reservationApi: this.deps.reservationApi,
-        // A definite conflict re-reads the group so the redraw uses current eligibility (A.5 R2).
-        reloadMemberState: async () => {
-          const fresh = await this.deps.loadGroup({ serviceId, groupId: input.groupId });
-          if (!fresh) return null;
-          const freshState = await this.deps.buildState(fresh, sessionId);
+    // Earlier targets the next decision replaces keep custody, untouched, until it is adopted.
+    const replacesDecisionIds = new Set<string>(targetFailed ? [pendingTarget.decisionId] : []);
+    const excluded = new Set<string>(targetFailed ? [pendingTarget.profileId] : []);
+    let candidateReplay = replay ?? null;
+    let lastRefusal: Readonly<{ profileId: string; errorCode: string; diagnostics: unknown }> | null = null;
+    for (let attempt = 0; attempt < PER_SESSION_APPLICATION_ATTEMPTS; attempt += 1) {
+      const nowMs = this.deps.nowMs();
+      const eligible = (profileId: string) => isPerSessionMemberEligible(
+        state, profileId, nowMs, this.deps.quotaFreshnessMs, state.requiredModelIds ?? [],
+      );
+      // C3 recheck: a reserved decision whose target is no longer eligible is replaced, not applied.
+      const replayUsable = candidateReplay
+        && (candidateReplay.proposal.custody === 'proposed' || eligible(candidateReplay.proposal.profileId)) ? candidateReplay : null;
+      if (candidateReplay && !replayUsable) {
+        this.deps.log?.('per_session_replay_target_ineligible', { decisionId: candidateReplay.decisionId, profileId: candidateReplay.proposal.profileId });
+        replacesDecisionIds.add(candidateReplay.decisionId);
+        excluded.add(candidateReplay.proposal.profileId);
+      }
+      candidateReplay = null;
+      const replaces = [...replacesDecisionIds];
+      const resumeProposal = replayUsable?.proposal.custody === 'proposed' ? replayUsable.proposal : null;
+      const decisionId = replayUsable?.decisionId ?? `recovery-${binding.subjectId}-${nowMs.toString(36)}${attempt > 0 ? `-${attempt}` : ''}`;
+      let proposal: PerSessionAssignmentProposal;
+      if (replayUsable && !resumeProposal) {
+        proposal = replayUsable.proposal;
+      } else {
+        const decision = await decidePerSessionGroupMemberUntilSettled({
+          serviceId,
+          groupId: input.groupId,
+          sessionId: binding.subjectId,
+          ownerMachineId: this.deps.ownerMachineId,
+          decisionId,
+          policy: state.policy,
+          members: state.members,
+          memberStatesByProfileId: state.memberStatesByProfileId,
+          memberHolds: state.memberHolds,
+          quotaFreshnessMs: this.deps.quotaFreshnessMs,
+          nowMs: this.deps.nowMs,
+          currentProfileId: failedProfileId,
+          switchReason: input.reason,
+          // The failed account is no longer an enabled member: the session moves because it was revoked (spec A.4).
+          ...(memberRevoked ? { replacementReason: 'member_revoked' as const } : {}),
+          ...(state.requiredModelIds ? { requiredModelIds: state.requiredModelIds } : {}),
+          ...(excluded.size > 0 ? { additionallyExcludedProfileIds: new Set(excluded) } : {}),
+          reservationApi: this.deps.reservationApi,
+          // A definite conflict re-reads the group so the redraw uses current eligibility (A.5 R2).
+          reloadMemberState: async () => {
+            const fresh = await this.loadFreshState(serviceId, input.groupId, sessionId);
+            return fresh
+              ? { members: fresh.members, memberStatesByProfileId: fresh.memberStatesByProfileId, memberHolds: fresh.memberHolds }
+              : null;
+          },
+          resumeProposal,
+          localReservationCountsByProfileId: () => this.deps.ledger.localCounts(serviceId, input.groupId, decisionId),
+          uniformSample: this.deps.uniformSample ?? createCryptoUniformSample,
+          persistProposal: async (next) => {
+            await this.deps.ledger.recordProposal({
+              decisionId, sessionId: binding.subjectId, serviceId, groupId: input.groupId,
+              origin: 'recovery', proposal: next, nowMs: this.deps.nowMs(),
+              ...(replaces.length > 0 ? { replacesDecisionIds: replaces } : {}),
+            });
+          },
+          deadlineAtMs: nowMs + this.deps.deadlineMs,
+          ...(this.deps.log ? { log: this.deps.log } : {}),
+        });
+        if (decision.kind === 'no_candidate') {
           return {
-            members: freshState.members,
-            memberStatesByProfileId: freshState.memberStatesByProfileId,
-            memberHolds: freshState.memberHolds,
+            status: 'no_eligible_member',
+            generation: state.generation,
+            groupExhausted: true,
+            retryAtMs: resolveEarliestRetryAtMs(decision.selection.excluded),
+            excluded: decision.selection.excluded,
           };
-        },
-        resumeProposal,
-        localReservationCountsByProfileId: () => this.deps.ledger.localCounts(serviceId, input.groupId, decisionId),
-        uniformSample: this.deps.uniformSample ?? createCryptoUniformSample,
-        persistProposal: async (next) => {
-          await this.deps.ledger.recordProposal({
-            decisionId, sessionId: binding.subjectId, serviceId, groupId: input.groupId,
-            origin: 'recovery', proposal: next, nowMs: this.deps.nowMs(),
-            ...(replacesDecisionIds.length > 0 ? { replacesDecisionIds } : {}),
-          });
-        },
-        deadlineAtMs: nowMs + this.deps.deadlineMs,
-        ...(this.deps.log ? { log: this.deps.log } : {}),
+        }
+        if (decision.kind === 'initial_profile_invalid') {
+          throw new Error(`per-session recovery produced an initial-profile decision (${decision.code})`);
+        }
+        proposal = decision.proposal;
+      }
+
+      // C3 admission after every awaited custody step and before any application, credential access
+      // or persistence: the canonical hold refusal (held or unreadable) and the target's current
+      // membership, health, quota and exact-model eligibility (t_1b770ae5 holds; spec A.5 C3).
+      const refusal = await this.applicationRefusal({
+        serviceId, groupId: input.groupId, sessionId, profileId: proposal.profileId, eligibility: true,
       });
-      if (decision.kind === 'no_candidate') {
-        return {
-          status: 'no_eligible_member',
-          generation: state.generation,
-          groupExhausted: true,
-          retryAtMs: resolveEarliestRetryAtMs(decision.selection.excluded),
-          excluded: decision.selection.excluded,
-        };
+      if (refusal) {
+        // Nothing was applied for this decision: it is released and its target excluded; the next
+        // decision still replaces the earlier failed target, which keeps custody until adoption.
+        this.deps.log?.('per_session_application_refused', { decisionId, profileId: proposal.profileId, errorCode: refusal.errorCode });
+        await this.deps.releaseUnappliedDecision(decisionId);
+        excluded.add(proposal.profileId);
+        lastRefusal = { profileId: proposal.profileId, ...refusal };
+        continue;
       }
-      if (decision.kind === 'initial_profile_invalid') {
-        throw new Error(`per-session recovery produced an initial-profile decision (${decision.code})`);
-      }
-      proposal = decision.proposal;
+
+      return await this.apply({
+        input, sessionId, serviceId, state, failedProfileId,
+        binding,
+        materializedAssignment: {
+          profileId: proposal.profileId,
+          decisionId,
+          reason: proposal.reason,
+          ...(failedProfileId ? { fromProfileId: failedProfileId } : {}),
+          materializedAtMs: this.deps.nowMs(),
+          ...(Number.isFinite(proposal.temperature) ? { temperature: proposal.temperature } : {}),
+          ...(Number.isFinite(proposal.offsetPercent) ? { offsetPercent: proposal.offsetPercent } : {}),
+          ...(proposal.probability === null ? {} : { probability: proposal.probability }),
+        },
+        generation: state.generation,
+      });
     }
-    return await this.apply({
-      input, sessionId, serviceId, state, failedProfileId,
-      binding,
-      materializedAssignment: {
-        profileId: proposal.profileId,
-        decisionId,
-        reason: proposal.reason,
-        ...(failedProfileId ? { fromProfileId: failedProfileId } : {}),
-        materializedAtMs: this.deps.nowMs(),
-        ...(Number.isFinite(proposal.temperature) ? { temperature: proposal.temperature } : {}),
-        ...(Number.isFinite(proposal.offsetPercent) ? { offsetPercent: proposal.offsetPercent } : {}),
-        ...(proposal.probability === null ? {} : { probability: proposal.probability }),
-      },
+    return {
+      status: 'generation_apply_failed',
+      activeProfileId: lastRefusal?.profileId ?? null,
       generation: state.generation,
-    });
+      errorCode: lastRefusal?.errorCode ?? 'per_session_application_refused',
+      ...(lastRefusal?.diagnostics === undefined ? {} : { diagnostics: lastRefusal.diagnostics }),
+    };
+  }
+
+  private async loadFreshState(serviceId: ConnectedServiceId, groupId: string, sessionId: string): Promise<ConnectedServiceAuthGroupSwitchState | null> {
+    const fresh = await this.deps.loadGroup({ serviceId, groupId });
+    return fresh ? await this.deps.buildState(fresh, sessionId) : null;
+  }
+
+  /**
+   * Whether an automatic application of `profileId` to this session must be refused now. Per-session
+   * recovery is runtime recovery, never a fresh user action, so holds are always enforced.
+   */
+  private async applicationRefusal(params: Readonly<{
+    serviceId: ConnectedServiceId;
+    groupId: string;
+    sessionId: string;
+    profileId: string;
+    eligibility: boolean;
+  }>): Promise<Readonly<{ errorCode: string; diagnostics: unknown }> | null> {
+    const fresh = await this.loadFreshState(params.serviceId, params.groupId, params.sessionId);
+    if (!fresh) return { errorCode: 'connected_service_group_missing', diagnostics: { groupId: params.groupId } };
+    const nowMs = this.deps.nowMs();
+    const holdRefusal = resolveConnectedServiceMemberHoldApplicationRefusal({ view: fresh.memberHolds, profileId: params.profileId, nowMs });
+    if (holdRefusal) return holdRefusal;
+    if (params.eligibility && !isPerSessionMemberEligible(
+      fresh, params.profileId, nowMs, this.deps.quotaFreshnessMs, fresh.requiredModelIds ?? [],
+    )) {
+      return { errorCode: 'per_session_target_ineligible_at_application', diagnostics: { profileId: params.profileId } };
+    }
+    return null;
   }
 
   /**
@@ -355,6 +417,13 @@ export class PerSessionFailoverCoordinator {
       if (shared.status !== 'switched' || shared.activeProfileId === params.failedProfileId) return shared;
       target = shared.activeProfileId;
       generation = shared.generation;
+    }
+    // The shared member's own eligibility is the shared pipeline's; holds still govern this application.
+    const refusal = await this.applicationRefusal({
+      serviceId: params.serviceId, groupId: params.input.groupId, sessionId: params.sessionId, profileId: target, eligibility: false,
+    });
+    if (refusal) {
+      return { status: 'generation_apply_failed', activeProfileId: target, generation, errorCode: refusal.errorCode, diagnostics: refusal.diagnostics };
     }
     return await this.apply({
       input: params.input,

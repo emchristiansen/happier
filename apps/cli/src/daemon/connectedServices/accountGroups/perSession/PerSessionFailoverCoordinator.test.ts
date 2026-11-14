@@ -99,6 +99,7 @@ async function fixture(options: Readonly<{
     readSessionBinding: () => binding,
     applyAssignment,
     ledger,
+    releaseUnappliedDecision: async (decisionId) => { await ledger.remove(decisionId); },
     ownerMachineId: 'machine-1',
     reservationApi: null,
     quotaFreshnessMs: 300_000,

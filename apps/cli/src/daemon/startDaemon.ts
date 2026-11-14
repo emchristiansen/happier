@@ -6982,6 +6982,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               perSessionBinding: assignment.binding,
             }),
             ledger: perSessionAssignmentRuntime.spawnDeps.ledger,
+            releaseUnappliedDecision: async (decisionId) => await perSessionAssignmentRuntime.release(decisionId),
             ownerMachineId: machineId,
             reservationApi: api.connectedServiceAssignmentReservations,
             quotaFreshnessMs: resolvePositiveIntEnv(
