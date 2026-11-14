@@ -562,6 +562,17 @@ export function createSessionTurnLifecycle(
             };
         }
 
+        // A provider turn id names one turn. A terminal marker for the turn that already ended
+        // (e.g. its task_complete arriving after failTurn) must not terminalize a newer turn.
+        if (
+            providerTurnId
+            && activeTurn
+            && activeTurn.providerTurnId !== providerTurnId
+            && lastTerminalTurn?.providerTurnId === providerTurnId
+        ) {
+            return { body: input.body, pendingWrite: null };
+        }
+
         const terminalResult = terminalTurnSync({
             provider: input.provider,
             providerTurnId,

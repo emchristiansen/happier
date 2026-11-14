@@ -377,6 +377,35 @@ describe('createDaemonConnectedServiceAuthGroupSwitchCoordinator', () => {
     expect(current.members.map(member => member.state)).toEqual([{ v: 1 }, { v: 1 }]);
   });
 
+  it('leaves an unrelated valid member selectable and unmodified after an unattributed provider limit', async () => {
+    // Provider-proven limit facts whose account is unproven (request identity contradicts the
+    // provider organization) must not quarantine or annotate any member, including one with no
+    // fresh quota evidence.
+    let current = group('primary', 1);
+    const updateRuntimeState = vi.fn(async () => current);
+    const api = {
+      getConnectedServiceAuthGroup: async () => current,
+      updateConnectedServiceAuthGroupRuntimeState: updateRuntimeState,
+      updateConnectedServiceAuthGroupActiveProfile: async (input: { activeProfileId: string }) => {
+        current = { ...current, activeProfileId: input.activeProfileId, generation: current.generation + 1 };
+        return current;
+      },
+    };
+    const coordinator = createTestDaemonConnectedServiceAuthGroupSwitchCoordinator({
+      api, runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
+      quotaFreshnessMs: 60_000, nowMs: () => 1_000, restartSession: async () => {},
+      probeQuotaSnapshotsForGroup: async () => {},
+    });
+    const result = await coordinator.switchAfterClassifiedFailure({
+      serviceId: 'openai-codex', groupId: 'main', reason: 'usage_limit', observedProfileId: null,
+      resetsAtMs: 1_000 + 4 * 24 * 60 * 60 * 1000, quotaScope: 'account', limitCategory: 'usage_limit',
+      allowCurrentProfileRetry: true, switchesThisTurn: 0,
+    });
+    expect(result).toMatchObject({ status: 'switched', activeProfileId: 'backup' });
+    expect(updateRuntimeState).not.toHaveBeenCalled();
+    expect(current.members.map((member) => member.state)).toEqual([{ v: 1 }, { v: 1 }]);
+  });
+
   it('loads group state, commits the selected member, and requests a session restart for rematerialization', async () => {
     const backupRevision = 'csr_abcdefghijklmnopqrstuv';
     const api = {

@@ -39,7 +39,6 @@ import { readClaudeJsonlTimestampMs } from '../utils/claudeJsonlTimestamp';
 import { routeClaudeAttachment } from '../attachments/claudeAttachmentRouter';
 import { notifyDaemonConnectedServiceTurnLifecycle } from '@/daemon/controlClient';
 import { readSessionHookEventName } from '../utils/sessionHookAttribution';
-import { isClaudeTaskNotificationUserPromptHook } from '../utils/sessionHookTaskNotification';
 import type { SessionHookData } from '../utils/startHookServer';
 import type { ClaudeCredentialOrganizationAttachment } from '../attachments/claudeAttachmentTypes';
 
@@ -153,7 +152,10 @@ export function observeClaudeRuntimeAuthTranscript(
     if (observation?.historicalReplay === true || isClaudeSidechainRuntimeEvidence(value)) return;
     if (observation?.authenticatedHook === true && value && typeof value === 'object') {
         const hook = value as SessionHookData;
-        if (readSessionHookEventName(hook) === 'UserPromptSubmit' && !isClaudeTaskNotificationUserPromptHook(hook)) {
+        // Every submitted prompt is a provider request, including task-notification turns the
+        // provider injects itself. Bind failures to the identity live at that dispatch, not to an
+        // earlier prompt issued before a switch.
+        if (readSessionHookEventName(hook) === 'UserPromptSubmit') {
             void captureClaudeRuntimeAuthRequestIdentity(session);
         }
     }

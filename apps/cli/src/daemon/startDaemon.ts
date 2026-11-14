@@ -8940,6 +8940,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           validateCurrentness: validateConnectedServiceGroupMutationCurrentness,
           readMemberHolds: readConfiguredConnectedServiceMemberHolds,
           nowMs: () => Date.now(),
+          recordGroupGenerationApplied: appendRuntimeAuthAttemptAccountEvent,
         }),
         applyCommittedGeneration: async (input) => {
           const tracked = getCurrentChildren().find((child) => child.happySessionId === input.sessionId) ?? null;

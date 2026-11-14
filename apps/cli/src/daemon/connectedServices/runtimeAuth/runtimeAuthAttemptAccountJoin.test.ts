@@ -82,10 +82,11 @@ describe('runtime-auth attempt → provider-observed applied account join', () =
       requested: { persistedAtMs: 100, failedProfileId: 'A', failureKind: 'usage_limit', failedRequestProviderOrganizationId: 'org-A', sourceKey: 'turn-7' },
       selected: [{ profileId: 'B', generation: 2, persistedAtMs: 120 }],
       materialized: 'not_separately_evidenced',
-      applications: [{ index: 0, profileId: 'B', generation: 2, windowStartMs: 110, persistedAtMs: 120, verdict: 'confirmed', countedNativeSessionIds: ['native-1'] }],
+      applications: [{ index: 0, profileId: 'B', generation: 2, windowStartMs: 110, persistedAtMs: 120, verdict: 'principal_unknown', credentialMetadata: 'agrees', countedNativeSessionIds: ['native-1'] }],
       schedulerRecovered: { persistedAtMs: 130, proofKinds: ['provider_activity'] },
       usefulContinuation: { kind: 'provider_activity', observedAtMs: 126, applicationIndex: 0 },
-      verdict: 'confirmed',
+      // credential_org is cached credential metadata, not the request principal: never 'confirmed'.
+      verdict: 'principal_unknown',
       latestStatus: 'recovered',
     });
     expect(join1!.transitions.map((event) => event.status)).toEqual(['waiting', 'checking', 'resumed_awaiting_proof', 'recovered']);
@@ -134,11 +135,15 @@ describe('runtime-auth attempt → provider-observed applied account join', () =
     }
   });
 
-  it('reports a provider-observed different account in the same native session as a mismatch, retaining every observation', () => {
+  it('reports disagreeing credential metadata as metadata only, never a mismatch, retaining every observation', () => {
     const [joined] = foldRuntimeAuthAttemptAccountJoins([
       ...appliedAttempt('a1', 100, 'B', true), observed(123, member('B')), observed(124, member('C')),
     ]);
-    expect(joined!.verdict).toBe('mismatch');
+    expect(joined!.verdict).toBe('principal_unknown');
+    expect(joined!.applications[0]!.credentialMetadata).toBe('mixed');
+    const [disagrees] = foldRuntimeAuthAttemptAccountJoins([...appliedAttempt('a1', 100, 'B', true), observed(124, member('C'))]);
+    expect(disagrees!.verdict).toBe('principal_unknown');
+    expect(disagrees!.applications[0]!.credentialMetadata).toBe('disagrees');
     expect(joined!.observations.map((entry) => [entry.event.resolution, entry.disposition])).toEqual([
       [member('B'), 'counted'], [member('C'), 'counted'],
     ]);
@@ -149,7 +154,8 @@ describe('runtime-auth attempt → provider-observed applied account join', () =
     ['an unreadable member identity', { kind: 'unproven', reason: 'member_identity_unreadable' } as ProviderAccountResolution],
   ])('keeps %s unknown, never confirmed', (_label, resolution) => {
     const [joined] = foldRuntimeAuthAttemptAccountJoins([...appliedAttempt('a1', 100), observed(123, resolution, { adoption: 'adopted' })]);
-    expect(joined!.verdict).toBe('unknown');
+    expect(joined!.verdict).toBe('principal_unknown');
+    expect(joined!.applications[0]!.credentialMetadata).toBe('not_unique');
   });
 
   it('JL-02: an observation inside the application window is boundary-uncertain; a pre-switch one is not counted', () => {
@@ -174,14 +180,16 @@ describe('runtime-auth attempt → provider-observed applied account join', () =
     ];
     const [joined] = foldRuntimeAuthAttemptAccountJoins(events);
     expect(joined!.applications.map((application) => [application.profileId, application.generation, application.verdict])).toEqual([
-      ['B', 2, 'confirmed'], ['C', 3, 'confirmed'],
+      ['B', 2, 'principal_unknown'], ['C', 3, 'principal_unknown'],
     ]);
-    expect(joined!.verdict).toBe('confirmed');
+    expect(joined!.applications.map((application) => application.credentialMetadata)).toEqual(['agrees', 'agrees']);
+    expect(joined!.verdict).toBe('principal_unknown');
     expect(joined!.observations.map((entry) => [entry.disposition, entry.applicationIndex])).toEqual([['counted', 1], ['counted', 0]]);
-    // A genuinely wrong account after the reselection is still a mismatch of the CURRENT application.
+    // Disagreeing metadata after the reselection is judged against the CURRENT application only.
     const [wrong] = foldRuntimeAuthAttemptAccountJoins([...events.slice(0, -2), observed(215, member('B'))]);
-    expect(wrong!.applications.map((application) => application.verdict)).toEqual(['applied_awaiting_observation', 'mismatch']);
-    expect(wrong!.verdict).toBe('mismatch');
+    expect(wrong!.applications.map((application) => [application.verdict, application.credentialMetadata])).toEqual([
+      ['applied_awaiting_observation', 'none'], ['principal_unknown', 'disagrees'],
+    ]);
   });
 
   it('JL-04: disagreeing native sessions are reported as conflicting in either arrival order', () => {
@@ -190,7 +198,8 @@ describe('runtime-auth attempt → provider-observed applied account join', () =
     const [oldFirst] = foldRuntimeAuthAttemptAccountJoins([...appliedAttempt('a1', 100), older, newer]);
     const [newFirst] = foldRuntimeAuthAttemptAccountJoins([...appliedAttempt('a1', 100), newer, older]);
     for (const joined of [oldFirst, newFirst]) {
-      expect(joined!.verdict).toBe('conflicting_native_sessions');
+      expect(joined!.verdict).toBe('principal_unknown');
+      expect(joined!.applications[0]!.credentialMetadata).toBe('mixed');
       expect(joined!.applications[0]!.countedNativeSessionIds).toEqual(['native-new', 'native-old']);
     }
   });
@@ -200,7 +209,7 @@ describe('runtime-auth attempt → provider-observed applied account join', () =
       ...appliedAttempt('a1', 100), observed(130, member('C'), { adoption: 'rejected_not_current' }), observed(131, member('B')),
     ]);
     expect(dispositions(joined)).toEqual(['not_adopted', 'counted']);
-    expect(joined!.verdict).toBe('confirmed');
+    expect(joined!.applications[0]!.credentialMetadata).toBe('agrees');
   });
 
   it('attributes observations after a newer attempt applied to that attempt only, keeping retry history', () => {
@@ -214,10 +223,10 @@ describe('runtime-auth attempt → provider-observed applied account join', () =
     const joins = foldRuntimeAuthAttemptAccountJoins(events);
     const first = joins.find((entry) => entry.attemptId === 'a1')!;
     const second = joins.find((entry) => entry.attemptId === 'a2')!;
-    expect(first.verdict).toBe('confirmed');
+    expect(first.verdict).toBe('principal_unknown');
     expect(first.firstTerminal).toMatchObject({ status: 'exhausted', reason: 'superseded' });
     expect(dispositions(first)).toEqual(['counted', 'superseded_by_newer_attempt']);
-    expect(second.verdict).toBe('confirmed');
+    expect(second.verdict).toBe('principal_unknown');
     expect(dispositions(second)).toEqual(['before_application', 'counted']);
   });
 
@@ -313,6 +322,6 @@ describe('attempt journal producers', () => {
     const read = await journal.read();
     expect(read.events).toEqual(events);
     expect(read.invalidLines).toHaveLength(1);
-    expect(foldRuntimeAuthAttemptAccountJoins(read.events)[0]!.verdict).toBe('confirmed');
+    expect(foldRuntimeAuthAttemptAccountJoins(read.events)[0]!.verdict).toBe('principal_unknown');
   });
 });

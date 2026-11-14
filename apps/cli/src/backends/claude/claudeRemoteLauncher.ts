@@ -1956,6 +1956,20 @@ export async function claudeRemoteLauncher(
                     onRuntimeAuthFailureEvent: async (error: unknown) => {
                         await surfaceClaudeRuntimeAuthFailure(session, error, '[remote]');
                     },
+                    // Agent SDK API-error result: fail the still-active turn so its release is not
+                    // recorded as completed provider work. A usage-limit tap that already failed
+                    // the turn leaves no active turn, so this does not fail twice.
+                    onResultFailure: async (failure: string) => {
+                        await surfacePrimarySessionRuntimeIssue({
+                            provider: 'claude',
+                            cause: 'status_error',
+                            error: { code: 'claude_agent_sdk_result_api_error', message: failure },
+                            session: session.client,
+                        }).catch((error) => {
+                            logger.debug('[remote]: failed to surface Claude Agent SDK API-error result turn failure (non-fatal)', error);
+                            return null;
+                        });
+                    },
                     runtimeActivityAdapter: session.getProviderTaskRuntimeActivityAdapter(),
                     providerRuntimeActivityEvidence,
                     onWorkflowActivityObserverReady: () => workflowActivitySource?.armStartupReconciliation(),

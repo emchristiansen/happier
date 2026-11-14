@@ -217,6 +217,11 @@ export async function claudeRemoteAgentSdk(opts: {
     /** Every quota window reported by one rate-limit event; they form one quota snapshot. */
     onQuotaEvidence?: (windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => void | Promise<void>;
     onRuntimeAuthFailureEvent?: (error: unknown) => void | Promise<void>;
+    /**
+     * A provider API-error result (`is_error` / `api_error_status`) ended the foreground turn.
+     * Called before the turn is released so the owner can fail it instead of completing it.
+     */
+    onResultFailure?: (failure: string) => void | Promise<void>;
     runtimeActivityAdapter?: ReturnType<typeof createClaudeProviderRuntimeActivityAdapter> | null;
     providerRuntimeActivityEvidence?: ClaudeRuntimeActivityEvidence | null;
     claudeSubscriptionAccessTokenRefreshSelection?: ClaudeSubscriptionAuthTokensRefreshSelection | null;
@@ -1266,11 +1271,29 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
             return detail ? `${subtype}: ${detail}` : subtype;
         };
 
+        const isAgentSdkExecutionFailureResult = (message: unknown): boolean => {
+            const subtype = (message as any)?.subtype;
+            return subtype === 'error_max_turns' || subtype === 'error_during_execution';
+        };
+
+        // The SDK reports provider API errors (e.g. a 429 usage limit answered by a synthetic
+        // assistant message) as subtype 'success' with is_error/api_error_status set.
+        const readAgentSdkResultApiErrorStatus = (message: unknown): number | 'unknown' | null => {
+            const msg: any = message;
+            if (!msg || typeof msg !== 'object' || msg.type !== 'result') return null;
+            if (typeof msg.api_error_status === 'number') return msg.api_error_status;
+            return msg.is_error === true ? 'unknown' : null;
+        };
+
         const readAgentSdkResultFailure = (message: unknown): string | null => {
             const msg: any = message;
             if (!msg || typeof msg !== 'object' || msg.type !== 'result') return null;
-            const subtype = typeof msg.subtype === 'string' ? msg.subtype : '';
-            if (subtype !== 'error_max_turns' && subtype !== 'error_during_execution') return null;
+            const apiErrorStatus = readAgentSdkResultApiErrorStatus(message);
+            const subtype = isAgentSdkExecutionFailureResult(message)
+                ? msg.subtype as string
+                : apiErrorStatus === null ? null
+                    : apiErrorStatus === 'unknown' ? 'api_error' : `api_error_${apiErrorStatus}`;
+            if (!subtype) return null;
             const errorParts: string[] = [];
             collectAgentSdkResultErrorText(msg.errors, errorParts);
             const resultText = extractResultText(message);
@@ -2354,6 +2377,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                 const failure = readAgentSdkResultFailure(message);
                 const retainForeground = promptSettlements.shouldRetainForegroundForResult(message);
                 const isRequestedExecutionInterrupt = didRequestThisResult && message.subtype === 'error_during_execution';
+                const isProviderApiErrorResult = failure !== null && !isAgentSdkExecutionFailureResult(message);
                 if (failure && !retainForeground) {
                     if (isRequestedExecutionInterrupt) {
                         if (!didFinalizeTurn) {
@@ -2361,10 +2385,19 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                         }
                         continue;
                     }
-                    await reconcileRuntimeActivityForResult();
-                    throw new Error(failure);
+                    if (isProviderApiErrorResult) {
+                        // The provider answered with an error, not work: fail the turn before
+                        // release so the release cannot record it completed. The query stays
+                        // usable (usage-limit recovery owns any switch); release proceeds below.
+                        if (!didFinalizeTurn && !didReleaseTurnForResult) {
+                            await opts.onResultFailure?.(failure);
+                        }
+                    } else {
+                        await reconcileRuntimeActivityForResult();
+                        throw new Error(failure);
+                    }
                 }
-                if (failure && !isRequestedExecutionInterrupt) opts.onCompletionEvent?.(failure);
+                if (failure && !isRequestedExecutionInterrupt && !isProviderApiErrorResult) opts.onCompletionEvent?.(failure);
 
                 const resultText = extractResultText(message);
                 if (!streamedTranscriptWriter && !didPublishAssistantTextThisTurn && resultText) {

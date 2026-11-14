@@ -29,6 +29,8 @@ import type { Session } from '../session';
 import { createSessionScanner } from '../utils/sessionScanner';
 import { createClaudeSessionTranscriptProjector } from '../localControl/createClaudeSessionTranscriptProjector';
 import { mapClaudeProviderFailureToUsageDetails } from './mapClaudeRateLimitEventToUsageDetails';
+import { isClaudeTaskNotificationUserPromptHook } from '../utils/sessionHookTaskNotification';
+import { resolveRuntimeAuthFailureSourceProfile } from '@/daemon/connectedServices/runtimeAuth/resolveRuntimeAuthFailureSourceProfile';
 
 import {
   recordClaudeRateLimitQuotaEvidence,
@@ -1571,6 +1573,55 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
         credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS', sourceProviderAccountId: 'issued-account',
         sourceProviderOrganizationId: 'issued-org' }),
     }), expect.anything());
+  });
+
+  it('binds a task-notification request to the account and generation live at its dispatch', async () => {
+    // Production shape: an ordinary prompt was issued under account A; the session was later
+    // switched to account B, and the next provider request was a background task-notification
+    // turn that hit B's weekly limit. The capture must describe the request that failed.
+    const transcriptPath = join(tmpDir, 'notification-session.jsonl');
+    await writeFile(transcriptPath, [
+      { type: 'attachment', sessionId: 'notification-session', timestamp: '2026-11-02T13:50:20.000Z',
+        attachment: { type: 'credential_org', organizationUuid: 'org-a' } },
+      { type: 'attachment', sessionId: 'notification-session', timestamp: '2026-11-02T13:58:00.000Z',
+        attachment: { type: 'credential_org', organizationUuid: 'org-b' } },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    let truth: { kind: 'current_auth_group_available'; groupId: string; generation: number; credentialRevision: string } = {
+      kind: 'current_auth_group_available', groupId: 'team-pool', generation: 4,
+      credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' };
+    const session = {
+      sessionId: 'notification-session', transcriptPath,
+      connectedServiceAuthGroupRequestFence: { readCurrentTruth: () => truth },
+      client: { sessionId: 'task-notification-failure', sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
+    };
+    const notificationHook: SessionHookData = { hook_event_name: 'UserPromptSubmit', session_id: 'notification-session',
+      prompt: '<task-notification><task-id>bg-task-1</task-id><status>completed</status></task-notification>' };
+    expect(isClaudeTaskNotificationUserPromptHook(notificationHook)).toBe(true);
+
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-a', organizationUuid: 'org-a' });
+    // The ordinary prompt's identity is captured before its dispatch (the remote launcher awaits it).
+    await captureClaudeRuntimeAuthRequestIdentity(session);
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-b', organizationUuid: 'org-b' });
+    truth = { ...truth, generation: 5, credentialRevision: 'csr_8123456789ABCDEFGHJKMNPQRS' };
+    observeClaudeRuntimeAuthTranscript(session, notificationHook, { historicalReplay: false, authenticatedHook: true });
+
+    await surfaceClaudeRateLimitRuntimeIssue(session, {
+      ...passiveUtilizationDetails(), limitCategory: 'usage_limit', utilization: 100,
+      providerObservedAtMs: Date.parse('2026-11-02T13:58:11.000Z'),
+    }, '[test]');
+
+    const reported = mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.at(-1)?.[0]?.classification;
+    expect(reported).toMatchObject({ sourceProviderAccountId: 'acct-b', sourceProviderOrganizationId: 'org-b',
+      providerReportedOrganizationId: 'org-b', groupGeneration: 5, credentialRevision: 'csr_8123456789ABCDEFGHJKMNPQRS' });
+    // The daemon's unchanged poisoning guard can now attribute the failure to the member that issued it.
+    const resolved = await resolveRuntimeAuthFailureSourceProfile({
+      classification: reported as Parameters<typeof resolveRuntimeAuthFailureSourceProfile>[0]['classification'],
+      getGroupMembers: async () => [{ profileId: 'claude-a', enabled: true }, { profileId: 'claude-b', enabled: true }],
+      resolveProviderAccountIdentity: async (profileId) => profileId === 'claude-a'
+        ? { providerAccountId: 'acct-a', providerOrganizationId: 'org-a' }
+        : { providerAccountId: 'acct-b', providerOrganizationId: 'org-b' },
+    });
+    expect(resolved.profileId).toBe('claude-b');
   });
 
   it('reports a rejected provider organization acknowledgement on the default log', async () => {

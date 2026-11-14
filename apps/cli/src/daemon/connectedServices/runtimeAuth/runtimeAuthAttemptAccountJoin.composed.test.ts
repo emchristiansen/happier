@@ -103,7 +103,8 @@ describe('attempt account join through the real scheduler and reconciler', () =>
     expect(f.scheduler.readByKey(RECOVERY_KEY)).toMatchObject({ pendingTargetProfileId: 'C', pendingTargetGeneration: 3 });
     const [joined] = foldRuntimeAuthAttemptAccountJoins([...f.events, observedEvent(310, 'C')]);
     expect(joined!.applications.map((application) => [application.profileId, application.generation])).toEqual([['B', 2], ['C', 3]]);
-    expect(joined!.verdict).toBe('confirmed');
+    expect(joined!.verdict).toBe('principal_unknown');
+    expect(joined!.applications.at(-1)!.credentialMetadata).toBe('agrees');
     // Without an intermediate persisted transition, B's later timestamps fall in C's window: uncertain, not mismatch.
     const [delayedB] = foldRuntimeAuthAttemptAccountJoins([...f.events, observedEvent(250, 'B')]);
     expect(delayedB!.observations.map((entry) => entry.disposition)).toEqual(['boundary_uncertain']);
