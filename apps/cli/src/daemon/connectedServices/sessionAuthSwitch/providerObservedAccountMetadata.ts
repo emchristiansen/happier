@@ -78,3 +78,20 @@ export function resolveAdoptedPerSessionDecisionId(
     ? previous.decisionId
     : null;
 }
+
+/** True when a projection proved the session's pending conversion to the group's shared home. */
+export function resolveProvedSharedConversion(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  serviceId: ConnectedServiceId,
+): boolean {
+  const read = (metadata: Record<string, unknown>) => {
+    const parsed = ConnectedServiceBindingsV1Schema.safeParse(metadata.connectedServices);
+    const binding = parsed.success ? parsed.data.bindingsByServiceId[serviceId] : undefined;
+    return binding?.source === 'connected' && binding.selection === 'group' ? binding : null;
+  };
+  const previous = read(before)?.materializedAssignment;
+  const next = read(after);
+  return previous?.home === 'group' && next !== null && !next.member && !next.materializedAssignment
+    && next.appliedProfileId === previous.profileId;
+}

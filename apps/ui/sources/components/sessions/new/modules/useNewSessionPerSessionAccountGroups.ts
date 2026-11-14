@@ -36,6 +36,8 @@ export function useNewSessionPerSessionAccountGroups(params: Readonly<{
             serviceId: enabled ? serviceId : null,
             enabled,
             serviceProjectionSignature: params.serviceProjectionSignature,
+            // The pools (policy and members) are the launch server's, not the Home server's.
+            targetServerId: params.targetServerId,
         });
         const loaded = enabled && (query.loadStatus === 'loaded' || query.loadStatus === 'refreshing');
         return { serviceId, groups: loaded ? query.groups : null };

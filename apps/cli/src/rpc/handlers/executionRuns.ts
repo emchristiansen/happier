@@ -158,6 +158,7 @@ export function registerExecutionRunHandlers(
         credentials: await readCredentials().catch(() => null),
         cwd: resolveCwd(),
         sessionId: params.sessionId,
+        ...(params.modelId ? { modelId: params.modelId } : {}),
         ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
       }),
   });
@@ -331,6 +332,7 @@ export function registerExecutionRunHandlers(
           })(),
           cwd: resolveCwd(),
           sessionId: ctx.sessionId,
+          ...(parsed.data.modelId ? { modelId: parsed.data.modelId } : {}),
         });
       } catch (error) {
         if (error instanceof ExecutionRunConnectedServicesUnavailableError) {

@@ -4,6 +4,8 @@ import {
   type ConnectedServiceAuthGroupV1,
   type ConnectedServiceCredentialRecordV1,
   type ConnectedServiceCredentialRevisionV1,
+  type ConnectedServiceGroupMaterializedAssignmentV1,
+  type ConnectedServiceGroupMemberAssignmentV1,
   type ConnectedServiceId,
   type ConnectedServiceMaterializationIdentityV1,
 } from '@happier-dev/protocol';
@@ -16,6 +18,7 @@ import { logger } from '@/ui/logger';
 
 import {
   parseConnectedServiceBindingSelections,
+  resolvePerSessionTargetProfileId,
   type ConnectedServiceBindingSelection,
   type ConnectedServicesBindingsV1,
 } from './parseConnectedServicesBindings';
@@ -871,6 +874,18 @@ async function resolveCredentialBindings(params: Readonly<{
         deadlineAtMs: params.perSessionDeadlineAtMs,
         deps: params.perSessionAssignment,
         requiredModelIds: params.perSessionRequiredModelIds,
+        // A definite reservation conflict re-reads the group so eligibility is rechecked (A.5 R2).
+        reloadState: async () => {
+          const fresh = await groupApi.getConnectedServiceAuthGroup?.({ serviceId: selection.serviceId, groupId: selection.groupId });
+          return fresh && isFullAuthGroup(fresh)
+            ? buildPerSessionGroupSwitchState({
+              group: fresh,
+              accountUsageStore: params.accountUsageStore,
+              runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
+              nowMs: params.clock(),
+            })
+            : null;
+        },
       });
       credentialBindings.push({ serviceId: selection.serviceId, profileId: assignment.profileId });
       groupSelections.set(selection.serviceId, {
@@ -919,6 +934,25 @@ async function resolveCredentialBindings(params: Readonly<{
       memberCount: Array.isArray(selectedGroup.members)
         ? selectedGroup.members.filter((member) => member.enabled !== false).length
         : 1,
+      // A formerly per-session session launching on the group home is a pending conversion (spec A.4
+      // Migration): its applied member stays until provider adoption proves the group's member.
+      ...(ownsPerSessionAssignment
+        ? {
+          perSessionConversion: {
+            ...(selection.member ? { member: selection.member } : {}),
+            materializedAssignment: selection.materializedAssignment?.home === 'group'
+              ? selection.materializedAssignment
+              : {
+                profileId: activeProfileId,
+                decisionId: `conversion-${params.perSessionSubjectId ?? selection.groupId}-${params.clock().toString(36)}`,
+                reason: 'policy_conversion' as const,
+                ...(resolvePerSessionTargetProfileId(selection) ? { fromProfileId: resolvePerSessionTargetProfileId(selection)! } : {}),
+                materializedAtMs: params.clock(),
+                home: 'group' as const,
+              },
+          },
+        }
+        : {}),
     });
   }
 
@@ -934,6 +968,11 @@ type ConnectedServiceResolvedGroupSelection = Readonly<{
   memberCount: number;
   /** Present for per_session_softmax groups: the session's own member, materialized via its member home. */
   perSession?: PerSessionSpawnAssignment;
+  /** Present when a per-session-owned session launches through the group home as a pending conversion. */
+  perSessionConversion?: Readonly<{
+    member?: ConnectedServiceGroupMemberAssignmentV1;
+    materializedAssignment: ConnectedServiceGroupMaterializedAssignmentV1;
+  }>;
 }>;
 
 function isAuthoritativeGroupActiveProfileEligible(params: Readonly<{
@@ -1215,6 +1254,13 @@ function buildCanonicalConnectedServicesBindingsForSpawn(params: Readonly<{
         ? {
           ...(selection.member ? { member: selection.member } : {}),
           materializedAssignment: group.perSession.binding.materializedAssignment,
+        }
+        : {}),
+      ...(group.perSessionConversion
+        ? {
+          ...(group.perSessionConversion.member ? { member: group.perSessionConversion.member } : {}),
+          // Retargeted to the member this launch actually materializes; adoption must prove that one.
+          materializedAssignment: { ...group.perSessionConversion.materializedAssignment, profileId: group.activeProfileId },
         }
         : {}),
     };

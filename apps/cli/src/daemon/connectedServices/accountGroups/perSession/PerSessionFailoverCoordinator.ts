@@ -207,14 +207,18 @@ export class PerSessionFailoverCoordinator {
     }
 
     // The pending target failed before adoption (spec A.5, T20). Its health is recorded above; its
-    // decision keeps custody (ledger entry and reservation) until the replacement drawn below is
-    // adopted, because only that restart retires the target's runner. It is excluded from the draw.
+    // decision is not modified or released here: it keeps custody (ledger entry and reservation)
+    // until the replacement is adopted, because only the restart that applies the replacement retires
+    // the target's runner. It is excluded from the draw.
     const targetFailed = pendingTarget !== null && failedProfileId === pendingTarget.profileId;
 
-    // Replay: an unsettled, not-superseded recovery decision for this session resumes under its own ID.
-    const replay = this.deps.ledger.list().find((entry) => entry.origin === 'recovery'
-      && entry.sessionId === binding.subjectId && entry.serviceId === serviceId && entry.groupId === input.groupId
-      && entry.state === 'pending' && !entry.supersededByDecisionId && entry.proposal.profileId !== failedProfileId);
+    // Replay: an unsettled recovery decision for this session that no later decision replaces
+    // resumes under its own ID.
+    const sessionEntries = this.deps.ledger.list().filter((entry) => entry.sessionId === binding.subjectId
+      && entry.serviceId === serviceId && entry.groupId === input.groupId);
+    const replacedIds = new Set(sessionEntries.flatMap((entry) => entry.replacesDecisionIds ?? []));
+    const replay = sessionEntries.find((entry) => entry.origin === 'recovery' && entry.state === 'pending'
+      && !replacedIds.has(entry.decisionId) && entry.proposal.profileId !== failedProfileId);
     if (replay && pendingTarget?.decisionId === replay.decisionId) {
       // The effect was already requested for this decision; adoption proof settles it.
       return {
@@ -235,6 +239,11 @@ export class PerSessionFailoverCoordinator {
       this.deps.log?.('per_session_replay_target_ineligible', { decisionId: ineligibleReplay.decisionId, profileId: ineligibleReplay.proposal.profileId });
     }
 
+    // Earlier targets this decision replaces keep custody, untouched, until it is adopted.
+    const replacesDecisionIds = [
+      ...(targetFailed ? [pendingTarget.decisionId] : []),
+      ...(ineligibleReplay ? [ineligibleReplay.decisionId] : []),
+    ];
     const resumeProposal = replayUsable?.proposal.custody === 'proposed' ? replayUsable.proposal : null;
     const decisionId = replayUsable?.decisionId ?? `recovery-${binding.subjectId}-${nowMs.toString(36)}`;
     let proposal: PerSessionAssignmentProposal;
@@ -263,6 +272,13 @@ export class PerSessionFailoverCoordinator {
         ...(state.requiredModelIds ? { requiredModelIds: state.requiredModelIds } : {}),
         ...(excluded.size > 0 ? { additionallyExcludedProfileIds: excluded } : {}),
         reservationApi: this.deps.reservationApi,
+        // A definite conflict re-reads the group so the redraw uses current eligibility (A.5 R2).
+        reloadMemberState: async () => {
+          const fresh = await this.deps.loadGroup({ serviceId, groupId: input.groupId });
+          if (!fresh) return null;
+          const freshState = this.deps.buildState(fresh, sessionId);
+          return { members: freshState.members, memberStatesByProfileId: freshState.memberStatesByProfileId };
+        },
         resumeProposal,
         localReservationCountsByProfileId: () => this.deps.ledger.localCounts(serviceId, input.groupId, decisionId),
         uniformSample: this.deps.uniformSample ?? createCryptoUniformSample,
@@ -270,6 +286,7 @@ export class PerSessionFailoverCoordinator {
           await this.deps.ledger.recordProposal({
             decisionId, sessionId: binding.subjectId, serviceId, groupId: input.groupId,
             origin: 'recovery', proposal: next, nowMs: this.deps.nowMs(),
+            ...(replacesDecisionIds.length > 0 ? { replacesDecisionIds } : {}),
           });
         },
         deadlineAtMs: nowMs + this.deps.deadlineMs,
@@ -289,13 +306,6 @@ export class PerSessionFailoverCoordinator {
       }
       proposal = decision.proposal;
     }
-    for (const superseded of [targetFailed ? pendingTarget.decisionId : null, ineligibleReplay?.decisionId ?? null]) {
-      if (superseded && superseded !== decisionId) {
-        this.deps.log?.('per_session_decision_superseded', { decisionId: superseded, supersededBy: decisionId, reason: targetFailed ? 'target_failed_before_adoption' : 'target_ineligible' });
-        await this.deps.ledger.markSuperseded(superseded, decisionId, this.deps.nowMs());
-      }
-    }
-
     return await this.apply({
       input, sessionId, serviceId, state, failedProfileId,
       binding,

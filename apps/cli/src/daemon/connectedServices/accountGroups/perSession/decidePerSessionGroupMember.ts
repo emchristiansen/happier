@@ -118,6 +118,15 @@ export type DecidePerSessionGroupMemberInput = Readonly<{
   resumeProposal?: PerSessionAssignmentProposal | null;
   /** Caller's existing spawn/recovery deadline; conflicts retry until it passes. */
   deadlineAtMs: number;
+  /**
+   * Re-reads the group's members and runtime states. A definite conflict means the decision was not
+   * admitted, so its re-proposal re-evaluates eligibility on current state (spec A.5 R2), including a
+   * named start's (which fails over when its member became unavailable meanwhile).
+   */
+  reloadMemberState?: () => Promise<Readonly<{
+    members: ReadonlyArray<ConnectedServiceAuthGroupMember>;
+    memberStatesByProfileId: ReadonlyMap<string, ConnectedServiceAuthGroupMemberRuntimeState>;
+  }> | null>;
   /** Optional log sink for `assignment_reservation_unavailable` and similar events. */
   log?: (event: string, detail: Record<string, unknown>) => void;
 }>;
@@ -207,7 +216,9 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
       exclusionReason: named.exclusionReason,
     };
   }
-  const namedStartEligible = named?.kind === 'eligible';
+  // Current group state; replaced on a definite conflict by the caller's reload (when supplied).
+  let current: DecidePerSessionGroupMemberInput = input;
+  let namedStartEligible = named?.kind === 'eligible';
   const sampledReason: ConnectedServiceGroupMemberAssignmentReasonV1 = input.switchReason
     ? input.replacementReason ?? 'failover'
     : initialProfileId ? 'initial_unavailable_failover' : 'initial_sampled';
@@ -222,7 +233,7 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
         ...resolveConnectedServiceAuthGroupSoftmaxParameters(input.policy, useDegraded),
       };
     }
-    const selection = drawMember(input, {
+    const selection = drawMember(current, {
       counts,
       degraded: useDegraded,
       excludeProfileId: initialProfileId ?? input.currentProfileId,
@@ -360,8 +371,25 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
       if (input.nowMs() >= input.deadlineAtMs) {
         throw new Error(`assignment reservation conflicts did not settle before the caller deadline (${input.decisionId})`);
       }
-      const next: Choice | ConnectedServiceAuthGroupCandidateSelection = proposal.reason === 'initial_requested'
-        // A named start keeps its requested target through unrelated revision conflicts.
+      const reloaded = input.reloadMemberState ? await input.reloadMemberState() : null;
+      if (reloaded) {
+        current = { ...input, members: reloaded.members, memberStatesByProfileId: reloaded.memberStatesByProfileId };
+        if (proposal.reason === 'initial_requested' && initialProfileId) {
+          const recheck = classifyNamedMember(current, initialProfileId);
+          if (recheck.kind === 'configuration_invalid') {
+            return {
+              kind: 'initial_profile_invalid',
+              profileId: initialProfileId,
+              code: recheck.exclusionReason === 'not_member' ? 'initial_profile_not_member' : 'initial_profile_disabled',
+              exclusionReason: recheck.exclusionReason,
+            };
+          }
+          // Runtime-unavailable now: the named start fails over to a weighted draw without it.
+          namedStartEligible = recheck.kind === 'eligible';
+        }
+      }
+      const next: Choice | ConnectedServiceAuthGroupCandidateSelection = proposal.reason === 'initial_requested' && namedStartEligible
+        // A named start that is still eligible keeps its requested target through revision conflicts.
         ? proposal
         : choose(countLiveReservations(put.reservations, input.nowMs(), input.decisionId), false);
       if (!isChoice(next)) return { kind: 'no_candidate', selection: next };

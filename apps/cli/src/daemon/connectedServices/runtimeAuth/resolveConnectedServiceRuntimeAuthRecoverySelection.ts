@@ -1,5 +1,5 @@
 import { readConnectedServiceChildSelectionsFromEnv } from '../connectedServiceChildEnvironment';
-import { parseConnectedServiceBindingSelections } from '../parseConnectedServicesBindings';
+import { isPerSessionOwnedGroupSelection, parseConnectedServiceBindingSelections } from '../parseConnectedServicesBindings';
 import type { ConnectedServiceRuntimeFailureClassification } from './types';
 
 export type RuntimeRecoverySelection =
@@ -85,6 +85,25 @@ export function resolveConnectedServiceRuntimeAuthRecoverySelection(input: Reado
   const childEnvSelection = readConnectedServiceChildSelectionsFromEnv(
     input.environmentVariables ?? {},
   ).find((candidate) => candidate.serviceId === serviceId) ?? null;
+  // A per-session-owned session runs in its member's own home, so its child selection is
+  // profile-kind; its logical owner is still the group binding (spec A.4/A.5). Recovery follows the
+  // durable group binding, with the physical member as the failed/fallback account.
+  if (childEnvSelection?.kind === 'profile') {
+    const ownedGroup = [input.trackedConnectedServices, input.sessionMetadataConnectedServices]
+      .map((raw) => parseConnectedServiceBindingSelections(raw).find((candidate) => candidate.serviceId === serviceId) ?? null)
+      .find((candidate) => candidate !== null && isPerSessionOwnedGroupSelection(candidate)) ?? null;
+    if (ownedGroup?.kind === 'group' && (!reportedGroupId || ownedGroup.groupId === reportedGroupId)) {
+      return {
+        selection: {
+          kind: 'group',
+          serviceId: ownedGroup.serviceId,
+          groupId: ownedGroup.groupId,
+          fallbackProfileId: reportedProfileId || childEnvSelection.profileId,
+        },
+        source: 'tracked_spawn_options',
+      };
+    }
+  }
   if (shouldUseDurableSelection(childEnvSelection, reportedGroupId, preferDurableGroup)) {
     if (childEnvSelection.kind === 'profile') {
       return {

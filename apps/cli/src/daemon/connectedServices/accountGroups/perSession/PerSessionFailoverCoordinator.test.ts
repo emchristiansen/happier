@@ -173,7 +173,10 @@ describe('PerSessionFailoverCoordinator', () => {
     const applied = f.applyAssignment.mock.calls[0]![0];
     expect(applied.profileId).not.toBe('b');
     // No release before the replacement's restart retires the target runner and is adopted.
-    expect(f.ledger.get('recovery-old')).toMatchObject({ state: 'pending', supersededByDecisionId: applied.binding.materializedAssignment.decisionId });
+    const replacementId = applied.binding.materializedAssignment.decisionId;
+    expect(f.ledger.get('recovery-old')).toMatchObject({ state: 'pending', proposal: { profileId: 'b' } });
+    // The replacement records which target it replaces; the failed entry itself is not rewritten.
+    expect(f.ledger.get(replacementId)?.replacesDecisionIds).toEqual(['recovery-old']);
     // The previously applied member remains the session's proved identity.
     expect(applied.binding.member).toMatchObject({ profileId: 'a' });
   });
@@ -206,7 +209,7 @@ describe('PerSessionFailoverCoordinator', () => {
     await f.coordinator.switchAfterClassifiedFailure(failure);
     const applied = f.applyAssignment.mock.calls[0]![0];
     expect(applied.profileId).toBe('c');
-    expect(f.ledger.get('reserved-b')).toMatchObject({ supersededByDecisionId: applied.binding.materializedAssignment.decisionId });
+    expect(f.ledger.get(applied.binding.materializedAssignment.decisionId)?.replacesDecisionIds).toContain('reserved-b');
   });
 
   it('records member_revoked and moves the session even when that failure kind is not switch-enabled (T10)', async () => {

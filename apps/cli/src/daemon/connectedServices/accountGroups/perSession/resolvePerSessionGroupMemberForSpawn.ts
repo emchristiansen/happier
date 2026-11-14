@@ -124,6 +124,8 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
   deps: PerSessionSpawnAssignmentDeps | null;
   /** This session's exact model (spec A.2, T13); empty when it runs the provider default. */
   requiredModelIds: ReadonlyArray<string>;
+  /** Fresh group state for re-evaluating eligibility after a definite reservation conflict. */
+  reloadState?: () => Promise<ConnectedServiceAuthGroupSwitchState | null>;
 }>): Promise<PerSessionSpawnAssignment> {
   if (!(CONNECTED_SERVICE_AUTH_GROUP_PER_SESSION_SOFTMAX_SERVICE_IDS as readonly string[]).includes(input.serviceId)) {
     throw new ConnectedServicePerSessionSpawnError('connect_group_strategy_unsupported_for_service',
@@ -206,6 +208,12 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
       });
     },
     deadlineAtMs: input.deadlineAtMs,
+    ...(input.reloadState ? {
+      reloadMemberState: async () => {
+        const fresh = await input.reloadState!();
+        return fresh ? { members: fresh.members, memberStatesByProfileId: fresh.memberStatesByProfileId } : null;
+      },
+    } : {}),
     ...(deps.log ? { log: deps.log } : {}),
   });
   if (decision.kind === 'initial_profile_invalid') {

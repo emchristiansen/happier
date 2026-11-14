@@ -310,8 +310,10 @@ describe('resolveConnectedServiceAuthForSpawn per_session_softmax', () => {
       recordScores(f.runtimeQuotaSnapshots, { a: 90, b: 0 });
       const result = await spawnOwned(f, 'b');
       const binding = result!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
-      expect(binding.member).toBeUndefined();
-      expect(binding.materializedAssignment).toBeUndefined();
+      // Ownership ends only when the provider proves the group account (spec A.4 Migration): the launch
+      // keeps the applied member and records a pending conversion to the group's shared home.
+      expect(binding.member).toMatchObject({ profileId: 'b' });
+      expect(binding.materializedAssignment).toMatchObject({ reason: 'policy_conversion', home: 'group', fromProfileId: 'b', profileId: 'a' });
       const memberHome = resolveConnectedServiceSelectionHomeDir({
         activeServerDir: f.activeServerDir, serviceId: 'claude-subscription', agentId: 'claude', fallbackProfileId: 'b',
         selection: { kind: 'profile', profileId: 'b' },

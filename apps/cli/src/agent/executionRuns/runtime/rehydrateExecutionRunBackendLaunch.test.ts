@@ -222,6 +222,8 @@ describe('resolveExecutionRunResumeBackendOptions', () => {
       backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
       connectedServices: CONNECTED_SELECTION,
       sessionId: 'sess_1',
+      // The run's model reaches re-materialization (per-session member eligibility, HPI-09).
+      modelId: 'gpt-5.5',
     });
     expect(options.modelId).toBe('gpt-5.5');
     expect(options.sessionConfigOptionOverrides).toEqual(overrides);

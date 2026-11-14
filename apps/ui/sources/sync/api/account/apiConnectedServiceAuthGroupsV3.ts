@@ -1,5 +1,6 @@
 import type { AuthCredentials } from '@/auth/storage/tokenStorage';
 import { serverFetch } from '@/sync/http/client';
+import { runtimeFetchWithServerReachability } from '@/sync/runtime/connectivity/serverReachabilityRuntimeFetch';
 import { HappyError } from '@/utils/errors/errors';
 import { backoff } from '@/utils/timing/time';
 import { createConnectedServiceApiError } from './connectedServiceApiError';
@@ -98,23 +99,33 @@ export async function createConnectedServiceAuthGroupV3(
     );
 }
 
+/**
+ * Lists a service's authoritative pools. `serverUrl` scopes the read to that server (with credentials
+ * for it); without it the read goes to the active server.
+ */
 export async function listConnectedServiceAuthGroupsV3(
     credentials: AuthCredentials,
-    params: Readonly<{ serviceId: ConnectedServiceId }>,
+    params: Readonly<{ serviceId: ConnectedServiceId; serverUrl?: string | null }>,
 ): Promise<ReadonlyArray<ConnectedServiceAuthGroupV1>> {
+    const path = appendConnectedServiceAuthGroupReaderCapabilities(`/v3/connect/${encodeURIComponent(params.serviceId)}/groups`);
+    const init = {
+        method: 'GET' as const,
+        headers: {
+            [CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER]: CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
+            Authorization: `Bearer ${credentials.token}`,
+            'Content-Type': 'application/json',
+        },
+    };
+    const scopedServerUrl = String(params.serverUrl ?? '').trim().replace(/\/+$/, '');
     return await backoff(async () => {
-        const response = await serverFetch(
-            appendConnectedServiceAuthGroupReaderCapabilities(`/v3/connect/${encodeURIComponent(params.serviceId)}/groups`),
-            {
-                method: 'GET',
-                headers: {
-                    [CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER]: CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE,
-                    Authorization: `Bearer ${credentials.token}`,
-                    'Content-Type': 'application/json',
-                },
-            },
-            { includeAuth: false },
-        );
+        const response = scopedServerUrl
+            ? await runtimeFetchWithServerReachability({
+                serverUrl: scopedServerUrl,
+                token: credentials.token,
+                url: `${scopedServerUrl}${path}`,
+                init,
+            })
+            : await serverFetch(path, init, { includeAuth: false });
 
         const json = await response.json().catch(() => null);
         if (!response.ok) {

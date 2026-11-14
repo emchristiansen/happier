@@ -552,6 +552,7 @@ import { handleProviderObservedSessionAccount } from './connectedServices/sessio
 import {
   projectProviderObservedAccountMetadata,
   resolveAdoptedPerSessionDecisionId,
+  resolveProvedSharedConversion,
 } from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
 import {
   PerSessionAssignmentLedger,
@@ -990,8 +991,9 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     providerObservedAccount: Readonly<{ serviceId: ConnectedServiceId; groupId: string; profileId: string }>;
     isCurrent: () => boolean;
   }>
-)): Promise<Readonly<{ adoptedPerSessionDecisionId: string | null }>> {
+)): Promise<Readonly<{ adoptedPerSessionDecisionId: string | null; provedSharedConversionSubjectId: string | null }>> {
   let adoptedPerSessionDecisionId: string | null = null;
+  let provedSharedConversionSubjectId: string | null = null;
   const rawSession = await fetchSessionByIdCompat({
     token: params.credentials.token,
     sessionId: params.sessionId,
@@ -1006,6 +1008,7 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     rawSession,
     updater: (metadata) => {
       adoptedPerSessionDecisionId = null;
+      provedSharedConversionSubjectId = null;
       if (params.isCurrent && !params.isCurrent()) return metadata;
       const projected = params.providerObservedAccount
         ? projectProviderObservedAccountMetadata(metadata, params.providerObservedAccount)
@@ -1014,6 +1017,13 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
       adoptedPerSessionDecisionId = params.providerObservedAccount
         ? resolveAdoptedPerSessionDecisionId(metadata, projected, params.providerObservedAccount.serviceId)
         : null;
+      if (params.providerObservedAccount
+        && resolveProvedSharedConversion(metadata, projected, params.providerObservedAccount.serviceId)) {
+        // The session's per-session decisions were keyed by its materialization identity.
+        provedSharedConversionSubjectId = readConnectedServiceMaterializationIdentityV1(
+          metadata.connectedServiceMaterializationIdentityV1,
+        )?.id ?? params.sessionId;
+      }
       const existingUpdatedAt = typeof metadata.connectedServicesUpdatedAt === 'number'
         && Number.isFinite(metadata.connectedServicesUpdatedAt)
         ? metadata.connectedServicesUpdatedAt
@@ -1033,7 +1043,7 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     },
     maxAttempts: 6,
   });
-  return { adoptedPerSessionDecisionId };
+  return { adoptedPerSessionDecisionId, provedSharedConversionSubjectId };
 }
 
 let lastTerminalControlServiceabilityObservation = 0;
@@ -4443,6 +4453,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               }
             }
             assertAutomaticAdmission();
+            // From here a launch adapter may create a process whose existence is not yet observable;
+            // a later failure no longer proves the decisions were never used (spec A.4, T17).
+            perSessionSpawnCustody.markLaunchAttempted();
 
             const liveRunnerSnapshotFingerprints = resolveLiveRunnerSnapshotFingerprints(getCurrentChildren());
             const runtimeDecision = resolveHappyCliSubprocessRuntimeDecision({ liveRunnerSnapshotFingerprints });
@@ -7198,7 +7211,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               planType: null,
               rateLimits: null,
               // The daemon's own projection of the member's revocation, not a provider message.
-              source: 'provider_runtime_marker',
+              source: 'daemon_member_revocation',
             },
           });
         };
@@ -7452,6 +7465,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           accountUsageStore: providerAccountUsageStore,
           runtimeQuotaSnapshots: connectedServiceRuntimeQuotaSnapshots,
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+          ...(params.modelId ? { modelId: params.modelId } : {}),
           accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
           processEnv: process.env,
           nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
@@ -7610,6 +7624,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           sessionDirectory: input.sessionDirectory ?? null,
           ...(input.previousMaterializedRoot ? { previousMaterializedRoot: input.previousMaterializedRoot } : {}),
           ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+          ...(input.modelId ? { modelId: input.modelId } : {}),
         });
       },
       handleExecutionRunConnectedServiceRelease: async (input) => {
@@ -8005,6 +8020,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     decisionId: published.adoptedPerSessionDecisionId,
                     profileId: binding.profileId,
                   }).catch((error) => logger.warn('[ConnectedServices] Per-session adoption settlement failed; renewal will retry', error));
+                }
+                if (published.provedSharedConversionSubjectId) {
+                  // Proved conversion to the group home ends every per-session decision of this session.
+                  await perSessionAssignmentRuntime.settleProvedSharedConversion({
+                    subjectId: published.provedSharedConversionSubjectId,
+                    serviceId: binding.serviceId,
+                    groupId: observation.groupId,
+                  }).catch((error) => logger.warn('[ConnectedServices] Per-session shared-conversion settlement failed', error));
                 }
               },
               reconcileGeneration: async (target) => {

@@ -851,6 +851,7 @@ export function createDaemonControlApp({
     previousMaterializedRoot?: string;
     sessionDirectory?: string | null;
     sessionId?: string;
+    modelId?: string;
   }>) => Promise<ExecutionRunConnectedServiceMaterializeResponseWire>;
   // Run-end lifecycle: unregister the runtime target and clean only disposable run materialization.
   handleExecutionRunConnectedServiceRelease?: (input: Readonly<{
@@ -1765,6 +1766,7 @@ export function createDaemonControlApp({
       ...(request.body.previousMaterializedRoot ? { previousMaterializedRoot: request.body.previousMaterializedRoot } : {}),
       sessionDirectory: request.body.sessionDirectory ?? null,
       ...(request.body.sessionId ? { sessionId: request.body.sessionId } : {}),
+      ...(request.body.modelId ? { modelId: request.body.modelId } : {}),
     });
     return { ok: true as const, result };
   });
@@ -2467,6 +2469,7 @@ export function startDaemonControlServer({
     previousMaterializedRoot?: string;
     sessionDirectory?: string | null;
     sessionId?: string;
+    modelId?: string;
   }>) => Promise<ExecutionRunConnectedServiceMaterializeResponseWire>;
   handleExecutionRunConnectedServiceRelease?: (input: Readonly<{
     runId: string;

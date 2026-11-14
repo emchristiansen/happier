@@ -247,6 +247,8 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
   credentials: Credentials | null;
   cwd: string;
   sessionId: string;
+  /** The run's model, when it names one; per-session pools draw only members that can serve it. */
+  modelId?: string;
   previousMaterializedRoot?: string;
   /** Boundary injection points; default to the canonical control client + session defaulting owner. */
   materializeViaDaemon?: MaterializeViaDaemon;
@@ -313,6 +315,7 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
       connectedServicesBindingsRaw: selection.bindings,
       sessionDirectory: params.cwd,
       sessionId: params.sessionId,
+      ...(params.modelId?.trim() ? { modelId: params.modelId.trim() } : {}),
       ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
     });
   } catch (error) {

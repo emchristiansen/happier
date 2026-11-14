@@ -854,6 +854,7 @@ export async function materializeDaemonConnectedServicesForExecutionRun(
     previousMaterializedRoot?: string;
     sessionDirectory?: string | null;
     sessionId?: string;
+    modelId?: string;
   }>,
   options: DaemonControlRequestOptions = {},
 ): Promise<ExecutionRunConnectedServiceMaterializeResponseWire> {
@@ -866,6 +867,7 @@ export async function materializeDaemonConnectedServicesForExecutionRun(
     ...(body.previousMaterializedRoot ? { previousMaterializedRoot: body.previousMaterializedRoot } : {}),
     ...(body.sessionDirectory !== undefined ? { sessionDirectory: body.sessionDirectory } : {}),
     ...(body.sessionId ? { sessionId: body.sessionId } : {}),
+    ...(body.modelId ? { modelId: body.modelId } : {}),
   }, {
     timeoutMs: resolveExecutionRunConnectedServiceMaterializeTimeoutMs(),
     ...options,

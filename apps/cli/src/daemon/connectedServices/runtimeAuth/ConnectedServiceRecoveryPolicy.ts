@@ -257,6 +257,26 @@ export function decideConnectedServiceRecovery(
     };
   }
 
+  // A per-session member the pool owner disabled or removed is not a credential failure of the
+  // session: only that session moves to another member through the group (spec A.4, T10).
+  if (
+    issue.kind === 'account_disabled'
+    && 'source' in issue
+    && issue.source === 'daemon_member_revocation'
+    && input.selection?.kind === 'group'
+  ) {
+    return {
+      action: 'switch_account',
+      mode: 'delegate_to_group_switch',
+      serviceId: input.selection.serviceId,
+      groupId: input.selection.groupId,
+      fromProfileId: input.selection.activeProfileId,
+      toProfileId: null,
+      reason: issue.kind,
+      actor: input.actor,
+    };
+  }
+
   if (
     issue.kind === 'account_disabled'
   ) {

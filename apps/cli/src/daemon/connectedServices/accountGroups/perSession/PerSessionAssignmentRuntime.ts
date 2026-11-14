@@ -9,9 +9,22 @@ import type { PerSessionSpawnAssignmentDeps } from './resolvePerSessionGroupMemb
 export const PER_SESSION_RESERVATION_LEASE_MS = 5 * 60_000;
 export const PER_SESSION_RESERVATION_RENEW_INTERVAL_MS = 60_000;
 
+/**
+ * Whether the renewal loop may refresh this decision's lease. Renewal only extends a reservation the
+ * server already admitted: an applied decision, or a pending one whose custody is `reserved`.
+ * Proposed, uncertain and locally degraded custody is resolved only by the decision owner's
+ * identical-request replay (spec A.5 R1–R5), never by a second writer.
+ */
+function isRenewable(entry: PerSessionAssignmentLedgerEntry | null): boolean {
+  if (!entry) return true;
+  return entry.state === 'applied' || entry.proposal.custody === 'reserved';
+}
+
 /** One spawn attempt's hold on the per-session decisions it created. */
 export type PerSessionSpawnCustody = Readonly<{
   claim: (decisionIds: ReadonlyArray<string>) => void;
+  /** Called immediately before the first launch adapter is entered; afterwards no release is definite. */
+  markLaunchAttempted: () => void;
   recordRunner: (runner: PerSessionAssignmentRunner) => Promise<void>;
   releaseIfNeverLaunched: () => Promise<void>;
 }>;
@@ -98,7 +111,9 @@ export class PerSessionAssignmentRuntime {
     let result = await api.putAssignmentReservation({
       serviceId: entry.serviceId, groupId: entry.groupId, decisionId: entry.decisionId, body,
     });
-    if (result.kind === 'conflict') {
+    // Only an applied decision (its effect and adoption already proved) may recreate a lapsed entry;
+    // admission of a not-yet-applied decision belongs to the decision owner's CAS selection (A.5 R2).
+    if (result.kind === 'conflict' && state === 'applied') {
       // The entry lapsed (pruned) and must be recreated; this restores an existing decision's
       // count and never changes its target, so it retries against the returned revision.
       result = await api.putAssignmentReservation({
@@ -122,14 +137,27 @@ export class PerSessionAssignmentRuntime {
       profileId: params.profileId,
       subjectId: entry?.sessionId ?? params.decisionId,
     }, 'applied');
-    // The session now serves on this decision: its previously applied decision and every failed
-    // target superseded along the way no longer own it, since the adopted runner replaced their
-    // runners. A different still-pending decision (a newer proposal) keeps its own custody.
+    // The session now serves on this decision: its previously applied decision no longer owns it,
+    // and neither does any earlier target this decision replaced (transitively), since the adopted
+    // runner replaced theirs. A different still-pending decision (a newer proposal) keeps custody.
     if (entry) {
+      const replaced = new Set<string>();
+      const pendingIds = [...(entry.replacesDecisionIds ?? [])];
+      while (pendingIds.length > 0) {
+        const id = pendingIds.pop()!;
+        if (replaced.has(id)) continue;
+        replaced.add(id);
+        pendingIds.push(...(this.input.ledger.get(id)?.replacesDecisionIds ?? []));
+      }
       for (const other of this.input.ledger.list()) {
         if (other.decisionId === params.decisionId || other.sessionId !== entry.sessionId
           || other.serviceId !== params.serviceId || other.groupId !== params.groupId) continue;
-        if (other.state === 'applied' || other.supersededByDecisionId !== undefined) {
+        if (other.state === 'applied' || replaced.has(other.decisionId)) {
+          this.log(other.state === 'applied' ? 'per_session_decision_released_replaced_member' : 'per_session_decision_superseded', {
+            decisionId: other.decisionId,
+            supersededByDecisionId: params.decisionId,
+            ...(other.state === 'applied' ? {} : { reason: 'target_failed_before_adoption' }),
+          });
           await this.release(other.decisionId);
         }
       }
@@ -138,23 +166,38 @@ export class PerSessionAssignmentRuntime {
 
   /**
    * Custody of the decisions one spawn attempt creates: record the runner once a process exists, or
-   * release them when the attempt ends without ever launching one (spec A.4 definite pre-launch failure).
+   * release them when the attempt ends before entering any launch adapter (spec A.4 definite
+   * pre-launch failure). Once a launch was attempted, an unconfirmed outcome (no pid, hosted launch
+   * unconfirmed, failed disposal) keeps custody until the runner's retirement is proved.
    */
   createSpawnCustody(): PerSessionSpawnCustody {
     let decisionIds: ReadonlyArray<string> = [];
-    let launchedRunner: PerSessionAssignmentRunner | null = null;
+    let launchAttempted = false;
     return {
       claim: (ids) => { decisionIds = [...ids]; },
+      markLaunchAttempted: () => { launchAttempted = true; },
       recordRunner: async (runner) => {
-        launchedRunner = runner;
+        launchAttempted = true;
         for (const decisionId of decisionIds) await this.recordSpawnedRunner(decisionId, runner);
       },
       releaseIfNeverLaunched: async () => {
-        if (launchedRunner) return;
+        if (launchAttempted) return;
         for (const decisionId of decisionIds) await this.releaseAfterDefinitePreLaunchFailure(decisionId);
         decisionIds = [];
       },
     };
+  }
+
+  /**
+   * Provider adoption proved this session's conversion to the group's shared home (spec A.4
+   * Migration): every per-session decision it still held for that group is retired.
+   */
+  async settleProvedSharedConversion(params: Readonly<{ subjectId: string; serviceId: ConnectedServiceId; groupId: string }>): Promise<void> {
+    for (const entry of this.input.ledger.list()) {
+      if (entry.sessionId !== params.subjectId || entry.serviceId !== params.serviceId || entry.groupId !== params.groupId) continue;
+      this.log('per_session_decision_released_shared_conversion', { decisionId: entry.decisionId, sessionId: entry.sessionId });
+      await this.release(entry.decisionId);
+    }
   }
 
   /** The runner process launched for a spawn decision; its later proved absence is retirement evidence. */
@@ -217,7 +260,9 @@ export class PerSessionAssignmentRuntime {
       } else if (decision.applied && entry.state !== 'applied') {
         await this.input.ledger.markApplied(decision.decisionId, nowMs);
       }
-      await this.renewSafely(decision, decision.applied ? 'applied' : 'pending');
+      if (decision.applied || isRenewable(entries.get(decision.decisionId) ?? null)) {
+        await this.renewSafely(decision, decision.applied ? 'applied' : 'pending');
+      }
     }
 
     for (const entry of entries.values()) {
@@ -242,6 +287,7 @@ export class PerSessionAssignmentRuntime {
           decisionId: entry.decisionId, sessionId: entry.sessionId, runnerRecorded: Boolean(entry.runner), ageMs: nowMs - entry.updatedAtMs,
         });
       }
+      if (!isRenewable(entry)) continue;
       await this.renewSafely({
         serviceId: entry.serviceId, groupId: entry.groupId, decisionId: entry.decisionId,
         profileId: entry.proposal.profileId, subjectId: entry.sessionId,

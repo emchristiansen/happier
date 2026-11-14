@@ -34,6 +34,7 @@ export type PrepareExecutionRunConnectedServicesForResume = (params: Readonly<{
   backendTarget: BackendTargetRefV1;
   connectedServices: unknown;
   sessionId: string;
+  modelId?: string;
   previousMaterializedRoot?: string;
 }>) => Promise<PreparedExecutionRunConnectedServices | null>;
 
@@ -77,6 +78,7 @@ export async function resolveExecutionRunResumeBackendOptions(args: Readonly<{
       // CS owner re-materializes the exact same account/profile rather than re-defaulting.
       connectedServices: selection,
       sessionId: args.run.sessionId,
+      ...(launch?.modelId ? { modelId: launch.modelId } : {}),
       ...(launch?.connectedServicesRegistration?.materializedRoot
         ? { previousMaterializedRoot: launch.connectedServicesRegistration.materializedRoot }
         : {}),

@@ -13,8 +13,9 @@ type TrackedSessionLike = Readonly<{
 }>;
 
 /**
- * Per-session decisions carried by live runners. The session's own metadata is preferred
- * (it records adoption), falling back to the launch bindings. The reservation subject is the
+ * Per-session decisions carried by live runners: the applied member and any pending per-session
+ * target (a group-home conversion target is not a member decision). The session's own metadata is
+ * preferred (it records adoption), falling back to the launch bindings. The reservation subject is the
  * session's materialization identity, the key its decision was made under before a session id existed.
  */
 function readSubjectId(session: TrackedSessionLike): string | null {
@@ -46,23 +47,29 @@ export function collectPerSessionLiveDecisions(tracked: Iterable<TrackedSessionL
     if (!parsed.success) continue;
     for (const [serviceId, binding] of Object.entries(parsed.data.bindingsByServiceId)) {
       if (!binding || binding.source !== 'connected' || binding.selection !== 'group') continue;
+      // Both decisions a runner carries are live: the applied member it still serves on and the
+      // pending target it is moving to. The applied one is retired only by adoption of the target.
       const pending = binding.materializedAssignment;
       const applied = binding.member;
-      const current = pending ?? applied;
-      if (!current) continue;
-      decisions.set(current.decisionId, {
-        serviceId: serviceId as ConnectedServiceId,
-        groupId: binding.groupId,
-        decisionId: current.decisionId,
-        profileId: current.profileId,
-        subjectId,
-        applied: !pending,
-        reason: current.reason,
-        ...(current.fromProfileId ? { fromProfileId: current.fromProfileId } : {}),
-        ...(current.temperature === undefined ? {} : { temperature: current.temperature }),
-        ...(current.offsetPercent === undefined ? {} : { offsetPercent: current.offsetPercent }),
-        ...(current.probability === undefined ? {} : { probability: current.probability }),
-      });
+      const carried = [
+        ...(applied ? [{ assignment: applied, isApplied: true }] : []),
+        ...(pending && pending.home !== 'group' ? [{ assignment: pending, isApplied: false }] : []),
+      ];
+      for (const { assignment, isApplied } of carried) {
+        decisions.set(assignment.decisionId, {
+          serviceId: serviceId as ConnectedServiceId,
+          groupId: binding.groupId,
+          decisionId: assignment.decisionId,
+          profileId: assignment.profileId,
+          subjectId,
+          applied: isApplied,
+          reason: assignment.reason,
+          ...(assignment.fromProfileId ? { fromProfileId: assignment.fromProfileId } : {}),
+          ...(assignment.temperature === undefined ? {} : { temperature: assignment.temperature }),
+          ...(assignment.offsetPercent === undefined ? {} : { offsetPercent: assignment.offsetPercent }),
+          ...(assignment.probability === undefined ? {} : { probability: assignment.probability }),
+        });
+      }
     }
   }
   return [...decisions.values()];

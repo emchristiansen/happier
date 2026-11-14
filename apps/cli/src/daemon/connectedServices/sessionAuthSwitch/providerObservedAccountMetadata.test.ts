@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ConnectedServiceBindingsV1Schema } from '@happier-dev/protocol';
-import { projectProviderObservedAccountMetadata, resolveAdoptedPerSessionDecisionId } from './providerObservedAccountMetadata';
+import { projectProviderObservedAccountMetadata, resolveAdoptedPerSessionDecisionId, resolveProvedSharedConversion } from './providerObservedAccountMetadata';
 
 describe('provider-observed account metadata', () => {
   const binding = { source: 'connected', selection: 'group', groupId: 'pool', profileId: 'fallback' };
@@ -79,5 +79,12 @@ describe('per-session adoption through provider-observed accounts', () => {
       source: 'connected', selection: 'group', groupId: 'pool', appliedProfileId: 'acct-a',
     });
     expect(resolveAdoptedPerSessionDecisionId(converting, converted, 'claude-subscription')).toBeNull();
+    // Only the matching group-home account proves conversion; the per-session decisions settle then (HPI-17).
+    expect(resolveProvedSharedConversion(converting, converted, 'claude-subscription')).toBe(true);
+    expect(resolveProvedSharedConversion(converting, stillOld, 'claude-subscription')).toBe(false);
+    const wrongAccount = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-c' });
+    expect(resolveProvedSharedConversion(converting, wrongAccount, 'claude-subscription')).toBe(false);
+    expect((wrongAccount.connectedServices as any).bindingsByServiceId['claude-subscription'].materializedAssignment)
+      .toMatchObject({ decisionId: 'conversion-1', home: 'group' });
   });
 });

@@ -146,6 +146,40 @@ describe('decidePerSessionGroupMember', () => {
     expect(persisted.map((proposal) => proposal.proposalRevision)).toEqual([1, 2, 3, 3]);
   });
 
+  it('rechecks a named start on current state after a definite conflict and fails over once it became unavailable (HPI-09)', async () => {
+    let conflicts = 0;
+    const server = createFakeReservationServer({
+      beforePut: () => { if (conflicts < 1) { conflicts += 1; server.bumpRevisionWithUnrelatedCommit(); } },
+    });
+    let reloads = 0;
+    const { input, persisted } = baseInput({
+      scores: { a: 80, b: 60 },
+      initialProfileId: 'a',
+      reservationApi: server.api,
+      // Between the first proposal and its refused PUT, a's quota ran out.
+      reloadMemberState: async () => { reloads += 1; return poolOf({ a: 0, b: 60 }); },
+    });
+    const decision = await decidePerSessionGroupMember(input);
+    expect(reloads).toBe(1);
+    expect(decision).toMatchObject({ kind: 'assigned', proposal: { profileId: 'b', reason: 'initial_unavailable_failover', custody: 'reserved' } });
+    expect(persisted.map((proposal) => [proposal.profileId, proposal.proposalRevision])).toEqual([['a', 1], ['b', 2], ['b', 2]]);
+    expect([...server.entries.values()].filter((entry) => entry.sessionId === 'session-1').map((entry) => entry.profileId)).toEqual(['b']);
+  });
+
+  it('keeps a still-eligible named start after a reload on conflict', async () => {
+    let conflicts = 0;
+    const server = createFakeReservationServer({
+      beforePut: () => { if (conflicts < 1) { conflicts += 1; server.bumpRevisionWithUnrelatedCommit(); } },
+    });
+    const { input } = baseInput({
+      scores: { a: 20, b: 100 },
+      initialProfileId: 'a',
+      reservationApi: server.api,
+      reloadMemberState: async () => poolOf({ a: 15, b: 100 }),
+    });
+    expect(await decidePerSessionGroupMember(input)).toMatchObject({ kind: 'assigned', proposal: { profileId: 'a', reason: 'initial_requested' } });
+  });
+
   it('fails over from an ineligible named member and retains the request reason', async () => {
     const { input } = baseInput({ scores: { a: 0, b: 60 }, initialProfileId: 'a' });
     const decision = await decidePerSessionGroupMember(input);

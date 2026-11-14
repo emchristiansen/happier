@@ -181,6 +181,22 @@ describe('prepareExecutionRunConnectedServices', () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it('carries the run\'s model to the daemon materialization (HPI-09)', async () => {
+    const materialize = vi.fn(async (input: unknown) => materialized(input));
+    await prepareExecutionRunConnectedServices({
+      backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      connectedServices: { v: 1, bindingsByServiceId: { 'openai-codex': { source: 'connected', selection: 'profile', profileId: 'work' } } },
+      credentials: CREDENTIALS,
+      cwd: '/tmp/workspace',
+      sessionId: 'session-1',
+      modelId: 'gpt-5.5',
+      materializeViaDaemon: materialize,
+      releaseViaDaemon: vi.fn(async (_input: unknown) => true),
+      resolveSessionSpawnDefaults: vi.fn(async () => null),
+    });
+    expect(materialize.mock.calls.at(0)?.[0]).toMatchObject({ sessionId: 'session-1', modelId: 'gpt-5.5' });
+  });
+
   it('an explicit per-target selection overrides the session default entirely', async () => {
     const materialize = vi.fn(async (input: unknown) => materialized(input));
     const resolveSessionSpawnDefaults = vi.fn(async (_input: unknown) => ({

@@ -32,10 +32,11 @@ export type PerSessionAssignmentLedgerEntry = Readonly<{
    */
   runner?: PerSessionAssignmentRunner;
   /**
-   * A replacement decision for the same session supersedes this one (its target failed before
-   * adoption). The entry keeps custody until that replacement is adopted (spec A.5, T20).
+   * Earlier decisions of the same session this one replaces (pending targets that failed before
+   * adoption, or reserved targets that became ineligible). They keep custody, untouched, until this
+   * decision is adopted, which proves their runners were retired (spec A.5, T20).
    */
-  supersededByDecisionId?: string;
+  replacesDecisionIds?: ReadonlyArray<string>;
 }>;
 
 export type PerSessionAssignmentRunner = Readonly<{ pid: number; processInstanceFingerprint?: string }>;
@@ -112,7 +113,9 @@ export class PerSessionAssignmentLedger {
     return result;
   }
 
-  async recordProposal(input: Omit<PerSessionAssignmentLedgerEntry, 'state' | 'updatedAtMs'> & Readonly<{ nowMs: number }>): Promise<void> {
+  async recordProposal(
+    input: Omit<PerSessionAssignmentLedgerEntry, 'state' | 'updatedAtMs' | 'runner'> & Readonly<{ nowMs: number }>,
+  ): Promise<void> {
     await this.mutate(() => {
       const previous = this.entries.get(input.decisionId);
       this.entries.set(input.decisionId, {
@@ -125,7 +128,9 @@ export class PerSessionAssignmentLedger {
         state: previous?.state ?? 'pending',
         updatedAtMs: input.nowMs,
         ...(previous?.runner ? { runner: previous.runner } : {}),
-        ...(previous?.supersededByDecisionId ? { supersededByDecisionId: previous.supersededByDecisionId } : {}),
+        ...((input.replacesDecisionIds ?? previous?.replacesDecisionIds)?.length
+          ? { replacesDecisionIds: input.replacesDecisionIds ?? previous!.replacesDecisionIds! }
+          : {}),
       });
     });
   }
@@ -145,15 +150,6 @@ export class PerSessionAssignmentLedger {
       const entry = this.entries.get(decisionId);
       if (!entry) return false;
       this.entries.set(decisionId, { ...entry, runner, updatedAtMs: nowMs });
-      return true;
-    });
-  }
-
-  async markSuperseded(decisionId: string, supersededByDecisionId: string, nowMs: number): Promise<boolean> {
-    return await this.mutate(() => {
-      const entry = this.entries.get(decisionId);
-      if (!entry) return false;
-      this.entries.set(decisionId, { ...entry, supersededByDecisionId, updatedAtMs: nowMs });
       return true;
     });
   }
