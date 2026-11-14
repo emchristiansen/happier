@@ -210,6 +210,24 @@ export function createClaudeRemotePromptSettlementTracker(options: Readonly<{
          * result is decided without touching settlement state; otherwise the retain decision is
          * taken here, once, and the caller must reuse this admission rather than ask again.
          */
+        /** The prompt a request issued now (an interrupt) targets: the latest submission, if any. */
+        latestSubmittedPromptUuid(): string | null {
+            return latestSubmittedUuid;
+        },
+        /**
+         * How a result relates to one submitted prompt. `earlier` only when every prompt it answers
+         * was submitted here before that prompt; `later` when it answers a prompt submitted after it
+         * (or the prompt has left the bounded memory); otherwise `answers`, which includes the prompt
+         * itself, unattributed results and ids never submitted here (provider-injected turns).
+         */
+        relateResultToPrompt(message: unknown, promptUuid: string | null): 'answers' | 'earlier' | 'later' {
+            const answeredUuids = readClaudeResultUserMessageUuids(message);
+            if (promptUuid === null || answeredUuids.length === 0 || answeredUuids.includes(promptUuid)) return 'answers';
+            if (answeredUuids.some((uuid) => !submittedUuids.includes(uuid))) return 'answers';
+            const promptIndex = submittedUuids.indexOf(promptUuid);
+            if (promptIndex < 0) return 'later';
+            return answeredUuids.some((uuid) => submittedUuids.indexOf(uuid) > promptIndex) ? 'later' : 'earlier';
+        },
         admitResult(message: unknown): ClaudeRemoteResultAdmission {
             if (isReplaySdkMessage(message)) {
                 return { replayed: true, forLatestPrompt: false, retainForeground: false, ownsForeground: false };

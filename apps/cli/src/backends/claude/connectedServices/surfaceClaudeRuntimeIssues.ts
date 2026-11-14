@@ -382,18 +382,20 @@ function projectClaudeRuntimeAuthRecoveryReport(input: Readonly<{
 async function enrichClaudeRuntimeEvidenceWithAccountIdentity<T extends Readonly<{
     sourceProviderAccountId?: string | null;
     sourceProviderOrganizationId?: string | null;
-}>>(details: T): Promise<T> {
+}>>(session: RuntimeIssueSession, details: T): Promise<T> {
     const suppliedAccountId = details.sourceProviderAccountId?.trim() || null;
     if (suppliedAccountId && details.sourceProviderOrganizationId?.trim()) return details;
     // Only connected-service (pool) sessions carry a source identity: the soft-switch is a pool
     // feature, and source links are attributed to a connected-service account. Native sessions
     // have no pool to switch within, so they stay unstamped (and must not read the ambient home).
-    const hasConnectedServiceSelection = Boolean(
-        findConnectedServiceChildSelection(process.env, 'claude-subscription')
-        ?? findConnectedServiceChildSelection(process.env, 'anthropic'),
-    );
-    if (!hasConnectedServiceSelection) return details;
-    const identity = await resolveClaudeRuntimeProviderAccountIdentity({ env: process.env }).catch(() => null);
+    const selection = resolveClaudeRuntimeIssueSelection(session);
+    if (!selection) return details;
+    // A group home is shared and rewritten before this runner learns of it: the identity is paired
+    // with this session's selection tuple only from a coherent snapshot naming exactly that tuple.
+    const identity = await resolveClaudeRuntimeProviderAccountIdentity({
+        env: process.env,
+        groupSelection: selection.kind === 'group' ? selection : null,
+    }).catch(() => null);
     const providerAccountId = identity?.providerAccountId ?? null;
     if (!providerAccountId || (suppliedAccountId && suppliedAccountId !== providerAccountId)) return details;
     return {
@@ -528,7 +530,7 @@ export async function recordClaudeRateLimitQuotaEvidence(
     const target = resolveClaudeQuotaSnapshotTarget(session, {});
     if (!target.profileId) return;
     // All windows come from one provider response, so one account identity covers them.
-    const enrichedPrimaryWindow = await enrichClaudeRuntimeEvidenceWithAccountIdentity(primaryWindow);
+    const enrichedPrimaryWindow = await enrichClaudeRuntimeEvidenceWithAccountIdentity(session, primaryWindow);
     const observedAt = Date.now();
     void claudeQuotaSnapshotDeliveryOutbox.enqueueAndFlush({
         sessionId: session.client.sessionId,
@@ -636,7 +638,7 @@ export async function surfaceClaudeRateLimitRuntimeIssue(
         ? requestIdentity.identity.then((identity) => ({ ...details, ...identity }))
         : 'transcriptPath' in session
             ? Promise.resolve({ ...details, sourceProviderAccountId: null, sourceProviderOrganizationId: null })
-            : enrichClaudeRuntimeEvidenceWithAccountIdentity(details);
+            : enrichClaudeRuntimeEvidenceWithAccountIdentity(session, details);
     const initialClassification = classifyClaudeConnectedServiceRuntimeAuthFailure({
         details,
         selection,
@@ -825,7 +827,7 @@ export async function surfaceClaudeRuntimeAuthFailure(
         ...initialClassification,
         ...(requestIdentity ? await requestIdentity.identity : 'transcriptPath' in session
             ? { sourceProviderAccountId: null, sourceProviderOrganizationId: null }
-            : await enrichClaudeRuntimeEvidenceWithAccountIdentity(initialClassification)),
+            : await enrichClaudeRuntimeEvidenceWithAccountIdentity(session, initialClassification)),
         ...await providerOrganization,
         ...(runtimeIssueFingerprint ? { runtimeIssueFingerprint } : {}),
     };

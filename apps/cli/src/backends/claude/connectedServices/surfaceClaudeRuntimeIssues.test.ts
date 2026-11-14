@@ -1717,6 +1717,8 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
 
   it('enriches passive quota evidence with the live account identity → source-linked PAU (soft-switch eligible)', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'acct_live_uuid', emailAddress: 'pool@happier.dev', organizationUuid: 'org-pool' });
+    // A group home's identity is attributable only with the provenance naming the session's tuple.
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
 
     await recordClaudeRateLimitQuotaEvidence({
       client: { sessionId: 'sess_r34_passive' },
@@ -1742,6 +1744,8 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
 
   it('preserves burn history when repeated native Claude observations attest the same user and organization', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'acct_live_uuid', organizationUuid: 'org-live' });
+    // A group home's identity is attributable only with the provenance naming the session's tuple.
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     const selection = process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
     if (!selection) throw new Error('Expected the connected-service selection fixture.');
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
@@ -1785,6 +1789,8 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
 
   it('stamps the live identity onto the rejected usage-limit snapshot too', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'acct_live_uuid', organizationUuid: 'org-live' });
+    // A group home's identity is attributable only with the provenance naming the session's tuple.
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     const failTurn = createClaudeFailTurnSpy();
 
     await surfaceClaudeRateLimitRuntimeIssue({

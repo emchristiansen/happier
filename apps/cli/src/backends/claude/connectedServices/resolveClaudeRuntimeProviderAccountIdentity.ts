@@ -1,12 +1,10 @@
-import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
-
-import { withConnectedServiceStateSharingDestinationLock } from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingLock';
 
 import { resolveConfiguredClaudeConfigDir } from '../utils/resolveConfiguredClaudeConfigDir';
 
 import { readClaudeConnectedServiceHomeProvenance } from './claudeConnectedServiceHomeProvenance';
 import { readClaudeOauthAccountIdentity, readClaudeRootConfigFile } from './claudeRootConfig';
+import { readClaudeGroupHomeSnapshot } from './readClaudeGroupHomeSnapshot';
 
 export type ClaudeRuntimeProviderAccountIdentity = Readonly<{
   providerAccountId: string | null;
@@ -27,11 +25,6 @@ const UNPROVEN_IDENTITY: ClaudeRuntimeProviderAccountIdentity = {
   providerEmail: null,
   providerOrganizationId: null,
 };
-
-// Bounded so a long-held writer lock delays a request dispatch only briefly; a timeout is unproven.
-// The bound covers the whole snapshot, including any in-process queue ahead of the file lock's own
-// acquire timeout (which only starts once this process's earlier waiters have finished).
-const GROUP_HOME_SNAPSHOT_LOCK_TIMEOUT_MS = 2_000;
 
 /**
  * Read the live provider-account identity from a materialized Claude config dir
@@ -63,12 +56,7 @@ async function readClaudeGroupHomeAccountIdentityForTuple(
   claudeConfigDir: string,
   tuple: ClaudeRuntimeGroupSelectionTuple,
 ): Promise<ClaudeRuntimeProviderAccountIdentity> {
-  // Never create a home (or its lock) merely to read it.
-  if (!await stat(claudeConfigDir).then((entry) => entry.isDirectory(), () => false)) return UNPROVEN_IDENTITY;
-  let abandoned = false;
-  const snapshot = withConnectedServiceStateSharingDestinationLock(claudeConfigDir, async () => {
-    // Past the deadline the caller has already recorded unproven; do not read for nobody.
-    if (abandoned) return UNPROVEN_IDENTITY;
+  return await readClaudeGroupHomeSnapshot(claudeConfigDir, async () => {
     const provenance = await readClaudeConnectedServiceHomeProvenance(claudeConfigDir);
     const coherent = provenance?.selection.kind === 'group'
       && provenance.selection.groupId === tuple.groupId
@@ -76,24 +64,7 @@ async function readClaudeGroupHomeAccountIdentityForTuple(
       && provenance.generation === tuple.generation
       && (provenance.credentialRevision ?? null) === (tuple.credentialRevision ?? null);
     return coherent ? await readClaudeMaterializedOAuthAccountIdentity(claudeConfigDir) : UNPROVEN_IDENTITY;
-  }, { providerId: 'claude', acquireTimeoutMs: GROUP_HOME_SNAPSHOT_LOCK_TIMEOUT_MS });
-  // A late outcome after the deadline is ignored, including a late failure.
-  snapshot.catch(() => {});
-  let deadline: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      snapshot,
-      new Promise<ClaudeRuntimeProviderAccountIdentity>((resolve) => {
-        deadline = setTimeout(() => {
-          abandoned = true;
-          resolve(UNPROVEN_IDENTITY);
-        }, GROUP_HOME_SNAPSHOT_LOCK_TIMEOUT_MS);
-        deadline.unref?.();
-      }),
-    ]);
-  } finally {
-    clearTimeout(deadline);
-  }
+  }, UNPROVEN_IDENTITY);
 }
 
 /**

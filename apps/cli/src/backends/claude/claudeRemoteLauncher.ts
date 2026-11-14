@@ -533,6 +533,10 @@ export async function claudeRemoteLauncher(
             didUserAbortThisLaunch = true;
             await permissionHandler?.abortPendingRequestsAndFlush('Aborted by user');
 	        if (turnInterrupt) {
+                // The interrupt concerns the task live now. Its own result can end that task before
+                // the acknowledgment and the next prompt can start meanwhile; a late acknowledgment
+                // must not cancel that successor.
+                const interruptedTaskTurnId = session.readCurrentTaskTurnId();
 	            try {
 	                await turnInterrupt();
             } catch (error) {
@@ -541,6 +545,11 @@ export async function claudeRemoteLauncher(
                 await recordUnifiedPromptTurnCancelled?.();
                 session.abortCurrentTaskTurn();
                 await abort();
+                return;
+            }
+            const liveTaskTurnId = session.readCurrentTaskTurnId();
+            if (liveTaskTurnId !== null && liveTaskTurnId !== interruptedTaskTurnId) {
+                logger.debug('[remote]: interrupted turn already ended; leaving its successor running');
                 return;
             }
             await recordUnifiedPromptTurnCancelled?.();

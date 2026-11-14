@@ -901,6 +901,9 @@ export class Session {
         );
     }
 
+    /** The task turn live now (null when none), to bind a deferred effect to the turn it concerns. */
+    readCurrentTaskTurnId = (): string | null => this.currentTaskId;
+
     abortCurrentTaskTurn = () => {
         const id = this.currentTaskId ?? randomUUID();
         this.currentTaskId = null;

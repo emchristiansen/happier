@@ -865,9 +865,13 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
     }
 
     let thinking = false;
+    // Advances each time a foreground turn begins holding thinking, so a late effect of an earlier
+    // turn (an interrupt acknowledged after that turn already ended) can tell it is no longer current.
+    let thinkingEpoch = 0;
     const updateThinking = (newThinking: boolean) => {
         if (thinking !== newThinking) {
             thinking = newThinking;
+            if (newThinking) thinkingEpoch += 1;
             opts.onThinkingChange?.(thinking);
         }
     };
@@ -1006,6 +1010,8 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
 
 	    let didRequestTurnInterrupt = false;
 	    let awaitingRequestedTurnInterruptResult = false;
+	    // The submitted prompt whose turn a pending requested interrupt targets.
+	    let requestedInterruptPromptUuid: string | null = null;
 	    const repairTranscriptAfterAbort = async () => {
 	        if (!didRequestTurnInterrupt && !abortSignal.aborted) return;
 	        try {
@@ -1134,6 +1140,11 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
 	        const interruptTurn = async (): Promise<void> => {
                 if (qualifyingPrompt) qualifyingPrompt.cancelled = true;
                 let stopTaskSucceeded = false;
+                // The interrupt belongs to the turn holding thinking now. Its own result may end that
+                // turn before the acknowledgment, and a next turn may start meanwhile: the late
+                // acknowledgment must not cancel or truncate that next turn.
+                const interruptedEpoch = thinkingEpoch;
+                const interruptedTurnStillCurrent = () => thinkingEpoch === interruptedEpoch;
 	            try {
                     const stopTask = (response as any)?.stopTask;
                     if (typeof stopTask === 'function') {
@@ -1143,6 +1154,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                             didRequestTurnInterrupt = true;
                             deferredInterruptedReason = deferredInterruptedReason ?? 'turn-interrupt';
                             awaitingRequestedTurnInterruptResult = true;
+                            requestedInterruptPromptUuid = promptSettlements.latestSubmittedPromptUuid();
                             try {
                                 await stopTask.call(response, taskId);
                                 stopTaskSucceeded = true;
@@ -1159,23 +1171,27 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
 	                    didRequestTurnInterrupt = true;
                         deferredInterruptedReason = deferredInterruptedReason ?? 'turn-interrupt';
 	                    awaitingRequestedTurnInterruptResult = true;
+	                    requestedInterruptPromptUuid = promptSettlements.latestSubmittedPromptUuid();
 	                    await interrupt.call(response);
 	                }
 	            } catch {
-	                awaitingRequestedTurnInterruptResult = false;
+	                if (interruptedTurnStillCurrent()) awaitingRequestedTurnInterruptResult = false;
 	                // Best-effort: interrupt is optional and should not crash cancellation.
 	            } finally {
 	                // Ensure UI thinking state is released even if Claude does not emit a clean result;
-	                // the interrupt is that turn's cancellation, not its completion.
-	                releaseThinkingWithoutResult('cancelled');
-                    if (!stopTaskSucceeded) {
-                        try {
-                            cleanupBufferedAssistantMessages?.(null);
-                        } catch {
-                            // ignore
-                        }
-	                    await flushStreamedTranscriptWriter('abort', 'turn-interrupt');
-                    }
+	                // the interrupt is that turn's cancellation, not its completion. A turn that
+	                // already ended through its own result settled its buffers then.
+	                if (interruptedTurnStillCurrent()) {
+	                    releaseThinkingWithoutResult('cancelled');
+	                    if (!stopTaskSucceeded) {
+	                        try {
+	                            cleanupBufferedAssistantMessages?.(null);
+	                        } catch {
+	                            // ignore
+	                        }
+	                        await flushStreamedTranscriptWriter('abort', 'turn-interrupt');
+	                    }
+	                }
 	            }
 	        };
 	        opts.setTurnInterrupt?.(interruptTurn);
@@ -1717,6 +1733,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                                 didRequestTurnInterrupt = true;
                                 deferredInterruptedReason = deferredInterruptedReason ?? 'pending-interrupt-and-send';
                                 awaitingRequestedTurnInterruptResult = true;
+                                requestedInterruptPromptUuid = promptSettlements.latestSubmittedPromptUuid();
                                 await interrupt.call(response);
                                 cleanupBufferedAssistantMessages?.(null);
                                 await flushStreamedTranscriptWriter('abort', 'pending-interrupt-and-send');
@@ -2420,8 +2437,14 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                 if (!resultAdmission.ownsForeground && !resultAdmission.retainForeground) {
                     continue;
                 }
-                const didRequestThisResult = awaitingRequestedTurnInterruptResult;
-                awaitingRequestedTurnInterruptResult = false;
+                // A requested interrupt is answered only by its own turn's result. A late result for a
+                // prompt submitted before the interrupted one leaves it pending; a result for a later
+                // prompt means the interrupted turn is over without that answer.
+                const interruptRelation = awaitingRequestedTurnInterruptResult
+                    ? promptSettlements.relateResultToPrompt(message, requestedInterruptPromptUuid)
+                    : null;
+                const didRequestThisResult = interruptRelation === 'answers';
+                if (interruptRelation !== 'earlier') awaitingRequestedTurnInterruptResult = false;
                 const failure = readAgentSdkResultFailure(message);
                 // Decided once on arrival (admitResult), before the failure taps above.
                 const resultForLatestPrompt = resultAdmission.forLatestPrompt;

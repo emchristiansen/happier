@@ -7,6 +7,7 @@ import { buildConnectedServiceCredentialRecord } from '@happier-dev/protocol';
 
 import { ConnectedServiceAuthGroupGenerationConsumer } from '@/daemon/connectedServices/accountGroups/generation/ConnectedServiceAuthGroupGenerationConsumer';
 import { createSharedGenerationApplication } from '@/daemon/connectedServices/accountGroups/generation/createSharedGenerationApplication';
+import { resolveRuntimeGenerationApplicationProofs } from '@/daemon/connectedServices/accountGroups/generation/resolveRuntimeGenerationApplicationProofs';
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import { buildConnectedServiceAuthGroupCommittedGenerationFact } from '@/daemon/connectedServices/sessionAuthSwitch/connectedServiceAuthSwitchOutcome';
 
@@ -14,7 +15,12 @@ import { applyClaudeSharedGroupGenerationApplication } from './applyClaudeShared
 import { ClaudeConnectedServiceAuthGroupRequestFence } from './claudeConnectedServiceAuthGroupRequestFence';
 import { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } from './nativeAuth/claudeCodeCredentialScopes';
 import { resolveClaudeConnectedServiceStableConfigDir } from './resolveClaudeConnectedServiceStableAuthDir';
-import { captureClaudeRuntimeAuthRequestIdentity, surfaceClaudeRateLimitRuntimeIssue } from './surfaceClaudeRuntimeIssues';
+import {
+  captureClaudeRuntimeAuthRequestIdentity,
+  recordClaudeRateLimitQuotaEvidence,
+  surfaceClaudeRateLimitRuntimeIssue,
+} from './surfaceClaudeRuntimeIssues';
+import { verifyClaudeSharedGroupGenerationApplication } from './verifyClaudeSharedGroupGenerationApplication';
 
 // The only scheduling seam is the real `.claude.json` read; the generation consumer, shared
 // application, materializer, credential/root/provenance writers, identity reader, capture and fence
@@ -44,9 +50,10 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   };
 });
 const notifyFailure = vi.hoisted(() => vi.fn(async (_input: any) => ({})));
+const notifyQuota = vi.hoisted(() => vi.fn(async (_input: any) => ({ ok: true })));
 vi.mock('@/daemon/controlClient', () => ({
   notifyDaemonConnectedServiceRuntimeAuthFailure: notifyFailure,
-  notifyDaemonConnectedServiceQuotaSnapshot: vi.fn(async () => ({ ok: true })),
+  notifyDaemonConnectedServiceQuotaSnapshot: notifyQuota,
   notifyDaemonConnectedServiceTurnLifecycle: vi.fn(async () => ({ ok: true })),
 }));
 
@@ -283,5 +290,160 @@ describe('request identity capture against the real shared group writer', () => 
     const recovered = runnerSession(`partial-recovered-${name}`, fence);
     await captureClaudeRuntimeAuthRequestIdentity(recovered);
     expect(await reportedFailure(recovered)).toMatchObject({ sourceProviderAccountId: 'acct-b', sourceProviderOrganizationId: 'org-b' });
+  });
+  async function deliveredQuota(session: ReturnType<typeof runnerSession>) {
+    notifyQuota.mockClear();
+    await recordClaudeRateLimitQuotaEvidence(session, [{
+      v: 1, resetAtMs: null, retryAfterMs: null, limitCategory: 'usage_limit', quotaScope: 'account',
+      recoverability: 'wait', planType: null, utilization: 95, overage: null, action: null, connectedService: null,
+    }], '[shared-capture]');
+    await vi.waitFor(() => expect(notifyQuota).toHaveBeenCalled());
+    return notifyQuota.mock.calls.at(-1)![0];
+  }
+
+  function verifyProof(move: Move) {
+    return verifyClaudeSharedGroupGenerationApplication({
+      serviceId: 'claude-subscription', groupId: 'team-pool', profileId: move.profileId, generation: move.generation,
+      credentialRevision: move.credentialRevision as never, environmentVariables: { CLAUDE_CONFIG_DIR: configDir },
+    });
+  }
+
+  it('keeps passive quota evidence but never stamps the next account under the unchanged tuple after a failed publication', async () => {
+    const fence = new ClaudeConnectedServiceAuthGroupRequestFence();
+    fence.applyCurrentTruth(initialTruth);
+    const session = runnerSession('passive-quota', fence);
+    // Control: a coherent home attributes the passive window to the account it actually holds.
+    expect(await deliveredQuota(session)).toMatchObject({ groupGeneration: 4, sourceProviderAccountId: 'acct-a' });
+
+    renameGate.path = join(configDir, '.happier-claude-connected-service-home.json');
+    renameGate.fail = Object.assign(new Error('injected EACCES at provenance publication'), { code: 'EACCES' });
+    const { releaseNotification, consumption } = startSharedConsumer(
+      { profileId: 'b', generation: 5, credentialRevision: revB }, fence, session.client.sessionId);
+    releaseNotification();
+    expect((await consumption as { ok?: boolean }).ok).toBe(false);
+    renameGate.fail = null;
+
+    const delivered = await deliveredQuota(session);
+    // The provider's in-band window is kept in full; only the account join is withheld.
+    expect(delivered).toMatchObject({ groupId: 'team-pool', groupGeneration: 4 });
+    expect(delivered.sourceProviderAccountId ?? null).toBeNull();
+    expect(delivered.snapshot).toMatchObject({ profileId: 'a', confidence: 'exact', source: 'in_band_provider_snapshot' });
+    expect(delivered.snapshot.activeAccountId ?? null).toBeNull();
+    expect(delivered.snapshot.meters).toEqual([expect.objectContaining({ utilizationPct: 95, remainingPct: 5 })]);
+  });
+
+  it('certifies a generation only from one publication while a rewrite to the next member fails', async () => {
+    const a = { profileId: 'a', generation: 4, credentialRevision: revA };
+    const b = { profileId: 'b', generation: 5, credentialRevision: revB };
+    const { readFile } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    const credentialsPath = join(configDir, '.credentials.json');
+    const provenancePath = join(configDir, '.happier-claude-connected-service-home.json');
+    const aCredentials = await readFile(credentialsPath, 'utf8');
+    const aFingerprint = JSON.parse(await readFile(provenancePath, 'utf8')).credentialFingerprint;
+
+    // The real verifier has read A's provenance record and pauses at its credentials read.
+    let paused!: () => void;
+    let resume!: () => void;
+    const reachedCredentials = new Promise<void>((resolve) => { paused = resolve; });
+    const resumed = new Promise<void>((resolve) => { resume = resolve; });
+    readGate.path = credentialsPath;
+    readGate.before = async () => { paused(); await resumed; };
+    const verifying = verifyProof(a);
+    await reachedCredentials;
+
+    // The ordinary shared rewrite to B starts now and fails at its final provenance publication.
+    const fence = new ClaudeConnectedServiceAuthGroupRequestFence();
+    fence.applyCurrentTruth(initialTruth);
+    renameGate.path = provenancePath;
+    renameGate.fail = Object.assign(new Error('injected EACCES at provenance publication'), { code: 'EACCES' });
+    const { releaseNotification, consumption } = startSharedConsumer(b, fence, 'shared-capture-verify');
+    releaseNotification();
+    // The writer cannot touch the home while the verifier's snapshot is open.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(await readFile(credentialsPath, 'utf8')).toBe(aCredentials);
+    resume();
+    expect(await verifying).toMatchObject({ status: 'verified', credentialRevision: revA, credentialFingerprint: aFingerprint });
+    expect((await consumption as { ok?: boolean }).ok).toBe(false);
+    renameGate.fail = null;
+
+    // After the failed publication neither member is certified, and the home holds B's credentials.
+    expect(await readFile(credentialsPath, 'utf8')).not.toBe(aCredentials);
+    expect(await verifyProof(a)).toEqual({ status: 'unavailable' });
+    expect(await verifyProof(b)).toEqual({ status: 'unavailable' });
+    // A later successful publication of B is certified again.
+    await applyDirectly(b);
+    expect(await verifyProof(b)).toMatchObject({ status: 'verified', credentialRevision: revB });
+    expect(await verifyProof(a)).toEqual({ status: 'unavailable' });
+  });
+  /** A consumer re-adopting A for a live session, through the real runtime proof resolver and verifier. */
+  function startAdoptingConsumer(name: string) {
+    const notified: unknown[] = [];
+    let applyCalls = 0;
+    const target = { sessionId: `adopt-${name}`, agentId: 'claude' as const,
+      connectedServiceSelectionsEnv: { CLAUDE_CONFIG_DIR: configDir },
+      activeBindings: [{ serviceId: 'claude-subscription' as const, groupId: 'team-pool', profileId: 'a', generation: 4,
+        credentialRevision: revA as never }] };
+    const consumer = new ConnectedServiceAuthGroupGenerationConsumer({
+      resolveGenerationApplicationScope: async () => ({ status: 'supported', scope: 'shared_group_auth_surface', ownerId: 'claude' }),
+      verifySharedGenerationApplication: async () => (await resolveRuntimeGenerationApplicationProofs({
+        target,
+        resolveLifecycleDescriptor: async () => ({ verifyGenerationApplication: verifyClaudeSharedGroupGenerationApplication }),
+        getCurrentGroup: async () => ({ serviceId: 'claude-subscription', groupId: 'team-pool', activeProfileId: 'a', generation: 4 }),
+        isCurrent: () => true,
+      } as never))[0] ?? null,
+      applyCommittedGeneration: async () => { throw new Error('unexpected per-session writer'); },
+      // Without a proof the consumer would rewrite; this stand-in refuses so a proof alone decides success.
+      applySharedGenerationApplication: async () => { applyCalls += 1; return { reconciliationDisposition: 'failed', errorCode: 'no_apply' } as never; },
+      notifyCurrentGroupTruth: async (input) => { notified.push(input); return { ok: true }; },
+    });
+    const consumption = consumer.consume({
+      executionAuthority: 'runtime_recovery',
+      switchReason: 'automatic_runtime_failure',
+      sessions: [{ sessionId: target.sessionId, activity: 'live', applicationOwnerId: 'claude' }],
+      committedGeneration: buildConnectedServiceAuthGroupCommittedGenerationFact({
+        decisionId: `adopt-${name}`, provenance: 'reconciliation',
+        decisionCommittedTarget: { serviceId: 'claude-subscription', groupId: 'team-pool', profileId: 'a', generation: 4, credentialRevision: revA } as never,
+      }),
+    });
+    return { consumption: consumption as Promise<{ acknowledgeable?: boolean; ok?: boolean }>, notified, applyCalls: () => applyCalls };
+  }
+
+  it('acknowledges a reader-first coherent A, and never A again after a same-member revision B failed publication', async () => {
+    const { readFile } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    const credentialsPath = join(configDir, '.credentials.json');
+    const aCredentials = await readFile(credentialsPath, 'utf8');
+    let paused!: () => void;
+    let resume!: () => void;
+    const reachedCredentials = new Promise<void>((resolve) => { paused = resolve; });
+    const resumed = new Promise<void>((resolve) => { resume = resolve; });
+    readGate.path = credentialsPath;
+    readGate.before = async () => { paused(); await resumed; };
+    const readerFirst = startAdoptingConsumer('reader-first');
+    await reachedCredentials;
+
+    const fence = new ClaudeConnectedServiceAuthGroupRequestFence();
+    fence.applyCurrentTruth(initialTruth);
+    renameGate.path = join(configDir, '.happier-claude-connected-service-home.json');
+    renameGate.fail = Object.assign(new Error('injected EACCES at provenance publication'), { code: 'EACCES' });
+    const writer = startSharedConsumer({ profileId: 'a', generation: 4, credentialRevision: revB }, fence, 'shared-capture-same-member-b');
+    writer.releaseNotification();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The proof that A is current was taken while A was the home's only publication.
+    expect(await readFile(credentialsPath, 'utf8')).toBe(aCredentials);
+    resume();
+    const first = await readerFirst.consumption;
+    expect(first.acknowledgeable).toBe(true);
+    expect(readerFirst.notified).toHaveLength(1);
+    expect(readerFirst.applyCalls()).toBe(0);
+    expect((await writer.consumption as { ok?: boolean }).ok).toBe(false);
+    renameGate.fail = null;
+
+    // After the failed publication the home holds B's credentials and no provenance: no proof.
+    expect(await readFile(credentialsPath, 'utf8')).not.toBe(aCredentials);
+    const after = startAdoptingConsumer('after-failure');
+    const second = await after.consumption;
+    expect(second.acknowledgeable).toBe(false);
+    expect(after.notified).toHaveLength(0);
+    expect(after.applyCalls()).toBe(1);
   });
 });
