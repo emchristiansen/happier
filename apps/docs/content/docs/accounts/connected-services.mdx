@@ -455,6 +455,7 @@ dead account.
 | **Least limited** | Picks whichever member has the most quota left. |
 | **Priority** | Uses your ordering, falling back down the list. |
 | **Manual** | Never chooses for you; you pick. |
+| **Per-session (weighted random)** | Claude subscription pools only: each new session draws its own member, weighted toward accounts with more quota left. |
 
 The expiry-first choice requires a server advertising `connectedServices.poolExpiryFirst`.
 It is the default for new pools in development builds; existing saved strategies
@@ -465,6 +466,34 @@ switch, without adding scheduled swaps or restarting the agent.
 
 Reorder members to set the fallback order, and enable or disable individual
 accounts without removing them.
+
+#### Per-session pools
+
+A per-session pool has no shared active account. Each new session in the pool
+gets its own member, chosen at random with odds that favour accounts with more
+quota left: a member whose remaining share is `s` percent, counting the sessions
+already placed on it, gets weight `(s' / (100 − s' + δ))^(1/τ)`, where
+`s' = s / (1 + k)` and `k` is the number of live sessions already assigned to it.
+**Temperature** (τ, default 1.5) flattens the odds as it rises; **Offset** (δ,
+default 10 percentage points) limits how strongly an almost-full account is
+preferred. Members below the pool's low-quota threshold are used only when no
+member is above it.
+
+Concurrent launches spread out through a shared reservation on the server. When
+a session hits a usage limit, only that session moves, onto its own newly drawn
+member, by restarting the agent with its conversation resumed; other sessions and
+the pool itself are unaffected. A session's account label shows the account the
+provider has confirmed, not one still being switched to.
+
+You can choose **Start on** a particular member when creating a session
+(`happier session create --auth cs:group:<pool> --initial-profile <profileId>`).
+If that member is exhausted or unavailable the session starts on a drawn member
+instead; a disabled or non-member choice is refused.
+
+The strategy requires a server with
+`HAPPIER_FEATURE_CONNECTED_SERVICES_POOL_PER_SESSION_SOFTMAX__ENABLED=1` (off by
+default). Clients that predate it see such a pool as manual and cannot edit its
+policy.
 
 If a provider reports more than one independent allowance, the pool's
 **Usage limits** row can either track every allowance reported by enabled pool
