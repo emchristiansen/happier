@@ -1160,6 +1160,10 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                                 stopTaskSucceeded = true;
                                 return;
                             } catch {
+                                // A late stopTask failure after a next turn began belongs to the
+                                // interrupted turn only: the turn-wide interrupt() fallback would
+                                // stop that next turn, and its interrupt state is not ours to clear.
+                                if (!interruptedTurnStillCurrent()) return;
                                 awaitingRequestedTurnInterruptResult = false;
                                 // Best-effort: if stopTask fails, fall back to interrupt().
                             }

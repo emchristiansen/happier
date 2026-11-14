@@ -145,4 +145,29 @@ describe('requested interrupt custody across turns',()=>{
   try{await vi.waitFor(()=>expect(h.terminals).toHaveLength(1));run.send(1);await vi.waitFor(()=>expect(bStarted).toBe(true));const b=h.lifecycle.getActiveTurnId();interruptJob=run.interrupt();stale.resolve();await vi.waitFor(()=>expect(staleDone).toBe(true));expect(h.lifecycle.getActiveTurnId()).toBe(b);own.resolve();await vi.waitFor(()=>expect(h.lifecycle.hasActiveTurn()).toBe(false));await h.settleDaemon();save('stale-consumes-interrupt',h,{b,failure});expect((h.mutations as any[]).filter(x=>x.turnId===b&&['complete','cancel','fail'].includes(x.action)).map(x=>x.action)).toEqual(['cancel']);
   }finally{ack.resolve();own.resolve();stale.resolve();await interruptJob;await run.cleanup()}
  });
+
+ it.each(['resolve','reject'] as const)('late A stopTask %s after B began issues no interrupt against B',async(kind)=>{
+  contractNotices.length=0;const h=createComposedHarness(),finish=gate(),stopRequested=gate(),stopAck=gate(),endA=gate(),endB=gate();let a='',b='',taskObserved=false;const controls:unknown[]=[];
+  const query=(({prompt}:Parameters<CreateQuery>[0])=>({async *[Symbol.asyncIterator](){const input=(prompt as AsyncIterable<SDKUserMessage>)[Symbol.asyncIterator]();a=await next(input);yield{type:'system',subtype:'init',session_id:'owned-session'};yield{type:'system',subtype:'task_started',task_id:'task-a',session_id:'owned-session'};taskObserved=true;await endA.promise;yield result([a],{subtype:'error_during_execution',errors:['interrupted A']});b=await next(input);await endB.promise;yield result([b]);await finish.promise},async stopTask(id:string){controls.push({op:'stopTask',id});stopRequested.resolve();await stopAck.promise;if(kind==='reject')throw Error('A stop_task failed after A ended')},async interrupt(){controls.push({op:'interrupt',currentPrompt:b})},close(){finish.resolve();endA.resolve();endB.resolve()}}))as unknown as CreateQuery;
+  const run=launch(h,query,['A','B'],finish);let job:Promise<void>|undefined;
+  try{
+   await vi.waitFor(()=>expect(taskObserved).toBe(true));const turnA=h.lifecycle.getActiveTurnId();job=run.interrupt();await stopRequested.promise;endA.resolve();run.send(1);await vi.waitFor(()=>expect(b).not.toBe(''));const turnB=h.lifecycle.getActiveTurnId();expect(turnB).not.toBe(turnA);
+   stopAck.resolve();await job;await h.settleDaemon();save('late-stopTask-'+kind,h,{a,b,turnA,turnB,controls});
+   expect(controls).toEqual([{op:'stopTask',id:'task-a'}]);expect(h.lifecycle.getActiveTurnId()).toBe(turnB);
+   expect((h.mutations as any[]).filter(x=>x.turnId===turnA&&['complete','cancel','fail'].includes(x.action)).map(x=>x.action)).toEqual(['cancel']);
+   endB.resolve();await vi.waitFor(()=>expect(h.terminals.at(-1)).toEqual({turnId:turnB,terminalStatus:'completed'}));await h.settleDaemon();save('late-stopTask-'+kind+'-B-complete',h,{controls});
+   expect(h.proofs.at(-1)).toMatchObject({completionContract:'claude_sdk_result_bound_v1'});expect((contractNotices.at(-1) as any)[0]).toMatchObject({turnId:turnB});
+  }finally{stopAck.resolve();endA.resolve();endB.resolve();await job;await run.cleanup()}
+ });
+
+ it('stopTask failure while A still runs falls back to interrupt() for A',async()=>{
+  contractNotices.length=0;const h=createComposedHarness(),finish=gate(),interrupted=gate();let a='',taskObserved=false;const controls:unknown[]=[];
+  const query=(({prompt}:Parameters<CreateQuery>[0])=>({async *[Symbol.asyncIterator](){const input=(prompt as AsyncIterable<SDKUserMessage>)[Symbol.asyncIterator]();a=await next(input);yield{type:'system',subtype:'init',session_id:'owned-session'};yield{type:'system',subtype:'task_started',task_id:'task-a',session_id:'owned-session'};taskObserved=true;await interrupted.promise;yield result([a],{subtype:'error_during_execution',errors:['interrupted A']});await finish.promise},async stopTask(id:string){controls.push({op:'stopTask',id});throw Error('stop_task failed while A runs')},async interrupt(){controls.push({op:'interrupt'});interrupted.resolve()},close(){finish.resolve();interrupted.resolve()}}))as unknown as CreateQuery;
+  const run=launch(h,query,['A'],finish);let job:Promise<void>|undefined;
+  try{
+   await vi.waitFor(()=>expect(taskObserved).toBe(true));const turnA=h.lifecycle.getActiveTurnId();job=run.interrupt();await job;await vi.waitFor(()=>expect(h.lifecycle.hasActiveTurn()).toBe(false));await h.settleDaemon();save('stopTask-fails-A-current',h,{turnA,controls});
+   expect(controls).toEqual([{op:'stopTask',id:'task-a'},{op:'interrupt'}]);
+   expect((h.mutations as any[]).filter(x=>x.turnId===turnA&&['complete','cancel','fail'].includes(x.action)).map(x=>x.action)).toEqual(['cancel']);expect(h.proofs).toEqual([]);
+  }finally{interrupted.resolve();await job;await run.cleanup()}
+ });
 });
