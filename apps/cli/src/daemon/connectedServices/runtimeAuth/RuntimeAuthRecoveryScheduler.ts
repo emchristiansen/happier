@@ -182,6 +182,8 @@ export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
     proofKind: ProviderOutcomeProofKind;
     expectedAttemptId: string | null;
     observedAtMs: number | null;
+    /** Producer-stated qualification of the evidence (e.g. turn ownership); null when unstated. */
+    turnOwnership: 'exact_turn' | 'unverified_turn' | null;
     before: RuntimeAuthRecoveryIntent | null;
     after: RuntimeAuthRecoveryIntent | null;
   }>) => void;
@@ -2421,6 +2423,8 @@ export class RuntimeAuthRecoveryScheduler {
     proofKind: ProviderOutcomeProofKind;
     expectedAttemptId?: string;
     observedAtMs?: number;
+    /** Evidence-only qualification forwarded to onProviderOutcomeProof; never changes control. */
+    evidence?: Readonly<{ turnOwnership: 'exact_turn' | 'unverified_turn' }>;
   }>): Promise<RuntimeAuthRecoveryIntent | null> {
     if (!this.deps.onProviderOutcomeProof) return await this.applyProviderOutcomeProofByKey(input);
     const before = this.readByKey(input.recoveryKey);
@@ -2431,6 +2435,7 @@ export class RuntimeAuthRecoveryScheduler {
         proofKind: input.proofKind,
         expectedAttemptId: input.expectedAttemptId ?? null,
         observedAtMs: typeof input.observedAtMs === 'number' && Number.isFinite(input.observedAtMs) ? input.observedAtMs : null,
+        turnOwnership: input.evidence?.turnOwnership ?? null,
         before,
         after,
       });

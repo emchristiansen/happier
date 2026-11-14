@@ -4,6 +4,13 @@ import { listMatchingRuntimeAuthRecoveryIntents } from '../runtimeAuth/matchRunt
 import { buildRuntimeAuthRecoveryKey } from '../runtimeAuth/recoveryKey/runtimeAuthRecoveryKey';
 import type { RuntimeAuthRecoveryIntent } from '../runtimeAuth/RuntimeAuthRecoveryScheduler';
 import type { ProviderOutcomeProofKind } from './providerOutcomeProof';
+import type { TrackedSessionTurnLifecycleResult } from '../../sessions/applyTrackedSessionTurnLifecycle';
+
+/**
+ * Whether the activity was proven to belong to the session's current exact turn. Only the exact
+ * turn owner (applyTrackedSessionTurnLifecycle) decides this; it is evidence, never control.
+ */
+export type ProviderActivityTurnOwnership = 'exact_turn' | 'unverified_turn';
 
 type RuntimeAuthRecoveryForProviderActivityProof = Readonly<{
   readForSession: (sessionId: string) => ReadonlyArray<RuntimeAuthRecoveryIntent>;
@@ -12,6 +19,7 @@ type RuntimeAuthRecoveryForProviderActivityProof = Readonly<{
     proofKind: ProviderOutcomeProofKind;
     expectedAttemptId?: string;
     observedAtMs?: number;
+    evidence?: Readonly<{ turnOwnership: ProviderActivityTurnOwnership }>;
   }>) => Promise<unknown>;
 }>;
 
@@ -29,7 +37,63 @@ type UsageLimitRecoveryForProviderActivityProof = Readonly<{
 export type ConnectedServiceProviderActivityProofRecorder = (input: Readonly<{
   sessionId: string;
   recoveryIdentities?: readonly SessionContinuationRecoveryIdentityV1[];
+  turnOwnership?: ProviderActivityTurnOwnership;
 }>) => Promise<void>;
+
+export type TurnLifecycleProviderActivityAdmission =
+  | Readonly<{ admitted: true; turnOwnership: ProviderActivityTurnOwnership }>
+  | Readonly<{ admitted: false; reason: 'not_provider_activity' | 'turn_mismatch' }>;
+
+/**
+ * The daemon's turn-lifecycle provider-activity step: admit the event against the exact-turn
+ * owner's verdict, and only then resolve current recovery identities and record the proof with
+ * its turn ownership. startDaemon calls exactly this.
+ */
+export async function recordTurnLifecycleProviderActivity(input: Readonly<{
+  sessionId: string;
+  event: 'prompt_or_steer' | 'task_started' | 'assistant_message_end' | 'turn_cancelled';
+  terminalStatus?: 'completed' | 'failed';
+  turnLifecycle: TrackedSessionTurnLifecycleResult;
+  resolveRecoveryIdentities: () => readonly SessionContinuationRecoveryIdentityV1[];
+  record: ConnectedServiceProviderActivityProofRecorder;
+}>): Promise<TurnLifecycleProviderActivityAdmission> {
+  const admission = admitTurnLifecycleProviderActivity(input);
+  if (admission.admitted) {
+    await input.record({
+      sessionId: input.sessionId,
+      recoveryIdentities: input.resolveRecoveryIdentities(),
+      turnOwnership: admission.turnOwnership,
+    });
+  }
+  return admission;
+}
+
+/**
+ * Canonical admission of a turn-lifecycle event as provider-activity proof. A terminal event the
+ * exact-turn owner rejected as belonging to a different (older) turn is never proof for the
+ * current recovery: the current attempt identity is reconstructed from today's state and would
+ * otherwise certify that stale completion. Events whose turn could not be verified (no exact turn,
+ * untracked session) keep their existing proof role but are labelled `unverified_turn`.
+ */
+export function admitTurnLifecycleProviderActivity(input: Readonly<{
+  event: 'prompt_or_steer' | 'task_started' | 'assistant_message_end' | 'turn_cancelled';
+  terminalStatus?: 'completed' | 'failed';
+  turnLifecycle: TrackedSessionTurnLifecycleResult;
+}>): TurnLifecycleProviderActivityAdmission {
+  if (!isProviderActivityTurnLifecycleEvent(input.event, input.terminalStatus)) {
+    return { admitted: false, reason: 'not_provider_activity' };
+  }
+  switch (input.turnLifecycle.status) {
+    case 'ignored_turn_mismatch':
+      return { admitted: false, reason: 'turn_mismatch' };
+    case 'recorded':
+    case 'ignored_marker_not_updated':
+      // Both passed the exact current-turn match; only the marker persistence differs.
+      return { admitted: true, turnOwnership: 'exact_turn' };
+    default:
+      return { admitted: true, turnOwnership: 'unverified_turn' };
+  }
+}
 
 /**
  * REV-1: gate for treating a turn-lifecycle event as `provider_activity` proof.
@@ -71,6 +135,7 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
     sessionId: string;
     recoveryIdentity: SessionContinuationRecoveryIdentityV1;
     serviceId: ReturnType<typeof ConnectedServiceIdSchema.parse>;
+    turnOwnership: ProviderActivityTurnOwnership;
   }>): Promise<void> => {
     if (!params.runtimeAuthRecovery) return;
     const serviceId = input.serviceId;
@@ -105,6 +170,7 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
         proofKind: 'provider_activity',
         expectedAttemptId: failureFingerprint!,
         observedAtMs: params.nowMs?.() ?? Date.now(),
+        evidence: { turnOwnership: input.turnOwnership },
       });
     }));
   };
@@ -112,6 +178,7 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
   const recordScopedProviderActivity = async (input: Readonly<{
     sessionId: string;
     recoveryIdentity: SessionContinuationRecoveryIdentityV1;
+    turnOwnership: ProviderActivityTurnOwnership;
   }>): Promise<void> => {
     const recoveryIdentity = input.recoveryIdentity;
     const runtimeAuthRecoveryAttemptId = normalizeOptionalString(recoveryIdentity.failureFingerprint);
@@ -139,6 +206,7 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
       sessionId: input.sessionId,
       recoveryIdentity,
       serviceId: serviceId.data,
+      turnOwnership: input.turnOwnership,
     }).catch((error) => {
       params.logDebug?.('[DAEMON RUN] Failed to clear runtime-auth recovery after connected-service provider activity (non-fatal)', error);
     });
@@ -161,6 +229,8 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
       await recordScopedProviderActivity({
         sessionId: input.sessionId,
         recoveryIdentity,
+        // Callers that do not state turn ownership are, truthfully, unverified.
+        turnOwnership: input.turnOwnership ?? 'unverified_turn',
       });
     }
   };

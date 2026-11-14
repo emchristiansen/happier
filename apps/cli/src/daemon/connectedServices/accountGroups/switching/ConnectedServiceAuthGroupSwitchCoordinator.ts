@@ -530,6 +530,23 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
     }
   }
 
+  /**
+   * Holds govern automatic group selection and application. A `manual` application carries the
+   * operator's own explicit choice of active member and is not subject to them.
+   */
+  private async resolveApplicationHoldRefusal(
+    completion: LeaseCompletion,
+  ): Promise<ConnectedServiceAuthGenerationApplyFailure | null> {
+    if (!this.deps.readMemberHolds || completion.reason === 'manual' || !completion.activeProfileId) return null;
+    const exclusion = resolveConnectedServiceMemberHoldExclusion(
+      await this.deps.readMemberHolds(completion.serviceId), completion.activeProfileId, this.deps.nowMs());
+    if (!exclusion) return null;
+    return {
+      errorCode: exclusion.reason === 'held' ? 'connected_service_member_held' : 'connected_service_member_hold_state_unreadable',
+      diagnostics: { memberHold: { profileId: completion.activeProfileId, ...exclusion } },
+    };
+  }
+
   private async applyObservedGeneration(completion: LeaseCompletion): Promise<ObservedGenerationApplyResult> {
     let applyResult: ConnectedServiceAuthGroupSwitchApplyGenerationResult | void;
     const decisionTrace = readSwitchResultDecisionTrace(completion.result);
@@ -541,6 +558,20 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
           generation: completion.generation,
           reason: completion.reason,
           failure: preflightFailure,
+          ...(decisionTrace === undefined ? {} : { decisionTrace }),
+        });
+      }
+      // Application admission: every automatic application of an existing generation (observed
+      // divergence, recipient fanout, quota recovery) reads current canonical holds after the
+      // awaited preflight. A held or unreadable target is refused, never applied; this path does
+      // not select or commit, so the refusal is reported for its owner to reselect or defer.
+      const holdRefusal = await this.resolveApplicationHoldRefusal(completion);
+      if (holdRefusal) {
+        return buildGenerationApplyResult({
+          activeProfileId: completion.activeProfileId,
+          generation: completion.generation,
+          reason: completion.reason,
+          failure: holdRefusal,
           ...(decisionTrace === undefined ? {} : { decisionTrace }),
         });
       }

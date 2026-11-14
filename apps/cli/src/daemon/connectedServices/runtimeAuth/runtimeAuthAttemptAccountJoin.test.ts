@@ -45,10 +45,13 @@ function observed(
   };
 }
 
-function proof(attemptId: string, proofKind: string, observedAtMs: number | null, statusAfter = 'recovered'): RuntimeAuthAttemptAccountJoinEvent {
+function proof(
+  attemptId: string, proofKind: string, observedAtMs: number | null, statusAfter = 'recovered',
+  turnOwnership: 'exact_turn' | 'unverified_turn' | null = 'exact_turn',
+): RuntimeAuthAttemptAccountJoinEvent {
   return {
     v: 1, kind: 'provider_outcome_proof', sessionId: 's1', attemptId, expectedAttemptId: attemptId, proofKind, observedAtMs,
-    statusBefore: 'resumed_awaiting_proof', statusAfter, attemptIdAfter: attemptId, persistedAtMs: (observedAtMs ?? 0) + 1,
+    turnOwnership, statusBefore: 'resumed_awaiting_proof', statusAfter, attemptIdAfter: attemptId, persistedAtMs: (observedAtMs ?? 0) + 1,
   };
 }
 
@@ -117,6 +120,18 @@ describe('runtime-auth attempt → provider-observed applied account join', () =
     expect(early!.usefulContinuation).toEqual({ kind: 'not_witnessed' });
     const [inWindow] = foldRuntimeAuthAttemptAccountJoins([...appliedAttempt('a1', 100), proof('a1', 'provider_activity', 115)]);
     expect(inWindow!.usefulContinuation).toMatchObject({ kind: 'boundary_uncertain', observedAtMs: 115 });
+  });
+
+  it('JL-05: post-application activity whose turn was not verified is labelled, not useful', () => {
+    for (const turnOwnership of ['unverified_turn', null] as const) {
+      const [joined] = foldRuntimeAuthAttemptAccountJoins([
+        ...appliedAttempt('a1', 100, 'B', true), proof('a1', 'provider_activity', 126, 'recovered', turnOwnership),
+      ]);
+      expect(joined).toMatchObject({
+        schedulerRecovered: { proofKinds: ['provider_activity'] },
+        usefulContinuation: { kind: 'provider_activity_unverified_turn', observedAtMs: 126, applicationIndex: 0 },
+      });
+    }
   });
 
   it('reports a provider-observed different account in the same native session as a mismatch, retaining every observation', () => {

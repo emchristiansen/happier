@@ -5,8 +5,16 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { routeClaudeAttachment } from '@/backends/claude/attachments/claudeAttachmentRouter';
+import { runConnectAttemptAccountsCommand } from '@/cli/commands/connect/connectAttemptAccounts';
+import { applyTrackedSessionTurnLifecycle } from '@/daemon/sessions/applyTrackedSessionTurnLifecycle';
+import type { TrackedSession } from '@/daemon/types';
 
 import { HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY } from '../connectedServiceChildEnvironment';
+import { listProviderActivityRecoveryIdentitiesFromRuntimeBindings } from '../continuation/continuationRecoveryIdentity';
+import {
+  createConnectedServiceProviderActivityProofRecorder,
+  recordTurnLifecycleProviderActivity,
+} from '../recovery/providerActivityProofRecorder';
 import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
 import { reconcileProviderObservedSessionAccount } from '../sessionAuthSwitch/reconcileProviderObservedSessionAccount';
 import { createRuntimeAuthRecoverySchedulerForDaemon } from './createRuntimeAuthRecoverySchedulerForDaemon';
@@ -14,6 +22,7 @@ import { buildRuntimeAuthRecoveryKey } from './recoveryKey/runtimeAuthRecoveryKe
 import type { RuntimeAuthRecoveryIntent, RuntimeAuthRecoverySchedulerDeps } from './RuntimeAuthRecoveryScheduler';
 import {
   buildRuntimeAuthAttemptTransitionEvent,
+  createRuntimeAuthAttemptAccountJoinJournal,
   foldRuntimeAuthAttemptAccountJoins,
   type RuntimeAuthAttemptAccountJoinEvent,
 } from './runtimeAuthAttemptAccountJoin';
@@ -46,7 +55,7 @@ async function realScheduler() {
       events.push({
         v: 1, kind: 'provider_outcome_proof', sessionId, attemptId: report.before?.attemptId ?? null,
         expectedAttemptId: report.expectedAttemptId, proofKind: report.proofKind, observedAtMs: report.observedAtMs,
-        statusBefore: report.before?.status ?? null, statusAfter: report.after?.status ?? null,
+        turnOwnership: report.turnOwnership, statusBefore: report.before?.status ?? null, statusAfter: report.after?.status ?? null,
         attemptIdAfter: report.after?.attemptId ?? null, persistedAtMs: clock.now,
       });
     },
@@ -125,6 +134,7 @@ describe('attempt account join through the real scheduler and reconciler', () =>
     f.clock.now = 260;
     await f.scheduler.markProviderOutcomeProofByKey({
       recoveryKey: RECOVERY_KEY, expectedAttemptId: f.attemptId, proofKind: 'provider_activity', observedAtMs: 250,
+      evidence: { turnOwnership: 'exact_turn' },
     });
     const [joined] = foldRuntimeAuthAttemptAccountJoins(f.events);
     expect(joined).toMatchObject({
@@ -189,5 +199,111 @@ describe('attempt account join through the real scheduler and reconciler', () =>
     expect(last.event.adoption).toBe('rejected_not_current');
     expect(last.disposition).toBe('not_adopted');
     expect(afterReject!.verdict).toBe('boundary_uncertain');
+  });
+});
+
+describe('JL-05: turn-lifecycle provider activity through the real producer → scheduler → journal → CLI', () => {
+  const disposers: Array<() => void> = [];
+  afterEach(() => {
+    while (disposers.length > 0) disposers.pop()!();
+  });
+
+  /** One real journal + CLI read of what the daemon's proof hook and attempt decorator emitted. */
+  async function cliView(events: ReadonlyArray<RuntimeAuthAttemptAccountJoinEvent>) {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-attempt-join-cli-'));
+    const journal = createRuntimeAuthAttemptAccountJoinJournal({ filePath: join(dir, 'journal.jsonl') });
+    for (const event of events) await journal.append(event);
+    const lines: string[] = [];
+    await runConnectAttemptAccountsCommand({ args: ['--session', 's'], journal, write: (line) => lines.push(line) });
+    return JSON.parse(lines.join('\n')) as { attempts: Array<{ usefulContinuation: unknown; latestStatus: string; proofs: unknown[] }> };
+  }
+
+  async function turnFixture(bindingGeneration = 2) {
+    const f = await realScheduler();
+    disposers.push(() => f.scheduler.dispose());
+    await f.applied(200, 'B', 2);
+    const registry = new ConnectedServiceRuntimeRegistry({ nowMs: () => f.clock.now });
+    registry.registerTarget({
+      pid: 42, sessionId: 's', agentId: 'claude',
+      connectedServicesBindingsRaw: { v: 1, bindingsByServiceId: { [SERVICE]: { source: 'connected', selection: 'group', groupId: 'g', profileId: 'B' } } },
+      connectedServiceSelectionsEnv: {
+        [HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY]: JSON.stringify([{
+          kind: 'group', serviceId: SERVICE, groupId: 'g', activeProfileId: 'B', fallbackProfileId: 'A', generation: bindingGeneration,
+          credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
+        }]),
+      },
+    } as unknown as Parameters<typeof registry.registerTarget>[0]);
+    const record = createConnectedServiceProviderActivityProofRecorder({
+      nowMs: () => f.clock.now,
+      runtimeAuthRecovery: {
+        readForSession: (sessionId) => f.scheduler.readForSession(sessionId),
+        markProviderOutcomeProofByKey: (input) => f.scheduler.markProviderOutcomeProofByKey(input),
+      },
+    });
+    const tracked = { pid: 42, happySessionId: 's', activeTurnId: 'current-turn' } as unknown as TrackedSession;
+    /** The daemon's block: exact-turn owner first, then the owned activity step it calls. */
+    const turnEnd = async (input: Readonly<{ turnId?: string; terminalStatus?: 'completed' | 'failed' }>) => {
+      f.clock.now = 500;
+      const turnLifecycle = await applyTrackedSessionTurnLifecycle({
+        trackedSessions: [tracked], sessionId: 's', event: 'assistant_message_end',
+        ...(input.turnId ? { turnId: input.turnId } : {}),
+        updateSessionMarkerActiveTurn: async () => true,
+      });
+      const admission = await recordTurnLifecycleProviderActivity({
+        sessionId: 's', event: 'assistant_message_end',
+        ...(input.terminalStatus ? { terminalStatus: input.terminalStatus } : {}),
+        turnLifecycle,
+        resolveRecoveryIdentities: () => listProviderActivityRecoveryIdentitiesFromRuntimeBindings(
+          registry.getBySessionId('s')?.activeBindings ?? [], f.scheduler.readForSession('s')),
+        record,
+      });
+      return { turnLifecycle, admission };
+    };
+    return { ...f, turnEnd };
+  }
+
+  it('a completion the exact-turn owner rejects as an older turn offers no proof and certifies nothing', async () => {
+    const f = await turnFixture();
+    const { turnLifecycle, admission } = await f.turnEnd({ turnId: 'old-turn', terminalStatus: 'completed' });
+    expect(turnLifecycle.status).toBe('ignored_turn_mismatch');
+    expect(admission).toEqual({ admitted: false, reason: 'turn_mismatch' });
+    expect(f.scheduler.readByKey(RECOVERY_KEY)?.status).toBe('resumed_awaiting_proof');
+    const view = await cliView(f.events);
+    expect(view.attempts[0]).toMatchObject({ latestStatus: 'resumed_awaiting_proof', proofs: [], usefulContinuation: { kind: 'not_witnessed' } });
+  });
+
+  it('the genuinely recorded matching completed turn is useful continuation', async () => {
+    const f = await turnFixture();
+    const { turnLifecycle } = await f.turnEnd({ turnId: 'current-turn', terminalStatus: 'completed' });
+    expect(turnLifecycle.status).toBe('recorded');
+    const view = await cliView(f.events);
+    expect(view.attempts[0]).toMatchObject({
+      latestStatus: 'recovered',
+      usefulContinuation: { kind: 'provider_activity', observedAtMs: 500, applicationIndex: 0 },
+    });
+  });
+
+  it('a failed current turn is not provider activity', async () => {
+    const f = await turnFixture();
+    const { admission } = await f.turnEnd({ turnId: 'current-turn', terminalStatus: 'failed' });
+    expect(admission).toEqual({ admitted: false, reason: 'not_provider_activity' });
+    expect((await cliView(f.events)).attempts[0]).toMatchObject({ latestStatus: 'resumed_awaiting_proof', usefulContinuation: { kind: 'not_witnessed' } });
+  });
+
+  it('an unrelated binding generation produces no proof for this attempt', async () => {
+    const f = await turnFixture(3);
+    await f.turnEnd({ turnId: 'current-turn', terminalStatus: 'completed' });
+    expect((await cliView(f.events)).attempts[0]).toMatchObject({ latestStatus: 'resumed_awaiting_proof', usefulContinuation: { kind: 'not_witnessed' } });
+  });
+
+  it('activity with no exact turn keeps its existing recovery role but is reported as unverified, not useful', async () => {
+    const f = await turnFixture();
+    const { turnLifecycle, admission } = await f.turnEnd({ terminalStatus: 'completed' });
+    expect(turnLifecycle.status).toBe('ignored_missing_exact_turn');
+    expect(admission).toEqual({ admitted: true, turnOwnership: 'unverified_turn' });
+    expect((await cliView(f.events)).attempts[0]).toMatchObject({
+      latestStatus: 'recovered',
+      usefulContinuation: { kind: 'provider_activity_unverified_turn', observedAtMs: 500 },
+    });
   });
 });

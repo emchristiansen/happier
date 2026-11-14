@@ -539,7 +539,7 @@ import { createConnectedServiceContinuationApplicationCorrelation } from './conn
 import { listMatchingRuntimeAuthRecoveryIntents } from './connectedServices/runtimeAuth/matchRuntimeAuthRecoveryIntent';
 import {
   createConnectedServiceProviderActivityProofRecorder,
-  isProviderActivityTurnLifecycleEvent,
+  recordTurnLifecycleProviderActivity,
 } from './connectedServices/recovery/providerActivityProofRecorder';
 import { resolveEffectiveProviderStateMode } from './connectedServices/stateSharing/resolveEffectiveProviderStateMode';
 import { listProviderActivityRecoveryIdentitiesFromRuntimeBindings } from './connectedServices/continuation/continuationRecoveryIdentity';
@@ -7102,6 +7102,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               expectedAttemptId: report.expectedAttemptId,
               proofKind: report.proofKind,
               observedAtMs: report.observedAtMs === null ? null : Math.max(0, Math.trunc(report.observedAtMs)),
+              turnOwnership: report.turnOwnership,
               statusBefore: report.before?.status ?? null,
               statusAfter: report.after?.status ?? null,
               attemptIdAfter: report.after?.attemptId ?? null,
@@ -7879,16 +7880,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         // REV-1: failTurn emits `assistant_message_end` too — a FAILED turn (the
         // usage-limit interruption itself) is not provider-activity proof and must
         // not clear the recovery intents the failure report just armed.
-        if (isProviderActivityTurnLifecycleEvent(input.event, input.terminalStatus)) {
-          await recordConnectedServiceContinuationProviderActivity({
+        // A stale completion the exact-turn owner rejected must not certify the current attempt.
+        await recordTurnLifecycleProviderActivity({
+          sessionId: input.sessionId,
+          event: input.event,
+          ...(input.terminalStatus ? { terminalStatus: input.terminalStatus } : {}),
+          turnLifecycle: trackedTurnResult,
+          resolveRecoveryIdentities: () => resolveTrackedContinuationRecoveryIdentities({
             sessionId: input.sessionId,
-            recoveryIdentities: resolveTrackedContinuationRecoveryIdentities({
-              sessionId: input.sessionId,
-              runtimeBindings: connectedServiceRuntimeRegistry.getBySessionId(input.sessionId)?.activeBindings ?? [],
-              recoveryIntents: runtimeAuthRecoveryScheduler?.readForSession(input.sessionId) ?? [],
-            }),
-          });
-        }
+            runtimeBindings: connectedServiceRuntimeRegistry.getBySessionId(input.sessionId)?.activeBindings ?? [],
+            recoveryIntents: runtimeAuthRecoveryScheduler?.readForSession(input.sessionId) ?? [],
+          }),
+          record: recordConnectedServiceContinuationProviderActivity,
+        });
         if (input.event === 'assistant_message_end' && input.terminalStatus !== 'failed') {
           await clearMemberRuntimeStateWithPositiveEvidenceForTarget(
             connectedServiceRuntimeRegistry.getBySessionId(input.sessionId),

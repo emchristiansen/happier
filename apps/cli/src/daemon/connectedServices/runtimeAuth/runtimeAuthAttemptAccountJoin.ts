@@ -18,8 +18,9 @@ import { z } from 'zod';
  *                 member only when that identity is unique in the pool, and adopted by the
  *                 application owner only after its registry/native currentness recheck;
  * - recovered:    the scheduler settled the attempt `recovered`, with the proof kind(s) offered;
- * - useful:       only a `provider_activity` proof for this attempt after a witnessed application.
- *                 Quota freshness recovers an attempt but is never useful-continuation evidence.
+ * - useful:       only a `provider_activity` proof for this attempt, after a witnessed application,
+ *                 from the session's exact current turn. Activity whose turn was not verified is
+ *                 reported as such. Quota freshness recovers an attempt but is never useful evidence.
  * Materialization is not separately evidenced by the scheduler and is reported as such.
  *
  * Times: `persistedAtMs` is daemon wall-clock after durable persistence; `observedAtMs` is the
@@ -91,6 +92,11 @@ const ProviderOutcomeProofEventSchema = z.object({
   proofKind: z.string().min(1),
   /** Provider-side time of the proven activity, when the caller supplied one. */
   observedAtMs: z.number().int().nonnegative().nullable(),
+  /**
+   * Producer-stated turn ownership of provider activity: `exact_turn` only when the exact-turn
+   * owner matched the session's current turn; null when the producer did not state it.
+   */
+  turnOwnership: z.enum(['exact_turn', 'unverified_turn']).nullable(),
   statusBefore: NullableString,
   statusAfter: NullableString,
   attemptIdAfter: NullableString,
@@ -148,6 +154,8 @@ export type RuntimeAuthAttemptApplication = Readonly<{
 
 export type RuntimeAuthAttemptUsefulContinuation =
   | Readonly<{ kind: 'provider_activity'; observedAtMs: number; applicationIndex: number }>
+  /** Post-application activity for this attempt whose turn ownership was not verified. */
+  | Readonly<{ kind: 'provider_activity_unverified_turn'; observedAtMs: number; applicationIndex: number }>
   | Readonly<{ kind: 'boundary_uncertain'; observedAtMs: number | null; applicationIndex: number | null }>
   | Readonly<{ kind: 'not_witnessed' }>;
 
@@ -386,6 +394,7 @@ function resolveUsefulContinuation(input: Readonly<{
   attemptId: string;
 }>): RuntimeAuthAttemptUsefulContinuation {
   let uncertain: RuntimeAuthAttemptUsefulContinuation | null = null;
+  let unverified: RuntimeAuthAttemptUsefulContinuation | null = null;
   for (const proof of input.proofs) {
     if (proof.proofKind !== 'provider_activity') continue;
     if (proof.observedAtMs === null) {
@@ -394,14 +403,18 @@ function resolveUsefulContinuation(input: Readonly<{
     }
     const attribution = attributeObservation(input.sessionIntervals, proof.observedAtMs);
     if (attribution.kind === 'certain' && attribution.interval.attemptId === input.attemptId) {
-      return { kind: 'provider_activity', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
+      if (proof.turnOwnership === 'exact_turn') {
+        return { kind: 'provider_activity', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
+      }
+      unverified ??= { kind: 'provider_activity_unverified_turn', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
+      continue;
     }
     if ((attribution.kind === 'window' && attribution.interval.attemptId === input.attemptId)
       || (attribution.kind === 'tie' && attribution.intervals.some((interval) => interval.attemptId === input.attemptId))) {
       uncertain ??= { kind: 'boundary_uncertain', observedAtMs: proof.observedAtMs, applicationIndex: null };
     }
   }
-  return uncertain ?? { kind: 'not_witnessed' };
+  return unverified ?? uncertain ?? { kind: 'not_witnessed' };
 }
 
 export type RuntimeAuthAttemptAccountJoinRead = Readonly<{
