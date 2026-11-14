@@ -1,3 +1,4 @@
+import type { ConnectedServiceMemberHoldView } from '../holds/connectedServiceMemberHolds';
 import type {
   ConnectedServiceAuthGroupV1,
   ConnectedServiceId,
@@ -132,6 +133,8 @@ export function evaluateConnectedServiceAuthGroupQuotaLifecycle(input: Readonly<
   nowMs: number;
   quotaFreshnessMs: number;
   allowUnconfirmedConfidence?: boolean;
+  /** Held members are never a recovery target; recovery waits for an eligible unheld member. */
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): ConnectedServiceAuthGroupQuotaLifecycleEvaluation {
   void input.changedProfileId;
   const serviceId = input.group.serviceId;
@@ -160,6 +163,7 @@ export function evaluateConnectedServiceAuthGroupQuotaLifecycle(input: Readonly<
     policy,
     members: buildMembers(input.group),
     memberStatesByProfileId: evidence.memberStatesByProfileId,
+    memberHolds: input.memberHolds,
     allowCurrentProfileRetry: true,
   });
 

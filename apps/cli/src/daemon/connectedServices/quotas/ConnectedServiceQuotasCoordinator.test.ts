@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../accountGroups/holds/connectedServiceMemberHolds';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -353,7 +354,7 @@ function createObservationProbeFixture(fetch: ConnectedServiceQuotaFetcher['fetc
     serviceId: 'openai-codex', groupId: 'team', activeProfileId: 'backup', generation: 2, runtimeStateRevision: 0,
     credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
     policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
-    members: [{ profileId: 'backup', priority: 1, enabled: true, createdAtMs: 1 }], memberStatesByProfileId: new Map(),
+    members: [{ profileId: 'backup', priority: 1, enabled: true, createdAtMs: 1 }], memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(),
   };
   const switching = new ConnectedServiceAuthGroupSwitchCoordinator({
     leases: new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(), nowMs: () => now, quotaFreshnessMs: 60_000,
@@ -435,7 +436,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true,
           autoUseQuotaResetsWhenExhausted: scenario === 'no_usable_with_resets' },
         members: profileIds.map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-        memberStatesByProfileId: runtimeQuotaSnapshots.buildMemberStates({ serviceId, groupId: 'claude', capturedAtMs: now }),
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: runtimeQuotaSnapshots.buildMemberStates({ serviceId, groupId: 'claude', capturedAtMs: now }),
       });
       const switching = new ConnectedServiceAuthGroupSwitchCoordinator({
         leases: new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(), nowMs: () => now, quotaFreshnessMs: 60_000,
@@ -9203,7 +9204,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         })),
       } as unknown as QuotaApi;
       const recordDiagnostic = vi.fn();
-      const coordinator = new ConnectedServiceQuotasCoordinator({
+      const coordinator = new ConnectedServiceQuotasCoordinator({ readMemberHolds: async () => NO_CONNECTED_SERVICE_MEMBER_HOLDS,
         api,
         credentials,
         quotaFetchers: [fetcher],
@@ -10080,6 +10081,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         changedProfileId: string;
         changedGroupGeneration: number;
         now: number;
+        memberHolds: typeof NO_CONNECTED_SERVICE_MEMBER_HOLDS;
       }>): Readonly<{
         edge: Readonly<{ phase: string }>;
         nextState: Readonly<{ status: string; resetAtMs?: number | null }>;
@@ -10087,6 +10089,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     }).evaluateGroupQuotaLifecycleFromAccountUsage({
       mode: 'cold_reconstruction',
       group,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       changedProfileId: 'primary',
       changedGroupGeneration: 4,
       now,

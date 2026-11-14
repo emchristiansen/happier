@@ -34,6 +34,11 @@ import { continueSessionAfterUsageLimitReset, type UsageLimitContinuationResult 
 import { buildRuntimeAuthUsageLimitRecoveryMetadataUpdater } from './connectedServices/runtimeAuth/projection/connectedServiceRuntimeAuthRecoveryUsageLimitMetadata';
 import { RPC_METHODS, SessionUsageLimitRecoveryV1Schema } from '@happier-dev/protocol';
 import { createRuntimeAuthRecoverySchedulerForDaemon } from './connectedServices/runtimeAuth/createRuntimeAuthRecoverySchedulerForDaemon';
+import {
+  buildRuntimeAuthAttemptTransitionEvent,
+  createRuntimeAuthAttemptAccountJoinJournal,
+  type RuntimeAuthAttemptAccountJoinEvent,
+} from './connectedServices/runtimeAuth/runtimeAuthAttemptAccountJoin';
 import { projectTemporaryThrottleRecoveryMetadata } from './connectedServices/runtimeAuth/projection/temporaryThrottleRecoveryMetadata';
 import { deriveConnectedServiceBrokerRefreshToken } from './connectedServices/broker/brokerRefreshCapabilityToken';
 import { createConnectedServiceCredentialApi } from '@/api/connectedServices/connectedServiceCredentialApi';
@@ -1938,6 +1943,18 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       }> | null = null;
       let connectedServiceQuotasCoordinator: ConnectedServiceQuotasCoordinator | null = null;
       const connectedServiceRuntimeRegistry = new ConnectedServiceRuntimeRegistry();
+      const runtimeAuthAttemptAccountJournal = createRuntimeAuthAttemptAccountJoinJournal({
+        filePath: configuration.connectedServiceRuntimeAuthAttemptAccountsFile,
+      });
+      // The journal is evidence, not control: a failed append is logged and never blocks recovery.
+      const appendRuntimeAuthAttemptAccountEvent = (event: RuntimeAuthAttemptAccountJoinEvent): void => {
+        void runtimeAuthAttemptAccountJournal.append(event).catch((error) => {
+          logger.warn('[ConnectedServices] Runtime-auth attempt account journal append failed', {
+            kind: event.kind, sessionId: event.sessionId, errorCode: 'runtime_auth_attempt_account_journal_append_failed',
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      };
       const connectedServiceRuntimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
       const providerAccountUsageStore = createProviderAccountUsageStore();
       const connectedServiceContinuationApplicationCorrelation =
@@ -7009,6 +7026,32 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         };
         const runtimeAuthRecoveryComposition = createRuntimeAuthRecoverySchedulerForDaemon({
           activeServerDir: configuration.activeServerDir,
+          onAttemptIntentCommitted: ({ after }) => {
+            if (!after.attemptId) return;
+            appendRuntimeAuthAttemptAccountEvent(buildRuntimeAuthAttemptTransitionEvent({
+              attemptId: after.attemptId,
+              transition: after.lastSettledTransition ?? 'unsettled',
+              persistedAtMs: Date.now(),
+              intent: after,
+            }));
+          },
+          onProviderOutcomeProof: (report) => {
+            const sessionId = report.before?.sessionId ?? report.after?.sessionId;
+            if (!sessionId) return;
+            appendRuntimeAuthAttemptAccountEvent({
+              v: 1,
+              kind: 'provider_outcome_proof',
+              sessionId,
+              attemptId: report.before?.attemptId ?? null,
+              expectedAttemptId: report.expectedAttemptId,
+              proofKind: report.proofKind,
+              observedAtMs: report.observedAtMs === null ? null : Math.max(0, Math.trunc(report.observedAtMs)),
+              statusBefore: report.before?.status ?? null,
+              statusAfter: report.after?.status ?? null,
+              attemptIdAfter: report.after?.attemptId ?? null,
+              persistedAtMs: Date.now(),
+            });
+          },
           nowMs: () => Date.now(),
           baseBackoffMs: runtimeAuthRecoveryBaseBackoffMs,
           maxBackoffMs: runtimeAuthRecoveryMaxBackoffMs,
@@ -7704,6 +7747,22 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   bindings: [{ serviceId: observation.serviceId, profileId }],
                 }).then((byServiceId) => byServiceId.get(observation.serviceId) ?? null);
                 return resolved ? readCredentialAccountIdentity(resolved.record) : null;
+              },
+              onResolution: (resolution, adoption) => {
+                appendRuntimeAuthAttemptAccountEvent({
+                  v: 1,
+                  kind: 'provider_account_observed',
+                  sessionId: input.sessionId,
+                  serviceId: observation.serviceId,
+                  groupId: observation.groupId,
+                  nativeSessionId: observation.sourceSessionId,
+                  providerOrganizationId: observation.providerOrganizationId ?? null,
+                  resolution: resolution.kind === 'ambiguous'
+                    ? { kind: 'ambiguous', matchingProfileIds: [...resolution.matchingProfileIds] }
+                    : resolution,
+                  adoption,
+                  observedAtMs: observation.observedAtMs,
+                });
               },
               publishAccount: async (target) => {
                 const binding = target.activeBindings.find((candidate) => (

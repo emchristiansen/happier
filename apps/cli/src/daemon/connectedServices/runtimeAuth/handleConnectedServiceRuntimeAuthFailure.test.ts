@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../accountGroups/holds/connectedServiceMemberHolds';
 import { describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1 } from '../accountGroups/selection/selectConnectedServiceAuthGroupCandidate';
@@ -23,7 +24,7 @@ function groupSwitchState(input: Readonly<{
       { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true },
       { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
     ],
-    memberStatesByProfileId: input.exhaustedProfileId
+    memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: input.exhaustedProfileId
       ? new Map([
           [input.exhaustedProfileId, {
             quotaExhaustedUntilMs: 10_000,
@@ -434,7 +435,7 @@ describe('handleConnectedServiceRuntimeAuthFailure', () => {
       members: [
         { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true },
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', {
           quotaSnapshot: {
             capturedAtMs: 20_000,
@@ -505,7 +506,7 @@ describe('handleConnectedServiceRuntimeAuthFailure', () => {
         runtimeStateRevision: 0,
         policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
         members: [{ profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true }],
-        memberStatesByProfileId: new Map([['primary', {
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['primary', {
           quotaSnapshot: { capturedAtMs: 10_000, effectiveRemainingPercent: 100, windows: [] },
         }]]),
       }),

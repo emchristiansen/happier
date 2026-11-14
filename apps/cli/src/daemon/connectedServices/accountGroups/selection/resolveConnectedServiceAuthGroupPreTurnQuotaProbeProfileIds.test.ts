@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds } from './resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds';
 import { DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1 } from './selectConnectedServiceAuthGroupCandidate';
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 
 describe('resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds', () => {
   it('probes a profile whose retained quota observation is dated in the future', () => {
@@ -19,6 +20,7 @@ describe('resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds', () => {
       nowMs: 1_000,
       quotaFreshnessMs: 60_000,
       allowCurrentProfileRetry: true,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
     })).toEqual(['active']);
   });
 });

@@ -16,6 +16,11 @@ import type { AcceptedConnectedServiceAccountVerificationByServiceId } from '../
 import { evaluatePredictiveSoftSwitchSessionApplyPolicy } from './predictiveSoftSwitchPolicy';
 import type { AutomaticQuotaResetContext, ConnectedServiceGroupQuotaProbeResult, ConnectedServiceQuotaRecoveryCreditConsumeResult } from '../../quotas/ConnectedServiceQuotasCoordinator';
 import { logger } from '@/ui/logger';
+import {
+  ConnectedServiceMemberHeldAtSwitchAdmissionError,
+  resolveConnectedServiceMemberHoldExclusion,
+  type ConnectedServiceMemberHoldView,
+} from '../holds/connectedServiceMemberHolds';
 import { isSameConnectedServiceAccountTarget } from '../../sessionAuthSwitch/connectedServiceAuthSwitchOutcome';
 import type { ConnectedServiceQuotaRecoveryCreditConsumeReceiptV1 } from '@happier-dev/protocol';
 import {
@@ -199,6 +204,12 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
     }>): Promise<ConnectedServiceGroupQuotaProbeResult | void>;
     resolveGenerationConflict?: (error: unknown) => number | null;
     emitEvent?: (event: ConnectedServiceAuthGroupSwitchEvent) => void;
+    /**
+     * Current canonical member holds. When supplied, a candidate is revalidated after its awaited
+     * preparation; commitSwitch remains the final admission point and refuses a held target with
+     * ConnectedServiceMemberHeldAtSwitchAdmissionError, which this coordinator reselects from.
+     */
+    readMemberHolds?: (serviceId: string) => Promise<ConnectedServiceMemberHoldView>;
   }>) {}
 
   private async loadStateAfterApply(input: Readonly<{
@@ -297,6 +308,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
   }>): Promise<ReturnType<typeof selectConnectedServiceAuthGroupCandidate>> {
     const memberStatesByProfileId = new Map(input.state.memberStatesByProfileId);
     const unavailableProfileIds = new Set<string>();
+    let memberHolds = input.state.memberHolds;
     for (;;) {
       const selected = selectConnectedServiceAuthGroupCandidate({
         lastSwitchReason: input.state.lastSwitchReason,
@@ -306,7 +318,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
         activeProfileId: input.activeProfileId ?? null,
         policy: input.state.policy,
         members: input.state.members,
-        memberStatesByProfileId,
+        memberStatesByProfileId, memberHolds,
         unavailableProfileIds,
         switchReason: input.reason,
         requiredModelIds: input.state.requiredModelIds,
@@ -323,7 +335,16 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
         profileId: selected.selected.profileId,
         reason: input.reason,
       });
-      if (prepared.status === 'ready') return selected;
+      if (prepared.status === 'ready') {
+        if (!this.deps.readMemberHolds) return selected;
+        // A hold written while preparation was awaited must win: reselect against the fresh view.
+        const currentHolds = await this.deps.readMemberHolds(input.state.serviceId);
+        if (resolveConnectedServiceMemberHoldExclusion(currentHolds, selected.selected.profileId, this.deps.nowMs()) === null) {
+          return selected;
+        }
+        memberHolds = currentHolds;
+        continue;
+      }
       // Retryable health remains globally usable, but a failed preflight must not be retried
       // indefinitely in this operation or disappear from the selector's exclusion evidence.
       unavailableProfileIds.add(selected.selected.profileId);
@@ -356,6 +377,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
       nowMs: this.deps.nowMs(),
       quotaFreshnessMs: this.deps.quotaFreshnessMs,
       allowCurrentProfileRetry: input.allowCurrentProfileRetry,
+      memberHolds: input.loaded.memberHolds,
     });
     if (profileIds.length === 0) return { status: 'ready', state: input.loaded };
     const probeResult = await this.deps.probeQuotaSnapshotsForGroup({
@@ -420,6 +442,17 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
     trigger: ConnectedServiceAuthGroupSwitchPipelineTrigger;
     lease: Extract<LeaseAcquireResult, { kind: 'owner' }>;
   }>): Promise<GenerationConflictResolution | null> {
+    if (input.error instanceof ConnectedServiceMemberHeldAtSwitchAdmissionError) {
+      // Nothing was written. Reload (with current holds) and let the canonical selector choose
+      // again; this operation's provider admission evidence survives the reload.
+      const reloaded = await this.deps.loadState({
+        serviceId: input.serviceId,
+        groupId: input.groupId,
+        trigger: input.trigger,
+      });
+      return { kind: 'retry', state: { ...reloaded, quotaProbeDeferredUntilMsByProfileId:
+        input.loaded.quotaProbeDeferredUntilMsByProfileId ?? reloaded.quotaProbeDeferredUntilMsByProfileId } };
+    }
     const conflictGeneration = this.deps.resolveGenerationConflict?.(input.error);
     if (typeof conflictGeneration !== 'number' || !Number.isFinite(conflictGeneration)) return null;
     const observedState = await this.deps.loadState({
@@ -448,7 +481,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
       activeProfileId: failedProfileId,
       policy: observed.policy,
       members: observed.members,
-      memberStatesByProfileId: observed.memberStatesByProfileId,
+      memberStatesByProfileId: observed.memberStatesByProfileId, memberHolds: observed.memberHolds,
       switchReason: input.reason,
       providerLimitId: input.providerLimitId,
       requiredModelIds: observed.requiredModelIds,
@@ -966,7 +999,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
       allowCurrentProfileRetry: true,
       policy: loaded.policy,
       members: loaded.members.filter((member) => member.profileId === loaded.activeProfileId),
-      memberStatesByProfileId: loaded.memberStatesByProfileId,
+      memberStatesByProfileId: loaded.memberStatesByProfileId, memberHolds: loaded.memberHolds,
       providerLimitId: input.failure?.providerLimitId,
       requiredModelIds: loaded.requiredModelIds,
       quotaProbeDeferredUntilMsByProfileId: loaded.quotaProbeDeferredUntilMsByProfileId,
@@ -1250,7 +1283,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
             activeProfileId: selectionActiveProfileId,
             policy: loaded.policy,
             members: loaded.members,
-            memberStatesByProfileId: loaded.memberStatesByProfileId,
+            memberStatesByProfileId: loaded.memberStatesByProfileId, memberHolds: loaded.memberHolds,
             switchReason: input.reason,
             providerLimitId: input.providerLimitId,
             requiredModelIds: loaded.requiredModelIds,
@@ -1362,7 +1395,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
             activeProfileId: observedProfileId,
             policy: loaded.policy,
             members: loaded.members,
-            memberStatesByProfileId: loaded.memberStatesByProfileId,
+            memberStatesByProfileId: loaded.memberStatesByProfileId, memberHolds: loaded.memberHolds,
             switchReason: input.reason,
             providerLimitId: input.providerLimitId,
             requiredModelIds: loaded.requiredModelIds,
@@ -1482,7 +1515,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
           lastSwitchAt: loaded.lastSwitchAt,
           nowMs: this.deps.nowMs(), quotaFreshnessMs: this.deps.quotaFreshnessMs,
           activeProfileId: loaded.activeProfileId, policy: loaded.policy,
-          members: loaded.members, memberStatesByProfileId: loaded.memberStatesByProfileId,
+          members: loaded.members, memberStatesByProfileId: loaded.memberStatesByProfileId, memberHolds: loaded.memberHolds,
           providerLimitId: input.providerLimitId,
           requiredModelIds: loaded.requiredModelIds,
           unavailableProfileIds,
@@ -1532,7 +1565,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
               lastSwitchAt: loaded.lastSwitchAt,
               nowMs: this.deps.nowMs(), quotaFreshnessMs: this.deps.quotaFreshnessMs,
               activeProfileId: loaded.activeProfileId, allowCurrentProfileRetry: true,
-              policy: loaded.policy, members: loaded.members, memberStatesByProfileId: loaded.memberStatesByProfileId,
+              policy: loaded.policy, members: loaded.members, memberStatesByProfileId: loaded.memberStatesByProfileId, memberHolds: loaded.memberHolds,
               providerLimitId: input.providerLimitId,
               requiredModelIds: loaded.requiredModelIds,
               unavailableProfileIds,

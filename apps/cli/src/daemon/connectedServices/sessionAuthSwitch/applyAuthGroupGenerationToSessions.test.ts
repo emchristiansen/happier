@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../accountGroups/holds/connectedServiceMemberHolds';
 import { describe, expect, it, vi } from 'vitest';
 
 import { applyConnectedServiceAuthGroupGenerationToSessions } from './applyAuthGroupGenerationToSessions';
@@ -206,7 +207,7 @@ describe('applyConnectedServiceAuthGroupGenerationToSessions', () => {
       credentialRevision,
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority' as const },
       members: [],
-      memberStatesByProfileId: new Map(),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(),
     };
     const runtimeEpochs: string[] = ['backup-c:3'];
     const coordinator = new ConnectedServiceAuthGroupSwitchCoordinator({

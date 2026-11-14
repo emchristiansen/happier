@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 import { describe, expect, it } from 'vitest';
 
 import { ConnectedServiceAuthGroupPolicyV1Schema } from '@happier-dev/protocol';
@@ -30,7 +31,7 @@ describe('quota reset admission', () => {
     activeProfileId: 'primary',
     policy: basePolicy,
     members: [member('primary', 1, 1), member('backup', 2, 2)],
-    memberStatesByProfileId: new Map([['primary', exhausted], ['backup', backup]]),
+    memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['primary', exhausted], ['backup', backup]]),
   });
 
   it('admits exhausted usable accounts including the current member, but not reconnect-required members', () => {
@@ -94,7 +95,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       activeProfileId: null,
       policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({}),
       members: [member('primary', 1, 1), member('backup', 2, 2)],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', { modelUnavailableUntilMsByModelId: { 'gpt-5.6-sol': 86_401_000 } }],
       ]),
     } as const;
@@ -127,7 +128,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('backup-b', 20, 2),
         member('backup-a', 10, 3),
       ],
-      memberStatesByProfileId: new Map(),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(),
     });
 
     expect(result.selected?.profileId).toBe('backup-a');
@@ -144,7 +145,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('bravo', 10, 5),
         member('alpha', 10, 5),
       ],
-      memberStatesByProfileId: new Map(),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(),
     });
 
     expect(result.selected?.profileId).toBe('alpha');
@@ -167,7 +168,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('medium', 1, 2),
         member('high', 1, 3),
       ],
-      memberStatesByProfileId: states,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: states,
     });
 
     expect(result.selected?.profileId).toBe('high');
@@ -207,7 +208,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       allowCurrentProfileRetry: true,
       policy: { ...basePolicy, strategy: 'priority', autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 15, cooldownMs: 500 },
       members: [member('primary', 10, 1), member('backup', 20, 2), member('other', 30, 3)],
-      memberStatesByProfileId: states,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: states,
     });
 
     expect(result.selected?.profileId).toBe('primary');
@@ -228,7 +229,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       lastSwitchAt: 400,
       policy: { ...basePolicy, strategy: 'priority' as const, autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 0 },
       members: [member('primary', 100, 1), member('backup', 200, 2)],
-      memberStatesByProfileId: new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>([
         ['primary', { ...failureState, quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 37 } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 9 } }],
       ]),
@@ -257,7 +258,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       allowCurrentProfileRetry: true,
       policy: { ...basePolicy, strategy: 'priority', softSwitchRemainingPercent: 15 },
       members: [member('primary', 10, 1), member('backup', 20, 2), member('other', 30, 3)],
-      memberStatesByProfileId: states,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: states,
     });
 
     // Restore disabled → the above-threshold current `backup` is retained (no re-pin to primary).
@@ -284,7 +285,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       activeProfileId: 'backup',
       policy: { ...basePolicy, strategy: 'least_limited', autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 15, cooldownMs: 100 },
       members: [member('primary', 10, 1), member('backup', 20, 2), member('other', 30, 3)],
-      memberStatesByProfileId: states,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: states,
     });
 
     expect(result.selected?.profileId).toBe('other');
@@ -306,7 +307,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       allowCurrentProfileRetry: true,
       policy: { ...basePolicy, strategy: 'priority', autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 15 },
       members: [member('primary', 10, 1), member('backup', 20, 2), member('other', 30, 3)],
-      memberStatesByProfileId: states,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: states,
     });
 
     expect(result.selected?.profileId).toBe('backup');
@@ -332,7 +333,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       allowCurrentProfileRetry: true,
       policy: { ...basePolicy, strategy: 'priority', autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 15 },
       members: [member('primary', 10, 1), member('backup', 20, 2)],
-      memberStatesByProfileId: states,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: states,
     });
 
     expect(result.selected?.profileId).toBe('backup');
@@ -358,7 +359,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       allowCurrentProfileRetry: true,
       policy: { ...basePolicy, strategy: 'priority', autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 15, cooldownMs: 100 },
       members: [member('primary', 10, 1), member('backup', 20, 2)],
-      memberStatesByProfileId: states,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: states,
     });
 
     expect(result.selected?.profileId).toBe('backup');
@@ -382,7 +383,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       allowCurrentProfileRetry: true,
       policy: { ...basePolicy, strategy: 'priority', autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 15 },
       members: [member('primary', 10, 1), member('backup', 20, 2)],
-      memberStatesByProfileId: states,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: states,
     });
 
     expect(result.selected?.profileId).toBe('backup');
@@ -433,7 +434,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('low-no-window', 1, 1),
         member('high-stale-window', 1, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['low-no-window', {
           quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'daily', effectiveRemainingPercent: 25 },
         }],
@@ -507,7 +508,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('gemini-daily', 1, 2),
         member('future-model', 1, 3),
       ],
-      memberStatesByProfileId: states,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: states,
     });
 
     expect(result.selected?.profileId).toBe('future-model');
@@ -528,7 +529,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('reset-later', 1, 1),
         member('ready', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['reset-later', { cooldownStartedAtMs: 500, providerResetsAtMs: 2_000 }],
       ]),
     });
@@ -555,7 +556,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('healthy-backup', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['healthy-backup', {
           providerResetsAtMs: 2_000,
           quotaSnapshot: {
@@ -591,7 +592,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('backup', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['active', {
           cooldownStartedAtMs: 900,
           cooldownUntilMs: 60_000,
@@ -657,7 +658,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('backup', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['active', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'daily', effectiveRemainingPercent: 10 } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 900, exhausted: true }, providerResetsAtMs: 5_000 }],
       ]),
@@ -682,7 +683,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('backup', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['active', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'daily', effectiveRemainingPercent: 10 } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'weekly', effectiveRemainingPercent: 75 } }],
       ]),
@@ -702,7 +703,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('backup', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['active', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'daily', effectiveRemainingPercent: 10 } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'weekly', effectiveRemainingPercent: 75 } }],
       ]),
@@ -722,7 +723,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('backup', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['active', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'daily', effectiveRemainingPercent: 50 } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'weekly', effectiveRemainingPercent: 90 } }],
       ]),
@@ -742,7 +743,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('backup', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['active', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'daily', effectiveRemainingPercent: 10 } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'weekly', effectiveRemainingPercent: 5 } }],
       ]),
@@ -761,7 +762,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('capacity-limited', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['capacity-limited', { capacityLimitedUntilMs: 5_000 }],
       ]),
     });
@@ -789,7 +790,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('rate-limited', 2, 2),
         member('healthy', 3, 3),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['quota-exhausted', { quotaExhaustedUntilMs: 5_000 }],
         ['rate-limited', { rateLimitedUntilMs: 4_000 }],
         ['healthy', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'daily', effectiveRemainingPercent: 30 } }],
@@ -813,7 +814,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('blocked-but-usable', 1, 1),
         member('fallback', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['blocked-but-usable', {
           quotaExhaustedUntilMs: 10_000,
           lastFailureKind: 'usage_limit',
@@ -874,7 +875,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('weekly-exhausted', 1, 1),
         member('fallback', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['weekly-exhausted', {
           quotaExhaustedUntilMs: 10_000,
           lastFailureKind: 'usage_limit',
@@ -925,7 +926,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('just-proven-usable', 1, 1),
         member('fallback', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['just-proven-usable', {
           quotaExhaustedUntilMs: 10_000,
           lastFailureKind: 'usage_limit',
@@ -964,7 +965,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('just-failed', 1, 1),
         member('fallback', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['just-failed', {
           quotaExhaustedUntilMs: 10_000,
           lastFailureKind: 'usage_limit',
@@ -1004,7 +1005,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('backup', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['active', {
           quotaSnapshot: {
             capturedAtMs: 1,
@@ -1123,7 +1124,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('capacity-limited', 2, 2),
         member('fallback', 3, 3),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['rate-limited', {
           lastFailureKind: 'rate_limit',
           lastObservedAtMs: 750,
@@ -1152,7 +1153,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('recently-limited', 1, 1),
         member('healthy', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['recently-limited', {
           lastFailureKind: 'usage_limit',
           lastObservedAtMs: 750,
@@ -1179,7 +1180,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('unknown', 1, 1),
         member('healthy', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['healthy', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'daily', effectiveRemainingPercent: 60 } }],
       ]),
     });
@@ -1199,7 +1200,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('validation-blocked', 3, 3),
         member('healthy', 4, 4),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['auth-blocked', { authInvalidUntilMs: 5_000 }],
         ['plan-blocked', { planUnavailableUntilMs: 5_000 }],
         ['validation-blocked', { validationBlockedUntilMs: 5_000 }],
@@ -1225,7 +1226,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('reauth', 1, 1),
         member('healthy', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['reauth', { credentialHealthStatus: 'needs_reauth' } as ConnectedServiceAuthGroupMemberRuntimeState],
       ]),
     });
@@ -1247,7 +1248,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('reauth', 1, 1),
         member('healthy', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['reauth', {
           credentialHealthStatus: 'needs_reauth',
         }],
@@ -1285,7 +1286,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('reauth', 3, 3),
         member('healthy', 4, 4),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['refreshing', { credentialHealthStatus: 'refreshing' }],
         ['retryable-refresh-failed', { credentialHealthStatus: 'refresh_failed_retryable' }],
         ['reauth', { credentialHealthStatus: 'needs_reauth' }],
@@ -1315,7 +1316,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('capacity-limited', 3, 3),
         member('healthy', 4, 4),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['plan-blocked', {
           quotaSnapshot: {
             capturedAtMs: 900,
@@ -1362,7 +1363,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
         member('active', 1, 1),
         member('backup', 2, 2),
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['active', { quotaSnapshot: { capturedAtMs: 900, planUnavailable: true } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 900, effectiveMeterId: 'daily', effectiveRemainingPercent: 20 } }],
       ]),
@@ -1382,7 +1383,7 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
       activeProfileId: 'active',
       policy: { ...basePolicy, strategy: 'manual' },
       members: [member('backup', 1, 1)],
-      memberStatesByProfileId: new Map(),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(),
     });
 
     expect(result.selected).toBeNull();
