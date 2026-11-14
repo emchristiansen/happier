@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { configuration } from '@/configuration';
 import { withJsonOwnerFileLock } from '@/utils/fs/jsonOwnerFileLock';
 import { writeJsonAtomic } from '@/utils/fs/writeJsonAtomic';
+import { lazySchema } from '@happier-dev/protocol';
 
 /**
  * Externally known holds on connected-service group members.
@@ -20,25 +21,25 @@ import { writeJsonAtomic } from '@/utils/fs/writeJsonAtomic';
 
 const HOLD_TEXT_MAX_LENGTH = 500;
 
-export const ConnectedServiceMemberHoldLifetimeSchema = z.discriminatedUnion('kind', [
+export const ConnectedServiceMemberHoldLifetimeSchema = lazySchema(() => z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('until'), untilMs: z.number().int().nonnegative() }).strict(),
   z.object({ kind: z.literal('until_released') }).strict(),
-]);
+]));
 
 export type ConnectedServiceMemberHoldLifetime = z.infer<typeof ConnectedServiceMemberHoldLifetimeSchema>;
 
-export const ConnectedServiceMemberHoldSchema = z.object({
+export const ConnectedServiceMemberHoldSchema = lazySchema(() => z.object({
   serviceId: z.string().trim().min(1),
   profileId: z.string().trim().min(1),
   reason: z.string().trim().min(1).max(HOLD_TEXT_MAX_LENGTH),
   source: z.string().trim().min(1).max(HOLD_TEXT_MAX_LENGTH),
   heldAtMs: z.number().int().nonnegative(),
   lifetime: ConnectedServiceMemberHoldLifetimeSchema,
-}).strict();
+}).strict());
 
 export type ConnectedServiceMemberHold = z.infer<typeof ConnectedServiceMemberHoldSchema>;
 
-const ConnectedServiceMemberHoldFileSchema = z.object({
+const ConnectedServiceMemberHoldFileSchema = lazySchema(() => z.object({
   v: z.literal(1),
   holds: z.array(ConnectedServiceMemberHoldSchema),
 }).strict().superRefine((file, context) => {
@@ -50,7 +51,7 @@ const ConnectedServiceMemberHoldFileSchema = z.object({
     }
     seen.add(key);
   }
-});
+}));
 
 type ConnectedServiceMemberHoldFile = z.infer<typeof ConnectedServiceMemberHoldFileSchema>;
 
