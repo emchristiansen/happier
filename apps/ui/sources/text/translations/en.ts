@@ -2378,6 +2378,7 @@ export const en = {
             labelWithCount: ({ count }: { count: number }) => `Auth: ${count}`,
             nativeLabel: 'CLI Auth',
             connectedCountLabel: ({ count }: { count: number }) => `${count} connected`,
+            pendingStartLabel: ({ pool, account }: { pool: string; account: string }) => `${pool} (starting on ${account}…)`,
         },
         authSwitch: {
             activeTurnDisabled: 'Finish or stop the current turn before switching authentication.',

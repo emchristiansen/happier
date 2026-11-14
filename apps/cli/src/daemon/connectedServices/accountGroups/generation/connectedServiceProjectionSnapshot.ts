@@ -30,9 +30,28 @@ export type ConnectedServiceProjectedCredential = Readonly<{
   boundary: ConnectedServiceProjectedCredentialBoundary;
 }>;
 
+/** Every enabled member of one group, as projected by the server (disabled members are omitted). */
+export type ConnectedServiceProjectedAuthGroupMembership = Readonly<{
+  serviceId: ConnectedServiceId;
+  groupId: string;
+  memberProfileIds: readonly string[];
+}>;
+
+export type ConnectedServiceProjectedGroupMember = Readonly<{
+  serviceId: ConnectedServiceId;
+  groupId: string;
+  profileId: string;
+}>;
+
 export type ConnectedServiceProjectionSnapshot = Readonly<{
   groups: readonly ConnectedServiceProjectedAuthGroup[];
+  groupMemberships: readonly ConnectedServiceProjectedAuthGroupMembership[];
   credentials: readonly ConnectedServiceProjectedCredential[];
+  /**
+   * A member is eligible to keep serving per-session-owned sessions while it is an enabled member
+   * of a projected group and its credential is present.
+   */
+  isGroupMemberEligible: (serviceId: ConnectedServiceId, groupId: string, profileId: string) => boolean;
   resolveCredentialBoundary: (
     serviceId: ConnectedServiceId,
     profileId: string,
@@ -46,6 +65,8 @@ export type ConnectedServiceProjectionDelta = Readonly<{
     groupId: string;
   }>>;
   changedCredentialBoundaries: readonly ConnectedServiceProjectedCredential[];
+  /** Members eligible in the previous projection and no longer eligible now (disabled, removed, credential gone). */
+  revokedGroupMembers: readonly ConnectedServiceProjectedGroupMember[];
 }>;
 
 function credentialScopeKey(serviceId: ConnectedServiceId, profileId: string): string {
@@ -56,11 +77,21 @@ function groupScopeKey(serviceId: ConnectedServiceId, groupId: string): string {
   return `${serviceId}\0${groupId}`;
 }
 
+function groupMemberKey(member: ConnectedServiceProjectedGroupMember): string {
+  return `${member.serviceId}\0${member.groupId}\0${member.profileId}`;
+}
+
+function listEligibleGroupMembers(snapshot: ConnectedServiceProjectionSnapshot): ConnectedServiceProjectedGroupMember[] {
+  return snapshot.groupMemberships.flatMap((membership) => membership.memberProfileIds
+    .filter((profileId) => snapshot.isGroupMemberEligible(membership.serviceId, membership.groupId, profileId))
+    .map((profileId) => ({ serviceId: membership.serviceId, groupId: membership.groupId, profileId })));
+}
+
 export function diffConnectedServiceProjectionSnapshots(
   previous: ConnectedServiceProjectionSnapshot | null,
   current: ConnectedServiceProjectionSnapshot,
 ): ConnectedServiceProjectionDelta {
-  if (!previous) return { changedGroupScopes: [], changedCredentialBoundaries: [] };
+  if (!previous) return { changedGroupScopes: [], changedCredentialBoundaries: [], revokedGroupMembers: [] };
   const previousGroups = new Map(previous.groups.map((group) => [
     groupScopeKey(group.serviceId, group.groupId),
     group,
@@ -119,7 +150,10 @@ export function diffConnectedServiceProjectionSnapshots(
     })
     .sort((left, right) => credentialScopeKey(left.serviceId, left.profileId)
       .localeCompare(credentialScopeKey(right.serviceId, right.profileId)));
-  return { changedGroupScopes, changedCredentialBoundaries };
+  const revokedGroupMembers = listEligibleGroupMembers(previous)
+    .filter((member) => !current.isGroupMemberEligible(member.serviceId, member.groupId, member.profileId))
+    .sort((left, right) => groupMemberKey(left).localeCompare(groupMemberKey(right)));
+  return { changedGroupScopes, changedCredentialBoundaries, revokedGroupMembers };
 }
 
 export function parseConnectedServiceProjectionSnapshot(input: Readonly<{
@@ -137,6 +171,14 @@ export function parseConnectedServiceProjectionSnapshot(input: Readonly<{
     activeProfileId: group.activeProfileId,
     generation: group.generation,
   })));
+  const groupMemberships = profile.connectedServicesV2.flatMap((service) => service.groups.map((group) => ({
+    serviceId: service.serviceId,
+    groupId: group.groupId,
+    memberProfileIds: [...new Set(group.memberProfileIds)],
+  })));
+  const memberKeys = new Set(groupMemberships.flatMap((membership) => membership.memberProfileIds.map((profileId) => (
+    groupMemberKey({ serviceId: membership.serviceId, groupId: membership.groupId, profileId })
+  ))));
   const credentialsByScope = new Map<string, ConnectedServiceProjectedCredential>();
   for (const service of profile.connectedServicesV2) {
     for (const credential of service.profiles) {
@@ -175,7 +217,12 @@ export function parseConnectedServiceProjectionSnapshot(input: Readonly<{
   );
   return {
     groups,
+    groupMemberships,
     credentials,
+    isGroupMemberEligible: (serviceId, groupId, profileId) => (
+      memberKeys.has(groupMemberKey({ serviceId, groupId, profileId }))
+      && resolveCredentialBoundary(serviceId, profileId).status === 'present'
+    ),
     resolveCredentialBoundary,
     resolveCredentialRevision: (serviceId, profileId) => {
       const boundary = resolveCredentialBoundary(serviceId, profileId);

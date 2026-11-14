@@ -9,6 +9,9 @@ import {
     ConnectedServiceAuthGroupPolicyV1Schema,
     ConnectedServiceBindingsV1Schema,
     stripConnectedServicePerSessionAssignmentFields,
+    stripConnectedServiceInternalAssignmentFields,
+    CONNECTED_SERVICE_INHERITANCE_STRIPPED_FIELDS,
+    CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS,
     CONNECTED_SERVICE_POOL_PER_SESSION_SOFTMAX_QUERY_KEY,
     findConnectedServiceInternalAssignmentFields,
 } from './connectedServiceSchemas.js';
@@ -129,5 +132,43 @@ describe('group binding assignment fields', () => {
     const plain = ConnectedServiceBindingsV1Schema.parse({ v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'native' } } });
     expect(stripConnectedServicePerSessionAssignmentFields(plain)).toBe(plain);
   });
-});
 
+  // HPI-13: inheritance stripping must use the same inventory the input guard rejects.
+  const internalFieldValues: Record<string, unknown> = {
+    member: { assignment: 'per_session', profileId: 'a', decisionId: 'd', reason: 'initial_requested', appliedAtMs: 1 },
+    materializedAssignment: { profileId: 'b', decisionId: 'd', reason: 'initial_sampled', materializedAtMs: 1 },
+    pendingAssignment: { profileId: 'b' },
+    decisionId: 'd',
+  };
+  const group = { source: 'connected', selection: 'group', groupId: 'pool' } as const;
+
+  it('inherits nothing from the inventory: every internal field and initialProfileId', () => {
+    expect([...CONNECTED_SERVICE_INHERITANCE_STRIPPED_FIELDS].sort()).toEqual(
+      [...CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS, 'initialProfileId'].sort());
+    expect(Object.keys(internalFieldValues).sort()).toEqual([...CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS].sort());
+  });
+
+  for (const field of [...CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS, 'initialProfileId']) {
+    it(`inheritance strips ${field} when it is the only per-session field (envelope and bare record)`, () => {
+      const value = field === 'initialProfileId' ? 'a' : internalFieldValues[field];
+      const bindings = ConnectedServiceBindingsV1Schema.parse({ v: 1, bindingsByServiceId: { 'claude-subscription': { ...group, [field]: value } } });
+      expect(stripConnectedServicePerSessionAssignmentFields(bindings)).toEqual({ v: 1, bindingsByServiceId: { 'claude-subscription': group } });
+      expect(stripConnectedServicePerSessionAssignmentFields({ 'claude-subscription': { ...group, [field]: value } }))
+        .toEqual({ 'claude-subscription': group });
+    });
+  }
+
+  for (const field of CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS) {
+    it(`internal-only strip removes ${field} and keeps the caller's initialProfileId request`, () => {
+      const input = { v: 1, bindingsByServiceId: { 'claude-subscription': { ...group, initialProfileId: 'a', [field]: internalFieldValues[field] } } };
+      expect(stripConnectedServiceInternalAssignmentFields(input)).toEqual({
+        v: 1, bindingsByServiceId: { 'claude-subscription': { ...group, initialProfileId: 'a' } },
+      });
+    });
+  }
+
+  it('internal-only strip returns the identical input for a legitimate named start', () => {
+    const named = { v: 1, bindingsByServiceId: { 'claude-subscription': { ...group, initialProfileId: 'a' } } };
+    expect(stripConnectedServiceInternalAssignmentFields(named)).toBe(named);
+  });
+});

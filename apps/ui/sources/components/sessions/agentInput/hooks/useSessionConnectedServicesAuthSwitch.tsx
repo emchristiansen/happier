@@ -48,9 +48,11 @@ import {
 } from '@/components/sessions/new/modules/connectedServicesNewSessionBindings';
 import { useProfile } from '@/sync/store/hooks';
 import {
+    readConnectedServiceGroupBindingMaterializedAssignment,
     readConnectedServiceGroupBindingMember,
-    resolveConnectedServiceGroupBindingAppliedProfileId,
+    resolveConnectedServiceGroupBindingServingState,
 } from '@/sync/domains/connectedServices/resolveConnectedServiceGroupBindingAppliedProfileId';
+import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
 import { t } from '@/text';
 import {
     createManualAuthSwitchRestartSignal,
@@ -250,8 +252,11 @@ function readBinding(value: unknown): ConnectedServicesServiceBinding | null {
     if (selection === 'group' && groupId) {
         const appliedProfileId = typeof raw.appliedProfileId === 'string' ? raw.appliedProfileId.trim() : '';
         const member = readConnectedServiceGroupBindingMember(raw);
+        // Kept so readers can tell a not-yet-adopted per-session start from a shared pool (spec A.4/T19).
+        const materializedAssignment = readConnectedServiceGroupBindingMaterializedAssignment(raw);
         return { source: 'connected', selection: 'group', groupId, ...(profileId ? { profileId } : {}),
-            ...(appliedProfileId ? { appliedProfileId } : {}), ...(member ? { member } : {}) };
+            ...(appliedProfileId ? { appliedProfileId } : {}), ...(member ? { member } : {}),
+            ...(materializedAssignment ? { materializedAssignment } : {}) };
     }
     if (profileId) return { source: 'connected', selection: 'profile', profileId };
     return null;
@@ -288,8 +293,8 @@ function areBindingsEqual(
         const rightBinding = right[serviceId];
         if (leftBinding?.source === 'connected' && leftBinding.selection === 'group'
             && rightBinding?.source === 'connected' && rightBinding.selection === 'group'
-            && resolveConnectedServiceGroupBindingAppliedProfileId(leftBinding)
-                !== resolveConnectedServiceGroupBindingAppliedProfileId(rightBinding)) return false;
+            && stableJsonStringify(resolveConnectedServiceGroupBindingServingState(leftBinding))
+                !== stableJsonStringify(resolveConnectedServiceGroupBindingServingState(rightBinding))) return false;
     }
     return true;
 }
@@ -320,7 +325,12 @@ export function buildSessionConnectedServicesBindings(params: Readonly<{
         const binding = params.bindingsByServiceId[serviceId] ?? { source: 'native' };
         if (binding.source === 'connected' && binding.selection === 'group') {
             // Applied identity and the internal per-session assignment are runtime evidence, never switch input.
-            const { appliedProfileId: _appliedProfileId, member: _member, ...selection } = binding;
+            const {
+                appliedProfileId: _appliedProfileId,
+                member: _member,
+                materializedAssignment: _materializedAssignment,
+                ...selection
+            } = binding;
             bindingsByServiceId[serviceId] = selection;
         } else {
             bindingsByServiceId[serviceId] = binding;
@@ -900,6 +910,7 @@ export function useSessionConnectedServicesAuthSwitch(params: Readonly<{
                 resolveServiceTitle: (serviceId) => resolveConnectedServiceShortName(serviceId as ConnectedServiceId, t),
                 nativeLabel: t('connectedServices.authChip.nativeLabel'),
                 formatConnectedCountLabel: (count) => t('connectedServices.authChip.connectedCountLabel', { count }),
+                formatPendingStartLabel: (labelParams) => t('connectedServices.authChip.pendingStartLabel', labelParams),
             });
             const warningKey = resolveConnectedServicesAuthWarningTranslationKey(label.warningCodes[0]);
             return createConnectedServicesAuthActionChip({
@@ -928,6 +939,7 @@ export function useSessionConnectedServicesAuthSwitch(params: Readonly<{
             resolveServiceTitle: (serviceId) => resolveConnectedServiceShortName(serviceId as ConnectedServiceId, t),
             nativeLabel: t('connectedServices.authChip.nativeLabel'),
             formatConnectedCountLabel: (count) => t('connectedServices.authChip.connectedCountLabel', { count }),
+            formatPendingStartLabel: (labelParams) => t('connectedServices.authChip.pendingStartLabel', labelParams),
         });
 
         return createConnectedServicesAuthActionChip({

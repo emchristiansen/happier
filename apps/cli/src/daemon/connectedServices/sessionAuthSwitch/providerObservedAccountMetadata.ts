@@ -1,10 +1,10 @@
-import { ConnectedServiceBindingsV1Schema, type ConnectedServiceId } from '@happier-dev/protocol';
+import { ConnectedServiceBindingsV1Schema, type ConnectedServiceBindingsV1, type ConnectedServiceId } from '@happier-dev/protocol';
 
 /**
  * Publishes provider-observed account evidence on a group binding. When the observed member is the
  * session's own pending per-session target (`materializedAssignment`), adoption is proved: the
- * target becomes the applied `member` (spec A.5 C4–C5). A different observed member leaves the
- * pending target in place.
+ * target becomes the applied `member` (spec A.5 C4–C5); a proved conversion to the group home ends
+ * per-session ownership. A different observed member leaves the pending target in place.
  */
 export function projectProviderObservedAccountMetadata(
   metadata: Record<string, unknown>,
@@ -18,6 +18,11 @@ export function projectProviderObservedAccountMetadata(
   const adoptsPending = pending !== undefined && pending.profileId === observation.profileId;
   if (binding.appliedProfileId === observation.profileId && !adoptsPending) return metadata;
   const { materializedAssignment: _adopted, ...rest } = binding;
+  if (adoptsPending && pending.home === 'group') {
+    // Proved conversion to the group home (spec A.4 Migration): per-session ownership ends here.
+    const { member: _member, initialProfileId: _initial, ...shared } = rest;
+    return withBinding(metadata, parsed.data, observation.serviceId, { ...shared, appliedProfileId: observation.profileId });
+  }
   const nextBinding = adoptsPending
     ? {
       ...rest,
@@ -35,13 +40,22 @@ export function projectProviderObservedAccountMetadata(
       },
     }
     : { ...binding, appliedProfileId: observation.profileId };
+  return withBinding(metadata, parsed.data, observation.serviceId, nextBinding);
+}
+
+function withBinding(
+  metadata: Record<string, unknown>,
+  bindings: ConnectedServiceBindingsV1,
+  serviceId: ConnectedServiceId,
+  nextBinding: unknown,
+): Record<string, unknown> {
   return {
     ...metadata,
     connectedServices: {
-      ...parsed.data,
+      ...bindings,
       bindingsByServiceId: {
-        ...parsed.data.bindingsByServiceId,
-        [observation.serviceId]: nextBinding,
+        ...bindings.bindingsByServiceId,
+        [serviceId]: nextBinding,
       },
     },
   };

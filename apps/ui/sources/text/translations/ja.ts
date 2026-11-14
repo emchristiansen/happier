@@ -2904,6 +2904,7 @@ localTailscale: {
       labelWithCount: ({ count }: { count: number }) => `認証: ${count}`,
       nativeLabel: "CLI認証",
       connectedCountLabel: ({ count }: { count: number }) => `${count} 件接続済み`,
+      pendingStartLabel: ({ pool, account }: { pool: string; account: string }) => `${pool}（${account} で開始中…）`,
     },
     authSwitch: {
       activeTurnDisabled:

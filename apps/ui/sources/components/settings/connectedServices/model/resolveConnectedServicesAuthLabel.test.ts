@@ -13,6 +13,7 @@ describe('resolveConnectedServicesAuthLabel', () => {
             resolveServiceTitle: (serviceId) => `service:${serviceId}`,
             nativeLabel: 'Native',
             formatConnectedCountLabel: (count) => `${count} connected`,
+            formatPendingStartLabel: ({ pool, account }) => `${pool} (starting on ${account}…)`,
         })).toEqual({
             label: 'Native',
             connectedCount: 0,
@@ -36,6 +37,7 @@ describe('resolveConnectedServicesAuthLabel', () => {
             resolveServiceTitle: (serviceId) => serviceId === 'anthropic' ? 'Anthropic' : serviceId,
             nativeLabel: 'Native',
             formatConnectedCountLabel: (count) => `${count} connected`,
+            formatPendingStartLabel: ({ pool, account }) => `${pool} (starting on ${account}…)`,
         })).toEqual({
             label: 'Anthropic: Work',
             connectedCount: 1,
@@ -66,6 +68,7 @@ describe('resolveConnectedServicesAuthLabel', () => {
             resolveServiceTitle: (serviceId) => serviceId,
             nativeLabel: 'Native',
             formatConnectedCountLabel: (count) => `${count} connected`,
+            formatPendingStartLabel: ({ pool, account }) => `${pool} (starting on ${account}…)`,
         })).toEqual({
             label: '2 connected',
             connectedCount: 2,
@@ -100,6 +103,7 @@ describe('resolveConnectedServicesAuthLabel', () => {
             resolveServiceTitle: (serviceId) => serviceId,
             nativeLabel: 'Native',
             formatConnectedCountLabel: (count) => `${count} connected`,
+            formatPendingStartLabel: ({ pool, account }) => `${pool} (starting on ${account}…)`,
         });
 
         expect(model.connectedCount).toBe(0);
@@ -146,6 +150,7 @@ describe('resolveConnectedServicesAuthLabel', () => {
             resolveServiceTitle: () => 'Codex',
             nativeLabel: 'Native',
             formatConnectedCountLabel: (count) => `${count} connected`,
+            formatPendingStartLabel: ({ pool, account }) => `${pool} (starting on ${account}…)`,
         });
 
         expect(model.connectedCount).toBe(1);
@@ -193,6 +198,7 @@ describe('resolveConnectedServicesAuthLabel', () => {
             resolveServiceTitle: () => 'Codex',
             nativeLabel: 'Native',
             formatConnectedCountLabel: (count) => `${count} connected`,
+            formatPendingStartLabel: ({ pool, account }) => `${pool} (starting on ${account}…)`,
         });
 
         expect(model.connectedCount).toBe(1);
@@ -227,6 +233,7 @@ describe('resolveConnectedServicesAuthLabel', () => {
             resolveServiceTitle: () => 'Codex',
             nativeLabel: 'Native',
             formatConnectedCountLabel: (count) => `${count} connected`,
+            formatPendingStartLabel: ({ pool, account }) => `${pool} (starting on ${account}…)`,
         });
 
         expect(model.connectedCount).toBe(0);
@@ -249,6 +256,7 @@ describe('resolveConnectedServicesAuthLabel', () => {
             resolveServiceTitle: (serviceId) => serviceId,
             nativeLabel: 'Native',
             formatConnectedCountLabel: (count) => `${count} connected`,
+            formatPendingStartLabel: ({ pool, account }) => `${pool} (starting on ${account}…)`,
         });
 
         expect(model.connectedCount).toBe(0);

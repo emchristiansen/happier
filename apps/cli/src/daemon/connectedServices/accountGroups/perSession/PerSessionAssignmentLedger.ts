@@ -25,7 +25,20 @@ export type PerSessionAssignmentLedgerEntry = Readonly<{
   /** pending until provider adoption proof; applied afterwards. */
   state: 'pending' | 'applied';
   updatedAtMs: number;
+  /**
+   * The runner process launched for this decision, once one exists. Its proved absence is the
+   * retirement evidence that lets an unowned decision be released (spec A.4, T17); a decision
+   * without a recorded runner may still have a pending/pre-registration child and keeps custody.
+   */
+  runner?: PerSessionAssignmentRunner;
+  /**
+   * A replacement decision for the same session supersedes this one (its target failed before
+   * adoption). The entry keeps custody until that replacement is adopted (spec A.5, T20).
+   */
+  supersededByDecisionId?: string;
 }>;
+
+export type PerSessionAssignmentRunner = Readonly<{ pid: number; processInstanceFingerprint?: string }>;
 
 type LedgerSnapshot = Readonly<{ v: 1; entriesByDecisionId: Readonly<Record<string, PerSessionAssignmentLedgerEntry>> }>;
 
@@ -111,6 +124,8 @@ export class PerSessionAssignmentLedger {
         proposal: input.proposal,
         state: previous?.state ?? 'pending',
         updatedAtMs: input.nowMs,
+        ...(previous?.runner ? { runner: previous.runner } : {}),
+        ...(previous?.supersededByDecisionId ? { supersededByDecisionId: previous.supersededByDecisionId } : {}),
       });
     });
   }
@@ -120,6 +135,25 @@ export class PerSessionAssignmentLedger {
       const entry = this.entries.get(decisionId);
       if (!entry) return false;
       this.entries.set(decisionId, { ...entry, state: 'applied', updatedAtMs: nowMs });
+      return true;
+    });
+  }
+
+  /** Records the runner launched for a decision; false when the decision is unknown. */
+  async recordRunner(decisionId: string, runner: PerSessionAssignmentRunner, nowMs: number): Promise<boolean> {
+    return await this.mutate(() => {
+      const entry = this.entries.get(decisionId);
+      if (!entry) return false;
+      this.entries.set(decisionId, { ...entry, runner, updatedAtMs: nowMs });
+      return true;
+    });
+  }
+
+  async markSuperseded(decisionId: string, supersededByDecisionId: string, nowMs: number): Promise<boolean> {
+    return await this.mutate(() => {
+      const entry = this.entries.get(decisionId);
+      if (!entry) return false;
+      this.entries.set(decisionId, { ...entry, supersededByDecisionId, updatedAtMs: nowMs });
       return true;
     });
   }

@@ -63,4 +63,21 @@ describe('per-session adoption through provider-observed accounts', () => {
     expect(binding.member.profileId).toBe('acct-a');
     expect(resolveAdoptedPerSessionDecisionId(metadata, observedOld, 'claude-subscription')).toBeNull();
   });
+  it('ends per-session ownership only when a group-home conversion is proved by the observed account (T12)', () => {
+    const converting = {
+      connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': {
+        source: 'connected', selection: 'group', groupId: 'pool', initialProfileId: 'acct-b',
+        member: { assignment: 'per_session', profileId: 'acct-b', decisionId: 'd-1', reason: 'initial_requested', appliedAtMs: 1 },
+        materializedAssignment: { profileId: 'acct-a', decisionId: 'conversion-1', reason: 'policy_conversion', materializedAtMs: 2, home: 'group' },
+      } } },
+    };
+    const stillOld = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-b' });
+    expect((stillOld.connectedServices as any).bindingsByServiceId['claude-subscription'].member.profileId).toBe('acct-b');
+
+    const converted = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-a' });
+    expect((converted.connectedServices as any).bindingsByServiceId['claude-subscription']).toEqual({
+      source: 'connected', selection: 'group', groupId: 'pool', appliedProfileId: 'acct-a',
+    });
+    expect(resolveAdoptedPerSessionDecisionId(converting, converted, 'claude-subscription')).toBeNull();
+  });
 });

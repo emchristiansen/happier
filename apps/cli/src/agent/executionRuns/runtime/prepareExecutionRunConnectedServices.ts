@@ -196,11 +196,13 @@ async function resolveRunSelection(params: Readonly<{
     if (!params.credentials) {
       throw new ExecutionRunConnectedServicesUnavailableError({ agentId });
     }
-    const resolvedDefaults = await params.resolvePerServiceDefaults({
+    // A stored default never pins a member or carries assignment state (spec A.1), exactly like the
+    // whole-session default below; explicit pins keep their own `initialProfileId` request.
+    const resolvedDefaults = stripConnectedServicePerSessionAssignmentForInheritance(await params.resolvePerServiceDefaults({
       backendTarget: params.backendTarget,
       credentials: params.credentials,
       serviceIds: defaultServiceIdsToResolve,
-    });
+    }));
     const merged: Record<string, ConnectedServiceBindingSelectionV1> = { ...explicitBindingsByServiceId };
     for (const serviceId of defaultServiceIdsToResolve) {
       const binding = resolvedDefaults?.bindingsByServiceId[serviceId];

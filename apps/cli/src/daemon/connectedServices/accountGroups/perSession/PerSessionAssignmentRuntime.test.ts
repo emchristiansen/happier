@@ -12,10 +12,29 @@ import type { PerSessionAssignmentProposal } from './decidePerSessionGroupMember
 import { PerSessionAssignmentLedger } from './PerSessionAssignmentLedger';
 import {
   PER_SESSION_RESERVATION_LEASE_MS,
-  PER_SESSION_UNOWNED_DECISION_GRACE_MS,
   PerSessionAssignmentRuntime,
   type PerSessionLiveDecision,
+  type PerSessionRunnerPresence,
 } from './PerSessionAssignmentRuntime';
+
+function runtimeFor(input: Readonly<{
+  ledger: PerSessionAssignmentLedger;
+  api: ReturnType<typeof reservationApi>;
+  now?: () => number;
+  live?: () => PerSessionLiveDecision[];
+  liveSubjects?: () => ReadonlySet<string>;
+  presence?: (pid: number) => PerSessionRunnerPresence;
+}>) {
+  return new PerSessionAssignmentRuntime({
+    ledger: input.ledger,
+    ownerMachineId: 'm1',
+    reservationApi: input.api,
+    nowMs: input.now ?? (() => 100),
+    listLiveDecisions: input.live ?? (() => []),
+    listLiveSubjectIds: input.liveSubjects ?? (() => new Set()),
+    probeRunnerPresence: async (runner) => input.presence?.(runner.pid) ?? 'present',
+  });
+}
 
 function proposal(decisionId: string, profileId: string): PerSessionAssignmentProposal {
   return {
@@ -66,7 +85,7 @@ describe('PerSessionAssignmentRuntime', () => {
     await ledger.markApplied('old', 2);
     await ledger.recordProposal({ decisionId: 'new', sessionId: 'csm_1', serviceId: 'claude-subscription', groupId: 'pool', origin: 'recovery', proposal: proposal('new', 'b'), nowMs: 3 });
     const api = reservationApi();
-    const runtime = new PerSessionAssignmentRuntime({ ledger, ownerMachineId: 'm1', reservationApi: api, nowMs: () => 100, listLiveDecisions: () => [] });
+    const runtime = runtimeFor({ ledger, api });
 
     await runtime.markAdopted({ serviceId: 'claude-subscription', groupId: 'pool', decisionId: 'new', profileId: 'b' });
 
@@ -79,25 +98,113 @@ describe('PerSessionAssignmentRuntime', () => {
     expect(api.deleteAssignmentReservation).toHaveBeenCalledWith({ serviceId: 'claude-subscription', groupId: 'pool', decisionId: 'old' });
   });
 
-  it('renews live decisions, rebuilds a lost entry, and releases an unowned one only after the grace period', async () => {
+  it('renews live decisions and rebuilds a lost entry', async () => {
     const ledger = new PerSessionAssignmentLedger(await ledgerAt());
     await ledger.recordProposal({ decisionId: 'fresh', sessionId: 'csm_2', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('fresh', 'a'), nowMs: 1_000 });
-    await ledger.recordProposal({ decisionId: 'stale', sessionId: 'csm_3', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('stale', 'a'), nowMs: 0 });
     const live: PerSessionLiveDecision = {
       serviceId: 'claude-subscription', groupId: 'pool', decisionId: 'lost', profileId: 'b', subjectId: 'csm_1', applied: true, reason: 'failover',
     };
     const api = reservationApi();
-    const now = PER_SESSION_UNOWNED_DECISION_GRACE_MS + 500;
-    const runtime = new PerSessionAssignmentRuntime({ ledger, ownerMachineId: 'm1', reservationApi: api, nowMs: () => now, listLiveDecisions: () => [live] });
+    const runtime = runtimeFor({ ledger, api, now: () => 5_000, live: () => [live] });
 
     await runtime.tick();
 
     expect(ledger.get('lost')).toMatchObject({ state: 'applied', sessionId: 'csm_1', proposal: { profileId: 'b', reason: 'failover' } });
-    expect(ledger.get('fresh')).not.toBeNull();
-    expect(ledger.get('stale')).toBeNull();
     const renewed = vi.mocked(api.putAssignmentReservation).mock.calls.map(([params]) => params.decisionId).sort();
     expect(renewed).toEqual(['fresh', 'lost']);
-    expect(api.deleteAssignmentReservation).toHaveBeenCalledWith(expect.objectContaining({ decisionId: 'stale' }));
+    expect(api.deleteAssignmentReservation).not.toHaveBeenCalled();
+  });
+
+  it('keeps custody of an unresolved spawn with no live owner however much time passes (T17)', async () => {
+    const ledger = new PerSessionAssignmentLedger(await ledgerAt());
+    await ledger.recordProposal({ decisionId: 'pre-registration', sessionId: 'csm_9', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('pre-registration', 'a'), nowMs: 0 });
+    const api = reservationApi();
+    // A day later, still no tracked child and no recorded runner: a pending child may exist.
+    const runtime = runtimeFor({ ledger, api, now: () => 24 * 60 * 60_000 });
+
+    await runtime.tick();
+    await runtime.tick();
+
+    expect(ledger.get('pre-registration')).not.toBeNull();
+    expect(api.deleteAssignmentReservation).not.toHaveBeenCalled();
+    expect(vi.mocked(api.putAssignmentReservation).mock.calls.map(([params]) => params.decisionId)).toEqual(['pre-registration', 'pre-registration']);
+  });
+
+  it('releases an unowned decision only once its recorded runner is proved absent', async () => {
+    const ledger = new PerSessionAssignmentLedger(await ledgerAt());
+    await ledger.recordProposal({ decisionId: 'launched', sessionId: 'csm_4', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('launched', 'a'), nowMs: 0 });
+    const runtime0 = runtimeFor({ ledger, api: reservationApi() });
+    const custody = runtime0.createSpawnCustody();
+    custody.claim(['launched']);
+    await custody.recordRunner({ pid: 4242, processInstanceFingerprint: 'linux-proc:1' });
+    expect(ledger.get('launched')?.runner).toEqual({ pid: 4242, processInstanceFingerprint: 'linux-proc:1' });
+
+    let presence: PerSessionRunnerPresence = 'unknown';
+    const api = reservationApi();
+    const runtime = runtimeFor({ ledger, api, presence: () => presence });
+    await runtime.tick();
+    expect(ledger.get('launched')).not.toBeNull();
+
+    presence = 'absent';
+    await runtime.tick();
+    expect(ledger.get('launched')).toBeNull();
+    expect(api.deleteAssignmentReservation).toHaveBeenCalledWith({ serviceId: 'claude-subscription', groupId: 'pool', decisionId: 'launched' });
+  });
+
+  it('releases a spawn decision after a definite pre-launch failure, but never once a runner existed', async () => {
+    const ledger = new PerSessionAssignmentLedger(await ledgerAt());
+    await ledger.recordProposal({ decisionId: 'never-launched', sessionId: 'csm_5', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('never-launched', 'a'), nowMs: 0 });
+    await ledger.recordProposal({ decisionId: 'launched', sessionId: 'csm_6', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('launched', 'a'), nowMs: 0 });
+    const api = reservationApi();
+    const runtime = runtimeFor({ ledger, api });
+
+    const failed = runtime.createSpawnCustody();
+    failed.claim(['never-launched']);
+    await failed.releaseIfNeverLaunched();
+    const launched = runtime.createSpawnCustody();
+    launched.claim(['launched']);
+    await launched.recordRunner({ pid: 77 });
+    await launched.releaseIfNeverLaunched();
+
+    expect(ledger.get('never-launched')).toBeNull();
+    expect(ledger.get('launched')).not.toBeNull();
+    expect(vi.mocked(api.deleteAssignmentReservation).mock.calls.map(([params]) => params.decisionId)).toEqual(['never-launched']);
+  });
+
+  it('on adoption releases the previous applied and superseded failed targets, keeping a newer pending proposal', async () => {
+    const ledger = new PerSessionAssignmentLedger(await ledgerAt());
+    const record = async (decisionId: string, profileId: string) => ledger.recordProposal({
+      decisionId, sessionId: 'csm_1', serviceId: 'claude-subscription', groupId: 'pool', origin: 'recovery', proposal: proposal(decisionId, profileId), nowMs: 1,
+    });
+    await record('applied-a', 'a');
+    await ledger.markApplied('applied-a', 2);
+    await record('failed-b', 'b');
+    await record('failed-c', 'c');
+    await ledger.markSuperseded('failed-b', 'failed-c', 3);
+    await ledger.markSuperseded('failed-c', 'adopted-d', 4);
+    await record('adopted-d', 'd');
+    await record('newer-e', 'e');
+    const runtime = runtimeFor({ ledger, api: reservationApi() });
+
+    await runtime.markAdopted({ serviceId: 'claude-subscription', groupId: 'pool', decisionId: 'adopted-d', profileId: 'd' });
+
+    expect(ledger.list().map((entry) => entry.decisionId).sort()).toEqual(['adopted-d', 'newer-e']);
+  });
+
+  it('releases an applied decision a live session no longer carries, and all of a retired session', async () => {
+    const ledger = new PerSessionAssignmentLedger(await ledgerAt());
+    await ledger.recordProposal({ decisionId: 'old-applied', sessionId: 'csm_live', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('old-applied', 'a'), nowMs: 1 });
+    await ledger.markApplied('old-applied', 1);
+    await ledger.recordProposal({ decisionId: 'pending-recovery', sessionId: 'csm_live', serviceId: 'claude-subscription', groupId: 'pool', origin: 'recovery', proposal: proposal('pending-recovery', 'b'), nowMs: 1 });
+    await ledger.recordProposal({ decisionId: 'ended', sessionId: 'csm_gone', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('ended', 'a'), nowMs: 1 });
+    const runtime = runtimeFor({ ledger, api: reservationApi(), liveSubjects: () => new Set(['csm_live']) });
+
+    await runtime.tick();
+    expect(ledger.get('old-applied')).toBeNull();
+    expect(ledger.get('pending-recovery')).not.toBeNull();
+
+    await runtime.releaseForRetiredSubjects(['csm_gone']);
+    expect(ledger.get('ended')).toBeNull();
   });
 
   it('recreates a lapsed reservation against the revision a conflict returns', async () => {
@@ -105,9 +212,9 @@ describe('PerSessionAssignmentRuntime', () => {
     const put = vi.fn()
       .mockResolvedValueOnce({ kind: 'conflict', reservationRevision: 7, reservations: [] })
       .mockResolvedValueOnce({ kind: 'reserved', outcome: 'created', reservationRevision: 8, reservation: {} });
-    const runtime = new PerSessionAssignmentRuntime({
-      ledger, ownerMachineId: 'm1', reservationApi: reservationApi({ putAssignmentReservation: put }), nowMs: () => 10,
-      listLiveDecisions: () => [{ serviceId: 'claude-subscription', groupId: 'pool', decisionId: 'd', profileId: 'a', subjectId: 'csm', applied: false, reason: 'initial_sampled' }],
+    const runtime = runtimeFor({
+      ledger, api: reservationApi({ putAssignmentReservation: put }), now: () => 10,
+      live: () => [{ serviceId: 'claude-subscription', groupId: 'pool', decisionId: 'd', profileId: 'a', subjectId: 'csm', applied: false, reason: 'initial_sampled' }],
     });
     await runtime.tick();
     expect(put).toHaveBeenCalledTimes(2);

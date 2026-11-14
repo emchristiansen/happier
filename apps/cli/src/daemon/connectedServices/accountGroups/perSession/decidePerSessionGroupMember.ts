@@ -18,11 +18,15 @@ import {
 } from '../selection/selectConnectedServiceAuthGroupCandidate';
 
 /**
- * One per-session member decision for a per_session_softmax group (spec A.2, A.3, A.5 C1–C2).
+ * One per-session member decision for a per_session_softmax group (spec A.2, A.3, A.5 C1–C2, R1–R5).
  *
  * Ordering: read shared reservations → choose → durably persist the proposal (caller callback)
  * → PUT the reservation → resolve custody. No provider effect may happen while custody is
- * `proposed`; the caller performs effects only after this returns.
+ * `proposed`; the caller performs effects only after an `assigned` result.
+ *
+ * A durable `proposed` proposal is written ahead of its PUT, so it always means "this exact PUT may
+ * have been sent and may still commit". Replay therefore re-sends that identical PUT and never
+ * degrades or redraws until a definite conflict proves the original revision can no longer commit.
  */
 export type PerSessionAssignmentCustody = 'reserved' | 'local_degraded' | 'reservation_uncertain';
 
@@ -37,13 +41,47 @@ export type PerSessionAssignmentProposal = Readonly<{
   probability: number | null;
   decidedAtMs: number;
   custody: 'proposed' | PerSessionAssignmentCustody;
+  /** For `proposed`: the `expectedReservationRevision` of this proposal's PUT. Afterwards: the revision that settled it. */
   observedReservationRevision: number | null;
+  /**
+   * `leaseUntilMs` of this proposal's PUT, persisted with the proposal so a replay re-sends the
+   * byte-identical request. Absent only on entries written before this field existed.
+   */
+  reservationLeaseUntilMs?: number;
 }>;
+
+export type PerSessionProposedAssignment = PerSessionAssignmentProposal & Readonly<{ custody: 'proposed' }>;
 
 export type PerSessionAssignmentDecision =
   | Readonly<{ kind: 'assigned'; proposal: PerSessionAssignmentProposal & { custody: PerSessionAssignmentCustody } }>
+  /**
+   * R4 before the caller's deadline: a potentially committing PUT has an unsettled outcome and
+   * reconciliation failed. No effect is permitted. The durable proposal stays `proposed`; the caller
+   * retries later by passing it back as `resumeProposal` with the SAME `deadlineAtMs`. Once that
+   * deadline passes, the retry returns `assigned` with `reservation_uncertain` on the same ID/target.
+   */
+  | Readonly<{ kind: 'custody_unresolved'; pendingProposal: PerSessionProposedAssignment; detail: string; deadlineAtMs: number }>
   | Readonly<{ kind: 'no_candidate'; selection: ConnectedServiceAuthGroupCandidateSelection }>
   | Readonly<{ kind: 'initial_profile_invalid'; profileId: string; code: 'initial_profile_not_member' | 'initial_profile_disabled'; exclusionReason?: string }>;
+
+/**
+ * The server holds this decision ID for a different (profile, session, owner machine) tuple than the
+ * durable proposal. Never adopted or overwritten; no effect may follow (spec A.3, A.5).
+ */
+export class PerSessionReservationDecisionMismatchError extends Error {
+  readonly code = 'assignment_reservation_decision_mismatch';
+
+  constructor(
+    readonly proposal: PerSessionAssignmentProposal,
+    readonly stored: ConnectedServiceAssignmentReservationV1 | null,
+  ) {
+    super(`assignment_reservation_decision_mismatch for decision ${proposal.decisionId}`);
+    this.name = 'PerSessionReservationDecisionMismatchError';
+  }
+}
+
+/** Identical PUTs (original plus resends after reconciled absence) one call makes before deferring to the caller's retry. */
+const MAX_IDENTICAL_SENDS_PER_CALL = 2;
 
 export type DecidePerSessionGroupMemberInput = Readonly<{
   serviceId: ConnectedServiceId;
@@ -62,6 +100,8 @@ export type DecidePerSessionGroupMemberInput = Readonly<{
   initialProfileId?: string | null;
   /** Failure classification for failover decisions; absent for an initial spawn. */
   switchReason?: string;
+  /** Recorded reason for a replacement draw when it is more specific than `failover` (e.g. `member_revoked`). */
+  replacementReason?: ConnectedServiceGroupMemberAssignmentReasonV1;
   requiredModelIds?: ReadonlyArray<string>;
   /** Members the caller already found ineligible for this decision (e.g. a pending target). */
   additionallyExcludedProfileIds?: ReadonlySet<string>;
@@ -169,21 +209,8 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
   }
   const namedStartEligible = named?.kind === 'eligible';
   const sampledReason: ConnectedServiceGroupMemberAssignmentReasonV1 = input.switchReason
-    ? 'failover'
+    ? input.replacementReason ?? 'failover'
     : initialProfileId ? 'initial_unavailable_failover' : 'initial_sampled';
-
-  let snapshot: ConnectedServiceAssignmentReservationSnapshot | null = null;
-  let degraded = input.reservationApi === null;
-  if (input.reservationApi) {
-    const listed = await input.reservationApi.listAssignmentReservations({ serviceId: input.serviceId, groupId: input.groupId });
-    if (listed.kind === 'ok') {
-      snapshot = listed;
-    } else {
-      // A failed read commits nothing, so local degraded selection is still safe here.
-      degraded = true;
-      input.log?.('assignment_reservation_unavailable', { stage: 'list', detail: listed.detail });
-    }
-  }
 
   const choose = (counts: ReadonlyMap<string, number>, useDegraded: boolean): Choice | ConnectedServiceAuthGroupCandidateSelection => {
     if (namedStartEligible) {
@@ -209,140 +236,159 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
       offsetPercent: selection.perSessionDecision.offsetPercent,
     };
   };
+  const localCounts = () => new Map(input.localReservationCountsByProfileId());
 
-  const countsFor = (current: ConnectedServiceAssignmentReservationSnapshot | null) => (current && !degraded
-    ? countLiveReservations(current.reservations, input.nowMs(), input.decisionId)
-    : new Map(input.localReservationCountsByProfileId()));
-
-  const resume = input.resumeProposal?.custody === 'proposed' && input.resumeProposal.decisionId === input.decisionId
-    ? input.resumeProposal
+  const resume: PerSessionProposedAssignment | null = input.resumeProposal?.custody === 'proposed'
+    && input.resumeProposal.decisionId === input.decisionId
+    ? { ...input.resumeProposal, custody: 'proposed' }
     : null;
-  const first: Choice | ConnectedServiceAuthGroupCandidateSelection = resume
-    ? {
-      profileId: resume.profileId,
-      reason: resume.reason,
-      probability: resume.probability,
-      temperature: resume.temperature,
-      offsetPercent: resume.offsetPercent,
-    }
-    : choose(countsFor(snapshot), degraded);
-  if (!isChoice(first)) return { kind: 'no_candidate', selection: first };
-  let choice: Choice = first;
-
-  let proposalRevision = resume?.proposalRevision ?? 1;
   const decidedAtMs = resume?.decidedAtMs ?? input.nowMs();
-  const proposalFor = (current: Choice, custody: PerSessionAssignmentProposal['custody']): PerSessionAssignmentProposal => ({
+  const fromProfileId = resume ? resume.fromProfileId : input.currentProfileId;
+  const proposalFrom = (choice: Choice, proposalRevision: number, custody: PerSessionAssignmentProposal['custody'], observedReservationRevision: number | null) => ({
     decisionId: input.decisionId,
     proposalRevision,
-    profileId: current.profileId,
-    reason: current.reason,
-    fromProfileId: input.currentProfileId,
-    temperature: current.temperature,
-    offsetPercent: current.offsetPercent,
-    probability: current.probability,
+    profileId: choice.profileId,
+    reason: choice.reason,
+    fromProfileId,
+    temperature: choice.temperature,
+    offsetPercent: choice.offsetPercent,
+    probability: choice.probability,
     decidedAtMs,
     custody,
-    observedReservationRevision: snapshot?.reservationRevision ?? null,
+    observedReservationRevision,
   });
-
-  if (resume && (!input.reservationApi || !snapshot)) {
-    // R4: a resumed proposal may already have committed; proceed only on the same ID and target.
-    const proposal = proposalFor(choice, 'reservation_uncertain');
+  // C1/R2: a proposal fixes its exact PUT (expected revision and lease) before anything is sent.
+  const proposedFrom = (choice: Choice, proposalRevision: number, expectedReservationRevision: number): PerSessionProposedAssignment => ({
+    ...proposalFrom(choice, proposalRevision, 'proposed', expectedReservationRevision),
+    custody: 'proposed',
+    reservationLeaseUntilMs: input.nowMs() + input.policy.probeIfSnapshotOlderThanMs,
+  });
+  const degradedFrom = async (proposalRevision: number): Promise<PerSessionAssignmentDecision> => {
+    const degradedChoice = choose(localCounts(), true);
+    if (!isChoice(degradedChoice)) return { kind: 'no_candidate', selection: degradedChoice };
+    const proposal = { ...proposalFrom(degradedChoice, proposalRevision, 'local_degraded', null), custody: 'local_degraded' as const };
     await input.persistProposal(proposal);
-    return { kind: 'assigned', proposal: { ...proposal, custody: 'reservation_uncertain' } };
+    return { kind: 'assigned', proposal };
+  };
+
+  let proposal: PerSessionProposedAssignment;
+  // Whether a PUT that may still commit has been sent for the current proposal. A durable proposal is
+  // written ahead of its PUT, so a resumed one may already have been sent (R3–R5).
+  let sendOutstanding: boolean;
+  if (resume) {
+    proposal = resume;
+    sendOutstanding = true;
+  } else {
+    let snapshot: ConnectedServiceAssignmentReservationSnapshot | null = null;
+    if (input.reservationApi) {
+      const listed = await input.reservationApi.listAssignmentReservations({ serviceId: input.serviceId, groupId: input.groupId });
+      if (listed.kind === 'ok') {
+        snapshot = listed;
+      } else {
+        input.log?.('assignment_reservation_unavailable', { stage: 'list', detail: listed.detail });
+      }
+    }
+    // R5: nothing has been sent for this decision, so a failed read permits local degraded selection.
+    if (!snapshot) return await degradedFrom(1);
+    const first = choose(countLiveReservations(snapshot.reservations, input.nowMs(), input.decisionId), false);
+    if (!isChoice(first)) return { kind: 'no_candidate', selection: first };
+    proposal = proposedFrom(first, 1, snapshot.reservationRevision);
+    await input.persistProposal(proposal);
+    sendOutstanding = false;
   }
 
-  if (degraded || !input.reservationApi || !snapshot) {
-    const proposal = proposalFor(choice, 'local_degraded');
-    await input.persistProposal(proposal);
-    return { kind: 'assigned', proposal: { ...proposal, custody: 'local_degraded' } };
-  }
+  const unresolved = async (current: PerSessionProposedAssignment, detail: string): Promise<PerSessionAssignmentDecision> => {
+    if (input.nowMs() < input.deadlineAtMs) {
+      input.log?.('assignment_reservation_custody_unresolved', { decisionId: input.decisionId, detail });
+      return { kind: 'custody_unresolved', pendingProposal: current, detail, deadlineAtMs: input.deadlineAtMs };
+    }
+    // R4: the caller's deadline requires action; only the same ID/target can have been reserved.
+    const uncertain = { ...current, custody: 'reservation_uncertain' as const };
+    await input.persistProposal(uncertain);
+    return { kind: 'assigned', proposal: uncertain };
+  };
+  const matchesProposal = (entry: ConnectedServiceAssignmentReservationV1, current: PerSessionAssignmentProposal) =>
+    entry.decisionId === current.decisionId && entry.profileId === current.profileId
+    && entry.sessionId === input.sessionId && entry.ownerMachineId === input.ownerMachineId;
+  const reserved = async (current: PerSessionProposedAssignment, reservationRevision: number): Promise<PerSessionAssignmentDecision> => {
+    const settled = { ...current, custody: 'reserved' as const, observedReservationRevision: reservationRevision };
+    await input.persistProposal(settled);
+    return { kind: 'assigned', proposal: settled };
+  };
 
-  // C1: durable proposal before any reservation mutation or effect (already durable on resume).
-  if (!resume) await input.persistProposal(proposalFor(choice, 'proposed'));
-
+  const api = input.reservationApi;
+  if (!api) return await unresolved(proposal, 'reservation_api_absent');
+  let identicalSends = 0;
   for (;;) {
-    const current = choice;
-    const put = await input.reservationApi.putAssignmentReservation({
+    const expectedReservationRevision = proposal.observedReservationRevision;
+    if (expectedReservationRevision === null) {
+      throw new Error(`durable proposal ${proposal.decisionId} is proposed without an observed reservation revision`);
+    }
+    const put = await api.putAssignmentReservation({
       serviceId: input.serviceId,
       groupId: input.groupId,
       decisionId: input.decisionId,
       body: {
-        profileId: current.profileId,
+        profileId: proposal.profileId,
         sessionId: input.sessionId,
         ownerMachineId: input.ownerMachineId,
         state: 'pending',
-        leaseUntilMs: input.nowMs() + input.policy.probeIfSnapshotOlderThanMs,
-        expectedReservationRevision: snapshot.reservationRevision,
+        // Entries written before the lease was persisted derive it from their own durable fields.
+        leaseUntilMs: proposal.reservationLeaseUntilMs ?? proposal.decidedAtMs + input.policy.probeIfSnapshotOlderThanMs,
+        expectedReservationRevision,
       },
     });
+    identicalSends += 1;
 
     if (put.kind === 'reserved') {
-      const proposal = { ...proposalFor(current, 'reserved'), observedReservationRevision: put.reservationRevision };
-      await input.persistProposal(proposal);
-      return { kind: 'assigned', proposal: { ...proposal, custody: 'reserved' } };
-    }
-
-    if (put.kind === 'unavailable') {
-      // Definitely nothing committed: local degraded selection with τ_degraded = 2τ.
-      input.log?.('assignment_reservation_unavailable', { stage: 'put', detail: put.detail });
-      degraded = true;
-      const degradedChoice = choose(new Map(input.localReservationCountsByProfileId()), true);
-      if (!isChoice(degradedChoice)) return { kind: 'no_candidate', selection: degradedChoice };
-      proposalRevision += 1;
-      const proposal = proposalFor(degradedChoice, 'local_degraded');
-      await input.persistProposal(proposal);
-      return { kind: 'assigned', proposal: { ...proposal, custody: 'local_degraded' } };
-    }
-
-    if (put.kind === 'uncertain') {
-      // R3/R4: keep the original ID and target; reconcile by exact read, never redraw.
-      const reconciled = await input.reservationApi.listAssignmentReservations({ serviceId: input.serviceId, groupId: input.groupId });
-      if (reconciled.kind === 'ok') {
-        const entry = reconciled.reservations.find((candidate) => candidate.decisionId === input.decisionId);
-        if (entry && entry.profileId === current.profileId) {
-          const proposal = { ...proposalFor(current, 'reserved'), observedReservationRevision: reconciled.reservationRevision };
-          await input.persistProposal(proposal);
-          return { kind: 'assigned', proposal: { ...proposal, custody: 'reserved' } };
-        }
-        if (!entry && input.nowMs() < input.deadlineAtMs) {
-          // Reconciled absence: the identical PUT may be re-sent against the observed revision.
-          snapshot = reconciled;
-          continue;
-        }
-      }
-      const proposal = proposalFor(current, 'reservation_uncertain');
-      await input.persistProposal(proposal);
-      return { kind: 'assigned', proposal: { ...proposal, custody: 'reservation_uncertain' } };
+      // R1: acknowledged.
+      if (!matchesProposal(put.reservation, proposal)) throw new PerSessionReservationDecisionMismatchError(proposal, put.reservation);
+      return await reserved(proposal, put.reservationRevision);
     }
 
     if (put.kind === 'decision_mismatch') {
-      const stored = put.reservations.find((candidate) => candidate.decisionId === input.decisionId);
-      if (stored && stored.sessionId === input.sessionId) {
-        // Our own earlier proposal committed: replay reuses its exact target (R1).
-        const adopted: Choice = { ...current, profileId: stored.profileId };
-        snapshot = put;
-        const proposal = { ...proposalFor(adopted, 'reserved'), observedReservationRevision: put.reservationRevision };
-        await input.persistProposal(proposal);
-        return { kind: 'assigned', proposal: { ...proposal, custody: 'reserved' } };
-      }
-      throw new Error(`assignment_reservation_decision_mismatch for decision ${input.decisionId}`);
+      throw new PerSessionReservationDecisionMismatchError(
+        proposal,
+        put.reservations.find((candidate) => candidate.decisionId === input.decisionId) ?? null,
+      );
     }
 
-    // put.kind === 'conflict': definite, nothing stored (R2).
-    snapshot = put;
-    if (input.nowMs() >= input.deadlineAtMs) {
-      throw new Error(`assignment reservation conflicts did not settle before the caller deadline (${input.decisionId})`);
-    }
-    proposalRevision += 1;
-    if (current.reason === 'initial_requested') {
-      // A named start keeps its requested target through unrelated revision conflicts.
-      choice = current;
-    } else {
-      const next = choose(countsFor(snapshot), false);
+    if (put.kind === 'conflict') {
+      // R2: definite, nothing stored. Every PUT sent for this decision carried a revision at or below
+      // the refused one, so none of them can commit any more.
+      sendOutstanding = false;
+      if (input.nowMs() >= input.deadlineAtMs) {
+        throw new Error(`assignment reservation conflicts did not settle before the caller deadline (${input.decisionId})`);
+      }
+      const next: Choice | ConnectedServiceAuthGroupCandidateSelection = proposal.reason === 'initial_requested'
+        // A named start keeps its requested target through unrelated revision conflicts.
+        ? proposal
+        : choose(countLiveReservations(put.reservations, input.nowMs(), input.decisionId), false);
       if (!isChoice(next)) return { kind: 'no_candidate', selection: next };
-      choice = next;
+      proposal = proposedFrom(next, proposal.proposalRevision + 1, put.reservationRevision);
+      await input.persistProposal(proposal);
+      identicalSends = 0;
+      continue;
     }
-    await input.persistProposal(proposalFor(choice, 'proposed'));
+
+    if (put.kind === 'unavailable') {
+      input.log?.('assignment_reservation_unavailable', { stage: 'put', detail: put.detail });
+      // R5 only when nothing potentially committing was sent; otherwise the original may still commit.
+      if (!sendOutstanding) return await degradedFrom(proposal.proposalRevision + 1);
+      return await unresolved(proposal, `put_unavailable_after_uncertain_send:${put.detail}`);
+    }
+
+    // put.kind === 'uncertain' (R3): keep the ID/target; reconcile by exact read, never redraw.
+    sendOutstanding = true;
+    const reconciled = await api.listAssignmentReservations({ serviceId: input.serviceId, groupId: input.groupId });
+    if (reconciled.kind !== 'ok') return await unresolved(proposal, `reconcile_${reconciled.kind}:${reconciled.detail}`);
+    const entry = reconciled.reservations.find((candidate) => candidate.decisionId === input.decisionId);
+    if (entry) {
+      if (!matchesProposal(entry, proposal)) throw new PerSessionReservationDecisionMismatchError(proposal, entry);
+      return await reserved(proposal, reconciled.reservationRevision);
+    }
+    // Absent: re-send the identical PUT (a no-op if the original lands first; a conflict if it can no longer commit).
+    if (identicalSends < MAX_IDENTICAL_SENDS_PER_CALL) continue;
+    return await unresolved(proposal, `put_uncertain:${put.detail}`);
   }
 }

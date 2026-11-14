@@ -2377,6 +2377,7 @@ export const de: TranslationStructure = {
             labelWithCount: ({ count }: { count: number }) => `Auth: ${count}`,
             nativeLabel: 'CLI-Auth',
             connectedCountLabel: ({ count }: { count: number }) => `${count} verbunden`,
+            pendingStartLabel: ({ pool, account }: { pool: string; account: string }) => `${pool} (startet auf ${account}…)`,
         },
         authSwitch: {
             activeTurnDisabled: 'Beende oder stoppe den aktuellen Turn, bevor du die Authentifizierung wechselst.',

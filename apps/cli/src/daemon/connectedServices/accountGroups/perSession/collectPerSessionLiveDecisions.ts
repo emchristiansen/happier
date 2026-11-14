@@ -17,14 +17,29 @@ type TrackedSessionLike = Readonly<{
  * (it records adoption), falling back to the launch bindings. The reservation subject is the
  * session's materialization identity, the key its decision was made under before a session id existed.
  */
+function readSubjectId(session: TrackedSessionLike): string | null {
+  const metadata = session.happySessionMetadataFromLocalWebhook ?? null;
+  const identity = readConnectedServiceMaterializationIdentityV1(
+    metadata?.connectedServiceMaterializationIdentityV1 ?? session.spawnOptions?.connectedServiceMaterializationIdentityV1,
+  );
+  return identity?.id ?? session.happySessionId ?? null;
+}
+
+/** Subjects (materialization identities) of every live runner, whatever its bindings. */
+export function collectPerSessionLiveSubjectIds(tracked: Iterable<TrackedSessionLike>): ReadonlySet<string> {
+  const subjects = new Set<string>();
+  for (const session of tracked) {
+    const subjectId = readSubjectId(session);
+    if (subjectId) subjects.add(subjectId);
+  }
+  return subjects;
+}
+
 export function collectPerSessionLiveDecisions(tracked: Iterable<TrackedSessionLike>): PerSessionLiveDecision[] {
   const decisions = new Map<string, PerSessionLiveDecision>();
   for (const session of tracked) {
     const metadata = session.happySessionMetadataFromLocalWebhook ?? null;
-    const identity = readConnectedServiceMaterializationIdentityV1(
-      metadata?.connectedServiceMaterializationIdentityV1 ?? session.spawnOptions?.connectedServiceMaterializationIdentityV1,
-    );
-    const subjectId = identity?.id ?? session.happySessionId ?? null;
+    const subjectId = readSubjectId(session);
     if (!subjectId) continue;
     const fromMetadata = ConnectedServiceBindingsV1Schema.safeParse(metadata?.connectedServices);
     const parsed = fromMetadata.success ? fromMetadata : ConnectedServiceBindingsV1Schema.safeParse(session.spawnOptions?.connectedServices);

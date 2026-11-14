@@ -1,5 +1,14 @@
-import type { ConnectedServiceCredentialRevisionV1, ConnectedServiceId } from '@happier-dev/protocol';
-import { isPerSessionOwnedGroupSelection, parseConnectedServiceBindingSelections } from '../../parseConnectedServicesBindings';
+import type {
+  ConnectedServiceCredentialRevisionV1,
+  ConnectedServiceGroupMemberAssignmentReasonV1,
+  ConnectedServiceId,
+} from '@happier-dev/protocol';
+import {
+  isPerSessionOwnedGroupSelection,
+  parseConnectedServiceBindingSelections,
+  resolvePerSessionTargetProfileId,
+  type ConnectedServiceBindingSelection,
+} from '../../parseConnectedServicesBindings';
 import {
   buildConnectedServiceAuthGroupCommittedGenerationFact,
   buildConnectedServiceAuthGroupTargetEpochIdentity,
@@ -13,6 +22,7 @@ import type {
   ConnectedServiceProjectedAuthGroup,
   ConnectedServiceProjectedCredential,
   ConnectedServiceProjectedCredentialBoundary,
+  ConnectedServiceProjectedGroupMember,
 } from './connectedServiceProjectionSnapshot';
 
 export class ConnectedServiceGenerationReconciliationNotAcknowledgeableError extends Error {
@@ -69,8 +79,39 @@ type ConnectedServiceDirectCredentialRevisionRuntimeScope = Readonly<{
   sessionId: string;
   serviceId: ConnectedServiceId;
   profileId: string;
+  /**
+   * The runner materialized this profile as its per-session group member's own home. Credential
+   * absence for such a member is a revocation (member_revoked), never a live credential deletion.
+   */
+  perSessionOwned: boolean;
   isCurrent: () => boolean;
 }>;
+
+type PerSessionOwnedGroupSelection = Extract<ConnectedServiceBindingSelection, { kind: 'group' }>;
+
+function listPerSessionOwnedGroupSelections(connectedServicesBindingsRaw: unknown): PerSessionOwnedGroupSelection[] {
+  return parseConnectedServiceBindingSelections(connectedServicesBindingsRaw)
+    .filter((selection): selection is PerSessionOwnedGroupSelection => (
+      selection.kind === 'group' && isPerSessionOwnedGroupSelection(selection)
+    ));
+}
+
+export type ConnectedServicePerSessionMemberRevocation = Readonly<{
+  sessionId: string;
+  serviceId: ConnectedServiceId;
+  groupId: string;
+  /** The revoked member this session is applied to or pending on. */
+  profileId: string;
+  reason: Extract<ConnectedServiceGroupMemberAssignmentReasonV1, 'member_revoked'>;
+}>;
+
+/**
+ * Moves one per-session-owned session off a revoked member at its turn boundary. Repeated delivery
+ * for the same session and member must be a no-op (projection retry and registration replay).
+ */
+export type RevokeConnectedServicePerSessionMember = (
+  input: ConnectedServicePerSessionMemberRevocation,
+) => Promise<void>;
 
 function readNonEmptyString(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -171,8 +212,17 @@ async function listCurrentConnectedServiceDirectCredentialScopes(params: Readonl
     const sessionId = readNonEmptyString(target.sessionId);
     if (!sessionId) continue;
     for (const selection of parseConnectedServiceBindingSelections(target.connectedServicesBindingsRaw)) {
-      if (selection.kind !== 'profile') continue;
-      add({ sessionId, serviceId: selection.serviceId, profileId: selection.profileId, isCurrent });
+      if (selection.kind === 'profile') {
+        add({ sessionId, serviceId: selection.serviceId, profileId: selection.profileId, perSessionOwned: false, isCurrent });
+        continue;
+      }
+      // A per-session-owned runner uses its member's own profile home: the pending materialized
+      // target when present, else the applied member (as spawn and switch materialize it).
+      const memberProfileId = isPerSessionOwnedGroupSelection(selection)
+        ? resolvePerSessionTargetProfileId(selection)
+        : null;
+      if (!memberProfileId) continue;
+      add({ sessionId, serviceId: selection.serviceId, profileId: memberProfileId, perSessionOwned: true, isCurrent });
     }
   }
   return [...byScope.values()].sort((left, right) => (
@@ -216,6 +266,7 @@ export async function reconcileConnectedServiceDirectCredentialRevisions(params:
     if (!scope.isCurrent()) continue;
     const projected = boundaries.get(`${scope.serviceId}\0${scope.profileId}`);
     if (!projected) continue;
+    if (scope.perSessionOwned && projected.boundary.status === 'absent') continue;
     const bindingKey = `${scope.serviceId}\0${scope.profileId}`;
     const previous = liveBindings.get(bindingKey);
     liveBindings.set(bindingKey, {
@@ -271,9 +322,19 @@ export async function reconcileConnectedServiceDirectCredentialRevisionForRuntim
     profileId: string;
     credentialBoundary: ConnectedServiceProjectedCredentialBoundary;
   }>>();
+  const perSessionMemberProfileIdsByGroup = new Map(listPerSessionOwnedGroupSelections(
+    params.target.connectedServicesBindingsRaw,
+  ).map((selection) => [groupScopeKey(selection), resolvePerSessionTargetProfileId(selection)] as const));
   for (const binding of params.target.activeBindings) {
-    if (binding.groupId !== null) continue;
+    const groupId = readNonEmptyString(binding.groupId);
+    const perSessionOwned = groupId !== null && perSessionMemberProfileIdsByGroup.get(
+      groupScopeKey({ serviceId: binding.serviceId, groupId }),
+    ) === binding.profileId;
+    // Shared group bindings are owned by group-generation reconciliation.
+    if (groupId !== null && !perSessionOwned) continue;
     const credentialBoundary = params.resolveCredentialBoundary(binding.serviceId, binding.profileId);
+    // A per-session member's missing credential is revocation, owned by member revocation reconciliation.
+    if (perSessionOwned && credentialBoundary.status === 'absent') continue;
     // A present exact-0.2.1 credential remains valid but has no CAS revision to compare.
     if (
       credentialBoundary.status === 'present'
@@ -550,6 +611,113 @@ export async function reconcileConnectedServiceAuthGroupGenerations(params: Read
     listCurrentGroups: params.listCurrentGroups,
     resolveCredentialRevision: params.resolveCredentialRevision,
     executionAuthority: params.executionAuthority,
+    ...(params.signal ? { signal: params.signal } : {}),
+  });
+}
+
+function findRevokedPerSessionMemberProfileId(
+  selection: PerSessionOwnedGroupSelection,
+  isRevoked: (member: ConnectedServiceProjectedGroupMember) => boolean,
+): string | null {
+  // The pending target is the runner's home, so it is checked first; the applied member second.
+  const candidates = [selection.materializedAssignment?.profileId, selection.member?.profileId];
+  for (const profileId of candidates) {
+    if (profileId && isRevoked({ serviceId: selection.serviceId, groupId: selection.groupId, profileId })) {
+      return profileId;
+    }
+  }
+  return null;
+}
+
+async function revokePerSessionMembersForRuntimeTargets(params: Readonly<{
+  runtimeTargets: readonly ConnectedServiceGenerationRuntimeTarget[];
+  isCurrentRuntimeTarget: (target: ConnectedServiceGenerationRuntimeTarget) => boolean;
+  isRevoked: (member: ConnectedServiceProjectedGroupMember) => boolean;
+  revokePerSessionMember: RevokeConnectedServicePerSessionMember;
+  signal?: AbortSignal;
+}>): Promise<Readonly<{ revokedSessionCount: number }>> {
+  const revocations = new Map<string, Readonly<{
+    revocation: ConnectedServicePerSessionMemberRevocation;
+    isCurrent: () => boolean;
+  }>>();
+  for (const target of params.runtimeTargets) {
+    const isCurrent = () => params.isCurrentRuntimeTarget(target);
+    if (!isCurrent()) continue;
+    const sessionId = readNonEmptyString(target.sessionId);
+    if (!sessionId) continue;
+    for (const selection of listPerSessionOwnedGroupSelections(target.connectedServicesBindingsRaw)) {
+      const profileId = findRevokedPerSessionMemberProfileId(selection, params.isRevoked);
+      if (!profileId) continue;
+      revocations.set(sessionScopeKey({ sessionId, serviceId: selection.serviceId, groupId: selection.groupId }), {
+        revocation: {
+          sessionId,
+          serviceId: selection.serviceId,
+          groupId: selection.groupId,
+          profileId,
+          reason: 'member_revoked',
+        },
+        isCurrent,
+      });
+    }
+  }
+  let revokedSessionCount = 0;
+  const ordered = [...revocations.entries()].sort(([left], [right]) => left.localeCompare(right));
+  for (const [, entry] of ordered) {
+    params.signal?.throwIfAborted();
+    if (!entry.isCurrent()) continue;
+    await params.revokePerSessionMember(entry.revocation);
+    revokedSessionCount += 1;
+  }
+  params.signal?.throwIfAborted();
+  return { revokedSessionCount };
+}
+
+/**
+ * Projection-change owner for per-session member revocation (spec A.4, T10). Only sessions whose own
+ * applied or pending member was revoked by this projection change are reported; peers on other
+ * members and shared-pointer sessions are untouched. The daemon calls this once per projection
+ * delta, so a later identical projection (empty delta) does not report again.
+ */
+export async function reconcileConnectedServicePerSessionMemberRevocations(params: Readonly<{
+  revokedGroupMembers: readonly ConnectedServiceProjectedGroupMember[];
+  listRuntimeTargets: () => readonly ConnectedServiceGenerationRuntimeTarget[];
+  isCurrentRuntimeTarget?: (target: ConnectedServiceGenerationRuntimeTarget) => boolean;
+  revokePerSessionMember: RevokeConnectedServicePerSessionMember;
+  signal?: AbortSignal;
+}>): Promise<Readonly<{ revokedSessionCount: number }>> {
+  params.signal?.throwIfAborted();
+  const memberKey = (member: ConnectedServiceProjectedGroupMember) => (
+    `${member.serviceId}\0${member.groupId}\0${member.profileId}`
+  );
+  const revoked = new Set(params.revokedGroupMembers.map(memberKey));
+  if (revoked.size === 0) return { revokedSessionCount: 0 };
+  return await revokePerSessionMembersForRuntimeTargets({
+    runtimeTargets: params.listRuntimeTargets(),
+    isCurrentRuntimeTarget: (target) => params.isCurrentRuntimeTarget?.(target) !== false,
+    isRevoked: (member) => revoked.has(memberKey(member)),
+    revokePerSessionMember: params.revokePerSessionMember,
+    ...(params.signal ? { signal: params.signal } : {}),
+  });
+}
+
+/**
+ * Registration replay for one newly reachable runtime target: a session that (re)registers while
+ * its own member is already ineligible in the latest projection (e.g. after a daemon restart, whose
+ * first projection is only a baseline) is reported the same way.
+ */
+export async function reconcileConnectedServicePerSessionMemberRevocationForRuntimeTarget(params: Readonly<{
+  target: ConnectedServiceGenerationRuntimeTarget;
+  isGroupMemberEligible: (serviceId: ConnectedServiceId, groupId: string, profileId: string) => boolean;
+  revokePerSessionMember: RevokeConnectedServicePerSessionMember;
+  isCurrent?: () => boolean;
+  signal?: AbortSignal;
+}>): Promise<Readonly<{ revokedSessionCount: number }>> {
+  params.signal?.throwIfAborted();
+  return await revokePerSessionMembersForRuntimeTargets({
+    runtimeTargets: [params.target],
+    isCurrentRuntimeTarget: () => params.isCurrent?.() !== false,
+    isRevoked: (member) => !params.isGroupMemberEligible(member.serviceId, member.groupId, member.profileId),
+    revokePerSessionMember: params.revokePerSessionMember,
     ...(params.signal ? { signal: params.signal } : {}),
   });
 }

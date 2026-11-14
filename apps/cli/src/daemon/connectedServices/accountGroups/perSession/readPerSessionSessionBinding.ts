@@ -17,7 +17,9 @@ type TrackedSessionLike = Readonly<{
 /**
  * A live session's group binding as per-session recovery sees it: its own applied member and
  * pending target, the subject its decisions are keyed by, and the account it currently serves on.
- * A not-yet-assigned shared session (migration) serves on the member its launch selected.
+ * Serving identity is proved only by an applied `member`; a pending-only target (first spawn not yet
+ * adopted) serves on no proved account (spec A.4, T19). A not-yet-assigned shared session
+ * (migration) serves on the member its launch selected.
  */
 export function readPerSessionSessionBinding(
   tracked: TrackedSessionLike,
@@ -46,10 +48,10 @@ export function readPerSessionSessionBinding(
     ...(binding.initialProfileId ? { initialProfileId: binding.initialProfileId } : {}),
     ...(binding.member ? { member: binding.member } : {}),
     ...(binding.materializedAssignment ? { materializedAssignment: binding.materializedAssignment } : {}),
-    currentProfileId: binding.member?.profileId
-      ?? binding.materializedAssignment?.profileId
-      ?? binding.appliedProfileId
-      ?? launchedProfileId
-      ?? null,
+    currentProfileId: binding.member
+      ? binding.member.profileId
+      : binding.materializedAssignment
+        ? null
+        : binding.appliedProfileId ?? launchedProfileId ?? null,
   };
 }

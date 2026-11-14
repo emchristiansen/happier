@@ -50,6 +50,7 @@ export const ConnectedServiceGroupMemberAssignmentReasonV1Schema = lazySchema(()
     'initial_unavailable_failover',
     'failover',
     'member_revoked',
+    'policy_conversion',
 ]));
 
 export type ConnectedServiceGroupMemberAssignmentReasonV1 = z.infer<typeof ConnectedServiceGroupMemberAssignmentReasonV1Schema>;
@@ -82,6 +83,11 @@ export const ConnectedServiceGroupMaterializedAssignmentV1Schema = lazySchema(()
         reason: ConnectedServiceGroupMemberAssignmentReasonV1Schema,
         fromProfileId: ConnectedServiceProfileIdSchema.optional(),
         materializedAtMs: z.number().int().nonnegative(),
+        /**
+         * Conversion target (spec A.4 Migration): materialize the group's shared home instead of the
+         * member home; on adoption the session's per-session ownership is removed rather than promoted.
+         */
+        home: z.literal('group').optional(),
         temperature: z.number().finite().positive().optional(),
         offsetPercent: z.number().finite().positive().optional(),
         probability: z.number().finite().min(0).max(1).optional(),
@@ -207,24 +213,51 @@ export type SessionConnectedServiceAuthSwitchRpcParams = z.infer<
     typeof SessionConnectedServiceAuthSwitchRpcParamsSchema
 >;
 
-/**
- * The group/source a child, fork, handoff target or stored default inherits: the parent's
- * `initialProfileId` and internal assignment fields removed (spec A.1). Returns the input when
- * nothing is removed.
- */
-export function stripConnectedServicePerSessionAssignmentFields<T extends ConnectedServiceBindingsV1 | null | undefined>(bindings: T): T {
-    if (!bindings) return bindings;
+function omitConnectedServiceBindingFields<T>(input: T, fields: ReadonlySet<string>): T {
+    if (!input || typeof input !== 'object') return input;
+    const record = input as Record<string, unknown>;
+    const isEnvelope = !!record.bindingsByServiceId && typeof record.bindingsByServiceId === 'object';
+    const byServiceId = (isEnvelope ? record.bindingsByServiceId : record) as Record<string, unknown>;
     let changed = false;
-    const bindingsByServiceId: Record<string, unknown> = {};
-    for (const [serviceId, binding] of Object.entries(bindings.bindingsByServiceId)) {
-        if (!binding || binding.source !== 'connected' || binding.selection !== 'group') {
-            bindingsByServiceId[serviceId] = binding;
+    const next: Record<string, unknown> = {};
+    for (const [serviceId, binding] of Object.entries(byServiceId)) {
+        if (!binding || typeof binding !== 'object') {
+            next[serviceId] = binding;
             continue;
         }
-        const { initialProfileId, member, materializedAssignment, ...rest } = binding as typeof binding & Record<string, unknown>;
-        if (initialProfileId !== undefined || member !== undefined || materializedAssignment !== undefined) changed = true;
-        bindingsByServiceId[serviceId] = rest;
+        const kept = Object.fromEntries(Object.entries(binding).filter(([field]) => !fields.has(field)));
+        if (Object.keys(kept).length !== Object.keys(binding).length) changed = true;
+        next[serviceId] = kept;
     }
-    return changed ? { ...bindings, bindingsByServiceId } as T : bindings;
+    if (!changed) return input;
+    return (isEnvelope ? { ...record, bindingsByServiceId: next } : next) as T;
 }
 
+const INTERNAL_ASSIGNMENT_FIELD_SET: ReadonlySet<string> = new Set(CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS);
+
+/** What a child, fork, handoff target or stored default never inherits: every internal field plus the parent's request. */
+export const CONNECTED_SERVICE_INHERITANCE_STRIPPED_FIELDS = Object.freeze([
+    ...CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS,
+    'initialProfileId',
+] as const);
+
+const INHERITANCE_STRIPPED_FIELD_SET: ReadonlySet<string> = new Set(CONNECTED_SERVICE_INHERITANCE_STRIPPED_FIELDS);
+
+/**
+ * Removes caller-supplied internal assignment state (CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS) and
+ * keeps `initialProfileId`. Accepts a V1 envelope or bare bindingsByServiceId record and returns the
+ * same shape; returns the input itself when nothing is removed.
+ */
+export function stripConnectedServiceInternalAssignmentFields<T>(input: T): T {
+    return omitConnectedServiceBindingFields(input, INTERNAL_ASSIGNMENT_FIELD_SET);
+}
+
+/**
+ * The group/source a child, fork, handoff target or stored default inherits: the parent's
+ * `initialProfileId` and every internal assignment field removed (spec A.1); the inheritor makes its
+ * own decision and reservation. Accepts a V1 envelope or bare record and returns the same shape;
+ * returns the input itself when nothing is removed.
+ */
+export function stripConnectedServicePerSessionAssignmentFields<T>(input: T): T {
+    return omitConnectedServiceBindingFields(input, INHERITANCE_STRIPPED_FIELD_SET);
+}

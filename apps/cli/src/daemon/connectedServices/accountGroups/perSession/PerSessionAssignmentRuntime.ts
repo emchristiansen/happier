@@ -2,14 +2,22 @@ import type { ConnectedServiceGroupMemberAssignmentReasonV1, ConnectedServiceId 
 
 import type { ConnectedServiceAssignmentReservationApi } from '@/api/connectedServices/connectedServiceAssignmentReservationApi';
 
-import type { PerSessionAssignmentLedger, PerSessionAssignmentLedgerEntry } from './PerSessionAssignmentLedger';
+import type { PerSessionAssignmentLedger, PerSessionAssignmentLedgerEntry, PerSessionAssignmentRunner } from './PerSessionAssignmentLedger';
 import type { PerSessionSpawnAssignmentDeps } from './resolvePerSessionGroupMemberForSpawn';
 
 /** Lease a live decision holds on the shared resource; renewed well before it lapses. */
 export const PER_SESSION_RESERVATION_LEASE_MS = 5 * 60_000;
 export const PER_SESSION_RESERVATION_RENEW_INTERVAL_MS = 60_000;
-/** A decision with no live owner yet (spawn in flight, child not registered) is kept this long. */
-export const PER_SESSION_UNOWNED_DECISION_GRACE_MS = 10 * 60_000;
+
+/** One spawn attempt's hold on the per-session decisions it created. */
+export type PerSessionSpawnCustody = Readonly<{
+  claim: (decisionIds: ReadonlyArray<string>) => void;
+  recordRunner: (runner: PerSessionAssignmentRunner) => Promise<void>;
+  releaseIfNeverLaunched: () => Promise<void>;
+}>;
+
+/** Positive process evidence for a recorded runner; only `absent` proves retirement. */
+export type PerSessionRunnerPresence = 'absent' | 'present' | 'unknown';
 
 /** A per-session decision a live runner currently carries in its bindings. */
 export type PerSessionLiveDecision = Readonly<{
@@ -34,7 +42,10 @@ type Log = (event: string, detail: Record<string, unknown>) => void;
  * - supplies spawn its ledger/reservation facilities;
  * - marks a decision applied (ledger and shared reservation) once adoption is proved;
  * - renews leases of decisions a live runner carries, rebuilding ledger entries the daemon lost;
- * - releases decisions with no live owner after a grace period.
+ * - releases a decision only on positive evidence that no live or pending child owns it: a definite
+ *   pre-launch failure, the observed retirement of its session, proved absence of its recorded
+ *   runner process, or adoption of a replacement decision for the same session (spec A.4, T17).
+ *   Elapsed time alone never releases custody; an unresolved decision keeps its lease.
  *
  * It never selects or changes a session's member; spawn and recovery own those decisions.
  */
@@ -48,14 +59,20 @@ export class PerSessionAssignmentRuntime {
     reservationApi: ConnectedServiceAssignmentReservationApi | null;
     nowMs: () => number;
     listLiveDecisions: () => ReadonlyArray<PerSessionLiveDecision>;
+    /** Subjects with a live runner; an applied decision such a runner no longer carries was replaced. */
+    listLiveSubjectIds: () => ReadonlySet<string>;
+    probeRunnerPresence: (runner: PerSessionAssignmentRunner) => Promise<PerSessionRunnerPresence>;
     log?: Log;
   }>) {}
+
+  private readonly unresolvedLogged = new Set<string>();
 
   get spawnDeps(): PerSessionSpawnAssignmentDeps {
     return {
       ledger: this.input.ledger,
       ownerMachineId: this.input.ownerMachineId,
       reservationApi: this.input.reservationApi,
+      releaseAfterDefinitePreLaunchFailure: async (decisionId) => await this.releaseAfterDefinitePreLaunchFailure(decisionId),
       ...(this.input.log ? { log: this.input.log } : {}),
     };
   }
@@ -105,14 +122,68 @@ export class PerSessionAssignmentRuntime {
       profileId: params.profileId,
       subjectId: entry?.sessionId ?? params.decisionId,
     }, 'applied');
-    // The session now serves on this decision; its previously applied decision no longer counts.
+    // The session now serves on this decision: its previously applied decision and every failed
+    // target superseded along the way no longer own it, since the adopted runner replaced their
+    // runners. A different still-pending decision (a newer proposal) keeps its own custody.
     if (entry) {
-      for (const superseded of this.input.ledger.list()) {
-        if (superseded.decisionId !== params.decisionId && superseded.sessionId === entry.sessionId
-          && superseded.serviceId === params.serviceId && superseded.groupId === params.groupId) {
-          await this.release(superseded.decisionId);
+      for (const other of this.input.ledger.list()) {
+        if (other.decisionId === params.decisionId || other.sessionId !== entry.sessionId
+          || other.serviceId !== params.serviceId || other.groupId !== params.groupId) continue;
+        if (other.state === 'applied' || other.supersededByDecisionId !== undefined) {
+          await this.release(other.decisionId);
         }
       }
+    }
+  }
+
+  /**
+   * Custody of the decisions one spawn attempt creates: record the runner once a process exists, or
+   * release them when the attempt ends without ever launching one (spec A.4 definite pre-launch failure).
+   */
+  createSpawnCustody(): PerSessionSpawnCustody {
+    let decisionIds: ReadonlyArray<string> = [];
+    let launchedRunner: PerSessionAssignmentRunner | null = null;
+    return {
+      claim: (ids) => { decisionIds = [...ids]; },
+      recordRunner: async (runner) => {
+        launchedRunner = runner;
+        for (const decisionId of decisionIds) await this.recordSpawnedRunner(decisionId, runner);
+      },
+      releaseIfNeverLaunched: async () => {
+        if (launchedRunner) return;
+        for (const decisionId of decisionIds) await this.releaseAfterDefinitePreLaunchFailure(decisionId);
+        decisionIds = [];
+      },
+    };
+  }
+
+  /** The runner process launched for a spawn decision; its later proved absence is retirement evidence. */
+  async recordSpawnedRunner(decisionId: string, runner: PerSessionAssignmentRunner): Promise<void> {
+    await this.input.ledger.recordRunner(decisionId, runner, this.input.nowMs());
+  }
+
+  /**
+   * The spawn attempt that created `decisionId` failed before any runner process existed. Only a
+   * pending decision with no recorded runner qualifies: one that ever launched a child keeps custody
+   * until that child's retirement is proved.
+   */
+  async releaseAfterDefinitePreLaunchFailure(decisionId: string): Promise<boolean> {
+    const entry = this.input.ledger.get(decisionId);
+    if (!entry || entry.state !== 'pending' || entry.origin !== 'spawn' || entry.runner) return false;
+    this.log('per_session_decision_released_pre_launch_failure', { decisionId });
+    await this.release(decisionId);
+    return true;
+  }
+
+  /** The daemon observed these sessions' runners exit with no replacement: their decisions are retired. */
+  async releaseForRetiredSubjects(subjectIds: ReadonlyArray<string>): Promise<void> {
+    const subjects = new Set(subjectIds);
+    if (subjects.size === 0) return;
+    const live = new Set(this.input.listLiveDecisions().map((decision) => decision.decisionId));
+    for (const entry of this.input.ledger.list()) {
+      if (!subjects.has(entry.sessionId) || live.has(entry.decisionId)) continue;
+      this.log('per_session_decision_released_session_retired', { decisionId: entry.decisionId, sessionId: entry.sessionId });
+      await this.release(entry.decisionId);
     }
   }
 
@@ -136,6 +207,7 @@ export class PerSessionAssignmentRuntime {
   private async runTick(): Promise<void> {
     const nowMs = this.input.nowMs();
     const live = new Map(this.input.listLiveDecisions().map((decision) => [decision.decisionId, decision]));
+    const liveSubjects = this.input.listLiveSubjectIds();
     const entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
 
     for (const decision of live.values()) {
@@ -150,15 +222,38 @@ export class PerSessionAssignmentRuntime {
 
     for (const entry of entries.values()) {
       if (live.has(entry.decisionId)) continue;
-      if (nowMs - entry.updatedAtMs < PER_SESSION_UNOWNED_DECISION_GRACE_MS) {
-        await this.renewSafely({
-          serviceId: entry.serviceId, groupId: entry.groupId, decisionId: entry.decisionId,
-          profileId: entry.proposal.profileId, subjectId: entry.sessionId,
-        }, entry.state);
+      if (entry.state === 'applied' && liveSubjects.has(entry.sessionId)) {
+        // The session's live runner serves on something else now (a later adopted decision or a
+        // proved conversion to the group home): this applied decision no longer owns it.
+        this.log('per_session_decision_released_replaced', { decisionId: entry.decisionId, sessionId: entry.sessionId });
+        await this.release(entry.decisionId);
         continue;
       }
-      this.log('per_session_decision_released_unowned', { decisionId: entry.decisionId, sessionId: entry.sessionId });
-      await this.release(entry.decisionId);
+      if (entry.runner && await this.runnerProvedAbsent(entry.runner)) {
+        this.log('per_session_decision_released_runner_absent', { decisionId: entry.decisionId, sessionId: entry.sessionId, pid: entry.runner.pid });
+        await this.release(entry.decisionId);
+        continue;
+      }
+      // No live owner yet and no retirement proof: a pending/pre-registration child may still own
+      // it, so it keeps custody and its lease (spec A.4: lease expiry alone never frees it).
+      if (!this.unresolvedLogged.has(entry.decisionId)) {
+        this.unresolvedLogged.add(entry.decisionId);
+        this.log('per_session_decision_unowned_custody_retained', {
+          decisionId: entry.decisionId, sessionId: entry.sessionId, runnerRecorded: Boolean(entry.runner), ageMs: nowMs - entry.updatedAtMs,
+        });
+      }
+      await this.renewSafely({
+        serviceId: entry.serviceId, groupId: entry.groupId, decisionId: entry.decisionId,
+        profileId: entry.proposal.profileId, subjectId: entry.sessionId,
+      }, entry.state);
+    }
+  }
+
+  private async runnerProvedAbsent(runner: PerSessionAssignmentRunner): Promise<boolean> {
+    try {
+      return (await this.input.probeRunnerPresence(runner)) === 'absent';
+    } catch {
+      return false;
     }
   }
 

@@ -26,8 +26,10 @@ import {
 } from '@/sync/domains/connectedServices/connectedServicesAgentOptionStateBindings';
 import {
   type NewSessionConnectedServicesAgentCore,
+  resolveAgentSupportedConnectedServiceIds,
   resolveNewSessionConnectedServicesBindingsForAgent,
 } from '@/components/sessions/new/modules/connectedServicesNewSessionBindings';
+import { useNewSessionPerSessionAccountGroups } from '@/components/sessions/new/modules/useNewSessionPerSessionAccountGroups';
 import type { ConnectedServicesAuthWarningCode } from '@/components/settings/connectedServices/model/resolveConnectedServicesAuthLabel';
 import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
 
@@ -80,6 +82,20 @@ export function useNewSessionConnectedServices(params: Readonly<{
     serverId: targetServerId,
   });
   const agentId = typeof agentCore?.id === 'string' ? agentCore.id.trim() : '';
+  const supportedConnectedServiceIdsForGroups = React.useMemo(() => resolveAgentSupportedConnectedServiceIds({
+    connectedServicesFeatureEnabled,
+    agentCore,
+  }), [agentCore, connectedServicesFeatureEnabled]);
+  const serviceGroupsProjectionSignature = React.useMemo(
+    () => stableJsonStringify((accountProfile?.connectedServicesV2 ?? []).map((service) => [service.serviceId, service.groups])),
+    [accountProfile?.connectedServicesV2],
+  );
+  const accountGroupsByServiceId = useNewSessionPerSessionAccountGroups({
+    targetServerId,
+    accountGroupsFeatureEnabled,
+    supportedConnectedServiceIds: supportedConnectedServiceIdsForGroups,
+    serviceProjectionSignature: serviceGroupsProjectionSignature,
+  });
   const baseConnectedServicesResolution = React.useMemo(() => {
     return resolveNewSessionConnectedServicesBindingsForAgent({
       agentId,
@@ -89,8 +105,10 @@ export function useNewSessionConnectedServices(params: Readonly<{
       settings,
       connectedServicesFeatureEnabled,
       accountGroupsFeatureEnabled,
+      accountGroupsByServiceId,
     });
   }, [
+    accountGroupsByServiceId,
     accountGroupsFeatureEnabled,
     accountProfile?.connectedServicesV2,
     agentCore,
@@ -120,9 +138,11 @@ export function useNewSessionConnectedServices(params: Readonly<{
       settings,
       connectedServicesFeatureEnabled,
       accountGroupsFeatureEnabled,
+      accountGroupsByServiceId,
       connectedServicesBindingsByServiceIdOverride: optimisticBindingsByServiceId,
     });
   }, [
+    accountGroupsByServiceId,
     accountGroupsFeatureEnabled,
     accountProfile?.connectedServicesV2,
     agentCore,
@@ -161,6 +181,7 @@ export function useNewSessionConnectedServices(params: Readonly<{
     resolveServiceTitle: (serviceId) => resolveConnectedServiceDisplayName(serviceId as ConnectedServiceId, t),
     nativeLabel: t('connectedServices.authChip.nativeLabel'),
     formatConnectedCountLabel: (count) => t('connectedServices.authChip.connectedCountLabel', { count }),
+    formatPendingStartLabel: (labelParams) => t('connectedServices.authChip.pendingStartLabel', labelParams),
   }), [
     accountGroupsFeatureEnabled,
     connectedServiceAccountGroupOptionsByServiceId,

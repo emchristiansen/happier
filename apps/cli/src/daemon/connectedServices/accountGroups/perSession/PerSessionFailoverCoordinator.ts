@@ -17,7 +17,9 @@ import {
   type ConnectedServiceAuthGroupSwitchState,
 } from '../switching/pipeline/switchPipeline';
 import { createCryptoUniformSample } from '../selection/perSessionOffsetOddsSelection';
-import { decidePerSessionGroupMember, type PerSessionAssignmentProposal } from './decidePerSessionGroupMember';
+import type { PerSessionAssignmentProposal } from './decidePerSessionGroupMember';
+import { decidePerSessionGroupMemberUntilSettled } from './decidePerSessionGroupMemberUntilSettled';
+import { isPerSessionMemberEligible } from './resolvePerSessionGroupMemberForSpawn';
 import type { PerSessionAssignmentLedger } from './PerSessionAssignmentLedger';
 
 /** The session's current per-session group binding and the subject its decisions are keyed by. */
@@ -26,7 +28,7 @@ export type PerSessionSessionBinding = Readonly<{
   initialProfileId?: string;
   member?: ConnectedServiceGroupMemberAssignmentV1;
   materializedAssignment?: ConnectedServiceGroupMaterializedAssignmentV1;
-  /** Account the session currently serves on, when known (applied member, else materialized target). */
+  /** Proved serving account: the applied member; null for a pending-only target; shared launch selection otherwise. */
   currentProfileId: string | null;
 }>;
 
@@ -83,7 +85,13 @@ export class PerSessionFailoverCoordinator {
 
   constructor(private readonly deps: Readonly<{
     loadGroup: (input: Readonly<{ serviceId: ConnectedServiceId; groupId: string }>) => Promise<ConnectedServiceAuthGroupV1 | null>;
-    buildState: (group: ConnectedServiceAuthGroupV1) => ConnectedServiceAuthGroupSwitchState;
+    /** Group state with `requiredModelIds` restricted to this session's own model (spec A.2, T13). */
+    buildState: (group: ConnectedServiceAuthGroupV1, sessionId: string) => ConnectedServiceAuthGroupSwitchState;
+    /**
+     * The shared pipeline for a group that is no longer per_session_softmax. Used only to choose the
+     * conversion target when the group's current shared member is the one that failed.
+     */
+    switchSharedGroup: (input: ClassifiedFailureInput) => Promise<ConnectedServiceAuthGroupSwitchResult>;
     /** Records the failed account's health for the whole group (existing runtime-state path). */
     recordFailure: (input: ClassifiedFailureInput & Readonly<{ observedProfileId: string }>) => Promise<void>;
     readSessionBinding: (input: Readonly<{ sessionId: string; serviceId: ConnectedServiceId; groupId: string }>) => PerSessionSessionBinding | null;
@@ -107,7 +115,11 @@ export class PerSessionFailoverCoordinator {
     log?: (event: string, detail: Record<string, unknown>) => void;
   }>) {}
 
-  private policyResult(input: ClassifiedFailureInput, state: ConnectedServiceAuthGroupSwitchState): ConnectedServiceAuthGroupSwitchResult | null {
+  private policyResult(
+    input: ClassifiedFailureInput,
+    state: ConnectedServiceAuthGroupSwitchState,
+    memberRevoked: boolean,
+  ): ConnectedServiceAuthGroupSwitchResult | null {
     const policy = state.policy;
     const waitable = WAITABLE_REASONS.has(input.reason)
       && (policy.recoveryMode === 'wait_until_reset' || policy.recoveryMode === 'switch_or_wait');
@@ -117,7 +129,8 @@ export class PerSessionFailoverCoordinator {
     });
     if (policy.recoveryMode === 'off') return { status: 'auto_switch_disabled', generation: state.generation };
     if (!policy.autoSwitch) return waitable ? waitResult() : { status: 'auto_switch_disabled', generation: state.generation };
-    if (!isReasonEnabled(policy, input.reason)) {
+    // A revoked member cannot serve whatever the failure kind; per-reason switch toggles do not apply (spec A.4).
+    if (!memberRevoked && !isReasonEnabled(policy, input.reason)) {
       return waitable ? waitResult() : { status: 'switch_reason_disabled', generation: state.generation };
     }
     if (policy.recoveryMode === 'wait_until_reset') return waitResult();
@@ -141,10 +154,17 @@ export class PerSessionFailoverCoordinator {
     return kept.length;
   }
 
-  /** True when this coordinator owns recovery for the session's binding in this group. */
+  /**
+   * True when this coordinator owns recovery for the session's binding in this group: the group is
+   * per_session_softmax, or the session still carries its own applied/pending per-session assignment
+   * after a policy rollback (spec A.4 Migration, T12) and must be converted through the proved path.
+   */
   async owns(input: Readonly<{ sessionId?: string; serviceId: string; groupId: string }>): Promise<boolean> {
     if (!input.sessionId) return false;
-    const group = await this.deps.loadGroup({ serviceId: input.serviceId as ConnectedServiceId, groupId: input.groupId });
+    const serviceId = input.serviceId as ConnectedServiceId;
+    const binding = this.deps.readSessionBinding({ sessionId: input.sessionId, serviceId, groupId: input.groupId });
+    if (binding?.member || binding?.materializedAssignment) return true;
+    const group = await this.deps.loadGroup({ serviceId, groupId: input.groupId });
     return group?.policy?.strategy === 'per_session_softmax';
   }
 
@@ -156,44 +176,46 @@ export class PerSessionFailoverCoordinator {
       throw new Error(`per-session recovery requires a session and its group (${input.serviceId}/${input.groupId})`);
     }
     const binding = this.deps.readSessionBinding({ sessionId, serviceId, groupId: input.groupId });
+    const pendingTarget = binding?.materializedAssignment ?? null;
+    // The account the report is about: its own observation, else the proved serving member.
     const failedProfileId = input.observedProfileId?.trim() || binding?.currentProfileId || null;
     if (failedProfileId) {
       await this.deps.recordFailure({ ...input, observedProfileId: failedProfileId });
     }
-    const state = this.deps.buildState((await this.deps.loadGroup({ serviceId, groupId: input.groupId })) ?? group);
-    const policy = this.policyResult(input, state);
+    const state = this.deps.buildState((await this.deps.loadGroup({ serviceId, groupId: input.groupId })) ?? group, sessionId);
+    const memberRevoked = failedProfileId !== null
+      && !state.members.some((member) => member.profileId === failedProfileId && member.enabled);
+    const policy = this.policyResult(input, state, memberRevoked);
     if (policy) return policy;
     if (!binding) {
       throw new Error(`per-session recovery could not read the session binding (${sessionId})`);
     }
 
     // A failure for an account the session neither serves on nor targets is superseded (spec A.4).
-    const pendingTarget = binding.materializedAssignment ?? null;
-    if (input.observedProfileId && binding.currentProfileId
+    if (input.observedProfileId
       && input.observedProfileId !== binding.currentProfileId
       && input.observedProfileId !== pendingTarget?.profileId) {
       return {
         status: 'observed_generation',
-        activeProfileId: binding.currentProfileId,
+        activeProfileId: binding.currentProfileId ?? pendingTarget?.profileId ?? null,
         generation: state.generation,
       };
     }
-    if (pendingTarget && input.observedProfileId === pendingTarget.profileId) {
-      // The pending target failed before adoption (spec A.5): its health is recorded above; the
-      // restart path retires its runner when the replacement applies. Supersede its decision and
-      // release its reservation before drawing again without it.
-      this.deps.log?.('per_session_target_failed_before_adoption', { decisionId: pendingTarget.decisionId, profileId: pendingTarget.profileId });
-      await this.deps.ledger.remove(pendingTarget.decisionId);
-      await this.deps.reservationApi?.deleteAssignmentReservation({
-        serviceId, groupId: input.groupId, decisionId: pendingTarget.decisionId,
-      });
+
+    if (state.policy.strategy !== 'per_session_softmax') {
+      return await this.convertToSharedGroup({ input, sessionId, serviceId, binding, state, failedProfileId });
     }
 
-    // Replay: an unsettled recovery decision for this session resumes under its own ID.
+    // The pending target failed before adoption (spec A.5, T20). Its health is recorded above; its
+    // decision keeps custody (ledger entry and reservation) until the replacement drawn below is
+    // adopted, because only that restart retires the target's runner. It is excluded from the draw.
+    const targetFailed = pendingTarget !== null && failedProfileId === pendingTarget.profileId;
+
+    // Replay: an unsettled, not-superseded recovery decision for this session resumes under its own ID.
     const replay = this.deps.ledger.list().find((entry) => entry.origin === 'recovery'
       && entry.sessionId === binding.subjectId && entry.serviceId === serviceId && entry.groupId === input.groupId
-      && entry.state === 'pending' && entry.proposal.profileId !== failedProfileId);
-    if (replay && binding.materializedAssignment?.decisionId === replay.decisionId) {
+      && entry.state === 'pending' && !entry.supersededByDecisionId && entry.proposal.profileId !== failedProfileId);
+    if (replay && pendingTarget?.decisionId === replay.decisionId) {
       // The effect was already requested for this decision; adoption proof settles it.
       return {
         status: 'switched',
@@ -202,17 +224,28 @@ export class PerSessionFailoverCoordinator {
         mode: 'restart_resume',
       };
     }
-    const resumeProposal = replay?.proposal.custody === 'proposed' ? replay.proposal : null;
     const nowMs = this.deps.nowMs();
-    const decisionId = resumeProposal?.decisionId
-      ?? (replay && replay.proposal.custody !== 'proposed' ? replay.decisionId : null)
-      ?? `recovery-${binding.subjectId}-${nowMs.toString(36)}`;
+    const eligible = (profileId: string) => isPerSessionMemberEligible(
+      state, profileId, nowMs, this.deps.quotaFreshnessMs, state.requiredModelIds ?? [],
+    );
+    // C3 recheck: a reserved decision whose target is no longer eligible is superseded, not applied.
+    const replayUsable = replay && (replay.proposal.custody === 'proposed' || eligible(replay.proposal.profileId)) ? replay : null;
+    const ineligibleReplay = replay && !replayUsable ? replay : null;
+    if (ineligibleReplay) {
+      this.deps.log?.('per_session_replay_target_ineligible', { decisionId: ineligibleReplay.decisionId, profileId: ineligibleReplay.proposal.profileId });
+    }
 
+    const resumeProposal = replayUsable?.proposal.custody === 'proposed' ? replayUsable.proposal : null;
+    const decisionId = replayUsable?.decisionId ?? `recovery-${binding.subjectId}-${nowMs.toString(36)}`;
     let proposal: PerSessionAssignmentProposal;
-    if (replay && !resumeProposal) {
-      proposal = replay.proposal;
+    if (replayUsable && !resumeProposal) {
+      proposal = replayUsable.proposal;
     } else {
-      const decision = await decidePerSessionGroupMember({
+      const excluded = new Set<string>([
+        ...(targetFailed ? [pendingTarget.profileId] : []),
+        ...(ineligibleReplay ? [ineligibleReplay.proposal.profileId] : []),
+      ]);
+      const decision = await decidePerSessionGroupMemberUntilSettled({
         serviceId,
         groupId: input.groupId,
         sessionId: binding.subjectId,
@@ -225,7 +258,10 @@ export class PerSessionFailoverCoordinator {
         nowMs: this.deps.nowMs,
         currentProfileId: failedProfileId,
         switchReason: input.reason,
+        // The failed account is no longer an enabled member: the session moves because it was revoked (spec A.4).
+        ...(memberRevoked ? { replacementReason: 'member_revoked' as const } : {}),
         ...(state.requiredModelIds ? { requiredModelIds: state.requiredModelIds } : {}),
+        ...(excluded.size > 0 ? { additionallyExcludedProfileIds: excluded } : {}),
         reservationApi: this.deps.reservationApi,
         resumeProposal,
         localReservationCountsByProfileId: () => this.deps.ledger.localCounts(serviceId, input.groupId, decisionId),
@@ -253,24 +289,94 @@ export class PerSessionFailoverCoordinator {
       }
       proposal = decision.proposal;
     }
+    for (const superseded of [targetFailed ? pendingTarget.decisionId : null, ineligibleReplay?.decisionId ?? null]) {
+      if (superseded && superseded !== decisionId) {
+        this.deps.log?.('per_session_decision_superseded', { decisionId: superseded, supersededBy: decisionId, reason: targetFailed ? 'target_failed_before_adoption' : 'target_ineligible' });
+        await this.deps.ledger.markSuperseded(superseded, decisionId, this.deps.nowMs());
+      }
+    }
 
-    const materializedAssignment: ConnectedServiceGroupMaterializedAssignmentV1 = {
-      profileId: proposal.profileId,
-      decisionId,
-      reason: proposal.reason,
-      ...(failedProfileId ? { fromProfileId: failedProfileId } : {}),
-      materializedAtMs: this.deps.nowMs(),
-      ...(Number.isFinite(proposal.temperature) ? { temperature: proposal.temperature } : {}),
-      ...(Number.isFinite(proposal.offsetPercent) ? { offsetPercent: proposal.offsetPercent } : {}),
-      ...(proposal.probability === null ? {} : { probability: proposal.probability }),
-    };
-    const applied = await this.deps.applyAssignment({
-      sessionId,
-      serviceId,
-      groupId: input.groupId,
+    return await this.apply({
+      input, sessionId, serviceId, state, failedProfileId,
+      binding,
+      materializedAssignment: {
+        profileId: proposal.profileId,
+        decisionId,
+        reason: proposal.reason,
+        ...(failedProfileId ? { fromProfileId: failedProfileId } : {}),
+        materializedAtMs: this.deps.nowMs(),
+        ...(Number.isFinite(proposal.temperature) ? { temperature: proposal.temperature } : {}),
+        ...(Number.isFinite(proposal.offsetPercent) ? { offsetPercent: proposal.offsetPercent } : {}),
+        ...(proposal.probability === null ? {} : { probability: proposal.probability }),
+      },
       generation: state.generation,
-      profileId: proposal.profileId,
-      fromProfileId: failedProfileId,
+    });
+  }
+
+  /**
+   * Policy rollback (spec A.4 Migration, T12): a session that still owns a per-session assignment
+   * converts at its next classified failure onto the group's current shared member and the group
+   * home. Its applied `member` stays until provider adoption proves the conversion; the shared home
+   * is never rewritten to match the session. If the shared member is itself the failed account, the
+   * shared pipeline (without this session) moves the group pointer first.
+   */
+  private async convertToSharedGroup(params: Readonly<{
+    input: ClassifiedFailureInput;
+    sessionId: string;
+    serviceId: ConnectedServiceId;
+    binding: PerSessionSessionBinding;
+    state: ConnectedServiceAuthGroupSwitchState;
+    failedProfileId: string | null;
+  }>): Promise<ConnectedServiceAuthGroupSwitchResult> {
+    const pending = params.binding.materializedAssignment;
+    if (pending?.home === 'group' && pending.profileId !== params.failedProfileId) {
+      return { status: 'switched', activeProfileId: pending.profileId, generation: params.state.generation, mode: 'restart_resume' };
+    }
+    let target = params.state.activeProfileId;
+    let generation = params.state.generation;
+    if (!target || target === params.failedProfileId) {
+      const shared = await this.deps.switchSharedGroup({ ...params.input, sessionId: undefined });
+      if (shared.status !== 'switched' || shared.activeProfileId === params.failedProfileId) return shared;
+      target = shared.activeProfileId;
+      generation = shared.generation;
+    }
+    return await this.apply({
+      input: params.input,
+      sessionId: params.sessionId,
+      serviceId: params.serviceId,
+      state: params.state,
+      failedProfileId: params.failedProfileId,
+      binding: params.binding,
+      materializedAssignment: {
+        profileId: target,
+        decisionId: `conversion-${params.binding.subjectId}-${this.deps.nowMs().toString(36)}`,
+        reason: 'policy_conversion',
+        ...(params.failedProfileId ? { fromProfileId: params.failedProfileId } : {}),
+        materializedAtMs: this.deps.nowMs(),
+        home: 'group',
+      },
+      generation,
+    });
+  }
+
+  private async apply(params: Readonly<{
+    input: ClassifiedFailureInput;
+    sessionId: string;
+    serviceId: ConnectedServiceId;
+    state: ConnectedServiceAuthGroupSwitchState;
+    failedProfileId: string | null;
+    binding: PerSessionSessionBinding;
+    materializedAssignment: ConnectedServiceGroupMaterializedAssignmentV1;
+    generation: number;
+  }>): Promise<ConnectedServiceAuthGroupSwitchResult> {
+    const { input, binding, materializedAssignment } = params;
+    const applied = await this.deps.applyAssignment({
+      sessionId: params.sessionId,
+      serviceId: params.serviceId,
+      groupId: input.groupId,
+      generation: params.generation,
+      profileId: materializedAssignment.profileId,
+      fromProfileId: params.failedProfileId,
       reason: input.reason,
       binding: {
         source: 'connected',
@@ -286,8 +392,8 @@ export class PerSessionFailoverCoordinator {
       // The decision stays durable; the scheduler's retry resumes it under the same ID.
       return {
         status: 'generation_apply_failed',
-        activeProfileId: proposal.profileId,
-        generation: state.generation,
+        activeProfileId: materializedAssignment.profileId,
+        generation: params.generation,
         errorCode: applied.errorCode ?? 'unknown',
         ...(applied.diagnostics === undefined ? {} : { diagnostics: applied.diagnostics }),
       };
@@ -298,8 +404,8 @@ export class PerSessionFailoverCoordinator {
     const mode = applyModeOf(applied.action);
     return {
       status: 'switched',
-      activeProfileId: proposal.profileId,
-      generation: state.generation,
+      activeProfileId: materializedAssignment.profileId,
+      generation: params.generation,
       ...(mode ? { mode } : {}),
       ...(applied.diagnostics === undefined ? {} : { diagnostics: applied.diagnostics }),
     };

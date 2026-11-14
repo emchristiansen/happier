@@ -1,6 +1,10 @@
 import { z } from 'zod';
 
-import { ConnectedServiceBindingsV1Schema, type ConnectedServiceBindingsV1 } from '../../connect/connectedServiceBindings.js';
+import {
+  ConnectedServiceBindingsV1Schema,
+  stripConnectedServicePerSessionAssignmentFields,
+  type ConnectedServiceBindingsV1,
+} from '../../connect/connectedServiceBindings.js';
 import { RELEASED_CONNECTED_SERVICE_IDS } from '../../connect/connectedServiceReaderSupport.js';
 import { lazySchema } from '../../lazySchema.js';
 
@@ -10,11 +14,12 @@ function defaultAuthSchema(acceptsService: (serviceId: string) => boolean) {
   return z
   .object({
     v: z.literal(1).default(1),
+    // Spec A.1: a stored default cannot pin future sessions to a member or carry assignment state.
     bindingsByAgentId: z.record(AgentIdSettingsKeySchema, ConnectedServiceBindingsV1Schema.superRefine((binding, ctx) => {
       for (const serviceId of Object.keys(binding.bindingsByServiceId)) {
         if (!acceptsService(serviceId)) ctx.addIssue({ code: 'custom', message: 'Unsupported service in default auth carrier', path: ['bindingsByServiceId', serviceId] });
       }
-    })).default({}),
+    }).transform(stripConnectedServicePerSessionAssignmentFields)).default({}),
   })
   .strict();
 }
@@ -63,7 +68,7 @@ export function buildConnectedServicesDefaultAuthSettingsPatch(defaults: Connect
   const legacy: ConnectedServicesDefaultAuthByAgentIdV1 = { v: 1, bindingsByAgentId: {} };
   const additional: ConnectedServicesDefaultAuthByAgentIdV1 = { v: 1, bindingsByAgentId: {} };
   for (const [agentId, binding] of Object.entries(defaults.bindingsByAgentId)) {
-    const normalized = ConnectedServiceBindingsV1Schema.parse(binding);
+    const normalized = stripConnectedServicePerSessionAssignmentFields(ConnectedServiceBindingsV1Schema.parse(binding));
     for (const [serviceId, selection] of Object.entries(normalized.bindingsByServiceId)) {
       const target = releasedDefaultServiceIds.has(serviceId) ? legacy : additional;
       target.bindingsByAgentId[agentId] ??= { v: 1, bindingsByServiceId: {} };

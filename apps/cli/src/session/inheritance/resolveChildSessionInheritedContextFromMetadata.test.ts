@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
+import { CONNECTED_SERVICE_INHERITANCE_STRIPPED_FIELDS } from '@happier-dev/protocol';
+
 import {
   CHILD_SESSION_INHERITANCE_FIELD_SETS,
   resolveChildSessionInheritedContextFromMetadata,
@@ -253,4 +255,28 @@ describe('resolveChildSessionInheritedContextFromMetadata', () => {
     expect(inherited.metadata).toEqual({});
     expect(inherited.sources).toEqual({});
   });
+
+  const forgedValues: Record<string, unknown> = {
+    initialProfileId: 'B',
+    member: { assignment: 'per_session', profileId: 'B', decisionId: 'parent-decision', reason: 'initial_sampled', appliedAtMs: 1 },
+    materializedAssignment: { profileId: 'B', decisionId: 'parent-decision', reason: 'initial_sampled', materializedAtMs: 1 },
+    pendingAssignment: { profileId: 'B' },
+    decisionId: 'parent-decision',
+  };
+  for (const field of CONNECTED_SERVICE_INHERITANCE_STRIPPED_FIELDS) {
+    for (const [setName, fields] of Object.entries(CHILD_SESSION_INHERITANCE_FIELD_SETS)) {
+      if (!fields.includes('connectedServices')) continue;
+      it(`${setName} child does not inherit the parent's ${field} (spec A.1)`, () => {
+        const group = { source: 'connected', selection: 'group', groupId: 'pool' };
+        const inherited = resolveChildSessionInheritedContextFromMetadata({
+          metadata: { connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': { ...group, [field]: forgedValues[field] } } } },
+          providerId: 'claude',
+          fields,
+        });
+        const expected = { v: 1, bindingsByServiceId: { 'claude-subscription': group } };
+        expect(inherited.spawn.connectedServices).toEqual(expected);
+        expect(inherited.metadata.connectedServices).toEqual(expected);
+      });
+    }
+  }
 });

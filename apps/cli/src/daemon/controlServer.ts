@@ -76,6 +76,7 @@ import {
 import { continueSessionWithReplay } from '@/session/replay/continueWithReplay';
 import { readAuthenticationStatus } from '@/api/client/httpStatusError';
 import {
+  CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR,
   ConnectedServiceIdSchema,
   ConnectedServiceQuotaRecoveryCreditConsumeRequestV1Schema,
   ConnectedServiceQuotaSnapshotV1Schema,
@@ -139,7 +140,10 @@ import {
   type SessionStartedRunnerReport,
 } from './sessionStartedReadiness';
 import { lazySchema } from '@happier-dev/protocol';
-import { rejectConnectedServiceInternalAssignmentInput } from './connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
+import {
+  rejectConnectedServiceInternalAssignmentInput,
+  stripConnectedServiceCallerAssignmentForResume,
+} from './connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
 const DEFAULT_DAEMON_CONTROL_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 const DAEMON_CONTROL_BODY_LIMIT_BYTES_ENV_KEY = 'HAPPIER_DAEMON_CONTROL_BODY_LIMIT_BYTES';
@@ -1718,6 +1722,12 @@ export function createDaemonControlApp({
           ok: z.literal(true),
           result: ExecutionRunConnectedServiceMaterializeResponseSchema,
         }),
+        400: z.object({
+          ok: z.literal(false),
+          errorCode: z.literal(CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR),
+          error: z.string(),
+          fields: z.array(z.string()),
+        }),
         401: authSchema401,
         501: z.object({
           ok: z.literal(false),
@@ -1732,6 +1742,18 @@ export function createDaemonControlApp({
       return {
         ok: false as const,
         errorCode: 'execution_run_connected_service_materialize_handler_unavailable' as const,
+      };
+    }
+    // Spec A.1: a run names its group/source and may request `initialProfileId`; assignment state is
+    // daemon-owned and never accepted from this ingress either.
+    const forgedRunAssignment = rejectConnectedServiceInternalAssignmentInput(request.body.connectedServicesBindingsRaw);
+    if (forgedRunAssignment) {
+      reply.code(400);
+      return {
+        ok: false as const,
+        errorCode: forgedRunAssignment.errorCode,
+        error: forgedRunAssignment.message,
+        fields: [...forgedRunAssignment.fields],
       };
     }
     const result = await handleExecutionRunConnectedServiceMaterialize({
@@ -1959,11 +1981,14 @@ export function createDaemonControlApp({
     preHandler: requireAuth,
   }, async (request, reply) => {
     const { directory, sessionId, existingSessionId } = request.body;
-    // Spec A.1: a new spawn may request `initialProfileId` but never carry assignment state; a
-    // resume's own state is restored from the session record by the spawn path.
-    const forgedAssignment = typeof existingSessionId === 'string' && existingSessionId.trim().length > 0
+    // Spec A.1: a new spawn may request `initialProfileId` but never carry assignment state. A resume
+    // drops caller-supplied state here; its own state is restored from the session record by the
+    // spawn path.
+    const isExistingSessionResume = typeof existingSessionId === 'string' && existingSessionId.trim().length > 0;
+    const callerConnectedServices = (request.body as { connectedServices?: unknown }).connectedServices;
+    const forgedAssignment = isExistingSessionResume
       ? null
-      : rejectConnectedServiceInternalAssignmentInput((request.body as { connectedServices?: unknown }).connectedServices);
+      : rejectConnectedServiceInternalAssignmentInput(callerConnectedServices);
     if (forgedAssignment) {
       reply.code(400);
       return { success: false, error: forgedAssignment.message, errorCode: forgedAssignment.errorCode };
@@ -1983,6 +2008,9 @@ export function createDaemonControlApp({
           {
             directory: normalizedDirectory,
             ...(normalizedExistingSessionId ? { existingSessionId: normalizedExistingSessionId } : {}),
+            ...(isExistingSessionResume && callerConnectedServices
+              ? { connectedServices: stripConnectedServiceCallerAssignmentForResume(callerConnectedServices) as SpawnSessionOptions['connectedServices'] }
+              : {}),
           },
           normalizedExistingSessionId ? { omit: ['sessionId'] } : {},
         ) as SpawnSessionOptions,

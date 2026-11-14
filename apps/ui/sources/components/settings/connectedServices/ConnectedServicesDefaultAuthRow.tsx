@@ -203,6 +203,7 @@ export function ConnectedServicesDefaultAuthRow(props: ConnectedServicesDefaultA
         resolveServiceTitle: (serviceId) => resolveConnectedServiceDisplayName(serviceId as ConnectedServiceId, t),
         nativeLabel: t('connectedServices.authChip.nativeLabel'),
         formatConnectedCountLabel: (count) => t('connectedServices.authChip.connectedCountLabel', { count }),
+        formatPendingStartLabel: (labelParams) => t('connectedServices.authChip.pendingStartLabel', labelParams),
     });
     const warningCode = authLabelModel.warningCodes[0];
     const warningLabel = resolveDefaultAuthWarningLabel(warningCode);

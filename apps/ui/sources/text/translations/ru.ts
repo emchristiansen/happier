@@ -2545,6 +2545,7 @@ export const ru: TranslationStructure = {
       labelWithCount: ({ count }: { count: number }) => `Авторизация: ${count}`,
       nativeLabel: "Авторизация CLI",
       connectedCountLabel: ({ count }: { count: number }) => `${count} подключено`,
+      pendingStartLabel: ({ pool, account }: { pool: string; account: string }) => `${pool} (запуск на ${account}…)`,
     },
     authSwitch: {
       activeTurnDisabled:

@@ -173,6 +173,7 @@ import {
 import { isAuthenticationError } from '@/api/client/httpStatusError';
 import {
   rejectConnectedServiceInternalAssignmentInput,
+  stripConnectedServiceCallerAssignmentForResume,
   stripConnectedServicePerSessionAssignmentForInheritance,
 } from '@/daemon/connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
@@ -769,9 +770,13 @@ export function registerMachineRpcHandlers(params: Readonly<{
       };
     }
     // Spec A.1: callers may request `initialProfileId`; assignment state is daemon-owned. A resume
-    // of an existing session drops caller-supplied state and restores the session's own record.
+    // of an existing session drops caller-supplied state here; the spawn path restores the session's
+    // own state from its persisted record.
     const existingSessionResume = params?.type === 'resume-session';
     const forgedAssignment = existingSessionResume ? null : rejectConnectedServiceInternalAssignmentInput(connectedServices);
+    const admittedConnectedServices = existingSessionResume
+      ? stripConnectedServiceCallerAssignmentForResume(connectedServices)
+      : connectedServices;
     if (forgedAssignment) {
       return {
         type: 'error',
@@ -933,7 +938,7 @@ export function registerMachineRpcHandlers(params: Readonly<{
       profileId,
       terminal,
       resume: normalizedResume,
-      connectedServices,
+      connectedServices: admittedConnectedServices,
       connectedServicesUpdatedAt,
       transcriptStorage: normalizedTranscriptStorage,
       attachMetadataIdentityPolicy: normalizedAttachMetadataIdentityPolicy,

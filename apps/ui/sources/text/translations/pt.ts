@@ -2715,6 +2715,7 @@ export const pt: TranslationStructure = {
       labelWithCount: ({ count }: { count: number }) => `Autenticação: ${count}`,
       nativeLabel: "Auth CLI",
       connectedCountLabel: ({ count }: { count: number }) => `${count} conectados`,
+      pendingStartLabel: ({ pool, account }: { pool: string; account: string }) => `${pool} (iniciando em ${account}…)`,
     },
     authSwitch: {
       activeTurnDisabled:

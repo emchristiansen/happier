@@ -1278,6 +1278,7 @@ const zhHantOverrides: DeepPartial<TranslationStructure> = {
             labelWithCount: ({ count }: { count: number }) => `認證：${count}`,
             nativeLabel: 'CLI 認證',
             connectedCountLabel: ({ count }: { count: number }) => `${count} 個已連線`,
+            pendingStartLabel: ({ pool, account }: { pool: string; account: string }) => `${pool}（正在以 ${account} 啟動…）`,
         },
         authSwitch: {
             activeTurnDisabled: '請先完成或停止目前回合，然後再切換認證。',

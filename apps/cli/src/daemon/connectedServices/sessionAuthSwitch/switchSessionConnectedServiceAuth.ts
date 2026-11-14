@@ -944,6 +944,15 @@ async function normalizeRequestedBindings(input: Readonly<{
         selection: 'group',
         groupId: binding.groupId,
         profileId: activeProfileId,
+        // A per-session session converting to the group home (spec A.4 Migration) keeps its applied
+        // member and pending conversion until provider adoption proves the group's member.
+        ...(binding.materializedAssignment?.home === 'group'
+          ? {
+            ...(binding.initialProfileId ? { initialProfileId: binding.initialProfileId } : {}),
+            ...(binding.member ? { member: binding.member } : {}),
+            materializedAssignment: binding.materializedAssignment,
+          }
+          : {}),
       };
       groupMetadataByServiceId.set(serviceId, {
         groupId: binding.groupId,

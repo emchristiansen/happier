@@ -39,9 +39,14 @@ export function isPerSessionOwnedGroupSelection(selection: ConnectedServiceBindi
   return selection.kind === 'group' && (selection.member !== undefined || selection.materializedAssignment !== undefined);
 }
 
-/** The member a per-session-owned session is materialized on: pending target first, then applied member. */
+/**
+ * The member whose own home a per-session-owned session is materialized on: pending target first,
+ * then applied member. Null for a pending conversion to the group home (spec A.4 Migration), which
+ * materializes through the shared group path.
+ */
 export function resolvePerSessionTargetProfileId(selection: ConnectedServiceBindingSelection): string | null {
   if (selection.kind !== 'group') return null;
+  if (selection.materializedAssignment?.home === 'group') return null;
   return selection.materializedAssignment?.profileId ?? selection.member?.profileId ?? null;
 }
 
@@ -50,10 +55,11 @@ export function resolvePerSessionBindingTargetProfileId(binding: unknown): strin
   if (!binding || typeof binding !== 'object') return null;
   const record = binding as {
     selection?: unknown;
-    materializedAssignment?: { profileId?: unknown } | null;
+    materializedAssignment?: { profileId?: unknown; home?: unknown } | null;
     member?: { profileId?: unknown } | null;
   };
   if (record.selection !== 'group') return null;
+  if (record.materializedAssignment?.home === 'group') return null;
   const target = record.materializedAssignment?.profileId ?? record.member?.profileId;
   return typeof target === 'string' && target.trim().length > 0 ? target.trim() : null;
 }

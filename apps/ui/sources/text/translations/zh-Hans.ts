@@ -2527,6 +2527,7 @@ export const zhHans: TranslationStructure = {
       labelWithCount: ({ count }: { count: number }) => `认证：${count}`,
       nativeLabel: "CLI 认证",
       connectedCountLabel: ({ count }: { count: number }) => `${count} 个已连接`,
+      pendingStartLabel: ({ pool, account }: { pool: string; account: string }) => `${pool}（正在以 ${account} 启动…）`,
     },
     authSwitch: {
       activeTurnDisabled: "请先完成或停止当前回合，然后再切换认证。",

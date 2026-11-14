@@ -11,7 +11,8 @@ import { resolvePerSessionTargetProfileId } from '../../parseConnectedServicesBi
 import type { ConnectedServiceAuthGroupSwitchState } from '../switching/ConnectedServiceAuthGroupSwitchCoordinator';
 import { selectConnectedServiceAuthGroupCandidate } from '../selection/selectConnectedServiceAuthGroupCandidate';
 import { createCryptoUniformSample } from '../selection/perSessionOffsetOddsSelection';
-import { decidePerSessionGroupMember, type PerSessionAssignmentProposal } from './decidePerSessionGroupMember';
+import type { PerSessionAssignmentProposal } from './decidePerSessionGroupMember';
+import { decidePerSessionGroupMemberUntilSettled } from './decidePerSessionGroupMemberUntilSettled';
 import type { PerSessionAssignmentLedger } from './PerSessionAssignmentLedger';
 
 /** Daemon facilities a per_session_softmax spawn needs; absent means this host cannot serve one. */
@@ -19,6 +20,8 @@ export type PerSessionSpawnAssignmentDeps = Readonly<{
   ledger: PerSessionAssignmentLedger;
   ownerMachineId: string;
   reservationApi: ConnectedServiceAssignmentReservationApi | null;
+  /** Releases a decision this spawn created when the attempt fails before any runner exists. */
+  releaseAfterDefinitePreLaunchFailure: (decisionId: string) => Promise<boolean>;
   uniformSample?: () => number;
   log?: (event: string, detail: Record<string, unknown>) => void;
 }>;
@@ -44,6 +47,11 @@ export class ConnectedServicePerSessionSpawnError extends Error {
 export type PerSessionSpawnAssignment = Readonly<{
   profileId: string;
   decisionId: string;
+  /**
+   * True when this spawn attempt owns the decision (new draw, resumed proposal or replayed attempt);
+   * false when it reuses the session's own persisted member/target, which the session keeps owning.
+   */
+  ownedByAttempt: boolean;
   /** What the canonical binding records: the reused applied member, or a new pending target. */
   binding:
     | Readonly<{ kind: 'member'; member: ConnectedServiceGroupMemberAssignmentV1 }>
@@ -63,7 +71,14 @@ function toMaterialized(proposal: PerSessionAssignmentProposal, nowMs: number): 
   };
 }
 
-function isMemberEligibleForSpawn(state: ConnectedServiceAuthGroupSwitchState, profileId: string, nowMs: number, quotaFreshnessMs: number): boolean {
+/** Whether one member can serve this session now: membership, enablement, health, quota and exact model. */
+export function isPerSessionMemberEligible(
+  state: ConnectedServiceAuthGroupSwitchState,
+  profileId: string,
+  nowMs: number,
+  quotaFreshnessMs: number,
+  requiredModelIds: ReadonlyArray<string>,
+): boolean {
   const member = state.members.find((candidate) => candidate.profileId === profileId);
   if (!member) return false;
   return selectConnectedServiceAuthGroupCandidate({
@@ -74,7 +89,20 @@ function isMemberEligibleForSpawn(state: ConnectedServiceAuthGroupSwitchState, p
     policy: { ...state.policy, strategy: 'priority' },
     members: [member],
     memberStatesByProfileId: state.memberStatesByProfileId,
+    ...(requiredModelIds.length > 0 ? { requiredModelIds } : {}),
   }).selected?.profileId === profileId;
+}
+
+/** Whether the session's own persisted member/pending target is still usable for this launch. */
+export function isPerSessionOwnedTargetUsable(input: Readonly<{
+  state: ConnectedServiceAuthGroupSwitchState;
+  selection: Extract<ConnectedServiceBindingSelection, { kind: 'group' }>;
+  nowMs: number;
+  quotaFreshnessMs: number;
+  requiredModelIds: ReadonlyArray<string>;
+}>): boolean {
+  const target = resolvePerSessionTargetProfileId(input.selection);
+  return target !== null && isPerSessionMemberEligible(input.state, target, input.nowMs, input.quotaFreshnessMs, input.requiredModelIds);
 }
 
 /**
@@ -94,6 +122,8 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
   nowMs: () => number;
   deadlineAtMs: number;
   deps: PerSessionSpawnAssignmentDeps | null;
+  /** This session's exact model (spec A.2, T13); empty when it runs the provider default. */
+  requiredModelIds: ReadonlyArray<string>;
 }>): Promise<PerSessionSpawnAssignment> {
   if (!(CONNECTED_SERVICE_AUTH_GROUP_PER_SESSION_SOFTMAX_SERVICE_IDS as readonly string[]).includes(input.serviceId)) {
     throw new ConnectedServicePerSessionSpawnError('connect_group_strategy_unsupported_for_service',
@@ -112,18 +142,21 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
   const nowMs = input.nowMs();
 
   // Resume: the same session's own assignment, revalidated.
+  const eligible = (profileId: string) => isPerSessionMemberEligible(input.state, profileId, nowMs, input.quotaFreshnessMs, input.requiredModelIds);
   const ownTarget = resolvePerSessionTargetProfileId(input.selection);
-  if (ownTarget && isMemberEligibleForSpawn(input.state, ownTarget, nowMs, input.quotaFreshnessMs)) {
+  if (ownTarget && eligible(ownTarget)) {
     if (input.selection.materializedAssignment) {
       return {
         profileId: ownTarget,
         decisionId: input.selection.materializedAssignment.decisionId,
+        ownedByAttempt: false,
         binding: { kind: 'materialized', materializedAssignment: input.selection.materializedAssignment },
       };
     }
     return {
       profileId: ownTarget,
       decisionId: input.selection.member!.decisionId,
+      ownedByAttempt: false,
       binding: { kind: 'member', member: input.selection.member! },
     };
   }
@@ -131,12 +164,12 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
   // Replay of an unadopted spawn decision for this session and group.
   const replay = deps.ledger.list().find((entry) => entry.origin === 'spawn' && entry.sessionId === sessionId
     && entry.serviceId === input.serviceId && entry.groupId === input.groupId && entry.state === 'pending');
-  const replayEligible = !ownTarget && replay
-    && isMemberEligibleForSpawn(input.state, replay.proposal.profileId, nowMs, input.quotaFreshnessMs);
+  const replayEligible = !ownTarget && replay && eligible(replay.proposal.profileId);
   if (replayEligible && replay.proposal.custody !== 'proposed') {
     return {
       profileId: replay.proposal.profileId,
       decisionId: replay.decisionId,
+      ownedByAttempt: true,
       binding: { kind: 'materialized', materializedAssignment: toMaterialized(replay.proposal, nowMs) },
     };
   }
@@ -144,16 +177,12 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
   // A durable C1 proposal resumes at C2 under its own ID; otherwise this is a new decision.
   const resumeProposal = replayEligible && replay.proposal.custody === 'proposed' ? replay.proposal : null;
   if (replay && !replayEligible && !ownTarget) {
-    // Actual target ineligibility supersedes the unadopted decision; release its reservation.
-    await deps.ledger.remove(replay.decisionId);
-    if (deps.reservationApi) {
-      await deps.reservationApi.deleteAssignmentReservation({
-        serviceId: input.serviceId, groupId: input.groupId, decisionId: replay.decisionId,
-      });
-    }
+    // Actual target ineligibility supersedes the unadopted decision. One that never launched a
+    // runner is released now; one that did keeps custody until that runner's retirement is proved.
+    await deps.releaseAfterDefinitePreLaunchFailure(replay.decisionId);
   }
   const decisionId = resumeProposal?.decisionId ?? `spawn-${sessionId}-${nowMs.toString(36)}`;
-  const decision = await decidePerSessionGroupMember({
+  const decision = await decidePerSessionGroupMemberUntilSettled({
     serviceId: input.serviceId,
     groupId: input.groupId,
     sessionId,
@@ -166,6 +195,7 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
     nowMs: input.nowMs,
     currentProfileId: ownTarget,
     initialProfileId: ownTarget ? null : (input.selection.initialProfileId ?? null),
+    ...(input.requiredModelIds.length > 0 ? { requiredModelIds: input.requiredModelIds } : {}),
     reservationApi: deps.reservationApi,
     resumeProposal,
     localReservationCountsByProfileId: () => deps.ledger.localCounts(input.serviceId, input.groupId, decisionId),
@@ -193,6 +223,7 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
   return {
     profileId: decision.proposal.profileId,
     decisionId,
+    ownedByAttempt: true,
     binding: { kind: 'materialized', materializedAssignment: toMaterialized(decision.proposal, input.nowMs()) },
   };
 }

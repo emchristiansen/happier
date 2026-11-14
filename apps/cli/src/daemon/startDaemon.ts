@@ -178,6 +178,7 @@ import { waitForExistingSessionExitIfStopRequested } from './sessions/waitForExi
 import { waitForTerminatingSessionRunnerExit } from './sessions/waitForTerminatingSessionRunnerExit';
 import { waitForTrackedRunnerProcessesExit } from './sessions/waitForTrackedRunnerProcessesExit';
 import { readProcessRunState } from './processRunState';
+import { classifySessionRunnerProcessPresence } from './sessionRunnerProcessIdentity';
 import { resolveSpawnWebhookResult } from './sessions/resolveSpawnWebhookResult';
 import {
   classifyTrackedSessionRunnerPresence,
@@ -346,7 +347,10 @@ import {
   reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget,
   reconcileConnectedServiceDirectCredentialRevisions,
   reconcileConnectedServiceAuthGroupGenerations,
+  reconcileConnectedServicePerSessionMemberRevocationForRuntimeTarget,
+  reconcileConnectedServicePerSessionMemberRevocations,
   listSessionGenerationRuntimeTargets,
+  type ConnectedServicePerSessionMemberRevocation,
 } from './connectedServices/accountGroups/generation/reconcileConnectedServiceAuthGroupGenerations';
 import { mapCommittedGenerationApplyResult } from './connectedServices/accountGroups/generation/mapCommittedGenerationApplyResult';
 import { createRuntimeGenerationApplicationProofResolver } from './connectedServices/accountGroups/generation/createRuntimeGenerationApplicationProofResolver';
@@ -553,8 +557,8 @@ import {
   PerSessionAssignmentLedger,
   resolvePerSessionAssignmentLedgerPath,
 } from './connectedServices/accountGroups/perSession/PerSessionAssignmentLedger';
-import { PerSessionAssignmentRuntime } from './connectedServices/accountGroups/perSession/PerSessionAssignmentRuntime';
-import { collectPerSessionLiveDecisions } from './connectedServices/accountGroups/perSession/collectPerSessionLiveDecisions';
+import { PerSessionAssignmentRuntime, type PerSessionSpawnCustody } from './connectedServices/accountGroups/perSession/PerSessionAssignmentRuntime';
+import { collectPerSessionLiveDecisions, collectPerSessionLiveSubjectIds } from './connectedServices/accountGroups/perSession/collectPerSessionLiveDecisions';
 import {
   PerSessionFailoverCoordinator,
   type PerSessionApplyBinding,
@@ -1997,8 +2001,35 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         reservationApi: api.connectedServiceAssignmentReservations,
         nowMs: () => Date.now(),
         listLiveDecisions: () => collectPerSessionLiveDecisions(pidToTrackedSession.values()),
+        listLiveSubjectIds: () => collectPerSessionLiveSubjectIds(pidToTrackedSession.values()),
+        // Retirement evidence for a recorded runner: dead/zombie, or a same-scheme fingerprint
+        // mismatch proving PID reuse. Anything else keeps the decision's custody.
+        probeRunnerPresence: async (runner) => classifySessionRunnerProcessPresence({
+          runState: await readProcessRunState(runner.pid).catch(() => null),
+          storedProcessCommandHash: null,
+          storedProcessInstanceFingerprint: runner.processInstanceFingerprint ?? null,
+          currentIdentity: { kind: 'unknown', ...(() => {
+            const processInstanceFingerprint = readProcessInstanceFingerprintSync(runner.pid);
+            return processInstanceFingerprint ? { processInstanceFingerprint } : {};
+          })() },
+        }) === 'absent' ? 'absent' : 'present',
         log: (event, detail) => logger.debug(`[ConnectedServices] ${event}`, detail),
       });
+      // Revocation of a per-session member (spec A.4, T10): the affected session is moved through its
+      // own classified-failure recovery (durable intent, FIFO lock, turn boundary). One request per
+      // session and member; reconciliation replays and retries collapse onto it.
+      let requestPerSessionMemberRevocationRecovery: ((revocation: ConnectedServicePerSessionMemberRevocation) => Promise<void>) | null = null;
+      const perSessionMemberRevocationsInFlight = new Map<string, Promise<void>>();
+      const revokePerSessionMember = async (revocation: ConnectedServicePerSessionMemberRevocation): Promise<void> => {
+        const key = `${revocation.sessionId}\0${revocation.serviceId}\0${revocation.groupId}\0${revocation.profileId}`;
+        const existing = perSessionMemberRevocationsInFlight.get(key);
+        if (existing) return await existing;
+        const request = requestPerSessionMemberRevocationRecovery;
+        if (!request) throw new Error('per_session_member_revocation_unavailable');
+        const pending = request(revocation).finally(() => perSessionMemberRevocationsInFlight.delete(key));
+        perSessionMemberRevocationsInFlight.set(key, pending);
+        return await pending;
+      };
       const connectedServiceContinuationApplicationCorrelation =
         createConnectedServiceContinuationApplicationCorrelation<
           Readonly<{
@@ -2723,6 +2754,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             ...(signal ? { signal } : {}),
           });
           if (!isCurrent()) return;
+          await reconcileConnectedServicePerSessionMemberRevocationForRuntimeTarget({
+            target,
+            isGroupMemberEligible: snapshot.isGroupMemberEligible,
+            revokePerSessionMember,
+            isCurrent,
+            ...(signal ? { signal } : {}),
+          });
+          if (!isCurrent()) return;
           await reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget({
             target,
             resolveCredentialBoundary: snapshot.resolveCredentialBoundary,
@@ -3291,10 +3330,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         // launch adapter to publish its owned runner before physical cleanup.
         const automaticSpawnPreparations = new Map<string, Set<Promise<void>>>();
             // Spawn a new session (sessionId reserved for future Happy session resume; vendor resume uses options.resume).
-                const spawnSession = async (
+                const spawnSessionUnderPerSessionCustody = async (
                   options: SpawnSessionOptions,
-                  acceptanceHooks?: SpawnSessionRunnerAcceptanceHooks,
-                  automaticRespawnSignal?: AbortSignal,
+                  acceptanceHooks: SpawnSessionRunnerAcceptanceHooks | undefined,
+                  automaticRespawnSignal: AbortSignal | undefined,
+                  perSessionSpawnCustody: PerSessionSpawnCustody,
                 ): Promise<SpawnSessionResult> => {
           const automaticSessionId = typeof options.existingSessionId === 'string' ? options.existingSessionId.trim() : '';
           const assertAutomaticAdmission = () => automaticRespawnSignal?.throwIfAborted();
@@ -4115,6 +4155,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       authGroupSwitchCoordinator: preTurnSwitchCoordinator,
                       quotaProbeDeadlineAtMs: connectedServiceSpawnQuotaProbeDeadlineAtMs,
                       perSessionAssignment: perSessionAssignmentRuntime.spawnDeps,
+                      modelId: normalizedOptions.modelId ?? null,
                       accountSettings: activeAccountSettings?.settings ?? null,
                       processEnv: process.env,
                       nativeSource: normalizedExistingSessionId && existingSessionAttachContext
@@ -4136,6 +4177,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                             existingSessionPersistedMetadata,
                           ),
                     });
+                    perSessionSpawnCustody.claim(connectedServiceAuth?.perSessionSpawnDecisionIds ?? []);
                     if (repairedMissingMaterializationIdentity && normalizedExistingSessionId) {
                       try {
                         await persistSessionConnectedServiceBindings({
@@ -4421,6 +4463,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               modelUpdatedAt,
             });
 
+            // A runner process now owns this attempt's per-session decisions; its proved absence
+            // (not elapsed time) is what later lets them be released.
+            const recordPerSessionSpawnRunner = async (pid: number) => {
+              const processInstanceFingerprint = readProcessInstanceFingerprintSync(pid);
+              await perSessionSpawnCustody.recordRunner({ pid, ...(processInstanceFingerprint ? { processInstanceFingerprint } : {}) })
+                .catch((error) => logger.warn('[ConnectedServices] Failed to record per-session spawn runner', error));
+            };
             let observedSpawnExit: Parameters<typeof onChildExited>[1] | null = null;
             let runnerWebhookCompletion: ReturnType<typeof waitForSessionWebhook> | undefined;
             const exitedBeforeFinalizationResult = (): Extract<SpawnSessionResult, { type: 'error' }> => ({
@@ -4435,6 +4484,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               createWebhookCompletion: () => ReturnType<typeof waitForSessionWebhook>,
             ): Promise<Readonly<{ acceptedResult: SpawnSessionResult; webhookCompletion: Promise<SpawnSessionResult> }>> => {
               const pid = trackedSession.pid;
+              await recordPerSessionSpawnRunner(pid);
               trackedSession.spawnOptionsCustody = 'accepted_live_launch';
               pidToTrackedSession.set(pid, trackedSession);
               if (spawnResourceCleanupOnExit) {
@@ -5155,6 +5205,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 )
                 : spawnHappyCLI(args, spawnOptions, runnerLaunchOptions);
 
+              if (happyProcess.pid) await recordPerSessionSpawnRunner(happyProcess.pid);
               if (!happyProcess.pid) {
                 logger.debug('[DAEMON RUN] Failed to spawn process - no PID returned');
                 if (spawnResourceCleanupOnFailure && !spawnResourceCleanupArmed) {
@@ -5302,6 +5353,30 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           } finally {
             finishAutomaticPreparation();
           }
+                };
+                // Per-session decisions created by a spawn attempt stay owned until a runner exists;
+                // an attempt that ends without launching one releases them (spec A.4, T17).
+                const spawnSession = async (
+                  options: SpawnSessionOptions,
+                  acceptanceHooks?: SpawnSessionRunnerAcceptanceHooks,
+                  automaticRespawnSignal?: AbortSignal,
+                ): Promise<SpawnSessionResult> => {
+                  const perSessionSpawnCustody = perSessionAssignmentRuntime.createSpawnCustody();
+                  let result: SpawnSessionResult;
+                  try {
+                    result = await spawnSessionUnderPerSessionCustody(options, acceptanceHooks, automaticRespawnSignal, perSessionSpawnCustody);
+                  } catch (error) {
+                    await perSessionSpawnCustody.releaseIfNeverLaunched().catch((releaseError) => {
+                      logger.debug('[ConnectedServices] Per-session spawn decision release failed (non-fatal)', releaseError);
+                    });
+                    throw error;
+                  }
+                  if (result.type !== 'success') {
+                    await perSessionSpawnCustody.releaseIfNeverLaunched().catch((releaseError) => {
+                      logger.debug('[ConnectedServices] Per-session spawn decision release failed (non-fatal)', releaseError);
+                    });
+                  }
+                  return result;
                 };
 
         const temporaryThrottleResumeSnapshotsBySessionId = new Map<string, TrackedSession>();
@@ -6239,6 +6314,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             if (!stillLive && !wasConnectedServicesRestartRequested) {
               connectedServiceRuntimeAuthSwitchAttempts.clearSession(trackedBeforeExit.happySessionId);
               connectedServiceSessionAuthSwitchCore.clearSession(trackedBeforeExit.happySessionId);
+              // The session's runner exited with no replacement: its per-session decisions are retired.
+              await perSessionAssignmentRuntime.releaseForRetiredSubjects([...collectPerSessionLiveSubjectIds([trackedBeforeExit])])
+                .catch((error) => logger.debug('[ConnectedServices] Per-session decision release after session exit failed (non-fatal)', error));
             }
           }
           void connectedServiceGroupHomeCleanupScheduler.cleanupPendingDeletedGroupHomes().catch((error) => {
@@ -6822,18 +6900,21 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           // pointer never moves (spec A.4). Other groups keep the shared switch pipeline.
           const perSessionFailoverCoordinator = new PerSessionFailoverCoordinator({
             loadGroup: async (groupInput) => await api.getConnectedServiceAuthGroup(groupInput),
-            buildState: (group) => ({
+            buildState: (group, stateSessionId) => ({
               ...buildPerSessionGroupSwitchState({
                 group,
                 accountUsageStore: providerAccountUsageStore,
                 runtimeQuotaSnapshots: connectedServiceRuntimeQuotaSnapshots,
                 nowMs: Date.now(),
               }),
+              // This session's own model only (spec A.2): other sessions' models never exclude its destination.
               requiredModelIds: resolveConnectedServiceAuthGroupRequiredModelIds({
                 serviceId: group.serviceId, groupId: group.groupId,
                 targets: connectedServiceRuntimeRegistry.listTargets(), sessions: getCurrentChildren(),
+                sessionId: stateSessionId,
               }),
             }),
+            switchSharedGroup: async (sharedInput) => await switchCoordinator.switchAfterClassifiedFailure(sharedInput),
             recordFailure: async (failure) => {
               await switchCoordinator.observeCurrentGenerationForRecovery({
                 serviceId: failure.serviceId,
@@ -7103,6 +7184,24 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           }
           return result;
         };
+        requestPerSessionMemberRevocationRecovery = async (revocation) => {
+          await handleConnectedServiceRuntimeAuthRecovery({
+            sessionId: revocation.sessionId,
+            switchesThisTurn: 0,
+            classification: {
+              kind: 'account_disabled',
+              serviceId: revocation.serviceId,
+              profileId: revocation.profileId,
+              groupId: revocation.groupId,
+              resetsAtMs: null,
+              sourceKey: `per_session_member_revoked:${revocation.profileId}`,
+              planType: null,
+              rateLimits: null,
+              // The daemon's own projection of the member's revocation, not a provider message.
+              source: 'provider_runtime_marker',
+            },
+          });
+        };
 
         const runtimeAuthRecoveryBaseBackoffMs = resolvePositiveIntEnv(
           process.env.HAPPIER_CONNECTED_SERVICES_RUNTIME_AUTH_RECOVERY_BASE_BACKOFF_MS,
@@ -7339,25 +7438,36 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
     // `resolveConnectedServiceAuthForSpawn` owner (no parallel resolver) and registers run PIDs in the
     // runtime registry so refresh distribution / canonical group-home ownership cover run homes.
     const executionRunConnectedServicesBridge = createExecutionRunConnectedServicesBridge({
-      resolveAuthForSpawn: async (params) => await resolveConnectedServiceAuthForSpawn({
-        agentId: params.agentId,
-        sessionDirectory: params.sessionDirectory ?? null,
-        connectedServicesBindingsRaw: params.connectedServicesBindingsRaw,
-        materializationKey: params.materializationKey,
-        ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
-        activeServerDir: configuration.activeServerDir,
-        baseDir: connectedServicesMaterializationBaseDir,
-        credentials,
-        api,
-        accountUsageStore: providerAccountUsageStore,
-        runtimeQuotaSnapshots: connectedServiceRuntimeQuotaSnapshots,
-        ...(params.sessionId ? { sessionId: params.sessionId } : {}),
-        accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
-        processEnv: process.env,
-        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
-        credentialRefreshService: connectedServiceRefreshCoordinator,
-        perSessionAssignment: perSessionAssignmentRuntime.spawnDeps,
-      }),
+      resolveAuthForSpawn: async (params) => {
+        const resolved = await resolveConnectedServiceAuthForSpawn({
+          agentId: params.agentId,
+          sessionDirectory: params.sessionDirectory ?? null,
+          connectedServicesBindingsRaw: params.connectedServicesBindingsRaw,
+          materializationKey: params.materializationKey,
+          ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
+          activeServerDir: configuration.activeServerDir,
+          baseDir: connectedServicesMaterializationBaseDir,
+          credentials,
+          api,
+          accountUsageStore: providerAccountUsageStore,
+          runtimeQuotaSnapshots: connectedServiceRuntimeQuotaSnapshots,
+          ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+          accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
+          processEnv: process.env,
+          nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
+          credentialRefreshService: connectedServiceRefreshCoordinator,
+          perSessionAssignment: perSessionAssignmentRuntime.spawnDeps,
+        });
+        // The run's runner already exists: it owns the decisions this materialization created, and
+        // its proved exit releases them (spec A.4).
+        if (resolved?.perSessionSpawnDecisionIds?.length && params.runnerPid) {
+          const custody = perSessionAssignmentRuntime.createSpawnCustody();
+          custody.claim(resolved.perSessionSpawnDecisionIds);
+          const processInstanceFingerprint = readProcessInstanceFingerprintSync(params.runnerPid);
+          await custody.recordRunner({ pid: params.runnerPid, ...(processInstanceFingerprint ? { processInstanceFingerprint } : {}) });
+        }
+        return resolved;
+      },
       runtimeRegistry: connectedServiceRuntimeRegistry,
       createAdoptedRootCleanup: ({ materializedRoot, materializationKey, agentId, retentionPolicy }) => {
         return createAdoptedExecutionRunRootCleanup({
@@ -9288,6 +9398,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     isInitialProjection
                     || projectionDelta.changedGroupScopes.length > 0
                     || projectionDelta.changedCredentialBoundaries.length > 0
+                    || projectionDelta.revokedGroupMembers.length > 0
                   ) {
                     connectedServiceProjectionEpoch += 1;
                   }
@@ -9307,6 +9418,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   if (
                     projectionDelta.changedGroupScopes.length === 0
                     && projectionDelta.changedCredentialBoundaries.length === 0
+                    && projectionDelta.revokedGroupMembers.length === 0
                   ) {
                     for (const registration of projectionRegistrations) {
                       notification.signal.throwIfAborted();
@@ -9329,6 +9441,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       )),
                       executionAuthority: notification.executionAuthority,
                       groupScopes: projectionDelta.changedGroupScopes,
+                      signal: notification.signal,
+                    });
+                  }
+                  notification.signal.throwIfAborted();
+                  if (projectionDelta.revokedGroupMembers.length > 0) {
+                    await reconcileConnectedServicePerSessionMemberRevocations({
+                      revokedGroupMembers: projectionDelta.revokedGroupMembers,
+                      listRuntimeTargets: () => listSessionGenerationRuntimeTargets(projectionRegistrations),
+                      isCurrentRuntimeTarget: (target) => projectionRegistrations.some((registration) => (
+                        registration.target === target
+                        && connectedServiceRuntimeRegistry.isCurrentTargetRegistration(registration)
+                      )),
+                      revokePerSessionMember,
                       signal: notification.signal,
                     });
                   }

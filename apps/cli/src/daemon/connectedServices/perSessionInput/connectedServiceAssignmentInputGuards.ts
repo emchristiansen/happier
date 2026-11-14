@@ -2,6 +2,8 @@ import {
   CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR,
   CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS,
   findConnectedServiceInternalAssignmentFields,
+  stripConnectedServiceInternalAssignmentFields,
+  stripConnectedServicePerSessionAssignmentFields,
 } from '@happier-dev/protocol';
 
 /**
@@ -25,46 +27,31 @@ export function rejectConnectedServiceInternalAssignmentInput(input: unknown): C
   };
 }
 
-const STRIPPED_FOR_INHERITANCE: ReadonlySet<string> = new Set([...CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS, 'initialProfileId']);
-
 /**
  * The group/source a child, fork or stored default inherits, without the parent's per-session
  * request and assignment (spec A.1): the inheritor makes its own decision and reservation.
- * Accepts a V1 envelope or bare record and returns the same shape; other values pass through.
+ * The protocol owns the single field inventory; this is that helper under its CLI name.
  */
-export function stripConnectedServicePerSessionAssignmentForInheritance<T>(input: T): T {
-  if (!input || typeof input !== 'object') return input;
-  const record = input as Record<string, unknown>;
-  const isEnvelope = !!record.bindingsByServiceId && typeof record.bindingsByServiceId === 'object';
-  const byServiceId = (isEnvelope ? record.bindingsByServiceId : record) as Record<string, unknown>;
-  let changed = false;
-  const next: Record<string, unknown> = {};
-  for (const [serviceId, binding] of Object.entries(byServiceId)) {
-    if (!binding || typeof binding !== 'object') {
-      next[serviceId] = binding;
-      continue;
-    }
-    const kept = Object.fromEntries(Object.entries(binding).filter(([field]) => !STRIPPED_FOR_INHERITANCE.has(field)));
-    if (Object.keys(kept).length !== Object.keys(binding).length) changed = true;
-    next[serviceId] = kept;
-  }
-  if (!changed) return input;
-  return (isEnvelope ? { ...record, bindingsByServiceId: next } : next) as T;
-}
+export const stripConnectedServicePerSessionAssignmentForInheritance = stripConnectedServicePerSessionAssignmentFields;
+
+/** Removes caller-supplied internal assignment state from a resume request, keeping `initialProfileId`. */
+export const stripConnectedServiceCallerAssignmentForResume = stripConnectedServiceInternalAssignmentFields;
 
 /**
  * Resume of an existing session keeps only that session's own pending/applied assignment
- * (spec A.1): its persisted metadata is the source, never the caller. Applies to bindings that
- * still name the same group; spawn then revalidates the member before using it.
+ * (spec A.1): caller-supplied internal fields are always removed first, then the persisted record's
+ * own fields are restored for a binding that still names the same service and group. Absent, empty
+ * or different-group persisted state restores nothing. Spawn then revalidates the member before use.
  */
 export function restoreConnectedServicePerSessionAssignmentFromPersisted<T>(bindings: T, persistedConnectedServices: unknown): T {
-  if (!bindings || typeof bindings !== 'object') return bindings;
-  if (!persistedConnectedServices || typeof persistedConnectedServices !== 'object') return bindings;
-  const record = bindings as Record<string, unknown>;
+  const withoutCaller = stripConnectedServiceInternalAssignmentFields(bindings);
+  if (!withoutCaller || typeof withoutCaller !== 'object') return withoutCaller;
+  if (!persistedConnectedServices || typeof persistedConnectedServices !== 'object') return withoutCaller;
+  const record = withoutCaller as Record<string, unknown>;
   const byServiceId = record.bindingsByServiceId as Record<string, Record<string, unknown> | undefined> | undefined;
   const persistedByServiceId = (persistedConnectedServices as Record<string, unknown>).bindingsByServiceId as
     Record<string, Record<string, unknown> | undefined> | undefined;
-  if (!byServiceId || typeof byServiceId !== 'object' || !persistedByServiceId || typeof persistedByServiceId !== 'object') return bindings;
+  if (!byServiceId || typeof byServiceId !== 'object' || !persistedByServiceId || typeof persistedByServiceId !== 'object') return withoutCaller;
   let changed = false;
   const next: Record<string, unknown> = { ...byServiceId };
   for (const [serviceId, binding] of Object.entries(byServiceId)) {
@@ -75,10 +62,8 @@ export function restoreConnectedServicePerSessionAssignmentFromPersisted<T>(bind
       .filter((field) => persisted[field] !== undefined)
       .map((field) => [field, persisted[field]]));
     if (Object.keys(own).length === 0) continue;
-    const withoutCaller = Object.fromEntries(Object.entries(binding)
-      .filter(([field]) => !(CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS as readonly string[]).includes(field)));
-    next[serviceId] = { ...withoutCaller, ...own };
+    next[serviceId] = { ...binding, ...own };
     changed = true;
   }
-  return changed ? ({ ...record, bindingsByServiceId: next } as T) : bindings;
+  return changed ? ({ ...record, bindingsByServiceId: next } as T) : withoutCaller;
 }

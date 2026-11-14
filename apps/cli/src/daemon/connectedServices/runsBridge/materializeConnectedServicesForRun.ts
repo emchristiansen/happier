@@ -76,6 +76,8 @@ export type ResolveConnectedServiceAuthForRun = (
     sessionDirectory?: string | null;
     previousMaterializedRoot?: string;
     sessionId?: string;
+    /** The run's already-running runner process; it owns any per-session decision this materialization creates. */
+    runnerPid?: number;
   }>,
 ) => ReturnType<typeof resolveConnectedServiceAuthForSpawn>;
 
@@ -169,6 +171,7 @@ export function createExecutionRunConnectedServicesBridge(deps: Readonly<{
           sessionDirectory: request.sessionDirectory ?? null,
           ...(request.previousMaterializedRoot ? { previousMaterializedRoot: request.previousMaterializedRoot } : {}),
           ...(request.sessionId ? { sessionId: request.sessionId } : {}),
+          runnerPid: request.pid,
         });
       } catch (error) {
         // Fail closed: a materialization fault must surface as a typed error, never as a silent

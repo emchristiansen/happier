@@ -8,7 +8,7 @@ import {
 import { getAgentCore, isAgentId } from '@/agents/catalog/catalog';
 import type { ConnectedServiceQuotaProfileRefProvenance } from '@/sync/domains/connectedServices/connectedServiceQuotaGauge';
 import { parseConnectedServicesBindingsByServiceIdFromAgentOptionState } from '@/sync/domains/connectedServices/connectedServicesAgentOptionStateBindings';
-import { resolveConnectedServiceGroupBindingAppliedProfileId } from '@/sync/domains/connectedServices/resolveConnectedServiceGroupBindingAppliedProfileId';
+import { resolveConnectedServiceGroupBindingServingState } from '@/sync/domains/connectedServices/resolveConnectedServiceGroupBindingAppliedProfileId';
 import { resolveConnectedServiceCredentialHealthStatus } from '@/sync/domains/connectedServices/resolveConnectedServiceCredentialHealthStatus';
 import type { Metadata } from '@/sync/domains/state/storageTypes';
 
@@ -86,12 +86,22 @@ function resolveBindingProfileId(params: Readonly<{
     const groupId =
         readTrimmedString(optionBindingRecord?.groupId)
         ?? readTrimmedString(params.payloadBinding?.groupId);
-    const appliedGroupProfileId = selection === 'group'
-        ? readTrimmedString(resolveConnectedServiceGroupBindingAppliedProfileId(optionBindingRecord))
-            ?? readTrimmedString(resolveConnectedServiceGroupBindingAppliedProfileId(params.payloadBinding))
-        : null;
-    if (appliedGroupProfileId && groupId) {
-        return { profileId: appliedGroupProfileId, selection: 'group', groupId };
+    if (selection === 'group') {
+        const servingStates = [
+            resolveConnectedServiceGroupBindingServingState(optionBindingRecord),
+            resolveConnectedServiceGroupBindingServingState(params.payloadBinding),
+        ];
+        const appliedMember = servingStates.find((state) => state.kind === 'per_session_applied');
+        if (appliedMember && groupId) return { profileId: appliedMember.profileId, selection: 'group', groupId };
+        // A not-yet-adopted per-session start has no serving account: neither its target nor the shared
+        // pool pointer may be gauged as one (spec A.4/T19).
+        if (servingStates.some((state) => state.kind === 'per_session_pending')) return null;
+        const sharedAppliedProfileId = servingStates
+            .map((state) => state.kind === 'shared' ? state.appliedProfileId : null)
+            .find((profileId) => profileId !== null) ?? null;
+        if (sharedAppliedProfileId && groupId) {
+            return { profileId: sharedAppliedProfileId, selection: 'group', groupId };
+        }
     }
     if (explicitProfileId) {
         return {

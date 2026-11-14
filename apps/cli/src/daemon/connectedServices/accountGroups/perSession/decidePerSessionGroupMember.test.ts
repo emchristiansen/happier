@@ -7,13 +7,18 @@ import {
 
 import type { ConnectedServiceAssignmentReservationApi } from '@/api/connectedServices/connectedServiceAssignmentReservationApi';
 import type { ConnectedServiceAuthGroupMemberRuntimeState } from '../selection/selectConnectedServiceAuthGroupCandidate';
-import { decidePerSessionGroupMember, type PerSessionAssignmentProposal } from './decidePerSessionGroupMember';
+import {
+  decidePerSessionGroupMember,
+  PerSessionReservationDecisionMismatchError,
+  type PerSessionAssignmentProposal,
+} from './decidePerSessionGroupMember';
 
 const NOW = 5_000_000;
 const policy = ConnectedServiceAuthGroupPolicyV1Schema.parse({ strategy: 'per_session_softmax' });
 
 /** In-memory reservation server with the A.3 CAS semantics. */
-function createFakeReservationServer(options: Readonly<{ beforePut?: (decisionId: string) => void }> = {}) {
+function createFakeReservationServer(options: Readonly<{ beforePut?: (decisionId: string) => void; clock?: { now: number } }> = {}) {
+  const clock = options.clock ?? { now: NOW };
   let revision = 0;
   const entries = new Map<string, ConnectedServiceAssignmentReservationV1>();
   const snapshot = () => ({ reservationRevision: revision, reservations: [...entries.values()] });
@@ -25,12 +30,14 @@ function createFakeReservationServer(options: Readonly<{ beforePut?: (decisionId
       options.beforePut?.(decisionId);
       const existing = entries.get(decisionId);
       if (existing) {
-        if (existing.profileId !== body.profileId || existing.sessionId !== body.sessionId) {
+        if (existing.profileId !== body.profileId || existing.sessionId !== body.sessionId
+          || existing.ownerMachineId !== body.ownerMachineId) {
           return { kind: 'decision_mismatch', ...snapshot() };
         }
         return { kind: 'reserved', outcome: 'unchanged', reservationRevision: revision, reservation: existing };
       }
       if (body.expectedReservationRevision !== revision) return { kind: 'conflict', ...snapshot() };
+      if (body.leaseUntilMs <= clock.now) return { kind: 'uncertain', detail: 'http_400' };
       const reservation: ConnectedServiceAssignmentReservationV1 = {
         decisionId,
         profileId: body.profileId,
@@ -221,7 +228,7 @@ describe('decidePerSessionGroupMember', () => {
     expect(new Set(persisted.map((proposal) => proposal.profileId))).toEqual(new Set(['a']));
   });
 
-  it('proceeds on the same target with reservation_uncertain when reconciliation is impossible', async () => {
+  it('proceeds on the same target with reservation_uncertain when reconciliation is impossible at the deadline', async () => {
     const api: ConnectedServiceAssignmentReservationApi = {
       listAssignmentReservations: (() => {
         let first = true;
@@ -233,18 +240,20 @@ describe('decidePerSessionGroupMember', () => {
       putAssignmentReservation: async () => ({ kind: 'uncertain', detail: 'timeout' }),
       deleteAssignmentReservation: async () => ({ kind: 'uncertain', detail: 'timeout' }),
     };
-    const { input } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api });
+    const { input } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api, deadlineAtMs: NOW });
     expect(await decidePerSessionGroupMember(input)).toMatchObject({
       kind: 'assigned', proposal: { profileId: 'a', custody: 'reservation_uncertain' },
     });
   });
 
-  it('replays its own committed decision instead of overwriting it', async () => {
+  it('rejects a stored entry on another target as a decision mismatch instead of adopting it (HPI-07)', async () => {
     const server = createFakeReservationServer();
     server.entries.set('decision-1', { decisionId: 'decision-1', profileId: 'b', sessionId: 'session-1', ownerMachineId: 'machine-1',
       state: 'pending', createdAtMs: NOW, leaseUntilMs: NOW + 1_000 });
-    const { input } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: server.api });
-    expect(await decidePerSessionGroupMember(input)).toMatchObject({ kind: 'assigned', proposal: { profileId: 'b', custody: 'reserved' } });
+    const { input, persisted } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: server.api });
+    await expect(decidePerSessionGroupMember(input)).rejects.toBeInstanceOf(PerSessionReservationDecisionMismatchError);
+    expect(persisted.map((proposal) => [proposal.profileId, proposal.custody])).toEqual([['a', 'proposed']]);
+    expect(server.entries.get('decision-1')!.profileId).toBe('b');
   });
 
   it('excludes the session\'s failed member on failover', async () => {
@@ -286,4 +295,285 @@ describe('decidePerSessionGroupMember', () => {
     const standardError = Math.sqrt((totalSquares / trials - mean * mean) / trials);
     expect(Math.abs(mean - 1.495)).toBeLessThanOrEqual(4 * standardError);
   }, 60_000);
+});
+
+/** Records each PUT body together with how many proposals were durable when it was sent. */
+function recording(api: ConnectedServiceAssignmentReservationApi, persisted: ReadonlyArray<PerSessionAssignmentProposal>) {
+  const puts: Array<Readonly<{ body: unknown; durable: number }>> = [];
+  const wrapped: ConnectedServiceAssignmentReservationApi = {
+    ...api,
+    putAssignmentReservation: async (params) => {
+      puts.push({ body: structuredClone(params.body), durable: persisted.length });
+      return api.putAssignmentReservation(params);
+    },
+  };
+  return { api: wrapped, puts };
+}
+
+function lastOf(persisted: ReadonlyArray<PerSessionAssignmentProposal>): PerSessionAssignmentProposal {
+  return persisted[persisted.length - 1]!;
+}
+
+const sentBody = (overrides: Readonly<{ profileId: string; leaseUntilMs: number; expectedReservationRevision: number }>) => ({
+  profileId: overrides.profileId,
+  sessionId: 'session-1',
+  ownerMachineId: 'machine-1',
+  state: 'pending',
+  leaseUntilMs: overrides.leaseUntilMs,
+  expectedReservationRevision: overrides.expectedReservationRevision,
+});
+
+describe('decidePerSessionGroupMember reservation custody (A.5 R1–R5)', () => {
+  it('HPI-05 replayNewRevision: a resumed proposal re-sends its identical PUT, then re-proposes durably only after the definite conflict', async () => {
+    const clock = { now: NOW + 20_000 };
+    const server = createFakeReservationServer({ clock });
+    server.bumpRevisionWithUnrelatedCommit();
+    const resumeProposal: PerSessionAssignmentProposal = {
+      decisionId: 'decision-1', proposalRevision: 1, profileId: 'a', reason: 'initial_sampled', fromProfileId: null,
+      temperature: 1.5, offsetPercent: 10, probability: 0.84, decidedAtMs: NOW, custody: 'proposed',
+      observedReservationRevision: 0, reservationLeaseUntilMs: NOW + 300_000,
+    };
+    const { input, persisted } = baseInput({ scores: { a: 100, b: 50 }, nowMs: () => clock.now, resumeProposal });
+    const recorder = recording(server.api, persisted);
+    const decision = await decidePerSessionGroupMember({ ...input, reservationApi: recorder.api });
+
+    expect(recorder.puts[0]).toStrictEqual({ body: sentBody({ profileId: 'a', leaseUntilMs: NOW + 300_000, expectedReservationRevision: 0 }), durable: 0 });
+    expect(persisted[0]).toMatchObject({ proposalRevision: 2, custody: 'proposed', observedReservationRevision: 1, reservationLeaseUntilMs: clock.now + 300_000 });
+    expect(recorder.puts[1]).toStrictEqual({ body: sentBody({ profileId: persisted[0]!.profileId, leaseUntilMs: clock.now + 300_000, expectedReservationRevision: 1 }), durable: 1 });
+    expect(decision).toMatchObject({ kind: 'assigned', proposal: { decisionId: 'decision-1', proposalRevision: 2, custody: 'reserved' } });
+    expect(server.entries.get('decision-1')).toMatchObject({ profileId: persisted[0]!.profileId });
+  });
+
+  it('HPI-05: a replay after intervening reservations and a changed clock sends a byte-identical PUT body', async () => {
+    const clock = { now: NOW };
+    const server = createFakeReservationServer({ clock });
+    let healthy = false;
+    let gets = 0;
+    const flaky: ConnectedServiceAssignmentReservationApi = {
+      ...server.api,
+      // The initial read succeeds; reconciliation reads fail until the outage ends.
+      listAssignmentReservations: async (params) => (healthy || gets++ === 0
+        ? server.api.listAssignmentReservations(params)
+        : { kind: 'uncertain', detail: 'timeout' }),
+      putAssignmentReservation: async (params) => (healthy
+        ? server.api.putAssignmentReservation(params)
+        : { kind: 'uncertain', detail: 'ECONNRESET' }),
+    };
+    const first = baseInput({ scores: { a: 100, b: 50 }, nowMs: () => clock.now });
+    const firstRecorder = recording(flaky, first.persisted);
+    const unresolved = await decidePerSessionGroupMember({ ...first.input, reservationApi: firstRecorder.api });
+    expect(unresolved).toMatchObject({ kind: 'custody_unresolved', pendingProposal: { profileId: 'a', proposalRevision: 1, custody: 'proposed' } });
+    expect(first.persisted.map((proposal) => proposal.custody)).toEqual(['proposed']);
+
+    server.bumpRevisionWithUnrelatedCommit();
+    server.bumpRevisionWithUnrelatedCommit();
+    clock.now = NOW + 45_000;
+    healthy = true;
+    const replay = baseInput({ scores: { a: 100, b: 50 }, nowMs: () => clock.now, resumeProposal: lastOf(first.persisted) });
+    const replayRecorder = recording(flaky, replay.persisted);
+    const decision = await decidePerSessionGroupMember({ ...replay.input, reservationApi: replayRecorder.api });
+
+    expect(replayRecorder.puts[0]!.body).toStrictEqual(firstRecorder.puts[0]!.body);
+    expect(JSON.stringify(replayRecorder.puts[0]!.body)).toBe(JSON.stringify(firstRecorder.puts[0]!.body));
+    expect(replayRecorder.puts[1]).toMatchObject({ body: { expectedReservationRevision: 2, leaseUntilMs: clock.now + 300_000 }, durable: 1 });
+    expect(decision).toMatchObject({ kind: 'assigned', proposal: { proposalRevision: 2, custody: 'reserved' } });
+  });
+
+  it('HPI-05 uncertainResend: an empty newer GET re-sends the identical PUT; only its definite conflict permits a re-proposal', async () => {
+    const server = createFakeReservationServer();
+    let puts = 0;
+    const lossy: ConnectedServiceAssignmentReservationApi = {
+      ...server.api,
+      putAssignmentReservation: async (params) => {
+        puts += 1;
+        if (puts === 1) {
+          // Lost before commit while another daemon commits meanwhile.
+          server.bumpRevisionWithUnrelatedCommit();
+          return { kind: 'uncertain', detail: 'timeout' };
+        }
+        return server.api.putAssignmentReservation(params);
+      },
+    };
+    const { input, persisted } = baseInput({ scores: { a: 100, b: 50 } });
+    const recorder = recording(lossy, persisted);
+    const decision = await decidePerSessionGroupMember({ ...input, reservationApi: recorder.api });
+
+    expect(recorder.puts[1]!.body).toStrictEqual(recorder.puts[0]!.body);
+    expect(recorder.puts.map((put) => (put.body as { expectedReservationRevision: number }).expectedReservationRevision)).toEqual([0, 0, 1]);
+    expect(persisted.map((proposal) => [proposal.proposalRevision, proposal.custody])).toEqual([[1, 'proposed'], [2, 'proposed'], [2, 'reserved']]);
+    expect(recorder.puts[2]!.durable).toBe(2);
+    expect(decision).toMatchObject({ kind: 'assigned', proposal: { proposalRevision: 2, custody: 'reserved' } });
+  });
+
+  it('HPI-06 uncertainThenUnavailable: a held-open original PUT completing late leaves decision A with one reservation and no degraded redraw', async () => {
+    const server = createFakeReservationServer();
+    let releaseOriginal!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseOriginal = resolve; });
+    let originalCommitted: Promise<unknown> | null = null;
+    let routeRefusing = true;
+    const api: ConnectedServiceAssignmentReservationApi = {
+      ...server.api,
+      putAssignmentReservation: async (params) => {
+        if (!originalCommitted) {
+          // The request stays open server-side; the client only observes a timeout.
+          originalCommitted = gate.then(() => server.api.putAssignmentReservation(params));
+          return { kind: 'uncertain', detail: 'timeout' };
+        }
+        if (routeRefusing) return { kind: 'unavailable', detail: 'ECONNREFUSED' };
+        return server.api.putAssignmentReservation(params);
+      },
+    };
+    const { input, persisted } = baseInput({ scores: { a: 100, b: 50 }, uniformSample: (() => { let draws = 0; return () => (draws++ === 0 ? 0 : 0.999); })() });
+    const recorder = recording(api, persisted);
+    const decision = await decidePerSessionGroupMember({ ...input, reservationApi: recorder.api });
+
+    expect(decision).toMatchObject({ kind: 'custody_unresolved', pendingProposal: { profileId: 'a', proposalRevision: 1, custody: 'proposed', temperature: 1.5 } });
+    expect(persisted.map((proposal) => [proposal.profileId, proposal.custody])).toEqual([['a', 'proposed']]);
+
+    releaseOriginal();
+    await originalCommitted;
+    routeRefusing = false;
+    const replay = baseInput({ scores: { a: 100, b: 50 }, resumeProposal: lastOf(persisted) });
+    const replayRecorder = recording(api, replay.persisted);
+    const settled = await decidePerSessionGroupMember({ ...replay.input, reservationApi: replayRecorder.api });
+
+    expect(replayRecorder.puts[0]!.body).toStrictEqual(recorder.puts[0]!.body);
+    expect(settled).toMatchObject({ kind: 'assigned', proposal: { decisionId: 'decision-1', profileId: 'a', proposalRevision: 1, custody: 'reserved' } });
+    expect([...server.entries.values()].filter((entry) => entry.decisionId === 'decision-1').map((entry) => entry.profileId)).toEqual(['a']);
+    expect(server.entries.size).toBe(1);
+  });
+
+  it('HPI-06: at the deadline a refused resend proceeds as reservation_uncertain on the same ID and target', async () => {
+    let puts = 0;
+    const api: ConnectedServiceAssignmentReservationApi = {
+      listAssignmentReservations: async () => ({ kind: 'ok', reservationRevision: 0, reservations: [] }),
+      putAssignmentReservation: async () => (++puts === 1 ? { kind: 'uncertain', detail: 'timeout' } : { kind: 'unavailable', detail: 'ECONNREFUSED' }),
+      deleteAssignmentReservation: async () => ({ kind: 'unavailable', detail: 'ECONNREFUSED' }),
+    };
+    const { input, persisted } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api, deadlineAtMs: NOW });
+    const decision = await decidePerSessionGroupMember(input);
+    expect(decision).toMatchObject({ kind: 'assigned', proposal: { profileId: 'a', proposalRevision: 1, custody: 'reservation_uncertain', temperature: 1.5 } });
+    expect(new Set(persisted.map((proposal) => proposal.profileId))).toEqual(new Set(['a']));
+    expect(persisted.some((proposal) => proposal.custody === 'local_degraded')).toBe(false);
+  });
+
+  it('HPI-06: a resumed proposal never degrades when the route is refused, since its PUT may already be committed', async () => {
+    const api: ConnectedServiceAssignmentReservationApi = {
+      listAssignmentReservations: async () => ({ kind: 'unavailable', detail: 'http_404' }),
+      putAssignmentReservation: async () => ({ kind: 'unavailable', detail: 'http_404' }),
+      deleteAssignmentReservation: async () => ({ kind: 'unavailable', detail: 'http_404' }),
+    };
+    const resumeProposal: PerSessionAssignmentProposal = {
+      decisionId: 'decision-1', proposalRevision: 1, profileId: 'b', reason: 'initial_sampled', fromProfileId: null,
+      temperature: 1.5, offsetPercent: 10, probability: 0.16, decidedAtMs: NOW, custody: 'proposed',
+      observedReservationRevision: 0, reservationLeaseUntilMs: NOW + 300_000,
+    };
+    const before = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api, resumeProposal });
+    expect(await decidePerSessionGroupMember(before.input)).toMatchObject({ kind: 'custody_unresolved', pendingProposal: { profileId: 'b' } });
+    expect(before.persisted).toEqual([]);
+    const atDeadline = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api, resumeProposal, deadlineAtMs: NOW });
+    expect(await decidePerSessionGroupMember(atDeadline.input)).toMatchObject({
+      kind: 'assigned', proposal: { profileId: 'b', proposalRevision: 1, custody: 'reservation_uncertain' },
+    });
+  });
+
+  it('HPI-07 mismatchSameSession: a server decision mismatch is an error, never a target rewrite', async () => {
+    const api: ConnectedServiceAssignmentReservationApi = {
+      listAssignmentReservations: async () => ({ kind: 'ok', reservationRevision: 0, reservations: [] }),
+      putAssignmentReservation: async () => ({
+        kind: 'decision_mismatch', reservationRevision: 1,
+        reservations: [{ decisionId: 'decision-1', profileId: 'b', sessionId: 'session-1', ownerMachineId: 'machine-1',
+          state: 'pending', createdAtMs: NOW, leaseUntilMs: NOW + 300_000 }],
+      }),
+      deleteAssignmentReservation: async () => ({ kind: 'ok', reservationRevision: 1, deleted: false }),
+    };
+    const { input, persisted } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api });
+    const error = await decidePerSessionGroupMember(input).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PerSessionReservationDecisionMismatchError);
+    expect(error).toMatchObject({ proposal: { profileId: 'a' }, stored: { profileId: 'b' } });
+    expect(persisted.map((proposal) => [proposal.profileId, proposal.custody])).toEqual([['a', 'proposed']]);
+  });
+
+  it.each([
+    ['profileId', { profileId: 'b' }],
+    ['sessionId', { sessionId: 'session-2' }],
+    ['ownerMachineId', { ownerMachineId: 'machine-2' }],
+  ] as const)('HPI-07: an exact GET entry differing in %s fails without effect', async (_field, difference) => {
+    const stored: ConnectedServiceAssignmentReservationV1 = {
+      decisionId: 'decision-1', profileId: 'a', sessionId: 'session-1', ownerMachineId: 'machine-1',
+      state: 'pending', createdAtMs: NOW, leaseUntilMs: NOW + 300_000, ...difference,
+    };
+    let gets = 0;
+    const api: ConnectedServiceAssignmentReservationApi = {
+      listAssignmentReservations: async () => (gets++ === 0
+        ? { kind: 'ok', reservationRevision: 0, reservations: [] }
+        : { kind: 'ok', reservationRevision: 1, reservations: [stored] }),
+      putAssignmentReservation: async () => ({ kind: 'uncertain', detail: 'timeout' }),
+      deleteAssignmentReservation: async () => ({ kind: 'ok', reservationRevision: 1, deleted: false }),
+    };
+    const { input, persisted } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api });
+    await expect(decidePerSessionGroupMember(input)).rejects.toBeInstanceOf(PerSessionReservationDecisionMismatchError);
+    expect(persisted.map((proposal) => proposal.custody)).toEqual(['proposed']);
+  });
+
+  it('HPI-07: an exact (decision, profile, session, owner) entry is R1 success on replay', async () => {
+    const server = createFakeReservationServer();
+    server.entries.set('decision-1', { decisionId: 'decision-1', profileId: 'b', sessionId: 'session-1', ownerMachineId: 'machine-1',
+      state: 'pending', createdAtMs: NOW, leaseUntilMs: NOW + 300_000 });
+    const resumeProposal: PerSessionAssignmentProposal = {
+      decisionId: 'decision-1', proposalRevision: 1, profileId: 'b', reason: 'initial_sampled', fromProfileId: null,
+      temperature: 1.5, offsetPercent: 10, probability: 0.16, decidedAtMs: NOW, custody: 'proposed',
+      observedReservationRevision: 0, reservationLeaseUntilMs: NOW + 300_000,
+    };
+    const { input } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: server.api, resumeProposal });
+    expect(await decidePerSessionGroupMember(input)).toMatchObject({ kind: 'assigned', proposal: { profileId: 'b', custody: 'reserved', probability: 0.16 } });
+  });
+
+  it('HPI-08 uncertainBeforeDeadline: an uncertain PUT with failed reconciliation is not effect-ready, then reserves normally on retry', async () => {
+    const server = createFakeReservationServer();
+    let outage = true;
+    const api: ConnectedServiceAssignmentReservationApi = {
+      ...server.api,
+      listAssignmentReservations: (() => {
+        let first = true;
+        return async (params) => {
+          if (first) { first = false; return server.api.listAssignmentReservations(params); }
+          return outage ? { kind: 'uncertain', detail: 'timeout' } : server.api.listAssignmentReservations(params);
+        };
+      })(),
+      putAssignmentReservation: async (params) => (outage ? { kind: 'uncertain', detail: 'timeout' } : server.api.putAssignmentReservation(params)),
+    };
+    const { input, persisted } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api });
+    const decision = await decidePerSessionGroupMember(input);
+    expect(decision).toEqual({
+      kind: 'custody_unresolved',
+      pendingProposal: lastOf(persisted),
+      detail: 'reconcile_uncertain:timeout',
+      deadlineAtMs: NOW + 60_000,
+    });
+    expect(persisted.map((proposal) => proposal.custody)).toEqual(['proposed']);
+
+    outage = false;
+    const retry = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api, resumeProposal: lastOf(persisted) });
+    expect(await decidePerSessionGroupMember(retry.input)).toMatchObject({
+      kind: 'assigned', proposal: { decisionId: 'decision-1', profileId: 'a', proposalRevision: 1, custody: 'reserved' },
+    });
+  });
+
+  it('HPI-08: the deadline-reached escape keeps the same ID and target and the original PUT for later reconciliation', async () => {
+    const api: ConnectedServiceAssignmentReservationApi = {
+      listAssignmentReservations: async () => ({ kind: 'uncertain', detail: 'timeout' }),
+      putAssignmentReservation: async () => ({ kind: 'uncertain', detail: 'timeout' }),
+      deleteAssignmentReservation: async () => ({ kind: 'uncertain', detail: 'timeout' }),
+    };
+    const resumeProposal: PerSessionAssignmentProposal = {
+      decisionId: 'decision-1', proposalRevision: 3, profileId: 'b', reason: 'initial_sampled', fromProfileId: null,
+      temperature: 1.5, offsetPercent: 10, probability: 0.16, decidedAtMs: NOW, custody: 'proposed',
+      observedReservationRevision: 7, reservationLeaseUntilMs: NOW + 300_000,
+    };
+    const { input, persisted } = baseInput({ scores: { a: 100, b: 50 }, reservationApi: api, resumeProposal, nowMs: () => NOW + 60_000 });
+    const decision = await decidePerSessionGroupMember(input);
+    expect(decision).toEqual({ kind: 'assigned', proposal: { ...resumeProposal, custody: 'reservation_uncertain' } });
+    expect(persisted).toEqual([{ ...resumeProposal, custody: 'reservation_uncertain' }]);
+  });
 });

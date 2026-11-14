@@ -18,6 +18,7 @@ import { resolveClaudeCodeCredentialsFilePath } from '@/backends/claude/connecte
 import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from './accountGroups/quotas/ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
 import { PerSessionAssignmentLedger, resolvePerSessionAssignmentLedgerPath } from './accountGroups/perSession/PerSessionAssignmentLedger';
+import { PerSessionAssignmentRuntime } from './accountGroups/perSession/PerSessionAssignmentRuntime';
 import { CLAUDE_SUBSCRIPTION_OAUTH_SCOPE } from './descriptors/connectedAccountDescriptors';
 import { resolveConnectedServiceSelectionHomeDir } from './homes/resolveConnectedServiceHomeDir';
 import { resolveConnectedServiceAuthForSpawn } from './resolveConnectedServiceAuthForSpawn';
@@ -62,7 +63,7 @@ function sealedFor(profileId: string) {
   };
 }
 
-function perSessionGroup(): ConnectedServiceAuthGroupV1 {
+function perSessionGroup(strategy: 'per_session_softmax' | 'priority' = 'per_session_softmax'): ConnectedServiceAuthGroupV1 {
   const member = (profileId: string, priority: number) => ({
     v: 1 as const, serviceId: 'claude-subscription' as const, groupId: 'pool', profileId,
     enabled: true, priority, state: { v: 1 as const }, createdAt: priority, updatedAt: priority,
@@ -75,7 +76,7 @@ function perSessionGroup(): ConnectedServiceAuthGroupV1 {
     activeProfileId: 'a',
     generation: 3,
     runtimeStateRevision: 0,
-    policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1, strategy: 'per_session_softmax' }),
+    policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ v: 1, strategy }),
     state: { v: 1 },
     members: [member('a', 1), member('b', 2)],
     createdAt: 1,
@@ -83,7 +84,7 @@ function perSessionGroup(): ConnectedServiceAuthGroupV1 {
   };
 }
 
-async function fixture() {
+async function fixture(strategy: 'per_session_softmax' | 'priority' = 'per_session_softmax') {
   const baseDir = await mkdtemp(join(tmpdir(), 'happier-per-session-spawn-base-'));
   const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-per-session-spawn-server-'));
   const home = await mkdtemp(join(tmpdir(), 'happier-per-session-spawn-home-'));
@@ -94,14 +95,19 @@ async function fixture() {
   });
   const api = {
     readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'connected' as const, health: null })),
-    getConnectedServiceAuthGroup: vi.fn(async () => perSessionGroup()),
+    getConnectedServiceAuthGroup: vi.fn(async () => perSessionGroup(strategy)),
     updateConnectedServiceAuthGroupActiveProfile,
     getConnectedServiceCredentialSealed: vi.fn(async (params: { serviceId: string; profileId: string }) =>
       params.serviceId === 'claude-subscription' ? sealedFor(params.profileId) : null),
   } as unknown as ApiClient;
   const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
   const ledger = new PerSessionAssignmentLedger(resolvePerSessionAssignmentLedgerPath(activeServerDir));
-  return { baseDir, activeServerDir, processEnv, api, runtimeQuotaSnapshots, ledger, updateConnectedServiceAuthGroupActiveProfile };
+  const runtime = new PerSessionAssignmentRuntime({
+    ledger, ownerMachineId: 'machine-1', reservationApi: null, nowMs: () => NOW,
+    listLiveDecisions: () => [], listLiveSubjectIds: () => new Set(), probeRunnerPresence: async () => 'present',
+  });
+  const deps = (uniformSample?: () => number) => ({ ...runtime.spawnDeps, ...(uniformSample ? { uniformSample } : {}) });
+  return { baseDir, activeServerDir, processEnv, api, runtimeQuotaSnapshots, ledger, deps, updateConnectedServiceAuthGroupActiveProfile };
 }
 
 function recordScores(store: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore, scores: Record<string, number>) {
@@ -143,7 +149,7 @@ describe('resolveConnectedServiceAuthForSpawn per_session_softmax', () => {
       quotaFreshnessMs: 300_000,
       nowMs: () => NOW,
       sessionId: 'session-1',
-      perSessionAssignment: { ledger: f.ledger, ownerMachineId: 'machine-1', reservationApi: null, uniformSample: () => 0.0001 },
+      perSessionAssignment: f.deps(() => 0.0001),
     });
 
     const binding = result!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, unknown>;
@@ -192,7 +198,7 @@ describe('resolveConnectedServiceAuthForSpawn per_session_softmax', () => {
       quotaFreshnessMs: 300_000,
       nowMs: () => NOW,
       sessionId: 'session-2',
-      perSessionAssignment: { ledger: f.ledger, ownerMachineId: 'machine-1', reservationApi: null, uniformSample: () => 0.99 },
+      perSessionAssignment: f.deps(() => 0.99),
     });
     const first = await spawn();
     const firstBinding = first!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
@@ -223,9 +229,95 @@ describe('resolveConnectedServiceAuthForSpawn per_session_softmax', () => {
       quotaFreshnessMs: 300_000,
       nowMs: () => NOW,
       sessionId: 'session-3',
-      perSessionAssignment: { ledger: f.ledger, ownerMachineId: 'machine-1', reservationApi: null },
+      perSessionAssignment: f.deps(),
     })).rejects.toBeInstanceOf(ConnectedServicePerSessionSpawnError);
     expect(f.updateConnectedServiceAuthGroupActiveProfile).not.toHaveBeenCalled();
+  });
+
+  it('releases the decision a spawn created when the attempt fails before launching anything (T17 definite pre-launch failure)', async () => {
+    const f = await fixture();
+    recordScores(f.runtimeQuotaSnapshots, { a: 30, b: 90 });
+    // Credential read fails after the decision was made: nothing can have launched.
+    vi.mocked((f.api as unknown as { getConnectedServiceCredentialSealed: () => unknown }).getConnectedServiceCredentialSealed)
+      .mockRejectedValue(new Error('credential store unavailable'));
+    await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
+      agentId: 'claude',
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool' } },
+      },
+      materializationKey: 'session-5',
+      activeServerDir: f.activeServerDir,
+      baseDir: f.baseDir,
+      credentials,
+      api: f.api,
+      processEnv: f.processEnv,
+      runtimeQuotaSnapshots: f.runtimeQuotaSnapshots,
+      quotaFreshnessMs: 300_000,
+      nowMs: () => NOW,
+      sessionId: 'session-5',
+      perSessionAssignment: f.deps(() => 0.5),
+    })).rejects.toThrow();
+    expect(f.ledger.list()).toHaveLength(0);
+  });
+
+  describe('after the group strategy is rolled back (T12)', () => {
+    const ownedBinding = (member: string) => ({
+      v: 1,
+      bindingsByServiceId: {
+        'claude-subscription': {
+          source: 'connected', selection: 'group', groupId: 'pool',
+          member: { assignment: 'per_session', profileId: member, decisionId: 'spawn-owned', reason: 'initial_sampled', appliedAtMs: 1 },
+        },
+      },
+    });
+    const spawnOwned = async (f: Awaited<ReturnType<typeof fixture>>, member: string) => await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
+      agentId: 'claude',
+      connectedServicesBindingsRaw: ownedBinding(member),
+      materializationKey: 'session-owned',
+      activeServerDir: f.activeServerDir,
+      baseDir: f.baseDir,
+      credentials,
+      api: f.api,
+      processEnv: f.processEnv,
+      runtimeQuotaSnapshots: f.runtimeQuotaSnapshots,
+      quotaFreshnessMs: 300_000,
+      nowMs: () => NOW,
+      sessionId: 'session-owned',
+      perSessionAssignment: f.deps(),
+    });
+
+    it('resumes a session on its own member and member home while the shared pointer stays elsewhere', async () => {
+      const f = await fixture('priority');
+      recordScores(f.runtimeQuotaSnapshots, { a: 90, b: 60 });
+      const result = await spawnOwned(f, 'b');
+      const binding = result!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
+      expect(binding.member).toMatchObject({ profileId: 'b', decisionId: 'spawn-owned' });
+      const memberHome = resolveConnectedServiceSelectionHomeDir({
+        activeServerDir: f.activeServerDir, serviceId: 'claude-subscription', agentId: 'claude', fallbackProfileId: 'b',
+        selection: { kind: 'profile', profileId: 'b' },
+      });
+      expect(result!.env.CLAUDE_CONFIG_DIR!.startsWith(memberHome)).toBe(true);
+      expect(result!.perSessionSpawnDecisionIds ?? []).toEqual([]);
+      expect(f.ledger.list()).toHaveLength(0);
+      expect(f.updateConnectedServiceAuthGroupActiveProfile).not.toHaveBeenCalled();
+    });
+
+    it('converts to the shared group path when the owned member can no longer serve', async () => {
+      const f = await fixture('priority');
+      recordScores(f.runtimeQuotaSnapshots, { a: 90, b: 0 });
+      const result = await spawnOwned(f, 'b');
+      const binding = result!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
+      expect(binding.member).toBeUndefined();
+      expect(binding.materializedAssignment).toBeUndefined();
+      const memberHome = resolveConnectedServiceSelectionHomeDir({
+        activeServerDir: f.activeServerDir, serviceId: 'claude-subscription', agentId: 'claude', fallbackProfileId: 'b',
+        selection: { kind: 'profile', profileId: 'b' },
+      });
+      expect(result!.env.CLAUDE_CONFIG_DIR!.startsWith(memberHome)).toBe(false);
+    });
   });
 
   it('fails closed when the daemon supplies no per-session facilities', async () => {

@@ -473,7 +473,9 @@ A per-session pool has no shared active account. Each new session in the pool
 gets its own member, chosen at random with odds that favour accounts with more
 quota left: a member whose remaining share is `s` percent, counting the sessions
 already placed on it, gets weight `(s' / (100 − s' + δ))^(1/τ)`, where
-`s' = s / (1 + k)` and `k` is the number of live sessions already assigned to it.
+`s' = s / (1 + k)` and `k` is the number of live reservations on it (one per
+session that was placed on it and has not ended or moved; a launch that is still
+starting keeps its reservation until its process has demonstrably ended).
 **Temperature** (τ, default 1.5) flattens the odds as it rises; **Offset** (δ,
 default 10 percentage points) limits how strongly an almost-full account is
 preferred. Members below the pool's low-quota threshold are used only when no
@@ -482,10 +484,17 @@ member is above it.
 Concurrent launches spread out through a shared reservation on the server. When
 a session hits a usage limit, only that session moves, onto its own newly drawn
 member, by restarting the agent with its conversation resumed; other sessions and
-the pool itself are unaffected. A session's account label shows the account the
-provider has confirmed, not one still being switched to.
+the pool itself are unaffected. Disabling or removing a member moves only the
+sessions on that member. A session's account label shows the account the provider
+has confirmed; a session whose first account is not yet confirmed shows that it is
+starting on that account rather than claiming it, and shows no usage for it.
 
-You can choose **Start on** a particular member when creating a session
+If you change a pool away from per-session, sessions that already have their own
+member keep it; each converts to the pool's shared account at its next failure,
+and only after the provider confirms that account.
+
+You can choose **Start on** a particular member when creating a session in the
+app (per-session pools only) or from the CLI
 (`happier session create --auth cs:group:<pool> --initial-profile <profileId>`).
 If that member is exhausted or unavailable the session starts on a drawn member
 instead; a disabled or non-member choice is refused.

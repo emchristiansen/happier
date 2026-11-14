@@ -2463,6 +2463,7 @@ export const ca: TranslationStructure = {
             labelWithCount: ({ count }: { count: number }) => `Autenticació: ${count}`,
             nativeLabel: 'Auth CLI',
             connectedCountLabel: ({ count }: { count: number }) => `${count} connectats`,
+            pendingStartLabel: ({ pool, account }: { pool: string; account: string }) => `${pool} (iniciant a ${account}…)`,
         },
         authSwitch: {
             activeTurnDisabled: 'Acaba o atura el torn actual abans de canviar l’autenticació.',
