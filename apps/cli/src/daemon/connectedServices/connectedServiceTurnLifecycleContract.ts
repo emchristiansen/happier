@@ -10,6 +10,20 @@ import {
 import { lazySchema } from '@happier-dev/protocol';
 
 export const NATIVE_PROVIDER_TURN_SOURCE_HEADER = 'x-happier-native-provider-source';
+
+/**
+ * Per-completion provenance for a completed terminal turn event, sent as a header so an older
+ * daemon (strict body) ignores it. `claude_sdk_result_bound_v1`: the Claude Agent SDK runner
+ * released this exact turn on a non-error, non-replayed result whose native attribution names the
+ * turn's latest submitted prompt. Absent means no such binding (older runners, other providers,
+ * unattributed or error results) and the completion is never qualified as useful provider work.
+ */
+export const TURN_COMPLETION_CONTRACT_HEADER = 'x-happier-turn-completion-contract';
+export const TURN_COMPLETION_CONTRACTS = ['claude_sdk_result_bound_v1'] as const;
+export type TurnCompletionContract = (typeof TURN_COMPLETION_CONTRACTS)[number];
+export function readTurnCompletionContract(value: unknown): TurnCompletionContract | undefined {
+  return TURN_COMPLETION_CONTRACTS.find((contract) => contract === value);
+}
 export const NativeProviderTurnSourceSchema = lazySchema(() => z.object({
   nativeId: z.string().min(1), pid: z.number().int().positive(),
   publisherIncarnationId: z.string().min(1),

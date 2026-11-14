@@ -7372,6 +7372,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               proofKind: report.proofKind,
               observedAtMs: report.observedAtMs === null ? null : Math.max(0, Math.trunc(report.observedAtMs)),
               turnOwnership: report.turnOwnership,
+              completionContract: report.completionContract,
               statusBefore: report.before?.status ?? null,
               statusAfter: report.after?.status ?? null,
               attemptIdAfter: report.after?.attemptId ?? null,
@@ -8193,6 +8194,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           event: input.event,
           ...(input.terminalStatus ? { terminalStatus: input.terminalStatus } : {}),
           turnLifecycle: trackedTurnResult,
+          completionContract: input.turnCompletionContract ?? null,
           resolveRecoveryIdentities: () => resolveTrackedContinuationRecoveryIdentities({
             sessionId: input.sessionId,
             runtimeBindings: connectedServiceRuntimeRegistry.getBySessionId(input.sessionId)?.activeBindings ?? [],
@@ -9251,6 +9253,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           validateCurrentness: validateConnectedServiceGroupMutationCurrentness,
           readMemberHolds: readConfiguredConnectedServiceMemberHolds,
           nowMs: () => Date.now(),
+          recordGroupGenerationApplied: appendRuntimeAuthAttemptAccountEvent,
         }),
         applyCommittedGeneration: async (input) => {
           const tracked = getCurrentChildren().find((child) => child.happySessionId === input.sessionId) ?? null;

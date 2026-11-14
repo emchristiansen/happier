@@ -10,7 +10,15 @@ import type { TrackedSessionTurnLifecycleResult } from '../../sessions/applyTrac
  * Whether the activity was proven to belong to the session's current exact turn. Only the exact
  * turn owner (applyTrackedSessionTurnLifecycle) decides this; it is evidence, never control.
  */
+import type { TurnCompletionContract } from '../connectedServiceTurnLifecycleContract';
+
 export type ProviderActivityTurnOwnership = 'exact_turn' | 'unverified_turn';
+/** Evidence-only qualification forwarded with a provider-activity proof; never changes control. */
+export type ProviderActivityEvidence = Readonly<{
+  turnOwnership: ProviderActivityTurnOwnership;
+  /** The runner's declared completion contract for this completion; null when undeclared. */
+  completionContract: TurnCompletionContract | null;
+}>;
 
 type RuntimeAuthRecoveryForProviderActivityProof = Readonly<{
   readForSession: (sessionId: string) => ReadonlyArray<RuntimeAuthRecoveryIntent>;
@@ -19,7 +27,7 @@ type RuntimeAuthRecoveryForProviderActivityProof = Readonly<{
     proofKind: ProviderOutcomeProofKind;
     expectedAttemptId?: string;
     observedAtMs?: number;
-    evidence?: Readonly<{ turnOwnership: ProviderActivityTurnOwnership }>;
+    evidence?: ProviderActivityEvidence;
   }>) => Promise<unknown>;
 }>;
 
@@ -38,6 +46,7 @@ export type ConnectedServiceProviderActivityProofRecorder = (input: Readonly<{
   sessionId: string;
   recoveryIdentities?: readonly SessionContinuationRecoveryIdentityV1[];
   turnOwnership?: ProviderActivityTurnOwnership;
+  completionContract?: TurnCompletionContract | null;
 }>) => Promise<void>;
 
 export type TurnLifecycleProviderActivityAdmission =
@@ -54,6 +63,7 @@ export async function recordTurnLifecycleProviderActivity(input: Readonly<{
   event: 'prompt_or_steer' | 'task_started' | 'assistant_message_end' | 'turn_cancelled';
   terminalStatus?: 'completed' | 'failed';
   turnLifecycle: TrackedSessionTurnLifecycleResult;
+  completionContract?: TurnCompletionContract | null;
   resolveRecoveryIdentities: () => readonly SessionContinuationRecoveryIdentityV1[];
   record: ConnectedServiceProviderActivityProofRecorder;
 }>): Promise<TurnLifecycleProviderActivityAdmission> {
@@ -63,6 +73,7 @@ export async function recordTurnLifecycleProviderActivity(input: Readonly<{
       sessionId: input.sessionId,
       recoveryIdentities: input.resolveRecoveryIdentities(),
       turnOwnership: admission.turnOwnership,
+      completionContract: input.completionContract ?? null,
     });
   }
   return admission;
@@ -136,6 +147,7 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
     recoveryIdentity: SessionContinuationRecoveryIdentityV1;
     serviceId: ReturnType<typeof ConnectedServiceIdSchema.parse>;
     turnOwnership: ProviderActivityTurnOwnership;
+    completionContract: TurnCompletionContract | null;
   }>): Promise<void> => {
     if (!params.runtimeAuthRecovery) return;
     const serviceId = input.serviceId;
@@ -170,7 +182,7 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
         proofKind: 'provider_activity',
         expectedAttemptId: failureFingerprint!,
         observedAtMs: params.nowMs?.() ?? Date.now(),
-        evidence: { turnOwnership: input.turnOwnership },
+        evidence: { turnOwnership: input.turnOwnership, completionContract: input.completionContract },
       });
     }));
   };
@@ -179,6 +191,7 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
     sessionId: string;
     recoveryIdentity: SessionContinuationRecoveryIdentityV1;
     turnOwnership: ProviderActivityTurnOwnership;
+    completionContract: TurnCompletionContract | null;
   }>): Promise<void> => {
     const recoveryIdentity = input.recoveryIdentity;
     const runtimeAuthRecoveryAttemptId = normalizeOptionalString(recoveryIdentity.failureFingerprint);
@@ -207,6 +220,7 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
       recoveryIdentity,
       serviceId: serviceId.data,
       turnOwnership: input.turnOwnership,
+      completionContract: input.completionContract,
     }).catch((error) => {
       params.logDebug?.('[DAEMON RUN] Failed to clear runtime-auth recovery after connected-service provider activity (non-fatal)', error);
     });
@@ -231,6 +245,7 @@ export function createConnectedServiceProviderActivityProofRecorder(params: Read
         recoveryIdentity,
         // Callers that do not state turn ownership are, truthfully, unverified.
         turnOwnership: input.turnOwnership ?? 'unverified_turn',
+        completionContract: input.completionContract ?? null,
       });
     }
   };

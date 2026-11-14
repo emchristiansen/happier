@@ -1,4 +1,5 @@
 import { readSessionUserMessageAdmissionBody, type SessionUserMessageAdmissionBody } from '@/session/services/admitSessionUserMessage';
+import type { TurnCompletionContract } from '../connectedServiceTurnLifecycleContract';
 import type { DaemonServerWorkErrorClassification, DaemonServerWorkErrorKind } from '@/daemon/serverWork/types';
 import { isDeepStrictEqual } from 'node:util';
 import { classifyDaemonServerWorkError } from '@/daemon/serverWork/classifyDaemonServerWorkError';
@@ -184,6 +185,8 @@ export type RuntimeAuthRecoverySchedulerDeps = Readonly<{
     observedAtMs: number | null;
     /** Producer-stated qualification of the evidence (e.g. turn ownership); null when unstated. */
     turnOwnership: 'exact_turn' | 'unverified_turn' | null;
+    /** The runner's declared completion contract for provider activity; null when undeclared. */
+    completionContract: TurnCompletionContract | null;
     before: RuntimeAuthRecoveryIntent | null;
     after: RuntimeAuthRecoveryIntent | null;
   }>) => void;
@@ -2424,7 +2427,7 @@ export class RuntimeAuthRecoveryScheduler {
     expectedAttemptId?: string;
     observedAtMs?: number;
     /** Evidence-only qualification forwarded to onProviderOutcomeProof; never changes control. */
-    evidence?: Readonly<{ turnOwnership: 'exact_turn' | 'unverified_turn' }>;
+    evidence?: Readonly<{ turnOwnership: 'exact_turn' | 'unverified_turn'; completionContract?: TurnCompletionContract | null }>;
   }>): Promise<RuntimeAuthRecoveryIntent | null> {
     if (!this.deps.onProviderOutcomeProof) return await this.applyProviderOutcomeProofByKey(input);
     const before = this.readByKey(input.recoveryKey);
@@ -2436,6 +2439,7 @@ export class RuntimeAuthRecoveryScheduler {
         expectedAttemptId: input.expectedAttemptId ?? null,
         observedAtMs: typeof input.observedAtMs === 'number' && Number.isFinite(input.observedAtMs) ? input.observedAtMs : null,
         turnOwnership: input.evidence?.turnOwnership ?? null,
+        completionContract: input.evidence?.completionContract ?? null,
         before,
         after,
       });

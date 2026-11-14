@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
+import { TURN_COMPLETION_CONTRACTS } from '../connectedServiceTurnLifecycleContract';
 import { lazySchema } from '@happier-dev/protocol';
 
 /**
@@ -100,9 +101,37 @@ const ProviderOutcomeProofEventSchema = lazySchema(() => z.object({
   // Rows written before this field existed omit it: they are read as unstated (null), never as
   // exact, and are not rewritten. A present value must still be one of the known kinds.
   turnOwnership: z.enum(['exact_turn', 'unverified_turn']).nullable().default(null),
+  /**
+   * The runner's declared completion contract for this activity (see TURN_COMPLETION_CONTRACTS).
+   * Rows written before it existed omit it and read as null: their activity carries no guarantee
+   * that the completion was the turn's own non-error provider result, and they are not rewritten.
+   */
+  completionContract: z.enum(TURN_COMPLETION_CONTRACTS).nullable().default(null),
   statusBefore: NullableString,
   statusAfter: NullableString,
   attemptIdAfter: NullableString,
+  persistedAtMs: z.number().int().nonnegative(),
+}).strict());
+
+/**
+ * A generation applied to a group's shared provider auth surface. Every session of the group runs
+ * with that surface, so this bounds every earlier application of the group, whichever session's
+ * attempt (or pre-turn switch) produced it. Journaled by the shared application owner.
+ */
+const GroupGenerationAppliedEventSchema = lazySchema(() => z.object({
+  v: z.literal(1),
+  kind: z.literal('group_generation_applied'),
+  /** The session whose committed generation was applied, when known; the effect is group-wide. */
+  sessionId: NullableString,
+  serviceId: z.string().min(1),
+  groupId: z.string().min(1),
+  generation: z.number().int().nonnegative(),
+  profileId: z.string().min(1),
+  /** Daemon wall-clock before the shared surface was rewritten: the switch cannot precede it. */
+  startedAtMs: z.number().int().nonnegative(),
+  /** Every attempted rewrite bounds earlier applications, verified or not. */
+  outcome: z.enum(['verified', 'superseded_after_apply', 'unverified', 'unavailable']),
+  /** Daemon wall-clock after the application attempt returned. */
   persistedAtMs: z.number().int().nonnegative(),
 }).strict());
 
@@ -110,11 +139,13 @@ export const RuntimeAuthAttemptAccountJoinEventSchema = lazySchema(() => z.discr
   AttemptTransitionEventSchema,
   ProviderAccountObservedEventSchema,
   ProviderOutcomeProofEventSchema,
+  GroupGenerationAppliedEventSchema,
 ]));
 
 export type RuntimeAuthAttemptTransitionEvent = z.infer<typeof AttemptTransitionEventSchema>;
 export type ProviderAccountObservedEvent = z.infer<typeof ProviderAccountObservedEventSchema>;
 export type ProviderOutcomeProofEvent = z.infer<typeof ProviderOutcomeProofEventSchema>;
+export type GroupGenerationAppliedEvent = z.infer<typeof GroupGenerationAppliedEventSchema>;
 export type RuntimeAuthAttemptAccountJoinEvent = z.infer<typeof RuntimeAuthAttemptAccountJoinEventSchema>;
 
 export type AttemptObservationDisposition =
@@ -126,22 +157,35 @@ export type AttemptObservationDisposition =
   | 'before_application'
   /** A later application (of another attempt) covers this observation. */
   | 'superseded_by_newer_attempt'
+  /** A newer generation of the group's shared auth surface (any session's) began before it. */
+  | 'superseded_by_shared_generation'
+  /**
+   * The group's next generation is missing from the journal (applied at an unknown time), and
+   * this observation falls between this application and the next generation the journal knows.
+   */
+  | 'generation_coverage_gap'
   /** Another attempt's application window starts at the same instant: no exclusive association. */
   | 'ambiguous_attempt_tie'
   /** The application owner did not adopt it (not unique, not current, or registry-rejected). */
   | 'not_adopted';
 
+/**
+ * The only account evidence the journal carries is Claude's `credential_org` transcript attachment:
+ * the CLI's cached credential metadata at query construction, emitted only when it changes. It is
+ * not bound to the request that ran, so it can neither confirm nor contradict the account that
+ * served the application. With counted metadata the verdict is therefore `principal_unknown`, and
+ * the metadata's relation to the applied member is reported separately as `credentialMetadata`.
+ */
 export type RuntimeAuthAttemptAccountVerdict =
   | 'awaiting_selection'
   | 'awaiting_application'
   | 'applied_awaiting_observation'
   | 'boundary_uncertain'
-  | 'confirmed'
-  | 'mismatch'
-  /** Counted observations from different native sessions disagree; no native witness decides. */
-  | 'conflicting_native_sessions'
-  | 'unknown'
+  | 'principal_unknown'
   | 'ended_unapplied';
+
+/** Counted credential metadata relative to the applied member. Never a request principal. */
+export type RuntimeAuthAttemptCredentialMetadata = 'none' | 'agrees' | 'disagrees' | 'mixed' | 'not_unique' | 'target_unknown';
 
 export type RuntimeAuthAttemptApplication = Readonly<{
   index: number;
@@ -152,11 +196,19 @@ export type RuntimeAuthAttemptApplication = Readonly<{
   /** The switch had completed by this (resumed status persisted). */
   persistedAtMs: number;
   countedNativeSessionIds: ReadonlyArray<string>;
+  credentialMetadata: RuntimeAuthAttemptCredentialMetadata;
   verdict: Exclude<RuntimeAuthAttemptAccountVerdict, 'awaiting_selection' | 'awaiting_application' | 'ended_unapplied'>;
 }>;
 
 export type RuntimeAuthAttemptUsefulContinuation =
+  /** Exact-turn activity whose completion the runner bound to the turn's own non-error result. */
   | Readonly<{ kind: 'provider_activity'; observedAtMs: number; applicationIndex: number }>
+  /**
+   * Exact-turn activity without a declared completion contract (every row from older runners).
+   * Such completions were shown to include synthetic API-error and stale results, so this is
+   * reported, never qualified as useful work. The scheduler's `recovered` stays separate.
+   */
+  | Readonly<{ kind: 'provider_activity_completion_unqualified'; observedAtMs: number; applicationIndex: number }>
   /** Post-application activity for this attempt whose turn ownership was not verified. */
   | Readonly<{ kind: 'provider_activity_unverified_turn'; observedAtMs: number; applicationIndex: number }>
   | Readonly<{ kind: 'boundary_uncertain'; observedAtMs: number | null; applicationIndex: number | null }>
@@ -207,6 +259,30 @@ type SessionAttribution =
   | { kind: 'certain'; interval: Interval }
   | { kind: 'window'; interval: Interval }
   | { kind: 'tie'; intervals: ReadonlyArray<Interval> };
+
+/** A generation of the group's shared auth surface, from any session's attempt or the application owner. */
+type GroupBoundary = { attemptId: string | null; generation: number | null; startMs: number };
+
+/**
+ * Whether the group's shared surface had moved past `interval` by `atMs`. Generations order
+ * boundaries when both are known; otherwise a later start does. A missing next generation (a gap
+ * in the journal) leaves the time between this application and the next known generation unknown.
+ */
+function sharedGenerationAfter(
+  interval: Interval,
+  boundaries: ReadonlyArray<GroupBoundary>,
+  atMs: number,
+): 'current' | 'superseded' | 'coverage_gap' {
+  const later = boundaries.filter((boundary) => (
+    boundary.generation !== null && interval.generation !== null
+      ? boundary.generation > interval.generation
+      : boundary.startMs > interval.windowStartMs && boundary.attemptId !== interval.attemptId
+  ));
+  if (later.some((boundary) => boundary.startMs <= atMs)) return 'superseded';
+  if (interval.generation !== null && later.length > 0
+    && !boundaries.some((boundary) => boundary.generation === interval.generation! + 1)) return 'coverage_gap';
+  return 'current';
+}
 
 function attributeObservation(intervals: ReadonlyArray<Interval>, observedAtMs: number): SessionAttribution {
   const started = intervals.filter((interval) => interval.windowStartMs <= observedAtMs);
@@ -267,10 +343,24 @@ export function foldRuntimeAuthAttemptAccountJoins(
   }
 
   const sessionKey = (sessionId: string, serviceId: string, groupId: string | null) => JSON.stringify([sessionId, serviceId, groupId]);
+  const groupKey = (serviceId: string, groupId: string | null) => JSON.stringify([serviceId, groupId]);
   const intervalsBySession = new Map<string, Interval[]>();
+  const boundariesByGroup = new Map<string, GroupBoundary[]>();
+  const addBoundary = (key: string, boundary: GroupBoundary) => {
+    boundariesByGroup.set(key, [...(boundariesByGroup.get(key) ?? []), boundary]);
+  };
   for (const draft of drafts.values()) {
     const key = sessionKey(draft.first.sessionId, draft.first.serviceId, draft.first.groupId);
     intervalsBySession.set(key, [...(intervalsBySession.get(key) ?? []), ...draft.intervals]);
+    for (const interval of draft.intervals) {
+      addBoundary(groupKey(draft.first.serviceId, draft.first.groupId), {
+        attemptId: interval.attemptId, generation: interval.generation, startMs: interval.windowStartMs,
+      });
+    }
+  }
+  for (const event of events) {
+    if (event.kind !== 'group_generation_applied') continue;
+    addBoundary(groupKey(event.serviceId, event.groupId), { attemptId: null, generation: event.generation, startMs: event.startedAtMs });
   }
   const observations = events.filter((event): event is ProviderAccountObservedEvent => event.kind === 'provider_account_observed');
   const proofs = events.filter((event): event is ProviderOutcomeProofEvent => event.kind === 'provider_outcome_proof');
@@ -278,6 +368,7 @@ export function foldRuntimeAuthAttemptAccountJoins(
   return [...drafts.entries()].map(([attemptId, draft]) => {
     const first = draft.first;
     const sessionIntervals = intervalsBySession.get(sessionKey(first.sessionId, first.serviceId, first.groupId)) ?? [];
+    const groupBoundaries = first.groupId === null ? [] : boundariesByGroup.get(groupKey(first.serviceId, first.groupId)) ?? [];
     const own = (interval: Interval) => interval.attemptId === attemptId;
     const ownStartedBefore = (observedAtMs: number) => draft.intervals.some((interval) => interval.windowStartMs <= observedAtMs);
     const classified = observations
@@ -300,10 +391,15 @@ export function foldRuntimeAuthAttemptAccountJoins(
               ? { disposition: 'ambiguous_attempt_tie', applicationIndex: mine[mine.length - 1]!.index }
               : outside();
           } else if (own(attribution.interval)) {
-            result = {
-              disposition: attribution.kind === 'certain' ? 'counted' : 'boundary_uncertain',
-              applicationIndex: attribution.interval.index,
-            };
+            const shared = sharedGenerationAfter(attribution.interval, groupBoundaries, event.observedAtMs);
+            result = shared === 'superseded'
+              ? { disposition: 'superseded_by_shared_generation', applicationIndex: null }
+              : shared === 'coverage_gap'
+                ? { disposition: 'generation_coverage_gap', applicationIndex: attribution.interval.index }
+                : {
+                  disposition: attribution.kind === 'certain' ? 'counted' : 'boundary_uncertain',
+                  applicationIndex: attribution.interval.index,
+                };
           } else if (attribution.kind === 'window' && ownStartedBefore(event.observedAtMs)) {
             // Inside another attempt's application window: it may still be this attempt's account.
             const latestOwn = draft.intervals.filter((interval) => interval.windowStartMs <= event.observedAtMs).pop()!;
@@ -318,7 +414,8 @@ export function foldRuntimeAuthAttemptAccountJoins(
     const applications: RuntimeAuthAttemptApplication[] = draft.intervals.map((interval) => {
       const counted = classified.filter((entry) => entry.disposition === 'counted' && entry.applicationIndex === interval.index);
       const uncertain = classified.some((entry) => entry.applicationIndex === interval.index
-        && (entry.disposition === 'boundary_uncertain' || entry.disposition === 'ambiguous_attempt_tie'));
+        && (entry.disposition === 'boundary_uncertain' || entry.disposition === 'ambiguous_attempt_tie'
+          || entry.disposition === 'generation_coverage_gap'));
       return {
         index: interval.index,
         profileId: interval.profileId,
@@ -326,7 +423,8 @@ export function foldRuntimeAuthAttemptAccountJoins(
         windowStartMs: interval.windowStartMs,
         persistedAtMs: interval.persistedAtMs,
         countedNativeSessionIds: [...new Set(counted.map((entry) => entry.event.nativeSessionId))].sort(),
-        verdict: resolveApplicationVerdict({ profileId: interval.profileId, counted: counted.map((entry) => entry.event), uncertain }),
+        credentialMetadata: resolveCredentialMetadata({ profileId: interval.profileId, counted: counted.map((entry) => entry.event) }),
+        verdict: counted.length > 0 ? 'principal_unknown' : uncertain ? 'boundary_uncertain' : 'applied_awaiting_observation',
       };
     });
 
@@ -357,7 +455,7 @@ export function foldRuntimeAuthAttemptAccountJoins(
         persistedAtMs: draft.recoveredAtMs,
         proofKinds: recoveringProofKinds.length > 0 ? [...new Set(recoveringProofKinds)] : 'not_recorded' as const,
       },
-      usefulContinuation: resolveUsefulContinuation({ intervals: draft.intervals, sessionIntervals, proofs: attemptProofs, attemptId }),
+      usefulContinuation: resolveUsefulContinuation({ sessionIntervals, groupBoundaries, proofs: attemptProofs, attemptId }),
       proofs: attemptProofs,
       firstTerminal: draft.firstTerminal,
       latestStatus,
@@ -371,33 +469,28 @@ export function foldRuntimeAuthAttemptAccountJoins(
   });
 }
 
-function resolveApplicationVerdict(input: Readonly<{
+function resolveCredentialMetadata(input: Readonly<{
   profileId: string | null;
   counted: ReadonlyArray<ProviderAccountObservedEvent>;
-  uncertain: boolean;
-}>): RuntimeAuthAttemptApplication['verdict'] {
-  if (input.counted.length === 0) return input.uncertain ? 'boundary_uncertain' : 'applied_awaiting_observation';
-  // Without a known applied target there is nothing to confirm or contradict.
-  if (input.profileId === null) return 'unknown';
+}>): RuntimeAuthAttemptCredentialMetadata {
+  if (input.counted.length === 0) return 'none';
+  if (input.profileId === null) return 'target_unknown';
   const resolutions = input.counted.map((event) => event.resolution);
-  const matches = (resolution: ProviderAccountResolution) => resolution.kind === 'unique_member' && resolution.profileId === input.profileId;
-  const contradicts = (resolution: ProviderAccountResolution) => resolution.kind === 'unique_member' && resolution.profileId !== input.profileId;
-  if (resolutions.some(contradicts)) {
-    // No application-owned native witness exists: disagreeing native sessions stay unresolved.
-    const natives = new Set(input.counted.map((event) => event.nativeSessionId));
-    return natives.size > 1 && resolutions.some(matches) ? 'conflicting_native_sessions' : 'mismatch';
-  }
-  return resolutions.every(matches) ? 'confirmed' : 'unknown';
+  if (resolutions.some((resolution) => resolution.kind !== 'unique_member')) return 'not_unique';
+  const agree = resolutions.filter((resolution) => resolution.kind === 'unique_member' && resolution.profileId === input.profileId).length;
+  if (agree === resolutions.length) return 'agrees';
+  return agree === 0 ? 'disagrees' : 'mixed';
 }
 
 function resolveUsefulContinuation(input: Readonly<{
-  intervals: ReadonlyArray<Interval>;
   sessionIntervals: ReadonlyArray<Interval>;
+  groupBoundaries: ReadonlyArray<GroupBoundary>;
   proofs: ReadonlyArray<ProviderOutcomeProofEvent>;
   attemptId: string;
 }>): RuntimeAuthAttemptUsefulContinuation {
   let uncertain: RuntimeAuthAttemptUsefulContinuation | null = null;
   let unverified: RuntimeAuthAttemptUsefulContinuation | null = null;
+  let unqualified: RuntimeAuthAttemptUsefulContinuation | null = null;
   for (const proof of input.proofs) {
     if (proof.proofKind !== 'provider_activity') continue;
     if (proof.observedAtMs === null) {
@@ -405,9 +498,26 @@ function resolveUsefulContinuation(input: Readonly<{
       continue;
     }
     const attribution = attributeObservation(input.sessionIntervals, proof.observedAtMs);
+    const shared = attribution.kind !== 'none' && attribution.kind !== 'tie'
+      ? sharedGenerationAfter(attribution.interval, input.groupBoundaries, proof.observedAtMs)
+      : 'current';
+    // Activity after the group's shared surface moved on ran on a later generation, not this one.
+    if (shared === 'superseded') continue;
+    // A missing group generation leaves which generation served the activity unknown: keep the
+    // proof as boundary uncertainty, never as useful continuation of this application.
+    if (shared === 'coverage_gap') {
+      if (attribution.kind !== 'none' && attribution.kind !== 'tie' && attribution.interval.attemptId === input.attemptId) {
+        uncertain ??= { kind: 'boundary_uncertain', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
+      }
+      continue;
+    }
     if (attribution.kind === 'certain' && attribution.interval.attemptId === input.attemptId) {
-      if (proof.turnOwnership === 'exact_turn') {
+      if (proof.turnOwnership === 'exact_turn' && proof.completionContract !== null) {
         return { kind: 'provider_activity', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
+      }
+      if (proof.turnOwnership === 'exact_turn') {
+        unqualified ??= { kind: 'provider_activity_completion_unqualified', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
+        continue;
       }
       unverified ??= { kind: 'provider_activity_unverified_turn', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
       continue;
@@ -417,7 +527,7 @@ function resolveUsefulContinuation(input: Readonly<{
       uncertain ??= { kind: 'boundary_uncertain', observedAtMs: proof.observedAtMs, applicationIndex: null };
     }
   }
-  return unverified ?? uncertain ?? { kind: 'not_witnessed' };
+  return unqualified ?? unverified ?? uncertain ?? { kind: 'not_witnessed' };
 }
 
 export type RuntimeAuthAttemptAccountJoinRead = Readonly<{

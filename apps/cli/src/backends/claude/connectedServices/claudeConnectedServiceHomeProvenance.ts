@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -232,6 +232,18 @@ export function matchesClaudeConnectedServiceHomeProvenance(
     && actual.selection.groupId === expected.selection.groupId
     && actual.selection.activeProfileId === expected.selection.activeProfileId
     && actual.selection.fallbackProfileId === expected.selection.fallbackProfileId;
+}
+
+/**
+ * Withdraw a home's provenance record before its credentials or `.claude.json` identity change.
+ * The record is published again only after both succeed, so a rewrite that fails part-way leaves
+ * no record that could vouch for the new bytes under the old tuple; readers then see unproven.
+ * An already-absent record is fine; any other failure aborts the rewrite before it mutates.
+ */
+export async function withdrawClaudeConnectedServiceHomeProvenance(claudeConfigDir: string): Promise<void> {
+  await unlink(resolveClaudeConnectedServiceHomeProvenancePath(claudeConfigDir)).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') throw error;
+  });
 }
 
 export async function writeClaudeConnectedServiceHomeProvenance(params: Readonly<{

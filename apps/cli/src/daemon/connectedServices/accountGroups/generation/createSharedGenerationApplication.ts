@@ -14,6 +14,7 @@ import {
   resolveConnectedServiceMemberHoldApplicationRefusal,
   type ConnectedServiceMemberHoldView,
 } from '../holds/connectedServiceMemberHolds';
+import type { GroupGenerationAppliedEvent } from '../../runtimeAuth/runtimeAuthAttemptAccountJoin';
 import { mapCommittedGenerationApplyResult } from './mapCommittedGenerationApplyResult';
 import type { ConnectedServiceAuthGroupGenerationConsumer } from './ConnectedServiceAuthGroupGenerationConsumer';
 
@@ -26,6 +27,9 @@ type SharedApply = NonNullable<ConsumerDeps['applySharedGenerationApplication']>
  * member holds are re-read AFTER the awaited credential resolution, immediately before the
  * protected materialization, so a hold written while the target was being prepared still wins
  * (the consumer's earlier admission alone could be stale). Only a fresh user action bypasses holds.
+ *
+ * Every attempted rewrite of the shared surface is reported to `recordGroupGenerationApplied`: all
+ * sessions of the group run with the surface, so it bounds every earlier application of the group.
  */
 export function createSharedGenerationApplication(deps: Readonly<{
   activeServerDir: string;
@@ -37,6 +41,8 @@ export function createSharedGenerationApplication(deps: Readonly<{
   validateCurrentness: (target: ConnectedServiceGroupMutationTarget) => Promise<ConnectedServiceSharedGenerationMutationCurrentness>;
   readMemberHolds: (serviceId: ConnectedServiceId) => Promise<ConnectedServiceMemberHoldView>;
   nowMs: () => number;
+  /** Evidence only: must not throw or block the application. */
+  recordGroupGenerationApplied?: (event: GroupGenerationAppliedEvent) => void;
 }>): SharedApply {
   return async (input) => {
     const target = input.committedGeneration.decisionCommittedTarget;
@@ -62,6 +68,7 @@ export function createSharedGenerationApplication(deps: Readonly<{
       if (refusal) return { reconciliationDisposition: 'failed', errorCode: refusal.errorCode };
     }
     const credentialRevision = resolved.credentialRevision;
+    const startedAtMs = deps.nowMs();
     const proof = await descriptor.applySharedGenerationApplication({
       activeServerDir: deps.activeServerDir,
       serviceId: target.serviceId,
@@ -82,6 +89,20 @@ export function createSharedGenerationApplication(deps: Readonly<{
         serviceId: target.serviceId, profileId: target.profileId, errorCode: 'shared_generation_application_unavailable',
       });
       return { status: 'unavailable' as const };
+    });
+    deps.recordGroupGenerationApplied?.({
+      v: 1,
+      kind: 'group_generation_applied',
+      sessionId: input.representativeSessionId,
+      serviceId: target.serviceId,
+      groupId: target.groupId,
+      generation: target.generation,
+      profileId: target.profileId,
+      startedAtMs,
+      outcome: proof.status === 'verified' && proof.credentialRevision === credentialRevision
+        ? 'verified'
+        : proof.status === 'superseded_after_apply' || proof.status === 'unavailable' ? proof.status : 'unverified',
+      persistedAtMs: deps.nowMs(),
     });
     if (proof.status === 'superseded_after_apply') {
       return mapCommittedGenerationApplyResult({

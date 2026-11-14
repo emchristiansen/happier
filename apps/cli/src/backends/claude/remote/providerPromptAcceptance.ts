@@ -1,5 +1,6 @@
 import type { EnhancedMode } from '../loop';
 import { hasClaudeQueuedUserTurns, readClaudeResultUserMessageUuids } from './resultTurnBoundary';
+import { isReplaySdkMessage } from './runtimeActivityEvidence';
 import { randomUUID } from 'node:crypto';
 import { readPendingLocalId } from '@happier-dev/protocol';
 import type { PendingProviderAction } from '@/agent/runtime/modeMessageQueue';
@@ -89,6 +90,24 @@ export function reportClaudeRemoteProviderPromptTransportFailure(
     })).catch(() => {});
 }
 
+/** Earlier submissions remembered to recognize a late result for them (native attribution keeps 64). */
+const SUBMITTED_PROMPT_UUID_MEMORY = 64;
+
+/**
+ * The ordered result consumer's single ownership decision for one inbound `result` frame.
+ * `ownsForeground` is false for a replayed result, a result while a submitted prompt still awaits
+ * its own result (retainForeground), and a result whose native attribution names only prompts this
+ * runner submitted earlier (not the latest). Unattributed (older native producer) results and
+ * results naming prompts never submitted here (provider-injected turns) keep their existing
+ * queue boundary.
+ */
+export type ClaudeRemoteResultAdmission = Readonly<{
+    replayed: boolean;
+    forLatestPrompt: boolean;
+    retainForeground: boolean;
+    ownsForeground: boolean;
+}>;
+
 /**
  * Owns settlement for prompts claimed from Happier's durable pending queue.
  *
@@ -106,6 +125,34 @@ export function createClaudeRemotePromptSettlementTracker(options: Readonly<{
     const unresolved = new Map<ClaudeRemoteProviderAcceptedPrompt, string | null>();
     const awaitingResultUuids = new Set<string>();
     let latestSubmittedUuid: string | null = null;
+    // Prompts this runner submitted, most recent last (bounded like native result attribution). A
+    // result naming only earlier ones answers earlier work; one naming an id never submitted here
+    // (e.g. a provider-injected task-notification turn) is not evidence of a foreign result.
+    const submittedUuids: string[] = [];
+
+    const isResultForLatestSubmittedPrompt = (message: unknown): boolean =>
+        latestSubmittedUuid !== null && readClaudeResultUserMessageUuids(message).includes(latestSubmittedUuid);
+
+    const shouldRetainForegroundForResult = (message: unknown): boolean => {
+        const hasQueuedUserTurns = hasClaudeQueuedUserTurns(message);
+        const answeredUuids = readClaudeResultUserMessageUuids(message);
+        if (answeredUuids.length === 0) {
+            // Older native producers lack attribution. Preserve their existing queue boundary.
+            if (!hasQueuedUserTurns) {
+                awaitingResultUuids.clear();
+                latestSubmittedUuid = null;
+            }
+            return hasQueuedUserTurns;
+        }
+        if (awaitingResultUuids.size === 0) return hasQueuedUserTurns;
+        for (const uuid of answeredUuids) awaitingResultUuids.delete(uuid);
+        if (!hasQueuedUserTurns && latestSubmittedUuid !== null && !awaitingResultUuids.has(latestSubmittedUuid)) {
+            // The latest send has its own result. Keep the existing empty-queue closeout for
+            // older IDs omitted by native attribution's 64-entry limit; this is not delivery proof.
+            awaitingResultUuids.clear();
+        }
+        return awaitingResultUuids.size > 0;
+    };
 
     const remove = (prompt: ClaudeRemoteProviderAcceptedPrompt): boolean => unresolved.delete(prompt);
     const rejectBeforeEffect = (prompt: ClaudeRemoteProviderAcceptedPrompt): void => {
@@ -127,6 +174,8 @@ export function createClaudeRemotePromptSettlementTracker(options: Readonly<{
             unresolved.set(prompt, uuid);
             awaitingResultUuids.add(uuid);
             latestSubmittedUuid = uuid;
+            submittedUuids.push(uuid);
+            if (submittedUuids.length > SUBMITTED_PROMPT_UUID_MEMORY) submittedUuids.shift();
             return uuid;
         },
         observeProviderMessage(message: unknown): boolean {
@@ -147,26 +196,55 @@ export function createClaudeRemotePromptSettlementTracker(options: Readonly<{
             // Callers suppress acknowledged user echoes, but still publish result output.
             return accepted && record.type === 'user';
         },
+        /**
+         * Whether the result names (in its native attribution) the latest prompt this tracker
+         * submitted: the only proof that it is that prompt's own result rather than an older or
+         * unattributed one. Read-only; call before shouldRetainForegroundForResult.
+         */
+        isResultForLatestSubmittedPrompt,
         /** Called once by the ordered result consumer, separately from raw delivery observation. */
-        shouldRetainForegroundForResult(message: unknown): boolean {
-            const hasQueuedUserTurns = hasClaudeQueuedUserTurns(message);
+        shouldRetainForegroundForResult,
+        /**
+         * Called exactly once per inbound `result` frame by the ordered consumer, BEFORE any
+         * failure/recovery effect (usage, auth, result failure, completion) may act on it. A replayed
+         * result is decided without touching settlement state; otherwise the retain decision is
+         * taken here, once, and the caller must reuse this admission rather than ask again.
+         */
+        /** The prompt a request issued now (an interrupt) targets: the latest submission, if any. */
+        latestSubmittedPromptUuid(): string | null {
+            return latestSubmittedUuid;
+        },
+        /**
+         * How a result relates to one submitted prompt. `earlier` only when every prompt it answers
+         * was submitted here before that prompt; `later` when it answers a prompt submitted after it
+         * (or the prompt has left the bounded memory); otherwise `answers`, which includes the prompt
+         * itself, unattributed results and ids never submitted here (provider-injected turns).
+         */
+        relateResultToPrompt(message: unknown, promptUuid: string | null): 'answers' | 'earlier' | 'later' {
             const answeredUuids = readClaudeResultUserMessageUuids(message);
-            if (answeredUuids.length === 0) {
-                // Older native producers lack attribution. Preserve their existing queue boundary.
-                if (!hasQueuedUserTurns) {
-                    awaitingResultUuids.clear();
-                    latestSubmittedUuid = null;
-                }
-                return hasQueuedUserTurns;
+            if (promptUuid === null || answeredUuids.length === 0 || answeredUuids.includes(promptUuid)) return 'answers';
+            if (answeredUuids.some((uuid) => !submittedUuids.includes(uuid))) return 'answers';
+            const promptIndex = submittedUuids.indexOf(promptUuid);
+            if (promptIndex < 0) return 'later';
+            return answeredUuids.some((uuid) => submittedUuids.indexOf(uuid) > promptIndex) ? 'later' : 'earlier';
+        },
+        admitResult(message: unknown): ClaudeRemoteResultAdmission {
+            if (isReplaySdkMessage(message)) {
+                return { replayed: true, forLatestPrompt: false, retainForeground: false, ownsForeground: false };
             }
-            if (awaitingResultUuids.size === 0) return hasQueuedUserTurns;
-            for (const uuid of answeredUuids) awaitingResultUuids.delete(uuid);
-            if (!hasQueuedUserTurns && latestSubmittedUuid !== null && !awaitingResultUuids.has(latestSubmittedUuid)) {
-                // The latest send has its own result. Keep the existing empty-queue closeout for
-                // older IDs omitted by native attribution's 64-entry limit; this is not delivery proof.
-                awaitingResultUuids.clear();
-            }
-            return awaitingResultUuids.size > 0;
+            const forLatestPrompt = isResultForLatestSubmittedPrompt(message);
+            const answeredUuids = readClaudeResultUserMessageUuids(message);
+            // Earlier work: every prompt it answers was submitted here before, none is the latest.
+            const answersOnlyEarlierSubmissions = answeredUuids.length > 0
+                && !forLatestPrompt
+                && answeredUuids.every((uuid) => submittedUuids.includes(uuid));
+            const retainForeground = shouldRetainForegroundForResult(message);
+            return {
+                replayed: false,
+                forLatestPrompt,
+                retainForeground,
+                ownsForeground: !retainForeground && !answersOnlyEarlierSubmissions,
+            };
         },
         /** Commands handled locally have no provider transport to acknowledge. */
         accept(prompt: ClaudeRemoteProviderAcceptedPrompt): void {

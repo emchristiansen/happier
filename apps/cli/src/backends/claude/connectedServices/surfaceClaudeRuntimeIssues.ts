@@ -39,7 +39,6 @@ import { readClaudeJsonlTimestampMs } from '../utils/claudeJsonlTimestamp';
 import { routeClaudeAttachment } from '../attachments/claudeAttachmentRouter';
 import { notifyDaemonConnectedServiceTurnLifecycle } from '@/daemon/controlClient';
 import { readSessionHookEventName } from '../utils/sessionHookAttribution';
-import { isClaudeTaskNotificationUserPromptHook } from '../utils/sessionHookTaskNotification';
 import type { SessionHookData } from '../utils/startHookServer';
 import type { ClaudeCredentialOrganizationAttachment } from '../attachments/claudeAttachmentTypes';
 
@@ -128,18 +127,41 @@ const requestIdentityBySession = new WeakMap<RuntimeIssueSession, Readonly<{
     identity: Promise<Readonly<{ sourceProviderAccountId: string | null; sourceProviderOrganizationId: string | null }>>;
 }>>();
 
+function readRequestFenceTupleKey(session: RuntimeIssueSession): string {
+    const truth = session.connectedServiceAuthGroupRequestFence?.readCurrentTruth() ?? null;
+    if (!truth) return 'none';
+    return truth.kind === 'current_auth_group_available'
+        ? JSON.stringify([truth.kind, truth.groupId, truth.generation, truth.credentialRevision])
+        : JSON.stringify([truth.kind, truth.groupId]);
+}
+
 /** Capture before dispatch: all pool runners share a home that another session may rewrite. */
 export async function captureClaudeRuntimeAuthRequestIdentity(session: RuntimeIssueSession): Promise<void> {
+    const unproven = { sourceProviderAccountId: null, sourceProviderOrganizationId: null };
+    const fenceBeforeRead = readRequestFenceTupleKey(session);
     const selection = resolveClaudeRuntimeIssueSelection(session);
+    // The selection tuple is recorded now; the account is read later from a home that the daemon
+    // rewrites BEFORE notifying this runner, so the fence alone cannot see that rewrite. A group
+    // account is read only from a coherent snapshot of the home naming this exact tuple; a moved
+    // fence during the read (a delivered notification) is unproven too.
     const identity = selection
-        ? resolveClaudeRuntimeProviderAccountIdentity({ env: process.env }).then((identity) => ({
-            sourceProviderAccountId: identity.providerAccountId,
-            sourceProviderOrganizationId: identity.providerOrganizationId ?? null,
-        })).catch((error) => {
+        ? resolveClaudeRuntimeProviderAccountIdentity({
+            env: process.env,
+            groupSelection: selection.kind === 'group' ? selection : null,
+        }).then((identity) => {
+            if (readRequestFenceTupleKey(session) !== fenceBeforeRead) {
+                logger.warnFile('[claude] Request account identity unproven: auth group fence moved during capture');
+                return unproven;
+            }
+            return {
+                sourceProviderAccountId: identity.providerAccountId,
+                sourceProviderOrganizationId: identity.providerOrganizationId ?? null,
+            };
+        }).catch((error) => {
             logger.warnFile('[claude] Failed to capture request account identity', { error });
-            return { sourceProviderAccountId: null, sourceProviderOrganizationId: null };
+            return unproven;
         })
-        : Promise.resolve({ sourceProviderAccountId: null, sourceProviderOrganizationId: null });
+        : Promise.resolve(unproven);
     requestIdentityBySession.set(session, { selection, identity });
     await identity;
 }
@@ -153,7 +175,10 @@ export function observeClaudeRuntimeAuthTranscript(
     if (observation?.historicalReplay === true || isClaudeSidechainRuntimeEvidence(value)) return;
     if (observation?.authenticatedHook === true && value && typeof value === 'object') {
         const hook = value as SessionHookData;
-        if (readSessionHookEventName(hook) === 'UserPromptSubmit' && !isClaudeTaskNotificationUserPromptHook(hook)) {
+        // Every submitted prompt is a provider request, including task-notification turns the
+        // provider injects itself. Bind failures to the identity live at that dispatch, not to an
+        // earlier prompt issued before a switch.
+        if (readSessionHookEventName(hook) === 'UserPromptSubmit') {
             void captureClaudeRuntimeAuthRequestIdentity(session);
         }
     }
@@ -357,18 +382,20 @@ function projectClaudeRuntimeAuthRecoveryReport(input: Readonly<{
 async function enrichClaudeRuntimeEvidenceWithAccountIdentity<T extends Readonly<{
     sourceProviderAccountId?: string | null;
     sourceProviderOrganizationId?: string | null;
-}>>(details: T): Promise<T> {
+}>>(session: RuntimeIssueSession, details: T): Promise<T> {
     const suppliedAccountId = details.sourceProviderAccountId?.trim() || null;
     if (suppliedAccountId && details.sourceProviderOrganizationId?.trim()) return details;
     // Only connected-service (pool) sessions carry a source identity: the soft-switch is a pool
     // feature, and source links are attributed to a connected-service account. Native sessions
     // have no pool to switch within, so they stay unstamped (and must not read the ambient home).
-    const hasConnectedServiceSelection = Boolean(
-        findConnectedServiceChildSelection(process.env, 'claude-subscription')
-        ?? findConnectedServiceChildSelection(process.env, 'anthropic'),
-    );
-    if (!hasConnectedServiceSelection) return details;
-    const identity = await resolveClaudeRuntimeProviderAccountIdentity({ env: process.env }).catch(() => null);
+    const selection = resolveClaudeRuntimeIssueSelection(session);
+    if (!selection) return details;
+    // A group home is shared and rewritten before this runner learns of it: the identity is paired
+    // with this session's selection tuple only from a coherent snapshot naming exactly that tuple.
+    const identity = await resolveClaudeRuntimeProviderAccountIdentity({
+        env: process.env,
+        groupSelection: selection.kind === 'group' ? selection : null,
+    }).catch(() => null);
     const providerAccountId = identity?.providerAccountId ?? null;
     if (!providerAccountId || (suppliedAccountId && suppliedAccountId !== providerAccountId)) return details;
     return {
@@ -511,7 +538,7 @@ export async function recordClaudeRateLimitQuotaEvidence(
     const target = resolveClaudeQuotaSnapshotTarget(session, {});
     if (!target.profileId) return;
     // All windows come from one provider response, so one account identity covers them.
-    const enrichedPrimaryWindow = await enrichClaudeRuntimeEvidenceWithAccountIdentity(primaryWindow);
+    const enrichedPrimaryWindow = await enrichClaudeRuntimeEvidenceWithAccountIdentity(session, primaryWindow);
     const observedAt = Date.now();
     void claudeQuotaSnapshotDeliveryOutbox.enqueueAndFlush({
         sessionId: session.client.sessionId,
@@ -621,7 +648,7 @@ export async function surfaceClaudeRateLimitRuntimeIssue(
         ? requestIdentity.identity.then((identity) => ({ ...details, ...identity }))
         : 'transcriptPath' in session
             ? Promise.resolve({ ...details, sourceProviderAccountId: null, sourceProviderOrganizationId: null })
-            : enrichClaudeRuntimeEvidenceWithAccountIdentity(details);
+            : enrichClaudeRuntimeEvidenceWithAccountIdentity(session, details);
     const initialClassification = classifyClaudeConnectedServiceRuntimeAuthFailure({
         details,
         selection,
@@ -810,7 +837,7 @@ export async function surfaceClaudeRuntimeAuthFailure(
         ...initialClassification,
         ...(requestIdentity ? await requestIdentity.identity : 'transcriptPath' in session
             ? { sourceProviderAccountId: null, sourceProviderOrganizationId: null }
-            : await enrichClaudeRuntimeEvidenceWithAccountIdentity(initialClassification)),
+            : await enrichClaudeRuntimeEvidenceWithAccountIdentity(session, initialClassification)),
         ...await providerOrganization,
         ...(runtimeIssueFingerprint ? { runtimeIssueFingerprint } : {}),
     };

@@ -770,4 +770,83 @@ describe('claudeRemoteAgentSdk post-result streaming', () => {
             await runnerPromise.catch(() => {});
         }
     });
+
+    it('fails instead of completing the active turn for a provider API-error result reported as success', async () => {
+        const mutations: SessionTurnMutationV1[] = [];
+        const lifecycleEvents: Array<readonly [string, string | undefined]> = [];
+        const lifecycle = createSessionTurnLifecycle({
+            sessionId: 'happier-session',
+            enqueueSessionTurn: async (mutation) => { mutations.push(mutation); },
+            onTurnLifecycleEvent: (event, terminalStatus) => { lifecycleEvents.push([event, terminalStatus]); },
+        });
+        // Mirror Session.onThinkingChange: thinking=false sends task_complete for the open task.
+        let currentTaskId: string | null = null;
+        let taskCounter = 0;
+        const onThinkingChange = (thinking: boolean) => {
+            if (thinking) {
+                if (currentTaskId) return;
+                currentTaskId = `task-${++taskCounter}`;
+                void lifecycle.observeAcpLifecycleMarker({ provider: 'claude', body: { type: 'task_started', id: currentTaskId } }).pendingWrite;
+                return;
+            }
+            if (!currentTaskId) return;
+            const id = currentTaskId;
+            currentTaskId = null;
+            void lifecycle.observeAcpLifecycleMarker({ provider: 'claude', body: { type: 'task_complete', id } }).pendingWrite;
+        };
+        let finishInput!: () => void;
+        const inputFinished = new Promise<void>((resolve) => { finishInput = resolve; });
+        let firstInput = true;
+        const createQuery = (() => ({
+            async *[Symbol.asyncIterator]() {
+                yield { type: 'system', subtype: 'init', session_id: 'owned-session' };
+                yield {
+                    type: 'assistant', session_id: 'owned-session', parent_tool_use_id: null, isApiErrorMessage: true,
+                    message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: "You've hit your limit" }] },
+                };
+                yield {
+                    type: 'result', subtype: 'success', is_error: true, api_error_status: 429,
+                    session_id: 'owned-session', result: "You've hit your limit", num_turns: 1,
+                };
+                await inputFinished;
+            },
+            close() { finishInput(); },
+        })) as unknown as CreateQuery;
+        const onReady = vi.fn();
+        const onResultFailure = vi.fn(async () => {
+            await lifecycle.failTurn({
+                provider: 'claude',
+                issue: {
+                    v: 1, scope: 'primary_session', status: 'failed', code: 'provider_status_error',
+                    source: 'provider_status_error', occurredAt: 1, sanitizedPreview: 'Provider API error',
+                },
+            });
+        });
+        const runner = claudeRemoteAgentSdk({
+            sessionId: null, transcriptPath: null, path: '/tmp', claudeArgs: [], claudeExecutablePath: '/tmp/claude',
+            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }), isAborted: () => false,
+            nextMessage: async () => {
+                if (firstInput) {
+                    firstInput = false;
+                    return { message: 'continue', mode: makeMode({ claudeRemoteAgentSdkEnabled: true }) };
+                }
+                await inputFinished;
+                return null;
+            },
+            onReady, onThinkingChange, onSessionFound: () => {}, onMessage: () => {}, createQuery,
+            onResultFailure,
+        } as Parameters<typeof claudeRemoteAgentSdk>[0]);
+        void runner.catch(() => {});
+        try {
+            await vi.waitFor(() => { expect(lifecycle.hasActiveTurn()).toBe(false); expect(mutations.length).toBeGreaterThanOrEqual(2); });
+            await vi.waitFor(() => { expect(onReady).toHaveBeenCalledOnce(); });
+            expect(mutations.map((mutation) => mutation.action)).toEqual(['begin', 'fail']);
+            expect(lifecycleEvents).not.toContainEqual(['assistant_message_end', 'completed']);
+            expect(lifecycleEvents).toContainEqual(['assistant_message_end', 'failed']);
+            expect(onResultFailure).toHaveBeenCalledWith(expect.stringContaining('429'), 'provider_api_error');
+        } finally {
+            finishInput();
+            await runner.catch(() => {});
+        }
+    });
 });

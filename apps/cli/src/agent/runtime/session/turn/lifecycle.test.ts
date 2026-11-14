@@ -412,6 +412,51 @@ describe('SessionTurnLifecycle', () => {
         ]);
     });
 
+    it('does not let a stale terminal marker from an already-terminal provider turn complete a newer active turn', async () => {
+        const mutations: SessionTurnMutationV1[] = [];
+        const events: Array<readonly [string, string | undefined]> = [];
+        let nextId = 0;
+        const lifecycle = createSessionTurnLifecycle({
+            sessionId: 's1',
+            createId: () => `turn-${++nextId}`,
+            enqueueSessionTurn: async (mutation) => { mutations.push(mutation); },
+            onTurnLifecycleEvent: (event, terminalStatus) => { events.push([event, terminalStatus]); },
+        });
+
+        await lifecycle.observeAcpLifecycleMarker({
+            provider: 'claude',
+            body: { type: 'task_started', id: 'provider-task-1' },
+        }).pendingWrite;
+        await lifecycle.failTurn({
+            provider: 'claude',
+            issue: { v: 1, scope: 'primary_session', status: 'failed', provider: 'claude', code: 'usage_limit', source: 'usage_limit', occurredAt: 1_000 },
+        });
+        await lifecycle.beginTurn({ provider: 'claude' });
+        const continuationTurnId = lifecycle.getActiveTurnId();
+
+        const stale = lifecycle.observeAcpLifecycleMarker({
+            provider: 'claude',
+            body: { type: 'task_complete', id: 'provider-task-1' },
+        });
+        await stale.pendingWrite;
+
+        expect(mutations.map((mutation) => [mutation.action, mutation.turnId])).toEqual([
+            ['begin', 'session-turn:turn-1'],
+            ['fail', 'session-turn:turn-1'],
+            ['begin', 'session-turn:turn-2'],
+        ]);
+        expect(lifecycle.getActiveTurnId()).toBe(continuationTurnId);
+        expect(events).not.toContainEqual(['assistant_message_end', 'completed']);
+
+        const live = lifecycle.observeAcpLifecycleMarker({
+            provider: 'claude',
+            body: { type: 'task_complete', id: 'provider-task-2' },
+        });
+        await live.pendingWrite;
+        expect(mutations.at(-1)).toEqual(expect.objectContaining({ action: 'complete', turnId: 'session-turn:turn-2' }));
+        expect(lifecycle.hasActiveTurn()).toBe(false);
+    });
+
     it('allocates and fails a session-owned turn for an idle session-scoped failure when opted in (silent host-death fix, incident cmq8y3nlx)', async () => {
         const mutations: SessionTurnMutationV1[] = [];
         const events: Array<readonly [string, string | undefined]> = [];

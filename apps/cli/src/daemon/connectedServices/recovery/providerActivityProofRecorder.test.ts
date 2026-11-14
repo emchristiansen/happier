@@ -109,7 +109,7 @@ describe('createConnectedServiceProviderActivityProofRecorder', () => {
       expectedAttemptId: 'runtime-auth-attempt:current',
       observedAtMs: 2_000,
       // No turn ownership was stated by this caller, so the evidence is unverified.
-      evidence: { turnOwnership: 'unverified_turn' },
+      evidence: { turnOwnership: 'unverified_turn', completionContract: null },
     });
     expect(markUsageLimitProviderOutcomeProof).toHaveBeenCalledWith({
       sessionId: 'session-1',

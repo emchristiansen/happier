@@ -29,6 +29,8 @@ import type { Session } from '../session';
 import { createSessionScanner } from '../utils/sessionScanner';
 import { createClaudeSessionTranscriptProjector } from '../localControl/createClaudeSessionTranscriptProjector';
 import { mapClaudeProviderFailureToUsageDetails, mapClaudeRateLimitEventToQuotaEvidence, readClaudeEventProviderCapturedAtMs } from './mapClaudeRateLimitEventToUsageDetails';
+import { isClaudeTaskNotificationUserPromptHook } from '../utils/sessionHookTaskNotification';
+import { resolveRuntimeAuthFailureSourceProfile } from '@/daemon/connectedServices/runtimeAuth/resolveRuntimeAuthFailureSourceProfile';
 
 import {
   recordClaudeRateLimitQuotaEvidence,
@@ -46,6 +48,20 @@ vi.mock('@/daemon/controlClient', () => ({
   notifyDaemonConnectedServiceQuotaSnapshot: mockNotifyDaemonConnectedServiceQuotaSnapshot,
   notifyDaemonConnectedServiceTurnLifecycle: mockNotifyDaemonConnectedServiceTurnLifecycle,
 }));
+
+// Lets a test hold the request-identity read open while the shared home and fence move.
+const identityReadGate = vi.hoisted(() => ({ before: null as null | (() => Promise<void>) }));
+vi.mock('./resolveClaudeRuntimeProviderAccountIdentity', async (importOriginal) => {
+  const original = await importOriginal<typeof import('./resolveClaudeRuntimeProviderAccountIdentity')>();
+  return {
+    ...original,
+    resolveClaudeRuntimeProviderAccountIdentity: async (params: Parameters<typeof original.resolveClaudeRuntimeProviderAccountIdentity>[0]) => {
+      const before = identityReadGate.before;
+      if (before) await before();
+      return await original.resolveClaudeRuntimeProviderAccountIdentity(params);
+    },
+  };
+});
 
 type ClaudeFailTurn = (params: FailTurnInput) => Promise<void>;
 
@@ -1476,6 +1492,15 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     await writeFile(join(tmpDir, '.claude.json'), JSON.stringify(rootConfig), 'utf8');
   }
 
+  /** A group home's materializer records the tuple its identity belongs to beside `.claude.json`. */
+  async function writeGroupHomeProvenance(tuple: { generation: number; credentialRevision: string }): Promise<void> {
+    await writeFile(join(tmpDir, '.happier-claude-connected-service-home.json'), JSON.stringify({
+      v: 1, serviceId: 'claude-subscription', credentialProfileId: 'claude-main', credentialCreatedAt: 1000,
+      credentialRevision: tuple.credentialRevision, generation: tuple.generation,
+      selection: { kind: 'group', groupId: 'team-pool', activeProfileId: 'claude-main', fallbackProfileId: 'claude-backup' },
+    }), 'utf8');
+  }
+
   function installConfigDir(): void {
     previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = tmpDir;
@@ -1580,6 +1605,7 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
 
   it('retains the issued request account and generation after a shared home and selection switch', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'issued-account', organizationUuid: 'issued-org' });
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     const session = { client: { sessionId: 'request-snapshot', sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } } };
     await captureClaudeRuntimeAuthRequestIdentity(session);
     await writeMaterializedClaudeConfig({ accountUuid: 'later-account', organizationUuid: 'later-org' });
@@ -1595,6 +1621,108 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
         credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS', sourceProviderAccountId: 'issued-account',
         sourceProviderOrganizationId: 'issued-org' }),
     }), expect.anything());
+  });
+
+  it('binds a task-notification request to the account and generation live at its dispatch', async () => {
+    // Production shape: an ordinary prompt was issued under account A; the session was later
+    // switched to account B, and the next provider request was a background task-notification
+    // turn that hit B's weekly limit. The capture must describe the request that failed.
+    const transcriptPath = join(tmpDir, 'notification-session.jsonl');
+    await writeFile(transcriptPath, [
+      { type: 'attachment', sessionId: 'notification-session', timestamp: '2026-11-02T13:50:20.000Z',
+        attachment: { type: 'credential_org', organizationUuid: 'org-a' } },
+      { type: 'attachment', sessionId: 'notification-session', timestamp: '2026-11-02T13:58:00.000Z',
+        attachment: { type: 'credential_org', organizationUuid: 'org-b' } },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    let truth: { kind: 'current_auth_group_available'; groupId: string; generation: number; credentialRevision: string } = {
+      kind: 'current_auth_group_available', groupId: 'team-pool', generation: 4,
+      credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' };
+    const session = {
+      sessionId: 'notification-session', transcriptPath,
+      connectedServiceAuthGroupRequestFence: { readCurrentTruth: () => truth },
+      client: { sessionId: 'task-notification-failure', sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
+    };
+    const notificationHook: SessionHookData = { hook_event_name: 'UserPromptSubmit', session_id: 'notification-session',
+      prompt: '<task-notification><task-id>bg-task-1</task-id><status>completed</status></task-notification>' };
+    expect(isClaudeTaskNotificationUserPromptHook(notificationHook)).toBe(true);
+
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-a', organizationUuid: 'org-a' });
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
+    // The ordinary prompt's identity is captured before its dispatch (the remote launcher awaits it).
+    await captureClaudeRuntimeAuthRequestIdentity(session);
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-b', organizationUuid: 'org-b' });
+    await writeGroupHomeProvenance({ generation: 5, credentialRevision: 'csr_8123456789ABCDEFGHJKMNPQRS' });
+    truth = { ...truth, generation: 5, credentialRevision: 'csr_8123456789ABCDEFGHJKMNPQRS' };
+    observeClaudeRuntimeAuthTranscript(session, notificationHook, { historicalReplay: false, authenticatedHook: true });
+
+    await surfaceClaudeRateLimitRuntimeIssue(session, {
+      ...passiveUtilizationDetails(), limitCategory: 'usage_limit', utilization: 100,
+      providerObservedAtMs: Date.parse('2026-11-02T13:58:11.000Z'),
+    }, '[test]');
+
+    const reported = mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.at(-1)?.[0]?.classification;
+    expect(reported).toMatchObject({ sourceProviderAccountId: 'acct-b', sourceProviderOrganizationId: 'org-b',
+      providerReportedOrganizationId: 'org-b', groupGeneration: 5, credentialRevision: 'csr_8123456789ABCDEFGHJKMNPQRS' });
+    // The daemon's unchanged poisoning guard can now attribute the failure to the member that issued it.
+    const resolved = await resolveRuntimeAuthFailureSourceProfile({
+      classification: reported as Parameters<typeof resolveRuntimeAuthFailureSourceProfile>[0]['classification'],
+      getGroupMembers: async () => [{ profileId: 'claude-a', enabled: true }, { profileId: 'claude-b', enabled: true }],
+      resolveProviderAccountIdentity: async (profileId) => profileId === 'claude-a'
+        ? { providerAccountId: 'acct-a', providerOrganizationId: 'org-a' }
+        : { providerAccountId: 'acct-b', providerOrganizationId: 'org-b' },
+    });
+    expect(resolved.profileId).toBe('claude-b');
+  });
+
+  it.each([
+    { name: 'generation', next: { generation: 5 } },
+    { name: 'credential revision', next: { credentialRevision: 'csr_8123456789ABCDEFGHJKMNPQRS' } },
+  ])('reports the request identity unproven when the fence $name moves during its read', async ({ next }) => {
+    let truth: { kind: 'current_auth_group_available'; groupId: string; generation: number; credentialRevision: string } = {
+      kind: 'current_auth_group_available', groupId: 'team-pool', generation: 4,
+      credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' };
+    const session = {
+      connectedServiceAuthGroupRequestFence: { readCurrentTruth: () => truth },
+      client: { sessionId: `fence-moves-${Object.keys(next)[0]}`, sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
+    };
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-a', organizationUuid: 'org-a' });
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
+    // Another session switches the shared home and this session's fence while the read is pending.
+    identityReadGate.before = async () => {
+      await writeMaterializedClaudeConfig({ accountUuid: 'acct-b', organizationUuid: 'org-b' });
+      truth = { ...truth, ...next };
+    };
+    try {
+      await captureClaudeRuntimeAuthRequestIdentity(session);
+    } finally {
+      identityReadGate.before = null;
+    }
+    await surfaceClaudeRateLimitRuntimeIssue(session, {
+      ...passiveUtilizationDetails(), limitCategory: 'usage_limit', utilization: 100,
+    }, '[test]');
+    const reported = mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.at(-1)?.[0]?.classification;
+    // Never a later account paired with the earlier dispatched generation.
+    expect(reported).toMatchObject({ groupGeneration: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS',
+      sourceProviderAccountId: null, sourceProviderOrganizationId: null });
+  });
+
+  it('keeps the request-bound identity when the fence is stable across its read', async () => {
+    const truth = { kind: 'current_auth_group_available' as const, groupId: 'team-pool', generation: 4,
+      credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' };
+    const session = {
+      connectedServiceAuthGroupRequestFence: { readCurrentTruth: () => ({ ...truth }) },
+      client: { sessionId: 'fence-stable', sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
+    };
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-a', organizationUuid: 'org-a' });
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
+    await captureClaudeRuntimeAuthRequestIdentity(session);
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-b', organizationUuid: 'org-b' });
+    await surfaceClaudeRateLimitRuntimeIssue(session, {
+      ...passiveUtilizationDetails(), limitCategory: 'usage_limit', utilization: 100,
+    }, '[test]');
+    expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.at(-1)?.[0]?.classification).toMatchObject({
+      groupGeneration: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS',
+      sourceProviderAccountId: 'acct-a', sourceProviderOrganizationId: 'org-a' });
   });
 
   it('reports a rejected provider organization acknowledgement on the default log', async () => {
@@ -1613,6 +1741,8 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
 
   it('enriches passive quota evidence with the live account identity → source-linked PAU (soft-switch eligible)', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'acct_live_uuid', emailAddress: 'pool@happier.dev', organizationUuid: 'org-pool' });
+    // A group home's identity is attributable only with the provenance naming the session's tuple.
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
 
     await recordClaudeRateLimitQuotaEvidence({
       client: { sessionId: 'sess_r34_passive' },
@@ -1638,6 +1768,8 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
 
   it('preserves burn history when repeated native Claude observations attest the same user and organization', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'acct_live_uuid', organizationUuid: 'org-live' });
+    // A group home's identity is attributable only with the provenance naming the session's tuple.
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     const selection = process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY];
     if (!selection) throw new Error('Expected the connected-service selection fixture.');
     const runtimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
@@ -1681,6 +1813,8 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
 
   it('stamps the live identity onto the rejected usage-limit snapshot too', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'acct_live_uuid', organizationUuid: 'org-live' });
+    // A group home's identity is attributable only with the provenance naming the session's tuple.
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     const failTurn = createClaudeFailTurnSpy();
 
     await surfaceClaudeRateLimitRuntimeIssue({

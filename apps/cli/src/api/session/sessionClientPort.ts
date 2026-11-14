@@ -1,3 +1,4 @@
+import type { TurnCompletionContract } from '@/daemon/connectedServices/connectedServiceTurnLifecycleContract';
 import type { RpcHandlerManagerLike } from '@/api/rpc/types';
 import type { RawJSONLines } from '@/backends/claude/types';
 import type { ACPMessageData, ACPProvider, SessionEventMessage } from './sessionMessageTypes';
@@ -178,6 +179,12 @@ export interface SessionClientPort {
   keepAlive(thinking: boolean, mode: 'local' | 'remote'): void;
 
   getMetadataSnapshot(): Metadata | null;
+  /**
+   * A provider runner marks the active turn as released on its own non-error result; only that
+   * turn's completed terminal then carries the contract to the daemon. Optional: ports without it
+   * report every completion without provenance.
+   */
+  markResultBoundTurnCompletion?(contract: TurnCompletionContract): void;
   hasPendingProviderInputAcceptance?(localId: string): boolean;
   hasCanonicalPendingProviderInputDelivery?(localId: string): boolean;
   blockPendingMessageDelivery?(params: Readonly<{
