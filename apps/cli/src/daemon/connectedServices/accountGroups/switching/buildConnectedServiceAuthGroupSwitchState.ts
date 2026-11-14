@@ -7,6 +7,7 @@ import {
   type ConnectedServiceAuthGroupPolicyV1,
 } from '../selection/selectConnectedServiceAuthGroupCandidate';
 import type { ConnectedServiceAuthGroupSwitchState } from './ConnectedServiceAuthGroupSwitchCoordinator';
+import type { ConnectedServiceMemberHoldView } from '../holds/connectedServiceMemberHolds';
 
 export function normalizeConnectedServiceAuthGroupPolicy(value: ConnectedServiceAuthGroupV1['policy']): ConnectedServiceAuthGroupPolicyV1 {
   return {
@@ -103,6 +104,7 @@ export function buildConnectedServiceAuthGroupSwitchState(input: Readonly<{
   group: ConnectedServiceAuthGroupV1;
   runtimeQuotaSnapshots: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore;
   nowMs: number;
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): ConnectedServiceAuthGroupSwitchState {
   const runtimeMemberStates = input.runtimeQuotaSnapshots.buildMemberStates({
     serviceId: input.group.serviceId,
@@ -113,21 +115,25 @@ export function buildConnectedServiceAuthGroupSwitchState(input: Readonly<{
   return buildConnectedServiceAuthGroupSwitchStateFromMemberRuntimeStates({
     group: input.group,
     runtimeMemberStates,
+    memberHolds: input.memberHolds,
   });
 }
 
 export function buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState(input: Readonly<{
   group: ConnectedServiceAuthGroupV1;
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): ConnectedServiceAuthGroupSwitchState {
   return buildConnectedServiceAuthGroupSwitchStateFromMemberRuntimeStates({
     group: input.group,
     runtimeMemberStates: new Map(),
+    memberHolds: input.memberHolds,
   });
 }
 
 function buildConnectedServiceAuthGroupSwitchStateFromMemberRuntimeStates(input: Readonly<{
   group: ConnectedServiceAuthGroupV1;
   runtimeMemberStates: ReadonlyMap<string, ConnectedServiceAuthGroupMemberRuntimeState>;
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): ConnectedServiceAuthGroupSwitchState {
   const memberStatesByProfileId = new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>();
   for (const member of input.group.members) {
@@ -153,5 +159,6 @@ function buildConnectedServiceAuthGroupSwitchStateFromMemberRuntimeStates(input:
       createdAtMs: member.createdAt,
     })),
     memberStatesByProfileId,
+    memberHolds: input.memberHolds,
   };
 }

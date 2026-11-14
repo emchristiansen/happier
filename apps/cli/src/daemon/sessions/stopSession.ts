@@ -1,3 +1,4 @@
+import type { ChildProcess } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import { spawnBackgroundSync } from '@happier-dev/cli-common/process';
 import type { TerminalHostAdapter } from '@/integrations/terminalHost/_types';
@@ -32,6 +33,7 @@ import { processInstanceFingerprintsProveDifferentInstances } from '../processIn
 import { isPidSafeHappySessionProcess } from '../pidSafety';
 import { resolveTrackedSessionTerminalPresentation } from './resolveTrackedSessionTerminalPresentation';
 import type { TrackedSession } from '../types';
+import { readDaemonOwnedRunnerProcessGroupLeader, waitForOwnedRunnerProcessGroupEmpty } from './daemonOwnedRunnerProcessGroup';
 import { recordTerminalHostKillAudit } from '@/daemon/sessionKillAudit';
 import {
   incompleteStopSession,
@@ -50,6 +52,11 @@ function mapDispositionFailureReason(
     : reason === 'descriptor_retirement_failed'
       ? 'terminal_attachment_descriptor_retirement_failed'
     : reason;
+}
+
+function holdsOwnedProcessGroupLeader(session: TrackedSession | undefined, exactRunner: ExactStopRunner): boolean {
+  if (!session || session.pid !== exactRunner.pid) return false;
+  return readDaemonOwnedRunnerProcessGroupLeader(session) === exactRunner.ownedProcessGroupLeader;
 }
 
 function isTrackedChildStillLiveForPid(session: TrackedSession, pid: number): boolean {
@@ -204,26 +211,28 @@ async function forceKillTrackedRunner(params: Readonly<{
   if (root && !isTrackedChildStillLiveForPid(params.expectedSession, params.pid)) {
     return 'not_signaled';
   }
+  // Only the daemon's own runner spawn (`detached: true`) makes the runner lead its own process
+  // group; a reattached, tmux, hosted-terminal or terminal-started runner is a bare PID here.
+  const processGroup = root ? 'owned' as const : undefined;
   try {
     if (!readExactRunnerIdentity) {
-      await killProcessTree(root ?? { pid: params.pid }, { graceMs: 1 });
+      // An ordinary Stop keeps best-effort cleanup; `snapshot` coverage guarantees no whole tree.
+      const { coverage } = await killProcessTree(root ?? { pid: params.pid }, { graceMs: 1, processGroup });
+      logger.debug(
+        `[DAEMON RUN] Forced process-tree termination of session ${params.normalizedSessionId} (pid=${params.pid}) reached ${coverage} coverage`,
+      );
     } else {
       // An exact runner's root is signalled only while it is still that incarnation: the helper awaits
       // between signals, and a reused pid must never receive the escalation.
       const outcome = await killProcessTreeGuarded(root ?? { pid: params.pid }, {
         graceMs: 1,
+        processGroup,
         readRootIdentity: () => readExactRunnerIdentity(params.pid),
       });
       if (outcome !== 'completed') {
-        if (outcome === 'root_unreadable_suspended') {
-          params.logWarning(
-            `[DAEMON RUN] Exact-runner Stop left PID ${params.pid} for session ${params.normalizedSessionId} SIGSTOPped: its process instance could not be re-identified after suspension, so it was neither resumed nor killed. Stop is incomplete; inspect and resume or kill PID ${params.pid} manually.`,
-          );
-        } else {
-          params.logWarning(
-            `[DAEMON RUN] Exact-runner forced Stop for session ${params.normalizedSessionId} stopped signalling PID ${params.pid} (${outcome}); Stop is incomplete`,
-          );
-        }
+        params.logWarning(
+          `[DAEMON RUN] Exact-runner forced Stop for session ${params.normalizedSessionId} stopped signalling PID ${params.pid} (${outcome}); Stop is incomplete`,
+        );
         return 'exact_runner_incomplete';
       }
     }
@@ -236,21 +245,36 @@ async function forceKillTrackedRunner(params: Readonly<{
       `[DAEMON RUN] Failed to force-kill session ${params.normalizedSessionId} (pid=${params.pid}):`,
       error,
     );
-    return 'not_signaled';
+    // An exact runner's cleanup that could not be verified (for example, members of its group outlived
+    // its root) is incomplete; a later exit probe of the root PID alone must not count it as stopped.
+    return readExactRunnerIdentity ? 'exact_runner_incomplete' : 'not_signaled';
   }
 }
 
 /**
  * `exact_runner_incomplete`: the exact runner's root stopped being identifiable or became another
- * process during forced escalation. That is never completed cleanup.
+ * process during forced escalation, or its owned process group could no longer be validated, so it
+ * was sent nothing further; or its termination could not be verified. That is never completed cleanup.
  */
+// After the root exits, its process-group members normally finish their own SIGTERM handling shortly.
+const EXACT_RUNNER_GROUP_EXIT_TIMEOUT_MS = 3_000;
+const EXACT_RUNNER_GROUP_EXIT_POLL_MS = 25;
+
 type ForcedRunnerKillResult = 'signaled' | 'not_signaled' | 'exact_runner_incomplete';
 
 /**
  * The one runner incarnation a replacement Stop may signal. Stop refuses, signalling nothing, unless
  * this pid is the session's only tracked runner, and re-verifies the process instance before every signal.
  */
-export type ExactStopRunner = Readonly<{ pid: number; processInstanceFingerprint: string }>;
+export type ExactStopRunner = Readonly<{
+  pid: number;
+  processInstanceFingerprint: string;
+  /**
+   * The daemon's live spawn of this runner, which leads the runner's process group. Stop signals
+   * nothing unless the session's tracked runner still holds this same handle.
+   */
+  ownedProcessGroupLeader: ChildProcess;
+}>;
 export type StopSessionOptions = Readonly<{ exactRunner?: ExactStopRunner }>;
 
 function selectTrackedRunnersForStop(
@@ -353,6 +377,12 @@ export function createStopSession(params: Readonly<{
       : undefined;
     if (exactRunner && !isExactStopRunnerSoleTrackedRunner({ pidToTrackedSession, sessionId: normalizedSessionId, exactRunner })) {
       logWarning(`[DAEMON RUN] Refusing exact-runner Stop for session ${normalizedSessionId}: PID ${exactRunner.pid} is not the session's only tracked runner`);
+      return incompleteStopSession('runner_signal_incomplete');
+    }
+    // An exact-runner Stop retires the runner for a replacement, so it must reach the runner's whole
+    // tree. Only the daemon's own process-group-leader spawn can: refuse anything else before any signal.
+    if (exactRunner && !holdsOwnedProcessGroupLeader(pidToTrackedSession.get(exactRunner.pid), exactRunner)) {
+      logWarning(`[DAEMON RUN] Refusing exact-runner Stop for session ${normalizedSessionId}: PID ${exactRunner.pid} is not the daemon's own live process-group-leader spawn`);
       return incompleteStopSession('runner_signal_incomplete');
     }
 
@@ -554,6 +584,17 @@ export function createStopSession(params: Readonly<{
         logPidReuseRefusal(`[DAEMON RUN] Refusing to signal PID ${pid} for session ${normalizedSessionId} (exact runner instance changed)`);
         continue;
       }
+      // Admission held custody before the awaits above, which the root's exit can overtake: the exit
+      // lifecycle retires the record and its group stops being this runner's. Re-establish custody
+      // synchronously at the signal itself; stale custody sends nothing, by group or by handle.
+      if (exactRunner && (
+        pidToTrackedSession.get(pid) !== session
+        || !holdsOwnedProcessGroupLeader(session, exactRunner)
+        || readExactRunnerIdentity?.(pid) !== 'same'
+      )) {
+        logPidReuseRefusal(`[DAEMON RUN] Refusing to signal PID ${pid} for session ${normalizedSessionId} (exact runner custody ended before the signal)`);
+        continue;
+      }
 
       if (session.startedBy === 'daemon' && session.childProcess) {
         if (process.platform === 'win32') {
@@ -730,6 +771,20 @@ export function createStopSession(params: Readonly<{
         );
         return incompleteStopSession('runner_exit_timeout');
       }
+    }
+
+    // Every arm above (already exited, graceful wait, forced escalation) proves only that the root
+    // PID is gone. An exact-runner Stop retires the runner for a replacement, so it also needs the
+    // runner's whole owned process group gone: a member that survived the root would keep running
+    // beside the replacement. Nothing is signalled here; an unproven empty group is incomplete.
+    if (exactRunner && process.platform !== 'win32' && !await waitForOwnedRunnerProcessGroupEmpty(exactRunner.pid, {
+      timeoutMs: EXACT_RUNNER_GROUP_EXIT_TIMEOUT_MS,
+      pollIntervalMs: EXACT_RUNNER_GROUP_EXIT_POLL_MS,
+    })) {
+      logWarning(
+        `[DAEMON RUN] Exact-runner root PID ${exactRunner.pid} exited, but its process group still has members (or could not be proven empty); Stop is incomplete for session ${normalizedSessionId}`,
+      );
+      return incompleteStopSession('runner_exit_timeout');
     }
 
     logger.infoFile('[DAEMON STOP] Runner exit proven', {

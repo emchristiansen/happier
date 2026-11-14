@@ -21,6 +21,7 @@ import { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } from './nativeAuth/claudeCodeCred
 import { materializeClaudeConnectedServiceRuntimeAuthSelection } from './materializeClaudeConnectedServiceRuntimeAuthSelection';
 import { resolveClaudeConnectedServiceStableConfigDir } from './resolveClaudeConnectedServiceStableAuthDir';
 import { CLAUDE_HOME_TRANSCRIPT_RETENTION_CLEANUP_PERIOD_DAYS } from './claudeTranscriptRetentionSettings';
+import { writeConnectedServiceStateSharingManifest } from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingManifest';
 
 // Server HTTP boundary mock: the persisted-metadata continuity fallback fetches the session
 // snapshot from the server; unit tests must never hit the network.
@@ -28,6 +29,35 @@ const mockFetchSessionByIdCompat = vi.hoisted(() => vi.fn(async (): Promise<unkn
 vi.mock('@/session/transport/http/sessionsHttp', () => ({
   fetchSessionByIdCompat: mockFetchSessionByIdCompat,
 }));
+
+/**
+ * In production every Claude home is produced (and its admitted native source recorded) by a spawn
+ * before an account switch rematerializes it; these fixtures skip that production, so they record,
+ * for the `work` group home and its active `backup` profile home, the source their `processEnv` names.
+ */
+async function seedAdmittedClaudeGroupHomeSources(
+  activeServerDir: string,
+  nativeSourceEnv: Readonly<Record<string, string>>,
+): Promise<void> {
+  const homes = [
+    resolveClaudeConnectedServiceStableConfigDir({
+      activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: 'backup',
+      selection: { kind: 'group', groupId: 'work' },
+    }),
+    resolveClaudeConnectedServiceStableConfigDir({
+      activeServerDir, serviceId: 'claude-subscription', fallbackProfileId: 'backup',
+      selection: { kind: 'profile', profileId: 'backup' },
+    }),
+  ];
+  for (const home of homes) {
+    if (!home) throw new Error('fixture: Claude config dir must resolve');
+    await writeConnectedServiceStateSharingManifest(home, {
+      v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+      configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+      nativeSourceEnv,
+    });
+  }
+}
 
 const CURRENT_CREDENTIAL_REVISION = 'csr_7123456789ABCDEFGHJKMNPQRS' as const;
 
@@ -202,6 +232,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
       },
     };
 
+    await seedAdmittedClaudeGroupHomeSources(activeServerDir, { CLAUDE_CONFIG_DIR: sourceClaudeConfigDir, HOME: homeDir });
     const result = await materializeClaudeConnectedServiceRuntimeAuthSelection({
       credentials: {
         token: 'token',
@@ -799,6 +830,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
       },
     };
 
+    await seedAdmittedClaudeGroupHomeSources(activeServerDir, { CLAUDE_CONFIG_DIR: sourceClaudeConfigDir, HOME: homeDir });
     const result = await materializeClaudeConnectedServiceRuntimeAuthSelection({
       credentials: {
         token: 'token',
@@ -955,6 +987,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
       },
     };
 
+    await seedAdmittedClaudeGroupHomeSources(activeServerDir, { CLAUDE_CONFIG_DIR: sourceClaudeConfigDir, HOME: homeDir });
     const result = await materializeClaudeConnectedServiceRuntimeAuthSelection({
       credentials: {
         token: 'token',
@@ -1122,6 +1155,7 @@ describe('materializeClaudeConnectedServiceRuntimeAuthSelection', () => {
         },
       };
 
+      await seedAdmittedClaudeGroupHomeSources(activeServerDir, { CLAUDE_CONFIG_DIR: sourceClaudeConfigDir, HOME: homeDir });
       const result = await materializeWithFixedUuid({
         credentials: {
           token: 'token',

@@ -579,6 +579,104 @@ describe('claude sdk query exit handling', () => {
     }
   });
 
+  it.runIf(process.platform === 'linux').each(['snapshot-only', 'owned-group'] as const)('retires provider tasks after ordinary cleanup only on whole-group proof (%s)', async (cleanupKind) => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'happier-claude-cleanup-proof-'));
+    const pidPath = join(tmpRoot, 'native-pid');
+    const ackPath = join(tmpRoot, 'native-ack');
+    // The first-party launcher runs this native provider as its child, inside the launcher's own group.
+    // It ignores SIGTERM, acknowledges SIGUSR2 and closes its output after the result.
+    const script = writeExecutableShimSync({ dir: tmpRoot, fileName: 'provider', contents: `#!${process.execPath}
+      const fs = require('node:fs');
+      process.on('SIGTERM', () => {});
+      process.on('SIGUSR2', () => fs.writeFileSync(${JSON.stringify(ackPath)}, String(process.pid)));
+      fs.writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));
+      fs.writeSync(1, JSON.stringify({ type: 'system', subtype: 'init', session_id: 'owned-session' }) + '\\n');
+      process.stdin.once('data', () => {
+        fs.writeSync(1, JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n');
+        fs.closeSync(1); fs.closeSync(2);
+      });
+      setInterval(() => {}, 1000);
+    ` });
+    const hookSettingsPath = join(tmpRoot, 'hooks.json');
+    writeFileSync(hookSettingsPath, '{}');
+    const env = createEnvKeyScope(['HAPPIER_CLAUDE_PATH', 'HAPPIER_JS_RUNTIME_PATH']);
+    env.patch({ HAPPIER_CLAUDE_PATH: script, HAPPIER_JS_RUNTIME_PATH: process.execPath });
+    if (cleanupKind === 'snapshot-only') {
+      // Explicit OS seams: an empty process enumeration, and (below) an unreadable root group, so
+      // cleanup can only fall back to root-and-snapshot signals and cannot see the native child.
+      vi.doMock('ps-list', () => ({ default: async () => [] }));
+      vi.resetModules();
+    }
+    const fs = await import('node:fs');
+    const { claudeRemote } = await import('../claudeRemote');
+    const ledger = createClaudeProviderActivityLedger();
+    ledger.apply({ type: 'started', sessionId: 'owned-session', taskId: 'native-child' });
+    const adapter = createClaudeProviderRuntimeActivityAdapter({ providerActivityLedger: ledger,
+      contributionHandle: { report: async () => {}, markUnknown: async () => {}, dispose: async () => {} } });
+    const losses: unknown[] = [];
+    const handleRuntimeLoss = adapter.handleRuntimeLoss.bind(adapter);
+    adapter.handleRuntimeLoss = async (...args: Parameters<typeof handleRuntimeLoss>) => {
+      losses.push(args);
+      return await handleRuntimeLoss(...args);
+    };
+    let sent = false;
+    let nativePid = 0;
+    let rootPid = 0;
+    let restoreGroupRead: (() => void) | undefined;
+    const spawnIndex = vi.mocked(spawn).mock.results.length;
+    try {
+      const failure = await withTimeout(claudeRemote({ path: tmpRoot, sessionId: null, transcriptPath: null, hookSettingsPath,
+        runtimeActivityAdapter: adapter,
+        // Ordinary cleanup: the consumer has no further input.
+        nextMessage: async () => {
+          if (sent) return null;
+          sent = true;
+          return { message: 'hi', mode: { permissionMode: 'default' } };
+        },
+        onReady: async () => {
+          const rootResult = vi.mocked(spawn).mock.results[spawnIndex];
+          if (rootResult?.type !== 'return' || !rootResult.value.pid) throw new Error('Expected actual launcher PID');
+          rootPid = rootResult.value.pid;
+          nativePid = Number(readFileSync(pidPath, 'utf8'));
+          if (cleanupKind !== 'snapshot-only') return;
+          const readFileSyncActual = fs.default.readFileSync;
+          const spy = vi.spyOn(fs.default, 'readFileSync').mockImplementation(((path: unknown, ...rest: unknown[]) => {
+            if (path === `/proc/${rootPid}/stat`) throw Object.assign(new Error('fixture EIO'), { code: 'EIO' });
+            return (readFileSyncActual as (...args: unknown[]) => unknown)(path, ...rest);
+          }) as typeof fs.default.readFileSync);
+          restoreGroupRead = () => spy.mockRestore();
+        },
+        onSessionFound: () => {}, onMessage: () => {}, isAborted: () => false,
+        canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+      }).then(() => null, (error: unknown) => error), 15_000, 'ordinary provider cleanup');
+      restoreGroupRead?.();
+      expect(nativePid).toBeGreaterThan(0);
+
+      if (cleanupKind === 'owned-group') {
+        // The launcher's own group was signalled to the end: the native child stopped, so the tasks retire.
+        await vi.waitFor(() => expect(isPidAlive(nativePid)).toBe(false), { timeout: 5_000 });
+        expect(failure).toBeNull();
+        expect(losses).toEqual([['claude_process_exit', { providerStopped: true }]]);
+        expect(ledger.getActiveProviderTaskCount()).toBe(0);
+        return;
+      }
+      // Root-and-snapshot cleanup could not reach the native child, which is still executing: its
+      // tasks stay active and the exit is reported unverified instead of stopped.
+      process.kill(nativePid, 'SIGUSR2');
+      await vi.waitFor(() => expect(readFileSync(ackPath, 'utf8')).toBe(String(nativePid)), { timeout: 5_000 });
+      expect(isPidAlive(nativePid)).toBe(true);
+      // The unverified exit is followed by the existing cleanup-failure report; neither retires tasks.
+      expect(losses).toEqual([['claude_process_exit', { providerStopped: false }], ['claude_process_cleanup_failed']]);
+      expect(ledger.getActiveProviderTaskCount()).toBe(1);
+      expect(failure).toMatchObject({ code: 'claude_native_provider_exit_unverified' });
+    } finally {
+      restoreGroupRead?.();
+      if (nativePid > 0) { try { process.kill(nativePid, 'SIGKILL'); } catch { /* already gone */ } }
+      if (rootPid > 0) { try { process.kill(rootPid, 'SIGKILL'); } catch { /* already gone */ } }
+      env.restore();
+    }
+  }, 30_000);
+
   it('rejects the consumer when the subprocess exits non-zero (no hang)', async () => {
     const originalDebug = process.env.DEBUG;
     delete process.env.DEBUG;

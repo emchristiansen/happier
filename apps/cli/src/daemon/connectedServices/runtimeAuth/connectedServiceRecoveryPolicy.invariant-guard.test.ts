@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ApiClient } from '@/api/api';
 import type { Credentials } from '@/persistence';
 import { resolveConnectedServiceAuthForSpawn } from '../resolveConnectedServiceAuthForSpawn';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 import { decideConnectedServiceRecovery } from './ConnectedServiceRecoveryPolicy';
 
 const baseIssue = {
@@ -168,6 +169,7 @@ describe('connected service recovery invariant guard', () => {
     };
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,

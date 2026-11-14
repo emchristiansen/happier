@@ -129,8 +129,10 @@ describe.skipIf(process.platform !== 'linux')('launchOwnedTerminalProcess after 
       await owned.terminate();
       const exit = await owned.whenExited;
       expect(isRunning(nativePid)).toBe(false);
-      // Stop evidence comes from the owned tree, not from the launcher's operation-error status.
-      expect(exit).toMatchObject({ processTreeStopped: true });
+      // Stop evidence is the launcher's report of the native child's actual exit, not its
+      // operation-error status. The launcher leads no group, so its snapshot cleanup is no tree proof.
+      expect(exit).toMatchObject({ nativeExited: true });
+      expect(exit).not.toHaveProperty('processTreeStopped');
     });
   }, 60_000);
 

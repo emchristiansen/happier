@@ -18,6 +18,7 @@ import type {
   ConnectedServiceQuotaRecoveryCreditConsumeReceiptV1,
 } from '@happier-dev/protocol';
 import { evaluatePredictiveSoftSwitchSessionApplyPolicy } from '../predictiveSoftSwitchPolicy';
+import type { ConnectedServiceMemberHoldView } from '../../holds/connectedServiceMemberHolds';
 
 export type ConnectedServiceAuthGroupSwitchState = Readonly<{
   serviceId: string;
@@ -32,6 +33,8 @@ export type ConnectedServiceAuthGroupSwitchState = Readonly<{
   policy: ConnectedServiceAuthGroupPolicyV1;
   members: ReadonlyArray<ConnectedServiceAuthGroupMember>;
   memberStatesByProfileId: ReadonlyMap<string, ConnectedServiceAuthGroupMemberRuntimeState>;
+  /** Externally known member holds, read for this decision. */
+  memberHolds: ConnectedServiceMemberHoldView;
   /** Models requested or applied by live sessions sharing this pool. */
   requiredModelIds?: ReadonlyArray<string>;
   quotaProbeDeferredUntilMsByProfileId?: ReadonlyMap<string, number>;

@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 import { describe, expect, it } from 'vitest';
 import { ConnectedServiceAuthGroupPolicyV1Schema, type ConnectedServiceAuthGroupV1 } from '@happier-dev/protocol';
 
@@ -38,7 +39,7 @@ function groupWithPersistedState(state: ConnectedServiceAuthGroupV1['members'][n
 
 describe('buildConnectedServiceAuthGroupSwitchState', () => {
   it('retains canonical model-specific cooldowns when rebuilding persisted state', () => {
-    const switchState = buildConnectedServiceAuthGroupSwitchState({
+    const switchState = buildConnectedServiceAuthGroupSwitchState({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       group: groupWithPersistedState({ modelUnavailableUntilMsByModelId: { 'model-M': 86_401_000 } }),
       runtimeQuotaSnapshots: new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore(),
       nowMs: 1_000,
@@ -78,7 +79,7 @@ describe('buildConnectedServiceAuthGroupSwitchState', () => {
   });
 
   it('preserves recognized persisted member runtime state used by candidate selection', () => {
-    const switchState = buildConnectedServiceAuthGroupSwitchState({
+    const switchState = buildConnectedServiceAuthGroupSwitchState({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       group: groupWithPersistedState({
         credentialHealthStatus: 'connected',
         cooldownUntilMs: 2_000,
@@ -129,7 +130,7 @@ describe('buildConnectedServiceAuthGroupSwitchState', () => {
       },
     });
 
-    const switchState = buildConnectedServiceAuthGroupSwitchState({
+    const switchState = buildConnectedServiceAuthGroupSwitchState({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       group: groupWithPersistedState({
         lastFailureKind: 'usage_limit',
         lastObservedAtMs: 900,

@@ -8,6 +8,7 @@ import type { ProviderAccountUsageStore } from '../../accountUsage/store';
 import { projectProviderAccountUsageSnapshotToAuthGroupRuntimeState } from '../quotas/projection';
 import type { ConnectedServiceAuthGroupMemberRuntimeState } from '../selection/selectConnectedServiceAuthGroupCandidate';
 import type { ConnectedServiceAuthGroupSwitchState } from './ConnectedServiceAuthGroupSwitchCoordinator';
+import type { ConnectedServiceMemberHoldView } from '../holds/connectedServiceMemberHolds';
 import {
   buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState,
   mergePersistedMemberRuntimeState,
@@ -80,6 +81,7 @@ export function buildConnectedServiceAuthGroupSwitchStateFromAccountUsage(input:
   changedProfileId?: string | null;
   changedSnapshot?: ProviderAccountUsageSnapshotV1 | null;
   changedGroupGeneration?: number | null;
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): Readonly<{
   kind: 'source_backed' | 'provisional';
   state: ConnectedServiceAuthGroupSwitchState;
@@ -89,7 +91,7 @@ export function buildConnectedServiceAuthGroupSwitchStateFromAccountUsage(input:
   if (snapshotsByProfileId.size === 0) {
     return {
       kind: 'provisional',
-      state: buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group: input.group }),
+      state: buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group: input.group, memberHolds: input.memberHolds }),
       sourceRefsByProfileId: new Map(),
     };
   }
@@ -135,6 +137,7 @@ export function buildConnectedServiceAuthGroupSwitchStateFromAccountUsage(input:
         createdAtMs: member.createdAt,
       })),
       memberStatesByProfileId,
+      memberHolds: input.memberHolds,
     },
     sourceRefsByProfileId,
   };

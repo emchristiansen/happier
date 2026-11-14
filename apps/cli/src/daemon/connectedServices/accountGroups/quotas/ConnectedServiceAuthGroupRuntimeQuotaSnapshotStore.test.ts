@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from './ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
@@ -355,7 +356,7 @@ describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
         { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true },
         { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
       ],
-      memberStatesByProfileId: store.buildMemberStates({
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: store.buildMemberStates({
         serviceId: 'openai-codex',
         groupId: 'main',
         capturedAtMs: 2_500,
@@ -622,7 +623,7 @@ describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
         { profileId: 'active', priority: 1, createdAtMs: 1, enabled: true },
         { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
       ],
-      memberStatesByProfileId,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId,
     });
 
     expect(selected.selected?.profileId).toBe('backup');
@@ -718,7 +719,7 @@ describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
         ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1,
         softSwitchRemainingPercent: 15,
       },
-      memberStatesByProfileId,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId,
       quotaFreshnessMs: 1_000,
     } as const;
 

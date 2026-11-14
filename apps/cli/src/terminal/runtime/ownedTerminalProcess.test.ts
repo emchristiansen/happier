@@ -12,6 +12,7 @@ import { readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/proc
 import { launchOwnedTerminalProcess } from './ownedTerminalProcess';
 import { createUnreadTerminalArtifactsCleanup, prepareOwnedTerminalSpawn } from './terminalLaunchSpec';
 import { killProcessTree } from '@/agent/runtime/process/killProcessTree';
+import { killProcessTree as terminateWithEnumeration } from '../../../scripts/process_tree.cjs';
 import { isPidAlive, waitForProcessExit } from '@/testkit/process/spawn';
 
 describe('launchOwnedTerminalProcess', () => {
@@ -37,13 +38,67 @@ describe('launchOwnedTerminalProcess', () => {
       expect(native.launcherPid).toBe(launcher!.pid);
       expect(native.pid).not.toBe(launcher!.pid);
       await launched.terminate();
-      expect(await launched.whenExited).toMatchObject({ processTreeStopped: true });
+      // The launcher leads no group of its own (TTY job control), so its cleanup has only snapshot
+      // coverage: the native child is gone here, but that cleanup is not reported as whole-tree proof.
+      expect(await launched.whenExited).not.toHaveProperty('processTreeStopped');
       expect(isPidAlive(native.pid)).toBe(false);
     } finally {
       if (launcher) await killProcessTree(launcher);
       await prepared.cleanupUnreadArtifacts?.();
       await rm(directory, { recursive: true, force: true });
     }
+  });
+  it.runIf(process.platform === 'linux')('does not report snapshot cleanup as tree proof beside a surviving native child', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'happier-terminal-snapshot-survivor-'));
+    const nativeIdentityPath = join(directory, 'native.json');
+    const ackPath = join(directory, 'native-ack');
+    const prepared = await prepareOwnedTerminalSpawn({ command: process.execPath,
+      args: ['-e', `const fs=require('node:fs');process.on('SIGTERM',()=>{});process.on('SIGHUP',()=>{});`
+        + `process.on('SIGUSR2',()=>fs.writeFileSync(${JSON.stringify(ackPath)},String(process.pid)));`
+        + `fs.writeFileSync(${JSON.stringify(nativeIdentityPath)},JSON.stringify({pid:process.pid}));setInterval(()=>{},1000)`],
+      cwd: directory, env: { PATH: process.env.PATH ?? '' } });
+    let native: { pid: number } | undefined;
+    let launcherPid: number | undefined;
+    try {
+      const launched = await launchOwnedTerminalProcess({ spawn: prepared, cwd: directory,
+        // The real termination owner with one explicit OS seam: an empty process snapshot, so cleanup
+        // reaches only the launcher root and misses its native child.
+        terminateProcess: async (child) => {
+          launcherPid = child.pid;
+          return await terminateWithEnumeration(child, { graceMs: 250 }, async () => []);
+        } });
+      await vi.waitFor(async () => { native = JSON.parse(await readFile(nativeIdentityPath, 'utf8')); });
+      await launched.terminate();
+      const exited = await launched.whenExited;
+      expect(exited).not.toHaveProperty('processTreeStopped');
+      expect(exited).not.toHaveProperty('nativeExited');
+      process.kill(native!.pid, 'SIGUSR2');
+      await vi.waitFor(async () => expect(await readFile(ackPath, 'utf8')).toBe(String(native!.pid)), { timeout: 5_000 });
+    } finally {
+      if (native) { try { process.kill(native.pid, 'SIGKILL'); } catch { /* already gone */ } }
+      if (launcherPid) await killProcessTree({ pid: launcherPid });
+      await prepared.cleanupUnreadArtifacts?.();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+  it.each([
+    [{ rootObservedAlive: true, coverage: 'process_group' as const }, true],
+    [{ rootObservedAlive: true, coverage: 'snapshot' as const }, false],
+    [undefined, false],
+  ])('reports tree proof only for whole-group cleanup (%o)', async (result, proven) => {
+    const child = Object.assign(new EventEmitter(), { pid: 42, exitCode: null as number | null, connected: true });
+    const spawnProcess = vi.fn(() => {
+      queueMicrotask(() => child.emit('message', { type: 'terminal-native-spawned' }));
+      return child;
+    });
+    const launched = await launchOwnedTerminalProcess({
+      spawn: { spawnArgv: ['/managed/node', '/happier/terminal_launch_spec_runner.cjs', '/tmp/launch.json'], spawnEnv: { PATH: '/bin' } },
+      cwd: '/workspace/project', spawnProcess: spawnProcess as never, terminateProcess: vi.fn(async () => result),
+    });
+    await launched.terminate();
+    child.emit('exit', null, 'SIGKILL');
+    child.emit('disconnect');
+    await expect(launched.whenExited).resolves.toEqual({ code: null, signal: 'SIGKILL', ...(proven ? { processTreeStopped: true } : {}) });
   });
   it('retries failed physical termination while coalescing each attempt and retaining successful completion', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'happier-terminal-termination-retry-'));

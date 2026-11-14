@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 import { ConnectedServiceQuotaMeterV1Schema } from '@happier-dev/protocol';
 import { buildConnectedServiceAuthGroupRuntimeStateFromMeters } from '../quotas/projection';
 import { describe, expect, it, vi } from 'vitest';
@@ -23,7 +24,7 @@ function state(activeProfileId: string, generation: number): ConnectedServiceAut
       { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true },
       { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
     ],
-    memberStatesByProfileId: new Map(),
+    memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(),
   };
 }
 
@@ -72,7 +73,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     let current: ConnectedServiceAuthGroupSwitchState = {
       ...state('backup', 2),
       members: [...state('backup', 2).members, { profileId: 'tertiary', priority: 3, enabled: true, createdAtMs: 3 }],
-      memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
         modelUnavailableUntilMsByModelId: { 'model-M': 86_401_000 },
       }])),
     };
@@ -123,7 +124,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         ...state('primary', 1).members,
         { profileId: 'tertiary', priority: 3, enabled: true, createdAtMs: 3 },
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', { modelUnavailableUntilMsByModelId: { 'model-M': 86_401_000 } }],
       ]),
     };
@@ -131,7 +132,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
       ...initial,
       activeProfileId: 'backup',
       generation: 2,
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ...initial.memberStatesByProfileId,
         ['backup', { modelUnavailableUntilMsByModelId: { 'model-M': 86_401_000 } }],
       ]),
@@ -181,7 +182,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         ...state('B', 2),
         requiredModelIds: scenario === 'live_model_control' ? [model] : [],
         members: ['A', 'B'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['A', { modelUnavailableUntilMsByModelId: { [model]: 100_000 } }],
           ['B', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 80 },
             modelUnavailableUntilMsByModelId: { [scenario === 'compatible_control' ? 'another-model' : model]: 100_000 } }],
@@ -215,7 +216,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
       let stored: ConnectedServiceAuthGroupSwitchState = {
         ...state('A', 1), requiredModelIds: [],
         members: ['A', 'B', 'C'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['A', { modelUnavailableUntilMsByModelId: { [model]: 100_000 } }],
           ['B', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 80 },
             modelUnavailableUntilMsByModelId: { [model]: 100_000 } }],
@@ -265,7 +266,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const log = vi.spyOn(logger, 'infoFile').mockImplementation(() => {});
     const coordinator = new ConnectedServiceAuthGroupSwitchCoordinator({
       leases: new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(), nowMs: () => 1_000, quotaFreshnessMs: 60_000,
-      loadState: async () => ({ ...state('backup', 7), memberStatesByProfileId: new Map([
+      loadState: async () => ({ ...state('backup', 7), memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['backup', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 90 } }],
       ]) }),
       commitSwitch: async () => { throw new Error('recipient must not select'); },
@@ -293,7 +294,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
       let current: ConnectedServiceAuthGroupSwitchState = {
         ...state(outcome === 'observed_generation' ? 'backup' : 'primary', 1),
         policy: { ...state('primary', 1).policy, softSwitchRemainingPercent: 15 },
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['primary', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: outcome === 'no_eligible_member' ? 0 : 10 } }],
           ['backup', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: outcome === 'switched' || outcome === 'observed_generation' ? 90 : 0 } }],
         ]),
@@ -323,7 +324,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     let current: ConnectedServiceAuthGroupSwitchState = {
       ...state('primary', 1),
       policy: { ...state('primary', 1).policy, softSwitchRemainingPercent: 15 },
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 10 } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 12 } }],
       ]),
@@ -344,7 +345,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         ...state('primary', 1).policy,
         quotaLimitSelection: { mode: 'selected', providerLimitIds: ['five_hour', 'seven_day_opus'] },
       },
-      memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId,
         buildConnectedServiceAuthGroupRuntimeStateFromMeters({
           capturedAtMs: 999,
           selection: { mode: 'selected', providerLimitIds: ['five_hour', 'seven_day_opus'] },
@@ -373,7 +374,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     let stored: ConnectedServiceAuthGroupSwitchState = {
       ...state('primary', 1),
       policy: { ...state('primary', 1).policy, autoUseQuotaResetsWhenExhausted: true },
-      memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
         quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 0, meters: [
           { meterId: 'weekly', limitCategory: 'usage_limit' as const, remainingPct: 0, resetAtMs: 100_000, providerLimitId: null },
         ] },
@@ -403,13 +404,13 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
   it.each(['before_debit', 'not_available'] as const)('adopts newly healthy quota %s without spending another reset', async (when) => {
     let stored: ConnectedServiceAuthGroupSwitchState = {
       ...state('primary', 1), policy: { ...state('primary', 1).policy, autoUseQuotaResetsWhenExhausted: true },
-      memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
         quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 0, meters: [
           { meterId: 'weekly', limitCategory: 'usage_limit' as const, remainingPct: 0, resetAtMs: 100_000, providerLimitId: null },
         ] },
       }])),
     };
-    const restore = () => { stored = { ...stored, memberStatesByProfileId: new Map(stored.memberStatesByProfileId).set('primary', {
+    const restore = () => { stored = { ...stored, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(stored.memberStatesByProfileId).set('primary', {
       quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 100 },
     }) }; };
     const debits: string[] = [];
@@ -435,7 +436,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const initial: ConnectedServiceAuthGroupSwitchState = {
       ...state('primary', 1),
       policy: { ...state('primary', 1).policy, autoUseQuotaResetsWhenExhausted: enabled },
-      memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
         quotaSnapshot: { capturedAtMs: 900, meters: [
           { meterId: 'weekly', limitCategory: 'usage_limit' as const, remainingPct: 0, resetAtMs: 100_000, providerLimitId: null },
         ] },
@@ -462,7 +463,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     let stored: ConnectedServiceAuthGroupSwitchState = {
       ...state('primary', 1),
       policy: { ...state('primary', 1).policy, autoUseQuotaResetsWhenExhausted: true },
-      memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(['primary', 'backup'].map((profileId) => [profileId, {
         quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 0, meters: [
           { meterId: 'weekly', limitCategory: 'usage_limit' as const, remainingPct: 0, resetAtMs: 100_000, providerLimitId: null },
         ] },
@@ -480,7 +481,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
       consumeAvailableRecoveryCreditForProfile: async ({ profileId }) => {
         if (profileId !== resetProfile) return { ok: false, errorCode: 'connected_service_quota_recovery_credit_not_available', error: 'not available' };
         redeemed.push(profileId);
-        stored = { ...stored, memberStatesByProfileId: new Map(stored.memberStatesByProfileId).set(profileId, {
+        stored = { ...stored, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(stored.memberStatesByProfileId).set(profileId, {
           quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 100 },
         }) };
         return { ok: true, snapshot: null, receipt: { idempotencyKey: `reset:${profileId}`, status: 'consumed' } };
@@ -1206,7 +1207,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
       emitEvent: (event) => events.push(event),
       loadState: async () => ({
         ...state('primary', 1),
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['backup', {
             providerResetsAtMs: 5_000,
             quotaSnapshot: {
@@ -1368,7 +1369,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         expect(observedProfileId).toBe('primary');
         currentState = {
           ...initialState,
-          memberStatesByProfileId: new Map([
+          memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
             ['primary', {
               quotaExhaustedUntilMs: 30_000,
               lastFailureKind: 'usage_limit',
@@ -1416,7 +1417,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const probeQuotaSnapshotsForGroup = vi.fn(async () => {
       current = {
         ...current,
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['primary', {
             quotaExhaustedUntilMs: 30_000,
             lastFailureKind: 'usage_limit',
@@ -1447,7 +1448,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         expect(input.observedProfileId).toBe('primary');
         current = {
           ...current,
-          memberStatesByProfileId: new Map([
+          memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
             ['primary', {
               quotaExhaustedUntilMs: 30_000,
               lastFailureKind: 'usage_limit',
@@ -1492,7 +1493,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
           { profileId: 'tertiary', priority: 3, createdAtMs: 3, enabled: true },
         ],
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['primary', {
             quotaExhaustedUntilMs: 30_000,
             lastFailureKind: 'usage_limit',
@@ -1567,7 +1568,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           { profileId: 'tertiary', priority: 2, createdAtMs: 2, enabled: true },
           { profileId: 'backup', priority: 3, createdAtMs: 3, enabled: true },
         ],
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['primary', {
             quotaExhaustedUntilMs: 30_000,
             lastFailureKind: 'usage_limit',
@@ -1626,7 +1627,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
           { profileId: 'tertiary', priority: 3, createdAtMs: 3, enabled: true },
         ],
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['primary', {
             quotaExhaustedUntilMs: 30_000,
             lastFailureKind: 'usage_limit',
@@ -1685,7 +1686,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
           { profileId: 'tertiary', priority: 3, createdAtMs: 3, enabled: true },
         ],
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['primary', {
             quotaExhaustedUntilMs: 30_000,
             lastFailureKind: 'usage_limit',
@@ -1737,7 +1738,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           { profileId: 'tertiary', priority: 2, createdAtMs: 2, enabled: true },
           { profileId: 'backup', priority: 3, createdAtMs: 3, enabled: true },
         ],
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['primary', {
             quotaExhaustedUntilMs: 30_000,
             lastFailureKind: 'usage_limit',
@@ -1793,7 +1794,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           return {
             ...state('primary', 1),
             members,
-            memberStatesByProfileId: new Map([
+            memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
               ['primary', {
                 quotaExhaustedUntilMs: 30_000,
                 lastFailureKind: 'usage_limit',
@@ -1805,7 +1806,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         return {
           ...state('backup', 2),
           members,
-          memberStatesByProfileId: new Map([
+          memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
             ['primary', {
               quotaExhaustedUntilMs: 30_000,
               lastFailureKind: 'usage_limit',
@@ -1869,7 +1870,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           return {
             ...state('primary', 1),
             members,
-            memberStatesByProfileId: new Map([
+            memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
               ['primary', {
                 quotaExhaustedUntilMs: 30_000,
                 lastFailureKind: 'usage_limit',
@@ -1881,7 +1882,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         return {
           ...state('backup', 2),
           members,
-          memberStatesByProfileId: new Map([
+          memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
             ['primary', {
               quotaExhaustedUntilMs: 30_000,
               lastFailureKind: 'usage_limit',
@@ -1945,7 +1946,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
       loadState: async () => ({
         ...state('primary', 1),
         policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['primary', {
             quotaSnapshot: {
               capturedAtMs: 900,
@@ -2001,7 +2002,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const withQuota = (activeProfileId: string, generation: number): ConnectedServiceAuthGroupSwitchState => ({
       ...state(activeProfileId, generation),
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 5 } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 80 } }],
       ]),
@@ -2187,7 +2188,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const probeQuotaSnapshotsForGroup = vi.fn(async () => {
       current = {
         ...current,
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['primary', {
             quotaSnapshot: {
               capturedAtMs: 1_000,
@@ -2338,7 +2339,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
             ...state('primary', 1),
             policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
             members,
-            memberStatesByProfileId: new Map([
+            memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
               ['primary', {
                 quotaSnapshot: {
                   capturedAtMs: 1_000,
@@ -2364,7 +2365,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           ...state('backup', 2),
           policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
           members,
-          memberStatesByProfileId: new Map([
+          memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
             ['primary', {
               quotaSnapshot: {
                 capturedAtMs: 1_000,
@@ -2448,7 +2449,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
             ...state('primary', 1),
             policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
             members,
-            memberStatesByProfileId: new Map([
+            memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
               ['primary', {
                 quotaSnapshot: {
                   capturedAtMs: 1_000,
@@ -2468,7 +2469,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           ...state('backup', 2),
           policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
           members,
-          memberStatesByProfileId: new Map([
+          memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
             ['primary', {
               quotaExhaustedUntilMs: 30_000,
             }],
@@ -2514,7 +2515,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const quotaReadyState = (activeProfileId: string, generation: number): ConnectedServiceAuthGroupSwitchState => ({
       ...state(activeProfileId, generation),
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 5 } }],
         ['backup', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 80 } }],
       ]),
@@ -2677,7 +2678,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     let loadCount = 0;
     const current: ConnectedServiceAuthGroupSwitchState = {
       ...state('primary', 1),
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['backup', {
           providerResetsAtMs: 5_000,
           quotaSnapshot: {
@@ -2786,7 +2787,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     let current: ConnectedServiceAuthGroupSwitchState = {
       ...state('primary', 1),
       members,
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', {
           quotaSnapshot: {
             capturedAtMs: 1_000,
@@ -2819,7 +2820,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         if (observedProfileId !== 'backup') return;
         current = {
           ...current,
-          memberStatesByProfileId: new Map([
+          memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
             ...current.memberStatesByProfileId,
             ['backup', {
               quotaSnapshot: {
@@ -2874,7 +2875,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const quotaReadyState = (activeProfileId: string, generation: number): ConnectedServiceAuthGroupSwitchState => ({
       ...state(activeProfileId, generation),
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', {
           quotaSnapshot: {
             capturedAtMs: 1_000,
@@ -2933,7 +2934,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const quotaReadyState = (activeProfileId: string, generation: number): ConnectedServiceAuthGroupSwitchState => ({
       ...state(activeProfileId, generation),
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', {
           quotaSnapshot: {
             capturedAtMs: 1_000,
@@ -3016,7 +3017,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           ? state('primary', 1)
           : {
               ...state('backup', 2),
-              memberStatesByProfileId: new Map([
+              memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
                 ['backup', {
                   quotaSnapshot: {
                     capturedAtMs: 1_000,
@@ -3080,7 +3081,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
           ? state('primary', 1)
           : {
               ...state('backup', 2),
-              memberStatesByProfileId: new Map([
+              memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
                 ['backup', {
                   quotaSnapshot: {
                     capturedAtMs: 1_000,
@@ -3144,7 +3145,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
   it('returns a structured apply failure when divergent observed generation apply fails', async () => {
     const current: ConnectedServiceAuthGroupSwitchState = {
       ...state('backup', 2),
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['backup', {
           quotaSnapshot: {
             capturedAtMs: 1_000,
@@ -3214,7 +3215,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: false },
         { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', {
           quotaSnapshot: {
             capturedAtMs: 1_000,
@@ -3281,7 +3282,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const current: ConnectedServiceAuthGroupSwitchState = {
       ...state('primary', 1),
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', {
           quotaSnapshot: {
             capturedAtMs: 1_000,
@@ -3362,7 +3363,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
     const current: ConnectedServiceAuthGroupSwitchState = {
       ...state('primary', 1),
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'least_limited', autoSwitch: true },
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', {
           quotaSnapshot: {
             capturedAtMs: 1_000,
@@ -3504,7 +3505,7 @@ describe('ConnectedServiceAuthGroupSwitchCoordinator', () => {
         { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
         { profileId: 'tertiary', priority: 3, createdAtMs: 3, enabled: true },
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['primary', {
           quotaSnapshot: {
             capturedAtMs: 1_000,

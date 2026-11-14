@@ -1,3 +1,7 @@
+import {
+  readConfiguredConnectedServiceMemberHolds,
+  type ConnectedServiceMemberHoldView,
+} from '../accountGroups/holds/connectedServiceMemberHolds';
 import { logger } from '@/ui/logger';
 import { createHash } from 'node:crypto';
 import {
@@ -295,6 +299,7 @@ export class ConnectedServiceQuotasCoordinator {
   private readonly discoveryIntervalMs: number;
   private readonly runtimeQuotaSnapshots: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore | null;
   private readonly accountUsageStore: AccountUsageStoreForQuotaPolicy | null;
+  private readonly readMemberHolds: (serviceId: ConnectedServiceId) => Promise<ConnectedServiceMemberHoldView>;
   private readonly accountUsagePersistence: Pick<ProviderAccountUsagePersistenceScheduler, 'recordInBandSnapshot'> | null;
   private readonly machineIdProvider: (() => string | null | undefined) | null;
   private readonly ownerIdProvider: (() => string | null | undefined) | null;
@@ -348,6 +353,8 @@ export class ConnectedServiceQuotasCoordinator {
   private lastDiscoveryAt = 0;
 
   public constructor(params: Readonly<{
+    /** Externally known member holds; defaults to this Happier home's canonical hold file. */
+    readMemberHolds?: (serviceId: ConnectedServiceId) => Promise<ConnectedServiceMemberHoldView>;
     api: QuotaApi;
     credentials: Credentials;
     quotaFetchers: ReadonlyArray<ConnectedServiceQuotaFetcher>;
@@ -436,6 +443,7 @@ export class ConnectedServiceQuotasCoordinator {
         : 60_000;
     this.runtimeQuotaSnapshots = params.runtimeQuotaSnapshots ?? null;
     this.accountUsageStore = params.accountUsageStore ?? null;
+    this.readMemberHolds = params.readMemberHolds ?? readConfiguredConnectedServiceMemberHolds;
     this.accountUsagePersistence = params.accountUsagePersistence ?? null;
     this.machineIdProvider = typeof params.machineIdProvider === 'function' ? params.machineIdProvider : null;
     this.ownerIdProvider = typeof params.ownerIdProvider === 'function' ? params.ownerIdProvider : null;
@@ -810,6 +818,7 @@ export class ConnectedServiceQuotasCoordinator {
     const evaluation = this.evaluateGroupQuotaLifecycleFromAccountUsage({
       mode: 'live_account_usage_change',
       group,
+      memberHolds: await this.readMemberHolds(group.serviceId),
       changedProfileId: input.profileId,
       changedGroupGeneration: input.groupGeneration,
       changedSnapshot: input.snapshot,
@@ -1513,6 +1522,7 @@ export class ConnectedServiceQuotasCoordinator {
 
   private buildSwitchStateFromAccountUsage(input: Readonly<{
     group: ConnectedServiceAuthGroupV1;
+    memberHolds: ConnectedServiceMemberHoldView;
   }>): Readonly<{
     kind: 'source_backed' | 'provisional';
     state: Readonly<{
@@ -1528,12 +1538,14 @@ export class ConnectedServiceQuotasCoordinator {
         createdAtMs: number;
       }>>;
       memberStatesByProfileId: ReadonlyMap<string, ConnectedServiceAuthGroupMemberRuntimeState>;
+      memberHolds: ConnectedServiceMemberHoldView;
     }>;
     sourceRefsByProfileId: ReadonlyMap<string, ConnectedServiceUsageSourceRecordRef>;
   }> | null {
     if (!this.accountUsageStore) return null;
     return buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
       group: input.group,
+      memberHolds: input.memberHolds,
       accountUsageStore: this.accountUsageStore,
     });
   }
@@ -1553,7 +1565,7 @@ export class ConnectedServiceQuotasCoordinator {
 
     const now = this.now();
     const accountUsageSwitchState = this.accountUsageStore
-      ? this.buildSwitchStateFromAccountUsage({ group })
+      ? this.buildSwitchStateFromAccountUsage({ group, memberHolds: await this.readMemberHolds(group.serviceId) })
       : null;
     // Proactive soft-switch policy must read canonical source-backed account usage only.
     // A provisional switch state (cold PAU, no source-backed records) carries no canonical
@@ -2489,6 +2501,7 @@ export class ConnectedServiceQuotasCoordinator {
     changedGroupGeneration: number;
     changedSnapshot?: ProviderAccountUsageSnapshotV1 | null;
     now: number;
+    memberHolds: ConnectedServiceMemberHoldView;
   }>) {
     const snapshotsByProfileId = this.buildAccountUsageSnapshotsByGroupProfile({
       group: input.group,
@@ -2509,6 +2522,7 @@ export class ConnectedServiceQuotasCoordinator {
       activeSessionIds: this.resolveActiveSessionIdsForGroup(input.group.serviceId, input.group.groupId),
       nowMs: input.now,
       quotaFreshnessMs: this.quotaLifecycleFreshnessMs,
+      memberHolds: input.memberHolds,
     });
   }
 
@@ -2633,6 +2647,7 @@ export class ConnectedServiceQuotasCoordinator {
     const evaluation = this.evaluateGroupQuotaLifecycleFromAccountUsage({
       mode: 'cold_reconstruction',
       group: input.group,
+      memberHolds: await this.readMemberHolds(input.group.serviceId),
       changedProfileId: input.changedProfileId ?? input.group.activeProfileId ?? '',
       changedGroupGeneration: input.group.generation,
       now: input.now,

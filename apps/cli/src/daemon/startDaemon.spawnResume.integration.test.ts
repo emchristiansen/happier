@@ -727,7 +727,8 @@ vi.mock('./platform/linux/buildCgroupSelfMigratingHappyCliLaunchSpec', () => ({
   buildCgroupSelfMigratingHappyCliLaunchSpec,
 }));
 
-vi.mock('./processSupervision/sessionRunnerRespawn', () => ({
+vi.mock('./processSupervision/sessionRunnerRespawn', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./processSupervision/sessionRunnerRespawn')>(),
   createSessionRunnerRespawnManager: sessionRespawnManagerCapture.createSessionRunnerRespawnManager,
 }));
 
@@ -1047,9 +1048,17 @@ vi.mock('@/session/services/resolveSessionTransportContext', () => ({
   resolveSessionTransportContext: pendingMaterializationRpcMocks.resolveSessionTransportContext,
 }));
 
-vi.mock('./sessions/onChildExited', () => ({
-  createOnChildExited: vi.fn(() => vi.fn()),
-}));
+// Most cases do not exercise runner exit. A case that does opts into the daemon's real exit lifecycle.
+const realExitLifecycle = vi.hoisted(() => ({ enabled: false }));
+vi.mock('./sessions/onChildExited', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./sessions/onChildExited')>();
+  return {
+    ...actual,
+    createOnChildExited: vi.fn((params: Parameters<typeof actual.createOnChildExited>[0]) => (
+      realExitLifecycle.enabled ? actual.createOnChildExited(params) : vi.fn()
+    )),
+  };
+});
 
 vi.mock('./sessions/visibleConsoleSpawnWaiter', async () => {
   const actual = await vi.importActual<typeof import('./spawn/waitForSessionWebhook')>('./spawn/waitForSessionWebhook');
@@ -5729,15 +5738,17 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     }
   });
 
-  it('spawns an existing session without re-fetching its attach payload when it was pre-resolved', async () => {
+  it('uses a pre-resolved attach payload as the attach file, still reading the session itself', async () => {
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     const refreshEnvOriginal = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
     process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = 'false';
     vi.mocked(waitForSessionWebhook).mockImplementationOnce((params) => completeReportedSession(params, 'sess-pre-resolved-1'));
-    vi.mocked(fetchSessionByIdCompat).mockRejectedValue(new Error('fetch should not be needed when the attach payload is pre-resolved'));
+    vi.mocked(fetchSessionByIdCompat).mockClear();
+    const { createSessionAttachFile } = await import('./sessionAttachFile');
+    vi.mocked(createSessionAttachFile).mockClear();
+    const suppliedPayload = { v: 2, encryptionMode: 'plain', lastObservedMessageSeq: 7 } as const;
 
     let run: Promise<void> | null = null;
-    let shutdownRequested = false;
     try {
       const { startDaemon } = await import('./startDaemon');
       run = startDaemon();
@@ -5750,7 +5761,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
           directory: '/tmp/workspace-pre-resolved',
           backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
           existingSessionId: 'sess-pre-resolved-1',
-          existingSessionAttachPayload: { v: 2, encryptionMode: 'plain' } as any,
+          existingSessionAttachPayload: suppliedPayload as any,
         }),
       ).resolves.toEqual({
         type: 'success',
@@ -5758,7 +5769,9 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         runnerAcceptance: 'newly_accepted',
       });
 
-      expect(fetchSessionByIdCompat).not.toHaveBeenCalled();
+      // The daemon's own authenticated read still happens; the supplied payload is the attach file.
+      expect(vi.mocked(fetchSessionByIdCompat).mock.calls.map(([params]) => params.sessionId)).toContain('sess-pre-resolved-1');
+      expect(vi.mocked(createSessionAttachFile).mock.calls.at(-1)?.[0]).toMatchObject({ payload: suppliedPayload });
       expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
       expect(spawnHappyCLI.mock.calls[0]?.[0]).toEqual(
         expect.arrayContaining([
@@ -5771,6 +5784,42 @@ describe('startDaemon spawn resume wiring (integration)', () => {
           'sess-pre-resolved-1',
         ]),
       );
+
+      harness.requestShutdown('happier-cli');
+      await run;
+    } finally {
+      if (refreshEnvOriginal === undefined) {
+        delete process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
+      } else {
+        process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = refreshEnvOriginal;
+      }
+      await restoreDaemonExitBoundary(exitSpy);
+    }
+  });
+
+  it('refuses a pre-resolved attach payload when the daemon cannot read the session itself', async () => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const refreshEnvOriginal = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
+    process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = 'false';
+    vi.mocked(fetchSessionByIdCompat).mockResolvedValueOnce(null as any);
+
+    let run: Promise<void> | null = null;
+    try {
+      const { startDaemon } = await import('./startDaemon');
+      run = startDaemon();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const spawnSession = await waitForSpawnSessionRegistration();
+
+      await expect(
+        spawnSession({
+          directory: '/tmp/workspace-pre-resolved-unreadable',
+          backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+          existingSessionId: 'sess-pre-resolved-unreadable',
+          existingSessionAttachPayload: { v: 2, encryptionMode: 'plain' } as any,
+        }),
+      ).resolves.toMatchObject({ type: 'error' });
+      expect(spawnHappyCLI).not.toHaveBeenCalled();
 
       harness.requestShutdown('happier-cli');
       await run;
@@ -6016,6 +6065,15 @@ describe('startDaemon spawn resume wiring (integration)', () => {
       drive?: () => Promise<unknown>;
       /** Runs inside the exact runner Stop, before the runner exits. */
       duringStop?: () => Promise<void>;
+      /**
+       * How the daemon holds the live runner: its own detached spawn (the normal launch), or only a
+       * pid it reattached from the runner's marker after a daemon restart.
+       */
+      runnerCustody?: 'daemon_spawned' | 'reattached_from_marker' | 'none';
+      /** Overrides the Resume request, e.g. with the launch a durable runtime-auth recovery replays. */
+      resumeOptions?: Record<string, unknown>;
+      /** Inspects the daemon's tracked runners after an explicit Resume returns. */
+      afterResume?: (trackedSessions: ReadonlyMap<number, unknown>) => void;
     }>) {
       const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
       sessionRunnerActivityBoundaryMocks.readProcessRunState.mockResolvedValue('servable');
@@ -6053,19 +6111,28 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         const { startDaemon } = await import('./startDaemon');
         run = startDaemon();
         const spawnSession = await waitForSpawnSessionRegistration();
-        tracked.current!.set(runnerPid, {
-          pid: runnerPid, startedBy: 'daemon', happySessionId: id,
-          spawnOptions: { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } },
-        });
+        const runnerCustody = params.runnerCustody ?? 'daemon_spawned';
+        if (runnerCustody !== 'none') {
+          tracked.current!.set(runnerPid, {
+            pid: runnerPid, startedBy: 'daemon', happySessionId: id,
+            spawnOptions: { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } },
+            ...(runnerCustody === 'daemon_spawned'
+              // The daemon's own live detached spawn, which leads the runner's process group.
+              ? { childProcess: { pid: runnerPid, exitCode: null, signalCode: null, kill: vi.fn(() => true) } as any }
+              : { reattachedFromDiskMarker: true }),
+          });
+        }
 
         if (params.drive) return await params.drive();
-        return await spawnSession({
+        const result = await spawnSession(params.resumeOptions ?? {
           directory: tmpdir(),
           existingSessionId: id,
           backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
           token: 't',
           codexBackendMode: 'acp',
         });
+        params.afterResume?.(tracked.current!);
+        return result;
       } finally {
         if (run) { harness.requestShutdown('happier-cli'); await run; }
         const webhook = await import('./sessions/onHappySessionWebhook');
@@ -6090,7 +6157,11 @@ describe('startDaemon spawn resume wiring (integration)', () => {
       await resumeAgainstLiveRunner({ capability: async () => publisherLost(localRunner) });
 
       expect(stopSessionMocks.stopSession).toHaveBeenCalledExactlyOnceWith(id, {
-        exactRunner: expect.objectContaining({ pid: runnerPid, processInstanceFingerprint: runnerFingerprint }),
+        exactRunner: expect.objectContaining({
+          pid: runnerPid,
+          processInstanceFingerprint: runnerFingerprint,
+          ownedProcessGroupLeader: expect.objectContaining({ pid: runnerPid, exitCode: null, signalCode: null }),
+        }),
       });
       expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
       expect(spawnHappyCLI.mock.calls[0]?.[0]).toEqual(expect.arrayContaining(['--existing-session', id]));
@@ -6105,6 +6176,330 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     ])('fences a loss reported with %s and never stops the local runner', async (_label, respondent) => {
       expectFencedWithoutStop(await resumeAgainstLiveRunner({ capability: async () => publisherLost(respondent) }));
     });
+
+    const UNOWNED_REPLACEMENT_REFUSAL = 'The existing session runtime can no longer receive queued messages, and this daemon '
+      + 'cannot stop all of its processes to replace it safely. Stop the session, then Resume again.';
+    const UNVERIFIED_RUNTIME_FENCE = 'The existing session runtime could not be verified. Retry resume after connectivity recovers.';
+    /** The launch a durable runtime-auth recovery replays when no live runner is tracked for the session. */
+    const durableRecoveryLaunch = {
+      existingSessionId: id,
+      directory: tmpdir(),
+      backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      approvedNewDirectoryCreation: true,
+    };
+
+    it('spawns a durable-recovery launch when no runner is tracked for the session, without any Stop', async () => {
+      await resumeAgainstLiveRunner({
+        capability: async () => publisherLost(localRunner),
+        runnerCustody: 'none',
+        resumeOptions: durableRecoveryLaunch,
+      });
+
+      // With no tracked runner the decision is a plain spawn: no lost-publisher report is even requested.
+      expect(pendingMaterializationRpcMocks.callSessionRpc.mock.calls
+        .filter(([rpc]) => String(rpc.method).endsWith('wakeCapability.v1.get'))).toEqual([]);
+      expect(stopSessionMocks.stopSession).not.toHaveBeenCalled();
+      expect(spawnHappyCLI).toHaveBeenCalledTimes(1);
+      expect(spawnHappyCLI.mock.calls[0]?.[0]).toEqual(expect.arrayContaining(['--existing-session', id]));
+    });
+
+    it('refuses a durable-recovery launch when an unowned lost-publisher runner arrived first, and keeps it', async () => {
+      let trackedAfter: unknown;
+      const result = await resumeAgainstLiveRunner({
+        capability: async () => publisherLost(localRunner),
+        runnerCustody: 'reattached_from_marker',
+        resumeOptions: durableRecoveryLaunch,
+        afterResume: (trackedSessions) => { trackedAfter = trackedSessions.get(runnerPid); },
+      });
+
+      expectFencedWithoutStop(result);
+      expect(result).toMatchObject({ errorMessage: UNOWNED_REPLACEMENT_REFUSAL });
+      expect(trackedAfter).toMatchObject({ pid: runnerPid, happySessionId: id, reattachedFromDiskMarker: true });
+    });
+
+    it('names the unowned runner at the after-wait decision too', async () => {
+      let capabilityProbes = 0;
+      const unowned = await resumeAgainstLiveRunner({
+        capability: async () => {
+          capabilityProbes += 1;
+          return capabilityProbes === 1 ? servable : publisherLost(localRunner);
+        },
+        runnerCustody: 'reattached_from_marker',
+      });
+      expect(capabilityProbes).toBeGreaterThanOrEqual(2);
+      expectFencedWithoutStop(unowned);
+      expect(unowned).toMatchObject({ errorMessage: UNOWNED_REPLACEMENT_REFUSAL });
+    });
+
+    it('keeps the unverified-runtime message for every other fence', async () => {
+      const unbound = await resumeAgainstLiveRunner({ capability: async () => publisherLost({ ...localRunner, pid: runnerPid + 1 }) });
+      expectFencedWithoutStop(unbound);
+      expect(unbound).toMatchObject({ errorMessage: UNVERIFIED_RUNTIME_FENCE });
+    });
+
+    it('refuses to replace a runner it holds only by a reattached pid, before any effect, and keeps that runner', async () => {
+      let trackedAfter: unknown;
+      const result = await resumeAgainstLiveRunner({
+        capability: async () => publisherLost(localRunner),
+        runnerCustody: 'reattached_from_marker',
+        afterResume: (trackedSessions) => { trackedAfter = trackedSessions.get(runnerPid); },
+      });
+
+      // No owned process group can reach this runner's whole tree, so no guarded Stop can retire it.
+      expectFencedWithoutStop(result);
+      expect(result).toMatchObject({ errorMessage: UNOWNED_REPLACEMENT_REFUSAL });
+      expect(trackedAfter).toMatchObject({ pid: runnerPid, happySessionId: id, reattachedFromDiskMarker: true });
+      expect(updateSessionMetadataWithRetryMock).not.toHaveBeenCalled();
+      expect(sessionRegistryCapture.writeSessionMarker).not.toHaveBeenCalled();
+    });
+
+    it('keeps a replaced runner\'s surviving group member from a later Resume until it exits, then resumes', async () => {
+      if (ORIGINAL_PLATFORM_DESCRIPTOR?.value !== 'linux') return;
+      Object.defineProperty(process, 'platform', { ...ORIGINAL_PLATFORM_DESCRIPTOR, value: 'linux' });
+      const actualChildProcess = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      const { createStopSession: actualCreateStopSession } = await vi.importActual<typeof import('./sessions/stopSession')>('./sessions/stopSession');
+      const actualRunState = await vi.importActual<typeof import('./processRunState')>('./processRunState');
+      const directory = await mkdtemp(join(tmpdir(), 'owned-tail-custody-'));
+      // A disposable runner the daemon spawned detached (leading its own group), shaped as a
+      // daemon-spawned Happier session so the real PID-safety check identifies it. Its child joins the
+      // group, ignores SIGTERM and acknowledges SIGUSR2; the root exits on SIGTERM.
+      const script = join(directory, 'dist', 'index.mjs');
+      const readyPath = join(directory, 'tail-ready');
+      const ackPath = join(directory, 'tail-alive');
+      await mkdir(dirname(script), { recursive: true });
+      await writeFile(script, `
+        import { spawn } from 'node:child_process';
+        spawn(process.execPath, ['-e', ${JSON.stringify(`
+          process.on('SIGTERM', () => {});
+          process.on('SIGUSR2', () => require('node:fs').writeFileSync(${JSON.stringify(ackPath)}, String(process.pid)));
+          require('node:fs').writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));
+          setInterval(() => {}, 1000);
+        `)}], { stdio: 'ignore' });
+        process.on('SIGTERM', () => process.exit(0));
+        setInterval(() => {}, 1000);
+      `);
+      const root = actualChildProcess.spawn(process.execPath, [script, '--started-by', 'daemon'], { detached: true, stdio: 'ignore' });
+      let tailPid = 0;
+      let run: Promise<void> | null = null;
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      try {
+        await vi.waitFor(async () => { tailPid = Number(await readFile(readyPath, 'utf8')); expect(tailPid).toBeGreaterThan(0); }, { timeout: 10_000 });
+        const rootPid = root.pid!;
+        const fingerprint = `linux-proc:fixture-${rootPid}`;
+        realExitLifecycle.enabled = true;
+        // The real Stop audits each signal under the logs directory, which this configuration double lacks.
+        const { configuration } = await import('@/configuration');
+        (configuration as { logsDir?: string }).logsDir = join(directory, 'logs');
+        // The real exact Stop, real physical run state and real exit lifecycle; only the session RPC,
+        // server and launch boundaries stay doubled.
+        stopSessionMocks.createStopSession.mockImplementation((input) => {
+          stopSessionMocks.stopSession.mockImplementation(actualCreateStopSession(input));
+          return stopSessionMocks.stopSession;
+        });
+        sessionRunnerActivityBoundaryMocks.readProcessRunState.mockImplementation(actualRunState.readProcessRunState);
+        processInstanceBoundaryMocks.readProcessInstanceFingerprintSync.mockImplementation((pid) => (pid === rootPid ? fingerprint : null));
+        pendingMaterializationRpcMocks.resolveSessionTransportContext.mockResolvedValue({
+          ok: true, sessionId: id, rawSession: { id, active: true, encryptionMode: 'plain' },
+          mode: 'plain', ctx: pendingMaterializationRpcMocks.ctx,
+        });
+        pendingMaterializationRpcMocks.callSessionRpc.mockImplementation(async (rpc) => {
+          if (rpc.method.endsWith('wakeCapability.v1.get')) {
+            return publisherLost({ machineId: 'machine-1', pid: rootPid, processInstanceFingerprint: fingerprint });
+          }
+          throw new Error(`unexpected session RPC ${rpc.method}`);
+        });
+        vi.mocked(fetchSessionByIdCompat).mockResolvedValue(createSessionRecordFixture({
+          id, encryptionMode: 'plain', metadata: JSON.stringify({ flavor: 'codex', path: tmpdir(), codexSessionId: 'vendor-owned-tail' }),
+        }));
+        const tracked: { current: Map<number, any> | null } = { current: null };
+        const webhook = await import('./sessions/onHappySessionWebhook');
+        vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(({ pidToTrackedSession }) => {
+          tracked.current = pidToTrackedSession as Map<number, any>;
+          return vi.fn();
+        });
+        const { startDaemon } = await import('./startDaemon');
+        run = startDaemon();
+        const spawnSession = await waitForSpawnSessionRegistration();
+        tracked.current!.set(rootPid, {
+          pid: rootPid, startedBy: 'daemon', happySessionId: id, childProcess: root,
+          spawnOptions: { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' } },
+        });
+        const resume = { directory: tmpdir(), existingSessionId: id, backendTarget: { kind: 'builtInAgent', agentId: 'codex' }, token: 't', codexBackendMode: 'acp' };
+        // A Linux launch goes through the cgroup launch spec and the process boundary, others through spawnHappyCLI.
+        const runnerLaunches = () => spawnHappyCLI.mock.calls.length + spawnChildProcess.mock.calls.length;
+
+        // 1. The lost-publisher runner is replaced through the real exact Stop: the root exits, its
+        // group member does not, so the Stop is incomplete and nothing is spawned.
+        const replaced = await spawnSession(resume);
+        expect(replaced).toMatchObject({ type: 'error', errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED });
+        await vi.waitFor(() => expect(root.exitCode).toBe(0));
+        expect(runnerLaunches()).toBe(0);
+        // The real exit lifecycle retired the root's tracking: no runner is tracked for the session now.
+        expect(tracked.current!.has(rootPid)).toBe(false);
+
+        // 2. A later Resume (here, the launch durable runtime-auth recovery replays) sees no tracked
+        // runner, yet must not start a second runtime beside the surviving member.
+        const durable = await spawnSession(durableRecoveryLaunch);
+        expect(durable).toMatchObject({
+          type: 'error',
+          errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+          errorMessage: 'Processes from this session\'s previous runtime are still running, and this daemon can no longer stop them safely. Resume again after they exit.',
+        });
+        expect(runnerLaunches()).toBe(0);
+        process.kill(tailPid, 'SIGUSR2');
+        await vi.waitFor(async () => expect(await readFile(ackPath, 'utf8')).toBe(String(tailPid)));
+
+        // 3. Once the member is gone (the fixture's own cleanup of its exact process), the same Resume proceeds.
+        process.kill(tailPid, 'SIGKILL');
+        await vi.waitFor(() => expect(() => process.kill(tailPid, 0)).toThrow(), { timeout: 5_000 });
+        await expect(spawnSession(durableRecoveryLaunch)).resolves.toMatchObject({ type: 'success' });
+        expect(runnerLaunches()).toBe(1);
+      } finally {
+        if (run) { harness.requestShutdown('happier-cli'); await run.catch(() => undefined); }
+        realExitLifecycle.enabled = false;
+        delete ((await import('@/configuration')).configuration as { logsDir?: string }).logsDir;
+        stopSessionMocks.createStopSession.mockImplementation(() => stopSessionMocks.stopSession);
+        stopSessionMocks.stopSession.mockImplementation(async () => ({ status: 'stopped' }));
+        const webhook = await import('./sessions/onHappySessionWebhook');
+        vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(() => vi.fn());
+        const actualProcessInstance = await vi.importActual<typeof import('@happier-dev/cli-common/processInstance')>(
+          '@happier-dev/cli-common/processInstance',
+        );
+        processInstanceBoundaryMocks.readProcessInstanceFingerprintSync.mockImplementation(
+          (pid) => actualProcessInstance.readProcessInstanceFingerprintSync(pid),
+        );
+        sessionRunnerActivityBoundaryMocks.readProcessRunState.mockImplementation(async () => 'dead');
+        root.kill('SIGKILL');
+        if (tailPid) { try { process.kill(tailPid, 'SIGKILL'); } catch { /* already gone */ } }
+        exitSpy.mockRestore();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    it.each([
+      { exitStaging: 'held', withTail: true },
+      { exitStaging: 'rejected', withTail: true },
+      { exitStaging: 'held', withTail: false },
+    ] as const)('keeps a spawned runner\'s owned group from Resume across its own exit lifecycle (staging $exitStaging, tail $withTail)', async ({ exitStaging, withTail }) => {
+      if (ORIGINAL_PLATFORM_DESCRIPTOR?.value !== 'linux') return;
+      Object.defineProperty(process, 'platform', { ...ORIGINAL_PLATFORM_DESCRIPTOR, value: 'linux' });
+      const actualChildProcess = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      const actualRunState = await vi.importActual<typeof import('./processRunState')>('./processRunState');
+      const directory = await mkdtemp(join(tmpdir(), 'owned-group-exit-order-'));
+      // A disposable runner the daemon itself launches detached (leading its own group). Its child
+      // joins the group, ignores SIGTERM and acknowledges SIGUSR2; the root exits 0 on SIGUSR1.
+      const script = join(directory, 'dist', 'index.mjs');
+      const readyPath = join(directory, 'tail-ready');
+      const ackPath = join(directory, 'tail-alive');
+      await mkdir(dirname(script), { recursive: true });
+      await writeFile(script, `
+        import { spawn } from 'node:child_process';
+        ${withTail ? `spawn(process.execPath, ['-e', ${JSON.stringify(`
+          process.on('SIGTERM', () => {});
+          process.on('SIGUSR2', () => require('node:fs').writeFileSync(${JSON.stringify(ackPath)}, String(process.pid)));
+          require('node:fs').writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));
+          setInterval(() => {}, 1000);
+        `)}], { stdio: 'ignore' });` : `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(readyPath)}, '0');`}
+        process.on('SIGUSR1', () => process.exit(0));
+        setInterval(() => {}, 1000);
+      `);
+      const spawned: { root: import('node:child_process').ChildProcess | null } = { root: null };
+      let tailPid = 0;
+      let run: Promise<void> | null = null;
+      const exitStage = createDeferred<void>();
+      let markerRemovalReached = false;
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+      try {
+        realExitLifecycle.enabled = true;
+        sessionRunnerActivityBoundaryMocks.readProcessRunState.mockImplementation(actualRunState.readProcessRunState);
+        vi.mocked(fetchSessionByIdCompat).mockResolvedValue(createSessionRecordFixture({
+          id, encryptionMode: 'plain', metadata: JSON.stringify({ flavor: 'codex', path: tmpdir(), codexSessionId: 'vendor-exit-order' }),
+        }));
+        const tracked: { current: Map<number, any> | null } = { current: null };
+        const webhook = await import('./sessions/onHappySessionWebhook');
+        vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(({ pidToTrackedSession }) => {
+          tracked.current = pidToTrackedSession as Map<number, any>;
+          return vi.fn();
+        });
+        // The daemon's own launch boundary starts the real fixture, so the daemon registers its real
+        // `exit` listener on that ChildProcess and tracks it as its own group-leader spawn.
+        spawnChildProcess.mockImplementationOnce((() => {
+          spawned.root = actualChildProcess.spawn(process.execPath, [script, '--started-by', 'daemon'], { detached: true, stdio: 'ignore' });
+          return spawned.root;
+        }) as never);
+        const { startDaemon } = await import('./startDaemon');
+        run = startDaemon();
+        const spawnSession = await waitForSpawnSessionRegistration();
+        const runnerLaunches = () => spawnHappyCLI.mock.calls.length + spawnChildProcess.mock.calls.length;
+
+        await expect(spawnSession(durableRecoveryLaunch)).resolves.toMatchObject({ type: 'success' });
+        expect(runnerLaunches()).toBe(1);
+        const rootPid = spawned.root!.pid!;
+        expect(tracked.current!.get(rootPid)).toMatchObject({ startedBy: 'daemon', childProcess: spawned.root });
+        await vi.waitFor(async () => { tailPid = Number(await readFile(readyPath, 'utf8')); expect(tailPid >= 0).toBe(true); }, { timeout: 10_000 });
+        // The exit lifecycle's durable staging releases the root's marker; hold (or fail) exactly that await.
+        sessionRegistryCapture.removeSessionMarker.mockImplementation(async (pid: number) => {
+          if (pid !== rootPid) return;
+          markerRemovalReached = true;
+          if (exitStaging === 'rejected') throw new Error('marker store unavailable');
+          await exitStage.promise;
+        });
+
+        process.kill(rootPid, 'SIGUSR1');
+        await vi.waitFor(() => expect(spawned.root!.exitCode).toBe(0), { timeout: 10_000 });
+        await vi.waitFor(() => expect(markerRemovalReached).toBe(true), { timeout: 10_000 });
+        // The root is dead and its record still tracked: presence already reads it as absent.
+        expect(tracked.current!.has(rootPid)).toBe(true);
+
+        if (!withTail) {
+          exitStage.resolve();
+          await vi.waitFor(() => expect(tracked.current!.has(rootPid)).toBe(false), { timeout: 10_000 });
+          await expect(spawnSession(durableRecoveryLaunch)).resolves.toMatchObject({ type: 'success' });
+          expect(runnerLaunches()).toBe(2);
+          return;
+        }
+
+        const tailFence = {
+          type: 'error',
+          errorCode: SPAWN_SESSION_ERROR_CODES.UNEXPECTED,
+          errorMessage: 'Processes from this session\'s previous runtime are still running, and this daemon can no longer stop them safely. Resume again after they exit.',
+        };
+        // 1. While the exit lifecycle is held (or after it failed), Resume is fenced and launches nothing.
+        await expect(spawnSession(durableRecoveryLaunch)).resolves.toMatchObject(tailFence);
+        expect(runnerLaunches()).toBe(1);
+        if (exitStaging === 'held') {
+          // 2. Once the lifecycle completes and retires the record, Resume stays fenced while the member lives.
+          exitStage.resolve();
+          await vi.waitFor(() => expect(tracked.current!.has(rootPid)).toBe(false), { timeout: 10_000 });
+        } else {
+          // 2. The failed staging keeps its record (and its exit obligations) instead of retiring it.
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(tracked.current!.has(rootPid)).toBe(true);
+        }
+        await expect(spawnSession(durableRecoveryLaunch)).resolves.toMatchObject(tailFence);
+        expect(runnerLaunches()).toBe(1);
+        process.kill(tailPid, 'SIGUSR2');
+        await vi.waitFor(async () => expect(await readFile(ackPath, 'utf8')).toBe(String(tailPid)));
+
+        // 3. Once the member is gone (the fixture's own cleanup of its exact process), the same Resume proceeds once.
+        process.kill(tailPid, 'SIGKILL');
+        await vi.waitFor(() => expect(() => process.kill(tailPid, 0)).toThrow(), { timeout: 5_000 });
+        await expect(spawnSession(durableRecoveryLaunch)).resolves.toMatchObject({ type: 'success' });
+        expect(runnerLaunches()).toBe(2);
+      } finally {
+        exitStage.resolve();
+        if (run) { harness.requestShutdown('happier-cli'); await run.catch(() => undefined); }
+        realExitLifecycle.enabled = false;
+        sessionRegistryCapture.removeSessionMarker.mockImplementation(async () => {});
+        const webhook = await import('./sessions/onHappySessionWebhook');
+        vi.mocked(webhook.createOnHappySessionWebhook).mockImplementation(() => vi.fn());
+        sessionRunnerActivityBoundaryMocks.readProcessRunState.mockImplementation(async () => 'dead');
+        spawned.root?.kill('SIGKILL');
+        if (tailPid > 0) { try { process.kill(tailPid, 'SIGKILL'); } catch { /* already gone */ } }
+        exitSpy.mockRestore();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }, 60_000);
 
     it('fences a transient session RPC failure without stopping the runner', async () => {
       expectFencedWithoutStop(await resumeAgainstLiveRunner({
@@ -9077,6 +9472,131 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = refreshEnvOriginal;
       }
       await restoreDaemonExitBoundary(exitSpy);
+    }
+  });
+
+  // An existing session's connected-service source authority and materialization identity come only
+  // from the daemon's own authenticated read of that session, whether or not the request carries a
+  // pre-resolved attach payload. Real direct producer, spawn resolver and Claude materializer on
+  // synthetic homes; the session read and process launch are the file's fixture substitutes.
+  it.each([
+    { label: 'ordinary continuation keeps source A under daemon B', supplied: false, otherIdentity: false, fresh: false },
+    { label: 'pre-resolved attach payload continuation keeps source A under daemon B', supplied: true, otherIdentity: false, fresh: false },
+    { label: 'pre-resolved attach payload cannot materialize under a different identity', supplied: true, otherIdentity: true, fresh: false },
+    { label: 'ordinary different identity is normalized to the persisted one', supplied: false, otherIdentity: true, fresh: false },
+    { label: 'a fresh daemon-B caller into source A\'s home conflicts', supplied: false, otherIdentity: false, fresh: true },
+  ])('connected-service continuation authority: $label', async ({ supplied, otherIdentity, fresh }) => {
+    const { CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE } = await import('@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialScopes');
+    if (ORIGINAL_PLATFORM_DESCRIPTOR) Object.defineProperty(process, 'platform', ORIGINAL_PLATFORM_DESCRIPTOR);
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const originalEnv = {
+      HOME: process.env.HOME,
+      CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+      REFRESH: process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED,
+    };
+    process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED = 'false';
+    let run: Promise<void> | null = null;
+    const root = await mkdtemp(join(tmpdir(), 'happier-continuation-authority-'));
+    const { buildConnectedServiceCredentialRecord } = await import('@happier-dev/protocol');
+    const { createConnectedServiceMaterializationIdentity } = await import('./connectedServices/materialize/createConnectedServiceMaterializationIdentity');
+    const { resolveDirectConnectedServiceEnvironment } = await import('@/cli/connectedServices/resolveDirectConnectedServiceEnvironment');
+    const resolver = await vi.importActual<typeof import('./connectedServices/resolveConnectedServiceAuthForSpawn')>('./connectedServices/resolveConnectedServiceAuthForSpawn');
+    const { ApiClient } = await import('@/api/api');
+    const identity = createConnectedServiceMaterializationIdentity();
+    const requestedIdentity = otherIdentity ? createConnectedServiceMaterializationIdentity() : identity;
+    const profileId = `p-${randomUUID()}`;
+    const bindings = { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'profile', profileId } } } as const;
+    const settings = accountSettingsParse({
+      connectedServicesProviderStateSharingSettingsV1: { v: 1, defaults: { configMode: 'linked', stateMode: 'isolated' }, byAgentId: {} },
+    });
+    const sourceA = join(root, 'A');
+    const sourceB = join(root, 'B');
+    for (const [source, name] of [[sourceA, 'A'], [sourceB, 'B']] as const) {
+      await mkdir(join(source, 'projects'), { recursive: true });
+      await writeFile(join(source, 'settings.json'), JSON.stringify({ mcpServers: { [name]: { command: `/${name}` } } }));
+    }
+    let currentToken = 'before';
+    const api = {
+      machineSyncClient: () => harness.apiMachine,
+      getAccountEncryptionMode: async () => 'plain',
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found', status: 'connected', health: null })),
+      getConnectedServiceCredentialPlain: vi.fn(async () => ({
+        revisionSemantics: 'revisioned',
+        credentialRevision: `csr_${'a'.repeat(22)}`,
+        content: { t: 'plain', v: buildConnectedServiceCredentialRecord({
+          now: Date.now(), serviceId: 'claude-subscription', profileId, kind: 'oauth', expiresAt: Date.now() + 3_600_000,
+          oauth: { accessToken: currentToken, refreshToken: 'refresh', idToken: null, scope: CLAUDE_CODE_RECOMMENDED_OAUTH_SCOPE, tokenType: 'Bearer', providerAccountId: 'acct', providerEmail: null },
+        }) },
+      })),
+      getConnectedServiceCredentialSealed: async () => null,
+      updateConnectedServiceCredentialHealth: vi.fn(async () => {}),
+    };
+    vi.mocked(ApiClient.create).mockResolvedValue(api as any);
+    resolveConnectedServiceAuthForSpawnMock.mockReset();
+    const boundaries: Array<{ nativeSourceKind: string; identityId: string | undefined }> = [];
+    resolveConnectedServiceAuthForSpawnMock.mockImplementation((async (input: any) => {
+      boundaries.push({ nativeSourceKind: input.nativeSource?.kind, identityId: input.connectedServiceMaterializationIdentityV1?.id });
+      return await resolver.resolveConnectedServiceAuthForSpawn(input);
+    }) as any);
+    setActiveAccountSettingsSnapshot({ source: 'network', settingsVersion: 1, loadedAtMs: Date.now(), settingsSecretsReadKeys: [], settings });
+    vi.mocked(fetchSessionByIdCompat).mockClear();
+    vi.mocked(fetchSessionByIdCompat).mockResolvedValue(createSessionRecordFixture({
+      id: 'sess_plain', active: false, encryptionMode: 'plain', dataEncryptionKey: null,
+      metadata: JSON.stringify({ flavor: 'claude', path: root, connectedServices: bindings, connectedServiceMaterializationIdentityV1: identity }),
+    }));
+    try {
+      process.env.HOME = root;
+      process.env.CLAUDE_CONFIG_DIR = sourceA;
+      const direct = await resolveDirectConnectedServiceEnvironment({
+        agentId: 'claude', directory: root, sessionId: 'sess_plain',
+        credentials: { token: 'synthetic', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) } },
+        accountSettings: settings, connectedServices: bindings,
+        sessionMetadata: { connectedServiceMaterializationIdentityV1: identity },
+      });
+      const producedHome = direct!.env.CLAUDE_CONFIG_DIR!;
+      const before = await readFile(join(producedHome, '.credentials.json'), 'utf8');
+      // Observe only the daemon's spawn resolution, not the direct production above.
+      boundaries.length = 0;
+      currentToken = 'after';
+      // The different-identity cases keep the daemon on source A, so only identity qualification can refuse them.
+      process.env.CLAUDE_CONFIG_DIR = otherIdentity ? sourceA : sourceB;
+      run = daemonStartupOwner.startDaemon();
+      const spawnSession = await harness.waitForSpawnSessionRegistration();
+      const result = await spawnSession({
+        directory: root,
+        backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
+        connectedServices: bindings,
+        connectedServiceMaterializationIdentityV1: requestedIdentity,
+        ...(!fresh ? { existingSessionId: 'sess_plain' } : {}),
+        ...(supplied ? { existingSessionAttachPayload: { v: 2, encryptionMode: 'plain' } } : {}),
+        token: 't',
+      } as any);
+      const after = await readFile(join(producedHome, '.credentials.json'), 'utf8');
+      const homeSettings = JSON.parse(await readFile(join(producedHome, 'settings.json'), 'utf8'));
+      if (fresh) {
+        expect(result.type).toBe('error');
+        expect(after).toBe(before);
+        expect(boundaries.map((boundary) => boundary.nativeSourceKind)).toEqual(['new_caller']);
+      } else {
+        expect(result.type).toBe('success');
+        expect(vi.mocked(fetchSessionByIdCompat).mock.calls.length).toBeGreaterThan(0);
+        expect(boundaries.length).toBeGreaterThan(0);
+        for (const boundary of boundaries) {
+          expect(boundary).toEqual({ nativeSourceKind: 'session_continuation', identityId: identity.id });
+        }
+        expect(homeSettings.mcpServers).toEqual({ A: { command: '/A' } });
+        expect(after).not.toBe(before);
+      }
+    } finally {
+      if (run) {
+        harness.requestShutdown('happier-cli');
+        await run.catch(() => {});
+      }
+      for (const [key, value] of [['HOME', originalEnv.HOME], ['CLAUDE_CONFIG_DIR', originalEnv.CLAUDE_CONFIG_DIR], ['HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED', originalEnv.REFRESH]] as const) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      await restoreDaemonExitBoundary(exitSpy);
+      await rm(root, { recursive: true, force: true });
     }
   });
 

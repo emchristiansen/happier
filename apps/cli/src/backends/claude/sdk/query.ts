@@ -34,7 +34,7 @@ import { buildMissingJavaScriptRuntimeMessage } from '@/runtime/js/buildMissingJ
 import { prepareClaudeSubprocessEnv } from '@/backends/claude/spawn/buildClaudeSubprocessEnv'
 import { spawnBackgroundSync, resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process'
 import { resolveExistingManagedJavaScriptRuntimeCommand } from '@happier-dev/cli-common/providers'
-import { killProcessTree } from '@/agent/runtime/process/killProcessTree'
+import { killProcessTree, processTreeTerminationProvesTreeStopped } from '@/agent/runtime/process/killProcessTree'
 import { logClaudeRuntimeAuthEnvDiagnostic } from '@/backends/claude/spawn/logClaudeRuntimeAuthEnvDiagnostic'
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers'
 import { resolveCliRuntimeAssetPath } from '@/runtime/assets/resolveCliRuntimeAssetPath'
@@ -444,6 +444,7 @@ export async function query(config: {
         ...permissionArgs.args,
     ])
     let child: ChildProcessWithoutNullStreams
+    const ownsProcessGroup = process.platform !== 'win32'
     try {
         if (config.options?.abort?.aborted) {
             throw new AbortError('Claude Code process aborted by user')
@@ -470,7 +471,8 @@ export async function query(config: {
             signal: config.options?.abort,
             env: spawnEnv,
             windowsHide: true,
-            detached: process.platform !== 'win32',
+            // On POSIX the provider leads its own process group, so cleanup reaches its whole tree.
+            detached: ownsProcessGroup,
             ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
         }) as ChildProcessWithoutNullStreams
     } catch (error) {
@@ -518,9 +520,9 @@ export async function query(config: {
     let cleanupPromise: ReturnType<typeof killProcessTree> | null = null
     const cleanup = (): ReturnType<typeof killProcessTree> => {
         if (cleanupPromise) return cleanupPromise
-        if (cleanupStarted) return Promise.resolve({ rootObservedAlive: false })
+        if (cleanupStarted) return Promise.resolve({ rootObservedAlive: false, coverage: 'snapshot' as const })
         cleanupStarted = true
-        cleanupPromise = killProcessTree(child, { graceMs: 250 })
+        cleanupPromise = killProcessTree(child, { graceMs: 250, ...(ownsProcessGroup ? { processGroup: 'owned' as const } : {}) })
         return cleanupPromise
     }
     const cleanupInBackground = (): void => {
@@ -583,7 +585,7 @@ export async function query(config: {
         // An actual exit of a launcher that imported the provider is the provider's physical exit.
         if (event.type === 'exited' || event.type === 'signaled') nativeExited ||= providerInLauncher
         const processTreeStopped = cleanupPromise
-            ? await cleanupPromise.then((result) => result.rootObservedAlive, () => false)
+            ? await cleanupPromise.then(processTreeTerminationProvesTreeStopped, () => false)
             : false
         // Proven normal/tree exits still drain buffered messages before retiring activity.
         // Only an unverified abrupt exit must surface before inherited pipes close.

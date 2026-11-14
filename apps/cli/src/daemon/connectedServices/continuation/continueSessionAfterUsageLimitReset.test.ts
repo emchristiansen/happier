@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../accountGroups/holds/connectedServiceMemberHolds';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -113,7 +114,7 @@ describe('continueSessionAfterUsageLimitReset', () => {
     let state: ConnectedServiceAuthGroupSwitchState = { serviceId, groupId: 'pool', activeProfileId: 'B', generation: 2,
       credentialRevision: revision, runtimeStateRevision: 0,
       policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ autoSwitch: true, strategy: 'priority', autoUseQuotaResetsWhenExhausted: true }),
-      members: [{ profileId: 'B', priority: 0, enabled: true, createdAtMs: 1 }], memberStatesByProfileId: exhausted() };
+      members: [{ profileId: 'B', priority: 0, enabled: true, createdAtMs: 1 }], memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: exhausted() };
     const consumed = new Set<string>();
     const sends: string[] = [];
     const origins: string[] = [];
@@ -177,7 +178,7 @@ describe('continueSessionAfterUsageLimitReset', () => {
       commitSwitch: async () => { throw new Error('same-account reset must retain generation'); },
       consumeAvailableRecoveryCreditForProfile: async () => {
         resets++;
-        state = { ...state, memberStatesByProfileId: new Map([['B', { quotaSnapshot: { capturedAtMs: now, effectiveRemainingPercent: 80 } }]]) };
+        state = { ...state, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['B', { quotaSnapshot: { capturedAtMs: now, effectiveRemainingPercent: 80 } }]]) };
         return { ok: true, snapshot: null, receipt: { idempotencyKey: `reset-${resets}`, status: 'consumed' } };
       },
       applyGeneration: async () => {
@@ -254,7 +255,7 @@ describe('continueSessionAfterUsageLimitReset', () => {
         tracked.activeTurnId = 'second-interrupted-turn';
         transport.fetchSessionById.mockResolvedValue({ ...input.rawSession, latestTurnId: tracked.activeTurnId,
           latestTurnStatusObservedAt: 200, lastRuntimeIssue: { ...issue, providerTurnId: tracked.activeTurnId, occurredAt: 200 } });
-        state = { ...state, memberStatesByProfileId: exhausted() };
+        state = { ...state, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: exhausted() };
         await first.beginClassifiedFailure({ reportId: 'reset-report-2', sessionId, classification: failure, switchesThisTurn: 0 });
         await first.wake({ sessionId, reason: 'manual' });
         expect(origins[1]).not.toBe(origins[0]);
@@ -346,7 +347,7 @@ describe('continueSessionAfterUsageLimitReset', () => {
       credentialRevision: revision, runtimeStateRevision: 0,
       policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ autoSwitch: true, strategy: 'priority', softSwitchRemainingPercent: 15 }),
       members: ['A', 'B'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['A', { quotaSnapshot: { capturedAtMs: now, effectiveRemainingPercent: 10 } }],
         ['B', { quotaSnapshot: { capturedAtMs: now, effectiveRemainingPercent: 80 } }],
       ]) };
@@ -368,7 +369,7 @@ describe('continueSessionAfterUsageLimitReset', () => {
           providerLimitId: value.providerLimitId, retryAtMs: value.resetsAtMs ?? null,
           planType: value.planType, observedAtMs: now,
         }));
-        state = { ...state, memberStatesByProfileId };
+        state = { ...state, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId };
       },
     });
     const consumed = new Set<string>();
@@ -422,7 +423,7 @@ describe('continueSessionAfterUsageLimitReset', () => {
         archivedAt: projection === 'archived' ? now : null,
         lastRuntimeIssue: projection === 'completed' || projection === 'cancelled' || projection === 'not_failed' ? null : issue });
       if (projection === 'unknown_quota' || projection === 'exhausted_quota') {
-        state = { ...state, memberStatesByProfileId: new Map([['B', projection === 'unknown_quota' ? {} : {
+        state = { ...state, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['B', projection === 'unknown_quota' ? {} : {
           quotaSnapshot: { capturedAtMs: now, effectiveRemainingPercent: 0,
             meters: [{ meterId: 'weekly', limitCategory: 'usage_limit', remainingPct: 0, resetAtMs: 180_000, providerLimitId: null }] },
         }]]) };
@@ -446,7 +447,7 @@ describe('continueSessionAfterUsageLimitReset', () => {
         expect(wait.nextRetryAtMs).toBe(projection === 'unknown_quota' ? now + 30_000 : 180_000);
         expect(sends).toHaveLength(0);
         now = wait.nextRetryAtMs!;
-        state = { ...state, memberStatesByProfileId: new Map([...state.memberStatesByProfileId,
+        state = { ...state, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([...state.memberStatesByProfileId,
           ['B', { quotaSnapshot: { capturedAtMs: now, effectiveRemainingPercent: 80 } }]]) };
         await scheduler.wake({ sessionId, reason: 'timer' });
       }
@@ -502,7 +503,7 @@ describe('continueSessionAfterUsageLimitReset', () => {
         const nextRecovery = scheduler.readForSession(sessionId)[0]!;
         expect(nextRecovery.attemptId).not.toBe(initial.attemptId);
         expect(nextRecovery.status).toBe('waiting');
-        state = { ...state, memberStatesByProfileId: new Map([...state.memberStatesByProfileId,
+        state = { ...state, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([...state.memberStatesByProfileId,
           ['B', { quotaSnapshot: { capturedAtMs: now, effectiveRemainingPercent: 80 } }]]) };
         now = nextRecovery.nextRetryAtMs!;
         await scheduler.wake({ sessionId, reason: 'timer' });
@@ -561,7 +562,7 @@ describe('continueSessionAfterUsageLimitReset', () => {
       credentialRevision: revision, runtimeStateRevision: 0,
       policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ autoSwitch: true, strategy: 'priority' }),
       members: ['A', 'B'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-      memberStatesByProfileId: new Map([['B', { quotaSnapshot: { capturedAtMs: 110, effectiveRemainingPercent: 60 } }]]),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['B', { quotaSnapshot: { capturedAtMs: 110, effectiveRemainingPercent: 60 } }]]),
     };
     let runtime: { serviceId: typeof serviceId; groupId: string; profileId: string; generation: number; credentialRevision: string } = {
       serviceId, groupId: 'pool', profileId: 'A', generation: 1, credentialRevision: revision,

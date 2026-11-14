@@ -80,9 +80,11 @@ it.each([true, false])('retains only captured metadata when the owned probe fail
   const signal = process.kill.bind(process);
   const childKill = ChildProcess.prototype.kill;
   const ownedPid = (): number | undefined => existsSync(pidPath) ? Number(readFileSync(pidPath, 'utf8')) : undefined;
-  // Genuine OS termination rejection, restricted to the process that emitted this fixture's init.
+  // Genuine OS termination rejection, restricted to the process that emitted this fixture's init and
+  // the process group it leads (the SDK spawns it detached and owns that group).
   const deniedSignal = vi.spyOn(process, 'kill').mockImplementation((pid, requestedSignal) => {
-    if (emitInit && pid === ownedPid() && requestedSignal !== 0) {
+    const owned = ownedPid();
+    if (emitInit && owned !== undefined && (pid === owned || pid === -owned) && requestedSignal !== 0) {
       throw Object.assign(new Error('fixture-signal-denied'), { code: 'EPERM' });
     }
     return signal(pid, requestedSignal);

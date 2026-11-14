@@ -24,6 +24,13 @@ vi.mock('node:child_process', async importOriginal => {
     return { ...actual, spawn: vi.fn(actual.spawn) };
 });
 
+// Process enumeration stays real unless a case explicitly empties the snapshot (an OS seam).
+const processSnapshot = vi.hoisted(() => ({ empty: false }));
+vi.mock('ps-list', async importOriginal => {
+    const actual = await importOriginal<typeof import('ps-list')>();
+    return { default: async (...args: Parameters<typeof actual.default>) => (processSnapshot.empty ? [] : await actual.default(...args)) };
+});
+
 // The SDK transport and OS process are the boundaries; the ledger, adapter and session
 // contribution below remain real so premature task abandonment reaches the publication.
 class ControlledProcess extends EventEmitter implements SpawnedProcess {
@@ -141,7 +148,7 @@ describe('claudeRemoteAgentSdk owned process exit', () => {
         }
     });
 
-    it.runIf(process.platform !== 'win32').each(['javascript-direct', 'native-direct', 'wrapper-exit', 'wrapper-cleanup'])('qualifies provider stop through SDK 0.2.123 and its actual OS invocation (%s)', async (kind) => {
+    it.runIf(process.platform !== 'win32').each(['javascript-direct', 'native-direct', 'wrapper-exit', 'wrapper-cleanup', 'wrapper-cleanup-survivor'])('qualifies provider stop through SDK 0.2.123 and its actual OS invocation (%s)', async (kind) => {
         const dir = await mkdtemp(join(tmpdir(), 'happier-sdk-owned-invocation-'));
         const pidPath = join(dir, 'provider-pid');
         const aliveAckPath = join(dir, 'provider-alive-ack');
@@ -206,6 +213,8 @@ describe('claudeRemoteAgentSdk owned process exit', () => {
             });
         }
         let providerPid: number | undefined;
+        // The survivor case hides the provider from cleanup's snapshot, as a child forked late would be.
+        processSnapshot.empty = kind === 'wrapper-cleanup-survivor';
         try {
             const run = claudeRemoteAgentSdk({
                 sessionId: null, transcriptPath: null, path: dir,
@@ -232,10 +241,17 @@ describe('claudeRemoteAgentSdk owned process exit', () => {
             if (wrapsProvider) {
                 expect(vi.mocked(spawn).mock.calls.some(([command, args]) => command === shellWrapper && Array.isArray(args) && args[0] === '/d')).toBe(true);
             }
-            if (kind === 'wrapper-exit') {
+            if (kind === 'wrapper-exit' || kind === 'wrapper-cleanup-survivor') {
                 expect(isPidAlive(providerPid)).toBe(true);
                 process.kill(providerPid, 'SIGUSR2');
                 await vi.waitFor(async () => expect(await readFile(aliveAckPath, 'utf8')).toBe('alive'));
+                expect(evidence.providerActivityLedger.getActiveProviderTaskCount()).toBe(1);
+                expect(snapshots.at(-1)).toEqual({ state: 'unknown', activeCount: 0 });
+                expect(failure).toMatchObject({ code: 'claude_native_provider_exit_unverified' });
+            } else if (kind === 'wrapper-cleanup') {
+                // Snapshot cleanup reached the provider, but snapshot coverage proves nothing about the
+                // whole tree: the wrapper owns no process group. The exit stays unverified and the task kept.
+                await vi.waitFor(() => expect(isPidAlive(providerPid!)).toBe(false));
                 expect(evidence.providerActivityLedger.getActiveProviderTaskCount()).toBe(1);
                 expect(snapshots.at(-1)).toEqual({ state: 'unknown', activeCount: 0 });
                 expect(failure).toMatchObject({ code: 'claude_native_provider_exit_unverified' });
@@ -246,6 +262,7 @@ describe('claudeRemoteAgentSdk owned process exit', () => {
                 expect(snapshots.at(-1)).toEqual({ state: 'idle', activeCount: 0 });
             }
         } finally {
+            processSnapshot.empty = false;
             restorePlatform();
             env.restore();
             if (!providerPid) providerPid = Number(await readFile(pidPath, 'utf8').catch(() => '0'));

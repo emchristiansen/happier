@@ -204,6 +204,10 @@ class Configuration {
   public readonly installationIdentityFile: string
   public readonly daemonStateFile: string
   public readonly connectedServiceBrokerStateFile: string
+  /** Externally known connected-service group member holds (`happier connect hold`). */
+  public readonly connectedServiceMemberHoldsFile: string
+  /** Append-only runtime-auth attempt → provider-observed applied account journal. */
+  public readonly connectedServiceRuntimeAuthAttemptAccountsFile: string
   public readonly daemonLockFile: string
   // Session attach file pruning (best-effort; defense-in-depth for crash-before-read scenarios).
   public readonly sessionAttachFileMaxAgeMs: number
@@ -430,6 +434,8 @@ class Configuration {
       : this.activeServerDir
     this.daemonStateFile = join(daemonLifecycleDir, CANONICAL_DAEMON_STATE_BASENAME)
     this.connectedServiceBrokerStateFile = join(daemonLifecycleDir, 'connected-service-broker.state.json')
+    this.connectedServiceMemberHoldsFile = join(daemonLifecycleDir, 'connected-service-member-holds.json')
+    this.connectedServiceRuntimeAuthAttemptAccountsFile = join(daemonLifecycleDir, 'connected-service-runtime-auth-attempt-accounts.jsonl')
     this.daemonLockFile = join(daemonLifecycleDir, `${CANONICAL_DAEMON_STATE_BASENAME}.lock`)
 
     const attachMaxAgeRaw = String(process.env.HAPPIER_SESSION_ATTACH_FILE_MAX_AGE_MS ?? '').trim();

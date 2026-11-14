@@ -31,6 +31,7 @@ import {
   persistMaterializationFailureCredentialHealthForSpawn,
   resolveConnectedServiceAuthForSpawn,
 } from './resolveConnectedServiceAuthForSpawn';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 import type { ConnectedServicesMaterializationDiagnostic } from './materialize/providerMaterializerTypes';
 import type { ConnectedServiceCredentialRefreshResult } from './refresh/ConnectedServiceRefreshCoordinator';
 import { resolveClaudeCodeCredentialsFilePath } from '@/backends/claude/connectedServices/nativeAuth/claudeCodeCredentialFile';
@@ -264,6 +265,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -406,6 +408,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         };
       });
       const spawn = resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'claude',
         connectedServicesBindingsRaw: {
           v: 1,
@@ -664,6 +667,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -765,6 +769,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -873,6 +878,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -971,6 +977,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1056,6 +1063,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1143,6 +1151,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1213,6 +1222,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1267,6 +1277,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       } as unknown as ApiClient;
 
       const rejection = await resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'claude',
         connectedServicesBindingsRaw: {
           v: 1,
@@ -1344,6 +1355,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1412,6 +1424,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1580,6 +1593,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1680,6 +1694,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1861,6 +1876,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -1992,6 +2008,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -2221,6 +2238,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -2419,6 +2437,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     }));
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -2674,6 +2693,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -2861,6 +2881,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -3074,6 +3095,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     }));
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'claude',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -3164,6 +3186,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -3252,6 +3275,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -3304,6 +3328,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } as unknown as ApiClient;
 
     await expect(resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -3483,6 +3508,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     await mkdir(targetHome, { recursive: true });
     await writeFile(join(targetHome, 'auth.json'), existingAuth);
     const resolution = resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -3663,6 +3689,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
     const switchBeforeTurn = vi.spyOn(coordinator, 'switchBeforeTurn');
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -3836,6 +3863,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     ) => ReturnType<typeof resolveConnectedServiceAuthForSpawn>;
 
     const connectedServiceAuth = await resolveWithCoordinator({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -4000,6 +4028,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     ) => ReturnType<typeof resolveConnectedServiceAuthForSpawn>;
 
     const connectedServiceAuth = await resolveWithCoordinator({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,
@@ -4229,6 +4258,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         Object.defineProperty(process, 'platform', { ...originalPlatformDescriptor, value: 'linux' });
       }
       connectedServiceAuth = await resolveWithCoordinator({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'claude',
         connectedServicesBindingsRaw: {
           v: 1,
@@ -4523,6 +4553,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         Object.defineProperty(process, 'platform', { ...originalPlatformDescriptor, value: 'linux' });
       }
       const resolution = resolveWithCoordinator({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'claude',
         connectedServicesBindingsRaw: {
           v: 1,
@@ -4724,6 +4755,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
 
     const api = new NoCoordinatorApi();
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+      nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
       agentId: 'codex',
       connectedServicesBindingsRaw: {
         v: 1,

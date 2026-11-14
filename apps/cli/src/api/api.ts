@@ -33,6 +33,7 @@ import {
   ConnectedServiceAuthGroupGenerationConflictError,
   ConnectedServiceAuthGroupRuntimeStateRevisionConflictError,
   createConnectedServiceCredentialApi,
+  getConfirmedAccountEncryptionMode,
   type ConnectedServiceAuthGroupApi,
   type ConnectedServiceCredentialHealthApi,
   type ConnectedServiceCredentialApi,
@@ -1399,6 +1400,18 @@ export class ApiClient {
     return await this.fetchAccountEncryptionModeFromServer(options?.signal);
   }
 
+  /**
+   * The account's encryption mode only as the server stated it, uncached; a 404 or any other answer
+   * is `unknown`. Use this, not {@link getAccountEncryptionMode}, before writing through a
+   * mode-specific route.
+   */
+  async getConfirmedAccountEncryptionMode(options?: Readonly<{ signal?: AbortSignal }>): Promise<'e2ee' | 'plain' | 'unknown'> {
+    return await getConfirmedAccountEncryptionMode({
+      token: this.credential.token,
+      ...(options?.signal ? { signal: options.signal } : {}),
+    });
+  }
+
   private async fetchAccountEncryptionModeFromServer(signal?: AbortSignal): Promise<'e2ee' | 'plain' | 'unknown'> {
     return await this.connectedServiceCredentialApi.getAccountEncryptionMode?.({ signal }) ?? 'e2ee';
   }
@@ -2096,6 +2109,71 @@ export class ApiClient {
       });
       throw createConnectedServiceQuotaApiError({
         message: 'Failed to get connected service quota snapshot',
+        cause: error,
+      });
+    }
+  }
+
+  /**
+   * Ask the server to have this one profile's quota refreshed by its normal refresher (the daemon's
+   * quota coordinator), through the account's own route: V2 for an end-to-end-encrypted account, V3
+   * for a plain one; the caller names the mode it read. `not_found` is returned only for a 404 whose
+   * body carries the route's own `connect_quotas_not_found`, which the route sends both when the
+   * account is not in that route's mode and when the profile has no quota source; it does not say
+   * which. Any other 404 (no such route on this server, for one) is an error, never `not_found`. A
+   * recorded request is not a completed refresh; its outcome is in the profile's quota metadata.
+   */
+  async requestConnectedServiceQuotaRefresh(params: {
+    serviceId: ConnectedServiceId;
+    profileId: string;
+    accountEncryptionMode: 'e2ee' | 'plain';
+    signal?: AbortSignal;
+  }): Promise<'requested' | 'not_found'> {
+    const serverUrl = resolveServerHttpBaseUrl();
+    const version = params.accountEncryptionMode === 'e2ee' ? 'v2' : 'v3';
+    const serviceId = encodeURIComponent(params.serviceId);
+    const profileId = encodeURIComponent(params.profileId);
+
+    try {
+      const response = await axios.post(
+        `${serverUrl}/${version}/connect/${serviceId}/profiles/${profileId}/quotas/refresh`,
+        {},
+        {
+          headers: {
+            'Authorization': `Bearer ${this.credential.token}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: resolveConnectedServicesServerApiTimeoutMs(),
+          signal: params.signal,
+        },
+      );
+      if (response.status !== 200 || (response.data as { success?: unknown } | null)?.success !== true) {
+        throw createConnectedServiceQuotaProtocolError(
+          `Connected service quota refresh request returned status ${response.status} without success`,
+        );
+      }
+      return 'requested';
+    } catch (error: unknown) {
+      if (error instanceof ConnectedServiceQuotaApiError) throw error;
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      const body = axios.isAxiosError(error) ? error.response?.data : undefined;
+      if (status === 404 && (body as { error?: unknown } | null | undefined)?.error === 'connect_quotas_not_found') {
+        return 'not_found';
+      }
+      if (status === 404) {
+        throw createConnectedServiceQuotaApiError({
+          message: `Connected service quota refresh request got a 404 without connect_quotas_not_found from ${version}; `
+            + 'the server may not have this route',
+          cause: error,
+        });
+      }
+      logServerEndpointFailure({
+        logger,
+        operation: `Failed to request connected service quota refresh (${version})`,
+        error,
+      });
+      throw createConnectedServiceQuotaApiError({
+        message: 'Failed to request connected service quota refresh',
         cause: error,
       });
     }

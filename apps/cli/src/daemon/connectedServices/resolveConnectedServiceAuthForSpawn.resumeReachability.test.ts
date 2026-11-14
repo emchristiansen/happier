@@ -15,6 +15,7 @@ import {
   ConnectedServiceSpawnResumeUnreachableError,
   resolveConnectedServiceAuthForSpawn,
 } from './resolveConnectedServiceAuthForSpawn';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 import { resolveConnectedServiceMaterializedRootDir } from './materialize/resolveConnectedServiceMaterializedRootDir';
 import { waitForCondition } from '@/testkit/async/waitFor';
 import { writeExecutableShim } from '@/testkit/fs/executableShim';
@@ -193,6 +194,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       await writeFile(sourcePath, 'native-only transcript\n');
       const resolveLaunch = async () => {
         const auth = await resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'codex', sessionDirectory: testRoot, connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
         materializationKey: 'existing', activeServerDir, baseDir: join(testRoot, 'materialized'),
         credentials, api: makeCodexApi(now, credentials), nowMs: () => now,
@@ -276,6 +278,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       );
 
       const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'codex',
         sessionDirectory: cwd,
         connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
@@ -336,6 +339,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       await writeFile(sentinelPath, '{"previous":true}\n');
 
       await expect(resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'codex',
         sessionDirectory: cwd,
         connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
@@ -384,6 +388,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       process.env.HOME = fakeHome;
 
       await expect(resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'codex',
         sessionDirectory: cwd,
         connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
@@ -445,6 +450,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       process.env.HOME = fakeHome;
 
       await expect(resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'pi',
         sessionDirectory: cwd,
         connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
@@ -507,6 +513,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       );
 
       const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'pi',
         sessionDirectory: cwd,
         connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
@@ -557,6 +564,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       // A persisted absolute hint recorded on another machine that no longer exists locally must not
       // hard-fail: it degrades to the id+cwd native search, which resolves the session.
       const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'pi',
         sessionDirectory: cwd,
         connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
@@ -599,6 +607,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       process.env.HOME = fakeHome;
       // No native session file, but no resume reference either -> not a continuity spawn, must not gate.
       const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'pi',
         sessionDirectory: cwd,
         connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
@@ -642,6 +651,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       // WITHOUT running the gate — silently disabling the hard gate for a continuity resume. It must
       // instead fail closed with the structured continuity reason BEFORE the vendor launches.
       await expect(resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'pi',
         sessionDirectory: null,
         connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,
@@ -689,6 +699,7 @@ describe('resolveConnectedServiceAuthForSpawn post-materialization resume reacha
       // Resume requested but continuity (shared state) NOT requested -> isolated spawn must not be gated
       // by the shared-state reachability proof.
       const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
         agentId: 'pi',
         sessionDirectory: cwd,
         connectedServicesBindingsRaw: PI_CONNECTED_BINDINGS,

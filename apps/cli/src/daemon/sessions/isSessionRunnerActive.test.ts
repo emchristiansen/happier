@@ -1,3 +1,4 @@
+import type { ChildProcess } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { TrackedSession } from '../types';
@@ -25,6 +26,8 @@ describe('probeSessionRunnerServiceability', () => {
   });
   describe('lost publisher replacement binding', () => {
     const localRunner = { machineId: 'machine-1', pid: 456, processInstanceFingerprint: 'linux-proc:456' };
+    /** The daemon's own live detached spawn of runner 456. */
+    const ownedSpawn = { pid: 456, exitCode: null, signalCode: null } as unknown as ChildProcess;
     const probeLostPublisher = async (params: Readonly<{
       respondent?: unknown;
       tracked?: readonly TrackedSession[];
@@ -33,7 +36,7 @@ describe('probeSessionRunnerServiceability', () => {
       lockPid?: number;
     }> = {}) => await probeSessionRunnerServiceability({
       sessionId: 'sess_1',
-      trackedSessions: params.tracked ?? [{ startedBy: 'daemon', pid: 456, happySessionId: 'sess_1' }],
+      trackedSessions: params.tracked ?? [{ startedBy: 'daemon', pid: 456, happySessionId: 'sess_1', childProcess: ownedSpawn }],
       localMachineId: 'localMachineId' in params ? params.localMachineId : 'machine-1',
       readProcessRunState: async () => 'servable',
       readSessionRunnerLockStatus: async () => (params.lockPid === undefined
@@ -48,11 +51,31 @@ describe('probeSessionRunnerServiceability', () => {
 
     it('replaces only the exact local runner that reported the loss, and names it as the Stop target', async () => {
       const probe = await probeLostPublisher({ respondent: localRunner });
-      expect(resolveSessionRunnerResumeDecision(probe)).toEqual({
+      const decision = resolveSessionRunnerResumeDecision(probe);
+      expect(decision).toEqual({
         action: 'replace',
         reason: 'publisher_lost',
-        target: localRunner,
+        target: { ...localRunner, ownedProcessGroupLeader: ownedSpawn },
       });
+      // The target carries the daemon's own spawn handle itself, not a copy or a pid.
+      expect(decision.action === 'replace' && decision.target.ownedProcessGroupLeader).toBe(ownedSpawn);
+    });
+
+    it.each([
+      ['a runner reattached from its marker', { startedBy: 'daemon', pid: 456, happySessionId: 'sess_1', reattachedFromDiskMarker: true }],
+      ['a terminal-started runner', { startedBy: 'terminal', pid: 456, happySessionId: 'sess_1' }],
+      ['a runner whose spawned process exited', {
+        startedBy: 'daemon', pid: 456, happySessionId: 'sess_1',
+        childProcess: { pid: 456, exitCode: 0, signalCode: null } as unknown as ChildProcess,
+      }],
+      ['a spawn handle the daemon holds as another runner', {
+        startedBy: 'terminal', pid: 456, happySessionId: 'sess_1', childProcess: ownedSpawn,
+      }],
+    ] as const)('refuses to replace %s, whose whole tree no owned process group reaches', async (_label, tracked) => {
+      expect(resolveSessionRunnerResumeDecision(await probeLostPublisher({
+        respondent: localRunner,
+        tracked: [tracked as TrackedSession],
+      }))).toEqual({ action: 'fence', reason: 'publisher_lost_runner_group_unowned' });
     });
 
     it.each([

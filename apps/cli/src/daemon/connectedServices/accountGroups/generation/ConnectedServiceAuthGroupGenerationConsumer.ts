@@ -1,5 +1,10 @@
 import type { ConnectedServiceSessionAuthSwitchReason } from '../../runtimeAuth/connectedServiceSessionAuthSwitchCore';
 import { logger } from '@/ui/logger';
+import {
+  resolveConnectedServiceMemberHoldAdmission,
+  resolveConnectedServiceMemberHoldApplicationRefusal,
+  type ConnectedServiceMemberHoldView,
+} from '../holds/connectedServiceMemberHolds';
 import { hasConnectedServiceAccountApplicationProof, readConnectedServiceAccountApplicationCredentialError } from '../../sessionAuthSwitch/connectedServiceAuthSwitchOutcome';
 import type {
   ConnectedServiceCredentialRevisionV1,
@@ -138,7 +143,35 @@ export class ConnectedServiceAuthGroupGenerationConsumer {
       applicationSettled?: true;
       isCurrent?: () => boolean;
     }>): Promise<Readonly<{ ok: true }> | Readonly<{ ok: false; errorCode: string }>>;
+    /**
+     * Current canonical member holds. When supplied, every NEW automatic application effect (shared
+     * surface or per-session) of a held/unreadable target is refused before it is dispatched, after
+     * any exact-proof verification. Recipients never reselect or commit on refusal.
+     */
+    readMemberHolds?(serviceId: ConnectedServiceId): Promise<ConnectedServiceMemberHoldView>;
+    nowMs?(): number;
   }>) {}
+
+  /** Refusal for a new application of `committedGeneration`, or null when it may proceed. */
+  private async resolveApplicationHoldRefusal(input: Readonly<{
+    committedGeneration: ConnectedServiceAuthGroupCommittedGenerationFact;
+    executionAuthority: ConnectedServiceGenerationExecutionAuthority;
+  }>): Promise<Readonly<{ reconciliationDisposition: 'failed'; errorCode: string }> | null> {
+    if (!this.deps.readMemberHolds) return null;
+    if (resolveConnectedServiceMemberHoldAdmission(input.executionAuthority) === 'explicit_operator_choice') return null;
+    const target = input.committedGeneration.decisionCommittedTarget;
+    const refusal = resolveConnectedServiceMemberHoldApplicationRefusal({
+      view: await this.deps.readMemberHolds(target.serviceId),
+      profileId: target.profileId,
+      nowMs: this.deps.nowMs?.() ?? Date.now(),
+    });
+    if (!refusal) return null;
+    logger.warn('[ConnectedServices] Automatic generation application refused: target member held', {
+      serviceId: target.serviceId, groupId: target.groupId, profileId: target.profileId, generation: target.generation,
+      executionAuthority: input.executionAuthority, errorCode: refusal.errorCode,
+    });
+    return { reconciliationDisposition: 'failed', errorCode: refusal.errorCode };
+  }
 
   async consumeUnavailable(input: Readonly<{
     serviceId: ConnectedServiceId;
@@ -325,12 +358,25 @@ export class ConnectedServiceAuthGroupGenerationConsumer {
       targets: liveTargets,
       executionAuthority: input.executionAuthority,
       ...(input.signal ? { signal: input.signal } : {}),
-      applyCommittedGeneration: async (applyInput) => await this.deps.applyCommittedGeneration({
-        ...applyInput,
-        generationApplyReason: resolveGenerationRecipientApplyReason(input.switchReason),
-      }),
+      applyCommittedGeneration: async (applyInput) => {
+        const refused = await this.resolveApplicationHoldRefusal(applyInput);
+        if (refused) return refused;
+        return await this.deps.applyCommittedGeneration({
+          ...applyInput,
+          generationApplyReason: resolveGenerationRecipientApplyReason(input.switchReason),
+        });
+      },
       ...(this.deps.applySharedGenerationApplication
-        ? { applySharedGenerationApplication: this.deps.applySharedGenerationApplication }
+        ? {
+            applySharedGenerationApplication: async (
+              applyInput: Parameters<NonNullable<typeof this.deps.applySharedGenerationApplication>>[0],
+            ) => {
+              // Reached only when no exact existing proof settled the shared surface.
+              const refused = await this.resolveApplicationHoldRefusal(applyInput);
+              if (refused) return refused;
+              return await this.deps.applySharedGenerationApplication!(applyInput);
+            },
+          }
         : {}),
       verifySharedGenerationApplication: this.deps.verifySharedGenerationApplication,
       ...(this.deps.settleExactRecipientApplication

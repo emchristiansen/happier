@@ -16,6 +16,7 @@ import {
   reconcileConnectedServiceDirectCredentialRevisions,
 } from '../accountGroups/generation/reconcileConnectedServiceAuthGroupGenerations';
 import { resolveConnectedServiceAuthForSpawn } from '../resolveConnectedServiceAuthForSpawn';
+import { NEW_CALLER_SPAWN_NATIVE_SOURCE } from '@/daemon/connectedServices/connectedServiceSpawnNativeSource';
 import {
   ConnectedServiceExternalCredentialUpdateRefusedError,
   ConnectedServiceRefreshCoordinator,
@@ -116,6 +117,7 @@ async function applyExternalRevision(params: Readonly<{ producer: Producer; heal
   });
   const bindings = { v: 1, bindingsByServiceId: { [SERVICE_ID]: { source: 'connected', profileId: 'A' } } };
   const auth = await resolveConnectedServiceAuthForSpawn({
+    nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
     agentId: 'claude',
     credentialRefreshService: coordinator,
     connectedServicesBindingsRaw: bindings,
@@ -245,6 +247,7 @@ async function forcedAdoptionUnderReconnectRequiredHealth() {
   });
   const bindings = { v: 1, bindingsByServiceId: { [SERVICE_ID]: { source: 'connected', profileId: 'A' } } };
   const auth = await resolveConnectedServiceAuthForSpawn({
+    nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
     agentId: 'claude',
     credentialRefreshService: coordinator,
     connectedServicesBindingsRaw: bindings,

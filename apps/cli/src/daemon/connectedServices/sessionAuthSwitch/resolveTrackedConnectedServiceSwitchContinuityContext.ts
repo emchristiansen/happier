@@ -67,6 +67,28 @@ function normalizeOptionalAbsolutePath(value: unknown): string | null {
   return normalized && isAbsolute(normalized) ? normalized : null;
 }
 
+function readSessionMetadataDirectory(metadata: unknown): string | null {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  return normalizeOptionalAbsolutePath((metadata as Record<string, unknown>).path);
+}
+
+/**
+ * The session's working directory. A runner the daemon spawned carries it in its spawn options; a
+ * runner adopted from a disk marker without a respawn descriptor has no spawn options, and its
+ * directory is the `path` its own session metadata reports (persisted first, then the runner's
+ * local webhook report), the same directory an inactive session's switch uses.
+ */
+function resolveTrackedConnectedServiceSessionDirectory(input: Readonly<{
+  tracked: ContinuityTrackedSession | null;
+  persistedSessionMetadata?: unknown;
+  cwd?: string | null;
+}>): string | null {
+  return normalizeOptionalString(input.tracked?.spawnOptions?.directory)
+    ?? normalizeOptionalString(input.cwd)
+    ?? readSessionMetadataDirectory(input.persistedSessionMetadata)
+    ?? readSessionMetadataDirectory(input.tracked?.happySessionMetadataFromLocalWebhook);
+}
+
 function resolveTrackedConnectedServiceResumeContext(input: Readonly<{
   agentId: CatalogAgentId;
   tracked: ContinuityTrackedSession | null;
@@ -185,8 +207,11 @@ export function resolveTrackedConnectedServiceSwitchContinuityContext(input: Rea
     targetMaterializedRoot,
     targetMaterializedEnv,
     vendorResumeId: resumeContext.vendorResumeId,
-    cwd: normalizeOptionalString(input.tracked?.spawnOptions?.directory)
-      ?? normalizeOptionalString(input.cwd),
+    cwd: resolveTrackedConnectedServiceSessionDirectory({
+      tracked: input.tracked,
+      persistedSessionMetadata: input.persistedSessionMetadata,
+      cwd: input.cwd,
+    }),
     candidatePersistedSessionFile: resumeContext.candidatePersistedSessionFile,
   };
 }

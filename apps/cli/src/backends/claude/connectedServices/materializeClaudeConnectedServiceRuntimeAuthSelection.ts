@@ -2,12 +2,13 @@ import type {
   ConnectedServiceCredentialRecordV1,
   ConnectedServiceId,
 } from '@happier-dev/protocol';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import type { ConnectedServiceRuntimeAuthSelectionMaterializer } from '@/daemon/connectedServices/sessionAuthSwitch/runtimeAuthSelectionMaterializerTypes';
 import type { ConnectedServiceResolvedSelection } from '@/daemon/connectedServices/materialize/materializeConnectedServicesForSpawn';
 import { resolveExistingSessionAttachContext } from '@/daemon/sessionEncryption/resolveExistingSessionAttachContext';
 import { resolveTrackedConnectedServiceSwitchContinuityContext } from '@/daemon/connectedServices/sessionAuthSwitch/resolveTrackedConnectedServiceSwitchContinuityContext';
+import { resolveConnectedServicePreviousStateRoot } from '@/daemon/connectedServices/materialize/resolveConnectedServicePreviousStateRoot';
 import { HAPPIER_CONNECTED_SERVICE_TARGET_MATERIALIZED_ROOT_ENV_KEY } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
 import type { Credentials } from '@/persistence';
 
@@ -233,6 +234,12 @@ export const materializeClaudeConnectedServiceRuntimeAuthSelection: ConnectedSer
         resolveCandidatePersistedSessionFile: (_agentId, metadata) =>
           resolveClaudeConnectedServiceCandidatePersistedSessionFile({ metadata }),
       });
+  // The session's current home records the source its launcher admitted; a switch never produces
+  // one. The daemon's environment is not source authority, so without a record the switch is refused.
+  const previousClaudeConfigDir = await resolveConnectedServicePreviousStateRoot({
+    previousRoot: continuityContext.targetMaterializedEnv?.CLAUDE_CONFIG_DIR ?? continuityContext.targetMaterializedRoot,
+    managedRoots: [join(activeServerDir, 'daemon', 'connected-services', 'homes')],
+  });
   const materialized = await materializeClaudeConnectedServiceSelection({
     activeServerDir,
     serviceId: params.input.serviceId,
@@ -240,8 +247,10 @@ export const materializeClaudeConnectedServiceRuntimeAuthSelection: ConnectedSer
     fallbackProfileId: params.baseSelection.profileId,
     selection,
     processEnv: params.processEnv ?? process.env,
+    nativeSourceAuthority: 'recorded',
+    previousClaudeConfigDir,
     accountSettings: params.accountSettings ?? null,
-    sessionDirectory: params.input.tracked?.spawnOptions?.directory ?? params.input.cwd ?? null,
+    sessionDirectory: continuityContext.cwd,
     vendorResumeId: continuityContext.vendorResumeId,
     candidatePersistedSessionFile: continuityContext.candidatePersistedSessionFile,
     validateGroupMutationCurrentness: createConnectedServiceGroupMutationCurrentnessValidator({

@@ -349,6 +349,13 @@ export class Session {
     // Once requested or proven, identity survives transcript loss: launch validation must
     // fail visibly instead of silently replacing an established conversation.
     private sessionIdMustBeResumed = false;
+    /**
+     * The established identity a local `--resume` launch cleared because Claude is expected to
+     * fork it. Until a hook-reported fork has materialized native history, this remains the
+     * session's resumable identity, so a switch before any local turn resumes it instead of
+     * silently starting a new conversation.
+     */
+    private unconfirmedForkOrigin: ClearedClaudeSessionIdentity | null = null;
     mode: 'local' | 'remote' = 'local';
     thinking: boolean = false;
     /** When `thinking` was last written; idle provider exit measures quiet time from here. */
@@ -525,16 +532,32 @@ export class Session {
 
     /** Project the coherent resume identity for launch, replay, and startup observers. */
     getResumableSessionIdentity = (): SessionFoundInfo | null => {
+        const forkOrigin = this.unconfirmedForkOrigin;
+        if (forkOrigin) {
+            if (this.sessionId === forkOrigin.sessionId) {
+                // Re-observing the origin itself (any hook source, or the eventless local
+                // callback) is no fork; it keeps the origin's established must-resume state,
+                // so lost history refuses instead of permitting a fresh start.
+                this.unconfirmedForkOrigin = null;
+                this.sessionIdMustBeResumed ||= forkOrigin.mustResume;
+                this.transcriptPath ??= forkOrigin.transcriptPath;
+            } else if (this.sessionId && this.hasMaterializedTranscript(this.sessionId, this.transcriptPath)) {
+                // The fork is confirmed: an observed id whose native history exists.
+                this.unconfirmedForkOrigin = null;
+                this.sessionIdMustBeResumed = true;
+                return { sessionId: this.sessionId, transcriptPath: this.transcriptPath };
+            } else {
+                logger.infoFile('[Session] Resuming the established Claude session; its local fork is unconfirmed', {
+                    event: 'claude_unconfirmed_fork_resume_origin',
+                    providerSessionId: forkOrigin.sessionId,
+                    observedProviderSessionId: this.sessionId,
+                });
+                return { sessionId: forkOrigin.sessionId, transcriptPath: forkOrigin.transcriptPath };
+            }
+        }
         if (!this.sessionId) return null;
         if (this.sessionIdMustBeResumed) return { sessionId: this.sessionId, transcriptPath: this.transcriptPath };
-        if (
-            hasClaudeMaterializedSessionTranscript(
-                this.sessionId,
-                this.path,
-                this.transcriptPath,
-                resolveConfiguredClaudeConfigDir({ env: process.env }),
-            )
-        ) {
+        if (this.hasMaterializedTranscript(this.sessionId, this.transcriptPath)) {
             this.sessionIdMustBeResumed = true;
             return { sessionId: this.sessionId, transcriptPath: this.transcriptPath };
         }
@@ -547,6 +570,15 @@ export class Session {
 
     /** Return only the ID when the caller does not need the canonical transcript path. */
     getResumableSessionId = (): string | null => this.getResumableSessionIdentity()?.sessionId ?? null;
+
+    private hasMaterializedTranscript(sessionId: string, transcriptPath: string | null): boolean {
+        return hasClaudeMaterializedSessionTranscript(
+            sessionId,
+            this.path,
+            transcriptPath,
+            resolveConfiguredClaudeConfigDir({ env: process.env }),
+        );
+    }
 
     setPushSender(pushSender: PushNotificationClient | null): void {
         this.pushSender = pushSender;
@@ -1121,6 +1153,7 @@ export class Session {
         this.claudeToolHookCorrelation.clear();
         this.sessionId = null;
         this.sessionIdMustBeResumed = false;
+        this.unconfirmedForkOrigin = null;
         this.transcriptPath = null;
         updateMetadataBestEffort(
             this.client,
@@ -1142,6 +1175,22 @@ export class Session {
         this.sessionId = cleared.sessionId;
         this.transcriptPath = cleared.transcriptPath;
         this.sessionIdMustBeResumed = cleared.mustResume;
+        this.unconfirmedForkOrigin = null;
+    }
+
+    /**
+     * Clear the identity before a local `--resume` launch that Claude is expected to fork, keeping
+     * the resumable identity it replaces as the unconfirmed fork origin (see
+     * `unconfirmedForkOrigin`). An origin still unconfirmed from an earlier launch carries over.
+     * Returns that origin for `restoreClearedSessionIdentity` when the launch rolls back.
+     */
+    clearSessionIdForExpectedFork = (): ClearedClaudeSessionIdentity | null => {
+        const origin = this.getResumableSessionIdentity();
+        this.clearSessionId();
+        this.unconfirmedForkOrigin = origin
+            ? { sessionId: origin.sessionId, transcriptPath: origin.transcriptPath, mustResume: true }
+            : null;
+        return this.unconfirmedForkOrigin;
     }
 
     /**
