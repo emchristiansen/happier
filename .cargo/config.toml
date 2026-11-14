@@ -1,0 +1,6 @@
+# Applies from the repository root and nested Rust callers, even with a private CARGO_HOME.
+[registry]
+global-min-publish-age = "14 days"
+
+[resolver]
+incompatible-publish-age = "deny"
