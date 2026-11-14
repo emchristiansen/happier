@@ -1,4 +1,4 @@
-import { mkdtemp } from 'node:fs/promises';
+import { appendFile, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -305,5 +305,102 @@ describe('JL-05: turn-lifecycle provider activity through the real producer → 
       latestStatus: 'recovered',
       usefulContinuation: { kind: 'provider_activity_unverified_turn', observedAtMs: 500 },
     });
+  });
+});
+
+describe('JL-06: retained provider_outcome_proof rows that predate turnOwnership, through the real journal reader → CLI', () => {
+  const disposers: Array<() => void> = [];
+  afterEach(() => {
+    while (disposers.length > 0) disposers.pop()!();
+  });
+
+  /** Real scheduler rows: B applied, a quota proof, then provider activity (exact turn as emitted today). */
+  async function emittedRows() {
+    const f = await realScheduler();
+    disposers.push(() => f.scheduler.dispose());
+    await f.applied(200, 'B', 2);
+    f.clock.now = 240;
+    await f.scheduler.markProviderOutcomeProofByKey({
+      recoveryKey: RECOVERY_KEY, expectedAttemptId: f.attemptId, proofKind: 'quota_probe_fresh', observedAtMs: 240,
+    });
+    f.clock.now = 260;
+    await f.scheduler.markProviderOutcomeProofByKey({
+      recoveryKey: RECOVERY_KEY, expectedAttemptId: f.attemptId, proofKind: 'provider_activity', observedAtMs: 250,
+      evidence: { turnOwnership: 'exact_turn' },
+    });
+    const rows = f.events.map((event) => JSON.parse(JSON.stringify(event)) as Record<string, unknown>);
+    expect(rows.filter((row) => row.kind === 'provider_outcome_proof').map((row) => row.proofKind))
+      .toEqual(['quota_probe_fresh', 'provider_activity']);
+    return { rows, attemptId: f.attemptId };
+  }
+
+  /** Writes raw JSONL exactly as a retained file would hold it and reads it back through the real CLI. */
+  async function cliRead(rows: ReadonlyArray<Record<string, unknown>>, args: ReadonlyArray<string> = ['--session', 's'], tail = '') {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-attempt-join-legacy-'));
+    const filePath = join(dir, 'journal.jsonl');
+    await writeFile(filePath, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    if (tail) await appendFile(filePath, tail);
+    const lines: string[] = [];
+    await runConnectAttemptAccountsCommand({ args, journal: createRuntimeAuthAttemptAccountJoinJournal({ filePath }), write: (line) => lines.push(line) });
+    return JSON.parse(lines.join('\n')) as {
+      attempts: Array<{ attemptId: string; proofs: unknown[]; schedulerRecovered: { proofKinds: string[] } | null; usefulContinuation: { kind: string } }>;
+      invalidLines: Array<{ lineNumber: number }>;
+    };
+  }
+
+  const withOwnership = (rows: ReadonlyArray<Record<string, unknown>>, value: unknown | 'omit') => rows.map((row) => {
+    if (row.kind !== 'provider_outcome_proof') return row;
+    const { turnOwnership: _ignored, ...rest } = row;
+    return value === 'omit' ? rest : { ...rest, turnOwnership: value };
+  });
+
+  it('legacy quota and activity rows without turnOwnership are retained and reported as unverified, never as exact useful continuation', async () => {
+    const { rows } = await emittedRows();
+    const legacy = withOwnership(rows, 'omit');
+    expect(legacy.some((row) => row.kind === 'provider_outcome_proof' && 'turnOwnership' in row)).toBe(false);
+    const view = await cliRead(legacy);
+    expect(view.invalidLines).toEqual([]);
+    expect(view.attempts).toHaveLength(1);
+    expect(view.attempts[0]!.proofs).toHaveLength(2);
+    expect(view.attempts[0]!.schedulerRecovered?.proofKinds).toEqual(['quota_probe_fresh']);
+    expect(view.attempts[0]!.usefulContinuation.kind).toBe('provider_activity_unverified_turn');
+  });
+
+  it('explicit null reads like an omitted field; exact_turn and unverified_turn keep their meanings', async () => {
+    const { rows } = await emittedRows();
+    expect((await cliRead(withOwnership(rows, null))).attempts[0]!.usefulContinuation.kind).toBe('provider_activity_unverified_turn');
+    expect((await cliRead(withOwnership(rows, 'unverified_turn'))).attempts[0]!.usefulContinuation.kind).toBe('provider_activity_unverified_turn');
+    const exact = await cliRead(withOwnership(rows, 'exact_turn'));
+    expect(exact.invalidLines).toEqual([]);
+    expect(exact.attempts[0]!.usefulContinuation.kind).toBe('provider_activity');
+  });
+
+  it('a malformed ownership value is still rejected as an invalid line and offers no proof', async () => {
+    const { rows } = await emittedRows();
+    const view = await cliRead(withOwnership(rows, 'invented_exact'));
+    expect(view.invalidLines).toHaveLength(2);
+    expect(view.attempts[0]!.proofs).toEqual([]);
+    expect(view.attempts[0]!.usefulContinuation.kind).toBe('not_witnessed');
+  });
+
+  it('a torn trailing line is reported without disturbing retained legacy rows', async () => {
+    const { rows } = await emittedRows();
+    const legacy = withOwnership(rows, 'omit');
+    const view = await cliRead(legacy, ['--session', 's'], '{"v":1,"kind":"provider_outcome_proof","sessi');
+    expect(view.invalidLines.map((line) => line.lineNumber)).toEqual([legacy.length + 1]);
+    expect(view.attempts[0]!.proofs).toHaveLength(2);
+    expect(view.attempts[0]!.usefulContinuation.kind).toBe('provider_activity_unverified_turn');
+  });
+
+  it('a legacy proof naming another attempt does not join this attempt', async () => {
+    const { rows, attemptId } = await emittedRows();
+    const foreign = withOwnership(rows, 'omit').map((row) => (
+      row.kind === 'provider_outcome_proof' ? { ...row, attemptId: 'other-attempt', expectedAttemptId: 'other-attempt', attemptIdAfter: 'other-attempt' } : row
+    ));
+    const view = await cliRead(foreign, ['--attempt', attemptId]);
+    expect(view.invalidLines).toEqual([]);
+    expect(view.attempts).toHaveLength(1);
+    expect(view.attempts[0]!.proofs).toEqual([]);
+    expect(view.attempts[0]!.usefulContinuation.kind).toBe('not_witnessed');
   });
 });

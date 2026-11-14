@@ -143,11 +143,22 @@ describe('member holds at automatic generation application (HOLD-03)', () => {
     expect(f.applied).toEqual(['B', 'B']);
   });
 
-  it('a manual application (the operator\'s explicit choice of active member) is not subject to holds', async () => {
+  it('an explicit operator choice (fresh_user_action admission) is not subject to holds', async () => {
+    const f = await fixture({ active: 'B' });
+    await f.store.set(hold('B'));
+    expect(await f.coordinator.applyCommittedGeneration({ ...recipient('manual'), holdAdmission: 'explicit_operator_choice' }))
+      .toMatchObject({ status: 'observed_generation', activeProfileId: 'B' });
+    expect(f.applied).toEqual(['B']);
+  });
+
+  it('a "manual" reason label alone is not operator authority: passive catch-up still refuses a held target (HOLD-05)', async () => {
     const f = await fixture({ active: 'B' });
     await f.store.set(hold('B'));
     expect(await f.coordinator.applyCommittedGeneration(recipient('manual')))
-      .toMatchObject({ status: 'observed_generation', activeProfileId: 'B' });
-    expect(f.applied).toEqual(['B']);
+      .toMatchObject({ status: 'generation_apply_failed', activeProfileId: 'B', errorCode: 'connected_service_member_held' });
+    expect(await f.coordinator.applyCommittedGeneration({ ...recipient('manual'), holdAdmission: 'enforce' }))
+      .toMatchObject({ status: 'generation_apply_failed', errorCode: 'connected_service_member_held' });
+    expect(f.applied).toEqual([]);
+    expect(f.commits).toEqual([]);
   });
 });

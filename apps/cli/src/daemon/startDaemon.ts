@@ -59,6 +59,10 @@ import { buildTrackedSpawnOptions, resolveDaemonTerminalPresentation } from '@/d
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { configuration, reloadConfiguration } from '@/configuration';
+import {
+  readConfiguredConnectedServiceMemberHolds,
+  resolveConnectedServiceMemberHoldAdmission,
+} from './connectedServices/accountGroups/holds/connectedServiceMemberHolds';
 import { startCaffeinate, stopCaffeinate } from '@/integrations/caffeinate';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
@@ -354,6 +358,7 @@ import {
   listSessionGenerationRuntimeTargets,
 } from './connectedServices/accountGroups/generation/reconcileConnectedServiceAuthGroupGenerations';
 import { mapCommittedGenerationApplyResult } from './connectedServices/accountGroups/generation/mapCommittedGenerationApplyResult';
+import { createSharedGenerationApplication } from './connectedServices/accountGroups/generation/createSharedGenerationApplication';
 import { createRuntimeGenerationApplicationProofResolver } from './connectedServices/accountGroups/generation/createRuntimeGenerationApplicationProofResolver';
 import type { RuntimeGenerationApplicationProofTarget } from './connectedServices/accountGroups/generation/resolveRuntimeGenerationApplicationProofs';
 import {
@@ -8881,6 +8886,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       };
 
       connectedServiceAuthGroupGenerationConsumer = new ConnectedServiceAuthGroupGenerationConsumer({
+        // Canonical member holds govern every new automatic application effect this consumer dispatches.
+        readMemberHolds: readConfiguredConnectedServiceMemberHolds,
+        nowMs: () => Date.now(),
         notifyCurrentGroupTruth: createConnectedServiceCurrentGroupTruthNotifier({
           applyRequestTimeBrokerCurrentTruth: async (input) => {
             if (input.applicationOwnerId !== 'opencode' && input.applicationOwnerId !== 'pi') return null;
@@ -8921,76 +8929,18 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             request,
           }),
         }),
-        applySharedGenerationApplication: async (input) => {
-          const target = input.committedGeneration.decisionCommittedTarget;
-          const descriptor = await resolveConnectedServiceCredentialLifecycleDescriptor(
-            input.applicationOwnerId as CatalogAgentId,
-          );
-          if (!descriptor.applySharedGenerationApplication) {
-            return { reconciliationDisposition: 'failed', errorCode: 'shared_generation_application_unavailable' };
-          }
-          const resolved = await resolveConnectedServiceCredentialsWithRevisions({
+        applySharedGenerationApplication: createSharedGenerationApplication({
+          activeServerDir: configuration.activeServerDir,
+          resolveDescriptor: async (ownerId) => await resolveConnectedServiceCredentialLifecycleDescriptor(ownerId as CatalogAgentId),
+          resolveTargetCredential: async (target) => await resolveConnectedServiceCredentialsWithRevisions({
             credentials,
             api,
             bindings: [{ serviceId: target.serviceId, profileId: target.profileId }],
-          }).then((byServiceId) => byServiceId.get(target.serviceId) ?? null).catch(() => {
-            logger.warn('[DAEMON RUN] Shared account application credential read failed', {
-              serviceId: target.serviceId, profileId: target.profileId, errorCode: 'credential_revision_read_failed',
-            });
-            return null;
-          });
-          if (!resolved || resolved.credentialRevision === null) {
-            return { reconciliationDisposition: 'failed', errorCode: 'credential_revision_missing' };
-          }
-          const credentialRevision = resolved.credentialRevision;
-          const proof = await descriptor.applySharedGenerationApplication({
-            activeServerDir: configuration.activeServerDir,
-            serviceId: target.serviceId,
-            groupId: target.groupId,
-            profileId: target.profileId,
-            generation: target.generation,
-            credentialRevision,
-            record: resolved.record,
-            validateCurrentBeforeMutation: async () => await validateConnectedServiceGroupMutationCurrentness({
-              serviceId: target.serviceId,
-              groupId: target.groupId,
-              profileId: target.profileId,
-              generation: target.generation,
-              credentialRevision,
-            }),
-          }).catch(() => {
-            logger.warn('[DAEMON RUN] Shared account application failed', {
-              serviceId: target.serviceId, profileId: target.profileId, errorCode: 'shared_generation_application_unavailable',
-            });
-            return { status: 'unavailable' as const };
-          });
-          if (proof.status === 'superseded_after_apply') {
-            return mapCommittedGenerationApplyResult({
-              committedGeneration: input.committedGeneration,
-              result: {
-                status: 'superseded_after_apply',
-                activeProfileId: proof.activeProfileId,
-                generation: proof.generation,
-                credentialRevision: proof.credentialRevision,
-              },
-            });
-          }
-          if (proof.status !== 'verified' || proof.credentialRevision !== credentialRevision) {
-            return { reconciliationDisposition: 'failed', errorCode: 'shared_generation_application_unverified' };
-          }
-          return {
-            reconciliationDisposition: 'converged',
-            errorCode: null,
-            providerAdoptedTarget: {
-              ...target,
-              credentialRevision,
-              proof: {
-                ...proof,
-                status: 'verified',
-              },
-            },
-          };
-        },
+          }).then((byServiceId) => byServiceId.get(target.serviceId) ?? null),
+          validateCurrentness: validateConnectedServiceGroupMutationCurrentness,
+          readMemberHolds: readConfiguredConnectedServiceMemberHolds,
+          nowMs: () => Date.now(),
+        }),
         applyCommittedGeneration: async (input) => {
           const tracked = getCurrentChildren().find((child) => child.happySessionId === input.sessionId) ?? null;
           if (!tracked) {
@@ -9011,6 +8961,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             credentialRevision: target.credentialRevision,
             reason: input.generationApplyReason,
             fromProfileId: input.fromProfileId,
+            holdAdmission: resolveConnectedServiceMemberHoldAdmission(input.executionAuthority),
           });
           const mapped = mapCommittedGenerationApplyResult({
             committedGeneration: input.committedGeneration,

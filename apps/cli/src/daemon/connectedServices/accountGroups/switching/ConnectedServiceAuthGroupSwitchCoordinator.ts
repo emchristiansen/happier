@@ -18,7 +18,9 @@ import type { AutomaticQuotaResetContext, ConnectedServiceGroupQuotaProbeResult,
 import { logger } from '@/ui/logger';
 import {
   ConnectedServiceMemberHeldAtSwitchAdmissionError,
+  resolveConnectedServiceMemberHoldApplicationRefusal,
   resolveConnectedServiceMemberHoldExclusion,
+  type ConnectedServiceMemberHoldAdmission,
   type ConnectedServiceMemberHoldView,
 } from '../holds/connectedServiceMemberHolds';
 import { isSameConnectedServiceAccountTarget } from '../../sessionAuthSwitch/connectedServiceAuthSwitchOutcome';
@@ -531,23 +533,25 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
   }
 
   /**
-   * Holds govern automatic group selection and application. A `manual` application carries the
-   * operator's own explicit choice of active member and is not subject to them.
+   * Holds govern every automatic application. Only a caller holding a typed explicit operator
+   * choice may bypass them; a `manual` reason label is not that authority.
    */
   private async resolveApplicationHoldRefusal(
     completion: LeaseCompletion,
+    holdAdmission: ConnectedServiceMemberHoldAdmission,
   ): Promise<ConnectedServiceAuthGenerationApplyFailure | null> {
-    if (!this.deps.readMemberHolds || completion.reason === 'manual' || !completion.activeProfileId) return null;
-    const exclusion = resolveConnectedServiceMemberHoldExclusion(
-      await this.deps.readMemberHolds(completion.serviceId), completion.activeProfileId, this.deps.nowMs());
-    if (!exclusion) return null;
-    return {
-      errorCode: exclusion.reason === 'held' ? 'connected_service_member_held' : 'connected_service_member_hold_state_unreadable',
-      diagnostics: { memberHold: { profileId: completion.activeProfileId, ...exclusion } },
-    };
+    if (!this.deps.readMemberHolds || holdAdmission === 'explicit_operator_choice' || !completion.activeProfileId) return null;
+    return resolveConnectedServiceMemberHoldApplicationRefusal({
+      view: await this.deps.readMemberHolds(completion.serviceId),
+      profileId: completion.activeProfileId,
+      nowMs: this.deps.nowMs(),
+    });
   }
 
-  private async applyObservedGeneration(completion: LeaseCompletion): Promise<ObservedGenerationApplyResult> {
+  private async applyObservedGeneration(
+    completion: LeaseCompletion,
+    holdAdmission: ConnectedServiceMemberHoldAdmission = 'enforce',
+  ): Promise<ObservedGenerationApplyResult> {
     let applyResult: ConnectedServiceAuthGroupSwitchApplyGenerationResult | void;
     const decisionTrace = readSwitchResultDecisionTrace(completion.result);
     try {
@@ -565,7 +569,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
       // divergence, recipient fanout, quota recovery) reads current canonical holds after the
       // awaited preflight. A held or unreadable target is refused, never applied; this path does
       // not select or commit, so the refusal is reported for its owner to reselect or defer.
-      const holdRefusal = await this.resolveApplicationHoldRefusal(completion);
+      const holdRefusal = await this.resolveApplicationHoldRefusal(completion, holdAdmission);
       if (holdRefusal) {
         return buildGenerationApplyResult({
           activeProfileId: completion.activeProfileId,
@@ -1111,6 +1115,8 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
     credentialRevision?: import('@happier-dev/protocol').ConnectedServiceCredentialRevisionV1 | null;
     reason: string;
     fromProfileId?: string | null;
+    /** Defaults to enforcing holds; see resolveConnectedServiceMemberHoldAdmission. */
+    holdAdmission?: ConnectedServiceMemberHoldAdmission;
   }>): Promise<ObservedGenerationApplyResult> {
     const startedAtMs = this.deps.nowMs();
     const result = await this.applyObservedGeneration(buildLeaseCompletion({
@@ -1128,7 +1134,7 @@ export class ConnectedServiceAuthGroupSwitchCoordinator {
         generation: input.generation,
         credentialRevision: input.credentialRevision ?? null,
       },
-    }));
+    }), input.holdAdmission ?? 'enforce');
     this.logSwitchPipelineResult({
       trigger: 'pre_turn', phase: 'observed_divergence', request: input,
       // Recipient application has no authoritative source generation. Keep it unknown rather

@@ -96,7 +96,9 @@ const ProviderOutcomeProofEventSchema = z.object({
    * Producer-stated turn ownership of provider activity: `exact_turn` only when the exact-turn
    * owner matched the session's current turn; null when the producer did not state it.
    */
-  turnOwnership: z.enum(['exact_turn', 'unverified_turn']).nullable(),
+  // Rows written before this field existed omit it: they are read as unstated (null), never as
+  // exact, and are not rewritten. A present value must still be one of the known kinds.
+  turnOwnership: z.enum(['exact_turn', 'unverified_turn']).nullable().default(null),
   statusBefore: NullableString,
   statusAfter: NullableString,
   attemptIdAfter: NullableString,

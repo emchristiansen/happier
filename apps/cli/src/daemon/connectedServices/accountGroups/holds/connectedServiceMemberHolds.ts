@@ -272,3 +272,31 @@ export class ConnectedServiceMemberHeldAtSwitchAdmissionError extends Error {
     this.exclusion = input.exclusion;
   }
 }
+
+/**
+ * Whether member holds govern an automatic application of an already-committed generation.
+ * Only a fresh user action is the operator's explicit choice; passive projection, catch-up and
+ * runtime recovery are automatic even when an upstream label says `manual`. Derive this from the
+ * execution authority, never from a switch-reason label.
+ */
+export type ConnectedServiceMemberHoldAdmission = 'enforce' | 'explicit_operator_choice';
+
+export function resolveConnectedServiceMemberHoldAdmission(
+  executionAuthority: 'passive_projection' | 'fresh_user_action' | 'runtime_recovery',
+): ConnectedServiceMemberHoldAdmission {
+  return executionAuthority === 'fresh_user_action' ? 'explicit_operator_choice' : 'enforce';
+}
+
+/** The refusal an automatic application reports when its immutable target is held or unreadable. */
+export function resolveConnectedServiceMemberHoldApplicationRefusal(input: Readonly<{
+  view: ConnectedServiceMemberHoldView;
+  profileId: string;
+  nowMs: number;
+}>): Readonly<{ errorCode: string; diagnostics: unknown }> | null {
+  const exclusion = resolveConnectedServiceMemberHoldExclusion(input.view, input.profileId, input.nowMs);
+  if (!exclusion) return null;
+  return {
+    errorCode: exclusion.reason === 'held' ? 'connected_service_member_held' : 'connected_service_member_hold_state_unreadable',
+    diagnostics: { memberHold: { profileId: input.profileId, ...exclusion } },
+  };
+}
