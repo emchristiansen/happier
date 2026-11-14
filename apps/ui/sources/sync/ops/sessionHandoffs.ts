@@ -55,6 +55,7 @@ import { followUpSpawnedSessionWithServerScope } from '../runtime/orchestration/
 import { buildSessionHandoffMetadataPatch } from './buildSessionHandoffMetadataPatch';
 import { ConnectedServiceAuthSelectionUnsupportedError, machineRpcWithConnectedServiceAuthAdmission, requireMachineConnectedServiceAuthSelection } from './connectedServiceAuthSupport';
 import { probeSessionHandoffCapability } from '../domains/sessionHandoff/probeSessionHandoffCapability';
+import { ConnectedServiceBindingsV1Schema, stripConnectedServicePerSessionAssignmentFields } from '@happier-dev/protocol';
 
 type MetadataRecord = Metadata;
 type HandoffErrorResult = Readonly<{
@@ -1160,9 +1161,11 @@ export async function completeSessionHandoff(options: CompleteSessionHandoffOpti
     const resumeConnectedServices = (() => {
         const metadata = (storage.getState().sessions?.[options.sessionId]?.metadata ?? options.sourceMetadata) as MetadataRecord | null;
         if (!metadata) return undefined;
-        return Object.prototype.hasOwnProperty.call(metadata, 'connectedServices')
-            ? (metadata as unknown as Record<string, unknown>).connectedServices
-            : undefined;
+        if (!Object.prototype.hasOwnProperty.call(metadata, 'connectedServices')) return undefined;
+        const raw = (metadata as unknown as Record<string, unknown>).connectedServices;
+        // The target machine makes its own per-session decision and reservation (spec A.1).
+        const parsed = ConnectedServiceBindingsV1Schema.safeParse(raw);
+        return parsed.success ? stripConnectedServicePerSessionAssignmentFields(parsed.data) : raw;
     })();
     const targetAttemptId = `target_${started.response.handoffId}`;
     const resumeResult = await resumeSessionHandoffTargetV2({

@@ -179,4 +179,45 @@ describe('resolveConnectedServiceQuotaProfileRefForSession', () => {
             provenance: 'connected_binding_group',
         });
     });
+
+    it('reports the per-session applied member of a group session, never the shared active member or an unadopted target', () => {
+        const accountProfileConnectedServicesV2 = AccountProfileSchema.parse({
+            id: 'acct',
+            connectedServicesV2: [{
+                serviceId: 'claude-subscription',
+                profiles: [
+                    { profileId: 'member-a', status: 'connected', kind: 'oauth', providerEmail: 'a@b.com', expiresAt: 1 },
+                    { profileId: 'member-b', status: 'connected', kind: 'oauth', providerEmail: 'b@b.com', expiresAt: 1 },
+                    { profileId: 'member-c', status: 'connected', kind: 'oauth', providerEmail: 'c@b.com', expiresAt: 1 },
+                ],
+                groups: [{
+                    groupId: 'claude-pool',
+                    displayName: 'Claude pool',
+                    activeProfileId: 'member-a',
+                    generation: 1,
+                    memberProfileIds: ['member-a', 'member-b', 'member-c'],
+                }],
+            }],
+        }).connectedServicesV2;
+        const resolve = (binding: Record<string, unknown>) => resolveConnectedServiceQuotaProfileRefForSession({
+            agentId: 'claude',
+            accountProfileConnectedServicesV2,
+            metadata: {
+                path: '/tmp/project',
+                host: 'local',
+                connectedServices: {
+                    v: 1,
+                    bindingsByServiceId: {
+                        'claude-subscription': { source: 'connected', selection: 'group', groupId: 'claude-pool', ...binding },
+                    },
+                },
+            },
+        })?.profileId;
+
+        expect(resolve({ materializedAssignment: { profileId: 'member-c', decisionId: 'd2' } })).toBe('member-a');
+        expect(resolve({
+            member: { assignment: 'per_session', profileId: 'member-b', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 },
+            materializedAssignment: { profileId: 'member-c', decisionId: 'd2' },
+        })).toBe('member-b');
+    });
 });

@@ -12,7 +12,7 @@ import type { Session } from '@/sync/domains/state/storageTypes';
 
 import {
     normalizeOptionalNumber,
-    normalizeSessionAuthoringConnectedServices,
+    normalizeInheritedSessionAuthoringConnectedServices,
     normalizeOptionalRecord,
     normalizeOptionalString,
     normalizeRequiredString,
@@ -70,7 +70,7 @@ export function deriveSessionAuthoringSnapshot(params: Readonly<{
         modelId: modelOverride?.modelId ?? metadataModelOverride.modelId,
         modelUpdatedAt: modelOverride?.modelUpdatedAt ?? metadataModelOverride.modelUpdatedAt,
         mcpSelection,
-        connectedServices: normalizeSessionAuthoringConnectedServices(
+        connectedServices: normalizeInheritedSessionAuthoringConnectedServices(
             metadata && Object.prototype.hasOwnProperty.call(metadata, 'connectedServices')
                 ? (metadata as Record<string, unknown>).connectedServices
                 : null,

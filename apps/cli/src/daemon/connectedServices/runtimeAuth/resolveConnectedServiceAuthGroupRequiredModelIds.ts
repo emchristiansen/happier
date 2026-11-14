@@ -7,9 +7,12 @@ export function resolveConnectedServiceAuthGroupRequiredModelIds(input: Readonly
   groupId: string;
   targets: ReadonlyArray<ConnectedServiceRuntimeTarget>;
   sessions: ReadonlyArray<TrackedSession>;
+  /** Restrict to one session's own model (per-session decisions); absent = every session in the group. */
+  sessionId?: string;
 }>): ReadonlyArray<string> {
   const models = new Set<string>();
   for (const target of input.targets) {
+    if (input.sessionId !== undefined && target.sessionId !== input.sessionId) continue;
     if (!target.activeBindings.some((binding) => binding.serviceId === input.serviceId && binding.groupId === input.groupId)) continue;
     const session = input.sessions.find((candidate) => candidate.happySessionId === target.sessionId
       && (candidate.pid === target.pid || candidate.sessionRunnerPid === target.pid));

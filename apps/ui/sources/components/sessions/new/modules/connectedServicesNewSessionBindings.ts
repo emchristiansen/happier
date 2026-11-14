@@ -1,6 +1,11 @@
 import type { ConnectedServiceId } from '@happier-dev/agents';
 import type { AccountProfile, ConnectedServiceBindingsV1, ConnectedServicesDefaultAuthByAgentIdV1 } from '@happier-dev/protocol';
-import { readConnectedServicesDefaultAuthSettings, type ConnectedServicesDefaultAuthSettings } from '@happier-dev/protocol';
+import type { ConnectedServiceAuthGroupV1 } from '@happier-dev/protocol';
+import {
+  readConnectedServicesDefaultAuthSettings,
+  stripConnectedServicePerSessionAssignmentFields,
+  type ConnectedServicesDefaultAuthSettings,
+} from '@happier-dev/protocol';
 import {
   buildConnectedServiceAccountGroupOptionsByServiceId,
   buildConnectedServiceProfileOptionsByServiceId as buildCoreConnectedServiceProfileOptionsByServiceId,
@@ -100,6 +105,18 @@ export type NewSessionConnectedServicesBindingsResolution = Readonly<{
   accountGroupSwitchingEnabled: boolean;
 }>;
 
+/** A stored default names group/source only; a named start is a per-launch choice (spec A.1). */
+function stripInheritedStartRequests(
+  bindingsByServiceId: Readonly<Record<string, ConnectedServicesServiceBinding | undefined>> | undefined,
+): Readonly<Record<string, ConnectedServicesServiceBinding | undefined>> | undefined {
+  if (!bindingsByServiceId) return bindingsByServiceId;
+  const stripped = stripConnectedServicePerSessionAssignmentFields({
+    v: 1,
+    bindingsByServiceId: bindingsByServiceId as ConnectedServiceBindingsV1['bindingsByServiceId'],
+  });
+  return stripped.bindingsByServiceId;
+}
+
 export function resolveNewSessionConnectedServicesBindingsForAgent(params: Readonly<{
   agentId: string;
   agentCore: NewSessionConnectedServicesAgentCore;
@@ -114,6 +131,12 @@ export function resolveNewSessionConnectedServicesBindingsForAgent(params: Reado
   connectedServicesFeatureEnabled: boolean;
   accountGroupsFeatureEnabled: boolean;
   connectedServicesBindingsByServiceIdOverride?: Readonly<Record<string, ConnectedServicesServiceBinding | undefined>> | null;
+  /**
+   * Authoritative V3 groups for services whose supporting server offers per-session pools. Supplies
+   * the policy strategy (and so `assignment`) the profile projection lacks; see
+   * useNewSessionPerSessionAccountGroups.
+   */
+  accountGroupsByServiceId?: Readonly<Record<string, ReadonlyArray<ConnectedServiceAuthGroupV1> | undefined>>;
 }>): NewSessionConnectedServicesBindingsResolution {
   const supportedConnectedServiceIds = resolveAgentSupportedConnectedServiceIds({
     connectedServicesFeatureEnabled: params.connectedServicesFeatureEnabled,
@@ -129,6 +152,7 @@ export function resolveNewSessionConnectedServicesBindingsForAgent(params: Reado
     accountGroupsFeatureEnabled: params.accountGroupsFeatureEnabled,
     accountProfileConnectedServicesV2: params.accountProfileConnectedServicesV2,
     supportedConnectedServiceIds,
+    accountGroupsByServiceId: params.accountGroupsByServiceId,
   });
   const explicitConnectedServicesBindingsByServiceId = parseConnectedServicesBindingsByServiceIdFromAgentOptionState({
     agentOptionState: params.agentOptionState,
@@ -145,7 +169,7 @@ export function resolveNewSessionConnectedServicesBindingsForAgent(params: Reado
     ?? (
       hasExplicitConnectedServicesBindings || !normalizedAgentId
         ? explicitConnectedServicesBindingsByServiceId
-        : connectedServicesDefaultAuthSettings.bindingsByAgentId[normalizedAgentId]?.bindingsByServiceId
+        : stripInheritedStartRequests(connectedServicesDefaultAuthSettings.bindingsByAgentId[normalizedAgentId]?.bindingsByServiceId)
           ?? explicitConnectedServicesBindingsByServiceId
     );
   const accountGroupSwitchingEnabled = Boolean(params.agentCore.connectedServices?.sessionAuthSwitch);

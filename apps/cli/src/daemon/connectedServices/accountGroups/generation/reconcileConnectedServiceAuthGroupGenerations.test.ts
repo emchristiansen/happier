@@ -12,8 +12,16 @@ import {
   listSessionGenerationRuntimeTargets,
   reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget,
   reconcileConnectedServiceDirectCredentialRevisions,
+  reconcileConnectedServicePerSessionMemberRevocationForRuntimeTarget,
+  reconcileConnectedServicePerSessionMemberRevocations,
   type ConnectedServiceGenerationRuntimeTarget,
+  type RevokeConnectedServicePerSessionMember,
 } from './reconcileConnectedServiceAuthGroupGenerations';
+import {
+  diffConnectedServiceProjectionSnapshots,
+  parseConnectedServiceProjectionSnapshot,
+  type ConnectedServiceProjectionSnapshot,
+} from './connectedServiceProjectionSnapshot';
 
 const credentialRevision = 'csr_aaaaaaaaaaaaaaaaaaaaaa';
 const revisionedCredentialBoundary = () => ({
@@ -250,6 +258,46 @@ describe('reconcileConnectedServiceAuthGroupGenerations', () => {
       expect(continueAfterExactRecipientApplication).not.toHaveBeenCalled();
     },
   );
+
+  it('T6: leaves per-session-owned sessions on their own member when the group generation moves', async () => {
+    const shared = groupTarget('shared-session');
+    const assigned: ConnectedServiceGenerationRuntimeTarget = {
+      ...groupTarget('assigned-session'),
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: {
+          'openai-codex': {
+            source: 'connected', selection: 'group', groupId: 'team',
+            member: { assignment: 'per_session', profileId: 'old', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 },
+          },
+        },
+      },
+    };
+    const pending: ConnectedServiceGenerationRuntimeTarget = {
+      ...groupTarget('pending-session'),
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: {
+          'openai-codex': {
+            source: 'connected', selection: 'group', groupId: 'team',
+            materializedAssignment: { profileId: 'old', decisionId: 'd2', reason: 'failover', materializedAtMs: 2 },
+          },
+        },
+      },
+    };
+    const { consumer, applyCommittedGeneration } = createConsumer();
+    await reconcileConnectedServiceAuthGroupGenerations({
+      consumer,
+      listCurrentGroups: async () => [group({ generation: 7, activeProfileId: 'backup' })],
+      resolveCredentialRevision: () => credentialRevision,
+      listRuntimeTargets: () => [shared, assigned, pending],
+      executionAuthority: 'passive_projection',
+    });
+    const appliedSessionIds = applyCommittedGeneration.mock.calls.map((call) => call[0].sessionId);
+    expect(appliedSessionIds).toContain('shared-session');
+    expect(appliedSessionIds).not.toContain('assigned-session');
+    expect(appliedSessionIds).not.toContain('pending-session');
+  });
 
   it('does not dispatch a frozen runtime target that is replaced while group truth is loading', async () => {
     const target = groupTarget('same-session');
@@ -877,5 +925,220 @@ describe('reconcileConnectedServiceAuthGroupGenerations', () => {
 
     expect(applyCommittedGeneration).not.toHaveBeenCalled();
     expect(notifyCurrentGroupTruth).toHaveBeenCalledOnce();
+  });
+});
+
+type ApplyLiveCredentialBoundary = Parameters<typeof reconcileConnectedServiceDirectCredentialRevisions>[0]['applyLiveCredentialBoundary'];
+
+describe('T10: per-session member revocation and rotation', () => {
+  const revisionA = 'csr_aaaaaaaaaaaaaaaaaaaaaa';
+  const revisionB = 'csr_bbbbbbbbbbbbbbbbbbbbbb';
+  const revisionB2 = 'csr_cccccccccccccccccccccc';
+
+  function projection(input: Readonly<{
+    memberProfileIds?: readonly string[];
+    generation?: number;
+    revisions?: Readonly<Record<string, string>>;
+  }> = {}): ConnectedServiceProjectionSnapshot {
+    const revisions = input.revisions ?? { A: revisionA, B: revisionB };
+    return parseConnectedServiceProjectionSnapshot({
+      connectedServicesV2: [{
+        serviceId: 'anthropic',
+        profiles: [],
+        groups: [{
+          groupId: 'pool',
+          activeProfileId: 'A',
+          generation: input.generation ?? 1,
+          memberProfileIds: input.memberProfileIds ?? ['A', 'B'],
+        }],
+      }],
+      connectedServiceCredentialRevisionsV1: Object.entries(revisions).map(([profileId, credentialRevision]) => ({
+        serviceId: 'anthropic', profileId, credentialRevision,
+      })),
+    });
+  }
+
+  function ownedTarget(sessionId: string, own: Readonly<{ member?: string; pending?: string }>): ConnectedServiceGenerationRuntimeTarget {
+    const runnerProfileId = own.pending ?? own.member!;
+    return {
+      sessionId,
+      agentId: 'claude',
+      // As the runtime registry derives it from the per-session child selection (member's own profile home).
+      activeBindings: [{ serviceId: 'anthropic', profileId: runnerProfileId, groupId: 'pool', generation: null, credentialRevision: runnerProfileId === 'A' ? revisionA : revisionB }],
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: {
+          anthropic: {
+            source: 'connected', selection: 'group', groupId: 'pool',
+            ...(own.member ? {
+              member: { assignment: 'per_session', profileId: own.member, decisionId: `d-${sessionId}`, reason: 'initial_sampled', appliedAtMs: 1 },
+            } : {}),
+            ...(own.pending ? {
+              materializedAssignment: { profileId: own.pending, decisionId: `p-${sessionId}`, reason: 'failover', materializedAtMs: 2 },
+            } : {}),
+          },
+        },
+      },
+    };
+  }
+
+  const sharedTarget: ConnectedServiceGenerationRuntimeTarget = {
+    sessionId: 'shared',
+    agentId: 'claude',
+    activeBindings: [{ serviceId: 'anthropic', profileId: 'A', groupId: 'pool', generation: 1, credentialRevision: revisionA }],
+    connectedServicesBindingsRaw: {
+      v: 1,
+      bindingsByServiceId: { anthropic: { source: 'connected', selection: 'group', groupId: 'pool' } },
+    },
+  };
+
+  const runtimeTargets = [
+    ownedTarget('on-a', { member: 'A' }),
+    ownedTarget('on-b', { member: 'B' }),
+    ownedTarget('pending-b', { member: 'A', pending: 'B' }),
+    sharedTarget,
+  ];
+
+  /** One daemon projection pass: diff against the baseline, then run the changed-scope owners. */
+  async function projectionPass(previous: ConnectedServiceProjectionSnapshot, current: ConnectedServiceProjectionSnapshot) {
+    const delta = diffConnectedServiceProjectionSnapshots(previous, current);
+    const revokePerSessionMember = vi.fn<RevokeConnectedServicePerSessionMember>(async () => {});
+    const applyLiveCredentialBoundary = vi.fn<ApplyLiveCredentialBoundary>(async () => {});
+    await reconcileConnectedServicePerSessionMemberRevocations({
+      revokedGroupMembers: delta.revokedGroupMembers,
+      listRuntimeTargets: () => runtimeTargets,
+      revokePerSessionMember,
+    });
+    await reconcileConnectedServiceDirectCredentialRevisions({
+      credentialBoundaries: delta.changedCredentialBoundaries,
+      listRuntimeTargets: () => runtimeTargets,
+      applyLiveCredentialBoundary,
+      executionAuthority: 'passive_projection',
+    });
+    return { delta, revokePerSessionMember, applyLiveCredentialBoundary };
+  }
+
+  const revokedB = (sessionId: string) => ({
+    sessionId, serviceId: 'anthropic', groupId: 'pool', profileId: 'B', reason: 'member_revoked',
+  });
+
+  it.each([
+    // The server projects only enabled members, so disable and removal both leave memberProfileIds.
+    ['disabled or removed', projection({ memberProfileIds: ['A'] })],
+    ['no longer entitled (credential gone)', projection({ revisions: { A: revisionA } })],
+    ['dropped with its whole group', parseConnectedServiceProjectionSnapshot({
+      connectedServicesV2: [{ serviceId: 'anthropic', profiles: [], groups: [] }],
+      connectedServiceCredentialRevisionsV1: [
+        { serviceId: 'anthropic', profileId: 'A', credentialRevision: revisionA },
+        { serviceId: 'anthropic', profileId: 'B', credentialRevision: revisionB },
+      ],
+    })],
+  ])('non-active member B %s moves only sessions applied to or pending on B', async (_label, current) => {
+    const { delta, revokePerSessionMember, applyLiveCredentialBoundary } = await projectionPass(projection(), current);
+
+    expect(delta.revokedGroupMembers).toContainEqual({ serviceId: 'anthropic', groupId: 'pool', profileId: 'B' });
+    const revocations = revokePerSessionMember.mock.calls.map((call) => call[0]);
+    if (delta.revokedGroupMembers.length === 1) {
+      expect(revocations).toEqual([revokedB('on-b'), revokedB('pending-b')]);
+    } else {
+      // Whole group gone: every owned session moves, each reported once on its runner's member.
+      expect(revocations).toEqual([
+        { ...revokedB('on-a'), profileId: 'A' }, revokedB('on-b'), revokedB('pending-b'),
+      ]);
+    }
+    // A deleted member credential is a revocation for owned sessions, not a live deletion.
+    expect(applyLiveCredentialBoundary).not.toHaveBeenCalled();
+  });
+
+  it('rotating non-active member B reaches only B-materialized sessions through direct credential reconciliation', async () => {
+    const { delta, revokePerSessionMember, applyLiveCredentialBoundary } = await projectionPass(
+      projection(),
+      projection({ revisions: { A: revisionA, B: revisionB2 } }),
+    );
+
+    expect(delta.changedGroupScopes).toEqual([]);
+    expect(revokePerSessionMember).not.toHaveBeenCalled();
+    expect(applyLiveCredentialBoundary.mock.calls.map((call) => call[0])).toEqual([expect.objectContaining({
+      serviceId: 'anthropic',
+      profileId: 'B',
+      credentialBoundary: { status: 'present', revisionSemantics: 'revisioned', credentialRevision: revisionB2 },
+    })]);
+  });
+
+  it('does not rotate when no live session is materialized on the rotated member', async () => {
+    const applyLiveCredentialBoundary = vi.fn<ApplyLiveCredentialBoundary>(async () => {});
+    await reconcileConnectedServiceDirectCredentialRevisions({
+      credentialBoundaries: diffConnectedServiceProjectionSnapshots(
+        projection(),
+        projection({ revisions: { A: revisionA, B: revisionB2 } }),
+      ).changedCredentialBoundaries,
+      // `pending-a` is still applied to B but already runs A's home, so B's rotation is not its credential.
+      listRuntimeTargets: () => [ownedTarget('on-a', { member: 'A' }), ownedTarget('pending-a', { member: 'B', pending: 'A' }), sharedTarget],
+      applyLiveCredentialBoundary,
+      executionAuthority: 'passive_projection',
+    });
+    expect(applyLiveCredentialBoundary).not.toHaveBeenCalled();
+  });
+
+  it('a group generation bump alone does not disturb any owned session', async () => {
+    const { delta, revokePerSessionMember, applyLiveCredentialBoundary } = await projectionPass(
+      projection(),
+      projection({ generation: 2 }),
+    );
+    expect(delta.changedGroupScopes).toEqual([{ serviceId: 'anthropic', groupId: 'pool' }]);
+    expect(delta.revokedGroupMembers).toEqual([]);
+    expect(revokePerSessionMember).not.toHaveBeenCalled();
+    expect(applyLiveCredentialBoundary).not.toHaveBeenCalled();
+
+    const { consumer, applyCommittedGeneration } = createConsumer();
+    await reconcileConnectedServiceAuthGroupGenerations({
+      consumer,
+      listCurrentGroups: async () => projection({ generation: 2 }).groups,
+      resolveCredentialRevision: () => revisionA,
+      listRuntimeTargets: () => runtimeTargets,
+      executionAuthority: 'passive_projection',
+      groupScopes: delta.changedGroupScopes,
+    });
+    expect(applyCommittedGeneration.mock.calls.map((call) => call[0].sessionId)).toEqual(['shared']);
+  });
+
+  it('does not re-report a revocation on a later pass over the same projection', async () => {
+    const revoked = projection({ memberProfileIds: ['A'] });
+    const first = await projectionPass(projection(), revoked);
+    expect(first.revokePerSessionMember).toHaveBeenCalledTimes(2);
+    const replay = await projectionPass(revoked, revoked);
+    expect(replay.delta.revokedGroupMembers).toEqual([]);
+    expect(replay.revokePerSessionMember).not.toHaveBeenCalled();
+  });
+
+  it('reports a re-registered session whose own member is already ineligible in the latest projection', async () => {
+    const latest = projection({ memberProfileIds: ['A'] });
+    const revokePerSessionMember = vi.fn<RevokeConnectedServicePerSessionMember>(async () => {});
+    for (const target of runtimeTargets) {
+      await reconcileConnectedServicePerSessionMemberRevocationForRuntimeTarget({
+        target,
+        isGroupMemberEligible: latest.isGroupMemberEligible,
+        revokePerSessionMember,
+      });
+    }
+    expect(revokePerSessionMember.mock.calls.map((call) => call[0])).toEqual([revokedB('on-b'), revokedB('pending-b')]);
+  });
+
+  it('replays a rotated member credential to a late-registered owned runtime, never to a shared group binding', async () => {
+    const latest = projection({ revisions: { A: revisionA, B: revisionB2 } });
+    const applyLiveCredentialBoundary = vi.fn<ApplyLiveCredentialBoundary>(async () => {});
+    for (const target of runtimeTargets) {
+      await reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget({
+        target,
+        resolveCredentialBoundary: latest.resolveCredentialBoundary,
+        applyLiveCredentialBoundary,
+        executionAuthority: 'passive_projection',
+      });
+    }
+    // on-a is current on A; the shared session's group binding belongs to group-generation reconciliation.
+    expect(applyLiveCredentialBoundary.mock.calls.map((call) => call[0])).toEqual([
+      expect.objectContaining({ profileId: 'B', credentialBoundary: expect.objectContaining({ credentialRevision: revisionB2 }) }),
+      expect.objectContaining({ profileId: 'B', credentialBoundary: expect.objectContaining({ credentialRevision: revisionB2 }) }),
+    ]);
   });
 });

@@ -49,6 +49,8 @@ export type ExecutionRunConnectedServiceMaterializeRequest = Readonly<{
   sessionDirectory?: string | null;
   previousMaterializedRoot?: string;
   sessionId?: string | null;
+  /** The run's model, when it names one. */
+  modelId?: string | null;
 }>;
 
 export type ExecutionRunConnectedServiceReleaseRequest = Readonly<{
@@ -76,6 +78,10 @@ export type ResolveConnectedServiceAuthForRun = (
     sessionDirectory?: string | null;
     previousMaterializedRoot?: string;
     sessionId?: string;
+    /** The run's model; per-session member eligibility and the draw use it (spec A.2). */
+    modelId?: string;
+    /** The run's already-running runner process; it owns any per-session decision this materialization creates. */
+    runnerPid?: number;
   }>,
 ) => ReturnType<typeof resolveConnectedServiceAuthForSpawn>;
 
@@ -169,6 +175,8 @@ export function createExecutionRunConnectedServicesBridge(deps: Readonly<{
           sessionDirectory: request.sessionDirectory ?? null,
           ...(request.previousMaterializedRoot ? { previousMaterializedRoot: request.previousMaterializedRoot } : {}),
           ...(request.sessionId ? { sessionId: request.sessionId } : {}),
+          ...(request.modelId ? { modelId: request.modelId } : {}),
+          runnerPid: request.pid,
         });
       } catch (error) {
         // Fail closed: a materialization fault must surface as a typed error, never as a silent

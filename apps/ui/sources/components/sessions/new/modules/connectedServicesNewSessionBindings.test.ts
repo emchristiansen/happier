@@ -436,3 +436,58 @@ describe('buildConnectedServiceAccountGroupOptionsByServiceId', () => {
         })]);
     });
 });
+
+describe('per-session pool "Start on" through the normal producer and creation normalizer (HPI-11)', () => {
+    const base = {
+        agentId: 'claude', agentCore: AGENTS_CORE.claude,
+        accountProfileConnectedServicesV2: AccountProfileSchema.shape.connectedServicesV2.parse([{
+            serviceId: 'claude-subscription',
+            profiles: [
+                { profileId: 'work', status: 'connected', kind: 'oauth' },
+                { profileId: 'home', status: 'connected', kind: 'oauth' },
+            ],
+            groups: [{ groupId: 'pool', activeProfileId: 'work', memberProfileIds: ['work', 'home'] }],
+        }]),
+        settings: { connectedServicesProfileLabelByKey: {}, connectedServicesDefaultProfileByServiceId: {} },
+        connectedServicesFeatureEnabled: true, accountGroupsFeatureEnabled: true,
+        agentOptionState: { connectedServicesBindingsByServiceId: { 'claude-subscription': {
+            source: 'connected', selection: 'group', groupId: 'pool', initialProfileId: 'home',
+        } } },
+    };
+    const authoritativeGroup = {
+        v: 1, serviceId: 'claude-subscription', groupId: 'pool', displayName: 'Pool', activeProfileId: 'work', generation: 1,
+        runtimeStateRevision: 0, policy: { v: 1, strategy: 'per_session_softmax', autoSwitch: true }, state: { v: 1 },
+        members: [
+            { v: 1, serviceId: 'claude-subscription', groupId: 'pool', profileId: 'work', enabled: true, priority: 1, state: { v: 1 }, createdAt: 1, updatedAt: 1 },
+            { v: 1, serviceId: 'claude-subscription', groupId: 'pool', profileId: 'home', enabled: true, priority: 2, state: { v: 1 }, createdAt: 1, updatedAt: 1 },
+        ],
+        createdAt: 1, updatedAt: 1,
+    };
+
+    it('marks the pool per-session only with the authoritative group, and the explicit start survives creation normalization', async () => {
+        const { normalizeSessionAuthoringConnectedServices, normalizeInheritedSessionAuthoringConnectedServices } =
+            await import('@/sync/domains/sessionAuthoring/sessionAuthoringNormalization');
+        const withoutGroups = resolveNewSessionConnectedServicesBindingsForAgent(base as never);
+        expect(withoutGroups.connectedServiceAccountGroupOptionsByServiceId['claude-subscription']?.[0]?.assignment).not.toBe('per_session');
+
+        const resolved = resolveNewSessionConnectedServicesBindingsForAgent({
+            ...base, accountGroupsByServiceId: { 'claude-subscription': [authoritativeGroup] },
+        } as never);
+        expect(resolved.connectedServiceAccountGroupOptionsByServiceId['claude-subscription']?.[0])
+            .toMatchObject({ groupId: 'pool', assignment: 'per_session' });
+        const payload = resolved.connectedServicesBindingsPayload;
+        expect(payload?.bindingsByServiceId['claude-subscription']).toMatchObject({ selection: 'group', groupId: 'pool', initialProfileId: 'home' });
+
+        const created = normalizeSessionAuthoringConnectedServices(payload) as { bindingsByServiceId: Record<string, Record<string, unknown>> };
+        expect(created.bindingsByServiceId['claude-subscription']).toMatchObject({ groupId: 'pool', initialProfileId: 'home' });
+
+        const forged = normalizeSessionAuthoringConnectedServices({ v: 1, bindingsByServiceId: { 'claude-subscription': {
+            source: 'connected', selection: 'group', groupId: 'pool', initialProfileId: 'home',
+            member: { assignment: 'per_session', profileId: 'home', decisionId: 'd', reason: 'initial_requested', appliedAtMs: 1 },
+        } } }) as { bindingsByServiceId: Record<string, Record<string, unknown>> };
+        expect(forged.bindingsByServiceId['claude-subscription']).toEqual({ source: 'connected', selection: 'group', groupId: 'pool', initialProfileId: 'home' });
+
+        const inherited = normalizeInheritedSessionAuthoringConnectedServices(payload) as { bindingsByServiceId: Record<string, Record<string, unknown>> };
+        expect(inherited.bindingsByServiceId['claude-subscription']).toEqual({ source: 'connected', selection: 'group', groupId: 'pool' });
+    });
+});

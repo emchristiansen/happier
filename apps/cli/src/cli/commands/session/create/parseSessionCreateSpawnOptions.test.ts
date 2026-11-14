@@ -274,4 +274,29 @@ describe('parseSessionCreateSpawnOptions', () => {
       '--launch-profile', 'work',
     ]).actionInput).toMatchObject({ profileId: 'work' });
   });
+
+  it('accepts --initial-profile with a group selector and its alias', () => {
+    expect(parseSessionCreateSpawnOptions(['--auth', 'cs:group:pool', '--initial-profile', 'work'])
+      .connectedServicesInitialProfileId).toBe('work');
+    expect(parseSessionCreateSpawnOptions(['--auth', 'cs:pool', '--connected-services-initial-profile', 'work'])
+      .connectedServicesInitialProfileId).toBe('work');
+  });
+
+  it('rejects --initial-profile without a group selector', () => {
+    expect(() => parseSessionCreateSpawnOptions(['--initial-profile', 'work']))
+      .toThrow('connected_service_initial_profile_requires_group');
+    expect(() => parseSessionCreateSpawnOptions(['--auth', 'cs:profile:work', '--initial-profile', 'work']))
+      .toThrow('connected_service_initial_profile_requires_group');
+  });
+
+  it('rejects forged per-session assignment state in --connected-services-json', () => {
+    expect(() => parseSessionCreateSpawnOptions([
+      '--connected-services-json',
+      JSON.stringify({ v: 1, bindingsByServiceId: { 'claude-subscription': {
+        source: 'connected', selection: 'group', groupId: 'pool',
+        member: { assignment: 'per_session', profileId: 'a', decisionId: 'd', reason: 'initial_sampled', appliedAtMs: 1 },
+      } } }),
+    ])).toThrow('connected_service_internal_assignment_field_forbidden');
+  });
 });
+

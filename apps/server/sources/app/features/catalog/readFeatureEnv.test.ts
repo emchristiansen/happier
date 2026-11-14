@@ -30,6 +30,7 @@ describe('readConnectedServicesFeatureEnv', () => {
     expect(res.quotasEnabled).toBe(true);
     expect(res.accountGroupsEnabled).toBe(true);
     expect(res.accountFallbackEnabled).toBe(true);
+    expect(res.poolPerSessionSoftmaxEnabled).toBe(false);
   });
 
   it('reads account group and fallback gates independently', () => {

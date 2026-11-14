@@ -118,6 +118,7 @@ export const UI_FEATURE_REGISTRY = {
     'connectedServices.autoDisablePlanInvalid': { settingsToggle: undefined },
     'connectedServices.poolQuotaLimitSelection': { settingsToggle: undefined },
     'connectedServices.poolExpiryFirst': { settingsToggle: undefined },
+    'connectedServices.poolPerSessionSoftmax': { settingsToggle: undefined },
     'connectedServices.accountFallback': {
         settingsToggle: undefined,
     },

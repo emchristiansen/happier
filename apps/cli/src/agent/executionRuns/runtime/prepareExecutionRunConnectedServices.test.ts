@@ -181,6 +181,22 @@ describe('prepareExecutionRunConnectedServices', () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it('carries the run\'s model to the daemon materialization (HPI-09)', async () => {
+    const materialize = vi.fn(async (input: unknown) => materialized(input));
+    await prepareExecutionRunConnectedServices({
+      backendTarget: { kind: 'builtInAgent', agentId: 'codex' },
+      connectedServices: { v: 1, bindingsByServiceId: { 'openai-codex': { source: 'connected', selection: 'profile', profileId: 'work' } } },
+      credentials: CREDENTIALS,
+      cwd: '/tmp/workspace',
+      sessionId: 'session-1',
+      modelId: 'gpt-5.5',
+      materializeViaDaemon: materialize,
+      releaseViaDaemon: vi.fn(async (_input: unknown) => true),
+      resolveSessionSpawnDefaults: vi.fn(async () => null),
+    });
+    expect(materialize.mock.calls.at(0)?.[0]).toMatchObject({ sessionId: 'session-1', modelId: 'gpt-5.5' });
+  });
+
   it('an explicit per-target selection overrides the session default entirely', async () => {
     const materialize = vi.fn(async (input: unknown) => materialized(input));
     const resolveSessionSpawnDefaults = vi.fn(async (_input: unknown) => ({
@@ -698,4 +714,73 @@ describe('prepareExecutionRunConnectedServices', () => {
     ).rejects.toBeInstanceOf(ExecutionRunConnectedServicesUnavailableError);
     expect(materialize).not.toHaveBeenCalled();
   });
+
+  describe('stored defaults never carry per-session request or assignment state (spec A.1)', () => {
+    const member = { assignment: 'per_session', profileId: 'B', decisionId: 'stored-decision', reason: 'initial_sampled', appliedAtMs: 1 };
+    const group = (groupId: string, extra: Record<string, unknown> = {}) => ({
+      source: 'connected' as const, selection: 'group' as const, groupId, ...extra,
+    });
+    const pinned = (groupId: string) => group(groupId, {
+      initialProfileId: 'B',
+      member,
+      materializedAssignment: { profileId: 'B', decisionId: 'stored-decision', reason: 'initial_sampled', materializedAtMs: 1 },
+      pendingAssignment: { profileId: 'B' },
+      decisionId: 'stored-decision',
+    });
+    const stopAtMaterialize = () => vi.fn(async (_input: unknown): Promise<never> => {
+      throw new Error('stopped at materialize boundary');
+    });
+    const base = {
+      backendTarget: { kind: 'builtInAgent' as const, agentId: 'claude' as const },
+      credentials: CREDENTIALS,
+      cwd: '/project',
+      sessionId: 'session-1',
+      releaseViaDaemon: vi.fn(async () => true),
+    };
+
+    it('per-service default branch strips the stored default and keeps an explicit pin\'s named start', async () => {
+      const materialize = stopAtMaterialize();
+      await expect(prepareExecutionRunConnectedServices({
+        ...base,
+        connectedServices: { v: 1, bindingsByServiceId: { anthropic: group('explicit-pool', { initialProfileId: 'A' }) } },
+        connectedServicesDefaultServiceIds: ['claude-subscription'],
+        materializeViaDaemon: materialize,
+        resolvePerServiceDefaults: async () => ({ v: 1 as const, bindingsByServiceId: { 'claude-subscription': pinned('pool') } }) as never,
+      })).rejects.toBeInstanceOf(ExecutionRunConnectedServicesUnavailableError);
+      expect((materialize.mock.calls[0]![0] as Record<string, unknown>).connectedServicesBindingsRaw).toEqual({
+        v: 1,
+        bindingsByServiceId: { anthropic: group('explicit-pool', { initialProfileId: 'A' }), 'claude-subscription': group('pool') },
+      });
+    });
+
+    it('whole-session default branch strips the stored default', async () => {
+      const materialize = stopAtMaterialize();
+      await expect(prepareExecutionRunConnectedServices({
+        ...base,
+        materializeViaDaemon: materialize,
+        resolveSessionSpawnDefaults: async () => ({
+          connectedServices: { v: 1 as const, bindingsByServiceId: { 'claude-subscription': pinned('pool') } },
+          connectedServicesUpdatedAt: 1,
+        }) as never,
+      })).rejects.toBeInstanceOf(ExecutionRunConnectedServicesUnavailableError);
+      expect((materialize.mock.calls[0]![0] as Record<string, unknown>).connectedServicesBindingsRaw).toEqual({
+        v: 1,
+        bindingsByServiceId: { 'claude-subscription': group('pool') },
+      });
+    });
+
+    it('positive control: an explicit named start reaches materialization unchanged', async () => {
+      const materialize = stopAtMaterialize();
+      await expect(prepareExecutionRunConnectedServices({
+        ...base,
+        connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': group('pool', { initialProfileId: 'A' }) } },
+        materializeViaDaemon: materialize,
+      })).rejects.toBeInstanceOf(ExecutionRunConnectedServicesUnavailableError);
+      expect((materialize.mock.calls[0]![0] as Record<string, unknown>).connectedServicesBindingsRaw).toEqual({
+        v: 1,
+        bindingsByServiceId: { 'claude-subscription': group('pool', { initialProfileId: 'A' }) },
+      });
+    });
+  });
 });
+

@@ -17,6 +17,8 @@ import {
   parseConnectedServicesLaunchAuth,
   type ConnectedServicesLaunchAuthIntent,
 } from '@/cli/connectedServicesLaunchAuth';
+import { CONNECTED_SERVICE_INITIAL_PROFILE_REQUIRES_GROUP_ERROR } from '@happier-dev/protocol';
+import { rejectConnectedServiceInternalAssignmentInput } from '@/daemon/connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
 export type SessionCreateSpawnActionInput = Record<string, unknown>;
 
@@ -26,6 +28,8 @@ export type ParsedSessionCreateSpawnOptions = Readonly<{
   spawnAttemptId: string | null;
   resumeSpawnAttempt: boolean;
   connectedServicesAuthIntent?: ConnectedServicesLaunchAuthIntent;
+  /** `--initial-profile`: explicit named start on a per_session_softmax group (spec A.1). */
+  connectedServicesInitialProfileId?: string;
   actionInput: SessionCreateSpawnActionInput;
 }>;
 
@@ -43,6 +47,7 @@ export const SESSION_CREATE_USAGE = [
   '  [--config-overrides-json <json>] [--launch-profile <profile-id>]',
   '  [--env <KEY=VALUE>]',
   '  [--auth <default|native|cs:<id>>|--connected-services <selector>|--auth-json <json>]',
+  '  [--initial-profile <profileId>]',
   '  [--mcp-selection-json <json>] [--transcript-storage <persisted|direct>]',
   '    MCP JSON: {"v":1,"managedServersEnabled":true,"happierToolsEnabled":true,',
   '      "forceIncludeServerIds":[],"forceExcludeServerIds":[]}. All fields are optional; unknown fields are rejected.',
@@ -246,6 +251,8 @@ export function parseSessionCreateSpawnOptions(argv: readonly string[]): ParsedS
   const connectedServices = connectedServicesRaw ? (() => {
     const flag = authJsonRaw ? '--auth-json' : '--connected-services-json';
     const parsed = parseJsonFlagValue(connectedServicesRaw, flag);
+    const forged = rejectConnectedServiceInternalAssignmentInput(parsed);
+    if (forged) throw new Error(forged.message);
     try {
       return ConnectedServiceBindingsV1Schema.parse(parsed);
     } catch {
@@ -255,6 +262,21 @@ export function parseSessionCreateSpawnOptions(argv: readonly string[]): ParsedS
   const connectedServicesAuthIntent = connectedServicesAuthRaw
     ? parseConnectedServicesLaunchAuth(connectedServicesAuthRaw)
     : undefined;
+  const initialProfileFlag = readFlagValue(argv, '--initial-profile');
+  const initialProfileAliasFlag = readFlagValue(argv, '--connected-services-initial-profile');
+  if (initialProfileFlag && initialProfileAliasFlag) {
+    throw new Error('Choose only one of --initial-profile and --connected-services-initial-profile.');
+  }
+  const connectedServicesInitialProfileId = (initialProfileFlag ?? initialProfileAliasFlag ?? '').trim();
+  if (connectedServicesInitialProfileId) {
+    // A named start needs a group selector; the resolved binding is checked again after resolution.
+    const namesGroup = connectedServicesAuthIntent
+      ? connectedServicesAuthIntent.kind === 'connected' && connectedServicesAuthIntent.selection !== 'profile'
+      : connectedServices
+        ? Object.values(connectedServices.bindingsByServiceId).some((binding) => binding?.source === 'connected' && binding.selection === 'group')
+        : false;
+    if (!namesGroup) throw new Error(CONNECTED_SERVICE_INITIAL_PROFILE_REQUIRES_GROUP_ERROR);
+  }
   const mcpSelection = readParsedJsonFlag(
     argv,
     '--mcp-selection-json',
@@ -277,6 +299,7 @@ export function parseSessionCreateSpawnOptions(argv: readonly string[]): ParsedS
     spawnAttemptId,
     resumeSpawnAttempt,
     ...(connectedServicesAuthIntent ? { connectedServicesAuthIntent } : {}),
+    ...(connectedServicesInitialProfileId ? { connectedServicesInitialProfileId } : {}),
     actionInput: {
       path,
       ...(backendTargetKey ? { backendTargetKey } : { agentId: DEFAULT_CATALOG_AGENT_ID }),

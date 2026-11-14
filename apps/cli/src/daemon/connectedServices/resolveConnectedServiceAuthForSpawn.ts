@@ -4,6 +4,8 @@ import {
   type ConnectedServiceAuthGroupV1,
   type ConnectedServiceCredentialRecordV1,
   type ConnectedServiceCredentialRevisionV1,
+  type ConnectedServiceGroupMaterializedAssignmentV1,
+  type ConnectedServiceGroupMemberAssignmentV1,
   type ConnectedServiceId,
   type ConnectedServiceMaterializationIdentityV1,
 } from '@happier-dev/protocol';
@@ -16,6 +18,7 @@ import { logger } from '@/ui/logger';
 
 import {
   parseConnectedServiceBindingSelections,
+  resolvePerSessionTargetProfileId,
   type ConnectedServiceBindingSelection,
   type ConnectedServicesBindingsV1,
 } from './parseConnectedServicesBindings';
@@ -44,6 +47,7 @@ import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from './accountGro
 import type { RuntimeAccountIdentitySelectionInput } from './quotas/identity/runtimeAccountIdentityTypes';
 import { selectConnectedServiceAuthGroupCandidate } from './accountGroups/selection/selectConnectedServiceAuthGroupCandidate';
 import { resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds } from './accountGroups/selection/resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds';
+import { buildPerSessionGroupSwitchState } from './accountGroups/perSession/buildPerSessionGroupSwitchState';
 import {
   buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState,
 } from './accountGroups/switching/buildConnectedServiceAuthGroupSwitchState';
@@ -56,6 +60,14 @@ import { evaluatePredictiveSoftSwitchPolicy } from './accountGroups/switching/pr
 import type { ConnectedServiceRefreshFailureCategory } from './credentials/lifecycleTypes';
 import { persistCredentialHealthForMaterializationFailure } from './refresh/refreshDiagnostics';
 import { verifySpawnResumeReachability } from './verifySpawnResumeReachability';
+import { DEFAULT_SWITCH_LEASE_TIMEOUT_MS } from './accountGroups/switching/pipeline/switchPipeline';
+import {
+  ConnectedServicePerSessionSpawnError,
+  isPerSessionOwnedTargetUsable,
+  resolvePerSessionGroupMemberForSpawn,
+  type PerSessionSpawnAssignment,
+  type PerSessionSpawnAssignmentDeps,
+} from './accountGroups/perSession/resolvePerSessionGroupMemberForSpawn';
 import {
   ConnectedServiceGroupMemberHeldForSpawnError,
   readConfiguredConnectedServiceMemberHolds,
@@ -807,6 +819,11 @@ async function resolveCredentialBindings(params: Readonly<{
   authGroupSwitchCoordinator?: ConnectedServiceAuthGroupPreTurnSwitchCoordinator | null;
   predictiveSoftSwitchMode: 'supported' | 'unsupported';
   quotaProbeDeadlineAtMs?: number;
+  perSessionAssignment: PerSessionSpawnAssignmentDeps | null;
+  perSessionSubjectId: string | undefined;
+  clock: () => number;
+  perSessionDeadlineAtMs: number;
+  perSessionRequiredModelIds: ReadonlyArray<string>;
   readMemberHolds: (serviceId: ConnectedServiceId) => Promise<ConnectedServiceMemberHoldView>;
 }>): Promise<Readonly<{
   credentialBindings: ReadonlyArray<{ serviceId: ConnectedServiceId; profileId: string }>;
@@ -833,7 +850,105 @@ async function resolveCredentialBindings(params: Readonly<{
     if (!group) {
       throw new Error(`Missing connected service auth group (${selection.serviceId}/${selection.groupId})`);
     }
+    // Member holds apply to every selection path, per-session included (t_1b770ae5 HOLD-01/02).
     const memberHolds = await params.readMemberHolds(selection.serviceId);
+    const groupPolicy = (group as { policy?: { strategy?: unknown } }).policy;
+    // A session that already owns a per-session member or pending target keeps it even after the
+    // group's strategy changes away (spec A.4 Migration, T12): ownership follows the session's
+    // persisted assignment, not only the current policy. If that owned target is no longer usable
+    // under a rolled-back policy, the session converts to the shared group path below.
+    const ownsPerSessionAssignment = Boolean(selection.member || selection.materializedAssignment);
+    const perSessionPolicy = groupPolicy?.strategy === 'per_session_softmax';
+    const ownedState = ownsPerSessionAssignment && !perSessionPolicy && isFullAuthGroup(group)
+      ? buildPerSessionGroupSwitchState({
+        group,
+        accountUsageStore: params.accountUsageStore,
+        runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
+        nowMs: params.nowMs,
+        memberHolds,
+      })
+      : null;
+    const keepsOwnedAssignment = ownedState !== null && isPerSessionOwnedTargetUsable({
+      state: ownedState,
+      selection,
+      nowMs: params.nowMs,
+      quotaFreshnessMs: params.quotaFreshnessMs,
+      requiredModelIds: params.perSessionRequiredModelIds,
+    });
+    if (perSessionPolicy || keepsOwnedAssignment) {
+      // Per-session assignment: never read or move the group's shared pointer (spec A.4).
+      const state = isFullAuthGroup(group)
+        ? buildPerSessionGroupSwitchState({
+          group,
+          accountUsageStore: params.accountUsageStore,
+          runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
+          nowMs: params.nowMs,
+          memberHolds,
+        })
+        : null;
+      if (!state) {
+        throw new Error(`Connected service auth group state unavailable for per-session assignment (${selection.serviceId}/${selection.groupId})`);
+      }
+      const assignment = await resolvePerSessionGroupMemberForSpawn({
+        serviceId: selection.serviceId,
+        groupId: selection.groupId,
+        selection,
+        state,
+        sessionId: params.perSessionSubjectId,
+        quotaFreshnessMs: params.quotaFreshnessMs,
+        nowMs: params.clock,
+        deadlineAtMs: params.perSessionDeadlineAtMs,
+        deps: params.perSessionAssignment,
+        requiredModelIds: params.perSessionRequiredModelIds,
+        // A definite reservation conflict re-reads the group so eligibility is rechecked (A.5 R2).
+        reloadState: async () => {
+          const fresh = await groupApi.getConnectedServiceAuthGroup?.({ serviceId: selection.serviceId, groupId: selection.groupId });
+          return fresh && isFullAuthGroup(fresh)
+            ? buildPerSessionGroupSwitchState({
+              group: fresh,
+              accountUsageStore: params.accountUsageStore,
+              runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
+              nowMs: params.clock(),
+              memberHolds: await params.readMemberHolds(selection.serviceId),
+            })
+            : null;
+        },
+      });
+      // Final admission, as on the shared path: a hold written while the decision was awaited wins.
+      // Nothing launched yet, so a decision this attempt created is released (definite pre-launch).
+      const admissionHolds = await params.readMemberHolds(selection.serviceId);
+      const assignedHold = resolveConnectedServiceMemberHoldExclusion(admissionHolds, assignment.profileId, params.clock());
+      if (assignedHold) {
+        if (assignment.ownedByAttempt) {
+          await params.perSessionAssignment?.releaseAfterDefinitePreLaunchFailure(assignment.decisionId).catch(() => false);
+        }
+        throw new ConnectedServiceGroupMemberHeldForSpawnError({
+          serviceId: selection.serviceId,
+          groupId: selection.groupId,
+          profileId: assignment.profileId,
+          exclusion: assignedHold,
+          unreadableError: admissionHolds.status === 'unreadable' ? admissionHolds.error : null,
+        });
+      }
+      credentialBindings.push({ serviceId: selection.serviceId, profileId: assignment.profileId });
+      groupSelections.set(selection.serviceId, {
+        groupId: selection.groupId,
+        activeProfileId: assignment.profileId,
+        fallbackProfileId: assignment.profileId,
+        generation: typeof group.generation === 'number' && Number.isFinite(group.generation) ? group.generation : 0,
+        policy: group.policy ?? null,
+        // One member per decision: spawn retries never move to another member behind the decision.
+        memberCount: 1,
+        perSession: assignment,
+      });
+      continue;
+    }
+    // A converting formerly per-session session keeps its original request on record; only a new
+    // request naming a start member needs a per-session group.
+    if (selection.initialProfileId && !ownsPerSessionAssignment) {
+      throw new ConnectedServicePerSessionSpawnError('initial_profile_requires_per_session_group',
+        `initialProfileId applies only to per_session_softmax groups (${selection.serviceId}/${selection.groupId})`);
+    }
     const selectedGroup = await maybeSelectGroupActiveProfileForSpawn({
       group,
       serviceId: selection.serviceId,
@@ -877,6 +992,25 @@ async function resolveCredentialBindings(params: Readonly<{
       memberCount: Array.isArray(selectedGroup.members)
         ? selectedGroup.members.filter((member) => member.enabled !== false).length
         : 1,
+      // A formerly per-session session launching on the group home is a pending conversion (spec A.4
+      // Migration): its applied member stays until provider adoption proves the group's member.
+      ...(ownsPerSessionAssignment
+        ? {
+          perSessionConversion: {
+            ...(selection.member ? { member: selection.member } : {}),
+            materializedAssignment: selection.materializedAssignment?.home === 'group'
+              ? selection.materializedAssignment
+              : {
+                profileId: activeProfileId,
+                decisionId: `conversion-${params.perSessionSubjectId ?? selection.groupId}-${params.clock().toString(36)}`,
+                reason: 'policy_conversion' as const,
+                ...(resolvePerSessionTargetProfileId(selection) ? { fromProfileId: resolvePerSessionTargetProfileId(selection)! } : {}),
+                materializedAtMs: params.clock(),
+                home: 'group' as const,
+              },
+          },
+        }
+        : {}),
     });
   }
 
@@ -890,6 +1024,13 @@ type ConnectedServiceResolvedGroupSelection = Readonly<{
   generation: number;
   policy: unknown;
   memberCount: number;
+  /** Present for per_session_softmax groups: the session's own member, materialized via its member home. */
+  perSession?: PerSessionSpawnAssignment;
+  /** Present when a per-session-owned session launches through the group home as a pending conversion. */
+  perSessionConversion?: Readonly<{
+    member?: ConnectedServiceGroupMemberAssignmentV1;
+    materializedAssignment: ConnectedServiceGroupMaterializedAssignmentV1;
+  }>;
 }>;
 
 function isAuthoritativeGroupActiveProfileEligible(params: Readonly<{
@@ -1120,6 +1261,17 @@ function buildSelectionsByServiceIdForSpawn(params: Readonly<{
     }
     const group = params.groupSelections.get(selection.serviceId);
     if (!group) continue;
+    if (group.perSession) {
+      // The member's own profile home, bypassing the shared group-home writer and verifier.
+      selectionsByServiceId.set(selection.serviceId, {
+        kind: 'profile',
+        serviceId: selection.serviceId,
+        profileId: group.perSession.profileId,
+        credentialRevision: params.credentialRevisionsByServiceId.get(selection.serviceId) ?? null,
+        record,
+      });
+      continue;
+    }
     selectionsByServiceId.set(selection.serviceId, {
       kind: 'group',
       serviceId: selection.serviceId,
@@ -1157,6 +1309,21 @@ function buildCanonicalConnectedServicesBindingsForSpawn(params: Readonly<{
       source: 'connected',
       selection: 'group',
       groupId: group.groupId,
+      ...(selection.initialProfileId ? { initialProfileId: selection.initialProfileId } : {}),
+      ...(group.perSession?.binding.kind === 'member' ? { member: group.perSession.binding.member } : {}),
+      ...(group.perSession?.binding.kind === 'materialized'
+        ? {
+          ...(selection.member ? { member: selection.member } : {}),
+          materializedAssignment: group.perSession.binding.materializedAssignment,
+        }
+        : {}),
+      ...(group.perSessionConversion
+        ? {
+          ...(group.perSessionConversion.member ? { member: group.perSessionConversion.member } : {}),
+          // Retargeted to the member this launch actually materializes; adoption must prove that one.
+          materializedAssignment: { ...group.perSessionConversion.materializedAssignment, profileId: group.activeProfileId },
+        }
+        : {}),
     };
   }
 
@@ -1168,8 +1335,21 @@ function buildCanonicalConnectedServicesBindingsForSpawn(params: Readonly<{
 
 function buildRuntimeAccountIdentitySelectionsForSpawn(
   selectionsByServiceId: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedSelection>,
+  groupSelections: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedGroupSelection> = new Map(),
 ): RuntimeAccountIdentitySelectionInput[] {
   return Array.from(selectionsByServiceId.values()).map((selection) => {
+    const perSessionGroup = groupSelections.get(selection.serviceId);
+    if (selection.kind === 'profile' && perSessionGroup?.perSession) {
+      // Group-scoped identity on the session's own member; no shared generation applies.
+      return {
+        serviceId: selection.serviceId,
+        profileId: selection.profileId,
+        groupId: perSessionGroup.groupId,
+        groupGeneration: null,
+        record: selection.record,
+        source: 'spawn_selection',
+      };
+    }
     if (selection.kind === 'group') {
       return {
         serviceId: selection.serviceId,
@@ -1353,6 +1533,10 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
   sessionStateMode?: 'existing';
   signal?: AbortSignal;
   onCleanup?: (cleanup: () => Promise<void>) => void;
+  /** Daemon facilities for per_session_softmax groups; null means this host cannot serve one. */
+  perSessionAssignment?: PerSessionSpawnAssignmentDeps | null;
+  /** The spawned session's exact model, for per-session eligibility (spec A.2); absent = provider default. */
+  modelId?: string | null;
 }>): Promise<Readonly<{
   env: Record<string, string>;
   materializationRoot?: string | null;
@@ -1362,6 +1546,11 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
   connectedServicesBindings: ConnectedServicesBindingsV1;
   runtimeAccountIdentitySelections: ReadonlyArray<RuntimeAccountIdentitySelectionInput>;
   diagnostics?: readonly ConnectedServicesMaterializationDiagnostic[];
+  /**
+   * Per-session decisions this spawn attempt created. The caller records the launched runner for
+   * each, or releases them after a definite pre-launch failure (spec A.4). Absent means none.
+   */
+  perSessionSpawnDecisionIds?: ReadonlyArray<string>;
 }> | null> {
   params.signal?.throwIfAborted();
   if (params.nativeSource.kind === 'session_continuation'
@@ -1391,8 +1580,54 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
     authGroupSwitchCoordinator: params.authGroupSwitchCoordinator ?? null,
     predictiveSoftSwitchMode: credentialLifecycleDescriptor.predictiveSoftSwitch.mode,
     quotaProbeDeadlineAtMs: params.quotaProbeDeadlineAtMs,
+    perSessionAssignment: params.perSessionAssignment ?? null,
+    // A new spawn has no session id yet; its stable per-session materialization identity keys the decision.
+    perSessionSubjectId: params.connectedServiceMaterializationIdentityV1?.id ?? params.sessionId ?? params.materializationKey,
+    clock,
+    // The caller's existing spawn deadline; otherwise the existing switch-lease timeout.
+    perSessionDeadlineAtMs: params.quotaProbeDeadlineAtMs ?? nowMs + DEFAULT_SWITCH_LEASE_TIMEOUT_MS,
+    perSessionRequiredModelIds: resolveSpawnRequiredModelIds(params.modelId),
     readMemberHolds: params.readMemberHolds ?? readConfiguredConnectedServiceMemberHolds,
   });
+  const perSessionSpawnDecisionIds = [...resolvedBindings.groupSelections.values()]
+    .flatMap((group) => (group.perSession?.ownedByAttempt ? [group.perSession.decisionId] : []));
+  // Every exit below that launches nothing releases the decisions this attempt created.
+  const releasePerSessionSpawnDecisions = async () => {
+    for (const decisionId of perSessionSpawnDecisionIds) {
+      await params.perSessionAssignment?.releaseAfterDefinitePreLaunchFailure(decisionId).catch(() => false);
+    }
+  };
+  try {
+    const resolved = await resolveConnectedServiceAuthForSpawnWithBindings(params, {
+      selections, clock, nowMs, resolvedBindings, forceSpawnPreflightOauthRefresh,
+    });
+    if (resolved === null) {
+      await releasePerSessionSpawnDecisions();
+      return null;
+    }
+    return { ...resolved, perSessionSpawnDecisionIds };
+  } catch (error) {
+    await releasePerSessionSpawnDecisions();
+    throw error;
+  }
+}
+
+function resolveSpawnRequiredModelIds(modelId: string | null | undefined): ReadonlyArray<string> {
+  const trimmed = modelId?.trim();
+  return trimmed && trimmed !== 'default' ? [trimmed] : [];
+}
+
+async function resolveConnectedServiceAuthForSpawnWithBindings(
+  params: Parameters<typeof resolveConnectedServiceAuthForSpawn>[0],
+  resolvedInput: Readonly<{
+    selections: ReturnType<typeof parseConnectedServiceBindingSelections>;
+    clock: () => number;
+    nowMs: number;
+    resolvedBindings: Awaited<ReturnType<typeof resolveCredentialBindings>>;
+    forceSpawnPreflightOauthRefresh: boolean;
+  }>,
+): Promise<Omit<NonNullable<Awaited<ReturnType<typeof resolveConnectedServiceAuthForSpawn>>>, 'perSessionSpawnDecisionIds'> | null> {
+  const { selections, clock, nowMs, resolvedBindings, forceSpawnPreflightOauthRefresh } = resolvedInput;
   params.signal?.throwIfAborted();
 
   const resolvedCredentials = await resolveConnectedServiceCredentialsWithRevisions({
@@ -1508,7 +1743,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
       return {
         ...materialized,
         connectedServicesBindings,
-        runtimeAccountIdentitySelections: buildRuntimeAccountIdentitySelectionsForSpawn(selectionsByServiceId),
+        runtimeAccountIdentitySelections: buildRuntimeAccountIdentitySelectionsForSpawn(selectionsByServiceId, groupSelections),
       };
     } catch (error) {
       if (!(error instanceof ConnectedServiceSpawnMaterializationError)) throw error;

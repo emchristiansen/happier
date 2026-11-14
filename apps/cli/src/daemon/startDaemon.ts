@@ -187,6 +187,7 @@ import { waitForExistingSessionExitIfStopRequested } from './sessions/waitForExi
 import { waitForTerminatingSessionRunnerExit } from './sessions/waitForTerminatingSessionRunnerExit';
 import { waitForTrackedRunnerProcessesExit } from './sessions/waitForTrackedRunnerProcessesExit';
 import { readProcessRunState } from './processRunState';
+import { classifySessionRunnerProcessPresence } from './sessionRunnerProcessIdentity';
 import { resolveSpawnWebhookResult } from './sessions/resolveSpawnWebhookResult';
 import {
   classifyTrackedSessionRunnerPresence,
@@ -355,7 +356,10 @@ import {
   reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget,
   reconcileConnectedServiceDirectCredentialRevisions,
   reconcileConnectedServiceAuthGroupGenerations,
+  reconcileConnectedServicePerSessionMemberRevocationForRuntimeTarget,
+  reconcileConnectedServicePerSessionMemberRevocations,
   listSessionGenerationRuntimeTargets,
+  type ConnectedServicePerSessionMemberRevocation,
 } from './connectedServices/accountGroups/generation/reconcileConnectedServiceAuthGroupGenerations';
 import { mapCommittedGenerationApplyResult } from './connectedServices/accountGroups/generation/mapCommittedGenerationApplyResult';
 import { createSharedGenerationApplication } from './connectedServices/accountGroups/generation/createSharedGenerationApplication';
@@ -555,7 +559,29 @@ import {
 import { materializeSessionConnectedServiceRuntimeAuthSelection } from './connectedServices/sessionAuthSwitch/materializeSessionConnectedServiceRuntimeAuthSelection';
 import { resolveTrackedConnectedServiceSwitchContinuityContext, resolveTrackedConnectedServiceVendorResumeId } from './connectedServices/sessionAuthSwitch/resolveTrackedConnectedServiceSwitchContinuityContext';
 import { handleProviderObservedSessionAccount } from './connectedServices/sessionAuthSwitch/reconcileProviderObservedSessionAccount';
-import { projectProviderObservedAccountMetadata } from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
+import {
+  projectProviderObservedAccountMetadata,
+  resolveAdoptedPerSessionDecisionId,
+  resolveCommittedSharedConversion,
+  resolveProvedSharedConversion,
+} from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
+import {
+  PerSessionAssignmentLedger,
+  resolvePerSessionAssignmentLedgerPath,
+} from './connectedServices/accountGroups/perSession/PerSessionAssignmentLedger';
+import { PerSessionAssignmentRuntime, type PerSessionSpawnCustody } from './connectedServices/accountGroups/perSession/PerSessionAssignmentRuntime';
+import {
+  collectPerSessionLiveDecisions,
+  collectPerSessionLiveSubjectIds,
+  collectPerSessionProvedSharedConversions,
+} from './connectedServices/accountGroups/perSession/collectPerSessionLiveDecisions';
+import {
+  PerSessionFailoverCoordinator,
+  type PerSessionApplyBinding,
+} from './connectedServices/accountGroups/perSession/PerSessionFailoverCoordinator';
+import { buildPerSessionGroupSwitchState } from './connectedServices/accountGroups/perSession/buildPerSessionGroupSwitchState';
+import { readPerSessionSessionBinding } from './connectedServices/accountGroups/perSession/readPerSessionSessionBinding';
+import { restoreConnectedServicePerSessionAssignmentFromPersisted } from './connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 import {
   createConnectedServiceMaterializationIdentity,
   readConnectedServiceMaterializationIdentityV1,
@@ -980,7 +1006,9 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     providerObservedAccount: Readonly<{ serviceId: ConnectedServiceId; groupId: string; profileId: string }>;
     isCurrent: () => boolean;
   }>
-)): Promise<void> {
+)): Promise<Readonly<{ adoptedPerSessionDecisionId: string | null; provedSharedConversionSubjectId: string | null }>> {
+  let adoptedPerSessionDecisionId: string | null = null;
+  let provedSharedConversionSubjectId: string | null = null;
   const rawSession = await fetchSessionByIdCompat({
     token: params.credentials.token,
     sessionId: params.sessionId,
@@ -994,11 +1022,32 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     sessionId: params.sessionId,
     rawSession,
     updater: (metadata) => {
+      adoptedPerSessionDecisionId = null;
+      provedSharedConversionSubjectId = null;
       if (params.isCurrent && !params.isCurrent()) return metadata;
       const projected = params.providerObservedAccount
         ? projectProviderObservedAccountMetadata(metadata, params.providerObservedAccount)
         : { ...metadata, connectedServices: params.normalizedBindings };
-      if (projected === metadata) return metadata;
+      if (projected === metadata) {
+        // An identical observation after the conversion committed (and its settlement may not
+        // have run) re-proves it from the committed metadata, so settlement is not lost.
+        if (params.providerObservedAccount && resolveCommittedSharedConversion(metadata, params.providerObservedAccount)) {
+          provedSharedConversionSubjectId = readConnectedServiceMaterializationIdentityV1(
+            metadata.connectedServiceMaterializationIdentityV1,
+          )?.id ?? params.sessionId;
+        }
+        return metadata;
+      }
+      adoptedPerSessionDecisionId = params.providerObservedAccount
+        ? resolveAdoptedPerSessionDecisionId(metadata, projected, params.providerObservedAccount.serviceId)
+        : null;
+      if (params.providerObservedAccount
+        && resolveProvedSharedConversion(metadata, projected, params.providerObservedAccount.serviceId)) {
+        // The session's per-session decisions were keyed by its materialization identity.
+        provedSharedConversionSubjectId = readConnectedServiceMaterializationIdentityV1(
+          metadata.connectedServiceMaterializationIdentityV1,
+        )?.id ?? params.sessionId;
+      }
       const existingUpdatedAt = typeof metadata.connectedServicesUpdatedAt === 'number'
         && Number.isFinite(metadata.connectedServicesUpdatedAt)
         ? metadata.connectedServicesUpdatedAt
@@ -1018,6 +1067,7 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     },
     maxAttempts: 6,
   });
+  return { adoptedPerSessionDecisionId, provedSharedConversionSubjectId };
 }
 
 let lastTerminalControlServiceabilityObservation = 0;
@@ -1990,6 +2040,47 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       };
       const connectedServiceRuntimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
       const providerAccountUsageStore = createProviderAccountUsageStore();
+      // per_session_softmax groups (spec A.3–A.5): this daemon's decision ledger and reservation leases.
+      const perSessionAssignmentRuntime = new PerSessionAssignmentRuntime({
+        ledger: new PerSessionAssignmentLedger(resolvePerSessionAssignmentLedgerPath(configuration.activeServerDir)),
+        ownerMachineId: machineId,
+        reservationApi: api.connectedServiceAssignmentReservations,
+        nowMs: () => Date.now(),
+        listLiveDecisions: () => collectPerSessionLiveDecisions(pidToTrackedSession.values()),
+        listLiveSubjectIds: () => collectPerSessionLiveSubjectIds(pidToTrackedSession.values()),
+        listProvedSharedConversions: () => collectPerSessionProvedSharedConversions(pidToTrackedSession.values()),
+        readMemberSnapshotCapturedAtMs: ({ serviceId, groupId, profileId }) => {
+          const fetchedAt = Number(connectedServiceRuntimeQuotaSnapshots.getSnapshotEntry({ serviceId, groupId, profileId })?.snapshot.fetchedAt);
+          return Number.isFinite(fetchedAt) && fetchedAt > 0 ? fetchedAt : null;
+        },
+        // Retirement evidence for a recorded runner: dead/zombie, or a same-scheme fingerprint
+        // mismatch proving PID reuse. Anything else keeps the decision's custody.
+        probeRunnerPresence: async (runner) => classifySessionRunnerProcessPresence({
+          runState: await readProcessRunState(runner.pid).catch(() => null),
+          storedProcessCommandHash: null,
+          storedProcessInstanceFingerprint: runner.processInstanceFingerprint ?? null,
+          currentIdentity: { kind: 'unknown', ...(() => {
+            const processInstanceFingerprint = readProcessInstanceFingerprintSync(runner.pid);
+            return processInstanceFingerprint ? { processInstanceFingerprint } : {};
+          })() },
+        }) === 'absent' ? 'absent' : 'present',
+        log: (event, detail) => logger.debug(`[ConnectedServices] ${event}`, detail),
+      });
+      // Revocation of a per-session member (spec A.4, T10): the affected session is moved through its
+      // own classified-failure recovery (durable intent, FIFO lock, turn boundary). One request per
+      // session and member; reconciliation replays and retries collapse onto it.
+      let requestPerSessionMemberRevocationRecovery: ((revocation: ConnectedServicePerSessionMemberRevocation) => Promise<void>) | null = null;
+      const perSessionMemberRevocationsInFlight = new Map<string, Promise<void>>();
+      const revokePerSessionMember = async (revocation: ConnectedServicePerSessionMemberRevocation): Promise<void> => {
+        const key = `${revocation.sessionId}\0${revocation.serviceId}\0${revocation.groupId}\0${revocation.profileId}`;
+        const existing = perSessionMemberRevocationsInFlight.get(key);
+        if (existing) return await existing;
+        const request = requestPerSessionMemberRevocationRecovery;
+        if (!request) throw new Error('per_session_member_revocation_unavailable');
+        const pending = request(revocation).finally(() => perSessionMemberRevocationsInFlight.delete(key));
+        perSessionMemberRevocationsInFlight.set(key, pending);
+        return await pending;
+      };
       const connectedServiceContinuationApplicationCorrelation =
         createConnectedServiceContinuationApplicationCorrelation<
           Readonly<{
@@ -2714,6 +2805,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             ...(signal ? { signal } : {}),
           });
           if (!isCurrent()) return;
+          await reconcileConnectedServicePerSessionMemberRevocationForRuntimeTarget({
+            target,
+            isGroupMemberEligible: snapshot.isGroupMemberEligible,
+            revokePerSessionMember,
+            isCurrent,
+            ...(signal ? { signal } : {}),
+          });
+          if (!isCurrent()) return;
           await reconcileConnectedServiceDirectCredentialRevisionForRuntimeTarget({
             target,
             resolveCredentialBoundary: snapshot.resolveCredentialBoundary,
@@ -3282,10 +3381,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         // launch adapter to publish its owned runner before physical cleanup.
         const automaticSpawnPreparations = new Map<string, Set<Promise<void>>>();
             // Spawn a new session (sessionId reserved for future Happy session resume; vendor resume uses options.resume).
-                const spawnSession = async (
+                const spawnSessionUnderPerSessionCustody = async (
                   options: SpawnSessionOptions,
-                  acceptanceHooks?: SpawnSessionRunnerAcceptanceHooks,
-                  automaticRespawnSignal?: AbortSignal,
+                  acceptanceHooks: SpawnSessionRunnerAcceptanceHooks | undefined,
+                  automaticRespawnSignal: AbortSignal | undefined,
+                  perSessionSpawnCustody: PerSessionSpawnCustody,
                 ): Promise<SpawnSessionResult> => {
           const automaticSessionId = typeof options.existingSessionId === 'string' ? options.existingSessionId.trim() : '';
           const assertAutomaticAdmission = () => automaticRespawnSignal?.throwIfAborted();
@@ -3746,6 +3846,16 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   ...runtimeSnapshot.spawnOptions,
                   ...(requestExecutionAuthorization ? { executionAuthorization: requestExecutionAuthorization } : {}),
                 };
+                if (normalizedOptions.connectedServices) {
+                  // Resume keeps only this session's own per-session assignment, from its persisted record.
+                  normalizedOptions = {
+                    ...normalizedOptions,
+                    connectedServices: restoreConnectedServicePerSessionAssignmentFromPersisted(
+                      normalizedOptions.connectedServices,
+                      existingSessionPersistedMetadata?.connectedServices,
+                    ),
+                  };
+                }
                 resume = normalizedOptions.resume;
                 permissionMode = normalizedOptions.permissionMode;
                 permissionModeUpdatedAt = normalizedOptions.permissionModeUpdatedAt;
@@ -4095,6 +4205,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       sessionId: connectedServiceAuthSessionId,
                       authGroupSwitchCoordinator: preTurnSwitchCoordinator,
                       quotaProbeDeadlineAtMs: connectedServiceSpawnQuotaProbeDeadlineAtMs,
+                      perSessionAssignment: perSessionAssignmentRuntime.spawnDeps,
+                      modelId: normalizedOptions.modelId ?? null,
                       accountSettings: activeAccountSettings?.settings ?? null,
                       processEnv: process.env,
                       nativeSource: normalizedExistingSessionId && existingSessionAttachContext
@@ -4116,6 +4228,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                             existingSessionPersistedMetadata,
                           ),
                     });
+                    perSessionSpawnCustody.claim(connectedServiceAuth?.perSessionSpawnDecisionIds ?? []);
                     if (repairedMissingMaterializationIdentity && normalizedExistingSessionId) {
                       try {
                         await persistSessionConnectedServiceBindings({
@@ -4381,6 +4494,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               }
             }
             assertAutomaticAdmission();
+            // From here a launch adapter may create a process whose existence is not yet observable;
+            // a later failure no longer proves the decisions were never used (spec A.4, T17).
+            await perSessionSpawnCustody.markLaunchAttempted();
 
             const liveRunnerSnapshotFingerprints = resolveLiveRunnerSnapshotFingerprints(getCurrentChildren());
             const runtimeDecision = resolveHappyCliSubprocessRuntimeDecision({ liveRunnerSnapshotFingerprints });
@@ -4401,6 +4517,13 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               modelUpdatedAt,
             });
 
+            // A runner process now owns this attempt's per-session decisions; its proved absence
+            // (not elapsed time) is what later lets them be released.
+            const recordPerSessionSpawnRunner = async (pid: number) => {
+              const processInstanceFingerprint = readProcessInstanceFingerprintSync(pid);
+              await perSessionSpawnCustody.recordRunner({ pid, ...(processInstanceFingerprint ? { processInstanceFingerprint } : {}) })
+                .catch((error) => logger.warn('[ConnectedServices] Failed to record per-session spawn runner', error));
+            };
             let observedSpawnExit: Parameters<typeof onChildExited>[1] | null = null;
             let runnerWebhookCompletion: ReturnType<typeof waitForSessionWebhook> | undefined;
             const exitedBeforeFinalizationResult = (): Extract<SpawnSessionResult, { type: 'error' }> => ({
@@ -4415,6 +4538,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               createWebhookCompletion: () => ReturnType<typeof waitForSessionWebhook>,
             ): Promise<Readonly<{ acceptedResult: SpawnSessionResult; webhookCompletion: Promise<SpawnSessionResult> }>> => {
               const pid = trackedSession.pid;
+              await recordPerSessionSpawnRunner(pid);
               trackedSession.spawnOptionsCustody = 'accepted_live_launch';
               pidToTrackedSession.set(pid, trackedSession);
               if (spawnResourceCleanupOnExit) {
@@ -5135,6 +5259,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 )
                 : spawnHappyCLI(args, spawnOptions, runnerLaunchOptions);
 
+              if (happyProcess.pid) await recordPerSessionSpawnRunner(happyProcess.pid);
               if (!happyProcess.pid) {
                 logger.debug('[DAEMON RUN] Failed to spawn process - no PID returned');
                 if (spawnResourceCleanupOnFailure && !spawnResourceCleanupArmed) {
@@ -5282,6 +5407,30 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           } finally {
             finishAutomaticPreparation();
           }
+                };
+                // Per-session decisions created by a spawn attempt stay owned until a runner exists;
+                // an attempt that ends without launching one releases them (spec A.4, T17).
+                const spawnSession = async (
+                  options: SpawnSessionOptions,
+                  acceptanceHooks?: SpawnSessionRunnerAcceptanceHooks,
+                  automaticRespawnSignal?: AbortSignal,
+                ): Promise<SpawnSessionResult> => {
+                  const perSessionSpawnCustody = perSessionAssignmentRuntime.createSpawnCustody();
+                  let result: SpawnSessionResult;
+                  try {
+                    result = await spawnSessionUnderPerSessionCustody(options, acceptanceHooks, automaticRespawnSignal, perSessionSpawnCustody);
+                  } catch (error) {
+                    await perSessionSpawnCustody.releaseIfNeverLaunched().catch((releaseError) => {
+                      logger.debug('[ConnectedServices] Per-session spawn decision release failed (non-fatal)', releaseError);
+                    });
+                    throw error;
+                  }
+                  if (result.type !== 'success') {
+                    await perSessionSpawnCustody.releaseIfNeverLaunched().catch((releaseError) => {
+                      logger.debug('[ConnectedServices] Per-session spawn decision release failed (non-fatal)', releaseError);
+                    });
+                  }
+                  return result;
                 };
 
         const temporaryThrottleResumeSnapshotsBySessionId = new Map<string, TrackedSession>();
@@ -5814,6 +5963,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           reason: string;
           switchReason: ConnectedServiceSessionAuthSwitchReason;
           fromProfileId?: string | null;
+          /** Per-session recovery: the session's own group binding carrying its new target. */
+          perSessionBinding?: PerSessionApplyBinding;
         }>): Promise<Readonly<{
           ok: boolean;
           action?: string;
@@ -6058,7 +6209,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               bindings: {
                 v: 1,
                 bindingsByServiceId: {
-                  [serviceId]: generationInput.groupId === null
+                  [serviceId]: generationInput.perSessionBinding
+                    ? generationInput.perSessionBinding
+                    : generationInput.groupId === null
                     ? {
                         source: 'connected',
                         selection: 'profile',
@@ -6072,7 +6225,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       },
                 },
               },
-              ...(generationInput.groupId === null || generationInput.generation === null
+              ...(generationInput.perSessionBinding
+                ? {}
+                : generationInput.groupId === null || generationInput.generation === null
                 ? { rematerializeServiceId: serviceId }
                 : {
                     expectedGroupGenerationByServiceId: {
@@ -6213,6 +6368,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             if (!stillLive && !wasConnectedServicesRestartRequested) {
               connectedServiceRuntimeAuthSwitchAttempts.clearSession(trackedBeforeExit.happySessionId);
               connectedServiceSessionAuthSwitchCore.clearSession(trackedBeforeExit.happySessionId);
+              // The session's runner exited with no replacement: its per-session decisions are retired.
+              await perSessionAssignmentRuntime.releaseForRetiredSubjects([...collectPerSessionLiveSubjectIds([trackedBeforeExit])])
+                .catch((error) => logger.debug('[ConnectedServices] Per-session decision release after session exit failed (non-fatal)', error));
             }
           }
           void connectedServiceGroupHomeCleanupScheduler.cleanupPendingDeletedGroupHomes().catch((error) => {
@@ -6792,6 +6950,77 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               }
             },
           });
+          // per_session_softmax groups: each session recovers onto its own member; the shared
+          // pointer never moves (spec A.4). Other groups keep the shared switch pipeline.
+          const perSessionFailoverCoordinator = new PerSessionFailoverCoordinator({
+            loadGroup: async (groupInput) => await api.getConnectedServiceAuthGroup(groupInput),
+            buildState: async (group, stateSessionId) => ({
+              ...buildPerSessionGroupSwitchState({
+                group,
+                accountUsageStore: providerAccountUsageStore,
+                runtimeQuotaSnapshots: connectedServiceRuntimeQuotaSnapshots,
+                nowMs: Date.now(),
+                // Holds govern per-session failover draws as well (t_1b770ae5 HOLD-01/02).
+                memberHolds: await readConfiguredConnectedServiceMemberHolds(group.serviceId),
+              }),
+              // This session's own model only (spec A.2): other sessions' models never exclude its destination.
+              requiredModelIds: resolveConnectedServiceAuthGroupRequiredModelIds({
+                serviceId: group.serviceId, groupId: group.groupId,
+                targets: connectedServiceRuntimeRegistry.listTargets(), sessions: getCurrentChildren(),
+                sessionId: stateSessionId,
+              }),
+            }),
+            switchSharedGroup: async (sharedInput) => await switchCoordinator.switchAfterClassifiedFailure(sharedInput),
+            recordFailure: async (failure) => {
+              await switchCoordinator.observeCurrentGenerationForRecovery({
+                serviceId: failure.serviceId,
+                groupId: failure.groupId,
+                observedProfileId: failure.observedProfileId,
+                failure: {
+                  reason: failure.reason,
+                  retryAfterMs: failure.retryAfterMs ?? null,
+                  resetsAtMs: failure.resetsAtMs ?? null,
+                },
+              }).catch((error) => {
+                logger.debug('[ConnectedServices] Per-session failure-state recording failed (non-fatal)', serializeAxiosErrorForLog(error));
+              });
+            },
+            readSessionBinding: ({ sessionId: bindingSessionId, serviceId: bindingServiceId, groupId: bindingGroupId }) => {
+              const tracked = getCurrentChildren().find((child) => child.happySessionId === bindingSessionId) ?? null;
+              return tracked ? readPerSessionSessionBinding(tracked, bindingServiceId, bindingGroupId) : null;
+            },
+            applyAssignment: async (assignment) => await applyConnectedServiceAuthGeneration({
+              sessionId: assignment.sessionId,
+              serviceId: assignment.serviceId,
+              groupId: assignment.groupId,
+              activeProfileId: assignment.profileId,
+              generation: assignment.generation,
+              reason: assignment.reason,
+              switchReason: 'automatic_runtime_failure',
+              fromProfileId: assignment.fromProfileId,
+              perSessionBinding: assignment.binding,
+            }),
+            ledger: perSessionAssignmentRuntime.spawnDeps.ledger,
+            releaseUnappliedDecision: async (decisionId) => await perSessionAssignmentRuntime.release(decisionId),
+            ownerMachineId: machineId,
+            reservationApi: api.connectedServiceAssignmentReservations,
+            quotaFreshnessMs: resolvePositiveIntEnv(
+              process.env.HAPPIER_CONNECTED_SERVICES_AUTH_GROUP_QUOTA_FRESHNESS_MS,
+              5 * 60_000,
+              { min: 1_000, max: 60 * 60_000 },
+            ),
+            nowMs: () => Date.now(),
+            deadlineMs: 30_000,
+            log: (event, detail) => logger.debug(`[ConnectedServices] ${event}`, detail),
+          });
+          const routedSwitchCoordinator = {
+            switchAfterClassifiedFailure: async (
+              switchInput: Parameters<typeof switchCoordinator.switchAfterClassifiedFailure>[0],
+            ) => (await perSessionFailoverCoordinator.owns(switchInput)
+              ? await perSessionFailoverCoordinator.switchAfterClassifiedFailure(switchInput)
+              : await switchCoordinator.switchAfterClassifiedFailure(switchInput)),
+            observeCurrentGenerationForRecovery: switchCoordinator.observeCurrentGenerationForRecovery.bind(switchCoordinator),
+          };
           const runtimeAuthApply = await resolveRuntimeAuthApplyForFailureSource({
             sessionId: input.sessionId,
             serviceId: ConnectedServiceIdSchema.parse(input.classification.serviceId),
@@ -6799,7 +7028,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           let supersedingSourceConverged = false;
           const result = await handleConnectedServiceRuntimeAuthFailureForSession({
             getChildren: getCurrentChildren,
-            switchCoordinator,
+            switchCoordinator: routedSwitchCoordinator,
             switchAttemptTracker: connectedServiceRuntimeAuthSwitchAttempts,
             switchCore: connectedServiceSessionAuthSwitchCore,
             resolveDurableSessionForRuntimeAuthRecovery: async ({ sessionId, classification }) =>
@@ -7011,6 +7240,24 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             }));
           }
           return result;
+        };
+        requestPerSessionMemberRevocationRecovery = async (revocation) => {
+          await handleConnectedServiceRuntimeAuthRecovery({
+            sessionId: revocation.sessionId,
+            switchesThisTurn: 0,
+            classification: {
+              kind: 'account_disabled',
+              serviceId: revocation.serviceId,
+              profileId: revocation.profileId,
+              groupId: revocation.groupId,
+              resetsAtMs: null,
+              sourceKey: `per_session_member_revoked:${revocation.profileId}`,
+              planType: null,
+              rateLimits: null,
+              // The daemon's own projection of the member's revocation, not a provider message.
+              source: 'daemon_member_revocation',
+            },
+          });
         };
 
         const runtimeAuthRecoveryBaseBackoffMs = resolvePositiveIntEnv(
@@ -7275,24 +7522,37 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
     // `resolveConnectedServiceAuthForSpawn` owner (no parallel resolver) and registers run PIDs in the
     // runtime registry so refresh distribution / canonical group-home ownership cover run homes.
     const executionRunConnectedServicesBridge = createExecutionRunConnectedServicesBridge({
-      resolveAuthForSpawn: async (params) => await resolveConnectedServiceAuthForSpawn({
-        agentId: params.agentId,
-        sessionDirectory: params.sessionDirectory ?? null,
-        connectedServicesBindingsRaw: params.connectedServicesBindingsRaw,
-        materializationKey: params.materializationKey,
-        ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
-        activeServerDir: configuration.activeServerDir,
-        baseDir: connectedServicesMaterializationBaseDir,
-        credentials,
-        api,
-        accountUsageStore: providerAccountUsageStore,
-        runtimeQuotaSnapshots: connectedServiceRuntimeQuotaSnapshots,
-        ...(params.sessionId ? { sessionId: params.sessionId } : {}),
-        accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
-        processEnv: process.env,
-        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
-        credentialRefreshService: connectedServiceRefreshCoordinator,
-      }),
+      resolveAuthForSpawn: async (params) => {
+        const resolved = await resolveConnectedServiceAuthForSpawn({
+          agentId: params.agentId,
+          sessionDirectory: params.sessionDirectory ?? null,
+          connectedServicesBindingsRaw: params.connectedServicesBindingsRaw,
+          materializationKey: params.materializationKey,
+          ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
+          activeServerDir: configuration.activeServerDir,
+          baseDir: connectedServicesMaterializationBaseDir,
+          credentials,
+          api,
+          accountUsageStore: providerAccountUsageStore,
+          runtimeQuotaSnapshots: connectedServiceRuntimeQuotaSnapshots,
+          ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+          ...(params.modelId ? { modelId: params.modelId } : {}),
+          accountSettings: getActiveAccountSettingsSnapshot()?.settings ?? null,
+          processEnv: process.env,
+          nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
+          credentialRefreshService: connectedServiceRefreshCoordinator,
+          perSessionAssignment: perSessionAssignmentRuntime.spawnDeps,
+        });
+        // The run's runner already exists: it owns the decisions this materialization created, and
+        // its proved exit releases them (spec A.4).
+        if (resolved?.perSessionSpawnDecisionIds?.length && params.runnerPid) {
+          const custody = perSessionAssignmentRuntime.createSpawnCustody();
+          custody.claim(resolved.perSessionSpawnDecisionIds);
+          const processInstanceFingerprint = readProcessInstanceFingerprintSync(params.runnerPid);
+          await custody.recordRunner({ pid: params.runnerPid, ...(processInstanceFingerprint ? { processInstanceFingerprint } : {}) });
+        }
+        return resolved;
+      },
       runtimeRegistry: connectedServiceRuntimeRegistry,
       createAdoptedRootCleanup: ({ materializedRoot, materializationKey, agentId, retentionPolicy }) => {
         return createAdoptedExecutionRunRootCleanup({
@@ -7435,6 +7695,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           sessionDirectory: input.sessionDirectory ?? null,
           ...(input.previousMaterializedRoot ? { previousMaterializedRoot: input.previousMaterializedRoot } : {}),
           ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+          ...(input.modelId ? { modelId: input.modelId } : {}),
         });
       },
       handleExecutionRunConnectedServiceRelease: async (input) => {
@@ -7831,12 +8092,30 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 const binding = target.activeBindings.find((candidate) => (
                   candidate.serviceId === observation.serviceId && candidate.groupId === observation.groupId
                 ));
-                if (binding) await persistSessionConnectedServiceBindings({
+                if (!binding) return;
+                const published = await persistSessionConnectedServiceBindings({
                   credentials, sessionId: input.sessionId,
                   providerObservedAccount: { serviceId: binding.serviceId, groupId: observation.groupId, profileId: binding.profileId },
                   isCurrent: () => connectedServiceRuntimeRegistry.getBySessionId(input.sessionId) === target
                     && getCurrentProviderSessionId() === observation.sourceSessionId,
                 });
+                if (published.adoptedPerSessionDecisionId) {
+                  // Provider-observed adoption proved the pending per-session target (spec A.5 C5).
+                  await perSessionAssignmentRuntime.markAdopted({
+                    serviceId: binding.serviceId,
+                    groupId: observation.groupId,
+                    decisionId: published.adoptedPerSessionDecisionId,
+                    profileId: binding.profileId,
+                  }).catch((error) => logger.warn('[ConnectedServices] Per-session adoption settlement failed; renewal will retry', error));
+                }
+                if (published.provedSharedConversionSubjectId) {
+                  // Proved conversion to the group home ends every per-session decision of this session.
+                  await perSessionAssignmentRuntime.settleProvedSharedConversion({
+                    subjectId: published.provedSharedConversionSubjectId,
+                    serviceId: binding.serviceId,
+                    groupId: observation.groupId,
+                  }).catch((error) => logger.warn('[ConnectedServices] Per-session shared-conversion settlement failed', error));
+                }
               },
               reconcileGeneration: async (target) => {
                 await enqueueConnectedServiceRuntimeTargetRegistrationReconciliation({
@@ -7886,7 +8165,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         // usage-limit interruption itself) is not provider-activity proof and must
         // not clear the recovery intents the failure report just armed.
         // A stale completion the exact-turn owner rejected must not certify the current attempt.
-        await recordTurnLifecycleProviderActivity({
+        const providerActivity = await recordTurnLifecycleProviderActivity({
           sessionId: input.sessionId,
           event: input.event,
           ...(input.terminalStatus ? { terminalStatus: input.terminalStatus } : {}),
@@ -7898,6 +8177,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           }),
           record: recordConnectedServiceContinuationProviderActivity,
         });
+        if (providerActivity.admitted) {
+          // Spec A.3: the first proved provider activity on the session's applied per-session member
+          // starts its reservation's release; the next fresh snapshot of that member completes it.
+          await perSessionAssignmentRuntime.recordProviderActivity({
+            decisions: collectPerSessionLiveDecisions(getCurrentChildren().filter((child) => child.happySessionId === input.sessionId)),
+            observedAtMs: lifecycleObservedAtMs,
+          }).catch((error) => logger.warn('[ConnectedServices] Per-session provider-activity record failed', error));
+        }
         if (input.event === 'assistant_message_end' && input.terminalStatus !== 'failed') {
           await clearMemberRuntimeStateWithPositiveEvidenceForTarget(
             connectedServiceRuntimeRegistry.getBySessionId(input.sessionId),
@@ -8370,6 +8657,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       });
       connectedServiceRefreshCoordinator = refreshStartup.coordinator;
       connectedServiceRefreshLoopHandle = refreshStartup.loopHandle;
+      perSessionAssignmentRuntime.start();
 
       const connectedServicesQuotasEnabled = await resolveConnectedServicesQuotasDaemonEnabled({
         env: process.env,
@@ -9177,6 +9465,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     isInitialProjection
                     || projectionDelta.changedGroupScopes.length > 0
                     || projectionDelta.changedCredentialBoundaries.length > 0
+                    || projectionDelta.revokedGroupMembers.length > 0
                   ) {
                     connectedServiceProjectionEpoch += 1;
                   }
@@ -9196,6 +9485,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   if (
                     projectionDelta.changedGroupScopes.length === 0
                     && projectionDelta.changedCredentialBoundaries.length === 0
+                    && projectionDelta.revokedGroupMembers.length === 0
                   ) {
                     for (const registration of projectionRegistrations) {
                       notification.signal.throwIfAborted();
@@ -9218,6 +9508,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       )),
                       executionAuthority: notification.executionAuthority,
                       groupScopes: projectionDelta.changedGroupScopes,
+                      signal: notification.signal,
+                    });
+                  }
+                  notification.signal.throwIfAborted();
+                  if (projectionDelta.revokedGroupMembers.length > 0) {
+                    await reconcileConnectedServicePerSessionMemberRevocations({
+                      revokedGroupMembers: projectionDelta.revokedGroupMembers,
+                      listRuntimeTargets: () => listSessionGenerationRuntimeTargets(projectionRegistrations),
+                      isCurrentRuntimeTarget: (target) => projectionRegistrations.some((registration) => (
+                        registration.target === target
+                        && connectedServiceRuntimeRegistry.isCurrentTargetRegistration(registration)
+                      )),
+                      revokePerSessionMember,
                       signal: notification.signal,
                     });
                   }
@@ -9296,6 +9599,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     credentialRefreshService: connectedServiceRefreshCoordinator,
                     sessionStateMode: 'existing',
                     existingSessionMetadata: metadata,
+                    perSessionAssignment: perSessionAssignmentRuntime.spawnDeps,
                   });
                   return { ...process.env, ...materialized?.env };
                 },
@@ -9749,6 +10053,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         connectedServiceRefreshLoopHandle.stop();
         connectedServiceRefreshLoopHandle = null;
       }
+      perSessionAssignmentRuntime.stop();
       if (connectedServiceQuotasLoopHandle) {
         await connectedServiceQuotasLoopHandle.stop();
         connectedServiceQuotasLoopHandle = null;

@@ -40,7 +40,12 @@ import { sync } from '@/sync/sync';
 import { useProfile, useSettings } from '@/sync/store/hooks';
 import { t } from '@/text';
 import {
+    CONNECTED_SERVICE_AUTH_GROUP_PER_SESSION_SOFTMAX_SERVICE_IDS,
+    CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_OFFSET_PERCENT,
+    CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_TEMPERATURE,
     ConnectedServiceAuthGroupIdSchema,
+    ConnectedServiceAuthGroupSoftmaxOffsetPercentSchema,
+    ConnectedServiceAuthGroupSoftmaxTemperatureSchema,
     ConnectedServiceAuthGroupStrategyV1Schema,
     ConnectedServiceIdSchema,
     isConnectedServiceCredentialHealthStatusUsable,
@@ -65,6 +70,8 @@ import {
     resolveConnectedServiceGroupProfileTitle,
     resolveConnectedServiceGroupStrategyLabel,
     resolveConnectedServiceGroupRecoveryMode,
+    resolveConnectedServiceGroupSoftmaxOffsetPercent,
+    resolveConnectedServiceGroupSoftmaxTemperature,
     resolveConnectedServiceGroupSoftSwitchRemainingPercent,
     resolveConnectedServiceGroupSwitchBudget,
     type ConnectedServiceGroupProfileLike,
@@ -134,7 +141,11 @@ function StrategyCheckmark() {
     return <Icon name="check" size={16} color={theme.colors.accent.blue} />;
 }
 
-function buildStrategyItems(currentStrategy: GroupStrategy, expiryFirstSupported: boolean): DropdownMenuItem[] {
+function buildStrategyItems(
+    currentStrategy: GroupStrategy,
+    support: Readonly<{ expiryFirst: boolean; perSessionSoftmax: boolean }>,
+): DropdownMenuItem[] {
+    const expiryFirstSupported = support.expiryFirst;
     return [
         ...(expiryFirstSupported || currentStrategy === 'expiry_first' ? [{
             id: 'expiry_first',
@@ -155,6 +166,13 @@ function buildStrategyItems(currentStrategy: GroupStrategy, expiryFirstSupported
             subtitle: t('connectedServices.detail.groupDetail.strategyLeastLimitedSubtitle'),
             rightElement: currentStrategy === 'least_limited' ? <StrategyCheckmark /> : null,
         },
+        ...(support.perSessionSoftmax || currentStrategy === 'per_session_softmax' ? [{
+            id: 'per_session_softmax',
+            title: t('connectedServices.detail.groupDetail.strategyPerSessionSoftmaxTitle'),
+            subtitle: t('connectedServices.detail.groupDetail.strategyPerSessionSoftmaxSubtitle'),
+            rightElement: currentStrategy === 'per_session_softmax' ? <StrategyCheckmark /> : null,
+            disabled: !support.perSessionSoftmax,
+        }] : []),
         {
             id: 'manual',
             title: t('connectedServices.detail.groupDetail.strategyManualTitle'),
@@ -223,6 +241,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
     const autoDisablePlanInvalidEnabled = useFeatureEnabled('connectedServices.autoDisablePlanInvalid');
     const poolQuotaLimitSelectionEnabled = useFeatureEnabled('connectedServices.poolQuotaLimitSelection');
     const poolExpiryFirstEnabled = useFeatureEnabled('connectedServices.poolExpiryFirst');
+    const poolPerSessionSoftmaxEnabled = useFeatureEnabled('connectedServices.poolPerSessionSoftmax');
     const [strategyOpen, setStrategyOpen] = React.useState(false);
     const [recoveryModeOpen, setRecoveryModeOpen] = React.useState(false);
     const [advancedExpanded, setAdvancedExpanded] = React.useState(false);
@@ -233,6 +252,9 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
     const rawGroupId = asStringParam((params as Record<string, unknown>).groupId).trim();
     const parsedGroupId = ConnectedServiceAuthGroupIdSchema.safeParse(rawGroupId);
     const groupId = parsedGroupId.success ? parsedGroupId.data : '';
+    const perSessionSoftmaxSupported = poolPerSessionSoftmaxEnabled
+        && serviceId !== null
+        && (CONNECTED_SERVICE_AUTH_GROUP_PER_SESSION_SOFTMAX_SERVICE_IDS as ReadonlyArray<string>).includes(serviceId);
     const credentials = auth.credentials ?? null;
     const serviceLabel = serviceId ? resolveConnectedServiceDisplayName(serviceId, t) : t('connectedServices.fallbackName');
     const svc = serviceId ? (profile.connectedServicesV2.find((candidate) => candidate.serviceId === serviceId) ?? null) : null;
@@ -381,6 +403,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
     const handleSetStrategy = (strategy: string) => {
         if (!isGroupStrategy(strategy)) return;
         if (strategy === 'expiry_first' && !poolExpiryFirstEnabled) return;
+        if (strategy === 'per_session_softmax' && !perSessionSoftmaxSupported) return;
         void patchPolicy({ strategy });
     };
 
@@ -420,6 +443,57 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
             return;
         }
         await patchPolicy({ softSwitchRemainingPercent: value });
+    };
+
+    const editSoftmaxParameter = async (params: Readonly<{
+        title: string;
+        body: string;
+        current: number;
+        placeholder: number;
+        isValid: (value: number) => boolean;
+        invalidBody: string;
+        toPatch: (value: number) => ConnectedServiceAuthGroupPolicyPatchV1;
+    }>) => {
+        if (!serviceId || !group || !fallbackControlsEnabled || !perSessionSoftmaxSupported) return;
+        const raw = await Modal.prompt(params.title, params.body, {
+            placeholder: String(params.placeholder),
+            defaultValue: String(params.current),
+            confirmText: t('common.save'),
+            cancelText: t('common.cancel'),
+        });
+        if (typeof raw !== 'string') return;
+        const value = parsePromptNumber(raw);
+        if (value === null || !params.isValid(value)) {
+            await Modal.alert(t('connectedServices.detail.groupDetail.invalidSoftmaxValueTitle'), params.invalidBody);
+            return;
+        }
+        await patchPolicy(params.toPatch(value));
+    };
+
+    const handleEditSoftmaxTemperature = () => {
+        if (!group) return;
+        void editSoftmaxParameter({
+            title: t('connectedServices.detail.groupDetail.softmaxTemperatureTitle'),
+            body: t('connectedServices.detail.groupDetail.softmaxTemperaturePromptBody'),
+            current: resolveConnectedServiceGroupSoftmaxTemperature(group),
+            placeholder: CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_TEMPERATURE,
+            isValid: (value) => ConnectedServiceAuthGroupSoftmaxTemperatureSchema.safeParse(value).success,
+            invalidBody: t('connectedServices.detail.groupDetail.invalidSoftmaxTemperatureBody'),
+            toPatch: (softmaxTemperature) => ({ softmaxTemperature }),
+        });
+    };
+
+    const handleEditSoftmaxOffsetPercent = () => {
+        if (!group) return;
+        void editSoftmaxParameter({
+            title: t('connectedServices.detail.groupDetail.softmaxOffsetTitle'),
+            body: t('connectedServices.detail.groupDetail.softmaxOffsetPromptBody'),
+            current: resolveConnectedServiceGroupSoftmaxOffsetPercent(group),
+            placeholder: CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_OFFSET_PERCENT,
+            isValid: (value) => ConnectedServiceAuthGroupSoftmaxOffsetPercentSchema.safeParse(value).success,
+            invalidBody: t('connectedServices.detail.groupDetail.invalidSoftmaxOffsetBody'),
+            toPatch: (softmaxOffsetPercent) => ({ softmaxOffsetPercent }),
+        });
     };
 
     const handleEditProbeIfSnapshotOlderThan = async () => {
@@ -781,6 +855,7 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
     const label = group.displayName ?? group.groupId;
     const enabledCount = group.members.filter((member) => member.enabled).length;
     const softSwitchRemainingPercent = resolveConnectedServiceGroupSoftSwitchRemainingPercent(group);
+    const softmaxControlsEnabled = fallbackControlsEnabled && perSessionSoftmaxSupported;
     const staleProbeMinutes = formatProbeMinutes(resolveConnectedServiceGroupProbeIfSnapshotOlderThanMs(group));
     const switchBudget = resolveConnectedServiceGroupSwitchBudget(group);
     const recoveryMode = resolveConnectedServiceGroupRecoveryMode(group);
@@ -1027,7 +1102,10 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
                 <DropdownMenu
                     open={strategyOpen}
                     onOpenChange={setStrategyOpen}
-                    items={buildStrategyItems(group.policy.strategy, poolExpiryFirstEnabled)}
+                    items={buildStrategyItems(group.policy.strategy, {
+                        expiryFirst: poolExpiryFirstEnabled,
+                        perSessionSoftmax: perSessionSoftmaxSupported,
+                    })}
                     selectedId={group.policy.strategy}
                     onSelect={handleSetStrategy}
                     itemTrigger={{
@@ -1044,6 +1122,37 @@ export const PoolDetailView = React.memo(function PoolDetailView() {
                     rowKind="item"
                     variant="selectable"
                 />
+                {group.policy.strategy === 'per_session_softmax' ? (
+                    <>
+                        <Item
+                            testID="connected-services-pool-detail:softmax-temperature"
+                            title={t('connectedServices.detail.groupDetail.softmaxTemperatureTitle')}
+                            subtitle={fallbackDisabledSubtitle ?? t('connectedServices.detail.groupDetail.softmaxTemperatureSubtitle', {
+                                value: String(resolveConnectedServiceGroupSoftmaxTemperature(group)),
+                            })}
+                            icon={<Icon name="flame" size={20} color={theme.colors.accent.indigo} />}
+                            disabled={!softmaxControlsEnabled}
+                            onPress={softmaxControlsEnabled ? handleEditSoftmaxTemperature : undefined}
+                        />
+                        <Item
+                            testID="connected-services-pool-detail:softmax-offset"
+                            title={t('connectedServices.detail.groupDetail.softmaxOffsetTitle')}
+                            subtitle={fallbackDisabledSubtitle ?? t('connectedServices.detail.groupDetail.softmaxOffsetSubtitle', {
+                                value: String(resolveConnectedServiceGroupSoftmaxOffsetPercent(group)),
+                            })}
+                            icon={<Icon name="arrows-left-right" size={20} color={theme.colors.accent.indigo} />}
+                            disabled={!softmaxControlsEnabled}
+                            onPress={softmaxControlsEnabled ? handleEditSoftmaxOffsetPercent : undefined}
+                        />
+                        <Item
+                            testID="connected-services-pool-detail:softmax-formula"
+                            title={t('connectedServices.detail.groupDetail.softmaxFormulaTitle')}
+                            subtitle={t('connectedServices.detail.groupDetail.softmaxFormulaBody')}
+                            icon={<Icon name="info" size={20} color={theme.colors.text.secondary} />}
+                            showChevron={false}
+                        />
+                    </>
+                ) : null}
                 <Item
                     testID="connected-services-pool-detail:soft-switch-threshold"
                     title={t('connectedServices.detail.groupDetail.softSwitchThresholdTitle')}

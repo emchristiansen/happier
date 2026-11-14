@@ -1170,6 +1170,127 @@ describe('PoolDetailView', () => {
             .not.toContain('expiry_first');
     });
 
+    function useClaudeSubscriptionPool(policyOverrides: Record<string, unknown> = {}) {
+        connectedServicesModuleState.searchParams = { serviceId: 'claude-subscription', groupId: 'primary' };
+        profileState.current = {
+            connectedServicesV2: [
+                {
+                    serviceId: 'claude-subscription',
+                    profiles: [
+                        { profileId: 'work', status: 'connected', providerEmail: 'work@example.com' },
+                        { profileId: 'backup', status: 'connected', providerEmail: 'backup@example.com' },
+                    ],
+                },
+            ],
+        };
+        const base = createAuthoritativeGroup({ serviceId: 'claude-subscription' });
+        authoritativeGroupState.groups = [{ ...base, policy: { ...base.policy, ...policyOverrides } }];
+    }
+
+    function strategyIds(screen: Awaited<ReturnType<typeof renderPoolDetail>>): string[] {
+        const dropdown = findDropdown(screen, 'connected-services-pool-detail:strategy');
+        if (!dropdown) throw new Error('Strategy control is missing');
+        return dropdown.props.items.map((item: { id: string }) => item.id);
+    }
+
+    it('offers per-session weighted selection only for Claude subscription pools on supporting servers', async () => {
+        useClaudeSubscriptionPool();
+        const screen = await renderPoolDetail();
+        expect(strategyIds(screen)).toContain('per_session_softmax');
+        await act(async () => {
+            findDropdown(screen, 'connected-services-pool-detail:strategy')?.props.onSelect('per_session_softmax');
+            await flushAsyncHandlers();
+        });
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({ patch: expect.objectContaining({ policy: { strategy: 'per_session_softmax' } }) }),
+        );
+
+        featureEnabledById.set('connectedServices.poolPerSessionSoftmax', false);
+        expect(strategyIds(await renderPoolDetail())).not.toContain('per_session_softmax');
+
+        featureEnabledById.clear();
+        connectedServicesModuleState.searchParams = { serviceId: 'openai-codex', groupId: 'primary' };
+        authoritativeGroupState.groups = [createAuthoritativeGroup()];
+        expect(strategyIds(await renderPoolDetail())).not.toContain('per_session_softmax');
+    });
+
+    it('keeps a stored per-session strategy visible but unselectable when the server stops advertising it', async () => {
+        featureEnabledById.set('connectedServices.poolPerSessionSoftmax', false);
+        useClaudeSubscriptionPool({ strategy: 'per_session_softmax' });
+        const screen = await renderPoolDetail();
+        const dropdown = findDropdown(screen, 'connected-services-pool-detail:strategy');
+        const item = dropdown?.props.items.find((candidate: { id: string }) => candidate.id === 'per_session_softmax');
+        expect(item?.disabled).toBe(true);
+        await act(async () => {
+            dropdown?.props.onSelect('per_session_softmax');
+            await flushAsyncHandlers();
+        });
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).not.toHaveBeenCalled();
+    });
+
+    it('shows temperature and offset with their defaults only while per-session selection is active', async () => {
+        useClaudeSubscriptionPool();
+        const priority = await renderPoolDetail();
+        expect(priority.findByTestId('connected-services-pool-detail:softmax-temperature')).toBeNull();
+        expect(priority.findByTestId('connected-services-pool-detail:softmax-offset')).toBeNull();
+
+        useClaudeSubscriptionPool({ strategy: 'per_session_softmax' });
+        textSpies.translate.mockClear();
+        const screen = await renderPoolDetail();
+        expect(screen.findByTestId('connected-services-pool-detail:softmax-temperature')).toBeTruthy();
+        expect(screen.findByTestId('connected-services-pool-detail:softmax-offset')).toBeTruthy();
+        expect(screen.findByTestId('connected-services-pool-detail:softmax-formula')).toBeTruthy();
+        expect(textSpies.translate).toHaveBeenCalledWith(
+            'connectedServices.detail.groupDetail.softmaxTemperatureSubtitle', { value: '1.5' },
+        );
+        expect(textSpies.translate).toHaveBeenCalledWith(
+            'connectedServices.detail.groupDetail.softmaxOffsetSubtitle', { value: '10' },
+        );
+    });
+
+    it('saves a valid temperature and offset through the policy patch and rejects out-of-range values', async () => {
+        useClaudeSubscriptionPool({ strategy: 'per_session_softmax', softmaxTemperature: 2, softmaxOffsetPercent: 5 });
+        const screen = await renderPoolDetail();
+
+        modalSpies.prompt.mockResolvedValueOnce('3');
+        await act(async () => {
+            screen.findByTestId('connected-services-pool-detail:softmax-temperature')?.props.onPress?.();
+            await flushAsyncHandlers();
+        });
+        expect(modalSpies.prompt).toHaveBeenLastCalledWith(
+            expect.any(String), expect.any(String), expect.objectContaining({ defaultValue: '2' }),
+        );
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).toHaveBeenLastCalledWith(
+            expect.anything(),
+            expect.objectContaining({ patch: { policy: { softmaxTemperature: 3 }, expectedGeneration: 2 } }),
+        );
+
+        modalSpies.prompt.mockResolvedValueOnce('20%');
+        await act(async () => {
+            screen.findByTestId('connected-services-pool-detail:softmax-offset')?.props.onPress?.();
+            await flushAsyncHandlers();
+        });
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).toHaveBeenLastCalledWith(
+            expect.anything(),
+            expect.objectContaining({ patch: { policy: { softmaxOffsetPercent: 20 }, expectedGeneration: 2 } }),
+        );
+
+        authGroupApiSpies.patchConnectedServiceAuthGroupV3.mockClear();
+        modalSpies.prompt.mockResolvedValueOnce('0.2');
+        await act(async () => {
+            screen.findByTestId('connected-services-pool-detail:softmax-temperature')?.props.onPress?.();
+            await flushAsyncHandlers();
+        });
+        modalSpies.prompt.mockResolvedValueOnce('0');
+        await act(async () => {
+            screen.findByTestId('connected-services-pool-detail:softmax-offset')?.props.onPress?.();
+            await flushAsyncHandlers();
+        });
+        expect(authGroupApiSpies.patchConnectedServiceAuthGroupV3).not.toHaveBeenCalled();
+        expect(modalSpies.alert).toHaveBeenCalledTimes(2);
+    });
+
     it('surfaces every Behavior control including the two previously-hidden knobs', async () => {
         const screen = await renderPoolDetail();
         await expandAdvanced(screen);

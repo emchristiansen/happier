@@ -44,6 +44,89 @@ const ConnectedServiceProfileBindingV1Schema = lazySchema(() => z
     })
     .passthrough());
 
+export const ConnectedServiceGroupMemberAssignmentReasonV1Schema = lazySchema(() => z.enum([
+    'initial_requested',
+    'initial_sampled',
+    'initial_unavailable_failover',
+    'failover',
+    'member_revoked',
+    'policy_conversion',
+]));
+
+export type ConnectedServiceGroupMemberAssignmentReasonV1 = z.infer<typeof ConnectedServiceGroupMemberAssignmentReasonV1Schema>;
+
+/** The session's own applied member under a per_session_softmax group (spec A.1). */
+export const ConnectedServiceGroupMemberAssignmentV1Schema = lazySchema(() => z
+    .object({
+        assignment: z.literal('per_session'),
+        profileId: ConnectedServiceProfileIdSchema,
+        decisionId: z.string().min(1).max(200),
+        reason: ConnectedServiceGroupMemberAssignmentReasonV1Schema,
+        fromProfileId: ConnectedServiceProfileIdSchema.optional(),
+        appliedAtMs: z.number().int().nonnegative(),
+        temperature: z.number().finite().positive().optional(),
+        offsetPercent: z.number().finite().positive().optional(),
+        probability: z.number().finite().min(0).max(1).optional(),
+    })
+    .strict());
+
+export type ConnectedServiceGroupMemberAssignmentV1 = z.infer<typeof ConnectedServiceGroupMemberAssignmentV1Schema>;
+
+/**
+ * Internal PENDING per-session target: the member a session was materialized onto (spawn or
+ * restart) before provider-observed adoption proves it. Promoted to `member` on adoption.
+ */
+export const ConnectedServiceGroupMaterializedAssignmentV1Schema = lazySchema(() => z
+    .object({
+        profileId: ConnectedServiceProfileIdSchema,
+        decisionId: z.string().min(1).max(200),
+        reason: ConnectedServiceGroupMemberAssignmentReasonV1Schema,
+        fromProfileId: ConnectedServiceProfileIdSchema.optional(),
+        materializedAtMs: z.number().int().nonnegative(),
+        /**
+         * Conversion target (spec A.4 Migration): materialize the group's shared home instead of the
+         * member home; on adoption the session's per-session ownership is removed rather than promoted.
+         */
+        home: z.literal('group').optional(),
+        temperature: z.number().finite().positive().optional(),
+        offsetPercent: z.number().finite().positive().optional(),
+        probability: z.number().finite().min(0).max(1).optional(),
+    })
+    .strict());
+
+export type ConnectedServiceGroupMaterializedAssignmentV1 = z.infer<typeof ConnectedServiceGroupMaterializedAssignmentV1Schema>;
+
+/** Internal-only assignment state that callers may never supply. */
+export const CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS = Object.freeze([
+    'member',
+    'materializedAssignment',
+    'pendingAssignment',
+    'decisionId',
+] as const);
+
+export const CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR = 'connected_service_internal_assignment_field_forbidden';
+export const CONNECTED_SERVICE_INITIAL_PROFILE_REQUIRES_GROUP_ERROR = 'connected_service_initial_profile_requires_group';
+
+/**
+ * Returns the `<serviceId>.<field>` paths of internal assignment fields present in external input.
+ * Accepts either a V1 envelope or a bare bindingsByServiceId record; unknown shapes yield [].
+ */
+export function findConnectedServiceInternalAssignmentFields(input: unknown): string[] {
+    if (!input || typeof input !== 'object') return [];
+    const record = input as Record<string, unknown>;
+    const byServiceId = record.bindingsByServiceId && typeof record.bindingsByServiceId === 'object'
+        ? record.bindingsByServiceId as Record<string, unknown>
+        : record;
+    const found: string[] = [];
+    for (const [serviceId, binding] of Object.entries(byServiceId)) {
+        if (!binding || typeof binding !== 'object') continue;
+        for (const field of CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS) {
+            if (Object.prototype.hasOwnProperty.call(binding, field)) found.push(`${serviceId}.${field}`);
+        }
+    }
+    return found;
+}
+
 const ConnectedServiceGroupBindingV1Schema = lazySchema(() => z
     .object({
         source: z.literal('connected'),
@@ -52,6 +135,12 @@ const ConnectedServiceGroupBindingV1Schema = lazySchema(() => z
         profileId: ConnectedServiceProfileIdSchema.optional(),
         // Runtime account evidence; profileId remains the requested fallback.
         appliedProfileId: ConnectedServiceProfileIdSchema.optional(),
+        // External request to start on this member (per_session_softmax groups). Not adoption evidence.
+        initialProfileId: ConnectedServiceProfileIdSchema.optional(),
+        // Internal APPLIED per-session assignment. Rejected at every external entry point; see
+        // findConnectedServiceInternalAssignmentFields.
+        member: ConnectedServiceGroupMemberAssignmentV1Schema.optional(),
+        materializedAssignment: ConnectedServiceGroupMaterializedAssignmentV1Schema.optional(),
     })
     .passthrough());
 
@@ -123,3 +212,52 @@ export const SessionConnectedServiceAuthSwitchRpcParamsSchema = lazySchema(() =>
 export type SessionConnectedServiceAuthSwitchRpcParams = z.infer<
     typeof SessionConnectedServiceAuthSwitchRpcParamsSchema
 >;
+
+function omitConnectedServiceBindingFields<T>(input: T, fields: ReadonlySet<string>): T {
+    if (!input || typeof input !== 'object') return input;
+    const record = input as Record<string, unknown>;
+    const isEnvelope = !!record.bindingsByServiceId && typeof record.bindingsByServiceId === 'object';
+    const byServiceId = (isEnvelope ? record.bindingsByServiceId : record) as Record<string, unknown>;
+    let changed = false;
+    const next: Record<string, unknown> = {};
+    for (const [serviceId, binding] of Object.entries(byServiceId)) {
+        if (!binding || typeof binding !== 'object') {
+            next[serviceId] = binding;
+            continue;
+        }
+        const kept = Object.fromEntries(Object.entries(binding).filter(([field]) => !fields.has(field)));
+        if (Object.keys(kept).length !== Object.keys(binding).length) changed = true;
+        next[serviceId] = kept;
+    }
+    if (!changed) return input;
+    return (isEnvelope ? { ...record, bindingsByServiceId: next } : next) as T;
+}
+
+const INTERNAL_ASSIGNMENT_FIELD_SET: ReadonlySet<string> = new Set(CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS);
+
+/** What a child, fork, handoff target or stored default never inherits: every internal field plus the parent's request. */
+export const CONNECTED_SERVICE_INHERITANCE_STRIPPED_FIELDS = Object.freeze([
+    ...CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS,
+    'initialProfileId',
+] as const);
+
+const INHERITANCE_STRIPPED_FIELD_SET: ReadonlySet<string> = new Set(CONNECTED_SERVICE_INHERITANCE_STRIPPED_FIELDS);
+
+/**
+ * Removes caller-supplied internal assignment state (CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS) and
+ * keeps `initialProfileId`. Accepts a V1 envelope or bare bindingsByServiceId record and returns the
+ * same shape; returns the input itself when nothing is removed.
+ */
+export function stripConnectedServiceInternalAssignmentFields<T>(input: T): T {
+    return omitConnectedServiceBindingFields(input, INTERNAL_ASSIGNMENT_FIELD_SET);
+}
+
+/**
+ * The group/source a child, fork, handoff target or stored default inherits: the parent's
+ * `initialProfileId` and every internal assignment field removed (spec A.1); the inheritor makes its
+ * own decision and reservation. Accepts a V1 envelope or bare record and returns the same shape;
+ * returns the input itself when nothing is removed.
+ */
+export function stripConnectedServicePerSessionAssignmentFields<T>(input: T): T {
+    return omitConnectedServiceBindingFields(input, INHERITANCE_STRIPPED_FIELD_SET);
+}

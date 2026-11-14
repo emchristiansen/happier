@@ -171,6 +171,11 @@ import {
 } from '@/daemon/controlClient';
 
 import { isAuthenticationError } from '@/api/client/httpStatusError';
+import {
+  rejectConnectedServiceInternalAssignmentInput,
+  stripConnectedServiceCallerAssignmentForResume,
+  stripConnectedServicePerSessionAssignmentForInheritance,
+} from '@/daemon/connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
 // Fork requests are idempotent per caller-supplied requestId: a transport-level
 // retry (machine RPC ack timeout) joins the fork already running instead of
@@ -454,6 +459,10 @@ export function registerMachineRpcHandlers(params: Readonly<{
     const parsed = parseSessionConnectedServiceAuthSwitchRpcParams(raw);
     if (!parsed) {
       return { ok: false, errorCode: 'unsupported_service' };
+    }
+    const forgedAssignment = rejectConnectedServiceInternalAssignmentInput(parsed.bindings);
+    if (forgedAssignment) {
+      return { ok: false, errorCode: forgedAssignment.errorCode, fields: forgedAssignment.fields };
     }
     return await requestDaemonSessionConnectedServiceAuthSwitch(parsed);
   });
@@ -760,6 +769,21 @@ export function registerMachineRpcHandlers(params: Readonly<{
         errorMessage: 'Invalid sourceContext',
       };
     }
+    // Spec A.1: callers may request `initialProfileId`; assignment state is daemon-owned. A resume
+    // of an existing session drops caller-supplied state here; the spawn path restores the session's
+    // own state from its persisted record.
+    const existingSessionResume = params?.type === 'resume-session';
+    const forgedAssignment = existingSessionResume ? null : rejectConnectedServiceInternalAssignmentInput(connectedServices);
+    const admittedConnectedServices = existingSessionResume
+      ? stripConnectedServiceCallerAssignmentForResume(connectedServices)
+      : connectedServices;
+    if (forgedAssignment) {
+      return {
+        type: 'error',
+        errorCode: SPAWN_SESSION_ERROR_CODES.INVALID_REQUEST,
+        errorMessage: forgedAssignment.message,
+      };
+    }
 
     const normalizedModelId = typeof modelId === 'string' && modelId.trim().length > 0 ? modelId : undefined;
     const normalizedPermissionMode =
@@ -914,7 +938,7 @@ export function registerMachineRpcHandlers(params: Readonly<{
       profileId,
       terminal,
       resume: normalizedResume,
-      connectedServices,
+      connectedServices: admittedConnectedServices,
       connectedServicesUpdatedAt,
       transcriptStorage: normalizedTranscriptStorage,
       attachMetadataIdentityPolicy: normalizedAttachMetadataIdentityPolicy,
@@ -1261,9 +1285,10 @@ export function registerMachineRpcHandlers(params: Readonly<{
           const sourceMetadata = rawSession
             ? tryDecryptSessionMetadata({ credentials, rawSession }) as Record<string, unknown> | null
             : null;
+          // The target machine makes its own per-session decision and reservation (spec A.1).
           const connectedServices = sourceMetadata
             && Object.prototype.hasOwnProperty.call(sourceMetadata, 'connectedServices')
-            ? sourceMetadata.connectedServices
+            ? stripConnectedServicePerSessionAssignmentForInheritance(sourceMetadata.connectedServices)
             : undefined;
           const targetRpc = async (method: string, payload: unknown): Promise<unknown> => await callMachineRpc(buildTrackedSessionHandoffMachineCall({
             credentials,

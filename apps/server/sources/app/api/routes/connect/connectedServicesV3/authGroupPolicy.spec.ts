@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
     DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1,
+    mergeConnectedServiceAuthGroupPolicyPatch,
     parseConnectedServiceAuthGroupPolicyJson,
 } from "./authGroupPolicy";
 
@@ -37,5 +38,28 @@ describe("parseConnectedServiceAuthGroupPolicyJson", () => {
             recoveryPromptMode: "standard",
             unrelatedUnknownField: true,
         }))).toEqual(DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1);
+    });
+});
+
+describe("mergeConnectedServiceAuthGroupPolicyPatch", () => {
+    it("keeps softmax parameters only while the merged strategy is per_session_softmax", () => {
+        const softmax = mergeConnectedServiceAuthGroupPolicyPatch(DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, {
+            strategy: "per_session_softmax",
+            softmaxTemperature: 2,
+            softmaxOffsetPercent: 5,
+        });
+        expect(softmax).toEqual(expect.objectContaining({
+            strategy: "per_session_softmax",
+            softmaxTemperature: 2,
+            softmaxOffsetPercent: 5,
+        }));
+
+        const unrelatedEdit = mergeConnectedServiceAuthGroupPolicyPatch(softmax, { cooldownMs: 1234 });
+        expect(unrelatedEdit).toEqual(expect.objectContaining({ softmaxTemperature: 2, softmaxOffsetPercent: 5 }));
+
+        const switchedAway = mergeConnectedServiceAuthGroupPolicyPatch(softmax, { strategy: "priority" });
+        expect(switchedAway.strategy).toBe("priority");
+        expect(switchedAway).not.toHaveProperty("softmaxTemperature");
+        expect(switchedAway).not.toHaveProperty("softmaxOffsetPercent");
     });
 });

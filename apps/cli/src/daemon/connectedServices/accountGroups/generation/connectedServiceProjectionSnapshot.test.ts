@@ -73,10 +73,12 @@ describe('diffConnectedServiceProjectionSnapshots', () => {
     expect(diffConnectedServiceProjectionSnapshots(null, first)).toEqual({
       changedGroupScopes: [],
       changedCredentialBoundaries: [],
+      revokedGroupMembers: [],
     });
     expect(diffConnectedServiceProjectionSnapshots(first, first)).toEqual({
       changedGroupScopes: [],
       changedCredentialBoundaries: [],
+      revokedGroupMembers: [],
     });
     expect(diffConnectedServiceProjectionSnapshots(first, changed)).toEqual({
       changedGroupScopes: [{ serviceId: 'anthropic', groupId: 'team' }],
@@ -93,7 +95,46 @@ describe('diffConnectedServiceProjectionSnapshots', () => {
         profileId: 'primary',
         boundary: { status: 'absent' },
       }],
+      revokedGroupMembers: [{ serviceId: 'anthropic', groupId: 'team', profileId: 'primary' }],
     });
+  });
+
+  it('diffs every member\'s enablement and credential, not only the active member', () => {
+    const snapshot = (memberProfileIds: string[], revisions: Record<string, string>) => parseConnectedServiceProjectionSnapshot({
+      connectedServicesV2: [{
+        serviceId: 'anthropic',
+        profiles: [],
+        groups: [{ groupId: 'team', activeProfileId: 'primary', generation: 1, memberProfileIds }],
+      }],
+      connectedServiceCredentialRevisionsV1: Object.entries(revisions).map(([profileId, credentialRevision]) => ({
+        serviceId: 'anthropic', profileId, credentialRevision,
+      })),
+    });
+    const base = snapshot(['primary', 'backup'], { primary: 'csr_aaaaaaaaaaaaaaaaaaaaaa', backup: 'csr_bbbbbbbbbbbbbbbbbbbbbb' });
+    expect(base.groupMemberships).toEqual([{ serviceId: 'anthropic', groupId: 'team', memberProfileIds: ['primary', 'backup'] }]);
+    expect(base.isGroupMemberEligible('anthropic', 'team', 'backup')).toBe(true);
+    expect(base.isGroupMemberEligible('anthropic', 'other', 'backup')).toBe(false);
+
+    const disabled = snapshot(['primary'], { primary: 'csr_aaaaaaaaaaaaaaaaaaaaaa', backup: 'csr_bbbbbbbbbbbbbbbbbbbbbb' });
+    expect(diffConnectedServiceProjectionSnapshots(base, disabled)).toEqual({
+      changedGroupScopes: [],
+      changedCredentialBoundaries: [],
+      revokedGroupMembers: [{ serviceId: 'anthropic', groupId: 'team', profileId: 'backup' }],
+    });
+
+    const rotated = snapshot(['primary', 'backup'], { primary: 'csr_aaaaaaaaaaaaaaaaaaaaaa', backup: 'csr_cccccccccccccccccccccc' });
+    expect(diffConnectedServiceProjectionSnapshots(base, rotated)).toEqual({
+      changedGroupScopes: [],
+      changedCredentialBoundaries: [{
+        serviceId: 'anthropic',
+        profileId: 'backup',
+        boundary: { status: 'present', revisionSemantics: 'revisioned', credentialRevision: 'csr_cccccccccccccccccccccc' },
+      }],
+      revokedGroupMembers: [],
+    });
+
+    // Re-enabling is not a revocation.
+    expect(diffConnectedServiceProjectionSnapshots(disabled, base).revokedGroupMembers).toEqual([]);
   });
 
   it('emits exact nullable direct-credential changes without including unchanged sibling scopes', () => {

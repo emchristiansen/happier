@@ -13,6 +13,15 @@ import {
   type ConnectedServiceAuthGroupPositiveEvidence,
 } from '../memberRuntimeState';
 import {
+  CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_OFFSET_PERCENT,
+  CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_TEMPERATURE,
+} from '@happier-dev/protocol';
+import {
+  computePerSessionOffsetOddsProbabilities,
+  drawPerSessionOffsetOddsCandidate,
+  type PerSessionOffsetOddsTraceEntry,
+} from './perSessionOffsetOddsSelection';
+import {
   resolveConnectedServiceMemberHoldExclusion,
   type ConnectedServiceMemberHoldView,
 } from '../holds/connectedServiceMemberHolds';
@@ -92,7 +101,41 @@ export type ConnectedServiceAuthGroupCandidateSelection = Readonly<{
   reason: 'selected' | 'manual_strategy' | 'no_eligible_members';
   excluded: ReadonlyArray<ConnectedServiceAuthGroupCandidateExclusion>;
   decisionTrace: ConnectedServiceAuthGroupCandidateDecisionTrace;
+  /** Present only for per_session_softmax decisions. */
+  perSessionDecision?: ConnectedServiceAuthGroupPerSessionDecision;
 }>;
+
+/** Per-session decision input: the session's own current member is passed as `activeProfileId`. */
+export type ConnectedServiceAuthGroupPerSessionSelectionInput = Readonly<{
+  /** Live pending/applied reservation counts, excluding the decision being made. */
+  reservationCountsByProfileId: ReadonlyMap<string, number>;
+  /** Uniform sample in [0, 1): CSPRNG in production, injected in tests. */
+  uniformSample: number;
+  /** Reservation coordination unavailable: local counts only and τ_degraded = 2τ. */
+  degraded: boolean;
+}>;
+
+export type ConnectedServiceAuthGroupPerSessionDecision = Readonly<{
+  temperature: number;
+  offsetPercent: number;
+  degraded: boolean;
+  tier: 'above_soft_threshold' | 'all_scored' | 'unknown_score_uniform';
+  unknownScoreFallback: boolean;
+  probabilityByProfileId: ReadonlyMap<string, number>;
+  selectedProbability: number | null;
+  trace: ReadonlyArray<PerSessionOffsetOddsTraceEntry>;
+}>;
+
+export function resolveConnectedServiceAuthGroupSoftmaxParameters(
+  policy: ConnectedServiceAuthGroupPolicyV1,
+  degraded: boolean,
+): Readonly<{ temperature: number; offsetPercent: number }> {
+  const temperature = policy.softmaxTemperature ?? CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_TEMPERATURE;
+  return {
+    temperature: degraded ? 2 * temperature : temperature,
+    offsetPercent: policy.softmaxOffsetPercent ?? CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_OFFSET_PERCENT,
+  };
+}
 
 export type ConnectedServiceAuthGroupCandidateDecisionTrace = Readonly<{
   activeProfileId: string | null;
@@ -677,8 +720,12 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
   requiredModelIds?: ReadonlyArray<string>;
   quotaProbeDeferredUntilMsByProfileId?: ReadonlyMap<string, number>;
   switchReason?: string;
+  /** Required when policy.strategy is per_session_softmax. */
+  perSession?: ConnectedServiceAuthGroupPerSessionSelectionInput;
 }>): ConnectedServiceAuthGroupCandidateSelection {
-  if (params.policy.strategy === 'manual') {
+  // Shared-group machinery never moves a per-session group's shared pointer: without per-session
+  // inputs, a per_session_softmax group behaves exactly like manual.
+  if (params.policy.strategy === 'manual' || (params.policy.strategy === 'per_session_softmax' && !params.perSession)) {
     return {
       selected: null,
       reason: 'manual_strategy',
@@ -915,6 +962,15 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
     candidates.push(candidate);
   }
 
+  if (params.policy.strategy === 'per_session_softmax') {
+    return selectPerSessionSoftmaxCandidate({
+      params,
+      candidates,
+      excluded,
+      decisionTraceCandidates,
+    });
+  }
+
   if (params.policy.strategy === 'expiry_first') {
     candidates.sort((left, right) => {
       const leftAdequate = left.leastLimitedScore !== null && left.leastLimitedScore > params.policy.softSwitchRemainingPercent;
@@ -966,5 +1022,85 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
       reason,
       candidates: decisionTraceCandidates,
     },
+  };
+}
+
+function selectPerSessionSoftmaxCandidate(input: Readonly<{
+  params: Parameters<typeof selectConnectedServiceAuthGroupCandidate>[0];
+  candidates: ReadonlyArray<ConnectedServiceAuthGroupCandidate>;
+  excluded: ReadonlyArray<ConnectedServiceAuthGroupCandidateExclusion>;
+  decisionTraceCandidates: Array<{
+    profileId: string;
+    decision: 'selected' | 'eligible' | 'excluded';
+    exclusionReason?: ConnectedServiceAuthGroupCandidateExclusion['reason'];
+    retryAtMs?: number | null;
+    quotaEvidence: ConnectedServiceAuthGroupCandidateDecisionTraceEntry['quotaEvidence'];
+  }>;
+}>): ConnectedServiceAuthGroupCandidateSelection {
+  const { params } = input;
+  const perSession = params.perSession!;
+  const { temperature, offsetPercent } = resolveConnectedServiceAuthGroupSoftmaxParameters(params.policy, perSession.degraded);
+  const known = input.candidates.filter((candidate) => candidate.leastLimitedScore !== null && candidate.leastLimitedScore > 0);
+  let selected: ConnectedServiceAuthGroupCandidate | null = null;
+  let decision: ConnectedServiceAuthGroupPerSessionDecision | undefined;
+
+  if (known.length > 0) {
+    const probabilities = computePerSessionOffsetOddsProbabilities({
+      candidates: known.map((candidate) => ({
+        profileId: candidate.profileId,
+        remainingPercent: Math.min(100, candidate.leastLimitedScore!),
+        reservationCount: perSession.reservationCountsByProfileId.get(candidate.profileId) ?? 0,
+      })),
+      temperature,
+      offsetPercent,
+      softSwitchRemainingPercent: params.policy.softSwitchRemainingPercent,
+    });
+    const selectedId = drawPerSessionOffsetOddsCandidate({ probabilities, uniformSample: perSession.uniformSample });
+    selected = known.find((candidate) => candidate.profileId === selectedId) ?? null;
+    decision = {
+      temperature,
+      offsetPercent,
+      degraded: perSession.degraded,
+      tier: probabilities.tier,
+      unknownScoreFallback: false,
+      probabilityByProfileId: probabilities.probabilityByProfileId,
+      selectedProbability: probabilities.probabilityByProfileId.get(selectedId) ?? null,
+      trace: probabilities.trace,
+    };
+  } else if (input.candidates.length > 0 && params.switchReason && allowsUnknownQuotaEvidenceForSwitchReason(params.switchReason)) {
+    // Never impute unknown quota: only these failover reasons may sample unknown-score members, uniformly.
+    const unknown = input.candidates;
+    if (!(perSession.uniformSample >= 0 && perSession.uniformSample < 1)) {
+      throw new RangeError(`uniform sample must be in [0, 1); received ${String(perSession.uniformSample)}`);
+    }
+    selected = unknown[Math.min(unknown.length - 1, Math.floor(perSession.uniformSample * unknown.length))]!;
+    const probability = 1 / unknown.length;
+    decision = {
+      temperature,
+      offsetPercent,
+      degraded: perSession.degraded,
+      tier: 'unknown_score_uniform',
+      unknownScoreFallback: true,
+      probabilityByProfileId: new Map(unknown.map((candidate) => [candidate.profileId, probability])),
+      selectedProbability: probability,
+      trace: [],
+    };
+  }
+
+  const reason = selected ? 'selected' as const : 'no_eligible_members' as const;
+  if (selected) {
+    const traceEntry = input.decisionTraceCandidates.find((candidate) => candidate.profileId === selected!.profileId);
+    if (traceEntry) traceEntry.decision = 'selected';
+  }
+  return {
+    selected,
+    reason,
+    excluded: input.excluded,
+    decisionTrace: {
+      activeProfileId: params.activeProfileId,
+      reason,
+      candidates: input.decisionTraceCandidates,
+    },
+    ...(decision ? { perSessionDecision: decision } : {}),
   };
 }

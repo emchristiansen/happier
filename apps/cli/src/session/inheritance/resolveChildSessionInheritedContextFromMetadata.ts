@@ -5,6 +5,7 @@ import {
   ConnectedServiceBindingsV1Schema,
   ModelOverrideV1Schema,
   readSessionMcpSelectionV1FromMetadata,
+  stripConnectedServicePerSessionAssignmentFields,
   type ConnectedServiceBindingsV1,
   type SessionMcpSelectionV1,
 } from '@happier-dev/protocol';
@@ -259,10 +260,12 @@ function resolveInheritedConnectedServices(params: Readonly<{
   metadata: Record<string, unknown> | null | undefined;
   providerId: string | null | undefined;
 }>): Readonly<{ value: ConnectedServiceBindingsV1; source: ChildSessionInheritedSource }> | null {
+  // Spec A.1: a child inherits the parent's group/source, never its initialProfileId or assignment;
+  // it makes its own decision and reservation.
   const explicit = ConnectedServiceBindingsV1Schema.safeParse(params.metadata?.connectedServices);
   if (explicit.success) {
     return {
-      value: explicit.data,
+      value: stripConnectedServicePerSessionAssignmentFields(explicit.data),
       source: { kind: 'metadata', key: 'connectedServices' },
     };
   }
@@ -277,7 +280,7 @@ function resolveInheritedConnectedServices(params: Readonly<{
   });
   return derived.success
     ? {
-      value: derived.data,
+      value: stripConnectedServicePerSessionAssignmentFields(derived.data),
       source: { kind: 'runtimeDescriptorMetadata', key: 'agentRuntimeDescriptorV1' },
     }
     : null;

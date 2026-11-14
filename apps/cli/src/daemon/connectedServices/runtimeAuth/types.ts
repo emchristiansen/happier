@@ -66,7 +66,15 @@ export type ConnectedServiceRuntimeFailureClassification = Readonly<{
   action?: Readonly<{ kind: 'open_url'; url: string }> | null;
   planType: string | null;
   rateLimits: unknown | null;
-  source: 'structured_provider_error' | 'stable_provider_message' | 'provider_runtime_marker';
+  /**
+   * Origin of the classification. `daemon_member_revocation` is the daemon's own projection that a
+   * per-session member was disabled or removed (spec A.4, T10); it is never accepted from a caller.
+   */
+  source:
+    | 'structured_provider_error'
+    | 'stable_provider_message'
+    | 'provider_runtime_marker'
+    | 'daemon_member_revocation';
   recoveryAction?:
     | Readonly<{ kind: 'provider_state_sharing_required' }>
     | Readonly<{ kind: 'quota_recovery_required' }>

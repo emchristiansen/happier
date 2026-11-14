@@ -7,6 +7,7 @@ import type { AccountSettings } from '@happier-dev/protocol';
 
 import type { SessionConnectedServiceRuntimeAuthSelectionMaterializerInput } from './switchSessionConnectedServiceAuth';
 import { createConnectedServiceAuthGenerationApplyFailureError } from '../runtimeAuth/connectedServiceAuthGenerationApplyFailure';
+import { resolvePerSessionBindingTargetProfileId } from '../parseConnectedServicesBindings';
 
 function readNonEmptyString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -21,8 +22,14 @@ export async function materializeSessionConnectedServiceRuntimeAuthSelection(par
   processEnv?: NodeJS.ProcessEnv;
 }>): Promise<unknown | null> {
   if (params.input.next.source !== 'connected') return null;
-  const binding = params.input.normalizedBindings.bindingsByServiceId[params.input.serviceId];
-  if (!binding || binding.source !== 'connected') return null;
+  const normalizedBinding = params.input.normalizedBindings.bindingsByServiceId[params.input.serviceId];
+  if (!normalizedBinding || normalizedBinding.source !== 'connected') return null;
+  // A per-session-owned group binding materializes its own member's profile home (spec A.4),
+  // bypassing the shared group-home writer.
+  const perSessionTargetProfileId = resolvePerSessionBindingTargetProfileId(normalizedBinding);
+  const binding = perSessionTargetProfileId
+    ? { source: 'connected' as const, selection: 'profile' as const, profileId: perSessionTargetProfileId }
+    : normalizedBinding;
 
   const previousSelection = findConnectedServiceChildSelection(
     params.input.tracked?.spawnOptions?.environmentVariables ?? {},

@@ -76,6 +76,7 @@ import {
 import { continueSessionWithReplay } from '@/session/replay/continueWithReplay';
 import { readAuthenticationStatus } from '@/api/client/httpStatusError';
 import {
+  CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR,
   ConnectedServiceIdSchema,
   ConnectedServiceQuotaRecoveryCreditConsumeRequestV1Schema,
   ConnectedServiceQuotaSnapshotV1Schema,
@@ -139,6 +140,10 @@ import {
   type SessionStartedRunnerReport,
 } from './sessionStartedReadiness';
 import { lazySchema } from '@happier-dev/protocol';
+import {
+  rejectConnectedServiceInternalAssignmentInput,
+  stripConnectedServiceCallerAssignmentForResume,
+} from './connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
 const DEFAULT_DAEMON_CONTROL_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 const DAEMON_CONTROL_BODY_LIMIT_BYTES_ENV_KEY = 'HAPPIER_DAEMON_CONTROL_BODY_LIMIT_BYTES';
@@ -846,6 +851,7 @@ export function createDaemonControlApp({
     previousMaterializedRoot?: string;
     sessionDirectory?: string | null;
     sessionId?: string;
+    modelId?: string;
   }>) => Promise<ExecutionRunConnectedServiceMaterializeResponseWire>;
   // Run-end lifecycle: unregister the runtime target and clean only disposable run materialization.
   handleExecutionRunConnectedServiceRelease?: (input: Readonly<{
@@ -1087,6 +1093,10 @@ export function createDaemonControlApp({
         ok: false as const,
         errorCode: 'connected_service_auth_switch_handler_unavailable' as const,
       };
+    }
+    const forgedSwitchAssignment = rejectConnectedServiceInternalAssignmentInput(request.body.bindings);
+    if (forgedSwitchAssignment) {
+      return { ok: true as const, result: { ok: false, errorCode: forgedSwitchAssignment.errorCode, fields: forgedSwitchAssignment.fields } };
     }
     const result = await handleSessionConnectedServiceAuthSwitch(request.body);
     return { ok: true as const, result };
@@ -1713,6 +1723,12 @@ export function createDaemonControlApp({
           ok: z.literal(true),
           result: ExecutionRunConnectedServiceMaterializeResponseSchema,
         }),
+        400: z.object({
+          ok: z.literal(false),
+          errorCode: z.literal(CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR),
+          error: z.string(),
+          fields: z.array(z.string()),
+        }),
         401: authSchema401,
         501: z.object({
           ok: z.literal(false),
@@ -1729,6 +1745,18 @@ export function createDaemonControlApp({
         errorCode: 'execution_run_connected_service_materialize_handler_unavailable' as const,
       };
     }
+    // Spec A.1: a run names its group/source and may request `initialProfileId`; assignment state is
+    // daemon-owned and never accepted from this ingress either.
+    const forgedRunAssignment = rejectConnectedServiceInternalAssignmentInput(request.body.connectedServicesBindingsRaw);
+    if (forgedRunAssignment) {
+      reply.code(400);
+      return {
+        ok: false as const,
+        errorCode: forgedRunAssignment.errorCode,
+        error: forgedRunAssignment.message,
+        fields: [...forgedRunAssignment.fields],
+      };
+    }
     const result = await handleExecutionRunConnectedServiceMaterialize({
       runId: request.body.runId,
       agentId: request.body.agentId,
@@ -1738,6 +1766,7 @@ export function createDaemonControlApp({
       ...(request.body.previousMaterializedRoot ? { previousMaterializedRoot: request.body.previousMaterializedRoot } : {}),
       sessionDirectory: request.body.sessionDirectory ?? null,
       ...(request.body.sessionId ? { sessionId: request.body.sessionId } : {}),
+      ...(request.body.modelId ? { modelId: request.body.modelId } : {}),
     });
     return { ok: true as const, result };
   });
@@ -1928,6 +1957,14 @@ export function createDaemonControlApp({
           status: z.literal('pending'),
           errorCode: z.literal(SPAWN_SESSION_ERROR_CODES.SESSION_WEBHOOK_TIMEOUT),
         }),
+        400: z.object({
+          success: z.boolean().optional(),
+          error: z.string().optional(),
+          errorCode: z.string().optional(),
+          message: z.string().optional(),
+          statusCode: z.number().optional(),
+          code: z.string().optional(),
+        }),
         401: authSchema401,
         409: z.object({
           success: z.boolean(),
@@ -1946,6 +1983,18 @@ export function createDaemonControlApp({
     preHandler: requireAuth,
   }, async (request, reply) => {
     const { directory, sessionId, existingSessionId } = request.body;
+    // Spec A.1: a new spawn may request `initialProfileId` but never carry assignment state. A resume
+    // drops caller-supplied state here; its own state is restored from the session record by the
+    // spawn path.
+    const isExistingSessionResume = typeof existingSessionId === 'string' && existingSessionId.trim().length > 0;
+    const callerConnectedServices = (request.body as { connectedServices?: unknown }).connectedServices;
+    const forgedAssignment = isExistingSessionResume
+      ? null
+      : rejectConnectedServiceInternalAssignmentInput(callerConnectedServices);
+    if (forgedAssignment) {
+      reply.code(400);
+      return { success: false, error: forgedAssignment.message, errorCode: forgedAssignment.errorCode };
+    }
     const spawnNonce = typeof request.body.spawnNonce === 'string' ? request.body.spawnNonce.trim() : '';
     const normalizedDirectory = normalizeSpawnSessionDirectory(directory, process.env);
 
@@ -1961,6 +2010,9 @@ export function createDaemonControlApp({
           {
             directory: normalizedDirectory,
             ...(normalizedExistingSessionId ? { existingSessionId: normalizedExistingSessionId } : {}),
+            ...(isExistingSessionResume && callerConnectedServices
+              ? { connectedServices: stripConnectedServiceCallerAssignmentForResume(callerConnectedServices) as SpawnSessionOptions['connectedServices'] }
+              : {}),
           },
           normalizedExistingSessionId ? { omit: ['sessionId'] } : {},
         ) as SpawnSessionOptions,
@@ -2417,6 +2469,7 @@ export function startDaemonControlServer({
     previousMaterializedRoot?: string;
     sessionDirectory?: string | null;
     sessionId?: string;
+    modelId?: string;
   }>) => Promise<ExecutionRunConnectedServiceMaterializeResponseWire>;
   handleExecutionRunConnectedServiceRelease?: (input: Readonly<{
     runId: string;

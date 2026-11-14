@@ -10,6 +10,7 @@ import {
     parseConnectedServiceGroupViewModels,
     resolveConnectedServiceGroupMemberIdentity,
     resolveConnectedServiceGroupProfileTitle,
+    resolveConnectedServiceGroupStrategyLabel,
 } from './connectedServiceGroupViewModel';
 
 describe('connectedServiceGroupViewModel', () => {
@@ -24,6 +25,21 @@ describe('connectedServiceGroupViewModel', () => {
             autoSwitch: true,
             quotaLimitSelection: { mode: 'selected', providerLimitIds: ['spark'] },
         });
+    });
+
+    it('preserves per-session weighting parameters while sanitizing unrelated legacy policy fields', () => {
+        expect(normalizeConnectedServiceGroupPolicy({
+            strategy: 'per_session_softmax',
+            softmaxTemperature: 2,
+            softmaxOffsetPercent: 5,
+            legacyUnknownField: true,
+        })).toMatchObject({
+            strategy: 'per_session_softmax',
+            softmaxTemperature: 2,
+            softmaxOffsetPercent: 5,
+        });
+        expect(resolveConnectedServiceGroupStrategyLabel('per_session_softmax'))
+            .toBe(t('connectedServices.detail.groups.strategyPerSessionSoftmax'));
     });
 
     it('surfaces the automatic model-entitlement disable reason instead of a generic plan failure', () => {

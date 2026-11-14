@@ -11,6 +11,12 @@ import {
 } from '@happier-dev/protocol';
 
 import type { Session } from '@/sync/domains/state/storageTypes';
+import {
+    ConnectedServiceBindingsV1Schema,
+    stripConnectedServiceInternalAssignmentFields,
+    stripConnectedServicePerSessionAssignmentFields,
+    type ConnectedServiceBindingsV1,
+} from '@happier-dev/protocol';
 
 export const normalizeCodexBackendMode = normalizeCanonicalCodexBackendMode;
 
@@ -50,11 +56,39 @@ export function normalizeTranscriptStorage(value: unknown): 'direct' | 'persiste
     return value === 'direct' || value === 'persisted' ? value : null;
 }
 
+function normalizeConnectedServices(
+    value: unknown,
+    strip: (bindings: ConnectedServiceBindingsV1) => ConnectedServiceBindingsV1,
+): SessionAuthoringValueV1['connectedServices'] {
+    const parsed = SessionAuthoringValueV1Schema.shape.connectedServices.safeParse(value);
+    if (!parsed.success) return null;
+    const bindings = ConnectedServiceBindingsV1Schema.safeParse(parsed.data);
+    if (!bindings.success) return parsed.data;
+    const stripped = strip(bindings.data);
+    return stripped === bindings.data ? parsed.data : stripped as unknown as SessionAuthoringValueV1['connectedServices'];
+}
+
+/**
+ * Connected services the user authored for a new launch. Keeps an explicit per-session
+ * `initialProfileId` ("Start on") and removes only internal assignment state, which a user cannot
+ * author (spec A.1).
+ */
 export function normalizeSessionAuthoringConnectedServices(
     value: unknown,
 ): SessionAuthoringValueV1['connectedServices'] {
-    const parsed = SessionAuthoringValueV1Schema.shape.connectedServices.safeParse(value);
-    return parsed.success ? parsed.data : null;
+    return normalizeConnectedServices(value, stripConnectedServiceInternalAssignmentFields);
+}
+
+/**
+ * Connected services inherited from an existing session (fork, "new session like this", resume
+ * seed): the desired group/source only. The parent's `initialProfileId` and assignment are removed;
+ * a resumed session's own assignment is restored by its daemon and a new session makes its own
+ * decision (spec A.1).
+ */
+export function normalizeInheritedSessionAuthoringConnectedServices(
+    value: unknown,
+): SessionAuthoringValueV1['connectedServices'] {
+    return normalizeConnectedServices(value, stripConnectedServicePerSessionAssignmentFields);
 }
 
 export function normalizeSessionAuthoringTerminal(

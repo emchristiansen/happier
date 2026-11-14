@@ -23,6 +23,7 @@ import { logger } from '@/ui/logger';
 import {
   readConnectedServiceChildSelectionsFromEnv,
 } from '@/daemon/connectedServices/connectedServiceChildEnvironment';
+import { stripConnectedServicePerSessionAssignmentForInheritance } from '@/daemon/connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
 /**
  * Runner-side owner of the ER-CS start flow: resolve the run's effective connected-services selection
@@ -195,11 +196,13 @@ async function resolveRunSelection(params: Readonly<{
     if (!params.credentials) {
       throw new ExecutionRunConnectedServicesUnavailableError({ agentId });
     }
-    const resolvedDefaults = await params.resolvePerServiceDefaults({
+    // A stored default never pins a member or carries assignment state (spec A.1), exactly like the
+    // whole-session default below; explicit pins keep their own `initialProfileId` request.
+    const resolvedDefaults = stripConnectedServicePerSessionAssignmentForInheritance(await params.resolvePerServiceDefaults({
       backendTarget: params.backendTarget,
       credentials: params.credentials,
       serviceIds: defaultServiceIdsToResolve,
-    });
+    }));
     const merged: Record<string, ConnectedServiceBindingSelectionV1> = { ...explicitBindingsByServiceId };
     for (const serviceId of defaultServiceIdsToResolve) {
       const binding = resolvedDefaults?.bindingsByServiceId[serviceId];
@@ -225,7 +228,8 @@ async function resolveRunSelection(params: Readonly<{
     credentials: params.credentials,
   });
   if (!resolved) return null;
-  return { bindings: resolved.connectedServices, source: 'session_default' };
+  // A stored default never pins a member; the run makes its own per-session decision (spec A.1).
+  return { bindings: stripConnectedServicePerSessionAssignmentForInheritance(resolved.connectedServices), source: 'session_default' };
 }
 
 export async function prepareExecutionRunConnectedServices(params: Readonly<{
@@ -243,6 +247,8 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
   credentials: Credentials | null;
   cwd: string;
   sessionId: string;
+  /** The run's model, when it names one; per-session pools draw only members that can serve it. */
+  modelId?: string;
   previousMaterializedRoot?: string;
   /** Boundary injection points; default to the canonical control client + session defaulting owner. */
   materializeViaDaemon?: MaterializeViaDaemon;
@@ -309,6 +315,7 @@ export async function prepareExecutionRunConnectedServices(params: Readonly<{
       connectedServicesBindingsRaw: selection.bindings,
       sessionDirectory: params.cwd,
       sessionId: params.sessionId,
+      ...(params.modelId?.trim() ? { modelId: params.modelId.trim() } : {}),
       ...(params.previousMaterializedRoot ? { previousMaterializedRoot: params.previousMaterializedRoot } : {}),
     });
   } catch (error) {

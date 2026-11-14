@@ -1,3 +1,4 @@
+import { ExecutionRunConnectedServiceMaterializeRequestSchema } from './contract';
 import { deleteConnectedServiceHomeCredentials } from '../credentials/deleteConnectedServiceHomeCredentials';
 import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -202,6 +203,17 @@ describe('createExecutionRunConnectedServicesBridge', () => {
     expect(registry.listQuotaTargets()[0]?.runtimeAccountIdentitySelections).toEqual([
       expect.objectContaining({ record: credential }),
     ]);
+  });
+
+  it('passes the run\'s model to spawn resolution so per-session member eligibility uses it (HPI-09)', async () => {
+    const resolveAuthForSpawn = vi.fn(async (_params: Record<string, unknown>) => buildResolved());
+    const bridge = createExecutionRunConnectedServicesBridge({
+      resolveAuthForSpawn: resolveAuthForSpawn as unknown as ResolveConnectedServiceAuthForRun,
+      runtimeRegistry: new ConnectedServiceRuntimeRegistry(),
+    });
+    const wire = ExecutionRunConnectedServiceMaterializeRequestSchema.parse({ ...buildRequest({ sessionId: 'session-1' }), modelId: 'claude-opus-x' });
+    await bridge.materialize({ ...buildRequest({ sessionId: 'session-1' }), modelId: wire.modelId });
+    expect(resolveAuthForSpawn.mock.calls[0]![0]).toMatchObject({ sessionId: 'session-1', modelId: 'claude-opus-x' });
   });
 
   it('R3-1: coexists with an existing session target on the same PID — BOTH covered by refresh distribution', async () => {

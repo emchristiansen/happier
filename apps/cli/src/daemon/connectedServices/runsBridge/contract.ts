@@ -22,6 +22,8 @@ export const ExecutionRunConnectedServiceMaterializeRequestSchema = lazySchema((
   sessionDirectory: z.string().nullable().optional(),
   previousMaterializedRoot: z.string().min(1).optional(),
   sessionId: z.string().min(1).optional(),
+  /** The run's model; a per-session pool only draws members that can serve it (spec A.2). */
+  modelId: z.string().min(1).optional(),
 }));
 
 export type ExecutionRunConnectedServiceMaterializeRequestWire =

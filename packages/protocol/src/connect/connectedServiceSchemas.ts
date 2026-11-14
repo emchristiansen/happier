@@ -33,6 +33,19 @@ export {
     type ConnectedServiceId,
     type ConnectedServiceProfileId,
     type SessionConnectedServiceAuthSwitchRpcParams,
+    ConnectedServiceGroupMemberAssignmentV1Schema,
+    ConnectedServiceGroupMaterializedAssignmentV1Schema,
+    type ConnectedServiceGroupMaterializedAssignmentV1,
+    ConnectedServiceGroupMemberAssignmentReasonV1Schema,
+    CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS,
+    CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR,
+    CONNECTED_SERVICE_INITIAL_PROFILE_REQUIRES_GROUP_ERROR,
+    findConnectedServiceInternalAssignmentFields,
+    CONNECTED_SERVICE_INHERITANCE_STRIPPED_FIELDS,
+    stripConnectedServiceInternalAssignmentFields,
+    stripConnectedServicePerSessionAssignmentFields,
+    type ConnectedServiceGroupMemberAssignmentV1,
+    type ConnectedServiceGroupMemberAssignmentReasonV1,
 } from './connectedServiceBindings.js';
 
 export const ConnectedServiceCredentialFormatSchema = lazySchema(() => z.enum(['account_scoped_v1']));
@@ -542,6 +555,8 @@ export const CONNECTED_SERVICE_AUTO_QUOTA_RESET_HEADER_VALUE = 'application/json
 export const CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY = 'happierAutoDisablePlanInvalidAccounts';
 export const CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY = 'happierPoolQuotaLimitSelection';
 export const CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY = 'happierPoolExpiryFirst';
+// Readers that understand the per-session weighted strategy and its softmax fields.
+export const CONNECTED_SERVICE_POOL_PER_SESSION_SOFTMAX_QUERY_KEY = 'happierPoolPerSessionSoftmax';
 export const CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE = '1';
 
 export const ConnectedServiceAuthGroupReaderCapabilitiesQueryV1Schema = lazySchema(() => z.object({
@@ -554,6 +569,9 @@ export const ConnectedServiceAuthGroupReaderCapabilitiesQueryV1Schema = lazySche
     [CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY]: z
         .literal(CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE)
         .optional(),
+    [CONNECTED_SERVICE_POOL_PER_SESSION_SOFTMAX_QUERY_KEY]: z
+        .literal(CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE)
+        .optional(),
 }));
 
 export type ConnectedServiceAuthGroupReaderCapabilitiesQueryV1 = z.infer<
@@ -562,7 +580,7 @@ export type ConnectedServiceAuthGroupReaderCapabilitiesQueryV1 = z.infer<
 
 export function appendConnectedServiceAuthGroupReaderCapabilities(path: string): string {
     const separator = path.includes('?') ? '&' : '?';
-    return `${path}${separator}${CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}&${CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}&${CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}`;
+    return `${path}${separator}${CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}&${CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}&${CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}&${CONNECTED_SERVICE_POOL_PER_SESSION_SOFTMAX_QUERY_KEY}=${CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE}`;
 }
 
 const ConnectedServiceSelectedProviderLimitIdsSchema = lazySchema(() => z
@@ -577,7 +595,16 @@ export const ConnectedServiceAuthGroupQuotaLimitSelectionV1Schema = lazySchema((
 
 export type ConnectedServiceAuthGroupQuotaLimitSelectionV1 = z.infer<typeof ConnectedServiceAuthGroupQuotaLimitSelectionV1Schema>;
 
-export const ConnectedServiceAuthGroupStrategyV1Schema = lazySchema(() => z.enum(['expiry_first', 'priority', 'least_limited', 'manual']));
+export const ConnectedServiceAuthGroupStrategyV1Schema = lazySchema(() => z.enum(['expiry_first', 'priority', 'least_limited', 'manual', 'per_session_softmax']));
+
+/** τ for the per_session_softmax strategy: dimensionless, finite, 0.25..10. */
+export const ConnectedServiceAuthGroupSoftmaxTemperatureSchema = lazySchema(() => z.number().finite().min(0.25).max(10));
+/** δ for the per_session_softmax strategy: percentage points, finite, 0.1..100 (δ = 0 is singular). */
+export const ConnectedServiceAuthGroupSoftmaxOffsetPercentSchema = lazySchema(() => z.number().finite().min(0.1).max(100));
+export const CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_TEMPERATURE = 1.5;
+export const CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_OFFSET_PERCENT = 10;
+/** Services that may use per_session_softmax in version 1. */
+export const CONNECTED_SERVICE_AUTH_GROUP_PER_SESSION_SOFTMAX_SERVICE_IDS = Object.freeze(['claude-subscription'] as const);
 
 export const ConnectedServiceAuthGroupPolicyV1Schema = lazySchema(() => z
     .object({
@@ -610,6 +637,10 @@ export const ConnectedServiceAuthGroupPolicyV1Schema = lazySchema(() => z
         maxSwitchesPerTurn: z.number().int().min(0).default(1),
         maxSwitchesPerSessionHour: z.number().int().min(0).default(3),
         softSwitchRemainingPercent: z.number().finite().min(0).max(100).default(15),
+        // per_session_softmax only. Absence means the defaults below; optional so strict older
+        // readers never receive them (reader negotiation strips them).
+        softmaxTemperature: ConnectedServiceAuthGroupSoftmaxTemperatureSchema.optional(),
+        softmaxOffsetPercent: ConnectedServiceAuthGroupSoftmaxOffsetPercentSchema.optional(),
         probeIfSnapshotOlderThanMs: z.number().int().min(1).default(300_000),
         preTurnProbeMode: z.enum(['never', 'when_stale', 'always_for_group']).default('when_stale'),
         preTurnProbeOrder: z
@@ -647,6 +678,8 @@ export const ConnectedServiceAuthGroupPolicyPatchV1Schema = lazySchema(() => z
         maxSwitchesPerTurn: z.number().int().min(0).optional(),
         maxSwitchesPerSessionHour: z.number().int().min(0).optional(),
         softSwitchRemainingPercent: z.number().finite().min(0).max(100).optional(),
+        softmaxTemperature: ConnectedServiceAuthGroupSoftmaxTemperatureSchema.optional(),
+        softmaxOffsetPercent: ConnectedServiceAuthGroupSoftmaxOffsetPercentSchema.optional(),
         probeIfSnapshotOlderThanMs: z.number().int().min(1).optional(),
         preTurnProbeMode: z.enum(['never', 'when_stale', 'always_for_group']).optional(),
         preTurnProbeOrder: z.enum(['current_first_then_candidates', 'candidates_first_then_current']).optional(),
@@ -895,6 +928,13 @@ export const ConnectedServiceAuthGroupErrorCodeV1Schema = lazySchema(() => z.enu
     'connect_group_fallback_disabled',
     'connect_group_runtime_fallback_unsupported',
     'connect_credential_referenced_by_group',
+    'connect_group_policy_field_invalid_for_strategy',
+    'connect_group_policy_field_out_of_range',
+    'connect_group_strategy_unsupported_for_service',
+    'connect_group_policy_requires_capability',
+    'assignment_reservation_conflict',
+    'assignment_reservation_decision_mismatch',
+    'assignment_reservation_invalid',
 ]));
 
 export type ConnectedServiceAuthGroupErrorCodeV1 = z.infer<typeof ConnectedServiceAuthGroupErrorCodeV1Schema>;
@@ -907,3 +947,95 @@ export const ConnectedServiceAuthGroupErrorResponseV1Schema = lazySchema(() => z
 }).strict());
 
 export type ConnectedServiceAuthGroupErrorResponseV1 = z.infer<typeof ConnectedServiceAuthGroupErrorResponseV1Schema>;
+
+/**
+ * Per-group shared assignment reservations for the per_session_softmax strategy (spec A.3).
+ * Shared counting only: reservation operations never bump group generation, emit account-profile
+ * changes, or touch member health state.
+ */
+export const ConnectedServiceAssignmentReservationStateV1Schema = lazySchema(() => z.enum(['pending', 'applied']));
+
+export type ConnectedServiceAssignmentReservationStateV1 = z.infer<typeof ConnectedServiceAssignmentReservationStateV1Schema>;
+
+export const ConnectedServiceAssignmentReservationDecisionIdSchema = lazySchema(() => z
+    .string()
+    .min(1)
+    .max(200)
+    .regex(/^[A-Za-z0-9._:-]+$/));
+
+export const ConnectedServiceAssignmentReservationV1Schema = lazySchema(() => z
+    .object({
+        decisionId: ConnectedServiceAssignmentReservationDecisionIdSchema,
+        profileId: z.string().min(1),
+        sessionId: z.string().min(1),
+        ownerMachineId: z.string().min(1),
+        state: ConnectedServiceAssignmentReservationStateV1Schema,
+        createdAtMs: z.number().int().nonnegative(),
+        leaseUntilMs: z.number().int().nonnegative(),
+    })
+    .strict());
+
+export type ConnectedServiceAssignmentReservationV1 = z.infer<typeof ConnectedServiceAssignmentReservationV1Schema>;
+
+export const ConnectedServiceAssignmentReservationListResponseV1Schema = lazySchema(() => z
+    .object({
+        reservationRevision: z.number().int().min(0),
+        reservations: z.array(ConnectedServiceAssignmentReservationV1Schema),
+    })
+    .strict());
+
+export type ConnectedServiceAssignmentReservationListResponseV1 = z.infer<
+    typeof ConnectedServiceAssignmentReservationListResponseV1Schema
+>;
+
+export const ConnectedServiceAssignmentReservationPutRequestV1Schema = lazySchema(() => z
+    .object({
+        profileId: z.string().min(1),
+        sessionId: z.string().min(1),
+        ownerMachineId: z.string().min(1),
+        state: ConnectedServiceAssignmentReservationStateV1Schema,
+        leaseUntilMs: z.number().int().nonnegative(),
+        // Required to create a new decision; ignored when updating one's own existing entry.
+        expectedReservationRevision: z.number().int().min(0),
+    })
+    .strict());
+
+export type ConnectedServiceAssignmentReservationPutRequestV1 = z.infer<
+    typeof ConnectedServiceAssignmentReservationPutRequestV1Schema
+>;
+
+export const ConnectedServiceAssignmentReservationPutResponseV1Schema = lazySchema(() => z
+    .object({
+        reservationRevision: z.number().int().min(0),
+        reservation: ConnectedServiceAssignmentReservationV1Schema,
+        outcome: z.enum(['created', 'updated', 'unchanged']),
+    })
+    .strict());
+
+export type ConnectedServiceAssignmentReservationPutResponseV1 = z.infer<
+    typeof ConnectedServiceAssignmentReservationPutResponseV1Schema
+>;
+
+export const ConnectedServiceAssignmentReservationDeleteResponseV1Schema = lazySchema(() => z
+    .object({
+        reservationRevision: z.number().int().min(0),
+        deleted: z.boolean(),
+    })
+    .strict());
+
+export type ConnectedServiceAssignmentReservationDeleteResponseV1 = z.infer<
+    typeof ConnectedServiceAssignmentReservationDeleteResponseV1Schema
+>;
+
+/** HTTP 409 body for a definite reservation conflict: nothing was stored. */
+export const ConnectedServiceAssignmentReservationConflictResponseV1Schema = lazySchema(() => z
+    .object({
+        error: z.enum(['assignment_reservation_conflict', 'assignment_reservation_decision_mismatch']),
+        reservationRevision: z.number().int().min(0),
+        reservations: z.array(ConnectedServiceAssignmentReservationV1Schema),
+    })
+    .strict());
+
+export type ConnectedServiceAssignmentReservationConflictResponseV1 = z.infer<
+    typeof ConnectedServiceAssignmentReservationConflictResponseV1Schema
+>;

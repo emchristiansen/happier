@@ -95,7 +95,7 @@ export type LeaseAcquireResult =
       waitForOwner(options?: Readonly<{ timeoutMs?: number; requireOwnerFinished?: boolean }>): Promise<LeaseCompletion>;
     }>;
 
-const DEFAULT_SWITCH_LEASE_TIMEOUT_MS = 30_000;
+export const DEFAULT_SWITCH_LEASE_TIMEOUT_MS = 30_000;
 export const SESSION_SWITCH_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 
 function switchKey(serviceId: string, groupId: string): string {

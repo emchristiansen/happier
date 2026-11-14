@@ -42,7 +42,7 @@ export function mergeConnectedServiceAuthGroupPolicyPatch(
     patch: ConnectedServiceAuthGroupPolicyPatch | undefined,
 ): ConnectedServiceAuthGroupPolicyV1 {
     if (!patch) return base;
-    return ConnectedServiceAuthGroupPolicyV1Schema.parse({
+    const merged = ConnectedServiceAuthGroupPolicyV1Schema.parse({
         ...base,
         ...patch,
         switchOn: {
@@ -50,6 +50,11 @@ export function mergeConnectedServiceAuthGroupPolicyPatch(
             ...patch.switchOn,
         },
     });
+    if (merged.strategy === "per_session_softmax") return merged;
+    // Softmax parameters belong to that strategy only; leaving it drops them so a stored policy
+    // never carries parameters its strategy ignores.
+    const { softmaxTemperature: _temperature, softmaxOffsetPercent: _offset, ...withoutSoftmax } = merged;
+    return withoutSoftmax;
 }
 
 export function parseConnectedServiceAuthGroupPolicyJson(policyJson: string): ConnectedServiceAuthGroupPolicyV1 {

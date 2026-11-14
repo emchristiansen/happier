@@ -30,6 +30,7 @@ const SOURCES = new Set<ConnectedServiceRuntimeFailureClassification['source']>(
   'structured_provider_error',
   'stable_provider_message',
   'provider_runtime_marker',
+  'daemon_member_revocation',
 ]);
 
 const SECRETISH_VALUE_PATTERN =

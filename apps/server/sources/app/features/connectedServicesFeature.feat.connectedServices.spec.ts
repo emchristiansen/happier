@@ -18,6 +18,7 @@ describe("resolveConnectedServicesFeature", () => {
             autoDisablePlanInvalid: { enabled: true },
             poolQuotaLimitSelection: { enabled: true },
             poolExpiryFirst: { enabled: true },
+            poolPerSessionSoftmax: { enabled: false },
         });
         expect(feature.capabilities?.connectedServices).toEqual({
             supportedServiceIds: ConnectedServiceIdSchema.options,
@@ -45,6 +46,7 @@ describe("resolveConnectedServicesFeature", () => {
             autoDisablePlanInvalid: { enabled: true },
             poolQuotaLimitSelection: { enabled: true },
             poolExpiryFirst: { enabled: true },
+            poolPerSessionSoftmax: { enabled: false },
         });
     });
 
@@ -65,6 +67,15 @@ describe("resolveConnectedServicesFeature", () => {
             autoDisablePlanInvalid: { enabled: true },
             poolQuotaLimitSelection: { enabled: true },
             poolExpiryFirst: { enabled: true },
+            poolPerSessionSoftmax: { enabled: false },
         });
+    });
+
+    it("enables the per-session softmax pool strategy only through its explicit env key", () => {
+        const feature = resolveConnectedServicesFeature({
+            HAPPIER_FEATURE_CONNECTED_SERVICES_POOL_PER_SESSION_SOFTMAX__ENABLED: "1",
+        } as NodeJS.ProcessEnv);
+
+        expect(feature.features?.connectedServices?.poolPerSessionSoftmax).toEqual({ enabled: true });
     });
 });

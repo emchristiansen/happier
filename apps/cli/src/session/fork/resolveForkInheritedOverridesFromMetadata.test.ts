@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { buildCodexAgentRuntimeDescriptor } from '@happier-dev/agents';
 
+import { createConnectedServiceForkLaunchContext } from './connectedServiceForkLaunchContext';
 import { resolveForkInheritedOverridesFromMetadata } from './resolveForkInheritedOverridesFromMetadata';
 
 describe('resolveForkInheritedOverridesFromMetadata', () => {
@@ -345,5 +346,26 @@ describe('resolveForkInheritedOverridesFromMetadata', () => {
     expect('profileId' in result.spawn).toBe(false);
     expect('mcpSelectionV1' in result.metadata).toBe(false);
     expect('profileId' in result.metadata).toBe(false);
+  });
+
+  it('a fork child launch and metadata carry the parent group but none of its per-session request or assignment (spec A.1)', () => {
+    const group = { source: 'connected', selection: 'group', groupId: 'pool' } as const;
+    const parentBinding = {
+      ...group,
+      initialProfileId: 'B',
+      member: { assignment: 'per_session', profileId: 'B', decisionId: 'parent-decision', reason: 'initial_sampled', appliedAtMs: 1 },
+      materializedAssignment: { profileId: 'C', decisionId: 'parent-next', reason: 'failover', materializedAtMs: 2 },
+      pendingAssignment: { profileId: 'C' },
+      decisionId: 'parent-decision',
+    };
+    const inherited = resolveForkInheritedOverridesFromMetadata({
+      flavor: 'claude',
+      path: '/project',
+      connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': parentBinding } },
+    }, 'claude');
+    const launch = createConnectedServiceForkLaunchContext({ inherited });
+    const expected = { v: 1, bindingsByServiceId: { 'claude-subscription': group } };
+    expect({ ...inherited.spawn, ...launch.spawn }.connectedServices).toEqual(expected);
+    expect({ ...inherited.metadata, ...launch.metadata }.connectedServices).toEqual(expected);
   });
 });

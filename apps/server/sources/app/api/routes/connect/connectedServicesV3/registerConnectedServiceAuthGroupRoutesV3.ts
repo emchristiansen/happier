@@ -11,7 +11,12 @@ import {
     CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY,
     CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY,
     CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY,
+    CONNECTED_SERVICE_POOL_PER_SESSION_SOFTMAX_QUERY_KEY,
+    CONNECTED_SERVICE_AUTH_GROUP_PER_SESSION_SOFTMAX_SERVICE_IDS,
     CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE,
+    ConnectedServiceAuthGroupSoftmaxOffsetPercentSchema,
+    ConnectedServiceAuthGroupSoftmaxTemperatureSchema,
+    type ConnectedServiceAuthGroupPolicyV1,
     CONNECTED_SERVICE_AUTH_GROUP_SWITCH_REASON_HEADER,
     type ConnectedServiceAuthGroupV1,
     type ConnectedServiceAuthGroupReaderCapabilitiesQueryV1,
@@ -97,8 +102,54 @@ function runtimeFallbackSupportedForService(serviceId: string): boolean {
     return parsed.success && isConnectedServiceRuntimeFallbackSupported(parsed.data);
 }
 
-function parsePolicyPatchForRequest(policy: unknown, serviceId: string): ConnectedServiceAuthGroupPolicyPatch | null | undefined {
-    if (policy === undefined) return undefined;
+type PolicyPatchRejection =
+    | "connect_group_invalid"
+    | "connect_group_policy_field_invalid_for_strategy"
+    | "connect_group_policy_field_out_of_range"
+    | "connect_group_strategy_unsupported_for_service";
+
+type PolicyPatchForRequest =
+    | Readonly<{ ok: true; patch: ConnectedServiceAuthGroupPolicyPatch | undefined }>
+    | Readonly<{ ok: false; error: PolicyPatchRejection }>;
+
+const SOFTMAX_POLICY_FIELD_SCHEMAS = [
+    ["softmaxTemperature", ConnectedServiceAuthGroupSoftmaxTemperatureSchema],
+    ["softmaxOffsetPercent", ConnectedServiceAuthGroupSoftmaxOffsetPercentSchema],
+] as const;
+
+function isPerSessionSoftmaxSupportedForService(serviceId: string): boolean {
+    return (CONNECTED_SERVICE_AUTH_GROUP_PER_SESSION_SOFTMAX_SERVICE_IDS as readonly string[]).includes(serviceId);
+}
+
+/**
+ * Parses a policy patch and applies the per-request feature/service rules. `baseStrategy` is the
+ * strategy the patch is merged onto (the stored strategy, or the default on create), so softmax
+ * parameters are judged against the resulting strategy.
+ */
+function parsePolicyPatchForRequest(policy: unknown, serviceId: string, baseStrategy: ConnectedServiceAuthGroupPolicyV1["strategy"]): PolicyPatchForRequest {
+    if (policy === undefined) return { ok: true, patch: undefined };
+    if (policy !== null && typeof policy === "object" && !Array.isArray(policy)) {
+        const fields = policy as Record<string, unknown>;
+        for (const [field, schema] of SOFTMAX_POLICY_FIELD_SCHEMAS) {
+            if (typeof fields[field] === "number" && !schema.safeParse(fields[field]).success) {
+                return { ok: false, error: "connect_group_policy_field_out_of_range" };
+            }
+        }
+    }
+    const patch = parsePolicyPatchWithFeatureGates(policy, serviceId);
+    if (patch === null) return { ok: false, error: "connect_group_invalid" };
+    if (patch.strategy === "per_session_softmax" && !isPerSessionSoftmaxSupportedForService(serviceId)) {
+        return { ok: false, error: "connect_group_strategy_unsupported_for_service" };
+    }
+    const resultingStrategy = patch.strategy ?? baseStrategy;
+    if (resultingStrategy !== "per_session_softmax"
+        && (patch.softmaxTemperature !== undefined || patch.softmaxOffsetPercent !== undefined)) {
+        return { ok: false, error: "connect_group_policy_field_invalid_for_strategy" };
+    }
+    return { ok: true, patch };
+}
+
+function parsePolicyPatchWithFeatureGates(policy: unknown, serviceId: string): ConnectedServiceAuthGroupPolicyPatch | null {
     const parsed = ConnectedServiceAuthGroupPolicyPatchSchema.safeParse(policy);
     if (parsed.success && parsed.data.autoUseQuotaResetsWhenExhausted === true) {
         const service = ConnectedServiceIdSchema.safeParse(serviceId);
@@ -112,6 +163,8 @@ function parsePolicyPatchForRequest(policy: unknown, serviceId: string): Connect
         && !isServerFeatureEnabledForRequest("connectedServices.poolQuotaLimitSelection", process.env)) return null;
     if (parsed.success && parsed.data.strategy === 'expiry_first'
         && !isServerFeatureEnabledForRequest("connectedServices.poolExpiryFirst", process.env)) return null;
+    if (parsed.success && parsed.data.strategy === 'per_session_softmax'
+        && !isServerFeatureEnabledForRequest("connectedServices.poolPerSessionSoftmax", process.env)) return null;
     return parsed.success ? parsed.data : null;
 }
 
@@ -229,6 +282,10 @@ function canReadPoolQuotaLimitSelection(query: ConnectedServiceAuthGroupReaderCa
         && isServerFeatureEnabledForRequest("connectedServices.poolQuotaLimitSelection", process.env);
 }
 
+function canReadPerSessionSoftmax(query: ConnectedServiceAuthGroupReaderCapabilitiesQueryV1): boolean {
+    return query[CONNECTED_SERVICE_POOL_PER_SESSION_SOFTMAX_QUERY_KEY] === CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE;
+}
+
 function projectAuthGroupForReader(
     group: ConnectedServiceAuthGroupV1,
     reader: Readonly<{
@@ -238,6 +295,12 @@ function projectAuthGroupForReader(
 ): ConnectedServiceAuthGroupV1 {
     // Released V1 readers are strict. Preserve each negotiated response shape, not a second policy owner.
     let policy = group.policy;
+    if (policy.strategy === 'per_session_softmax' && !canReadPerSessionSoftmax(reader.query)) {
+        // Older readers would fall back to defaults on the unknown strategy; show them a pool that
+        // never switches on its own, and reject their edits (see the group PATCH route).
+        const { softmaxTemperature: _temperature, softmaxOffsetPercent: _offset, ...projected } = policy;
+        policy = { ...projected, strategy: 'manual', autoSwitch: false };
+    }
     if (policy.strategy === 'expiry_first'
         && reader.query[CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY] !== CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE) {
         policy = { ...policy, strategy: 'least_limited' };
@@ -302,11 +365,11 @@ export function registerConnectedServiceAuthGroupRoutesV3(app: Fastify): void {
         const serviceId = request.params.serviceId;
         const body = request.body;
         const members = body.members;
-        const policyPatch = parsePolicyPatchForRequest(body.policy, serviceId);
-
-        if (policyPatch === null) {
-            return reply.code(400).send({ error: "connect_group_invalid" });
+        const parsedPolicy = parsePolicyPatchForRequest(body.policy, serviceId, DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1.strategy);
+        if (!parsedPolicy.ok) {
+            return reply.code(400).send({ error: parsedPolicy.error });
         }
+        const policyPatch = parsedPolicy.patch;
 
         if (hasDuplicateProfileIds(members)) {
             return reply.code(400).send({ error: "connect_group_duplicate_member" });
@@ -414,10 +477,15 @@ export function registerConnectedServiceAuthGroupRoutesV3(app: Fastify): void {
         const existingRecord = await findAuthGroupWithStoredActiveProfileForAccount({ accountId: request.userId, serviceId, groupId });
         if (!existingRecord) return reply.code(404).send({ error: "connect_group_not_found" });
         const existing = existingRecord.group;
-        const policyPatch = parsePolicyPatchForRequest(request.body.policy, serviceId);
-        if (policyPatch === null) {
-            return reply.code(400).send({ error: "connect_group_invalid" });
+        if (existing.policy.strategy === "per_session_softmax" && !canReadPerSessionSoftmax(request.query)) {
+            // Such a reader saw a projected manual pool; any edit it sends is built on that projection.
+            return reply.code(409).send({ error: "connect_group_policy_requires_capability" });
         }
+        const parsedPolicy = parsePolicyPatchForRequest(request.body.policy, serviceId, existing.policy.strategy);
+        if (!parsedPolicy.ok) {
+            return reply.code(400).send({ error: parsedPolicy.error });
+        }
+        const policyPatch = parsedPolicy.patch;
         const policy = mergeConnectedServiceAuthGroupPolicyPatch(existing.policy, policyPatch);
         const generationSensitivePatch = request.body.activeProfileId !== undefined || request.body.policy !== undefined;
         if (generationSensitivePatch && !runtimeFallbackSupportedForService(serviceId)) {

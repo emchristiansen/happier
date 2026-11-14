@@ -95,6 +95,12 @@ vi.mock('@/sync/store/hooks', () => ({
     useProfile: () => profileState.current,
 }));
 
+// Authoritative per-session groups are read only from a supporting server; these hook tests cover
+// the shared-pool chip, and the per-session composition is tested in connectedServicesNewSessionBindings.
+vi.mock('./useNewSessionPerSessionAccountGroups', () => ({
+    useNewSessionPerSessionAccountGroups: () => undefined,
+}));
+
 function requireCollapsedContentPopover(chip: AgentInputExtraActionChip | null) {
     const popover = chip?.collapsedContentPopover;
     if (!popover) {

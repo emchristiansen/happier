@@ -37,6 +37,10 @@ import {
 } from '@/session/services/spawnConnectedServicesDefaults';
 import { resolveSpawnConnectedServicesDefaultsForAccount } from '@/session/services/resolveSpawnConnectedServicesDefaultsForAccount';
 import type { CreateSpawnedSessionParams } from '@/session/services/createSpawnedSession';
+import {
+  rejectConnectedServiceInternalAssignmentInput,
+  stripConnectedServicePerSessionAssignmentForInheritance,
+} from '@/daemon/connectedServices/perSessionInput/connectedServiceAssignmentInputGuards';
 
 export type SessionAgentSpawnActionSurface = keyof ActionSurfaces;
 
@@ -102,6 +106,12 @@ type SessionAgentSpawnActionErrorResult = Readonly<
       type: 'error';
       errorCode: 'spawn_target_missing' | 'invalid_parameters' | 'agent_not_found';
       errorMessage: 'spawn_target_missing' | 'invalid_parameters' | 'agent_not_found';
+    }
+  | {
+      type: 'error';
+      errorCode: 'connected_service_internal_assignment_field_forbidden';
+      errorMessage: string;
+      details: Readonly<{ fields: ReadonlyArray<string> }>;
     }
   | {
       type: 'error';
@@ -650,6 +660,19 @@ export async function normalizeSessionAgentSpawnActionRequest(params: Readonly<{
     sources.environmentVariables = { kind: 'explicit', key: input.environmentVariables ? 'environmentVariables' : 'profileId' };
   }
 
+  // Spec A.1: a caller may name `initialProfileId` but never supply assignment state.
+  const forgedAssignment = rejectConnectedServiceInternalAssignmentInput(input.connectedServices);
+  if (forgedAssignment) {
+    return {
+      ok: false,
+      result: {
+        type: 'error',
+        errorCode: forgedAssignment.errorCode,
+        errorMessage: forgedAssignment.message,
+        details: { fields: forgedAssignment.fields },
+      },
+    };
+  }
   const defaultsResolver =
     params.resolveConnectedServicesDefaults ?? resolveSessionAgentSpawnConnectedServicesDefaults;
   const connectedServicesDefaults = input.connectedServices || inherited.spawn.connectedServices
@@ -658,10 +681,11 @@ export async function normalizeSessionAgentSpawnActionRequest(params: Readonly<{
       credentials: params.credentials,
       backendTarget: backend.backendTarget,
     });
+  // A child inherits the parent's group/source and defaults never pin a member; both make their own decision.
   const resolvedConnectedServices =
     input.connectedServices
-    ?? inherited.spawn.connectedServices
-    ?? connectedServicesDefaults?.connectedServices;
+    ?? stripConnectedServicePerSessionAssignmentForInheritance(inherited.spawn.connectedServices)
+    ?? stripConnectedServicePerSessionAssignmentForInheritance(connectedServicesDefaults?.connectedServices);
   const resolvedConnectedServicesUpdatedAt =
     finiteNumber(input.connectedServicesUpdatedAt)
     ?? inherited.spawn.connectedServicesUpdatedAt

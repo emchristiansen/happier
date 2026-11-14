@@ -10,7 +10,7 @@ import {
   type ConnectedServiceProfileActionRoute,
 } from '@/sync/domains/connectedServices/resolveConnectedServiceProfileActionRoute';
 import { useFeatureEnabled } from '@/hooks/server/useFeatureEnabled';
-import { useProfile } from '@/sync/store/hooks';
+import { useLaunchServerConnectedServicesProjection } from '@/hooks/server/connectedServices/useLaunchServerConnectedServicesProjection';
 import type { ConnectedServiceId } from '@happier-dev/agents';
 import type { ConnectedServiceBindingsV1 } from '@happier-dev/protocol';
 
@@ -26,10 +26,14 @@ import {
 } from '@/sync/domains/connectedServices/connectedServicesAgentOptionStateBindings';
 import {
   type NewSessionConnectedServicesAgentCore,
+  resolveAgentSupportedConnectedServiceIds,
   resolveNewSessionConnectedServicesBindingsForAgent,
 } from '@/components/sessions/new/modules/connectedServicesNewSessionBindings';
+import { useNewSessionPerSessionAccountGroups } from '@/components/sessions/new/modules/useNewSessionPerSessionAccountGroups';
 import type { ConnectedServicesAuthWarningCode } from '@/components/settings/connectedServices/model/resolveConnectedServicesAuthLabel';
 import { stableJsonStringify } from '@/utils/json/stableJsonStringify';
+
+const EMPTY_CONNECTED_SERVICES_V2: never[] = [];
 
 export type NewSessionConnectedServicesResult = Readonly<{
   connectedServicesBindingsPayload: ConnectedServiceBindingsV1 | null;
@@ -70,7 +74,6 @@ export function useNewSessionConnectedServices(params: Readonly<{
   setAgentOptionStateForCurrentAgent: (key: string, value: unknown) => void;
 }>): NewSessionConnectedServicesResult {
   const { agentCore, agentOptionState, settings, targetServerId, router, setAgentOptionStateForCurrentAgent } = params;
-  const accountProfile = useProfile();
   const connectedServicesFeatureEnabled = useFeatureEnabled('connectedServices', {
     scopeKind: 'spawn',
     serverId: targetServerId,
@@ -79,24 +82,47 @@ export function useNewSessionConnectedServices(params: Readonly<{
     scopeKind: 'spawn',
     serverId: targetServerId,
   });
+  // Services, profiles and pool membership belong to the launch server: Home's projection only when
+  // launching on Home, otherwise the target's own, and none while the target's is loading or failed.
+  const launchProjection = useLaunchServerConnectedServicesProjection({
+    targetServerId,
+    enabled: connectedServicesFeatureEnabled,
+  });
+  const launchConnectedServicesV2 = launchProjection.connectedServicesV2 ?? EMPTY_CONNECTED_SERVICES_V2;
   const agentId = typeof agentCore?.id === 'string' ? agentCore.id.trim() : '';
+  const supportedConnectedServiceIdsForGroups = React.useMemo(() => resolveAgentSupportedConnectedServiceIds({
+    connectedServicesFeatureEnabled,
+    agentCore,
+  }), [agentCore, connectedServicesFeatureEnabled]);
+  const serviceGroupsProjectionSignature = React.useMemo(
+    () => stableJsonStringify(launchConnectedServicesV2.map((service) => [service.serviceId, service.groups])),
+    [launchConnectedServicesV2],
+  );
+  const accountGroupsByServiceId = useNewSessionPerSessionAccountGroups({
+    targetServerId,
+    accountGroupsFeatureEnabled,
+    supportedConnectedServiceIds: supportedConnectedServiceIdsForGroups,
+    serviceProjectionSignature: serviceGroupsProjectionSignature,
+  });
   const baseConnectedServicesResolution = React.useMemo(() => {
     return resolveNewSessionConnectedServicesBindingsForAgent({
       agentId,
       agentCore,
       agentOptionState,
-      accountProfileConnectedServicesV2: accountProfile?.connectedServicesV2 ?? [],
+      accountProfileConnectedServicesV2: launchConnectedServicesV2,
       settings,
       connectedServicesFeatureEnabled,
       accountGroupsFeatureEnabled,
+      accountGroupsByServiceId,
     });
   }, [
+    accountGroupsByServiceId,
     accountGroupsFeatureEnabled,
-    accountProfile?.connectedServicesV2,
     agentCore,
     agentId,
     agentOptionState,
     connectedServicesFeatureEnabled,
+    launchConnectedServicesV2,
     settings,
   ]);
   const [optimisticBindingsByServiceId, setOptimisticBindingsByServiceId] = React.useState(
@@ -116,19 +142,21 @@ export function useNewSessionConnectedServices(params: Readonly<{
       agentId,
       agentCore,
       agentOptionState,
-      accountProfileConnectedServicesV2: accountProfile?.connectedServicesV2 ?? [],
+      accountProfileConnectedServicesV2: launchConnectedServicesV2,
       settings,
       connectedServicesFeatureEnabled,
       accountGroupsFeatureEnabled,
+      accountGroupsByServiceId,
       connectedServicesBindingsByServiceIdOverride: optimisticBindingsByServiceId,
     });
   }, [
+    accountGroupsByServiceId,
     accountGroupsFeatureEnabled,
-    accountProfile?.connectedServicesV2,
     agentCore,
     agentId,
     agentOptionState,
     connectedServicesFeatureEnabled,
+    launchConnectedServicesV2,
     optimisticBindingsByServiceId,
     settings,
   ]);
@@ -161,6 +189,7 @@ export function useNewSessionConnectedServices(params: Readonly<{
     resolveServiceTitle: (serviceId) => resolveConnectedServiceDisplayName(serviceId as ConnectedServiceId, t),
     nativeLabel: t('connectedServices.authChip.nativeLabel'),
     formatConnectedCountLabel: (count) => t('connectedServices.authChip.connectedCountLabel', { count }),
+    formatPendingStartLabel: (labelParams) => t('connectedServices.authChip.pendingStartLabel', labelParams),
   }), [
     accountGroupsFeatureEnabled,
     connectedServiceAccountGroupOptionsByServiceId,
@@ -222,7 +251,7 @@ export function useNewSessionConnectedServices(params: Readonly<{
       onReconnectProfile={(serviceId, profileId) => {
         const profile = connectedServiceProfileOptionsByServiceId[serviceId]?.find((option) => option.profileId === profileId);
         const profileKind = readConnectedServiceProfileKindFromServices({
-          connectedServicesV2: accountProfile?.connectedServicesV2 ?? null,
+          connectedServicesV2: launchProjection.connectedServicesV2,
           serviceId,
           profileId,
         }) ?? profile?.kind;
@@ -236,8 +265,8 @@ export function useNewSessionConnectedServices(params: Readonly<{
       maxHeight={maxHeight}
     />
   ), [
-    accountProfile?.connectedServicesV2,
     connectedServiceProfileOptionsByServiceId,
+    launchProjection.connectedServicesV2,
     connectedServiceAccountGroupOptionsByServiceId,
     optimisticBindingsByServiceId,
     resolveOptionAvailability,

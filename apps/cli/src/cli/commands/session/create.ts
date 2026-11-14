@@ -1,7 +1,11 @@
 import chalk from 'chalk';
 import { randomUUID } from 'node:crypto';
 import { AGENTS_CORE, resolveAgentIdFromFlavor, type AgentId } from '@happier-dev/agents';
-import { buildBackendTargetKey, parseBackendTargetKey } from '@happier-dev/protocol';
+import {
+  buildBackendTargetKey,
+  CONNECTED_SERVICE_INITIAL_PROFILE_REQUIRES_GROUP_ERROR,
+  parseBackendTargetKey,
+} from '@happier-dev/protocol';
 
 import { hasFlag } from '@/cli/commands/shared/argvFlags';
 import { wantsJson, printJsonEnvelope, writeJsonStdout } from '@/cli/output/jsonEnvelope';
@@ -23,7 +27,44 @@ function hasSpawnNonce(details: unknown): boolean {
     && (details as { spawnNonce: string }).spawnNonce.trim());
 }
 
+/** Applies `--initial-profile` to the one resolved group binding (spec A.1). */
+export function applySessionCreateInitialProfile(
+  actionInput: Record<string, unknown>,
+  initialProfileId: string | undefined,
+): Record<string, unknown> {
+  if (!initialProfileId) return actionInput;
+  const bindings = actionInput.connectedServices as
+    { v?: number; bindingsByServiceId?: Record<string, Record<string, unknown> | undefined> } | undefined;
+  const groupServiceIds = Object.entries(bindings?.bindingsByServiceId ?? {})
+    .filter(([, binding]) => binding?.source === 'connected' && binding.selection === 'group')
+    .map(([serviceId]) => serviceId);
+  if (!bindings?.bindingsByServiceId || groupServiceIds.length !== 1) {
+    throw new Error(CONNECTED_SERVICE_INITIAL_PROFILE_REQUIRES_GROUP_ERROR);
+  }
+  const serviceId = groupServiceIds[0]!;
+  return {
+    ...actionInput,
+    connectedServices: {
+      ...bindings,
+      bindingsByServiceId: {
+        ...bindings.bindingsByServiceId,
+        [serviceId]: { ...bindings.bindingsByServiceId[serviceId], initialProfileId },
+      },
+    },
+  };
+}
+
 async function resolveSessionCreateConnectedServices(params: Readonly<{
+  executor: ReturnType<typeof createCliActionExecutorFromCredentials>;
+  parsedOptions: ReturnType<typeof parseSessionCreateSpawnOptions>;
+}>): Promise<Record<string, unknown>> {
+  return applySessionCreateInitialProfile(
+    await resolveSessionCreateConnectedServicesSelection(params),
+    params.parsedOptions.connectedServicesInitialProfileId,
+  );
+}
+
+async function resolveSessionCreateConnectedServicesSelection(params: Readonly<{
   executor: ReturnType<typeof createCliActionExecutorFromCredentials>;
   parsedOptions: ReturnType<typeof parseSessionCreateSpawnOptions>;
 }>): Promise<Record<string, unknown>> {

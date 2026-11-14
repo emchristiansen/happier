@@ -42,6 +42,10 @@ import {
   type ConnectedServiceCredentialSealedResponse,
 } from './connectedServices/connectedServiceCredentialApi';
 import { resolveConnectedServicesServerApiTimeoutMs } from './connectedServices/serverApiTimeout';
+import {
+  createConnectedServiceAssignmentReservationApi,
+  type ConnectedServiceAssignmentReservationApi,
+} from './connectedServices/connectedServiceAssignmentReservationApi';
 import { fetchServerFeaturesSnapshot } from '@/features/serverFeaturesClient';
 import {
   ConnectedServiceQuotaApiError,
@@ -401,12 +405,19 @@ export class ApiClient {
   private readonly connectedServiceCredentialApi: ConnectedServiceCredentialApi
     & ConnectedServiceCredentialHealthApi
     & ConnectedServiceAuthGroupApi;
+  /** Per-group assignment reservations for per_session_softmax groups (spec A.3). */
+  readonly connectedServiceAssignmentReservations: ConnectedServiceAssignmentReservationApi;
   private readonly connectedServiceProfileListCache = new Map<ConnectedServiceId, ConnectedServiceProfileListCacheEntry>();
   private accountEncryptionModeCache: AccountEncryptionModeCacheEntry | null = null;
 
   private constructor(credential: Credentials) {
     this.credential = credential
     this.connectedServiceCredentialApi = createConnectedServiceCredentialApi(credential);
+    this.connectedServiceAssignmentReservations = createConnectedServiceAssignmentReservationApi({
+      serverUrl: resolveServerHttpBaseUrl(),
+      token: credential.token,
+      timeoutMs: resolveConnectedServicesServerApiTimeoutMs(),
+    });
     this.pushClient = new PushNotificationClient(credential.token, resolveServerHttpBaseUrl())
   }
 

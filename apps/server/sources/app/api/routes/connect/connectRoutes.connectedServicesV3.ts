@@ -4,6 +4,7 @@ import { parseIntEnv } from "@/config/env";
 import { createServerFeatureGatedRouteApp } from "@/app/features/catalog/serverFeatureGate";
 import { registerConnectedServiceCredentialRoutesV3 } from "./connectedServicesV3/registerConnectedServiceCredentialRoutesV3";
 import { registerConnectedServiceAuthGroupRoutesV3 } from "./connectedServicesV3/registerConnectedServiceAuthGroupRoutesV3";
+import { registerConnectedServiceAssignmentReservationRoutesV3 } from "./connectedServicesV3/registerConnectedServiceAssignmentReservationRoutesV3";
 import { registerConnectedServiceRefreshLeaseRoutesV3 } from "./connectedServicesV2/registerConnectedServiceRefreshLeaseRoutesV2";
 
 function resolveRefreshLeaseMaxMs(env: NodeJS.ProcessEnv): number {
@@ -15,5 +16,7 @@ export function connectConnectedServicesV3Routes(app: Fastify): void {
 
     registerConnectedServiceCredentialRoutesV3(app);
     registerConnectedServiceRefreshLeaseRoutesV3(app, { refreshLeaseMaxMs });
-    registerConnectedServiceAuthGroupRoutesV3(createServerFeatureGatedRouteApp(app, "connectedServices.accountGroups", process.env));
+    const accountGroupsApp = createServerFeatureGatedRouteApp(app, "connectedServices.accountGroups", process.env);
+    registerConnectedServiceAuthGroupRoutesV3(accountGroupsApp);
+    registerConnectedServiceAssignmentReservationRoutesV3(accountGroupsApp);
 }

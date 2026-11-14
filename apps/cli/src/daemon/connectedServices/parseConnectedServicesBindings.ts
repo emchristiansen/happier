@@ -10,6 +10,8 @@ import {
   ConnectedServiceIdSchema,
   ConnectedServiceBindingsV1Schema,
   type ConnectedServiceBindingsV1,
+  type ConnectedServiceGroupMaterializedAssignmentV1,
+  type ConnectedServiceGroupMemberAssignmentV1,
   type ConnectedServiceId,
 } from '@happier-dev/protocol';
 
@@ -24,7 +26,43 @@ export type ConnectedServiceBindingSelection =
       serviceId: ConnectedServiceId;
       groupId: string;
       fallbackProfileId?: string;
+      /** External named-start request (per_session_softmax groups only). */
+      initialProfileId?: string;
+      /** This session's own applied per-session member. */
+      member?: ConnectedServiceGroupMemberAssignmentV1;
+      /** This session's own pending (materialized, not yet adopted) per-session target. */
+      materializedAssignment?: ConnectedServiceGroupMaterializedAssignmentV1;
     }>;
+
+/** A session owns a per-session assignment once it has an applied or materialized member. */
+export function isPerSessionOwnedGroupSelection(selection: ConnectedServiceBindingSelection): boolean {
+  return selection.kind === 'group' && (selection.member !== undefined || selection.materializedAssignment !== undefined);
+}
+
+/**
+ * The member whose own home a per-session-owned session is materialized on: pending target first,
+ * then applied member. Null for a pending conversion to the group home (spec A.4 Migration), which
+ * materializes through the shared group path.
+ */
+export function resolvePerSessionTargetProfileId(selection: ConnectedServiceBindingSelection): string | null {
+  if (selection.kind !== 'group') return null;
+  if (selection.materializedAssignment?.home === 'group') return null;
+  return selection.materializedAssignment?.profileId ?? selection.member?.profileId ?? null;
+}
+
+/** Raw-binding form of `resolvePerSessionTargetProfileId` for switch/materialization code that holds bindings. */
+export function resolvePerSessionBindingTargetProfileId(binding: unknown): string | null {
+  if (!binding || typeof binding !== 'object') return null;
+  const record = binding as {
+    selection?: unknown;
+    materializedAssignment?: { profileId?: unknown; home?: unknown } | null;
+    member?: { profileId?: unknown } | null;
+  };
+  if (record.selection !== 'group') return null;
+  if (record.materializedAssignment?.home === 'group') return null;
+  const target = record.materializedAssignment?.profileId ?? record.member?.profileId;
+  return typeof target === 'string' && target.trim().length > 0 ? target.trim() : null;
+}
 
 export type ConnectedServicesBindingsV1 = ConnectedServiceBindingsV1;
 
@@ -48,11 +86,17 @@ export function parseConnectedServiceBindingSelections(raw: unknown): ConnectedS
     if (selection === 'group') {
       const groupId = readTrimmedString(bindingRaw.groupId);
       if (!groupId) continue;
+      const initialProfileId = bindingRaw.selection === 'group' ? readTrimmedString(bindingRaw.initialProfileId) : '';
       out.push({
         kind: 'group',
         serviceId: parsedId.data,
         groupId,
         ...(profileId ? { fallbackProfileId: profileId } : {}),
+        ...(initialProfileId ? { initialProfileId } : {}),
+        ...(bindingRaw.selection === 'group' && bindingRaw.member ? { member: bindingRaw.member } : {}),
+        ...(bindingRaw.selection === 'group' && bindingRaw.materializedAssignment
+          ? { materializedAssignment: bindingRaw.materializedAssignment }
+          : {}),
       });
       continue;
     }

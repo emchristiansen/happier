@@ -232,4 +232,47 @@ describe('connected-service session options', () => {
             },
         });
     });
+
+    it('keeps an explicit per-session initialProfileId on a group binding', () => {
+        expect(buildConnectedServicesBindingsPayload({
+            supportedConnectedServiceIds: ['claude-subscription'],
+            connectedServiceProfileOptionsByServiceId: {
+                'claude-subscription': [{ profileId: 'a', status: 'connected', kind: 'oauth' }],
+            },
+            accountGroupsFeatureEnabled: true,
+            accountGroupSwitchingEnabled: true,
+            connectedServiceAccountGroupOptionsByServiceId: {
+                'claude-subscription': [{
+                    groupId: 'pool', label: 'Pool', activeProfileId: 'a', memberProfileIds: ['a'],
+                    enabledMemberCount: 1, autoSwitch: true, status: 'ready', strategy: 'per_session_softmax', assignment: 'per_session',
+                }],
+            },
+            connectedServicesBindingsByServiceId: {
+                'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', initialProfileId: 'a' },
+            },
+            defaultProfileByServiceId: {},
+        })).toEqual({
+            v: 1,
+            bindingsByServiceId: {
+                'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', initialProfileId: 'a' },
+            },
+        });
+    });
+
+    it('reports group strategy and assignment from authoritative groups', () => {
+        const options = buildConnectedServiceAccountGroupOptionsByServiceId({
+            accountGroupsFeatureEnabled: true,
+            supportedConnectedServiceIds: ['claude-subscription'],
+            accountProfileConnectedServicesV2: [{ serviceId: 'claude-subscription', profiles: [], groups: [] }] as never,
+            accountGroupsByServiceId: {
+                'claude-subscription': [{
+                    groupId: 'pool', activeProfileId: 'a', displayName: 'Pool',
+                    policy: { strategy: 'per_session_softmax', autoSwitch: true },
+                    members: [{ profileId: 'a', enabled: true }],
+                } as never],
+            },
+        });
+        expect(options['claude-subscription']?.[0]).toMatchObject({ strategy: 'per_session_softmax', assignment: 'per_session' });
+    });
 });
+

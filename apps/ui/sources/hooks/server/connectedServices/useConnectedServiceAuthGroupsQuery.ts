@@ -1,6 +1,8 @@
 import * as React from 'react';
 
 import { useAuth } from '@/auth/context/AuthContext';
+import type { AuthCredentials } from '@/auth/storage/tokenStorage';
+import { resolveConnectedServiceLaunchServerScope } from '@/sync/domains/connectedServices/resolveConnectedServiceLaunchServerScope';
 import { listConnectedServiceAuthGroupsV3 } from '@/sync/api/account/apiConnectedServiceAuthGroupsV3';
 import { useConnectedServiceGroupsRefreshSignal } from '@/sync/domains/connectedServices/connectedServiceGroupsRefreshSignal';
 import type { ConnectedServiceAuthGroupV1, ConnectedServiceId } from '@happier-dev/protocol';
@@ -44,10 +46,27 @@ export function readConnectedServiceAuthGroupsLoadStatus(value: unknown): Connec
         : undefined;
 }
 
+type GroupsReadScope = Readonly<{ credentials: AuthCredentials; serverUrl: string | null }>;
+
+/**
+ * The server a pool read belongs to: the active server unless `targetServerId` names another one, in
+ * which case that server's own profile URL and credentials are used (never the active server's).
+ */
+async function resolveGroupsReadScope(
+    activeCredentials: AuthCredentials | null,
+    targetServerId: string | null | undefined,
+): Promise<GroupsReadScope | null> {
+    const scope = await resolveConnectedServiceLaunchServerScope(targetServerId);
+    if (scope.kind === 'active') return activeCredentials ? { credentials: activeCredentials, serverUrl: null } : null;
+    return { credentials: scope.credentials, serverUrl: scope.serverUrl };
+}
+
 export function useConnectedServiceAuthGroupsQuery(params: Readonly<{
     serviceId: ConnectedServiceId | null;
     enabled: boolean;
     serviceProjectionSignature: string;
+    /** Server whose pools to read; defaults to the active server. */
+    targetServerId?: string | null;
 }>): Readonly<{
     groups: ReadonlyArray<ConnectedServiceAuthGroupV1>;
     loadStatus: ConnectedServiceAuthGroupsLoadStatus;
@@ -58,17 +77,26 @@ export function useConnectedServiceAuthGroupsQuery(params: Readonly<{
     const credentials = auth.credentials ?? null;
     const refreshSignal = useConnectedServiceGroupsRefreshSignal();
     const [state, setState] = React.useState<State>(EMPTY_STATE);
-    const loadedServiceIdRef = React.useRef<ConnectedServiceId | null>(null);
+    const loadedServiceIdRef = React.useRef<string | null>(null);
 
+    const targetServerId = params.targetServerId ?? null;
     const fetchGroups = React.useCallback(async () => {
         if (!params.serviceId || !params.enabled || !credentials) return [];
         try {
-            return await listConnectedServiceAuthGroupsV3(credentials, { serviceId: params.serviceId });
+            const scope = await resolveGroupsReadScope(credentials, targetServerId);
+            if (!scope) return [];
+            return await listConnectedServiceAuthGroupsV3(scope.credentials, {
+                serviceId: params.serviceId,
+                ...(scope.serverUrl ? { serverUrl: scope.serverUrl } : {}),
+            });
         } catch (error) {
-            console.warn('[connectedServices] Failed to load authoritative account pools', { serviceId: params.serviceId });
+            console.warn('[connectedServices] Failed to load authoritative account pools', {
+                serviceId: params.serviceId,
+                ...(targetServerId ? { targetServerId } : {}),
+            });
             throw error;
         }
-    }, [credentials, params.enabled, params.serviceId]);
+    }, [credentials, params.enabled, params.serviceId, targetServerId]);
 
     const refresh = React.useCallback(async () => {
         setState((prev) => ({
@@ -91,14 +119,16 @@ export function useConnectedServiceAuthGroupsQuery(params: Readonly<{
 
     React.useEffect(() => {
         let cancelled = false;
+        const loadedKey = params.serviceId ? `${params.serviceId}\0${targetServerId ?? ''}` : null;
         if (!params.serviceId || !params.enabled || !credentials) {
-            loadedServiceIdRef.current = params.serviceId;
+            loadedServiceIdRef.current = loadedKey;
             setState(EMPTY_STATE);
             return () => { cancelled = true; };
         }
 
-        const serviceChanged = loadedServiceIdRef.current !== params.serviceId;
-        loadedServiceIdRef.current = params.serviceId;
+        // A different service or launch server is a different pool list: never show the previous one.
+        const serviceChanged = loadedServiceIdRef.current !== loadedKey;
+        loadedServiceIdRef.current = loadedKey;
         setState((prev) => ({
             groups: serviceChanged ? [] : prev.groups,
             hasLoaded: serviceChanged ? false : prev.hasLoaded,
@@ -119,7 +149,7 @@ export function useConnectedServiceAuthGroupsQuery(params: Readonly<{
             },
         );
         return () => { cancelled = true; };
-    }, [credentials, fetchGroups, params.enabled, params.serviceId, params.serviceProjectionSignature, refreshSignal]);
+    }, [credentials, fetchGroups, params.enabled, params.serviceId, params.serviceProjectionSignature, refreshSignal, targetServerId]);
 
     const upsertGroup = React.useCallback((group: ConnectedServiceAuthGroupV1) => {
         setState((prev) => {

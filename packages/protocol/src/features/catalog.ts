@@ -111,6 +111,12 @@ const FEATURE_CATALOG_DEFINITION = {
     dependencies: ['connectedServices.accountGroups'],
     representation: 'server',
   },
+  'connectedServices.poolPerSessionSoftmax': {
+    description: 'Per-session weighted-random (offset-odds) member assignment for Claude subscription account pools.',
+    defaultFailMode: 'fail_closed',
+    dependencies: ['connectedServices.accountGroups'],
+    representation: 'server',
+  },
   channelBridges: {
     description: 'Channel bridge integrations (Telegram/Discord/etc).',
     defaultFailMode: 'fail_closed',

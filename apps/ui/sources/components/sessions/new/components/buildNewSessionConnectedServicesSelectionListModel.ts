@@ -40,6 +40,7 @@ export type ConnectedServicesSelectionListTranslationKey =
     | 'connectedServices.authModal.groupExhaustedSubtitle'
     | 'connectedServices.authModal.groupNeedsMembersSubtitle'
     | 'connectedServices.authModal.groupSwitchingSubtitle'
+    | 'connectedServices.authModal.startOnMember'
     | 'connectedServices.authModal.groupErrorSubtitle'
     | 'connectedServices.authModal.groupUnknownSubtitle'
     | 'connectedServices.authModal.nativeAuthTitle'
@@ -260,6 +261,30 @@ export function buildNewSessionConnectedServicesSelectionListModel(
                     groupId,
                 }),
             });
+            // A selected per-session pool offers an optional named start member (spec A.1).
+            if (selected && group.assignment === 'per_session' && !availability.disabled) {
+                const requestedProfileId = binding?.source === 'connected' && binding.selection === 'group'
+                    ? readOptionalString(binding.initialProfileId)
+                    : '';
+                for (const memberProfileId of group.memberProfileIds ?? []) {
+                    const member = selectableProfiles.find((option) => option.profileId.trim() === memberProfileId);
+                    if (!member) continue;
+                    const startOptionId = `${optionId}:start:${encodeURIComponent(memberProfileId)}`;
+                    const startSelected = requestedProfileId === memberProfileId;
+                    const startLabel = `${params.translate('connectedServices.authModal.startOnMember')}: ${resolveProfileTitle(member)}`;
+                    const memberBadges = params.quotaBadgesByKey[connectedServiceProfileKey({ serviceId, profileId: memberProfileId })] ?? [];
+                    options.push({
+                        id: startOptionId,
+                        label: startLabel,
+                        accessibilityLabel: resolveServiceOptionAccessibilityLabel({ serviceTitle, optionLabel: startLabel }),
+                        icon: params.renderSelectionIcon({ selected: startSelected }),
+                        rightAccessory: memberBadges.length > 0 ? params.renderQuotaBadges(memberBadges) : undefined,
+                        onSelect: () => params.setBindingForService(serviceId, startSelected
+                            ? { source: 'connected', selection: 'group', groupId }
+                            : { source: 'connected', selection: 'group', groupId, initialProfileId: memberProfileId }),
+                    });
+                }
+            }
         }
 
         for (const option of selectableProfiles) {

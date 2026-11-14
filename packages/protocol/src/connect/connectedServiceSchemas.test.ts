@@ -673,12 +673,12 @@ describe('connectedServiceSchemas', () => {
             .appendConnectedServiceAuthGroupReaderCapabilities;
         expect(typeof appendReaderCapabilities).toBe('function');
         expect((appendReaderCapabilities as (path: string) => string)('/v3/connect/openai-codex/groups')).toBe(
-            '/v3/connect/openai-codex/groups?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1',
+            '/v3/connect/openai-codex/groups?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1',
         );
         expect((appendReaderCapabilities as (path: string) => string)(
             '/v3/connect/openai-codex/groups/main/members/work?expectedGeneration=4',
         )).toBe(
-            '/v3/connect/openai-codex/groups/main/members/work?expectedGeneration=4&happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1',
+            '/v3/connect/openai-codex/groups/main/members/work?expectedGeneration=4&happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1',
         );
     });
 

@@ -69,6 +69,7 @@ export const FeatureGatesSchema = lazySchema(() => z.object({
       autoDisablePlanInvalid: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
       poolQuotaLimitSelection: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
       poolExpiryFirst: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
+      poolPerSessionSoftmax: FeatureGateSchema.optional().default(DEFAULT_GATE_DISABLED),
     })
     .optional()
     .default({
@@ -82,6 +83,7 @@ export const FeatureGatesSchema = lazySchema(() => z.object({
       autoDisablePlanInvalid: DEFAULT_GATE_DISABLED,
       poolQuotaLimitSelection: DEFAULT_GATE_DISABLED,
       poolExpiryFirst: DEFAULT_GATE_DISABLED,
+      poolPerSessionSoftmax: DEFAULT_GATE_DISABLED,
     }),
   channelBridges: z
     .object({

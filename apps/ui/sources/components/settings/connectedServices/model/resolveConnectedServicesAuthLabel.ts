@@ -1,5 +1,6 @@
 import { resolveConnectedServiceDefaultProfileId } from '@/sync/domains/connectedServices/connectedServiceProfilePreferences';
 import type { ConnectedServicesServiceBinding } from '@/sync/domains/connectedServices/connectedServicesAgentOptionStateBindings';
+import { resolveConnectedServiceGroupBindingServingState } from '@/sync/domains/connectedServices/resolveConnectedServiceGroupBindingAppliedProfileId';
 import type {
     ConnectedServicesAccountGroupOptionsByServiceId,
     ConnectedServicesProfileOption,
@@ -41,6 +42,8 @@ export type ConnectedServicesAuthServiceState = Readonly<{
     profileId?: string;
     groupId?: string;
     activeProfileId?: string;
+    /** Per-session first-spawn target awaiting provider adoption; set only when nothing serves yet. */
+    pendingProfileId?: string;
     warningCode?: ConnectedServicesAuthWarningCode;
 }>;
 
@@ -54,6 +57,8 @@ export type ResolveConnectedServicesAuthLabelParams = Readonly<{
     resolveServiceTitle: (serviceId: string) => string;
     nativeLabel: string;
     formatConnectedCountLabel: (count: number) => string;
+    /** Label for a per-session pool whose first spawn is not yet adopted by the provider. */
+    formatPendingStartLabel: (params: Readonly<{ pool: string; account: string }>) => string;
     bindingPresentation?: 'effective' | 'requested';
 }>;
 
@@ -150,15 +155,39 @@ function resolveConnectedBindingState(
         const viableProfileId = group
             ? resolveConnectedServiceAccountGroupViableProfileId({ group, connectedProfileIds })
             : null;
-        if (group && viableProfileId) {
+        const servingState = resolveConnectedServiceGroupBindingServingState(binding);
+        if (group && servingState.kind === 'per_session_pending') {
+            // No serving account until provider adoption: never the shared pool pointer, never the target.
             return {
                 requestedSource: 'connected',
                 requestedSelection: 'group',
                 effectiveSource: 'connected',
                 effectiveSelection: 'group',
                 groupId: explicitGroupId,
-                activeProfileId: readOptionalString(binding.appliedProfileId) || readOptionalString(group.activeProfileId) || viableProfileId,
-                profileId: readOptionalString(binding.appliedProfileId) || viableProfileId,
+                pendingProfileId: servingState.pendingProfileId,
+            };
+        }
+        if (group && servingState.kind === 'per_session_applied') {
+            return {
+                requestedSource: 'connected',
+                requestedSelection: 'group',
+                effectiveSource: 'connected',
+                effectiveSelection: 'group',
+                groupId: explicitGroupId,
+                activeProfileId: servingState.profileId,
+                profileId: servingState.profileId,
+            };
+        }
+        if (group && viableProfileId) {
+            const appliedProfileId = servingState.kind === 'shared' ? servingState.appliedProfileId ?? '' : '';
+            return {
+                requestedSource: 'connected',
+                requestedSelection: 'group',
+                effectiveSource: 'connected',
+                effectiveSelection: 'group',
+                groupId: explicitGroupId,
+                activeProfileId: appliedProfileId || readOptionalString(group.activeProfileId) || viableProfileId,
+                profileId: appliedProfileId || viableProfileId,
             };
         }
         return {
@@ -223,6 +252,18 @@ function resolveConnectedBindingLabel(
             option.groupId === state.groupId
         );
         if (!group) return requested ? `${params.resolveServiceTitle(serviceId)}: ${state.groupId}` : null;
+        if (state.pendingProfileId && !state.activeProfileId) {
+            const groupIdentity = resolveConnectedServiceGroupIdentityDisplay({
+                group: { groupId: group.groupId, label: group.label, activeProfileId: null },
+                profiles: [],
+            });
+            const pendingProfile = (params.profileOptionsByServiceId[serviceId] ?? [])
+                .find((option) => option.profileId === state.pendingProfileId) ?? { profileId: state.pendingProfileId };
+            return `${params.resolveServiceTitle(serviceId)}: ${params.formatPendingStartLabel({
+                pool: groupIdentity.primaryLabel,
+                account: resolveConnectedServiceProfileIdentityDisplay(pendingProfile).compactLabel,
+            })}`;
+        }
         const identity = resolveConnectedServiceGroupIdentityDisplay({
             group: state.activeProfileId && state.activeProfileId !== group.activeProfileId
                 ? { ...group, activeProfileId: state.activeProfileId }
