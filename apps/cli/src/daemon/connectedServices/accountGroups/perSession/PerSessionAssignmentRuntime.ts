@@ -105,6 +105,15 @@ export class PerSessionAssignmentRuntime {
       profileId: params.profileId,
       subjectId: entry?.sessionId ?? params.decisionId,
     }, 'applied');
+    // The session now serves on this decision; its previously applied decision no longer counts.
+    if (entry) {
+      for (const superseded of this.input.ledger.list()) {
+        if (superseded.decisionId !== params.decisionId && superseded.sessionId === entry.sessionId
+          && superseded.serviceId === params.serviceId && superseded.groupId === params.groupId) {
+          await this.release(superseded.decisionId);
+        }
+      }
+    }
   }
 
   /** Release a decision that no longer owns a session (superseded, ended, or definitely never launched). */

@@ -45,6 +45,19 @@ export function resolvePerSessionTargetProfileId(selection: ConnectedServiceBind
   return selection.materializedAssignment?.profileId ?? selection.member?.profileId ?? null;
 }
 
+/** Raw-binding form of `resolvePerSessionTargetProfileId` for switch/materialization code that holds bindings. */
+export function resolvePerSessionBindingTargetProfileId(binding: unknown): string | null {
+  if (!binding || typeof binding !== 'object') return null;
+  const record = binding as {
+    selection?: unknown;
+    materializedAssignment?: { profileId?: unknown } | null;
+    member?: { profileId?: unknown } | null;
+  };
+  if (record.selection !== 'group') return null;
+  const target = record.materializedAssignment?.profileId ?? record.member?.profileId;
+  return typeof target === 'string' && target.trim().length > 0 ? target.trim() : null;
+}
+
 export type ConnectedServicesBindingsV1 = ConnectedServiceBindingsV1;
 
 function readTrimmedString(value: unknown): string {

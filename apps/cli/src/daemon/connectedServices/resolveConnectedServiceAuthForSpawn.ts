@@ -44,8 +44,8 @@ import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from './accountGro
 import type { RuntimeAccountIdentitySelectionInput } from './quotas/identity/runtimeAccountIdentityTypes';
 import { selectConnectedServiceAuthGroupCandidate } from './accountGroups/selection/selectConnectedServiceAuthGroupCandidate';
 import { resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds } from './accountGroups/selection/resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds';
+import { buildPerSessionGroupSwitchState } from './accountGroups/perSession/buildPerSessionGroupSwitchState';
 import {
-  buildConnectedServiceAuthGroupSwitchState,
   buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState,
 } from './accountGroups/switching/buildConnectedServiceAuthGroupSwitchState';
 import {
@@ -577,34 +577,6 @@ function buildSpawnSwitchState(params: Readonly<{
   });
 }
 
-/**
- * Score state for a per-session draw. It names no shared pointer, so it may use the daemon's
- * runtime quota snapshots when account usage is not yet source-backed (cold store); without
- * either, members carry only persisted state and an initial draw refuses rather than imputing.
- */
-function buildPerSessionSpawnSwitchState(params: Readonly<{
-  group: ConnectedServiceAuthGroupV1;
-  accountUsageStore: AccountUsageStoreForAuthGroupSwitchState | null;
-  runtimeQuotaSnapshots: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore | null;
-  nowMs: number;
-}>): ConnectedServiceAuthGroupSwitchState {
-  if (params.accountUsageStore) {
-    const accountUsageSwitchState = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
-      group: params.group,
-      accountUsageStore: params.accountUsageStore,
-    });
-    if (accountUsageSwitchState.kind === 'source_backed') return accountUsageSwitchState.state;
-  }
-  if (params.runtimeQuotaSnapshots) {
-    return buildConnectedServiceAuthGroupSwitchState({
-      group: params.group,
-      runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
-      nowMs: params.nowMs,
-    });
-  }
-  return buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group: params.group });
-}
-
 async function resolveAuthoritativeGroupAfterSpawnSwitchResult(params: Readonly<{
   group: ConnectedServiceAuthGroupResponse;
   serviceId: ConnectedServiceId;
@@ -855,7 +827,7 @@ async function resolveCredentialBindings(params: Readonly<{
     if (groupPolicy?.strategy === 'per_session_softmax') {
       // Per-session assignment: never read or move the group's shared pointer (spec A.4).
       const state = isFullAuthGroup(group)
-        ? buildPerSessionSpawnSwitchState({
+        ? buildPerSessionGroupSwitchState({
           group,
           accountUsageStore: params.accountUsageStore,
           runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,

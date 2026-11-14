@@ -90,6 +90,7 @@ import {
   runPostSwitchVerification,
   type RuntimeAuthSelectionsByServiceId,
 } from './verification/runPostSwitchVerification';
+import { resolvePerSessionBindingTargetProfileId } from '../parseConnectedServicesBindings';
 
 type ConnectedServiceBinding = ConnectedServiceBindingsV1['bindingsByServiceId'][string];
 type AgentConnectedServiceSupport = Readonly<{
@@ -667,6 +668,18 @@ function buildConnectedServiceChildSelection(input: Readonly<{
   groupMetadata?: ConnectedServiceGroupRuntimeMetadata;
 }>): ConnectedServiceChildSelection | null {
   const runtimeAuthSelection = readRecord(input.runtimeAuthSelection);
+  const perSessionTargetProfileId = resolvePerSessionBindingTargetProfileId(input.binding);
+  if (perSessionTargetProfileId) {
+    // The session's own member home (spec A.4), as at spawn: never the shared group home.
+    return {
+      kind: 'profile',
+      serviceId: input.serviceId,
+      profileId: perSessionTargetProfileId,
+      credentialRevision: ConnectedServiceCredentialRevisionV1Schema.safeParse(
+        runtimeAuthSelection?.credentialRevision,
+      ).data ?? null,
+    };
+  }
   if (input.binding.selection === 'profile') {
     return {
       kind: 'profile',
@@ -835,6 +848,44 @@ async function normalizeRequestedBindings(input: Readonly<{
       });
       if (!group) {
         return { ok: false, errorCode: 'group_missing', serviceId };
+      }
+      // A per-session-owned binding (internal daemon input only; external entry points reject these
+      // fields) targets the session's own member, never the group's shared pointer (spec A.4/A.5).
+      const perSessionTargetProfileId = resolvePerSessionBindingTargetProfileId(binding);
+      if (perSessionTargetProfileId) {
+        if (!groupHasEnabledMember({ group, profileId: perSessionTargetProfileId })) {
+          return { ok: false, errorCode: 'profile_missing', serviceId };
+        }
+        const perSessionProfileError = await validateConnectedProfile({
+          api: input.api,
+          serviceId,
+          profileId: perSessionTargetProfileId,
+          diagnosticSource: input.diagnosticSource,
+        });
+        if (perSessionProfileError) return perSessionProfileError;
+        normalizedBindingsByServiceId[serviceId] = {
+          source: 'connected',
+          selection: 'group',
+          groupId: binding.groupId,
+          profileId: perSessionTargetProfileId,
+          ...(binding.initialProfileId ? { initialProfileId: binding.initialProfileId } : {}),
+          ...(binding.member ? { member: binding.member } : {}),
+          ...(binding.materializedAssignment ? { materializedAssignment: binding.materializedAssignment } : {}),
+        };
+        groupMetadataByServiceId.set(serviceId, {
+          groupId: binding.groupId,
+          activeProfileId: perSessionTargetProfileId,
+          fallbackProfileId: perSessionTargetProfileId,
+          generation: readGroupGeneration(group.generation),
+        });
+        effectiveByServiceId.set(serviceId, {
+          source: 'connected',
+          selection: 'group',
+          serviceId,
+          profileId: perSessionTargetProfileId,
+          groupId: binding.groupId,
+        });
+        continue;
       }
       const expectedGeneration = readExpectedGeneration(input.request.expectedGroupGenerationByServiceId, serviceId);
       const currentGeneration = readGroupGeneration(group.generation);

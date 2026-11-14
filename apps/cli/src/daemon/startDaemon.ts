@@ -556,6 +556,12 @@ import {
 import { PerSessionAssignmentRuntime } from './connectedServices/accountGroups/perSession/PerSessionAssignmentRuntime';
 import { collectPerSessionLiveDecisions } from './connectedServices/accountGroups/perSession/collectPerSessionLiveDecisions';
 import {
+  PerSessionFailoverCoordinator,
+  type PerSessionApplyBinding,
+} from './connectedServices/accountGroups/perSession/PerSessionFailoverCoordinator';
+import { buildPerSessionGroupSwitchState } from './connectedServices/accountGroups/perSession/buildPerSessionGroupSwitchState';
+import { readPerSessionSessionBinding } from './connectedServices/accountGroups/perSession/readPerSessionSessionBinding';
+import {
   createConnectedServiceMaterializationIdentity,
   readConnectedServiceMaterializationIdentityV1,
 } from './connectedServices/materialize/createConnectedServiceMaterializationIdentity';
@@ -5817,6 +5823,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           reason: string;
           switchReason: ConnectedServiceSessionAuthSwitchReason;
           fromProfileId?: string | null;
+          /** Per-session recovery: the session's own group binding carrying its new target. */
+          perSessionBinding?: PerSessionApplyBinding;
         }>): Promise<Readonly<{
           ok: boolean;
           action?: string;
@@ -6061,7 +6069,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               bindings: {
                 v: 1,
                 bindingsByServiceId: {
-                  [serviceId]: generationInput.groupId === null
+                  [serviceId]: generationInput.perSessionBinding
+                    ? generationInput.perSessionBinding
+                    : generationInput.groupId === null
                     ? {
                         source: 'connected',
                         selection: 'profile',
@@ -6075,7 +6085,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                       },
                 },
               },
-              ...(generationInput.groupId === null || generationInput.generation === null
+              ...(generationInput.perSessionBinding
+                ? {}
+                : generationInput.groupId === null || generationInput.generation === null
                 ? { rematerializeServiceId: serviceId }
                 : {
                     expectedGroupGenerationByServiceId: {
@@ -6795,6 +6807,71 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               }
             },
           });
+          // per_session_softmax groups: each session recovers onto its own member; the shared
+          // pointer never moves (spec A.4). Other groups keep the shared switch pipeline.
+          const perSessionFailoverCoordinator = new PerSessionFailoverCoordinator({
+            loadGroup: async (groupInput) => await api.getConnectedServiceAuthGroup(groupInput),
+            buildState: (group) => ({
+              ...buildPerSessionGroupSwitchState({
+                group,
+                accountUsageStore: providerAccountUsageStore,
+                runtimeQuotaSnapshots: connectedServiceRuntimeQuotaSnapshots,
+                nowMs: Date.now(),
+              }),
+              requiredModelIds: resolveConnectedServiceAuthGroupRequiredModelIds({
+                serviceId: group.serviceId, groupId: group.groupId,
+                targets: connectedServiceRuntimeRegistry.listTargets(), sessions: getCurrentChildren(),
+              }),
+            }),
+            recordFailure: async (failure) => {
+              await switchCoordinator.observeCurrentGenerationForRecovery({
+                serviceId: failure.serviceId,
+                groupId: failure.groupId,
+                observedProfileId: failure.observedProfileId,
+                failure: {
+                  reason: failure.reason,
+                  retryAfterMs: failure.retryAfterMs ?? null,
+                  resetsAtMs: failure.resetsAtMs ?? null,
+                },
+              }).catch((error) => {
+                logger.debug('[ConnectedServices] Per-session failure-state recording failed (non-fatal)', serializeAxiosErrorForLog(error));
+              });
+            },
+            readSessionBinding: ({ sessionId: bindingSessionId, serviceId: bindingServiceId, groupId: bindingGroupId }) => {
+              const tracked = getCurrentChildren().find((child) => child.happySessionId === bindingSessionId) ?? null;
+              return tracked ? readPerSessionSessionBinding(tracked, bindingServiceId, bindingGroupId) : null;
+            },
+            applyAssignment: async (assignment) => await applyConnectedServiceAuthGeneration({
+              sessionId: assignment.sessionId,
+              serviceId: assignment.serviceId,
+              groupId: assignment.groupId,
+              activeProfileId: assignment.profileId,
+              generation: assignment.generation,
+              reason: assignment.reason,
+              switchReason: 'automatic_runtime_failure',
+              fromProfileId: assignment.fromProfileId,
+              perSessionBinding: assignment.binding,
+            }),
+            ledger: perSessionAssignmentRuntime.spawnDeps.ledger,
+            ownerMachineId: machineId,
+            reservationApi: api.connectedServiceAssignmentReservations,
+            quotaFreshnessMs: resolvePositiveIntEnv(
+              process.env.HAPPIER_CONNECTED_SERVICES_AUTH_GROUP_QUOTA_FRESHNESS_MS,
+              5 * 60_000,
+              { min: 1_000, max: 60 * 60_000 },
+            ),
+            nowMs: () => Date.now(),
+            deadlineMs: 30_000,
+            log: (event, detail) => logger.debug(`[ConnectedServices] ${event}`, detail),
+          });
+          const routedSwitchCoordinator = {
+            switchAfterClassifiedFailure: async (
+              switchInput: Parameters<typeof switchCoordinator.switchAfterClassifiedFailure>[0],
+            ) => (await perSessionFailoverCoordinator.owns(switchInput)
+              ? await perSessionFailoverCoordinator.switchAfterClassifiedFailure(switchInput)
+              : await switchCoordinator.switchAfterClassifiedFailure(switchInput)),
+            observeCurrentGenerationForRecovery: switchCoordinator.observeCurrentGenerationForRecovery.bind(switchCoordinator),
+          };
           const runtimeAuthApply = await resolveRuntimeAuthApplyForFailureSource({
             sessionId: input.sessionId,
             serviceId: ConnectedServiceIdSchema.parse(input.classification.serviceId),
@@ -6802,7 +6879,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           let supersedingSourceConverged = false;
           const result = await handleConnectedServiceRuntimeAuthFailureForSession({
             getChildren: getCurrentChildren,
-            switchCoordinator,
+            switchCoordinator: routedSwitchCoordinator,
             switchAttemptTracker: connectedServiceRuntimeAuthSwitchAttempts,
             switchCore: connectedServiceSessionAuthSwitchCore,
             resolveDurableSessionForRuntimeAuthRecovery: async ({ sessionId, classification }) =>
