@@ -1,13 +1,8 @@
 import * as React from 'react';
 
 import { useAuth } from '@/auth/context/AuthContext';
-import { TokenStorage, type AuthCredentials } from '@/auth/storage/tokenStorage';
-import {
-    areServerProfileIdentifiersEquivalent,
-    getServerProfileById,
-    resolveServerProfileScopeIdForIdentifier,
-} from '@/sync/domains/server/serverProfiles';
-import { getActiveServerSnapshot } from '@/sync/domains/server/serverRuntime';
+import type { AuthCredentials } from '@/auth/storage/tokenStorage';
+import { resolveConnectedServiceLaunchServerScope } from '@/sync/domains/connectedServices/resolveConnectedServiceLaunchServerScope';
 import { listConnectedServiceAuthGroupsV3 } from '@/sync/api/account/apiConnectedServiceAuthGroupsV3';
 import { useConnectedServiceGroupsRefreshSignal } from '@/sync/domains/connectedServices/connectedServiceGroupsRefreshSignal';
 import type { ConnectedServiceAuthGroupV1, ConnectedServiceId } from '@happier-dev/protocol';
@@ -61,16 +56,9 @@ async function resolveGroupsReadScope(
     activeCredentials: AuthCredentials | null,
     targetServerId: string | null | undefined,
 ): Promise<GroupsReadScope | null> {
-    const target = String(targetServerId ?? '').trim();
-    const activeServerId = String(getActiveServerSnapshot().serverId ?? '').trim();
-    if (!target || areServerProfileIdentifiersEquivalent(target, activeServerId)) {
-        return activeCredentials ? { credentials: activeCredentials, serverUrl: null } : null;
-    }
-    const profile = getServerProfileById(resolveServerProfileScopeIdForIdentifier(target)) ?? getServerProfileById(target);
-    if (!profile) throw new Error('connected_service_groups_target_server_profile_missing');
-    const credentials = await TokenStorage.getCredentialsForServerUrl(profile.serverUrl, { serverId: profile.id });
-    if (!credentials) throw new Error('connected_service_groups_target_server_credentials_missing');
-    return { credentials, serverUrl: profile.serverUrl };
+    const scope = await resolveConnectedServiceLaunchServerScope(targetServerId);
+    if (scope.kind === 'active') return activeCredentials ? { credentials: activeCredentials, serverUrl: null } : null;
+    return { credentials: scope.credentials, serverUrl: scope.serverUrl };
 }
 
 export function useConnectedServiceAuthGroupsQuery(params: Readonly<{
