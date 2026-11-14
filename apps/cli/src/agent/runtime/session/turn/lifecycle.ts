@@ -30,6 +30,8 @@ import type {
 } from './types';
 import { createTurnStallWatchdog, type TurnStallNotice } from './stallWatch';
 
+/** How many ended provider turn ids a lifecycle remembers to reject their late terminal markers. */
+const ENDED_PROVIDER_TURN_ID_MEMORY = 64;
 const DEFAULT_ACTIVE_TURN_TOUCH_INTERVAL_MS = 60_000;
 
 type MutableTurn = {
@@ -143,6 +145,10 @@ export function createSessionTurnLifecycle(
     );
     let activeTurn: MutableTurn | null = null;
     let lastTerminalTurn: MutableTurn | null = null;
+    // Provider turn ids of turns this lifecycle has already ended, most recent last. A terminal marker
+    // naming one of them is stale: it can never settle a different (newer) turn. Bounded and local to
+    // this session; an id outside it (e.g. a producer's fresh random marker id) keeps existing behavior.
+    const endedProviderTurnIds: string[] = [];
     let lastActiveTurnTouchAt: number | null = null;
     const terminalWrites = new Set<string>();
     let observationDisposed = false;
@@ -383,6 +389,10 @@ export function createSessionTurnLifecycle(
         activeTurn = null;
         lastActiveTurnTouchAt = null;
         lastTerminalTurn = turn;
+        if (turn.providerTurnId) {
+            endedProviderTurnIds.push(turn.providerTurnId);
+            if (endedProviderTurnIds.length > ENDED_PROVIDER_TURN_ID_MEMORY) endedProviderTurnIds.shift();
+        }
         return {
             turn,
             pendingWrite: enqueue(buildMutation({
@@ -562,13 +572,16 @@ export function createSessionTurnLifecycle(
             };
         }
 
-        // A provider turn id names one turn. A terminal marker for the turn that already ended
-        // (e.g. its task_complete arriving after failTurn) must not terminalize a newer turn.
+        // A provider turn id names one turn. A terminal marker naming a turn that already ended here
+        // (any recent earlier turn, not only the last one; e.g. its task_complete arriving after
+        // failTurn, or A's terminal after B ended and C began) must not terminalize the active turn.
+        // Unbound markers, and ids never seen ending (several producers mint a fresh id per terminal
+        // marker), keep their existing behavior.
         if (
             providerTurnId
             && activeTurn
             && activeTurn.providerTurnId !== providerTurnId
-            && lastTerminalTurn?.providerTurnId === providerTurnId
+            && endedProviderTurnIds.includes(providerTurnId)
         ) {
             return { body: input.body, pendingWrite: null };
         }

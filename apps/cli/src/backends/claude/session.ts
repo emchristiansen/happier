@@ -862,7 +862,12 @@ export class Session {
         this.applyThinkingState(thinking);
     }
 
-    onThinkingChange = (thinking: boolean) => {
+    /**
+     * `release.endedWithoutResult`: the runner is releasing thinking because the foreground turn
+     * ended without its own result — interrupt/abort ('cancelled') or transport failure / stream
+     * end ('failed'). The open task then ends with that outcome instead of task_complete.
+     */
+    onThinkingChange = (thinking: boolean, release?: Readonly<{ endedWithoutResult?: 'cancelled' | 'failed' }>) => {
         this.applyThinkingState(thinking);
 
         // The task lifecycle is keyed on `currentTaskId` — NOT on the `thinking` display flag's
@@ -887,7 +892,13 @@ export class Session {
 
         const id = this.currentTaskId;
         this.currentTaskId = null;
-        this.client.sendAgentMessage('claude', { type: 'task_complete', id });
+        const outcome = thinking ? undefined : release?.endedWithoutResult;
+        this.client.sendAgentMessage(
+            'claude',
+            outcome === 'cancelled' ? { type: 'turn_aborted', id }
+                : outcome === 'failed' ? { type: 'turn_failed', id }
+                    : { type: 'task_complete', id },
+        );
     }
 
     abortCurrentTaskTurn = () => {

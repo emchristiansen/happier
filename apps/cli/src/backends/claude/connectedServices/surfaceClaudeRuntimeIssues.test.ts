@@ -1468,6 +1468,15 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     await writeFile(join(tmpDir, '.claude.json'), JSON.stringify(rootConfig), 'utf8');
   }
 
+  /** A group home's materializer records the tuple its identity belongs to beside `.claude.json`. */
+  async function writeGroupHomeProvenance(tuple: { generation: number; credentialRevision: string }): Promise<void> {
+    await writeFile(join(tmpDir, '.happier-claude-connected-service-home.json'), JSON.stringify({
+      v: 1, serviceId: 'claude-subscription', credentialProfileId: 'claude-main', credentialCreatedAt: 1000,
+      credentialRevision: tuple.credentialRevision, generation: tuple.generation,
+      selection: { kind: 'group', groupId: 'team-pool', activeProfileId: 'claude-main', fallbackProfileId: 'claude-backup' },
+    }), 'utf8');
+  }
+
   function installConfigDir(): void {
     previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = tmpDir;
@@ -1572,6 +1581,7 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
 
   it('retains the issued request account and generation after a shared home and selection switch', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'issued-account', organizationUuid: 'issued-org' });
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     const session = { client: { sessionId: 'request-snapshot', sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } } };
     await captureClaudeRuntimeAuthRequestIdentity(session);
     await writeMaterializedClaudeConfig({ accountUuid: 'later-account', organizationUuid: 'later-org' });
@@ -1613,9 +1623,11 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     expect(isClaudeTaskNotificationUserPromptHook(notificationHook)).toBe(true);
 
     await writeMaterializedClaudeConfig({ accountUuid: 'acct-a', organizationUuid: 'org-a' });
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     // The ordinary prompt's identity is captured before its dispatch (the remote launcher awaits it).
     await captureClaudeRuntimeAuthRequestIdentity(session);
     await writeMaterializedClaudeConfig({ accountUuid: 'acct-b', organizationUuid: 'org-b' });
+    await writeGroupHomeProvenance({ generation: 5, credentialRevision: 'csr_8123456789ABCDEFGHJKMNPQRS' });
     truth = { ...truth, generation: 5, credentialRevision: 'csr_8123456789ABCDEFGHJKMNPQRS' };
     observeClaudeRuntimeAuthTranscript(session, notificationHook, { historicalReplay: false, authenticatedHook: true });
 
@@ -1650,6 +1662,7 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
       client: { sessionId: `fence-moves-${Object.keys(next)[0]}`, sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
     };
     await writeMaterializedClaudeConfig({ accountUuid: 'acct-a', organizationUuid: 'org-a' });
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     // Another session switches the shared home and this session's fence while the read is pending.
     identityReadGate.before = async () => {
       await writeMaterializedClaudeConfig({ accountUuid: 'acct-b', organizationUuid: 'org-b' });
@@ -1677,6 +1690,7 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
       client: { sessionId: 'fence-stable', sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
     };
     await writeMaterializedClaudeConfig({ accountUuid: 'acct-a', organizationUuid: 'org-a' });
+    await writeGroupHomeProvenance({ generation: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     await captureClaudeRuntimeAuthRequestIdentity(session);
     await writeMaterializedClaudeConfig({ accountUuid: 'acct-b', organizationUuid: 'org-b' });
     await surfaceClaudeRateLimitRuntimeIssue(session, {

@@ -498,9 +498,19 @@ function resolveUsefulContinuation(input: Readonly<{
       continue;
     }
     const attribution = attributeObservation(input.sessionIntervals, proof.observedAtMs);
+    const shared = attribution.kind !== 'none' && attribution.kind !== 'tie'
+      ? sharedGenerationAfter(attribution.interval, input.groupBoundaries, proof.observedAtMs)
+      : 'current';
     // Activity after the group's shared surface moved on ran on a later generation, not this one.
-    if (attribution.kind !== 'none' && attribution.kind !== 'tie'
-      && sharedGenerationAfter(attribution.interval, input.groupBoundaries, proof.observedAtMs) === 'superseded') continue;
+    if (shared === 'superseded') continue;
+    // A missing group generation leaves which generation served the activity unknown: keep the
+    // proof as boundary uncertainty, never as useful continuation of this application.
+    if (shared === 'coverage_gap') {
+      if (attribution.kind !== 'none' && attribution.kind !== 'tie' && attribution.interval.attemptId === input.attemptId) {
+        uncertain ??= { kind: 'boundary_uncertain', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
+      }
+      continue;
+    }
     if (attribution.kind === 'certain' && attribution.interval.attemptId === input.attemptId) {
       if (proof.turnOwnership === 'exact_turn' && proof.completionContract !== null) {
         return { kind: 'provider_activity', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };

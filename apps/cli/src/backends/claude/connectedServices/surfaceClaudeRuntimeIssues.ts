@@ -140,11 +140,15 @@ export async function captureClaudeRuntimeAuthRequestIdentity(session: RuntimeIs
     const unproven = { sourceProviderAccountId: null, sourceProviderOrganizationId: null };
     const fenceBeforeRead = readRequestFenceTupleKey(session);
     const selection = resolveClaudeRuntimeIssueSelection(session);
+    // The selection tuple is recorded now; the account is read later from a home that the daemon
+    // rewrites BEFORE notifying this runner, so the fence alone cannot see that rewrite. A group
+    // account is read only from a coherent snapshot of the home naming this exact tuple; a moved
+    // fence during the read (a delivered notification) is unproven too.
     const identity = selection
-        ? resolveClaudeRuntimeProviderAccountIdentity({ env: process.env }).then((identity) => {
-            // The selection tuple is recorded now; the account is read later from a shared home.
-            // If the fence moved around that read, the account may belong to a later generation:
-            // report it unproven rather than pair it with the recorded tuple.
+        ? resolveClaudeRuntimeProviderAccountIdentity({
+            env: process.env,
+            groupSelection: selection.kind === 'group' ? selection : null,
+        }).then((identity) => {
             if (readRequestFenceTupleKey(session) !== fenceBeforeRead) {
                 logger.warnFile('[claude] Request account identity unproven: auth group fence moved during capture');
                 return unproven;

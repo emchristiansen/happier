@@ -1,8 +1,13 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+import { runConnectAttemptAccountsCommand } from '@/cli/commands/connect/connectAttemptAccounts';
 import {
   RuntimeAuthAttemptAccountJoinEventSchema,
   buildRuntimeAuthAttemptTransitionEvent,
+  createRuntimeAuthAttemptAccountJoinJournal,
   foldRuntimeAuthAttemptAccountJoins,
   type ProviderAccountObservedEvent,
   type RuntimeAuthAttemptAccountJoinEvent,
@@ -43,6 +48,14 @@ function observed(sessionId: string, observedAtMs: number, profileId: string): P
     v: 1, kind: 'provider_account_observed', sessionId, serviceId: SERVICE, groupId: GROUP,
     nativeSessionId: `native-${sessionId}`, providerOrganizationId: `org-${profileId}`,
     resolution: { kind: 'unique_member', profileId }, adoption: 'adopted', observedAtMs,
+  };
+}
+
+function contractedProof(attemptId: string, observedAtMs: number): RuntimeAuthAttemptAccountJoinEvent {
+  return {
+    v: 1, kind: 'provider_outcome_proof', sessionId: 'matrix', attemptId, expectedAttemptId: attemptId,
+    proofKind: 'provider_activity', observedAtMs, turnOwnership: 'exact_turn', completionContract: 'claude_sdk_result_bound_v1',
+    statusBefore: 'resumed_awaiting_proof', statusAfter: 'recovered', attemptIdAfter: attemptId, persistedAtMs: observedAtMs + 1,
   };
 }
 
@@ -110,6 +123,46 @@ describe('attempt-account join across a shared group generation', () => {
       },
     ]);
     expect(joins.find((join) => join.attemptId === 'a73')!.usefulContinuation).toEqual({ kind: 'not_witnessed' });
+  });
+
+  it('does not credit useful continuation while a missing group generation leaves the serving generation unknown', async () => {
+    // JOIN-GAP-1: g74..g79 are absent, so which generation served contracted activity at 1500 is
+    // unknown. Keep the proof, but report boundary uncertainty, never useful continuation of g73.
+    const events = [
+      ...applied('matrix', 'a73', 1_000, 'sothmod-like', 73),
+      ...applied('search', 'a80', 2_000, 'holdmod-like', 80),
+      observed('matrix', 1_500, 'sothmod-like'),
+      contractedProof('a73', 1_500),
+    ];
+    const matrix = foldRuntimeAuthAttemptAccountJoins(events).find((join) => join.attemptId === 'a73')!;
+    expect(matrix.observations.map((entry) => entry.disposition)).toEqual(['generation_coverage_gap']);
+    expect(matrix.usefulContinuation).toEqual({ kind: 'boundary_uncertain', observedAtMs: 1_500, applicationIndex: 0 });
+
+    // The same journal through the real append-only writer, reader and session-filtered CLI.
+    const dir = await mkdtemp(join(tmpdir(), 'happier-join-gap-'));
+    try {
+      const journal = createRuntimeAuthAttemptAccountJoinJournal({ filePath: join(dir, 'attempt-accounts.jsonl') });
+      for (const event of events) await journal.append(event);
+      let output = '';
+      await runConnectAttemptAccountsCommand({ args: ['--session', 'matrix'], journal, write: (line) => { output += line; } });
+      const view = JSON.parse(output);
+      expect(view.invalidLines).toEqual([]);
+      expect(view.attempts).toHaveLength(1);
+      expect(view.attempts[0].observations[0].disposition).toBe('generation_coverage_gap');
+      expect(view.attempts[0].usefulContinuation).toEqual({ kind: 'boundary_uncertain', observedAtMs: 1_500, applicationIndex: 0 });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still credits contracted useful continuation before the next contiguous generation', () => {
+    const joins = foldRuntimeAuthAttemptAccountJoins([
+      ...applied('matrix', 'a73', 1_000, 'sothmod-like', 73),
+      ...applied('search', 'a74', 2_000, 'holdmod-like', 74),
+      contractedProof('a73', 1_500),
+    ]);
+    expect(joins.find((join) => join.attemptId === 'a73')!.usefulContinuation)
+      .toEqual({ kind: 'provider_activity', observedAtMs: 1_500, applicationIndex: 0 });
   });
 
   it('reports legacy exact-turn activity without a completion contract as unqualified, never useful', () => {

@@ -181,7 +181,13 @@ export async function claudeRemoteAgentSdk(opts: {
     onSessionFound: (id: string, data?: SessionHookData) => void;
     /** Authenticated SDK hooks share the existing workflow observation channel without transcript output. */
     onSessionHook?: (data: SessionHookData) => void;
-    onThinkingChange?: (thinking: boolean) => void;
+    /**
+     * `release.endedWithoutResult` accompanies a thinking release for a foreground turn that ended
+     * WITHOUT its own result: an interrupt or SDK abort cancelled it ('cancelled'); a transport
+     * failure or stream end before any result failed it ('failed'). The owner publishes that
+     * outcome instead of a completion. Never a claim of provider work.
+     */
+    onThinkingChange?: (thinking: boolean, release?: Readonly<{ endedWithoutResult?: 'cancelled' | 'failed' }>) => void;
     onProviderPromptStarted?: () => void | Promise<void>;
     onMessage: (message: SDKMessage) => void;
     /** Live provider ingress, before transcript filtering or buffering. */
@@ -390,6 +396,8 @@ export async function claudeRemoteAgentSdk(opts: {
         let mode = initial.mode;
         let response: any;
         let runtimeFailure: { error: unknown } | null = null;
+        // The query ended through a user/launcher abort rather than a provider failure.
+        let didEndForegroundByAbort = false;
         let didSettleRuntimeActivityForCurrentTurn = false;
 		    let latestClaudeSessionId: string | null =
 		        typeof opts.sessionId === 'string' && opts.sessionId.trim().length > 0 ? opts.sessionId.trim() : startFrom ?? null;
@@ -863,6 +871,14 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
             opts.onThinkingChange?.(thinking);
         }
     };
+    // Thinking is held only by a foreground turn whose own result has not released it (a result
+    // releases it through reconcile/finalize first). Releasing it here carries how that turn
+    // actually ended, so no completion is published for work that produced no result.
+    const releaseThinkingWithoutResult = (endedWithoutResult: 'cancelled' | 'failed') => {
+        if (!thinking) return;
+        thinking = false;
+        opts.onThinkingChange?.(false, { endedWithoutResult });
+    };
 
     const shapeLogger = createEventShapeLoggerForLog({ logger, scope: 'claude-agent-sdk' });
 
@@ -1149,8 +1165,9 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
 	                awaitingRequestedTurnInterruptResult = false;
 	                // Best-effort: interrupt is optional and should not crash cancellation.
 	            } finally {
-	                // Ensure UI thinking state is released even if Claude does not emit a clean result.
-	                updateThinking(false);
+	                // Ensure UI thinking state is released even if Claude does not emit a clean result;
+	                // the interrupt is that turn's cancellation, not its completion.
+	                releaseThinkingWithoutResult('cancelled');
                     if (!stopTaskSucceeded) {
                         try {
                             cleanupBufferedAssistantMessages?.(null);
@@ -1898,7 +1915,16 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                 turnDiagnostics.unknownMessageCount += 1;
             }
 
-            const runtimeAuthFailure = classifyClaudeConnectedServiceRuntimeAuthFailure({ error: message });
+            // One ownership decision per result frame, taken BEFORE any failure/recovery tap. A
+            // replayed result, or one answering an earlier prompt while a newer one is active,
+            // must not fail or recover the current turn through the usage/auth corridor.
+            const resultAdmission = message && typeof message === 'object' && (message as any).type === 'result'
+                ? promptSettlements.admitResult(message)
+                : null;
+            const isUnownedResult = resultAdmission !== null && !resultAdmission.ownsForeground;
+            const runtimeAuthFailure = isUnownedResult
+                ? null
+                : classifyClaudeConnectedServiceRuntimeAuthFailure({ error: message });
             if (runtimeAuthFailure) {
                 const retryDecision = resolveClaudeRuntimeAuthRetryDecision(message);
                 if (retryDecision.action === 'await_provider_retry') {
@@ -1913,7 +1939,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                 if (quotaEvidence.length > 0) {
                     await opts.onQuotaEvidence?.(quotaEvidence);
                 }
-                const rateLimitDetails = mapClaudeProviderFailureToUsageDetails(message);
+                const rateLimitDetails = isUnownedResult ? null : mapClaudeProviderFailureToUsageDetails(message);
                 if (rateLimitDetails) {
                     await opts.onRateLimitEvent?.(rateLimitDetails, readClaudeRateLimitEventWindows(message));
                 }
@@ -2366,13 +2392,14 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                     for (const c of msg.message.content) {
                         if (c.type === 'tool_result' && c.tool_use_id && opts.isAborted(c.tool_use_id)) {
                             logger.debug('[claudeRemoteAgentSdk] Tool aborted, exiting claudeRemoteAgentSdk');
+                            didEndForegroundByAbort = true;
                             return;
                         }
                     }
                 }
             }
 
-            if (message && message.type === 'result') {
+            if (message && message.type === 'result' && resultAdmission) {
                 // Init allocates the native identity before its JSONL exists.
                 // A completed turn can now prove it at the existing Session owner.
                 if (latestClaudeSessionId) {
@@ -2383,14 +2410,15 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                 // A replayed result restates earlier history (resume replays prior turns before the
                 // supplied prompt). It is not bound to the current turn: it must neither complete
                 // nor fail it, nor consume prompt attribution or a requested interrupt.
-                if (isReplaySdkMessage(message)) {
+                if (resultAdmission.replayed) {
                     continue;
                 }
                 const didRequestThisResult = awaitingRequestedTurnInterruptResult;
                 awaitingRequestedTurnInterruptResult = false;
                 const failure = readAgentSdkResultFailure(message);
-                const resultForLatestPrompt = promptSettlements.isResultForLatestSubmittedPrompt(message);
-                const retainForeground = promptSettlements.shouldRetainForegroundForResult(message);
+                // Decided once on arrival (admitResult), before the failure taps above.
+                const resultForLatestPrompt = resultAdmission.forLatestPrompt;
+                const retainForeground = resultAdmission.retainForeground;
                 const isRequestedExecutionInterrupt = didRequestThisResult && message.subtype === 'error_during_execution';
                 const isProviderApiErrorResult = failure !== null && !isAgentSdkExecutionFailureResult(message);
                 if (failure && !retainForeground) {
@@ -2476,6 +2504,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
 	    } catch (e) {
 	        if (e instanceof AgentSdkAbortError) {
 	            logger.debug('[claudeRemoteAgentSdk] Aborted');
+	            didEndForegroundByAbort = true;
 	            return;
 	        }
         runtimeFailure = { error: e };
@@ -2519,7 +2548,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                 reason: 'claude_agent_sdk_stream_finalized',
             });
         }
-        updateThinking(false);
+        releaseThinkingWithoutResult(didEndForegroundByAbort || abortSignal.aborted ? 'cancelled' : 'failed');
         cleanupBufferedAssistantMessages?.(null);
 
         await flushStreamedTranscriptWriter('abort', 'runner-finalize');
