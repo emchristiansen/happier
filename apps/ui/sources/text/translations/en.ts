@@ -3057,6 +3057,7 @@ export const en = {
             groupExhaustedSubtitle: 'All enabled members are waiting for quota',
             groupNeedsMembersSubtitle: 'Add or enable a member before using this pool',
             groupSwitchingSubtitle: 'Switching pool member',
+            startOnMember: 'Start on',
             groupErrorSubtitle: 'This pool needs attention',
             groupUnknownSubtitle: 'Readiness is still syncing',
             groupUnsupportedSubtitle: 'This runtime cannot switch account pools',

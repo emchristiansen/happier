@@ -3214,6 +3214,7 @@ export const zhHans: TranslationStructure = {
       groupExhaustedSubtitle: "所有已启用成员都在等待额度恢复",
       groupNeedsMembersSubtitle: "使用此池前请添加或启用成员",
       groupSwitchingSubtitle: "正在切换池成员",
+      startOnMember: "起始账户",
       groupErrorSubtitle: "此池需要处理",
       groupUnknownSubtitle: "就绪状态仍在同步",
       groupUnsupportedSubtitle: "此运行时无法切换账号池",

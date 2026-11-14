@@ -3244,6 +3244,7 @@ export const ru: TranslationStructure = {
       groupExhaustedSubtitle: "Все включенные участники ждут восстановления квоты",
       groupNeedsMembersSubtitle: "Добавьте или включите участника перед использованием пула",
       groupSwitchingSubtitle: "Переключение участника пула",
+      startOnMember: "Начать на",
       groupErrorSubtitle: "Этот пул требует внимания",
       groupUnknownSubtitle: "Готовность ещё синхронизируется",
       groupUnsupportedSubtitle: "Этот runtime не может переключать пулы аккаунтов",

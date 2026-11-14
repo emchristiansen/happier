@@ -1944,6 +1944,7 @@ const zhHantOverrides: DeepPartial<TranslationStructure> = {
             groupExhaustedSubtitle: '所有已啟用成員都在等待額度恢復',
             groupNeedsMembersSubtitle: '使用此池前請新增或啟用成員',
             groupSwitchingSubtitle: '正在切換池成員',
+            startOnMember: '起始帳戶',
             groupErrorSubtitle: '此池需要處理',
             groupUnknownSubtitle: '準備狀態仍在同步',
             groupUnsupportedSubtitle: '此執行階段無法切換帳號池',

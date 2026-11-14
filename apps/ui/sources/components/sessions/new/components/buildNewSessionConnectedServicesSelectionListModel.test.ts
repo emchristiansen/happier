@@ -455,4 +455,48 @@ describe('buildNewSessionConnectedServicesSelectionListModel', () => {
             'service:openai-codex · connectedServices.authModal.notConnectedTitle',
         ]);
     });
+
+    it('offers optional start-on members for a selected per-session pool and binds initialProfileId', () => {
+        const setBindingForService = vi.fn();
+        const group = {
+            groupId: 'pool', label: 'Pool', activeProfileId: 'work', memberProfileIds: ['work', 'home'],
+            enabledMemberCount: 2, autoSwitch: true, status: 'ready' as const,
+            strategy: 'per_session_softmax', assignment: 'per_session' as const,
+        };
+        const model = buildModel({
+            supportedServiceIds: ['claude-subscription'],
+            profileOptionsByServiceId: {
+                'claude-subscription': [
+                    { profileId: 'work', status: 'connected', providerEmail: 'work@example.com' },
+                    { profileId: 'home', status: 'connected', providerEmail: 'home@example.com' },
+                ],
+            },
+            accountGroupOptionsByServiceId: { 'claude-subscription': [group] },
+            bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool' } },
+            setBindingForService,
+        });
+        const startOptions = firstStaticSection(model).options.filter((option) => option.id.includes(':start:'));
+        expect(startOptions.map((option) => option.label)).toEqual([
+            'connectedServices.authModal.startOnMember: work@example.com',
+            'connectedServices.authModal.startOnMember: home@example.com',
+        ]);
+        startOptions[1]?.onSelect?.();
+        expect(setBindingForService).toHaveBeenCalledWith('claude-subscription', {
+            source: 'connected', selection: 'group', groupId: 'pool', initialProfileId: 'home',
+        });
+    });
+
+    it('offers no start-on members for a shared pool', () => {
+        const model = buildModel({
+            supportedServiceIds: ['claude-subscription'],
+            profileOptionsByServiceId: { 'claude-subscription': [{ profileId: 'work', status: 'connected' }] },
+            accountGroupOptionsByServiceId: { 'claude-subscription': [{
+                groupId: 'pool', label: 'Pool', activeProfileId: 'work', memberProfileIds: ['work'],
+                enabledMemberCount: 1, autoSwitch: true, status: 'ready' as const, strategy: 'priority', assignment: 'shared' as const,
+            }] },
+            bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool' } },
+        });
+        expect(firstStaticSection(model).options.some((option) => option.id.includes(':start:'))).toBe(false);
+    });
 });
+

@@ -3321,6 +3321,7 @@ export const pl: TranslationStructure = {
       groupExhaustedSubtitle: "Wszyscy włączeni członkowie czekają na limit",
       groupNeedsMembersSubtitle: "Dodaj lub włącz członka przed użyciem tej puli",
       groupSwitchingSubtitle: "Przełączanie członka puli",
+      startOnMember: "Rozpocznij na",
       groupErrorSubtitle: "Ta pula wymaga uwagi",
       groupUnknownSubtitle: "Gotowość nadal się synchronizuje",
       groupUnsupportedSubtitle: "Ten runtime nie może przełączać pul kont",

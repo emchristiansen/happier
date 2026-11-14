@@ -41,6 +41,7 @@ export {
     CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR,
     CONNECTED_SERVICE_INITIAL_PROFILE_REQUIRES_GROUP_ERROR,
     findConnectedServiceInternalAssignmentFields,
+  stripConnectedServicePerSessionAssignmentFields,
     type ConnectedServiceGroupMemberAssignmentV1,
     type ConnectedServiceGroupMemberAssignmentReasonV1,
 } from './connectedServiceBindings.js';

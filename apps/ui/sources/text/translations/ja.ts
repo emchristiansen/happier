@@ -3599,6 +3599,7 @@ localTailscale: {
       groupExhaustedSubtitle: "有効なメンバーは全員、利用枠の回復待ちです",
       groupNeedsMembersSubtitle: "このプールを使う前にメンバーを追加または有効化してください",
       groupSwitchingSubtitle: "プールメンバーを切り替え中",
+      startOnMember: "開始アカウント",
       groupErrorSubtitle: "このプールには対応が必要です",
       groupUnknownSubtitle: "準備状況をまだ同期中です",
       groupUnsupportedSubtitle: "このランタイムではアカウントプールを切り替えられません",

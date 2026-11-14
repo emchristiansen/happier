@@ -206,3 +206,25 @@ export const SessionConnectedServiceAuthSwitchRpcParamsSchema = lazySchema(() =>
 export type SessionConnectedServiceAuthSwitchRpcParams = z.infer<
     typeof SessionConnectedServiceAuthSwitchRpcParamsSchema
 >;
+
+/**
+ * The group/source a child, fork, handoff target or stored default inherits: the parent's
+ * `initialProfileId` and internal assignment fields removed (spec A.1). Returns the input when
+ * nothing is removed.
+ */
+export function stripConnectedServicePerSessionAssignmentFields<T extends ConnectedServiceBindingsV1 | null | undefined>(bindings: T): T {
+    if (!bindings) return bindings;
+    let changed = false;
+    const bindingsByServiceId: Record<string, unknown> = {};
+    for (const [serviceId, binding] of Object.entries(bindings.bindingsByServiceId)) {
+        if (!binding || binding.source !== 'connected' || binding.selection !== 'group') {
+            bindingsByServiceId[serviceId] = binding;
+            continue;
+        }
+        const { initialProfileId, member, materializedAssignment, ...rest } = binding as typeof binding & Record<string, unknown>;
+        if (initialProfileId !== undefined || member !== undefined || materializedAssignment !== undefined) changed = true;
+        bindingsByServiceId[serviceId] = rest;
+    }
+    return changed ? { ...bindings, bindingsByServiceId } as T : bindings;
+}
+

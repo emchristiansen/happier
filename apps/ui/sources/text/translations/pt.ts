@@ -3414,6 +3414,7 @@ export const pt: TranslationStructure = {
       groupExhaustedSubtitle: "Todos os membros habilitados estão aguardando cota",
       groupNeedsMembersSubtitle: "Adicione ou habilite um membro antes de usar este Pool",
       groupSwitchingSubtitle: "Trocando membro do Pool",
+      startOnMember: "Iniciar em",
       groupErrorSubtitle: "Este Pool precisa de atenção",
       groupUnknownSubtitle: "A prontidão ainda está sincronizando",
       groupUnsupportedSubtitle: "Este runtime não pode trocar Pools de contas",

@@ -8,6 +8,7 @@ import {
     ConnectedServiceAuthGroupPolicyPatchV1Schema,
     ConnectedServiceAuthGroupPolicyV1Schema,
     ConnectedServiceBindingsV1Schema,
+    stripConnectedServicePerSessionAssignmentFields,
     CONNECTED_SERVICE_POOL_PER_SESSION_SOFTMAX_QUERY_KEY,
     findConnectedServiceInternalAssignmentFields,
 } from './connectedServiceSchemas.js';
@@ -110,4 +111,23 @@ describe('group binding assignment fields', () => {
         })).toEqual([]);
         expect(findConnectedServiceInternalAssignmentFields(null)).toEqual([]);
     });
+
+  it('strips per-session request and assignment for inheritance, keeping group and source', () => {
+    const bindings = ConnectedServiceBindingsV1Schema.parse({
+      v: 1,
+      bindingsByServiceId: {
+        'claude-subscription': {
+          source: 'connected', selection: 'group', groupId: 'pool', initialProfileId: 'a',
+          member: { assignment: 'per_session', profileId: 'a', decisionId: 'd', reason: 'initial_requested', appliedAtMs: 1 },
+        },
+      },
+    });
+    expect(stripConnectedServicePerSessionAssignmentFields(bindings)).toEqual({
+      v: 1,
+      bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool' } },
+    });
+    const plain = ConnectedServiceBindingsV1Schema.parse({ v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'native' } } });
+    expect(stripConnectedServicePerSessionAssignmentFields(plain)).toBe(plain);
+  });
 });
+

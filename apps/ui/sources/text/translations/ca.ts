@@ -3142,6 +3142,7 @@ export const ca: TranslationStructure = {
             groupExhaustedSubtitle: 'Tots els membres activats esperen quota',
             groupNeedsMembersSubtitle: 'Afegeix o activa un membre abans d\'usar aquest Pool',
             groupSwitchingSubtitle: 'Canviant membre del Pool',
+            startOnMember: 'Comença a',
             groupErrorSubtitle: 'Aquest Pool necessita atenció',
             groupUnknownSubtitle: 'La disponibilitat encara se sincronitza',
             groupUnsupportedSubtitle: 'Aquest runtime no pot canviar Pools de comptes',
