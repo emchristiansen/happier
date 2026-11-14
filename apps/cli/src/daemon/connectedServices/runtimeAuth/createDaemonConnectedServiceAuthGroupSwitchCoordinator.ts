@@ -1,4 +1,10 @@
 import {
+  ConnectedServiceMemberHeldAtSwitchAdmissionError,
+  readConfiguredConnectedServiceMemberHolds,
+  resolveConnectedServiceMemberHoldExclusion,
+  type ConnectedServiceMemberHoldView,
+} from '../accountGroups/holds/connectedServiceMemberHolds';
+import {
   ConnectedServiceIdSchema,
   isConnectedServiceCredentialHealthStatusReconnectRequired,
   type ConnectedServiceAuthGroupV1,
@@ -19,6 +25,7 @@ import { evaluatePredictiveSoftSwitchSessionApplyPolicy } from '../accountGroups
 import {
   buildConnectedServiceAuthGroupSwitchState,
   buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState,
+  normalizeConnectedServiceAuthGroupPolicy,
 } from '../accountGroups/switching/buildConnectedServiceAuthGroupSwitchState';
 import {
   buildConnectedServiceAuthGroupSwitchStateFromAccountUsage,
@@ -183,6 +190,11 @@ async function loadConnectedServiceAuthGroupWithRetry(input: Readonly<{
 
 export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: Readonly<{
   api: AuthGroupApi;
+  /**
+   * Externally known member holds, read for every decision so changes apply without a restart.
+   * Defaults to this Happier home's canonical hold file.
+   */
+  readMemberHolds?: (serviceId: ConnectedServiceId) => Promise<ConnectedServiceMemberHoldView>;
   runtimeQuotaSnapshots: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore;
   accountUsageStore?: AccountUsageStoreForAuthGroupSwitchState | null;
   leases?: InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry;
@@ -263,7 +275,9 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
   }>) => Promise<void> | void;
   emitEvent?: (event: ConnectedServiceAuthGroupSwitchEvent) => void;
 }>): ConnectedServiceAuthGroupSwitchCoordinator {
+  const readMemberHolds = params.readMemberHolds ?? readConfiguredConnectedServiceMemberHolds;
   return new ConnectedServiceAuthGroupSwitchCoordinator({
+    readMemberHolds: async (serviceId) => await readMemberHolds(ConnectedServiceIdSchema.parse(serviceId)),
     leases: params.leases ?? new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(),
     nowMs: params.nowMs,
     quotaFreshnessMs: params.quotaFreshnessMs,
@@ -282,6 +296,7 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
         sleepMs: params.sleepMs ?? defaultSwitchCoordinatorSleepMs,
       });
       if (!group) throw new Error(`Connected service auth group not found (${input.serviceId}/${input.groupId})`);
+      const memberHolds = await readMemberHolds(serviceId);
       // CLOSE-11 contract: when the account-usage store exists, only an explicitly SOURCE-BACKED
       // result carries canonical authority; a provisional result (store present but cold) is the
       // persisted-member-state projection and must never masquerade as source-backed evidence.
@@ -291,19 +306,21 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
         ? buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
           group,
           accountUsageStore: params.accountUsageStore,
+          memberHolds,
         })
         : null;
       const unresolvedState = params.accountUsageStore
         ? (accountUsageSwitchState?.kind === 'source_backed'
           ? accountUsageSwitchState.state
-          : buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group }))
+          : buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group, memberHolds }))
         : input.trigger === 'pre_turn'
           ? buildConnectedServiceAuthGroupSwitchState({
             group,
             runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
             nowMs: params.nowMs(),
+            memberHolds,
           })
-          : buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group });
+          : buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group, memberHolds });
       const state: ConnectedServiceAuthGroupSwitchState = {
         ...unresolvedState,
         requiredModelIds: params.resolveRequiredModelIdsForGroup?.({ serviceId, groupId: input.groupId }) ?? [],
@@ -336,6 +353,15 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
     },
     commitSwitch: async (input) => {
       const serviceId = ConnectedServiceIdSchema.parse(input.serviceId);
+      // Admission: holds may have been written while the candidate was being prepared or the
+      // apply preflighted. Re-read the canonical store immediately before the active-profile write.
+      const admissionHold = resolveConnectedServiceMemberHoldExclusion(
+        await readMemberHolds(serviceId), input.toProfileId, params.nowMs());
+      if (admissionHold) {
+        throw new ConnectedServiceMemberHeldAtSwitchAdmissionError({
+          serviceId, groupId: input.groupId, profileId: input.toProfileId, exclusion: admissionHold,
+        });
+      }
       let group = await params.api.updateConnectedServiceAuthGroupActiveProfile({
         serviceId,
         groupId: input.groupId,
@@ -366,15 +392,17 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
       });
       // CLOSE-11 contract: same rule as the loader above — provisional (cold PAU) results must not
       // masquerade as source-backed; they intentionally degrade to persisted member state.
+      const memberHolds = await readMemberHolds(serviceId);
       const refreshedAccountUsageSwitchState = params.accountUsageStore
         ? buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
           group,
           accountUsageStore: params.accountUsageStore,
+          memberHolds,
         })
         : null;
       const unresolvedState = refreshedAccountUsageSwitchState?.kind === 'source_backed'
         ? refreshedAccountUsageSwitchState.state
-        : buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group });
+        : buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group, memberHolds });
       const credentialRevision = await params.resolveCurrentCredentialRevision(
         serviceId,
         unresolvedState.activeProfileId,
@@ -579,7 +607,7 @@ export function createDaemonConnectedServiceAuthGroupSwitchCoordinator(params: R
           generation = group.generation;
           runtimeStateRevision = group.runtimeStateRevision;
           existingState = member.state;
-          policy = buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group }).policy;
+          policy = normalizeConnectedServiceAuthGroupPolicy(group.policy);
         }
       }
     },

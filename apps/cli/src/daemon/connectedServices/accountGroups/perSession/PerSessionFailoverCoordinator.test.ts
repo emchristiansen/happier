@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 
 import {
   ConnectedServiceAuthGroupPolicyV1Schema,
@@ -50,6 +51,7 @@ function stateFor(
     policy: normalizeConnectedServiceAuthGroupPolicy(source.policy),
     members: source.members.map((member) => ({ profileId: member.profileId, priority: member.priority, enabled: member.enabled, createdAtMs: member.createdAt })),
     memberStatesByProfileId,
+    memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
     ...(requiredModelIds ? { requiredModelIds } : {}),
   } as ConnectedServiceAuthGroupSwitchState;
 }
@@ -62,6 +64,7 @@ async function fixture(options: Readonly<{
   modelBlocked?: Readonly<Record<string, string>>;
   activeProfileId?: string;
   sharedSwitchResult?: Awaited<ReturnType<PerSessionFailoverCoordinator['switchAfterClassifiedFailure']>>;
+  heldProfileIds?: ReadonlyArray<string>;
 }> = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'per-session-failover-'));
   const ledger = new PerSessionAssignmentLedger(join(dir, 'ledger.json'));
@@ -79,7 +82,18 @@ async function fixture(options: Readonly<{
   const switchSharedGroup = vi.fn(async () => options.sharedSwitchResult ?? { status: 'switched' as const, activeProfileId: 'c', generation: 5 });
   const coordinator = new PerSessionFailoverCoordinator({
     loadGroup: async () => source,
-    buildState: (loaded, sessionId) => stateFor(loaded, options.scores ?? { a: 0, b: 80, c: 40 }, options.modelsBySessionId?.[sessionId], options.modelBlocked),
+    buildState: async (loaded, sessionId) => ({
+      ...stateFor(loaded, options.scores ?? { a: 0, b: 80, c: 40 }, options.modelsBySessionId?.[sessionId], options.modelBlocked),
+      ...(options.heldProfileIds ? {
+        memberHolds: {
+          status: 'readable' as const,
+          holdsByProfileId: new Map(options.heldProfileIds.map((profileId) => [profileId, {
+            serviceId: 'claude-subscription', profileId, reason: 'operator hold', source: 'test', heldAtMs: NOW - 1,
+            lifetime: { kind: 'until_released' as const },
+          }])),
+        },
+      } : {}),
+    }),
     switchSharedGroup,
     recordFailure,
     readSessionBinding: () => binding,
@@ -179,6 +193,17 @@ describe('PerSessionFailoverCoordinator', () => {
     expect(f.ledger.get(replacementId)?.replacesDecisionIds).toEqual(['recovery-old']);
     // The previously applied member remains the session's proved identity.
     expect(applied.binding.member).toMatchObject({ profileId: 'a' });
+  });
+
+  it('never moves a session onto a held member (composition with t_1b770ae5 holds)', async () => {
+    const f = await fixture({ scores: { a: 0, b: 80, c: 40 }, heldProfileIds: ['b'] });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await f.coordinator.switchAfterClassifiedFailure(failure);
+    }
+    expect(f.applyAssignment.mock.calls.map((call) => call[0].profileId)).not.toContain('b');
+    const g = await fixture({ scores: { a: 0, b: 80, c: 40 }, heldProfileIds: ['b', 'c'] });
+    expect(await g.coordinator.switchAfterClassifiedFailure(failure)).toMatchObject({ status: 'no_eligible_member' });
+    expect(g.applyAssignment).not.toHaveBeenCalled();
   });
 
   it('draws for the session\'s own model only: another session\'s model never excludes a destination (T13)', async () => {

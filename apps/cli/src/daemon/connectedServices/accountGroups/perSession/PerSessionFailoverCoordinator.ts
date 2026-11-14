@@ -86,7 +86,8 @@ export class PerSessionFailoverCoordinator {
   constructor(private readonly deps: Readonly<{
     loadGroup: (input: Readonly<{ serviceId: ConnectedServiceId; groupId: string }>) => Promise<ConnectedServiceAuthGroupV1 | null>;
     /** Group state with `requiredModelIds` restricted to this session's own model (spec A.2, T13). */
-    buildState: (group: ConnectedServiceAuthGroupV1, sessionId: string) => ConnectedServiceAuthGroupSwitchState;
+    /** Score state for this session's draw, including freshly read member holds. */
+    buildState: (group: ConnectedServiceAuthGroupV1, sessionId: string) => Promise<ConnectedServiceAuthGroupSwitchState>;
     /**
      * The shared pipeline for a group that is no longer per_session_softmax. Used only to choose the
      * conversion target when the group's current shared member is the one that failed.
@@ -182,7 +183,7 @@ export class PerSessionFailoverCoordinator {
     if (failedProfileId) {
       await this.deps.recordFailure({ ...input, observedProfileId: failedProfileId });
     }
-    const state = this.deps.buildState((await this.deps.loadGroup({ serviceId, groupId: input.groupId })) ?? group, sessionId);
+    const state = await this.deps.buildState((await this.deps.loadGroup({ serviceId, groupId: input.groupId })) ?? group, sessionId);
     const memberRevoked = failedProfileId !== null
       && !state.members.some((member) => member.profileId === failedProfileId && member.enabled);
     const policy = this.policyResult(input, state, memberRevoked);
@@ -263,6 +264,7 @@ export class PerSessionFailoverCoordinator {
         policy: state.policy,
         members: state.members,
         memberStatesByProfileId: state.memberStatesByProfileId,
+        memberHolds: state.memberHolds,
         quotaFreshnessMs: this.deps.quotaFreshnessMs,
         nowMs: this.deps.nowMs,
         currentProfileId: failedProfileId,
@@ -276,8 +278,12 @@ export class PerSessionFailoverCoordinator {
         reloadMemberState: async () => {
           const fresh = await this.deps.loadGroup({ serviceId, groupId: input.groupId });
           if (!fresh) return null;
-          const freshState = this.deps.buildState(fresh, sessionId);
-          return { members: freshState.members, memberStatesByProfileId: freshState.memberStatesByProfileId };
+          const freshState = await this.deps.buildState(fresh, sessionId);
+          return {
+            members: freshState.members,
+            memberStatesByProfileId: freshState.memberStatesByProfileId,
+            memberHolds: freshState.memberHolds,
+          };
         },
         resumeProposal,
         localReservationCountsByProfileId: () => this.deps.ledger.localCounts(serviceId, input.groupId, decisionId),

@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../accountGroups/holds/connectedServiceMemberHolds';
 import { describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -128,7 +129,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       runtimeStateRevision: 0, credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
       members: ['ai1', 'batiplus_ai'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-      memberStatesByProfileId: new Map([['batiplus_ai', {
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['batiplus_ai', {
         quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 98 },
       }]]),
     };
@@ -259,7 +260,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
         generation: 1, runtimeStateRevision: 0,
         policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
         members: ['primary', 'backup'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-        memberStatesByProfileId: new Map(),
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(),
       }),
       // Provider/server probe boundary has not produced a complete group observation.
       probeQuotaSnapshotsForGroup: async ({ profileIds }) => ({ status: 'incomplete', reason,
@@ -302,7 +303,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       runtimeStateRevision: 0, credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb',
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
       members: ['primary', 'backup'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-      memberStatesByProfileId: new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>(),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>(),
     };
     const coordinator = new ConnectedServiceAuthGroupSwitchCoordinator({
       leases: new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(), nowMs: () => nowMs,
@@ -314,7 +315,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
           status: 'incomplete', requestedProfileCount: 1, completedProfileCount: 0,
           completedProfileIds: [], reason: 'probe_unavailable',
         };
-        if (publishFreshEvidence) current = { ...current, memberStatesByProfileId: new Map([['backup', {
+        if (publishFreshEvidence) current = { ...current, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['backup', {
           quotaSnapshot: { capturedAtMs: nowMs, effectiveRemainingPercent: remainingPercent, exhausted: remainingPercent === 0,
             meters: [{ meterId: 'weekly', limitCategory: 'usage_limit', remainingPct: remainingPercent, resetAtMs: 180_000, providerLimitId: null }] },
           ...(remainingPercent === 0 ? { quotaExhaustedUntilMs: 180_000 } : {}),
@@ -376,7 +377,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       runtimeStateRevision: 0, credentialRevision: ordinarySwitch ? 'csr_aaaaaaaaaaaaaaaaaaaaaa' : 'csr_cccccccccccccccccccccc',
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
       members: ['A', 'B', 'C', 'D'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-      memberStatesByProfileId: new Map(['B', 'C'].map((profileId) => [profileId,
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(['B', 'C'].map((profileId) => [profileId,
         { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 60 } }])),
     };
     const coordinator = new ConnectedServiceAuthGroupSwitchCoordinator({
@@ -471,7 +472,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       runtimeStateRevision: 0, credentialRevision: 'csr_cccccccccccccccccccccc',
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
       members: ['A', 'B', 'C'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-      memberStatesByProfileId: new Map([['C', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 60 } }]]),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['C', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 60 } }]]),
     };
     const coordinator = new ConnectedServiceAuthGroupSwitchCoordinator({
       leases: new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(), nowMs: () => 1_000,
@@ -541,7 +542,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
       members: ['primary', 'backup'].map((profileId, priority) => ({ profileId, priority, enabled: true, createdAtMs: 1 })),
-      memberStatesByProfileId: new Map([['backup', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 60 } }]]),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['backup', { quotaSnapshot: { capturedAtMs: 1_000, effectiveRemainingPercent: 60 } }]]),
     };
     const coordinator = new ConnectedServiceAuthGroupSwitchCoordinator({
       leases: new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(), nowMs: () => 1_000,
@@ -658,7 +659,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
         { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true },
         { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
       ],
-      memberStatesByProfileId: new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>([
         ['primary', source === 'returned_to_failed_member'
           ? { quotaSnapshot: { capturedAtMs: 20_000, effectiveRemainingPercent: 60 } }
           : { exhaustedUntilMs: 100_000 }],
@@ -741,7 +742,7 @@ describe('RuntimeAuthRecoveryScheduler', () => {
       members: [
         { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true },
         { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
-      ], memberStatesByProfileId: new Map(),
+      ], memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(),
     };
     // Group state, CAS and application are the remote storage/session boundaries.
     const coordinator = new ConnectedServiceAuthGroupSwitchCoordinator({

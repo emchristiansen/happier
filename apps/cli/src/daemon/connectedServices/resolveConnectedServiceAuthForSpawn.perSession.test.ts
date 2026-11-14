@@ -23,6 +23,11 @@ import { CLAUDE_SUBSCRIPTION_OAUTH_SCOPE } from './descriptors/connectedAccountD
 import { resolveConnectedServiceSelectionHomeDir } from './homes/resolveConnectedServiceHomeDir';
 import { resolveConnectedServiceAuthForSpawn } from './resolveConnectedServiceAuthForSpawn';
 import { ConnectedServicePerSessionSpawnError } from './accountGroups/perSession/resolvePerSessionGroupMemberForSpawn';
+import {
+  ConnectedServiceGroupMemberHeldForSpawnError,
+  NO_CONNECTED_SERVICE_MEMBER_HOLDS,
+  type ConnectedServiceMemberHoldView,
+} from './accountGroups/holds/connectedServiceMemberHolds';
 
 const NOW = 1_000_000;
 
@@ -208,6 +213,89 @@ describe('resolveConnectedServiceAuthForSpawn per_session_softmax', () => {
     const secondBinding = second!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
     expect(f.ledger.list()).toHaveLength(1);
     expect(secondBinding.materializedAssignment.decisionId).toBe(firstBinding.materializedAssignment.decisionId);
+  });
+
+  describe('member holds (composition with t_1b770ae5 HOLD-01/02)', () => {
+    const heldView = (...profileIds: string[]): ConnectedServiceMemberHoldView => ({
+      status: 'readable',
+      holdsByProfileId: new Map(profileIds.map((profileId) => [profileId, {
+        serviceId: 'claude-subscription', profileId, reason: 'operator hold', source: 'test', heldAtMs: NOW - 1,
+        lifetime: { kind: 'until_released' as const },
+      }])),
+    });
+    const spawnWith = (f: Awaited<ReturnType<typeof fixture>>, readMemberHolds: () => Promise<ConnectedServiceMemberHoldView>, binding: Record<string, unknown> = {}) =>
+      resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE,
+        agentId: 'claude',
+        connectedServicesBindingsRaw: {
+          v: 1,
+          bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', ...binding } },
+        },
+        materializationKey: 'session-held',
+        activeServerDir: f.activeServerDir,
+        baseDir: f.baseDir,
+        credentials,
+        api: f.api,
+        processEnv: f.processEnv,
+        runtimeQuotaSnapshots: f.runtimeQuotaSnapshots,
+        quotaFreshnessMs: 300_000,
+        nowMs: () => NOW,
+        sessionId: 'session-held',
+        perSessionAssignment: f.deps(() => 0.0001),
+        readMemberHolds,
+      });
+
+    it('never draws a held member', async () => {
+      for (const sample of [0.0001, 0.5, 0.9999]) {
+        const f = await fixture();
+        recordScores(f.runtimeQuotaSnapshots, { a: 30, b: 90 });
+        const result = await resolveConnectedServiceAuthForSpawn({
+          nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE, agentId: 'claude',
+          connectedServicesBindingsRaw: { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool' } } },
+          materializationKey: 'session-held', activeServerDir: f.activeServerDir, baseDir: f.baseDir, credentials, api: f.api,
+          processEnv: f.processEnv, runtimeQuotaSnapshots: f.runtimeQuotaSnapshots, quotaFreshnessMs: 300_000, nowMs: () => NOW,
+          sessionId: 'session-held', perSessionAssignment: f.deps(() => sample), readMemberHolds: async () => heldView('b'),
+        });
+        const binding = result!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
+        expect(binding.materializedAssignment.profileId).toBe('a');
+      }
+    });
+
+    it('fails a named start on a held member over to an eligible one', async () => {
+      const f = await fixture();
+      recordScores(f.runtimeQuotaSnapshots, { a: 30, b: 90 });
+      const result = await spawnWith(f, async () => heldView('b'), { initialProfileId: 'b' });
+      const binding = result!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
+      expect(binding.materializedAssignment).toMatchObject({ profileId: 'a', reason: 'initial_unavailable_failover' });
+    });
+
+    it('refuses at final admission when the drawn member became held meanwhile, releasing the never-launched decision', async () => {
+      const f = await fixture();
+      recordScores(f.runtimeQuotaSnapshots, { a: 30, b: 90 });
+      let reads = 0;
+      // The draw sees no holds; the admission read just before launch sees every member held.
+      const readMemberHolds = async () => (reads++ === 0 ? NO_CONNECTED_SERVICE_MEMBER_HOLDS : heldView('a', 'b'));
+      await expect(spawnWith(f, readMemberHolds)).rejects.toBeInstanceOf(ConnectedServiceGroupMemberHeldForSpawnError);
+      expect(f.ledger.list()).toHaveLength(0);
+    });
+
+    it('refuses when holds cannot be read rather than treating them as empty', async () => {
+      const f = await fixture();
+      recordScores(f.runtimeQuotaSnapshots, { a: 30, b: 90 });
+      await expect(spawnWith(f, async () => ({ status: 'unreadable', error: 'corrupt hold file' })))
+        .rejects.toBeTruthy();
+      expect(f.ledger.list().filter((entry) => entry.state === 'applied')).toHaveLength(0);
+    });
+
+    it('does not keep an owned member that became held after a rollback; it converts through the group home', async () => {
+      const f = await fixture('priority');
+      recordScores(f.runtimeQuotaSnapshots, { a: 90, b: 60 });
+      const result = await spawnWith(f, async () => heldView('b'), {
+        member: { assignment: 'per_session', profileId: 'b', decisionId: 'spawn-owned', reason: 'initial_sampled', appliedAtMs: 1 },
+      });
+      const binding = result!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
+      expect(binding.materializedAssignment).toMatchObject({ reason: 'policy_conversion', home: 'group', profileId: 'a' });
+    });
   });
 
   it('refuses a spawn when no member has a known score instead of imputing quota', async () => {

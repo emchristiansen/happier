@@ -10,6 +10,7 @@ import {
   type AccountUsageStoreForAuthGroupSwitchState,
 } from '../switching/buildConnectedServiceAuthGroupSwitchStateFromAccountUsage';
 import type { ConnectedServiceAuthGroupSwitchState } from '../switching/ConnectedServiceAuthGroupSwitchCoordinator';
+import type { ConnectedServiceMemberHoldView } from '../holds/connectedServiceMemberHolds';
 
 /**
  * Score state for a per-session draw (spawn or failover). A per-session decision moves no shared
@@ -22,11 +23,14 @@ export function buildPerSessionGroupSwitchState(params: Readonly<{
   accountUsageStore: AccountUsageStoreForAuthGroupSwitchState | null;
   runtimeQuotaSnapshots: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore | null;
   nowMs: number;
+  /** Current member holds; every per-session eligibility check and draw excludes held members. */
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): ConnectedServiceAuthGroupSwitchState {
   if (params.accountUsageStore) {
     const accountUsageSwitchState = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
       group: params.group,
       accountUsageStore: params.accountUsageStore,
+      memberHolds: params.memberHolds,
     });
     if (accountUsageSwitchState.kind === 'source_backed') return accountUsageSwitchState.state;
   }
@@ -35,7 +39,8 @@ export function buildPerSessionGroupSwitchState(params: Readonly<{
       group: params.group,
       runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
       nowMs: params.nowMs,
+      memberHolds: params.memberHolds,
     });
   }
-  return buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group: params.group });
+  return buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group: params.group, memberHolds: params.memberHolds });
 }

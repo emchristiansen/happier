@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -117,7 +118,7 @@ describe('buildConnectedServiceAuthGroupSwitchStateFromAccountUsage', () => {
     group.activeProfileId = 'fresh';
     group.state = { lastSwitchReason, lastSwitchAt: 400 };
     group.policy = { ...group.policy, strategy: 'priority', autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 0 };
-    const { state } = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
+    const { state } = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       group, accountUsageStore: { resolveBySource: (source) => createSnapshot(source.profileId, source.profileId === 'exhausted' ? 37 : 9) },
     });
     expect(selectConnectedServiceAuthGroupCandidate({ ...state, nowMs: 1_000, quotaFreshnessMs: 300_000,
@@ -148,7 +149,7 @@ describe('buildConnectedServiceAuthGroupSwitchStateFromAccountUsage', () => {
       store.recordSnapshot(snapshot, { sources: [{ serviceId: group.serviceId, profileId: snapshot.recordKey.accountSubjectId.replace('acct_', ''),
         bindingKind: 'group_member', groupId: group.groupId, groupGeneration: group.generation }] });
     }
-    const { state } = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({ group, accountUsageStore: store });
+    const { state } = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, group, accountUsageStore: store });
     expect(selectConnectedServiceAuthGroupCandidate({ ...state, nowMs: 1_000, quotaFreshnessMs: 300_000 }).selected?.profileId).toBe(scenario.expected);
   });
 
@@ -162,7 +163,7 @@ describe('buildConnectedServiceAuthGroupSwitchStateFromAccountUsage', () => {
       { ...fresh.meters[0]!, resetAtMs: 20_000, windowDurationMs: 604_800_000 },
       { ...fresh.meters[0]!, meterId: 'session', resetAtMs: 2_000, windowDurationMs: 18_000_000 },
     ];
-    const { state } = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
+    const { state } = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       group, accountUsageStore: { resolveBySource: (source) => source.profileId === 'early' ? early : fresh },
     });
     expect(selectConnectedServiceAuthGroupCandidate({ ...state, activeProfileId: null, nowMs: 1_000, quotaFreshnessMs: 300_000 }).selected?.profileId).toBe('early');
@@ -172,7 +173,7 @@ describe('buildConnectedServiceAuthGroupSwitchStateFromAccountUsage', () => {
     const group = createGroup();
     group.policy.quotaLimitSelection = { mode: 'selected', providerLimitIds: ['standard'] };
     const snapshot = createMultiLimitSnapshot('exhausted');
-    const result = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
+    const result = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       group,
       accountUsageStore: { resolveBySource: () => snapshot },
     });
@@ -188,7 +189,7 @@ describe('buildConnectedServiceAuthGroupSwitchStateFromAccountUsage', () => {
   it('keeps a selected but currently unreported limit unknown instead of falling back to all meters', () => {
     const group = createGroup();
     group.policy.quotaLimitSelection = { mode: 'selected', providerLimitIds: ['future-limit'] };
-    const result = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
+    const result = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       group,
       accountUsageStore: { resolveBySource: () => createMultiLimitSnapshot('exhausted') },
     });
@@ -212,7 +213,7 @@ describe('buildConnectedServiceAuthGroupSwitchStateFromAccountUsage', () => {
       },
     };
 
-    const result = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
+    const result = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       group,
       accountUsageStore,
     });
@@ -243,7 +244,7 @@ describe('buildConnectedServiceAuthGroupSwitchStateFromAccountUsage', () => {
       resolveBySource: () => null,
     };
 
-    const result = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
+    const result = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       group,
       accountUsageStore,
     });

@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../../daemon/connectedServices/accountGroups/holds/connectedServiceMemberHolds';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   SessionUsageLimitRecoveryOperationResultV1Schema,
@@ -143,7 +144,7 @@ describe('routeSessionUsageLimitRecoverySwitchAccountNow', () => {
         { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true },
         { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
       ],
-      memberStatesByProfileId: new Map([['backup', {
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([['backup', {
         quotaSnapshot: { capturedAtMs: 1000, effectiveRemainingPercent: 99 },
       }]]),
     };

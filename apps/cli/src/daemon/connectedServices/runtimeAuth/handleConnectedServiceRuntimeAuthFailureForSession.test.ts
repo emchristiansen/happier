@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../accountGroups/holds/connectedServiceMemberHolds';
 import { describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1 } from '../accountGroups/selection/selectConnectedServiceAuthGroupCandidate';
@@ -1280,7 +1281,7 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
           { profileId: 'previous', priority: 1, createdAtMs: 1, enabled: true },
           { profileId: 'we-are', priority: 2, createdAtMs: 2, enabled: true },
         ],
-        memberStatesByProfileId: new Map([
+        memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
           ['we-are', {
             quotaSnapshot: {
               capturedAtMs: 1_000,
@@ -2271,7 +2272,7 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         { profileId: 'stale_member', priority: 1, createdAtMs: 1, enabled: true },
         { profileId: 'current', priority: 2, createdAtMs: 2, enabled: true },
       ],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['stale_member', { exhaustedUntilMs: 100_000 }],
         ['current', state === 'unknown' ? {} : {
           quotaSnapshot: { capturedAtMs: 20_000, effectiveRemainingPercent: state === 'exhausted' ? 0 : 60 },
@@ -2489,7 +2490,7 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
       credentialRevision: 'csr_aaaaaaaaaaaaaaaaaaaaaa',
       policy: { ...DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1, strategy: 'priority', autoSwitch: true },
       members: [{ profileId: 'current', priority: 1, createdAtMs: 1, enabled: true }],
-      memberStatesByProfileId: new Map([
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
         ['current', {
           quotaSnapshot: {
             capturedAtMs: 20_000,
@@ -5165,7 +5166,7 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
         { profileId: 'primary', priority: 1, createdAtMs: 1, enabled: true },
         { profileId: 'backup', priority: 2, createdAtMs: 2, enabled: true },
       ],
-      memberStatesByProfileId: new Map(),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map(),
     };
     const switchAttemptTracker = new ConnectedServiceRuntimeAuthSwitchAttemptTracker({
       nowMs: () => 1_000,
@@ -5210,7 +5211,7 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
           ...current,
           activeProfileId: toProfileId,
           generation: current.generation + 1,
-          memberStatesByProfileId: new Map([
+          memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS, memberStatesByProfileId: new Map([
             [toProfileId, {
               quotaSnapshot: {
                 capturedAtMs: 1_000,

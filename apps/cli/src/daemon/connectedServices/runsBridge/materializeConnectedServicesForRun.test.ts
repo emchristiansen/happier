@@ -206,7 +206,7 @@ describe('createExecutionRunConnectedServicesBridge', () => {
   });
 
   it('passes the run\'s model to spawn resolution so per-session member eligibility uses it (HPI-09)', async () => {
-    const resolveAuthForSpawn = vi.fn(async () => buildResolved());
+    const resolveAuthForSpawn = vi.fn(async (_params: Record<string, unknown>) => buildResolved());
     const bridge = createExecutionRunConnectedServicesBridge({
       resolveAuthForSpawn: resolveAuthForSpawn as unknown as ResolveConnectedServiceAuthForRun,
       runtimeRegistry: new ConnectedServiceRuntimeRegistry(),

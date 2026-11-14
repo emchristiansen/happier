@@ -5,6 +5,11 @@ import type {
 } from './selectConnectedServiceAuthGroupCandidate';
 import { isConnectedServiceQuotaObservationFresh } from '@happier-dev/protocol';
 
+import {
+  resolveConnectedServiceMemberHoldExclusion,
+  type ConnectedServiceMemberHoldView,
+} from '../holds/connectedServiceMemberHolds';
+
 function normalizeProfileId(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
 }
@@ -36,11 +41,18 @@ export function resolveConnectedServiceAuthGroupPreTurnQuotaProbeProfileIds(inpu
   nowMs: number;
   quotaFreshnessMs: number;
   allowCurrentProfileRetry: boolean;
+  /**
+   * A held member (or every member, when hold state is unreadable) cannot be selected, so its
+   * quota evidence is not a prerequisite for selection: probing it, or waiting on its deferred
+   * probe, would strand an eligible unheld member behind an account nobody may use.
+   */
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): ReadonlyArray<string> {
   const mode = input.policy.preTurnProbeMode;
   if (mode === 'never') return [];
   const currentProfileId = normalizeProfileId(input.activeProfileId);
-  const enabledMembers = input.members.filter((member) => member.enabled);
+  const enabledMembers = input.members.filter((member) => member.enabled
+    && resolveConnectedServiceMemberHoldExclusion(input.memberHolds, member.profileId, input.nowMs) === null);
   const currentMembers = currentProfileId && input.allowCurrentProfileRetry
     ? enabledMembers.filter((member) => member.profileId === currentProfileId)
     : [];

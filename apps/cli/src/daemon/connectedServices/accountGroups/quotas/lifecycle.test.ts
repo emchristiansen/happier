@@ -1,3 +1,4 @@
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 import {
   buildProviderAccountUsageRecordId,
   type ConnectedServiceAuthGroupV1,
@@ -108,7 +109,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
     const primaryBlocked = createUsageSnapshot({ profileId: 'primary', nowMs, remainingPct: 0, resetAtMs });
     const backupBlocked = createUsageSnapshot({ profileId: 'backup', nowMs, remainingPct: 0, resetAtMs });
 
-    const first = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const first = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'primary',
@@ -130,7 +131,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
       resetAtMs,
     });
 
-    const duplicate = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const duplicate = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'primary',
@@ -145,7 +146,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
     expect(duplicate.nextState).toBe(first.nextState);
 
     const backupRecovered = createUsageSnapshot({ profileId: 'backup', nowMs: nowMs + 1_000, remainingPct: 80 });
-    const recovered = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const recovered = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'backup',
@@ -169,7 +170,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
     const resetAtMs = nowMs + 600_000;
     const group = createGroup();
 
-    const cold = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const cold = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'cold_reconstruction',
       group,
       changedProfileId: 'primary',
@@ -196,7 +197,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
     const nowMs = 1_000_000;
     const group = createGroup();
 
-    const partialBlocked = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const partialBlocked = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'primary',
@@ -215,7 +216,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
       cycleId: 'reset_at_1200000',
       resetAtMs: 1_200_000,
     };
-    const partialRecovered = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const partialRecovered = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'backup',
@@ -242,7 +243,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
     });
     const backupBlocked = createUsageSnapshot({ profileId: 'backup', nowMs, remainingPct: 0 });
 
-    const stale = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const stale = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'primary',
@@ -255,7 +256,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
     });
     expect(stale.edge).toEqual({ phase: 'no_edge' });
 
-    const future = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const future = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'primary',
@@ -272,7 +273,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
     expect(future.edge).toEqual({ phase: 'no_edge' });
     expect(future.nextState).toEqual({ status: 'unblocked' });
 
-    const mismatchedGeneration = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const mismatchedGeneration = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'backup',
@@ -298,7 +299,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
       resetAtMs: 1_200_000,
     };
 
-    const sameWindow = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const sameWindow = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'primary',
@@ -315,7 +316,7 @@ describe('evaluateConnectedServiceAuthGroupQuotaLifecycle', () => {
     expect(sameWindow.edge).toEqual({ phase: 'no_edge' });
     expect(sameWindow.nextState).toEqual(previousState);
 
-    const newWindow = evaluateConnectedServiceAuthGroupQuotaLifecycle({
+    const newWindow = evaluateConnectedServiceAuthGroupQuotaLifecycle({ memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
       mode: 'live_account_usage_change',
       group,
       changedProfileId: 'primary',

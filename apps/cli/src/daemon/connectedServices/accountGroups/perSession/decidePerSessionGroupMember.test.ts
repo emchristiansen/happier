@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 
 import {
   ConnectedServiceAuthGroupPolicyV1Schema,
@@ -78,7 +79,7 @@ function poolOf(scores: Record<string, number | null>) {
       memberStatesByProfileId.set(profileId, { quotaSnapshot: { capturedAtMs: NOW - 1, effectiveRemainingPercent: score } });
     }
   }
-  return { members, memberStatesByProfileId };
+  return { members, memberStatesByProfileId, memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS };
 }
 
 function baseInput(overrides: Partial<Parameters<typeof decidePerSessionGroupMember>[0]> & {

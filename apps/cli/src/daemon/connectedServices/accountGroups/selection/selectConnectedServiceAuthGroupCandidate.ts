@@ -21,6 +21,10 @@ import {
   drawPerSessionOffsetOddsCandidate,
   type PerSessionOffsetOddsTraceEntry,
 } from './perSessionOffsetOddsSelection';
+import {
+  resolveConnectedServiceMemberHoldExclusion,
+  type ConnectedServiceMemberHoldView,
+} from '../holds/connectedServiceMemberHolds';
 
 export {
   reconcileMemberRuntimeStateWithFreshQuotaEvidence,
@@ -164,6 +168,8 @@ type ConnectedServiceAuthGroupCandidateExclusion = Readonly<{
     profileId: string;
     reason:
       | 'current_active'
+      | 'held'
+      | 'hold_state_unreadable'
       | 'quota_probe_deferred'
       | 'disabled'
       | 'cooldown'
@@ -386,7 +392,7 @@ export function resolveConnectedServiceAuthGroupQuotaResetCandidates(
   if (selection.selected || selection.reason === 'manual_strategy') return [];
   const resettable = new Set<string>();
   for (const excluded of selection.excluded) {
-    if (excluded.reason === 'disabled' || excluded.reason === 'auth_invalid' || excluded.reason === 'plan_unavailable') continue;
+    if (excluded.reason === 'disabled' || excluded.reason === 'held' || excluded.reason === 'auth_invalid' || excluded.reason === 'plan_unavailable') continue;
     if (excluded.reason !== 'quota_exhausted') return [];
     const snapshot = params.memberStatesByProfileId.get(excluded.profileId)?.quotaSnapshot;
     if (!isFreshQuotaSnapshot(snapshot, params.nowMs, params.quotaFreshnessMs) || !snapshot) return [];
@@ -703,6 +709,11 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
   policy: ConnectedServiceAuthGroupPolicyV1;
   members: ReadonlyArray<ConnectedServiceAuthGroupMember>;
   memberStatesByProfileId: ReadonlyMap<string, ConnectedServiceAuthGroupMemberRuntimeState>;
+  /**
+   * Externally known member holds for this service. Required so no selection path can forget
+   * them; an unreadable hold source excludes every member rather than being treated as empty.
+   */
+  memberHolds: ConnectedServiceMemberHoldView;
   allowCurrentProfileRetry?: boolean;
   unavailableProfileIds?: ReadonlySet<string>;
   providerLimitId?: string | null;
@@ -756,6 +767,21 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
         profileId: member.profileId,
         decision: 'excluded',
         exclusionReason: 'disabled',
+        quotaEvidence,
+      });
+      continue;
+    }
+    // A known hold applies to the active member too (no same-account retry onto a held member),
+    // and it is checked before any switch candidate is admitted, so held members never consume
+    // switch budget.
+    const holdExclusion = resolveConnectedServiceMemberHoldExclusion(params.memberHolds, member.profileId, params.nowMs);
+    if (holdExclusion) {
+      excluded.push({ profileId: member.profileId, reason: holdExclusion.reason, retryAtMs: holdExclusion.retryAtMs });
+      decisionTraceCandidates.push({
+        profileId: member.profileId,
+        decision: 'excluded',
+        exclusionReason: holdExclusion.reason,
+        retryAtMs: holdExclusion.retryAtMs,
         quotaEvidence,
       });
       continue;

@@ -46,7 +46,7 @@ function classification(overrides: Partial<ConnectedServiceRuntimeFailureClassif
 }
 
 async function intake(tracked: TrackedSession, report: ConnectedServiceRuntimeFailureClassification) {
-  const switchAfterClassifiedFailure = vi.fn(async () => ({
+  const switchAfterClassifiedFailure = vi.fn(async (_input: Record<string, unknown>) => ({
     status: 'switched' as const, activeProfileId: 'c', generation: 3, mode: 'restart_resume' as const,
   }));
   const result = await handleConnectedServiceRuntimeAuthFailureForSession({

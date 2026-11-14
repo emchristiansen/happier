@@ -89,6 +89,7 @@ export function isPerSessionMemberEligible(
     policy: { ...state.policy, strategy: 'priority' },
     members: [member],
     memberStatesByProfileId: state.memberStatesByProfileId,
+    memberHolds: state.memberHolds,
     ...(requiredModelIds.length > 0 ? { requiredModelIds } : {}),
   }).selected?.profileId === profileId;
 }
@@ -193,6 +194,7 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
     policy: input.state.policy,
     members: input.state.members,
     memberStatesByProfileId: input.state.memberStatesByProfileId,
+    memberHolds: input.state.memberHolds,
     quotaFreshnessMs: input.quotaFreshnessMs,
     nowMs: input.nowMs,
     currentProfileId: ownTarget,
@@ -211,7 +213,9 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
     ...(input.reloadState ? {
       reloadMemberState: async () => {
         const fresh = await input.reloadState!();
-        return fresh ? { members: fresh.members, memberStatesByProfileId: fresh.memberStatesByProfileId } : null;
+        return fresh
+          ? { members: fresh.members, memberStatesByProfileId: fresh.memberStatesByProfileId, memberHolds: fresh.memberHolds }
+          : null;
       },
     } : {}),
     ...(deps.log ? { log: deps.log } : {}),

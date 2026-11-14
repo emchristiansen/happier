@@ -4,6 +4,7 @@ import { RuntimeAuthRecoveryScheduler } from '../runtimeAuth/RuntimeAuthRecovery
 import { buildRuntimeAuthRecoveryKey } from '../runtimeAuth/recoveryKey/runtimeAuthRecoveryKey';
 import { listProviderActivityRecoveryIdentitiesFromRuntimeBindings } from '../continuation/continuationRecoveryIdentity';
 import {
+  admitTurnLifecycleProviderActivity,
   createConnectedServiceProviderActivityProofRecorder,
   isProviderActivityTurnLifecycleEvent,
 } from './providerActivityProofRecorder';
@@ -107,6 +108,8 @@ describe('createConnectedServiceProviderActivityProofRecorder', () => {
       proofKind: 'provider_activity',
       expectedAttemptId: 'runtime-auth-attempt:current',
       observedAtMs: 2_000,
+      // No turn ownership was stated by this caller, so the evidence is unverified.
+      evidence: { turnOwnership: 'unverified_turn' },
     });
     expect(markUsageLimitProviderOutcomeProof).toHaveBeenCalledWith({
       sessionId: 'session-1',
@@ -188,5 +191,24 @@ describe('createConnectedServiceProviderActivityProofRecorder', () => {
       status: 'recovered',
       attemptId: attempt.attemptId,
     });
+  });
+});
+
+describe('admitTurnLifecycleProviderActivity', () => {
+  const end = (status: Parameters<typeof admitTurnLifecycleProviderActivity>[0]['turnLifecycle']['status'], terminalStatus?: 'completed' | 'failed') =>
+    admitTurnLifecycleProviderActivity({
+      event: 'assistant_message_end', ...(terminalStatus ? { terminalStatus } : {}), turnLifecycle: { status, activeTurnId: null },
+    });
+
+  it('admits exact-turn completions as exact_turn, rejects stale turns, labels the rest unverified', () => {
+    expect(end('recorded', 'completed')).toEqual({ admitted: true, turnOwnership: 'exact_turn' });
+    expect(end('ignored_marker_not_updated')).toEqual({ admitted: true, turnOwnership: 'exact_turn' });
+    expect(end('ignored_turn_mismatch', 'completed')).toEqual({ admitted: false, reason: 'turn_mismatch' });
+    for (const status of ['ignored_missing_exact_turn', 'ignored_session_not_found', 'ignored_session_ambiguous'] as const) {
+      expect(end(status)).toEqual({ admitted: true, turnOwnership: 'unverified_turn' });
+    }
+    expect(end('recorded', 'failed')).toEqual({ admitted: false, reason: 'not_provider_activity' });
+    expect(admitTurnLifecycleProviderActivity({ event: 'task_started', turnLifecycle: { status: 'recorded', activeTurnId: 't' } }))
+      .toEqual({ admitted: false, reason: 'not_provider_activity' });
   });
 });

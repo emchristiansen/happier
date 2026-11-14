@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { NO_CONNECTED_SERVICE_MEMBER_HOLDS } from '../holds/connectedServiceMemberHolds';
 
 import { ConnectedServiceAuthGroupPolicyV1Schema } from '@happier-dev/protocol';
 
@@ -42,6 +43,7 @@ function select(input: Readonly<{
     policy: input.policyOverride ? ConnectedServiceAuthGroupPolicyV1Schema.parse({ ...policy, ...input.policyOverride }) : policy,
     members,
     memberStatesByProfileId,
+    memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
     ...(input.switchReason ? { switchReason: input.switchReason } : {}),
     perSession: {
       reservationCountsByProfileId: new Map(Object.entries(input.counts ?? {})),
@@ -107,6 +109,7 @@ describe('per_session_softmax selection', () => {
       nowMs: NOW, quotaFreshnessMs: 300_000, activeProfileId: 'a', policy,
       members: [member('a'), member('b', 2)],
       memberStatesByProfileId: new Map([['a', scored(10)], ['b', scored(90)]]),
+      memberHolds: NO_CONNECTED_SERVICE_MEMBER_HOLDS,
     });
     expect(selection.selected).toBeNull();
     expect(selection.reason).toBe('manual_strategy');

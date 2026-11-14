@@ -13,6 +13,8 @@ import { parseConnectArgs, type ConnectParsedOptions } from './connect/parseConn
 import { formatConnectStatusLines, type ConnectStatusServiceListing, type ConnectStatusVendor } from './connect/formatConnectStatus';
 import { resolveConnectAuthIntent } from './connect/resolveConnectAuthIntent';
 import { resolveConnectTargetServiceIds } from './connect/resolveConnectTargetServiceIds';
+import { runConnectHoldCommand } from './connect/connectHold';
+import { runConnectAttemptAccountsCommand } from './connect/connectAttemptAccounts';
 import {
   CONNECT_QUOTA_SUBCOMMANDS,
   connectQuotaExitCode,
@@ -36,6 +38,18 @@ import { fail, info, neutral, ok, sectionTitle, warn } from '@happier-dev/cli-co
  * - connect gemini: Store Gemini OAuth (gemini)
  */
 export async function handleConnectCommand(args: string[]): Promise<void> {
+    const operatorCommand = args[0]?.toLowerCase();
+    if (operatorCommand === 'hold' || operatorCommand === 'attempt-accounts') {
+      try {
+        const write = (line: string) => console.log(line);
+        if (operatorCommand === 'hold') await runConnectHoldCommand({ args: args.slice(1), nowMs: Date.now(), write });
+        else await runConnectAttemptAccountsCommand({ args: args.slice(1), write });
+      } catch (error) {
+        console.error(chalk.red(error instanceof Error ? error.message : String(error)));
+        process.exit(1);
+      }
+      return;
+    }
     const quotaSubcommand = args[0]?.toLowerCase();
     if (quotaSubcommand !== undefined && Object.hasOwn(CONNECT_QUOTA_SUBCOMMANDS, quotaSubcommand)) {
       await handleConnectQuota(quotaSubcommand, args.slice(1));
@@ -107,6 +121,8 @@ ${chalk.bold('Usage:')}
 ${targetLines}
   happier connect status       Show every stored profile and its health, per vendor
   happier connect status --profile <id>        Show only profiles with this id
+  happier connect hold set|release|list        Keep group selection off a known-held profile
+  happier connect attempt-accounts [--session <id>] [--attempt <id>]  Runtime-auth attempts joined to provider-observed accounts (JSON)
   happier connect quota-refresh --service <id> --profile <id> [--json]
                                Ask the refresher to fetch this profile's quota now
   happier connect quota-status --service <id> --profile <id> [--json]

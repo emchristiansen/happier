@@ -16,6 +16,7 @@ import {
   type ConnectedServiceAuthGroupMemberRuntimeState,
   type ConnectedServiceAuthGroupPolicyV1,
 } from '../selection/selectConnectedServiceAuthGroupCandidate';
+import type { ConnectedServiceMemberHoldView } from '../holds/connectedServiceMemberHolds';
 
 /**
  * One per-session member decision for a per_session_softmax group (spec A.2, A.3, A.5 C1–C2, R1–R5).
@@ -92,6 +93,8 @@ export type DecidePerSessionGroupMemberInput = Readonly<{
   policy: ConnectedServiceAuthGroupPolicyV1;
   members: ReadonlyArray<ConnectedServiceAuthGroupMember>;
   memberStatesByProfileId: ReadonlyMap<string, ConnectedServiceAuthGroupMemberRuntimeState>;
+  /** Current member holds (t_1b770ae5): a held member is never drawn or kept as a named start. */
+  memberHolds: ConnectedServiceMemberHoldView;
   quotaFreshnessMs: number;
   nowMs: () => number;
   /** This session's failed/current member, excluded from a replacement draw. */
@@ -126,6 +129,7 @@ export type DecidePerSessionGroupMemberInput = Readonly<{
   reloadMemberState?: () => Promise<Readonly<{
     members: ReadonlyArray<ConnectedServiceAuthGroupMember>;
     memberStatesByProfileId: ReadonlyMap<string, ConnectedServiceAuthGroupMemberRuntimeState>;
+    memberHolds: ConnectedServiceMemberHoldView;
   }> | null>;
   /** Optional log sink for `assignment_reservation_unavailable` and similar events. */
   log?: (event: string, detail: Record<string, unknown>) => void;
@@ -161,6 +165,7 @@ function classifyNamedMember(
     policy: { ...input.policy, strategy: 'priority' },
     members: [member],
     memberStatesByProfileId: input.memberStatesByProfileId,
+    memberHolds: input.memberHolds,
     ...(input.requiredModelIds ? { requiredModelIds: input.requiredModelIds } : {}),
   });
   if (selection.selected?.profileId === profileId) return { kind: 'eligible' };
@@ -183,6 +188,7 @@ function drawMember(
     policy: input.policy,
     members: input.members.filter((member) => !extra.has(member.profileId)),
     memberStatesByProfileId: input.memberStatesByProfileId,
+    memberHolds: input.memberHolds,
     ...(input.requiredModelIds ? { requiredModelIds: input.requiredModelIds } : {}),
     ...(input.switchReason ? { switchReason: input.switchReason } : {}),
     perSession: {
@@ -373,7 +379,12 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
       }
       const reloaded = input.reloadMemberState ? await input.reloadMemberState() : null;
       if (reloaded) {
-        current = { ...input, members: reloaded.members, memberStatesByProfileId: reloaded.memberStatesByProfileId };
+        current = {
+          ...input,
+          members: reloaded.members,
+          memberStatesByProfileId: reloaded.memberStatesByProfileId,
+          memberHolds: reloaded.memberHolds,
+        };
         if (proposal.reason === 'initial_requested' && initialProfileId) {
           const recheck = classifyNamedMember(current, initialProfileId);
           if (recheck.kind === 'configuration_invalid') {

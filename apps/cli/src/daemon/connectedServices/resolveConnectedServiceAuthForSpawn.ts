@@ -68,6 +68,12 @@ import {
   type PerSessionSpawnAssignment,
   type PerSessionSpawnAssignmentDeps,
 } from './accountGroups/perSession/resolvePerSessionGroupMemberForSpawn';
+import {
+  ConnectedServiceGroupMemberHeldForSpawnError,
+  readConfiguredConnectedServiceMemberHolds,
+  resolveConnectedServiceMemberHoldExclusion,
+  type ConnectedServiceMemberHoldView,
+} from './accountGroups/holds/connectedServiceMemberHolds';
 
 type ConnectedServiceAuthGroupResponse = Readonly<{
   v?: number;
@@ -562,6 +568,7 @@ function buildSpawnSwitchState(params: Readonly<{
   accountUsageStore: AccountUsageStoreForAuthGroupSwitchState | null;
   runtimeQuotaSnapshots: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore | null;
   nowMs: number;
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): ConnectedServiceAuthGroupSwitchState | null {
   if (params.accountUsageStore) {
     // CLOSE-11 contract: only an explicitly SOURCE-BACKED account-usage result carries canonical
@@ -569,15 +576,18 @@ function buildSpawnSwitchState(params: Readonly<{
     const accountUsageSwitchState = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
       group: params.group,
       accountUsageStore: params.accountUsageStore,
+      memberHolds: params.memberHolds,
     });
     return accountUsageSwitchState.kind === 'source_backed'
       ? accountUsageSwitchState.state
       : buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({
         group: params.group,
+        memberHolds: params.memberHolds,
       });
   }
   return buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({
     group: params.group,
+    memberHolds: params.memberHolds,
   });
 }
 
@@ -650,6 +660,7 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
   authGroupSwitchCoordinator?: ConnectedServiceAuthGroupPreTurnSwitchCoordinator | null;
   predictiveSoftSwitchMode: 'supported' | 'unsupported';
   quotaProbeDeadlineAtMs?: number;
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): Promise<ConnectedServiceAuthGroupResponse> {
   if (!isFullAuthGroup(params.group)) return params.group;
   // Pre-spawn switches only happen through the injected switch coordinator FSM. There is no
@@ -662,10 +673,16 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
     accountUsageStore: params.accountUsageStore,
     runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
     nowMs: params.nowMs,
+    memberHolds: params.memberHolds,
   });
   if (!state) return params.group;
   if (!state.policy.autoSwitch) return params.group;
-  const activeUsageExhausted = isActiveGroupProfileUsageExhausted(state, params.nowMs);
+  // A held active member cannot serve this spawn: use the existing "active cannot serve" switch
+  // path (gated by switchOn.usageLimit). Selection excludes every held member, so the switch
+  // lands only on an eligible member, and the decision trace names the hold.
+  const activeHeld = state.activeProfileId !== null
+    && resolveConnectedServiceMemberHoldExclusion(state.memberHolds, state.activeProfileId, params.nowMs) !== null;
+  const activeUsageExhausted = activeHeld || isActiveGroupProfileUsageExhausted(state, params.nowMs);
   const switchReason = activeUsageExhausted ? 'usage_limit' : 'soft_threshold';
   if (switchReason === 'soft_threshold' && !params.accountUsageStore) return params.group;
   const predictivePolicy = evaluatePredictiveSoftSwitchPolicy({
@@ -685,6 +702,7 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
       nowMs: params.nowMs,
       quotaFreshnessMs: params.quotaFreshnessMs,
       allowCurrentProfileRetry: true,
+      memberHolds: state.memberHolds,
     }).length > 0
   ) {
     const switched = await params.authGroupSwitchCoordinator.switchBeforeTurn({
@@ -719,6 +737,7 @@ async function maybeSelectGroupActiveProfileForSpawn(params: Readonly<{
     policy: state.policy,
     members: state.members,
     memberStatesByProfileId: state.memberStatesByProfileId,
+    memberHolds: state.memberHolds,
     allowCurrentProfileRetry: true,
   });
   const selectedProfileId = selected.selected?.profileId ?? null;
@@ -757,6 +776,7 @@ async function maybeResolveAuthoritativeGroupForPreTurnUnavailableSwitch(params:
   runtimeQuotaSnapshots: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore | null;
   quotaFreshnessMs: number;
   nowMs: number;
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): Promise<ConnectedServiceAuthGroupResponse | null> {
   if (typeof params.api.getConnectedServiceAuthGroup !== 'function') return null;
   const currentGroup = await params.api.getConnectedServiceAuthGroup({
@@ -773,6 +793,7 @@ async function maybeResolveAuthoritativeGroupForPreTurnUnavailableSwitch(params:
     runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
     quotaFreshnessMs: params.quotaFreshnessMs,
     nowMs: params.nowMs,
+    memberHolds: params.memberHolds,
   })) {
     return null;
   }
@@ -803,6 +824,7 @@ async function resolveCredentialBindings(params: Readonly<{
   clock: () => number;
   perSessionDeadlineAtMs: number;
   perSessionRequiredModelIds: ReadonlyArray<string>;
+  readMemberHolds: (serviceId: ConnectedServiceId) => Promise<ConnectedServiceMemberHoldView>;
 }>): Promise<Readonly<{
   credentialBindings: ReadonlyArray<{ serviceId: ConnectedServiceId; profileId: string }>;
   groupSelections: ReadonlyMap<ConnectedServiceId, ConnectedServiceResolvedGroupSelection>;
@@ -828,6 +850,8 @@ async function resolveCredentialBindings(params: Readonly<{
     if (!group) {
       throw new Error(`Missing connected service auth group (${selection.serviceId}/${selection.groupId})`);
     }
+    // Member holds apply to every selection path, per-session included (t_1b770ae5 HOLD-01/02).
+    const memberHolds = await params.readMemberHolds(selection.serviceId);
     const groupPolicy = (group as { policy?: { strategy?: unknown } }).policy;
     // A session that already owns a per-session member or pending target keeps it even after the
     // group's strategy changes away (spec A.4 Migration, T12): ownership follows the session's
@@ -841,6 +865,7 @@ async function resolveCredentialBindings(params: Readonly<{
         accountUsageStore: params.accountUsageStore,
         runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
         nowMs: params.nowMs,
+        memberHolds,
       })
       : null;
     const keepsOwnedAssignment = ownedState !== null && isPerSessionOwnedTargetUsable({
@@ -858,6 +883,7 @@ async function resolveCredentialBindings(params: Readonly<{
           accountUsageStore: params.accountUsageStore,
           runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
           nowMs: params.nowMs,
+          memberHolds,
         })
         : null;
       if (!state) {
@@ -883,10 +909,27 @@ async function resolveCredentialBindings(params: Readonly<{
               accountUsageStore: params.accountUsageStore,
               runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
               nowMs: params.clock(),
+              memberHolds: await params.readMemberHolds(selection.serviceId),
             })
             : null;
         },
       });
+      // Final admission, as on the shared path: a hold written while the decision was awaited wins.
+      // Nothing launched yet, so a decision this attempt created is released (definite pre-launch).
+      const admissionHolds = await params.readMemberHolds(selection.serviceId);
+      const assignedHold = resolveConnectedServiceMemberHoldExclusion(admissionHolds, assignment.profileId, params.clock());
+      if (assignedHold) {
+        if (assignment.ownedByAttempt) {
+          await params.perSessionAssignment?.releaseAfterDefinitePreLaunchFailure(assignment.decisionId).catch(() => false);
+        }
+        throw new ConnectedServiceGroupMemberHeldForSpawnError({
+          serviceId: selection.serviceId,
+          groupId: selection.groupId,
+          profileId: assignment.profileId,
+          exclusion: assignedHold,
+          unreadableError: admissionHolds.status === 'unreadable' ? admissionHolds.error : null,
+        });
+      }
       credentialBindings.push({ serviceId: selection.serviceId, profileId: assignment.profileId });
       groupSelections.set(selection.serviceId, {
         groupId: selection.groupId,
@@ -919,10 +962,25 @@ async function resolveCredentialBindings(params: Readonly<{
       authGroupSwitchCoordinator: params.authGroupSwitchCoordinator ?? null,
       predictiveSoftSwitchMode: params.predictiveSoftSwitchMode,
       quotaProbeDeadlineAtMs: params.quotaProbeDeadlineAtMs,
+      memberHolds,
     });
     const activeProfileId = readProfileId(selectedGroup.activeProfileId);
     if (!activeProfileId) {
       throw new Error(`Connected service auth group has no active profile (${selection.serviceId}/${selection.groupId})`);
+    }
+    // Never spawn onto a member known to be held (or when holds cannot be read). An explicit
+    // profile selection above is the user's own choice and is not subject to group holds. The
+    // selection above awaited switching and preparation, so admission uses a fresh hold read.
+    const admissionHolds = await params.readMemberHolds(selection.serviceId);
+    const activeHold = resolveConnectedServiceMemberHoldExclusion(admissionHolds, activeProfileId, params.nowMs);
+    if (activeHold) {
+      throw new ConnectedServiceGroupMemberHeldForSpawnError({
+        serviceId: selection.serviceId,
+        groupId: selection.groupId,
+        profileId: activeProfileId,
+        exclusion: activeHold,
+        unreadableError: admissionHolds.status === 'unreadable' ? admissionHolds.error : null,
+      });
     }
     credentialBindings.push({ serviceId: selection.serviceId, profileId: activeProfileId });
     groupSelections.set(selection.serviceId, {
@@ -982,6 +1040,7 @@ function isAuthoritativeGroupActiveProfileEligible(params: Readonly<{
   runtimeQuotaSnapshots: ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore | null;
   quotaFreshnessMs: number;
   nowMs: number;
+  memberHolds: ConnectedServiceMemberHoldView;
 }>): boolean {
   if (!isFullAuthGroup(params.group)) return false;
   const state = buildSpawnSwitchState({
@@ -989,6 +1048,7 @@ function isAuthoritativeGroupActiveProfileEligible(params: Readonly<{
     accountUsageStore: params.accountUsageStore,
     runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
     nowMs: params.nowMs,
+    memberHolds: params.memberHolds,
   });
   if (!state) return false;
   const activeMembers = state.members.filter((member) => member.profileId === params.activeProfileId);
@@ -1002,6 +1062,7 @@ function isAuthoritativeGroupActiveProfileEligible(params: Readonly<{
     policy: state.policy,
     members: activeMembers,
     memberStatesByProfileId: state.memberStatesByProfileId,
+    memberHolds: state.memberHolds,
     allowCurrentProfileRetry: true,
   });
   return selected.selected?.profileId === params.activeProfileId;
@@ -1449,6 +1510,8 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
   previousMaterializedRoot?: string | null;
   existingSessionMetadata?: unknown;
   credentialRefreshService?: ConnectedServiceSpawnCredentialRefreshService | null;
+  /** Externally known member holds; defaults to this Happier home's canonical hold file. */
+  readMemberHolds?: (serviceId: ConnectedServiceId) => Promise<ConnectedServiceMemberHoldView>;
   /**
    * The vendor `--resume` reference the spawned process will resume from. Required for the §2
    * post-materialization reachability re-verify; null/absent means this is a fresh (non-resume)
@@ -1524,6 +1587,7 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
     // The caller's existing spawn deadline; otherwise the existing switch-lease timeout.
     perSessionDeadlineAtMs: params.quotaProbeDeadlineAtMs ?? nowMs + DEFAULT_SWITCH_LEASE_TIMEOUT_MS,
     perSessionRequiredModelIds: resolveSpawnRequiredModelIds(params.modelId),
+    readMemberHolds: params.readMemberHolds ?? readConfiguredConnectedServiceMemberHolds,
   });
   const perSessionSpawnDecisionIds = [...resolvedBindings.groupSelections.values()]
     .flatMap((group) => (group.perSession?.ownedByAttempt ? [group.perSession.decisionId] : []));
