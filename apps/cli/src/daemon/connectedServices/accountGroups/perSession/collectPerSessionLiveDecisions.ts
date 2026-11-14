@@ -2,8 +2,12 @@ import { ConnectedServiceBindingsV1Schema, type ConnectedServiceId } from '@happ
 
 import { readConnectedServiceMaterializationIdentityV1 } from '../../materialize/createConnectedServiceMaterializationIdentity';
 import type { PerSessionLiveDecision, PerSessionProvedSharedConversion } from './PerSessionAssignmentRuntime';
+import { readTrackedLauncherIdentity } from './readTrackedLauncherIdentity';
 
 type TrackedSessionLike = Readonly<{
+  pid?: number;
+  sessionRunnerPid?: number;
+  processInstanceFingerprint?: string;
   happySessionId?: string;
   happySessionMetadataFromLocalWebhook?: Readonly<Record<string, unknown>> | null;
   spawnOptions?: Readonly<{
@@ -45,6 +49,7 @@ export function collectPerSessionLiveDecisions(tracked: Iterable<TrackedSessionL
     const fromMetadata = ConnectedServiceBindingsV1Schema.safeParse(metadata?.connectedServices);
     const parsed = fromMetadata.success ? fromMetadata : ConnectedServiceBindingsV1Schema.safeParse(session.spawnOptions?.connectedServices);
     if (!parsed.success) continue;
+    const runner = readTrackedLauncherIdentity(session);
     for (const [serviceId, binding] of Object.entries(parsed.data.bindingsByServiceId)) {
       if (!binding || binding.source !== 'connected' || binding.selection !== 'group') continue;
       // Both decisions a runner carries are live: the applied member it still serves on and the
@@ -68,6 +73,7 @@ export function collectPerSessionLiveDecisions(tracked: Iterable<TrackedSessionL
           ...(assignment.temperature === undefined ? {} : { temperature: assignment.temperature }),
           ...(assignment.offsetPercent === undefined ? {} : { offsetPercent: assignment.offsetPercent }),
           ...(assignment.probability === undefined ? {} : { probability: assignment.probability }),
+          ...(runner ? { runner } : {}),
         });
       }
     }

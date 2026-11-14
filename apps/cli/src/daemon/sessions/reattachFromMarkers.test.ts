@@ -85,9 +85,10 @@ vi.mock('../doctor', () => ({
 }));
 
 // Synthetic fixture PIDs must not read a coincidentally live host process's identity.
+const processFingerprints = vi.hoisted(() => new Map<number, string>());
 vi.mock('@happier-dev/cli-common/processInstance', async (importOriginal) => ({
   ...await importOriginal<typeof import('@happier-dev/cli-common/processInstance')>(),
-  readProcessInstanceFingerprintSync: () => null,
+  readProcessInstanceFingerprintSync: (pid: number) => processFingerprints.get(pid) ?? null,
 }));
 
 vi.mock('../reattach', () => ({
@@ -1154,6 +1155,50 @@ describe('reattachTrackedSessionsFromMarkers', () => {
         startedBy: 'daemon',
       }),
     );
+  });
+
+  it.each([
+    ['a fingerprint-rejected marker', 'linux-proc:200', false],
+    ['the same incarnation', 'linux-proc:100', true],
+  ] as const)('fallback recovery restores the observed launch only for %s (HPI-41)', async (_label, currentFingerprint, restored) => {
+    const launched = { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'g' } } };
+    vi.mocked(listSessionMarkers).mockResolvedValue([
+      {
+        pid: 23457,
+        happySessionId: 'session-launch-fallback',
+        happyHomeDir: '/tmp/happy',
+        createdAt: 1,
+        updatedAt: 1,
+        startedBy: 'daemon',
+        cwd: '/tmp/project',
+        processCommandHash: 'a'.repeat(64),
+        processInstanceFingerprint: 'linux-proc:100',
+        respawn: { version: 1, directory: '/tmp/project', backendTarget: { kind: 'builtInAgent', agentId: 'claude' } },
+        launchedConnectedServices: launched,
+      } as any,
+    ]);
+    mockHappyProcessesForDiscovery([
+      {
+        pid: 23457,
+        type: 'daemon-spawned-session',
+        cwd: '/tmp/project',
+        command:
+          '/home/guest/.happier/cli-preview/current/happier claude --happy-starting-mode remote --started-by daemon --existing-session session-launch-fallback',
+      } as any,
+    ]);
+    vi.spyOn(process, 'kill').mockImplementation(() => true);
+    processFingerprints.set(23457, currentFingerprint);
+    try {
+      const pidToTrackedSession = new Map<number, TrackedSession>();
+      await reattachTrackedSessionsFromMarkers({ pidToTrackedSession });
+      const tracked = pidToTrackedSession.get(23457);
+      expect(tracked).toEqual(expect.objectContaining({ pid: 23457, processInstanceFingerprint: currentFingerprint }));
+      expect(tracked?.launchedConnectedServices).toEqual(restored ? launched : undefined);
+      const rewrite = vi.mocked(writeSessionMarker).mock.calls.at(-1)?.[0];
+      expect(rewrite?.launchedConnectedServices).toEqual(restored ? launched : undefined);
+    } finally {
+      processFingerprints.clear();
+    }
   });
 
   it('applies incomplete marker metadata runtime snapshot when recovering markerless daemon sessions', async () => {

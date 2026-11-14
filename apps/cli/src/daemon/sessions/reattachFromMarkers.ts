@@ -30,6 +30,7 @@ import {
   writeSessionMarker,
   type DaemonSessionMarker,
 } from '../sessionRegistry';
+import { readMarkerLaunchForProcess } from '../readMarkerLaunchForProcess';
 import { extractResumeIdFromCommand } from './extractResumeIdFromCommand';
 import {
   readTerminalAttachmentState,
@@ -203,6 +204,8 @@ async function recoverMarkerlessDaemonSpawnedSessions(params: Readonly<{
     metadata?: unknown;
     respawn?: unknown;
     connectedServiceRestartIntent?: DaemonSessionMarker['connectedServiceRestartIntent'];
+    processInstanceFingerprint?: string;
+    launchedConnectedServices?: unknown;
   }>>;
   markedPids: ReadonlySet<number>;
   pidToTrackedSession: Map<number, TrackedSession>;
@@ -302,6 +305,11 @@ async function recoverMarkerlessDaemonSpawnedSessions(params: Readonly<{
       vendorResumeId,
     });
     const processInstanceFingerprint = readProcessInstanceFingerprintSync(processInfo.pid) ?? undefined;
+    // A marker this recovery reaches may have been rejected for another incarnation; its launch is
+    // proof only for the process it was observed on (HPI-41).
+    const launchedConnectedServices = incompleteMarker
+      ? readMarkerLaunchForProcess(incompleteMarker, processInstanceFingerprint)
+      : undefined;
     const trackedSession: TrackedSession = {
       startedBy: 'daemon',
       happySessionId,
@@ -310,6 +318,7 @@ async function recoverMarkerlessDaemonSpawnedSessions(params: Readonly<{
       ...(processInstanceFingerprint ? { processInstanceFingerprint } : {}),
       processCommand: processInfo.command,
       reattachedFromDiskMarker: true,
+      ...(launchedConnectedServices !== undefined ? { launchedConnectedServices } : {}),
       ...(vendorResumeId ? { vendorResumeId } : {}),
       ...(spawnOptions ? { spawnOptions } : {}),
     };
@@ -335,6 +344,7 @@ async function recoverMarkerlessDaemonSpawnedSessions(params: Readonly<{
       ...(incompleteMarker?.connectedServiceRestartIntent
         ? { connectedServiceRestartIntent: incompleteMarker.connectedServiceRestartIntent }
         : {}),
+      ...(launchedConnectedServices !== undefined ? { launchedConnectedServices } : {}),
     });
     recovered++;
   }
@@ -538,6 +548,8 @@ export async function reattachTrackedSessionsFromMarkers(params: Readonly<{
             metadata: marker.metadata,
             respawn: marker.respawn,
             connectedServiceRestartIntent: marker.connectedServiceRestartIntent,
+            processInstanceFingerprint: marker.processInstanceFingerprint,
+            launchedConnectedServices: marker.launchedConnectedServices,
           },
         ] as const),
     );

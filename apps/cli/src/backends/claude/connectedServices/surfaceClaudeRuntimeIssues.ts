@@ -480,8 +480,8 @@ function buildClaudeRuntimeQuotaSnapshot(params: Readonly<{
         ...(primaryWindow.sourceProviderOrganizationId ? { providerOrganizationId: primaryWindow.sourceProviderOrganizationId } : {}),
         fetchedAt: params.fetchedAt,
         fetchedAtMs: params.fetchedAt,
-        staleAfterMs: 300_000,
-        staleAtMs: params.fetchedAt + 300_000,
+        staleAfterMs: CLAUDE_RUNTIME_QUOTA_STALE_AFTER_MS,
+        staleAtMs: params.fetchedAt + CLAUDE_RUNTIME_QUOTA_STALE_AFTER_MS,
         planLabel: primaryWindow.planType,
         accountLabel: null,
         source,
@@ -524,7 +524,27 @@ function resolveClaudeQuotaSnapshotTarget(session: RuntimeIssueSession, input: R
 }
 
 /** When the provider captured an in-band quota observation, if it said so (never receipt time). */
-export type ClaudeQuotaEvidenceCapture = Readonly<{ providerCapturedAtMs: number | null }>;
+export type ClaudeQuotaEvidenceCapture = Readonly<{
+    providerCapturedAtMs: number | null;
+    /**
+     * The row was read back from transcript history (the reader's replay window). Its receipt says
+     * nothing about when quota was captured, so its freshness clock is the capture it states (HPI-30).
+     */
+    replayed?: boolean;
+}>;
+
+/** Freshness of a Claude in-band quota snapshot (its `staleAfterMs`). */
+const CLAUDE_RUNTIME_QUOTA_STALE_AFTER_MS = 300_000;
+
+/**
+ * Whether a replayed quota row is still current evidence: it states its capture, and that capture is
+ * within the snapshot freshness window. Older rows are history, never ingested (HPI-30).
+ */
+export function isReplayedClaudeQuotaCaptureCurrent(providerCapturedAtMs: number | null, nowMs: number): providerCapturedAtMs is number {
+    return typeof providerCapturedAtMs === 'number'
+        && providerCapturedAtMs <= nowMs
+        && nowMs - providerCapturedAtMs < CLAUDE_RUNTIME_QUOTA_STALE_AFTER_MS;
+}
 
 export async function recordClaudeRateLimitQuotaEvidence(
     session: RuntimeIssueSession,
@@ -538,8 +558,12 @@ export async function recordClaudeRateLimitQuotaEvidence(
     const target = resolveClaudeQuotaSnapshotTarget(session, {});
     if (!target.profileId) return;
     // All windows come from one provider response, so one account identity covers them.
+    const receivedAt = Date.now();
+    if (capture?.replayed && !isReplayedClaudeQuotaCaptureCurrent(capture.providerCapturedAtMs, receivedAt)) return;
     const enrichedPrimaryWindow = await enrichClaudeRuntimeEvidenceWithAccountIdentity(session, primaryWindow);
-    const observedAt = Date.now();
+    // A live row's freshness runs from receipt; a replayed row's from the capture it states, so it can
+    // never present history as fresher than it is or displace newer state.
+    const observedAt = capture?.replayed && typeof capture.providerCapturedAtMs === 'number' ? capture.providerCapturedAtMs : receivedAt;
     void claudeQuotaSnapshotDeliveryOutbox.enqueueAndFlush({
         sessionId: session.client.sessionId,
         serviceId: target.serviceId,

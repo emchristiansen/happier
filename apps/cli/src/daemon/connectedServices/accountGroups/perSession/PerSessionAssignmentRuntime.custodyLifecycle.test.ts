@@ -29,6 +29,8 @@ const NOW = 1_000_000;
 type Event = Readonly<{ put: string } | { delete: string }>;
 type TrackedFixture = Readonly<{
   happySessionId: string;
+  pid?: number;
+  processInstanceFingerprint?: string;
   happySessionMetadataFromLocalWebhook?: Record<string, unknown>;
   spawnOptions: Readonly<{ connectedServices: unknown }>;
 }>;
@@ -411,9 +413,34 @@ describe('recovery replay and redraw (HPI-21, HPI-26)', () => {
   }
 
   it.each([
-    ['requests the deferred restart again when no runner was launched with the committed decision', [], 'spawn_next_turn'],
-    ['waits for adoption once a runner was launched with it', ['replay-c'], 'restart_resume'],
-  ] as const)('a durable retry %s', async (_label, launchedDecisionIds, mode) => {
+    ['requests the deferred restart again when no runner was ever started with the committed decision', null, 'spawn_next_turn'],
+    ['requests it again when the recorded launch is not the current runner', 77, 'spawn_next_turn'],
+    ['waits for adoption once the current runner is the one started with it', 123, 'restart_resume'],
+  ] as const)('a durable retry %s', async (_label, launchedPid, mode) => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'replay-c', { profileId: 'c' });
+    if (launchedPid !== null) await ledger.recordLaunchedRunner(['replay-c'], { pid: launchedPid }, 2);
+    const member = { assignment: 'per_session', profileId: 'a', decisionId: 'applied-a', reason: 'initial_sampled', appliedAtMs: 1 };
+    const pending = { profileId: 'c', decisionId: 'replay-c', reason: 'failover', materializedAtMs: 2 };
+    const applied: string[] = [];
+    const coordinator = coordinatorFor(ledger, {
+      state: groupState,
+      // Metadata and (mutable) respawn options both already name the target; only the ledger's launch
+      // record says whether a runner was started with it.
+      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, materializedAssignment: pending, runner: { pid: 123 } }),
+      applied,
+    });
+    const result = await coordinator.switchAfterClassifiedFailure({ sessionId: 'subject', serviceId, groupId: 'g', reason: 'usage_limit', observedProfileId: 'a' });
+    expect(result).toMatchObject({ status: 'switched', activeProfileId: 'c', mode });
+    expect(applied).toEqual([]);
+    expect(ids(ledger)).toEqual(['replay-c']);
+  });
+
+  it.each([
+    ['a runner launched with the target, though its launch record was never written (HPI-31)', ['applied-a', 'replay-c'], 'restart_resume'],
+    ['the reporting runner, launched before the target existed', ['applied-a'], 'spawn_next_turn'],
+    ['a runner whose launch was not observed (reattached) and has no launch record', undefined, 'spawn_next_turn'],
+  ] as const)('replay judges the restart performed from the launch the spawn site recorded: %s', async (_label, launchedIds, mode) => {
     const { ledger } = await freshLedger();
     await record(ledger, 'replay-c', { profileId: 'c' });
     const member = { assignment: 'per_session', profileId: 'a', decisionId: 'applied-a', reason: 'initial_sampled', appliedAtMs: 1 };
@@ -421,13 +448,120 @@ describe('recovery replay and redraw (HPI-21, HPI-26)', () => {
     const applied: string[] = [];
     const coordinator = coordinatorFor(ledger, {
       state: groupState,
-      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, materializedAssignment: pending, launchedDecisionIds }),
+      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, materializedAssignment: pending, runner: { pid: 123 }, ...(launchedIds ? { runnerLaunchedDecisionIds: launchedIds } : {}) }),
       applied,
     });
     const result = await coordinator.switchAfterClassifiedFailure({ sessionId: 'subject', serviceId, groupId: 'g', reason: 'usage_limit', observedProfileId: 'a' });
     expect(result).toMatchObject({ status: 'switched', activeProfileId: 'c', mode });
     expect(applied).toEqual([]);
-    expect(ids(ledger)).toEqual(['replay-c']);
+  });
+
+  it.each([
+    ['performed: the current runner was launched with the conversion target', ['applied-a', 'convert-b'], 'restart_resume'],
+    ['definitely not performed: the old runner still runs', ['applied-a'], 'spawn_next_turn'],
+  ] as const)('a replayed shared conversion is %s (HPI-32)', async (_label, launchedIds, mode) => {
+    const { ledger } = await freshLedger();
+    const member = { assignment: 'per_session', profileId: 'a', decisionId: 'applied-a', reason: 'initial_sampled', appliedAtMs: 1 };
+    const pending = { home: 'group', profileId: 'b', decisionId: 'convert-b', reason: 'policy_rollback', materializedAtMs: 2 };
+    const shared = () => ({ ...groupState(), policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ strategy: 'least_limited', autoSwitch: true }) });
+    const coordinator = coordinatorFor(ledger, {
+      state: shared,
+      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, materializedAssignment: pending, runner: { pid: 456 }, runnerLaunchedDecisionIds: launchedIds }),
+      applied: [],
+    });
+    // The durable retry replays the old runner's original report on A.
+    const result = await coordinator.switchAfterClassifiedFailure({ sessionId: 'subject', serviceId, groupId: 'g', reason: 'usage_limit', observedProfileId: 'a' });
+    expect(result).toMatchObject({ status: 'switched', activeProfileId: 'b', mode });
+  });
+
+  it.each([
+    ['refused while its launch is unperformed', ['applied-a'], { status: 'generation_apply_failed', activeProfileId: 'b' }],
+    ['left awaiting adoption once its launch is performed', ['applied-a', 'convert-b'], { status: 'switched', activeProfileId: 'b', mode: 'restart_resume' }],
+  ] as const)('a replayed shared conversion onto a held member is %s (HPI-45)', async (_label, launchedIds, expected) => {
+    const { ledger } = await freshLedger();
+    const member = { assignment: 'per_session', profileId: 'a', decisionId: 'applied-a', reason: 'initial_sampled', appliedAtMs: 1 };
+    const pending = { home: 'group', profileId: 'b', decisionId: 'convert-b', reason: 'policy_rollback', materializedAtMs: 2 };
+    const shared = () => ({
+      ...groupState(),
+      policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ strategy: 'least_limited', autoSwitch: true }),
+      memberHolds: { status: 'readable', holdsByProfileId: new Map([['b', {
+        serviceId, profileId: 'b', reason: 'test', source: 'test', heldAtMs: 1, lifetime: { kind: 'until_released' as const },
+      }]]) },
+    }) as unknown as ReturnType<typeof groupState>;
+    const applied: string[] = [];
+    const coordinator = coordinatorFor(ledger, {
+      state: shared,
+      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, materializedAssignment: pending, runner: { pid: 456 }, runnerLaunchedDecisionIds: launchedIds }),
+      applied,
+    });
+    const result = await coordinator.switchAfterClassifiedFailure({ sessionId: 'subject', serviceId, groupId: 'g', reason: 'usage_limit', observedProfileId: 'a' });
+    expect(result).toMatchObject(expected);
+    // Neither case rewrites the committed conversion or the proved member.
+    expect(applied).toEqual([]);
+  });
+
+  it.each([
+    ['missing from the ledger', false],
+    ['rebuilt from live bindings as a spawn-origin entry', true],
+  ] as const)('resumes the committed pending target under its own decision when it is %s (HPI-39)', async (_label, rebuilt) => {
+    const { ledger } = await freshLedger();
+    if (rebuilt) await record(ledger, 'pending-b', { profileId: 'b', origin: 'spawn' });
+    const member = { assignment: 'per_session', profileId: 'a', decisionId: 'applied-a', reason: 'initial_sampled', appliedAtMs: 1 };
+    const pending = { profileId: 'b', decisionId: 'pending-b', reason: 'failover', materializedAtMs: 2 };
+    const applied: string[] = [];
+    const coordinator = coordinatorFor(ledger, {
+      state: groupState,
+      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, materializedAssignment: pending, runner: { pid: 123 }, runnerLaunchedDecisionIds: ['applied-a', 'pending-b'] }),
+      applied,
+    });
+    const result = await coordinator.switchAfterClassifiedFailure({ sessionId: 'subject', serviceId, groupId: 'g', reason: 'usage_limit', observedProfileId: 'a' });
+    expect(result).toMatchObject({ status: 'switched', activeProfileId: 'b', mode: 'restart_resume' });
+    expect(applied).toEqual([]);
+    expect(ids(ledger)).toEqual(rebuilt ? ['pending-b'] : []);
+  });
+
+  it.each([
+    ['missing, before its launch', false, false],
+    ['missing, after its launch', false, true],
+    ['rebuilt, before its launch', true, false],
+    ['rebuilt, after its launch', true, true],
+  ] as const)('replaces a committed pending target that is no longer eligible when its record is %s (HPI-42)', async (_label, rebuilt, launched) => {
+    const { ledger } = await freshLedger();
+    if (rebuilt) await record(ledger, 'pending-b', { profileId: 'b', origin: 'spawn' });
+    const member = { assignment: 'per_session', profileId: 'a', decisionId: 'applied-a', reason: 'initial_sampled', appliedAtMs: 1 };
+    const pending = { profileId: 'b', decisionId: 'pending-b', reason: 'failover', materializedAtMs: 2 };
+    const applied: string[] = [];
+    const coordinator = coordinatorFor(ledger, {
+      state: () => {
+        const state = groupState();
+        state.members = state.members.map((m) => ({ ...m, enabled: m.profileId !== 'b' }));
+        return state;
+      },
+      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, materializedAssignment: pending, runner: { pid: 123 },
+        runnerLaunchedDecisionIds: launched ? ['applied-a', 'pending-b'] : ['applied-a'] }),
+      applied,
+    });
+    const result = await coordinator.switchAfterClassifiedFailure({ sessionId: 'subject', serviceId, groupId: 'g', reason: 'usage_limit', observedProfileId: 'a' });
+    expect(result).toMatchObject({ status: 'switched', activeProfileId: 'c', mode: 'spawn_next_turn' });
+    expect(applied).toEqual(['c']);
+    const replacement = ledger.list().find((entry) => entry.proposal.profileId === 'c');
+    expect(replacement?.replacesDecisionIds).toEqual(['pending-b']);
+    // The superseded target keeps custody until its replacement is adopted.
+    if (rebuilt) expect(ledger.get('pending-b')).toBeDefined();
+  });
+
+  it('records the started runner on every decision the launch carries, owned or reused', async () => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'reused-c', { profileId: 'c' });
+    await record(ledger, 'owned-d', { profileId: 'a', origin: 'spawn' });
+    const custody = runtimeFor(ledger, () => []).createSpawnCustody();
+    custody.claim(['owned-d']);
+    custody.claimLaunched(['reused-c', 'owned-d']);
+    await custody.markLaunchAttempted();
+    await custody.recordRunner({ pid: 55 });
+    expect(ledger.get('reused-c')).toMatchObject({ launchedRunner: { pid: 55 } });
+    expect(ledger.get('reused-c')?.runner).toBeUndefined();
+    expect(ledger.get('owned-d')).toMatchObject({ launchedRunner: { pid: 55 }, runner: { pid: 55 } });
   });
 
   it('redraws from the fresh state that refused the target, reaching a member added meanwhile', async () => {
@@ -438,7 +572,7 @@ describe('recovery replay and redraw (HPI-21, HPI-26)', () => {
     const applied: string[] = [];
     const coordinator = coordinatorFor(ledger, {
       state: () => state,
-      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, launchedDecisionIds: ['applied-a'] }),
+      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, runner: { pid: 123 } }),
       applied,
       // While B's reservation is acknowledged, the group replaces B with a healthy C.
       onPut: (profileId) => {
@@ -452,5 +586,152 @@ describe('recovery replay and redraw (HPI-21, HPI-26)', () => {
     expect(result).toMatchObject({ status: 'switched', activeProfileId: 'c' });
     expect(applied).toEqual(['c']);
     expect(ledger.list().map((entry) => entry.proposal.profileId)).toEqual(['c']);
+  });
+});
+
+describe('offline-ended recovery retention (HPI-28)', () => {
+  async function appliedRecovery(ledger: PerSessionAssignmentLedger, decisionId: string, pid: number, sessionId = 'subject') {
+    await record(ledger, decisionId, { sessionId });
+    await ledger.markApplied(decisionId, 1);
+    // A restart-resume launch records the runner only as launched, never as this decision's own spawn.
+    await ledger.recordLaunchedRunner([decisionId], { pid }, 1);
+  }
+
+  it('releases an applied recovery decision whose launched runner is proved gone and nothing for the subject is pending', async () => {
+    const { ledger } = await freshLedger();
+    await appliedRecovery(ledger, 'recovered-b', 9);
+    const events: Event[] = [];
+    await runtimeFor(ledger, () => [], { events, presence: 'absent' }).tick();
+    expect(ids(ledger)).toEqual([]);
+    expect(events).toContainEqual({ delete: 'recovered-b' });
+  });
+
+  it('control: keeps it while a recovery for the same subject is still pending, and while runner presence is unknown', async () => {
+    const { ledger } = await freshLedger();
+    await appliedRecovery(ledger, 'recovered-b', 9);
+    await record(ledger, 'pending-c', { profileId: 'c' });
+    await runtimeFor(ledger, () => [], { presence: 'absent' }).tick();
+    expect(ids(ledger)).toContain('recovered-b');
+
+    const { ledger: unknownLedger } = await freshLedger();
+    await appliedRecovery(unknownLedger, 'recovered-b', 9);
+    await runtimeFor(unknownLedger, () => [], { presence: 'unknown' }).tick();
+    expect(ids(unknownLedger)).toEqual(['recovered-b']);
+  });
+
+  it('releases the subjects whose recorded or launched runner ended while the daemon was down, and nothing else', async () => {
+    const { ledger } = await freshLedger();
+    await appliedRecovery(ledger, 'recovered-b', 9);
+    await record(ledger, 'spawned-c', { profileId: 'c', origin: 'spawn', sessionId: 'other' });
+    await ledger.recordRunner('spawned-c', { pid: 10 }, 1);
+    await record(ledger, 'alive-d', { profileId: 'a', origin: 'spawn', sessionId: 'alive' });
+    await ledger.recordRunner('alive-d', { pid: 11 }, 1);
+    const runtime = runtimeFor(ledger, () => []);
+    await runtime.releaseForEndedRunnerPids([]);
+    expect(ids(ledger)).toEqual(['alive-d', 'recovered-b', 'spawned-c']);
+    await runtime.releaseForEndedRunnerPids([9, 10, 404]);
+    expect(ids(ledger)).toEqual(['alive-d']);
+  });
+
+  it('never retires an unfinished recovery chain because its old runner ended offline (HPI-01 kept)', async () => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'first-b', { origin: 'spawn' });
+    await ledger.recordRunner('first-b', { pid: 1 }, 1);
+    await record(ledger, 'successor-c', { profileId: 'c', replaces: ['first-b'] });
+    const events: Event[] = [];
+    await runtimeFor(ledger, () => [], { events }).releaseForEndedRunnerPids([1]);
+    expect(ids(ledger)).toEqual(['first-b', 'successor-c']);
+    expect(events).toEqual([]);
+  });
+});
+
+describe('runner identity of reused launches and rebuilt entries (HPI-33)', () => {
+  it('a rebuilt entry keeps the live runner carrying it, so its next offline end releases it once', async () => {
+    const { ledger } = await freshLedger();
+    const member = { assignment: 'per_session', profileId: 'b', decisionId: 'resumed-d', reason: 'initial_sampled', appliedAtMs: 1 };
+    let sessions: TrackedFixture[] = [{
+      happySessionId: 'subject',
+      pid: 200, processInstanceFingerprint: 'fp-200',
+      spawnOptions: { connectedServices: groupBindings({ member }) },
+      happySessionMetadataFromLocalWebhook: { connectedServices: groupBindings({ member }) },
+    }];
+    const events: Event[] = [];
+    const runtime = runtimeFor(ledger, () => sessions, { events, presence: 'present' });
+    await runtime.tick();
+    expect(ledger.get('resumed-d')).toMatchObject({ state: 'applied', launchedRunner: { pid: 200, processInstanceFingerprint: 'fp-200' } });
+
+    // The resumed session ends while the daemon is down; startup reports its dead marker.
+    sessions = [];
+    await runtime.releaseForEndedRunnerPids([200]);
+    expect(ids(ledger)).toEqual([]);
+    expect(events.filter((event) => 'delete' in event)).toEqual([{ delete: 'resumed-d' }]);
+  });
+
+  it('a healthy live tick completes a rebuild cut before its runner write, so the offline end releases once (HPI-36)', async () => {
+    const { ledger } = await freshLedger();
+    // Durable state left by the cut: proposal and applied written, runner never recorded.
+    await record(ledger, 'resumed-d', { origin: 'spawn' });
+    await ledger.markApplied('resumed-d', 1);
+    const member = { assignment: 'per_session', profileId: 'b', decisionId: 'resumed-d', reason: 'initial_sampled', appliedAtMs: 1 };
+    let sessions: TrackedFixture[] = [{
+      happySessionId: 'subject', pid: 200, processInstanceFingerprint: 'fp-200',
+      spawnOptions: { connectedServices: groupBindings({ member }) },
+      happySessionMetadataFromLocalWebhook: { connectedServices: groupBindings({ member }) },
+    }];
+    const events: Event[] = [];
+    const runtime = runtimeFor(ledger, () => sessions, { events, presence: 'present' });
+    await runtime.tick();
+    expect(ledger.get('resumed-d')).toMatchObject({ launchedRunner: { pid: 200, processInstanceFingerprint: 'fp-200' } });
+    await runtime.tick();
+    sessions = [];
+    await runtime.releaseForEndedRunnerPids([200]);
+    expect(ids(ledger)).toEqual([]);
+    expect(events.filter((event) => 'delete' in event)).toEqual([{ delete: 'resumed-d' }]);
+  });
+
+  it('never credits the current runner as the launch of a pending target its bindings already name (HPI-21 kept)', async () => {
+    const { ledger } = await freshLedger();
+    const member = { assignment: 'per_session', profileId: 'a', decisionId: 'applied-a', reason: 'initial_sampled', appliedAtMs: 1 };
+    const pending = { profileId: 'c', decisionId: 'pending-c', reason: 'failover', materializedAtMs: 2 };
+    let sessions: TrackedFixture[] = [{
+      happySessionId: 'subject', pid: 123,
+      spawnOptions: { connectedServices: groupBindings({ member, materializedAssignment: pending }) },
+      happySessionMetadataFromLocalWebhook: { connectedServices: groupBindings({ member, materializedAssignment: pending }) },
+    }];
+    const runtime = runtimeFor(ledger, () => sessions, { presence: 'present' });
+    await runtime.tick();
+    await runtime.tick();
+    expect(ledger.get('pending-c')?.launchedRunner).toBeUndefined();
+    // Recorded only as its carrier: not definitely pre-launch, and retired when that runner ends offline.
+    expect(ledger.get('pending-c')?.carrierRunner).toEqual({ pid: 123 });
+    expect(ledger.get('applied-a')).toMatchObject({ launchedRunner: { pid: 123 } });
+    expect(await runtime.releaseAfterDefinitePreLaunchFailure('pending-c')).toBe(false);
+    sessions = [];
+    await runtime.releaseForEndedRunnerPids([123]);
+    expect(ids(ledger)).toEqual([]);
+  });
+
+  it('an earlier runner\'s offline end never retires a resumed launch not yet recorded', async () => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'old-b', { origin: 'spawn' });
+    await ledger.recordRunner('old-b', { pid: 100 }, 1);
+    await ledger.markApplied('old-b', 1);
+    await record(ledger, 'resumed-c', { profileId: 'c', origin: 'spawn' });
+    await ledger.markLaunchAttempted(['resumed-c'], 2);
+    await runtimeFor(ledger, () => []).releaseForEndedRunnerPids([100]);
+    expect(ids(ledger)).toEqual(['old-b', 'resumed-c']);
+  });
+
+  it('a later launch, not the decision\'s first runner, decides its retirement', async () => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'spawned-b', { origin: 'spawn' });
+    await ledger.recordRunner('spawned-b', { pid: 100 }, 1);
+    await ledger.markApplied('spawned-b', 1);
+    await ledger.recordLaunchedRunner(['spawned-b'], { pid: 200 }, 2);
+    const runtime = runtimeFor(ledger, () => []);
+    await runtime.releaseForEndedRunnerPids([100]);
+    expect(ids(ledger)).toEqual(['spawned-b']);
+    await runtime.releaseForEndedRunnerPids([200]);
+    expect(ids(ledger)).toEqual([]);
   });
 });

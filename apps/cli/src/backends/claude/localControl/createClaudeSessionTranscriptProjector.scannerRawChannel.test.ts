@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -12,6 +12,13 @@ import { createSessionScanner } from '../utils/sessionScanner';
 import { getProjectPath } from '../utils/path';
 import { createClaudeSessionTranscriptProjector } from './createClaudeSessionTranscriptProjector';
 import { wireClaudeWorkflowActivitySource } from '../workflows/wireClaudeWorkflowActivitySource';
+
+// Quota delivery is the only replaced boundary: the scanner, projector and mapper are real.
+const recordQuota = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => {}));
+vi.mock('../connectedServices/surfaceClaudeRuntimeIssues', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../connectedServices/surfaceClaudeRuntimeIssues')>(),
+  recordClaudeRateLimitQuotaEvidence: recordQuota,
+}));
 
 // INTEGRATION (plan H7): the native Claude `/goal` signal is a `goal_status`
 // transcript ATTACHMENT. The session scanner DELIBERATELY drops `attachment`
@@ -156,6 +163,83 @@ describe('Claude goal source — scanner raw-channel integration (H7)', () => {
     // F2 guard: the goal_status attachment must STILL be kept out of the visible
     // transcript even though the goal source observed it on the raw channel.
     expect(readVisibleTranscriptTypes(fixture.session)).not.toContain('attachment');
+  });
+
+  it('ingests a rate_limit_event row read off the scanner raw channel as quota evidence with its own capture time, never as visible transcript (HPI-30)', async () => {
+    recordQuota.mockClear();
+    const claudeSessionId = 'integration-claude-session-quota';
+    const fixture = createSessionFixture(claudeSessionId);
+    await wireScannerToProjector({ claudeSessionId, fixture });
+
+    const sessionFile = join(projectDir, `${claudeSessionId}.jsonl`);
+    const rateLimitRow = (uuid: string, timestamp: string) => ({
+      type: 'rate_limit_event', uuid, sessionId: claudeSessionId, timestamp,
+      rate_limit_info: { status: 'allowed', unifiedWindows: { five_hour: { utilization: 0.2, resetsAt: 1_782_000_000 } } },
+    });
+    const goalRow = (uuid: string, met: boolean) => ({
+      type: 'attachment', uuid, sessionId: claudeSessionId, timestamp: '2026-06-24T00:00:00.000Z',
+      attachment: { type: 'goal_status', met, condition: 'quota marker' },
+    });
+    // Rows present when the session is discovered are historical replay: not new quota evidence.
+    await writeFile(sessionFile, [
+      rateLimitRow('rl-historical', '2026-06-23T00:00:00.000Z'),
+      goalRow('goal-active', false),
+    ].map((line) => JSON.stringify(line)).join('\n') + '\n');
+    scanner!.onNewSession(claudeSessionId);
+    await waitFor(() => readGoalItem(fixture.getMetadata())?.status === 'active');
+
+    const capturedAt = '2026-06-24T00:00:00.000Z';
+    await appendFile(sessionFile, [
+      rateLimitRow('rl-live', capturedAt),
+      // A later raw row proving ordered scanning reached past the live quota row.
+      goalRow('goal-complete', true),
+    ].map((line) => JSON.stringify(line)).join('\n') + '\n');
+    scanner!.onNewSession(claudeSessionId);
+    await waitFor(() => readGoalItem(fixture.getMetadata())?.status === 'complete');
+
+    expect(recordQuota).toHaveBeenCalledTimes(1);
+    const [, windows, , capture] = recordQuota.mock.calls[0]!;
+    expect(windows).toEqual([expect.objectContaining({ providerLimitId: 'five_hour' })]);
+    expect(capture).toEqual({ providerCapturedAtMs: Date.parse(capturedAt) });
+    expect(readVisibleTranscriptTypes(fixture.session)).not.toContain('rate_limit_event');
+  });
+
+  it('ingests a current quota row that falls in the reader\'s replay window, keyed to its own capture (HPI-30)', async () => {
+    recordQuota.mockClear();
+    const claudeSessionId = 'integration-claude-session-quota-first-live';
+    const fixture = createSessionFixture(claudeSessionId);
+    await wireScannerToProjector({ claudeSessionId, fixture });
+    const sessionFile = join(projectDir, `${claudeSessionId}.jsonl`);
+    const capturedAt = new Date(Date.now() - 1_000).toISOString();
+    // Written before the reader's live boundary exists, so the scanner labels it historical replay.
+    await writeFile(sessionFile, [
+      {
+        type: 'rate_limit_event', uuid: 'rl-first-live', sessionId: claudeSessionId, timestamp: capturedAt,
+        rate_limit_info: { status: 'allowed', unifiedWindows: { five_hour: { utilization: 0.2, resetsAt: 1_782_000_000 } } },
+      },
+      { type: 'attachment', uuid: 'goal-marker', sessionId: claudeSessionId, timestamp: capturedAt, attachment: { type: 'goal_status', met: false, condition: 'marker' } },
+    ].map((line) => JSON.stringify(line)).join('\n') + '\n');
+    scanner!.onNewSession(claudeSessionId);
+    await waitFor(() => readGoalItem(fixture.getMetadata())?.status === 'active');
+    await waitFor(() => recordQuota.mock.calls.length > 0);
+    expect(recordQuota).toHaveBeenCalledTimes(1);
+    expect(recordQuota.mock.calls[0]![3]).toEqual({ providerCapturedAtMs: Date.parse(capturedAt), replayed: true });
+    expect(readVisibleTranscriptTypes(fixture.session)).not.toContain('rate_limit_event');
+  });
+
+  it('records a quota row once when both the raw channel and a direct observe deliver it', async () => {
+    recordQuota.mockClear();
+    const fixture = createSessionFixture('integration-claude-session-quota-dedupe');
+    const projector = createClaudeSessionTranscriptProjector({ session: fixture.session, logPrefix: '[integration]' });
+    const row = {
+      type: 'rate_limit_event', uuid: 'rl-once', timestamp: '2026-06-24T00:00:00.000Z',
+      rate_limit_info: { status: 'allowed', unifiedWindows: { five_hour: { utilization: 0.2, resetsAt: 1_782_000_000 } } },
+    };
+    projector.observeRaw(row, { historicalReplay: false });
+    await projector.observe(row as unknown as RawJSONLines);
+    const other = { ...row, uuid: 'rl-other' };
+    await projector.observe(other as unknown as RawJSONLines);
+    expect(recordQuota).toHaveBeenCalledTimes(2);
   });
 
   it('transitions the goal to complete on a met:true goal_status attachment appended to the transcript', async () => {

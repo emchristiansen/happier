@@ -2,7 +2,7 @@ import type { ConnectedServiceGroupMemberAssignmentReasonV1, ConnectedServiceId 
 
 import type { ConnectedServiceAssignmentReservationApi } from '@/api/connectedServices/connectedServiceAssignmentReservationApi';
 
-import type { PerSessionAssignmentLedger, PerSessionAssignmentLedgerEntry, PerSessionAssignmentRunner } from './PerSessionAssignmentLedger';
+import { isSamePerSessionRunner, type PerSessionAssignmentLedger, type PerSessionAssignmentLedgerEntry, type PerSessionAssignmentRunner } from './PerSessionAssignmentLedger';
 import type { PerSessionSpawnAssignmentDeps } from './resolvePerSessionGroupMemberForSpawn';
 
 /** Lease a live decision holds on the shared resource; renewed well before it lapses. */
@@ -22,6 +22,41 @@ function isRenewable(entry: PerSessionAssignmentLedgerEntry | null): boolean {
 }
 
 /** Every earlier decision `entry` replaces, transitively through the ledger. */
+/**
+ * The runner currently carrying a decision: the latest one launched with it, else the one its own
+ * spawn started. An older runner's end says nothing about a later launch.
+ */
+function currentRunnerOf(entry: PerSessionAssignmentLedgerEntry): PerSessionAssignmentRunner | undefined {
+  return entry.launchedRunner ?? entry.runner;
+}
+
+/**
+ * Any live process tied to a decision: its current runner, else the runner observed carrying it. Used
+ * for retirement and for refusing a "definitely pre-launch" release, never as launch evidence.
+ */
+function knownRunnerOf(entry: PerSessionAssignmentLedgerEntry): PerSessionAssignmentRunner | undefined {
+  return currentRunnerOf(entry) ?? entry.carrierRunner;
+}
+
+/** Every distinct process the ledger ties to a decision (its spawn runner, latest launch and carrier). */
+function knownRunnersOf(entry: PerSessionAssignmentLedgerEntry): PerSessionAssignmentRunner[] {
+  const runners: PerSessionAssignmentRunner[] = [];
+  for (const runner of [entry.launchedRunner, entry.runner, entry.carrierRunner]) {
+    if (runner && !runners.some((known) => isSamePerSessionRunner(known, runner))) runners.push(runner);
+  }
+  return runners;
+}
+
+/** A pending decision whose launch may have started a child that no runner record names yet. */
+function isUncertainLaunch(entry: PerSessionAssignmentLedgerEntry): boolean {
+  return entry.state === 'pending' && entry.launchAttemptedAtMs !== undefined && currentRunnerOf(entry) === undefined;
+}
+
+/** A pending decision recovery owns: drawn by recovery, or replacing earlier decisions of its subject. */
+function isUnfinishedRecovery(entry: PerSessionAssignmentLedgerEntry): boolean {
+  return entry.state === 'pending' && (entry.origin === 'recovery' || (entry.replacesDecisionIds?.length ?? 0) > 0);
+}
+
 function replacedClosure(entry: PerSessionAssignmentLedgerEntry, byId: ReadonlyMap<string, PerSessionAssignmentLedgerEntry>): Set<string> {
   const replaced = new Set<string>();
   const pendingIds = [...(entry.replacesDecisionIds ?? [])];
@@ -41,6 +76,8 @@ function sameSubject(left: PerSessionAssignmentLedgerEntry, right: Readonly<{ se
 /** One spawn attempt's hold on the per-session decisions it created. */
 export type PerSessionSpawnCustody = Readonly<{
   claim: (decisionIds: ReadonlyArray<string>) => void;
+  /** Every decision the launch will carry (owned or reused); the started runner is recorded on each. */
+  claimLaunched: (decisionIds: ReadonlyArray<string>) => void;
   /**
    * Durably records, immediately before the first launch adapter is entered, that a child may now
    * exist; afterwards no release is definite, across daemon restarts too.
@@ -78,6 +115,8 @@ export type PerSessionLiveDecision = Readonly<{
   temperature?: number;
   offsetPercent?: number;
   probability?: number | null;
+  /** The live runner carrying the decision; a rebuilt entry keeps it for later retirement (HPI-33). */
+  runner?: PerSessionAssignmentRunner;
 }>;
 
 type Log = (event: string, detail: Record<string, unknown>) => void;
@@ -216,9 +255,11 @@ export class PerSessionAssignmentRuntime {
    */
   createSpawnCustody(): PerSessionSpawnCustody {
     let decisionIds: ReadonlyArray<string> = [];
+    let launchedDecisionIds: ReadonlyArray<string> = [];
     let launchAttempted = false;
     return {
       claim: (ids) => { decisionIds = [...ids]; },
+      claimLaunched: (ids) => { launchedDecisionIds = [...ids]; },
       markLaunchAttempted: async () => {
         // Durable before any launch adapter runs; if the write fails nothing has launched yet and
         // the caller's failure path may still release them as a definite pre-launch failure.
@@ -228,6 +269,7 @@ export class PerSessionAssignmentRuntime {
       recordRunner: async (runner) => {
         launchAttempted = true;
         for (const decisionId of decisionIds) await this.recordSpawnedRunner(decisionId, runner);
+        await this.input.ledger.recordLaunchedRunner([...new Set([...decisionIds, ...launchedDecisionIds])], runner, this.input.nowMs());
       },
       releaseIfNeverLaunched: async () => {
         if (launchAttempted) return;
@@ -264,7 +306,7 @@ export class PerSessionAssignmentRuntime {
    */
   async releaseAfterDefinitePreLaunchFailure(decisionId: string): Promise<boolean> {
     const entry = this.input.ledger.get(decisionId);
-    if (!entry || entry.state !== 'pending' || entry.origin !== 'spawn' || entry.runner || entry.launchAttemptedAtMs !== undefined) return false;
+    if (!entry || entry.state !== 'pending' || entry.origin !== 'spawn' || knownRunnerOf(entry) || entry.launchAttemptedAtMs !== undefined) return false;
     this.log('per_session_decision_released_pre_launch_failure', { decisionId });
     await this.release(decisionId);
     return true;
@@ -280,9 +322,12 @@ export class PerSessionAssignmentRuntime {
     const entry = this.input.ledger.get(decisionId);
     if (!entry) return true;
     if (entry.state !== 'pending' || entry.origin !== 'spawn') return false;
-    if (entry.runner) {
-      if (!await this.runnerProvedAbsent(entry.runner)) return false;
-      this.log('per_session_decision_released_runner_absent', { decisionId, sessionId: entry.sessionId, pid: entry.runner.pid });
+    // Every process tied to the decision must be proved gone: an older launch record and a newer
+    // observed carrier may each be the one still owning the session.
+    const known = knownRunnersOf(entry);
+    if (known.length > 0) {
+      for (const runner of known) if (!await this.runnerProvedAbsent(runner)) return false;
+      this.log('per_session_decision_released_runner_absent', { decisionId, sessionId: entry.sessionId, pids: known.map((runner) => runner.pid) });
     } else if (entry.launchAttemptedAtMs !== undefined) {
       this.log('per_session_decision_launch_unsettled', { decisionId, sessionId: entry.sessionId, launchAttemptedAtMs: entry.launchAttemptedAtMs });
       return false;
@@ -320,6 +365,30 @@ export class PerSessionAssignmentRuntime {
     }
   }
 
+  /**
+   * Startup found these runners' sessions ended while the daemon was down (dead daemon-session
+   * markers, not recovered live; a marker is dead only when no process holds its pid). A session
+   * whose settled decisions recorded one of these runners has ended, so they are retired (spec A.3 T14).
+   */
+  async releaseForEndedRunnerPids(pids: ReadonlyArray<number>): Promise<void> {
+    const ended = new Set(pids);
+    if (ended.size === 0) return;
+    const entries = this.input.ledger.list();
+    // An unfinished recovery may still be resumed by its durable owner, and a launch attempted but not
+    // yet recorded may have started a child; a dead old runner proves neither ended (HPI-01). Such a
+    // subject keeps every decision until adoption, its own runner's end, or terminal proof.
+    const unsettled = new Set(entries
+      .filter((entry) => isUnfinishedRecovery(entry) || isUncertainLaunch(entry))
+      .map((entry) => entry.sessionId));
+    const subjects = new Set<string>();
+    for (const entry of entries) {
+      if (unsettled.has(entry.sessionId)) continue;
+      const known = knownRunnerOf(entry);
+      if (known && ended.has(known.pid)) subjects.add(entry.sessionId);
+    }
+    await this.releaseForRetiredSubjects([...subjects]);
+  }
+
   /** Release a decision that no longer owns a session (superseded, ended, or definitely never launched). */
   async release(decisionId: string): Promise<void> {
     const entry = await this.input.ledger.remove(decisionId);
@@ -347,9 +416,10 @@ export class PerSessionAssignmentRuntime {
       const entry = entries.get(decision.decisionId);
       if (!entry) {
         await this.rebuild(decision);
-      } else if (decision.applied && entry.state !== 'applied') {
-        await this.input.ledger.markApplied(decision.decisionId, nowMs);
+        continue;
       }
+      if (decision.applied && entry.state !== 'applied') await this.input.ledger.markApplied(decision.decisionId, nowMs);
+      await this.recordServingRunner(decision, entry);
     }
 
     // Durable settlement (spec A.5 T20, A.4 Migration): completes adoption and conversion
@@ -377,8 +447,12 @@ export class PerSessionAssignmentRuntime {
     // adopted or released, or the session retires: its old runner's retirement is not the end of
     // the session while the successor owns it (spec A.5 T20).
     const replacedByUnsettledSuccessor = new Set<string>();
+    // Sessions with unfinished recovery or launch: any pending decision.
+    const subjectsWithPendingDecision = new Set<string>();
     for (const entry of entries.values()) {
-      if (entry.state === 'pending') for (const id of replacedClosure(entry, entries)) replacedByUnsettledSuccessor.add(id);
+      if (entry.state !== 'pending') continue;
+      subjectsWithPendingDecision.add(entry.sessionId);
+      for (const id of replacedClosure(entry, entries)) replacedByUnsettledSuccessor.add(id);
     }
 
     for (const entry of entries.values()) {
@@ -391,13 +465,17 @@ export class PerSessionAssignmentRuntime {
         await this.release(entry.decisionId);
         continue;
       }
-      // A dead runner proves only that a spawn's own child is gone. A recovery decision, or any
-      // decision replacing earlier ones, belongs to the session's unfinished recovery: its runner's
-      // absence is not the end of the session, so it keeps custody until a later decision is
-      // adopted, conversion is proved, or the session's retirement is observed (spec A.5 T20).
-      const recoveryOwned = entry.origin === 'recovery' || (entry.replacesDecisionIds?.length ?? 0) > 0;
-      if (!successorOwned && !recoveryOwned && entry.runner && await this.runnerProvedAbsent(entry.runner)) {
-        this.log('per_session_decision_released_runner_absent', { decisionId: entry.decisionId, sessionId: entry.sessionId, pid: entry.runner.pid });
+      // A dead runner is not the end of a session whose recovery is unfinished: a pending recovery or
+      // replacing decision, or an applied one while its session still has a pending decision, keeps
+      // custody until a later decision is adopted, conversion is proved, or the session's end is
+      // observed (spec A.5 T20). A settled decision (a lone spawn, or an applied one with nothing
+      // pending) is retired when the runner recorded for it is proved gone (spec A.3 T14).
+      const recoveryOwned = entry.state === 'pending'
+        ? isUnfinishedRecovery(entry)
+        : subjectsWithPendingDecision.has(entry.sessionId);
+      const recordedRunner = currentRunnerOf(entry);
+      if (!successorOwned && !recoveryOwned && recordedRunner && await this.runnerProvedAbsent(recordedRunner)) {
+        this.log('per_session_decision_released_runner_absent', { decisionId: entry.decisionId, sessionId: entry.sessionId, pid: recordedRunner.pid });
         await this.release(entry.decisionId);
         continue;
       }
@@ -472,6 +550,26 @@ export class PerSessionAssignmentRuntime {
     }
   }
 
+  /**
+   * Records the live runner serving an applied decision whenever the ledger does not name it already,
+   * so its next offline end can be reconciled (HPI-33). Idempotent: a rebuild or earlier tick cut
+   * before this write is completed by the next healthy observation (HPI-36). A pending target is never
+   * credited with a launch: its bindings name it before any launch (HPI-21). Its runner is recorded
+   * only as its carrier.
+   */
+  private async recordServingRunner(decision: PerSessionLiveDecision, entry: PerSessionAssignmentLedgerEntry | null | undefined): Promise<void> {
+    if (!decision.runner || !entry) return;
+    if (!decision.applied) {
+      // A pending target: only its carrier is known, never its launch.
+      if (entry.carrierRunner && isSamePerSessionRunner(entry.carrierRunner, decision.runner)) return;
+      await this.input.ledger.recordCarrierRunner(decision.decisionId, decision.runner, this.input.nowMs());
+      return;
+    }
+    const current = currentRunnerOf(entry);
+    if (current && isSamePerSessionRunner(current, decision.runner)) return;
+    await this.input.ledger.recordLaunchedRunner([decision.decisionId], decision.runner, this.input.nowMs());
+  }
+
   /** A live runner carries a decision this ledger lost (daemon restart or another writer): adopt it. */
   private async rebuild(decision: PerSessionLiveDecision): Promise<void> {
     const proposal: PerSessionAssignmentLedgerEntry['proposal'] = {
@@ -498,6 +596,7 @@ export class PerSessionAssignmentRuntime {
       nowMs: this.input.nowMs(),
     });
     if (decision.applied) await this.input.ledger.markApplied(decision.decisionId, this.input.nowMs());
+    await this.recordServingRunner(decision, this.input.ledger.get(decision.decisionId));
     this.log('per_session_decision_rebuilt', { decisionId: decision.decisionId, profileId: decision.profileId });
   }
 

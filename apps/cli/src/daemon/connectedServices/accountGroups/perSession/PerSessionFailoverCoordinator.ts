@@ -21,7 +21,7 @@ import type { PerSessionAssignmentProposal } from './decidePerSessionGroupMember
 import { decidePerSessionGroupMemberUntilSettled } from './decidePerSessionGroupMemberUntilSettled';
 import { isPerSessionMemberEligible } from './resolvePerSessionGroupMemberForSpawn';
 import { resolveConnectedServiceMemberHoldApplicationRefusal } from '../holds/connectedServiceMemberHolds';
-import type { PerSessionAssignmentLedger } from './PerSessionAssignmentLedger';
+import { isSamePerSessionRunner, type PerSessionAssignmentLedger, type PerSessionAssignmentRunner } from './PerSessionAssignmentLedger';
 
 /** The session's current per-session group binding and the subject its decisions are keyed by. */
 export type PerSessionSessionBinding = Readonly<{
@@ -31,22 +31,32 @@ export type PerSessionSessionBinding = Readonly<{
   materializedAssignment?: ConnectedServiceGroupMaterializedAssignmentV1;
   /** Proved serving account: the applied member; null for a pending-only target; shared launch selection otherwise. */
   currentProfileId: string | null;
-  /**
-   * Per-session decisions the session's current runner process was launched with (its launch
-   * bindings, not its later metadata). A pending target absent here has had no runner started for it;
-   * absent means unknown and is treated the same way.
-   */
-  launchedDecisionIds?: ReadonlyArray<string>;
+  /** The session's current runner process (its launcher); absent when unknown. */
+  runner?: PerSessionAssignmentRunner;
+  /** Decisions the current runner was actually launched with; absent when its launch was not observed. */
+  runnerLaunchedDecisionIds?: ReadonlyArray<string>;
 }>;
 
 /**
- * Mode for a replayed decision whose pending target metadata is already committed. Metadata alone
- * does not prove the deferred restart happened: only a runner launched with the decision does. Until
- * then the recovery owner is asked again (`spawn_next_turn`); the planned-restart owner collapses a
- * request that is still in flight (spec A.5 T20, HPI-21).
+ * Mode for a replayed application whose pending target is already committed (spec A.5 T20). Neither
+ * metadata nor respawn options prove the deferred restart happened: both name the target before its
+ * launch (HPI-21). The restart was performed when the session's current runner either
+ * - was launched with the target decision, as its spawn site recorded (the effect owner's readback;
+ *   this also covers a launch record that was never written, HPI-31, and a shared conversion, which
+ *   has no ledger launch record, HPI-32), or
+ * - is the runner spawn custody recorded launching this decision (for a runner reattached from disk,
+ *   whose launch bindings were not observed).
+ * A performed restart awaits adoption proof (`restart_resume`); otherwise the recovery owner is asked
+ * again (`spawn_next_turn`), and the planned-restart owner collapses a request still in flight.
  */
-function replayedApplicationMode(binding: PerSessionSessionBinding, decisionId: string): 'restart_resume' | 'spawn_next_turn' {
-  return binding.launchedDecisionIds?.includes(decisionId) ? 'restart_resume' : 'spawn_next_turn';
+function replayedApplicationMode(
+  target: Readonly<{ decisionId: string }>,
+  launchedRunner: PerSessionAssignmentRunner | undefined,
+  binding: PerSessionSessionBinding,
+): 'restart_resume' | 'spawn_next_turn' {
+  if (!binding.runner) return 'spawn_next_turn';
+  if (binding.runnerLaunchedDecisionIds?.includes(target.decisionId)) return 'restart_resume';
+  return launchedRunner && isSamePerSessionRunner(launchedRunner, binding.runner) ? 'restart_resume' : 'spawn_next_turn';
 }
 
 /** A per-session group binding handed to the switch FSM: target in `materializedAssignment`. */
@@ -240,6 +250,16 @@ export class PerSessionFailoverCoordinator {
     // until the replacement is adopted, because only the restart that applies the replacement retires
     // the target's runner. It is excluded from the draw.
     const targetFailed = pendingTarget !== null && failedProfileId === pendingTarget.profileId;
+    // A committed member target that has not failed but is no longer eligible (disabled, held, stale or
+    // model-ineligible) is superseded exactly like a failed one: never resumed, kept in custody, and
+    // replaced by a fresh draw that excludes it (spec A.2, A.5 C3/R1; HPI-42). "Not failed in this
+    // report" is not eligibility.
+    const targetSuperseded = pendingTarget !== null && !targetFailed && pendingTarget.home !== 'group'
+      && !isPerSessionMemberEligible(state, pendingTarget.profileId, this.deps.nowMs(), this.deps.quotaFreshnessMs, state.requiredModelIds ?? []);
+    if (targetSuperseded) {
+      this.deps.log?.('per_session_replay_target_ineligible', { decisionId: pendingTarget.decisionId, profileId: pendingTarget.profileId });
+    }
+    const targetReplaced = targetFailed || targetSuperseded;
 
     // Replay: an unsettled recovery decision for this session that no later decision replaces
     // resumes under its own ID.
@@ -248,20 +268,36 @@ export class PerSessionFailoverCoordinator {
     const replacedIds = new Set(sessionEntries.flatMap((entry) => entry.replacesDecisionIds ?? []));
     const replay = sessionEntries.find((entry) => entry.origin === 'recovery' && entry.state === 'pending'
       && !replacedIds.has(entry.decisionId) && entry.proposal.profileId !== failedProfileId);
-    if (replay && pendingTarget?.decisionId === replay.decisionId) {
+    if (replay && !targetSuperseded && pendingTarget?.decisionId === replay.decisionId) {
       // The decision's metadata is committed. If its runner was started, adoption proof settles it;
       // otherwise the deferred restart is requested again under the same decision.
       return {
         status: 'switched',
         activeProfileId: replay.proposal.profileId,
         generation: state.generation,
-        mode: replayedApplicationMode(binding, replay.decisionId),
+        mode: replayedApplicationMode(pendingTarget, replay.launchedRunner, binding),
       };
     }
+    // The session's committed pending target is the decision owner's own record of this recovery. When
+    // it has not failed it is resumed under its own ID even if the ledger lost its entry or rebuilt it
+    // from live bindings (as a spawn-origin, carrier-only entry); drawing again would discard a valid
+    // target (HPI-39). A failed target is replaced below as before.
+    if (pendingTarget && !targetReplaced && pendingTarget.home !== 'group') {
+      const committedEntry = sessionEntries.find((entry) => entry.decisionId === pendingTarget.decisionId);
+      if (!committedEntry || (committedEntry.state === 'pending' && !replacedIds.has(committedEntry.decisionId))) {
+        this.deps.log?.('per_session_replay_committed_target', { decisionId: pendingTarget.decisionId, ledgerEntry: committedEntry ? committedEntry.origin : 'missing' });
+        return {
+          status: 'switched',
+          activeProfileId: pendingTarget.profileId,
+          generation: state.generation,
+          mode: replayedApplicationMode(pendingTarget, committedEntry?.launchedRunner, binding),
+        };
+      }
+    }
     // Earlier targets the next decision replaces keep custody, untouched, until it is adopted.
-    const replacesDecisionIds = new Set<string>(targetFailed ? [pendingTarget.decisionId] : []);
-    const excluded = new Set<string>(targetFailed ? [pendingTarget.profileId] : []);
-    let candidateReplay = replay ?? null;
+    const replacesDecisionIds = new Set<string>(targetReplaced ? [pendingTarget.decisionId] : []);
+    const excluded = new Set<string>(targetReplaced ? [pendingTarget.profileId] : []);
+    let candidateReplay = replay && !(targetSuperseded && replay.decisionId === pendingTarget.decisionId) ? replay : null;
     let lastRefusal: Readonly<{ profileId: string; errorCode: string; diagnostics: unknown }> | null = null;
     // The state each draw uses; after a refusal it is the fresh state that justified the refusal.
     let drawState = state;
@@ -433,10 +469,24 @@ export class PerSessionFailoverCoordinator {
   }>): Promise<ConnectedServiceAuthGroupSwitchResult> {
     const pending = params.binding.materializedAssignment;
     if (pending?.home === 'group' && pending.profileId !== params.failedProfileId) {
-      return {
-        status: 'switched', activeProfileId: pending.profileId, generation: params.state.generation,
-        mode: replayedApplicationMode(params.binding, pending.decisionId),
-      };
+      // A durable retry replays the old runner's original report, so the report proves nothing about
+      // the restart; only the current runner's recorded launch bindings do (HPI-32).
+      const mode = replayedApplicationMode(pending, undefined, params.binding);
+      if (mode === 'spawn_next_turn') {
+        // The conversion's launch has not been performed, so replaying it requests a fresh effect, which
+        // current holds govern exactly as for a first conversion (HPI-45). The committed target and the
+        // last proved member are left untouched; a launch already performed awaits adoption instead.
+        const { refusal } = await this.applicationRefusal({
+          serviceId: params.serviceId, groupId: params.input.groupId, sessionId: params.sessionId, profileId: pending.profileId, eligibility: false,
+        });
+        if (refusal) {
+          return {
+            status: 'generation_apply_failed', activeProfileId: pending.profileId, generation: params.state.generation,
+            errorCode: refusal.errorCode, diagnostics: refusal.diagnostics,
+          };
+        }
+      }
+      return { status: 'switched', activeProfileId: pending.profileId, generation: params.state.generation, mode };
     }
     let target = params.state.activeProfileId;
     let generation = params.state.generation;

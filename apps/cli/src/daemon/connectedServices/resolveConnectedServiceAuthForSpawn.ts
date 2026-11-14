@@ -1551,6 +1551,12 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
    * each, or releases them after a definite pre-launch failure (spec A.4). Absent means none.
    */
   perSessionSpawnDecisionIds?: ReadonlyArray<string>;
+  /**
+   * Every per-session decision the launched runner will carry, created by this attempt or reused
+   * (a resumed pending target). The caller records the runner it actually starts against each: the
+   * only proof that a decision's runner was launched (spec A.5 T20).
+   */
+  perSessionLaunchDecisionIds?: ReadonlyArray<string>;
 }> | null> {
   params.signal?.throwIfAborted();
   if (params.nativeSource.kind === 'session_continuation'
@@ -1605,7 +1611,9 @@ export async function resolveConnectedServiceAuthForSpawn(params: Readonly<{
       await releasePerSessionSpawnDecisions();
       return null;
     }
-    return { ...resolved, perSessionSpawnDecisionIds };
+    const perSessionLaunchDecisionIds = [...resolvedBindings.groupSelections.values()]
+      .flatMap((group) => (group.perSession ? [group.perSession.decisionId] : []));
+    return { ...resolved, perSessionSpawnDecisionIds, perSessionLaunchDecisionIds };
   } catch (error) {
     await releasePerSessionSpawnDecisions();
     throw error;
@@ -1626,7 +1634,7 @@ async function resolveConnectedServiceAuthForSpawnWithBindings(
     resolvedBindings: Awaited<ReturnType<typeof resolveCredentialBindings>>;
     forceSpawnPreflightOauthRefresh: boolean;
   }>,
-): Promise<Omit<NonNullable<Awaited<ReturnType<typeof resolveConnectedServiceAuthForSpawn>>>, 'perSessionSpawnDecisionIds'> | null> {
+): Promise<Omit<NonNullable<Awaited<ReturnType<typeof resolveConnectedServiceAuthForSpawn>>>, 'perSessionSpawnDecisionIds' | 'perSessionLaunchDecisionIds'> | null> {
   const { selections, clock, nowMs, resolvedBindings, forceSpawnPreflightOauthRefresh } = resolvedInput;
   params.signal?.throwIfAborted();
 

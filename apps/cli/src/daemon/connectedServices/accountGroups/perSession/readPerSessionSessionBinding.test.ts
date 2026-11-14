@@ -25,16 +25,27 @@ describe('readPerSessionSessionBinding serving identity (T19)', () => {
     expect(readPerSessionSessionBinding(tracked({ appliedProfileId: 'c' }), 'claude-subscription', 'pool')?.currentProfileId).toBe('c');
   });
 
-  it('reports the decisions the runner was launched with, not those only in later metadata (HPI-21)', () => {
-    const launchedPendingOnlyInMetadata = {
-      ...tracked({ member, materializedAssignment: { ...pendingB, reason: 'failover' } }),
-      spawnOptions: { connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', member } } } },
-    };
-    expect(readPerSessionSessionBinding(launchedPendingOnlyInMetadata, 'claude-subscription', 'pool')?.launchedDecisionIds).toEqual(['d-a']);
-    const launchedWithPending = {
-      ...launchedPendingOnlyInMetadata,
-      spawnOptions: { connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', member, materializedAssignment: pendingB } } } },
-    };
-    expect(readPerSessionSessionBinding(launchedWithPending, 'claude-subscription', 'pool')?.launchedDecisionIds).toEqual(['d-a', 'd-b']);
+  it('reports the current runner process, not launch options, as the session\'s runner (HPI-21)', () => {
+    expect(readPerSessionSessionBinding({ ...tracked({ member }), pid: 42, processInstanceFingerprint: 'fp' }, 'claude-subscription', 'pool')?.runner)
+      .toEqual({ pid: 42, processInstanceFingerprint: 'fp' });
+    expect(readPerSessionSessionBinding(tracked({ member }), 'claude-subscription', 'pool')?.runner).toBeUndefined();
+  });
+
+  it('never pairs the launcher pid with a wrapper child\'s reported fingerprint (HPI-31)', () => {
+    const wrapped = { ...tracked({ member }), pid: 42, sessionRunnerPid: 43, processInstanceFingerprint: 'fp-reporter-43' };
+    expect(readPerSessionSessionBinding(wrapped, 'claude-subscription', 'pool')?.runner).toEqual({ pid: 42 });
+    expect(readPerSessionSessionBinding({ ...wrapped, sessionRunnerPid: 42 }, 'claude-subscription', 'pool')?.runner)
+      .toEqual({ pid: 42, processInstanceFingerprint: 'fp-reporter-43' });
+  });
+
+  it('reads the decisions the runner was launched with from its spawn-site record, never metadata (HPI-31/32)', () => {
+    const launchedWith = (binding: Record<string, unknown>) => ({ v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', ...binding } } });
+    // Metadata already names the pending target; the runner was launched before it existed.
+    const committed = tracked({ member, materializedAssignment: { ...pendingB, reason: 'failover' } });
+    expect(readPerSessionSessionBinding({ ...committed, launchedConnectedServices: launchedWith({ member }) }, 'claude-subscription', 'pool')?.runnerLaunchedDecisionIds)
+      .toEqual(['d-a']);
+    expect(readPerSessionSessionBinding({ ...committed, launchedConnectedServices: launchedWith({ member, materializedAssignment: pendingB }) }, 'claude-subscription', 'pool')?.runnerLaunchedDecisionIds)
+      .toEqual(['d-a', 'd-b']);
+    expect(readPerSessionSessionBinding(committed, 'claude-subscription', 'pool')?.runnerLaunchedDecisionIds).toBeUndefined();
   });
 });

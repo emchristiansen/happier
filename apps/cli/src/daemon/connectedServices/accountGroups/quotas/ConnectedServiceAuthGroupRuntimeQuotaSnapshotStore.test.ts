@@ -38,6 +38,112 @@ function quotaSnapshot(input: Readonly<{
 }
 
 describe('ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore', () => {
+  describe('release capture evidence apart from quota-state recency (HPI-35, spec A.3)', () => {
+    const binding = { serviceId: 'openai-codex', groupId: 'main', profileId: 'primary' } as const;
+    // An in-band row: `fetchedAt` is receipt when live, capture when replayed; capture is `observedAtMs`.
+    const inBand = (fetchedAt: number, observedAtMs?: number) => ({
+      ...quotaSnapshot({ profileId: 'primary', fetchedAt, utilizationPct: 20 }),
+      staleAfterMs: 300_000,
+      source: 'in_band_provider_snapshot' as const,
+      evidence: observedAtMs === undefined ? {} : { observedAtMs },
+    });
+    afterEach(() => vi.useRealTimers());
+
+    it.each([
+      ['a live row captured before activity', 50],
+      ['a live row stating no capture', undefined],
+    ] as const)('keeps a replayed later capture as evidence when %s holds the newer receipt', (_label, olderCapture) => {
+      vi.useFakeTimers(); vi.setSystemTime(400);
+      const store = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+      store.recordSnapshot({ ...binding, snapshot: inBand(306, olderCapture) });
+      store.recordSnapshot({ ...binding, snapshot: inBand(150, 150) });
+      // Quota state keeps the newer receipt; release evidence keeps the later capture.
+      expect(store.getSnapshot(binding)?.fetchedAt).toBe(306);
+      expect(store.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 400 })).toBe(150);
+    });
+
+    it('a later capture supersedes an earlier one, and evidence expires with its snapshot', () => {
+      vi.useFakeTimers(); vi.setSystemTime(400);
+      const store = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+      store.recordSnapshot({ ...binding, snapshot: inBand(150, 150) });
+      store.recordSnapshot({ ...binding, snapshot: inBand(120, 120) });
+      expect(store.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 400 })).toBe(150);
+      expect(store.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 150 + 300_000 })).toBeNull();
+    });
+
+    it('qualifies capture evidence by the observation\'s provider context (HPI-37)', () => {
+      vi.useFakeTimers(); vi.setSystemTime(400);
+      const ofAccount = (accountId: string, fetchedAt: number, observedAtMs?: number) => ({ ...inBand(fetchedAt, observedAtMs), activeAccountId: accountId });
+      // Authoritative retention against another account drops the evidence with the state.
+      const store = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+      store.recordSnapshot({ ...binding, snapshot: ofAccount('acct-a', 150, 150), verifiedCredentialFingerprint: 'fp-a' });
+      store.retainProfileSnapshots({ serviceId: binding.serviceId, profileId: binding.profileId, context: { providerAccountId: 'acct-b', providerOrganizationId: null }, verifiedCredentialFingerprint: 'fp-b' });
+      expect(store.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 400 })).toBeNull();
+      // A losing replay from another account never counts against the current account's state.
+      const reverse = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+      reverse.recordSnapshot({ ...binding, snapshot: ofAccount('acct-b', 350), verifiedCredentialFingerprint: 'fp-b' });
+      reverse.recordSnapshot({ ...binding, snapshot: ofAccount('acct-a', 150, 150), verifiedCredentialFingerprint: 'fp-a' });
+      expect(reverse.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 400 })).toBeNull();
+      // The same account's losing replay still counts.
+      const same = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+      same.recordSnapshot({ ...binding, snapshot: ofAccount('acct-b', 350), verifiedCredentialFingerprint: 'fp-b' });
+      same.recordSnapshot({ ...binding, snapshot: ofAccount('acct-b', 150, 150), verifiedCredentialFingerprint: 'fp-b' });
+      expect(same.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 400 })).toBe(150);
+    });
+
+    it('an obsolete-context replay neither counts nor displaces the current context\'s evidence (HPI-43)', () => {
+      vi.useFakeTimers(); vi.setSystemTime(400);
+      const ofAccount = (accountId: string, fetchedAt: number, observedAtMs?: number) => ({ ...inBand(fetchedAt, observedAtMs), activeAccountId: accountId });
+      for (const record of ['profile', 'group'] as const) {
+        const store = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+        const put = (snapshot: ReturnType<typeof ofAccount>, fp: string) => record === 'group'
+          ? store.recordSnapshot({ ...binding, snapshot, verifiedCredentialFingerprint: fp })
+          : store.recordProfileSnapshot({ serviceId: binding.serviceId, profileId: binding.profileId, snapshot, verifiedCredentialFingerprint: fp });
+        put(ofAccount('acct-b', 390), 'fp-b');
+        put(ofAccount('acct-b', 350, 350), 'fp-b');
+        expect(store.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 400 })).toBe(350);
+        put(ofAccount('acct-a', 150, 150), 'fp-a');
+        expect(store.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 400 })).toBe(350);
+        store.retainProfileSnapshots({ serviceId: binding.serviceId, profileId: binding.profileId, context: { providerAccountId: 'acct-b', providerOrganizationId: null }, verifiedCredentialFingerprint: 'fp-b' });
+        expect(store.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 400 })).toBe(350);
+      }
+    });
+
+    it('without quota state, reads the latest capture its authoritative retention accepted (HPI-44)', () => {
+      vi.useFakeTimers(); vi.setSystemTime(1000);
+      const of = (accountId: string, fetchedAt: number, observedAtMs?: number, org?: string) => ({
+        ...inBand(fetchedAt, observedAtMs), activeAccountId: accountId, ...(org ? { providerOrganizationId: org } : {}),
+      });
+      const seed = () => {
+        const store = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+        store.recordSnapshot({ ...binding, snapshot: of('obsolete', 990), verifiedCredentialFingerprint: 'obsolete-token' });
+        store.recordProfileSnapshot({ serviceId: binding.serviceId, profileId: binding.profileId, snapshot: of('a', 900, 900, 'org-a'), verifiedCredentialFingerprint: 'old-token' });
+        store.recordProfileSnapshot({ serviceId: binding.serviceId, profileId: binding.profileId, snapshot: of('a', 800, 800), verifiedCredentialFingerprint: 'new-token' });
+        return store;
+      };
+      // Authoritative retention for A removes the obsolete state and accepts both A contexts.
+      const accepted = seed();
+      accepted.retainProfileSnapshots({ serviceId: binding.serviceId, profileId: binding.profileId, context: { providerAccountId: 'a', providerOrganizationId: 'org-a' }, verifiedCredentialFingerprint: 'new-token' });
+      expect(accepted.getSnapshotEntry(binding)).toBeNull();
+      expect(accepted.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 1000 })).toBe(900);
+      // A retention that could not read the credential accepts nothing, so only the latest arrival counts.
+      const unverified = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+      unverified.recordSnapshot({ ...binding, snapshot: of('state', 990) });
+      unverified.recordProfileSnapshot({ serviceId: binding.serviceId, profileId: binding.profileId, snapshot: of('a', 900, 900), verifiedCredentialFingerprint: 'a' });
+      unverified.recordProfileSnapshot({ serviceId: binding.serviceId, profileId: binding.profileId, snapshot: of('b', 800, 800), verifiedCredentialFingerprint: 'b' });
+      unverified.retainProfileSnapshots({ serviceId: binding.serviceId, profileId: binding.profileId, context: null });
+      expect(unverified.getSnapshotEntry(binding)).toBeNull();
+      expect(unverified.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 1000 })).toBe(800);
+    });
+
+    it('records nothing for a delivery that proves no capture', () => {
+      vi.useFakeTimers(); vi.setSystemTime(400);
+      const store = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
+      store.recordSnapshot({ ...binding, snapshot: inBand(306) });
+      expect(store.readFreshCaptureAtOrAfterMs({ ...binding, nowMs: 400 })).toBeNull();
+    });
+  });
+
   it('preserves verified unscoped quota through unavailable proof reads until an authoritative mismatch', () => {
     const store = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
     const binding = { serviceId: 'openai-codex', groupId: 'main', profileId: 'primary' } as const;

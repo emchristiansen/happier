@@ -3,6 +3,7 @@ import { daemonProcessMatchesCurrentScope } from './ownership/daemonProcessScope
 import type { HappyProcessInfo } from './doctor';
 import type { DaemonSessionMarker } from './sessionRegistry';
 import { hashProcessCommand } from './sessionRegistry';
+import { readMarkerLaunchForProcess } from './readMarkerLaunchForProcess';
 import type { TrackedSession } from './types';
 import type { Credentials } from '@/persistence';
 import { projectPath } from '@/projectPath';
@@ -257,6 +258,10 @@ export function adoptSessionsFromMarkers(params: {
       ...(currentProcessInstanceFingerprint ? { processInstanceFingerprint: currentProcessInstanceFingerprint } : {}),
       processCommand: currentCommand,
       reattachedFromDiskMarker: true,
+      ...(() => {
+        const launchedConnectedServices = readMarkerLaunchForProcess(marker, currentProcessInstanceFingerprint);
+        return launchedConnectedServices !== undefined ? { launchedConnectedServices } : {};
+      })(),
     });
     adoptedPids.push(marker.pid);
     adopted++;

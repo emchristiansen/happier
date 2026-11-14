@@ -34,6 +34,11 @@ const DaemonSessionMarkerSchema = lazySchema(() => z.object({
   metadata: z.any().optional(),
   // Safe daemon respawn inputs (no secrets). Used to reconstruct SpawnSessionOptions after reattach.
   respawn: SessionRunnerRespawnDescriptorV1Schema.optional(),
+  // The connected-service bindings this runner was actually launched with, as its spawn site observed
+  // them. Unlike `respawn` (the next launch's descriptor, rewritten before a deferred restart) it never
+  // changes for the process, so per-session recovery still knows which decisions the runner carries
+  // after a daemon restart (spec A.5, HPI-31/32). Absent when the launch was not observed.
+  launchedConnectedServices: z.unknown().optional(),
   // Durable marker that a connected-service auth switch has entered the gated restart primitive.
   connectedServiceRestartIntent: z.object({
     v: z.literal(1),
@@ -173,18 +178,32 @@ async function writeSessionMarkerUnlocked(
     && existingMarkerFromDisk?.happySessionId === marker.happySessionId
       ? existingMarkerFromDisk.connectedServiceRestartIntent
       : undefined;
+  // The observed launch is evidence about one process incarnation, so it is stored only beside a known
+  // process fingerprint. A rewrite that does not restate it keeps it only when it names that same
+  // fingerprint for the same session; a rewrite with no fingerprint, or a marker that never had one,
+  // cannot carry it onto a later incarnation of the pid (HPI-40).
+  const launchedConnectedServices = marker.processInstanceFingerprint === undefined
+    ? undefined
+    : marker.launchedConnectedServices !== undefined
+      ? marker.launchedConnectedServices
+      : existingMarkerFromDisk?.happySessionId === marker.happySessionId
+        && existingMarkerFromDisk?.processInstanceFingerprint === marker.processInstanceFingerprint
+        ? existingMarkerFromDisk.launchedConnectedServices
+        : undefined;
   const preservedTerminalHostHealth =
     options.preserveTerminalHostHealth !== false
     && marker.terminalHostHealth === undefined
     && existingMarkerFromDisk?.happySessionId === marker.happySessionId
       ? existingMarkerFromDisk.terminalHostHealth
       : undefined;
+  const { launchedConnectedServices: _statedLaunch, ...markerWithoutLaunch } = marker;
   const payload: DaemonSessionMarker = DaemonSessionMarkerSchema.parse({
-    ...marker,
+    ...markerWithoutLaunch,
     ...(preservedConnectedServiceRestartIntent
       ? { connectedServiceRestartIntent: preservedConnectedServiceRestartIntent }
       : {}),
     ...(preservedTerminalHostHealth ? { terminalHostHealth: preservedTerminalHostHealth } : {}),
+    ...(launchedConnectedServices !== undefined ? { launchedConnectedServices } : {}),
     ...(marker.metadata === undefined
       ? {}
       : { metadata: withoutMirroredReplaySeedText(marker.metadata) }),

@@ -274,6 +274,31 @@ describe('surfaceClaudeRuntimeIssues runtime-auth projection', () => {
     }
   });
 
+  it('keys a replayed row to the capture it states, and drops replayed history (HPI-30)', async () => {
+    const previousSelectionEnv = installClaudeSelectionEnv();
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    try {
+      const event = { type: 'rate_limit_event', rate_limit_info: { status: 'allowed', unifiedWindows: { five_hour: { utilization: 0.2, resetsAt: 1_781_221_200 } } } };
+      const windows = mapClaudeRateLimitEventToQuotaEvidence(event);
+      mockNotifyDaemonConnectedServiceQuotaSnapshot.mockClear();
+      await recordClaudeRateLimitQuotaEvidence({ client: { sessionId: 'sess_claude_replay' } } as any, windows, '[claude-test]',
+        { providerCapturedAtMs: 990_000, replayed: true });
+      const snapshot = (mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.calls.at(-1)![0] as any).snapshot;
+      expect(snapshot.fetchedAt).toBe(990_000);
+      expect(snapshot.staleAtMs).toBe(1_290_000);
+      expect(snapshot.evidence.observedAtMs).toBe(990_000);
+
+      mockNotifyDaemonConnectedServiceQuotaSnapshot.mockClear();
+      for (const capture of [{ providerCapturedAtMs: 700_000, replayed: true }, { providerCapturedAtMs: null, replayed: true }]) {
+        await recordClaudeRateLimitQuotaEvidence({ client: { sessionId: 'sess_claude_replay' } } as any, windows, '[claude-test]', capture);
+      }
+      expect(mockNotifyDaemonConnectedServiceQuotaSnapshot).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+      restoreClaudeSelectionEnv(previousSelectionEnv);
+    }
+  });
+
   it('reads the capture time a Claude event states, and nothing when it states none', () => {
     expect(readClaudeEventProviderCapturedAtMs({ type: 'rate_limit_event', timestamp: '2026-11-14T00:00:00.000Z' })).toBe(Date.parse('2026-11-14T00:00:00.000Z'));
     expect(readClaudeEventProviderCapturedAtMs({ type: 'rate_limit_event' })).toBeNull();

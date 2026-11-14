@@ -571,7 +571,6 @@ import {
 import { PerSessionAssignmentRuntime, type PerSessionSpawnCustody } from './connectedServices/accountGroups/perSession/PerSessionAssignmentRuntime';
 import { buildPerSessionSpawnErrorResult } from './connectedServices/buildPerSessionSpawnErrorResult';
 import { ConnectedServicePerSessionSpawnError } from './connectedServices/accountGroups/perSession/resolvePerSessionGroupMemberForSpawn';
-import { resolveFreshQuotaSnapshotCapturedAtOrAfterMs } from './connectedServices/quotas/resolveFreshQuotaSnapshotCapturedAtOrAfterMs';
 import {
   collectPerSessionLiveDecisions,
   collectPerSessionLiveSubjectIds,
@@ -2060,10 +2059,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         listLiveDecisions: () => collectPerSessionLiveDecisions(pidToTrackedSession.values()),
         listLiveSubjectIds: () => collectPerSessionLiveSubjectIds(pidToTrackedSession.values()),
         listProvedSharedConversions: () => collectPerSessionProvedSharedConversions(pidToTrackedSession.values()),
-        readMemberSnapshotCapturedAtOrAfterMs: ({ serviceId, groupId, profileId, nowMs }) => {
-          const snapshot = connectedServiceRuntimeQuotaSnapshots.getSnapshotEntry({ serviceId, groupId, profileId })?.snapshot ?? null;
-          return snapshot ? resolveFreshQuotaSnapshotCapturedAtOrAfterMs(snapshot, nowMs) : null;
-        },
+        readMemberSnapshotCapturedAtOrAfterMs: ({ serviceId, groupId, profileId, nowMs }) =>
+          connectedServiceRuntimeQuotaSnapshots.readFreshCaptureAtOrAfterMs({ serviceId, groupId, profileId, nowMs }),
         // Retirement evidence for a recorded runner: dead/zombie, or a same-scheme fingerprint
         // mismatch proving PID reuse. Anything else keeps the decision's custody.
         probeRunnerPresence: async (runner) => classifySessionRunnerProcessPresence({
@@ -3020,6 +3017,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           await sessionMachineAccessBindingReconcileInFlight;
         };
         const orphanedDeadDaemonSessions = [...startupReattachResult.orphanedDeadDaemonSessions];
+        // Sessions that ended while the daemon was down retire their per-session decisions (spec A.3 T14).
+        await perSessionAssignmentRuntime.releaseForEndedRunnerPids(orphanedDeadDaemonSessions.map((session) => session.pid))
+          .catch((error) => logger.debug('[ConnectedServices] Per-session release for sessions ended while offline failed (non-fatal)', error));
         const disconnectedTerminalHostCandidates = [...(startupReattachResult.disconnectedTerminalHostCandidates ?? [])];
         const unresolvedTerminalHostSessionIds = new Set(startupReattachResult.unresolvedTerminalHostSessionIds ?? []);
         const terminalizedDisconnectedTerminalHostIds = new Set<string>();
@@ -3382,6 +3382,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             cwd: params.directory,
             ...(processInstanceFingerprint ? { processInstanceFingerprint } : {}),
             respawn,
+            // The bindings this accepted launch read: durable launch observation (HPI-31/32).
+            launchedConnectedServices: structuredClone(params.spawnOptions.connectedServices),
           });
         };
 
@@ -4240,6 +4242,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                           ),
                     });
                     perSessionSpawnCustody.claim(connectedServiceAuth?.perSessionSpawnDecisionIds ?? []);
+                    perSessionSpawnCustody.claimLaunched(connectedServiceAuth?.perSessionLaunchDecisionIds ?? []);
                     if (repairedMissingMaterializationIdentity && normalizedExistingSessionId) {
                       try {
                         await persistSessionConnectedServiceBindings({
@@ -4810,6 +4813,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   startedBy: 'daemon',
                   happySessionId: normalizedExistingSessionId || undefined,
                   pid: tmuxPid, // Real PID from tmux -P flag
+                  launchedConnectedServices: structuredClone(tmuxTrackedSpawnOptions.connectedServices),
                   spawnOptions: tmuxTrackedSpawnOptions,
                   tmuxSessionId: tmuxResult.sessionId,
                   tmuxTmpDir: typeof tmuxTmpDir === 'string' && tmuxTmpDir.trim().length > 0 ? tmuxTmpDir.trim() : undefined,
@@ -4934,6 +4938,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   happySessionId: normalizedExistingSessionId || undefined,
                   pid: params.pid,
                   spawnOptions: hostedTrackedSpawnOptions,
+                  launchedConnectedServices: structuredClone(hostedTrackedSpawnOptions.connectedServices),
                   vendorResumeId: effectiveResume || undefined,
                   hostedTerminal: params.terminal,
                   directoryCreated,
@@ -5324,6 +5329,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     happySessionId: normalizedExistingSessionId || undefined,
                     pid: happyProcess.pid,
                     childProcess: happyProcess,
+                    launchedConnectedServices: structuredClone(regularTrackedSpawnOptions.connectedServices),
                     spawnOptions: regularTrackedSpawnOptions,
                     vendorResumeId: effectiveResume || undefined,
                     directoryCreated,
@@ -6385,8 +6391,16 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             if (!stillLive && !wasConnectedServicesRestartRequested) {
               connectedServiceRuntimeAuthSwitchAttempts.clearSession(trackedBeforeExit.happySessionId);
               connectedServiceSessionAuthSwitchCore.clearSession(trackedBeforeExit.happySessionId);
-              // The session's runner exited with no replacement: its per-session decisions are retired.
-              await perSessionAssignmentRuntime.releaseForRetiredSubjects([...collectPerSessionLiveSubjectIds([trackedBeforeExit])])
+            }
+          }
+          if (trackedBeforeExit && !wasConnectedServicesRestartRequested) {
+            // A runner exited with no requested replacement: the per-session decisions of every subject it
+            // carried that no remaining child carries are retired. Subjects are materialization identities,
+            // known before the session registers, so a pre-registration exit retires too (HPI-38).
+            const liveSubjects = collectPerSessionLiveSubjectIds(getCurrentChildren());
+            const retiredSubjects = [...collectPerSessionLiveSubjectIds([trackedBeforeExit])].filter((subject) => !liveSubjects.has(subject));
+            if (retiredSubjects.length > 0) {
+              await perSessionAssignmentRuntime.releaseForRetiredSubjects(retiredSubjects)
                 .catch((error) => logger.debug('[ConnectedServices] Per-session decision release after session exit failed (non-fatal)', error));
             }
           }
@@ -7563,9 +7577,10 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         });
         // The run's runner already exists: it owns the decisions this materialization created, and
         // its proved exit releases them (spec A.4).
-        if (resolved?.perSessionSpawnDecisionIds?.length && params.runnerPid) {
+        if ((resolved?.perSessionSpawnDecisionIds?.length || resolved?.perSessionLaunchDecisionIds?.length) && params.runnerPid) {
           const custody = perSessionAssignmentRuntime.createSpawnCustody();
-          custody.claim(resolved.perSessionSpawnDecisionIds);
+          custody.claim(resolved.perSessionSpawnDecisionIds ?? []);
+          custody.claimLaunched(resolved.perSessionLaunchDecisionIds ?? []);
           const processInstanceFingerprint = readProcessInstanceFingerprintSync(params.runnerPid);
           await custody.recordRunner({ pid: params.runnerPid, ...(processInstanceFingerprint ? { processInstanceFingerprint } : {}) });
         }

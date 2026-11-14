@@ -18,7 +18,7 @@ import {
 import type { ClaudeWorkflowActivitySource, ClaudeWorkflowActivityObservationContext } from '../workflows/claudeWorkflowActivitySource';
 import { filterWorkflowOwnedWorkStateItems } from '../workflows/claudeWorkflowOwnedWorkState';
 import { mapClaudeRateLimitEventToQuotaEvidence, mapClaudeProviderFailureToUsageDetails, readClaudeEventProviderCapturedAtMs, type NormalizedProviderUsageLimitDetailsV1 } from '../connectedServices/mapClaudeRateLimitEventToUsageDetails';
-import { observeClaudeRuntimeAuthTranscript, recordClaudeRateLimitQuotaEvidence, surfaceClaudeRateLimitRuntimeIssue } from '../connectedServices/surfaceClaudeRuntimeIssues';
+import { isReplayedClaudeQuotaCaptureCurrent, observeClaudeRuntimeAuthTranscript, recordClaudeRateLimitQuotaEvidence, surfaceClaudeRateLimitRuntimeIssue } from '../connectedServices/surfaceClaudeRuntimeIssues';
 import {
   buildClaudeCompactBoundaryEventIdentity,
   buildClaudeCompactionCompletedEvent,
@@ -307,14 +307,9 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
         maybeAdoptEffectiveModel(message);
         maybeProjectWorkState(message);
         maybeEmitCompactionEvents(message);
-        const quotaEvidence = mapClaudeRateLimitEventToQuotaEvidence(message);
-        if (quotaEvidence.length > 0) {
-          void recordClaudeRateLimitQuotaEvidence(params.session, quotaEvidence, params.logPrefix, {
-            providerCapturedAtMs: readClaudeEventProviderCapturedAtMs(message),
-          }).catch(() => {
-            logger.infoFile(`${params.logPrefix} Failed to record Claude quota evidence`);
-          });
-        }
+        // The scanner never forwards `rate_limit_event` here (it is internal); the raw channel below
+        // ingests it. A direct caller's row is still recorded, once per row.
+        recordQuotaEvidence(message);
         const rateLimitDetails = mapClaudeProviderFailureToUsageDetails(message);
         if (rateLimitDetails) surfaceRateLimit(rateLimitDetails);
       }
@@ -336,6 +331,29 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
     const current = observationTail.then(observe);
     observationTail = current.catch(() => {});
     return current;
+  };
+
+  // A quota row reaches the raw channel (the scanner's real path, HPI-30) and may also reach `observe`
+  // from a direct caller; each provider row is recorded once, whichever channel delivers it first.
+  const recordedRateLimitRowIds = new Set<string>();
+  const recordQuotaEvidence = (message: unknown, replayed = false): void => {
+    const providerCapturedAtMs = readClaudeEventProviderCapturedAtMs(message);
+    // A replayed row counts only by the capture it states; history is skipped without being marked
+    // recorded, so the same row delivered live later is still ingested.
+    if (replayed && !isReplayedClaudeQuotaCaptureCurrent(providerCapturedAtMs, Date.now())) return;
+    const rowId = readClaudeRateLimitEventRowId(message);
+    if (rowId !== null) {
+      if (recordedRateLimitRowIds.has(rowId)) return;
+      recordedRateLimitRowIds.add(rowId);
+    }
+    const quotaEvidence = mapClaudeRateLimitEventToQuotaEvidence(message);
+    if (quotaEvidence.length === 0) return;
+    void recordClaudeRateLimitQuotaEvidence(params.session, quotaEvidence, params.logPrefix, {
+      providerCapturedAtMs,
+      ...(replayed ? { replayed: true } : {}),
+    }).catch(() => {
+      logger.infoFile(`${params.logPrefix} Failed to record Claude quota evidence`);
+    });
   };
 
   return {
@@ -395,6 +413,11 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
     // already tolerate raw objects. This NEVER emits to the visible transcript.
     observeRaw(value, observation) {
       observeClaudeRuntimeAuthTranscript(params.session, value, observation);
+      // Quota telemetry rows are excluded from the visible transcript, so they are ingested here, with
+      // the capture time the row states. The reader's replay label is not chronology: a first live row
+      // can fall in its replay window, so a replayed row counts while its stated capture is current
+      // (HPI-30); lifecycle, identity and workflow effects keep their replay guards.
+      if (isClaudeRateLimitEventRow(value)) recordQuotaEvidence(value, observation?.historicalReplay === true);
       if (observation?.historicalReplay !== true) params.session.observeClaudePermissionTranscript?.(value);
       goalWorkStateSource.observeTranscriptMessage(value);
       // The Claude workflow ACTIVITY source rides the SAME raw transcript channel as the goal source
@@ -430,4 +453,14 @@ export function createClaudeSessionTranscriptProjector(params: Readonly<{
       workflowActivitySource?.dispose();
     },
   };
+}
+
+function isClaudeRateLimitEventRow(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && (value as { type?: unknown }).type === 'rate_limit_event';
+}
+
+function readClaudeRateLimitEventRowId(value: unknown): string | null {
+  if (!isClaudeRateLimitEventRow(value)) return null;
+  const uuid = (value as { uuid?: unknown }).uuid;
+  return typeof uuid === 'string' && uuid.length > 0 ? uuid : null;
 }

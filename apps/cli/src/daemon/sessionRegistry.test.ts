@@ -104,6 +104,29 @@ describe('sessionRegistry', () => {
     expect(markers2[0].happySessionId).toBe('sess-2');
   });
 
+  it('keeps the observed launch across rewrites of the same process, never across a reused pid (HPI-31/32)', async () => {
+    const { listSessionMarkers, writeSessionMarker } = await import('./sessionRegistry');
+    const launched = { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'g' } } };
+    await writeSessionMarker({ pid: 4242, happySessionId: 'sess-1', startedBy: 'daemon', processInstanceFingerprint: 'fp-1', launchedConnectedServices: launched });
+    await writeSessionMarker({ pid: 4242, happySessionId: 'sess-1', startedBy: 'daemon', processInstanceFingerprint: 'fp-1', cwd: '/tmp' });
+    expect((await listSessionMarkers())[0]?.launchedConnectedServices).toEqual(launched);
+    await writeSessionMarker({ pid: 4242, happySessionId: 'sess-1', startedBy: 'daemon', processInstanceFingerprint: 'fp-2' });
+    expect((await listSessionMarkers())[0]?.launchedConnectedServices).toBeUndefined();
+  });
+
+  it('never carries an observed launch across a fingerprint gap onto a later incarnation (HPI-40)', async () => {
+    const { listSessionMarkers, writeSessionMarker } = await import('./sessionRegistry');
+    const launched = { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'g' } } };
+    // A rewrite that cannot name the process drops the launch, so a later known generation cannot inherit it.
+    await writeSessionMarker({ pid: 4243, happySessionId: 'sess-1', startedBy: 'daemon', processInstanceFingerprint: 'fp-1', launchedConnectedServices: launched });
+    await writeSessionMarker({ pid: 4243, happySessionId: 'sess-1', startedBy: 'daemon' });
+    await writeSessionMarker({ pid: 4243, happySessionId: 'sess-1', startedBy: 'daemon', processInstanceFingerprint: 'fp-2' });
+    expect((await listSessionMarkers()).find((m) => m.pid === 4243)?.launchedConnectedServices).toBeUndefined();
+    // A launch stated without any process identity is not stored at all.
+    await writeSessionMarker({ pid: 4244, happySessionId: 'sess-2', startedBy: 'daemon', launchedConnectedServices: launched });
+    expect((await listSessionMarkers()).find((m) => m.pid === 4244)?.launchedConnectedServices).toBeUndefined();
+  });
+
   it('reports an incomplete marker listing when cleanup requires complete custody evidence', async () => {
     const { listSessionMarkers, writeSessionMarker } = await import('./sessionRegistry');
     await writeSessionMarker({ pid: 12345, happySessionId: 'valid-session', flavor: 'opencode' });

@@ -3,8 +3,13 @@ import { ConnectedServiceBindingsV1Schema, type ConnectedServiceId } from '@happ
 import { findConnectedServiceChildSelection } from '../../connectedServiceChildEnvironment';
 import { readConnectedServiceMaterializationIdentityV1 } from '../../materialize/createConnectedServiceMaterializationIdentity';
 import type { PerSessionSessionBinding } from './PerSessionFailoverCoordinator';
+import { readTrackedLauncherIdentity } from './readTrackedLauncherIdentity';
 
 type TrackedSessionLike = Readonly<{
+  pid?: number;
+  sessionRunnerPid?: number;
+  processInstanceFingerprint?: string;
+  launchedConnectedServices?: unknown;
   happySessionId?: string;
   happySessionMetadataFromLocalWebhook?: Readonly<Record<string, unknown>> | null;
   spawnOptions?: Readonly<{
@@ -39,16 +44,11 @@ export function readPerSessionSessionBinding(
   if (!parsed.success) return null;
   const binding = parsed.data.bindingsByServiceId[serviceId];
   if (!binding || binding.source !== 'connected' || binding.selection !== 'group' || binding.groupId !== groupId) return null;
-  // Decisions the runner was launched with: its launch bindings, never later metadata (HPI-21).
-  const launchedBindings = ConnectedServiceBindingsV1Schema.safeParse(tracked.spawnOptions?.connectedServices);
-  const launchedBinding = launchedBindings.success ? launchedBindings.data.bindingsByServiceId[serviceId] : undefined;
-  const launchedDecisionIds = launchedBinding?.source === 'connected' && launchedBinding.selection === 'group' && launchedBinding.groupId === groupId
-    ? [launchedBinding.member?.decisionId, launchedBinding.materializedAssignment?.decisionId].filter((id): id is string => typeof id === 'string')
-    : [];
   const launched = findConnectedServiceChildSelection(tracked.spawnOptions?.environmentVariables ?? {}, serviceId);
   const launchedProfileId = launched
     ? (launched.kind === 'group' ? launched.activeProfileId : launched.profileId)
     : null;
+  const runner = readTrackedLauncherIdentity(tracked);
   return {
     subjectId,
     ...(binding.initialProfileId ? { initialProfileId: binding.initialProfileId } : {}),
@@ -59,6 +59,29 @@ export function readPerSessionSessionBinding(
       : binding.materializedAssignment
         ? null
         : binding.appliedProfileId ?? launchedProfileId ?? null,
-    launchedDecisionIds,
+    ...(runner ? { runner } : {}),
+    ...readRunnerLaunchedDecisionIds(tracked.launchedConnectedServices, serviceId, groupId),
+  };
+}
+
+/**
+ * The decisions of this group binding the current runner was actually launched with, from the
+ * bindings its spawn site recorded: the effect owner's readback, never the respawn descriptor or
+ * metadata (HPI-21/31/32). Absent when the launch was not observed (a runner reattached from disk).
+ */
+function readRunnerLaunchedDecisionIds(
+  launched: unknown,
+  serviceId: ConnectedServiceId,
+  groupId: string,
+): Readonly<{ runnerLaunchedDecisionIds?: ReadonlyArray<string> }> {
+  if (launched === undefined) return {};
+  const parsed = ConnectedServiceBindingsV1Schema.safeParse(launched);
+  const binding = parsed.success ? parsed.data.bindingsByServiceId[serviceId] : undefined;
+  if (!binding || binding.source !== 'connected' || binding.selection !== 'group' || binding.groupId !== groupId) {
+    return { runnerLaunchedDecisionIds: [] };
+  }
+  return {
+    runnerLaunchedDecisionIds: [binding.member?.decisionId, binding.materializedAssignment?.decisionId]
+      .filter((id): id is string => typeof id === 'string'),
   };
 }

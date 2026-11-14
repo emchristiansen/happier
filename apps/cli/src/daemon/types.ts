@@ -55,6 +55,13 @@ export interface TrackedSession {
   processCommandHash?: string;
   /** Exact OS process-instance fingerprint used to distinguish PID generations. */
   processInstanceFingerprint?: string;
+  /**
+   * In-memory: the connected-service bindings this runner was actually launched with, captured by the
+   * spawn site that started it. Never rewritten: the switch FSM rewrites `spawnOptions` (the respawn
+   * descriptor) before a deferred restart, so only this records which decisions a runner carries
+   * (spec A.5, HPI-21/31/32). Absent for a runner reattached from disk, whose launch was not observed.
+   */
+  launchedConnectedServices?: unknown;
   /** Best-effort observed process command line used for startup runtime refresh checks. */
   processCommand?: string;
   childProcess?: ChildProcess;

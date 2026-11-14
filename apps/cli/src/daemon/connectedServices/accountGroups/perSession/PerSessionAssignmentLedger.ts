@@ -42,6 +42,19 @@ export type PerSessionAssignmentLedgerEntry = Readonly<{
    * exist before any runner is observable, so no pre-launch release is definite (spec A.4, T17).
    */
   launchAttemptedAtMs?: number;
+  /**
+   * The runner process most recently started carrying this decision, written only once that process
+   * exists. Unlike session metadata or respawn options, which name a target before its launch, this
+   * proves the decision's runner was launched (spec A.5 T20).
+   */
+  launchedRunner?: PerSessionAssignmentRunner;
+  /**
+   * A live runner observed carrying this decision in its bindings. It is never launch evidence: the
+   * bindings of a pending target name it before its launch (HPI-21). It ties the decision to a live
+   * process, so the decision is not definitely pre-launch and retires when that process ends while
+   * the daemon is down (HPI-33/36).
+   */
+  carrierRunner?: PerSessionAssignmentRunner;
   /** First proved provider activity on this applied decision's member (spec A.3). */
   firstProviderActivityAtMs?: number;
   /**
@@ -52,6 +65,13 @@ export type PerSessionAssignmentLedgerEntry = Readonly<{
 }>;
 
 export type PerSessionAssignmentRunner = Readonly<{ pid: number; processInstanceFingerprint?: string }>;
+
+/** The same process: equal pid, and equal fingerprint when both sides know one. */
+export function isSamePerSessionRunner(left: PerSessionAssignmentRunner, right: PerSessionAssignmentRunner): boolean {
+  if (left.pid !== right.pid) return false;
+  return !left.processInstanceFingerprint || !right.processInstanceFingerprint
+    || left.processInstanceFingerprint === right.processInstanceFingerprint;
+}
 
 type LedgerSnapshot = Readonly<{ v: 1; entriesByDecisionId: Readonly<Record<string, PerSessionAssignmentLedgerEntry>> }>;
 
@@ -126,7 +146,7 @@ export class PerSessionAssignmentLedger {
   }
 
   async recordProposal(
-    input: Omit<PerSessionAssignmentLedgerEntry, 'state' | 'updatedAtMs' | 'runner' | 'launchAttemptedAtMs' | 'firstProviderActivityAtMs' | 'reservationReleasedAtMs'>
+    input: Omit<PerSessionAssignmentLedgerEntry, 'state' | 'updatedAtMs' | 'runner' | 'launchAttemptedAtMs' | 'launchedRunner' | 'carrierRunner' | 'firstProviderActivityAtMs' | 'reservationReleasedAtMs'>
       & Readonly<{ nowMs: number }>,
   ): Promise<void> {
     await this.mutate(() => {
@@ -142,6 +162,8 @@ export class PerSessionAssignmentLedger {
         updatedAtMs: input.nowMs,
         ...(previous?.runner ? { runner: previous.runner } : {}),
         ...(previous?.launchAttemptedAtMs === undefined ? {} : { launchAttemptedAtMs: previous.launchAttemptedAtMs }),
+        ...(previous?.launchedRunner ? { launchedRunner: previous.launchedRunner } : {}),
+        ...(previous?.carrierRunner ? { carrierRunner: previous.carrierRunner } : {}),
         ...(previous?.firstProviderActivityAtMs === undefined ? {} : { firstProviderActivityAtMs: previous.firstProviderActivityAtMs }),
         ...(previous?.reservationReleasedAtMs === undefined ? {} : { reservationReleasedAtMs: previous.reservationReleasedAtMs }),
         ...((input.replacesDecisionIds ?? previous?.replacesDecisionIds)?.length
@@ -179,6 +201,25 @@ export class PerSessionAssignmentLedger {
         if (!entry || entry.launchAttemptedAtMs !== undefined) continue;
         this.entries.set(decisionId, { ...entry, launchAttemptedAtMs: nowMs, updatedAtMs: nowMs });
       }
+    });
+  }
+
+  /** Records the runner process just started carrying these decisions (launch evidence only). */
+  async recordLaunchedRunner(decisionIds: ReadonlyArray<string>, runner: PerSessionAssignmentRunner, nowMs: number): Promise<void> {
+    if (decisionIds.length === 0) return;
+    await this.mutate(() => {
+      for (const decisionId of decisionIds) {
+        const entry = this.entries.get(decisionId);
+        if (entry) this.entries.set(decisionId, { ...entry, launchedRunner: runner, updatedAtMs: nowMs });
+      }
+    });
+  }
+
+  /** Records the live runner observed carrying a decision (never launch evidence). */
+  async recordCarrierRunner(decisionId: string, runner: PerSessionAssignmentRunner, nowMs: number): Promise<void> {
+    await this.mutate(() => {
+      const entry = this.entries.get(decisionId);
+      if (entry) this.entries.set(decisionId, { ...entry, carrierRunner: runner, updatedAtMs: nowMs });
     });
   }
 
