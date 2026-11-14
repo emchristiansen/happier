@@ -99,10 +99,13 @@ export function useConnectedServiceAuthGroupsQuery(params: Readonly<{
             if (!scope) return [];
             return await listConnectedServiceAuthGroupsV3(scope.credentials, {
                 serviceId: params.serviceId,
-                serverUrl: scope.serverUrl,
+                ...(scope.serverUrl ? { serverUrl: scope.serverUrl } : {}),
             });
         } catch (error) {
-            console.warn('[connectedServices] Failed to load authoritative account pools', { serviceId: params.serviceId, targetServerId });
+            console.warn('[connectedServices] Failed to load authoritative account pools', {
+                serviceId: params.serviceId,
+                ...(targetServerId ? { targetServerId } : {}),
+            });
             throw error;
         }
     }, [credentials, params.enabled, params.serviceId, targetServerId]);

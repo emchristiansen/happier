@@ -64,7 +64,7 @@ describe('useNewSessionPerSessionAccountGroups', () => {
         const hook = await render('server-a');
         await flushHookEffects({ cycles: 5, turns: 5 });
         expect(credentialsForServerUrlSpy).not.toHaveBeenCalled();
-        expect(listSpy).toHaveBeenCalledWith(activeCredentials, { serviceId: 'claude-subscription', serverUrl: null });
+        expect(listSpy).toHaveBeenCalledWith(activeCredentials, { serviceId: 'claude-subscription' });
         expect(hook.getCurrent()?.['claude-subscription']?.map((group) => group.groupId)).toEqual(['pool-on-a']);
     });
 
