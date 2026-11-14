@@ -3,7 +3,6 @@ import { ConnectedServiceBindingsV1Schema } from '@happier-dev/protocol';
 import {
   projectProviderObservedAccountMetadata,
   resolveAdoptedPerSessionDecisionId,
-  resolveCommittedSharedConversion,
   resolveProvedSharedConversion,
 } from './providerObservedAccountMetadata';
 
@@ -85,21 +84,13 @@ describe('per-session adoption through provider-observed accounts', () => {
     });
     expect(resolveAdoptedPerSessionDecisionId(converting, converted, 'claude-subscription')).toBeNull();
     // Only the matching group-home account proves conversion; the per-session decisions settle then (HPI-17).
-    expect(resolveProvedSharedConversion(converting, converted, 'claude-subscription')).toBe(true);
-    expect(resolveProvedSharedConversion(converting, stillOld, 'claude-subscription')).toBe(false);
+    // The proof names what it retires: decisions made at or before the conversion target (HPI-23).
+    expect(resolveProvedSharedConversion(converting, converted, 'claude-subscription')).toEqual({ retiresDecisionsDecidedAtOrBeforeMs: 2 });
+    expect(resolveProvedSharedConversion(converting, stillOld, 'claude-subscription')).toBeNull();
     const wrongAccount = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-c' });
-    expect(resolveProvedSharedConversion(converting, wrongAccount, 'claude-subscription')).toBe(false);
+    expect(resolveProvedSharedConversion(converting, wrongAccount, 'claude-subscription')).toBeNull();
     expect((wrongAccount.connectedServices as any).bindingsByServiceId['claude-subscription'].materializedAssignment)
       .toMatchObject({ decisionId: 'conversion-1', home: 'group' });
 
-    // A repeated identical observation after the commit changes nothing but re-proves the
-    // committed conversion, so settlement interrupted after the commit is not lost (HPI-17).
-    const observedA = { serviceId: 'claude-subscription' as const, groupId: 'pool', profileId: 'acct-a' };
-    expect(projectProviderObservedAccountMetadata(converted, observedA)).toBe(converted);
-    expect(resolveCommittedSharedConversion(converted, observedA)).toBe(true);
-    expect(resolveCommittedSharedConversion(converted, { ...observedA, profileId: 'acct-c' })).toBe(false);
-    expect(resolveCommittedSharedConversion(converted, { ...observedA, groupId: 'other' })).toBe(false);
-    expect(resolveCommittedSharedConversion(converting, observedA)).toBe(false);
-    expect(resolveCommittedSharedConversion(wrongAccount, { ...observedA, profileId: 'acct-c' })).toBe(false);
   });
 });

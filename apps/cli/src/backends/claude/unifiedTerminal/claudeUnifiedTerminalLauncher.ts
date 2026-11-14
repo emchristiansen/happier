@@ -1237,7 +1237,7 @@ export async function claudeUnifiedTerminalLauncher(
         session.onThinkingChange(thinking);
       },
       onUsageLimitDetails: surfaceRateLimit,
-      onQuotaEvidence: (windows) => recordClaudeRateLimitQuotaEvidence(session, windows, '[unified-terminal]'),
+      onQuotaEvidence: (windows, capture) => recordClaudeRateLimitQuotaEvidence(session, windows, '[unified-terminal]', capture),
       onRuntimeAuthFailureEvent: async (error) => {
         try {
           const surfaced = await surfaceClaudeRuntimeAuthFailure(session, error, '[unified]');

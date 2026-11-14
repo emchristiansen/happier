@@ -17,9 +17,11 @@ import {
 import type { createClaudeProviderRuntimeActivityAdapter } from '../providerActivity/createClaudeProviderRuntimeActivityAdapter';
 import { isClaudeRuntimeAuthFailureEvidence } from '../connectedServices/classifyClaudeConnectedServiceRuntimeAuthFailure';
 import { containsDefinitiveClaudeOAuthRevocationEvidence } from '../connectedServices/surfaceClaudeRuntimeIssues';
+import type { ClaudeQuotaEvidenceCapture } from '@/backends/claude/connectedServices/surfaceClaudeRuntimeIssues';
 import {
   mapClaudeProviderFailureToUsageDetails,
   mapClaudeRateLimitEventToQuotaEvidence,
+  readClaudeEventProviderCapturedAtMs,
   mapClaudeStopFailureHookToUsageDetails,
   type NormalizedProviderUsageLimitDetailsV1,
 } from '../connectedServices/mapClaudeRateLimitEventToUsageDetails';
@@ -145,7 +147,7 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
   onThinkingChange?: ((thinking: boolean) => void) | undefined;
   onReady?: (() => void | Promise<void>) | undefined;
   onUsageLimitDetails?: ((details: NormalizedProviderUsageLimitDetailsV1) => void | Promise<void>) | undefined;
-  onQuotaEvidence?: ((windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => void | Promise<void>) | undefined;
+  onQuotaEvidence?: ((windows: readonly NormalizedProviderUsageLimitDetailsV1[], capture?: ClaudeQuotaEvidenceCapture) => void | Promise<void>) | undefined;
   onRuntimeAuthFailureEvent?: ((error: unknown) => void | Promise<void>) | undefined;
   onProviderPromptStarted?: (() => void | Promise<void>) | undefined;
   /**
@@ -712,7 +714,8 @@ export function createClaudeUnifiedHookLifecycleBridge(opts: Readonly<{
       }
       const quotaEvidence = mapClaudeRateLimitEventToQuotaEvidence(message);
       if (quotaEvidence.length > 0) {
-        chainTerminalSideEffect('quota-evidence', () => opts.onQuotaEvidence?.(quotaEvidence));
+        const capture = { providerCapturedAtMs: readClaudeEventProviderCapturedAtMs(message) };
+        chainTerminalSideEffect('quota-evidence', () => opts.onQuotaEvidence?.(quotaEvidence, capture));
       }
       const usageLimitDetails = mapClaudeProviderFailureToUsageDetails(message);
       if (usageLimitDetails) {

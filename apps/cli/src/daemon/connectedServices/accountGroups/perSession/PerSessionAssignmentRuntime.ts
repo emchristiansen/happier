@@ -54,12 +54,15 @@ export type PerSessionSpawnCustody = Readonly<{
 export type PerSessionRunnerPresence = 'absent' | 'present' | 'unknown';
 
 /**
- * A live runner whose provider-observed metadata binding for the group no longer carries any
- * per-session field, while it was launched either for the group home (a pending `home:'group'`
- * conversion target, `conversionProfileId`) or without per-session fields. Only a proved conversion
- * to the shared home removes those fields (spec A.4 Migration), so this is that proof, durably.
+ * A proved conversion of a session to its group's shared home (spec A.4 Migration). It retires the
+ * per-session decisions made at or before the conversion target was materialized, never a later one.
  */
-export type PerSessionProvedSharedConversion = Readonly<{ subjectId: string; serviceId: ConnectedServiceId; groupId: string }>;
+export type PerSessionProvedSharedConversion = Readonly<{
+  subjectId: string;
+  serviceId: ConnectedServiceId;
+  groupId: string;
+  retiresDecisionsDecidedAtOrBeforeMs: number;
+}>;
 
 /** A per-session decision a live runner currently carries in its bindings. */
 export type PerSessionLiveDecision = Readonly<{
@@ -107,10 +110,11 @@ export class PerSessionAssignmentRuntime {
     /** Live runners whose committed metadata proves conversion to the group's shared home. */
     listProvedSharedConversions?: () => ReadonlyArray<PerSessionProvedSharedConversion>;
     /**
-     * Capture time (`fetchedAt`) of the freshest quota snapshot this daemon holds for a member, or
-     * null when it has none. Read only after proved provider activity (spec A.3).
+     * The earliest capture time of the member's freshest quota snapshot this daemon holds, if that
+     * snapshot is still fresh at `nowMs` and proves its capture time; otherwise null. Read only after
+     * proved provider activity (spec A.3).
      */
-    readMemberSnapshotCapturedAtMs?: (input: Readonly<{ serviceId: ConnectedServiceId; groupId: string; profileId: string }>) => number | null;
+    readMemberSnapshotCapturedAtOrAfterMs?: (input: Readonly<{ serviceId: ConnectedServiceId; groupId: string; profileId: string; nowMs: number }>) => number | null;
     log?: Log;
   }>) {}
 
@@ -235,11 +239,14 @@ export class PerSessionAssignmentRuntime {
 
   /**
    * Provider adoption proved this session's conversion to the group's shared home (spec A.4
-   * Migration): every per-session decision it still held for that group is retired.
+   * Migration): the per-session decisions it retires (made at or before the conversion target was
+   * materialized, and not carried by a live runner) are released. A later decision is kept.
    */
-  async settleProvedSharedConversion(params: Readonly<{ subjectId: string; serviceId: ConnectedServiceId; groupId: string }>): Promise<void> {
+  async settleProvedSharedConversion(conversion: PerSessionProvedSharedConversion): Promise<void> {
+    const live = new Set(this.input.listLiveDecisions().map((decision) => decision.decisionId));
     for (const entry of this.input.ledger.list()) {
-      if (entry.sessionId !== params.subjectId || entry.serviceId !== params.serviceId || entry.groupId !== params.groupId) continue;
+      if (live.has(entry.decisionId) || !sameSubject(entry, { ...conversion, sessionId: conversion.subjectId })) continue;
+      if (!(entry.proposal.decidedAtMs <= conversion.retiresDecisionsDecidedAtOrBeforeMs)) continue;
       this.log('per_session_decision_released_shared_conversion', { decisionId: entry.decisionId, sessionId: entry.sessionId });
       await this.release(entry.decisionId);
     }
@@ -352,11 +359,7 @@ export class PerSessionAssignmentRuntime {
       if (entry.state === 'applied' && live.get(entry.decisionId)?.applied) await this.settleAdoption(entry, { includePreviouslyApplied: false });
     }
     for (const conversion of this.input.listProvedSharedConversions?.() ?? []) {
-      for (const entry of this.input.ledger.list()) {
-        if (live.has(entry.decisionId) || !sameSubject(entry, { ...conversion, sessionId: conversion.subjectId })) continue;
-        this.log('per_session_decision_released_shared_conversion', { decisionId: entry.decisionId, sessionId: entry.sessionId });
-        await this.release(entry.decisionId);
-      }
+      await this.settleProvedSharedConversion(conversion);
     }
     entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
     await this.releaseReservationsAfterActivitySnapshot(entries, live, nowMs);
@@ -388,7 +391,12 @@ export class PerSessionAssignmentRuntime {
         await this.release(entry.decisionId);
         continue;
       }
-      if (!successorOwned && entry.runner && await this.runnerProvedAbsent(entry.runner)) {
+      // A dead runner proves only that a spawn's own child is gone. A recovery decision, or any
+      // decision replacing earlier ones, belongs to the session's unfinished recovery: its runner's
+      // absence is not the end of the session, so it keeps custody until a later decision is
+      // adopted, conversion is proved, or the session's retirement is observed (spec A.5 T20).
+      const recoveryOwned = entry.origin === 'recovery' || (entry.replacesDecisionIds?.length ?? 0) > 0;
+      if (!successorOwned && !recoveryOwned && entry.runner && await this.runnerProvedAbsent(entry.runner)) {
         this.log('per_session_decision_released_runner_absent', { decisionId: entry.decisionId, sessionId: entry.sessionId, pid: entry.runner.pid });
         await this.release(entry.decisionId);
         continue;
@@ -400,7 +408,7 @@ export class PerSessionAssignmentRuntime {
         this.unresolvedLogged.add(entry.decisionId);
         this.log('per_session_decision_unowned_custody_retained', {
           decisionId: entry.decisionId, sessionId: entry.sessionId, runnerRecorded: Boolean(entry.runner),
-          launchAttempted: entry.launchAttemptedAtMs !== undefined, successorOwned, ageMs: nowMs - entry.updatedAtMs,
+          launchAttempted: entry.launchAttemptedAtMs !== undefined, successorOwned, recoveryOwned, ageMs: nowMs - entry.updatedAtMs,
         });
       }
       if (!isRenewable(entry)) continue;
@@ -422,13 +430,13 @@ export class PerSessionAssignmentRuntime {
     live: ReadonlyMap<string, PerSessionLiveDecision>,
     nowMs: number,
   ): Promise<void> {
-    const readCapturedAt = this.input.readMemberSnapshotCapturedAtMs;
+    const readCapturedAt = this.input.readMemberSnapshotCapturedAtOrAfterMs;
     if (!readCapturedAt) return;
     for (const entry of entries.values()) {
       const activityAtMs = entry.firstProviderActivityAtMs;
       if (entry.state !== 'applied' || activityAtMs === undefined || entry.reservationReleasedAtMs !== undefined) continue;
       if (!live.get(entry.decisionId)?.applied) continue;
-      const capturedAtMs = readCapturedAt({ serviceId: entry.serviceId, groupId: entry.groupId, profileId: entry.proposal.profileId });
+      const capturedAtMs = readCapturedAt({ serviceId: entry.serviceId, groupId: entry.groupId, profileId: entry.proposal.profileId, nowMs });
       if (capturedAtMs === null || !(capturedAtMs > activityAtMs)) continue;
       try {
         const result = this.input.reservationApi

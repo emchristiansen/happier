@@ -37,7 +37,7 @@ function runtimeFor(input: Readonly<{
     listLiveSubjectIds: input.liveSubjects ?? (() => new Set()),
     probeRunnerPresence: async (runner) => input.presence?.(runner.pid) ?? 'present',
     ...(input.conversions ? { listProvedSharedConversions: input.conversions } : {}),
-    ...(input.snapshotCapturedAt ? { readMemberSnapshotCapturedAtMs: ({ profileId }: { profileId: string }) => input.snapshotCapturedAt!(profileId) } : {}),
+    ...(input.snapshotCapturedAt ? { readMemberSnapshotCapturedAtOrAfterMs: ({ profileId }: { profileId: string }) => input.snapshotCapturedAt!(profileId) } : {}),
   });
 }
 
@@ -284,7 +284,7 @@ describe('PerSessionAssignmentRuntime', () => {
     const api = reservationApi();
     const runtime = runtimeFor({ ledger, api, liveSubjects: () => new Set(['s', 'peer']) });
 
-    await runtime.settleProvedSharedConversion({ subjectId: 's', serviceId: 'claude-subscription', groupId: 'pool' });
+    await runtime.settleProvedSharedConversion({ subjectId: 's', serviceId: 'claude-subscription', groupId: 'pool', retiresDecisionsDecidedAtOrBeforeMs: 10 });
     await runtime.tick();
 
     expect(ledger.list().map((entry) => entry.decisionId)).toEqual(['other']);

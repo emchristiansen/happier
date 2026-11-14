@@ -33,10 +33,10 @@ type TrackedFixture = Readonly<{
   spawnOptions: Readonly<{ connectedServices: unknown }>;
 }>;
 
-function proposal(decisionId: string, profileId: string): PerSessionAssignmentProposal {
+function proposal(decisionId: string, profileId: string, decidedAtMs = 1): PerSessionAssignmentProposal {
   return {
     decisionId, profileId, proposalRevision: 1, reason: 'failover', fromProfileId: 'a', temperature: 1.5, offsetPercent: 10,
-    probability: 1, decidedAtMs: 1, custody: 'reserved', observedReservationRevision: 0,
+    probability: 1, decidedAtMs, custody: 'reserved', observedReservationRevision: 0,
   };
 }
 
@@ -48,7 +48,7 @@ async function freshLedger() {
 async function record(
   ledger: PerSessionAssignmentLedger,
   decisionId: string,
-  options: Readonly<{ profileId?: string; origin?: 'spawn' | 'recovery'; replaces?: string[]; sessionId?: string }> = {},
+  options: Readonly<{ profileId?: string; origin?: 'spawn' | 'recovery'; replaces?: string[]; sessionId?: string; decidedAtMs?: number }> = {},
 ) {
   await ledger.recordProposal({
     decisionId,
@@ -56,7 +56,7 @@ async function record(
     serviceId,
     groupId: 'g',
     origin: options.origin ?? 'recovery',
-    proposal: proposal(decisionId, options.profileId ?? 'b'),
+    proposal: proposal(decisionId, options.profileId ?? 'b', options.decidedAtMs),
     nowMs: 1,
     ...(options.replaces ? { replacesDecisionIds: options.replaces } : {}),
   });
@@ -79,7 +79,7 @@ function runtimeFor(ledger: PerSessionAssignmentLedger, sessions: () => Readonly
   presence?: PerSessionRunnerPresence;
   failPut?: boolean;
   nowMs?: () => number;
-  snapshotCapturedAt?: (profileId: string) => number | null;
+  snapshotCapturedAt?: (profileId: string, nowMs: number) => number | null;
 }> = {}) {
   const events = options.events ?? [];
   return new PerSessionAssignmentRuntime({
@@ -89,7 +89,9 @@ function runtimeFor(ledger: PerSessionAssignmentLedger, sessions: () => Readonly
     listLiveDecisions: () => collectPerSessionLiveDecisions(sessions()),
     listLiveSubjectIds: () => collectPerSessionLiveSubjectIds(sessions()),
     listProvedSharedConversions: () => collectPerSessionProvedSharedConversions(sessions()),
-    ...(options.snapshotCapturedAt ? { readMemberSnapshotCapturedAtMs: ({ profileId }: { profileId: string }) => options.snapshotCapturedAt!(profileId) } : {}),
+    ...(options.snapshotCapturedAt ? {
+      readMemberSnapshotCapturedAtOrAfterMs: ({ profileId, nowMs }: { profileId: string; nowMs: number }) => options.snapshotCapturedAt!(profileId, nowMs),
+    } : {}),
     probeRunnerPresence: async () => options.presence ?? 'unknown',
     reservationApi: {
       listAssignmentReservations: async () => ({ kind: 'unavailable', detail: 'fixture' }),
@@ -325,5 +327,130 @@ describe('reservation release at the first fresh snapshot after first provider a
     await runtime.tick();
     expect(events).toEqual([{ put: 'applied-a' }]);
     expect(ledger.get('applied-a')?.reservationReleasedAtMs).toBeUndefined();
+  });
+});
+
+describe('round-5 custody and proof boundaries', () => {
+  it('keeps an unadopted successor and its failed predecessor when the successor\'s runner is gone too (HPI-01)', async () => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'first-b', { origin: 'spawn' });
+    await ledger.recordRunner('first-b', { pid: 1 }, 1);
+    await record(ledger, 'successor-c', { profileId: 'c', replaces: ['first-b'] });
+    await ledger.recordRunner('successor-c', { pid: 2 }, 1);
+    const events: Event[] = [];
+    const runtime = runtimeFor(ledger, () => [], { events, presence: 'absent' });
+    await runtime.tick();
+    await runtime.tick();
+    expect(ids(ledger)).toEqual(['first-b', 'successor-c']);
+    expect(events.filter((event) => 'delete' in event)).toEqual([]);
+
+    // The session's observed retirement is the terminal proof that releases the whole chain.
+    await runtime.releaseForRetiredSubjects(['subject']);
+    expect(ids(ledger)).toEqual([]);
+  });
+
+  it('control: a lone spawn decision whose recorded runner is gone is still released', async () => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'only-b', { origin: 'spawn' });
+    await ledger.recordRunner('only-b', { pid: 1 }, 1);
+    await runtimeFor(ledger, () => [], { presence: 'absent' }).tick();
+    expect(ids(ledger)).toEqual([]);
+  });
+
+  it('never treats an ordinary shared session as a conversion of its first new per-session decision (HPI-23)', async () => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'first-per-session', { profileId: 'c', decidedAtMs: NOW });
+    const shared = launchedWith({ appliedProfileId: 'a' }, { appliedProfileId: 'a' });
+    await runtimeFor(ledger, () => shared).tick();
+    expect(ids(ledger)).toEqual(['first-per-session']);
+  });
+
+  it('a real earlier conversion retires only decisions made up to it, never a later one (HPI-23)', async () => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'before-conversion', { decidedAtMs: 1 });
+    await record(ledger, 'after-conversion', { profileId: 'c', decidedAtMs: NOW });
+    const converted = launchedWith(
+      { materializedAssignment: { profileId: 'a', decisionId: 'convert-a', reason: 'policy_conversion', home: 'group', materializedAtMs: 2 } },
+      { appliedProfileId: 'a' },
+    );
+    await runtimeFor(ledger, () => converted).tick();
+    expect(ids(ledger)).toEqual(['after-conversion']);
+  });
+});
+
+describe('recovery replay and redraw (HPI-21, HPI-26)', () => {
+  function coordinatorFor(ledger: PerSessionAssignmentLedger, options: Readonly<{
+    state: () => ReturnType<typeof groupState>;
+    binding: () => any;
+    onPut?: (profileId: string) => void;
+    applied?: string[];
+  }>) {
+    return new PerSessionFailoverCoordinator({
+      loadGroup: async () => options.state() as any,
+      buildState: async () => options.state() as any,
+      switchSharedGroup: async () => { throw new Error('unexpected shared switch'); },
+      recordFailure: async () => {},
+      readSessionBinding: options.binding,
+      applyAssignment: async (assignment) => { options.applied?.push(assignment.profileId); return { ok: true, action: 'metadata_updated' } as any; },
+      ledger,
+      releaseUnappliedDecision: async (decisionId) => { await ledger.remove(decisionId); },
+      ownerMachineId: 'm',
+      reservationApi: {
+        listAssignmentReservations: async () => ({ kind: 'ok', reservationRevision: 0, reservations: [] }),
+        putAssignmentReservation: async (put: any) => {
+          options.onPut?.(put.body.profileId);
+          return { kind: 'reserved', reservationRevision: 1, reservation: { decisionId: put.decisionId, ...put.body, createdAtMs: NOW } };
+        },
+        deleteAssignmentReservation: async () => ({ kind: 'ok', reservationRevision: 2, deleted: true }),
+      } as any,
+      quotaFreshnessMs: 300_000,
+      nowMs: () => NOW,
+      deadlineMs: 30_000,
+      uniformSample: () => 0,
+    });
+  }
+
+  it.each([
+    ['requests the deferred restart again when no runner was launched with the committed decision', [], 'spawn_next_turn'],
+    ['waits for adoption once a runner was launched with it', ['replay-c'], 'restart_resume'],
+  ] as const)('a durable retry %s', async (_label, launchedDecisionIds, mode) => {
+    const { ledger } = await freshLedger();
+    await record(ledger, 'replay-c', { profileId: 'c' });
+    const member = { assignment: 'per_session', profileId: 'a', decisionId: 'applied-a', reason: 'initial_sampled', appliedAtMs: 1 };
+    const pending = { profileId: 'c', decisionId: 'replay-c', reason: 'failover', materializedAtMs: 2 };
+    const applied: string[] = [];
+    const coordinator = coordinatorFor(ledger, {
+      state: groupState,
+      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, materializedAssignment: pending, launchedDecisionIds }),
+      applied,
+    });
+    const result = await coordinator.switchAfterClassifiedFailure({ sessionId: 'subject', serviceId, groupId: 'g', reason: 'usage_limit', observedProfileId: 'a' });
+    expect(result).toMatchObject({ status: 'switched', activeProfileId: 'c', mode });
+    expect(applied).toEqual([]);
+    expect(ids(ledger)).toEqual(['replay-c']);
+  });
+
+  it('redraws from the fresh state that refused the target, reaching a member added meanwhile', async () => {
+    const { ledger } = await freshLedger();
+    let state = groupState();
+    state.members = state.members.filter((member) => member.profileId !== 'c');
+    const member = { assignment: 'per_session', profileId: 'a', decisionId: 'applied-a', reason: 'initial_sampled', appliedAtMs: 1 };
+    const applied: string[] = [];
+    const coordinator = coordinatorFor(ledger, {
+      state: () => state,
+      binding: () => ({ subjectId: 'subject', currentProfileId: 'a', member, launchedDecisionIds: ['applied-a'] }),
+      applied,
+      // While B's reservation is acknowledged, the group replaces B with a healthy C.
+      onPut: (profileId) => {
+        if (profileId !== 'b') return;
+        const fresh = groupState();
+        fresh.members = fresh.members.filter((candidate) => candidate.profileId !== 'b');
+        state = fresh;
+      },
+    });
+    const result = await coordinator.switchAfterClassifiedFailure({ sessionId: 'subject', serviceId, groupId: 'g', reason: 'usage_limit', observedProfileId: 'a' });
+    expect(result).toMatchObject({ status: 'switched', activeProfileId: 'c' });
+    expect(applied).toEqual(['c']);
+    expect(ledger.list().map((entry) => entry.proposal.profileId)).toEqual(['c']);
   });
 });

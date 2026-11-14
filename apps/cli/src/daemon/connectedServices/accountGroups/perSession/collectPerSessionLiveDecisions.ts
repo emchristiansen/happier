@@ -86,34 +86,46 @@ function readGroupBindings(value: unknown) {
 }
 
 /**
- * Live runners whose committed (provider-observed) metadata proves conversion to the group's shared
- * home (spec A.4 Migration), read durably so a settlement interrupted after the metadata commit is
- * completed on a later pass. The proof needs all of:
- * - the session's own metadata binding for the group has no per-session field and records the
- *   provider-observed `appliedProfileId`; the projection removes those fields only on proved
- *   conversion, and spawn under a rolled-back policy keeps them (pending `home:'group'`);
+ * Proved conversions of one runner to the group's shared home (spec A.4 Migration), from its launch
+ * bindings and committed metadata. Proof needs both:
  * - the runner was launched for the group home: its launch binding's pending target is
- *   `home:'group'` on that same observed account, or it carries no per-session field at all.
- * A runner launched for a per-session member, launch bindings alone, or a wrong observed account
- * prove nothing.
+ *   `home:'group'`, and that conversion is what it retires: decisions made at or before the target
+ *   was materialized. A runner launched shared or for a per-session member proves nothing, and a
+ *   decision made after the conversion (a new per-session draw) is never retired by it;
+ * - the committed binding for that group carries no per-session field and records the conversion
+ *   target as the provider-observed `appliedProfileId`.
+ * Used by the renewal tick (webhook metadata) and by the provider-observation updater (the metadata
+ * it just committed), so a settlement interrupted after the commit is completed by either.
  */
+export function resolveLaunchedSharedConversions(
+  session: TrackedSessionLike,
+  committedConnectedServices: unknown,
+): PerSessionProvedSharedConversion[] {
+  const subjectId = readSubjectId(session);
+  const committed = readGroupBindings(committedConnectedServices);
+  const launched = readGroupBindings(session.spawnOptions?.connectedServices);
+  if (!subjectId || !committed || !launched) return [];
+  const conversions: PerSessionProvedSharedConversion[] = [];
+  for (const [serviceId, binding] of committed) {
+    if (binding.member || binding.materializedAssignment || !binding.appliedProfileId) continue;
+    const conversion = launched.get(serviceId)?.materializedAssignment;
+    if (!conversion || conversion.home !== 'group' || conversion.profileId !== binding.appliedProfileId) continue;
+    if (launched.get(serviceId)!.groupId !== binding.groupId) continue;
+    conversions.push({
+      subjectId,
+      serviceId: serviceId as ConnectedServiceId,
+      groupId: binding.groupId,
+      retiresDecisionsDecidedAtOrBeforeMs: conversion.materializedAtMs,
+    });
+  }
+  return conversions;
+}
+
+/** Live runners whose committed metadata proves their conversion to the group's shared home. */
 export function collectPerSessionProvedSharedConversions(tracked: Iterable<TrackedSessionLike>): PerSessionProvedSharedConversion[] {
   const conversions: PerSessionProvedSharedConversion[] = [];
   for (const session of tracked) {
-    const subjectId = readSubjectId(session);
-    const committed = readGroupBindings(session.happySessionMetadataFromLocalWebhook?.connectedServices);
-    if (!subjectId || !committed) continue;
-    const launched = readGroupBindings(session.spawnOptions?.connectedServices);
-    for (const [serviceId, binding] of committed) {
-      if (binding.member || binding.materializedAssignment || !binding.appliedProfileId) continue;
-      const launch = launched?.get(serviceId);
-      if (!launch || launch.groupId !== binding.groupId) continue;
-      const launchedForGroupHome = launch.materializedAssignment
-        ? launch.materializedAssignment.home === 'group' && launch.materializedAssignment.profileId === binding.appliedProfileId
-        : !launch.member;
-      if (!launchedForGroupHome) continue;
-      conversions.push({ subjectId, serviceId: serviceId as ConnectedServiceId, groupId: binding.groupId });
-    }
+    conversions.push(...resolveLaunchedSharedConversions(session, session.happySessionMetadataFromLocalWebhook?.connectedServices));
   }
   return conversions;
 }

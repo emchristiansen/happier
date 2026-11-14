@@ -24,4 +24,17 @@ describe('readPerSessionSessionBinding serving identity (T19)', () => {
     expect(readPerSessionSessionBinding(tracked({ member }), 'claude-subscription', 'pool')?.currentProfileId).toBe('a');
     expect(readPerSessionSessionBinding(tracked({ appliedProfileId: 'c' }), 'claude-subscription', 'pool')?.currentProfileId).toBe('c');
   });
+
+  it('reports the decisions the runner was launched with, not those only in later metadata (HPI-21)', () => {
+    const launchedPendingOnlyInMetadata = {
+      ...tracked({ member, materializedAssignment: { ...pendingB, reason: 'failover' } }),
+      spawnOptions: { connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', member } } } },
+    };
+    expect(readPerSessionSessionBinding(launchedPendingOnlyInMetadata, 'claude-subscription', 'pool')?.launchedDecisionIds).toEqual(['d-a']);
+    const launchedWithPending = {
+      ...launchedPendingOnlyInMetadata,
+      spawnOptions: { connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', member, materializedAssignment: pendingB } } } },
+    };
+    expect(readPerSessionSessionBinding(launchedWithPending, 'claude-subscription', 'pool')?.launchedDecisionIds).toEqual(['d-a', 'd-b']);
+  });
 });

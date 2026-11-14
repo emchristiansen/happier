@@ -1,3 +1,4 @@
+import type { ClaudeQuotaEvidenceCapture } from '@/backends/claude/connectedServices/surfaceClaudeRuntimeIssues';
 import { createUnreadTerminalArtifactsCleanup } from '@/terminal/runtime/terminalLaunchSpec';
 import { ClaudeNativeProviderExitUnverifiedError } from '../sdk/types';
 
@@ -307,7 +308,7 @@ export type ClaudeUnifiedTerminalSessionOptions<Mode extends EnhancedMode = Enha
   onThinkingChange?: ((thinking: boolean) => void) | undefined;
   onReady?: (() => void | Promise<void>) | undefined;
   onUsageLimitDetails?: ((details: NormalizedProviderUsageLimitDetailsV1) => void | Promise<void>) | undefined;
-  onQuotaEvidence?: ((windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => void | Promise<void>) | undefined;
+  onQuotaEvidence?: ((windows: readonly NormalizedProviderUsageLimitDetailsV1[], capture?: ClaudeQuotaEvidenceCapture) => void | Promise<void>) | undefined;
   onTerminalScreenObserved?: ((observation: ClaudeUnifiedTerminalScreenObservation) => void) | undefined;
   onRuntimeAuthFailureEvent?: ((error: unknown) => void | Promise<void>) | undefined;
   onProviderPromptStarted?: (() => void | Promise<void>) | undefined;

@@ -437,6 +437,8 @@ function buildClaudeRuntimeQuotaSnapshot(params: Readonly<{
     profileId: string;
     source?: ClaudeQuotaSnapshotSource;
     evidenceKind?: ClaudeQuotaSnapshotEvidenceKind;
+    /** When the provider itself captured the observation, if it said so. */
+    providerCapturedAtMs?: number | null;
 }>): ConnectedServiceQuotaSnapshotV1 {
     const [primaryWindow] = params.windows;
     const source = params.source ?? 'runtime_event';
@@ -460,7 +462,9 @@ function buildClaudeRuntimeQuotaSnapshot(params: Readonly<{
         evidence: {
             kind: evidenceKind,
             providerLimitId: resolveClaudeQuotaProviderLimitId(primaryWindow),
-            observedAtMs: params.fetchedAt,
+            // Provider capture time only when the provider stated it. `fetchedAt` is receipt time and
+            // stays the freshness clock; it is never relabelled as capture (readers fall back to it).
+            ...(typeof params.providerCapturedAtMs === 'number' ? { observedAtMs: params.providerCapturedAtMs } : {}),
         },
         meters: params.windows.map((window) => buildClaudeRuntimeQuotaMeter(window, source)),
     };
@@ -492,10 +496,14 @@ function resolveClaudeQuotaSnapshotTarget(session: RuntimeIssueSession, input: R
     };
 }
 
+/** When the provider captured an in-band quota observation, if it said so (never receipt time). */
+export type ClaudeQuotaEvidenceCapture = Readonly<{ providerCapturedAtMs: number | null }>;
+
 export async function recordClaudeRateLimitQuotaEvidence(
     session: RuntimeIssueSession,
     windows: readonly NormalizedProviderUsageLimitDetailsV1[],
     logPrefix: string,
+    capture?: ClaudeQuotaEvidenceCapture,
 ): Promise<void> {
     void logPrefix;
     const [primaryWindow, ...otherWindows] = windows;
@@ -520,6 +528,8 @@ export async function recordClaudeRateLimitQuotaEvidence(
             profileId: target.profileId,
             source: 'in_band_provider_snapshot',
             evidenceKind: 'claude_runtime_quota_utilization',
+            // Receipt time stays the freshness clock; capture time is only what the provider stated.
+            providerCapturedAtMs: capture?.providerCapturedAtMs ?? null,
         }),
     }).catch(() => undefined);
 }

@@ -88,7 +88,7 @@ describe('claudeRemoteAgentSdk work-state projection', () => {
     expect(onQuotaEvidence).toHaveBeenCalledWith(expect.arrayContaining([
       expect.objectContaining({ providerLimitId: 'five_hour', utilization: 100 }),
       expect.objectContaining({ providerLimitId: 'seven_day', utilization: 42 }),
-    ]));
+    ]), { providerCapturedAtMs: null });
     expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'rate_limit_event' }));
   });
 
@@ -162,7 +162,7 @@ describe('claudeRemoteAgentSdk work-state projection', () => {
       overage: null,
       action: null,
       connectedService: null,
-    }]);
+    }], { providerCapturedAtMs: null });
     expect(onMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'rate_limit_event' }));
   });
 
@@ -203,7 +203,7 @@ describe('claudeRemoteAgentSdk work-state projection', () => {
     expect(onQuotaEvidence).toHaveBeenCalledWith([
       expect.objectContaining({ providerLimitId: 'five_hour', utilization: 5, resetAtMs: 1_790_378_400_000 }),
       expect.objectContaining({ providerLimitId: 'seven_day', utilization: 100, resetAtMs: 1_790_928_000_000 }),
-    ]);
+    ], { providerCapturedAtMs: null });
   });
 
   it('surfaces synthetic API-error rate-limit assistant records before transcript conversion', async () => {

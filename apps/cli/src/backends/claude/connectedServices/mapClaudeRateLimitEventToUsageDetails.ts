@@ -610,3 +610,11 @@ export function mapClaudeRateLimitEventToQuotaEvidence(event: unknown): readonly
   return status === 'allowed' || status === 'allowed_warning' || status === 'rejected'
     ? readClaudeRateLimitEventWindows(event) : [];
 }
+
+/**
+ * When the provider produced this event, from its own `timestamp`; null when it carries none.
+ * Receipt or processing time is never substituted: it is not proof of when quota was captured.
+ */
+export function readClaudeEventProviderCapturedAtMs(event: unknown): number | null {
+  return isRecord(event) ? readTimestampMs(event.timestamp) : null;
+}

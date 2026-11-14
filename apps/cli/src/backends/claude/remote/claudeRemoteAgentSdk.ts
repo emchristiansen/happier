@@ -71,8 +71,10 @@ import { repairClaudeTranscriptAfterInterrupt } from './agentSdk/repairClaudeTra
 import { enforceClaudeModelEffortPinBeforePrompt } from '../utils/claudeModelEffortPinBridge';
 import { readNonBlankOpaqueIdentifier } from '@/utils/opaqueIdentifiers';
 import { parseCheckpointsCommand, parseRewindCommand } from './agentSdk/claudeAgentSdkSlashCommands';
+import type { ClaudeQuotaEvidenceCapture } from '@/backends/claude/connectedServices/surfaceClaudeRuntimeIssues';
 import {
     mapClaudeRateLimitEventToQuotaEvidence,
+    readClaudeEventProviderCapturedAtMs,
     readClaudeRateLimitEventWindows,
     mapClaudeProviderFailureToUsageDetails,
     type NormalizedProviderUsageLimitDetailsV1,
@@ -215,7 +217,7 @@ export async function claudeRemoteAgentSdk(opts: {
         observedWindows: readonly NormalizedProviderUsageLimitDetailsV1[],
     ) => void | Promise<void>;
     /** Every quota window reported by one rate-limit event; they form one quota snapshot. */
-    onQuotaEvidence?: (windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => void | Promise<void>;
+    onQuotaEvidence?: (windows: readonly NormalizedProviderUsageLimitDetailsV1[], capture?: ClaudeQuotaEvidenceCapture) => void | Promise<void>;
     onRuntimeAuthFailureEvent?: (error: unknown) => void | Promise<void>;
     runtimeActivityAdapter?: ReturnType<typeof createClaudeProviderRuntimeActivityAdapter> | null;
     providerRuntimeActivityEvidence?: ClaudeRuntimeActivityEvidence | null;
@@ -1880,7 +1882,7 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
             } else {
                 const quotaEvidence = mapClaudeRateLimitEventToQuotaEvidence(message);
                 if (quotaEvidence.length > 0) {
-                    await opts.onQuotaEvidence?.(quotaEvidence);
+                    await opts.onQuotaEvidence?.(quotaEvidence, { providerCapturedAtMs: readClaudeEventProviderCapturedAtMs(message) });
                 }
                 const rateLimitDetails = mapClaudeProviderFailureToUsageDetails(message);
                 if (rateLimitDetails) {

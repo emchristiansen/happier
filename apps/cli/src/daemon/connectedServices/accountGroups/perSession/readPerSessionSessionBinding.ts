@@ -39,6 +39,12 @@ export function readPerSessionSessionBinding(
   if (!parsed.success) return null;
   const binding = parsed.data.bindingsByServiceId[serviceId];
   if (!binding || binding.source !== 'connected' || binding.selection !== 'group' || binding.groupId !== groupId) return null;
+  // Decisions the runner was launched with: its launch bindings, never later metadata (HPI-21).
+  const launchedBindings = ConnectedServiceBindingsV1Schema.safeParse(tracked.spawnOptions?.connectedServices);
+  const launchedBinding = launchedBindings.success ? launchedBindings.data.bindingsByServiceId[serviceId] : undefined;
+  const launchedDecisionIds = launchedBinding?.source === 'connected' && launchedBinding.selection === 'group' && launchedBinding.groupId === groupId
+    ? [launchedBinding.member?.decisionId, launchedBinding.materializedAssignment?.decisionId].filter((id): id is string => typeof id === 'string')
+    : [];
   const launched = findConnectedServiceChildSelection(tracked.spawnOptions?.environmentVariables ?? {}, serviceId);
   const launchedProfileId = launched
     ? (launched.kind === 'group' ? launched.activeProfileId : launched.profileId)
@@ -53,5 +59,6 @@ export function readPerSessionSessionBinding(
       : binding.materializedAssignment
         ? null
         : binding.appliedProfileId ?? launchedProfileId ?? null,
+    launchedDecisionIds,
   };
 }

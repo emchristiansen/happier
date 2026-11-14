@@ -162,6 +162,7 @@ import {
     surfaceClaudeRateLimitRuntimeIssue,
     captureClaudeRuntimeAuthRequestIdentity,
     observeClaudeRuntimeAuthTranscript,
+    type ClaudeQuotaEvidenceCapture,
 } from './connectedServices/surfaceClaudeRuntimeIssues';
 import type { NormalizedProviderUsageLimitDetailsV1 } from './connectedServices/mapClaudeRateLimitEventToUsageDetails';
 import { surfacePrimarySessionRuntimeIssue } from '@/agent/runtime/session/errors/surfacePrimarySessionRuntimeIssue';
@@ -1336,8 +1337,11 @@ export async function claudeRemoteLauncher(
             recordPrimaryProviderUnavailableForPromptDelivery(details);
             await surfaceClaudeRateLimitRuntimeIssue(session, details, '[remote]', { observedWindows });
         };
-        const recordRemoteQuotaEvidence = async (windows: readonly NormalizedProviderUsageLimitDetailsV1[]): Promise<void> => {
-            await recordClaudeRateLimitQuotaEvidence(session, windows, '[remote]');
+        const recordRemoteQuotaEvidence = async (
+            windows: readonly NormalizedProviderUsageLimitDetailsV1[],
+            capture?: ClaudeQuotaEvidenceCapture,
+        ): Promise<void> => {
+            await recordClaudeRateLimitQuotaEvidence(session, windows, '[remote]', capture);
         };
         // Initial goal (P1-E4): consumed once from the daemon-provided env so the FIRST unified
         // launch injects `/goal <objective>`; a park/respawn relaunch must not re-inject it.
@@ -1903,8 +1907,8 @@ export async function claudeRemoteLauncher(
                     onRateLimitEvent: async (details: NormalizedProviderUsageLimitDetailsV1, observedWindows: readonly NormalizedProviderUsageLimitDetailsV1[]) => {
                         await surfaceRemoteRateLimitRuntimeIssue(details, observedWindows);
                     },
-                    onQuotaEvidence: async (windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => {
-                        await recordRemoteQuotaEvidence(windows);
+                    onQuotaEvidence: async (windows: readonly NormalizedProviderUsageLimitDetailsV1[], capture?: ClaudeQuotaEvidenceCapture) => {
+                        await recordRemoteQuotaEvidence(windows, capture);
                     },
                     // Unified terminal usage-limit evidence is detected by the hook lifecycle
                     // bridge and surfaced through onUsageLimitDetails (the legacy/agent-SDK

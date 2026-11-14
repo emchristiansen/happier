@@ -562,7 +562,6 @@ import { handleProviderObservedSessionAccount } from './connectedServices/sessio
 import {
   projectProviderObservedAccountMetadata,
   resolveAdoptedPerSessionDecisionId,
-  resolveCommittedSharedConversion,
   resolveProvedSharedConversion,
 } from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
 import {
@@ -570,10 +569,14 @@ import {
   resolvePerSessionAssignmentLedgerPath,
 } from './connectedServices/accountGroups/perSession/PerSessionAssignmentLedger';
 import { PerSessionAssignmentRuntime, type PerSessionSpawnCustody } from './connectedServices/accountGroups/perSession/PerSessionAssignmentRuntime';
+import { buildPerSessionSpawnErrorResult } from './connectedServices/buildPerSessionSpawnErrorResult';
+import { ConnectedServicePerSessionSpawnError } from './connectedServices/accountGroups/perSession/resolvePerSessionGroupMemberForSpawn';
+import { resolveFreshQuotaSnapshotCapturedAtOrAfterMs } from './connectedServices/quotas/resolveFreshQuotaSnapshotCapturedAtOrAfterMs';
 import {
   collectPerSessionLiveDecisions,
   collectPerSessionLiveSubjectIds,
   collectPerSessionProvedSharedConversions,
+  resolveLaunchedSharedConversions,
 } from './connectedServices/accountGroups/perSession/collectPerSessionLiveDecisions';
 import {
   PerSessionFailoverCoordinator,
@@ -1006,9 +1009,19 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     providerObservedAccount: Readonly<{ serviceId: ConnectedServiceId; groupId: string; profileId: string }>;
     isCurrent: () => boolean;
   }>
-)): Promise<Readonly<{ adoptedPerSessionDecisionId: string | null; provedSharedConversionSubjectId: string | null }>> {
+)): Promise<Readonly<{
+  adoptedPerSessionDecisionId: string | null;
+  /** A conversion this projection proved, with the ownership it retires. */
+  provedSharedConversion: Readonly<{ subjectId: string; retiresDecisionsDecidedAtOrBeforeMs: number }> | null;
+  /**
+   * The committed connected-service bindings when the observation changed nothing; the caller
+   * re-checks them against the runner's launch for a conversion whose settlement was interrupted.
+   */
+  unchangedConnectedServices: unknown;
+}>> {
   let adoptedPerSessionDecisionId: string | null = null;
-  let provedSharedConversionSubjectId: string | null = null;
+  let provedSharedConversion: Readonly<{ subjectId: string; retiresDecisionsDecidedAtOrBeforeMs: number }> | null = null;
+  let unchangedConnectedServices: unknown = null;
   const rawSession = await fetchSessionByIdCompat({
     token: params.credentials.token,
     sessionId: params.sessionId,
@@ -1023,30 +1036,28 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     rawSession,
     updater: (metadata) => {
       adoptedPerSessionDecisionId = null;
-      provedSharedConversionSubjectId = null;
+      provedSharedConversion = null;
+      unchangedConnectedServices = null;
       if (params.isCurrent && !params.isCurrent()) return metadata;
       const projected = params.providerObservedAccount
         ? projectProviderObservedAccountMetadata(metadata, params.providerObservedAccount)
         : { ...metadata, connectedServices: params.normalizedBindings };
       if (projected === metadata) {
-        // An identical observation after the conversion committed (and its settlement may not
-        // have run) re-proves it from the committed metadata, so settlement is not lost.
-        if (params.providerObservedAccount && resolveCommittedSharedConversion(metadata, params.providerObservedAccount)) {
-          provedSharedConversionSubjectId = readConnectedServiceMaterializationIdentityV1(
-            metadata.connectedServiceMaterializationIdentityV1,
-          )?.id ?? params.sessionId;
-        }
+        unchangedConnectedServices = metadata.connectedServices ?? null;
         return metadata;
       }
       adoptedPerSessionDecisionId = params.providerObservedAccount
         ? resolveAdoptedPerSessionDecisionId(metadata, projected, params.providerObservedAccount.serviceId)
         : null;
-      if (params.providerObservedAccount
-        && resolveProvedSharedConversion(metadata, projected, params.providerObservedAccount.serviceId)) {
+      const conversion = params.providerObservedAccount
+        ? resolveProvedSharedConversion(metadata, projected, params.providerObservedAccount.serviceId)
+        : null;
+      if (conversion) {
         // The session's per-session decisions were keyed by its materialization identity.
-        provedSharedConversionSubjectId = readConnectedServiceMaterializationIdentityV1(
-          metadata.connectedServiceMaterializationIdentityV1,
-        )?.id ?? params.sessionId;
+        provedSharedConversion = {
+          subjectId: readConnectedServiceMaterializationIdentityV1(metadata.connectedServiceMaterializationIdentityV1)?.id ?? params.sessionId,
+          ...conversion,
+        };
       }
       const existingUpdatedAt = typeof metadata.connectedServicesUpdatedAt === 'number'
         && Number.isFinite(metadata.connectedServicesUpdatedAt)
@@ -1067,7 +1078,7 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
     },
     maxAttempts: 6,
   });
-  return { adoptedPerSessionDecisionId, provedSharedConversionSubjectId };
+  return { adoptedPerSessionDecisionId, provedSharedConversion, unchangedConnectedServices };
 }
 
 let lastTerminalControlServiceabilityObservation = 0;
@@ -2049,9 +2060,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         listLiveDecisions: () => collectPerSessionLiveDecisions(pidToTrackedSession.values()),
         listLiveSubjectIds: () => collectPerSessionLiveSubjectIds(pidToTrackedSession.values()),
         listProvedSharedConversions: () => collectPerSessionProvedSharedConversions(pidToTrackedSession.values()),
-        readMemberSnapshotCapturedAtMs: ({ serviceId, groupId, profileId }) => {
-          const fetchedAt = Number(connectedServiceRuntimeQuotaSnapshots.getSnapshotEntry({ serviceId, groupId, profileId })?.snapshot.fetchedAt);
-          return Number.isFinite(fetchedAt) && fetchedAt > 0 ? fetchedAt : null;
+        readMemberSnapshotCapturedAtOrAfterMs: ({ serviceId, groupId, profileId, nowMs }) => {
+          const snapshot = connectedServiceRuntimeQuotaSnapshots.getSnapshotEntry({ serviceId, groupId, profileId })?.snapshot ?? null;
+          return snapshot ? resolveFreshQuotaSnapshotCapturedAtOrAfterMs(snapshot, nowMs) : null;
         },
         // Retirement evidence for a recorded runner: dead/zombie, or a same-scheme fingerprint
         // mismatch proving PID reuse. Anything else keeps the decision's custody.
@@ -4297,6 +4308,12 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                         })),
                       });
                       return buildConnectedServiceMaterializationSpawnErrorResult(error);
+                    }
+                    if (error instanceof ConnectedServicePerSessionSpawnError) {
+                      logger.warn('[DAEMON RUN] Per-session account assignment refused the spawn', {
+                        agentId: catalogAgentId, code: error.code, retryAtMs: error.retryAtMs,
+                      });
+                      return buildPerSessionSpawnErrorResult(error, catalogAgentId);
                     }
                     const credentialRefreshErrorResult = buildConnectedServiceCredentialSpawnErrorResult({
                       agentId: catalogAgentId,
@@ -8108,13 +8125,19 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                     profileId: binding.profileId,
                   }).catch((error) => logger.warn('[ConnectedServices] Per-session adoption settlement failed; renewal will retry', error));
                 }
-                if (published.provedSharedConversionSubjectId) {
-                  // Proved conversion to the group home ends every per-session decision of this session.
-                  await perSessionAssignmentRuntime.settleProvedSharedConversion({
-                    subjectId: published.provedSharedConversionSubjectId,
-                    serviceId: binding.serviceId,
-                    groupId: observation.groupId,
-                  }).catch((error) => logger.warn('[ConnectedServices] Per-session shared-conversion settlement failed', error));
+                const tracked = pidToTrackedSession.get(target.pid) ?? null;
+                const conversions = published.provedSharedConversion
+                  ? [{ ...published.provedSharedConversion, serviceId: binding.serviceId, groupId: observation.groupId }]
+                  // An identical observation re-checks committed metadata against this runner's launch,
+                  // completing a conversion settlement interrupted after the commit.
+                  : published.unchangedConnectedServices && tracked
+                    ? resolveLaunchedSharedConversions(tracked, published.unchangedConnectedServices)
+                      .filter((conversion) => conversion.serviceId === binding.serviceId && conversion.groupId === observation.groupId)
+                    : [];
+                for (const conversion of conversions) {
+                  // Proved conversion to the group home ends the per-session decisions it retires.
+                  await perSessionAssignmentRuntime.settleProvedSharedConversion(conversion)
+                    .catch((error) => logger.warn('[ConnectedServices] Per-session shared-conversion settlement failed', error));
                 }
               },
               reconcileGeneration: async (target) => {

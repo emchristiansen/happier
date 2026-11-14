@@ -28,7 +28,7 @@ import type { SessionHookData } from '../utils/startHookServer';
 import type { Session } from '../session';
 import { createSessionScanner } from '../utils/sessionScanner';
 import { createClaudeSessionTranscriptProjector } from '../localControl/createClaudeSessionTranscriptProjector';
-import { mapClaudeProviderFailureToUsageDetails } from './mapClaudeRateLimitEventToUsageDetails';
+import { mapClaudeProviderFailureToUsageDetails, mapClaudeRateLimitEventToQuotaEvidence, readClaudeEventProviderCapturedAtMs } from './mapClaudeRateLimitEventToUsageDetails';
 
 import {
   recordClaudeRateLimitQuotaEvidence,
@@ -237,6 +237,30 @@ describe('surfaceClaudeRuntimeIssues runtime-auth projection', () => {
     } finally {
       restoreClaudeSelectionEnv(previousSelectionEnv);
     }
+  });
+
+  it.each([
+    ['no provider-stated capture time', undefined, undefined],
+    ['the provider-stated capture time, not receipt time', { providerCapturedAtMs: 1_000 }, 1_000],
+  ] as const)('records %s as the observation time of an in-band quota snapshot (HPI-25)', async (_label, capture, observedAtMs) => {
+    const previousSelectionEnv = installClaudeSelectionEnv();
+    const now = vi.spyOn(Date, 'now').mockReturnValue(5_000);
+    try {
+      const event = { type: 'rate_limit_event', rate_limit_info: { status: 'allowed', unifiedWindows: { five_hour: { utilization: 0.2, resetsAt: 1_781_221_200 } } } };
+      await recordClaudeRateLimitQuotaEvidence({ client: { sessionId: 'sess_claude_capture' } } as any,
+        mapClaudeRateLimitEventToQuotaEvidence(event), '[claude-test]', capture);
+      const snapshot = (mockNotifyDaemonConnectedServiceQuotaSnapshot.mock.calls.at(-1)![0] as any).snapshot;
+      expect(snapshot.fetchedAt).toBe(5_000);
+      expect(snapshot.evidence.observedAtMs).toBe(observedAtMs);
+    } finally {
+      now.mockRestore();
+      restoreClaudeSelectionEnv(previousSelectionEnv);
+    }
+  });
+
+  it('reads the capture time a Claude event states, and nothing when it states none', () => {
+    expect(readClaudeEventProviderCapturedAtMs({ type: 'rate_limit_event', timestamp: '2026-11-14T00:00:00.000Z' })).toBe(Date.parse('2026-11-14T00:00:00.000Z'));
+    expect(readClaudeEventProviderCapturedAtMs({ type: 'rate_limit_event' })).toBeNull();
   });
 
   it('records passive allowed-warning Claude utilization as quota evidence without failing the turn', async () => {
