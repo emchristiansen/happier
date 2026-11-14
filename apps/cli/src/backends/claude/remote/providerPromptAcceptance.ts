@@ -147,6 +147,14 @@ export function createClaudeRemotePromptSettlementTracker(options: Readonly<{
             // Callers suppress acknowledged user echoes, but still publish result output.
             return accepted && record.type === 'user';
         },
+        /**
+         * Whether the result names (in its native attribution) the latest prompt this tracker
+         * submitted: the only proof that it is that prompt's own result rather than an older or
+         * unattributed one. Read-only; call before shouldRetainForegroundForResult.
+         */
+        isResultForLatestSubmittedPrompt(message: unknown): boolean {
+            return latestSubmittedUuid !== null && readClaudeResultUserMessageUuids(message).includes(latestSubmittedUuid);
+        },
         /** Called once by the ordered result consumer, separately from raw delivery observation. */
         shouldRetainForegroundForResult(message: unknown): boolean {
             const hasQueuedUserTurns = hasClaudeQueuedUserTurns(message);

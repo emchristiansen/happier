@@ -55,7 +55,7 @@ async function realScheduler() {
       events.push({
         v: 1, kind: 'provider_outcome_proof', sessionId, attemptId: report.before?.attemptId ?? null,
         expectedAttemptId: report.expectedAttemptId, proofKind: report.proofKind, observedAtMs: report.observedAtMs,
-        turnOwnership: report.turnOwnership, statusBefore: report.before?.status ?? null, statusAfter: report.after?.status ?? null,
+        turnOwnership: report.turnOwnership, completionContract: report.completionContract, statusBefore: report.before?.status ?? null, statusAfter: report.after?.status ?? null,
         attemptIdAfter: report.after?.attemptId ?? null, persistedAtMs: clock.now,
       });
     },
@@ -128,19 +128,23 @@ describe('attempt account join through the real scheduler and reconciler', () =>
     });
   });
 
-  it('JL-03: real provider_activity after application is useful continuation for that application', async () => {
+  it.each([
+    ['claude_sdk_result_bound_v1', 'provider_activity'],
+    [null, 'provider_activity_completion_unqualified'],
+  ] as const)('JL-03: real exact-turn provider_activity after application with completion contract %s is %s', async (completionContract, kind) => {
     const f = await realScheduler();
     disposers.push(() => f.scheduler.dispose());
     await f.applied(200, 'B', 2);
     f.clock.now = 260;
     await f.scheduler.markProviderOutcomeProofByKey({
       recoveryKey: RECOVERY_KEY, expectedAttemptId: f.attemptId, proofKind: 'provider_activity', observedAtMs: 250,
-      evidence: { turnOwnership: 'exact_turn' },
+      evidence: { turnOwnership: 'exact_turn', completionContract },
     });
     const [joined] = foldRuntimeAuthAttemptAccountJoins(f.events);
+    // The scheduler's recovery is reported either way; only a contracted completion is useful work.
     expect(joined).toMatchObject({
       schedulerRecovered: { proofKinds: ['provider_activity'] },
-      usefulContinuation: { kind: 'provider_activity', observedAtMs: 250, applicationIndex: 0 },
+      usefulContinuation: { kind, observedAtMs: 250, applicationIndex: 0 },
     });
   });
 
@@ -243,7 +247,9 @@ describe('JL-05: turn-lifecycle provider activity through the real producer → 
     });
     const tracked = { pid: 42, happySessionId: 's', activeTurnId: 'current-turn' } as unknown as TrackedSession;
     /** The daemon's block: exact-turn owner first, then the owned activity step it calls. */
-    const turnEnd = async (input: Readonly<{ turnId?: string; terminalStatus?: 'completed' | 'failed' }>) => {
+    const turnEnd = async (input: Readonly<{
+      turnId?: string; terminalStatus?: 'completed' | 'failed'; completionContract?: 'claude_sdk_result_bound_v1';
+    }>) => {
       f.clock.now = 500;
       const turnLifecycle = await applyTrackedSessionTurnLifecycle({
         trackedSessions: [tracked], sessionId: 's', event: 'assistant_message_end',
@@ -254,6 +260,7 @@ describe('JL-05: turn-lifecycle provider activity through the real producer → 
         sessionId: 's', event: 'assistant_message_end',
         ...(input.terminalStatus ? { terminalStatus: input.terminalStatus } : {}),
         turnLifecycle,
+        completionContract: input.completionContract ?? null,
         resolveRecoveryIdentities: () => listProviderActivityRecoveryIdentitiesFromRuntimeBindings(
           registry.getBySessionId('s')?.activeBindings ?? [], f.scheduler.readForSession('s')),
         record,
@@ -273,14 +280,24 @@ describe('JL-05: turn-lifecycle provider activity through the real producer → 
     expect(view.attempts[0]).toMatchObject({ latestStatus: 'resumed_awaiting_proof', proofs: [], usefulContinuation: { kind: 'not_witnessed' } });
   });
 
-  it('the genuinely recorded matching completed turn is useful continuation', async () => {
+  it('the genuinely recorded matching completed turn from a contracted runner is useful continuation', async () => {
     const f = await turnFixture();
-    const { turnLifecycle } = await f.turnEnd({ turnId: 'current-turn', terminalStatus: 'completed' });
+    const { turnLifecycle } = await f.turnEnd({ turnId: 'current-turn', terminalStatus: 'completed', completionContract: 'claude_sdk_result_bound_v1' });
     expect(turnLifecycle.status).toBe('recorded');
     const view = await cliView(f.events);
     expect(view.attempts[0]).toMatchObject({
       latestStatus: 'recovered',
       usefulContinuation: { kind: 'provider_activity', observedAtMs: 500, applicationIndex: 0 },
+    });
+  });
+
+  it('a matching completed turn from a runner without the completion contract recovers but is not useful work', async () => {
+    const f = await turnFixture();
+    await f.turnEnd({ turnId: 'current-turn', terminalStatus: 'completed' });
+    expect((await cliView(f.events)).attempts[0]).toMatchObject({
+      latestStatus: 'recovered',
+      schedulerRecovered: { proofKinds: ['provider_activity'] },
+      usefulContinuation: { kind: 'provider_activity_completion_unqualified', observedAtMs: 500, applicationIndex: 0 },
     });
   });
 
@@ -327,7 +344,7 @@ describe('JL-06: retained provider_outcome_proof rows that predate turnOwnership
     f.clock.now = 260;
     await f.scheduler.markProviderOutcomeProofByKey({
       recoveryKey: RECOVERY_KEY, expectedAttemptId: f.attemptId, proofKind: 'provider_activity', observedAtMs: 250,
-      evidence: { turnOwnership: 'exact_turn' },
+      evidence: { turnOwnership: 'exact_turn', completionContract: 'claude_sdk_result_bound_v1' },
     });
     const rows = f.events.map((event) => JSON.parse(JSON.stringify(event)) as Record<string, unknown>);
     expect(rows.filter((row) => row.kind === 'provider_outcome_proof').map((row) => row.proofKind))

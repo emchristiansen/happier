@@ -48,10 +48,11 @@ function observed(
 function proof(
   attemptId: string, proofKind: string, observedAtMs: number | null, statusAfter = 'recovered',
   turnOwnership: 'exact_turn' | 'unverified_turn' | null = 'exact_turn',
+  completionContract: 'claude_sdk_result_bound_v1' | null = 'claude_sdk_result_bound_v1',
 ): RuntimeAuthAttemptAccountJoinEvent {
   return {
     v: 1, kind: 'provider_outcome_proof', sessionId: 's1', attemptId, expectedAttemptId: attemptId, proofKind, observedAtMs,
-    turnOwnership, statusBefore: 'resumed_awaiting_proof', statusAfter, attemptIdAfter: attemptId, persistedAtMs: (observedAtMs ?? 0) + 1,
+    turnOwnership, completionContract, statusBefore: 'resumed_awaiting_proof', statusAfter, attemptIdAfter: attemptId, persistedAtMs: (observedAtMs ?? 0) + 1,
   };
 }
 

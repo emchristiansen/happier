@@ -362,6 +362,7 @@ import {
     ConnectedServiceTurnLifecycleResultSchema,
     type ConnectedServiceTurnLifecycleResult,
     nativeProviderSourceFromMetadata,
+    type TurnCompletionContract,
 } from '@/daemon/connectedServices/connectedServiceTurnLifecycleContract';
 import {
     applyKnownPendingQueueState,
@@ -899,6 +900,8 @@ export class ApiSessionClient extends EventEmitter {
     private startupMessageCatchUpInitialAfterSeq = 0;
     private readonly startupMessageCatchUpExplicitAfterSeq: number | null;
     private readonly startedByDaemonProcess: boolean;
+    /** The active turn a provider runner marked as settled by its own result (see TURN_COMPLETION_CONTRACTS). */
+    private resultBoundTurnCompletion: Readonly<{ turnId: string; contract: TurnCompletionContract }> | null = null;
     private readonly transcriptStorage: 'persisted' | 'direct';
     private readonly transcriptRecoveryErrorStateByLocalId = new Map<string, { lastLoggedAt: number; suppressed: number }>();
     private messageCommitQueueTail: Promise<unknown> = Promise.resolve();
@@ -5872,6 +5875,16 @@ export class ApiSessionClient extends EventEmitter {
         );
     }
 
+    /**
+     * Called by a provider runner immediately before it releases the active turn on that turn's own
+     * non-error result. Only the completed terminal of that same turn carries the contract to the
+     * daemon; any other completion carries none and is never qualified as useful provider work.
+     */
+    markResultBoundTurnCompletion(contract: TurnCompletionContract): void {
+        const turnId = this.sessionTurnLifecycle.getActiveTurnId();
+        this.resultBoundTurnCompletion = turnId ? { turnId, contract } : null;
+    }
+
     private async notifyDaemonConnectedServiceTurnLifecycle(
         event: 'prompt_or_steer' | 'task_started' | 'assistant_message_end' | 'turn_cancelled',
         terminalStatus?: 'completed' | 'failed',
@@ -5883,6 +5896,11 @@ export class ApiSessionClient extends EventEmitter {
             recordRuntimeAuthProviderCompletion(this.sessionId);
         }
         let lifecycleResult: ConnectedServiceTurnLifecycleResult | null = null;
+        // Consume the mark at the terminal itself; it never outlives the turn it names.
+        const boundCompletion = event === 'assistant_message_end' || event === 'turn_cancelled'
+            ? this.resultBoundTurnCompletion
+            : null;
+        if (event === 'assistant_message_end' || event === 'turn_cancelled') this.resultBoundTurnCompletion = null;
         const nativeProviderSource = nativeProviderSourceFromMetadata(this.getMetadataSnapshot());
         const notify = async (): Promise<void> => {
             try {
@@ -5900,8 +5918,17 @@ export class ApiSessionClient extends EventEmitter {
                         }
                         : {}),
                 };
-                const result = nativeProviderSource
-                    ? await notifyDaemonConnectedServiceTurnLifecycle(body, { nativeProviderSource })
+                // Only the completed terminal of the exact turn the runner marked carries the contract.
+                const turnCompletionContract = event === 'assistant_message_end' && terminalStatus === 'completed'
+                    && turnId !== undefined && boundCompletion?.turnId === turnId
+                    ? boundCompletion.contract
+                    : undefined;
+                const options = {
+                    ...(nativeProviderSource ? { nativeProviderSource } : {}),
+                    ...(turnCompletionContract ? { turnCompletionContract } : {}),
+                };
+                const result = Object.keys(options).length > 0
+                    ? await notifyDaemonConnectedServiceTurnLifecycle(body, options)
                     : await notifyDaemonConnectedServiceTurnLifecycle(body);
                 const parsedResult = ConnectedServiceTurnLifecycleResultSchema.safeParse(result);
                 if (parsedResult.success) {

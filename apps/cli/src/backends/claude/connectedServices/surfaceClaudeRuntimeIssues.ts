@@ -127,18 +127,37 @@ const requestIdentityBySession = new WeakMap<RuntimeIssueSession, Readonly<{
     identity: Promise<Readonly<{ sourceProviderAccountId: string | null; sourceProviderOrganizationId: string | null }>>;
 }>>();
 
+function readRequestFenceTupleKey(session: RuntimeIssueSession): string {
+    const truth = session.connectedServiceAuthGroupRequestFence?.readCurrentTruth() ?? null;
+    if (!truth) return 'none';
+    return truth.kind === 'current_auth_group_available'
+        ? JSON.stringify([truth.kind, truth.groupId, truth.generation, truth.credentialRevision])
+        : JSON.stringify([truth.kind, truth.groupId]);
+}
+
 /** Capture before dispatch: all pool runners share a home that another session may rewrite. */
 export async function captureClaudeRuntimeAuthRequestIdentity(session: RuntimeIssueSession): Promise<void> {
+    const unproven = { sourceProviderAccountId: null, sourceProviderOrganizationId: null };
+    const fenceBeforeRead = readRequestFenceTupleKey(session);
     const selection = resolveClaudeRuntimeIssueSelection(session);
     const identity = selection
-        ? resolveClaudeRuntimeProviderAccountIdentity({ env: process.env }).then((identity) => ({
-            sourceProviderAccountId: identity.providerAccountId,
-            sourceProviderOrganizationId: identity.providerOrganizationId ?? null,
-        })).catch((error) => {
+        ? resolveClaudeRuntimeProviderAccountIdentity({ env: process.env }).then((identity) => {
+            // The selection tuple is recorded now; the account is read later from a shared home.
+            // If the fence moved around that read, the account may belong to a later generation:
+            // report it unproven rather than pair it with the recorded tuple.
+            if (readRequestFenceTupleKey(session) !== fenceBeforeRead) {
+                logger.warnFile('[claude] Request account identity unproven: auth group fence moved during capture');
+                return unproven;
+            }
+            return {
+                sourceProviderAccountId: identity.providerAccountId,
+                sourceProviderOrganizationId: identity.providerOrganizationId ?? null,
+            };
+        }).catch((error) => {
             logger.warnFile('[claude] Failed to capture request account identity', { error });
-            return { sourceProviderAccountId: null, sourceProviderOrganizationId: null };
+            return unproven;
         })
-        : Promise.resolve({ sourceProviderAccountId: null, sourceProviderOrganizationId: null });
+        : Promise.resolve(unproven);
     requestIdentityBySession.set(session, { selection, identity });
     await identity;
 }

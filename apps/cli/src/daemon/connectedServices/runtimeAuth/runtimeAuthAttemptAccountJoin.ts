@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
+import { TURN_COMPLETION_CONTRACTS } from '../connectedServiceTurnLifecycleContract';
 import { lazySchema } from '@happier-dev/protocol';
 
 /**
@@ -100,6 +101,12 @@ const ProviderOutcomeProofEventSchema = lazySchema(() => z.object({
   // Rows written before this field existed omit it: they are read as unstated (null), never as
   // exact, and are not rewritten. A present value must still be one of the known kinds.
   turnOwnership: z.enum(['exact_turn', 'unverified_turn']).nullable().default(null),
+  /**
+   * The runner's declared completion contract for this activity (see TURN_COMPLETION_CONTRACTS).
+   * Rows written before it existed omit it and read as null: their activity carries no guarantee
+   * that the completion was the turn's own non-error provider result, and they are not rewritten.
+   */
+  completionContract: z.enum(TURN_COMPLETION_CONTRACTS).nullable().default(null),
   statusBefore: NullableString,
   statusAfter: NullableString,
   attemptIdAfter: NullableString,
@@ -194,7 +201,14 @@ export type RuntimeAuthAttemptApplication = Readonly<{
 }>;
 
 export type RuntimeAuthAttemptUsefulContinuation =
+  /** Exact-turn activity whose completion the runner bound to the turn's own non-error result. */
   | Readonly<{ kind: 'provider_activity'; observedAtMs: number; applicationIndex: number }>
+  /**
+   * Exact-turn activity without a declared completion contract (every row from older runners).
+   * Such completions were shown to include synthetic API-error and stale results, so this is
+   * reported, never qualified as useful work. The scheduler's `recovered` stays separate.
+   */
+  | Readonly<{ kind: 'provider_activity_completion_unqualified'; observedAtMs: number; applicationIndex: number }>
   /** Post-application activity for this attempt whose turn ownership was not verified. */
   | Readonly<{ kind: 'provider_activity_unverified_turn'; observedAtMs: number; applicationIndex: number }>
   | Readonly<{ kind: 'boundary_uncertain'; observedAtMs: number | null; applicationIndex: number | null }>
@@ -476,6 +490,7 @@ function resolveUsefulContinuation(input: Readonly<{
 }>): RuntimeAuthAttemptUsefulContinuation {
   let uncertain: RuntimeAuthAttemptUsefulContinuation | null = null;
   let unverified: RuntimeAuthAttemptUsefulContinuation | null = null;
+  let unqualified: RuntimeAuthAttemptUsefulContinuation | null = null;
   for (const proof of input.proofs) {
     if (proof.proofKind !== 'provider_activity') continue;
     if (proof.observedAtMs === null) {
@@ -487,8 +502,12 @@ function resolveUsefulContinuation(input: Readonly<{
     if (attribution.kind !== 'none' && attribution.kind !== 'tie'
       && sharedGenerationAfter(attribution.interval, input.groupBoundaries, proof.observedAtMs) === 'superseded') continue;
     if (attribution.kind === 'certain' && attribution.interval.attemptId === input.attemptId) {
-      if (proof.turnOwnership === 'exact_turn') {
+      if (proof.turnOwnership === 'exact_turn' && proof.completionContract !== null) {
         return { kind: 'provider_activity', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
+      }
+      if (proof.turnOwnership === 'exact_turn') {
+        unqualified ??= { kind: 'provider_activity_completion_unqualified', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
+        continue;
       }
       unverified ??= { kind: 'provider_activity_unverified_turn', observedAtMs: proof.observedAtMs, applicationIndex: attribution.interval.index };
       continue;
@@ -498,7 +517,7 @@ function resolveUsefulContinuation(input: Readonly<{
       uncertain ??= { kind: 'boundary_uncertain', observedAtMs: proof.observedAtMs, applicationIndex: null };
     }
   }
-  return unverified ?? uncertain ?? { kind: 'not_witnessed' };
+  return unqualified ?? unverified ?? uncertain ?? { kind: 'not_witnessed' };
 }
 
 export type RuntimeAuthAttemptAccountJoinRead = Readonly<{

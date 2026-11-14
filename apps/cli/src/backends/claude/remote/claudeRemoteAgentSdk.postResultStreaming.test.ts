@@ -843,7 +843,7 @@ describe('claudeRemoteAgentSdk post-result streaming', () => {
             expect(mutations.map((mutation) => mutation.action)).toEqual(['begin', 'fail']);
             expect(lifecycleEvents).not.toContainEqual(['assistant_message_end', 'completed']);
             expect(lifecycleEvents).toContainEqual(['assistant_message_end', 'failed']);
-            expect(onResultFailure).toHaveBeenCalledWith(expect.stringContaining('429'));
+            expect(onResultFailure).toHaveBeenCalledWith(expect.stringContaining('429'), 'provider_api_error');
         } finally {
             finishInput();
             await runner.catch(() => {});

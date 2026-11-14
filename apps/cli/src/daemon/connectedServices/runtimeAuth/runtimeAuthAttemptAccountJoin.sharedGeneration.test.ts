@@ -105,11 +105,29 @@ describe('attempt-account join across a shared group generation', () => {
       ...applied('search', 'a74', 2_000, 'holdmod-like', 74),
       {
         v: 1, kind: 'provider_outcome_proof', sessionId: 'matrix', attemptId: 'a73', expectedAttemptId: 'a73',
-        proofKind: 'provider_activity', observedAtMs: 2_500, turnOwnership: 'exact_turn',
+        proofKind: 'provider_activity', observedAtMs: 2_500, turnOwnership: 'exact_turn', completionContract: 'claude_sdk_result_bound_v1',
         statusBefore: 'resumed_awaiting_proof', statusAfter: 'recovered', attemptIdAfter: 'a73', persistedAtMs: 2_501,
       },
     ]);
     expect(joins.find((join) => join.attemptId === 'a73')!.usefulContinuation).toEqual({ kind: 'not_witnessed' });
+  });
+
+  it('reports legacy exact-turn activity without a completion contract as unqualified, never useful', () => {
+    // Rows from runners before the completion contract: their raw bytes parse unchanged (no
+    // retrofit), and the derived reader keeps the scheduler's recovery separate from usefulness.
+    const legacyProof = RuntimeAuthAttemptAccountJoinEventSchema.parse(JSON.parse(JSON.stringify({
+      v: 1, kind: 'provider_outcome_proof', sessionId: 'matrix', attemptId: 'a73', expectedAttemptId: 'a73',
+      proofKind: 'provider_activity', observedAtMs: 1_100, turnOwnership: 'exact_turn',
+      statusBefore: 'resumed_awaiting_proof', statusAfter: 'recovered', attemptIdAfter: 'a73', persistedAtMs: 1_101,
+    })));
+    expect(legacyProof).toMatchObject({ completionContract: null });
+    const [join] = foldRuntimeAuthAttemptAccountJoins([
+      ...applied('matrix', 'a73', 1_000, 'sothmod-like', 73),
+      transition('matrix', 'a73', 1_102, { status: 'recovered', pendingTargetProfileId: 'sothmod-like', pendingTargetGeneration: 73 }),
+      legacyProof,
+    ]);
+    expect(join!.usefulContinuation).toEqual({ kind: 'provider_activity_completion_unqualified', observedAtMs: 1_100, applicationIndex: 0 });
+    expect(join!.schedulerRecovered).toEqual({ persistedAtMs: 1_102, proofKinds: ['provider_activity'] });
   });
 
   it('reads a mixed-version journal: legacy rows keep parsing and new rows only add boundaries', () => {

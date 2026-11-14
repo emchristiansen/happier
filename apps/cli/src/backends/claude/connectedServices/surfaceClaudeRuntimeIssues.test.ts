@@ -49,6 +49,20 @@ vi.mock('@/daemon/controlClient', () => ({
   notifyDaemonConnectedServiceTurnLifecycle: mockNotifyDaemonConnectedServiceTurnLifecycle,
 }));
 
+// Lets a test hold the request-identity read open while the shared home and fence move.
+const identityReadGate = vi.hoisted(() => ({ before: null as null | (() => Promise<void>) }));
+vi.mock('./resolveClaudeRuntimeProviderAccountIdentity', async (importOriginal) => {
+  const original = await importOriginal<typeof import('./resolveClaudeRuntimeProviderAccountIdentity')>();
+  return {
+    ...original,
+    resolveClaudeRuntimeProviderAccountIdentity: async (params: Parameters<typeof original.resolveClaudeRuntimeProviderAccountIdentity>[0]) => {
+      const before = identityReadGate.before;
+      if (before) await before();
+      return await original.resolveClaudeRuntimeProviderAccountIdentity(params);
+    },
+  };
+});
+
 type ClaudeFailTurn = (params: FailTurnInput) => Promise<void>;
 
 function createClaudeFailTurnSpy() {
@@ -1622,6 +1636,55 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
         : { providerAccountId: 'acct-b', providerOrganizationId: 'org-b' },
     });
     expect(resolved.profileId).toBe('claude-b');
+  });
+
+  it.each([
+    { name: 'generation', next: { generation: 5 } },
+    { name: 'credential revision', next: { credentialRevision: 'csr_8123456789ABCDEFGHJKMNPQRS' } },
+  ])('reports the request identity unproven when the fence $name moves during its read', async ({ next }) => {
+    let truth: { kind: 'current_auth_group_available'; groupId: string; generation: number; credentialRevision: string } = {
+      kind: 'current_auth_group_available', groupId: 'team-pool', generation: 4,
+      credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' };
+    const session = {
+      connectedServiceAuthGroupRequestFence: { readCurrentTruth: () => truth },
+      client: { sessionId: `fence-moves-${Object.keys(next)[0]}`, sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
+    };
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-a', organizationUuid: 'org-a' });
+    // Another session switches the shared home and this session's fence while the read is pending.
+    identityReadGate.before = async () => {
+      await writeMaterializedClaudeConfig({ accountUuid: 'acct-b', organizationUuid: 'org-b' });
+      truth = { ...truth, ...next };
+    };
+    try {
+      await captureClaudeRuntimeAuthRequestIdentity(session);
+    } finally {
+      identityReadGate.before = null;
+    }
+    await surfaceClaudeRateLimitRuntimeIssue(session, {
+      ...passiveUtilizationDetails(), limitCategory: 'usage_limit', utilization: 100,
+    }, '[test]');
+    const reported = mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.at(-1)?.[0]?.classification;
+    // Never a later account paired with the earlier dispatched generation.
+    expect(reported).toMatchObject({ groupGeneration: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS',
+      sourceProviderAccountId: null, sourceProviderOrganizationId: null });
+  });
+
+  it('keeps the request-bound identity when the fence is stable across its read', async () => {
+    const truth = { kind: 'current_auth_group_available' as const, groupId: 'team-pool', generation: 4,
+      credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' };
+    const session = {
+      connectedServiceAuthGroupRequestFence: { readCurrentTruth: () => ({ ...truth }) },
+      client: { sessionId: 'fence-stable', sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } },
+    };
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-a', organizationUuid: 'org-a' });
+    await captureClaudeRuntimeAuthRequestIdentity(session);
+    await writeMaterializedClaudeConfig({ accountUuid: 'acct-b', organizationUuid: 'org-b' });
+    await surfaceClaudeRateLimitRuntimeIssue(session, {
+      ...passiveUtilizationDetails(), limitCategory: 'usage_limit', utilization: 100,
+    }, '[test]');
+    expect(mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.at(-1)?.[0]?.classification).toMatchObject({
+      groupGeneration: 4, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS',
+      sourceProviderAccountId: 'acct-a', sourceProviderOrganizationId: 'org-a' });
   });
 
   it('reports a rejected provider organization acknowledgement on the default log', async () => {

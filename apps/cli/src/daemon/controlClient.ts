@@ -46,6 +46,8 @@ import {
   type ConnectedServiceTurnLifecycleRequestBody,
   type ConnectedServiceTurnLifecycleResult,
   NATIVE_PROVIDER_TURN_SOURCE_HEADER,
+  TURN_COMPLETION_CONTRACT_HEADER,
+  type TurnCompletionContract,
   NativeProviderTurnSourceSchema,
   type NativeProviderTurnSource,
 } from '@/daemon/connectedServices/connectedServiceTurnLifecycleContract';
@@ -122,6 +124,7 @@ type DaemonPostAuthScope = 'daemon-control' | 'connected-service-broker-refresh'
 type DaemonPostOptions = DaemonControlRequestOptions & {
   authScope?: DaemonPostAuthScope;
   nativeProviderSource?: NativeProviderTurnSource;
+  turnCompletionContract?: TurnCompletionContract;
 };
 
 const DEFAULT_DAEMON_HTTP_TIMEOUT_MS = 10_000;
@@ -489,6 +492,10 @@ async function daemonPost(path: string, body?: any, options: DaemonPostOptions =
       }
       headers[NATIVE_PROVIDER_TURN_SOURCE_HEADER] = JSON.stringify(NativeProviderTurnSourceSchema.parse(options.nativeProviderSource));
     }
+    if (options.turnCompletionContract) {
+      if (path !== '/connected-service-turn-lifecycle') throw new Error('Turn completion contract is scoped to turn lifecycle');
+      headers[TURN_COMPLETION_CONTRACT_HEADER] = options.turnCompletionContract;
+    }
     const authToken = options.authScope === 'connected-service-broker-refresh'
       ? deriveConnectedServiceBrokerRefreshToken(state.controlToken)
       : options.authScope === 'connected-service-run-materialize'
@@ -672,7 +679,10 @@ export async function notifyDaemonConnectedServiceRuntimeAuthFailure(
 
 export async function notifyDaemonConnectedServiceTurnLifecycle(
   body: ConnectedServiceTurnLifecycleRequestBody,
-  options: DaemonControlRequestOptions & { nativeProviderSource?: NativeProviderTurnSource } = {},
+  options: DaemonControlRequestOptions & {
+    nativeProviderSource?: NativeProviderTurnSource;
+    turnCompletionContract?: TurnCompletionContract;
+  } = {},
 ): Promise<ConnectedServiceTurnLifecycleResult | { error?: string }> {
   const response = await daemonPost('/connected-service-turn-lifecycle', {
     sessionId: body.sessionId,

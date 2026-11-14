@@ -117,6 +117,9 @@ import {
   type ConnectedServiceTurnLifecycleRequestBody,
   type ConnectedServiceTurnLifecycleResult,
   NATIVE_PROVIDER_TURN_SOURCE_HEADER,
+  TURN_COMPLETION_CONTRACT_HEADER,
+  readTurnCompletionContract,
+  type TurnCompletionContract,
   readNativeProviderTurnSource,
   type NativeProviderTurnSource,
 } from './connectedServices/connectedServiceTurnLifecycleContract';
@@ -878,7 +881,10 @@ export function createDaemonControlApp({
   // post-shutdown work can never reach provider-outcome proof and races a dying endpoint.
   isShuttingDown?: () => boolean;
   handleConnectedServiceTurnLifecycle?: (
-    input: ConnectedServiceTurnLifecycleRequestBody & { nativeProviderSource?: NativeProviderTurnSource },
+    input: ConnectedServiceTurnLifecycleRequestBody & {
+      nativeProviderSource?: NativeProviderTurnSource;
+      turnCompletionContract?: TurnCompletionContract;
+    },
   ) => Promise<ConnectedServiceTurnLifecycleResult>;
   // QAE-1: user "Stop waiting" propagation — cancels the daemon-side durable
   // recovery wait state (runtime-auth recovery + inactive usage-limit stores).
@@ -1351,11 +1357,13 @@ export function createDaemonControlApp({
       };
     }
     const nativeProviderSource = readNativeProviderTurnSource(request.headers[NATIVE_PROVIDER_TURN_SOURCE_HEADER]);
+    const turnCompletionContract = readTurnCompletionContract(request.headers[TURN_COMPLETION_CONTRACT_HEADER]);
     const result = await handleConnectedServiceTurnLifecycle({
       sessionId: request.body.sessionId,
       event: request.body.event,
       ...(request.body.terminalStatus ? { terminalStatus: request.body.terminalStatus } : {}),
       ...(nativeProviderSource ? { nativeProviderSource } : {}),
+      ...(turnCompletionContract ? { turnCompletionContract } : {}),
       ...(request.body.turnId ? { turnId: request.body.turnId } : {}),
       ...(request.body.requestedAction ? { requestedAction: request.body.requestedAction } : {}),
       ...(request.body.activeTurnId !== undefined ? { activeTurnId: request.body.activeTurnId } : {}),
@@ -2443,7 +2451,10 @@ export function startDaemonControlServer({
   runtimeAuthFailureReportIntake?: (body: RuntimeAuthFailureReportBody) => Promise<RuntimeAuthFailureReportResult>;
   isShuttingDown?: () => boolean;
   handleConnectedServiceTurnLifecycle?: (
-    input: ConnectedServiceTurnLifecycleRequestBody & { nativeProviderSource?: NativeProviderTurnSource },
+    input: ConnectedServiceTurnLifecycleRequestBody & {
+      nativeProviderSource?: NativeProviderTurnSource;
+      turnCompletionContract?: TurnCompletionContract;
+    },
   ) => Promise<ConnectedServiceTurnLifecycleResult>;
   // QAE-1: user "Stop waiting" propagation — cancels the daemon-side durable
   // recovery wait state (runtime-auth recovery + inactive usage-limit stores).

@@ -113,6 +113,7 @@ import {
     type ClaudeRemoteProviderPromptAcceptedHandler,
     type ClaudeRemoteProviderPromptTransportFailureHandler,
 } from './providerPromptAcceptance';
+import type { ClaudeAgentSdkResultFailureKind } from './surfaceClaudeAgentSdkResultFailure';
 import type { ClaudeSubscriptionAuthTokensRefreshSelection } from '../connectedServices/claudeSubscriptionAuthTokensRefreshBridgeContract';
 import {
     createClaudeSubscriptionAccessTokenRefreshCallback,
@@ -218,10 +219,17 @@ export async function claudeRemoteAgentSdk(opts: {
     onQuotaEvidence?: (windows: readonly NormalizedProviderUsageLimitDetailsV1[]) => void | Promise<void>;
     onRuntimeAuthFailureEvent?: (error: unknown) => void | Promise<void>;
     /**
-     * A provider API-error result (`is_error` / `api_error_status`) ended the foreground turn.
-     * Called before the turn is released so the owner can fail it instead of completing it.
+     * A failed result (`error_*` subtype, or a provider API error reported via `is_error` /
+     * `api_error_status`) ended the foreground turn it is bound to. Called before the runner
+     * settles thinking or releases the turn, so the owner fails it before anything can record it
+     * completed. Never called for replayed results or results answering another prompt.
      */
-    onResultFailure?: (failure: string) => void | Promise<void>;
+    onResultFailure?: (failure: string, kind: ClaudeAgentSdkResultFailureKind) => void | Promise<void>;
+    /**
+     * The foreground turn is about to be released by a non-error, non-replayed result whose native
+     * attribution names the latest submitted prompt: a completion bound to its own result.
+     */
+    onResultBoundCompletion?: () => void;
     runtimeActivityAdapter?: ReturnType<typeof createClaudeProviderRuntimeActivityAdapter> | null;
     providerRuntimeActivityEvidence?: ClaudeRuntimeActivityEvidence | null;
     claudeSubscriptionAccessTokenRefreshSelection?: ClaudeSubscriptionAuthTokensRefreshSelection | null;
@@ -2372,9 +2380,16 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                         ? { transcript_path: latestTranscriptPath, transcriptPath: latestTranscriptPath }
                         : undefined);
                 }
+                // A replayed result restates earlier history (resume replays prior turns before the
+                // supplied prompt). It is not bound to the current turn: it must neither complete
+                // nor fail it, nor consume prompt attribution or a requested interrupt.
+                if (isReplaySdkMessage(message)) {
+                    continue;
+                }
                 const didRequestThisResult = awaitingRequestedTurnInterruptResult;
                 awaitingRequestedTurnInterruptResult = false;
                 const failure = readAgentSdkResultFailure(message);
+                const resultForLatestPrompt = promptSettlements.isResultForLatestSubmittedPrompt(message);
                 const retainForeground = promptSettlements.shouldRetainForegroundForResult(message);
                 const isRequestedExecutionInterrupt = didRequestThisResult && message.subtype === 'error_during_execution';
                 const isProviderApiErrorResult = failure !== null && !isAgentSdkExecutionFailureResult(message);
@@ -2385,19 +2400,26 @@ Current model: ${lastAppliedRuntimeSettings.model ?? 'provider default'}.${messa
                         }
                         continue;
                     }
-                    if (isProviderApiErrorResult) {
-                        // The provider answered with an error, not work: fail the turn before
-                        // release so the release cannot record it completed. The query stays
-                        // usable (usage-limit recovery owns any switch); release proceeds below.
-                        if (!didFinalizeTurn && !didReleaseTurnForResult) {
-                            await opts.onResultFailure?.(failure);
-                        }
-                    } else {
+                    // This result is bound to the foreground turn (not replayed, and no submitted prompt
+                    // still awaits its own result). Fail that turn BEFORE reconcile/release settles
+                    // thinking, which would otherwise publish task_complete (completed) first.
+                    if (!didFinalizeTurn && !didReleaseTurnForResult) {
+                        await opts.onResultFailure?.(
+                            failure,
+                            isProviderApiErrorResult ? 'provider_api_error' : 'execution_error',
+                        );
+                    }
+                    if (!isProviderApiErrorResult) {
                         await reconcileRuntimeActivityForResult();
                         throw new Error(failure);
                     }
+                    // The provider answered with an error, not work. The query stays usable
+                    // (usage-limit recovery owns any switch); the failed turn is released below.
                 }
                 if (failure && !isRequestedExecutionInterrupt && !isProviderApiErrorResult) opts.onCompletionEvent?.(failure);
+                if (!failure && !retainForeground && resultForLatestPrompt && !didFinalizeTurn && !didReleaseTurnForResult) {
+                    opts.onResultBoundCompletion?.();
+                }
 
                 const resultText = extractResultText(message);
                 if (!streamedTranscriptWriter && !didPublishAssistantTextThisTurn && resultText) {

@@ -165,6 +165,10 @@ import {
 } from './connectedServices/surfaceClaudeRuntimeIssues';
 import type { NormalizedProviderUsageLimitDetailsV1 } from './connectedServices/mapClaudeRateLimitEventToUsageDetails';
 import { surfacePrimarySessionRuntimeIssue } from '@/agent/runtime/session/errors/surfacePrimarySessionRuntimeIssue';
+import {
+    surfaceClaudeAgentSdkResultFailure,
+    type ClaudeAgentSdkResultFailureKind,
+} from './remote/surfaceClaudeAgentSdkResultFailure';
 import { createClaudeUnifiedTerminalMetadataModeApplier } from './unifiedTerminal/metadataRuntimeModeApplier';
 import { createClaudeUnifiedTerminalSharedCallbacks } from './unifiedTerminal/createClaudeUnifiedTerminalSharedCallbacks';
 import { resolveClaudeSubscriptionRefreshSelectionFromEnv } from './connectedServices/claudeSubscriptionAccessTokenRefresh';
@@ -1959,16 +1963,16 @@ export async function claudeRemoteLauncher(
                     // Agent SDK API-error result: fail the still-active turn so its release is not
                     // recorded as completed provider work. A usage-limit tap that already failed
                     // the turn leaves no active turn, so this does not fail twice.
-                    onResultFailure: async (failure: string) => {
-                        await surfacePrimarySessionRuntimeIssue({
-                            provider: 'claude',
-                            cause: 'status_error',
-                            error: { code: 'claude_agent_sdk_result_api_error', message: failure },
+                    onResultFailure: async (failure: string, kind?: ClaudeAgentSdkResultFailureKind) => {
+                        await surfaceClaudeAgentSdkResultFailure({
                             session: session.client,
-                        }).catch((error) => {
-                            logger.debug('[remote]: failed to surface Claude Agent SDK API-error result turn failure (non-fatal)', error);
-                            return null;
+                            failure,
+                            kind,
+                            logDebug: (message, error) => logger.debug(message, error),
                         });
+                    },
+                    onResultBoundCompletion: () => {
+                        session.client.markResultBoundTurnCompletion?.('claude_sdk_result_bound_v1');
                     },
                     runtimeActivityAdapter: session.getProviderTaskRuntimeActivityAdapter(),
                     providerRuntimeActivityEvidence,
