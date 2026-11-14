@@ -81,7 +81,7 @@ describe('ApiClient connected service auth groups v3', () => {
     expect(group?.generation).toBe(1);
     expect(group?.policy.autoUseQuotaResetsWhenExhausted).toBe(true);
     expect(axios.get).toHaveBeenCalledWith(
-      expect.stringContaining('/v3/connect/openai-codex/groups/main?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
+      expect.stringContaining('/v3/connect/openai-codex/groups/main?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1'),
       expect.objectContaining({
         headers: expect.objectContaining({
           Authorization: 'Bearer happy-token',
@@ -119,7 +119,7 @@ describe('ApiClient connected service auth groups v3', () => {
     await expect(api.listConnectedServiceAuthGroups({ serviceId: 'openai-codex' }))
       .resolves.toEqual([expect.objectContaining({ groupId: 'main', generation: 1 })]);
     expect(axios.get).toHaveBeenCalledWith(
-      expect.stringContaining('/v3/connect/openai-codex/groups?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
+      expect.stringContaining('/v3/connect/openai-codex/groups?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1'),
       expect.objectContaining({
         headers: expect.objectContaining({
           Authorization: 'Bearer happy-token',
@@ -227,7 +227,7 @@ describe('ApiClient connected service auth groups v3', () => {
     expect(group.generation).toBe(2);
     expect(axios.patch).not.toHaveBeenCalled();
     expect(axios.post).toHaveBeenCalledWith(
-      expect.stringContaining('/v3/connect/openai-codex/groups/main/active-profile?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
+      expect.stringContaining('/v3/connect/openai-codex/groups/main/active-profile?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1'),
       { profileId: 'backup', expectedGeneration: 1 },
       expect.objectContaining({
         headers: expect.objectContaining({
@@ -256,7 +256,7 @@ describe('ApiClient connected service auth groups v3', () => {
 
     expect(group.activeProfileId).toBe('backup');
     expect(axios.post).toHaveBeenCalledWith(
-      expect.stringContaining('/v3/connect/openai-codex/groups/main/active-profile?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
+      expect.stringContaining('/v3/connect/openai-codex/groups/main/active-profile?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1'),
       { profileId: 'backup', expectedGeneration: 1, overrideRuntimeCooldown: true },
       expect.objectContaining({
         headers: expect.objectContaining({
@@ -293,7 +293,7 @@ describe('ApiClient connected service auth groups v3', () => {
 
     expect(group.activeProfileId).toBe('primary');
     expect(axios.patch).toHaveBeenCalledWith(
-      expect.stringContaining('/v3/connect/openai-codex/groups/main/runtime-state?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
+      expect.stringContaining('/v3/connect/openai-codex/groups/main/runtime-state?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1'),
       {
         expectedGeneration: 1,
         expectedRuntimeStateRevision: 0,
@@ -346,7 +346,7 @@ describe('ApiClient connected service auth groups v3', () => {
 
     expect(group.activeProfileId).toBe('primary');
     expect(axios.patch).toHaveBeenCalledWith(
-      expect.stringContaining('/v3/connect/openai-codex/groups/main/runtime-state?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
+      expect.stringContaining('/v3/connect/openai-codex/groups/main/runtime-state?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1'),
       { memberStates: [] },
       expect.objectContaining({
         headers: expect.objectContaining({
@@ -409,7 +409,7 @@ describe('ApiClient connected service auth groups v3', () => {
     });
 
     expect(axios.post).toHaveBeenCalledWith(
-      expect.stringContaining('/v3/connect/openai-codex/groups/main/members?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
+      expect.stringContaining('/v3/connect/openai-codex/groups/main/members?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1'),
       { profileId: 'backup', priority: 50, expectedGeneration: 1 },
       expect.objectContaining({
         headers: expect.objectContaining({
@@ -419,7 +419,7 @@ describe('ApiClient connected service auth groups v3', () => {
       }),
     );
     expect(axios.patch).toHaveBeenCalledWith(
-      expect.stringContaining('/v3/connect/openai-codex/groups/main/members/backup?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
+      expect.stringContaining('/v3/connect/openai-codex/groups/main/members/backup?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1'),
       { enabled: false, expectedGeneration: 2 },
       expect.objectContaining({
         headers: expect.objectContaining({
@@ -429,7 +429,7 @@ describe('ApiClient connected service auth groups v3', () => {
       }),
     );
     expect(axios.delete).toHaveBeenCalledWith(
-      expect.stringContaining('/v3/connect/openai-codex/groups/main/members/backup?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1'),
+      expect.stringContaining('/v3/connect/openai-codex/groups/main/members/backup?happierAutoDisablePlanInvalidAccounts=1&happierPoolQuotaLimitSelection=1&happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1'),
       expect.objectContaining({
         headers: expect.objectContaining({
           Authorization: 'Bearer happy-token',

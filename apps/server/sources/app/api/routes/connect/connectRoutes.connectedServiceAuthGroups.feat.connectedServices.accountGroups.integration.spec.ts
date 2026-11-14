@@ -213,7 +213,7 @@ describe("connectRoutes connected service auth groups (integration)", () => {
         const app = await createReadyApp();
         const headers = authHeaders(user.id);
         const url = "/v3/connect/openai-codex/groups/expiry-pool";
-        const create = await app.inject({ method: "POST", url: "/v3/connect/openai-codex/groups?happierPoolExpiryFirst=1", headers,
+        const create = await app.inject({ method: "POST", url: "/v3/connect/openai-codex/groups?happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1", headers,
             payload: { groupId: "expiry-pool", members: [{ profileId: "work", priority: 10 }] },
         });
         expect(create.statusCode).toBe(200);
@@ -224,9 +224,9 @@ describe("connectRoutes connected service auth groups (integration)", () => {
             payload: { expectedGeneration: create.json().group.generation, policy: { cooldownMs: 1234 } },
         });
         expect(edit.statusCode).toBe(200);
-        const read = await app.inject({ method: "GET", url: `${url}?happierPoolExpiryFirst=1`, headers });
+        const read = await app.inject({ method: "GET", url: `${url}?happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1`, headers });
         expect(read.json().group.policy).toMatchObject({ strategy: "expiry_first", cooldownMs: 1234 });
-        const explicit = await app.inject({ method: "PATCH", url: `${url}?happierPoolExpiryFirst=1`, headers,
+        const explicit = await app.inject({ method: "PATCH", url: `${url}?happierPoolExpiryFirst=1&happierPoolPerSessionSoftmax=1`, headers,
             payload: { expectedGeneration: read.json().group.generation, policy: { strategy: "least_limited" } },
         });
         expect(explicit.statusCode).toBe(200);

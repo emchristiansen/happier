@@ -44,6 +44,64 @@ const ConnectedServiceProfileBindingV1Schema = lazySchema(() => z
     })
     .passthrough());
 
+export const ConnectedServiceGroupMemberAssignmentReasonV1Schema = lazySchema(() => z.enum([
+    'initial_requested',
+    'initial_sampled',
+    'initial_unavailable_failover',
+    'failover',
+    'member_revoked',
+]));
+
+export type ConnectedServiceGroupMemberAssignmentReasonV1 = z.infer<typeof ConnectedServiceGroupMemberAssignmentReasonV1Schema>;
+
+/** The session's own applied member under a per_session_softmax group (spec A.1). */
+export const ConnectedServiceGroupMemberAssignmentV1Schema = lazySchema(() => z
+    .object({
+        assignment: z.literal('per_session'),
+        profileId: ConnectedServiceProfileIdSchema,
+        decisionId: z.string().min(1).max(200),
+        reason: ConnectedServiceGroupMemberAssignmentReasonV1Schema,
+        fromProfileId: ConnectedServiceProfileIdSchema.optional(),
+        appliedAtMs: z.number().int().nonnegative(),
+        temperature: z.number().finite().positive().optional(),
+        offsetPercent: z.number().finite().positive().optional(),
+        probability: z.number().finite().min(0).max(1).optional(),
+    })
+    .strict());
+
+export type ConnectedServiceGroupMemberAssignmentV1 = z.infer<typeof ConnectedServiceGroupMemberAssignmentV1Schema>;
+
+/** Internal-only assignment state that callers may never supply. */
+export const CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS = Object.freeze([
+    'member',
+    'materializedAssignment',
+    'pendingAssignment',
+    'decisionId',
+] as const);
+
+export const CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR = 'connected_service_internal_assignment_field_forbidden';
+export const CONNECTED_SERVICE_INITIAL_PROFILE_REQUIRES_GROUP_ERROR = 'connected_service_initial_profile_requires_group';
+
+/**
+ * Returns the `<serviceId>.<field>` paths of internal assignment fields present in external input.
+ * Accepts either a V1 envelope or a bare bindingsByServiceId record; unknown shapes yield [].
+ */
+export function findConnectedServiceInternalAssignmentFields(input: unknown): string[] {
+    if (!input || typeof input !== 'object') return [];
+    const record = input as Record<string, unknown>;
+    const byServiceId = record.bindingsByServiceId && typeof record.bindingsByServiceId === 'object'
+        ? record.bindingsByServiceId as Record<string, unknown>
+        : record;
+    const found: string[] = [];
+    for (const [serviceId, binding] of Object.entries(byServiceId)) {
+        if (!binding || typeof binding !== 'object') continue;
+        for (const field of CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS) {
+            if (Object.prototype.hasOwnProperty.call(binding, field)) found.push(`${serviceId}.${field}`);
+        }
+    }
+    return found;
+}
+
 const ConnectedServiceGroupBindingV1Schema = lazySchema(() => z
     .object({
         source: z.literal('connected'),
@@ -52,6 +110,11 @@ const ConnectedServiceGroupBindingV1Schema = lazySchema(() => z
         profileId: ConnectedServiceProfileIdSchema.optional(),
         // Runtime account evidence; profileId remains the requested fallback.
         appliedProfileId: ConnectedServiceProfileIdSchema.optional(),
+        // External request to start on this member (per_session_softmax groups). Not adoption evidence.
+        initialProfileId: ConnectedServiceProfileIdSchema.optional(),
+        // Internal APPLIED per-session assignment. Rejected at every external entry point; see
+        // findConnectedServiceInternalAssignmentFields.
+        member: ConnectedServiceGroupMemberAssignmentV1Schema.optional(),
     })
     .passthrough());
 
