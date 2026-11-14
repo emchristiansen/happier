@@ -3216,4 +3216,233 @@ describe("connectRoutes connected service auth groups (integration)", () => {
             expect.objectContaining({ profileId: "work", state: {} }),
         ]));
     });
+
+    describe("per-session softmax strategy", () => {
+        const SOFTMAX_ENV_KEY = "HAPPIER_FEATURE_CONNECTED_SERVICES_POOL_PER_SESSION_SOFTMAX__ENABLED";
+        const capabilityQuery = "happierPoolPerSessionSoftmax=1";
+        const softmaxPolicy = { strategy: "per_session_softmax", softmaxTemperature: 2, softmaxOffsetPercent: 5 };
+
+        async function createSoftmaxPool(userId: string, app: Awaited<ReturnType<typeof createReadyApp>>) {
+            const create = await app.inject({ method: "POST", url: `/v3/connect/claude-subscription/groups?${capabilityQuery}`, headers: authHeaders(userId),
+                payload: { groupId: "spread", members: [{ profileId: "a", priority: 10 }, { profileId: "b", priority: 20 }], policy: softmaxPolicy },
+            });
+            expect(create.statusCode).toBe(200);
+            return create.json().group as { generation: number; policy: Record<string, unknown> };
+        }
+
+        it("requires the server feature and a claude-subscription pool", async () => {
+            const user = await createAccount("pk-softmax-gates");
+            await createConnectedProfile(user.id, "claude-subscription", "a");
+            await createConnectedProfile(user.id, "openai-codex", "work");
+            const app = await createReadyApp();
+            const featureOff = await app.inject({ method: "POST", url: `/v3/connect/claude-subscription/groups?${capabilityQuery}`, headers: authHeaders(user.id),
+                payload: { groupId: "spread", members: [{ profileId: "a" }], policy: softmaxPolicy },
+            });
+            expect(featureOff.statusCode).toBe(400);
+            expect(featureOff.json()).toEqual({ error: "connect_group_invalid" });
+
+            process.env[SOFTMAX_ENV_KEY] = "1";
+            const codex = await app.inject({ method: "POST", url: `/v3/connect/openai-codex/groups?${capabilityQuery}`, headers: authHeaders(user.id),
+                payload: { groupId: "codex-spread", members: [{ profileId: "work" }], policy: { strategy: "per_session_softmax" } },
+            });
+            expect(codex.statusCode).toBe(400);
+            expect(codex.json()).toEqual({ error: "connect_group_strategy_unsupported_for_service" });
+            await seedAuthGroup({ accountId: user.id, serviceId: "openai-codex", groupId: "codex-existing", memberProfileIds: ["work"], activeProfileId: "work" });
+            const codexPatch = await app.inject({ method: "PATCH", url: `/v3/connect/openai-codex/groups/codex-existing?${capabilityQuery}`, headers: authHeaders(user.id),
+                payload: { expectedGeneration: 0, policy: { strategy: "per_session_softmax" } },
+            });
+            expect(codexPatch.statusCode).toBe(400);
+            expect(codexPatch.json()).toEqual({ error: "connect_group_strategy_unsupported_for_service" });
+
+            const claude = await app.inject({ method: "POST", url: `/v3/connect/claude-subscription/groups?${capabilityQuery}`, headers: authHeaders(user.id),
+                payload: { groupId: "spread", members: [{ profileId: "a" }], policy: softmaxPolicy },
+            });
+            expect(claude.statusCode).toBe(200);
+            expect(claude.json().group.policy).toMatchObject(softmaxPolicy);
+        });
+
+        it("rejects softmax fields on other strategies and out-of-range values", async () => {
+            process.env[SOFTMAX_ENV_KEY] = "1";
+            const user = await createAccount("pk-softmax-validation");
+            await createConnectedProfile(user.id, "claude-subscription", "a");
+            const app = await createReadyApp();
+            const post = (policy: Record<string, unknown>) => app.inject({ method: "POST", url: `/v3/connect/claude-subscription/groups?${capabilityQuery}`, headers: authHeaders(user.id),
+                payload: { groupId: "validation", members: [{ profileId: "a" }], policy },
+            });
+
+            const wrongStrategy = await post({ strategy: "least_limited", softmaxTemperature: 2 });
+            expect(wrongStrategy.statusCode).toBe(400);
+            expect(wrongStrategy.json()).toEqual({ error: "connect_group_policy_field_invalid_for_strategy" });
+            const defaultStrategy = await post({ softmaxOffsetPercent: 10 });
+            expect(defaultStrategy.json()).toEqual({ error: "connect_group_policy_field_invalid_for_strategy" });
+            for (const outOfRange of [
+                { softmaxOffsetPercent: 0 },
+                { softmaxOffsetPercent: -1 },
+                { softmaxOffsetPercent: 100.5 },
+                { softmaxTemperature: 0.2 },
+                { softmaxTemperature: 11 },
+            ]) {
+                const response = await post({ strategy: "per_session_softmax", ...outOfRange });
+                expect(response.statusCode).toBe(400);
+                expect(response.json()).toEqual({ error: "connect_group_policy_field_out_of_range" });
+            }
+            const wrongType = await post({ strategy: "per_session_softmax", softmaxTemperature: "hot" });
+            expect(wrongType.json()).toEqual({ error: "connect_group_invalid" });
+            expect(await db.connectedServiceAuthGroup.count({ where: { accountId: user.id } })).toBe(0);
+
+            await seedAuthGroup({ accountId: user.id, serviceId: "claude-subscription", groupId: "shared", memberProfileIds: ["a"], activeProfileId: "a" });
+            const patch = await app.inject({ method: "PATCH", url: `/v3/connect/claude-subscription/groups/shared?${capabilityQuery}`, headers: authHeaders(user.id),
+                payload: { expectedGeneration: 0, policy: { softmaxTemperature: 2 } },
+            });
+            expect(patch.statusCode).toBe(400);
+            expect(patch.json()).toEqual({ error: "connect_group_policy_field_invalid_for_strategy" });
+        });
+
+        it("shows readers without the capability a manual pool and rejects their edits", async () => {
+            process.env[SOFTMAX_ENV_KEY] = "1";
+            const user = await createAccount("pk-softmax-readers");
+            await createConnectedProfile(user.id, "claude-subscription", "a");
+            await createConnectedProfile(user.id, "claude-subscription", "b");
+            const app = await createReadyApp();
+            const created = await createSoftmaxPool(user.id, app);
+            const url = "/v3/connect/claude-subscription/groups/spread";
+
+            const oldRead = await app.inject({ method: "GET", url, headers: authHeaders(user.id) });
+            expect(oldRead.json().group.policy).toMatchObject({ strategy: "manual", autoSwitch: false });
+            expect(oldRead.json().group.policy).not.toHaveProperty("softmaxTemperature");
+            expect(oldRead.json().group.policy).not.toHaveProperty("softmaxOffsetPercent");
+            const oldList = await app.inject({ method: "GET", url: "/v3/connect/claude-subscription/groups", headers: authHeaders(user.id) });
+            expect(oldList.json().groups[0].policy).toMatchObject({ strategy: "manual", autoSwitch: false });
+            const newRead = await app.inject({ method: "GET", url: `${url}?${capabilityQuery}`, headers: authHeaders(user.id) });
+            expect(newRead.json().group.policy).toMatchObject({ ...softmaxPolicy, autoSwitch: created.policy.autoSwitch });
+
+            const oldPatch = await app.inject({ method: "PATCH", url, headers: authHeaders(user.id),
+                payload: { expectedGeneration: created.generation, policy: { ...oldRead.json().group.policy, cooldownMs: 1234 } },
+            });
+            expect(oldPatch.statusCode).toBe(409);
+            expect(oldPatch.json()).toEqual({ error: "connect_group_policy_requires_capability" });
+            const unchanged = await app.inject({ method: "GET", url: `${url}?${capabilityQuery}`, headers: authHeaders(user.id) });
+            expect(unchanged.json().group.policy).toMatchObject(softmaxPolicy);
+            expect(unchanged.json().group.generation).toBe(created.generation);
+
+            const newPatch = await app.inject({ method: "PATCH", url: `${url}?${capabilityQuery}`, headers: authHeaders(user.id),
+                payload: { expectedGeneration: created.generation, policy: { cooldownMs: 1234 } },
+            });
+            expect(newPatch.statusCode).toBe(200);
+            expect(newPatch.json().group.policy).toMatchObject({ ...softmaxPolicy, cooldownMs: 1234 });
+            const switchedAway = await app.inject({ method: "PATCH", url: `${url}?${capabilityQuery}`, headers: authHeaders(user.id),
+                payload: { expectedGeneration: newPatch.json().group.generation, policy: { strategy: "priority" } },
+            });
+            expect(switchedAway.statusCode).toBe(200);
+            expect(switchedAway.json().group.policy.strategy).toBe("priority");
+            expect(switchedAway.json().group.policy).not.toHaveProperty("softmaxTemperature");
+            const oldEditAfterSwitch = await app.inject({ method: "PATCH", url, headers: authHeaders(user.id),
+                payload: { expectedGeneration: switchedAway.json().group.generation, policy: { cooldownMs: 99 } },
+            });
+            expect(oldEditAfterSwitch.statusCode).toBe(200);
+        });
+
+        it("keeps reservation routes behind the server feature", async () => {
+            const user = await createAccount("pk-softmax-reservations-gated");
+            await createConnectedProfile(user.id, "claude-subscription", "a");
+            await seedAuthGroup({ accountId: user.id, serviceId: "claude-subscription", groupId: "spread", memberProfileIds: ["a"], activeProfileId: "a" });
+            const app = await createReadyApp();
+            const response = await app.inject({ method: "GET", url: "/v3/connect/claude-subscription/groups/spread/assignment-reservations", headers: authHeaders(user.id) });
+            expect(response.statusCode).toBe(404);
+            expect(response.json()).toEqual({ error: "not_found" });
+        });
+
+        it("records shared assignment reservations under a revision without touching group state", async () => {
+            process.env[SOFTMAX_ENV_KEY] = "1";
+            const user = await createAccount("pk-softmax-reservations");
+            await createConnectedProfile(user.id, "claude-subscription", "a");
+            await createConnectedProfile(user.id, "claude-subscription", "b");
+            await createConnectedProfile(user.id, "claude-subscription", "outsider");
+            const app = await createReadyApp();
+            const created = await createSoftmaxPool(user.id, app);
+            await db.connectedServiceAuthGroupMember.updateMany({
+                where: { accountId: user.id, groupId: "spread", profileId: "a" },
+                data: { stateJson: JSON.stringify({ cooldownUntilMs: 5 }) },
+            });
+            const groupRow = await db.connectedServiceAuthGroup.findUniqueOrThrow({
+                where: { accountId_vendor_groupId: { accountId: user.id, vendor: "claude-subscription", groupId: "spread" } },
+                select: { id: true, updatedAt: true },
+            });
+            const now = Date.now();
+            await db.connectedServiceAssignmentReservation.create({
+                data: { groupDbId: groupRow.id, decisionId: "expired", profileId: "a", sessionId: "s-old", ownerMachineId: "m1", state: "applied", createdAtMs: BigInt(now - 10_000), leaseUntilMs: BigInt(now - 1) },
+            });
+            const cursorBefore = await readAccountChangeCursor(user.id);
+            emitUpdate.mockClear();
+            const base = "/v3/connect/claude-subscription/groups/spread/assignment-reservations";
+            const lease = now + 300_000;
+            const put = (decisionId: string, payload: Record<string, unknown>) => app.inject({ method: "PUT", url: `${base}/${decisionId}`, headers: authHeaders(user.id), payload });
+            const entry = { profileId: "a", sessionId: "s1", ownerMachineId: "m1", state: "pending", leaseUntilMs: lease };
+
+            const empty = await app.inject({ method: "GET", url: base, headers: authHeaders(user.id) });
+            expect(empty.statusCode).toBe(200);
+            expect(empty.json()).toEqual({ reservationRevision: 0, reservations: [] });
+
+            const first = await put("d1", { ...entry, expectedReservationRevision: 0 });
+            expect(first.statusCode).toBe(200);
+            expect(first.json()).toEqual({
+                reservationRevision: 1,
+                outcome: "created",
+                reservation: { decisionId: "d1", ...entry, createdAtMs: expect.any(Number) },
+            });
+
+            const replay = await put("d1", { ...entry, expectedReservationRevision: 0 });
+            expect(replay.statusCode).toBe(200);
+            expect(replay.json()).toMatchObject({ reservationRevision: 1, outcome: "unchanged" });
+
+            const stale = await put("d2", { ...entry, profileId: "b", sessionId: "s2", expectedReservationRevision: 0 });
+            expect(stale.statusCode).toBe(409);
+            expect(stale.json()).toEqual({
+                error: "assignment_reservation_conflict",
+                reservationRevision: 1,
+                reservations: [expect.objectContaining({ decisionId: "d1", profileId: "a" })],
+            });
+
+            const mismatch = await put("d1", { ...entry, profileId: "b", expectedReservationRevision: 1 });
+            expect(mismatch.statusCode).toBe(409);
+            expect(mismatch.json()).toMatchObject({ error: "assignment_reservation_decision_mismatch", reservationRevision: 1 });
+            const otherSession = await put("d1", { ...entry, sessionId: "s9", expectedReservationRevision: 1 });
+            expect(otherSession.json()).toMatchObject({ error: "assignment_reservation_decision_mismatch" });
+
+            const notMember = await put("d3", { ...entry, profileId: "outsider", expectedReservationRevision: 1 });
+            expect(notMember.statusCode).toBe(400);
+            expect(notMember.json()).toEqual({ error: "assignment_reservation_invalid" });
+
+            const applied = await put("d1", { ...entry, state: "applied", leaseUntilMs: lease + 1000, expectedReservationRevision: 0 });
+            expect(applied.statusCode).toBe(200);
+            expect(applied.json()).toMatchObject({ reservationRevision: 2, outcome: "updated", reservation: { state: "applied", leaseUntilMs: lease + 1000 } });
+
+            const second = await put("d2", { ...entry, profileId: "b", sessionId: "s2", expectedReservationRevision: 2 });
+            expect(second.json()).toMatchObject({ reservationRevision: 3, outcome: "created" });
+
+            const listed = await app.inject({ method: "GET", url: base, headers: authHeaders(user.id) });
+            expect(listed.json().reservationRevision).toBe(3);
+            expect(listed.json().reservations.map((r: { decisionId: string }) => r.decisionId).sort()).toEqual(["d1", "d2"]);
+
+            const deleted = await app.inject({ method: "DELETE", url: `${base}/d1`, headers: authHeaders(user.id) });
+            expect(deleted.statusCode).toBe(200);
+            expect(deleted.json()).toEqual({ reservationRevision: 4, deleted: true });
+            const deletedAgain = await app.inject({ method: "DELETE", url: `${base}/d1`, headers: authHeaders(user.id) });
+            expect(deletedAgain.json()).toEqual({ reservationRevision: 4, deleted: false });
+
+            const missingGroup = await app.inject({ method: "GET", url: "/v3/connect/claude-subscription/groups/missing/assignment-reservations", headers: authHeaders(user.id) });
+            expect(missingGroup.statusCode).toBe(404);
+            expect(missingGroup.json()).toEqual({ error: "connect_group_not_found" });
+
+            const after = await db.connectedServiceAuthGroup.findUniqueOrThrow({
+                where: { id: groupRow.id },
+                select: { generation: true, updatedAt: true, members: { where: { profileId: "a" }, select: { stateJson: true } } },
+            });
+            expect(after.generation).toBe(created.generation);
+            expect(after.updatedAt).toEqual(groupRow.updatedAt);
+            expect(after.members[0]?.stateJson).toBe(JSON.stringify({ cooldownUntilMs: 5 }));
+            expect(await readAccountChangeCursor(user.id)).toBe(cursorBefore);
+            expect(emitUpdate).not.toHaveBeenCalled();
+        });
+    });
 });

@@ -33,6 +33,7 @@ export type ConnectedServicesFeatureEnv = Readonly<{
   quotasEnabled: boolean;
   accountGroupsEnabled: boolean;
   accountFallbackEnabled: boolean;
+  poolPerSessionSoftmaxEnabled: boolean;
 }>;
 
 export type ChannelBridgesFeatureEnv = Readonly<{
@@ -253,6 +254,8 @@ export function readConnectedServicesFeatureEnv(env: NodeJS.ProcessEnv): Connect
     quotasEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.connectedServicesQuotasEnabled], true),
     accountGroupsEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.connectedServicesAccountGroupsEnabled], true),
     accountFallbackEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.connectedServicesAccountFallbackEnabled], true),
+    // Off by default: per-session pool assignment is a staged rollout (spec C.3).
+    poolPerSessionSoftmaxEnabled: parseBooleanEnv(env[FEATURE_ENV_KEYS.connectedServicesPoolPerSessionSoftmaxEnabled], false),
   };
 }
 

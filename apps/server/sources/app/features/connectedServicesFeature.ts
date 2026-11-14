@@ -24,6 +24,7 @@ export function resolveConnectedServicesFeature(
                 autoDisablePlanInvalid: { enabled: true },
                 poolQuotaLimitSelection: { enabled: true },
                 poolExpiryFirst: { enabled: true },
+                poolPerSessionSoftmax: { enabled: featureEnv.poolPerSessionSoftmaxEnabled },
             },
         },
         capabilities: {

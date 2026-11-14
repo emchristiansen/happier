@@ -71,6 +71,25 @@ export const ConnectedServiceGroupMemberAssignmentV1Schema = lazySchema(() => z
 
 export type ConnectedServiceGroupMemberAssignmentV1 = z.infer<typeof ConnectedServiceGroupMemberAssignmentV1Schema>;
 
+/**
+ * Internal PENDING per-session target: the member a session was materialized onto (spawn or
+ * restart) before provider-observed adoption proves it. Promoted to `member` on adoption.
+ */
+export const ConnectedServiceGroupMaterializedAssignmentV1Schema = lazySchema(() => z
+    .object({
+        profileId: ConnectedServiceProfileIdSchema,
+        decisionId: z.string().min(1).max(200),
+        reason: ConnectedServiceGroupMemberAssignmentReasonV1Schema,
+        fromProfileId: ConnectedServiceProfileIdSchema.optional(),
+        materializedAtMs: z.number().int().nonnegative(),
+        temperature: z.number().finite().positive().optional(),
+        offsetPercent: z.number().finite().positive().optional(),
+        probability: z.number().finite().min(0).max(1).optional(),
+    })
+    .strict());
+
+export type ConnectedServiceGroupMaterializedAssignmentV1 = z.infer<typeof ConnectedServiceGroupMaterializedAssignmentV1Schema>;
+
 /** Internal-only assignment state that callers may never supply. */
 export const CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS = Object.freeze([
     'member',
@@ -115,6 +134,7 @@ const ConnectedServiceGroupBindingV1Schema = lazySchema(() => z
         // Internal APPLIED per-session assignment. Rejected at every external entry point; see
         // findConnectedServiceInternalAssignmentFields.
         member: ConnectedServiceGroupMemberAssignmentV1Schema.optional(),
+        materializedAssignment: ConnectedServiceGroupMaterializedAssignmentV1Schema.optional(),
     })
     .passthrough());
 

@@ -691,6 +691,8 @@ export {
   ConnectedServiceUsageSourceV1Schema,
   SessionConnectedServiceAuthSwitchRpcParamsSchema,
   ConnectedServiceGroupMemberAssignmentV1Schema,
+  ConnectedServiceGroupMaterializedAssignmentV1Schema,
+  type ConnectedServiceGroupMaterializedAssignmentV1,
   ConnectedServiceGroupMemberAssignmentReasonV1Schema,
   CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS,
   CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR,

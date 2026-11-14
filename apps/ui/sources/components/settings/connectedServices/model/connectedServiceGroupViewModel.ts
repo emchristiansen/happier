@@ -6,6 +6,8 @@ import {
     resolveConnectedServiceProfileIdentityDisplay,
 } from './resolveConnectedServiceIdentityDisplay';
 import {
+    CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_OFFSET_PERCENT,
+    CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_TEMPERATURE,
     ConnectedServiceAuthGroupPolicyV1Schema,
     ConnectedServiceAuthGroupStrategyV1Schema,
     type ConnectedServiceCredentialHealthStatusV1,
@@ -88,6 +90,8 @@ const connectedServiceAuthGroupPolicyKeys = [
     'maxSwitchesPerTurn',
     'maxSwitchesPerSessionHour',
     'softSwitchRemainingPercent',
+    'softmaxTemperature',
+    'softmaxOffsetPercent',
     'probeIfSnapshotOlderThanMs',
     'preTurnProbeMode',
     'preTurnProbeOrder',
@@ -141,6 +145,7 @@ export function normalizeConnectedServiceGroupPolicy(
 
 export function resolveConnectedServiceGroupStrategyLabel(strategy: ConnectedServiceAuthGroupPolicyV1['strategy']): string {
     if (strategy === 'expiry_first') return t('connectedServices.detail.groups.strategyExpiryFirst');
+    if (strategy === 'per_session_softmax') return t('connectedServices.detail.groups.strategyPerSessionSoftmax');
     if (strategy === 'manual') return t('connectedServices.detail.groups.strategyManual');
     if (strategy === 'least_limited') return t('connectedServices.detail.groups.strategyLeastLimited');
     return t('connectedServices.detail.groups.strategyPriority');
@@ -460,6 +465,16 @@ export function resolveConnectedServiceGroupSoftSwitchRemainingPercent(group: Co
     return typeof value === 'number' && Number.isFinite(value)
         ? value
         : CONNECTED_SERVICE_GROUP_DEFAULT_POLICY.softSwitchRemainingPercent;
+}
+
+export function resolveConnectedServiceGroupSoftmaxTemperature(group: ConnectedServiceAuthGroupV1): number {
+    const value = group.policy.softmaxTemperature;
+    return typeof value === 'number' && Number.isFinite(value) ? value : CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_TEMPERATURE;
+}
+
+export function resolveConnectedServiceGroupSoftmaxOffsetPercent(group: ConnectedServiceAuthGroupV1): number {
+    const value = group.policy.softmaxOffsetPercent;
+    return typeof value === 'number' && Number.isFinite(value) ? value : CONNECTED_SERVICE_AUTH_GROUP_SOFTMAX_DEFAULT_OFFSET_PERCENT;
 }
 
 export function resolveConnectedServiceGroupProbeIfSnapshotOlderThanMs(group: ConnectedServiceAuthGroupV1): number {

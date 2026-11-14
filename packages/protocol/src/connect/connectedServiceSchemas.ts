@@ -34,6 +34,8 @@ export {
     type ConnectedServiceProfileId,
     type SessionConnectedServiceAuthSwitchRpcParams,
     ConnectedServiceGroupMemberAssignmentV1Schema,
+    ConnectedServiceGroupMaterializedAssignmentV1Schema,
+    type ConnectedServiceGroupMaterializedAssignmentV1,
     ConnectedServiceGroupMemberAssignmentReasonV1Schema,
     CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELDS,
     CONNECTED_SERVICE_INTERNAL_ASSIGNMENT_FIELD_FORBIDDEN_ERROR,
