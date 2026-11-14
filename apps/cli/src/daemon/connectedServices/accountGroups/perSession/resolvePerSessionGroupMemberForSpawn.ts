@@ -22,6 +22,11 @@ export type PerSessionSpawnAssignmentDeps = Readonly<{
   reservationApi: ConnectedServiceAssignmentReservationApi | null;
   /** Releases a decision this spawn created when the attempt fails before any runner exists. */
   releaseAfterDefinitePreLaunchFailure: (decisionId: string) => Promise<boolean>;
+  /**
+   * Releases an earlier attempt's unusable decision only on positive evidence that none of its
+   * children can still own the session; false means custody stays and no new draw may happen.
+   */
+  releaseReplayedSpawnDecision: (decisionId: string) => Promise<boolean>;
   uniformSample?: () => number;
   log?: (event: string, detail: Record<string, unknown>) => void;
 }>;
@@ -35,7 +40,9 @@ export class ConnectedServicePerSessionSpawnError extends Error {
       | 'initial_profile_requires_per_session_group'
       | 'initial_profile_not_member'
       | 'initial_profile_disabled'
-      | 'no_eligible_member',
+      | 'no_eligible_member'
+      | 'per_session_launch_unsettled'
+      | 'per_session_target_revalidation_unavailable',
     message: string,
     readonly retryAtMs: number | null = null,
   ) {
@@ -57,6 +64,9 @@ export type PerSessionSpawnAssignment = Readonly<{
     | Readonly<{ kind: 'member'; member: ConnectedServiceGroupMemberAssignmentV1 }>
     | Readonly<{ kind: 'materialized'; materializedAssignment: ConnectedServiceGroupMaterializedAssignmentV1 }>;
 }>;
+
+/** Draws a spawn makes when a reserved target turns out ineligible on fresh state (spec A.5 C3). */
+const PER_SESSION_SPAWN_ADMISSION_ATTEMPTS = 3;
 
 function toMaterialized(proposal: PerSessionAssignmentProposal, nowMs: number): ConnectedServiceGroupMaterializedAssignmentV1 {
   return {
@@ -178,64 +188,97 @@ export async function resolvePerSessionGroupMemberForSpawn(input: Readonly<{
   }
 
   // A durable C1 proposal resumes at C2 under its own ID; otherwise this is a new decision.
-  const resumeProposal = replayEligible && replay.proposal.custody === 'proposed' ? replay.proposal : null;
+  let resumeProposal = replayEligible && replay.proposal.custody === 'proposed' ? replay.proposal : null;
   if (replay && !replayEligible && !ownTarget) {
-    // Actual target ineligibility supersedes the unadopted decision. One that never launched a
-    // runner is released now; one that did keeps custody until that runner's retirement is proved.
-    await deps.releaseAfterDefinitePreLaunchFailure(replay.decisionId);
+    // Actual target ineligibility supersedes the unadopted decision, but only once no child of that
+    // earlier attempt can still own the session (spec A.4, T17); otherwise nothing new is drawn.
+    if (!await deps.releaseReplayedSpawnDecision(replay.decisionId)) {
+      throw new ConnectedServicePerSessionSpawnError('per_session_launch_unsettled',
+        `an earlier launch of this session on ${replay.proposal.profileId} is unsettled (${input.serviceId}/${input.groupId}, decision ${replay.decisionId}); `
+        + 'it keeps custody until its child registers or is proved gone');
+    }
   }
-  const decisionId = resumeProposal?.decisionId ?? `spawn-${sessionId}-${nowMs.toString(36)}`;
-  const decision = await decidePerSessionGroupMemberUntilSettled({
-    serviceId: input.serviceId,
-    groupId: input.groupId,
-    sessionId,
-    ownerMachineId: deps.ownerMachineId,
-    decisionId,
-    policy: input.state.policy,
-    members: input.state.members,
-    memberStatesByProfileId: input.state.memberStatesByProfileId,
-    memberHolds: input.state.memberHolds,
-    quotaFreshnessMs: input.quotaFreshnessMs,
-    nowMs: input.nowMs,
-    currentProfileId: ownTarget,
-    initialProfileId: ownTarget ? null : (input.selection.initialProfileId ?? null),
-    ...(input.requiredModelIds.length > 0 ? { requiredModelIds: input.requiredModelIds } : {}),
-    reservationApi: deps.reservationApi,
-    resumeProposal,
-    localReservationCountsByProfileId: () => deps.ledger.localCounts(input.serviceId, input.groupId, decisionId),
-    uniformSample: deps.uniformSample ?? createCryptoUniformSample,
-    persistProposal: async (proposal) => {
-      await deps.ledger.recordProposal({
-        decisionId, sessionId, serviceId: input.serviceId, groupId: input.groupId, origin: 'spawn', proposal, nowMs: input.nowMs(),
-      });
-    },
-    deadlineAtMs: input.deadlineAtMs,
-    ...(input.reloadState ? {
-      reloadMemberState: async () => {
-        const fresh = await input.reloadState!();
-        return fresh
-          ? { members: fresh.members, memberStatesByProfileId: fresh.memberStatesByProfileId, memberHolds: fresh.memberHolds }
-          : null;
+  let state = input.state;
+  for (let attempt = 1; ; attempt += 1) {
+    const decisionId = resumeProposal?.decisionId ?? `spawn-${sessionId}-${input.nowMs().toString(36)}${attempt > 1 ? `-${attempt}` : ''}`;
+    const decision = await decidePerSessionGroupMemberUntilSettled({
+      serviceId: input.serviceId,
+      groupId: input.groupId,
+      sessionId,
+      ownerMachineId: deps.ownerMachineId,
+      decisionId,
+      policy: state.policy,
+      members: state.members,
+      memberStatesByProfileId: state.memberStatesByProfileId,
+      memberHolds: state.memberHolds,
+      quotaFreshnessMs: input.quotaFreshnessMs,
+      nowMs: input.nowMs,
+      currentProfileId: ownTarget,
+      initialProfileId: ownTarget ? null : (input.selection.initialProfileId ?? null),
+      ...(input.requiredModelIds.length > 0 ? { requiredModelIds: input.requiredModelIds } : {}),
+      reservationApi: deps.reservationApi,
+      resumeProposal,
+      localReservationCountsByProfileId: () => deps.ledger.localCounts(input.serviceId, input.groupId, decisionId),
+      uniformSample: deps.uniformSample ?? createCryptoUniformSample,
+      persistProposal: async (proposal) => {
+        await deps.ledger.recordProposal({
+          decisionId, sessionId, serviceId: input.serviceId, groupId: input.groupId, origin: 'spawn', proposal, nowMs: input.nowMs(),
+        });
       },
-    } : {}),
-    ...(deps.log ? { log: deps.log } : {}),
-  });
-  if (decision.kind === 'initial_profile_invalid') {
-    throw new ConnectedServicePerSessionSpawnError(decision.code,
-      `initialProfileId ${decision.profileId} is not usable in ${input.serviceId}/${input.groupId} (${decision.exclusionReason ?? decision.code})`);
+      deadlineAtMs: input.deadlineAtMs,
+      ...(input.reloadState ? {
+        reloadMemberState: async () => {
+          const fresh = await input.reloadState!();
+          return fresh
+            ? { members: fresh.members, memberStatesByProfileId: fresh.memberStatesByProfileId, memberHolds: fresh.memberHolds }
+            : null;
+        },
+      } : {}),
+      ...(deps.log ? { log: deps.log } : {}),
+    });
+    if (decision.kind === 'initial_profile_invalid') {
+      throw new ConnectedServicePerSessionSpawnError(decision.code,
+        `initialProfileId ${decision.profileId} is not usable in ${input.serviceId}/${input.groupId} (${decision.exclusionReason ?? decision.code})`);
+    }
+    if (decision.kind === 'no_candidate') {
+      const retryAtMs = decision.selection.excluded
+        .map((entry) => entry.retryAtMs)
+        .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+        .sort((left, right) => left - right)[0] ?? null;
+      throw new ConnectedServicePerSessionSpawnError('no_eligible_member',
+        `no eligible member for a per-session assignment in ${input.serviceId}/${input.groupId}`, retryAtMs);
+    }
+    const assignment: PerSessionSpawnAssignment = {
+      profileId: decision.proposal.profileId,
+      decisionId,
+      ownedByAttempt: true,
+      binding: { kind: 'materialized', materializedAssignment: toMaterialized(decision.proposal, input.nowMs()) },
+    };
+    if (!input.reloadState) return assignment;
+
+    // C3: custody is resolved (acknowledged or conflict-resolved); the target's complete eligibility
+    // (membership, enablement, health, quota, holds, exact model) is rechecked on fresh state before
+    // any credential or provider application. Nothing has launched, so an ineligible target's
+    // decision is released and the draw repeats on that fresh state, where a named start fails over
+    // or is refused by the same classification as at proposal time.
+    const fresh = await input.reloadState();
+    if (!fresh) {
+      await deps.releaseAfterDefinitePreLaunchFailure(decisionId);
+      throw new ConnectedServicePerSessionSpawnError('per_session_target_revalidation_unavailable',
+        `group state for ${input.serviceId}/${input.groupId} could not be re-read to admit ${assignment.profileId}`);
+    }
+    if (isPerSessionMemberEligible(fresh, assignment.profileId, input.nowMs(), input.quotaFreshnessMs, input.requiredModelIds)) return assignment;
+    deps.log?.('per_session_spawn_target_ineligible_at_admission', { decisionId, profileId: assignment.profileId, attempt });
+    if (!await deps.releaseAfterDefinitePreLaunchFailure(decisionId)) {
+      // A resumed decision an earlier attempt already launched keeps custody; never draw beside it.
+      throw new ConnectedServicePerSessionSpawnError('per_session_launch_unsettled',
+        `decision ${decisionId} on ${assignment.profileId} became ineligible but an earlier launch of it is unsettled (${input.serviceId}/${input.groupId})`);
+    }
+    if (attempt >= PER_SESSION_SPAWN_ADMISSION_ATTEMPTS) {
+      throw new ConnectedServicePerSessionSpawnError('no_eligible_member',
+        `no member stayed eligible through admission for a per-session assignment in ${input.serviceId}/${input.groupId}`);
+    }
+    state = fresh;
+    resumeProposal = null;
   }
-  if (decision.kind === 'no_candidate') {
-    const retryAtMs = decision.selection.excluded
-      .map((entry) => entry.retryAtMs)
-      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
-      .sort((left, right) => left - right)[0] ?? null;
-    throw new ConnectedServicePerSessionSpawnError('no_eligible_member',
-      `no eligible member for a per-session assignment in ${input.serviceId}/${input.groupId}`, retryAtMs);
-  }
-  return {
-    profileId: decision.proposal.profileId,
-    decisionId,
-    ownedByAttempt: true,
-    binding: { kind: 'materialized', materializedAssignment: toMaterialized(decision.proposal, input.nowMs()) },
-  };
 }

@@ -37,6 +37,18 @@ export type PerSessionAssignmentLedgerEntry = Readonly<{
    * decision is adopted, which proves their runners were retired (spec A.5, T20).
    */
   replacesDecisionIds?: ReadonlyArray<string>;
+  /**
+   * When the spawn attempt entered a launch adapter for this decision. From then on a child may
+   * exist before any runner is observable, so no pre-launch release is definite (spec A.4, T17).
+   */
+  launchAttemptedAtMs?: number;
+  /** First proved provider activity on this applied decision's member (spec A.3). */
+  firstProviderActivityAtMs?: number;
+  /**
+   * The shared reservation was released at the first fresh snapshot captured after first provider
+   * activity (spec A.3). The decision still owns its session; only its reservation count ended.
+   */
+  reservationReleasedAtMs?: number;
 }>;
 
 export type PerSessionAssignmentRunner = Readonly<{ pid: number; processInstanceFingerprint?: string }>;
@@ -114,7 +126,8 @@ export class PerSessionAssignmentLedger {
   }
 
   async recordProposal(
-    input: Omit<PerSessionAssignmentLedgerEntry, 'state' | 'updatedAtMs' | 'runner'> & Readonly<{ nowMs: number }>,
+    input: Omit<PerSessionAssignmentLedgerEntry, 'state' | 'updatedAtMs' | 'runner' | 'launchAttemptedAtMs' | 'firstProviderActivityAtMs' | 'reservationReleasedAtMs'>
+      & Readonly<{ nowMs: number }>,
   ): Promise<void> {
     await this.mutate(() => {
       const previous = this.entries.get(input.decisionId);
@@ -128,6 +141,9 @@ export class PerSessionAssignmentLedger {
         state: previous?.state ?? 'pending',
         updatedAtMs: input.nowMs,
         ...(previous?.runner ? { runner: previous.runner } : {}),
+        ...(previous?.launchAttemptedAtMs === undefined ? {} : { launchAttemptedAtMs: previous.launchAttemptedAtMs }),
+        ...(previous?.firstProviderActivityAtMs === undefined ? {} : { firstProviderActivityAtMs: previous.firstProviderActivityAtMs }),
+        ...(previous?.reservationReleasedAtMs === undefined ? {} : { reservationReleasedAtMs: previous.reservationReleasedAtMs }),
         ...((input.replacesDecisionIds ?? previous?.replacesDecisionIds)?.length
           ? { replacesDecisionIds: input.replacesDecisionIds ?? previous!.replacesDecisionIds! }
           : {}),
@@ -154,6 +170,36 @@ export class PerSessionAssignmentLedger {
     });
   }
 
+  /** Durably records that a launch adapter was entered for these decisions (before the launch). */
+  async markLaunchAttempted(decisionIds: ReadonlyArray<string>, nowMs: number): Promise<void> {
+    if (decisionIds.length === 0) return;
+    await this.mutate(() => {
+      for (const decisionId of decisionIds) {
+        const entry = this.entries.get(decisionId);
+        if (!entry || entry.launchAttemptedAtMs !== undefined) continue;
+        this.entries.set(decisionId, { ...entry, launchAttemptedAtMs: nowMs, updatedAtMs: nowMs });
+      }
+    });
+  }
+
+  /** Records the first provider activity of an applied decision; later activity changes nothing. */
+  async recordFirstProviderActivity(decisionId: string, atMs: number): Promise<boolean> {
+    return await this.mutate(() => {
+      const entry = this.entries.get(decisionId);
+      if (!entry || entry.state !== 'applied' || entry.firstProviderActivityAtMs !== undefined) return false;
+      this.entries.set(decisionId, { ...entry, firstProviderActivityAtMs: atMs, updatedAtMs: atMs });
+      return true;
+    });
+  }
+
+  async markReservationReleased(decisionId: string, nowMs: number): Promise<void> {
+    await this.mutate(() => {
+      const entry = this.entries.get(decisionId);
+      if (!entry || entry.reservationReleasedAtMs !== undefined) return;
+      this.entries.set(decisionId, { ...entry, reservationReleasedAtMs: nowMs, updatedAtMs: nowMs });
+    });
+  }
+
   async remove(decisionId: string): Promise<PerSessionAssignmentLedgerEntry | null> {
     return await this.mutate(() => {
       const entry = this.entries.get(decisionId) ?? null;
@@ -172,11 +218,15 @@ export class PerSessionAssignmentLedger {
     return this.entries.get(decisionId) ?? null;
   }
 
-  /** Live local decisions per member for degraded selection (pending and applied both count). */
+  /**
+   * Live local decisions per member for degraded selection (pending and applied both count) until
+   * their reservation is released.
+   */
   localCounts(serviceId: ConnectedServiceId, groupId: string, excludeDecisionId?: string): Map<string, number> {
     const counts = new Map<string, number>();
     for (const entry of this.list()) {
       if (entry.serviceId !== serviceId || entry.groupId !== groupId || entry.decisionId === excludeDecisionId) continue;
+      if (entry.reservationReleasedAtMs !== undefined) continue;
       counts.set(entry.proposal.profileId, (counts.get(entry.proposal.profileId) ?? 0) + 1);
     }
     return counts;

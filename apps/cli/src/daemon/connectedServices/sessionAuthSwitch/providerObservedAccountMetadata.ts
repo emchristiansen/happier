@@ -95,3 +95,20 @@ export function resolveProvedSharedConversion(
   return previous?.home === 'group' && next !== null && !next.member && !next.materializedAssignment
     && next.appliedProfileId === previous.profileId;
 }
+
+/**
+ * True when committed metadata already records a proved conversion to the group home for the observed
+ * account: the group binding carries no per-session field and its provider-observed account is the
+ * observed one. The projection removes those fields only on proved conversion (spec A.4 Migration),
+ * so a repeated observation after a crash between the metadata commit and settlement re-proves it.
+ * A session that never held per-session decisions matches too; settling it releases nothing.
+ */
+export function resolveCommittedSharedConversion(
+  metadata: Record<string, unknown>,
+  observation: Readonly<{ serviceId: ConnectedServiceId; groupId: string; profileId: string }>,
+): boolean {
+  const parsed = ConnectedServiceBindingsV1Schema.safeParse(metadata.connectedServices);
+  const binding = parsed.success ? parsed.data.bindingsByServiceId[observation.serviceId] : undefined;
+  return binding?.source === 'connected' && binding.selection === 'group' && binding.groupId === observation.groupId
+    && !binding.member && !binding.materializedAssignment && binding.appliedProfileId === observation.profileId;
+}

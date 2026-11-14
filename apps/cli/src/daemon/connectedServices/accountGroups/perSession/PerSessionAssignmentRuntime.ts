@@ -17,20 +17,49 @@ export const PER_SESSION_RESERVATION_RENEW_INTERVAL_MS = 60_000;
  */
 function isRenewable(entry: PerSessionAssignmentLedgerEntry | null): boolean {
   if (!entry) return true;
+  if (entry.reservationReleasedAtMs !== undefined) return false;
   return entry.state === 'applied' || entry.proposal.custody === 'reserved';
+}
+
+/** Every earlier decision `entry` replaces, transitively through the ledger. */
+function replacedClosure(entry: PerSessionAssignmentLedgerEntry, byId: ReadonlyMap<string, PerSessionAssignmentLedgerEntry>): Set<string> {
+  const replaced = new Set<string>();
+  const pendingIds = [...(entry.replacesDecisionIds ?? [])];
+  while (pendingIds.length > 0) {
+    const id = pendingIds.pop()!;
+    if (replaced.has(id) || id === entry.decisionId) continue;
+    replaced.add(id);
+    pendingIds.push(...(byId.get(id)?.replacesDecisionIds ?? []));
+  }
+  return replaced;
+}
+
+function sameSubject(left: PerSessionAssignmentLedgerEntry, right: Readonly<{ sessionId: string; serviceId: ConnectedServiceId; groupId: string }>): boolean {
+  return left.sessionId === right.sessionId && left.serviceId === right.serviceId && left.groupId === right.groupId;
 }
 
 /** One spawn attempt's hold on the per-session decisions it created. */
 export type PerSessionSpawnCustody = Readonly<{
   claim: (decisionIds: ReadonlyArray<string>) => void;
-  /** Called immediately before the first launch adapter is entered; afterwards no release is definite. */
-  markLaunchAttempted: () => void;
+  /**
+   * Durably records, immediately before the first launch adapter is entered, that a child may now
+   * exist; afterwards no release is definite, across daemon restarts too.
+   */
+  markLaunchAttempted: () => Promise<void>;
   recordRunner: (runner: PerSessionAssignmentRunner) => Promise<void>;
   releaseIfNeverLaunched: () => Promise<void>;
 }>;
 
 /** Positive process evidence for a recorded runner; only `absent` proves retirement. */
 export type PerSessionRunnerPresence = 'absent' | 'present' | 'unknown';
+
+/**
+ * A live runner whose provider-observed metadata binding for the group no longer carries any
+ * per-session field, while it was launched either for the group home (a pending `home:'group'`
+ * conversion target, `conversionProfileId`) or without per-session fields. Only a proved conversion
+ * to the shared home removes those fields (spec A.4 Migration), so this is that proof, durably.
+ */
+export type PerSessionProvedSharedConversion = Readonly<{ subjectId: string; serviceId: ConnectedServiceId; groupId: string }>;
 
 /** A per-session decision a live runner currently carries in its bindings. */
 export type PerSessionLiveDecision = Readonly<{
@@ -75,6 +104,13 @@ export class PerSessionAssignmentRuntime {
     /** Subjects with a live runner; an applied decision such a runner no longer carries was replaced. */
     listLiveSubjectIds: () => ReadonlySet<string>;
     probeRunnerPresence: (runner: PerSessionAssignmentRunner) => Promise<PerSessionRunnerPresence>;
+    /** Live runners whose committed metadata proves conversion to the group's shared home. */
+    listProvedSharedConversions?: () => ReadonlyArray<PerSessionProvedSharedConversion>;
+    /**
+     * Capture time (`fetchedAt`) of the freshest quota snapshot this daemon holds for a member, or
+     * null when it has none. Read only after proved provider activity (spec A.3).
+     */
+    readMemberSnapshotCapturedAtMs?: (input: Readonly<{ serviceId: ConnectedServiceId; groupId: string; profileId: string }>) => number | null;
     log?: Log;
   }>) {}
 
@@ -86,6 +122,7 @@ export class PerSessionAssignmentRuntime {
       ownerMachineId: this.input.ownerMachineId,
       reservationApi: this.input.reservationApi,
       releaseAfterDefinitePreLaunchFailure: async (decisionId) => await this.releaseAfterDefinitePreLaunchFailure(decisionId),
+      releaseReplayedSpawnDecision: async (decisionId) => await this.releaseReplayedSpawnDecision(decisionId),
       ...(this.input.log ? { log: this.input.log } : {}),
     };
   }
@@ -126,10 +163,17 @@ export class PerSessionAssignmentRuntime {
     }
   }
 
-  /** Adoption proved for `decisionId` (spec A.5 C5): record applied in the ledger and the shared resource. */
+  /**
+   * Adoption proved for `decisionId` (spec A.5 C5): record applied in the ledger, settle what it
+   * replaced, then renew the shared reservation as applied. Each step is idempotent and the renewal
+   * tick repeats the first two from the durable ledger and live bindings, so a failure partway
+   * (after metadata commit, after mark-applied, during the reservation update or during
+   * settlement) is completed later rather than lost.
+   */
   async markAdopted(params: Readonly<{ serviceId: ConnectedServiceId; groupId: string; decisionId: string; profileId: string }>): Promise<void> {
     const entry = this.input.ledger.get(params.decisionId);
     await this.input.ledger.markApplied(params.decisionId, this.input.nowMs());
+    if (entry) await this.settleAdoption({ ...entry, state: 'applied' }, { includePreviouslyApplied: true });
     await this.putLease({
       serviceId: params.serviceId,
       groupId: params.groupId,
@@ -137,30 +181,26 @@ export class PerSessionAssignmentRuntime {
       profileId: params.profileId,
       subjectId: entry?.sessionId ?? params.decisionId,
     }, 'applied');
-    // The session now serves on this decision: its previously applied decision no longer owns it,
-    // and neither does any earlier target this decision replaced (transitively), since the adopted
-    // runner replaced theirs. A different still-pending decision (a newer proposal) keeps custody.
-    if (entry) {
-      const replaced = new Set<string>();
-      const pendingIds = [...(entry.replacesDecisionIds ?? [])];
-      while (pendingIds.length > 0) {
-        const id = pendingIds.pop()!;
-        if (replaced.has(id)) continue;
-        replaced.add(id);
-        pendingIds.push(...(this.input.ledger.get(id)?.replacesDecisionIds ?? []));
-      }
-      for (const other of this.input.ledger.list()) {
-        if (other.decisionId === params.decisionId || other.sessionId !== entry.sessionId
-          || other.serviceId !== params.serviceId || other.groupId !== params.groupId) continue;
-        if (other.state === 'applied' || replaced.has(other.decisionId)) {
-          this.log(other.state === 'applied' ? 'per_session_decision_released_replaced_member' : 'per_session_decision_superseded', {
-            decisionId: other.decisionId,
-            supersededByDecisionId: params.decisionId,
-            ...(other.state === 'applied' ? {} : { reason: 'target_failed_before_adoption' }),
-          });
-          await this.release(other.decisionId);
-        }
-      }
+  }
+
+  /**
+   * The session now serves on `adopted`: every earlier target it replaced (transitively) is retired
+   * with the runner the adopted one replaced, and on direct adoption so is the previously applied
+   * member. A different still-pending decision (a newer proposal) keeps custody.
+   */
+  private async settleAdoption(adopted: PerSessionAssignmentLedgerEntry, options: Readonly<{ includePreviouslyApplied: boolean }>): Promise<void> {
+    const entries = this.input.ledger.list();
+    const replaced = replacedClosure(adopted, new Map(entries.map((entry) => [entry.decisionId, entry])));
+    for (const other of entries) {
+      if (other.decisionId === adopted.decisionId || !sameSubject(other, adopted)) continue;
+      const previouslyApplied = options.includePreviouslyApplied && other.state === 'applied';
+      if (!previouslyApplied && !replaced.has(other.decisionId)) continue;
+      this.log(previouslyApplied ? 'per_session_decision_released_replaced_member' : 'per_session_decision_superseded', {
+        decisionId: other.decisionId,
+        supersededByDecisionId: adopted.decisionId,
+        ...(previouslyApplied ? {} : { reason: 'target_failed_before_adoption' }),
+      });
+      await this.release(other.decisionId);
     }
   }
 
@@ -175,7 +215,12 @@ export class PerSessionAssignmentRuntime {
     let launchAttempted = false;
     return {
       claim: (ids) => { decisionIds = [...ids]; },
-      markLaunchAttempted: () => { launchAttempted = true; },
+      markLaunchAttempted: async () => {
+        // Durable before any launch adapter runs; if the write fails nothing has launched yet and
+        // the caller's failure path may still release them as a definite pre-launch failure.
+        await this.input.ledger.markLaunchAttempted(decisionIds, this.input.nowMs());
+        launchAttempted = true;
+      },
       recordRunner: async (runner) => {
         launchAttempted = true;
         for (const decisionId of decisionIds) await this.recordSpawnedRunner(decisionId, runner);
@@ -212,10 +257,48 @@ export class PerSessionAssignmentRuntime {
    */
   async releaseAfterDefinitePreLaunchFailure(decisionId: string): Promise<boolean> {
     const entry = this.input.ledger.get(decisionId);
-    if (!entry || entry.state !== 'pending' || entry.origin !== 'spawn' || entry.runner) return false;
+    if (!entry || entry.state !== 'pending' || entry.origin !== 'spawn' || entry.runner || entry.launchAttemptedAtMs !== undefined) return false;
     this.log('per_session_decision_released_pre_launch_failure', { decisionId });
     await this.release(decisionId);
     return true;
+  }
+
+  /**
+   * A replayed spawn found its earlier unadopted decision unusable. It is released only with positive
+   * evidence that no child of the earlier attempt can still own the session: no launch adapter was
+   * ever entered, or its recorded runner is proved absent. A launch attempted without an observed
+   * runner, or a runner not proved absent, keeps custody (false): the caller must not draw again.
+   */
+  async releaseReplayedSpawnDecision(decisionId: string): Promise<boolean> {
+    const entry = this.input.ledger.get(decisionId);
+    if (!entry) return true;
+    if (entry.state !== 'pending' || entry.origin !== 'spawn') return false;
+    if (entry.runner) {
+      if (!await this.runnerProvedAbsent(entry.runner)) return false;
+      this.log('per_session_decision_released_runner_absent', { decisionId, sessionId: entry.sessionId, pid: entry.runner.pid });
+    } else if (entry.launchAttemptedAtMs !== undefined) {
+      this.log('per_session_decision_launch_unsettled', { decisionId, sessionId: entry.sessionId, launchAttemptedAtMs: entry.launchAttemptedAtMs });
+      return false;
+    } else {
+      this.log('per_session_decision_released_pre_launch_failure', { decisionId });
+    }
+    await this.release(decisionId);
+    return true;
+  }
+
+  /**
+   * Proved provider activity on the session's applied member(s) (spec A.3): records the first
+   * activity of each applied decision the session's runner carries. Pending targets are not credited.
+   */
+  async recordProviderActivity(params: Readonly<{ decisions: ReadonlyArray<PerSessionLiveDecision>; observedAtMs: number }>): Promise<void> {
+    for (const decision of params.decisions) {
+      if (!decision.applied) continue;
+      const entry = this.input.ledger.get(decision.decisionId);
+      if (!entry || entry.state !== 'applied' || entry.proposal.profileId !== decision.profileId) continue;
+      if (await this.input.ledger.recordFirstProviderActivity(decision.decisionId, params.observedAtMs)) {
+        this.log('per_session_decision_first_provider_activity', { decisionId: decision.decisionId, observedAtMs: params.observedAtMs });
+      }
+    }
   }
 
   /** The daemon observed these sessions' runners exit with no replacement: their decisions are retired. */
@@ -251,7 +334,7 @@ export class PerSessionAssignmentRuntime {
     const nowMs = this.input.nowMs();
     const live = new Map(this.input.listLiveDecisions().map((decision) => [decision.decisionId, decision]));
     const liveSubjects = this.input.listLiveSubjectIds();
-    const entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
+    let entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
 
     for (const decision of live.values()) {
       const entry = entries.get(decision.decisionId);
@@ -260,31 +343,64 @@ export class PerSessionAssignmentRuntime {
       } else if (decision.applied && entry.state !== 'applied') {
         await this.input.ledger.markApplied(decision.decisionId, nowMs);
       }
-      if (decision.applied || isRenewable(entries.get(decision.decisionId) ?? null)) {
+    }
+
+    // Durable settlement (spec A.5 T20, A.4 Migration): completes adoption and conversion
+    // settlement that an earlier callback did not finish (crash or failure partway).
+    entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
+    for (const entry of entries.values()) {
+      if (entry.state === 'applied' && live.get(entry.decisionId)?.applied) await this.settleAdoption(entry, { includePreviouslyApplied: false });
+    }
+    for (const conversion of this.input.listProvedSharedConversions?.() ?? []) {
+      for (const entry of this.input.ledger.list()) {
+        if (live.has(entry.decisionId) || !sameSubject(entry, { ...conversion, sessionId: conversion.subjectId })) continue;
+        this.log('per_session_decision_released_shared_conversion', { decisionId: entry.decisionId, sessionId: entry.sessionId });
+        await this.release(entry.decisionId);
+      }
+    }
+    entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
+    await this.releaseReservationsAfterActivitySnapshot(entries, live, nowMs);
+    entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
+
+    for (const decision of live.values()) {
+      const entry = entries.get(decision.decisionId) ?? null;
+      if (entry?.reservationReleasedAtMs !== undefined) continue;
+      if (decision.applied || isRenewable(entry)) {
         await this.renewSafely(decision, decision.applied ? 'applied' : 'pending');
       }
     }
 
+    // A decision some unreleased successor still replaces keeps custody until that successor is
+    // adopted or released, or the session retires: its old runner's retirement is not the end of
+    // the session while the successor owns it (spec A.5 T20).
+    const replacedByUnsettledSuccessor = new Set<string>();
+    for (const entry of entries.values()) {
+      if (entry.state === 'pending') for (const id of replacedClosure(entry, entries)) replacedByUnsettledSuccessor.add(id);
+    }
+
     for (const entry of entries.values()) {
       if (live.has(entry.decisionId)) continue;
-      if (entry.state === 'applied' && liveSubjects.has(entry.sessionId)) {
+      const successorOwned = replacedByUnsettledSuccessor.has(entry.decisionId);
+      if (!successorOwned && entry.state === 'applied' && liveSubjects.has(entry.sessionId)) {
         // The session's live runner serves on something else now (a later adopted decision or a
         // proved conversion to the group home): this applied decision no longer owns it.
         this.log('per_session_decision_released_replaced', { decisionId: entry.decisionId, sessionId: entry.sessionId });
         await this.release(entry.decisionId);
         continue;
       }
-      if (entry.runner && await this.runnerProvedAbsent(entry.runner)) {
+      if (!successorOwned && entry.runner && await this.runnerProvedAbsent(entry.runner)) {
         this.log('per_session_decision_released_runner_absent', { decisionId: entry.decisionId, sessionId: entry.sessionId, pid: entry.runner.pid });
         await this.release(entry.decisionId);
         continue;
       }
-      // No live owner yet and no retirement proof: a pending/pre-registration child may still own
-      // it, so it keeps custody and its lease (spec A.4: lease expiry alone never frees it).
+      // No live owner yet and no retirement proof: a pending/pre-registration child or an unsettled
+      // successor may still own it, so it keeps custody and its lease (spec A.4: lease expiry alone
+      // never frees it).
       if (!this.unresolvedLogged.has(entry.decisionId)) {
         this.unresolvedLogged.add(entry.decisionId);
         this.log('per_session_decision_unowned_custody_retained', {
-          decisionId: entry.decisionId, sessionId: entry.sessionId, runnerRecorded: Boolean(entry.runner), ageMs: nowMs - entry.updatedAtMs,
+          decisionId: entry.decisionId, sessionId: entry.sessionId, runnerRecorded: Boolean(entry.runner),
+          launchAttempted: entry.launchAttemptedAtMs !== undefined, successorOwned, ageMs: nowMs - entry.updatedAtMs,
         });
       }
       if (!isRenewable(entry)) continue;
@@ -292,6 +408,43 @@ export class PerSessionAssignmentRuntime {
         serviceId: entry.serviceId, groupId: entry.groupId, decisionId: entry.decisionId,
         profileId: entry.proposal.profileId, subjectId: entry.sessionId,
       }, entry.state);
+    }
+  }
+
+  /**
+   * Spec A.3: an applied decision's shared reservation ends at the first fresh snapshot of its member
+   * captured after the session's first proved provider activity on it. Snapshot fetch time without
+   * activity proof, a snapshot captured before the activity, or another member's snapshot does not
+   * release. The decision keeps owning its session; it is only no longer counted or renewed.
+   */
+  private async releaseReservationsAfterActivitySnapshot(
+    entries: ReadonlyMap<string, PerSessionAssignmentLedgerEntry>,
+    live: ReadonlyMap<string, PerSessionLiveDecision>,
+    nowMs: number,
+  ): Promise<void> {
+    const readCapturedAt = this.input.readMemberSnapshotCapturedAtMs;
+    if (!readCapturedAt) return;
+    for (const entry of entries.values()) {
+      const activityAtMs = entry.firstProviderActivityAtMs;
+      if (entry.state !== 'applied' || activityAtMs === undefined || entry.reservationReleasedAtMs !== undefined) continue;
+      if (!live.get(entry.decisionId)?.applied) continue;
+      const capturedAtMs = readCapturedAt({ serviceId: entry.serviceId, groupId: entry.groupId, profileId: entry.proposal.profileId });
+      if (capturedAtMs === null || !(capturedAtMs > activityAtMs)) continue;
+      try {
+        const result = this.input.reservationApi
+          ? await this.input.reservationApi.deleteAssignmentReservation({ serviceId: entry.serviceId, groupId: entry.groupId, decisionId: entry.decisionId })
+          : { kind: 'ok' as const };
+        if (result.kind !== 'ok') {
+          this.log('per_session_reservation_release_unsettled', { decisionId: entry.decisionId, result: result.kind });
+          continue;
+        }
+        await this.input.ledger.markReservationReleased(entry.decisionId, nowMs);
+        this.log('per_session_reservation_released_after_activity_snapshot', {
+          decisionId: entry.decisionId, profileId: entry.proposal.profileId, firstProviderActivityAtMs: activityAtMs, snapshotCapturedAtMs: capturedAtMs,
+        });
+      } catch (error) {
+        this.log('per_session_reservation_lease_error', { decisionId: entry.decisionId, error: error instanceof Error ? error.message : String(error) });
+      }
     }
   }
 

@@ -14,6 +14,7 @@ import {
   PER_SESSION_RESERVATION_LEASE_MS,
   PerSessionAssignmentRuntime,
   type PerSessionLiveDecision,
+  type PerSessionProvedSharedConversion,
   type PerSessionRunnerPresence,
 } from './PerSessionAssignmentRuntime';
 
@@ -24,6 +25,8 @@ function runtimeFor(input: Readonly<{
   live?: () => PerSessionLiveDecision[];
   liveSubjects?: () => ReadonlySet<string>;
   presence?: (pid: number) => PerSessionRunnerPresence;
+  conversions?: () => ReadonlyArray<PerSessionProvedSharedConversion>;
+  snapshotCapturedAt?: (profileId: string) => number | null;
 }>) {
   return new PerSessionAssignmentRuntime({
     ledger: input.ledger,
@@ -33,6 +36,8 @@ function runtimeFor(input: Readonly<{
     listLiveDecisions: input.live ?? (() => []),
     listLiveSubjectIds: input.liveSubjects ?? (() => new Set()),
     probeRunnerPresence: async (runner) => input.presence?.(runner.pid) ?? 'present',
+    ...(input.conversions ? { listProvedSharedConversions: input.conversions } : {}),
+    ...(input.snapshotCapturedAt ? { readMemberSnapshotCapturedAtMs: ({ profileId }: { profileId: string }) => input.snapshotCapturedAt!(profileId) } : {}),
   });
 }
 
@@ -287,16 +292,40 @@ describe('PerSessionAssignmentRuntime', () => {
   });
 
   it('keeps custody once a launch adapter was entered, even when no runner pid was observed (HPI-02)', async () => {
-    const ledger = new PerSessionAssignmentLedger(await ledgerAt());
+    const ledgerPath = await ledgerAt();
+    const ledger = new PerSessionAssignmentLedger(ledgerPath);
     await ledger.recordProposal({ decisionId: 'attempted', sessionId: 'csm_7', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('attempted', 'a'), nowMs: 0 });
     const api = reservationApi();
     const runtime = runtimeFor({ ledger, api });
     const custody = runtime.createSpawnCustody();
     custody.claim(['attempted']);
-    custody.markLaunchAttempted();
+    await custody.markLaunchAttempted();
     await custody.releaseIfNeverLaunched();
     expect(ledger.get('attempted')).not.toBeNull();
     expect(api.deleteAssignmentReservation).not.toHaveBeenCalled();
+
+    // The attempt record is durable: after a daemon restart neither the pre-launch release nor a
+    // replayed spawn may release it without a recorded runner proved absent.
+    const restarted = runtimeFor({ ledger: new PerSessionAssignmentLedger(ledgerPath), api });
+    expect(await restarted.releaseAfterDefinitePreLaunchFailure('attempted')).toBe(false);
+    expect(await restarted.releaseReplayedSpawnDecision('attempted')).toBe(false);
+    expect(restarted.spawnDeps.ledger.get('attempted')?.launchAttemptedAtMs).toBeTypeOf('number');
+    expect(api.deleteAssignmentReservation).not.toHaveBeenCalled();
+  });
+
+  it('releases a replayed spawn decision that never launched, or whose recorded runner is proved absent', async () => {
+    const ledger = new PerSessionAssignmentLedger(await ledgerAt());
+    for (const id of ['never', 'gone', 'alive']) {
+      await ledger.recordProposal({ decisionId: id, sessionId: `csm_${id}`, serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal(id, 'a'), nowMs: 0 });
+    }
+    await ledger.recordRunner('gone', { pid: 1 }, 0);
+    await ledger.recordRunner('alive', { pid: 2 }, 0);
+    const api = reservationApi();
+    const runtime = runtimeFor({ ledger, api, presence: (pid) => (pid === 1 ? 'absent' : 'present') });
+    expect(await runtime.releaseReplayedSpawnDecision('never')).toBe(true);
+    expect(await runtime.releaseReplayedSpawnDecision('gone')).toBe(true);
+    expect(await runtime.releaseReplayedSpawnDecision('alive')).toBe(false);
+    expect(ledger.list().map((entry) => entry.decisionId)).toEqual(['alive']);
   });
 });
 

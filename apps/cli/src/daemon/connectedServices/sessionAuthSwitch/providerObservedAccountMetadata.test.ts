@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { ConnectedServiceBindingsV1Schema } from '@happier-dev/protocol';
-import { projectProviderObservedAccountMetadata, resolveAdoptedPerSessionDecisionId, resolveProvedSharedConversion } from './providerObservedAccountMetadata';
+import {
+  projectProviderObservedAccountMetadata,
+  resolveAdoptedPerSessionDecisionId,
+  resolveCommittedSharedConversion,
+  resolveProvedSharedConversion,
+} from './providerObservedAccountMetadata';
 
 describe('provider-observed account metadata', () => {
   const binding = { source: 'connected', selection: 'group', groupId: 'pool', profileId: 'fallback' };
@@ -86,5 +91,15 @@ describe('per-session adoption through provider-observed accounts', () => {
     expect(resolveProvedSharedConversion(converting, wrongAccount, 'claude-subscription')).toBe(false);
     expect((wrongAccount.connectedServices as any).bindingsByServiceId['claude-subscription'].materializedAssignment)
       .toMatchObject({ decisionId: 'conversion-1', home: 'group' });
+
+    // A repeated identical observation after the commit changes nothing but re-proves the
+    // committed conversion, so settlement interrupted after the commit is not lost (HPI-17).
+    const observedA = { serviceId: 'claude-subscription' as const, groupId: 'pool', profileId: 'acct-a' };
+    expect(projectProviderObservedAccountMetadata(converted, observedA)).toBe(converted);
+    expect(resolveCommittedSharedConversion(converted, observedA)).toBe(true);
+    expect(resolveCommittedSharedConversion(converted, { ...observedA, profileId: 'acct-c' })).toBe(false);
+    expect(resolveCommittedSharedConversion(converted, { ...observedA, groupId: 'other' })).toBe(false);
+    expect(resolveCommittedSharedConversion(converting, observedA)).toBe(false);
+    expect(resolveCommittedSharedConversion(wrongAccount, { ...observedA, profileId: 'acct-c' })).toBe(false);
   });
 });

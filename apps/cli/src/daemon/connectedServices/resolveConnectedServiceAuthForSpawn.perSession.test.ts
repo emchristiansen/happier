@@ -273,10 +273,52 @@ describe('resolveConnectedServiceAuthForSpawn per_session_softmax', () => {
       const f = await fixture();
       recordScores(f.runtimeQuotaSnapshots, { a: 30, b: 90 });
       let reads = 0;
-      // The draw sees no holds; the admission read just before launch sees every member held.
-      const readMemberHolds = async () => (reads++ === 0 ? NO_CONNECTED_SERVICE_MEMBER_HOLDS : heldView('a', 'b'));
+      // The draw and its post-custody revalidation see no holds; the admission read just before
+      // launch sees every member held.
+      const readMemberHolds = async () => (reads++ < 2 ? NO_CONNECTED_SERVICE_MEMBER_HOLDS : heldView('a', 'b'));
       await expect(spawnWith(f, readMemberHolds)).rejects.toBeInstanceOf(ConnectedServiceGroupMemberHeldForSpawnError);
       expect(f.ledger.list()).toHaveLength(0);
+    });
+
+    it.each([
+      ['becomes unavailable for the exact model', 'exact', 'b', 'initial_unavailable_failover'],
+      ['control: is blocked only for another model', 'other', 'a', 'initial_requested'],
+    ])('rechecks an acknowledged named start that %s while its reservation is acknowledged (C3, HPI-09)', async (_label, blockedModel, expected, reason) => {
+      const f = await fixture();
+      recordScores(f.runtimeQuotaSnapshots, { a: 90, b: 60 });
+      const blocked = perSessionGroup();
+      (blocked.members[0] as any).state = { v: 1, modelUnavailableUntilMsByModelId: { [blockedModel]: NOW + 60_000 } };
+      const reservationApi = {
+        listAssignmentReservations: async () => ({ kind: 'ok' as const, reservationRevision: 0, reservations: [] }),
+        putAssignmentReservation: async (put: any) => {
+          vi.mocked(f.api.getConnectedServiceAuthGroup).mockResolvedValue(blocked);
+          return { kind: 'reserved' as const, reservationRevision: 1, reservation: { decisionId: put.decisionId, ...put.body, createdAtMs: NOW } };
+        },
+        deleteAssignmentReservation: async () => ({ kind: 'ok' as const, reservationRevision: 2, deleted: true }),
+      };
+      const result = await resolveConnectedServiceAuthForSpawn({
+        nativeSource: NEW_CALLER_SPAWN_NATIVE_SOURCE, agentId: 'claude',
+        connectedServicesBindingsRaw: { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', initialProfileId: 'a' } } },
+        materializationKey: 'session-ack', activeServerDir: f.activeServerDir, baseDir: f.baseDir, credentials, api: f.api,
+        processEnv: f.processEnv, runtimeQuotaSnapshots: f.runtimeQuotaSnapshots, quotaFreshnessMs: 300_000, nowMs: () => NOW,
+        sessionId: 'session-ack', modelId: 'exact', perSessionAssignment: { ...f.deps(() => 0), reservationApi: reservationApi as any },
+        readMemberHolds: async () => NO_CONNECTED_SERVICE_MEMBER_HOLDS,
+      });
+      const binding = result!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
+      expect(binding.materializedAssignment).toMatchObject({ profileId: expected, reason });
+      expect(f.ledger.list().map((entry) => entry.proposal.profileId)).toEqual([expected]);
+    });
+
+    it('redraws when the reserved member became held before the post-custody revalidation (C3)', async () => {
+      const f = await fixture();
+      recordScores(f.runtimeQuotaSnapshots, { a: 30, b: 90 });
+      let reads = 0;
+      // The draw sees no holds and lands on the named start b; by revalidation b is held.
+      const readMemberHolds = async () => (reads++ === 0 ? NO_CONNECTED_SERVICE_MEMBER_HOLDS : heldView('b'));
+      const result = await spawnWith(f, readMemberHolds, { initialProfileId: 'b' });
+      const binding = result!.connectedServicesBindings.bindingsByServiceId['claude-subscription'] as Record<string, any>;
+      expect(binding.materializedAssignment).toMatchObject({ profileId: 'a', reason: 'initial_unavailable_failover' });
+      expect(f.ledger.list().map((entry) => entry.proposal.profileId)).toEqual(['a']);
     });
 
     it('refuses when holds cannot be read rather than treating them as empty', async () => {

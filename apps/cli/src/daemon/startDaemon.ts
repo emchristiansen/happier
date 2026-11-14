@@ -562,6 +562,7 @@ import { handleProviderObservedSessionAccount } from './connectedServices/sessio
 import {
   projectProviderObservedAccountMetadata,
   resolveAdoptedPerSessionDecisionId,
+  resolveCommittedSharedConversion,
   resolveProvedSharedConversion,
 } from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
 import {
@@ -569,7 +570,11 @@ import {
   resolvePerSessionAssignmentLedgerPath,
 } from './connectedServices/accountGroups/perSession/PerSessionAssignmentLedger';
 import { PerSessionAssignmentRuntime, type PerSessionSpawnCustody } from './connectedServices/accountGroups/perSession/PerSessionAssignmentRuntime';
-import { collectPerSessionLiveDecisions, collectPerSessionLiveSubjectIds } from './connectedServices/accountGroups/perSession/collectPerSessionLiveDecisions';
+import {
+  collectPerSessionLiveDecisions,
+  collectPerSessionLiveSubjectIds,
+  collectPerSessionProvedSharedConversions,
+} from './connectedServices/accountGroups/perSession/collectPerSessionLiveDecisions';
 import {
   PerSessionFailoverCoordinator,
   type PerSessionApplyBinding,
@@ -1023,7 +1028,16 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
       const projected = params.providerObservedAccount
         ? projectProviderObservedAccountMetadata(metadata, params.providerObservedAccount)
         : { ...metadata, connectedServices: params.normalizedBindings };
-      if (projected === metadata) return metadata;
+      if (projected === metadata) {
+        // An identical observation after the conversion committed (and its settlement may not
+        // have run) re-proves it from the committed metadata, so settlement is not lost.
+        if (params.providerObservedAccount && resolveCommittedSharedConversion(metadata, params.providerObservedAccount)) {
+          provedSharedConversionSubjectId = readConnectedServiceMaterializationIdentityV1(
+            metadata.connectedServiceMaterializationIdentityV1,
+          )?.id ?? params.sessionId;
+        }
+        return metadata;
+      }
       adoptedPerSessionDecisionId = params.providerObservedAccount
         ? resolveAdoptedPerSessionDecisionId(metadata, projected, params.providerObservedAccount.serviceId)
         : null;
@@ -2034,6 +2048,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         nowMs: () => Date.now(),
         listLiveDecisions: () => collectPerSessionLiveDecisions(pidToTrackedSession.values()),
         listLiveSubjectIds: () => collectPerSessionLiveSubjectIds(pidToTrackedSession.values()),
+        listProvedSharedConversions: () => collectPerSessionProvedSharedConversions(pidToTrackedSession.values()),
+        readMemberSnapshotCapturedAtMs: ({ serviceId, groupId, profileId }) => {
+          const fetchedAt = Number(connectedServiceRuntimeQuotaSnapshots.getSnapshotEntry({ serviceId, groupId, profileId })?.snapshot.fetchedAt);
+          return Number.isFinite(fetchedAt) && fetchedAt > 0 ? fetchedAt : null;
+        },
         // Retirement evidence for a recorded runner: dead/zombie, or a same-scheme fingerprint
         // mismatch proving PID reuse. Anything else keeps the decision's custody.
         probeRunnerPresence: async (runner) => classifySessionRunnerProcessPresence({
@@ -4477,7 +4496,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             assertAutomaticAdmission();
             // From here a launch adapter may create a process whose existence is not yet observable;
             // a later failure no longer proves the decisions were never used (spec A.4, T17).
-            perSessionSpawnCustody.markLaunchAttempted();
+            await perSessionSpawnCustody.markLaunchAttempted();
 
             const liveRunnerSnapshotFingerprints = resolveLiveRunnerSnapshotFingerprints(getCurrentChildren());
             const runtimeDecision = resolveHappyCliSubprocessRuntimeDecision({ liveRunnerSnapshotFingerprints });
@@ -8146,7 +8165,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
         // usage-limit interruption itself) is not provider-activity proof and must
         // not clear the recovery intents the failure report just armed.
         // A stale completion the exact-turn owner rejected must not certify the current attempt.
-        await recordTurnLifecycleProviderActivity({
+        const providerActivity = await recordTurnLifecycleProviderActivity({
           sessionId: input.sessionId,
           event: input.event,
           ...(input.terminalStatus ? { terminalStatus: input.terminalStatus } : {}),
@@ -8158,6 +8177,14 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           }),
           record: recordConnectedServiceContinuationProviderActivity,
         });
+        if (providerActivity.admitted) {
+          // Spec A.3: the first proved provider activity on the session's applied per-session member
+          // starts its reservation's release; the next fresh snapshot of that member completes it.
+          await perSessionAssignmentRuntime.recordProviderActivity({
+            decisions: collectPerSessionLiveDecisions(getCurrentChildren().filter((child) => child.happySessionId === input.sessionId)),
+            observedAtMs: lifecycleObservedAtMs,
+          }).catch((error) => logger.warn('[ConnectedServices] Per-session provider-activity record failed', error));
+        }
         if (input.event === 'assistant_message_end' && input.terminalStatus !== 'failed') {
           await clearMemberRuntimeStateWithPositiveEvidenceForTarget(
             connectedServiceRuntimeRegistry.getBySessionId(input.sessionId),

@@ -1,7 +1,7 @@
 import { ConnectedServiceBindingsV1Schema, type ConnectedServiceId } from '@happier-dev/protocol';
 
 import { readConnectedServiceMaterializationIdentityV1 } from '../../materialize/createConnectedServiceMaterializationIdentity';
-import type { PerSessionLiveDecision } from './PerSessionAssignmentRuntime';
+import type { PerSessionLiveDecision, PerSessionProvedSharedConversion } from './PerSessionAssignmentRuntime';
 
 type TrackedSessionLike = Readonly<{
   happySessionId?: string;
@@ -73,4 +73,47 @@ export function collectPerSessionLiveDecisions(tracked: Iterable<TrackedSessionL
     }
   }
   return [...decisions.values()];
+}
+
+function readGroupBindings(value: unknown) {
+  const parsed = ConnectedServiceBindingsV1Schema.safeParse(value);
+  if (!parsed.success) return null;
+  const groups = new Map<string, Extract<(typeof parsed.data.bindingsByServiceId)[string], { selection: 'group' }>>();
+  for (const [serviceId, binding] of Object.entries(parsed.data.bindingsByServiceId)) {
+    if (binding?.source === 'connected' && binding.selection === 'group') groups.set(serviceId, binding);
+  }
+  return groups;
+}
+
+/**
+ * Live runners whose committed (provider-observed) metadata proves conversion to the group's shared
+ * home (spec A.4 Migration), read durably so a settlement interrupted after the metadata commit is
+ * completed on a later pass. The proof needs all of:
+ * - the session's own metadata binding for the group has no per-session field and records the
+ *   provider-observed `appliedProfileId`; the projection removes those fields only on proved
+ *   conversion, and spawn under a rolled-back policy keeps them (pending `home:'group'`);
+ * - the runner was launched for the group home: its launch binding's pending target is
+ *   `home:'group'` on that same observed account, or it carries no per-session field at all.
+ * A runner launched for a per-session member, launch bindings alone, or a wrong observed account
+ * prove nothing.
+ */
+export function collectPerSessionProvedSharedConversions(tracked: Iterable<TrackedSessionLike>): PerSessionProvedSharedConversion[] {
+  const conversions: PerSessionProvedSharedConversion[] = [];
+  for (const session of tracked) {
+    const subjectId = readSubjectId(session);
+    const committed = readGroupBindings(session.happySessionMetadataFromLocalWebhook?.connectedServices);
+    if (!subjectId || !committed) continue;
+    const launched = readGroupBindings(session.spawnOptions?.connectedServices);
+    for (const [serviceId, binding] of committed) {
+      if (binding.member || binding.materializedAssignment || !binding.appliedProfileId) continue;
+      const launch = launched?.get(serviceId);
+      if (!launch || launch.groupId !== binding.groupId) continue;
+      const launchedForGroupHome = launch.materializedAssignment
+        ? launch.materializedAssignment.home === 'group' && launch.materializedAssignment.profileId === binding.appliedProfileId
+        : !launch.member;
+      if (!launchedForGroupHome) continue;
+      conversions.push({ subjectId, serviceId: serviceId as ConnectedServiceId, groupId: binding.groupId });
+    }
+  }
+  return conversions;
 }
