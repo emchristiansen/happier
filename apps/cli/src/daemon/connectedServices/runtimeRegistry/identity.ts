@@ -3,7 +3,7 @@ import {
   type ConnectedServiceId,
 } from '@happier-dev/protocol';
 
-import { parseConnectedServicesBindings } from '../parseConnectedServicesBindings';
+import { parseConnectedServiceBindingSelections, parseConnectedServicesBindings } from '../parseConnectedServicesBindings';
 import {
   readConnectedServiceChildSelectionsFromEnv,
   type ConnectedServiceChildSelection,
@@ -77,10 +77,38 @@ export function normalizeConnectedServicesBindingsRaw(raw: unknown): Readonly<{
   };
 }
 
+/**
+ * A runtime target's selections: those its child serialized, completed by the native-source
+ * nominations its declared bindings carry. A nomination names the selection's home, so a target
+ * registered without serialized selections (a direct session reported through the session webhook)
+ * still selects its nominated home rather than the profile's default one; a serialized selection of
+ * the same profile that omits it receives it. A serialized selection that differs (another profile or
+ * a group) is the child's own and is kept: a nominated home's admission refuses any other source.
+ */
 export function readRuntimeChildSelections(
   env: Pick<NodeJS.ProcessEnv, string> | null | undefined,
+  connectedServicesBindingsRaw: unknown,
 ): ReadonlyArray<ConnectedServiceChildSelection> {
-  return readConnectedServiceChildSelectionsFromEnv(env ?? {});
+  const selections = [...readConnectedServiceChildSelectionsFromEnv(env ?? {})];
+  for (const declared of parseConnectedServiceBindingSelections(connectedServicesBindingsRaw)) {
+    if (declared.kind !== 'profile' || !declared.nativeSource) continue;
+    const index = selections.findIndex((selection) => selection.serviceId === declared.serviceId);
+    if (index < 0) {
+      selections.push({
+        kind: 'profile',
+        serviceId: declared.serviceId,
+        profileId: declared.profileId,
+        credentialRevision: null,
+        nativeSource: declared.nativeSource,
+      });
+      continue;
+    }
+    const current = selections[index]!;
+    if (current.kind === 'profile' && current.profileId === declared.profileId && !current.nativeSource) {
+      selections[index] = { ...current, nativeSource: declared.nativeSource };
+    }
+  }
+  return selections;
 }
 
 export function buildRuntimeBoundProfiles(input: Readonly<{

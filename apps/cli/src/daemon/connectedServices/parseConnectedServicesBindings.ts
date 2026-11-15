@@ -10,6 +10,7 @@ import {
   ConnectedServiceIdSchema,
   ConnectedServiceBindingsV1Schema,
   type ConnectedServiceBindingsV1,
+  type ConnectedServiceCodexNativeSourceV1,
   type ConnectedServiceId,
 } from '@happier-dev/protocol';
 
@@ -18,6 +19,8 @@ export type ConnectedServiceBindingSelection =
       kind: 'profile';
       serviceId: ConnectedServiceId;
       profileId: string;
+      /** A new caller's nominated native source; its home is that source's own home of the profile. */
+      nativeSource?: ConnectedServiceCodexNativeSourceV1;
     }>
   | Readonly<{
       kind: 'group';
@@ -57,7 +60,10 @@ export function parseConnectedServiceBindingSelections(raw: unknown): ConnectedS
       continue;
     }
     if (!profileId) continue;
-    out.push({ kind: 'profile', serviceId: parsedId.data, profileId });
+    const nativeSource = 'nativeSource' in bindingRaw
+      ? bindingRaw.nativeSource as ConnectedServiceCodexNativeSourceV1 | undefined
+      : undefined;
+    out.push({ kind: 'profile', serviceId: parsedId.data, profileId, ...(nativeSource ? { nativeSource } : {}) });
   }
   return out;
 }
