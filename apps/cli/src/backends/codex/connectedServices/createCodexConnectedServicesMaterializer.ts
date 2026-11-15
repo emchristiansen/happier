@@ -61,6 +61,8 @@ export function createCodexConnectedServicesMaterializer(): ConnectedServicesPro
         accountSettings: params.accountSettings ?? null,
         processEnv: params.processEnv ?? process.env,
         nativeSourceAuthority: params.nativeSourceAuthority,
+        // A nominated source names this selection's home (`rootDir` above) and is its only source.
+        nominatedNativeSource: selection?.kind === 'profile' ? selection.nativeSource ?? null : null,
         sessionStateMode: params.sessionStateMode,
         validateCurrentBeforeMutation: selection?.kind === 'group' && validateGroupMutationCurrentness
           ? () => validateGroupMutationCurrentness({

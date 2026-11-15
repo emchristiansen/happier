@@ -634,10 +634,10 @@ export class ConnectedServiceRuntimeRegistry {
     const connectedServiceSelectionsEnv = patch.connectedServiceSelectionsEnv !== undefined
       ? normalizeRuntimeRegistryEnv(patch.connectedServiceSelectionsEnv)
       : previous?.connectedServiceSelectionsEnv ?? {};
-    const connectedServiceSelections = readRuntimeChildSelections(connectedServiceSelectionsEnv);
     const connectedServicesBindingsRaw = patch.connectedServicesBindingsRaw !== undefined
       ? normalizeConnectedServicesBindingsRaw(patch.connectedServicesBindingsRaw)
       : previous?.connectedServicesBindingsRaw ?? {};
+    const connectedServiceSelections = readRuntimeChildSelections(connectedServiceSelectionsEnv, connectedServicesBindingsRaw);
     const agentId = patch.agentId !== undefined ? patch.agentId ?? null : previous?.agentId ?? null;
     const sessionId = patch.sessionId !== undefined ? normalizeString(patch.sessionId) : previous?.sessionId ?? null;
     const brokerSelectionIdentity = patch.brokerSelectionIdentity !== undefined

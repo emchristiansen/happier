@@ -3,6 +3,7 @@ import { lstat, mkdir, rename } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 
 import type {
+  ConnectedServiceCodexNativeSourceV1,
   AccountSettings,
   ConnectedServiceCredentialRecordV1,
   ConnectedServiceCredentialRevisionV1,
@@ -45,6 +46,7 @@ export type ConnectedServiceResolvedSelection =
       profileId: string;
       credentialRevision?: ConnectedServiceCredentialRevisionV1 | null;
       record: ConnectedServiceCredentialRecordV1;
+      nativeSource?: ConnectedServiceCodexNativeSourceV1;
     }>
   | Readonly<{
       kind: 'group';

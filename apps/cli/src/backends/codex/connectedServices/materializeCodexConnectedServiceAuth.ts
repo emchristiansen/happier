@@ -20,6 +20,7 @@ export async function materializeCodexConnectedServiceAuth(params: Readonly<{
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv?: NodeJS.ProcessEnv;
   nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
+  nominatedNativeSource?: Readonly<{ CODEX_HOME: string; CODEX_SQLITE_HOME: string }> | null;
   sessionStateMode?: 'existing';
   validateCurrentBeforeMutation?: () => Promise<ConnectedServiceSharedGenerationMutationCurrentness>;
 }>): Promise<Readonly<{
@@ -38,6 +39,7 @@ export async function materializeCodexConnectedServiceAuth(params: Readonly<{
     accountSettings: params.accountSettings ?? null,
     processEnv: params.processEnv ?? process.env,
     nativeSourceAuthority: params.nativeSourceAuthority,
+    nominatedNativeSource: params.nominatedNativeSource ?? null,
   });
   const current = await writeCodexAuthStoreFile({
     codexHome, record: params.record, validateCurrentBeforeMutation: params.validateCurrentBeforeMutation,

@@ -1,5 +1,5 @@
 import { lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
 import { stringify, type TomlTable, type TomlValue } from 'smol-toml';
 
@@ -12,7 +12,10 @@ import {
 import { codexConnectedServiceStateSharingDescriptor } from '@/backends/codex/connectedServices/codexConnectedServiceStateSharingDescriptor';
 import { resolveConfiguredCodexHome } from '@/backends/codex/utils/resolveConfiguredCodexHome';
 import { isMatchingCodexRolloutFileName, normalizeCodexVendorResumeId } from '@/backends/codex/utils/codexSessionFiles';
-import { resolveConnectedServiceHomesDir } from '@/daemon/connectedServices/homes/resolveConnectedServiceHomeDir';
+import {
+  isConnectedServiceNominatedNativeSourceHomeRoot,
+  resolveConnectedServiceHomesDir,
+} from '@/daemon/connectedServices/homes/resolveConnectedServiceHomeDir';
 import { isConnectedServiceStateRootWithin } from '@/daemon/connectedServices/materialize/resolveConnectedServicePreviousStateRoot';
 import {
   ConnectedServiceNativeSourceProvenanceError,
@@ -83,13 +86,28 @@ export type CodexConnectedServiceStateSharingDiagnostic = Readonly<{
  * - `recorded`: the destination's record; a never-produced destination inherits the previous home's
  *   record. A legacy-unrecorded destination, or no record at all, is refused.
  * Both participating records must agree; an invalid record is refused, never inherited around.
+ *
+ * A nominated source (`nominatedNativeSource`, from the selection's profile binding) replaces the
+ * caller's environment as the requested source, and is the only source its home may ever have: the
+ * destination must be that pair's own home of the profile, and a `recorded` rematerializer's record
+ * must equal it. Without a nomination, a source recorded by a previous nominated home is never
+ * carried into another home (a switch or respawn that dropped the nomination is refused).
  */
 async function admitCodexNativeSource(params: Readonly<{
   nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
   destinationCodexHome: string;
   previousCodexHome: string | null;
   processEnv: NodeJS.ProcessEnv;
+  nominatedNativeSource: CodexAdmittedNativeSource | null;
+  managedHomesRoot: string | null;
 }>): Promise<CodexAdmittedNativeSource> {
+  const nominated = params.nominatedNativeSource
+    ? await admitCodexNominatedNativeSource({
+        nominated: params.nominatedNativeSource,
+        destinationCodexHome: params.destinationCodexHome,
+        managedHomesRoot: params.managedHomesRoot,
+      })
+    : null;
   const destination = await readCodexHomeProvenance(params.destinationCodexHome);
   const previous = params.previousCodexHome && resolve(params.previousCodexHome) !== resolve(params.destinationCodexHome)
     ? await readCodexHomeProvenance(params.previousCodexHome)
@@ -99,8 +117,21 @@ async function admitCodexNativeSource(params: Readonly<{
       throw new CodexConnectedServiceNativeSourceConflictError(params.destinationCodexHome, recorded.source, requested);
     }
   };
+  if (
+    !nominated
+    && previous?.kind === 'recorded'
+    && isConnectedServiceNominatedNativeSourceHomeRoot(dirname(params.previousCodexHome!), previous.source)
+  ) {
+    throw new ConnectedServiceNativeSourceProvenanceError(
+      'connected_service_native_source_conflict',
+      params.destinationCodexHome,
+      `Codex connected-service home ${params.previousCodexHome} was produced from nominated native source `
+        + `${previous.source.CODEX_HOME} (SQLite ${previous.source.CODEX_SQLITE_HOME}); refusing to carry it into `
+        + `${params.destinationCodexHome}, which was not nominated that source`,
+    );
+  }
   if (params.nativeSourceAuthority === 'caller_env') {
-    const requested: CodexAdmittedNativeSource = {
+    const requested: CodexAdmittedNativeSource = nominated ?? {
       CODEX_HOME: resolve(resolveConfiguredCodexHome(params.processEnv)),
       CODEX_SQLITE_HOME: resolve(resolveConfiguredCodexSqliteHome(params.processEnv)),
     };
@@ -122,7 +153,74 @@ async function admitCodexNativeSource(params: Readonly<{
     );
   }
   refuseUnless(previous, recorded);
+  if (nominated && !isSameCodexAdmittedNativeSource(recorded, nominated)) {
+    throw new CodexConnectedServiceNativeSourceConflictError(params.destinationCodexHome, recorded, nominated);
+  }
   return recorded;
+}
+
+/**
+ * A nominated pair, resolved. Refused (before anything is read, created or locked) unless the
+ * destination is exactly that pair's own home, and unless neither location lies inside the managed
+ * connected-service homes, physically or lexically: a nomination may name only a native source, never
+ * another (or this) materialized home.
+ */
+async function admitCodexNominatedNativeSource(params: Readonly<{
+  nominated: CodexAdmittedNativeSource;
+  destinationCodexHome: string;
+  managedHomesRoot: string | null;
+}>): Promise<CodexAdmittedNativeSource> {
+  const refuse = (source: CodexAdmittedNativeSource, reason: string): never => {
+    throw new ConnectedServiceNativeSourceProvenanceError(
+      'connected_service_native_source_invalid',
+      params.destinationCodexHome,
+      `Codex connected-service home ${params.destinationCodexHome} cannot be produced from nominated native source `
+        + `${source.CODEX_HOME} (SQLite ${source.CODEX_SQLITE_HOME}): ${reason}`,
+    );
+  };
+  // The wire binding admits every platform's absolute syntax; this filesystem admits only its own. A
+  // path absolute elsewhere (`C:\\x` or a UNC share on POSIX) is relative here and would otherwise
+  // resolve against the working directory, so it is refused before it is resolved.
+  if (!isAbsolute(params.nominated.CODEX_HOME) || !isAbsolute(params.nominated.CODEX_SQLITE_HOME)) {
+    refuse(params.nominated, `it is not an absolute path on this platform (${process.platform})`);
+  }
+  const nominated: CodexAdmittedNativeSource = {
+    CODEX_HOME: resolve(params.nominated.CODEX_HOME),
+    CODEX_SQLITE_HOME: resolve(params.nominated.CODEX_SQLITE_HOME),
+  };
+  if (!isConnectedServiceNominatedNativeSourceHomeRoot(dirname(params.destinationCodexHome), nominated)) {
+    refuse(nominated, 'the destination is not that source\'s own home');
+  }
+  if (params.managedHomesRoot) {
+    const managed = [resolve(params.managedHomesRoot), await physicalLocation(params.managedHomesRoot)];
+    for (const location of [nominated.CODEX_HOME, nominated.CODEX_SQLITE_HOME]) {
+      for (const candidate of [location, await physicalLocation(location)]) {
+        if (managed.some((root) => root !== null && candidate !== null && isConnectedServiceStateRootWithin(root, candidate))) {
+          refuse(nominated, 'it lies inside the managed connected-service homes');
+        }
+      }
+    }
+  }
+  return nominated;
+}
+
+/** `realpath` of the nearest existing ancestor joined with the rest; null when it cannot be read. */
+async function physicalLocation(path: string): Promise<string | null> {
+  const absolute = resolve(path);
+  let existing = absolute;
+  const rest: string[] = [];
+  for (;;) {
+    try {
+      return join(await realpath(existing), ...rest.reverse());
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') return null;
+      const parent = dirname(existing);
+      if (parent === existing) return null;
+      rest.push(basename(existing));
+      existing = parent;
+    }
+  }
 }
 
 /**
@@ -350,6 +448,8 @@ export async function syncCodexConnectedServiceHome(params: Readonly<{
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv?: NodeJS.ProcessEnv;
   nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
+  /** The source the selection's binding nominated, if any (see `admitCodexNativeSource`). */
+  nominatedNativeSource?: CodexAdmittedNativeSource | null;
 }>): Promise<SyncCodexConnectedServiceHomeResult> {
   const settings = resolveCodexHomeSharingSettings(params.accountSettings ?? null);
   // A rematerializer that did not produce this home reads its source only from the home's own record
@@ -360,8 +460,14 @@ export async function syncCodexConnectedServiceHome(params: Readonly<{
     destinationCodexHome: params.destinationCodexHome,
     previousCodexHome: params.previousCodexHome ?? null,
     processEnv: params.processEnv ?? process.env,
+    nominatedNativeSource: params.nominatedNativeSource ?? null,
+    managedHomesRoot: params.activeServerDir
+      ? resolveConnectedServiceHomesDir({ activeServerDir: params.activeServerDir })
+      : null,
   });
-  const processEnv: NodeJS.ProcessEnv = params.nativeSourceAuthority === 'recorded'
+  // A rematerializer or a nominating caller reads exactly the admitted source; only an unnominated
+  // producing caller's own environment names it.
+  const processEnv: NodeJS.ProcessEnv = params.nativeSourceAuthority === 'recorded' || params.nominatedNativeSource
     ? admittedSource
     : params.processEnv ?? process.env;
   const configuredSourceCodexHome = admittedSource.CODEX_HOME === resolve(params.destinationCodexHome)

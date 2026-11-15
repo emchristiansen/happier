@@ -62,6 +62,7 @@ export function buildResolvedSelectionsForTarget(
       profileId: selection.profileId,
       credentialRevision,
       record,
+      ...(selection.nativeSource ? { nativeSource: selection.nativeSource } : {}),
     });
   }
   return selectionsByServiceId;

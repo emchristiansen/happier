@@ -36,11 +36,36 @@ const ConnectedServiceNativeBindingV1Schema = lazySchema(() => z
     })
     .passthrough());
 
+// An absolute POSIX or Windows path. The daemon resolves it again before use; this only refuses
+// operands that could name a location relative to an unknown working directory.
+const ConnectedServiceAbsolutePathSchema = lazySchema(() => z
+    .string()
+    .min(1)
+    .refine((value) => value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\'), 'Expected an absolute path'));
+
+/**
+ * A native Codex source a new caller nominates for an `openai-codex` profile binding: the
+ * configuration/state root and the SQLite home a fresh connected-service home is produced from,
+ * instead of the spawning process's own environment. The binding's home is then a separate home of
+ * that profile bound to exactly this pair (see the CLI's Codex native-source admission).
+ */
+export const ConnectedServiceCodexNativeSourceV1Schema = lazySchema(() => z
+    .object({
+        CODEX_HOME: ConnectedServiceAbsolutePathSchema,
+        CODEX_SQLITE_HOME: ConnectedServiceAbsolutePathSchema,
+    })
+    .strict());
+
+export type ConnectedServiceCodexNativeSourceV1 = z.infer<typeof ConnectedServiceCodexNativeSourceV1Schema>;
+
+const CONNECTED_SERVICE_NATIVE_SOURCE_BINDING_KEY = 'nativeSource';
+
 const ConnectedServiceProfileBindingV1Schema = lazySchema(() => z
     .object({
         source: z.literal('connected'),
         selection: z.literal('profile').optional().default('profile'),
         profileId: ConnectedServiceProfileIdSchema,
+        nativeSource: ConnectedServiceCodexNativeSourceV1Schema.optional(),
     })
     .passthrough());
 
@@ -66,12 +91,24 @@ export type ConnectedServiceBindingSelectionV1 = z.infer<typeof ConnectedService
 const ConnectedServiceBindingsByServiceIdV1Schema = lazySchema(() => z
     .record(z.string(), ConnectedServiceBindingSelectionV1Schema)
     .superRefine((bindings, ctx) => {
-        for (const serviceId of Object.keys(bindings)) {
+        for (const [serviceId, binding] of Object.entries(bindings)) {
             if (!ConnectedServiceIdSchema.safeParse(serviceId).success) {
                 ctx.addIssue({
                     code: z.ZodIssueCode.custom,
                     message: 'Invalid connected service id',
                     path: [serviceId],
+                });
+            }
+            // Bindings pass unknown fields through, so a nomination an owner cannot honour would
+            // otherwise be silently ignored: only a connected openai-codex profile binding takes one.
+            if (
+                Object.prototype.hasOwnProperty.call(binding, CONNECTED_SERVICE_NATIVE_SOURCE_BINDING_KEY)
+                && !(serviceId === 'openai-codex' && binding.source === 'connected' && binding.selection === 'profile')
+            ) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: 'A native source may be nominated only on a connected openai-codex profile binding',
+                    path: [serviceId, CONNECTED_SERVICE_NATIVE_SOURCE_BINDING_KEY],
                 });
             }
         }

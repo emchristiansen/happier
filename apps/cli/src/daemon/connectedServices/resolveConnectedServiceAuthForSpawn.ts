@@ -1115,6 +1115,7 @@ function buildSelectionsByServiceIdForSpawn(params: Readonly<{
         profileId: selection.profileId,
         credentialRevision: params.credentialRevisionsByServiceId.get(selection.serviceId) ?? null,
         record,
+        ...(selection.nativeSource ? { nativeSource: selection.nativeSource } : {}),
       });
       continue;
     }
@@ -1148,6 +1149,7 @@ function buildCanonicalConnectedServicesBindingsForSpawn(params: Readonly<{
         source: 'connected',
         selection: 'profile',
         profileId: selection.profileId,
+        ...(selection.nativeSource ? { nativeSource: selection.nativeSource } : {}),
       };
       continue;
     }

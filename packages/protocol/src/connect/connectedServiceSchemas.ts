@@ -24,6 +24,8 @@ export {
     ConnectedServiceAuthGroupIdSchema,
     ConnectedServiceBindingSelectionV1Schema,
     ConnectedServiceBindingsV1Schema,
+    ConnectedServiceCodexNativeSourceV1Schema,
+    type ConnectedServiceCodexNativeSourceV1,
     ConnectedServiceIdSchema,
     ConnectedServiceProfileIdSchema,
     SessionConnectedServiceAuthSwitchRpcParamsSchema,

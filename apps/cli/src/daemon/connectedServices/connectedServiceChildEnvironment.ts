@@ -1,7 +1,9 @@
 import {
   ConnectedServiceBindingsV1Schema,
+  ConnectedServiceCodexNativeSourceV1Schema,
   ConnectedServiceCredentialRevisionV1Schema,
   type ConnectedServiceBindingSelectionV1,
+  type ConnectedServiceCodexNativeSourceV1,
   type ConnectedServiceId,
   type ConnectedServiceCredentialRevisionV1,
   type ConnectedServiceProfileId,
@@ -19,6 +21,7 @@ export type ConnectedServiceChildSelection =
       serviceId: ConnectedServiceId;
       profileId: string;
       credentialRevision: ConnectedServiceCredentialRevisionV1 | null;
+      nativeSource?: ConnectedServiceCodexNativeSourceV1;
     }>
   | Readonly<{
       kind: 'group';
@@ -36,6 +39,7 @@ type ConnectedServiceSerializableSelection =
       serviceId: ConnectedServiceId;
       profileId: string;
       credentialRevision?: ConnectedServiceCredentialRevisionV1 | null;
+      nativeSource?: ConnectedServiceCodexNativeSourceV1;
     }>
   | Readonly<{
       kind: 'group';
@@ -88,6 +92,7 @@ export function serializeConnectedServiceChildSelections(
         serviceId: selection.serviceId,
         profileId: selection.profileId,
         credentialRevision: selection.credentialRevision ?? null,
+        ...(selection.nativeSource ? { nativeSource: selection.nativeSource } : {}),
       });
       continue;
     }
@@ -126,11 +131,18 @@ export function readConnectedServiceChildSelectionsFromEnv(
     if (kind === 'profile') {
       const profileId = readString(record.profileId);
       if (!profileId) continue;
+      // A nominated source names the selection's home: a selection whose nomination cannot be read
+      // is dropped whole, never re-read as the profile's default home.
+      const nativeSource = record.nativeSource === undefined
+        ? undefined
+        : ConnectedServiceCodexNativeSourceV1Schema.safeParse(record.nativeSource);
+      if (nativeSource && !nativeSource.success) continue;
       selections.push({
         kind: 'profile',
         serviceId,
         profileId,
         credentialRevision: readCredentialRevision(record.credentialRevision),
+        ...(nativeSource?.success ? { nativeSource: nativeSource.data } : {}),
       });
       continue;
     }
