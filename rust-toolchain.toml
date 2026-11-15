@@ -1,0 +1,6 @@
+[toolchain]
+# Build compiler, not the minimum supported Rust version in apps/ui/src-tauri/Cargo.toml.
+# Repository scope also covers Cargo invoked from the root with --manifest-path.
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
