@@ -249,6 +249,50 @@ describe('resolveClaudeConnectedServiceSwitchContinuity', () => {
     }
   });
 
+  // T12-CONV-01: a per_session_softmax runner on a member's own home never reads the group home, so a
+  // switch that writes the group home (a policy-rollback conversion) must restart it onto that home.
+  it.each([
+    ['an applied per-session member', { member: { assignment: 'per_session', profileId: 'primary', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 } }, false],
+    ['a pending member-home target', { materializedAssignment: { profileId: 'primary', decisionId: 'd1', reason: 'initial_sampled', materializedAtMs: 1 } }, false],
+    ['a converted runner awaiting group-home adoption', { materializedAssignment: { profileId: 'backup', decisionId: 'c1', reason: 'policy_conversion', materializedAtMs: 1, home: 'group' } }, true],
+    ['no per-session ownership', {}, true],
+  ] as const)('hot-applies the shared group home only for a runner on it: %s', async (_label, ownership, hotApplies) => {
+    const runtimeClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-group-config-'));
+    const sourceClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-source-root-'));
+    try {
+      await mkdir(join(runtimeClaudeConfigDir, 'projects', 'project-1'), { recursive: true });
+      await writeFile(join(runtimeClaudeConfigDir, 'projects', 'project-1', 'vendor-session-1.jsonl'), '{}\n');
+      const result = await resolveClaudeConnectedServiceSwitchContinuity(createParams({
+        previousBinding: { source: 'connected', selection: 'group', serviceId: 'claude-subscription', profileId: 'primary', groupId: 'claude' },
+        nextBinding: { source: 'connected', selection: 'group', serviceId: 'claude-subscription', profileId: 'backup', groupId: 'claude' },
+        fromBindings: { v: 1, bindingsByServiceId: { 'claude-subscription': {
+          source: 'connected', selection: 'group', groupId: 'claude', ...ownership,
+        } } } as ConnectedServiceSwitchContinuityParams['fromBindings'],
+        runtimeAuthSelection: {
+          serviceId: 'claude-subscription',
+          record: createClaudeSubscriptionOauthRecord('backup'),
+          groupId: 'claude', activeProfileId: 'backup', fallbackProfileId: 'primary', generation: 7,
+          credentialRevision: CREDENTIAL_REVISION,
+          targetMaterializedEnv: { CLAUDE_CONFIG_DIR: runtimeClaudeConfigDir },
+          targetMaterializedRoot: runtimeClaudeConfigDir,
+          claudeRuntimeAuthSharedGroupSurface: {
+            mode: 'shared_group_auth_surface', runtimeClaudeConfigDir, runtimeMaterializedRoot: runtimeClaudeConfigDir, sourceClaudeConfigDir,
+          },
+        },
+        targetMaterializedEnv: { CLAUDE_CONFIG_DIR: runtimeClaudeConfigDir },
+        targetMaterializedRoot: runtimeClaudeConfigDir,
+        connectedServiceMaterializationIdentityV1: { v: 1, id: 'materialization-1', createdAtMs: 1 },
+        vendorResumeId: 'vendor-session-1',
+        cwd: process.cwd(),
+      }));
+      if (hotApplies) expect(result).toEqual({ mode: 'hot_apply' });
+      else expect(result.mode).not.toBe('hot_apply');
+    } finally {
+      await rm(runtimeClaudeConfigDir, { recursive: true, force: true });
+      await rm(sourceClaudeConfigDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not use hot_apply for token-backed Claude subscription groups even when stale shared-home metadata is present', async () => {
     const runtimeClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-token-group-config-'));
     const sourceClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-token-source-root-'));

@@ -8,6 +8,7 @@ import {
   hasExactConnectedServiceRestartContinuityContext,
   isConnectedToConnectedServiceSwitch,
   isExactSameConnectedServiceSelection,
+  isPerSessionMemberHomeRunner,
   isSameConnectedServiceAuthGroup,
   providerSessionStateUnavailableForResume,
 } from '@/backends/connectedServices/switchContinuityContext';
@@ -112,8 +113,13 @@ export async function resolveClaudeConnectedServiceSwitchContinuity(
 
   // A repeated group selection can carry a newer credential revision. Its
   // proven shared auth surface supports the same in-place application as a
-  // member change; it does not require a provider Session restart.
-  if (isSameConnectedServiceAuthGroup(params) && targetsClaudeSharedGroupRuntimeConfig(params)) {
+  // member change; it does not require a provider Session restart. A runner on
+  // a per-session member's own home never reads that shared surface (T12-CONV-01).
+  if (
+    isSameConnectedServiceAuthGroup(params)
+    && targetsClaudeSharedGroupRuntimeConfig(params)
+    && !isPerSessionMemberHomeRunner(params)
+  ) {
     return { mode: 'hot_apply' };
   }
 

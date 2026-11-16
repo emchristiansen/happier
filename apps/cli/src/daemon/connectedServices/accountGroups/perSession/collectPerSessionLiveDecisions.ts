@@ -112,6 +112,7 @@ export function resolveLaunchedSharedConversions(
   const launched = readGroupBindings(session.spawnOptions?.connectedServices);
   if (!subjectId || !committed || !launched) return [];
   const conversions: PerSessionProvedSharedConversion[] = [];
+  const convertedRunner = readTrackedLauncherIdentity(session);
   for (const [serviceId, binding] of committed) {
     if (binding.member || binding.materializedAssignment || !binding.appliedProfileId) continue;
     const conversion = launched.get(serviceId)?.materializedAssignment;
@@ -122,6 +123,7 @@ export function resolveLaunchedSharedConversions(
       serviceId: serviceId as ConnectedServiceId,
       groupId: binding.groupId,
       retiresDecisionsDecidedAtOrBeforeMs: conversion.materializedAtMs,
+      ...(convertedRunner ? { convertedRunner } : {}),
     });
   }
   return conversions;

@@ -188,6 +188,24 @@ function resolveClaudeProviderIdentityReport(
     return assignedProfileId === selection.profileId ? { groupId: binding.groupId, launchHome: 'member' } : null;
 }
 
+/**
+ * A per_session_softmax runner reports a failure in its member home's exact form: the session
+ * binding's group, its own profile and credential revision, and no group generation (no shared
+ * generation applies to a member's own home). The daemon verifies that form against the runner's
+ * registered member-home binding. Any other session is reported as before.
+ */
+function withPerSessionMemberHomeGroup<T extends Readonly<{ profileId?: string | null; groupId?: string | null }>>(
+    session: RuntimeIssueSession,
+    classification: T,
+): T {
+    if (classification.groupId) return classification;
+    const report = resolveClaudeProviderIdentityReport(session);
+    const selection = resolveClaudeRuntimeIssueSelection(session);
+    if (report?.launchHome !== 'member' || selection?.kind !== 'profile') return classification;
+    if (!classification.profileId || classification.profileId !== selection.profileId) return classification;
+    return { ...classification, groupId: report.groupId };
+}
+
 /** Every launcher feeds its existing trusted raw channel here; history never reconciles live identity. */
 export function observeClaudeRuntimeAuthTranscript(
     session: RuntimeIssueSession,
@@ -748,10 +766,10 @@ export async function surfaceClaudeRateLimitRuntimeIssue(
         selection,
     });
     const classification = classifiedFailure
-        ? { ...classifiedFailure,
+        ? withPerSessionMemberHomeGroup(session, { ...classifiedFailure,
             ...(requestIdentity ? await requestIdentity.identity : {}),
             ...await providerOrganization,
-            ...(runtimeIssueFingerprint ? { runtimeIssueFingerprint } : {}) }
+            ...(runtimeIssueFingerprint ? { runtimeIssueFingerprint } : {}) })
         : null;
     if (!classification) return;
     const observedLimitedWindow = options?.observedWindows?.find((window) => (
@@ -882,14 +900,14 @@ export async function surfaceClaudeRuntimeAuthFailure(
     const runtimeIssueFingerprint = !subagentScoped
         ? beginConnectedClaudeTurnFailure(session, issue, logPrefix)
         : undefined;
-    const classification = {
+    const classification = withPerSessionMemberHomeGroup(session, {
         ...initialClassification,
         ...(requestIdentity ? await requestIdentity.identity : 'transcriptPath' in session
             ? { sourceProviderAccountId: null, sourceProviderOrganizationId: null }
             : await enrichClaudeRuntimeEvidenceWithAccountIdentity(session, initialClassification)),
         ...await providerOrganization,
         ...(runtimeIssueFingerprint ? { runtimeIssueFingerprint } : {}),
-    };
+    });
     const recoveryReport = await reportConnectedServiceRuntimeAuthFailureToDaemon({
         sessionId: session.client.sessionId,
         switchesThisTurn: 0,

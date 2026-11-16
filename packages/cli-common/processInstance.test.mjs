@@ -41,3 +41,11 @@ test('processInstanceFingerprintMatches fails closed when either observation is 
   assert.equal(processInstanceFingerprintMatches('linux-proc:1', null), false);
   assert.equal(processInstanceFingerprintMatches(null, 'linux-proc:1'), false);
 });
+
+test('readLinuxProcProcessInstanceFingerprintSync reads /proc only and is unknown (no child process) when unreadable', async () => {
+  const { readLinuxProcProcessInstanceFingerprintSync } = await import('./processInstance.mjs');
+  const stat = `123 (node (x)) S ${Array.from({ length: 18 }, (_, index) => index + 1).join(' ')} 987654 0 0`;
+  assert.equal(readLinuxProcProcessInstanceFingerprintSync(123, { readFileSyncImpl: () => stat }), 'linux-proc:987654');
+  assert.equal(readLinuxProcProcessInstanceFingerprintSync(123, { readFileSyncImpl: () => { throw new Error('ENOENT'); } }), null);
+  assert.equal(readLinuxProcProcessInstanceFingerprintSync(1, { readFileSyncImpl: () => stat }), null);
+});

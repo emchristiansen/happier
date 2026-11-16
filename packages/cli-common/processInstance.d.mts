@@ -1,3 +1,8 @@
+export function readLinuxProcProcessInstanceFingerprintSync(
+  pid: number,
+  options?: Readonly<{ readFileSyncImpl?: typeof import('node:fs').readFileSync }>,
+): string | null;
+
 export function readProcessInstanceFingerprintSync(
   pid: number,
   options?: Readonly<{

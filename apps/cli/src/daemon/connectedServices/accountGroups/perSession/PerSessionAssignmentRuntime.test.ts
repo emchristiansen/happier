@@ -291,6 +291,28 @@ describe('PerSessionAssignmentRuntime', () => {
     expect(vi.mocked(api.deleteAssignmentReservation).mock.calls.map(([params]) => params.decisionId).sort()).toEqual(['applied-a', 'failed-b', 'pending-c']);
   });
 
+  // T12-CONV-01: the converted runner's own launch binding (and lagging local metadata) still lists
+  // the previous member; that never keeps a retired decision alive. Another runner's carriage does.
+  it.each([
+    ['the converted runner itself', { pid: 7, processInstanceFingerprint: 'fp-7' }, []],
+    ['another runner', { pid: 8, processInstanceFingerprint: 'fp-8' }, ['applied-a']],
+    ['a reused pid of another process instance', { pid: 7, processInstanceFingerprint: 'fp-other' }, ['applied-a']],
+  ] as const)('settles a proved conversion when the retired member is listed by %s', async (_label, runner, kept) => {
+    const ledger = new PerSessionAssignmentLedger(await ledgerAt());
+    await ledger.recordProposal({ decisionId: 'applied-a', sessionId: 's', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('applied-a', 'a'), nowMs: 1 });
+    await ledger.markApplied('applied-a', 2);
+    const api = reservationApi();
+    const runtime = runtimeFor({ ledger, api, liveSubjects: () => new Set(['s']), live: () => [{
+      serviceId: 'claude-subscription', groupId: 'pool', decisionId: 'applied-a', profileId: 'a', subjectId: 's',
+      applied: true, reason: 'initial_sampled', runner,
+    }] });
+    await runtime.settleProvedSharedConversion({
+      subjectId: 's', serviceId: 'claude-subscription', groupId: 'pool', retiresDecisionsDecidedAtOrBeforeMs: 10,
+      convertedRunner: { pid: 7, processInstanceFingerprint: 'fp-7' },
+    });
+    expect(ledger.list().map((entry) => entry.decisionId)).toEqual(kept);
+  });
+
   it('keeps custody once a launch adapter was entered, even when no runner pid was observed (HPI-02)', async () => {
     const ledgerPath = await ledgerAt();
     const ledger = new PerSessionAssignmentLedger(ledgerPath);
@@ -387,6 +409,57 @@ describe('per-session launch custody as adoption provenance (R16-CUSTODY-01)', (
     const after = runtimeFor({ ledger: reloaded, api: reservationApi() });
     expect(after.isDecisionLaunchedInRunner('d', runner)).toBe(true);
     expect(after.isDecisionLaunchedInRunner('d', { pid: 43, processInstanceFingerprint: 'fp-43' })).toBe(false);
+  });
+
+  // R16-WRAPPER-02: a wrapper launch's reporter child stays adoptable after the wrapper exits and the
+  // child is reparented, through the lineage bound while the wrapper was its live parent.
+  describe('wrapper reporter lineage', () => {
+    const wrapper = { pid: 42, processInstanceFingerprint: 'fp-42' };
+    const reporter = { pid: 77, processInstanceFingerprint: 'fp-77' };
+    async function launchedByWrapper() {
+      const { path, ledger } = await pendingLedger();
+      await ledger.recordSpawnCustody({ spawnDecisionIds: ['d'], launchedDecisionIds: ['d'], runner: wrapper, nowMs: 2 });
+      return { path, ledger, runtime: runtimeFor({ ledger, api: reservationApi() }) };
+    }
+
+    it('binds the reporter while the wrapper is its live parent, durably', async () => {
+      const { path, runtime } = await launchedByWrapper();
+      expect(runtime.isDecisionLaunchedInRunner('d', reporter)).toBe(false);
+      await runtime.recordWrapperReporter({ reporter, parent: wrapper });
+      const after = runtimeFor({ ledger: new PerSessionAssignmentLedger(path), api: reservationApi() });
+      expect(after.isDecisionLaunchedInRunner('d', reporter)).toBe(true);
+      expect(after.isDecisionLaunchedInRunner('d', reporter, { requireFingerprint: true })).toBe(true);
+    });
+
+    it.each([
+      ['a reused reporter pid of another process instance', { pid: 77, processInstanceFingerprint: 'fp-other' }],
+      ['a reporter pid without a process instance', { pid: 77 }],
+      ['another process', { pid: 78, processInstanceFingerprint: 'fp-78' }],
+    ] as const)('never adopts %s through the bound lineage', async (_label, candidate) => {
+      const { runtime } = await launchedByWrapper();
+      await runtime.recordWrapperReporter({ reporter, parent: wrapper });
+      expect(runtime.isDecisionLaunchedInRunner('d', candidate)).toBe(false);
+    });
+
+    it.each([
+      ['an unrelated parent', { pid: 50, processInstanceFingerprint: 'fp-50' }],
+      ['a reused wrapper pid of another process instance', { pid: 42, processInstanceFingerprint: 'fp-reused' }],
+      ['a parent without a process instance', { pid: 42 }],
+      ['no readable parent', null],
+    ] as const)('binds nothing for %s', async (_label, parent) => {
+      const { ledger, runtime } = await launchedByWrapper();
+      await runtime.recordWrapperReporter({ reporter, parent });
+      expect(ledger.get('d')?.launchedReporter).toBeUndefined();
+      expect(runtime.isDecisionLaunchedInRunner('d', reporter)).toBe(false);
+    });
+
+    it('is superseded by a later launch of the decision', async () => {
+      const { ledger, runtime } = await launchedByWrapper();
+      await runtime.recordWrapperReporter({ reporter, parent: wrapper });
+      await ledger.recordSpawnCustody({ spawnDecisionIds: [], launchedDecisionIds: ['d'], runner: { pid: 90, processInstanceFingerprint: 'fp-90' }, nowMs: 3 });
+      expect(ledger.get('d')?.launchedReporter).toBeUndefined();
+      expect(runtime.isDecisionLaunchedInRunner('d', reporter)).toBe(false);
+    });
   });
 
   it('keeps the original child adoptable when only the spawn runner record survived a split custody write', async () => {

@@ -17,6 +17,27 @@ function runProbe(command, args, { spawnSyncImpl }) {
   return value || null;
 }
 
+/**
+ * The Linux process-instance fingerprint read from `/proc/<pid>/stat` alone (never a child process),
+ * or null when the process or its start time is unreadable. The same value
+ * `readProcessInstanceFingerprintSync` returns on Linux when `/proc` is readable.
+ */
+export function readLinuxProcProcessInstanceFingerprintSync(pid, { readFileSyncImpl = readFileSync } = {}) {
+  const normalizedPid = normalizePid(pid);
+  if (!normalizedPid) return null;
+  try {
+    const stat = String(readFileSyncImpl(`/proc/${normalizedPid}/stat`, 'utf8'));
+    const closingParen = stat.lastIndexOf(')');
+    const fieldsAfterCommand = closingParen >= 0
+      ? stat.slice(closingParen + 1).trim().split(/\s+/)
+      : [];
+    const startTimeTicks = fieldsAfterCommand[19];
+    return /^\d+$/.test(String(startTimeTicks ?? '')) ? `linux-proc:${startTimeTicks}` : null;
+  } catch {
+    return null;
+  }
+}
+
 export function readProcessInstanceFingerprintSync(pid, {
   platform = process.platform,
   spawnSyncImpl = spawnSync,
@@ -26,19 +47,9 @@ export function readProcessInstanceFingerprintSync(pid, {
   if (!normalizedPid) return null;
 
   if (platform === 'linux') {
-    try {
-      const stat = String(readFileSyncImpl(`/proc/${normalizedPid}/stat`, 'utf8'));
-      const closingParen = stat.lastIndexOf(')');
-      const fieldsAfterCommand = closingParen >= 0
-        ? stat.slice(closingParen + 1).trim().split(/\s+/)
-        : [];
-      const startTimeTicks = fieldsAfterCommand[19];
-      if (/^\d+$/.test(String(startTimeTicks ?? ''))) {
-        return `linux-proc:${startTimeTicks}`;
-      }
-    } catch {
-      // Fall through to the portable POSIX probe.
-    }
+    const fromProc = readLinuxProcProcessInstanceFingerprintSync(normalizedPid, { readFileSyncImpl });
+    if (fromProc) return fromProc;
+    // Fall through to the portable POSIX probe.
   }
 
   if (platform === 'win32') {

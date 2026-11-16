@@ -565,6 +565,8 @@ import {
   resolveProvedSharedConversion,
   type ProviderObservedAccountProvenance,
 } from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
+import { isPerSessionMemberHomeRegistration } from './connectedServices/runtimeAuth/isPerSessionMemberHomeRegistration';
+import { readTrackedLauncherIdentity } from './connectedServices/accountGroups/perSession/readTrackedLauncherIdentity';
 import { resolveProviderObservationProvenance } from './connectedServices/sessionAuthSwitch/resolveProviderObservationProvenance';
 import { readLiveParentProcessSync } from './connectedServices/accountGroups/perSession/readLiveParentProcessSync';
 import { DEFAULT_CONNECTED_SERVICE_RUNTIME_AUTH_APPLY_CAPABILITY } from './connectedServices/credentials/lifecycleTypes';
@@ -3258,6 +3260,15 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           },
           onTrackedSessionReported: async (tracked) => {
             persistPiResumeEnvironment({ tracked, happyHomeDir: configuration.happyHomeDir, logger });
+            // A wrapper launch's reporter child: bind it to the wrapper's per-session decisions while the
+            // wrapper is still its live parent (R16-WRAPPER-02).
+            const reporterPid = tracked.sessionRunnerPid;
+            if (typeof reporterPid === 'number' && reporterPid !== tracked.pid && tracked.processInstanceFingerprint) {
+              await perSessionAssignmentRuntime.recordWrapperReporter({
+                reporter: { pid: reporterPid, processInstanceFingerprint: tracked.processInstanceFingerprint },
+                parent: readLiveParentProcessSync(reporterPid),
+              }).catch((error) => logger.warn('[ConnectedServices] Per-session wrapper reporter binding failed', error));
+            }
             if (tracked.startedBy !== 'daemon') {
               // Session reports are the first durable identity boundary for terminal-started
               // runtimes. Index them through the same registry owner used by daemon spawns and
@@ -6631,6 +6642,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               registeredServiceIds: runtimeTarget.activeBindings.map((candidate) => candidate.serviceId),
             };
           }
+          const perSessionMemberHome = isPerSessionMemberHomeRegistration({
+            binding,
+            selections: runtimeTarget.connectedServiceSelections,
+            bindingsRaw: runtimeTarget.connectedServicesBindingsRaw,
+          });
           return {
             status: 'bound',
             binding: {
@@ -6640,6 +6656,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               generation: binding.generation,
               credentialRevision: binding.credentialRevision,
             },
+            ...(perSessionMemberHome ? { perSessionMemberHome: true } : {}),
           };
         };
         const resolveRuntimeAuthApplyForFailureSource = async (input: Readonly<{
@@ -8185,8 +8202,12 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                   }).catch((error) => logger.warn('[ConnectedServices] Per-session adoption settlement failed; renewal will retry', error));
                 }
                 const tracked = pidToTrackedSession.get(target.pid) ?? null;
+                const convertedRunner = tracked ? readTrackedLauncherIdentity(tracked) : null;
                 const conversions = published.provedSharedConversion
-                  ? [{ ...published.provedSharedConversion, serviceId: binding.serviceId, groupId: observation.groupId }]
+                  ? [{
+                      ...published.provedSharedConversion, serviceId: binding.serviceId, groupId: observation.groupId,
+                      ...(convertedRunner ? { convertedRunner } : {}),
+                    }]
                   // An identical observation re-checks committed metadata against this runner's launch,
                   // completing a conversion settlement interrupted after the commit.
                   : published.unchangedConnectedServices && tracked

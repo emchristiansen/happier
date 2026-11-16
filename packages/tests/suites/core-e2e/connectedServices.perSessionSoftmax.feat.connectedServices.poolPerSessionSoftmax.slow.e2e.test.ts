@@ -15,7 +15,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile, readdir, realpath } from 'node:fs/promises';
+import { readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import {
@@ -571,6 +571,119 @@ describe('core e2e: per-session softmax connected-service account selection', ()
     const groupAfter = await readGroup(f, groupId);
     expect(groupAfter.activeProfileId).toBe('gamma');
     expect(groupAfter.generation).toBe(generationBefore);
+  }, 300_000);
+
+  // T12: rolling the policy back causes no immediate restart; per-session ownership stays until the
+  // next failure converts the session, and only provider adoption through the group's shared home
+  // (the converted runner's own launch) ends it (spec A.4 Migration, C3′/C4).
+  it('T12: policy rollback keeps the session until a failure converts it through the group home', async () => {
+    const f = fx();
+    const groupId = 'rollback-t12';
+    const created = await createGroup(f, {
+      groupId,
+      members: POOL_MEMBERS.map((profileId) => ({ profileId })),
+      activeProfileId: 'gamma',
+      policy: { strategy: 'per_session_softmax', autoSwitch: true, recoveryMode: 'switch_or_wait' },
+    });
+    expect(created.status, JSON.stringify(created.data)).toBe(200);
+    // The provider's own usage-limit failure, on the turn after this file appears.
+    const usageLimitSignal = resolve(f.daemonHomeDir, `usage-limit-${randomUUID()}.signal`);
+    const sessionId = await spawnConnectedClaudeSession({
+      fixture: f, sessionId: randomUUID(), groupId, initialProfileId: 'alpha',
+      extraEnvironmentVariables: { ...fakeClaudeEnv, HAPPIER_E2E_FAKE_CLAUDE_USAGE_LIMIT_SIGNAL: usageLimitSignal },
+    });
+    const turn = async (label: string) => await enqueueEncryptedUiTextMessage({
+      baseUrl: f.serverBaseUrl, token: f.auth.token, secret: f.accountSecret, sessionId, text: `PER_SESSION_T12_${label}_${randomUUID()}`,
+    });
+    await turn('initial');
+    await waitFor(async () => asRecord((await readSessionBinding(f, sessionId))?.member)?.profileId === 'alpha',
+      { timeoutMs: 60_000, context: 'initial adoption on alpha' });
+    const pidBefore = (await listRunnerPids(f)).get(sessionId);
+    const appliedDecisionId = String(asRecord((await readSessionBinding(f, sessionId))?.member)?.decisionId);
+
+    const current = await readGroup(f, groupId);
+    const rollback = await serverRequest(f, 'PATCH', groupsPath(CLAUDE_SUBSCRIPTION_SERVICE_ID, groupId), {
+      expectedGeneration: current.generation, policy: { strategy: 'priority' },
+    });
+    expect(rollback.status, JSON.stringify(rollback.data)).toBe(200);
+
+    // A turn after rollback is served by the same runner on the same member.
+    // Each served turn attests its account from the home it ran on.
+    const invocationsOnAlpha = async () => ((await readFakeClaudeLogEvents(f.fakeClaudeLogPath)) as UnknownRecord[])
+      .filter((event) => event.type === 'credential_org_attachment' && event.emitted === true
+        && String(event.claudeConfigDir ?? '').includes('/claude-subscription/alpha/')).length;
+    const alphaInvocationsBefore = await invocationsOnAlpha();
+    await turn('after-rollback');
+    await waitFor(async () => (await invocationsOnAlpha()) > alphaInvocationsBefore,
+      { timeoutMs: 60_000, context: 'turn after rollback served on alpha' });
+    expect((await listRunnerPids(f)).get(sessionId)).toBe(pidBefore);
+    expect(asRecord((await readSessionBinding(f, sessionId))?.member)).toMatchObject({ profileId: 'alpha', decisionId: appliedDecisionId });
+
+    // The next provider failure (a real usage-limit result of the served turn) converts the session
+    // to the group's shared home.
+    await writeFile(usageLimitSignal, 'fail next turn\n', 'utf8');
+    await turn('usage-limit');
+    await waitFor(async () => {
+      const pid = (await listRunnerPids(f)).get(sessionId);
+      return typeof pid === 'number' && pid !== pidBefore;
+    }, { timeoutMs: 60_000, context: 'converting session restarted' });
+    await turn('after-conversion');
+    // Adoption through the group home ends per-session ownership.
+    let converted: UnknownRecord | null = null;
+    await waitFor(async () => {
+      converted = await readSessionBinding(f, sessionId);
+      return converted !== null && !('member' in converted) && !('materializedAssignment' in converted)
+        && typeof converted.appliedProfileId === 'string';
+    }, { timeoutMs: 90_000, context: 'conversion proved through the group home' });
+    expect(converted!.appliedProfileId).not.toBe('alpha');
+    const groupHomeInvocations = ((await readFakeClaudeLogEvents(f.fakeClaudeLogPath)) as UnknownRecord[])
+      .filter((event) => event.type === 'invocation' && String(event.claudeConfigDir ?? '').includes(`/__groups/${groupId}/`));
+    expect(groupHomeInvocations.length, 'the converted runner runs on the group home').toBeGreaterThan(0);
+    // The per-session decisions it retired are released.
+    await waitFor(async () => !(await readReservations(f, groupId)).reservations.some((row) => row.sessionId === sessionId
+      || row.decisionId === appliedDecisionId), { timeoutMs: 30_000, context: 'per-session reservations released' });
+  }, 300_000);
+
+  // T7 driven by the provider itself: the served turn fails with a real usage-limit result, which the
+  // runner reports through its own runtime-auth path (source verification included).
+  it('T7 (provider failure): a real usage-limit turn failure moves only that session to another member', async () => {
+    const f = fx();
+    const groupId = 'failover-t7-real';
+    const created = await createGroup(f, {
+      groupId,
+      members: POOL_MEMBERS.map((profileId) => ({ profileId })),
+      activeProfileId: 'gamma',
+      policy: { strategy: 'per_session_softmax', autoSwitch: true, recoveryMode: 'switch_or_wait' },
+    });
+    expect(created.status, JSON.stringify(created.data)).toBe(200);
+    const usageLimitSignal = resolve(f.daemonHomeDir, `usage-limit-${randomUUID()}.signal`);
+    const sessionId = await spawnConnectedClaudeSession({
+      fixture: f, sessionId: randomUUID(), groupId, initialProfileId: 'alpha',
+      extraEnvironmentVariables: { ...fakeClaudeEnv, HAPPIER_E2E_FAKE_CLAUDE_USAGE_LIMIT_SIGNAL: usageLimitSignal },
+    });
+    const turn = async (label: string) => await enqueueEncryptedUiTextMessage({
+      baseUrl: f.serverBaseUrl, token: f.auth.token, secret: f.accountSecret, sessionId, text: `PER_SESSION_T7R_${label}_${randomUUID()}`,
+    });
+    await turn('initial');
+    await waitFor(async () => asRecord((await readSessionBinding(f, sessionId))?.member)?.profileId === 'alpha',
+      { timeoutMs: 60_000, context: 'initial adoption on alpha' });
+    const pidBefore = (await listRunnerPids(f)).get(sessionId);
+    await writeFile(usageLimitSignal, 'fail next turn\n', 'utf8');
+    await turn('usage-limit');
+    let target = '';
+    await waitFor(async () => {
+      const binding = await readSessionBinding(f, sessionId);
+      const pending = asRecord(binding?.materializedAssignment);
+      const member = asRecord(binding?.member);
+      target = String(pending?.profileId ?? (member?.profileId !== 'alpha' ? member?.profileId ?? '' : ''));
+      return target.length > 0 && target !== 'alpha';
+    }, { timeoutMs: 60_000, context: 'failover decision for the real provider failure' });
+    await waitFor(async () => {
+      const pid = (await listRunnerPids(f)).get(sessionId);
+      return typeof pid === 'number' && pid !== pidBefore;
+    }, { timeoutMs: 60_000, context: 'failing session runner restarted' });
+    await waitFor(async () => asRecord((await readSessionBinding(f, sessionId))?.member)?.profileId === target,
+      { timeoutMs: 90_000, context: `adoption of failover target ${target}` });
   }, 300_000);
 
   it('T2 (subset): a shared group rejects initialProfileId; configuration-invalid named starts reject', async () => {

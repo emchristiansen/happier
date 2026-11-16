@@ -912,6 +912,28 @@ async function runSdkStreamUntilEof() {
     turn += 1;
     scheduleCredentialOrgAttachments(turn);
 
+    // On demand: when `HAPPIER_E2E_FAKE_CLAUDE_USAGE_LIMIT_SIGNAL` names an existing file, this
+    // session's next turn fails with a usage limit, once per signal file and session (recorded in the
+    // log so a restarted child does not fail again).
+    const usageLimitSignal = process.env.HAPPIER_E2E_FAKE_CLAUDE_USAGE_LIMIT_SIGNAL;
+    if (usageLimitSignal && fs.existsSync(usageLimitSignal)) {
+      const previous = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '';
+      const marker = JSON.stringify({ signal: usageLimitSignal, sessionId }).slice(1, -1);
+      if (!previous.includes(marker)) {
+        const resetAtMs = now + Number(process.env.HAPPIER_E2E_FAKE_CLAUDE_RESET_DELAY_MS || '3600000');
+        safeAppendJsonl(logPath, { type: 'sdk_usage_limit_signaled', signal: usageLimitSignal, sessionId, invocationId, resetAtMs, ts: now });
+        emitSdk({
+          type: 'rate_limit_event',
+          rate_limit_info: { status: 'rejected', rateLimitType: 'seven_day', resetsAt: resetAtMs / 1000, utilization: 1 },
+          uuid: randomUUID(),
+          session_id: sessionId,
+        });
+        const failureText = `Claude AI usage limit reached|${Math.floor(resetAtMs / 1000)}`;
+        emitSdk({ ...createResultSuccess(), subtype: 'error_during_execution', is_error: true, errors: [failureText], result: failureText });
+        continue;
+      }
+    }
+
     // Persist the first rejection in the existing log so a restarted SDK child
     // accepts the continuation for the same provider session.
     if (scenario === 'usage-limit-once') {

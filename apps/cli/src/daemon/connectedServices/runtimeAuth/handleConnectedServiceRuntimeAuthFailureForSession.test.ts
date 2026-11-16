@@ -976,6 +976,44 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
       });
     });
 
+    // FAILOVER-SRC-01: a per_session_softmax runner is launched on its member's own home inside the
+    // group; no shared group generation applies to it.
+    describe('per-session member home', () => {
+      const memberHomeReport = { ...exactReport, groupGeneration: null };
+      const memberHomeBinding = { ...exactBinding, generation: null };
+      const authorize = (
+        classification: ConnectedServiceRuntimeFailureClassification,
+        resolution: RegisteredRuntimeAuthFailureSourceResolution,
+      ) => authorizeConnectedServiceRuntimeAuthFailureSource({
+        getChildren: () => [tracked],
+        sessionId: tracked.happySessionId,
+        classification,
+        resolveRegisteredRuntimeAuthFailureSource: () => resolution,
+        runtimeAuthApply: registryOnlyRuntimeAuthCapability,
+      }).then((value) => value, (error: unknown) => error);
+
+      it('authorizes the member-home report against the registered member-home binding', async () => {
+        await expect(authorize(memberHomeReport, { status: 'bound', binding: memberHomeBinding, perSessionMemberHome: true }))
+          .resolves.toEqual({ status: 'authorized', tracked, sourceBinding: memberHomeBinding });
+      });
+
+      it('keeps a group without a generation on the unchanged inexact path when the registered binding is not a member home', async () => {
+        // The exact-source gate does not bind it to the registered source; the legacy path decides.
+        const outcome = await authorize(memberHomeReport, { status: 'bound', binding: memberHomeBinding });
+        expect(outcome).not.toHaveProperty('sourceBinding');
+      });
+
+      it.each([
+        ['another group', { ...memberHomeReport, groupId: 'other' }],
+        ['another profile', { ...memberHomeReport, profileId: 'other' }],
+        ['another credential revision', { ...memberHomeReport, credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb' }],
+        ['a shared-home generation', exactReport],
+      ] as const)('does not authorize a member-home binding from a report naming %s', async (_label, classification) => {
+        const outcome = await authorize(classification, { status: 'bound', binding: memberHomeBinding, perSessionMemberHome: true });
+        expect(outcome).not.toMatchObject({ status: 'authorized' });
+      });
+    });
+
     it('authorizes an exact registered binding that matches the report without throwing', async () => {
       await expect(authorizeConnectedServiceRuntimeAuthFailureSource({
         getChildren: () => [tracked],

@@ -41,7 +41,7 @@ function knownRunnerOf(entry: PerSessionAssignmentLedgerEntry): PerSessionAssign
 /** Every distinct process the ledger ties to a decision (its spawn runner, latest launch and carrier). */
 function knownRunnersOf(entry: PerSessionAssignmentLedgerEntry): PerSessionAssignmentRunner[] {
   const runners: PerSessionAssignmentRunner[] = [];
-  for (const runner of [entry.launchedRunner, entry.runner, entry.carrierRunner]) {
+  for (const runner of [entry.launchedRunner, entry.runner, entry.launchedReporter, entry.carrierRunner]) {
     if (runner && !runners.some((known) => isSamePerSessionRunner(known, runner))) runners.push(runner);
   }
   return runners;
@@ -99,9 +99,22 @@ export type PerSessionProvedSharedConversion = Readonly<{
   serviceId: ConnectedServiceId;
   groupId: string;
   retiresDecisionsDecidedAtOrBeforeMs: number;
+  /**
+   * The runner whose launch on the group home proved the conversion. It runs on the group home, so a
+   * per-session decision it still lists (its launch binding keeps the previous member until adoption,
+   * and its local metadata can lag the committed conversion) is not served by it (T12-CONV-01).
+   */
+  convertedRunner?: PerSessionAssignmentRunner;
 }>;
 
 /** A per-session decision a live runner currently carries in its bindings. */
+/** Same process instance: the pid, and the fingerprint whenever both sides record one. */
+function isSameRunnerInstance(left: PerSessionAssignmentRunner, right: PerSessionAssignmentRunner): boolean {
+  if (left.pid !== right.pid) return false;
+  return !left.processInstanceFingerprint || !right.processInstanceFingerprint
+    || left.processInstanceFingerprint === right.processInstanceFingerprint;
+}
+
 export type PerSessionLiveDecision = Readonly<{
   serviceId: ConnectedServiceId;
   groupId: string;
@@ -286,10 +299,21 @@ export class PerSessionAssignmentRuntime {
    * materialized, and not carried by a live runner) are released. A later decision is kept.
    */
   async settleProvedSharedConversion(conversion: PerSessionProvedSharedConversion): Promise<void> {
-    const live = new Set(this.input.listLiveDecisions().map((decision) => decision.decisionId));
+    this.log('per_session_shared_conversion_proved', { ...conversion });
+    const converted = conversion.convertedRunner;
+    const live = new Set(this.input.listLiveDecisions()
+      .filter((decision) => !(converted && decision.subjectId === conversion.subjectId && decision.runner
+        && isSameRunnerInstance(decision.runner, converted)))
+      .map((decision) => decision.decisionId));
     for (const entry of this.input.ledger.list()) {
-      if (live.has(entry.decisionId) || !sameSubject(entry, { ...conversion, sessionId: conversion.subjectId })) continue;
-      if (!(entry.proposal.decidedAtMs <= conversion.retiresDecisionsDecidedAtOrBeforeMs)) continue;
+      if (!sameSubject(entry, { ...conversion, sessionId: conversion.subjectId })) continue;
+      if (live.has(entry.decisionId) || !(entry.proposal.decidedAtMs <= conversion.retiresDecisionsDecidedAtOrBeforeMs)) {
+        this.log('per_session_decision_kept_by_shared_conversion', {
+          decisionId: entry.decisionId, sessionId: entry.sessionId, live: live.has(entry.decisionId),
+          decidedAtMs: entry.proposal.decidedAtMs, retiresAtOrBeforeMs: conversion.retiresDecisionsDecidedAtOrBeforeMs,
+        });
+        continue;
+      }
       this.log('per_session_decision_released_shared_conversion', { decisionId: entry.decisionId, sessionId: entry.sessionId });
       await this.release(entry.decisionId);
     }
@@ -313,12 +337,35 @@ export class PerSessionAssignmentRuntime {
     const entry = this.input.ledger.get(decisionId);
     const launched = entry ? currentRunnerOf(entry) : undefined;
     if (!launched) return false;
+    // The wrapper launch's own reporter child, bound by exact process instance (R16-WRAPPER-02).
+    const reporter = entry?.launchedReporter;
+    if (reporter && reporter.pid === runner.pid && reporter.processInstanceFingerprint !== undefined
+      && reporter.processInstanceFingerprint === runner.processInstanceFingerprint) return true;
     if (options.requireFingerprint) {
       return launched.pid === runner.pid
         && launched.processInstanceFingerprint !== undefined
         && launched.processInstanceFingerprint === runner.processInstanceFingerprint;
     }
     return isSamePerSessionRunner(launched, runner);
+  }
+
+  /**
+   * A wrapper launch reported its session-runner child: bind that child to the decisions the wrapper
+   * was launched with, while the wrapper is its live parent, so the same child stays adoptable after
+   * the wrapper exits and the child is reparented (R16-WRAPPER-02). `parent` is the reporter's live
+   * parent read with its process instance; nothing is bound without both instances.
+   */
+  async recordWrapperReporter(input: Readonly<{
+    reporter: PerSessionAssignmentRunner;
+    parent: PerSessionAssignmentRunner | null;
+  }>): Promise<void> {
+    if (!input.parent) return;
+    const bound = await this.input.ledger.recordLaunchedReporter({
+      launcher: input.parent, reporter: input.reporter, nowMs: this.input.nowMs(),
+    });
+    if (bound.length > 0) {
+      this.log('per_session_wrapper_reporter_bound', { decisionIds: bound, reporter: input.reporter, launcher: input.parent });
+    }
   }
 
   /** The runner process launched for a spawn decision; its later proved absence is retirement evidence. */

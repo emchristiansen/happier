@@ -49,6 +49,13 @@ export type PerSessionAssignmentLedgerEntry = Readonly<{
    */
   launchedRunner?: PerSessionAssignmentRunner;
   /**
+   * The session-runner child a wrapper launch started, bound while its live parent was exactly this
+   * decision's launched runner (both process instances known). It is launch evidence for that same
+   * child after the wrapper is gone and the child was reparented (R16-WRAPPER-02). A later launch of
+   * the decision clears it.
+   */
+  launchedReporter?: PerSessionAssignmentRunner;
+  /**
    * A live runner observed carrying this decision in its bindings. It is never launch evidence: the
    * bindings of a pending target name it before its launch (HPI-21). It ties the decision to a live
    * process, so the decision is not definitely pre-launch and retires when that process ends while
@@ -146,7 +153,7 @@ export class PerSessionAssignmentLedger {
   }
 
   async recordProposal(
-    input: Omit<PerSessionAssignmentLedgerEntry, 'state' | 'updatedAtMs' | 'runner' | 'launchAttemptedAtMs' | 'launchedRunner' | 'carrierRunner' | 'firstProviderActivityAtMs' | 'reservationReleasedAtMs'>
+    input: Omit<PerSessionAssignmentLedgerEntry, 'state' | 'updatedAtMs' | 'runner' | 'launchAttemptedAtMs' | 'launchedRunner' | 'launchedReporter' | 'carrierRunner' | 'firstProviderActivityAtMs' | 'reservationReleasedAtMs'>
       & Readonly<{ nowMs: number }>,
   ): Promise<void> {
     await this.mutate(() => {
@@ -163,6 +170,7 @@ export class PerSessionAssignmentLedger {
         ...(previous?.runner ? { runner: previous.runner } : {}),
         ...(previous?.launchAttemptedAtMs === undefined ? {} : { launchAttemptedAtMs: previous.launchAttemptedAtMs }),
         ...(previous?.launchedRunner ? { launchedRunner: previous.launchedRunner } : {}),
+        ...(previous?.launchedReporter ? { launchedReporter: previous.launchedReporter } : {}),
         ...(previous?.carrierRunner ? { carrierRunner: previous.carrierRunner } : {}),
         ...(previous?.firstProviderActivityAtMs === undefined ? {} : { firstProviderActivityAtMs: previous.firstProviderActivityAtMs }),
         ...(previous?.reservationReleasedAtMs === undefined ? {} : { reservationReleasedAtMs: previous.reservationReleasedAtMs }),
@@ -210,7 +218,9 @@ export class PerSessionAssignmentLedger {
     await this.mutate(() => {
       for (const decisionId of decisionIds) {
         const entry = this.entries.get(decisionId);
-        if (entry) this.entries.set(decisionId, { ...entry, launchedRunner: runner, updatedAtMs: nowMs });
+        if (!entry) continue;
+        const { launchedReporter: _supersededReporter, ...rest } = entry;
+        this.entries.set(decisionId, { ...rest, launchedRunner: runner, updatedAtMs: nowMs });
       }
     });
   }
@@ -231,13 +241,41 @@ export class PerSessionAssignmentLedger {
       for (const decisionId of new Set([...input.spawnDecisionIds, ...input.launchedDecisionIds])) {
         const entry = this.entries.get(decisionId);
         if (!entry) continue;
+        const { launchedReporter: _supersededReporter, ...rest } = entry;
         this.entries.set(decisionId, {
-          ...entry,
+          ...rest,
           ...(input.spawnDecisionIds.includes(decisionId) ? { runner: input.runner } : {}),
           launchedRunner: input.runner,
           updatedAtMs: input.nowMs,
         });
       }
+    });
+  }
+
+  /**
+   * Binds a wrapper launch's reporter child to the decisions whose launched runner is exactly
+   * `launcher` (pid and process instance both known and equal). The caller has verified that the
+   * reporter's live parent is that launcher. Returns the decisions bound.
+   */
+  async recordLaunchedReporter(input: Readonly<{
+    launcher: PerSessionAssignmentRunner;
+    reporter: PerSessionAssignmentRunner;
+    nowMs: number;
+  }>): Promise<string[]> {
+    const { launcher, reporter } = input;
+    if (!launcher.processInstanceFingerprint || !reporter.processInstanceFingerprint || launcher.pid === reporter.pid) return [];
+    return await this.mutate(() => {
+      const bound: string[] = [];
+      for (const [decisionId, entry] of this.entries) {
+        const launched = entry.launchedRunner ?? entry.runner;
+        if (!launched || launched.pid !== launcher.pid
+          || launched.processInstanceFingerprint !== launcher.processInstanceFingerprint) continue;
+        if (entry.launchedReporter && isSamePerSessionRunner(entry.launchedReporter, reporter)
+          && entry.launchedReporter.processInstanceFingerprint === reporter.processInstanceFingerprint) continue;
+        this.entries.set(decisionId, { ...entry, launchedReporter: reporter, updatedAtMs: input.nowMs });
+        bound.push(decisionId);
+      }
+      return bound;
     });
   }
 

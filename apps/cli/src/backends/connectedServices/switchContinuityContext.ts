@@ -41,6 +41,19 @@ export function isSameConnectedServiceAuthGroup(
     && params.previousBinding.groupId === params.nextBinding.groupId;
 }
 
+/**
+ * Whether the runner being switched is on a per_session_softmax member's own home rather than the
+ * group's shared home: its current binding still carries per-session ownership (an applied member, or
+ * a pending target on a member home). Such a runner does not read the shared group home, so writing
+ * the group home never applies a switch to it (T12-CONV-01); only a restart onto the target home does.
+ */
+export function isPerSessionMemberHomeRunner(params: ConnectedServiceSwitchContinuityParams): boolean {
+  const binding = params.fromBindings.bindingsByServiceId?.[params.serviceId];
+  if (!binding || binding.source !== 'connected' || binding.selection !== 'group') return false;
+  if (binding.member) return true;
+  return Boolean(binding.materializedAssignment && binding.materializedAssignment.home !== 'group');
+}
+
 export function providerSessionStateUnavailableForResume(input: Readonly<{
   diagnostics?: ConnectedServiceResumeContinuityDiagnostics;
 }> = {}) {

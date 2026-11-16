@@ -124,7 +124,16 @@ type RuntimeAuthFailureSourceBindingResolver = (input: Readonly<{
 }>) => Promise<RuntimeAuthFailureSourceBinding | null>;
 
 export type RegisteredRuntimeAuthFailureSourceResolution =
-  | Readonly<{ status: 'bound'; binding: RuntimeAuthFailureSourceBinding }>
+  | Readonly<{
+      status: 'bound';
+      binding: RuntimeAuthFailureSourceBinding;
+      /**
+       * The registered binding is a per_session_softmax member home: the runner was launched with its
+       * own profile inside the bound group, so no shared group generation applies. Its exact form is
+       * (group, profile, credential revision) with a null generation, on both sides.
+       */
+      perSessionMemberHome?: boolean;
+    }>
   | Readonly<{
       status: 'absent';
       reason: 'session_unregistered' | 'service_unbound';
@@ -427,12 +436,24 @@ export async function authorizeConnectedServiceRuntimeAuthFailureSource(input: R
     && classification.groupGeneration >= 0
     ? classification.groupGeneration
     : null;
-  const modernExactReport = classification !== null
+  const reportedIdentityComplete = classification !== null
     && reportedProfileId.length > 0
-    && reportedCredentialRevision.length > 0
+    && reportedCredentialRevision.length > 0;
+  // A per-session member-home report: group and profile without a group generation. It is exact only
+  // against a registered binding that is itself that member home (checked below); anywhere else a
+  // group without a generation remains an incomplete report.
+  const memberHomeFormReport = reportedIdentityComplete
+    && reportedGroupId !== null && reportedGroupId.length > 0 && reportedGeneration === null;
+  const memberHomeRegisteredResolution = memberHomeFormReport && classification !== null && tracked
+    ? input.resolveRegisteredRuntimeAuthFailureSource?.({ sessionId: input.sessionId, tracked, classification }) ?? null
+    : null;
+  const memberHomeExactReport = memberHomeRegisteredResolution?.status === 'bound'
+    && memberHomeRegisteredResolution.perSessionMemberHome === true;
+  const modernExactReport = reportedIdentityComplete
     && (
       (reportedGroupId !== null && reportedGroupId.length > 0 && reportedGeneration !== null)
       || ((reportedGroupId === null || reportedGroupId.length === 0) && reportedGeneration === null)
+      || memberHomeExactReport
     );
   const exactLiveSourceResolverApplicable = typeof directLiveHotAuth === 'object'
     && directLiveHotAuth.requiresExactRuntimeIdentity === true;
@@ -440,7 +461,7 @@ export async function authorizeConnectedServiceRuntimeAuthFailureSource(input: R
     if (!tracked) {
       throw new Error('connected-service exact runtime source session temporarily unavailable');
     }
-    const registeredResolution = input.resolveRegisteredRuntimeAuthFailureSource?.({
+    const registeredResolution = memberHomeExactReport ? memberHomeRegisteredResolution : input.resolveRegisteredRuntimeAuthFailureSource?.({
       sessionId: input.sessionId,
       tracked,
       classification,
@@ -469,11 +490,13 @@ export async function authorizeConnectedServiceRuntimeAuthFailureSource(input: R
       && registeredBinding.generation >= 0
       ? registeredBinding.generation
       : null;
+    const registeredMemberHome = registeredResolution.perSessionMemberHome === true;
     const registeredBindingIsExact = registeredProfileId.length > 0
       && registeredCredentialRevision.length > 0
       && (
         (registeredGroupId !== null && registeredGeneration !== null)
         || (registeredGroupId === null && registeredGeneration === null)
+        || (registeredMemberHome && registeredGroupId !== null && registeredGeneration === null)
       );
     if (!registeredBindingIsExact) {
       const deficiencies: RegisteredRuntimeAuthFailureSourceBindingDeficiency[] = [];

@@ -1796,6 +1796,26 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     }));
   });
 
+  it.each([
+    ['an applied member', { member: { assignment: 'per_session', profileId: 'alpha', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 } }, 'pool'],
+    ['another member', { member: { assignment: 'per_session', profileId: 'beta', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 } }, null],
+  ] as const)('reports a per-session runner failure in its member-home form (FAILOVER-SRC-01) only for %s', async (_label, assignment, expectedGroupId) => {
+    process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY] = JSON.stringify([{
+      kind: 'profile', serviceId: 'claude-subscription', profileId: 'alpha', credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS',
+    }]);
+    const metadata = { connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': {
+      source: 'connected', selection: 'group', groupId: 'pool', ...assignment } } } };
+    const session = { client: { sessionId: `member-home-failure-${expectedGroupId ?? 'none'}`, getMetadataSnapshot: () => metadata,
+      sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } } };
+    await surfaceClaudeRateLimitRuntimeIssue(session as any, {
+      ...passiveUtilizationDetails(), limitCategory: 'usage_limit', utilization: 100,
+    }, '[test]');
+    const reported = mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mock.calls.at(-1)?.[0]?.classification as { groupId?: string | null; groupGeneration?: number | null } | undefined;
+    expect(reported).toMatchObject({ profileId: 'alpha', credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
+    expect(reported?.groupId ?? null).toBe(expectedGroupId);
+    expect(reported?.groupGeneration ?? null).toBeNull();
+  });
+
   it('enriches passive quota evidence with the live account identity → source-linked PAU (soft-switch eligible)', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'acct_live_uuid', emailAddress: 'pool@happier.dev', organizationUuid: 'org-pool' });
     // A group home's identity is attributable only with the provenance naming the session's tuple.
