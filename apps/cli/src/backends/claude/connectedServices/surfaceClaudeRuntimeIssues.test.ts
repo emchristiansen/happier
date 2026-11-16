@@ -1621,7 +1621,7 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
       await vi.waitFor(() => expect(mockNotifyDaemonConnectedServiceTurnLifecycle).toHaveBeenCalledWith({
         sessionId: 'identity-observer', event: 'provider_identity_observed', providerIdentity: {
           serviceId: 'claude-subscription', groupId: 'team-pool', providerOrganizationId: 'live-org',
-          sourceSessionId: 'native-session', observedAtMs: 1793627979000,
+          sourceSessionId: 'native-session', observedAtMs: 1793627979000, runnerPid: process.pid, launchHome: 'group',
         },
       }));
       expect(session.client.sendClaudeSessionMessage).not.toHaveBeenCalled();
@@ -1769,7 +1769,7 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     ['applied member', { member: { assignment: 'per_session', profileId: 'alpha', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 } }, 'pool'],
     ['a different materialized member', { materializedAssignment: { profileId: 'beta', decisionId: 'd1', reason: 'initial_sampled', materializedAtMs: 1 } }, null],
     ['no assignment', {}, null],
-  ] as const)('reports a per-session runner (profile launch, group binding) against its group only for %s', async (_label, assignment, expectedGroupId) => {
+  ] as const)('reports a per-session runner (profile launch, group binding) against its group, as member-home evidence, only for %s', async (_label, assignment, expectedGroupId) => {
     // per_session_softmax runners launch with their member's PROFILE selection; the session binding
     // names the group. Adoption (T1/T19) depends on this report reaching the daemon.
     process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY] = JSON.stringify([{
@@ -1791,7 +1791,7 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     await vi.waitFor(() => expect(mockNotifyDaemonConnectedServiceTurnLifecycle).toHaveBeenCalledWith({
       sessionId: 'per-session-runner', event: 'provider_identity_observed', providerIdentity: {
         serviceId: 'claude-subscription', groupId: expectedGroupId, providerOrganizationId: 'org-alpha',
-        sourceSessionId: 'native-session', observedAtMs: 1793627979000,
+        sourceSessionId: 'native-session', observedAtMs: 1793627979000, runnerPid: process.pid, launchHome: 'member',
       },
     }));
   });

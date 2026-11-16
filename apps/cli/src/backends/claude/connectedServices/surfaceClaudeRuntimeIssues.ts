@@ -167,21 +167,25 @@ export async function captureClaudeRuntimeAuthRequestIdentity(session: RuntimeIs
 }
 
 /**
- * The group whose session account an observed provider organization is reported against. A shared
- * group runner is launched with the group selection. A per_session_softmax runner is launched with a
- * profile selection for its member's own home; its session binding still names the group and the
- * member it was materialized onto (or adopted), and only that member's observation is reported, so
- * the daemon can adopt the pending target (spec T1/T19).
+ * The group an observed provider organization is reported against, and the home this runner's own
+ * launch materialized (its provenance; the daemon decides what the evidence may prove). A shared group
+ * runner, or a converting session's runner, is launched with the group selection on the group's
+ * shared home. A per_session_softmax runner is launched with a profile selection on its member's own
+ * home; its session binding still names the group and the member it was materialized onto (or
+ * adopted), and only that member's observation is reported, so the daemon can adopt the pending
+ * target this runner was launched for (spec T1/T19).
  */
-function resolveClaudeProviderIdentityReportGroupId(session: RuntimeIssueSession): string | null {
+function resolveClaudeProviderIdentityReport(
+    session: RuntimeIssueSession,
+): Readonly<{ groupId: string; launchHome: 'group' | 'member' }> | null {
     const selection = resolveClaudeRuntimeIssueSelection(session);
     if (!selection || selection.serviceId !== 'claude-subscription') return null;
-    if (selection.kind === 'group') return selection.groupId;
+    if (selection.kind === 'group') return { groupId: selection.groupId, launchHome: 'group' };
     if (selection.kind !== 'profile') return null;
     const binding = findConnectedServiceBindingSelectionFromSessionMetadata(session.client, 'claude-subscription');
     if (binding?.source !== 'connected' || binding.selection !== 'group') return null;
     const assignedProfileId = binding.materializedAssignment?.profileId ?? binding.member?.profileId;
-    return assignedProfileId === selection.profileId ? binding.groupId : null;
+    return assignedProfileId === selection.profileId ? { groupId: binding.groupId, launchHome: 'member' } : null;
 }
 
 /** Every launcher feeds its existing trusted raw channel here; history never reconciles live identity. */
@@ -200,8 +204,9 @@ export function observeClaudeRuntimeAuthTranscript(
             void captureClaudeRuntimeAuthRequestIdentity(session);
         }
     }
-    const groupId = resolveClaudeProviderIdentityReportGroupId(session);
-    if (!groupId) return;
+    const report = resolveClaudeProviderIdentityReport(session);
+    if (!report) return;
+    const { groupId } = report;
     routeClaudeAttachment(value, {
         onCredentialOrganization(event) {
             if (!session.sessionId || event.sourceSessionId !== session.sessionId) return;
@@ -214,6 +219,8 @@ export function observeClaudeRuntimeAuthTranscript(
                     providerOrganizationId: event.organizationId,
                     observedAtMs: event.timestampMs,
                     sourceSessionId: event.sourceSessionId,
+                    runnerPid: process.pid,
+                    launchHome: report.launchHome,
                 },
             }).then((result) => {
                 if ('error' in result && result.error) {

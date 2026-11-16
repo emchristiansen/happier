@@ -9,7 +9,7 @@ import {
 describe('provider-observed account metadata', () => {
   const binding = { source: 'connected', selection: 'group', groupId: 'pool', profileId: 'fallback' };
   const metadata = { connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': binding } }, other: 'preserved' };
-  const observation = { serviceId: 'claude-subscription' as const, groupId: 'pool', profileId: 'observed' };
+  const observation = { serviceId: 'claude-subscription' as const, groupId: 'pool', profileId: 'observed', provenance: null };
 
   it('publishes explicit applied account evidence without changing group fallback or selection', () => {
     const next = projectProviderObservedAccountMetadata(metadata, observation);
@@ -27,6 +27,11 @@ describe('provider-observed account metadata', () => {
 });
 
 describe('per-session adoption through provider-observed accounts', () => {
+  // Provenance of the reporting runner: the home its launch materialized and the decisions launched in it.
+  const memberRunner = (...launched: string[]) => ({
+    launchHome: 'member' as const, isDecisionLaunchedInRunner: (decisionId: string) => launched.includes(decisionId),
+  });
+  const groupHomeRunner = { launchHome: 'group' as const, isDecisionLaunchedInRunner: () => false };
   const pending = {
     profileId: 'acct-b', decisionId: 'd-9', reason: 'failover' as const, fromProfileId: 'acct-a',
     materializedAtMs: 10, temperature: 1.5, offsetPercent: 10, probability: 0.4,
@@ -46,7 +51,7 @@ describe('per-session adoption through provider-observed accounts', () => {
 
   it('promotes the pending target to the applied member only when the observed account matches', () => {
     const adopted = projectProviderObservedAccountMetadata(metadata, {
-      serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-b', observedAtMs: 99,
+      serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-b', observedAtMs: 99, provenance: memberRunner('d-9'),
     });
     const binding = (adopted.connectedServices as any).bindingsByServiceId['claude-subscription'];
     expect(binding.materializedAssignment).toBeUndefined();
@@ -60,12 +65,27 @@ describe('per-session adoption through provider-observed accounts', () => {
 
   it('keeps the pending target and the previous applied member when a different account is observed', () => {
     const observedOld = projectProviderObservedAccountMetadata(metadata, {
-      serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-a',
+      serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-a', provenance: memberRunner('d-1'),
     });
     const binding = (observedOld.connectedServices as any).bindingsByServiceId['claude-subscription'];
     expect(binding.materializedAssignment).toEqual(pending);
     expect(binding.member.profileId).toBe('acct-a');
     expect(resolveAdoptedPerSessionDecisionId(metadata, observedOld, 'claude-subscription')).toBeNull();
+  });
+
+  it.each([
+    ['a runner the target was not launched in (delayed report of an earlier launch, R15-STALE-PROOF-02)', memberRunner('d-1')],
+    ['evidence without runner provenance (old runner or shared application)', null],
+    ['a group-home runner', groupHomeRunner],
+  ] as const)('keeps a matching member-home target pending for %s', (_label, provenance) => {
+    const projected = projectProviderObservedAccountMetadata(metadata, {
+      serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-b', observedAtMs: 99, provenance,
+    });
+    const binding = (projected.connectedServices as any).bindingsByServiceId['claude-subscription'];
+    expect(binding.materializedAssignment).toEqual(pending);
+    expect(binding.member.decisionId).toBe('d-1');
+    expect(binding.appliedProfileId).toBe('acct-b');
+    expect(resolveAdoptedPerSessionDecisionId(metadata, projected, 'claude-subscription')).toBeNull();
   });
   it('ends per-session ownership only when a group-home conversion is proved by the observed account (T12)', () => {
     const converting = {
@@ -75,10 +95,10 @@ describe('per-session adoption through provider-observed accounts', () => {
         materializedAssignment: { profileId: 'acct-a', decisionId: 'conversion-1', reason: 'policy_conversion', materializedAtMs: 2, home: 'group' },
       } } },
     };
-    const stillOld = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-b' });
+    const stillOld = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-b', provenance: groupHomeRunner });
     expect((stillOld.connectedServices as any).bindingsByServiceId['claude-subscription'].member.profileId).toBe('acct-b');
 
-    const converted = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-a' });
+    const converted = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-a', provenance: groupHomeRunner });
     expect((converted.connectedServices as any).bindingsByServiceId['claude-subscription']).toEqual({
       source: 'connected', selection: 'group', groupId: 'pool', appliedProfileId: 'acct-a',
     });
@@ -87,10 +107,22 @@ describe('per-session adoption through provider-observed accounts', () => {
     // The proof names what it retires: decisions made at or before the conversion target (HPI-23).
     expect(resolveProvedSharedConversion(converting, converted, 'claude-subscription')).toEqual({ retiresDecisionsDecidedAtOrBeforeMs: 2 });
     expect(resolveProvedSharedConversion(converting, stillOld, 'claude-subscription')).toBeNull();
-    const wrongAccount = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-c' });
+    const wrongAccount = projectProviderObservedAccountMetadata(converting, { serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-c', provenance: groupHomeRunner });
     expect(resolveProvedSharedConversion(converting, wrongAccount, 'claude-subscription')).toBeNull();
     expect((wrongAccount.connectedServices as any).bindingsByServiceId['claude-subscription'].materializedAssignment)
       .toMatchObject({ decisionId: 'conversion-1', home: 'group' });
+
+    // R15-HOME-PROOF-01: the conversion target's own member-home runner (a pending earlier launch on
+    // acct-a's member home) names the right organization but has not applied the group home.
+    for (const provenance of [memberRunner('d-earlier-a'), null]) {
+      const memberHome = projectProviderObservedAccountMetadata(converting, {
+        serviceId: 'claude-subscription', groupId: 'pool', profileId: 'acct-a', provenance,
+      });
+      const kept = (memberHome.connectedServices as any).bindingsByServiceId['claude-subscription'];
+      expect(kept.materializedAssignment).toMatchObject({ decisionId: 'conversion-1', home: 'group' });
+      expect(kept.member).toMatchObject({ profileId: 'acct-b', decisionId: 'd-1' });
+      expect(resolveProvedSharedConversion(converting, memberHome, 'claude-subscription')).toBeNull();
+    }
 
   });
 });

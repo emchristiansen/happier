@@ -294,6 +294,16 @@ export class PerSessionAssignmentRuntime {
     }
   }
 
+  /**
+   * Whether `decisionId` was launched in `runner`: the ledger's record of the latest launch carrying
+   * that decision names this process. Provenance for provider adoption (spec A.5 C4): evidence from
+   * any other process (an earlier runner, a replaced one) never adopts the decision.
+   */
+  isDecisionLaunchedInRunner(decisionId: string, runner: PerSessionAssignmentRunner): boolean {
+    const launched = this.input.ledger.get(decisionId)?.launchedRunner;
+    return launched !== undefined && isSamePerSessionRunner(launched, runner);
+  }
+
   /** The runner process launched for a spawn decision; its later proved absence is retirement evidence. */
   async recordSpawnedRunner(decisionId: string, runner: PerSessionAssignmentRunner): Promise<void> {
     await this.input.ledger.recordRunner(decisionId, runner, this.input.nowMs());

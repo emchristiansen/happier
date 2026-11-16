@@ -15,7 +15,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile, realpath } from 'node:fs/promises';
+import { readFile, readdir, realpath } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import {
@@ -137,6 +137,24 @@ async function readSessionBinding(fixture: StartedConnectedServicesClaudeDaemonF
   const metadata = asRecord(decryptLegacyBase64Normalized(session.metadata, fixture.accountSecret));
   const bindings = asRecord(asRecord(metadata?.connectedServices)?.bindingsByServiceId);
   return asRecord(bindings?.[CLAUDE_SUBSCRIPTION_SERVICE_ID]);
+}
+
+/** The decrypted server session metadata. */
+async function readSessionMetadata(fixture: StartedConnectedServicesClaudeDaemonFixture, sessionId: string): Promise<UnknownRecord | null> {
+  const session = await fetchSessionV2(fixture.serverBaseUrl, fixture.auth.token, sessionId);
+  return asRecord(decryptLegacyBase64Normalized(session.metadata, fixture.accountSecret));
+}
+
+/** Lines of this daemon's own log files containing `needle`. */
+async function daemonLogLinesContaining(fixture: StartedConnectedServicesClaudeDaemonFixture, needle: string): Promise<string[]> {
+  const logsDir = resolve(fixture.daemonHomeDir, 'logs');
+  const lines: string[] = [];
+  for (const name of await readdir(logsDir).catch(() => [] as string[])) {
+    if (!name.endsWith('-daemon.log')) continue;
+    const text = await readFile(resolve(logsDir, name), 'utf8').catch(() => '');
+    lines.push(...text.split('\n').filter((line) => line.includes(needle)));
+  }
+  return lines;
 }
 
 /** This daemon's durable per-session decision ledger (spec A.3, A.5). */
@@ -368,6 +386,13 @@ describe('core e2e: per-session softmax connected-service account selection', ()
         profileId: session.initialProfileId, decisionId: session.decisionId, reason: 'initial_requested',
       });
     }
+    // Adoption records the ledger first, then renews the shared reservation as applied.
+    await waitFor(async () => {
+      const rows = (await readReservations(f, groupId)).reservations;
+      return sessions.every((session) => rows.some((row) => (
+        row.decisionId === session.decisionId && row.state === 'applied'
+      )));
+    }, { timeoutMs: 20_000, context: 'adopted reservations renewed as applied' });
     const rows = (await readReservations(f, groupId)).reservations;
     for (const session of sessions) {
       expect(rows.find((row) => row.decisionId === session.decisionId)).toMatchObject({
@@ -377,6 +402,87 @@ describe('core e2e: per-session softmax connected-service account selection', ()
     const after = await readGroup(f, groupId);
     expect(after.activeProfileId).toBe('gamma');
   }, 60_000);
+
+  // R15-HOME-PROOF-01 / R15-STALE-PROOF-02, through the real daemon route and its durable launch
+  // custody. The session's own fake Claude attests nothing, so every report below is the test's, sent
+  // the way a runner sends it; only evidence from the current runner for the decision launched in it,
+  // on the home that decision materialized, may adopt the pending target (spec A.5 C4, T18/T19).
+  it('R15: provider evidence adopts a pending target only with the current runner\'s own launch provenance', async () => {
+    const f = fx();
+    const groupId = 'provenance-r15';
+    const created = await createGroup(f, {
+      groupId,
+      members: POOL_MEMBERS.map((profileId) => ({ profileId })),
+      activeProfileId: 'gamma',
+      policy: { strategy: 'per_session_softmax', autoSwitch: true, recoveryMode: 'switch_or_wait' },
+    });
+    expect(created.status, JSON.stringify(created.data)).toBe(200);
+    const silentClaudeEnv = { ...fakeClaudeEnv, HAPPIER_E2E_FAKE_CLAUDE_CREDENTIAL_ORG_BY_ACCESS_TOKEN: '{}' };
+    const sessionId = await spawnConnectedClaudeSession({
+      fixture: f, sessionId: randomUUID(), groupId, initialProfileId: 'alpha', extraEnvironmentVariables: silentClaudeEnv,
+    });
+    let decisionId = '';
+    await waitFor(async () => {
+      decisionId = String(asRecord((await readSessionBinding(f, sessionId))?.materializedAssignment)?.decisionId ?? '');
+      return decisionId.length > 0;
+    }, { timeoutMs: 30_000, context: 'pending target committed' });
+    await enqueueEncryptedUiTextMessage({
+      baseUrl: f.serverBaseUrl, token: f.auth.token, secret: f.accountSecret,
+      sessionId, text: `PER_SESSION_R15_${randomUUID()}`,
+    });
+    let nativeSessionId = '';
+    await waitFor(async () => {
+      nativeSessionId = String((await readSessionMetadata(f, sessionId))?.claudeSessionId ?? '');
+      return nativeSessionId.length > 0;
+    }, { timeoutMs: 60_000, context: 'native Claude session recorded' });
+    const runnerPid = (await listRunnerPids(f)).get(sessionId);
+    expect(runnerPid).toBeTypeOf('number');
+    // Launch custody: the ledger names the runner the decision was launched in.
+    expect(asRecord((await readLedgerEntry(f, decisionId))?.launchedRunner)).toMatchObject({ pid: runnerPid });
+
+    const report = async (provenance: Readonly<{ runnerPid?: number; launchHome?: 'group' | 'member' }>) => {
+      const response = await daemonControlPostJson<UnknownRecord>({
+        port: f.daemonPort, path: '/connected-service-turn-lifecycle', controlToken: f.controlToken,
+        body: {
+          sessionId, event: 'provider_identity_observed',
+          providerIdentity: {
+            serviceId: CLAUDE_SUBSCRIPTION_SERVICE_ID, groupId, providerOrganizationId: organizationOf('alpha'),
+            observedAtMs: Date.now(), sourceSessionId: nativeSessionId, ...provenance,
+          },
+        },
+        timeoutMs: 30_000,
+      });
+      expect(response.status, JSON.stringify(response.data)).toBe(200);
+    };
+    const expectStillPending = async () => {
+      const binding = await readSessionBinding(f, sessionId);
+      expect(binding).not.toHaveProperty('member');
+      expect(asRecord(binding?.materializedAssignment)).toMatchObject({ decisionId, profileId: 'alpha' });
+      expect(await readLedgerEntry(f, decisionId)).toMatchObject({ state: 'pending' });
+    };
+
+    // A process other than the current runner (a replaced runner's delayed report) is rejected.
+    await report({ runnerPid: runnerPid! + 1_000_000, launchHome: 'member' });
+    await waitFor(async () => (
+      await daemonLogLinesContaining(f, 'provider_session_account_observation_runner_not_current')
+    ).some((line) => line.includes(sessionId)), { timeoutMs: 20_000, context: 'stale-runner report rejected' });
+    await expectStillPending();
+    expect(await readSessionBinding(f, sessionId)).not.toHaveProperty('appliedProfileId');
+
+    // Evidence without provenance (an older runner build) is published as account evidence only.
+    await report({});
+    await waitFor(async () => (await readSessionBinding(f, sessionId))?.appliedProfileId === 'alpha',
+      { timeoutMs: 20_000, context: 'unqualified evidence published' });
+    await expectStillPending();
+
+    // The current runner's report for the member home its decision was launched on adopts it.
+    await report({ runnerPid: runnerPid!, launchHome: 'member' });
+    await waitFor(async () => {
+      const member = asRecord((await readSessionBinding(f, sessionId))?.member);
+      return member?.decisionId === decisionId && (await readLedgerEntry(f, decisionId))?.state === 'applied';
+    }, { timeoutMs: 20_000, context: 'current runner evidence adopts its launched decision' });
+    expect(asRecord((await readSessionBinding(f, sessionId))?.member)).toMatchObject({ profileId: 'alpha', decisionId });
+  }, 180_000);
 
   it('T2 (subset): a shared group rejects initialProfileId; configuration-invalid named starts reject', async () => {
     const f = fx();

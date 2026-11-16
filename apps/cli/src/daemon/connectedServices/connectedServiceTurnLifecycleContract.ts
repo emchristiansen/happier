@@ -61,6 +61,14 @@ export const ConnectedServiceTurnLifecycleRequestBodySchema = lazySchema(() => z
     providerOrganizationId: z.string().trim().min(1).nullable(),
     observedAtMs: z.number().int().nonnegative(),
     sourceSessionId: z.string().trim().min(1),
+    /**
+     * Provenance of the evidence: the reporting runner's own process id and the home its launch
+     * selection materialized (`group`: the group's shared home; `member`: one member's own home).
+     * Per-session adoption and group-home conversion accept only the current runner's evidence for
+     * the home and decision it was launched with; without provenance a report is account evidence only.
+     */
+    runnerPid: z.number().int().positive().optional(),
+    launchHome: z.enum(['group', 'member']).optional(),
   }).strict().optional(),
 }).strict());
 

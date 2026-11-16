@@ -563,7 +563,9 @@ import {
   projectProviderObservedAccountMetadata,
   resolveAdoptedPerSessionDecisionId,
   resolveProvedSharedConversion,
+  type ProviderObservedAccountProvenance,
 } from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
+import { resolveProviderObservationProvenance } from './connectedServices/sessionAuthSwitch/resolveProviderObservationProvenance';
 import {
   PerSessionAssignmentLedger,
   resolvePerSessionAssignmentLedgerPath,
@@ -1005,7 +1007,12 @@ async function persistSessionConnectedServiceBindings(params: Readonly<{
   | Readonly<{ normalizedBindings: ReturnType<typeof readConnectedServiceBindingsOrEmpty>; providerObservedAccount?: never; isCurrent?: never }>
   | Readonly<{
     normalizedBindings?: never;
-    providerObservedAccount: Readonly<{ serviceId: ConnectedServiceId; groupId: string; profileId: string }>;
+    providerObservedAccount: Readonly<{
+      serviceId: ConnectedServiceId;
+      groupId: string;
+      profileId: string;
+      provenance: ProviderObservedAccountProvenance | null;
+    }>;
     isCurrent: () => boolean;
   }>
 )): Promise<Readonly<{
@@ -8097,11 +8104,28 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               ? resolveTrackedConnectedServiceVendorResumeId({ agentId: currentAgentId, tracked: current })
               : null;
           };
-          if (tracked && observation && sourceSessionId === observation.sourceSessionId) {
+          // Evidence from a process other than the session's current runner (a delayed report of a
+          // replaced runner shares its native session id) proves nothing about the current launch.
+          const resolvedProvenance = tracked && observation
+            ? resolveProviderObservationProvenance({
+              tracked,
+              runnerPid: observation.runnerPid,
+              launchHome: observation.launchHome,
+              isDecisionLaunchedInRunner: (decisionId, runner) => perSessionAssignmentRuntime.isDecisionLaunchedInRunner(decisionId, runner),
+            })
+            : null;
+          if (tracked && observation && resolvedProvenance?.kind === 'not_current_runner') {
+            logger.warn('[ConnectedServices] Provider account observation is not from the current runner', {
+              sessionId: input.sessionId, runnerPid: observation.runnerPid, trackedPid: tracked.pid,
+              errorCode: 'provider_session_account_observation_runner_not_current',
+            });
+          } else if (tracked && observation && sourceSessionId === observation.sourceSessionId) {
+            const provenance = resolvedProvenance?.kind === 'evidence' ? resolvedProvenance.provenance : null;
+            const { runnerPid: _runnerPid, launchHome: _launchHome, ...identity } = observation;
             await handleProviderObservedSessionAccount({
               runtimeRegistry: connectedServiceRuntimeRegistry,
               sessionId: input.sessionId,
-              ...observation,
+              ...identity,
               getCurrentProviderSessionId,
               getGroup: async () => await api.getConnectedServiceAuthGroup({
                 serviceId: observation.serviceId, groupId: observation.groupId,
@@ -8136,7 +8160,9 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 if (!binding) return;
                 const published = await persistSessionConnectedServiceBindings({
                   credentials, sessionId: input.sessionId,
-                  providerObservedAccount: { serviceId: binding.serviceId, groupId: observation.groupId, profileId: binding.profileId },
+                  providerObservedAccount: {
+                    serviceId: binding.serviceId, groupId: observation.groupId, profileId: binding.profileId, provenance,
+                  },
                   isCurrent: () => connectedServiceRuntimeRegistry.getBySessionId(input.sessionId) === target
                     && getCurrentProviderSessionId() === observation.sourceSessionId,
                 });
@@ -9324,6 +9350,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               serviceId: providerAdoptedTarget.serviceId,
               groupId: providerAdoptedTarget.groupId,
               profileId: providerAdoptedTarget.profileId,
+              // A shared generation application is not a per-session runner's launch evidence.
+              provenance: null,
             },
             isCurrent: () => connectedServiceRuntimeRegistry.getBySessionId(sessionId) === settledRuntimeTarget,
           });
