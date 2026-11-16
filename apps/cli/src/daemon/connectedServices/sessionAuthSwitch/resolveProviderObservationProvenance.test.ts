@@ -6,11 +6,18 @@ import { resolveProviderObservationProvenance } from './resolveProviderObservati
 
 // Ledger launch custody of decision `d-2` (the pending member-home target) in launcher pid 42.
 const launches = new Map<string, PerSessionAssignmentRunner>([['d-2', { pid: 42, processInstanceFingerprint: 'fp-42' }]]);
-const isDecisionLaunchedInRunner = (decisionId: string, runner: PerSessionAssignmentRunner) => {
+const isDecisionLaunchedInRunner = (
+  decisionId: string,
+  runner: PerSessionAssignmentRunner,
+  options?: Readonly<{ requireFingerprint?: boolean }>,
+) => {
   const launched = launches.get(decisionId);
-  return launched !== undefined && launched.pid === runner.pid
-    && (!launched.processInstanceFingerprint || !runner.processInstanceFingerprint
-      || launched.processInstanceFingerprint === runner.processInstanceFingerprint);
+  if (!launched || launched.pid !== runner.pid) return false;
+  if (options?.requireFingerprint) {
+    return launched.processInstanceFingerprint !== undefined && launched.processInstanceFingerprint === runner.processInstanceFingerprint;
+  }
+  return !launched.processInstanceFingerprint || !runner.processInstanceFingerprint
+    || launched.processInstanceFingerprint === runner.processInstanceFingerprint;
 };
 const currentRunner = { pid: 42, processInstanceFingerprint: 'fp-42' };
 
@@ -65,4 +72,27 @@ describe('provider observation provenance', () => {
       tracked: currentRunner, runnerPid: 42, launchHome: undefined, isDecisionLaunchedInRunner,
     }))).toBeNull();
   });
+
+  // R16-WRAPPER-02: after a daemon restart the reattached tracker names the wrapper's reporter child;
+  // launch custody names the wrapper, the child's live parent.
+  describe('a wrapper child reattached from its marker', () => {
+    const reattached = { pid: 77, processInstanceFingerprint: 'fp-77' };
+    const resolve = (parent: PerSessionAssignmentRunner | null) => resolveProviderObservationProvenance({
+      tracked: reattached, runnerPid: 77, launchHome: 'member', isDecisionLaunchedInRunner, readParentProcess: () => parent,
+    });
+
+    it('adopts through its live parent when that parent is exactly the launch custody names', () => {
+      expect(project(resolve({ pid: 42, processInstanceFingerprint: 'fp-42' }))).toBe('d-2');
+    });
+
+    it.each([
+      ['a reused parent pid with another process instance', { pid: 42, processInstanceFingerprint: 'fp-reused' }],
+      ['a parent without a process instance', { pid: 42 }],
+      ['an unrelated parent', { pid: 50, processInstanceFingerprint: 'fp-50' }],
+      ['no readable parent', null],
+    ] as const)('does not adopt through %s', (_label, parent) => {
+      expect(project(resolve(parent))).toBeNull();
+    });
+  });
 });
+

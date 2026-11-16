@@ -215,6 +215,32 @@ export class PerSessionAssignmentLedger {
     });
   }
 
+  /**
+   * Launch custody of one spawn attempt in a single commit: `runner` on the decisions the attempt
+   * created and `launchedRunner` on every decision it launched, so a crash or a failed write cannot
+   * leave a surviving child with only part of its custody (T5/T19).
+   */
+  async recordSpawnCustody(input: Readonly<{
+    spawnDecisionIds: ReadonlyArray<string>;
+    launchedDecisionIds: ReadonlyArray<string>;
+    runner: PerSessionAssignmentRunner;
+    nowMs: number;
+  }>): Promise<void> {
+    if (input.spawnDecisionIds.length === 0 && input.launchedDecisionIds.length === 0) return;
+    await this.mutate(() => {
+      for (const decisionId of new Set([...input.spawnDecisionIds, ...input.launchedDecisionIds])) {
+        const entry = this.entries.get(decisionId);
+        if (!entry) continue;
+        this.entries.set(decisionId, {
+          ...entry,
+          ...(input.spawnDecisionIds.includes(decisionId) ? { runner: input.runner } : {}),
+          launchedRunner: input.runner,
+          updatedAtMs: input.nowMs,
+        });
+      }
+    });
+  }
+
   /** Records the live runner observed carrying a decision (never launch evidence). */
   async recordCarrierRunner(decisionId: string, runner: PerSessionAssignmentRunner, nowMs: number): Promise<void> {
     await this.mutate(() => {

@@ -566,6 +566,7 @@ import {
   type ProviderObservedAccountProvenance,
 } from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
 import { resolveProviderObservationProvenance } from './connectedServices/sessionAuthSwitch/resolveProviderObservationProvenance';
+import { readLiveParentProcessSync } from './connectedServices/accountGroups/perSession/readLiveParentProcessSync';
 import { DEFAULT_CONNECTED_SERVICE_RUNTIME_AUTH_APPLY_CAPABILITY } from './connectedServices/credentials/lifecycleTypes';
 import {
   PerSessionAssignmentLedger,
@@ -8118,7 +8119,8 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               tracked,
               runnerPid: observation.runnerPid,
               launchHome: observation.launchHome,
-              isDecisionLaunchedInRunner: (decisionId, runner) => perSessionAssignmentRuntime.isDecisionLaunchedInRunner(decisionId, runner),
+              isDecisionLaunchedInRunner: (decisionId, runner, options) => perSessionAssignmentRuntime.isDecisionLaunchedInRunner(decisionId, runner, options),
+              readParentProcess: readLiveParentProcessSync,
             })
             : null;
           if (tracked && observation && resolvedProvenance?.kind === 'not_current_runner') {

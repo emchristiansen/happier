@@ -557,7 +557,12 @@ describe('core e2e: per-session softmax connected-service account selection', ()
     }, { timeoutMs: 90_000, context: `adoption of failover target ${target}` });
     const invocations = ((await readFakeClaudeLogEvents(f.fakeClaudeLogPath)) as UnknownRecord[])
       .filter((event) => event.type === 'invocation' && String(event.claudeConfigDir ?? '').includes(`/claude-subscription/${target}/`));
-    expect(invocations.some((event) => JSON.stringify(event.argv).includes(nativeSessionId)),
+    const resumedSession = (argv: unknown): string | null => {
+      if (!Array.isArray(argv)) return null;
+      const index = argv.indexOf('--resume');
+      return index >= 0 && typeof argv[index + 1] === 'string' ? argv[index + 1] : null;
+    };
+    expect(invocations.some((event) => resumedSession(event.argv) === nativeSessionId),
       `an invocation on ${target}'s home resumes ${nativeSessionId}: ${JSON.stringify(invocations.map((event) => event.argv))}`).toBe(true);
 
     // Only the failing session moved; the shared pointer and generation did not.

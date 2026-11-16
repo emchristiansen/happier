@@ -268,8 +268,9 @@ export class PerSessionAssignmentRuntime {
       },
       recordRunner: async (runner) => {
         launchAttempted = true;
-        for (const decisionId of decisionIds) await this.recordSpawnedRunner(decisionId, runner);
-        await this.input.ledger.recordLaunchedRunner([...new Set([...decisionIds, ...launchedDecisionIds])], runner, this.input.nowMs());
+        await this.input.ledger.recordSpawnCustody({
+          spawnDecisionIds: decisionIds, launchedDecisionIds, runner, nowMs: this.input.nowMs(),
+        });
       },
       releaseIfNeverLaunched: async () => {
         if (launchAttempted) return;
@@ -295,13 +296,29 @@ export class PerSessionAssignmentRuntime {
   }
 
   /**
-   * Whether `decisionId` was launched in `runner`: the ledger's record of the latest launch carrying
-   * that decision names this process. Provenance for provider adoption (spec A.5 C4): evidence from
-   * any other process (an earlier runner, a replaced one) never adopts the decision.
+   * Whether `decisionId` was launched in `runner`: the ledger's launch custody of that decision (its
+   * latest launch, else the runner its own spawn recorded, as `currentRunnerOf`) names this process.
+   * Provenance for provider adoption (spec A.5 C4): evidence from any other process (an earlier
+   * runner, a replaced one) never adopts the decision. The spawn record alone suffices because launch
+   * custody is two commits and a surviving child must stay adoptable when the second one is lost
+   * (T5/T19). A runner merely observed carrying the decision (`carrierRunner`, from mutable session
+   * metadata) is never launch evidence. `requireFingerprint` demands an exact process-instance match,
+   * for identities not taken from the daemon's own tracking.
    */
-  isDecisionLaunchedInRunner(decisionId: string, runner: PerSessionAssignmentRunner): boolean {
-    const launched = this.input.ledger.get(decisionId)?.launchedRunner;
-    return launched !== undefined && isSamePerSessionRunner(launched, runner);
+  isDecisionLaunchedInRunner(
+    decisionId: string,
+    runner: PerSessionAssignmentRunner,
+    options: Readonly<{ requireFingerprint?: boolean }> = {},
+  ): boolean {
+    const entry = this.input.ledger.get(decisionId);
+    const launched = entry ? currentRunnerOf(entry) : undefined;
+    if (!launched) return false;
+    if (options.requireFingerprint) {
+      return launched.pid === runner.pid
+        && launched.processInstanceFingerprint !== undefined
+        && launched.processInstanceFingerprint === runner.processInstanceFingerprint;
+    }
+    return isSamePerSessionRunner(launched, runner);
   }
 
   /** The runner process launched for a spawn decision; its later proved absence is retirement evidence. */

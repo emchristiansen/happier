@@ -365,3 +365,58 @@ describe('collectPerSessionLiveDecisions', () => {
     ]);
   });
 });
+
+describe('per-session launch custody as adoption provenance (R16-CUSTODY-01)', () => {
+  const runner = { pid: 42, processInstanceFingerprint: 'fp-42' };
+  async function pendingLedger() {
+    const path = await ledgerAt();
+    const ledger = new PerSessionAssignmentLedger(path);
+    await ledger.recordProposal({ decisionId: 'd', sessionId: 'csm_1', serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('d', 'a'), nowMs: 1 });
+    return { path, ledger };
+  }
+
+  it('commits spawn custody once, and a reloaded ledger names the launched runner', async () => {
+    const { path, ledger } = await pendingLedger();
+    const runtime = runtimeFor({ ledger, api: reservationApi() });
+    const custody = runtime.createSpawnCustody();
+    custody.claim(['d']);
+    custody.claimLaunched(['d']);
+    await custody.recordRunner(runner);
+    const reloaded = new PerSessionAssignmentLedger(path);
+    expect(reloaded.get('d')).toMatchObject({ runner, launchedRunner: runner });
+    const after = runtimeFor({ ledger: reloaded, api: reservationApi() });
+    expect(after.isDecisionLaunchedInRunner('d', runner)).toBe(true);
+    expect(after.isDecisionLaunchedInRunner('d', { pid: 43, processInstanceFingerprint: 'fp-43' })).toBe(false);
+  });
+
+  it('keeps the original child adoptable when only the spawn runner record survived a split custody write', async () => {
+    // A ledger written by the earlier two-commit custody whose second commit (launchedRunner) was lost.
+    const { path, ledger } = await pendingLedger();
+    await ledger.recordRunner('d', runner, 2);
+    const reloaded = new PerSessionAssignmentLedger(path);
+    expect(reloaded.get('d')?.launchedRunner).toBeUndefined();
+    const runtime = runtimeFor({ ledger: reloaded, api: reservationApi() });
+    expect(runtime.isDecisionLaunchedInRunner('d', runner)).toBe(true);
+    expect(runtime.isDecisionLaunchedInRunner('d', { pid: 43, processInstanceFingerprint: 'fp-43' })).toBe(false);
+  });
+
+  it('never treats a runner merely observed carrying the decision as its launch', async () => {
+    const { ledger } = await pendingLedger();
+    await ledger.recordCarrierRunner('d', runner, 2);
+    expect(runtimeFor({ ledger, api: reservationApi() }).isDecisionLaunchedInRunner('d', runner)).toBe(false);
+  });
+
+  it('requires an exact process instance when asked (identities not taken from daemon tracking)', async () => {
+    const { ledger } = await pendingLedger();
+    await ledger.recordRunner('d', runner, 2);
+    const runtime = runtimeFor({ ledger, api: reservationApi() });
+    expect(runtime.isDecisionLaunchedInRunner('d', runner, { requireFingerprint: true })).toBe(true);
+    expect(runtime.isDecisionLaunchedInRunner('d', { pid: 42 }, { requireFingerprint: true })).toBe(false);
+    expect(runtime.isDecisionLaunchedInRunner('d', { pid: 42, processInstanceFingerprint: 'fp-reused' }, { requireFingerprint: true })).toBe(false);
+    const { ledger: noFingerprint } = await pendingLedger();
+    await noFingerprint.recordRunner('d', { pid: 42 }, 2);
+    expect(runtimeFor({ ledger: noFingerprint, api: reservationApi() })
+      .isDecisionLaunchedInRunner('d', runner, { requireFingerprint: true })).toBe(false);
+  });
+});
+

@@ -25,7 +25,17 @@ export function resolveProviderObservationProvenance(input: Readonly<{
   tracked: TrackedRunnerLike;
   runnerPid: number | undefined;
   launchHome: 'group' | 'member' | undefined;
-  isDecisionLaunchedInRunner: (decisionId: string, runner: PerSessionAssignmentRunner) => boolean;
+  isDecisionLaunchedInRunner: (
+    decisionId: string,
+    runner: PerSessionAssignmentRunner,
+    options?: Readonly<{ requireFingerprint?: boolean }>,
+  ) => boolean;
+  /**
+   * The live parent process of `pid` with its instance fingerprint, or null. A runner started by a
+   * wrapper is tracked by the reporter child's pid once reattached from its marker; its launch custody
+   * names the wrapper, its parent.
+   */
+  readParentProcess?: (pid: number) => PerSessionAssignmentRunner | null;
 }>): ProviderObservationProvenanceResolution {
   if (input.runnerPid === undefined) return { kind: 'evidence', provenance: null };
   if (input.runnerPid !== input.tracked.pid && input.runnerPid !== input.tracked.sessionRunnerPid) {
@@ -34,11 +44,19 @@ export function resolveProviderObservationProvenance(input: Readonly<{
   if (!input.launchHome) return { kind: 'evidence', provenance: null };
   // Launch custody records the launcher process the daemon tracks, never a wrapper's child.
   const launcher = readTrackedLauncherIdentity(input.tracked);
+  const runnerPid = input.runnerPid;
   return {
     kind: 'evidence',
     provenance: {
       launchHome: input.launchHome,
-      isDecisionLaunchedInRunner: (decisionId) => launcher !== null && input.isDecisionLaunchedInRunner(decisionId, launcher),
+      isDecisionLaunchedInRunner: (decisionId) => {
+        if (launcher !== null && input.isDecisionLaunchedInRunner(decisionId, launcher)) return true;
+        // The current runner's own parent, matched by exact process instance (never by pid alone), is
+        // the wrapper launch that custody recorded for this decision.
+        const parent = input.readParentProcess?.(runnerPid) ?? null;
+        return parent !== null && parent.processInstanceFingerprint !== undefined
+          && input.isDecisionLaunchedInRunner(decisionId, parent, { requireFingerprint: true });
+      },
     },
   };
 }
