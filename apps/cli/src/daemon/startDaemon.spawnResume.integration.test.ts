@@ -188,12 +188,17 @@ const ORIGINAL_PLATFORM_DESCRIPTOR = Object.getOwnPropertyDescriptor(process, 'p
 const archiveHttp = vi.hoisted(() => ({
   archivedAt: null as number | null,
   read: null as null | ((id: string) => Promise<unknown>),
+  // Served account profile; null keeps that request unconfigured.
+  accountProfile: null as null | Record<string, unknown>,
 }));
 
 vi.mock('axios', () => ({
   default: {
     get: vi.fn(async (url: string) => {
       const parsed = new URL(url);
+      if (parsed.origin === 'https://relay.example.invalid' && parsed.pathname === '/v1/account/profile' && archiveHttp.accountProfile) {
+        return { status: 200, data: archiveHttp.accountProfile };
+      }
       if (parsed.origin !== 'https://relay.example.invalid' || !parsed.pathname.startsWith('/v2/sessions/')) {
         throw new Error(`Unconfigured offline daemon HTTP request: ${url}`);
       }
@@ -248,6 +253,7 @@ const resolveConnectedServiceAuthForSpawnMock = vi.hoisted(() => vi.fn(async ():
     v: 1;
     bindingsByServiceId: Record<string, unknown>;
   };
+  perSessionLaunchDecisionIds?: readonly string[];
   diagnostics?: readonly ConnectedServicesMaterializationDiagnostic[];
 }> => ({
   env: { CLAUDE_CONFIG_DIR: '/tmp/claude-connected' },
@@ -2601,6 +2607,7 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     'herdr_creation_unconfirmed', 'herdr_creation_stopped',
     'binding_write_failed', 'windows_binding_write_failed', 'binding_exit_overlap', 'committed_binding_exit_overlap', 'heartbeat_binding_exit_overlap', 'tmux_binding_exit_overlap',
     'early_regular_exit', 'early_regular_report_exit', 'exit_before_first_report', 'wrapper_promotion',
+    'runner_record_exit', 'runner_record_report_exit', 'runner_record_report_survives', 'runner_record_report_survives_new',
     'ready_nonce_replay', 'unready_nonce_replay', 'unbound_nonce_replay', 'restored_plain_nonce_replay',
     'wrong_binding_nonce_replay', 'sameid_wrong_mode_nonce_replay', 'late_binding_nonce_replay', 'late_geometry_nonce_replay',
     'wrong_marker_session_nonce_replay', 'wrong_marker_pid_nonce_replay', 'wrong_marker_identity_nonce_replay',
@@ -2611,6 +2618,21 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     const { configuration } = await import('@/configuration');
     const originalHome = configuration.happyHomeDir;
     const fixtureHome = await mkdtemp(join(tmpdir(), 'happier-hosted-completion-'));
+    const originalActiveServerDir = configuration.activeServerDir;
+    let enteredRunnerLedger!: () => void;
+    let releaseRunnerLedger!: () => void;
+    const runnerLedgerEntered = new Promise<void>((resolve) => { enteredRunnerLedger = resolve; });
+    const runnerLedgerReleased = new Promise<void>((resolve) => { releaseRunnerLedger = resolve; });
+    // The daemon's per-session ledger lives under the active server directory it reads at startup.
+    if (contract.startsWith('runner_record_')) {
+      Object.defineProperty(configuration, 'activeServerDir', { value: join(fixtureHome, 'servers', 'active') });
+      // A connected-service session report reconciles runtime targets against the account profile.
+      archiveHttp.accountProfile = { id: 'fixture-account', connectedServicesV2: [{
+        serviceId: 'openai-codex',
+        profiles: [{ profileId: 'fixture-profile', status: 'connected' }],
+        groups: [{ groupId: 'fixture-group', activeProfileId: 'fixture-profile', memberProfileIds: ['fixture-profile'] }],
+      }] };
+    }
     const previousRefresh = process.env.HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED;
     const previousNonceTtl = process.env.HAPPIER_DAEMON_SPAWN_ACCEPTED_NONCE_TTL_MS;
     const previousExitPoll = process.env.HAPPIER_DAEMON_VISIBLE_CONSOLE_EXIT_POLL_MS;
@@ -2627,7 +2649,14 @@ describe('startDaemon spawn resume wiring (integration)', () => {
     const isRestoredPlain = contract === 'restored_plain_nonce_replay';
     const isWrapperPromotion = contract === 'wrapper_promotion';
     const isExitBeforeFirstReport = contract === 'exit_before_first_report';
-    const isEarlyRegularExit = contract === 'early_regular_exit' || contract === 'early_regular_report_exit' || isWrapperPromotion || isExitBeforeFirstReport;
+    // The child exits (optionally after reporting) while the accepted runner's
+    // per-session ledger record is still being written, before the accepted marker.
+    // Or the child reports while that record is held and keeps running: its report marker
+    // must survive acceptance, for an existing session and for a new launch.
+    const isRunnerRecordSurvivingReport = contract === 'runner_record_report_survives' || contract === 'runner_record_report_survives_new';
+    const isRunnerRecordExit = contract === 'runner_record_exit' || contract === 'runner_record_report_exit' || isRunnerRecordSurvivingReport;
+    const isEarlyRegularExit = contract === 'early_regular_exit' || contract === 'early_regular_report_exit' || isWrapperPromotion || isExitBeforeFirstReport
+      || isRunnerRecordExit;
     const fixtureAgent = isEarlyRegularExit || isRestoredPlain || isWindows ? 'codex' : 'claude';
     await stubRunnerProcessCensus(fixtureAgent);
     const isNonceReplay = contract.endsWith('_nonce_replay');
@@ -2939,11 +2968,49 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         await harness.getStopSession()!('sess_plain');
       }
       guardedRpc.mockClear();
+      if (isRunnerRecordExit) {
+        // One carried per-session decision makes the accepted runner record a real
+        // ledger lock and filesystem commit; only that commit is held.
+        const decisionId = 'runner-record-launch';
+        const ledgerPath = join(configuration.activeServerDir, 'connected-services', 'per-session-assignments.json');
+        await mkdir(dirname(ledgerPath), { recursive: true });
+        await writeFile(ledgerPath, JSON.stringify({ v: 1, entriesByDecisionId: { [decisionId]: {
+          decisionId, sessionId: 'sess_plain', serviceId: 'openai-codex', groupId: 'fixture-group', origin: 'spawn', state: 'applied', updatedAtMs: Date.now(),
+          proposal: { decisionId, proposalRevision: 1, profileId: 'fixture-profile', reason: 'initial', fromProfileId: null, temperature: 1.5, offsetPercent: 10,
+            probability: 1, decidedAtMs: Date.now(), custody: 'local_degraded', observedReservationRevision: null },
+        } } }));
+        resolveConnectedServiceAuthForSpawnMock.mockResolvedValueOnce({
+          env: {}, cleanupOnFailure: null, cleanupOnExit: null, perSessionLaunchDecisionIds: [decisionId],
+        });
+        const holdMarker = acceptedMarkerBoundary.beforeCommit;
+        // The accepted marker and the runner record are written concurrently; the marker hook
+        // clears the boundary when it fires, so keep this ledger hold installed until it is used.
+        const holdRunnerLedger = async (target: unknown) => {
+          if (String(target) === ledgerPath && spawnHappyCLI.mock.calls.length > 0) {
+            acceptedMarkerBoundary.beforeCommit = holdMarker;
+            enteredRunnerLedger();
+            await runnerLedgerReleased;
+            return;
+          }
+          const markerHold = holdMarker?.(target);
+          if (acceptedMarkerBoundary.beforeCommit === null) acceptedMarkerBoundary.beforeCommit = holdRunnerLedger;
+          await markerHold;
+        };
+        acceptedMarkerBoundary.beforeCommit = holdRunnerLedger;
+      }
       const accepting = spawnSession({
         directory: '/tmp', backendTarget: { kind: 'builtInAgent', agentId: fixtureAgent },
-        existingSessionId: 'sess_plain', ...(fixtureAgent === 'codex' ? { codexBackendMode: 'appServer' as const } : {}),
+        ...(contract === 'runner_record_report_survives_new' ? {} : { existingSessionId: 'sess_plain' }),
+        ...(fixtureAgent === 'codex' ? { codexBackendMode: 'appServer' as const } : {}),
         terminal: isTmux ? { mode: 'tmux', tmux: { sessionName: 'happier-fixture' } } : isEarlyRegularExit || isRestoredPlain || isWindows ? { mode: 'plain' } : { mode: 'herdr', herdr: { sessionName: 'default' } },
         ...(isWindows ? { windowsRemoteSessionLaunchMode: 'console' as const } : {}),
+        ...(isRunnerRecordExit ? {
+          connectedServices: { v: 1 as const, bindingsByServiceId: { 'openai-codex': {
+            source: 'connected' as const, selection: 'group' as const, groupId: 'fixture-group', profileId: 'fixture-profile',
+          } } },
+          connectedServiceMaterializationIdentityV1: (await import('./connectedServices/materialize/createConnectedServiceMaterializationIdentity'))
+            .createConnectedServiceMaterializationIdentity(),
+        } : {}),
         token: 'token-daemon', ...(contract !== 'resume_after_stop' ? { spawnNonce: `hosted-completion-${contract}` } : {}),
       });
       const metadata = {
@@ -2968,7 +3035,57 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         }
         releaseMarker();
       }
-      if (isEarlyRegularExit) {
+      if (isRunnerRecordSurvivingReport) {
+        await runnerLedgerEntered;
+        expect(regularChildEvents.listenerCount('exit')).toBeGreaterThan(0);
+        expect(tracked?.has(12345)).toBe(true);
+        releaseMarker();
+        // Same fixture boundary as runner_record_report_exit: readiness is refused offline.
+        await expect(report!('sess_plain', metadata)).rejects.toThrow('connected_service_generation_reconciliation_not_acknowledgeable');
+        const owner = tracked!.get(12345)!;
+        await owner.reportMarkerCustody?.pending;
+        const actualMarkers = await vi.importActual<typeof import('./sessionRegistry')>('./sessionRegistry');
+        const reported = await actualMarkers.readSessionMarkerForPid(12345);
+        expect(reported).toMatchObject({
+          happySessionId: 'sess_plain',
+          metadata: { codexSessionId: 'vendor-plain-1', hostPid: 12345 },
+          respawn: { vendorResumeId: 'vendor-plain-1' },
+        });
+        expect(reported?.processCommandHash).toEqual(expect.any(String));
+        releaseRunnerLedger();
+        expect(await accepting).toMatchObject({ type: 'success' });
+        await owner.startupCustody?.finalization;
+        await owner.reportMarkerCustody?.pending;
+        // Acceptance must not replace the completed report marker with its launch placeholder.
+        const afterAcceptance = await actualMarkers.readSessionMarkerForPid(12345);
+        expect(afterAcceptance).toMatchObject({
+          happySessionId: 'sess_plain',
+          metadata: { codexSessionId: 'vendor-plain-1', hostPid: 12345 },
+          processCommand: reported?.processCommand,
+          processCommandHash: reported?.processCommandHash,
+          respawn: { vendorResumeId: 'vendor-plain-1', spawnNonce: `hosted-completion-${contract}` },
+        });
+        expect(tracked?.get(12345)).toMatchObject({ happySessionId: 'sess_plain' });
+        return;
+      }
+      if (isRunnerRecordExit) {
+        await runnerLedgerEntered;
+        // The runner is already tracked, awaited and subscribed while its record is written.
+        expect(regularChildEvents.listenerCount('exit')).toBeGreaterThan(0);
+        expect(tracked?.has(12345)).toBe(true);
+        expect(awaiters?.has(12345)).toBe(true);
+        if (contract === 'runner_record_report_exit') {
+          // The fixture has no live runner to apply the group generation, so the report's
+          // readiness answer is refused; the report itself must still reach the waiter.
+          await expect(report!('sess_plain', metadata)).rejects.toThrow('connected_service_generation_reconciliation_not_acknowledgeable');
+          expect(awaiters?.has(12345)).toBe(false);
+          expect(tracked?.get(12345)).toMatchObject({ happySessionId: 'sess_plain' });
+          expect(tracked?.get(12345)?.happySessionMetadataFromLocalWebhook).toBeDefined();
+        }
+        regularChildEvents.emit('exit', 1, null);
+        releaseMarker();
+        releaseRunnerLedger();
+      } else if (isEarlyRegularExit) {
         await markerEntered;
         if (isWrapperPromotion) await report!('PID-23456', { ...metadata, hostPid: 23456 });
         else if (contract === 'early_regular_report_exit') await report!('sess_plain', metadata);
@@ -3330,6 +3447,9 @@ describe('startDaemon spawn resume wiring (integration)', () => {
         }
       }
     } finally {
+      releaseRunnerLedger();
+      archiveHttp.accountProfile = null;
+      Object.defineProperty(configuration, 'activeServerDir', { value: originalActiveServerDir });
       if (previousHerdrBinary === undefined) delete process.env.HERDR_BIN_PATH;
       else process.env.HERDR_BIN_PATH = previousHerdrBinary;
       replayClock?.mockRestore();

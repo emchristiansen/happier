@@ -4558,7 +4558,11 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               createWebhookCompletion: () => ReturnType<typeof waitForSessionWebhook>,
             ): Promise<Readonly<{ acceptedResult: SpawnSessionResult; webhookCompletion: Promise<SpawnSessionResult> }>> => {
               const pid = trackedSession.pid;
-              await recordPerSessionSpawnRunner(pid);
+              // Begin the per-session runner record without yielding: tracking and the webhook
+              // finalizer below must be registered synchronously, because each launch site arms
+              // finalization right after this call returns (a yield here made every spawn fail
+              // with 'Accepted runner tracking is unavailable').
+              const perSessionRunnerRecorded = recordPerSessionSpawnRunner(pid);
               trackedSession.spawnOptionsCustody = 'accepted_live_launch';
               pidToTrackedSession.set(pid, trackedSession);
               if (spawnResourceCleanupOnExit) {
@@ -4573,13 +4577,18 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               // report must use the same finalization callback as every later report.
               const webhookCompletion = createWebhookCompletion();
               runnerWebhookCompletion = webhookCompletion;
+              // Take the accepted marker's place in the per-PID marker queue before yielding, so
+              // a fast child's report marker is written after it and is never replaced by it.
+              const acceptedMarkerPersisted = persistAcceptedSpawnMarker({
+                pid,
+                spawnOptions: actualSpawnOptions,
+                directory: resolvedDirectory,
+                existingSessionId: normalizedExistingSessionId,
+              }).then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+              await perSessionRunnerRecorded;
               try {
-                await persistAcceptedSpawnMarker({
-                  pid,
-                  spawnOptions: actualSpawnOptions,
-                  directory: resolvedDirectory,
-                  existingSessionId: normalizedExistingSessionId,
-                });
+                const acceptedMarker = await acceptedMarkerPersisted;
+                if (!acceptedMarker.ok) throw acceptedMarker.error;
               } catch (error) {
                 const currentPid = webhookCompletion.getCurrentPid();
                 const timeout = pidToSpawnWebhookTimeout.get(currentPid);
@@ -5281,7 +5290,6 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
                 )
                 : spawnHappyCLI(args, spawnOptions, runnerLaunchOptions);
 
-              if (happyProcess.pid) await recordPerSessionSpawnRunner(happyProcess.pid);
               if (!happyProcess.pid) {
                 logger.debug('[DAEMON RUN] Failed to spawn process - no PID returned');
                 if (spawnResourceCleanupOnFailure && !spawnResourceCleanupArmed) {
