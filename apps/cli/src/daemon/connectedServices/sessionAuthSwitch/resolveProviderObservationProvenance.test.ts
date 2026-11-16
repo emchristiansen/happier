@@ -50,10 +50,37 @@ describe('provider observation provenance', () => {
     }))).toBe('d-2');
   });
 
-  it('accepts a wrapper child reporting as the session runner, with the launcher as launch identity', () => {
+  it('accepts a wrapper child reporting as the session runner only through exact lineage to the launcher', () => {
+    const split = { ...currentRunner, sessionRunnerPid: 77 };
+    // Its live parent is exactly the launch custody's wrapper.
     expect(project(resolveProviderObservationProvenance({
-      tracked: { ...currentRunner, sessionRunnerPid: 77 }, runnerPid: 77, launchHome: 'member', isDecisionLaunchedInRunner,
+      tracked: split, runnerPid: 77, launchHome: 'member', isDecisionLaunchedInRunner,
+      readParentProcess: () => ({ pid: 42, processInstanceFingerprint: 'fp-42' }),
     }))).toBe('d-2');
+    // The tracked wrapper pid alone never proves the process now at the reporter pid (R20-LINEAGE-CONSUMER-01).
+    expect(project(resolveProviderObservationProvenance({
+      tracked: split, runnerPid: 77, launchHome: 'member', isDecisionLaunchedInRunner,
+      readParentProcess: () => ({ pid: 1234, processInstanceFingerprint: 'fp-foreign-parent' }),
+      readProcessInstance: () => 'fp-77-foreign',
+    }))).toBeNull();
+    expect(project(resolveProviderObservationProvenance({
+      tracked: { ...split, processInstanceFingerprint: 'fp-77-foreign' }, runnerPid: 77, launchHome: 'member', isDecisionLaunchedInRunner,
+    }))).toBeNull();
+  });
+
+  it('accepts a split reporter by its own exact bound instance after the wrapper is gone', () => {
+    const custody = (decisionId: string, runner: PerSessionAssignmentRunner, options?: Readonly<{ requireFingerprint?: boolean }>) => (
+      decisionId === 'd-2' && runner.pid === 77 && runner.processInstanceFingerprint === 'fp-77' && options?.requireFingerprint === true
+    ) || isDecisionLaunchedInRunner(decisionId, runner, options);
+    const split = { pid: 42, sessionRunnerPid: 77 };
+    expect(project(resolveProviderObservationProvenance({
+      tracked: split, runnerPid: 77, launchHome: 'member', isDecisionLaunchedInRunner: custody,
+      readParentProcess: () => null, readProcessInstance: () => 'fp-77',
+    }))).toBe('d-2');
+    expect(project(resolveProviderObservationProvenance({
+      tracked: split, runnerPid: 77, launchHome: 'member', isDecisionLaunchedInRunner: custody,
+      readParentProcess: () => null, readProcessInstance: () => 'fp-77-reused',
+    }))).toBeNull();
   });
 
   it('does not adopt from the current runner when the target was launched elsewhere (same member, earlier launch)', () => {

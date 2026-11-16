@@ -70,6 +70,7 @@ export function collectPerSessionLiveDecisions(tracked: Iterable<TrackedSessionL
           profileId: assignment.profileId,
           subjectId,
           applied: isApplied,
+          recordedAtMs: 'appliedAtMs' in assignment ? assignment.appliedAtMs : assignment.materializedAtMs,
           reason: assignment.reason,
           ...(assignment.fromProfileId ? { fromProfileId: assignment.fromProfileId } : {}),
           ...(assignment.temperature === undefined ? {} : { temperature: assignment.temperature }),

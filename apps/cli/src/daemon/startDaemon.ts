@@ -8153,6 +8153,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               launchHome: observation.launchHome,
               isDecisionLaunchedInRunner: (decisionId, runner, options) => perSessionAssignmentRuntime.isDecisionLaunchedInRunner(decisionId, runner, options),
               readParentProcess: readLiveParentProcessSync,
+              readProcessInstance: (pid) => readLinuxProcProcessInstanceFingerprintSync(pid),
             })
             : null;
           if (tracked && observation && resolvedProvenance?.kind === 'not_current_runner') {

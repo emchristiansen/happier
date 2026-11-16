@@ -107,6 +107,29 @@ export type PerSessionProvedSharedConversion = Readonly<{
   convertedRunner?: PerSessionAssignmentRunner;
 }>;
 
+/**
+ * A live listing retired by a proved conversion (R20-CONVERSION-REBUILD-01): every carrier is exactly
+ * the converted runner of a conversion of the same subject and group, and the binding recorded the
+ * decision at or before the conversion. That runner serves the group home; its lagging listing is not
+ * a live decision and is never rebuilt, marked applied or renewed. Any other carrier keeps it live.
+ */
+function isRetiredByProvedConversion(
+  decision: PerSessionLiveDecision,
+  conversions: ReadonlyArray<PerSessionProvedSharedConversion>,
+): boolean {
+  const carriers = decision.carriers ?? [decision.runner ?? null];
+  if (carriers.length === 0 || decision.recordedAtMs === undefined) return false;
+  return conversions.some((conversion) => {
+    const converted = conversion.convertedRunner;
+    return converted !== undefined
+      && conversion.subjectId === decision.subjectId
+      && conversion.serviceId === decision.serviceId
+      && conversion.groupId === decision.groupId
+      && decision.recordedAtMs! <= conversion.retiresDecisionsDecidedAtOrBeforeMs
+      && carriers.every((carrier) => carrier !== null && isExactRunnerInstance(carrier, converted));
+  });
+}
+
 /** Exactly the same process instance: equal pid and equal, known fingerprints on both sides. */
 function isExactRunnerInstance(left: PerSessionAssignmentRunner, right: PerSessionAssignmentRunner): boolean {
   return left.pid === right.pid && left.processInstanceFingerprint !== undefined
@@ -122,6 +145,11 @@ export type PerSessionLiveDecision = Readonly<{
   /** Subject the decision was reserved under (the materialization identity). */
   subjectId: string;
   applied: boolean;
+  /**
+   * When the session binding recorded this decision (the applied member's `appliedAtMs`, the pending
+   * target's `materializedAtMs`); a rebuilt entry takes it as its decision time, never "now".
+   */
+  recordedAtMs?: number;
   reason: ConnectedServiceGroupMemberAssignmentReasonV1;
   fromProfileId?: string | null;
   temperature?: number;
@@ -153,6 +181,8 @@ type Log = (event: string, detail: Record<string, unknown>) => void;
  */
 export class PerSessionAssignmentRuntime {
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Conversions this daemon settled, until their subject has no live runner (R20-CONVERSION-REBUILD-01). */
+  private readonly settledConversions = new Map<string, PerSessionProvedSharedConversion>();
   private tickInFlight: Promise<void> | null = null;
 
   constructor(private readonly input: Readonly<{
@@ -305,6 +335,7 @@ export class PerSessionAssignmentRuntime {
    */
   async settleProvedSharedConversion(conversion: PerSessionProvedSharedConversion): Promise<void> {
     this.log('per_session_shared_conversion_proved', { ...conversion });
+    this.settledConversions.set(`${conversion.subjectId}\u0000${conversion.serviceId}\u0000${conversion.groupId}`, conversion);
     // A decision stays live while any runner other than the converted one (exactly that process
     // instance) carries it, or a carrier's identity is unknown. The converted runner's own listing
     // lags (its launch binding keeps the previous member until adoption) and never keeps it alive.
@@ -463,9 +494,14 @@ export class PerSessionAssignmentRuntime {
     const unsettled = new Set(entries
       .filter((entry) => isUnfinishedRecovery(entry) || isUncertainLaunch(entry))
       .map((entry) => entry.sessionId));
+    // A wrapper launch's bound reporter child outlives the wrapper (R20-REPORTER-RETIRE-01): a subject
+    // naming one whose own pid did not end is left to the renewal tick's exact probe.
+    const reporterMayLive = new Set(entries
+      .filter((entry) => entry.launchedReporter !== undefined && !ended.has(entry.launchedReporter.pid))
+      .map((entry) => entry.sessionId));
     const subjects = new Set<string>();
     for (const entry of entries) {
-      if (unsettled.has(entry.sessionId)) continue;
+      if (unsettled.has(entry.sessionId) || reporterMayLive.has(entry.sessionId)) continue;
       const known = knownRunnerOf(entry);
       if (known && ended.has(known.pid)) subjects.add(entry.sessionId);
     }
@@ -491,8 +527,15 @@ export class PerSessionAssignmentRuntime {
 
   private async runTick(): Promise<void> {
     const nowMs = this.input.nowMs();
-    const live = new Map(this.input.listLiveDecisions().map((decision) => [decision.decisionId, decision]));
     const liveSubjects = this.input.listLiveSubjectIds();
+    for (const [key, conversion] of this.settledConversions) {
+      if (!liveSubjects.has(conversion.subjectId)) this.settledConversions.delete(key);
+    }
+    const listedConversions = this.input.listProvedSharedConversions?.() ?? [];
+    const conversions = [...this.settledConversions.values(), ...listedConversions];
+    const live = new Map(this.input.listLiveDecisions()
+      .filter((decision) => !isRetiredByProvedConversion(decision, conversions))
+      .map((decision) => [decision.decisionId, decision]));
     let entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
 
     for (const decision of live.values()) {
@@ -511,7 +554,7 @@ export class PerSessionAssignmentRuntime {
     for (const entry of entries.values()) {
       if (entry.state === 'applied' && live.get(entry.decisionId)?.applied) await this.settleAdoption(entry, { includePreviouslyApplied: false });
     }
-    for (const conversion of this.input.listProvedSharedConversions?.() ?? []) {
+    for (const conversion of listedConversions) {
       await this.settleProvedSharedConversion(conversion);
     }
     entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
@@ -557,7 +600,10 @@ export class PerSessionAssignmentRuntime {
         ? isUnfinishedRecovery(entry)
         : subjectsWithPendingDecision.has(entry.sessionId);
       const recordedRunner = currentRunnerOf(entry);
-      if (!successorOwned && !recoveryOwned && recordedRunner && await this.runnerProvedAbsent(recordedRunner)) {
+      // The launch's bound reporter child (exact instance) is a live witness of the same launch: both
+      // must be proved absent (R20-REPORTER-RETIRE-01).
+      if (!successorOwned && !recoveryOwned && recordedRunner && await this.runnerProvedAbsent(recordedRunner)
+        && (!entry.launchedReporter || await this.runnerProvedAbsent(entry.launchedReporter))) {
         this.log('per_session_decision_released_runner_absent', { decisionId: entry.decisionId, sessionId: entry.sessionId, pid: recordedRunner.pid });
         await this.release(entry.decisionId);
         continue;
@@ -665,7 +711,9 @@ export class PerSessionAssignmentRuntime {
       temperature: decision.temperature ?? Number.NaN,
       offsetPercent: decision.offsetPercent ?? Number.NaN,
       probability: decision.probability ?? null,
-      decidedAtMs: this.input.nowMs(),
+      // The binding's own record time, never now: a later rebuild must not look newer than a
+      // conversion that retires it (R20-CONVERSION-REBUILD-01).
+      decidedAtMs: decision.recordedAtMs ?? this.input.nowMs(),
       custody: 'reserved',
       observedReservationRevision: null,
     };

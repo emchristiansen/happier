@@ -36,23 +36,33 @@ export function resolveProviderObservationProvenance(input: Readonly<{
    * names the wrapper, its parent.
    */
   readParentProcess?: (pid: number) => PerSessionAssignmentRunner | null;
+  /** The live process instance at `pid` (Linux `/proc`), or null when unknown. */
+  readProcessInstance?: (pid: number) => string | null;
 }>): ProviderObservationProvenanceResolution {
   if (input.runnerPid === undefined) return { kind: 'evidence', provenance: null };
   if (input.runnerPid !== input.tracked.pid && input.runnerPid !== input.tracked.sessionRunnerPid) {
     return { kind: 'not_current_runner' };
   }
   if (!input.launchHome) return { kind: 'evidence', provenance: null };
-  // Launch custody records the launcher process the daemon tracks, never a wrapper's child.
-  const launcher = readTrackedLauncherIdentity(input.tracked);
   const runnerPid = input.runnerPid;
+  // The tracked launcher's own identity, used only when the report comes from that very process: launch
+  // custody records exactly it. A split wrapper's reporter never inherits it: the tracked wrapper pid
+  // proves nothing about the process now at the reporter pid, which may be a foreign incarnation of a
+  // stale reporter pid (R20-LINEAGE-CONSUMER-01).
+  const launcher = runnerPid === input.tracked.pid ? readTrackedLauncherIdentity(input.tracked) : null;
   return {
     kind: 'evidence',
     provenance: {
       launchHome: input.launchHome,
       isDecisionLaunchedInRunner: (decisionId) => {
         if (launcher !== null && input.isDecisionLaunchedInRunner(decisionId, launcher)) return true;
-        // The current runner's own parent, matched by exact process instance (never by pid alone), is
-        // the wrapper launch that custody recorded for this decision.
+        // The reporting process by its own exact instance: its bound wrapper lineage or exact custody.
+        const instance = input.readProcessInstance?.(runnerPid) ?? null;
+        if (instance !== null && input.isDecisionLaunchedInRunner(
+          decisionId, { pid: runnerPid, processInstanceFingerprint: instance }, { requireFingerprint: true },
+        )) return true;
+        // Its live parent, matched by exact process instance (never by pid alone), is the wrapper launch
+        // that custody recorded for this decision.
         const parent = input.readParentProcess?.(runnerPid) ?? null;
         return parent !== null && parent.processInstanceFingerprint !== undefined
           && input.isDecisionLaunchedInRunner(decisionId, parent, { requireFingerprint: true });

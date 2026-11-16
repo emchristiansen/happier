@@ -74,11 +74,12 @@ describe.runIf(process.platform === 'linux')('wrapper reporter lineage with real
     expect(readProcessInstanceFingerprintSync(reporterPid)).toBe(reporterRunner.processInstanceFingerprint);
 
     const restarted = runtimeOn(new PerSessionAssignmentLedger(path));
-    const adoptedBy = (runnerPid: number, tracked: { pid: number; processInstanceFingerprint?: string }) => {
+    const adoptedBy = (runnerPid: number, tracked: { pid: number; sessionRunnerPid?: number; processInstanceFingerprint?: string }) => {
       const resolution = resolveProviderObservationProvenance({
         tracked, runnerPid, launchHome: 'member',
         isDecisionLaunchedInRunner: (decisionId, runner, options) => restarted.isDecisionLaunchedInRunner(decisionId, runner, options),
         readParentProcess: (pid) => readLiveParentProcessSync(pid),
+        readProcessInstance: (pid) => readProcessInstanceFingerprintSync(pid),
       });
       if (resolution.kind !== 'evidence') return null;
       const projected = projectProviderObservedAccountMetadata(metadata, {
@@ -88,6 +89,9 @@ describe.runIf(process.platform === 'linux')('wrapper reporter lineage with real
     };
     // The daemon reattached the reporter from its marker: it tracks the reporter itself.
     expect(adoptedBy(reporterPid, reporterRunner)).toBe('d');
+    // Split tracking still naming the dead wrapper: the exact bound reporter adopts by its own instance
+    // (R20-LINEAGE-CONSUMER-01 positive control).
+    expect(adoptedBy(reporterPid, { pid: wrapperRunner.pid, sessionRunnerPid: reporterPid })).toBe('d');
     expect(adoptedBy(process.pid, { pid: process.pid, processInstanceFingerprint: readProcessInstanceFingerprintSync(process.pid)! })).toBeNull();
   }, 20_000);
 });
