@@ -176,6 +176,7 @@ export function sanitizeConnectedServiceRuntimeFailureClassification(
     profileId: readNullableString(value.profileId),
     groupId: readNullableString(value.groupId),
     ...(value.groupGeneration === undefined ? {} : { groupGeneration: readNullableNonNegativeInt(value.groupGeneration) }),
+    ...(value.perSessionMemberHome === true ? { perSessionMemberHome: true as const } : {}),
     ...(value.credentialRevision === undefined
       ? {}
       : { credentialRevision: credentialRevision.success ? credentialRevision.data : null }),

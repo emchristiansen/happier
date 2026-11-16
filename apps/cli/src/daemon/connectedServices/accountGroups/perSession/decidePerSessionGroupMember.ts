@@ -229,7 +229,11 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
     ? input.replacementReason ?? 'failover'
     : initialProfileId ? 'initial_unavailable_failover' : 'initial_sampled';
 
+  // The weighted draw behind the latest choice, recorded with each proposal made from it (spec A.2
+  // step 7, T22): every candidate's score, reservation count and probability, τ, δ and the choice.
+  let lastDraw: ConnectedServiceAuthGroupCandidateSelection['perSessionDecision'] | null = null;
   const choose = (counts: ReadonlyMap<string, number>, useDegraded: boolean): Choice | ConnectedServiceAuthGroupCandidateSelection => {
+    lastDraw = null;
     if (namedStartEligible) {
       // An eligible explicit start is not a weighted draw.
       return {
@@ -245,6 +249,7 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
       excludeProfileId: initialProfileId ?? input.currentProfileId,
     });
     if (!selection.selected || !selection.perSessionDecision) return selection;
+    lastDraw = selection.perSessionDecision;
     return {
       profileId: selection.selected.profileId,
       reason: sampledReason,
@@ -280,11 +285,29 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
     custody: 'proposed',
     reservationLeaseUntilMs: input.nowMs() + input.policy.probeIfSnapshotOlderThanMs,
   });
+  const recordTrace = (proposal: Readonly<{ decisionId: string; proposalRevision: number; profileId: string; reason: string; custody: string }>) => {
+    const draw = lastDraw;
+    if (!draw) return;
+    input.log?.('per_session_decision_trace', {
+      serviceId: input.serviceId, groupId: input.groupId, sessionId: input.sessionId,
+      decisionId: proposal.decisionId, proposalRevision: proposal.proposalRevision, custody: proposal.custody,
+      reason: proposal.reason, selectedProfileId: proposal.profileId, selectedProbability: draw.selectedProbability,
+      temperature: draw.temperature, offsetPercent: draw.offsetPercent, degraded: draw.degraded, tier: draw.tier,
+      unknownScoreFallback: draw.unknownScoreFallback,
+      candidates: draw.trace.length > 0
+        ? draw.trace.map((entry) => ({
+            profileId: entry.profileId, score: entry.remainingPercent, count: entry.reservationCount,
+            adjustedScore: entry.adjustedRemainingPercent, inTier: entry.inTier, weight: entry.weight, probability: entry.probability,
+          }))
+        : [...draw.probabilityByProfileId].map(([profileId, probability]) => ({ profileId, score: null, probability })),
+    });
+  };
   const degradedFrom = async (proposalRevision: number): Promise<PerSessionAssignmentDecision> => {
     const degradedChoice = choose(localCounts(), true);
     if (!isChoice(degradedChoice)) return { kind: 'no_candidate', selection: degradedChoice };
     const proposal = { ...proposalFrom(degradedChoice, proposalRevision, 'local_degraded', null), custody: 'local_degraded' as const };
     await input.persistProposal(proposal);
+    recordTrace(proposal);
     return { kind: 'assigned', proposal };
   };
 
@@ -311,6 +334,7 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
     if (!isChoice(first)) return { kind: 'no_candidate', selection: first };
     proposal = proposedFrom(first, 1, snapshot.reservationRevision);
     await input.persistProposal(proposal);
+    recordTrace(proposal);
     sendOutstanding = false;
   }
 
@@ -406,6 +430,7 @@ export async function decidePerSessionGroupMember(input: DecidePerSessionGroupMe
       if (!isChoice(next)) return { kind: 'no_candidate', selection: next };
       proposal = proposedFrom(next, proposal.proposalRevision + 1, put.reservationRevision);
       await input.persistProposal(proposal);
+      recordTrace(proposal);
       identicalSends = 0;
       continue;
     }

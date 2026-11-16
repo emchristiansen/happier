@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { authorizeConnectedServiceRuntimeAuthFailureSource } from '@/daemon/connectedServices/runtimeAuth/handleConnectedServiceRuntimeAuthFailureForSession';
+import { isPerSessionMemberHomeRegistration } from '@/daemon/connectedServices/runtimeAuth/isPerSessionMemberHomeRegistration';
 import { logger } from '@/ui/logger';
 import type { SessionRuntimeIssueV1 } from '@happier-dev/protocol';
 
@@ -1768,6 +1770,11 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     ['pending materialized member', { materializedAssignment: { profileId: 'alpha', decisionId: 'd1', reason: 'initial_sampled', materializedAtMs: 1 } }, 'pool'],
     ['applied member', { member: { assignment: 'per_session', profileId: 'alpha', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 } }, 'pool'],
     ['a different materialized member', { materializedAssignment: { profileId: 'beta', decisionId: 'd1', reason: 'initial_sampled', materializedAtMs: 1 } }, null],
+    ['the applied member while another target is pending (R19-PENDING-SOURCE-01)', {
+      member: { assignment: 'per_session', profileId: 'alpha', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 },
+      materializedAssignment: { profileId: 'beta', decisionId: 'd2', reason: 'failover', fromProfileId: 'alpha', materializedAtMs: 2 },
+    }, 'pool'],
+    ['a group-home pending target on its own profile', { materializedAssignment: { profileId: 'alpha', decisionId: 'c1', reason: 'policy_conversion', materializedAtMs: 2, home: 'group' } }, null],
     ['no assignment', {}, null],
   ] as const)('reports a per-session runner (profile launch, group binding) against its group, as member-home evidence, only for %s', async (_label, assignment, expectedGroupId) => {
     // per_session_softmax runners launch with their member's PROFILE selection; the session binding
@@ -1799,13 +1806,18 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
   it.each([
     ['an applied member', { member: { assignment: 'per_session', profileId: 'alpha', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 } }, 'pool'],
     ['another member', { member: { assignment: 'per_session', profileId: 'beta', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 } }, null],
-  ] as const)('reports a per-session runner failure in its member-home form (FAILOVER-SRC-01) only for %s', async (_label, assignment, expectedGroupId) => {
+    ['the applied member while another target is pending (R19-PENDING-SOURCE-01)', {
+      member: { assignment: 'per_session', profileId: 'alpha', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 },
+      materializedAssignment: { profileId: 'beta', decisionId: 'd2', reason: 'failover', fromProfileId: 'alpha', materializedAtMs: 2 },
+    }, 'pool'],
+  ] as const)('reports a per-session runner failure in its member-home form (FAILOVER-SRC-01) only for %s', async (label, assignment, expectedGroupId) => {
+    mockNotifyDaemonConnectedServiceRuntimeAuthFailure.mockClear();
     process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY] = JSON.stringify([{
       kind: 'profile', serviceId: 'claude-subscription', profileId: 'alpha', credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS',
     }]);
     const metadata = { connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': {
       source: 'connected', selection: 'group', groupId: 'pool', ...assignment } } } };
-    const session = { client: { sessionId: `member-home-failure-${expectedGroupId ?? 'none'}`, getMetadataSnapshot: () => metadata,
+    const session = { client: { sessionId: `member-home-failure-${label}`, getMetadataSnapshot: () => metadata,
       sessionTurnLifecycle: { failTurn: createClaudeFailTurnSpy() } } };
     await surfaceClaudeRateLimitRuntimeIssue(session as any, {
       ...passiveUtilizationDetails(), limitCategory: 'usage_limit', utilization: 100,
@@ -1814,6 +1826,28 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     expect(reported).toMatchObject({ profileId: 'alpha', credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' });
     expect(reported?.groupId ?? null).toBe(expectedGroupId);
     expect(reported?.groupGeneration ?? null).toBeNull();
+    // The member-home form carries the runner's explicit marker; any other report never does.
+    expect((reported as { perSessionMemberHome?: true } | undefined)?.perSessionMemberHome ?? null)
+      .toBe(expectedGroupId === null ? null : true);
+    if (expectedGroupId === null) return;
+    // Composed with the daemon (R19-PENDING-SOURCE-01 repair check): the emitted report, sanitized as
+    // staged, against the registration the daemon resolves for this same binding, authorizes the
+    // still-applied member as its exact source; it is not superseded by the pending target.
+    const registered = { serviceId: 'claude-subscription' as const, groupId: 'pool', profileId: 'alpha',
+      generation: null, credentialRevision: 'csr_7123456789ABCDEFGHJKMNPQRS' };
+    const perSessionMemberHome = isPerSessionMemberHomeRegistration({
+      binding: registered, selections: JSON.parse(process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY]!),
+      bindingsRaw: metadata.connectedServices,
+    });
+    expect(perSessionMemberHome).toBe(true);
+    const tracked = { startedBy: 'daemon' as const, happySessionId: session.client.sessionId, pid: process.pid,
+      spawnOptions: { directory: '/tmp/project' } };
+    await expect(authorizeConnectedServiceRuntimeAuthFailureSource({
+      getChildren: () => [tracked], sessionId: tracked.happySessionId,
+      classification: sanitizeConnectedServiceRuntimeFailureClassification(reported)!,
+      resolveRegisteredRuntimeAuthFailureSource: () => ({ status: 'bound', binding: registered, perSessionMemberHome }),
+      runtimeAuthApply: { directLiveHotAuth: 'unsupported' },
+    })).resolves.toEqual({ status: 'authorized', tracked, sourceBinding: registered });
   });
 
   it('enriches passive quota evidence with the live account identity → source-linked PAU (soft-switch eligible)', async () => {

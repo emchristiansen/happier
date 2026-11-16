@@ -184,8 +184,13 @@ function resolveClaudeProviderIdentityReport(
     if (selection.kind !== 'profile') return null;
     const binding = findConnectedServiceBindingSelectionFromSessionMetadata(session.client, 'claude-subscription');
     if (binding?.source !== 'connected' || binding.selection !== 'group') return null;
-    const assignedProfileId = binding.materializedAssignment?.profileId ?? binding.member?.profileId;
-    return assignedProfileId === selection.profileId ? { groupId: binding.groupId, launchHome: 'member' } : null;
+    // The launched member is either the still-applied member (it keeps serving, and its failures stay
+    // attributable, while another target is pending: R19-PENDING-SOURCE-01) or the pending member-home
+    // target this runner was launched for. A group-home pending target is never a member home.
+    const pending = binding.materializedAssignment;
+    const launchedOnMemberHome = binding.member?.profileId === selection.profileId
+        || (pending !== undefined && pending.home !== 'group' && pending.profileId === selection.profileId);
+    return launchedOnMemberHome ? { groupId: binding.groupId, launchHome: 'member' } : null;
 }
 
 /**
@@ -203,7 +208,7 @@ function withPerSessionMemberHomeGroup<T extends Readonly<{ profileId?: string |
     const selection = resolveClaudeRuntimeIssueSelection(session);
     if (report?.launchHome !== 'member' || selection?.kind !== 'profile') return classification;
     if (!classification.profileId || classification.profileId !== selection.profileId) return classification;
-    return { ...classification, groupId: report.groupId };
+    return { ...classification, groupId: report.groupId, perSessionMemberHome: true };
 }
 
 /** Every launcher feeds its existing trusted raw channel here; history never reconciles live identity. */

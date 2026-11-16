@@ -439,21 +439,20 @@ export async function authorizeConnectedServiceRuntimeAuthFailureSource(input: R
   const reportedIdentityComplete = classification !== null
     && reportedProfileId.length > 0
     && reportedCredentialRevision.length > 0;
-  // A per-session member-home report: group and profile without a group generation. It is exact only
-  // against a registered binding that is itself that member home (checked below); anywhere else a
-  // group without a generation remains an incomplete report.
+  // A per-session member-home report: the runner marks it, with complete identity, a group and no
+  // group generation. It is always an exact report (R19-SRC-LEGACY-01): against a registration marked
+  // as that member home it compares exactly; against any other registration it is compared like every
+  // exact report (a stale runner after conversion, rollback, pinning or credential replacement is
+  // superseded); with no registration it is refused. It never takes the legacy non-exact path. An
+  // unmarked report of the same shape is an older provider report and keeps the legacy path.
   const memberHomeFormReport = reportedIdentityComplete
+    && classification?.perSessionMemberHome === true
     && reportedGroupId !== null && reportedGroupId.length > 0 && reportedGeneration === null;
-  const memberHomeRegisteredResolution = memberHomeFormReport && classification !== null && tracked
-    ? input.resolveRegisteredRuntimeAuthFailureSource?.({ sessionId: input.sessionId, tracked, classification }) ?? null
-    : null;
-  const memberHomeExactReport = memberHomeRegisteredResolution?.status === 'bound'
-    && memberHomeRegisteredResolution.perSessionMemberHome === true;
   const modernExactReport = reportedIdentityComplete
     && (
       (reportedGroupId !== null && reportedGroupId.length > 0 && reportedGeneration !== null)
       || ((reportedGroupId === null || reportedGroupId.length === 0) && reportedGeneration === null)
-      || memberHomeExactReport
+      || memberHomeFormReport
     );
   const exactLiveSourceResolverApplicable = typeof directLiveHotAuth === 'object'
     && directLiveHotAuth.requiresExactRuntimeIdentity === true;
@@ -461,7 +460,7 @@ export async function authorizeConnectedServiceRuntimeAuthFailureSource(input: R
     if (!tracked) {
       throw new Error('connected-service exact runtime source session temporarily unavailable');
     }
-    const registeredResolution = memberHomeExactReport ? memberHomeRegisteredResolution : input.resolveRegisteredRuntimeAuthFailureSource?.({
+    const registeredResolution = input.resolveRegisteredRuntimeAuthFailureSource?.({
       sessionId: input.sessionId,
       tracked,
       classification,
@@ -641,6 +640,9 @@ export async function authorizeConnectedServiceRuntimeAuthFailureSource(input: R
         && confirmedBinding.groupId === (reportedGroupId || null)
         && confirmedBinding.profileId === reportedProfileId
         && confirmedBinding.credentialRevision === reportedCredentialRevision
+        // A member-home report names no group generation; only a live member home (no generation)
+        // confirms it, never the group home that a converted runner now uses.
+        && (!memberHomeFormReport || confirmedBinding.generation === null)
       ) {
         return { status: 'authorized', tracked, sourceBinding: confirmedBinding };
       }

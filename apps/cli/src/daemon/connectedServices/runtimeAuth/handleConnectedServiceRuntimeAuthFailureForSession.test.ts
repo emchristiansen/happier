@@ -979,7 +979,7 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
     // FAILOVER-SRC-01: a per_session_softmax runner is launched on its member's own home inside the
     // group; no shared group generation applies to it.
     describe('per-session member home', () => {
-      const memberHomeReport = { ...exactReport, groupGeneration: null };
+      const memberHomeReport = { ...exactReport, groupGeneration: null, perSessionMemberHome: true as const };
       const memberHomeBinding = { ...exactBinding, generation: null };
       const authorize = (
         classification: ConnectedServiceRuntimeFailureClassification,
@@ -997,10 +997,58 @@ describe('handleConnectedServiceRuntimeAuthFailureForSession', () => {
           .resolves.toEqual({ status: 'authorized', tracked, sourceBinding: memberHomeBinding });
       });
 
-      it('keeps a group without a generation on the unchanged inexact path when the registered binding is not a member home', async () => {
-        // The exact-source gate does not bind it to the registered source; the legacy path decides.
+      const superseded = {
+        status: 'recovery_superseded', reason: 'source_tuple_mismatch',
+        serviceId: memberHomeReport.serviceId, groupId: memberHomeReport.groupId, profileId: memberHomeReport.profileId,
+      };
+
+      it('refuses the member-home form against an unmarked group binding without a generation (R19-SRC-LEGACY-01)', async () => {
+        // Never the legacy non-exact path: an unmarked registration is not a member home.
         const outcome = await authorize(memberHomeReport, { status: 'bound', binding: memberHomeBinding });
+        expect(outcome).toBeInstanceOf(ConnectedServiceExactRuntimeSourceBindingUnavailableError);
+        expect((outcome as ConnectedServiceExactRuntimeSourceBindingUnavailableError).detail)
+          .toMatchObject({ kind: 'registered_binding_not_exact', deficiencies: ['group_generation_absent'] });
+      });
+
+      it('keeps an unmarked older report of the same shape on the legacy path', async () => {
+        const { perSessionMemberHome: _marker, ...olderReport } = memberHomeReport;
+        const outcome = await authorize(olderReport, { status: 'bound', binding: memberHomeBinding });
+        expect(outcome).toMatchObject({ status: 'authorized' });
         expect(outcome).not.toHaveProperty('sourceBinding');
+      });
+
+      it('refuses the member-home form when the session is not registered', async () => {
+        const outcome = await authorize(memberHomeReport, {
+          status: 'absent', reason: 'session_unregistered', registeredServiceIds: [],
+        });
+        expect(outcome).toBeInstanceOf(ConnectedServiceExactRuntimeSourceBindingUnavailableError);
+        expect((outcome as ConnectedServiceExactRuntimeSourceBindingUnavailableError).detail)
+          .toMatchObject({ kind: 'registered_binding_absent' });
+      });
+
+      it.each([
+        ['converted to the group home', exactBinding],
+        ['converted to the group home on another member', { ...exactBinding, profileId: 'other' }],
+        ['rolled back to a plain profile', { ...exactBinding, groupId: null, generation: null }],
+        ['credential replaced on the member home', { ...memberHomeBinding, credentialRevision: 'csr_bbbbbbbbbbbbbbbbbbbbbb' }],
+      ] as const)('supersedes a stale member-home report after the session was %s', async (_label, binding) => {
+        const marked = binding.groupId !== null && binding.generation === null;
+        await expect(authorize(memberHomeReport, {
+          status: 'bound', binding, ...(marked ? { perSessionMemberHome: true } : {}),
+        })).resolves.toEqual(superseded);
+      });
+
+      it('does not let a live group home confirm a member-home report, but a live member home does', async () => {
+        const authorizeLive = (live: typeof exactBinding | typeof memberHomeBinding) => authorizeConnectedServiceRuntimeAuthFailureSource({
+          getChildren: () => [tracked],
+          sessionId: tracked.happySessionId,
+          classification: memberHomeReport,
+          resolveRegisteredRuntimeAuthFailureSource: () => ({ status: 'bound', binding: exactBinding }),
+          resolveCurrentRuntimeAuthFailureSource: async () => live,
+          runtimeAuthApply: exactLiveRuntimeIdentityCapability,
+        });
+        await expect(authorizeLive(exactBinding)).resolves.toEqual(superseded);
+        await expect(authorizeLive(memberHomeBinding)).resolves.toEqual({ status: 'authorized', tracked, sourceBinding: memberHomeBinding });
       });
 
       it.each([

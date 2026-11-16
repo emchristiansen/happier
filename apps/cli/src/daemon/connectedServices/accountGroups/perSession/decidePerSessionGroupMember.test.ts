@@ -227,6 +227,44 @@ describe('decidePerSessionGroupMember', () => {
     expect(decision).toMatchObject({ kind: 'assigned', proposal: { profileId: 'other', custody: 'reserved', proposalRevision: 2 } });
   });
 
+  // Spec A.2 step 7 / T22: each proposal's draw is recorded with every candidate's score, count and
+  // probability, τ, δ and the choice; a recomputed proposal records its own counts.
+  it('records the decision trace of each drawn proposal, including the recomputed one', async () => {
+    let first = true;
+    const server = createFakeReservationServer({
+      beforePut: () => {
+        if (!first) return;
+        first = false;
+        server.entries.set('x1', { decisionId: 'x1', profileId: 'fresh', sessionId: 'x1', ownerMachineId: 'm2',
+          state: 'pending', createdAtMs: NOW, leaseUntilMs: NOW + 1_000_000 });
+        server.bumpRevisionWithUnrelatedCommit();
+      },
+    });
+    const traces: Array<Record<string, any>> = [];
+    const { input } = baseInput({
+      scores: { fresh: 100, other: 60 }, reservationApi: server.api, uniformSample: () => 0,
+      log: (event, detail) => { if (event === 'per_session_decision_trace') traces.push(detail); },
+    });
+    await decidePerSessionGroupMember(input);
+    expect(traces.map((trace) => trace.proposalRevision)).toEqual([1, 2]);
+    expect(traces[0]).toMatchObject({
+      decisionId: 'decision-1', selectedProfileId: 'fresh', temperature: 1.5, offsetPercent: 10, degraded: false,
+      candidates: [
+        expect.objectContaining({ profileId: 'fresh', score: 100, count: 0 }),
+        expect.objectContaining({ profileId: 'other', score: 60, count: 0 }),
+      ],
+    });
+    expect(traces[1]!.candidates).toEqual([
+      expect.objectContaining({ profileId: 'fresh', score: 100, count: 1 }),
+      expect.objectContaining({ profileId: 'other', score: 60, count: 0 }),
+    ]);
+    for (const trace of traces) {
+      const total = trace.candidates.reduce((sum: number, candidate: { probability: number }) => sum + candidate.probability, 0);
+      expect(Math.abs(total - 1)).toBeLessThanOrEqual(1e-12);
+      expect(trace.selectedProbability).toBe(trace.candidates.find((candidate: { profileId: string }) => candidate.profileId === trace.selectedProfileId).probability);
+    }
+  });
+
   it('uses local degraded mode with doubled temperature only when the route is definitely unavailable', async () => {
     const unavailable: ConnectedServiceAssignmentReservationApi = {
       listAssignmentReservations: async () => ({ kind: 'unavailable', detail: 'http_404' }),

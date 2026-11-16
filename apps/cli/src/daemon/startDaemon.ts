@@ -88,7 +88,11 @@ import {
   notifyTerminalAttachmentRetiredThroughCatalog,
 } from '@/backends/catalog';
 import { CATALOG_AGENT_IDS } from '@/backends/types';
-import { processInstanceFingerprintMatches, readProcessInstanceFingerprintSync } from '@happier-dev/cli-common/processInstance';
+import {
+  processInstanceFingerprintMatches,
+  readLinuxProcProcessInstanceFingerprintSync,
+  readProcessInstanceFingerprintSync,
+} from '@happier-dev/cli-common/processInstance';
 import {
   writeDaemonStateIfLockOwned,
   writeConnectedServiceBrokerState,
@@ -569,6 +573,7 @@ import { isPerSessionMemberHomeRegistration } from './connectedServices/runtimeA
 import { readTrackedLauncherIdentity } from './connectedServices/accountGroups/perSession/readTrackedLauncherIdentity';
 import { resolveProviderObservationProvenance } from './connectedServices/sessionAuthSwitch/resolveProviderObservationProvenance';
 import { readLiveParentProcessSync } from './connectedServices/accountGroups/perSession/readLiveParentProcessSync';
+import { bindWrapperReporterLineage } from './connectedServices/accountGroups/perSession/bindWrapperReporterLineage';
 import { DEFAULT_CONNECTED_SERVICE_RUNTIME_AUTH_APPLY_CAPABILITY } from './connectedServices/credentials/lifecycleTypes';
 import {
   PerSessionAssignmentLedger,
@@ -2062,6 +2067,12 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
       const connectedServiceRuntimeQuotaSnapshots = new ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore();
       const providerAccountUsageStore = createProviderAccountUsageStore();
       // per_session_softmax groups (spec A.3–A.5): this daemon's decision ledger and reservation leases.
+      // Per-session events are debug diagnostics, except each decision's trace (spec A.2 step 7, T22),
+      // which is the decision's record and is always written.
+      const logPerSessionEvent = (event: string, detail: Record<string, unknown>) => {
+        if (event === 'per_session_decision_trace') logger.infoFile(`[ConnectedServices] ${event}`, detail);
+        else logger.debug(`[ConnectedServices] ${event}`, detail);
+      };
       const perSessionAssignmentRuntime = new PerSessionAssignmentRuntime({
         ledger: new PerSessionAssignmentLedger(resolvePerSessionAssignmentLedgerPath(configuration.activeServerDir)),
         ownerMachineId: machineId,
@@ -2083,7 +2094,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             return processInstanceFingerprint ? { processInstanceFingerprint } : {};
           })() },
         }) === 'absent' ? 'absent' : 'present',
-        log: (event, detail) => logger.debug(`[ConnectedServices] ${event}`, detail),
+        log: logPerSessionEvent,
       });
       // Revocation of a per-session member (spec A.4, T10): the affected session is moved through its
       // own classified-failure recovery (durable intent, FIFO lock, turn boundary). One request per
@@ -3261,12 +3272,16 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
           onTrackedSessionReported: async (tracked) => {
             persistPiResumeEnvironment({ tracked, happyHomeDir: configuration.happyHomeDir, logger });
             // A wrapper launch's reporter child: bind it to the wrapper's per-session decisions while the
-            // wrapper is still its live parent (R16-WRAPPER-02).
+            // wrapper is still its live parent (R16-WRAPPER-02). The reporter's own process instance is
+            // read from /proc here: the tracked fingerprint may still be absent or the wrapper's when the
+            // report arrives (R19-WRAPPER-PRODUCER-01). Every report retries the binding.
             const reporterPid = tracked.sessionRunnerPid;
-            if (typeof reporterPid === 'number' && reporterPid !== tracked.pid && tracked.processInstanceFingerprint) {
-              await perSessionAssignmentRuntime.recordWrapperReporter({
-                reporter: { pid: reporterPid, processInstanceFingerprint: tracked.processInstanceFingerprint },
-                parent: readLiveParentProcessSync(reporterPid),
+            if (typeof reporterPid === 'number' && reporterPid !== tracked.pid) {
+              await bindWrapperReporterLineage({
+                reporterPid,
+                readProcessInstance: (pid) => readLinuxProcProcessInstanceFingerprintSync(pid),
+                readParentProcess: (pid) => readLiveParentProcessSync(pid),
+                record: (input) => perSessionAssignmentRuntime.recordWrapperReporter(input),
               }).catch((error) => logger.warn('[ConnectedServices] Per-session wrapper reporter binding failed', error));
             }
             if (tracked.startedBy !== 'daemon') {
@@ -7082,7 +7097,7 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
             ),
             nowMs: () => Date.now(),
             deadlineMs: 30_000,
-            log: (event, detail) => logger.debug(`[ConnectedServices] ${event}`, detail),
+            log: logPerSessionEvent,
           });
           const routedSwitchCoordinator = {
             switchAfterClassifiedFailure: async (

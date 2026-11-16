@@ -45,6 +45,11 @@ export type ConnectedServiceRuntimeFailureClassification = Readonly<{
   profileId: string | null;
   groupId: string | null;
   groupGeneration?: number | null;
+  /**
+   * Set only by a per-session runner launched on a group member's own home: `groupId` names the
+   * bound group and no group generation applies. Such a report is always exact (R19-SRC-LEGACY-01).
+   */
+  perSessionMemberHome?: true;
   credentialRevision?: ConnectedServiceCredentialRevisionV1 | null;
   activeProfileId?: string | null;
   credentialHealthStatus?: ConnectedServiceCredentialHealthStatusV1 | null;

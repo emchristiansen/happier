@@ -313,6 +313,50 @@ describe('PerSessionAssignmentRuntime', () => {
     expect(ledger.list().map((entry) => entry.decisionId)).toEqual(kept);
   });
 
+  // R19-CONV-MULTIPLICITY-01: with the real collector, an old member-home runner still carrying d1
+  // keeps it in custody whatever the tracking order; only the converted runner's own lag settles.
+  describe('conversion settlement with several carriers', () => {
+    const identity = createConnectedServiceMaterializationIdentity();
+    const member = { assignment: 'per_session' as const, profileId: 'a', decisionId: 'd1', reason: 'initial_sampled' as const, appliedAtMs: 1 };
+    const carrier = (pid: number) => ({
+      pid, processInstanceFingerprint: `fp-${pid}`, happySessionId: 'sess-1',
+      happySessionMetadataFromLocalWebhook: {
+        connectedServiceMaterializationIdentityV1: identity,
+        connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': { source: 'connected', selection: 'group', groupId: 'pool', member } } },
+      },
+    });
+    const old = carrier(111);
+    const converted = carrier(222);
+    async function settleWith(tracked: ReadonlyArray<ReturnType<typeof carrier>>) {
+      const path = await ledgerAt();
+      const ledger = new PerSessionAssignmentLedger(path);
+      await ledger.recordProposal({ decisionId: 'd1', sessionId: identity.id, serviceId: 'claude-subscription', groupId: 'pool', origin: 'spawn', proposal: proposal('d1', 'a'), nowMs: 1 });
+      await ledger.markApplied('d1', 2);
+      const runtime = runtimeFor({ ledger, api: reservationApi(), live: () => collectPerSessionLiveDecisions(tracked) });
+      await runtime.settleProvedSharedConversion({
+        subjectId: identity.id, serviceId: 'claude-subscription', groupId: 'pool', retiresDecisionsDecidedAtOrBeforeMs: 10,
+        convertedRunner: { pid: 222, processInstanceFingerprint: 'fp-222' },
+      });
+      return new PerSessionAssignmentLedger(path).list().map((entry) => entry.decisionId);
+    }
+
+    it.each([
+      ['old then converted', [old, converted]],
+      ['converted then old', [converted, old]],
+    ] as const)('keeps d1 while the old runner still carries it (%s)', async (_label, tracked) => {
+      expect(await settleWith(tracked)).toEqual(['d1']);
+    });
+
+    it('settles d1 when only the converted runner lists it', async () => {
+      expect(await settleWith([converted])).toEqual([]);
+    });
+
+    it('keeps d1 when the converted runner is listed without a process instance', async () => {
+      const { processInstanceFingerprint: _omitted, ...withoutInstance } = converted;
+      expect(await settleWith([withoutInstance as ReturnType<typeof carrier>])).toEqual(['d1']);
+    });
+  });
+
   it('keeps custody once a launch adapter was entered, even when no runner pid was observed (HPI-02)', async () => {
     const ledgerPath = await ledgerAt();
     const ledger = new PerSessionAssignmentLedger(ledgerPath);

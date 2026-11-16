@@ -787,6 +787,9 @@ export async function requestConnectedClaudeSessionSpawn(
       agent: 'claude',
       backendTarget: { kind: 'builtInAgent', agentId: 'claude' },
       sessionId: params.sessionId,
+      // A distinct spawn per request, as a real client sends: identical nonce-less requests are
+      // coalesced into one session by the daemon (duplicate-submission protection).
+      spawnNonce: `e2e-${randomBytes(12).toString('hex')}`,
       terminal: { mode: 'plain' },
       ...(params.initialPrompt ? { initialPrompt: params.initialPrompt } : {}),
       environmentVariables: {

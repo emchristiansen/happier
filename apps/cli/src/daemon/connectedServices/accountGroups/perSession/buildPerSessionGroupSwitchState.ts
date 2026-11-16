@@ -4,6 +4,7 @@ import type { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from '../quot
 import {
   buildConnectedServiceAuthGroupSwitchState,
   buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState,
+  mergePersistedMemberRuntimeState,
 } from '../switching/buildConnectedServiceAuthGroupSwitchState';
 import {
   buildConnectedServiceAuthGroupSwitchStateFromAccountUsage,
@@ -26,21 +27,38 @@ export function buildPerSessionGroupSwitchState(params: Readonly<{
   /** Current member holds; every per-session eligibility check and draw excludes held members. */
   memberHolds: ConnectedServiceMemberHoldView;
 }>): ConnectedServiceAuthGroupSwitchState {
-  if (params.accountUsageStore) {
-    const accountUsageSwitchState = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
-      group: params.group,
-      accountUsageStore: params.accountUsageStore,
-      memberHolds: params.memberHolds,
-    });
-    if (accountUsageSwitchState.kind === 'source_backed') return accountUsageSwitchState.state;
-  }
-  if (params.runtimeQuotaSnapshots) {
-    return buildConnectedServiceAuthGroupSwitchState({
+  const runtimeState = params.runtimeQuotaSnapshots
+    ? buildConnectedServiceAuthGroupSwitchState({
       group: params.group,
       runtimeQuotaSnapshots: params.runtimeQuotaSnapshots,
       nowMs: params.nowMs,
       memberHolds: params.memberHolds,
+    })
+    : null;
+  if (params.accountUsageStore) {
+    const accountUsage = buildConnectedServiceAuthGroupSwitchStateFromAccountUsage({
+      group: params.group,
+      accountUsageStore: params.accountUsageStore,
+      memberHolds: params.memberHolds,
     });
+    if (accountUsage.kind === 'source_backed') {
+      if (!runtimeState) return accountUsage.state;
+      // Per member: an account-usage record wins; a member without one keeps its runtime quota
+      // snapshot. One member's record (for example after its classified failure) must not erase the
+      // other members' scores and push a failover draw into the unknown-score fallback.
+      const memberStatesByProfileId = new Map(accountUsage.state.memberStatesByProfileId);
+      for (const member of params.group.members) {
+        const profileId = member.profileId.trim();
+        if (!profileId || accountUsage.sourceRefsByProfileId.has(profileId)) continue;
+        memberStatesByProfileId.set(
+          profileId,
+          runtimeState.memberStatesByProfileId.get(member.profileId)
+            ?? mergePersistedMemberRuntimeState(null, member.state),
+        );
+      }
+      return { ...accountUsage.state, memberStatesByProfileId };
+    }
   }
-  return buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group: params.group, memberHolds: params.memberHolds });
+  return runtimeState
+    ?? buildConnectedServiceAuthGroupSwitchStateFromPersistedMemberState({ group: params.group, memberHolds: params.memberHolds });
 }

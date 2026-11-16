@@ -61,6 +61,8 @@ export function collectPerSessionLiveDecisions(tracked: Iterable<TrackedSessionL
         ...(pending && pending.home !== 'group' ? [{ assignment: pending, isApplied: false }] : []),
       ];
       for (const { assignment, isApplied } of carried) {
+        // Every runner carrying the decision is kept, whatever the tracking order (R19-CONV-MULTIPLICITY-01).
+        const carriers = [...(decisions.get(assignment.decisionId)?.carriers ?? []), runner];
         decisions.set(assignment.decisionId, {
           serviceId: serviceId as ConnectedServiceId,
           groupId: binding.groupId,
@@ -74,6 +76,7 @@ export function collectPerSessionLiveDecisions(tracked: Iterable<TrackedSessionL
           ...(assignment.offsetPercent === undefined ? {} : { offsetPercent: assignment.offsetPercent }),
           ...(assignment.probability === undefined ? {} : { probability: assignment.probability }),
           ...(runner ? { runner } : {}),
+          carriers,
         });
       }
     }

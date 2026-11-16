@@ -107,14 +107,13 @@ export type PerSessionProvedSharedConversion = Readonly<{
   convertedRunner?: PerSessionAssignmentRunner;
 }>;
 
-/** A per-session decision a live runner currently carries in its bindings. */
-/** Same process instance: the pid, and the fingerprint whenever both sides record one. */
-function isSameRunnerInstance(left: PerSessionAssignmentRunner, right: PerSessionAssignmentRunner): boolean {
-  if (left.pid !== right.pid) return false;
-  return !left.processInstanceFingerprint || !right.processInstanceFingerprint
-    || left.processInstanceFingerprint === right.processInstanceFingerprint;
+/** Exactly the same process instance: equal pid and equal, known fingerprints on both sides. */
+function isExactRunnerInstance(left: PerSessionAssignmentRunner, right: PerSessionAssignmentRunner): boolean {
+  return left.pid === right.pid && left.processInstanceFingerprint !== undefined
+    && left.processInstanceFingerprint === right.processInstanceFingerprint;
 }
 
+/** A per-session decision a live runner currently carries in its bindings. */
 export type PerSessionLiveDecision = Readonly<{
   serviceId: ConnectedServiceId;
   groupId: string;
@@ -130,6 +129,12 @@ export type PerSessionLiveDecision = Readonly<{
   probability?: number | null;
   /** The live runner carrying the decision; a rebuilt entry keeps it for later retirement (HPI-33). */
   runner?: PerSessionAssignmentRunner;
+  /**
+   * Every live runner carrying the decision (null for a runner whose identity is unknown). Several
+   * runners of one session may carry it at once, e.g. an old member-home runner and the runner
+   * converting the session (R19-CONV-MULTIPLICITY-01). Absent means `[runner ?? null]`.
+   */
+  carriers?: ReadonlyArray<PerSessionAssignmentRunner | null>;
 }>;
 
 type Log = (event: string, detail: Record<string, unknown>) => void;
@@ -300,10 +305,14 @@ export class PerSessionAssignmentRuntime {
    */
   async settleProvedSharedConversion(conversion: PerSessionProvedSharedConversion): Promise<void> {
     this.log('per_session_shared_conversion_proved', { ...conversion });
+    // A decision stays live while any runner other than the converted one (exactly that process
+    // instance) carries it, or a carrier's identity is unknown. The converted runner's own listing
+    // lags (its launch binding keeps the previous member until adoption) and never keeps it alive.
     const converted = conversion.convertedRunner;
     const live = new Set(this.input.listLiveDecisions()
-      .filter((decision) => !(converted && decision.subjectId === conversion.subjectId && decision.runner
-        && isSameRunnerInstance(decision.runner, converted)))
+      .filter((decision) => (decision.carriers ?? [decision.runner ?? null]).some((carrier) => (
+        carrier === null || !converted || decision.subjectId !== conversion.subjectId || !isExactRunnerInstance(carrier, converted)
+      )))
       .map((decision) => decision.decisionId));
     for (const entry of this.input.ledger.list()) {
       if (!sameSubject(entry, { ...conversion, sessionId: conversion.subjectId })) continue;
