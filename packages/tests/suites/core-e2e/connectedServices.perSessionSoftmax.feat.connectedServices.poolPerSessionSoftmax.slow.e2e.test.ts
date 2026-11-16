@@ -484,6 +484,90 @@ describe('core e2e: per-session softmax connected-service account selection', ()
     expect(asRecord((await readSessionBinding(f, sessionId))?.member)).toMatchObject({ profileId: 'alpha', decisionId });
   }, 180_000);
 
+  // T7 (first part) through the real runtime-auth failure route: a usage-limit failure on one
+  // session's member draws a new per-session decision and restarts only that session onto the new
+  // member's own home with the same native resume id; its provider adoption applies the new member.
+  // Other sessions and the shared pointer are untouched (spec A.4, A.5 C1–C5).
+  it('T7: a usage-limit failure restarts only that session onto another member, resuming the same native session', async () => {
+    const f = fx();
+    const groupId = 'failover-t7';
+    const created = await createGroup(f, {
+      groupId,
+      members: POOL_MEMBERS.map((profileId) => ({ profileId })),
+      activeProfileId: 'gamma',
+      policy: { strategy: 'per_session_softmax', autoSwitch: true, recoveryMode: 'switch_or_wait' },
+    });
+    expect(created.status, JSON.stringify(created.data)).toBe(200);
+    const generationBefore = asRecord(created.data.group)!.generation;
+    const start = async (initialProfileId: string) => {
+      const sessionId = await spawnConnectedClaudeSession({
+        fixture: f, sessionId: randomUUID(), groupId, initialProfileId, extraEnvironmentVariables: fakeClaudeEnv,
+      });
+      await enqueueEncryptedUiTextMessage({
+        baseUrl: f.serverBaseUrl, token: f.auth.token, secret: f.accountSecret,
+        sessionId, text: `PER_SESSION_T7_${initialProfileId}_${randomUUID()}`,
+      });
+      await waitFor(async () => asRecord((await readSessionBinding(f, sessionId))?.member)?.profileId === initialProfileId,
+        { timeoutMs: 60_000, context: `initial adoption on ${initialProfileId}` });
+      return sessionId;
+    };
+    const failing = await start('alpha');
+    const bystander = await start('beta');
+    const pidsBefore = await listRunnerPids(f);
+    const nativeSessionId = String((await readSessionMetadata(f, failing))?.claudeSessionId ?? '');
+    expect(nativeSessionId.length).toBeGreaterThan(0);
+    const appliedBefore = asRecord((await readSessionBinding(f, failing))?.member)!;
+
+    const failure = await daemonControlPostJson<UnknownRecord>({
+      port: f.daemonPort, path: '/connected-service-runtime-auth/failure', controlToken: f.controlToken,
+      body: {
+        sessionId: failing, switchesThisTurn: 0,
+        classification: {
+          kind: 'usage_limit', limitCategory: 'quota', serviceId: CLAUDE_SUBSCRIPTION_SERVICE_ID, profileId: 'alpha', groupId,
+          resetsAtMs: Date.now() + 3_600_000, retryAfterMs: 3_600_000, quotaScope: 'account', providerLimitId: 'weekly',
+          action: null, planType: null, rateLimits: null, source: 'structured_provider_error',
+        },
+      },
+      timeoutMs: 120_000,
+    });
+    expect(failure.status, JSON.stringify(failure.data)).toBe(200);
+    expect(JSON.stringify(failure.data)).not.toContain('recovery_terminal');
+
+    // The new decision is materialized for this session only, on another member.
+    let target = '';
+    await waitFor(async () => {
+      const pending = asRecord((await readSessionBinding(f, failing))?.materializedAssignment);
+      target = String(pending?.profileId ?? '');
+      return target.length > 0;
+    }, { timeoutMs: 30_000, context: 'failover target materialized' });
+    expect(target).not.toBe('alpha');
+
+    // The runner is restarted (a new process) onto the target member's own home, resuming the same native session.
+    await waitFor(async () => {
+      const pid = (await listRunnerPids(f)).get(failing);
+      return typeof pid === 'number' && pid !== pidsBefore.get(failing);
+    }, { timeoutMs: 60_000, context: 'failing session runner restarted' });
+    await enqueueEncryptedUiTextMessage({
+      baseUrl: f.serverBaseUrl, token: f.auth.token, secret: f.accountSecret,
+      sessionId: failing, text: `PER_SESSION_T7_after_${randomUUID()}`,
+    });
+    await waitFor(async () => {
+      const member = asRecord((await readSessionBinding(f, failing))?.member);
+      return member?.profileId === target && member.decisionId !== appliedBefore.decisionId;
+    }, { timeoutMs: 90_000, context: `adoption of failover target ${target}` });
+    const invocations = ((await readFakeClaudeLogEvents(f.fakeClaudeLogPath)) as UnknownRecord[])
+      .filter((event) => event.type === 'invocation' && String(event.claudeConfigDir ?? '').includes(`/claude-subscription/${target}/`));
+    expect(invocations.some((event) => JSON.stringify(event.argv).includes(nativeSessionId)),
+      `an invocation on ${target}'s home resumes ${nativeSessionId}: ${JSON.stringify(invocations.map((event) => event.argv))}`).toBe(true);
+
+    // Only the failing session moved; the shared pointer and generation did not.
+    expect((await listRunnerPids(f)).get(bystander)).toBe(pidsBefore.get(bystander));
+    expect(asRecord((await readSessionBinding(f, bystander))?.member)?.profileId).toBe('beta');
+    const groupAfter = await readGroup(f, groupId);
+    expect(groupAfter.activeProfileId).toBe('gamma');
+    expect(groupAfter.generation).toBe(generationBefore);
+  }, 300_000);
+
   it('T2 (subset): a shared group rejects initialProfileId; configuration-invalid named starts reject', async () => {
     const f = fx();
     const sharedGroupId = 'shared-t2';

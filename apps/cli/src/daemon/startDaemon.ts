@@ -566,6 +566,7 @@ import {
   type ProviderObservedAccountProvenance,
 } from './connectedServices/sessionAuthSwitch/providerObservedAccountMetadata';
 import { resolveProviderObservationProvenance } from './connectedServices/sessionAuthSwitch/resolveProviderObservationProvenance';
+import { DEFAULT_CONNECTED_SERVICE_RUNTIME_AUTH_APPLY_CAPABILITY } from './connectedServices/credentials/lifecycleTypes';
 import {
   PerSessionAssignmentLedger,
   resolvePerSessionAssignmentLedgerPath,
@@ -6118,6 +6119,12 @@ export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}
               });
             },
             runtimeAuthApplyCapabilityResolver: async ({ agentId }) => {
+              // A per-session assignment moves the session to another home (a member's own home, or
+              // the group home when converting). A provider's direct live auth surface is the home the
+              // runner already uses, so it cannot apply such a move: only a restart onto the new home
+              // can (spec A.5 C3, T7). Declaring the descriptor's capability here would make the switch
+              // policy demand a hot apply and leave the session on its failed member.
+              if (generationInput.perSessionBinding) return DEFAULT_CONNECTED_SERVICE_RUNTIME_AUTH_APPLY_CAPABILITY;
               const lifecycleDescriptor = await resolveConnectedServiceCredentialLifecycleDescriptor(agentId);
               return lifecycleDescriptor.runtimeAuthApply;
             },
