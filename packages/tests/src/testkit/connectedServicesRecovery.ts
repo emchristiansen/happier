@@ -18,6 +18,7 @@
 // each class substitutes for.
 
 import { once } from 'node:events';
+import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -573,6 +574,13 @@ export async function startConnectedServicesClaudeDaemon(params: Readonly<{
   accountSettings?: Readonly<Record<string, unknown>>;
   serverExtraEnv?: Record<string, string>;
   extraEnv?: Record<string, string>;
+  /**
+   * An already-prepared CLI dist snapshot (for example an installed release payload: `package-dist/`
+   * and `node_modules/` beside a `.cli-dist-snapshot.ready.json` marker). When set, the daemon and
+   * every session runner it spawns run that exact build instead of the repository source entrypoint,
+   * and no repository CLI build or snapshot is prepared.
+   */
+  cliSnapshotDir?: string;
 }>): Promise<StartedConnectedServicesClaudeDaemonFixture> {
   const startedAt = new Date().toISOString();
   const server = await startServerLight({
@@ -654,7 +662,9 @@ export async function startConnectedServicesClaudeDaemon(params: Readonly<{
     HAPPIER_E2E_FAKE_CLAUDE_LOG: params.fakeClaudeLogPath,
     HAPPIER_E2E_FAKE_CLAUDE_REQUIRE_NATIVE_OAUTH: '1',
     ...(params.fakeClaudeScenario ? { HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: params.fakeClaudeScenario } : {}),
-    HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1',
+    ...(params.cliSnapshotDir
+      ? resolvePreparedCliSnapshotSubprocessEnv(params.cliSnapshotDir)
+      : { HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT: '1' }),
     HAPPIER_CONNECTED_SERVICES_REFRESH_ENABLED: '1',
     HAPPIER_CONNECTED_SERVICES_REFRESH_TICK_MS: '300000',
     HAPPIER_CONNECTED_SERVICES_AUTH_GROUP_RESTART_SIGNAL_DELAY_MS: '0',
@@ -663,12 +673,19 @@ export async function startConnectedServicesClaudeDaemon(params: Readonly<{
     ...(params.extraEnv ?? {}),
   };
 
-  await ensureCliSharedDepsBuilt({ testDir: params.testDir, env: daemonEnv });
+  if (params.cliSnapshotDir) {
+    // The prepared build is used as-is; an inherited source-entrypoint request must not redirect it.
+    delete daemonEnv.HAPPIER_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT;
+    delete daemonEnv.HAPPY_E2E_PROVIDER_USE_CLI_SOURCE_ENTRYPOINT;
+  } else {
+    await ensureCliSharedDepsBuilt({ testDir: params.testDir, env: daemonEnv });
+  }
   const daemon = await startTestDaemon({
     testDir: params.testDir,
     happyHomeDir: daemonHomeDir,
     env: daemonEnv,
     startupTimeoutMs: 120_000,
+    ...(params.cliSnapshotDir ? { snapshotDir: params.cliSnapshotDir, preparedDistSnapshotOnly: true } : {}),
   });
   await waitForDaemonControlList({
     daemonPort: daemon.state.httpPort,
@@ -689,6 +706,25 @@ export async function startConnectedServicesClaudeDaemon(params: Readonly<{
     controlToken: daemon.state.controlToken,
     fakeClaudeLogPath: params.fakeClaudeLogPath,
     fakeClaudeScenario: params.fakeClaudeScenario ?? null,
+  };
+}
+
+/** The entrypoint of a prepared CLI dist snapshot, as `resolveCliTestLaunchSpec` resolves it. */
+export function resolvePreparedCliSnapshotEntrypoint(snapshotDir: string): string {
+  const packageEntrypoint = resolve(snapshotDir, 'dist', 'index.mjs');
+  return existsSync(packageEntrypoint) ? packageEntrypoint : resolve(snapshotDir, 'package-dist', 'index.mjs');
+}
+
+/**
+ * Pins the daemon's session-runner subprocesses to the prepared snapshot's entrypoint. Without it a
+ * dev-variant daemon prefers a TSX source runner, and the test launch spec of a prepared snapshot
+ * (`--preserve-symlinks <entrypoint>`) does not carry the entrypoint to subprocesses by itself.
+ */
+function resolvePreparedCliSnapshotSubprocessEnv(snapshotDir: string): Record<string, string> {
+  return {
+    HAPPIER_CLI_SUBPROCESS_RUNTIME: 'node',
+    HAPPIER_CLI_SUBPROCESS_ENTRYPOINT: resolvePreparedCliSnapshotEntrypoint(snapshotDir),
+    HAPPIER_CLI_SUBPROCESS_PREFER_TSX: '0',
   };
 }
 
@@ -721,14 +757,28 @@ export async function spawnConnectedClaudeGroupSession(params: Readonly<{
   return spawnConnectedClaudeSession(params);
 }
 
-export async function spawnConnectedClaudeSession(params: Readonly<{
+export type SpawnConnectedClaudeSessionParams = Readonly<{
   fixture: StartedConnectedServicesClaudeDaemonFixture;
   sessionId: string;
   groupId?: string;
-  profileId: string;
+  /** Requested fallback profile; optional for group bindings. */
+  profileId?: string;
+  /** Explicit start member for a per_session_softmax group (spec A.1). */
+  initialProfileId?: string;
   initialPrompt?: string;
-}>): Promise<string> {
-  const response = await daemonControlPostJson<{ success?: boolean; sessionId?: unknown; error?: string }>({
+  extraEnvironmentVariables?: Readonly<Record<string, string>>;
+}>;
+
+export type SpawnConnectedClaudeSessionResponse = Readonly<{
+  status: number;
+  data: { success?: boolean; sessionId?: unknown; error?: string; errorCode?: string };
+}>;
+
+/** POSTs a daemon `/spawn-session` for a connected Claude binding and returns the raw response. */
+export async function requestConnectedClaudeSessionSpawn(
+  params: SpawnConnectedClaudeSessionParams,
+): Promise<SpawnConnectedClaudeSessionResponse> {
+  return await daemonControlPostJson<SpawnConnectedClaudeSessionResponse['data']>({
     port: params.fixture.daemonPort,
     path: '/spawn-session',
     controlToken: params.fixture.controlToken,
@@ -751,6 +801,7 @@ export async function spawnConnectedClaudeSession(params: Readonly<{
         ...(params.fixture.fakeClaudeScenario
           ? { HAPPIER_E2E_FAKE_CLAUDE_SCENARIO: params.fixture.fakeClaudeScenario }
           : {}),
+        ...(params.extraEnvironmentVariables ?? {}),
       },
       connectedServices: {
         v: 1,
@@ -758,13 +809,18 @@ export async function spawnConnectedClaudeSession(params: Readonly<{
           [CLAUDE_SUBSCRIPTION_SERVICE_ID]: {
             source: 'connected',
             ...(params.groupId ? { selection: 'group', groupId: params.groupId } : {}),
-            profileId: params.profileId,
+            ...(params.profileId ? { profileId: params.profileId } : {}),
+            ...(params.initialProfileId ? { initialProfileId: params.initialProfileId } : {}),
           },
         },
       },
     },
     timeoutMs: 90_000,
   });
+}
+
+export async function spawnConnectedClaudeSession(params: SpawnConnectedClaudeSessionParams): Promise<string> {
+  const response = await requestConnectedClaudeSessionSpawn(params);
   if (response.status !== 200 || response.data?.success !== true) {
     throw new Error(`Expected Claude group spawn success (status=${response.status}, data=${JSON.stringify(response.data)})`);
   }

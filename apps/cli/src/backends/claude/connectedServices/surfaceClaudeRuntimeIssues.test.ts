@@ -1764,6 +1764,38 @@ describe('R3-4: Claude in-band evidence becomes source-backed → predictive sof
     } finally { warning.mockRestore(); }
   });
 
+  it.each([
+    ['pending materialized member', { materializedAssignment: { profileId: 'alpha', decisionId: 'd1', reason: 'initial_sampled', materializedAtMs: 1 } }, 'pool'],
+    ['applied member', { member: { assignment: 'per_session', profileId: 'alpha', decisionId: 'd1', reason: 'initial_sampled', appliedAtMs: 1 } }, 'pool'],
+    ['a different materialized member', { materializedAssignment: { profileId: 'beta', decisionId: 'd1', reason: 'initial_sampled', materializedAtMs: 1 } }, null],
+    ['no assignment', {}, null],
+  ] as const)('reports a per-session runner (profile launch, group binding) against its group only for %s', async (_label, assignment, expectedGroupId) => {
+    // per_session_softmax runners launch with their member's PROFILE selection; the session binding
+    // names the group. Adoption (T1/T19) depends on this report reaching the daemon.
+    process.env[HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY] = JSON.stringify([{
+      kind: 'profile', serviceId: 'claude-subscription', profileId: 'alpha', credentialRevision: null,
+    }]);
+    mockNotifyDaemonConnectedServiceTurnLifecycle.mockClear();
+    const metadata = { connectedServices: { v: 1, bindingsByServiceId: { 'claude-subscription': {
+      source: 'connected', selection: 'group', groupId: 'pool', ...assignment } } } };
+    observeClaudeRuntimeAuthTranscript({ sessionId: 'native-session',
+      client: { sessionId: 'per-session-runner', getMetadataSnapshot: () => metadata } }, {
+      type: 'attachment', sessionId: 'native-session', timestamp: '2026-11-02T13:59:39.000Z',
+      attachment: { type: 'credential_org', organizationUuid: 'org-alpha' },
+    });
+    if (expectedGroupId === null) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(mockNotifyDaemonConnectedServiceTurnLifecycle).not.toHaveBeenCalled();
+      return;
+    }
+    await vi.waitFor(() => expect(mockNotifyDaemonConnectedServiceTurnLifecycle).toHaveBeenCalledWith({
+      sessionId: 'per-session-runner', event: 'provider_identity_observed', providerIdentity: {
+        serviceId: 'claude-subscription', groupId: expectedGroupId, providerOrganizationId: 'org-alpha',
+        sourceSessionId: 'native-session', observedAtMs: 1793627979000,
+      },
+    }));
+  });
+
   it('enriches passive quota evidence with the live account identity → source-linked PAU (soft-switch eligible)', async () => {
     await writeMaterializedClaudeConfig({ accountUuid: 'acct_live_uuid', emailAddress: 'pool@happier.dev', organizationUuid: 'org-pool' });
     // A group home's identity is attributable only with the provenance naming the session's tuple.

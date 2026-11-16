@@ -317,6 +317,69 @@ function readReadySignalObjective(signalPath) {
   }
 }
 
+// Provider account attestation: when `HAPPIER_E2E_FAKE_CLAUDE_CREDENTIAL_ORG_BY_ACCESS_TOKEN` maps
+// native OAuth access tokens to organization uuids (JSON object), each SDK turn appends Claude-native
+// `credential_org` transcript attachments naming the organization of the access token this process
+// actually reads from its `.credentials.json`, as real Claude reports the account a request used.
+// Repeated a few times after the turn because the runner's transcript follower starts at the end of
+// file once it learns the transcript path.
+function readCredentialOrgByAccessToken() {
+  const raw = String(process.env.HAPPIER_E2E_FAKE_CLAUDE_CREDENTIAL_ORG_BY_ACCESS_TOKEN || '').trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+const credentialOrgByAccessToken = readCredentialOrgByAccessToken();
+const credentialOrgAttachmentDelaysMs = [250, 1500, 4000];
+
+function appendCredentialOrgAttachment(trigger) {
+  const accessToken = readCurrentNativeOauthAccessToken();
+  const organizationUuid = credentialOrgByAccessToken && typeof credentialOrgByAccessToken[accessToken] === 'string'
+    ? credentialOrgByAccessToken[accessToken]
+    : null;
+  const event = {
+    type: 'credential_org_attachment',
+    invocationId,
+    sessionId,
+    trigger,
+    ts: Date.now(),
+    claudeConfigDir: resolveClaudeConfigDir(),
+    accessTokenSha256: accessToken ? sha256Text(accessToken) : null,
+    organizationUuid,
+  };
+  if (!organizationUuid) {
+    safeAppendJsonl(logPath, { ...event, emitted: false });
+    return;
+  }
+  safeAppendTranscriptJsonl({
+    type: 'attachment',
+    uuid: randomUUID(),
+    parentUuid: null,
+    isSidechain: false,
+    sessionId,
+    timestamp: new Date().toISOString(),
+    userType: 'external',
+    entrypoint: 'sdk-cli',
+    cwd: process.cwd(),
+    version: '0.0.0-fake',
+    attachment: { type: 'credential_org', organizationUuid },
+  });
+  safeAppendJsonl(logPath, { ...event, emitted: true });
+}
+
+function scheduleCredentialOrgAttachments(turn) {
+  if (!credentialOrgByAccessToken) return;
+  for (const delayMs of credentialOrgAttachmentDelaysMs) {
+    const timer = setTimeout(() => appendCredentialOrgAttachment(`turn_${turn}_${delayMs}ms`), delayMs);
+    timer.unref?.();
+  }
+}
+
 /**
  * Append a Claude-native `goal_status` transcript `attachment` record, matching
  * the real Claude Code shape (and the captured fixtures under
@@ -847,6 +910,7 @@ async function runSdkStreamUntilEof() {
 
     const now = Date.now();
     turn += 1;
+    scheduleCredentialOrgAttachments(turn);
 
     // Persist the first rejection in the existing log so a restarted SDK child
     // accepts the continuation for the same provider session.
