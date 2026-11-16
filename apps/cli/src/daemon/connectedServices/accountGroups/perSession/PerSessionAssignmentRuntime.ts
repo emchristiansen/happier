@@ -554,7 +554,10 @@ export class PerSessionAssignmentRuntime {
     for (const entry of entries.values()) {
       if (entry.state === 'applied' && live.get(entry.decisionId)?.applied) await this.settleAdoption(entry, { includePreviouslyApplied: false });
     }
-    for (const conversion of listedConversions) {
+    // Every proved conversion the tick filters with is (re)settled, remembered callback proofs as well
+    // as readback: one deferred by an independent carrier settles once that carrier retires, even while
+    // the converted runner's metadata still lags and readback is empty (R21-CONVERSION-DEFERRED-01).
+    for (const conversion of conversions) {
       await this.settleProvedSharedConversion(conversion);
     }
     entries = new Map(this.input.ledger.list().map((entry) => [entry.decisionId, entry]));
