@@ -39,6 +39,13 @@ function pendingAuthStatePath(publicKey: Uint8Array): string {
   return join(pendingAuthStateDir(), `${publicKeyHex}.json`);
 }
 
+// A finished request's pending state (its secret key and claim secret) and its public occurrence record
+// (written beside it by `auth request`) are both dropped.
+async function unlinkPendingAuthState(statePath: string): Promise<void> {
+  await unlink(statePath).catch(() => {});
+  await unlink(statePath.replace(/\.json$/, '.request.json')).catch(() => {});
+}
+
 function decodePublicKey(value: string): Uint8Array {
   const raw = String(value ?? '').trim();
   if (!raw) throw new Error('Missing --public-key');
@@ -135,7 +142,7 @@ export async function handleAuthWait(argsRaw: string[]): Promise<void> {
     const { machineId } = await ensureMachineIdForCredentials(existing);
     // This request is finished, whichever way it ended: drop its pending state — which holds the
     // request's secret key and claim secret — exactly as the claiming paths below do.
-    await unlink(statePath).catch(() => {});
+    await unlinkPendingAuthState(statePath);
     await writeJsonStdout({
       success: true,
       ...tokenField(existing.token),
@@ -200,7 +207,7 @@ export async function handleAuthWait(argsRaw: string[]): Promise<void> {
       if (opened.type === 'tokenOnly') {
         const credentials = await writeCredentialsTokenOnly({ token });
         const { machineId } = await ensureMachineIdForCredentials(credentials);
-        await unlink(statePath).catch(() => {});
+        await unlinkPendingAuthState(statePath);
         await writeJsonStdout({
           success: true,
           ...tokenField(token),
@@ -221,7 +228,7 @@ export async function handleAuthWait(argsRaw: string[]): Promise<void> {
           },
         };
         const { machineId } = await ensureMachineIdForCredentials(credentials);
-        await unlink(statePath).catch(() => {});
+        await unlinkPendingAuthState(statePath);
         await writeJsonStdout({
           success: true,
           ...tokenField(token),
@@ -245,7 +252,7 @@ export async function handleAuthWait(argsRaw: string[]): Promise<void> {
           },
         };
         const { machineId } = await ensureMachineIdForCredentials(credentials);
-        await unlink(statePath).catch(() => {});
+        await unlinkPendingAuthState(statePath);
         await writeJsonStdout({
           success: true,
           ...tokenField(token),
