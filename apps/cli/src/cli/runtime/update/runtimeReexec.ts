@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 import { compareVersions } from '@happier-dev/cli-common/update';
 import { getReleaseRingCatalogEntry, getReleaseRingPublicLabel, type PublicReleaseRingId } from '@happier-dev/release-runtime/releaseRings';
+import { assertCredentialsAreNotDescriptorBound } from '@/persistence';
 import { ensureJavaScriptRuntimeExecutable } from '../../../runtime/js/ensureJavaScriptRuntimeExecutable';
 import { isBun } from '../../../utils/runtime';
 
@@ -78,6 +79,9 @@ export async function maybeReexecToRuntime(params: Readonly<{
   const localVersion = readVersion(localPkgJson);
   if (!runtimeVersion || !localVersion) return;
   if (compareVersions(runtimeVersion, localVersion) <= 0) return;
+  // The replacement process would not inherit HAPPIER_CREDENTIALS_FD/HAPPIER_CREDENTIALS_SINK_FD and would read the
+  // native credential store instead, so descriptor mode refuses here, before a runtime is resolved or launched.
+  assertCredentialsAreNotDescriptorBound('Re-executing into the installed newer Happier runtime');
 
   const execImpl = params.exec ?? execFileSync;
   const ensureRuntimeExecutable = params.ensureRuntimeExecutable ?? ensureJavaScriptRuntimeExecutable;
