@@ -134,6 +134,34 @@ flow. A genuinely revisionless application observation is retryable and never
 acknowledged as runner availability. Provider identity checks and write fences
 remain intact.
 
+### Exact-profile credential health (0.2 development)
+
+`GET /v3/connect/:serviceId/profiles/:profileId/credential/health` returns one
+stored profile's canonical credential status and health, `{ profileId, status,
+health }`. The server reads the row by its account, service and profile key
+only; an absent profile is `404 { error: "connect_credential_not_found" }`.
+The daemon's spawn and direct-resume health preflight, its pre-refresh health
+reprobe and in-place session auth switching read selected profiles this way.
+They no longer list `GET /v2/connect/:serviceId/profiles`, which returns every
+profile of the service with provider identity. That list and its UI callers are
+unchanged.
+
+A new CLI against a server without the route receives a plain 404 and reports
+`connected_service_credential_health_read_unavailable`. Health that cannot be
+read (an old server, a malformed response, a transport failure, a profile
+without a health row, or a client without the reader) is never treated as
+healthy. Spawn, resume and switch refuse instead of skipping the check or
+falling back to the list. Health-gated refresh (scheduled, spawn preflight,
+runtime auth failure and the quota and provider-auth bridges) returns
+`credential_health_unavailable` before taking a refresh lease or calling the
+provider. The provider-auth bridge also refuses to serve a setup token or adopt
+the current token, forced or not, until it has read the profile's health.
+Health actually read as needing reauthentication still permits the existing
+paced refresh reprobe, and a forced bridge retry may still adopt a current
+token newer than the failing one. Deploy the server before the daemon; a new
+daemon against an old server cannot refresh or serve connected credentials.
+Older CLIs are unaffected because the v2 list keeps its shape.
+
 ### Quota recovery details (0.2 development)
 
 Reset availability remains in the existing strict recovery-credit inventory.

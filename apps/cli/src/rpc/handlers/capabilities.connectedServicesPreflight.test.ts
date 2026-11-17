@@ -256,8 +256,8 @@ describe('capabilities.invoke connected-service preflight', () => {
         : path === '/v3/connect/openai-codex/groups/happier' ? { group }
         : path === '/v3/connect/openai-codex/profiles/leeroy/credential'
           ? { content: { t: 'plain', v: credentialRecord }, credentialRevision: 'csr_1123456789ABCDEFGHJKMNPQRS' }
-        : path === '/v2/connect/openai-codex/profiles'
-          ? { serviceId: 'openai-codex', profiles: [{ profileId: 'leeroy', status: 'connected' }] } : null;
+        : path === '/v3/connect/openai-codex/profiles/leeroy/credential/health'
+          ? { profileId: 'leeroy', status: 'connected', health: null } : null;
       if (!data) throw new Error(`Unexpected selected-account HTTP request: ${path}`);
       return { status: 200, data };
     });

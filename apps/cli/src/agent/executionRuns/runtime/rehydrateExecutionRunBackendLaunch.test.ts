@@ -67,6 +67,9 @@ describe('resolveExecutionRunResumeBackendOptions', () => {
         members: ['primary', 'backup'].map((profileId, priority): ConnectedServiceAuthGroupV1['members'][number] => ({ v: 1, serviceId: 'openai-codex', groupId: 'team',
           profileId, enabled: true, priority, state: { v: 1 }, createdAt: 1, updatedAt: 1 })),
       }),
+      readConnectedServiceCredentialHealth: async ({ profileId }: { profileId: string }) => (records.has(profileId)
+        ? { kind: 'found' as const, status: 'connected' as const, health: null }
+        : { kind: 'not_found' as const }),
       getConnectedServiceCredentialPlain: async ({ profileId }: { profileId: string }) => {
         const record = records.get(profileId);
         return record ? { content: { t: 'plain' as const, v: record }, revisionSemantics: 'legacy_unfenced' as const, credentialRevision: null } : null;
@@ -144,6 +147,7 @@ describe('resolveExecutionRunResumeBackendOptions', () => {
         runtimeRegistry: null,
         resolveAuthForSpawn: async (params) => {
           const materialized = await materializeConnectedServicesForSpawn({
+            nativeSourceAuthority: 'caller_env',
             agentId: 'codex', materializationKey: params.materializationKey,
             activeServerDir: join(sandbox, 'server'), baseDir: join(sandbox, 'materialized'),
             previousMaterializedRoot: params.previousMaterializedRoot,

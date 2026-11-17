@@ -1,4 +1,4 @@
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import type {
   AccountSettings,
@@ -10,7 +10,9 @@ import type { ConnectedServicesMaterializationDiagnostic } from '@/daemon/connec
 import type { ConnectedServicesProviderMaterializerInput } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import type { ConnectedServiceResolvedSelection } from '@/daemon/connectedServices/materialize/materializeConnectedServicesForSpawn';
 
+import { resolveClaudeConfigDirOverride } from '@/backends/claude/utils/resolveClaudeConfigDirOverride';
 import { resolveConfiguredClaudeConfigDir } from '@/backends/claude/utils/resolveConfiguredClaudeConfigDir';
+import { findClaudeConfigurationSourceScopeViolation, isPathWithinDirectory } from './claudeConfigurationSourceScope';
 import { materializeClaudeAnthropicApiKeyAuth } from './materializeClaudeAnthropicApiKeyAuth';
 import {
   materializeClaudeSubscriptionNativeAuthHome,
@@ -39,35 +41,68 @@ function withoutClaudeConfigDirOverrides(processEnv: NodeJS.ProcessEnv): NodeJS.
   return nextEnv;
 }
 
+function isWithinDir(path: string, root: string): boolean {
+  return isPathWithinDirectory(resolve(path), resolve(root));
+}
+
+function resolveConnectedServiceManagedHomesRoot(activeServerDir: string): string {
+  return join(activeServerDir, 'daemon', 'connected-services', 'homes');
+}
+
 function isClaudeManagedConnectedServiceConfigDir(params: Readonly<{
   activeServerDir: string;
   claudeConfigDir: string;
 }>): boolean {
-  const managedHomesRoot = resolve(
-    join(params.activeServerDir, 'daemon', 'connected-services', 'homes', 'claude-subscription'),
+  return isWithinDir(
+    params.claudeConfigDir,
+    join(resolveConnectedServiceManagedHomesRoot(params.activeServerDir), 'claude-subscription'),
   );
-  const rel = relative(managedHomesRoot, resolve(params.claudeConfigDir));
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
+/** The refusal returned, with nothing read from the source, when its entries resolve out of scope. */
+function sourceScopeRefusal(params: Readonly<{
+  claudeConfigDir: string;
+  diagnostic: ConnectedServicesMaterializationDiagnostic;
+}>): ClaudeConnectedServiceSelectionMaterialization {
+  return {
+    env: { CLAUDE_CONFIG_DIR: params.claudeConfigDir },
+    targetMaterializedRoot: params.claudeConfigDir,
+    diagnostics: [params.diagnostic],
+  };
+}
+
+/**
+ * The environment naming the one permitted Claude configuration source for a managed home.
+ *
+ * Credential provenance governs auth preservation, not configuration freshness: reconcile from the
+ * configured native home, never from a materialized copy of it. A configured dir that is the target
+ * or another managed home is not a permitted source, and the ambient HOME is never substituted for
+ * it. `HAPPIER_CLAUDE_CONFIG_DIR` can still name the permitted source when an inherited
+ * `CLAUDE_CONFIG_DIR` (a daemon started inside a managed session) shadows it. Otherwise the target
+ * is its own source: nothing is imported or projected into it, and its existing state is kept.
+ */
 function resolveClaudeConfigurationSourceEnv(params: Readonly<{
   activeServerDir: string;
   processEnv: NodeJS.ProcessEnv;
   targetClaudeConfigDir: string;
 }>): NodeJS.ProcessEnv {
-  // Credential provenance governs auth preservation, not configuration freshness. Always
-  // reconcile from the configured native home, never an earlier materialized copy of it.
-  const configuredClaudeConfigDir = resolveConfiguredClaudeConfigDir({ env: params.processEnv });
-  if (
-    resolve(configuredClaudeConfigDir) === resolve(params.targetClaudeConfigDir)
-    || isClaudeManagedConnectedServiceConfigDir({
-      activeServerDir: params.activeServerDir,
-      claudeConfigDir: configuredClaudeConfigDir,
-    })
-  ) {
-    return withoutClaudeConfigDirOverrides(params.processEnv);
+  const isPermittedSource = (claudeConfigDir: string): boolean =>
+    resolve(claudeConfigDir) !== resolve(params.targetClaudeConfigDir)
+    && !isClaudeManagedConnectedServiceConfigDir({ activeServerDir: params.activeServerDir, claudeConfigDir });
+
+  if (isPermittedSource(resolveConfiguredClaudeConfigDir({ env: params.processEnv }))) {
+    return params.processEnv;
   }
-  return params.processEnv;
+  const happierOverrideEnv = { ...params.processEnv };
+  delete happierOverrideEnv.CLAUDE_CONFIG_DIR;
+  const happierOverride = resolveClaudeConfigDirOverride(happierOverrideEnv);
+  if (happierOverride && isPermittedSource(happierOverride)) {
+    return happierOverrideEnv;
+  }
+  return {
+    ...withoutClaudeConfigDirOverrides(params.processEnv),
+    CLAUDE_CONFIG_DIR: params.targetClaudeConfigDir,
+  };
 }
 
 export function buildClaudeSubscriptionNativeAuthSelectionDescriptor(params: Readonly<{
@@ -146,7 +181,7 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
       fallbackProfileId: params.fallbackProfileId,
       selection: params.selection ?? null,
     });
-    let groupSourceEnv: NodeJS.ProcessEnv | null = null;
+    let groupSource: Readonly<{ env: NodeJS.ProcessEnv; originSourceEnv: NodeJS.ProcessEnv }> | null = null;
     let groupSourceDiagnostics: readonly ConnectedServicesMaterializationDiagnostic[] = [];
     if (selectionDescriptor.kind === 'group' && !params.probeConfigDir) {
       const profileClaudeConfigDir = resolveClaudeConnectedServiceStableConfigDir({
@@ -166,14 +201,25 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
           serviceId: 'claude-subscription' as const,
           profileId: selectionDescriptor.activeProfileId,
         };
+        const profileSourceEnv = resolveClaudeConfigurationSourceEnv({
+          activeServerDir: params.activeServerDir,
+          processEnv: params.processEnv,
+          targetClaudeConfigDir: profileClaudeConfigDir,
+        });
+        const profileSourceViolation = await findClaudeConfigurationSourceScopeViolation({
+          sourceEnv: profileSourceEnv,
+          targetDir: profileClaudeConfigDir,
+          managedHomesRoot: resolveConnectedServiceManagedHomesRoot(params.activeServerDir),
+          permittedManagedHome: null,
+          serviceId: params.serviceId,
+        });
+        if (profileSourceViolation) {
+          return sourceScopeRefusal({ claudeConfigDir, diagnostic: profileSourceViolation });
+        }
         const canonicalProfileMaterialized = await materializeClaudeSubscriptionNativeAuthHome({
           record: params.record,
           targetClaudeConfigDir: profileClaudeConfigDir,
-          sourceEnv: resolveClaudeConfigurationSourceEnv({
-            activeServerDir: params.activeServerDir,
-            processEnv: params.processEnv,
-            targetClaudeConfigDir: profileClaudeConfigDir,
-          }),
+          sourceEnv: profileSourceEnv,
           accountSettings: params.accountSettings ?? null,
           sessionDirectory: params.sessionDirectory ?? null,
           vendorResumeId: params.vendorResumeId ?? null,
@@ -194,17 +240,30 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
             identityDiagnostic: canonicalProfileMaterialized.identityDiagnostic,
           };
         }
-        groupSourceEnv = {
-          ...params.processEnv,
-          ...canonicalProfileMaterialized.env,
+        groupSource = {
+          env: { ...params.processEnv, ...canonicalProfileMaterialized.env },
+          originSourceEnv: profileSourceEnv,
         };
       }
     }
-    const sourceEnv = groupSourceEnv ?? resolveClaudeConfigurationSourceEnv({
+    const sourceEnv = groupSource?.env ?? resolveClaudeConfigurationSourceEnv({
       activeServerDir: params.activeServerDir,
       processEnv: params.processEnv,
       targetClaudeConfigDir: claudeConfigDir,
     });
+    const sourceViolation = await findClaudeConfigurationSourceScopeViolation({
+      sourceEnv,
+      targetDir: claudeConfigDir,
+      managedHomesRoot: resolveConnectedServiceManagedHomesRoot(params.activeServerDir),
+      // A group's canonical member home is a deliberate managed source; no other managed home is.
+      // The native source it was materialized from keeps its permission for the links it retains.
+      permittedManagedHome: groupSource ? resolveConfiguredClaudeConfigDir({ env: groupSource.env }) : null,
+      permittedOriginSourceEnv: groupSource?.originSourceEnv ?? null,
+      serviceId: params.serviceId,
+    });
+    if (sourceViolation) {
+      return sourceScopeRefusal({ claudeConfigDir, diagnostic: sourceViolation });
+    }
     const materialized = await materializeClaudeSubscriptionNativeAuthHome({
       record: params.record,
       targetClaudeConfigDir: claudeConfigDir,
@@ -225,6 +284,23 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
     };
   }
 
+  if (params.sessionStateMode !== 'existing') {
+    const managedHomesRoot = resolveConnectedServiceManagedHomesRoot(params.activeServerDir);
+    const sourceViolation = await findClaudeConfigurationSourceScopeViolation({
+      sourceEnv: params.processEnv,
+      targetDir: claudeConfigDir,
+      managedHomesRoot,
+      // This path has always imported from the configured dir as given, including a managed home it
+      // names directly; only entries that resolve elsewhere than they appear are refused here.
+      permittedManagedHome: isWithinDir(resolveConfiguredClaudeConfigDir({ env: params.processEnv }), managedHomesRoot)
+        ? resolveConfiguredClaudeConfigDir({ env: params.processEnv })
+        : null,
+      serviceId: params.serviceId,
+    });
+    if (sourceViolation) {
+      return sourceScopeRefusal({ claudeConfigDir, diagnostic: sourceViolation });
+    }
+  }
   const diagnostics = params.sessionStateMode === 'existing' ? [] : (await syncClaudeConnectedServiceHome({
     sourceEnv: params.processEnv,
     targetDir: claudeConfigDir,

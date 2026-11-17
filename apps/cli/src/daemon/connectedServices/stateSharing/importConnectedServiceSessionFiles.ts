@@ -34,6 +34,9 @@ export async function importConnectedServiceSessionFiles(params: Readonly<{
   for (const root of params.roots) {
     const sourceRoot = resolve(root.sourceRoot);
     const destinationRoot = resolve(root.destinationRoot);
+    // A symlinked source root lists no importable files; skip it before resolving it physically, so
+    // a link into another (non-admitted) source root is never followed.
+    if (await isSymbolicLinkPath(sourceRoot)) continue;
     // Compare PHYSICAL roots: a destination symlinked into the source store (e.g. a shared-mode
     // staged home whose `projects` links to the shared store) is the same root even though the
     // lexical paths differ. Importing a store onto itself would hash every file twice for nothing
@@ -65,6 +68,15 @@ export async function importConnectedServiceSessionFiles(params: Readonly<{
     conflicted: details.filter((detail) => detail.action === 'conflicted').length,
     details,
   };
+}
+
+async function isSymbolicLinkPath(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isSymbolicLink();
+  } catch (error) {
+    if (isEnoentError(error)) return false;
+    throw error;
+  }
 }
 
 async function listImportableFiles(

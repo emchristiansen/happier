@@ -31,6 +31,7 @@ export type SessionConnectedServiceAuthSwitchErrorCode =
     | 'provider_state_sharing_unavailable'
     | 'metadata_update_failed'
     | 'restart_disallowed_by_execution_policy'
+    | 'restart_replacement_unavailable'
     | 'restart_failed'
     | 'hot_apply_failed'
     | 'bindings_rollback_failed'

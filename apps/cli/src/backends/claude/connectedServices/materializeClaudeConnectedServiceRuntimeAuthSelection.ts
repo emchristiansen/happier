@@ -241,7 +241,7 @@ export const materializeClaudeConnectedServiceRuntimeAuthSelection: ConnectedSer
     selection,
     processEnv: params.processEnv ?? process.env,
     accountSettings: params.accountSettings ?? null,
-    sessionDirectory: params.input.tracked?.spawnOptions?.directory ?? params.input.cwd ?? null,
+    sessionDirectory: continuityContext.cwd,
     vendorResumeId: continuityContext.vendorResumeId,
     candidatePersistedSessionFile: continuityContext.candidatePersistedSessionFile,
     validateGroupMutationCurrentness: createConnectedServiceGroupMutationCurrentnessValidator({

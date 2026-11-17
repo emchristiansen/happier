@@ -204,7 +204,31 @@ describe('materializeClaudeWorkspaceTrust', () => {
     });
   });
 
-  it('projects the exact top-level onboarding-complete boolean from the ambient Claude root', async () => {
+  it('projects the exact top-level onboarding-complete boolean from the explicit Claude config root', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-home-'));
+    const sourceDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-source-'));
+    const targetDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-target-'));
+    const sessionDirectory = await mkdtemp(join(tmpdir(), 'happier-claude-trust-project-'));
+
+    await writeFile(join(sourceDir, '.claude.json'), JSON.stringify({
+      hasCompletedOnboarding: true,
+      projects: { [sessionDirectory]: { hasTrustDialogAccepted: true } },
+    }));
+    await writeFile(join(homeDir, '.claude.json'), JSON.stringify({
+      hasCompletedOnboarding: false,
+    }));
+
+    await materializeClaudeWorkspaceTrust({
+      sourceEnv: { CLAUDE_CONFIG_DIR: sourceDir, HOME: homeDir },
+      targetDir,
+      sessionDirectory,
+    });
+
+    const written = JSON.parse(await readFile(join(targetDir, '.claude.json'), 'utf8')) as Record<string, unknown>;
+    expect(written.hasCompletedOnboarding).toBe(true);
+  });
+
+  it('does not project onboarding completion from the ambient HOME root when an explicit Claude config dir is set', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-home-'));
     const sourceDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-source-'));
     const targetDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-target-'));
@@ -224,10 +248,11 @@ describe('materializeClaudeWorkspaceTrust', () => {
     });
 
     const written = JSON.parse(await readFile(join(targetDir, '.claude.json'), 'utf8')) as Record<string, unknown>;
-    expect(written.hasCompletedOnboarding).toBe(true);
+    expect(written.hasCompletedOnboarding).toBeUndefined();
+    expect(written.projects).toEqual({ [sessionDirectory]: { hasTrustDialogAccepted: true } });
   });
 
-  it.each([undefined, false])('does not synthesize onboarding completion from %s', async (hasCompletedOnboarding) => {
+  it.each([undefined, false])('does not synthesize onboarding completion into an empty target from source %s', async (hasCompletedOnboarding) => {
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-home-'));
     const sourceDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-source-'));
     const targetDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-target-'));
@@ -236,9 +261,6 @@ describe('materializeClaudeWorkspaceTrust', () => {
       ...(hasCompletedOnboarding === undefined ? {} : { hasCompletedOnboarding }),
       projects: { [sessionDirectory]: { hasTrustDialogAccepted: true } },
     }));
-    if (hasCompletedOnboarding === false) {
-      await writeFile(join(homeDir, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true }));
-    }
 
     await materializeClaudeWorkspaceTrust({
       sourceEnv: { CLAUDE_CONFIG_DIR: sourceDir, HOME: homeDir },
@@ -248,6 +270,76 @@ describe('materializeClaudeWorkspaceTrust', () => {
 
     const written = JSON.parse(await readFile(join(targetDir, '.claude.json'), 'utf8')) as Record<string, unknown>;
     expect(written).not.toHaveProperty('hasCompletedOnboarding');
+    expect(written.projects).toEqual({ [sessionDirectory]: { hasTrustDialogAccepted: true } });
+  });
+
+  it.each([undefined, true])(
+    'revokes a trust the target kept when the source now explicitly distrusts the directory (source onboarding %s)',
+    async (hasCompletedOnboarding) => {
+      const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-home-'));
+      const sourceDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-source-'));
+      const targetDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-target-'));
+      const sessionDirectory = await mkdtemp(join(tmpdir(), 'happier-claude-trust-project-'));
+      const otherDirectory = await mkdtemp(join(tmpdir(), 'happier-claude-trust-other-'));
+      await writeFile(join(sourceDir, '.claude.json'), JSON.stringify({
+        ...(hasCompletedOnboarding === undefined ? {} : { hasCompletedOnboarding }),
+        projects: { [sessionDirectory]: { hasTrustDialogAccepted: false } },
+      }));
+      await writeFile(join(targetDir, '.claude.json'), JSON.stringify({
+        targetOwnedSetting: 'kept',
+        projects: {
+          [sessionDirectory]: {
+            hasTrustDialogAccepted: true,
+            allowedTools: ['Bash(ls)'],
+            history: [{ display: 'earlier prompt' }],
+          },
+          [otherDirectory]: { hasTrustDialogAccepted: true },
+        },
+      }));
+
+      await materializeClaudeWorkspaceTrust({
+        sourceEnv: { CLAUDE_CONFIG_DIR: sourceDir, HOME: homeDir },
+        targetDir,
+        sessionDirectory,
+      });
+
+      const written = JSON.parse(await readFile(join(targetDir, '.claude.json'), 'utf8')) as Record<string, unknown>;
+      expect(written).toEqual({
+        targetOwnedSetting: 'kept',
+        ...(hasCompletedOnboarding === true ? { hasCompletedOnboarding: true } : {}),
+        projects: {
+          [sessionDirectory]: {
+            hasTrustDialogAccepted: false,
+            allowedTools: ['Bash(ls)'],
+            history: [{ display: 'earlier prompt' }],
+          },
+          [otherDirectory]: { hasTrustDialogAccepted: true },
+        },
+      });
+    },
+  );
+
+  it('keeps the target trust decision when the source is silent about the directory', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-home-'));
+    const sourceDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-source-'));
+    const targetDir = await mkdtemp(join(tmpdir(), 'happier-claude-trust-target-'));
+    const sessionDirectory = await mkdtemp(join(tmpdir(), 'happier-claude-trust-project-'));
+    await writeFile(join(sourceDir, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true, projects: {} }));
+    await writeFile(join(targetDir, '.claude.json'), JSON.stringify({
+      projects: { [sessionDirectory]: { hasTrustDialogAccepted: true, allowedTools: ['Bash(ls)'] } },
+    }));
+
+    await materializeClaudeWorkspaceTrust({
+      sourceEnv: { CLAUDE_CONFIG_DIR: sourceDir, HOME: homeDir },
+      targetDir,
+      sessionDirectory,
+    });
+
+    const written = JSON.parse(await readFile(join(targetDir, '.claude.json'), 'utf8')) as Record<string, unknown>;
+    expect(written).toEqual({
+      hasCompletedOnboarding: true,
+      projects: { [sessionDirectory]: { hasTrustDialogAccepted: true, allowedTools: ['Bash(ls)'] } },
+    });
   });
 
   it('preserves an existing target onboarding decision when no source completion is projected', async () => {

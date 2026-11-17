@@ -7,6 +7,9 @@ import type { CanCallToolCallback, SDKAssistantMessage, SDKMessage, SDKResultMes
 import { createSubprocessStderrAppender, type BoundedTextFileAppender } from '@/agent/runtime/subprocessArtifacts';
 import { emitCanonicalTurnDiffTool } from '@/agent/runtime/emitCanonicalTurnDiffTool';
 import { ensureClaudeJsRuntimeExecutable } from '@/backends/claude/utils/ensureClaudeJsRuntimeExecutable';
+import { buildClaudeEffortCliArgs, isClaudeModelEffortPinned } from '@/backends/claude/utils/claudeEffort';
+import { resolveClaudeLaunchSettingsOverlayArg } from '@/backends/claude/utils/resolveClaudeLaunchSettingsOverlay';
+import { enforceClaudeModelEffortPinBeforePrompt } from '@/backends/claude/utils/claudeModelEffortPinBridge';
 import { ClaudeTurnChangeTracker } from '../utils/ClaudeTurnChangeTracker';
 import { isClaudeExplicitDiffToolInput } from '../utils/isClaudeExplicitDiffToolInput';
 import { createClaudeSdkResultError } from './failure';
@@ -46,6 +49,8 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
   private sendChain: Promise<void> = Promise.resolve();
   private pendingTurn: { resolve: () => void; reject: (e: Error) => void; buffer: string[] } | null = null;
   private pendingTurnCompletion: Promise<void> | null = null;
+  // The turn whose prompt waits on the effort-pin check: not yet sent, but cancel() must drop it.
+  private qualifyingTurn: { cancelled: boolean } | null = null;
   private ignoreNextNonSuccessResult = false;
   private currentTurnOrdinal = 0;
   private settledTurnOrdinal = 0;
@@ -107,11 +112,19 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
 
   private async startSessionInternal(params: Readonly<{ resume: string | null }>): Promise<void> {
     if (this.started) return;
+    const model = this.normalizeModelId(this.opts.modelId);
+    // Execution runs select no effort of their own; only a configured per-model pin applies.
+    // Resolving it here also rejects a malformed policy before anything is spawned.
+    const effortArgs = buildClaudeEffortCliArgs({ modelId: model, effort: undefined });
+    const settingsPath = resolveClaudeLaunchSettingsOverlayArg({
+        settingsPath: this.opts.settingsPath,
+        // Explicitly off: an ultracode Claude Code saved would otherwise override a pinned effort.
+        launchSettings: isClaudeModelEffortPinned(model) ? { ultracode: false } : {},
+    });
     this.started = true;
     this.activeTaskId = null;
     this.activeTaskSessionId = null;
 
-    const model = this.normalizeModelId(this.opts.modelId);
     const canCallTool = this.buildCanCallTool();
 
     this.emit({ type: 'status', status: 'starting' });
@@ -133,7 +146,8 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
         permissionMode: 'default',
         forcePermissionMode: true,
         canCallTool,
-        settingsPath: this.opts.settingsPath,
+        settingsPath,
+        ...(effortArgs.length > 0 ? { extraArgs: effortArgs } : {}),
         env: this.env,
         ...(params.resume ? { resume: params.resume } : {}),
         abort: this.abortController.signal,
@@ -171,6 +185,22 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
       if (this.fatalError) throw this.fatalError;
 
       try {
+        // A prompt runs only once Claude Code reports the pinned effort for its applied model
+        // (execution runs may leave the model to Claude Code). Failure rejects it unsent.
+        const query = this.query;
+        const qualifying = { cancelled: false };
+        this.qualifyingTurn = qualifying;
+        try {
+          await enforceClaudeModelEffortPinBeforePrompt({
+            getSettings: query ? () => query.getSettings() : undefined,
+            applyFlagSettings: query ? (settings) => query.applyFlagSettings(settings) : undefined,
+          });
+        } finally {
+          this.qualifyingTurn = null;
+        }
+        if (qualifying.cancelled) throw new Error('Turn cancelled');
+        if (this.disposed) throw new Error('Backend disposed');
+
         let completionResolve!: () => void;
         let completionReject!: (e: Error) => void;
         const completionPromise = new Promise<void>((resolve, reject) => {
@@ -199,7 +229,10 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
       }
     };
 
-    this.sendChain = this.sendChain.then(run, run);
+    // The chain only serializes turns: a failed turn reaches this caller, never the next turn.
+    this.sendChain = this.sendChain.then(run, run).catch((e: unknown) => {
+      startedReject(e instanceof Error ? e : new Error('Failed to send prompt'));
+    });
 
     try {
       await startedPromise;
@@ -238,6 +271,8 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
 
     // Only ignore a non-success result when we're actually cancelling an in-flight turn.
     // Otherwise we'd swallow legitimate error results from future turns.
+    // A prompt still waiting on its effort check is dropped unsent; later prompts still run.
+    if (this.qualifyingTurn) this.qualifyingTurn.cancelled = true;
     const hadPendingTurn = Boolean(this.pendingTurn);
     if (hadPendingTurn) {
       this.ignoreNextNonSuccessResult = true;

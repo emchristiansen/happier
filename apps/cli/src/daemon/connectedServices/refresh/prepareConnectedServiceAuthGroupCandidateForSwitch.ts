@@ -58,6 +58,7 @@ export async function prepareConnectedServiceAuthGroupCandidateForSwitch(input: 
         },
       };
     case 'lease_not_acquired':
+    case 'credential_health_unavailable':
       return {
         status: 'ineligible',
         memberState: { credentialHealthStatus: 'refresh_failed_retryable' },

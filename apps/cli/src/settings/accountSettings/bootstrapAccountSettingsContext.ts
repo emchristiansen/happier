@@ -16,7 +16,7 @@ import type { Credentials } from '@/persistence';
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
 import { decryptAccountSettingsCiphertext } from '@/settings/accountSettingsClient';
-import { assertBackendEnabledByAccountSettings } from '@/settings/backendEnabled';
+import { assertBackendEnabledByAccountSettings, isBackendDisabledByAccountSettingsError } from '@/settings/backendEnabled';
 import { applyAccountSettingsToProcessEnv } from '@/settings/applyAccountSettingsToProcessEnv';
 import { deriveSettingsSecretsReadKeysForCredentials } from '@/settings/secrets/settingsSecretsKey';
 
@@ -325,6 +325,17 @@ export function resetInMemoryAccountSettingsContextForTests(): void {
   resetActiveAccountSettingsSnapshotForTests();
 }
 
+/**
+ * Outcomes of a refresh that are decisions, not load failures: falling back to cached or empty
+ * settings would override them. A successfully fetched setting that disables the backend is one;
+ * a failed transport is not, and still falls back.
+ */
+function isAccountSettingsRefreshRefusal(error: unknown): boolean {
+  return isClientE2eeRequiredError(error)
+    || isAccountSettingsContentInvalidError(error)
+    || isBackendDisabledByAccountSettingsError(error);
+}
+
 export async function bootstrapAccountSettingsContext(params: Readonly<{
   credentials: Credentials;
   agentId?: AgentId;
@@ -535,12 +546,19 @@ export async function bootstrapAccountSettingsContext(params: Readonly<{
 
     // Fire refresh immediately; expose promise for long-running processes.
     const whenRefreshed = fetchAndPersist().catch(async (err) => {
-      if (isClientE2eeRequiredError(err) || isAccountSettingsContentInvalidError(err)) throw err;
+      if (isAccountSettingsRefreshRefusal(err)) throw err;
       if (minSettingsVersion !== null) {
         throw err;
       }
       logger.debug('[accountSettings] background refresh failed; using cache', serializeAxiosErrorForLog(err));
       return base;
+    });
+    // This background refresh is owned here. A caller that awaits `whenRefreshed` still receives an
+    // authoritative refusal (such as a backend disabled by the fetched settings); a caller that
+    // started from cache and never awaits it must not leave that refusal as a process-level
+    // unhandled rejection. The refused settings are already committed as the active snapshot.
+    whenRefreshed.catch((err: unknown) => {
+      logger.debug('[accountSettings] background refresh refused; awaiting callers receive the refusal', serializeAxiosErrorForLog(err));
     });
     return { ...base, whenRefreshed };
   }
@@ -553,7 +571,7 @@ export async function bootstrapAccountSettingsContext(params: Readonly<{
   try {
     return await fetchAndPersist();
   } catch (err) {
-    if (isClientE2eeRequiredError(err) || isAccountSettingsContentInvalidError(err)) throw err;
+    if (isAccountSettingsRefreshRefusal(err)) throw err;
     if (minSettingsVersion !== null) {
       throw err;
     }

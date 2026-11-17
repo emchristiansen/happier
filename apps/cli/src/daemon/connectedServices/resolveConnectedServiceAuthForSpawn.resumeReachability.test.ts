@@ -101,6 +101,7 @@ function makeCodexApi(now: number, credentials: ReturnType<typeof makeLegacyCred
     randomBytes: (length) => randomBytes(length),
   });
   return {
+    readConnectedServiceCredentialHealth: async () => ({ kind: 'found' as const, status: 'connected' as const, health: null }),
     getConnectedServiceCredentialSealed: async (params: { serviceId: string; profileId: string }) => {
       if (params.serviceId !== 'openai-codex' || params.profileId !== 'work') return null;
       return {
@@ -123,6 +124,7 @@ function makePiCodexApi(now: number, credentials: ReturnType<typeof makeLegacyCr
     randomBytes: (length) => randomBytes(length),
   });
   return {
+    readConnectedServiceCredentialHealth: async () => ({ kind: 'found' as const, status: 'connected' as const, health: null }),
     getConnectedServiceCredentialSealed: async (params: { serviceId: string; profileId: string }) => {
       if (params.serviceId !== 'openai-codex' || params.profileId !== 'work') return null;
       return {

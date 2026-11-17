@@ -34,6 +34,7 @@ vi.mock('@/lib', () => ({
   logger: {
     debug: vi.fn(),
     debugLargeJson: vi.fn(),
+    warnFile: vi.fn(),
   },
 }));
 
@@ -506,6 +507,172 @@ describe('claudeRemote', () => {
     expect(call?.options?.extraArgs).toEqual(['--replay-user-messages', '--effort', 'medium']);
     expect(onEffectiveModel).toHaveBeenCalledWith({ modelId: 'claude-opus-4-6', reasoningEffort: 'medium' });
     expect(onEffectiveModel).toHaveBeenLastCalledWith({ modelId: 'claude-next' });
+  });
+
+  it('launches with the session effort instead of a stale launch --effort flag', async () => {
+    mockQuery.mockReturnValue(messageStream(resultMessage()));
+
+    const { claudeRemote } = await import('./claudeRemote');
+
+    await claudeRemote(
+      createBaseOptions({
+        claudeArgs: ['--effort', 'high'],
+        nextMessage: async () => ({
+          message: 'hello',
+          mode: defaultMode({ model: 'claude-opus-5-5', reasoningEffort: 'medium' }),
+        }),
+      }),
+    );
+
+    const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
+    expect(call?.options?.extraArgs).toEqual(['--replay-user-messages', '--effort', 'medium']);
+  });
+
+  it('launches a pinned model at its operational effort despite a stale launch --effort high', async () => {
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+    (await import('@/configuration')).reloadConfiguration();
+    try {
+      mockQuery.mockReturnValue(messageStream(resultMessage()));
+      const { claudeRemote } = await import('./claudeRemote');
+
+      await claudeRemote(
+        createBaseOptions({
+          hookSettingsPath: undefined,
+          claudeArgs: ['--effort', 'high'],
+          nextMessage: async () => ({
+            message: 'hello',
+            mode: defaultMode({ model: 'claude-opus-5-5', reasoningEffort: 'high', ultracode: true }),
+          }),
+        }),
+      );
+
+      const call = mockQuery.mock.calls[0]?.[0] as QueryCall | undefined;
+      expect(call?.options?.extraArgs).toEqual(['--replay-user-messages', '--effort', 'medium']);
+      // Claude Code may have saved ultracode as its default; a pinned launch turns it off explicitly.
+      expect(JSON.parse(String((call?.options as { settingsPath?: string } | undefined)?.settingsPath))).toEqual({ ultracode: false });
+    } finally {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+    }
+  });
+
+  describe('per-model effort pin bridge', () => {
+    // The Claude Code process is the boundary. This fake keeps its observed control semantics
+    // (native 2.1.280: `get_settings` reports `applied`; `apply_flag_settings` acknowledges values
+    // it then ignores) and records controls and delivered prompts in order.
+    function nativeClaude(
+      settings: { model: string; effort: string; ultracode: boolean },
+      ignoresApply = false,
+      // Runs while the n-th get_settings is pending (1-based), before it is answered.
+      duringGet?: { n: number; run: () => Promise<void> },
+    ) {
+      const events: string[] = [];
+      let gets = 0;
+      mockQuery.mockImplementation((config: QueryCall) => ({
+        async *[Symbol.asyncIterator]() {
+          for await (const message of config.prompt!) {
+            events.push(`prompt:${String(message.message.content)}`);
+            yield resultMessage();
+          }
+        },
+        async getSettings() {
+          events.push('get');
+          gets += 1;
+          if (duringGet?.n === gets) await duringGet.run();
+          return { applied: { ...settings, advisor: null }, effective: {}, sources: [] };
+        },
+        async interrupt() {
+          events.push('interrupt');
+        },
+        async applyFlagSettings(next: Record<string, unknown>) {
+          events.push(`apply:${JSON.stringify(next)}`);
+          if (ignoresApply) return;
+          if (typeof next.effortLevel === 'string') settings.effort = next.effortLevel;
+          if (typeof next.ultracode === 'boolean') settings.ultracode = next.ultracode;
+        },
+      }));
+      return events;
+    }
+
+    async function withOpusPinnedMedium(run: () => Promise<void>): Promise<void> {
+      vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+      (await import('@/configuration')).reloadConfiguration();
+      try {
+        await run();
+      } finally {
+        vi.unstubAllEnvs();
+        (await import('@/configuration')).reloadConfiguration();
+      }
+    }
+
+    function prompts(...texts: string[]): () => Promise<{ message: string; mode: EnhancedMode; userMessageLocalIds: string[] } | null> {
+      const queue = [...texts];
+      return async () => {
+        const text = queue.shift();
+        return text ? { message: text, mode: defaultMode(), userMessageLocalIds: [text] } : null;
+      };
+    }
+
+    it('applies and verifies the pinned effort for a natively chosen default model before each prompt', async () => {
+      await withOpusPinnedMedium(async () => {
+        const events = nativeClaude({ model: 'claude-opus-5-5[1m]', effort: 'high', ultracode: false });
+        const { claudeRemote } = await import('./claudeRemote');
+
+        await claudeRemote(createBaseOptions({ hookSettingsPath: undefined, nextMessage: prompts('first', 'second') }));
+
+        expect(events).toEqual([
+          'get',
+          'apply:{"effortLevel":"medium","ultracode":false}',
+          'get',
+          'prompt:first',
+          'get',
+          'prompt:second',
+        ]);
+      });
+    });
+
+    it('reports unsent, and never delivers, a message whose turn is interrupted while its pinned effort is checked', async () => {
+      await withOpusPinnedMedium(async () => {
+        let interruptTurn: (() => Promise<void>) | null = null;
+        // The user aborts while the accepted second message waits on its effort check.
+        const events = nativeClaude({ model: 'claude-opus-5-5', effort: 'medium', ultracode: false }, false, {
+          n: 2,
+          run: async () => { await interruptTurn!(); },
+        });
+        const onPromptTransportFailure = vi.fn();
+        const { claudeRemote } = await import('./claudeRemote');
+
+        await claudeRemote(createBaseOptions({
+          hookSettingsPath: undefined,
+          nextMessage: prompts('FIRST', 'CANCELLED_SECOND', 'THIRD'),
+          onPromptTransportFailure,
+          setTurnInterrupt: (next: (() => Promise<void>) | null) => { if (next) interruptTurn = next; },
+        } as any));
+
+        expect(events.filter((event) => event.startsWith('prompt:'))).toEqual(['prompt:FIRST', 'prompt:THIRD']);
+        expect(onPromptTransportFailure).toHaveBeenCalledWith(expect.objectContaining({
+          kind: 'rejected_before_effect',
+          userMessageLocalIds: ['CANCELLED_SECOND'],
+        }));
+      });
+    });
+
+    it('holds the prompt and reports explicitly when Claude Code does not adopt the pin', async () => {
+      await withOpusPinnedMedium(async () => {
+        const events = nativeClaude({ model: 'claude-opus-5-5', effort: 'high', ultracode: false }, true);
+        const onCompletionEvent = vi.fn();
+        const onPromptTransportFailure = vi.fn();
+        const { claudeRemote } = await import('./claudeRemote');
+
+        await claudeRemote(createBaseOptions({
+          hookSettingsPath: undefined, nextMessage: prompts('first'), onCompletionEvent, onPromptTransportFailure,
+        }));
+
+        expect(events.filter((event) => event.startsWith('prompt:'))).toEqual([]);
+        expect(onPromptTransportFailure).toHaveBeenCalledWith(expect.objectContaining({ kind: 'rejected_before_effect', userMessageLocalIds: ['first'] }));
+        expect(onCompletionEvent.mock.calls.flat().join(' ')).toMatch(/did not adopt the pinned effort medium/);
+      });
+    });
   });
 
   it('injects --effort high for Opus 4.7 because xhigh is the model default', async () => {

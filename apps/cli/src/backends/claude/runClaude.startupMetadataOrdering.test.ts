@@ -53,6 +53,7 @@ const testCredentials: Credentials = {
 
 let metadataUpdateDeferred: Deferred<void>;
 let currentMetadataVersion = 1;
+let currentMetadataSnapshot: Record<string, unknown> = { path: '/srv/project' };
 const getOrCreateSessionMock = vi.fn<(opts: { tag: string }) => Promise<StartupSessionResponse>>(async () => ({
     id: 'session-start',
     metadataVersion: currentMetadataVersion,
@@ -136,7 +137,7 @@ vi.mock('@/agent/runtime/initializeBackendApiContext', () => ({
                 keepAlive: vi.fn(),
                 rpcHandlerManager: { registerHandler: vi.fn(), invokeLocal: vi.fn() },
                 ensureMetadataSnapshot: vi.fn(async () => ({ path: '/srv/project' })),
-                getMetadataSnapshot: vi.fn(() => ({ path: '/srv/project' })),
+                getMetadataSnapshot: vi.fn(() => currentMetadataSnapshot),
                 onUserMessage: lastSessionClient.onUserMessage,
                 sendSessionEvent: lastSessionClient.sendSessionEvent,
                 enqueueSessionUserMessage: lastSessionClient.enqueueSessionUserMessage,
@@ -298,6 +299,7 @@ describe('runClaude startup metadata ordering', () => {
         vi.clearAllMocks();
         metadataUpdateDeferred = createDeferred<void>();
         currentMetadataVersion = 1;
+        currentMetadataSnapshot = { path: '/srv/project' };
         getOrCreateSessionMock.mockImplementation(async () => ({ id: 'session-start', metadataVersion: currentMetadataVersion }));
         runStartupCoordinatorMock.mockImplementation(() => {
             throw new Error('fast-start coordinator should not run');
@@ -820,6 +822,65 @@ describe('runClaude startup metadata ordering', () => {
             expect.not.objectContaining({ reasoningEffort: expect.anything(), ultracode: expect.anything() }),
         ]);
         expect(probeClaudeInstalledRuntimeCapabilitiesMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats a launch --effort as the session effort until a newer session selection supersedes it', async () => {
+        currentMetadataVersion = 1;
+        const effortOverride = (value: string, updatedAt: number) => ({
+            path: '/srv/project',
+            sessionConfigOptionOverridesV1: { v: 1, updatedAt, overrides: { reasoning_effort: { value, updatedAt } } },
+        });
+        // A selection persisted before this launch must not beat the explicit launch flag.
+        currentMetadataSnapshot = effortOverride('low', 20);
+        initializeRuntimeOverridesSynchronizerMock.mockImplementationOnce(async (params: RuntimeOverridesSynchronizerParams) => {
+            lastRuntimeOverridesSynchronizerParams = params;
+            return createRuntimeOverridesSynchronizer({
+                seedFromSession: vi.fn(async () => {}),
+                syncFromMetadata: vi.fn(),
+            });
+        });
+        const { loop } = await import('@/backends/claude/loop');
+        const launchModes: Array<{ reasoningEffort?: string }> = [];
+        vi.mocked(loop).mockImplementationOnce(async (params: any) => {
+            params.messageQueue.push = vi.fn((_text: string, mode: { reasoningEffort?: string }) => launchModes.push(mode));
+            const handler = lastSessionClient?.onUserMessage.mock.calls[0]?.[0];
+            await handler?.({ content: { type: 'text', text: 'first' }, localId: 'launch-effort-1', createdAt: 101 });
+            // A selection made after launch (e.g. session.config_option.set medium) wins at the next message.
+            currentMetadataSnapshot = effortOverride('medium', Date.now() + 60_000);
+            await handler?.({ content: { type: 'text', text: 'second' }, localId: 'launch-effort-2', createdAt: 102 });
+            return 0;
+        });
+        const { runClaude } = await import('./runClaude');
+
+        const runPromise = runClaude(testCredentials, {
+            startedBy: 'daemon',
+            startingMode: 'remote',
+            model: 'claude-opus-5-5',
+            claudeArgs: ['--effort', 'high'],
+        });
+        await waitFor(() => applyStartupMetadataUpdateToSessionMock.mock.calls.length === 1);
+        metadataUpdateDeferred.resolve();
+        await runPromise;
+
+        expect(launchModes.map((mode) => mode.reasoningEffort)).toEqual(['high', 'medium']);
+    });
+
+    it('fails before creating a session when the per-model effort policy is malformed', async () => {
+        vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"turbo"}');
+        (await import('@/configuration')).reloadConfiguration();
+        try {
+            const { runClaude } = await import('./runClaude');
+
+            await expect(runClaude(testCredentials, {
+                startedBy: 'daemon',
+                startingMode: 'remote',
+                model: 'claude-opus-5-5',
+            })).rejects.toThrow(/HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES/);
+            expect(getOrCreateSessionMock).not.toHaveBeenCalled();
+        } finally {
+            vi.unstubAllEnvs();
+            (await import('@/configuration')).reloadConfiguration();
+        }
     });
 
     it('retains discovered model effort evidence for the initial ordinary launch after readiness', async () => {

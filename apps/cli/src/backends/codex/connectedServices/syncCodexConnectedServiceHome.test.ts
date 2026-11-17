@@ -68,6 +68,7 @@ describe('syncCodexConnectedServiceHome', () => {
       // Shared session state is the default now, so explicitly opt this Codex home
       // out via the isolated state mode to exercise the isolated-preservation path.
       const result = await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         previousCodexHome,
         accountSettings: settings('linked', 'isolated'),
@@ -85,6 +86,7 @@ describe('syncCodexConnectedServiceHome', () => {
       await writeFile(join(destinationCodexHome, 'state_5.sqlite-wal'), 'wal');
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -107,6 +109,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       const result = await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: {
@@ -130,6 +133,7 @@ describe('syncCodexConnectedServiceHome', () => {
       await writeFile(join(sourceCodexHome, 'native-private', 'retained'), 'private');
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('copied', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -147,6 +151,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('isolated', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -189,11 +194,13 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
       });
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -216,6 +223,7 @@ describe('syncCodexConnectedServiceHome', () => {
       await expect(readFile(join(destinationCodexHome, migratedSessionsEntry!, 'local-rollout.jsonl'), 'utf8')).resolves.toBe('{"id":"local"}\n');
       await expect(readFile(join(destinationCodexHome, 'state_5.sqlite'), 'utf8')).resolves.toBe('local sqlite');
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -248,6 +256,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         previousCodexHome,
         accountSettings: settings('linked', 'isolated'),
@@ -283,6 +292,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       const result = await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         previousCodexHome,
         accountSettings: settings('linked', 'shared'),
@@ -327,6 +337,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       const result = await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: {
@@ -353,6 +364,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -386,6 +398,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await expect(syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -418,6 +431,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings(configMode, 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -436,6 +450,7 @@ describe('syncCodexConnectedServiceHome', () => {
       await writeFile(join(sourceCodexHome, 'hooks.json'), '{"hooks":[{"changed":true}]}\n');
       await expect(readFile(join(destinationCodexHome, 'hooks.json'), 'utf8')).resolves.toBe('{"hooks":[]}\n');
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -448,7 +463,7 @@ describe('syncCodexConnectedServiceHome', () => {
       await expect(readFile(join(destinationCodexHome, 'skills', 'reviewer', 'SKILL.md'), 'utf8')).resolves.toBe('# Reviewer\n');
       await expect(readFile(join(destinationCodexHome, 'skills', '.system', 'builtin.md'), 'utf8')).resolves.toBe('built in\n');
       await expect(exists(join(destinationCodexHome, 'config.json'))).resolves.toBe(false);
-      await syncCodexConnectedServiceHome({ destinationCodexHome, accountSettings: settings('isolated', 'isolated'), processEnv: { CODEX_HOME: sourceCodexHome } });
+      await syncCodexConnectedServiceHome({ nativeSourceAuthority: 'caller_env', destinationCodexHome, accountSettings: settings('isolated', 'isolated'), processEnv: { CODEX_HOME: sourceCodexHome } });
       await expect(exists(join(destinationCodexHome, 'plugins'))).resolves.toBe(false);
       await expect(readFile(join(sourceCodexHome, 'plugins', 'cache', 'example', 'plugin.json'), 'utf8')).resolves.toBe('{"name":"example"}\n');
     } finally {
@@ -474,6 +489,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -484,6 +500,7 @@ describe('syncCodexConnectedServiceHome', () => {
       await writeFile(sourceHooks, '{"hooks":{"SessionStart":[]}}\n');
       await expect(readFile(targetHooks, 'utf8')).resolves.toBe('{"hooks":{"Stop":[]}}\n');
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -506,6 +523,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('isolated', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -526,6 +544,7 @@ describe('syncCodexConnectedServiceHome', () => {
       }
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
       const sync = () => syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -565,7 +584,7 @@ describe('syncCodexConnectedServiceHome', () => {
         '[hooks.state."plugin:example:stop:0:0"]', 'trusted_hash = "sha256:plugin"', '',
       ].join('\n');
       await writeFile(join(sourceCodexHome, 'config.toml'), nativeConfig);
-      const materialize = () => sync({ destinationCodexHome, previousCodexHome: promotedHome,
+      const materialize = () => sync({ nativeSourceAuthority: 'caller_env', destinationCodexHome, previousCodexHome: promotedHome,
         accountSettings: settings('copied', 'isolated'), processEnv: { CODEX_HOME: sourceCodexHome } });
       await materialize();
       const readStates = async () => (parse(await readFile(join(destinationCodexHome, 'config.toml'), 'utf8')).hooks as { state: Record<string, unknown> }).state;
@@ -608,6 +627,7 @@ describe('syncCodexConnectedServiceHome', () => {
         '',
       ].join('\n'));
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome, previousCodexHome,
         accountSettings: settings(configMode, 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -633,6 +653,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('copied', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -641,6 +662,7 @@ describe('syncCodexConnectedServiceHome', () => {
       await writeFile(join(destinationCodexHome, 'skills', 'local', 'SKILL.md'), '# Local\n');
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('isolated', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -671,6 +693,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -692,6 +715,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -728,12 +752,14 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       const firstSync = syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
       });
       await waitFor(() => symlinkCalls.length === 1, 10_000);
       const secondSync = syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('linked', 'shared'),
         processEnv: { CODEX_HOME: sourceCodexHome },
@@ -785,12 +811,14 @@ describe('syncCodexConnectedServiceHome', () => {
 
       await Promise.all([
         syncCodexConnectedServiceHome({
+          nativeSourceAuthority: 'caller_env',
           destinationCodexHome,
           previousCodexHome: firstPreviousCodexHome,
           accountSettings: settings('linked', 'shared'),
           processEnv: { CODEX_HOME: sourceCodexHome },
         }),
         syncCodexConnectedServiceHome({
+          nativeSourceAuthority: 'caller_env',
           destinationCodexHome: secondDestinationCodexHome,
           previousCodexHome: secondPreviousCodexHome,
           accountSettings: settings('linked', 'shared'),
@@ -832,6 +860,7 @@ describe('syncCodexConnectedServiceHome', () => {
       const syncCodexConnectedServiceHome = await loadSyncCodexConnectedServiceHome();
 
       await syncCodexConnectedServiceHome({
+        nativeSourceAuthority: 'caller_env',
         destinationCodexHome,
         accountSettings: settings('copied', 'isolated'),
         processEnv: { CODEX_HOME: sourceCodexHome },

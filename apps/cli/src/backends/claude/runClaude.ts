@@ -108,6 +108,8 @@ import {
     createClaudeModelEffortLevelsTracker,
 } from '@/backends/claude/models/claudeModelEffortLevelsTracker';
 import { prepareClaudeUnifiedTerminalInitialMode } from './startup/prepareUnifiedTerminalInitialMode';
+import { resolveLaunchReasoningEffortState } from './utils/resolveLaunchReasoningEffortState';
+import { requireClaudeModelEffortOverrides } from './utils/claudeEffort';
 import { buildClaudeAgentState } from '@/backends/claude/localControl/buildClaudeAgentState';
 import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
 import type { SessionRuntimeActivityContributionHandle } from '@/session/runtimeActivity/types';
@@ -275,6 +277,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     if (options.startedBy === 'daemon' && options.startingMode === 'local' && !daemonStartedInOwnedHerdrTerminal) {
         throw new Error('Daemon-spawned sessions cannot use local/interactive mode. Use --happy-starting-mode remote or spawn sessions directly from terminal.');
     }
+
+    // A malformed per-model effort policy must stop the runner before any session or launch exists.
+    requireClaudeModelEffortOverrides();
 
     // Set backend for offline warnings (before any API calls)
     connectionState.setBackend('Claude');
@@ -857,8 +862,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentAgentModeId: string | null =
         typeof options.agentModeId === 'string' && options.agentModeId.trim().length > 0 ? options.agentModeId.trim() : null;
     let currentAgentModeUpdatedAt = typeof options.agentModeUpdatedAt === 'number' ? options.agentModeUpdatedAt : 0;
-        let currentReasoningEffort: string | undefined = undefined;
-        let currentReasoningEffortUpdatedAt = 0;
+        const launchReasoningEffort = resolveLaunchReasoningEffortState(options.claudeArgs, Date.now());
+        let currentReasoningEffort = launchReasoningEffort.value;
+        let currentReasoningEffortUpdatedAt = launchReasoningEffort.updatedAt;
         // Effort tiers the selected model reports. Resolved from the shared Claude model catalog
         // (cached, best-effort) and carried on the mode so spawn-time resolution and launch-option
         // hashing both see the same value instead of reading a cache at hash time.
@@ -1551,8 +1557,9 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
     let currentAgentModeUpdatedAt = typeof options.agentModeUpdatedAt === 'number' ? options.agentModeUpdatedAt : 0;
     let currentModel = options.model;
     let currentModelUpdatedAt = typeof options.modelUpdatedAt === 'number' ? options.modelUpdatedAt : 0;
-    let currentReasoningEffort: string | undefined = undefined;
-    let currentReasoningEffortUpdatedAt = 0;
+    const launchReasoningEffort = resolveLaunchReasoningEffortState(options.claudeArgs, Date.now());
+    let currentReasoningEffort = launchReasoningEffort.value;
+    let currentReasoningEffortUpdatedAt = launchReasoningEffort.updatedAt;
     // See the sibling runtime path above: tiers travel on the mode so hashing stays pure.
     const modelEffortTracker = createClaudeModelEffortLevelsTracker({
         resolveTimeoutMs: () => resolveClaudeHelpProbeTimeoutMs(),

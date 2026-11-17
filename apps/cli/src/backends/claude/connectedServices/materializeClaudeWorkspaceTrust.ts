@@ -45,15 +45,19 @@ function dedupeRootConfigPathCandidates(
   return result;
 }
 
-function resolveClaudeRootConfigPathCandidates(env: NodeJS.ProcessEnv): ClaudeRootConfigPathCandidate[] {
+/**
+ * Root config files of the one permitted Claude configuration source. An explicit config-dir
+ * override is the whole source identity (native Claude then reads only `<override>/.claude.json`),
+ * so the ambient HOME is never consulted; without an override the native HOME layout is the source.
+ */
+export function resolveClaudeRootConfigPathCandidates(env: NodeJS.ProcessEnv): ClaudeRootConfigPathCandidate[] {
   const explicitConfigDir = resolveClaudeConfigDirOverride(env);
+  if (explicitConfigDir) {
+    return [{ rootDir: explicitConfigDir, path: join(explicitConfigDir, '.claude.json') }];
+  }
   const homeDir = resolveHomeDirFromEnvironment(env);
   const configuredConfigDir = resolveConfiguredClaudeConfigDir({ env });
   return dedupeRootConfigPathCandidates([
-    ...(explicitConfigDir ? [{
-      rootDir: explicitConfigDir,
-      path: join(explicitConfigDir, '.claude.json'),
-    }] : []),
     {
       rootDir: homeDir,
       path: join(homeDir, '.claude.json'),
@@ -65,19 +69,29 @@ function resolveClaudeRootConfigPathCandidates(env: NodeJS.ProcessEnv): ClaudeRo
   ]);
 }
 
-function readProjectTrustProjection(
+/**
+ * The permitted source's decision about one workspace. Explicit distrust and silence are different:
+ * distrust revokes a trust the target kept from an earlier projection, while silence leaves the
+ * target's own state alone.
+ */
+type ClaudeWorkspaceTrustDecision =
+  | Readonly<{ kind: 'trusted'; projection: ClaudeWorkspaceTrustProjection }>
+  | Readonly<{ kind: 'distrusted' }>
+  | Readonly<{ kind: 'silent' }>;
+
+function readProjectTrustDecision(
   rootConfig: JsonObject,
   sessionDirectory: string,
-): { hasExplicitTrustState: boolean; projection: ClaudeWorkspaceTrustProjection | null } {
+): ClaudeWorkspaceTrustDecision {
   const projectConfig = readObject(readObject(rootConfig.projects)?.[sessionDirectory]);
   if (!projectConfig || typeof projectConfig.hasTrustDialogAccepted !== 'boolean') {
-    return { hasExplicitTrustState: false, projection: null };
+    return { kind: 'silent' };
   }
   if (projectConfig.hasTrustDialogAccepted !== true) {
-    return { hasExplicitTrustState: true, projection: null };
+    return { kind: 'distrusted' };
   }
   return {
-    hasExplicitTrustState: true,
+    kind: 'trusted',
     projection: {
       hasTrustDialogAccepted: true,
       ...(projectConfig.hasCompletedProjectOnboarding === true ? { hasCompletedProjectOnboarding: true } : {}),
@@ -85,28 +99,22 @@ function readProjectTrustProjection(
   };
 }
 
-async function resolveWorkspaceTrustProjection(params: Readonly<{
+async function resolveWorkspaceTrustDecision(params: Readonly<{
   sourceEnv: NodeJS.ProcessEnv;
   sessionDirectory: string;
   targetDir: string;
-}>): Promise<ClaudeWorkspaceTrustProjection | null> {
+}>): Promise<ClaudeWorkspaceTrustDecision> {
   const targetRoot = resolve(params.targetDir);
   const candidates = resolveClaudeRootConfigPathCandidates(params.sourceEnv)
     .filter((candidate) => resolve(candidate.rootDir) !== targetRoot);
-  for (let index = 0; index < candidates.length; index += 1) {
-    const rootConfig = await readClaudeRootConfigFile(candidates[index].path);
+  for (const candidate of candidates) {
+    const rootConfig = await readClaudeRootConfigFile(candidate.path);
     if (!rootConfig) continue;
-    const result = readProjectTrustProjection(rootConfig, params.sessionDirectory);
-    if (result.projection) return result.projection;
-    if (result.hasExplicitTrustState && index === 0 && resolveClaudeConfigDirOverride(params.sourceEnv)) {
-      return null;
-    }
-    if (result.hasExplicitTrustState) {
-      // The user explicitly declined trust for this directory in their own config — respect it.
-      return null;
-    }
+    const decision = readProjectTrustDecision(rootConfig, params.sessionDirectory);
+    // The first explicit decision, trust or distrust, is the user's own answer for this directory.
+    if (decision.kind !== 'silent') return decision;
   }
-  return null;
+  return { kind: 'silent' };
 }
 
 async function resolveClaudeOauthAccountProjection(params: Readonly<{
@@ -173,7 +181,7 @@ export async function materializeClaudeWorkspaceTrust(params: Readonly<{
     : null;
   if (!sessionDirectory) return;
 
-  const projection = await resolveWorkspaceTrustProjection({
+  const decision = await resolveWorkspaceTrustDecision({
     sourceEnv: params.sourceEnv,
     sessionDirectory,
     targetDir: params.targetDir,
@@ -182,10 +190,21 @@ export async function materializeClaudeWorkspaceTrust(params: Readonly<{
     sourceEnv: params.sourceEnv,
     targetDir: params.targetDir,
   });
-  if (!projection && !hasCompletedOnboarding) return;
+  if (decision.kind === 'silent' && !hasCompletedOnboarding) return;
 
   const existingRoot = await readClaudeRootConfigFile(join(params.targetDir, '.claude.json')) ?? {};
-  const oauthAccount = projection
+  const existingProjects = readObject(existingRoot.projects) ?? {};
+  // Merge into any claude-written project entry instead of replacing it, so rematerialization does
+  // not clobber per-project state (allowedTools, history, ...).
+  const existingProjectEntry = readObject(existingProjects[sessionDirectory]) ?? {};
+  const projectEntry = decision.kind === 'trusted'
+    ? { ...existingProjectEntry, ...decision.projection }
+    : decision.kind === 'distrusted' && existingProjectEntry.hasTrustDialogAccepted === true
+      ? { ...existingProjectEntry, hasTrustDialogAccepted: false }
+      : null;
+  if (!projectEntry && !hasCompletedOnboarding) return;
+
+  const oauthAccount = decision.kind === 'trusted'
     ? params.preserveExistingOauthAccountProjection === true
       ? sanitizeClaudeOauthAccountProjection(existingRoot.oauthAccount)
       : await resolveClaudeOauthAccountProjection({
@@ -193,28 +212,14 @@ export async function materializeClaudeWorkspaceTrust(params: Readonly<{
           targetDir: params.targetDir,
         })
     : null;
-  const existingProjects = projection ? (readObject(existingRoot.projects) ?? {}) : null;
-  // Merge the trust projection into any claude-written project entry instead of replacing it, so
-  // rematerialization does not clobber per-project state (allowedTools, history, ...).
-  const existingProjectEntry = projection && existingProjects
-    ? (readObject(existingProjects[sessionDirectory]) ?? {})
-    : null;
   await writeClaudeRootConfig({
     targetDir: params.targetDir,
     rootConfig: {
       ...existingRoot,
       ...(oauthAccount ? { oauthAccount } : {}),
       ...(hasCompletedOnboarding ? { hasCompletedOnboarding } : {}),
-      ...(projection && existingProjects && existingProjectEntry
-        ? {
-            projects: {
-              ...existingProjects,
-              [sessionDirectory]: {
-                ...existingProjectEntry,
-                ...projection,
-              },
-            },
-          }
+      ...(projectEntry
+        ? { projects: { ...existingProjects, [sessionDirectory]: projectEntry } }
         : {}),
     },
   });

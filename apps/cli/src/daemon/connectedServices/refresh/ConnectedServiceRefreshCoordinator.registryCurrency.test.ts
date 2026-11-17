@@ -1,3 +1,7 @@
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -12,8 +16,17 @@ import {
   HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY,
   type ConnectedServiceChildSelection,
 } from '../connectedServiceChildEnvironment';
+import { resolveConnectedServiceSelectionHomeDir } from '../homes/resolveConnectedServiceHomeDir';
 import { ConnectedServiceRuntimeRegistry } from '../runtimeRegistry/registry';
+import { writeConnectedServiceStateSharingManifest } from '../stateSharing/connectedServiceStateSharingManifest';
 import { ConnectedServiceRefreshCoordinator } from './ConnectedServiceRefreshCoordinator';
+
+/** Credential health actually read as connected; refresh behavior under unread health is tested separately. */
+function readConnectedCredentialHealth() {
+  return {
+    readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'connected' as const, health: null })),
+  };
+}
 
 const sourceRevision = ConnectedServiceCredentialRevisionV1Schema.parse('csr_aaaaaaaaaaaaaaaaaaaaaa');
 const refreshedRevision = ConnectedServiceCredentialRevisionV1Schema.parse('csr_bbbbbbbbbbbbbbbbbbbbbb');
@@ -38,6 +51,27 @@ function activeRevision(
     )
   ));
   return registration?.target.activeBindings.find((binding) => binding.serviceId === serviceId)?.credentialRevision;
+}
+
+/**
+ * In production every Codex home is produced (and its admitted native source recorded) by a spawn or
+ * direct caller before the daemon rematerializes it; registering a target directly skips that
+ * production, so fixtures record an admitted source for the profile home they register.
+ */
+async function seedAdmittedCodexProfileHomeSource(activeServerDir: string, profileId: string): Promise<void> {
+  const codexHome = join(resolveConnectedServiceSelectionHomeDir({
+    activeServerDir,
+    serviceId: 'openai-codex',
+    agentId: 'codex',
+    fallbackProfileId: profileId,
+    selection: { kind: 'profile', profileId },
+  }), 'codex-home');
+  const source = await mkdtemp(join(tmpdir(), 'happier-admitted-codex-source-'));
+  await writeConnectedServiceStateSharingManifest(codexHome, {
+    v: 1, requestedStateMode: 'isolated', effectiveStateMode: 'isolated', lastSyncAtMs: 0,
+    configEntries: [], stateEntries: [], sessionFileMappings: [], diagnostics: [],
+    nativeSourceEnv: { CODEX_HOME: source, CODEX_SQLITE_HOME: source },
+  });
 }
 
 describe('ConnectedServiceRefreshCoordinator runtime-registry currency', () => {
@@ -65,6 +99,7 @@ describe('ConnectedServiceRefreshCoordinator runtime-registry currency', () => {
       },
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         revisionSemantics: 'revisioned' as const,
@@ -149,6 +184,7 @@ describe('ConnectedServiceRefreshCoordinator runtime-registry currency', () => {
       connectedServiceSelectionsEnv: selectionEnv([otherServiceSelection]),
     });
 
+    await seedAdmittedCodexProfileHomeSource('/tmp/happier-registry-currency-server', 'work');
     const coordinator = new ConnectedServiceRefreshCoordinator({
       api,
       credentials,
@@ -236,6 +272,7 @@ describe('ConnectedServiceRefreshCoordinator runtime-registry currency', () => {
       },
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         revisionSemantics: 'revisioned' as const,
@@ -288,6 +325,7 @@ describe('ConnectedServiceRefreshCoordinator runtime-registry currency', () => {
     const onAuthUpdated = vi.fn(async () => {
       throw new Error('represented target rejected refreshed credential distribution');
     });
+    await seedAdmittedCodexProfileHomeSource('/tmp/happier-registry-currency-failure-server', 'work');
     const coordinator = new ConnectedServiceRefreshCoordinator({
       api,
       credentials,
@@ -360,6 +398,7 @@ describe('ConnectedServiceRefreshCoordinator runtime-registry currency', () => {
       },
     });
     const api = {
+      ...readConnectedCredentialHealth(),
       getAccountEncryptionMode: vi.fn(async () => 'plain' as const),
       getConnectedServiceCredentialPlain: vi.fn(async () => ({
         revisionSemantics: 'revisioned' as const,

@@ -3,15 +3,8 @@ import { ConnectedServiceIdSchema } from "@happier-dev/protocol";
 
 import type { Tx } from "@/storage/inTx";
 import { isServerFeatureEnabledForRequest } from "@/app/features/catalog/serverFeatureGate";
-import {
-    isConnectedServiceCredentialMetadataV2,
-    normalizeConnectedServiceCredentialMetadataV2,
-} from "../connect/connectedServicesV2/credentialMetadataV2";
-import {
-    isConnectedServiceCredentialMetadataV3,
-    normalizeConnectedServiceCredentialMetadataV3,
-} from "../connect/connectedServicesV3/credentialMetadataV3";
 import { deriveConnectedServiceCredentialStatus } from "../connect/credentialHealthMetadata";
+import { readStoredConnectedServiceCredentialMetadata } from "../connect/readStoredConnectedServiceCredentialMetadata";
 import { resolveConnectedServiceCredentialRevision } from "../connect/credentials/credentialRevision";
 
 export type AccountConnectedServicesProjection = Pick<
@@ -34,13 +27,7 @@ type ServiceAccountTokenProjectionRow = Readonly<{
 }>;
 
 function projectConnectedServiceProfile(row: ServiceAccountTokenProjectionRow): ConnectedServiceProfile {
-    const metadataV2 = isConnectedServiceCredentialMetadataV2(row.metadata)
-        ? normalizeConnectedServiceCredentialMetadataV2(row.metadata)
-        : null;
-    const metadataV3 = !metadataV2 && isConnectedServiceCredentialMetadataV3(row.metadata)
-        ? normalizeConnectedServiceCredentialMetadataV3(row.metadata)
-        : null;
-    const metadata = metadataV2 ?? metadataV3;
+    const metadata = readStoredConnectedServiceCredentialMetadata(row.metadata);
 
     return {
         profileId: row.profileId,

@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { EnhancedMode } from '../loop';
 import {
@@ -284,6 +284,60 @@ describe('createClaudeUnifiedRuntimeControlBridge', () => {
     expect(port.sentLiteral).toEqual(['/effort medium']);
     expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
     expect(await bridge.applyBeforePrompt(initial)).toEqual({ attempted: false, promptMayProceed: true });
+  });
+
+  it('re-applies a pinned model effort after native controls switch it to high', async () => {
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+    (await import('@/configuration')).reloadConfiguration();
+    try {
+      const confirmed = ['Set effort level to medium', IDLE].join('\n');
+      const port = createFakeControlPort({ captures: [IDLE, IDLE, confirmed] });
+      const controller = await makeController(port);
+      // A stale HIGH selection reaches the bridge; native /effort high is what the statusline shows.
+      const initial = mode({ model: 'claude-opus-5-5', reasoningEffort: 'high' });
+      const bridge = createClaudeUnifiedRuntimeControlBridge({
+        controller,
+        emitRuntimeConfigOutcome: () => undefined,
+        startupMode: initial,
+      });
+      bridge.reconcileFromStatusline({ model: initial.model, reasoningEffort: 'high' });
+
+      expect(await bridge.applyBeforePrompt(initial)).toMatchObject({ attempted: true, promptMayProceed: true });
+      expect(port.sentLiteral).toEqual(['/effort medium']);
+      expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
+    } finally {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+    }
+  });
+
+  it('desires ultracode off for a pinned model and re-applies the pinned effort over native ultracode', async () => {
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+    (await import('@/configuration')).reloadConfiguration();
+    try {
+      expect(mapEnhancedModeToDesiredRuntimeConfig(
+        mode({ model: 'claude-opus-5-5', reasoningEffort: 'high', ultracode: true }),
+      )).toMatchObject({ reasoningEffort: 'medium', ultracode: false });
+
+      const confirmed = ['Set effort level to medium', IDLE].join('\n');
+      const port = createFakeControlPort({ captures: [IDLE, IDLE, confirmed] });
+      const controller = await makeController(port);
+      // No ultracode selection on the session; Claude Code shows its own saved ultracode.
+      const initial = mode({ model: 'claude-opus-5-5', reasoningEffort: 'high' });
+      const bridge = createClaudeUnifiedRuntimeControlBridge({
+        controller,
+        emitRuntimeConfigOutcome: () => undefined,
+        startupMode: initial,
+      });
+      bridge.reconcileFromStatusline({ model: initial.model, reasoningEffort: 'ultracode' });
+
+      await bridge.applyBeforePrompt(initial);
+      expect(port.sentLiteral).toEqual(['/effort medium']);
+      expect(controller.getLastVerifiedRuntimeConfig().reasoningEffort).toBe('medium');
+    } finally {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+    }
   });
 
   it('preserves enabled ultracode while verifying the selected startup effort', async () => {

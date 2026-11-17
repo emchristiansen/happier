@@ -280,16 +280,14 @@ async function readClaudeProjectsEntryState(path: string): Promise<ClaudeProject
   }
 }
 
-function resolveAmbientClaudeStateSourceDir(params: Readonly<{
-  ambientStateSourceDir?: string | null;
-  sourceEnv: NodeJS.ProcessEnv;
-}>): string {
-  const explicit = typeof params.ambientStateSourceDir === 'string' ? params.ambientStateSourceDir.trim() : '';
-  if (explicit) return explicit;
-  const envWithoutOverrides = { ...params.sourceEnv };
-  delete envWithoutOverrides.CLAUDE_CONFIG_DIR;
-  delete envWithoutOverrides.HAPPIER_CLAUDE_CONFIG_DIR;
-  return resolveConfiguredClaudeConfigDir({ env: envWithoutOverrides });
+/**
+ * The explicitly supplied native store a self-source home may share state with. A self-source
+ * home's own env names only itself, so there is no other permitted store to derive; the ambient
+ * HOME is never substituted.
+ */
+function resolveAmbientClaudeStateSourceDir(ambientStateSourceDir: string | null | undefined): string | null {
+  const explicit = typeof ambientStateSourceDir === 'string' ? ambientStateSourceDir.trim() : '';
+  return explicit || null;
 }
 
 function buildSelfSourceSharedStateUnavailableDiagnostic(reason: string): ConnectedServicesMaterializationDiagnostic {
@@ -331,7 +329,7 @@ type SelfSourceProjectsReconciliation = Readonly<{
 async function reconcileSelfSourceClaudeProjectsStateMode(params: Readonly<{
   targetDir: string;
   requestedStateMode: ClaudeStateMode;
-  ambientStateSourceDir: string;
+  ambientStateSourceDir: string | null;
 }>): Promise<SelfSourceProjectsReconciliation> {
   const targetProjectsRoot = join(params.targetDir, 'projects');
   const entryState = await readClaudeProjectsEntryState(targetProjectsRoot);
@@ -349,8 +347,7 @@ async function reconcileSelfSourceClaudeProjectsStateMode(params: Readonly<{
     };
   }
 
-  const ambientProjectsRoot = join(params.ambientStateSourceDir, 'projects');
-  if (resolve(params.ambientStateSourceDir) === resolve(params.targetDir)) {
+  if (!params.ambientStateSourceDir || resolve(params.ambientStateSourceDir) === resolve(params.targetDir)) {
     return {
       effectiveStateMode: 'isolated',
       sharedProjectsRoot: null,
@@ -359,6 +356,7 @@ async function reconcileSelfSourceClaudeProjectsStateMode(params: Readonly<{
     };
   }
 
+  const ambientProjectsRoot = join(params.ambientStateSourceDir, 'projects');
   try {
     await mkdir(ambientProjectsRoot, { recursive: true });
     if (entryState === 'symlink') {
@@ -416,8 +414,8 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
   candidatePersistedSessionFile?: string | null | undefined;
   /**
    * Ambient native store root (`~/.claude`-equivalent) used to reconcile a self-source home's
-   * `projects` link with the CURRENT sharing policy. Derived from the source env without
-   * config-dir overrides when not provided.
+   * `projects` link with the CURRENT sharing policy. Without it a self-source home has no
+   * permitted store to share with, so requested shared state fails closed.
    */
   ambientStateSourceDir?: string | null | undefined;
   destinationLockAlreadyHeld?: boolean | undefined;
@@ -433,10 +431,7 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
       const reconciliation = await reconcileSelfSourceClaudeProjectsStateMode({
         targetDir: params.targetDir,
         requestedStateMode: settings.stateMode,
-        ambientStateSourceDir: resolveAmbientClaudeStateSourceDir({
-          ambientStateSourceDir: params.ambientStateSourceDir ?? null,
-          sourceEnv: params.sourceEnv,
-        }),
+        ambientStateSourceDir: resolveAmbientClaudeStateSourceDir(params.ambientStateSourceDir),
       });
       const importedSessionFileMappings = reconciliation.effectiveStateMode === 'shared' && reconciliation.sharedProjectsRoot
         ? await importClaudeCandidatePersistedSessionFile({

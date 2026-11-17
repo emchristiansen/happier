@@ -80,6 +80,7 @@ describe('Antigravity native credential import', () => {
     expect(record).toMatchObject({ oauth: { accessToken: 'refreshed-access', refreshToken: 'acp-refresh', scope: AGY_OAUTH_SCOPES.join(' '), raw: { project_id: 'native-selected-project' } } });
     const ownedRoot = join(file, '..', '..', 'connected');
     const materialized = await materializeConnectedServicesForSpawn({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'agy', materializationKey: 'native-project', activeServerDir: ownedRoot,
       baseDir: join(ownedRoot, 'materialized'), sessionDirectory: ownedRoot, processEnv: { HOME: ownedRoot },
       recordsByServiceId: new Map([['antigravity', record]]),

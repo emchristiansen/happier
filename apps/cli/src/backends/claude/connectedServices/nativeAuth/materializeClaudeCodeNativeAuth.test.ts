@@ -803,7 +803,7 @@ describe('materializeClaudeCodeNativeAuth', () => {
     ]);
   });
 
-  it('carries a previous connected-service Claude session file into a canonical shared-state home even when source env already points at the target home', async () => {
+  it('carries a previous connected-service Claude session file into a canonical shared-state home through an explicit native store when source env already points at the target home', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-home-'));
     const previousClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-previous-'));
     const targetClaudeConfigDir = await mkdtemp(join(tmpdir(), 'happier-claude-native-auth-target-'));
@@ -826,6 +826,7 @@ describe('materializeClaudeCodeNativeAuth', () => {
       record,
       targetClaudeConfigDir,
       sourceEnv: { HOME: homeDir, CLAUDE_CONFIG_DIR: targetClaudeConfigDir },
+      ambientStateSourceDir: join(homeDir, '.claude'),
       accountSettings: {
         connectedServicesProviderStateSharingSettingsV1: {
           v: 1,

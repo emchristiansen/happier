@@ -464,9 +464,10 @@ export async function claudeLocalLauncher(
             if (expectsFork) {
                 // Starting local mode from an existing session uses `--resume`, which forks
                 // to a new Claude session ID and transcript file. Clear the current
-                // session info so a fast local→remote switch waits for the new hook data,
-                // instead of resuming the stale pre-fork sessionId/transcriptPath.
-                clearedIdentity = session.clearSessionId();
+                // session info so the new hook data is observed; until that fork has
+                // materialized native history the Session keeps resuming the pre-fork
+                // identity, so a switch before any local turn never starts fresh.
+                clearedIdentity = session.clearSessionIdForExpectedFork();
             }
 
             // Launch

@@ -16,6 +16,9 @@ import { getProjectPath } from './utils/path';
 import type { EnhancedMode } from './loop';
 import { completedNativeChildTranscript } from './workflows/claudeWorkflowActivitySource.testkit';
 import type { SessionWorkflowRunSnapshotV1 } from '@happier-dev/protocol';
+import { resolveClaudeRemoteSessionStartPlan } from './remote/sessionStartPlan';
+import { resolveClaudeConfigDirOverride } from './utils/resolveClaudeConfigDirOverride';
+import { ClaudeResumeSessionUnavailableError } from './utils/claudeCheckSession';
 
 vi.mock('@/agent/runtime/createHappierMcpBridge', () => ({
   createHappierMcpBridge: vi.fn(async () => ({
@@ -167,6 +170,7 @@ function createLocalHarness(options?: {
   metadataSnapshot?: MetadataSnapshot;
   sessionId?: string;
   path?: string;
+  claudeArgs?: string[];
   providerTasks?: NonNullable<ConstructorParameters<typeof Session>[0]['runtimeActivityContributions']>['providerTasks'];
 }): LocalHarness {
   const switchDeferred = createDeferred<RpcHandler>();
@@ -227,6 +231,7 @@ function createLocalHarness(options?: {
     path: options?.path ?? '/tmp',
     logPath: '/tmp/log',
     sessionId: options?.sessionId ?? null,
+    ...(options?.claudeArgs ? { claudeArgs: options.claudeArgs } : {}),
     messageQueue: new MessageQueue2<EnhancedMode>(() => 'mode'),
     onModeChange: () => {},
     hookSettingsPath: '/tmp/hooks.json',
@@ -1633,5 +1638,268 @@ describe('claudeLocalLauncher', () => {
       ...registration,
       source: 'workflow-agent',
     });
+  });
+});
+
+describe('requested Claude resume across a local launch and a switch to remote', () => {
+  const requestedNativeId = '00000000-0000-4000-8000-0000000bdf81';
+  const forkNativeId = '00000000-0000-4000-8000-0000000f0c6a';
+  const cleanups: Array<() => Promise<void>> = [];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockClaudeLocal.mockReset();
+    mockCreateSessionScanner.mockReset();
+    mockCreateSessionScanner.mockResolvedValue(createSessionScannerStub());
+    mockCreateClaudeWorkflowActivitySourceForSession.mockReset();
+    mockCreateClaudeWorkflowActivitySourceForSession.mockResolvedValue(null);
+  });
+
+  afterEach(async () => {
+    for (const session of createdSessions.splice(0)) {
+      session.client.sessionTurnLifecycle?.dispose();
+      session.cleanup();
+    }
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  });
+
+  async function writeNativeTranscript(projectDir: string, nativeId: string): Promise<string> {
+    const transcriptPath = join(projectDir, `${nativeId}.jsonl`);
+    await writeFile(transcriptPath, `${JSON.stringify({
+      type: 'user', uuid: `${nativeId}-user`, sessionId: nativeId,
+      timestamp: new Date().toISOString(), message: { role: 'user', content: 'earlier work' },
+    })}\n`);
+    return transcriptPath;
+  }
+
+  /** Owned Claude config dir; the requested native session is materialized unless told otherwise. */
+  async function createRequestedResumeFixture(input?: Readonly<{ requestedMaterialized?: boolean; requested?: boolean }>) {
+    const dir = await mkdtemp(join(tmpdir(), 'happier-claude-requested-resume-'));
+    const workspaceDir = join(dir, 'workspace');
+    const configDir = join(dir, 'claude-config');
+    const projectDir = getProjectPath(workspaceDir, configDir);
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(projectDir, { recursive: true });
+    if (input?.requestedMaterialized !== false) await writeNativeTranscript(projectDir, requestedNativeId);
+    const env = createEnvKeyScope(['CLAUDE_CONFIG_DIR']);
+    env.patch({ CLAUDE_CONFIG_DIR: configDir });
+    cleanups.push(async () => {
+      env.restore();
+      await rm(dir, { recursive: true, force: true });
+    });
+    // `happier resume` of an inactive session: `claude --resume <native> --started-by terminal`.
+    const harness = createLocalHarness({
+      path: workspaceDir,
+      ...(input?.requested === false ? {} : { claudeArgs: ['--resume', requestedNativeId] }),
+    });
+    return { ...harness, projectDir };
+  }
+
+  function latestSwitchHandler(client: SessionClientStub): RpcHandler {
+    const calls = vi.mocked(client.rpcHandlerManager.registerHandler).mock.calls
+      .filter(([method]) => method === 'switch');
+    const handler = calls.at(-1)?.[1];
+    if (!handler) throw new Error('switch handler was not registered');
+    return handler as RpcHandler;
+  }
+
+  /**
+   * One local Claude invocation that is switched to remote before any local turn: the process
+   * spawned, observed `during`, then was torn down for the mode switch.
+   */
+  function localInvocationSwitchedToRemote(
+    client: SessionClientStub,
+    during?: (opts: LocalLaunchOptions) => Promise<void>,
+  ): { spawnedWithResume: () => string | null | undefined } {
+    let spawnedWithResume: string | null | undefined;
+    mockClaudeLocal.mockImplementationOnce(async (opts) => {
+      spawnedWithResume = opts.sessionId;
+      await during?.(opts);
+      void latestSwitchHandler(client)({ to: 'remote' });
+      await waitForAbort(opts.abort);
+      // As claudeLocal does for an abort teardown: the provider exit is observed and the
+      // invocation resolves normally (it does not reject with the SIGTERM exit code).
+      opts.onProcessExit?.({ providerStopped: true });
+    });
+    return { spawnedWithResume: () => spawnedWithResume };
+  }
+
+  /** The remote start owner's own steps (claudeRemoteLauncher input seeding + remote dispatch). */
+  function resolveRemoteStart(session: Session) {
+    session.adoptExplicitResumeSessionIdFromArgs();
+    const identity = session.getResumableSessionIdentity();
+    return resolveClaudeRemoteSessionStartPlan({
+      sessionId: identity?.sessionId ?? null,
+      transcriptPath: identity?.transcriptPath ?? null,
+      path: session.path,
+      claudeConfigDir: resolveClaudeConfigDirOverride(process.env),
+      claudeArgs: session.claudeArgs,
+    });
+  }
+
+  it('resumes the requested native session remotely when no hook reported a fork', async () => {
+    const { session, client } = await createRequestedResumeFixture();
+    const local = localInvocationSwitchedToRemote(client);
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+
+    expect(local.spawnedWithResume()).toBe(requestedNativeId);
+    expect(resolveRemoteStart(session)).toEqual({ startFrom: requestedNativeId, shouldContinue: false });
+  });
+
+  it.each(['startup', 'resume'] as const)(
+    'resumes the requested native session when the hook-reported fork (%s) never materialized',
+    async (source) => {
+      const { session, client, projectDir } = await createRequestedResumeFixture();
+      localInvocationSwitchedToRemote(client, async () => {
+        session.onSessionFound(forkNativeId, {
+          hook_event_name: 'SessionStart', source, transcript_path: join(projectDir, `${forkNativeId}.jsonl`),
+        });
+        await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+      });
+      const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+      await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+
+      expect(resolveRemoteStart(session)).toEqual({ startFrom: requestedNativeId, shouldContinue: false });
+    },
+  );
+
+  it('uses a hook-reported fork once its native history is materialized', async () => {
+    const { session, client, projectDir } = await createRequestedResumeFixture();
+    localInvocationSwitchedToRemote(client, async () => {
+      const transcriptPath = await writeNativeTranscript(projectDir, forkNativeId);
+      session.onSessionFound(forkNativeId, { hook_event_name: 'SessionStart', source: 'resume', transcript_path: transcriptPath });
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+    });
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+
+    expect(resolveRemoteStart(session)).toEqual({ startFrom: forkNativeId, shouldContinue: false });
+  });
+
+  it('refuses a remote start precisely, instead of starting fresh, when the requested history is unavailable', async () => {
+    const { session, client } = await createRequestedResumeFixture({ requestedMaterialized: false });
+    localInvocationSwitchedToRemote(client);
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+
+    expect(() => resolveRemoteStart(session)).toThrow(ClaudeResumeSessionUnavailableError);
+  });
+
+  it('keeps the requested native session after a local spawn error and a later switch', async () => {
+    const { session, client } = await createRequestedResumeFixture();
+    mockClaudeLocal.mockImplementationOnce(async () => { throw new Error('spawn claude ENOENT'); });
+    const second = localInvocationSwitchedToRemote(client);
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+
+    expect(mockClaudeLocal).toHaveBeenCalledTimes(2);
+    expect(second.spawnedWithResume()).toBe(requestedNativeId);
+    expect(resolveRemoteStart(session)).toEqual({ startFrom: requestedNativeId, shouldContinue: false });
+  });
+
+  it('keeps the requested native session across repeated local and remote transitions', async () => {
+    const { session, client } = await createRequestedResumeFixture();
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    localInvocationSwitchedToRemote(client);
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+    expect(resolveRemoteStart(session)).toEqual({ startFrom: requestedNativeId, shouldContinue: false });
+
+    const again = localInvocationSwitchedToRemote(client);
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+    expect(again.spawnedWithResume()).toBe(requestedNativeId);
+    expect(resolveRemoteStart(session)).toEqual({ startFrom: requestedNativeId, shouldContinue: false });
+  });
+
+  it('still starts a genuinely new session fresh when no resume was requested', async () => {
+    const { session, client, projectDir } = await createRequestedResumeFixture({ requested: false });
+    const local = localInvocationSwitchedToRemote(client, async () => {
+      session.onSessionFound(forkNativeId, {
+        hook_event_name: 'SessionStart', source: 'startup', transcript_path: join(projectDir, `${forkNativeId}.jsonl`),
+      });
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+    });
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+
+    expect(local.spawnedWithResume()).toBeNull();
+    expect(resolveRemoteStart(session)).toEqual({ startFrom: null, shouldContinue: false });
+  });
+
+  it.each(['startup', 'eventless', 'resume'] as const)(
+    'refuses a remote start when the requested native session is re-observed (%s) after its history was lost',
+    async (source) => {
+      const { session, client, projectDir } = await createRequestedResumeFixture();
+      localInvocationSwitchedToRemote(client, async (opts) => {
+        await rm(join(projectDir, `${requestedNativeId}.jsonl`));
+        if (source === 'eventless') opts.onSessionFound(requestedNativeId);
+        else session.onSessionFound(requestedNativeId, {
+          hook_event_name: 'SessionStart', source, transcript_path: join(projectDir, `${requestedNativeId}.jsonl`),
+        });
+        await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+      });
+      const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+      await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+
+      expect(() => resolveRemoteStart(session)).toThrow(ClaudeResumeSessionUnavailableError);
+    },
+  );
+
+  it('resumes the requested native session when it is re-observed with its history intact', async () => {
+    const { session, client, projectDir } = await createRequestedResumeFixture();
+    localInvocationSwitchedToRemote(client, async () => {
+      session.onSessionFound(requestedNativeId, {
+        hook_event_name: 'SessionStart', source: 'startup', transcript_path: join(projectDir, `${requestedNativeId}.jsonl`),
+      });
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+    });
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+
+    expect(resolveRemoteStart(session)).toEqual({ startFrom: requestedNativeId, shouldContinue: false });
+  });
+
+  it('permits a genuinely fresh start after an explicit reset of an unconfirmed fork', async () => {
+    const { session, client } = await createRequestedResumeFixture();
+    localInvocationSwitchedToRemote(client);
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+    expect(session.getResumableSessionId()).toBe(requestedNativeId);
+
+    session.clearSessionId();
+    expect(resolveRemoteStart(session)).toEqual({ startFrom: null, shouldContinue: false });
+  });
+
+  it('refuses a remote start when a confirmed fork later loses its history', async () => {
+    const { session, client, projectDir } = await createRequestedResumeFixture();
+    localInvocationSwitchedToRemote(client, async () => {
+      const transcriptPath = await writeNativeTranscript(projectDir, forkNativeId);
+      session.onSessionFound(forkNativeId, { hook_event_name: 'SessionStart', source: 'resume', transcript_path: transcriptPath });
+      await session.drainCriticalMetadataWrites({ timeoutMs: 500 });
+    });
+    const { claudeLocalLauncher } = await import('./claudeLocalLauncher');
+
+    await expect(claudeLocalLauncher(session)).resolves.toEqual({ type: 'switch' });
+    expect(session.getResumableSessionId()).toBe(forkNativeId);
+
+    await rm(join(projectDir, `${forkNativeId}.jsonl`));
+    expect(() => resolveRemoteStart(session)).toThrow(ClaudeResumeSessionUnavailableError);
+  });
+
+  it('still resumes the requested native session when the session starts in remote mode', async () => {
+    const { session } = await createRequestedResumeFixture();
+
+    expect(resolveRemoteStart(session)).toEqual({ startFrom: requestedNativeId, shouldContinue: false });
+    expect(mockClaudeLocal).not.toHaveBeenCalled();
   });
 });

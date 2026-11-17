@@ -165,4 +165,22 @@ describe('tmux session resource policy', () => {
       HAPPIER_DAEMON_STARTUP_SOURCE: '',
     });
   });
+
+  it.each([
+    { title: 'carries the daemon\'s Claude effort pin', daemonValue: '{"claude-opus-5-5":"medium"}', expected: '{"claude-opus-5-5":"medium"}' },
+    { title: 'masks a stale tmux-server Claude effort pin when the daemon has none', daemonValue: undefined, expected: '' },
+  ])('$title into the tmux window', async ({ daemonValue, expected }) => {
+    const config = await buildTmuxSpawnConfig({
+      launchId: LAUNCH_ID,
+      agent: 'claude',
+      directory: '/tmp',
+      extraEnv: {},
+      processEnv: {
+        PATH: '/bin',
+        ...(daemonValue === undefined ? {} : { HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES: daemonValue }),
+      },
+    });
+
+    expect(config.tmuxEnv.HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES).toBe(expected);
+  });
 });

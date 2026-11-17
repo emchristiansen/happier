@@ -50,10 +50,13 @@ describe('createActionToolExecutorBridge', () => {
         await reply.code(401).send({ error: 'not_authenticated' });
       }
     });
+    // The server's full artifact record (artifactsRoutes.ts GET /v1/artifacts/:id): creation starts seq at 0,
+    // and each update advances seq and updatedAt (artifactWriteService.ts).
     const artifacts = new Map<string, {
       id: string; header: string; body: string; dataEncryptionKey: string;
-      headerVersion: number; bodyVersion: number;
+      headerVersion: number; bodyVersion: number; seq: number; createdAt: number; updatedAt: number;
     }>();
+    let clock = 1_700_000_000_000;
     let notifyCreated!: (id: string) => void;
     const approvalCreated = new Promise<string>((resolve) => { notifyCreated = resolve; });
     app.get<{ Params: { id: string } }>('/v2/sessions/:id', async (request) => ({
@@ -63,7 +66,10 @@ describe('createActionToolExecutorBridge', () => {
     }));
     app.post<{ Body: { id: string; header: string; body: string; dataEncryptionKey: string } }>(
       '/v1/artifacts', async (request) => {
-        artifacts.set(request.body.id, { ...request.body, headerVersion: 1, bodyVersion: 1 });
+        const now = ++clock;
+        artifacts.set(request.body.id, {
+          ...request.body, headerVersion: 1, bodyVersion: 1, seq: 0, createdAt: now, updatedAt: now,
+        });
         notifyCreated(request.body.id);
         return { id: request.body.id };
       },
@@ -85,6 +91,7 @@ describe('createActionToolExecutorBridge', () => {
       artifacts.set(artifact.id, {
         ...artifact, header: request.body.header, body: request.body.body,
         headerVersion: artifact.headerVersion + 1, bodyVersion: artifact.bodyVersion + 1,
+        seq: artifact.seq + 1, updatedAt: ++clock,
       });
       return { success: true };
     });

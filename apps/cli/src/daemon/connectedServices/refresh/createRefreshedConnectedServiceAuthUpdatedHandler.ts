@@ -226,6 +226,12 @@ export function createRefreshedConnectedServiceAuthUpdatedHandler(params: Readon
             excludedFromGenericRestart.add(sessionId);
             return;
           }
+          if (result.errorCode === 'restart_replacement_unavailable') {
+            // A generic restart would retire this runner with no replacement launch as well.
+            excludedFromGenericRestart.add(sessionId);
+            logger.warn('[ConnectedServiceRefresh] Refreshed credential application refused: runner has no replacement launch', { sessionId });
+            return;
+          }
           if (result.errorCode === 'hot_apply_restart_required') {
             excludedFromGenericRestart.add(sessionId);
             reportRestartRequired(event, target, sessionId);

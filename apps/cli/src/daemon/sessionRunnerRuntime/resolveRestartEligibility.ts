@@ -1,4 +1,5 @@
 import type { TrackedSession } from '@/daemon/types';
+import { resolveSessionRunnerReplacementOperand } from '@/daemon/processSupervision/sessionRunnerRespawn';
 
 import { readSessionRunnerStartingModeFromProcessCommand } from './readSessionRunnerStartingMode';
 import type { SessionRunnerRestartDisabledReason } from './types';
@@ -13,10 +14,6 @@ function normalizeString(value: unknown): string {
 
 function isActiveTrackedRunner(tracked: TrackedSession): boolean {
   return Number.isInteger(tracked.pid) && tracked.pid > 0;
-}
-
-function hasSpawnOptions(tracked: TrackedSession): boolean {
-  return !!normalizeString(tracked.spawnOptions?.directory);
 }
 
 export function hasSessionRunnerResumeIdentity(tracked: TrackedSession): boolean {
@@ -44,12 +41,16 @@ export function resolveSessionRunnerRestartEligibility(
   tracked: TrackedSession | null | undefined,
 ): SessionRunnerRestartEligibility {
   if (!tracked) return { eligible: false, disabledReason: 'no_tracked_process' };
-  if (tracked.startedBy !== 'daemon') return { eligible: false, disabledReason: 'not_daemon_started' };
+  // The respawn owner's replacement rule; the checks below keep their historical order.
+  const replacement = resolveSessionRunnerReplacementOperand(tracked);
+  if (!replacement.replaceable && replacement.reason === 'not_daemon_started') {
+    return { eligible: false, disabledReason: 'not_daemon_started' };
+  }
   if (readSessionRunnerStartingModeFromProcessCommand(tracked.processCommand) !== 'remote') {
     return { eligible: false, disabledReason: 'not_remote_started' };
   }
   if (!isActiveTrackedRunner(tracked)) return { eligible: false, disabledReason: 'not_active' };
-  if (!hasSpawnOptions(tracked)) return { eligible: false, disabledReason: 'missing_spawn_options' };
+  if (!replacement.replaceable) return { eligible: false, disabledReason: 'missing_spawn_options' };
   if (!hasSessionRunnerResumeIdentity(tracked)) {
     return { eligible: false, disabledReason: 'missing_resume_identity' };
   }

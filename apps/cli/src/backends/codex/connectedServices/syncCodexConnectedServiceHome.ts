@@ -14,6 +14,10 @@ import { resolveConfiguredCodexHome } from '@/backends/codex/utils/resolveConfig
 import { isMatchingCodexRolloutFileName, normalizeCodexVendorResumeId } from '@/backends/codex/utils/codexSessionFiles';
 import { resolveConnectedServiceHomesDir } from '@/daemon/connectedServices/homes/resolveConnectedServiceHomeDir';
 import { isConnectedServiceStateRootWithin } from '@/daemon/connectedServices/materialize/resolveConnectedServicePreviousStateRoot';
+import {
+  ConnectedServiceNativeSourceProvenanceError,
+  type ConnectedServiceNativeSourceAuthority,
+} from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import { ConnectedServiceSharedStateLinkUnavailableError } from '@/daemon/connectedServices/stateSharing/createSharedStateLink';
 import { withConnectedServiceStateSharingLocks } from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingLock';
 import {
@@ -28,6 +32,12 @@ import {
 } from '@/daemon/connectedServices/stateSharing/importConnectedServiceSessionFiles';
 import { logger } from '@/ui/logger';
 
+import {
+  isSameCodexAdmittedNativeSource,
+  readCodexHomeProvenance,
+  type CodexAdmittedNativeSource,
+  type CodexHomeProvenance,
+} from './codexHomeNativeSource';
 import { resolveConfiguredCodexSqliteHome } from './codexStateFileNames';
 import { isCodexFixedJsonlStateFile, reconcileCodexSharedJsonlState } from './reconcileCodexSharedJsonlState';
 
@@ -61,6 +71,80 @@ export type CodexConnectedServiceStateSharingDiagnostic = Readonly<{
   reason: 'symlink_unavailable';
   fsCode?: string;
 }>;
+
+/**
+ * Decide, before any lock, traversal or write, which native source this materialization may use.
+ *
+ * The admitted source belongs to the session's homes for their whole lifecycle: once the destination or
+ * the session's previous home records one, no later materialization (account switch, daemon spawn or
+ * recovery, refresh) may name another, whatever its environment says.
+ * - `caller_env`: the caller's own CODEX_HOME/CODEX_SQLITE_HOME, refused if either record differs. An
+ *   absent or legacy-unrecorded destination is (re-)admitted by this producing caller.
+ * - `recorded`: the destination's record; a never-produced destination inherits the previous home's
+ *   record. A legacy-unrecorded destination, or no record at all, is refused.
+ * Both participating records must agree; an invalid record is refused, never inherited around.
+ */
+async function admitCodexNativeSource(params: Readonly<{
+  nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
+  destinationCodexHome: string;
+  previousCodexHome: string | null;
+  processEnv: NodeJS.ProcessEnv;
+}>): Promise<CodexAdmittedNativeSource> {
+  const destination = await readCodexHomeProvenance(params.destinationCodexHome);
+  const previous = params.previousCodexHome && resolve(params.previousCodexHome) !== resolve(params.destinationCodexHome)
+    ? await readCodexHomeProvenance(params.previousCodexHome)
+    : null;
+  const refuseUnless = (recorded: CodexHomeProvenance | null, requested: CodexAdmittedNativeSource) => {
+    if (recorded?.kind === 'recorded' && !isSameCodexAdmittedNativeSource(recorded.source, requested)) {
+      throw new CodexConnectedServiceNativeSourceConflictError(params.destinationCodexHome, recorded.source, requested);
+    }
+  };
+  if (params.nativeSourceAuthority === 'caller_env') {
+    const requested: CodexAdmittedNativeSource = {
+      CODEX_HOME: resolve(resolveConfiguredCodexHome(params.processEnv)),
+      CODEX_SQLITE_HOME: resolve(resolveConfiguredCodexSqliteHome(params.processEnv)),
+    };
+    refuseUnless(destination, requested);
+    refuseUnless(previous, requested);
+    return requested;
+  }
+  const recorded = destination.kind === 'recorded'
+    ? destination.source
+    : destination.kind === 'absent' && previous?.kind === 'recorded'
+      ? previous.source
+      : null;
+  if (!recorded) {
+    throw new ConnectedServiceNativeSourceProvenanceError(
+      'connected_service_native_source_unrecorded',
+      params.destinationCodexHome,
+      `Codex connected-service home ${params.destinationCodexHome} records no admitted native source; `
+        + 'refusing to rematerialize it from any other source',
+    );
+  }
+  refuseUnless(previous, recorded);
+  return recorded;
+}
+
+/**
+ * The target was produced from another admitted source (or, for a rematerializer, its recorded source
+ * changed underneath it). Refused before the requested source is traversed or linked.
+ */
+export class CodexConnectedServiceNativeSourceConflictError extends ConnectedServiceNativeSourceProvenanceError {
+  constructor(
+    readonly destinationCodexHome: string,
+    readonly recorded: CodexAdmittedNativeSource,
+    readonly requested: CodexAdmittedNativeSource,
+  ) {
+    super(
+      'connected_service_native_source_conflict',
+      destinationCodexHome,
+      `Codex connected-service home ${destinationCodexHome} was produced from native source `
+        + `${recorded.CODEX_HOME} (SQLite ${recorded.CODEX_SQLITE_HOME}); refusing to materialize it from `
+        + `${requested.CODEX_HOME} (SQLite ${requested.CODEX_SQLITE_HOME})`,
+    );
+    this.name = 'CodexConnectedServiceNativeSourceConflictError';
+  }
+}
 
 export type SyncCodexConnectedServiceHomeResult = Readonly<{
   providerId: 'codex';
@@ -181,15 +265,6 @@ function toStateSymlinkUnavailableDiagnostic(
   };
 }
 
-function resolveSourceCodexHome(params: Readonly<{
-  destinationCodexHome: string;
-  processEnv: NodeJS.ProcessEnv;
-}>): string | null {
-  const sourceCodexHome = resolve(resolveConfiguredCodexHome(params.processEnv));
-  if (sourceCodexHome === resolve(params.destinationCodexHome)) return null;
-  return sourceCodexHome;
-}
-
 function resolveVendorResumeIdFromImportedRollout(
   detail: ConnectedServiceSessionFileImportDetail,
 ): string | null {
@@ -274,28 +349,63 @@ export async function syncCodexConnectedServiceHome(params: Readonly<{
   vendorResumeId?: string | null;
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv?: NodeJS.ProcessEnv;
+  nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
 }>): Promise<SyncCodexConnectedServiceHomeResult> {
   const settings = resolveCodexHomeSharingSettings(params.accountSettings ?? null);
-  const processEnv = params.processEnv ?? process.env;
-  const configuredSourceCodexHome = resolveSourceCodexHome({
+  // A rematerializer that did not produce this home reads its source only from the home's own record
+  // (or the session's previous home); its environment (the daemon's) is never a source. Admission is
+  // decided before any lock: locking a source creates it, so a refused source is never touched.
+  const admittedSource = await admitCodexNativeSource({
+    nativeSourceAuthority: params.nativeSourceAuthority,
     destinationCodexHome: params.destinationCodexHome,
-    processEnv,
+    previousCodexHome: params.previousCodexHome ?? null,
+    processEnv: params.processEnv ?? process.env,
   });
-  const sourceCodexHome = configuredSourceCodexHome ?? resolve(params.destinationCodexHome);
+  const processEnv: NodeJS.ProcessEnv = params.nativeSourceAuthority === 'recorded'
+    ? admittedSource
+    : params.processEnv ?? process.env;
+  const configuredSourceCodexHome = admittedSource.CODEX_HOME === resolve(params.destinationCodexHome)
+    ? null
+    : admittedSource.CODEX_HOME;
+  const sourceCodexHome = admittedSource.CODEX_HOME;
+  const sourceSqliteHome = admittedSource.CODEX_SQLITE_HOME;
   const lockRoots = settings.stateMode === 'shared' && configuredSourceCodexHome
     ? [params.destinationCodexHome, sourceCodexHome]
     : [params.destinationCodexHome];
   return await withConnectedServiceStateSharingLocks(lockRoots, async () => {
-    const sourceSqliteHome = resolve(resolveConfiguredCodexSqliteHome(processEnv));
+    // Re-check under the home lock: another producer may have recorded a source since admission.
+    const currently = await readCodexHomeProvenance(params.destinationCodexHome);
+    if (currently.kind === 'recorded' && !isSameCodexAdmittedNativeSource(currently.source, admittedSource)) {
+      throw new CodexConnectedServiceNativeSourceConflictError(
+        params.destinationCodexHome,
+        currently.source,
+        admittedSource,
+      );
+    }
     if (!configuredSourceCodexHome && settings.stateMode === 'shared') {
+      // The home is its own shared source: nothing to link, but it is admitted and recorded like
+      // any other, so a later recorded rematerialization keeps this exact SQLite home. Its modes are
+      // published before returning the shared SQLite home, also when an earlier isolated pass left
+      // the recorded home isolated, so consumers choose the SQLite home this producer chose.
+      const existing = await readConnectedServiceStateSharingManifest(params.destinationCodexHome);
+      if (
+        currently.kind !== 'recorded'
+        || existing.requestedStateMode !== 'shared'
+        || existing.effectiveStateMode !== 'shared'
+      ) {
+        await writeConnectedServiceStateSharingManifest(params.destinationCodexHome, {
+          ...existing,
+          requestedStateMode: 'shared',
+          effectiveStateMode: 'shared',
+          nativeSourceEnv: admittedSource,
+        });
+      }
       return {
         providerId: 'codex',
         requestedStateMode: settings.stateMode,
         effectiveStateMode: settings.stateMode,
         diagnostics: [],
-        targetSqliteHome: settings.stateMode === 'shared'
-          ? sourceSqliteHome
-          : params.destinationCodexHome,
+        targetSqliteHome: sourceSqliteHome,
       };
     }
 
@@ -401,7 +511,10 @@ export async function syncCodexConnectedServiceHome(params: Readonly<{
         });
       }
     }
-    await writeConnectedServiceStateSharingManifest(params.destinationCodexHome, applyResult.manifest);
+    await writeConnectedServiceStateSharingManifest(params.destinationCodexHome, {
+      ...applyResult.manifest,
+      nativeSourceEnv: admittedSource,
+    });
     await removeLegacyConnectedServiceStateSharingManifest(params.destinationCodexHome);
 
     return {

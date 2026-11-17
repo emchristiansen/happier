@@ -1,3 +1,5 @@
+import type { ConnectedServiceCredentialHealthStatusV1 } from '@happier-dev/protocol';
+
 import type { ConnectedServiceRefreshReason } from '@/daemon/connectedServices/credentials/lifecycleTypes';
 import type { ApiClient } from '@/api/api';
 import { serializeAxiosErrorForLog } from '@/api/client/serializeAxiosErrorForLog';
@@ -44,22 +46,38 @@ export function credentialHealthReprobeDelayMs(failureCount: number): number {
   return CREDENTIAL_HEALTH_REPROBE_BACKOFF_MS[index]!;
 }
 
-export async function readCredentialHealthStatusForRefresh(input: Readonly<{
-  api: ApiClient;
+/**
+ * The bound profile's credential health as the refresh path may act on it. Health that could not be
+ * read is `unavailable`, never an implied healthy status: an older server without the exact route,
+ * a malformed response, a transport failure, a client without the reader, or a profile that vanished
+ * after its credential was read.
+ */
+export type CredentialHealthForRefresh =
+  | Readonly<{ kind: 'read'; status: ConnectedServiceCredentialHealthStatusV1 }>
+  | Readonly<{ kind: 'unavailable' }>;
+
+/** Reads the bound profile's health by its exact key, so no other profile of the service is read. */
+export async function readCredentialHealthForRefresh(input: Readonly<{
+  api: Pick<ApiClient, 'readConnectedServiceCredentialHealth'>;
   binding: BoundProfile;
-}>): Promise<unknown> {
-  const listProfiles = input.api.listConnectedServiceProfiles;
-  if (typeof listProfiles !== 'function') return null;
+}>): Promise<CredentialHealthForRefresh> {
   try {
-    const result = await listProfiles.call(input.api, { serviceId: input.binding.serviceId });
-    const profile = result.profiles.find((candidate) => candidate.profileId === input.binding.profileId);
-    return profile?.status ?? null;
+    const health = await input.api.readConnectedServiceCredentialHealth({
+      serviceId: input.binding.serviceId,
+      profileId: input.binding.profileId,
+    });
+    if (health.kind === 'found') return { kind: 'read', status: health.status };
+    logger.warn('[DAEMON RUN] Connected-service profile health is absent before refresh', {
+      serviceId: input.binding.serviceId,
+      profileId: input.binding.profileId,
+    });
+    return { kind: 'unavailable' };
   } catch (error) {
     logger.warn('[DAEMON RUN] Failed to read connected-service profile health before refresh', {
       serviceId: input.binding.serviceId,
       profileId: input.binding.profileId,
       error: serializeAxiosErrorForLog(error),
     });
-    return null;
+    return { kind: 'unavailable' };
   }
 }

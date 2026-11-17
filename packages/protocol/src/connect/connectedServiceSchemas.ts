@@ -100,6 +100,19 @@ export const ConnectedServiceCredentialHealthV1Schema = lazySchema(() => z.objec
 export type ConnectedServiceCredentialHealthV1 = z.infer<typeof ConnectedServiceCredentialHealthV1Schema>;
 
 /**
+ * Response of the exact-profile credential-health read
+ * (`GET /v3/connect/:serviceId/profiles/:profileId/credential/health`). It carries one
+ * profile's canonical status and stored health, and nothing about any other profile, so a
+ * caller that already knows the profile it uses never needs the service-wide profile list.
+ */
+export const ConnectedServiceCredentialHealthReadV1Schema = lazySchema(() => z.object({
+    profileId: ConnectedServiceProfileIdSchema,
+    status: ConnectedServiceCredentialHealthStatusV1Schema,
+    health: ConnectedServiceCredentialHealthV1Schema.nullable(),
+}).strict());
+export type ConnectedServiceCredentialHealthReadV1 = z.infer<typeof ConnectedServiceCredentialHealthReadV1Schema>;
+
+/**
  * Opaque server-owned revision for one connected-service credential value.
  * It is intentionally independent from row timestamps and refresh-lease bookkeeping.
  */

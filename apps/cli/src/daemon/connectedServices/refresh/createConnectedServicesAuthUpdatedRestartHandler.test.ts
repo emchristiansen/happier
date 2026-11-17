@@ -1330,7 +1330,9 @@ describe('createConnectedServicesAuthUpdatedRestartHandler', () => {
         executionPolicy: { allowRestartResume: false, allowContinuation: false, source: 'startup_reconciliation' },
         switchReason: 'automatic_runtime_failure', expectedCredentialRevisionByServiceId: { [serviceId]: credentialRevision },
         api: {
-          listConnectedServiceProfiles: async () => ({ serviceId, profiles: [{ profileId: 'work', status: 'connected' }] }),
+          readConnectedServiceCredentialHealth: async (input) => (input.serviceId === serviceId && input.profileId === 'work'
+            ? { kind: 'found', status: 'connected', health: null }
+            : { kind: 'not_found' }),
           getConnectedServiceAuthGroup: async () => ({ v: 1, ...target, activeProfileId: 'work', displayName: 'Team',
             policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({}), runtimeStateRevision: 0, state: { v: 1 },
             members: [{ v: 1, serviceId, groupId: 'team', profileId: 'work', priority: 100, enabled: true, state: {}, createdAt: 1, updatedAt: 1 }],

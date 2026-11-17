@@ -106,6 +106,27 @@ function resolveRespawnKind(event: TerminationEvent): 'connected_service_intende
     : 'respawn_retry';
 }
 
+export type SessionRunnerReplacementOperand =
+  | Readonly<{ replaceable: true; spawnOptions: SpawnSessionOptions; vendorResumeId: string }>
+  | Readonly<{ replaceable: false; reason: 'not_daemon_started' | 'missing_spawn_options' }>;
+
+/**
+ * The single eligibility rule for relaunching a session runner after it exits: only a
+ * daemon-started runner whose spawn options name a working directory can be replaced. Callers that
+ * are about to retire a runner (connected-service restarts) evaluate the same rule on the operand
+ * they will leave on the tracked session, so an unreplaceable runner is never retired.
+ */
+export function resolveSessionRunnerReplacementOperand(
+  tracked: Pick<TrackedSession, 'startedBy' | 'spawnOptions' | 'vendorResumeId'>,
+): SessionRunnerReplacementOperand {
+  if (tracked.startedBy !== 'daemon') return { replaceable: false, reason: 'not_daemon_started' };
+  const spawnOptions = tracked.spawnOptions;
+  if (!spawnOptions || !normalizeOptionalString(spawnOptions.directory)) {
+    return { replaceable: false, reason: 'missing_spawn_options' };
+  }
+  return { replaceable: true, spawnOptions, vendorResumeId: normalizeOptionalString(tracked.vendorResumeId) };
+}
+
 function buildRespawnOptions(params: Readonly<{
   spawnOptions: SpawnSessionOptions;
   sessionId: string;
@@ -423,7 +444,8 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
     },
     handleUnexpectedExit: (trackedSession: TrackedSession, exit: DaemonChildExit, options) => {
       if (!params.enabled && options?.forceRestart !== true) return;
-      if (trackedSession.startedBy !== 'daemon') return;
+      const operand = resolveSessionRunnerReplacementOperand(trackedSession);
+      if (!operand.replaceable && operand.reason === 'not_daemon_started') return;
       const sessionId = normalizeSessionId(trackedSession.happySessionId);
       if (!sessionId) return;
       const forceRestart = options?.forceRestart === true;
@@ -443,15 +465,14 @@ export function createSessionRunnerRespawnManager(params: Readonly<{
       const stopRequest = stopRequestedBySessionId.get(sessionId);
       if (stopRequest) return;
 
-      const spawnOptions = trackedSession.spawnOptions;
-      if (!spawnOptions || typeof (spawnOptions as any).directory !== 'string' || !String((spawnOptions as any).directory).trim()) {
+      if (!operand.replaceable) {
         if (forceRestart) {
           params.onRespawnTerminal?.({ sessionId, previousPid: trackedSession.pid, reason: 'missing_spawn_options' });
         }
         return;
       }
 
-      const vendorResumeId = normalizeOptionalString(trackedSession.vendorResumeId);
+      const { spawnOptions, vendorResumeId } = operand;
       const controller = getOrCreateController(sessionId);
       if (options?.quotaRecoveryAttemptId !== undefined) {
         const attemptId = options.quotaRecoveryAttemptId;

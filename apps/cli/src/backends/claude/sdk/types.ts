@@ -88,6 +88,8 @@ export interface SDKControlResponse extends SDKMessage {
         request_id: string
         subtype: 'success' | 'error'
         error?: string
+        /** The request's result payload, when it has one (for example `get_settings`). */
+        response?: unknown
     }
 }
 
@@ -108,6 +110,15 @@ export interface ControlRequest {
 
 export interface InterruptRequest extends ControlRequest {
     subtype: 'interrupt'
+}
+
+export interface GetSettingsRequest extends ControlRequest {
+    subtype: 'get_settings'
+}
+
+export interface ApplyFlagSettingsRequest extends ControlRequest {
+    subtype: 'apply_flag_settings'
+    settings: Record<string, unknown>
 }
 
 export interface CanUseToolRequest extends ControlRequest {

@@ -33,6 +33,18 @@ let didCompact = false;
 const args = process.argv.slice(2);
 const resumeIdx = args.findIndex((a) => a === '--resume' || a === '-r');
 const isResuming = resumeIdx >= 0;
+const argValue = (flag) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : undefined; };
+const nativeSettings = {
+  model: argValue('--model') || process.env.FAKE_CLAUDE_DEFAULT_MODEL || 'claude-opus-5-5[1m]',
+  effort: argValue('--effort') || process.env.FAKE_CLAUDE_START_EFFORT || 'high',
+  ultracode: false,
+};
+// FAKE_CLAUDE_HOLD_FIRST_GET=1 leaves the first get_settings unanswered until an interrupt arrives.
+let heldGetSettings = process.env.FAKE_CLAUDE_HOLD_FIRST_GET === '1' ? 'waiting' : null;
+const answerSettingsControl = (msg) => {
+  const payload = msg.request.subtype === 'get_settings' ? { response: { applied: { ...nativeSettings, advisor: null }, effective: {}, sources: [] } } : {};
+  process.stdout.write(JSON.stringify({ type: 'control_response', response: { request_id: msg.request_id, subtype: 'success', ...payload } }) + '\\n');
+};
 // Use UUID-like values to mirror real Claude Code behavior.
 const sessionId = isResuming ? '1433467f-ff14-4292-b5b2-2aac77a808f0' : 'aada10c6-9299-4c45-abc4-91db9c0f935d';
 
@@ -46,10 +58,35 @@ const rl = readline.createInterface({ input: process.stdin });
 	    if (!trimmed) return;
 	    let msg;
 	    try { msg = JSON.parse(trimmed); } catch { return; }
+    if (msg && msg.type === 'control_request' && msg.request
+      && (msg.request.subtype === 'get_settings' || msg.request.subtype === 'apply_flag_settings')) {
+      // Mirrors native Claude Code 2.1.280: get_settings reports the applied (alias- and
+      // default-resolved) model; apply_flag_settings acknowledges even settings it then ignores.
+      if (logPath) fs.appendFileSync(logPath, JSON.stringify({ kind: 'control', subtype: msg.request.subtype, settings: msg.request.settings }) + '\\n', 'utf8');
+      if (process.env.FAKE_CLAUDE_NO_SETTINGS_CONTROL === '1') {
+        process.stdout.write(JSON.stringify({ type: 'control_response', response: { request_id: msg.request_id, subtype: 'error', error: 'Unsupported control request subtype: ' + msg.request.subtype } }) + '\\n');
+        return;
+      }
+      if (msg.request.subtype === 'apply_flag_settings' && process.env.FAKE_CLAUDE_IGNORE_APPLY !== '1') {
+        if (typeof msg.request.settings.effortLevel === 'string') nativeSettings.effort = msg.request.settings.effortLevel;
+        if (typeof msg.request.settings.ultracode === 'boolean') nativeSettings.ultracode = msg.request.settings.ultracode;
+      }
+      if (msg.request.subtype === 'get_settings' && heldGetSettings === 'waiting') {
+        heldGetSettings = msg;
+        return;
+      }
+      answerSettingsControl(msg);
+      return;
+    }
     if (msg && msg.type === 'control_request' && msg.request && msg.request.subtype === 'interrupt') {
       // Acknowledge the interrupt so the query wrapper unblocks, then emit a non-success result
       // to signal turn cancellation (mirrors real Claude Code behavior closely enough for tests).
+      if (logPath) fs.appendFileSync(logPath, JSON.stringify({ kind: 'control', subtype: 'interrupt' }) + '\\n', 'utf8');
       process.stdout.write(JSON.stringify({ type: 'control_response', response: { request_id: msg.request_id, subtype: 'success' } }) + '\\n');
+      if (heldGetSettings && heldGetSettings !== 'waiting') {
+        answerSettingsControl(heldGetSettings);
+        heldGetSettings = null;
+      }
       if (hangTurn && turn === 1) {
         process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error', result: 'INTERRUPTED', num_turns: turn, total_cost_usd: 0, usage: undefined, duration_ms: 1, duration_api_ms: 1, is_error: true, session_id: sessionId }) + '\\n');
       }
@@ -394,6 +431,145 @@ describe('ClaudeSdkAgentBackend', () => {
         expect(statuses.filter((s) => s === 'running')).toHaveLength(1);
       },
     );
+  });
+
+  it('launches a pinned execution-run model at its pinned effort with ultracode explicitly off', async () => {
+    delete process.env.DEBUG;
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+    (await import('@/configuration')).reloadConfiguration();
+    try {
+      await withFakeClaudeBackend(
+        { dirPrefix: 'happier-claude-sdk-pinned-', permissionPolicy: 'no_tools', modelId: 'claude-opus-5-5' },
+        async ({ backend, logPath }) => {
+          const { sessionId } = await backend.startSession();
+          await backend.sendPrompt(sessionId, 'hi');
+          await (backend as any).waitForResponseComplete?.();
+
+          const argvLog = await (await import('node:fs/promises')).readFile(logPath, 'utf8');
+          const argv = (JSON.parse(argvLog.trim().split('\n')[0] ?? '{}') as { argv: string[] }).argv;
+          expect(argv[argv.indexOf('--effort') + 1]).toBe('medium');
+          expect(JSON.parse(argv[argv.indexOf('--settings') + 1] ?? '{}')).toMatchObject({ ultracode: false });
+        },
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+    }
+  });
+
+  describe('per-model effort pin bridge', () => {
+    async function readLog(logPath: string): Promise<Array<Record<string, unknown>>> {
+      const raw = await (await import('node:fs/promises')).readFile(logPath, 'utf8');
+      return raw.trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+    }
+
+    function controlsAndPrompts(entries: Array<Record<string, unknown>>): string[] {
+      return entries.flatMap((entry) => entry.kind === 'control'
+        ? [`${String(entry.subtype)}${entry.settings ? `:${JSON.stringify(entry.settings)}` : ''}`]
+        : entry.kind === 'user' ? [`prompt:${String(entry.content)}`] : []);
+    }
+
+    async function withOpusPinnedMedium(run: () => Promise<void>): Promise<void> {
+      delete process.env.DEBUG;
+      vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+      (await import('@/configuration')).reloadConfiguration();
+      try {
+        await run();
+      } finally {
+        vi.unstubAllEnvs();
+        delete process.env.FAKE_CLAUDE_IGNORE_APPLY;
+        (await import('@/configuration')).reloadConfiguration();
+      }
+    }
+
+    it('applies and verifies the pinned effort for the native default model before each prompt', async () => {
+      await withOpusPinnedMedium(() => withFakeClaudeBackend(
+        { dirPrefix: 'happier-claude-sdk-default-pin-', permissionPolicy: 'no_tools', modelId: 'default' },
+        async ({ backend, logPath }) => {
+          const { sessionId } = await backend.startSession();
+          await backend.sendPrompt(sessionId, 'first');
+          await (backend as any).waitForResponseComplete?.();
+          await backend.sendPrompt(sessionId, 'second');
+          await (backend as any).waitForResponseComplete?.();
+
+          expect(controlsAndPrompts(await readLog(logPath))).toEqual([
+            'get_settings',
+            'apply_flag_settings:{"effortLevel":"medium","ultracode":false}',
+            'get_settings',
+            'prompt:first',
+            'get_settings',
+            'prompt:second',
+          ]);
+        },
+      ));
+    });
+
+    it('drops a prompt cancelled while its pinned effort is being checked, and runs the next one', async () => {
+      await withOpusPinnedMedium(() => withFakeClaudeBackend(
+        {
+          dirPrefix: 'happier-claude-sdk-cancel-qualifying-',
+          permissionPolicy: 'no_tools',
+          modelId: 'default',
+          env: { FAKE_CLAUDE_HOLD_FIRST_GET: '1', FAKE_CLAUDE_START_EFFORT: 'medium' },
+        },
+        async ({ backend, logPath }) => {
+          const seen: string[] = [];
+          backend.onMessage((msg: any) => {
+            if (msg.type === 'model-output' && typeof msg.fullText === 'string') seen.push(msg.fullText);
+          });
+          const { sessionId } = await backend.startSession();
+
+          const cancelled = backend.sendPrompt(sessionId, 'CANCELLED_PROMPT');
+          const cancelledOutcome = cancelled.then(() => 'sent', (error: unknown) => `rejected:${(error as Error).message}`);
+          // Cancel only once Claude Code holds the effort check (the prompt is not yet sent).
+          const { readFile } = await import('node:fs/promises');
+          while (!(await readFile(logPath, 'utf8').catch(() => '')).includes('"get_settings"')) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+          await backend.cancel(sessionId);
+
+          expect(await cancelledOutcome).toBe('rejected:Turn cancelled');
+          await backend.sendPrompt(sessionId, 'KEPT_PROMPT');
+          await (backend as any).waitForResponseComplete();
+
+          const events = controlsAndPrompts(await readLog(logPath));
+          expect(events.filter((event) => event.startsWith('prompt:'))).toEqual(['prompt:KEPT_PROMPT']);
+          expect(events.indexOf('interrupt')).toBeLessThan(events.indexOf('prompt:KEPT_PROMPT'));
+          expect(seen.join(' ')).toContain('FAKE_ASSIST_1');
+        },
+      ));
+    });
+
+    it('rejects the prompt unsent when Claude Code does not adopt the pin', async () => {
+      await withOpusPinnedMedium(() => withFakeClaudeBackend(
+        { dirPrefix: 'happier-claude-sdk-ignored-pin-', permissionPolicy: 'no_tools', modelId: 'default' },
+        async ({ backend, logPath }) => {
+          process.env.FAKE_CLAUDE_IGNORE_APPLY = '1';
+          const { sessionId } = await backend.startSession();
+
+          await expect(backend.sendPrompt(sessionId, 'first')).rejects.toThrow(/did not adopt the pinned effort medium/);
+          expect(controlsAndPrompts(await readLog(logPath)).filter((event) => event.startsWith('prompt:'))).toEqual([]);
+        },
+      ));
+    });
+  });
+
+  it('refuses to start an execution run under a malformed effort policy before spawning Claude', async () => {
+    delete process.env.DEBUG;
+    vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"turbo"}');
+    (await import('@/configuration')).reloadConfiguration();
+    try {
+      await withFakeClaudeBackend(
+        { dirPrefix: 'happier-claude-sdk-malformed-', permissionPolicy: 'no_tools', modelId: 'claude-opus-5-5' },
+        async ({ backend, logPath }) => {
+          await expect(backend.startSession()).rejects.toThrow(/HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES/);
+          await expect((await import('node:fs/promises')).access(logPath)).rejects.toThrow();
+        },
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      (await import('@/configuration')).reloadConfiguration();
+    }
   });
 
   it('passes explicit env overrides through to the spawned process', async () => {

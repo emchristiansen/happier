@@ -410,4 +410,65 @@ describe('ApiClient connected services v3 credentials', () => {
       },
     });
   });
+
+  it('reads one profile\'s credential health from its exact-profile route, never the service-wide list', async () => {
+    mockGet.mockResolvedValue({
+      status: 200,
+      data: {
+        profileId: 'work',
+        status: 'needs_reauth',
+        health: { v: 1, status: 'needs_reauth', reconnectRequired: true, lastRefreshFailureKind: 'invalid_grant' },
+      },
+    });
+
+    const api = await ApiClient.create(createTestCredentials());
+    const result = await api.readConnectedServiceCredentialHealth({ serviceId: 'claude-subscription', profileId: 'work' });
+
+    expect(result).toEqual({
+      kind: 'found',
+      status: 'needs_reauth',
+      health: { v: 1, status: 'needs_reauth', reconnectRequired: true, lastRefreshFailureKind: 'invalid_grant' },
+    });
+    expect(mockGet).toHaveBeenCalledTimes(1);
+    expect(mockGet.mock.calls[0]?.[0]).toMatch(/\/v3\/connect\/claude-subscription\/profiles\/work\/credential\/health$/);
+  });
+
+  it('reports a profile the server does not have as not found', async () => {
+    mockGet.mockRejectedValue(createAxiosResponseError({ status: 404, data: { error: 'connect_credential_not_found' } }));
+
+    const api = await ApiClient.create(createTestCredentials());
+    await expect(api.readConnectedServiceCredentialHealth({ serviceId: 'claude-subscription', profileId: 'gone' }))
+      .resolves.toEqual({ kind: 'not_found' });
+  });
+
+  it('fails closed with a typed error when the server lacks the exact-profile health route', async () => {
+    mockGet.mockRejectedValue(createAxiosResponseError({
+      status: 404,
+      data: { message: 'Route GET:/v3/connect/claude-subscription/profiles/work/credential/health not found', error: 'Not Found', statusCode: 404 },
+    }));
+
+    const api = await ApiClient.create(createTestCredentials());
+    await expect(api.readConnectedServiceCredentialHealth({ serviceId: 'claude-subscription', profileId: 'work' }))
+      .rejects.toMatchObject({ code: 'connected_service_credential_health_read_unavailable' });
+    expect(mockGet).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a health response for a different profile', async () => {
+    mockGet.mockResolvedValue({ status: 200, data: { profileId: 'other', status: 'connected', health: null } });
+
+    const api = await ApiClient.create(createTestCredentials());
+    await expect(api.readConnectedServiceCredentialHealth({ serviceId: 'claude-subscription', profileId: 'work' }))
+      .rejects.toThrow('Invalid connected service credential health response');
+  });
+
+  it('keeps the canonical status when a newer server sends a health shape this client does not know', async () => {
+    mockGet.mockResolvedValue({
+      status: 200,
+      data: { profileId: 'work', status: 'refresh_failed_retryable', health: { v: 1, status: 'refresh_failed_retryable', lastRefreshFailureKind: 'future_kind' } },
+    });
+
+    const api = await ApiClient.create(createTestCredentials());
+    await expect(api.readConnectedServiceCredentialHealth({ serviceId: 'claude-subscription', profileId: 'work' }))
+      .resolves.toEqual({ kind: 'found', status: 'refresh_failed_retryable', health: null, healthUnrecognised: true });
+  });
 });

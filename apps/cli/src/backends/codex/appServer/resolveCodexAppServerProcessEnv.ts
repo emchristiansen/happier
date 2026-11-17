@@ -1,7 +1,7 @@
 import { readSessionMetadataRuntimeDescriptor } from '@happier-dev/agents';
 
+import { resolveCodexConnectedServiceHomeSqliteHome } from '@/backends/codex/connectedServices/codexHomeNativeSource';
 import { resolveConfiguredCodexSqliteHome } from '@/backends/codex/connectedServices/codexStateFileNames';
-import { readConnectedServiceStateSharingManifest } from '@/daemon/connectedServices/stateSharing/connectedServiceStateSharingManifest';
 
 export type CodexRuntimeHomeAffinity = Readonly<{
   home: 'user' | 'connectedService' | null;
@@ -21,10 +21,7 @@ export async function resolveCodexAppServerProcessEnv(params: Readonly<{
   let sqliteHomePath = persistedSqliteHomePath;
   if (!sqliteHomePath) {
     if (params.affinity?.home === 'connectedService') {
-      const manifest = await readConnectedServiceStateSharingManifest(homePath);
-      sqliteHomePath = manifest.effectiveStateMode === 'shared'
-        ? resolveConfiguredCodexSqliteHome(processEnv)
-        : homePath;
+      sqliteHomePath = await resolveCodexConnectedServiceHomeSqliteHome({ codexHome: homePath, processEnv });
     } else {
       sqliteHomePath = typeof processEnv.CODEX_SQLITE_HOME === 'string' && processEnv.CODEX_SQLITE_HOME.trim()
         ? resolveConfiguredCodexSqliteHome(processEnv)

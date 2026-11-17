@@ -31,6 +31,7 @@ describe('createOpenCodeConnectedServicesMaterializer', () => {
     const materializer = createOpenCodeConnectedServicesMaterializer();
 
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'opencode',
       activeServerDir,
       rootDir,
@@ -66,6 +67,7 @@ describe('createOpenCodeConnectedServicesMaterializer', () => {
     const materializer = createOpenCodeConnectedServicesMaterializer();
 
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'opencode',
       activeServerDir,
       rootDir,
@@ -93,6 +95,7 @@ describe('createOpenCodeConnectedServicesMaterializer', () => {
     const materializer = createOpenCodeConnectedServicesMaterializer();
 
     const result = await materializer({
+      nativeSourceAuthority: 'caller_env',
       agentId: 'opencode',
       activeServerDir,
       rootDir,

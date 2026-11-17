@@ -586,26 +586,18 @@ describe('happier resume', () => {
       payload: credentialRecord,
       randomBytes,
     });
+    const requestedPaths: string[] = [];
     const server = await new Promise<Server>((resolve, reject) => {
       const next = createServer((req, res) => {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+        requestedPaths.push(url.pathname);
         res.setHeader('content-type', 'application/json');
         if (req.method === 'GET' && url.pathname === '/v1/account/encryption') {
           res.end(JSON.stringify({ mode: 'e2ee', updatedAt: now }));
           return;
         }
-        if (req.method === 'GET' && url.pathname === '/v2/connect/openai-codex/profiles') {
-          res.end(JSON.stringify({
-            serviceId: 'openai-codex',
-            profiles: [{
-              profileId: 'work',
-              status: 'connected',
-              kind: 'oauth',
-              providerEmail: 'codex@example.test',
-              providerAccountId: 'connected-account',
-              expiresAt: now + 3_600_000,
-            }],
-          }));
+        if (req.method === 'GET' && url.pathname === '/v3/connect/openai-codex/profiles/work/credential/health') {
+          res.end(JSON.stringify({ profileId: 'work', status: 'connected', health: null }));
           return;
         }
         if (req.method === 'GET' && url.pathname === '/v2/connect/openai-codex/profiles/work/credential') {
@@ -728,6 +720,9 @@ describe('happier resume', () => {
       });
 
       expect(agentHandler).toHaveBeenCalledTimes(1);
+      // Direct resume checks the selected profile's health by its exact key, never the service-wide list.
+      expect(requestedPaths).toContain('/v3/connect/openai-codex/profiles/work/credential/health');
+      expect(requestedPaths).not.toContain('/v2/connect/openai-codex/profiles');
       expect(process.env.CODEX_HOME).toBe(prevCodexHome);
       expect(process.env.CODEX_SQLITE_HOME).toBe(prevCodexSqliteHome);
       expect(process.env.HAPPIER_SESSION_CONNECTED_SERVICES_BINDINGS_JSON).toBe(prevBindingsEnv);
@@ -812,26 +807,18 @@ describe('happier resume', () => {
       payload: credentialRecord,
       randomBytes,
     });
+    const requestedPaths: string[] = [];
     const server = await new Promise<Server>((resolve, reject) => {
       const next = createServer((req, res) => {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+        requestedPaths.push(url.pathname);
         res.setHeader('content-type', 'application/json');
         if (req.method === 'GET' && url.pathname === '/v1/account/encryption') {
           res.end(JSON.stringify({ mode: 'e2ee', updatedAt: now }));
           return;
         }
-        if (req.method === 'GET' && url.pathname === '/v2/connect/openai-codex/profiles') {
-          res.end(JSON.stringify({
-            serviceId: 'openai-codex',
-            profiles: [{
-              profileId: 'work',
-              status: 'connected',
-              kind: 'oauth',
-              providerEmail: 'cleanup@example.test',
-              providerAccountId: 'cleanup-account',
-              expiresAt: now + 3_600_000,
-            }],
-          }));
+        if (req.method === 'GET' && url.pathname === '/v3/connect/openai-codex/profiles/work/credential/health') {
+          res.end(JSON.stringify({ profileId: 'work', status: 'connected', health: null }));
           return;
         }
         if (req.method === 'GET' && url.pathname === '/v2/connect/openai-codex/profiles/work/credential') {
@@ -925,6 +912,9 @@ describe('happier resume', () => {
       })).rejects.toThrow(/Codex ACP is enabled/);
 
       expect(agentHandler).not.toHaveBeenCalled();
+      // Direct resume checks the selected profile's health by its exact key, never the service-wide list.
+      expect(requestedPaths).toContain('/v3/connect/openai-codex/profiles/work/credential/health');
+      expect(requestedPaths).not.toContain('/v2/connect/openai-codex/profiles');
       await expectPathRemoved(materializedRoot);
     } finally {
       await new Promise<void>((resolve, reject) => {

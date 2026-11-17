@@ -73,6 +73,7 @@ describe('execution run connected services (integration: codex profile -> run CO
       sessionDirectory?: string | null;
     }) => {
       const materialized = await materializeConnectedServicesForSpawn({
+        nativeSourceAuthority: 'caller_env',
         agentId: 'codex',
         materializationKey: params.materializationKey,
         activeServerDir,

@@ -25,7 +25,17 @@ import { HAPPIER_BASE_SYSTEM_PROMPT_V1 } from '@happier-dev/protocol';
 import { configuration } from '@/configuration';
 import { isNativeProcessExited, isProviderInLauncher } from '../../../scripts/native_process_exit.cjs';
 import { logClaudeRuntimeAuthEnvDiagnostic } from './spawn/logClaudeRuntimeAuthEnvDiagnostic';
-import { claudeCliFlagCanConsumeNextArg } from './cli/flagArity';
+import {
+    readClaudeModelFlag,
+    replaceClaudeModelFlag,
+    selectClaudeModelResolutionArgs,
+    splitClaudeLaunchArgs,
+    withoutClaudeFlag,
+    type ClaudeFlagGroup,
+} from './cli/claudeLaunchFlagGroups';
+import { qualifyClaudeTerminalLaunchModelEffortPin } from './utils/claudeModelEffortPinBridge';
+import { createClaudeAppliedSettingsReader, type ClaudeAppliedSettingsReader } from './utils/readClaudeAppliedSettings';
+import { buildClaudeEffortCliArgs, isClaudeModelEffortPinned, requireClaudeModelEffortOverrides } from './utils/claudeEffort';
 import {
     buildClaudePermissionModeLaunchSettings,
     resolveClaudeLaunchSettingsOverlayArg,
@@ -82,6 +92,21 @@ function redactClaudeArgsForLog(args: readonly string[]): string[] {
     return redacted;
 }
 
+/**
+ * Apply the per-model effort pin to the flag groups of the user's raw argv.
+ *
+ * Legacy local mode launches the model named by its `--model` flag (a model Claude Code would
+ * resolve itself has already been qualified into that flag), so a pinned model replaces every
+ * `--effort` with the pinned effort, which also turns off any saved ultracode. Throws on a
+ * malformed pin.
+ */
+function applyClaudeModelEffortPinToFlagGroups(groups: readonly ClaudeFlagGroup[]): string[] {
+    requireClaudeModelEffortOverrides();
+    const model = readClaudeModelFlag(groups);
+    if (!isClaudeModelEffortPinned(model)) return groups.flat();
+    return [...withoutClaudeFlag(groups, '--effort').flat(), ...buildClaudeEffortCliArgs({ modelId: model, effort: undefined })];
+}
+
 export async function claudeLocal(opts: {
     abort: AbortSignal,
     sessionId: string | null,
@@ -99,6 +124,8 @@ export async function claudeLocal(opts: {
     happierSessionId?: string | null,
     /** Optional env overrides to apply to the spawned Claude Code subprocess. */
     envOverlay?: Record<string, string>,
+    /** Reads Claude Code's applied settings before launch (defaults to the native stream-json enquiry). */
+    readClaudeAppliedSettings?: ClaudeAppliedSettingsReader,
     /** Optional MCP config JSON to inject into the Claude Code CLI invocation (e.g. Happier MCP). */
     happierMcpConfigJson?: string,
     /** Path to temporary settings file with non-hook config (optional - for session tracking) */
@@ -325,6 +352,29 @@ export async function claudeLocal(opts: {
         ]);
         process.once('exit', cleanupOnParentExit);
         const { args: effectiveClaudeArgs, permissionMode } = extractClaudePermissionModeArgs(materializedSystemPrompt.args);
+        // Claude CLI treats the first non-flag token as the prompt, so positional args are moved after
+        // all flags (including our injected --settings) below.
+        const launchArgs = splitClaudeLaunchArgs(effectiveClaudeArgs);
+        // The terminal offers no control channel before its first prompt: qualify a model Claude Code
+        // resolves itself before starting it, and launch the exact model that was qualified.
+        const terminalPin = await qualifyClaudeTerminalLaunchModelEffortPin({
+            explicitModel: readClaudeModelFlag(launchArgs.flagGroups),
+            modelResolutionArgs: selectClaudeModelResolutionArgs(launchArgs.flagGroups),
+            readSettings: opts.readClaudeAppliedSettings ?? createClaudeAppliedSettingsReader({
+                cwd: opts.path,
+                claudeCliPath: resolvedClaudeCliPath,
+                javaScriptRuntime: nodeExecutable ?? null,
+                envOverlay: {
+                    DISABLE_AUTOUPDATER: '1',
+                    ...resolveClaudeConfigDirEnvOverlay(processEnv),
+                    ...(opts.envOverlay ?? {}),
+                },
+                abort: opts.abort,
+            }),
+        });
+        const launchFlagGroups = terminalPin.kind === 'pinned'
+            ? replaceClaudeModelFlag(launchArgs.flagGroups, terminalPin.model)
+            : launchArgs.flagGroups;
         await new Promise<void>((r, reject) => {
             const args: string[] = []
 
@@ -352,40 +402,18 @@ export async function claudeLocal(opts: {
             // Claude CLI treats the first non-flag token as the prompt. If a positional prompt
             // is provided before later flags, those flags can be mis-parsed as prompt text.
             // Ensure positional args come after all flags (including our injected --settings).
-            const flagArgs: string[] = [];
-            const positionalArgs: string[] = [];
-            let hasExplicitPositionalDelimiter = false;
-
-            if (effectiveClaudeArgs.length > 0) {
-                for (let i = 0; i < effectiveClaudeArgs.length; i++) {
-                    const arg = effectiveClaudeArgs[i];
-                    if (arg === '--') {
-                        hasExplicitPositionalDelimiter = true;
-                        positionalArgs.push(...effectiveClaudeArgs.slice(i + 1));
-                        break;
-                    }
-                    if (arg.startsWith('-')) {
-                        flagArgs.push(arg);
-                        const nextArg = i + 1 < effectiveClaudeArgs.length ? effectiveClaudeArgs[i + 1] : undefined;
-                        if (claudeCliFlagCanConsumeNextArg(arg, nextArg)) {
-                            flagArgs.push(nextArg!);
-                            i++;
-                        }
-                        continue;
-                    }
-                    positionalArgs.push(arg);
-                }
-            }
+            const { positionalArgs, hasExplicitPositionalDelimiter } = launchArgs;
+            const flagArgs = applyClaudeModelEffortPinToFlagGroups(launchFlagGroups);
 
             // Happier-injected flags were appended before parsing so user ordering stays intact.
             //
             // Claude Code merges multiple `--mcp-config` sources additively and uses last-write-wins on collisions.
             // Appending here means we do not need to parse/merge user JSON and Happier wins on collisions.
             //
-            // `--settings` is treated as a single overlay for the hooks field: when more than one
-            // --settings flag is passed, only the first wins and the rest are silently dropped.
-            // Any PATH-resident wrapper that prepends its own --settings (cmux's claude wrapper is
-            // our in-the-wild case) therefore silently discards Happier's hook block. We carry
+            // `--settings` is not additive: when more than one --settings flag is passed, Claude Code
+            // uses only one of them whole and silently drops the rest (native 2.1.280 keeps the last).
+            // Any PATH-resident wrapper that adds its own --settings (cmux's claude wrapper is
+            // our in-the-wild case) can therefore silently discard Happier's hook block. We carry
             // non-hook config (permissions.allow) in --settings and move hooks to --plugin-dir,
             // which is additive across multiple invocations so wrappers and Happier coexist.
             if (opts.hookPluginDir) {
@@ -394,6 +422,9 @@ export async function claudeLocal(opts: {
             }
             const settingsOverlay = resolveClaudeLaunchSettingsOverlayArg({
                 settingsPath: opts.hookSettingsPath,
+                // No ultracode setting for the pin: the pinned `--effort` already overrides any saved
+                // ultracode (native 2.1.280), and Claude Code keeps only the last `--settings`, so an
+                // overlay added for the pin would silently discard a user's own `--settings`.
                 launchSettings: buildClaudePermissionModeLaunchSettings(permissionMode),
             });
             if (settingsOverlay) {

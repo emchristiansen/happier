@@ -25,6 +25,21 @@ function formatBackendDisabledMessage(backendTarget: BackendTargetRefV1): string
   return `${label} is disabled in your account settings (enable it in the UI provider settings).`;
 }
 
+/**
+ * Account settings actually read say this backend is disabled. This is a policy decision, not a
+ * failure to load settings, so callers must never treat it as a refresh failure to fall back from.
+ */
+export class BackendDisabledByAccountSettingsError extends Error {
+  constructor(backendTarget: BackendTargetRefV1) {
+    super(formatBackendDisabledMessage(backendTarget));
+    this.name = 'BackendDisabledByAccountSettingsError';
+  }
+}
+
+export function isBackendDisabledByAccountSettingsError(error: unknown): error is BackendDisabledByAccountSettingsError {
+  return error instanceof BackendDisabledByAccountSettingsError;
+}
+
 export function assertBackendEnabledByAccountSettings(params: Readonly<{
   agentId?: AgentId;
   backendTarget?: BackendTargetRefV1;
@@ -34,7 +49,7 @@ export function assertBackendEnabledByAccountSettings(params: Readonly<{
     ?? (params.agentId ? ({ kind: 'builtInAgent', agentId: params.agentId } as const satisfies BackendTargetRefV1) : null);
   if (!backendTarget) return;
   if (!isBackendEnabledByAccountSettings(params)) {
-    throw new Error(formatBackendDisabledMessage(backendTarget));
+    throw new BackendDisabledByAccountSettingsError(backendTarget);
   }
 }
 

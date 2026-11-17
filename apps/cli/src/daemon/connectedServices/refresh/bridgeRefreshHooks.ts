@@ -30,7 +30,14 @@ export type ConnectedServiceBridgeRefreshCapabilities = Readonly<{
   readCredentialSource: (binding: BoundProfile) => Promise<ConnectedServiceCredentialSource | null>;
   isOauthSourceStillValid: (source: ConnectedServiceCredentialSource) => boolean;
   resolveSourceExpiresAt: (source: ConnectedServiceCredentialSource) => number | null;
-  rematerializeTargets: (binding: BoundProfile) => Promise<ReadonlyArray<SpawnTarget>>;
+  /**
+   * Rematerialize after the skeleton's successful rotation of `binding`. The rotation's revision is
+   * the health evidence for that binding; every other binding written is health-checked here.
+   */
+  rematerializeTargets: (
+    binding: BoundProfile,
+    rotation: Readonly<{ credentialRevision: string }>,
+  ) => Promise<ReadonlyArray<SpawnTarget>>;
 }>;
 
 /**

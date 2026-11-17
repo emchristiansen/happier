@@ -58,16 +58,17 @@ export async function cmdSessionStatus(
     return;
   }
   const usageLimitRecovery = SessionStatusResultSchema.shape.usageLimitRecovery.parse(result.usageLimitRecovery);
+  const runtimeConfig = SessionStatusResultSchema.shape.runtimeConfig.parse(result.runtimeConfig);
 
   if (json) {
     await printJsonEnvelope({
       ok: true,
       kind: 'session_status',
-      data: { session: result.session, ...(result.agentState ? { agentState: result.agentState } : {}), usageLimitRecovery },
+      data: { session: result.session, ...(result.agentState ? { agentState: result.agentState } : {}), usageLimitRecovery, runtimeConfig },
     });
     return;
   }
 
   console.log(chalk.green('✓'), 'status fetched');
-  await writeJsonStdout({ session: result.session, agentState: result.agentState, usageLimitRecovery }, { pretty: true });
+  await writeJsonStdout({ session: result.session, agentState: result.agentState, usageLimitRecovery, runtimeConfig }, { pretty: true });
 }

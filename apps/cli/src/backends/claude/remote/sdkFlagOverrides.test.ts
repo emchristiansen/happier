@@ -51,4 +51,19 @@ describe('parseClaudeSdkFlagOverridesFromArgs', () => {
     expect((parsed as any).allowedTools).toBeUndefined();
     expect((parsed as any).disallowedTools).toBeUndefined();
   });
+
+  it.each([
+    {
+      title: 'another flag\'s value that looks like a model flag',
+      args: ['--model', 'claude-opus-5-5', '--name', '--model=claude-sonnet-4-6', 'prompt'],
+      expected: { model: 'claude-opus-5-5' },
+    },
+    {
+      title: 'a system prompt that looks like an effort flag',
+      args: ['--model', 'claude-opus-5-5', '--system-prompt', '--effort=high', 'prompt'],
+      expected: { model: 'claude-opus-5-5', customSystemPrompt: '--effort=high' },
+    },
+  ])('reads option values by flag arity: $title', ({ args, expected }) => {
+    expect(parseClaudeSdkFlagOverridesFromArgs(args)).toEqual(expected);
+  });
 });

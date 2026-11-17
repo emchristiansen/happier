@@ -16,7 +16,9 @@ import { logClaudeRuntimeAuthEnvDiagnostic } from "./spawn/logClaudeRuntimeAuthE
 import { ensureClaudeJsRuntimeExecutable } from "./utils/ensureClaudeJsRuntimeExecutable";
 import { resolveClaudeCliPath } from "./utils/resolveClaudeCliPath";
 import { resolveCliRuntimeAssetPath } from '@/runtime/assets/resolveCliRuntimeAssetPath';
-import { buildClaudeEffortCliArgs, resolveModeEffortLevelsForModel } from "./utils/claudeEffort";
+import { buildClaudeEffortCliArgs, isClaudeModelEffortPinned, resolveModeEffortLevelsForModel } from "./utils/claudeEffort";
+import { enforceClaudeModelEffortPinBeforePrompt } from "./utils/claudeModelEffortPinBridge";
+import { resolveClaudeLaunchSettingsOverlayArg } from "./utils/resolveClaudeLaunchSettingsOverlay";
 import {
     buildClaudeCompactionCompletedEvent,
     buildClaudeCompactionLifecycleId,
@@ -249,7 +251,7 @@ export async function claudeRemote(opts: {
             : null;
     const effortArgs = buildClaudeEffortArgs({
         modelId: argOverrides.model ?? initial.mode.model,
-        effort: argOverrides.effort ?? initial.mode.reasoningEffort,
+        effort: initial.mode.reasoningEffort,
         supportedLevels: resolveModeEffortLevelsForModel(initial.mode, argOverrides.model ?? initial.mode.model),
     });
     const rawExtraArgs = [
@@ -309,7 +311,11 @@ export async function claudeRemote(opts: {
         abort: opts.signal,
         pathToClaudeCodeExecutable: resolveCliRuntimeAssetPath('scripts', 'claude_remote_launcher.cjs'),
         env: launcherEnv,
-        settingsPath: opts.hookSettingsPath,
+        settingsPath: resolveClaudeLaunchSettingsOverlayArg({
+            settingsPath: opts.hookSettingsPath,
+            // Explicitly off: an ultracode Claude Code saved would otherwise override a pinned effort.
+            launchSettings: isClaudeModelEffortPinned(argOverrides.model ?? initial.mode.model) ? { ultracode: false } : {},
+        }),
     }
 
     // Track thinking state
@@ -368,6 +374,39 @@ export async function claudeRemote(opts: {
     try {
     opts.onWorkflowActivityObserverReady?.();
     await opts.runtimeActivityAdapter?.activateObservation('claude-legacy-provider-observer-installed');
+    // The prompt whose pinned effort is being checked: not yet sent, so a turn interrupt in that
+    // window cancels it instead of a provider turn.
+    let qualifyingPrompt: { cancelled: boolean } | null = null;
+    // Each prompt waits until Claude Code reports the pinned effort for its applied model. On
+    // failure the prompt is rejected unsent and this query ends; the next prompt starts a fresh one.
+    // A prompt interrupted during the check is reported unsent and never delivered.
+    const qualifyPromptEffort = async (prompt: typeof initial): Promise<'send' | 'cancelled' | 'failed'> => {
+        const qualifying = { cancelled: false };
+        qualifyingPrompt = qualifying;
+        try {
+            await enforceClaudeModelEffortPinBeforePrompt({
+                getSettings: () => response.getSettings(),
+                applyFlagSettings: (settings) => response.applyFlagSettings(settings),
+            });
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            logger.warnFile(`[claudeRemote] Pinned Claude effort not verified: ${reason}`);
+            opts.onCompletionEvent?.(`Failed to apply the pinned Claude effort: ${reason}. Message was not sent; retry it.`);
+            promptSettlements.rejectBeforeEffect(prompt);
+            messages.end();
+            return 'failed';
+        } finally {
+            qualifyingPrompt = null;
+        }
+        if (qualifying.cancelled) {
+            logger.debug('[claudeRemote] Message cancelled before it was sent');
+            promptSettlements.rejectBeforeEffect(prompt);
+            return 'cancelled';
+        }
+        return 'send';
+    };
+    // No turn interrupt is installed yet while the first prompt is checked, so it is never cancelled.
+    if (await qualifyPromptEffort(initial) !== 'send') return;
     opts.setUserMessageSender?.((message: SDKUserMessage) => messages.push(message));
     messages.push({
         type: 'user',
@@ -379,6 +418,7 @@ export async function claudeRemote(opts: {
     });
 
     const interruptTurn = async (): Promise<void> => {
+        if (qualifyingPrompt) qualifyingPrompt.cancelled = true;
         try {
             const interrupt = (response as any)?.interrupt;
             if (typeof interrupt === 'function') {
@@ -440,15 +480,21 @@ export async function claudeRemote(opts: {
                 // Send ready event
                 await opts.onReady();
 
-                // Push next message
-                const next = await opts.nextMessage();
-                if (!next) {
-                    messages.end();
-                    return;
+                // Push next message; one cancelled before it was sent gives way to the one after it.
+                for (;;) {
+                    const next = await opts.nextMessage();
+                    if (!next) {
+                        messages.end();
+                        return;
+                    }
+                    promptSettlements.track(next);
+                    mode = next.mode;
+                    const qualified = await qualifyPromptEffort(next);
+                    if (qualified === 'failed') return;
+                    if (qualified === 'cancelled') continue;
+                    messages.push({ type: 'user', uuid: promptSettlements.submit(next), message: { role: 'user', content: next.message } });
+                    break;
                 }
-                promptSettlements.track(next);
-                mode = next.mode;
-                messages.push({ type: 'user', uuid: promptSettlements.submit(next), message: { role: 'user', content: next.message } });
             }
 
             // Handle tool result

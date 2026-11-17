@@ -315,9 +315,11 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
     });
 
     it.each([
-        { requestedModel: 'sonnet', runtimeModel: 'claude-sonnet-4-6', effort: 'low' },
-        { requestedModel: 'claude-opus-4-6', runtimeModel: 'claude-opus-4-6', effort: 'max' },
-    ])('passes effort when the mode specifies a reasoningEffort ($requestedModel/$effort)', async ({ requestedModel, runtimeModel, effort }) => {
+        { requestedModel: 'sonnet', runtimeModel: 'claude-sonnet-4-6', effort: 'low', claudeArgs: [] },
+        { requestedModel: 'claude-opus-4-6', runtimeModel: 'claude-opus-4-6', effort: 'max', claudeArgs: [] },
+        // The session effort supersedes a stale launch flag.
+        { requestedModel: 'claude-opus-5-5', runtimeModel: 'claude-opus-5-5', effort: 'medium', claudeArgs: ['--effort', 'high'] },
+    ])('passes effort when the mode specifies a reasoningEffort ($requestedModel/$effort/$claudeArgs)', async ({ requestedModel, runtimeModel, effort, claudeArgs }) => {
         let capturedOptions: any = null;
         const onEffectiveModel = vi.fn();
 
@@ -357,7 +359,7 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
             sessionId: null,
             transcriptPath: null,
             path: '/tmp',
-            claudeArgs: [],
+            claudeArgs,
             claudeExecutablePath: '/tmp/claude',
             canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
             isAborted: () => false,
@@ -423,6 +425,58 @@ describe('claudeRemoteAgentSdk options and hooks', () => {
         expect(capturedOptions.extraArgs).toMatchObject({
             settings: JSON.stringify({ ultracode: true }),
         });
+    });
+
+    it('launches a pinned model at its pinned effort with ultracode explicitly off', async () => {
+        vi.stubEnv('HAPPIER_CLAUDE_MODEL_EFFORT_OVERRIDES', '{"claude-opus-5-5":"medium"}');
+        (await import('@/configuration')).reloadConfiguration();
+        try {
+            let capturedOptions: any = null;
+            const createQuery = vi.fn((_params: any) => {
+                capturedOptions = _params.options;
+                return {
+                    async *[Symbol.asyncIterator]() {
+                        yield { type: 'result' } as any;
+                    },
+                    close: vi.fn(),
+                    setPermissionMode: vi.fn(),
+                    setModel: vi.fn(),
+                    setMaxThinkingTokens: vi.fn(),
+                    supportedCommands: vi.fn(async () => []),
+                    supportedModels: vi.fn(async () => []),
+                } as any;
+            });
+            let didSendFirst = false;
+            const nextMessage = vi.fn(async () => {
+                if (didSendFirst) return null;
+                didSendFirst = true;
+                return {
+                    message: 'hello',
+                    mode: makeMode({ permissionMode: 'default', model: 'claude-opus-5-5', reasoningEffort: 'high', ultracode: true } as any),
+                };
+            });
+
+            await claudeRemoteAgentSdk({
+                sessionId: null,
+                transcriptPath: null,
+                path: '/tmp',
+                claudeArgs: ['--effort', 'high'],
+                claudeExecutablePath: '/tmp/claude',
+                canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+                isAborted: () => false,
+                nextMessage,
+                onReady: () => {},
+                onSessionFound: () => {},
+                onMessage: () => {},
+                createQuery,
+            } as any);
+
+            expect(capturedOptions.effort).toBe('medium');
+            expect(capturedOptions.extraArgs).toMatchObject({ settings: JSON.stringify({ ultracode: false }) });
+        } finally {
+            vi.unstubAllEnvs();
+            (await import('@/configuration')).reloadConfiguration();
+        }
     });
 
     it('omits the ultracode settings extraArg for models without xhigh support', async () => {

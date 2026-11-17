@@ -24,6 +24,7 @@ import {
   serializeConnectedServiceChildSelections,
 } from '../connectedServiceChildEnvironment';
 import type {
+  ConnectedServiceNativeSourceAuthority,
   ConnectedServicesMaterializationDiagnostic,
   ConnectedServicesMaterializeResult,
   ConnectedServicesProviderMaterializerInput,
@@ -333,6 +334,8 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
   refreshCredentialForMaterialization?: ConnectedServiceMaterializationCredentialRefresh | null;
   accountSettings?: AccountSettings | Readonly<Record<string, unknown>> | null;
   processEnv?: NodeJS.ProcessEnv;
+  /** Whether `processEnv` may name the provider-native source, or only the target's recorded one. */
+  nativeSourceAuthority: ConnectedServiceNativeSourceAuthority;
   vendorResumeId?: string | null;
   candidatePersistedSessionFile?: string | null;
   sessionStateMode?: 'existing';
@@ -424,6 +427,7 @@ export async function materializeConnectedServicesForSpawn(params: Readonly<{
       selectionsByServiceId: freshMaterial.selectionsByServiceId,
       accountSettings: params.accountSettings ?? null,
       processEnv: params.processEnv ?? process.env,
+      nativeSourceAuthority: params.nativeSourceAuthority,
       vendorResumeId: params.vendorResumeId ?? null,
       candidatePersistedSessionFile: params.candidatePersistedSessionFile ?? null,
       sessionStateMode: params.sessionStateMode,

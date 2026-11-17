@@ -4,6 +4,14 @@ import {
   SessionUsageLimitRecoveryV1Schema,
   type SessionStatusResult,
 } from '@happier-dev/protocol';
+import {
+  LEGACY_ACP_SESSION_MODELS_STATE_KEY,
+  SESSION_MODELS_STATE_KEY,
+  readNewestSessionModelsMetadataStateV1,
+} from '@happier-dev/agents';
+import type { Metadata } from '@/api/types';
+import { resolveModelOverrideFromMetadataSnapshot } from '@/agent/runtime/permission/permissionModeFromMetadata';
+import { resolveSessionConfigOptionOverridesFromMetadataSnapshot } from '@/agent/runtime/sessionConfigOptionOverrideSync';
 import { summarizeSessionRecord, type SessionSummary } from '@/cli/output/session/sessionSummary';
 import { decryptSessionPayload } from '@/session/transport/encryption/sessionEncryptionContext';
 import {
@@ -15,7 +23,13 @@ import {
 import { resolveSessionTransportContext } from './resolveSessionTransportContext';
 
 export type GetSessionStatusResult =
-  | Readonly<{ ok: true; session: SessionSummary; agentState: AgentStateSummary | null; usageLimitRecovery: SessionStatusResult['usageLimitRecovery'] }>
+  | Readonly<{
+      ok: true;
+      session: SessionSummary;
+      agentState: AgentStateSummary | null;
+      usageLimitRecovery: SessionStatusResult['usageLimitRecovery'];
+      runtimeConfig: SessionStatusResult['runtimeConfig'];
+    }>
   | Readonly<{ ok: false; code: 'session_not_found' | 'session_id_ambiguous' | 'session_lookup_timeout' | 'unsupported'; candidates?: string[] }>;
 
 function summarizeSessionAgentState(params: Readonly<{
@@ -49,9 +63,13 @@ function resolveLiveStatusWaitMs(): number {
   return Number.isFinite(liveWaitParsed) && liveWaitParsed > 0 ? Math.min(30_000, liveWaitParsed) : 3_000;
 }
 
-function readUsageLimitRecovery(
+type HeldSessionMetadata =
+  | Readonly<{ state: 'object'; metadataVersion: number; metadata: Record<string, unknown> }>
+  | Readonly<{ state: 'malformed' | 'unreadable'; metadataVersion: number }>;
+
+function readHeldSessionMetadata(
   target: Extract<Awaited<ReturnType<typeof resolveSessionTransportContext>>, { ok: true }>,
-): SessionStatusResult['usageLimitRecovery'] {
+): HeldSessionMetadata {
   const metadataVersion = target.rawSession.metadataVersion;
   let metadata: unknown;
   try {
@@ -67,11 +85,66 @@ function readUsageLimitRecovery(
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
     return { state: 'malformed', metadataVersion };
   }
+  return { state: 'object', metadataVersion, metadata: metadata as Record<string, unknown> };
+}
+
+// A reasoning-effort level is a short lowercase token (low, medium, xhigh, ...). Anything else is
+// reported as invalid without its value.
+const REASONING_EFFORT_LEVEL = /^[a-z][a-z0-9_-]{0,31}$/;
+const REASONING_EFFORT_CONFIG_ID = 'reasoning_effort';
+
+function readReportedModelState(metadata: Record<string, unknown>): RuntimeConfigPresent['reported'] {
+  const state = readNewestSessionModelsMetadataStateV1(metadata);
+  if (!state) {
+    const published = [SESSION_MODELS_STATE_KEY, LEGACY_ACP_SESSION_MODELS_STATE_KEY]
+      .some((key) => Object.prototype.hasOwnProperty.call(metadata, key));
+    return published ? { state: 'invalid' } : { state: 'absent' };
+  }
+  const effort = state.availableModels
+    .find((model) => model.id === state.currentModelId)
+    ?.modelOptions?.find((option) => option.id === REASONING_EFFORT_CONFIG_ID)
+    ?.currentValue;
+  return {
+    state: 'present',
+    provider: state.provider,
+    currentModelId: state.currentModelId,
+    ...(typeof effort === 'string' && REASONING_EFFORT_LEVEL.test(effort) ? { reasoningEffort: effort } : {}),
+    updatedAt: state.updatedAt,
+  };
+}
+
+type RuntimeConfigPresent = Extract<SessionStatusResult['runtimeConfig'], { state: 'present' }>;
+
+function readRuntimeConfig(held: HeldSessionMetadata): SessionStatusResult['runtimeConfig'] {
+  if (held.state !== 'object') return { state: held.state, metadataVersion: held.metadataVersion };
+  const model = resolveModelOverrideFromMetadataSnapshot({ metadata: held.metadata as Metadata });
+  const effort = resolveSessionConfigOptionOverridesFromMetadataSnapshot({ metadata: held.metadata as Metadata })
+    .find((option) => option.configId === REASONING_EFFORT_CONFIG_ID);
+  return {
+    state: 'present',
+    metadataVersion: held.metadataVersion,
+    desired: {
+      ...(model ? { model } : {}),
+      ...(effort
+        ? {
+            reasoningEffort: REASONING_EFFORT_LEVEL.test(effort.valueId)
+              ? { state: 'present' as const, value: effort.valueId, updatedAt: effort.updatedAt }
+              : { state: 'invalid' as const, updatedAt: effort.updatedAt },
+          }
+        : {}),
+    },
+    reported: readReportedModelState(held.metadata),
+  };
+}
+
+function readUsageLimitRecovery(held: HeldSessionMetadata): SessionStatusResult['usageLimitRecovery'] {
+  if (held.state !== 'object') return { state: held.state, metadataVersion: held.metadataVersion };
+  const { metadata, metadataVersion } = held;
   if (!Object.prototype.hasOwnProperty.call(metadata, SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY)) {
     return { state: 'absent', metadataVersion };
   }
   const parsed = SessionUsageLimitRecoveryV1Schema.safeParse(
-    (metadata as Record<string, unknown>)[SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY],
+    metadata[SESSION_USAGE_LIMIT_RECOVERY_METADATA_KEY],
   );
   if (!parsed.success) return { state: 'malformed', metadataVersion };
   const { status, issueFingerprint, armedAtMs, runtimeAuthRecoveryAttemptId } = parsed.data;
@@ -104,6 +177,7 @@ export async function getSessionStatus(params: Readonly<{
     return { ok: false, code: 'unsupported' };
   }
 
+  const heldMetadata = readHeldSessionMetadata(sessionTarget);
   let agentStateSummary = summarizeSessionAgentState({
     sessionTarget,
   });
@@ -132,6 +206,7 @@ export async function getSessionStatus(params: Readonly<{
       session: sessionTarget.rawSession,
     }),
     agentState: agentStateSummary,
-    usageLimitRecovery: readUsageLimitRecovery(sessionTarget),
+    usageLimitRecovery: readUsageLimitRecovery(heldMetadata),
+    runtimeConfig: readRuntimeConfig(heldMetadata),
   };
 }

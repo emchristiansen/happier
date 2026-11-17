@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ import {
   buildProviderAccountUsageRecordId,
   ConnectedServiceAuthGroupPolicyV1Schema,
   sealAccountScopedBlobCiphertext,
+  type ConnectedServiceCredentialHealthStatusV1,
   type ConnectedServiceCredentialRecordV1,
   type ConnectedServiceAuthGroupV1,
   type ProviderAccountUsageRecordKeyV1,
@@ -20,6 +21,7 @@ import {
 import { buildConnectedServiceCredentialRecord } from '@happier-dev/protocol';
 import type { Credentials } from '@/persistence';
 import type { ApiClient } from '@/api/api';
+import { ConnectedServiceCredentialHealthReadUnavailableError } from '@/api/connectedServices/connectedServiceCredentialApi';
 import { ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore } from './accountGroups/quotas/ConnectedServiceAuthGroupRuntimeQuotaSnapshotStore';
 import { createDaemonConnectedServiceAuthGroupSwitchCoordinator } from './runtimeAuth/createDaemonConnectedServiceAuthGroupSwitchCoordinator';
 import { CLAUDE_SUBSCRIPTION_OAUTH_SCOPE } from './descriptors/connectedAccountDescriptors';
@@ -48,6 +50,20 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 async function readClaudeCodeNativeCredential(claudeConfigDir: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(resolveClaudeCodeCredentialsFilePath(claudeConfigDir), 'utf8')) as Record<string, unknown>;
+}
+
+/**
+ * The server's exact-profile credential-health read for a fake whose profiles are healthy unless
+ * `statusByProfileId` gives a status.
+ */
+function exactProfileCredentialHealth(
+  statusByProfileId: (profileId: string) => ConnectedServiceCredentialHealthStatusV1 | undefined = () => undefined,
+) {
+  return vi.fn(async (params: Readonly<{ serviceId: string; profileId: string }>) => ({
+    kind: 'found' as const,
+    status: statusByProfileId(params.profileId) ?? ('connected' as const),
+    health: null,
+  }));
 }
 
 /**
@@ -243,6 +259,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
     } as unknown as ApiClient;
 
@@ -348,6 +365,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         credentialRevision: currentRevision,
       });
       const api = {
+        readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
         getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
       } as unknown as ApiClient;
       // The coordinator's adoption of an in-flight rotation's credentialReady result
@@ -638,6 +656,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceCredentialSealed: async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: now - 1_000 },
@@ -741,6 +760,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
     } as unknown as ApiClient;
 
@@ -848,6 +868,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
     } as unknown as ApiClient;
 
@@ -942,6 +963,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     }));
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceCredentialSealed: async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: freshRecord.expiresAt },
@@ -1026,6 +1048,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     }));
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceCredentialSealed: async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: expiredRecord.expiresAt },
@@ -1102,11 +1125,17 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         refreshWindowMs: 60_000,
       },
     }));
+    const readConnectedServiceCredentialHealth = vi.fn(async () => ({
+      kind: 'found' as const,
+      status: 'needs_reauth' as const,
+      health: null,
+    }));
+    const listConnectedServiceProfiles = vi.fn(async () => {
+      throw new Error('spawn must not read the service-wide profile list');
+    });
     const api = {
-      listConnectedServiceProfiles: vi.fn(async () => ({
-        serviceId: 'claude-subscription' as const,
-        profiles: [{ profileId: 'work', status: 'needs_reauth' as const }],
-      })),
+      readConnectedServiceCredentialHealth,
+      listConnectedServiceProfiles,
       getConnectedServiceCredentialSealed: async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: futureRecord.expiresAt },
@@ -1142,6 +1171,200 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     expect(refreshConnectedServiceCredentialForSpawnPreflight).not.toHaveBeenCalled();
+    expect(readConnectedServiceCredentialHealth).toHaveBeenCalledWith({ serviceId: 'claude-subscription', profileId: 'work' });
+    expect(listConnectedServiceProfiles).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before preflight refresh when the server cannot read one profile\'s credential health', async () => {
+    const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-test-'));
+    const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-test-'));
+    const now = 1_000_000;
+    const record = buildConnectedServiceCredentialRecord({
+      now,
+      serviceId: 'claude-subscription',
+      profileId: 'work',
+      kind: 'oauth',
+      expiresAt: now + 3_600_000,
+      oauth: {
+        accessToken: 'access',
+        refreshToken: 'refresh',
+        idToken: null,
+        scope: CLAUDE_SUBSCRIPTION_OAUTH_SCOPE,
+        tokenType: 'Bearer',
+        providerAccountId: 'acct',
+        providerEmail: null,
+      },
+    });
+    const credentials = {
+      token: 'happy-token',
+      encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
+    } satisfies Credentials;
+    const server = createSealedCredentialServer({ credentials, record });
+    const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn();
+    const listConnectedServiceProfiles = vi.fn(async () => {
+      throw new Error('spawn must not fall back to the service-wide profile list');
+    });
+    const api = {
+      getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
+      readConnectedServiceCredentialHealth: vi.fn(async () => {
+        throw new ConnectedServiceCredentialHealthReadUnavailableError('claude-subscription', 'work');
+      }),
+      listConnectedServiceProfiles,
+    } as unknown as ApiClient;
+
+    await expect(resolveConnectedServiceAuthForSpawn({
+      agentId: 'claude',
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: {
+          'claude-subscription': { source: 'connected', profileId: 'work' },
+        },
+      },
+      materializationKey: 'session-1',
+      activeServerDir,
+      baseDir,
+      credentials,
+      api,
+      nowMs: () => now,
+      credentialRefreshService: { refreshConnectedServiceCredentialForSpawnPreflight },
+    })).rejects.toBeInstanceOf(ConnectedServiceCredentialHealthReadUnavailableError);
+
+    expect(refreshConnectedServiceCredentialForSpawnPreflight).not.toHaveBeenCalled();
+    expect(listConnectedServiceProfiles).not.toHaveBeenCalled();
+  });
+
+  for (const refreshServiceCase of ['with', 'without'] as const) {
+    it(`refuses ${refreshServiceCase} a refresh service when the profile's health is absent after its credential was read`, async () => {
+      const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-test-'));
+      const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-test-'));
+      const now = 1_000_000;
+      const record = buildConnectedServiceCredentialRecord({
+        now,
+        serviceId: 'claude-subscription',
+        profileId: 'work',
+        kind: 'oauth',
+        expiresAt: now + 3_600_000,
+        oauth: {
+          accessToken: 'access',
+          refreshToken: 'refresh',
+          idToken: null,
+          scope: CLAUDE_SUBSCRIPTION_OAUTH_SCOPE,
+          tokenType: 'Bearer',
+          providerAccountId: 'acct',
+          providerEmail: null,
+        },
+      });
+      const credentials = {
+        token: 'happy-token',
+        encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
+      } satisfies Credentials;
+      const server = createSealedCredentialServer({ credentials, record });
+      const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn();
+      // The credential read succeeds; the exact health read then reports the profile gone (deleted between the two reads).
+      const api = {
+        getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
+        readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'not_found' as const })),
+      } as unknown as ApiClient;
+
+      const rejection = await resolveConnectedServiceAuthForSpawn({
+        agentId: 'claude',
+        connectedServicesBindingsRaw: {
+          v: 1,
+          bindingsByServiceId: {
+            'claude-subscription': { source: 'connected', profileId: 'work' },
+          },
+        },
+        materializationKey: 'session-1',
+        activeServerDir,
+        baseDir,
+        credentials,
+        api,
+        nowMs: () => now,
+        ...(refreshServiceCase === 'with'
+          ? { credentialRefreshService: { refreshConnectedServiceCredentialForSpawnPreflight } }
+          : {}),
+      }).then(() => null, (error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(ConnectedServiceSpawnCredentialRefreshError);
+      expect(rejection).toMatchObject({
+        kind: 'reconnect_required',
+        serviceId: 'claude-subscription',
+        profileId: 'work',
+        diagnostic: expect.objectContaining({ status: 'credential_missing' }),
+      });
+      expect(server.getConnectedServiceCredentialSealed).toHaveBeenCalled();
+      expect(refreshConnectedServiceCredentialForSpawnPreflight).not.toHaveBeenCalled();
+      // Nothing was materialized for the refused spawn.
+      expect(await readdir(baseDir)).toEqual([]);
+      expect(await readdir(activeServerDir)).toEqual([]);
+    });
+  }
+
+  it('refuses a still-valid credential when the refresh coordinator cannot read its health', async () => {
+    const baseDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-test-'));
+    const activeServerDir = await mkdtemp(join(tmpdir(), 'happier-connected-services-server-test-'));
+    const now = 1_000_000;
+    const record = buildConnectedServiceCredentialRecord({
+      now,
+      serviceId: 'claude-subscription',
+      profileId: 'work',
+      kind: 'oauth',
+      expiresAt: now + 3_600_000,
+      oauth: {
+        accessToken: 'access',
+        refreshToken: 'refresh',
+        idToken: null,
+        scope: CLAUDE_SUBSCRIPTION_OAUTH_SCOPE,
+        tokenType: 'Bearer',
+        providerAccountId: 'acct',
+        providerEmail: null,
+      },
+    });
+    const credentials = {
+      token: 'happy-token',
+      encryption: { type: 'legacy', secret: new Uint8Array(32).fill(7) },
+    } satisfies Credentials;
+    const server = createSealedCredentialServer({ credentials, record });
+    const diagnostic = {
+      serviceId: 'claude-subscription' as const,
+      profileId: 'work',
+      reason: 'spawn_preflight' as const,
+      status: 'credential_health_unavailable' as const,
+      expiresAt: record.expiresAt,
+      refreshWindowMs: 60_000,
+    };
+    const refreshConnectedServiceCredentialForSpawnPreflight = vi.fn(async () => ({
+      status: 'credential_health_unavailable' as const,
+      credential: null,
+      diagnostic,
+    }));
+    const api = {
+      getConnectedServiceCredentialSealed: server.getConnectedServiceCredentialSealed,
+      readConnectedServiceCredentialHealth: vi.fn(async () => ({ kind: 'found' as const, status: 'connected' as const, health: null })),
+    } as unknown as ApiClient;
+
+    await expect(resolveConnectedServiceAuthForSpawn({
+      agentId: 'claude',
+      connectedServicesBindingsRaw: {
+        v: 1,
+        bindingsByServiceId: {
+          'claude-subscription': { source: 'connected', profileId: 'work' },
+        },
+      },
+      materializationKey: 'session-1',
+      activeServerDir,
+      baseDir,
+      credentials,
+      api,
+      nowMs: () => now,
+      credentialRefreshService: { refreshConnectedServiceCredentialForSpawnPreflight },
+    })).rejects.toMatchObject({
+      name: 'ConnectedServiceSpawnCredentialRefreshError',
+      kind: 'transient_refresh_failed',
+      diagnostic: expect.objectContaining({ status: 'credential_health_unavailable' }),
+    });
+    expect(refreshConnectedServiceCredentialForSpawnPreflight).toHaveBeenCalledTimes(1);
+    expect(await readdir(baseDir)).toEqual([]);
   });
 
   it('fails closed before spawning Claude when OAuth materialization cannot write native credentials', async () => {
@@ -1181,6 +1404,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       randomBytes: (length) => randomBytes(length),
     });
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceCredentialSealed: async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: missingScopeRecord.expiresAt },
@@ -1298,6 +1522,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     }));
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth((profileId) => (profileId === 'primary' ? 'needs_reauth' : undefined)),
       listConnectedServiceProfiles: vi.fn(async () => ({
         serviceId: 'openai-codex' as const,
         profiles: [
@@ -1447,6 +1672,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     }));
 
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceCredentialSealed: async () => ({
         sealed: { format: 'account_scoped_v1', ciphertext },
         metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: expiredExpiresAt },
@@ -1620,6 +1846,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       return await getConnectedServiceAuthGroup();
     });
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup,
       updateConnectedServiceAuthGroupActiveProfile,
       getConnectedServiceCredentialSealed,
@@ -1724,6 +1951,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     }));
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup: async () => ({
         v: 1,
         serviceId: 'claude-subscription',
@@ -1987,6 +2215,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       };
     });
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup,
       getConnectedServiceCredentialSealed,
     } as unknown as ApiClient;
@@ -2160,6 +2389,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       };
     });
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup,
       updateConnectedServiceAuthGroupActiveProfile,
       updateConnectedServiceAuthGroupRuntimeState,
@@ -2407,6 +2637,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       ],
     }));
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth((profileId) => credentialHealthByProfileId.get(profileId)),
       getConnectedServiceAuthGroup,
       updateConnectedServiceAuthGroupActiveProfile,
       updateConnectedServiceAuthGroupRuntimeState,
@@ -2555,6 +2786,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
 
     const updateConnectedServiceCredentialHealth = vi.fn(async () => {});
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup: vi.fn(async () => ({
         v: 1 as const,
         serviceId: 'claude-subscription' as const,
@@ -2812,6 +3044,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       };
     });
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup,
       updateConnectedServiceAuthGroupActiveProfile,
       updateConnectedServiceAuthGroupRuntimeState,
@@ -2909,6 +3142,14 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       randomBytes: (length) => randomBytes(length),
     });
 
+    const readConnectedServiceCredentialHealth = vi.fn(async () => ({
+      kind: 'found' as const,
+      status: 'connected' as const,
+      health: null,
+    }));
+    const listConnectedServiceProfiles = vi.fn(async () => {
+      throw new Error('spawn must not read the service-wide profile list');
+    });
     const api = {
       getConnectedServiceCredentialSealed: async (params: { serviceId: string; profileId: string }) => {
         const { serviceId, profileId } = params;
@@ -2918,6 +3159,8 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
           metadata: { kind: 'oauth', providerEmail: null, providerAccountId: 'acct', expiresAt: null },
         };
       },
+      readConnectedServiceCredentialHealth,
+      listConnectedServiceProfiles,
     } as unknown as ApiClient;
 
     const connectedServiceAuth = await resolveConnectedServiceAuthForSpawn({
@@ -2944,6 +3187,9 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     );
     const auth = JSON.parse(await readFile(join(connectedServiceAuth!.env.CODEX_HOME, 'auth.json'), 'utf8'));
     expect(auth.access_token).toBe('access');
+    expect(readConnectedServiceCredentialHealth).toHaveBeenCalledTimes(1);
+    expect(readConnectedServiceCredentialHealth).toHaveBeenCalledWith({ serviceId: 'openai-codex', profileId: 'work' });
+    expect(listConnectedServiceProfiles).not.toHaveBeenCalled();
   });
 
   it('resolves group bindings through the server active profile and materializes the group home', async () => {
@@ -2984,6 +3230,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     });
 
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup: async (params: { serviceId: string; groupId: string }) => {
         expect(params).toEqual({ serviceId: 'openai-codex', groupId: 'main' });
         return {
@@ -3045,6 +3292,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
     } satisfies Credentials;
 
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup: async () => ({
         serviceId: 'openai-codex',
         groupId: 'main',
@@ -3183,6 +3431,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       return await getConnectedServiceAuthGroup();
     });
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup,
       updateConnectedServiceAuthGroupActiveProfile,
       getConnectedServiceCredentialSealed: async (params: { serviceId: string; profileId: string }) => {
@@ -3384,6 +3633,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       throw new Error('Stale quota evidence must not commit another selection');
     });
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup,
       updateConnectedServiceAuthGroupActiveProfile,
       getConnectedServiceCredentialSealed: async (params: { serviceId: string; profileId: string }) => {
@@ -3516,6 +3766,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       generation: 8,
     }));
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup: async () => ({
         v: 1,
         serviceId: 'openai-codex',
@@ -3679,6 +3930,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       generation: 8,
     }));
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup: async () => ({
         v: 1,
         serviceId: 'openai-codex',
@@ -3902,6 +4154,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
       },
     });
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup: async () => ({
         v: 1,
         serviceId: 'claude-subscription',
@@ -4221,6 +4474,7 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         };
       });
     const api = {
+      readConnectedServiceCredentialHealth: exactProfileCredentialHealth(),
       getConnectedServiceAuthGroup,
       updateConnectedServiceAuthGroupActiveProfile,
       getConnectedServiceCredentialSealed,
@@ -4456,6 +4710,8 @@ describe('resolveConnectedServiceAuthForSpawn', () => {
         this.updateRequest = params;
         throw new Error('direct active-profile writes must not happen without the switch coordinator (RD-SW-4)');
       }
+
+      readonly readConnectedServiceCredentialHealth = exactProfileCredentialHealth();
 
       async getConnectedServiceCredentialSealed(params: { serviceId: string; profileId: string }) {
         if (params.serviceId !== 'openai-codex' || params.profileId !== 'primary') return null;
