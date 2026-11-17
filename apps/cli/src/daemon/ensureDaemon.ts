@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger';
+import { usesCredentialDescriptors } from '@/persistence';
 import { readStartedByArg } from '@/cli/readStartedByArg';
 
 import { isDaemonRunningCurrentlyInstalledHappyVersion } from '@/daemon/controlClient';
@@ -53,6 +54,8 @@ export function shouldAutoStartDaemonAfterAuth(
 ): boolean {
   if (params.callerIntent === 'setup-managed') return false;
   if (params.isDaemonProcess) return false;
+  // Descriptor credentials serve this process only; a daemon could not use them.
+  if (usesCredentialDescriptors()) return false;
   if (params.startedBy === 'daemon') return false;
   const raw = (params.env.HAPPIER_SESSION_AUTOSTART_DAEMON ?? '').toString().trim().toLowerCase();
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'y';

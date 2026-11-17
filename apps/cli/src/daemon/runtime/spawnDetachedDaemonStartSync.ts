@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 import { getReleaseRingCatalogEntry } from '@happier-dev/release-runtime/releaseRings';
 import { configuration } from '@/configuration';
+import { assertCredentialsAreNotDescriptorBound } from '@/persistence';
 import type { DaemonStartupSource } from '@/daemon/ownership/daemonOwnershipMetadata';
 import {
   buildSystemdUserCriticalScopedLaunchSpec,
@@ -104,6 +105,7 @@ async function spawnWindowsDetachedDaemonStartSync(params: Readonly<{
 export async function spawnDetachedDaemonStartSync(
   options: Readonly<SpawnOptions & { startupSource?: DaemonStartupSource }> = {},
 ): Promise<ChildProcess> {
+  assertCredentialsAreNotDescriptorBound('Starting the daemon');
   const { startupSource, ...spawnOptions } = options;
   const launchEnv = spawnOptions.env ?? process.env;
   const launchSpec = await resolveDaemonLaunchSpec(['daemon', 'start-sync'], launchEnv);

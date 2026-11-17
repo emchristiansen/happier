@@ -94,6 +94,7 @@ import {
   readProcessInstanceFingerprintSync,
 } from '@happier-dev/cli-common/processInstance';
 import {
+  assertCredentialsAreNotDescriptorBound,
   writeDaemonStateIfLockOwned,
   writeConnectedServiceBrokerState,
   DaemonLocallyPersistedState,
@@ -1775,6 +1776,8 @@ function mapExistingSessionAttachFailureToSpawnError(reason: import('./sessionEn
 }
 
 export async function startDaemon(options: Readonly<{ takeover?: boolean }> = {}): Promise<void> {
+  // The daemon spawns session runners that need credentials; descriptor credentials cannot reach them.
+  assertCredentialsAreNotDescriptorBound('Running the daemon');
   // We don't have cleanup function at the time of server construction
   // Control flow is:
   // 1. Create promise that will resolve when shutdown is requested

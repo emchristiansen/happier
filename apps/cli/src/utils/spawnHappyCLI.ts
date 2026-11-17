@@ -64,6 +64,7 @@ import { basename, dirname, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { projectPath } from '@/projectPath';
 import { logger } from '@/ui/logger';
+import { assertCredentialsAreNotDescriptorBound } from '@/persistence';
 import { isBun } from './runtime';
 import { createRequire } from 'node:module';
 import { resolveJavaScriptRuntimeExecutable } from '@/runtime/js/resolveJavaScriptRuntimeExecutable';
@@ -757,6 +758,9 @@ export function buildHappyCliSubprocessInvocation(
   args: string[],
   options?: HappyCliSubprocessLaunchOptions,
 ): HappyCliSubprocessInvocation {
+  // Every Happier self-launch is built here. Descriptor credentials serve this process only, and a child would fall
+  // back to native credentials, so no Happier child is launched in descriptor mode.
+  assertCredentialsAreNotDescriptorBound('Launching another Happier process');
   if (options?.runtimeDecision) {
     return {
       runtime: options.runtimeDecision.runtime,

@@ -1,4 +1,4 @@
-import { readSettings, updateSettings, type Settings } from '@/persistence';
+import { readSettings, updateSettings, usesCredentialDescriptors, type Settings } from '@/persistence';
 import { deriveServerIdFromName, deriveServerIdFromUrl, sanitizeServerIdForFilesystem } from '@/server/serverId';
 import { isLocalishServerUrl } from '@/server/serverUrlClassification';
 import { createServerUrlComparableKey } from '@happier-dev/protocol';
@@ -28,6 +28,8 @@ async function maybeAdoptDerivedServerProfileState(params: Readonly<{
   serverUrl: string;
   localServerUrl?: string;
 }>): Promise<void> {
+  // Descriptor credentials are never native: do not read, copy or adopt an incumbent access.key for them.
+  if (usesCredentialDescriptors()) return;
   const serversDir = join(resolveHappyHomeDirFromEnvironment(process.env), 'servers');
   const targetDir = join(serversDir, params.targetServerId);
   const targetKeyPath = join(targetDir, 'access.key');

@@ -34,7 +34,8 @@ describe('spawnDetachedDaemonStartSync', () => {
     process.argv = ['node', '/Users/alice/.happier/bin/hdev', 'daemon', 'start'];
 
     const spawnMock: Mock<(typeof import('child_process'))['spawn']> = vi.fn(() => ({ unref() {} }) as any);
-    vi.doMock('child_process', () => ({
+    vi.doMock('child_process', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('child_process')>()),
       spawn: spawnMock,
     }));
 

@@ -7,7 +7,7 @@ import tweetnacl from 'tweetnacl';
 import { decodeBase64 } from '@/api/encryption';
 import { writeJsonStdout } from '@/cli/output/jsonEnvelope';
 import { configuration } from '@/configuration';
-import { readCredentials, writeCredentialsDataKey, writeCredentialsLegacy, writeCredentialsTokenOnly, type Credentials } from '@/persistence';
+import { credentialDescriptors, readCredentials, writeCredentialsDataKey, writeCredentialsLegacy, writeCredentialsTokenOnly, type Credentials } from '@/persistence';
 import { applyServerSelectionFromArgs } from '@/server/serverSelection';
 import { ensureMachineIdForCredentials } from '@/ui/auth';
 import {
@@ -90,6 +90,12 @@ function parsePendingAuthState(raw: string): PendingAuthState {
   };
 }
 
+// With HAPPIER_CREDENTIALS_SINK_FD the credentials (bearer token included) leave only through that descriptor,
+// so the JSON result reports success and identity without the token.
+function tokenField(token: string): { token?: string } {
+  return credentialDescriptors().sink === null ? { token } : {};
+}
+
 export async function handleAuthWait(argsRaw: string[]): Promise<void> {
   const args = await applyServerSelectionFromArgs(argsRaw);
 
@@ -132,7 +138,7 @@ export async function handleAuthWait(argsRaw: string[]): Promise<void> {
     await unlink(statePath).catch(() => {});
     await writeJsonStdout({
       success: true,
-      token: existing.token,
+      ...tokenField(existing.token),
       encryptionType: existing.encryption?.type ?? 'tokenOnly',
       machineId,
     });
@@ -197,7 +203,7 @@ export async function handleAuthWait(argsRaw: string[]): Promise<void> {
         await unlink(statePath).catch(() => {});
         await writeJsonStdout({
           success: true,
-          token,
+          ...tokenField(token),
           encryptionType: credentials.encryption?.type ?? 'tokenOnly',
           pairingAuthentication: opened.authenticated ? 'v3' : 'legacy',
           machineId,
@@ -218,7 +224,7 @@ export async function handleAuthWait(argsRaw: string[]): Promise<void> {
         await unlink(statePath).catch(() => {});
         await writeJsonStdout({
           success: true,
-          token,
+          ...tokenField(token),
           encryptionType: 'legacy' as const,
           pairingAuthentication: opened.authenticated ? 'v3' : 'legacy',
           machineId,
@@ -242,7 +248,7 @@ export async function handleAuthWait(argsRaw: string[]): Promise<void> {
         await unlink(statePath).catch(() => {});
         await writeJsonStdout({
           success: true,
-          token,
+          ...tokenField(token),
           encryptionType: 'dataKey' as const,
           pairingAuthentication: opened.authenticated ? 'v3' : 'legacy',
           machineId,

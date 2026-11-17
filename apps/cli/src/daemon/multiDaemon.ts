@@ -9,7 +9,9 @@ import { configuration } from '@/configuration';
 import { resolveDaemonStartupSourceServiceManagedState } from '@/daemon/ownership/daemonOwnershipMetadata';
 import {
   DaemonLocallyPersistedStateSchema,
+  readCredentials,
   readSettings,
+  usesCredentialDescriptors,
   resolveDaemonStateCandidatePathsForCurrentLifecycle,
   reclaimDeadDaemonPublication,
 } from '@/persistence';
@@ -177,6 +179,8 @@ function resolveCredentialPathCandidates(serverId: string): Readonly<{ primaryPa
 }
 
 async function readAuthTokenForServerId(serverId: string): Promise<string | null> {
+  // Descriptor mode: the persistence owner answers (active server only); no native credential file is read.
+  if (usesCredentialDescriptors()) return (await readCredentials({ serverId }))?.token ?? null;
   const { primaryPath, legacyPath } = resolveCredentialPathCandidates(serverId);
   const canUseLegacy = serverId === 'cloud' && existsSync(legacyPath) && !existsSync(primaryPath);
 

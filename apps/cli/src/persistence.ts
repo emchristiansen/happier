@@ -6,7 +6,7 @@
 
 import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat, chmod, readdir } from 'node:fs/promises'
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, fstatSync, mkdirSync, readFileSync, unlinkSync, writeSync } from 'node:fs'
 import { constants } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { configuration } from '@/configuration'
@@ -676,6 +676,218 @@ export type Credentials = {
 
 export type CredentialReadScope = Readonly<{ serverId?: string }>;
 
+// Descriptor credential mode, for callers that keep credentials in a secret manager rather than in a native file.
+// HAPPIER_CREDENTIALS_FD names an inherited descriptor holding the active server's credential JSON (the same schema
+// as access.key); HAPPIER_CREDENTIALS_SINK_FD names an inherited descriptor that receives the one credential JSON a
+// pairing writes. In this mode access.key is never read, written, copied or cleared.
+//
+// The descriptors belong to this process only. Their numbers are taken from the environment when this module loads
+// and removed from it, so no child process inherits a number that would name some other resource there; the daemon
+// and other credential-reading children are refused (assertCredentialsAreNotDescriptorBound).
+type CredentialDescriptors = Readonly<{ source: number | null; sink: number | null }>;
+type StoredCredentials = z.infer<typeof credentialsSchema>;
+type CredentialDescriptorErrorCode =
+  | 'AUTH_CREDENTIAL_DESCRIPTOR_INVALID'
+  | 'AUTH_CREDENTIAL_DESCRIPTOR_UNREADABLE'
+  | 'AUTH_CREDENTIAL_DESCRIPTOR_MALFORMED'
+  | 'AUTH_CREDENTIAL_DESCRIPTOR_SCOPE'
+  | 'AUTH_CREDENTIAL_DESCRIPTOR_READ_ONLY'
+  | 'AUTH_CREDENTIAL_DESCRIPTOR_SINGLE_PROCESS'
+  | 'AUTH_CREDENTIAL_SINK_USED'
+  | 'AUTH_CREDENTIAL_SINK_WRITE_FAILED';
+
+// Messages name the operation, descriptor number and error class only: credential bytes never appear in them, and no
+// underlying error (whose message may quote the input) is attached.
+function credentialDescriptorError(code: CredentialDescriptorErrorCode, message: string): Error & { code: CredentialDescriptorErrorCode } {
+  return Object.assign(new Error(message), { code });
+}
+
+function osErrorCode(error: unknown): string {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  return typeof code === 'string' && /^[A-Z0-9_]+$/.test(code) ? code : 'unknown error';
+}
+
+type DescriptorName = 'HAPPIER_CREDENTIALS_FD' | 'HAPPIER_CREDENTIALS_SINK_FD';
+// Identity of the resource each inherited number named when this module loaded. A number is used only while it still
+// names that same resource, so a number the process later reuses for something else is never read, written or closed.
+type InheritedDescriptor = Readonly<{ raw: string | undefined; identity: string | null }>;
+
+function descriptorIdentity(fd: number): string | null {
+  try {
+    const stat = fstatSync(fd);
+    return `${stat.dev}:${stat.ino}:${stat.rdev}:${stat.mode}`;
+  } catch {
+    return null;
+  }
+}
+
+function isDescriptorNumber(raw: string | undefined): raw is string {
+  return raw !== undefined && /^[0-9]+$/.test(raw) && Number(raw) >= 3 && Number.isSafeInteger(Number(raw));
+}
+
+const inheritedDescriptors: Readonly<Record<DescriptorName, InheritedDescriptor>> = (() => {
+  const names: DescriptorName[] = ['HAPPIER_CREDENTIALS_FD', 'HAPPIER_CREDENTIALS_SINK_FD'];
+  const taken = Object.fromEntries(names.map((name) => {
+    const raw = process.env[name];
+    return [name, { raw, identity: isDescriptorNumber(raw) ? descriptorIdentity(Number(raw)) : null }];
+  })) as Record<DescriptorName, InheritedDescriptor>;
+  for (const name of names) delete process.env[name];
+  return taken;
+})();
+
+function parseCredentialDescriptor(name: DescriptorName): number | null {
+  const { raw } = inheritedDescriptors[name];
+  if (raw === undefined || raw === '') return null;
+  if (!isDescriptorNumber(raw)) {
+    throw credentialDescriptorError('AUTH_CREDENTIAL_DESCRIPTOR_INVALID', `${name} must name an inherited descriptor number of 3 or more`);
+  }
+  return Number(raw);
+}
+
+export function credentialDescriptors(): CredentialDescriptors {
+  const source = parseCredentialDescriptor('HAPPIER_CREDENTIALS_FD');
+  const sink = parseCredentialDescriptor('HAPPIER_CREDENTIALS_SINK_FD');
+  // Each role owns and closes its own one-shot resource; a shared resource would be used after its owner closed it.
+  const sourceIdentity = inheritedDescriptors.HAPPIER_CREDENTIALS_FD.identity;
+  if (source !== null && sink !== null
+    && (source === sink || (sourceIdentity !== null && sourceIdentity === inheritedDescriptors.HAPPIER_CREDENTIALS_SINK_FD.identity))) {
+    throw credentialDescriptorError(
+      'AUTH_CREDENTIAL_DESCRIPTOR_INVALID',
+      'HAPPIER_CREDENTIALS_FD and HAPPIER_CREDENTIALS_SINK_FD must name different inherited resources',
+    );
+  }
+  return { source, sink };
+}
+
+function stillInherited(name: DescriptorName, fd: number): boolean {
+  const inherited = inheritedDescriptors[name].identity;
+  return inherited !== null && descriptorIdentity(fd) === inherited;
+}
+
+export function usesCredentialDescriptors(): boolean {
+  const { source, sink } = credentialDescriptors();
+  return source !== null || sink !== null;
+}
+
+/** Refuses an operation that would start another process needing these credentials (descriptor mode is single-process). */
+export function assertCredentialsAreNotDescriptorBound(operation: string): void {
+  if (!usesCredentialDescriptors()) return;
+  throw credentialDescriptorError(
+    'AUTH_CREDENTIAL_DESCRIPTOR_SINGLE_PROCESS',
+    `${operation} is not available with HAPPIER_CREDENTIALS_FD/HAPPIER_CREDENTIALS_SINK_FD: descriptor credentials serve this process only`,
+  );
+}
+
+// Each descriptor is used at most once per process. The outcome is terminal: a failed read is never retried (the
+// number may since name an unrelated descriptor), and credentials stay bound to the server they were obtained for.
+type DescriptorState =
+  | Readonly<{ kind: 'unread' }>
+  | Readonly<{ kind: 'loaded'; serverId: string; value: StoredCredentials }>
+  | Readonly<{ kind: 'failed'; error: Error }>;
+let descriptorState: DescriptorState = { kind: 'unread' };
+let sinkUsed = false;
+
+function consumeSourceDescriptor(source: number): StoredCredentials {
+  let raw: string;
+  if (!stillInherited('HAPPIER_CREDENTIALS_FD', source)) {
+    throw credentialDescriptorError('AUTH_CREDENTIAL_DESCRIPTOR_UNREADABLE', `HAPPIER_CREDENTIALS_FD ${source} does not name the resource inherited at startup`);
+  }
+  try {
+    raw = readFileSync(source, 'utf8');
+  } catch (error) {
+    throw credentialDescriptorError('AUTH_CREDENTIAL_DESCRIPTOR_UNREADABLE', `HAPPIER_CREDENTIALS_FD ${source} could not be read (${osErrorCode(error)})`);
+  } finally {
+    try { closeSync(source); } catch { /* already consumed; the read outcome above decides */ }
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    throw credentialDescriptorError('AUTH_CREDENTIAL_DESCRIPTOR_MALFORMED', `HAPPIER_CREDENTIALS_FD ${source} did not contain credential JSON (${raw.length} characters; content not shown)`);
+  }
+  const parsed = credentialsSchema.safeParse(json);
+  if (!parsed.success) {
+    const fields = [...new Set(parsed.error.issues.map((issue) => issue.path.join('.') || '(root)'))].join(', ');
+    throw credentialDescriptorError('AUTH_CREDENTIAL_DESCRIPTOR_MALFORMED', `HAPPIER_CREDENTIALS_FD ${source} credential JSON is invalid at: ${fields} (values not shown)`);
+  }
+  return parsed.data;
+}
+
+function readDescriptorCredentials(source: number | null, serverId: string): StoredCredentials | null {
+  if (descriptorState.kind === 'unread') {
+    if (source === null) return null; // sink-only: nothing until this process's pairing writes it
+    try {
+      descriptorState = { kind: 'loaded', serverId, value: consumeSourceDescriptor(source) };
+    } catch (error) {
+      descriptorState = { kind: 'failed', error: error as Error };
+    }
+  }
+  if (descriptorState.kind === 'failed') throw descriptorState.error;
+  if (descriptorState.serverId !== serverId) {
+    throw credentialDescriptorError(
+      'AUTH_CREDENTIAL_DESCRIPTOR_SCOPE',
+      `Descriptor credentials were obtained for server ${descriptorState.serverId}; the active server is now ${serverId}`,
+    );
+  }
+  return descriptorState.value;
+}
+
+function sendToSinkDescriptor(sink: number, credentials: StoredCredentials): void {
+  if (sinkUsed) {
+    throw credentialDescriptorError('AUTH_CREDENTIAL_SINK_USED', 'HAPPIER_CREDENTIALS_SINK_FD was already used by this process');
+  }
+  // Marked before writing: an uncertain or partial transfer is reported, never blindly repeated.
+  sinkUsed = true;
+  if (!stillInherited('HAPPIER_CREDENTIALS_SINK_FD', sink)) {
+    throw credentialDescriptorError(
+      'AUTH_CREDENTIAL_SINK_WRITE_FAILED',
+      `HAPPIER_CREDENTIALS_SINK_FD ${sink} does not name the resource inherited at startup; nothing written`,
+    );
+  }
+  const bytes = Buffer.from(JSON.stringify(credentials), 'utf8');
+  let offset = 0;
+  let failure: unknown = null;
+  try {
+    while (offset < bytes.length) {
+      const written = writeSync(sink, bytes, offset, bytes.length - offset);
+      if (!(written > 0)) throw Object.assign(new Error('zero-length write'), { code: 'EIO' });
+      offset += written;
+    }
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    closeSync(sink);
+  } catch (error) {
+    failure ??= error;
+  }
+  if (failure !== null) {
+    throw credentialDescriptorError(
+      'AUTH_CREDENTIAL_SINK_WRITE_FAILED',
+      `HAPPIER_CREDENTIALS_SINK_FD ${sink}: credential transfer failed after ${offset} of ${bytes.length} bytes (${osErrorCode(failure)}); not retried`,
+    );
+  }
+  descriptorState = { kind: 'loaded', serverId: configuration.activeServerId, value: credentials };
+}
+
+function credentialsFromStored(credentials: StoredCredentials): Credentials | null {
+  if (credentials.secret) {
+    return { token: credentials.token, encryption: { type: 'legacy', secret: decodeBase64(credentials.secret) } };
+  } else if (credentials.encryption) {
+    return {
+      token: credentials.token,
+      encryption: {
+        type: 'dataKey',
+        publicKey: decodeBase64(credentials.encryption.publicKey),
+        machineKey: decodeBase64(credentials.encryption.machineKey),
+      },
+    };
+  } else if (credentials.encryption === null) {
+    return { token: credentials.token, encryption: null };
+  }
+  return null;
+}
+
 export function requireEncryptionCredentials(credentials: Credentials): asserts credentials is Credentials & {
   encryption: NonNullable<Credentials['encryption']>;
 } {
@@ -689,6 +901,13 @@ export function requireEncryptionCredentials(credentials: Credentials): asserts 
 export async function readCredentials(scope: CredentialReadScope = {}): Promise<Credentials | null> {
   const serverId = scope.serverId === undefined ? configuration.activeServerId : scope.serverId.trim();
   if (!isServerIdFilesystemSafe(serverId)) return null;
+  const descriptors = credentialDescriptors();
+  if (descriptors.source !== null || descriptors.sink !== null) {
+    // Descriptor mode serves only the active server and never falls back to a native file.
+    if (serverId !== configuration.activeServerId) return null;
+    const stored = readDescriptorCredentials(descriptors.source, serverId);
+    return stored ? credentialsFromStored(stored) : null;
+  }
   const primaryPath = scope.serverId === undefined
     ? configuration.privateKeyFile
     : join(configuration.happyHomeDir, 'servers', serverId, 'access.key');
@@ -702,34 +921,21 @@ export async function readCredentials(scope: CredentialReadScope = {}): Promise<
   if (!path) return null;
   try {
     const keyBase64 = (await readFile(path, 'utf8'));
-    const credentials = credentialsSchema.parse(JSON.parse(keyBase64));
-    if (credentials.secret) {
-      return {
-        token: credentials.token,
-        encryption: {
-          type: 'legacy',
-          secret: decodeBase64(credentials.secret)
-        }
-      };
-    } else if (credentials.encryption) {
-      return {
-        token: credentials.token,
-        encryption: {
-          type: 'dataKey',
-          publicKey: decodeBase64(credentials.encryption.publicKey),
-          machineKey: decodeBase64(credentials.encryption.machineKey)
-        }
-      }
-    } else if (credentials.encryption === null) {
-      return { token: credentials.token, encryption: null };
-    }
+    return credentialsFromStored(credentialsSchema.parse(JSON.parse(keyBase64)));
   } catch {
     return null
   }
-  return null
 }
 
 async function writeStoredCredentialFile(credentials: z.infer<typeof credentialsSchema>): Promise<void> {
+  const descriptors = credentialDescriptors();
+  if (descriptors.sink !== null) {
+    sendToSinkDescriptor(descriptors.sink, credentials);
+    return;
+  }
+  if (descriptors.source !== null) {
+    throw credentialDescriptorError('AUTH_CREDENTIAL_DESCRIPTOR_READ_ONLY', 'Credentials come from HAPPIER_CREDENTIALS_FD; refusing to write a native credential file');
+  }
   await ensureHappyHomeDirExists();
   const serverId = configuration.activeServerId;
   const keyPath = configuration.privateKeyFile;
@@ -778,6 +984,8 @@ export async function writeCredentialsTokenOnly(credentials: { token: string }):
 }
 
 export async function clearCredentials(): Promise<void> {
+  // Descriptor-held credentials belong to the caller's secret manager; nothing native exists to clear.
+  if (usesCredentialDescriptors()) return;
   if (existsSync(configuration.privateKeyFile)) {
     await unlink(configuration.privateKeyFile).catch(() => {});
   }
