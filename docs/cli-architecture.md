@@ -45,6 +45,82 @@ graph TB
 - **Persistence/config:** `src/persistence.ts` + `src/configuration.ts` manage local state in `~/.happy`.
 - **Agents:** `src/claude`, `src/codex`, `src/gemini` provide provider-specific runners.
 
+## Session message provenance and references (development)
+
+Session-bound Happier action and MCP tools bind their sender independently of the
+selected recipient. The shared action executor passes that host origin through
+`createCliActionDeps` and `sendSessionMessage` into the existing Pending admission
+metadata. `sessionMessages/sessionMessageProvenance.ts` in protocol owns the
+`happierProvenanceV1` session-origin shape, compatible with the corresponding 0.3
+shape, and its tolerant reader. Tool input cannot override the host binding.
+Unbound CLI and external MCP calls do not acquire a sender from their current target.
+Deferred approvals preserve this host origin on the existing approval request;
+replay uses the original origin and never the approving session's identity.
+
+`resolveProviderPromptForDispatch` renders the origin once as
+`<happier_input_context>` alongside the existing session-reference block, for both
+new turns and in-flight steering. For ordinary agent messages,
+`<happier_session_message>` groups this context and the exact JSON-string body;
+replay and restored conversation history stay outside it. Provider-native slash
+commands retain their first-line syntax with the source context appended. Claude's
+local clear/checkpoint/rewind commands retain their raw grammar without model-only
+context or replay seeds. Terminal compaction acceptance uses the shared special
+command parser, including when attribution follows the command on a new line.
+Replay context reserves the framing overhead through the existing total budget.
+The short guidance allows agent requests within the user's authorized scope and
+existing permissions, without treating an agent message as user approval. Replying
+normally completes an existing send wait; a separate message can use
+`session.message.send` with the source session ID. This guidance is included only
+with attributed input, without startup instructions or a persistent received flag.
+Claude, Gemini, Codex and shared ACP preserve input metadata through the shared mode queue; entries
+carrying metadata stay separate so batching cannot attribute a neighbor's text to
+another sender. Their adapters use the same finalizer. Queued metadata has one
+carrier rather than competing mode fields or typed-message fields. Rejected
+Codex steering returns raw input to queue custody for fresh dispatch, avoiding
+nested attribution or repeated reference resolution. This does not introduce the
+0.3 reply action or returned-answer state machine.
+Delivery's existing `source`, `sentFrom`, permissions, and notice behavior retain
+their separate meanings. The UI reads the same protocol shape and displays the
+sender's cached title, exact ID, and transport without fetching another transcript.
+
+Composer session mentions continue to use typed reference metadata rather than
+resolving pasted titles or slugs. Editing a queued message hydrates those bindings
+into the existing composer and saves replacements through the Pending writer's
+canonical structured-input sanitizer. Removed bindings also remove shadowed legacy
+mention aliases so they cannot become active again. Existing attachments and other
+message metadata survive the edit. No referenced transcript is embedded or read
+automatically.
+
+Older messages without provenance remain readable without an inferred identity.
+The `cli-v0.2.20` message-meta reader at `282a8fc3f999df1d104b78daa489317e65d395a6`
+accepts additive metadata through its passthrough schema. Older receiving runtimes
+and UIs retain message delivery but do not render this new attribution; displaying
+it requires updated consumers. This section describes development source, not a
+released-channel guarantee.
+
+## Repository grouping evidence (development)
+
+The shared local session-metadata preparation path records optional
+`sessionRepositoryV1` evidence for automatic project headings. Its protocol-owned
+reader requires the observing `machineId`, the main repository `rootPath`, and the
+observed checkout `worktreePath`. Git's ordered worktree registrations establish
+the main repository; a separate Git administrative directory is not assumed to be
+a working checkout. Independent clones therefore retain separate local identities.
+
+The UI uses valid evidence only for the same machine and a session path inside
+the observed checkout. This changes heading identity, while execution paths and
+saved folder scopes remain checkout-specific. Handoffs and machine reassignment
+discard source-host evidence; the target can publish a fresh local observation.
+Container paths without a proven host mapping, unsupported repository layouts,
+and sessions without evidence retain directory grouping. Existing historical
+sessions are not scanned speculatively.
+
+The field is additive: released older UI metadata readers accept unknown fields,
+and updated readers fall back to directory grouping when evidence is absent or
+invalid. The machine binding also rejects evidence retained by an older handoff
+writer after reassignment. This describes development source, not a released
+channel guarantee.
+
 ## Claude unified questions and approvals (development)
 
 `backends/claude/localPermissions/routeClaudePermissionHook` owns hook delivery
@@ -87,7 +163,23 @@ input or waiting for a reconnect. Other errors retain their original meaning;
 no timeout budget, wire format, or acceptance authority changes. This correction
 is development source, not a statement of stable release availability.
 
+In development source, `ApiSessionClient.commitSessionMessage` shares socket
+acknowledgement handling across direct and persisted transcript storage. An
+explicit rejection settles only that message's retry intent and is recorded in
+the normal file log. Required commits reject their caller; best-effort commits
+return without interrupting replay of later offline messages. Missing
+acknowledgements retain each storage mode's existing confirmation and retry
+behavior. This does not add retry or process-restart durability for an explicitly
+rejected best-effort message.
+
 ## Direct-session JSONL read progress (development)
+
+Claude's direct-session mapper and stored-session writer share
+`backends/claude/utils/readClaudeUserMessageText` to project human prompts from
+both string content and SDK text-block arrays into user text messages. Direct
+history, follow and import use the same mapper. Tool/media content, peer deliveries,
+sidechains and meta records retain their structured output path. This correction
+is in development source; it does not establish preview or stable availability.
 
 The shared readers in `api/directSessions/filePaging` own byte paging for native
 JSONL sources. If their existing read allowance cannot complete the next record
@@ -481,6 +573,15 @@ holding its `daemon.state.json` and `daemon.state.json.lock` — and only that s
 - `daemon stop` stops the current scope only; `daemon stop --all` and `auth logout --all` deliberately
   stop every relay's daemon.
 
+### Session Stop without a live runtime (development)
+
+The existing Protocol Session Stop owner classifies a missing runtime separately
+from a missing saved Session. CLI and UI both report `already_stopped` with
+`no_runtime_session_inactive` only when an authoritative Session read confirms
+that the saved Session is inactive. An active Session or an unavailable read
+leaves termination unconfirmed; cached UI activity and transport errors do not
+prove that a process stopped.
+
 ### Confirmed daemon stop outcomes (development)
 
 Current 0.2 development source reports `not_running` separately from a confirmed `stopped`
@@ -518,6 +619,12 @@ home on incomplete stop. Restart remains best effort for its stop phase, logs in
 through the default file logger, and requires its existing distinct running identity proof.
 
 ### One CLI update transaction (plan R13 f)
+
+In development source, the post-update repair handoff also runs when the canonical doctor relay
+inventory finds an installed local relay, even if background services need no repair. The newly
+activated CLI owns the diagnosis: repair displays installed relay versions, checks the matching
+channel against the published server release, and asks before updating. Relay update commands
+preserve the installed channel and user/system scope; CLI activation itself does not update relays.
 
 `runManagedCliUpdate` (`packages/cli-common/src/firstPartyRuntime/runManagedCliUpdate.ts`) is the
 only way a managed first-party CLI is updated in place. `happier self update`, the desktop's
@@ -606,6 +713,17 @@ daemon is not. The
 desktop's `cli.update.v1` does not pass that step: it relies on the launcher move-aside and does
 not end sessions, but it is unverified on a real Windows host. Remote update is disabled on Windows
 (below).
+
+In current development source (not yet released), self-update and direct `self __install-payload` CLI promotion reject
+invocations below a Happier daemon or daemon-started session before downloads, locks, launcher
+capture or service shutdown. The update owner uses the daemon's Windows process inspection and
+shared session-command classification to walk the calling process's ancestors. Run the update
+from an independent terminal after saving work. System/service ancestors without command lines
+are traversed using their parent PID; command lines are required only for potential Happier hosts.
+This also applies to fresh-install payload promotion. Failure to inspect ancestry still refuses the
+update without modifying the installation, with the inspection reason (no command text) in the error.
+`self update --help` and `-h` print help before update
+dispatch. This prevents self-termination during quiescing; the recovery limits above still apply.
 
 **Rolling back across a migration.** The previous version must read whatever the new one wrote
 before it failed. CLI self-update callers are ≥ 0.2.13; current desktop hsetup can also replace
@@ -706,6 +824,13 @@ install root) either way — leaves the definition as it is and starts what is i
 desktop's quiet start of a stopped service (D6) runs the CLI the service already runs and any switch
 goes through the install dry-run's consent and the strict install.
 
+In development source, status and start/restart resolve their expected launcher through
+`resolveDaemonServiceInstallRuntimeTarget`, the installer's canonical launcher policy, without
+acquiring a JavaScript runtime. Once a managed shim is available, start/restart refresh an older
+version-pinned managed bootstrap launcher to that shim. With no stable launcher available they
+retain the already-resolved runtime target. The installed autostart mode and desktop attribution
+are preserved; the managed/user-installed CLI consent boundary above still applies.
+
 **One CLI per computer (plan R12).** That consent is asked at most once per decision: when the
 executor has asked "Let Happier manage it / Keep my own" (prompt `setup.cliChoice`, before any write;
 see [One CLI per computer](binary-runtime.md#one-cli-per-computer-plan-r12)), a recorded **manage**
@@ -784,7 +909,7 @@ login start the mode exists to remove — at the deliberate cost of no crash rel
 on-demand.
 
 In current development source (not yet released), the same shared planner gives current-user
-tasks (daemon, relay host and stack self-host) a native action instead of `powershell.exe`: Task
+tasks (daemon, relay host, stack self-host and its auto-updater) a native action instead of `powershell.exe`: Task
 Scheduler starts `services/<label>/launcher-<build>-<sha256 prefix>/happier-service-launcher.exe
 --wrapper "<services/<label>.ps1>" --diagnostic-log "<services/<label>.launcher.log>"`. It is a
 GUI-subsystem program, so no console window is created for the task; it starts the unchanged
@@ -808,8 +933,11 @@ PowerShell action, and refuses any other registered action. A task still registe
 action keeps working for start, stop and restart, and service status reports it as a launcher
 upgrade (`windowsLauncherUpgradeNeeded`), which doctor and background-service repair treat as needing
 a reinstall. Only `install` rewrites the action and verifies it afterwards; start/restart drift
-refresh rewrites the wrapper but never the task action. SYSTEM tasks and the self-host auto-update task
-still use the PowerShell action.
+refresh rewrites the wrapper but never the task action. CLI self-update repairs a discovered legacy
+user task through that installer before its version-proven restart. It preserves the definition's
+autostart and Desktop ownership, and preserves an external CLI command. A custom command prefix
+that the installer cannot represent is left unchanged with a warning. SYSTEM tasks still use the
+PowerShell action.
 
 ### Desktop control of the background service
 
@@ -911,7 +1039,7 @@ platform opens its menu, built by one native builder (`src-tauri/src/tray/model.
   template (`Sessions: {count}`), including zero; absent/null makes no session-count claim;
 - Open Happier (⌘O), the Updates item when there is one, Settings… (⌘,), the **Start at login** check
   item (the same login-start setting, through `daemon.service.autostart.set.v1`), then **Quit Happier**
-  (⌘Q) and **Stop background services and quit**.
+  (⌘Q) and **Quit Happier (close background services)**.
   Tray Quit, service mutations and the login toggle are disabled while a native service action runs.
 
 The web UI pushes its localized labels (U14), its rows, the setting and the status task's params
@@ -948,7 +1076,7 @@ from its `tauri.conf.json` entry (`"create": false`: the app creates it at start
 implicit exit request, which menu-bar mode holds; only an explicit Quit ends the tray process, and it
 follows the one login-start setting (D11-1): **on**, it leaves every service running — they and the
 tray come back at the next login; **off**, it stops every desktop-managed service first, through the
-same confirmed path as **Stop background services and quit**, and a stop that fails keeps the tray
+same confirmed path as **Quit Happier (close background services)**, and a stop that fails keeps the tray
 alive with the failure shown so it can be retried; **unknown**, it leaves every service as it is. Once
 the setting is known the item says which it will do (*Quit Happier (keep background services
 running)* / *Quit Happier and stop background services*); unknown, it is the plain *Quit Happier*.
@@ -973,6 +1101,17 @@ creation, and the same creation path applies the resolved decorations when the t
 the window. Changing the setting applies the native frame immediately. A failed save retains the
 applied runtime mode and exposes the persistence failure in settings so another change can retry.
 This is unreleased development behavior; compatibility with ActualTitleButtons has not been tested.
+
+On Windows and Linux, `window_frame.rs` owns the main window's remembered physical position,
+inner size and maximized state in `window-state/main-window-frame.json`. One app-lifetime tracker
+survives tray-driven window recreation, debounces changes and flushes pending state on destruction,
+actual app exit and Windows updater installation. Failed writes remain pending for the next flush.
+Controls and persistence share the chrome owner's native presentation-state read; Linux uses
+current GDK flags so stale GTK/Tao flags cannot classify maximized geometry as normal.
+Minimized and fullscreen geometry does not replace the last normal frame. Restoration rejects
+frames without reachable title-bar space on a connected monitor; Linux Wayland does not support
+restoring window position.
+macOS continues to use its native frame autosave. This persistence is development-only.
 
 ### What may repoint this computer's daemon
 
@@ -1191,6 +1330,16 @@ Local state lives under `~/.happier` (or `HAPPIER_HOME_DIR`):
 - `daemon.state.json`: daemon PID + control port + version.
 - `logs/`: CLI/daemon logs.
 
+In development source, settings reads and updates share the parser, migrations,
+and derived-field normalization in `persistence.ts`. Read-only `readSettings()`
+callers retain a warning and defaults when loading fails. Under the settings
+lock, `updateSettings()` uses that same loader without the fallback: only an
+`ENOENT` from reading the file permits initialization from defaults. Other read,
+parse, and migration errors reject before the updater or temporary write runs,
+preserving the existing file and releasing the lock. Repair invalid JSON or retry
+after a file lock clears before updating again. The persisted schema and existing
+atomic-write/rename retry policy are unchanged; this is not a released guarantee.
+
 In current development source, protected local files and MCP runtime
 configuration use the shared Windows ACL boundary in
 `packages/cli-common/src/fs/windowsProtectedAcl.ts`. It grants only the current
@@ -1289,6 +1438,15 @@ The daemon prepares managed credential projections;
 live runtime application verifies that preparation without becoming another file
 writer. Refresh distribution checks pool generation and credential revision
 inside the existing materialization lock.
+
+Same-account quota fan-out reads effective pool bindings from the runtime
+registry for both the reporting session and its siblings. Exact application
+adoption updates those bindings even when launch selections were absent or
+older. A provider-observed account change alone leaves its applied generation
+unknown; launch selections cannot restore that proof. Same-account candidate
+proof fails closed for unknown or mismatched generations. Committed pool
+convergence remains with the existing generation consumer and does not depend
+on the number of same-account candidates.
 
 Execution-run isolation no longer assigns private XDG cache, data or state
 directories. User-configured locations and ordinary tool caches are preserved,
@@ -1409,6 +1567,14 @@ terminal binding, and host-failure reporting to its runtime, including deferred 
 after a server connection failure. The shared session initializer still reports the
 session to the daemon; its temporary plain/requested-tmux launch metadata is not a
 terminal fallback. Ordinary daemon tmux fallbacks retain their warning.
+In development source, the Claude liveness monitor can prove native exit in an
+independent host after matching a positive PID/argv observation to the actual
+provider invocation and retaining its process-instance fingerprint. Foreground
+omission is not exit evidence: a foreground job list is not a descendant census.
+The existing process-custody reader qualifies death, then the existing lifecycle
+owner reconciles provider tasks before expected or unexpected exit disposition.
+Owned processes retain their IPC exit authority. Adopted hosts without the launch
+invocation, shell shims, and unavailable identity observations remain unqualified.
 Hosted clients of supported Codex App Server and OpenCode server runtimes use the same ownership:
 their shared attached-terminal supervisor persists and reports the actual presenter.
 In development source, the tmux host adapter uses the requested `TMUX_TMPDIR` for
@@ -1660,6 +1826,17 @@ deadlines and cancellation remain available. A guarded refusal to signal never
 authorizes an unsafe kill: Stop rechecks positive runner exit before deciding
 that termination is incomplete. Transport timeout or disconnect still does not
 prove physical termination.
+In current 0.2 development source, Stop actions retain the original tool caller
+through approval replay and carry optional diagnostic source fields to the daemon.
+The authenticated HTTP and machine-RPC receivers record their own transport;
+caller-supplied source fields are diagnostic claims, never authorization. Daemon
+file logs record each received request before coalescing and each physical Stop
+attempt, including unknown legacy/internal callers. The existing terminal-host
+kill audit includes that context on signals. Only surface, requesting session ID
+and tool-call ID travel as source metadata; tool input and credentials do not.
+Older daemons ignore the additive metadata. Stop still terminates active work;
+per-surface action availability and approvals remain the policy owners.
+
 After proving runner exit, Stop supplies its captured attachment to that owner:
 if normal exit already removed the descriptor, the same owned-host disposal and
 metadata-retirement pipeline still completes. Borrowed attachments release control
@@ -1724,6 +1901,14 @@ be verified requires reopening the original server; live custom sockets remain
 attachable. There is no parallel Herdr session synchronization service.
 
 ## Daemon architecture
+
+In current 0.2 development source, Windows process inspection in
+`apps/cli/src/daemon/doctor.ts` awaits PowerShell/CIM asynchronously for both
+PID-specific enrichment and the full-discovery fallback. Slow queries keep the
+daemon event loop available; inspection adds no query-local deadline or buffer
+override. Query and JSON failures retain the existing unavailable-evidence result
+and write a file warning without command lines or query output. Process
+classification and PID safety continue to use the same inspection owner.
 
 Startup reattachment and resume of an already-running session reconcile both
 the daemon's session access key and the session's machine routing metadata.
@@ -1869,6 +2054,23 @@ builder publishes the resolved home even when the daemon inherited no home overr
 
 ### Connected-service quota refresh outcomes (development)
 
+Quota automation starts only after account settings are ready and Provider Account
+Usage has hydrated from the current connected-service inventory. Startup activation
+runs as background daemon server work, sharing its budget, connectivity gate,
+transient-error classification and sampled warning logs. Transient settings,
+network, timeout, inventory-conflict and server failures retry until activation or
+shutdown. Delays use the existing quota failure-backoff bounds and jitter through
+the daemon's backoff calculator; activation does not hold machine connection open.
+Authentication and invalid-content failures leave the policy disabled and emit a
+warning. Shutdown cancels retry waits and prevents late coordinator creation.
+
+Late activation assigns the same coordinator, schedules current-source refresh and
+starts the same quota loop as successful startup. Connectivity pause/resume reads
+the current loop handle, so a loop created after machine connection still follows
+connectivity changes. Session credential hot-apply warnings include the Session,
+service, available profile/group/generation, mapped failure code and sanitized
+underlying error summary.
+
 An explicit quota refresh records a request, then the daemon quota coordinator
 publishes its outcome through the existing Provider Account Usage owner.
 Protocol's `isProviderAccountUsageRefreshRequestSettled` is the completion rule:
@@ -1899,6 +2101,24 @@ read fails, or the consumer cancels it. The quota store has no authoritative dae
 availability fact; if no daemon serves an accepted request, that request can
 remain pending. The [compatibility notes](compatibility.md#quota-refresh-outcomes-02-development)
 describe the released plain/sealed wire shapes and mixed-version limits.
+
+### Claude pool launch settings (development)
+
+Claude connected-service pool launches set `autoContinueAtUsageLimit: false`
+through `resolveClaudeLaunchSettingsOverlayArg`, the existing per-launch settings
+owner used by local, unified-terminal and both remote SDK runners. This lets
+Happier handle pool switching and reset recovery. The optional pool policy
+`claudeCodeAutoContinueAtUsageLimit: true` restores Claude's native waiting for
+new launches; absence keeps Happier-managed behavior. The Claude materializer
+carries that preference in the child environment, and the launch owner applies it
+only when the connected-service selection identifies a pool. Native and individual
+profile launches retain their existing settings. Shared Claude home
+`settings.json` files are never rewritten for this setting.
+
+The strict V1 policy field uses the existing auth-group reader negotiation:
+current readers append `happierClaudeCodeAutoContinueAtUsageLimit=1`; the server
+omits it from older-reader responses and preserves its stored value across their
+unrelated edits.
 
 ### Usage-limit reset continuation (development)
 
@@ -1937,15 +2157,24 @@ on this superseded source. A different failed-turn report can start a new
 attempt after terminal recovery; replaying the settled report cannot revive it.
 The failed member's attributed evidence is retained
 through the coordinator's existing member-state writer; provider-scoped capacity
-does not penalize an individual member. Scheduler retries observe the pool's
-current member without replaying account selection or spending switch budget.
-Fresh eligible quota evidence is necessary but does not prove that this runner
+does not penalize an individual member. Scheduler retries that observe a different
+eligible replacement use that member without replaying account selection or
+spending switch budget. If the pool's current member is still the failed member, recovery
+uses normal failure persistence and selection, including existing switch budgets
+and restart handling.
+In development source, hard usage-limit recovery prefers fresh usable quota but
+can adopt an eligible replacement using last-known quota when probes are unavailable.
+The canonical selector excludes known exhaustion (including weekly allowances),
+credential/plan blockers and the failed member, and ranks fresh evidence before
+the healthiest last-known candidate. A pool member explicitly selected by the user
+can be adopted without a fresh probe, including under manual selection policy;
+known blockers still apply. These decisions do not prove that this runner
 adopted the account: when its authorized tuple differs, the existing generation
 consumer must settle the already-committed target before continuation. If that
 application redirects to newer committed truth, continuation and the recovery's
 provider-proof identity follow the recipient's actual settled target. Missing or
-stale current-member quota proof uses the existing recovery backoff and quota
-probe owner to recheck that member. Fresh exhaustion waits for that member's
+stale quota proof for the same failed member uses the existing recovery backoff
+and quota probe owner to recheck that member. Fresh exhaustion waits for that member's
 reset; a different failed member's classification reset cannot govern this wait.
 Equivalent concurrent quota reads share one provider fetch, bounded by the quota
 owner's fetch timeout. A waiter's cancellation leaves other waiters active, and
@@ -1959,13 +2188,34 @@ cannot reuse a quota read begun before the provider consumed the recovery credit
 
 In development source, group probes report provider-backoff deferrals per member
 with their retry boundaries. These are completed admission decisions rather than
-an incomplete group observation: the selector excludes deferred members while
-using other members' evidence. A genuine incomplete probe, including deadline
-expiry, returns `quota_proof_unavailable` from the switch owner for every trigger.
-Interrupted turns retain durable recovery at the existing unknown-quota backoff
-or a later provider boundary. New spawns retain their existing retryable launch
+an incomplete group observation: where fresh evidence is required, the selector
+excludes deferred members while using other members' evidence. A genuine
+incomplete probe, including deadline
+expiry, returns `quota_proof_unavailable` when fresh evidence is required. Hard
+usage-limit replacement selection instead reloads the latest member state and
+logs `hard_limit_last_known_quota`; soft switches retain fresh, meaningfully better
+quota admission. Resuming the same failed member still requires fresh usable
+proof. Interrupted turns without an eligible replacement retain durable recovery
+at the existing unknown-quota backoff or a later provider boundary. New spawns retain their existing retryable launch
 rejection for hard-limit uncertainty; predictive soft switching keeps the current
 selection. Consumers no longer catch a separate quota-probe exception.
+
+Permission to reconsider the failed member on scheduler replay does not gate
+replacement selection. An exhausted allowance whose recorded reset has elapsed
+becomes unknown for hard replacement or manual adoption, without supplying
+positive same-member proof. Active longer windows and credential, model, plan or
+later runtime blockers remain exclusionary. Exhaustion with no reset boundary
+remains known until a new observation changes it; age alone cannot prove a reset.
+When all members are exhausted, recovery wakes at the earliest member retry
+boundary rather than inheriting only the failed member's later reset.
+
+The daemon's single local-server storm owner observes completed local HTTP
+attempts. Stored recovery classifications replayed by waiting intents do not add
+failures. Its window expires independently of recovery traffic; local-server
+success, successful quota observation or completed recovery clears it. Recovery
+and quota admission read the same owner. A committed hard-limit switch fans out
+through the existing generation consumer for both initial reports and scheduler
+retries, so recovery after a server outage also carries reachable siblings.
 
 Initial intake and scheduler replay use the same durable recovery identity for
 Pending deduplication, even after the first continuation is consumed and the
@@ -1973,12 +2223,35 @@ daemon is replaced. The selected target and durable interrupted recovery determi
 that identity; quota reset receipts and snapshots only establish eligibility.
 A later independent recovery can continue at the same account and generation.
 Recovery continuations also recheck the current failed-turn
-projection and live turn at message admission, so an old wait cannot steer newer
-consumed user work. An unresolved original turn projection is retryable, not proof
-of newer work: the durable recovery retains custody until the failure projection arrives
-and Pending admits the continuation, or terminal supersession/disabled policy
-retires it. Failure reporting does not wait for that projection. Recovery remains
-pending until provider outcome proof arrives.
+projection and live turn at message admission. A failed projection whose issue
+occurred at or before recovery arming is eligible; a failure after arming is
+superseded. When the issue is absent, the turn-status observation supplies that
+boundary. Provider observers can describe one rejection with different timestamps
+and reset details, so report and projection fingerprints are diagnostic evidence,
+not a byte-equality admission requirement. The protocol session recovery owner also
+associates daemon-owned usage-limit presentation, controls and reset revalidation
+with an enriched issue when its structured fingerprint identifies the same provider
+and does not contradict a known turn, both observations are at or before arming, and its selected auth source
+still matches. Opaque attempt ids do not associate presentation or controls with
+another issue. Daemon projection may rebase its visible fingerprint through that
+same rule without changing the attempt or arming boundary. The live Session observer
+uses that association too, so an enriched report does not rearm a daemon-owned wait.
+Local unowned recovery
+continues to require the exact captured issue. The arming-time check cannot establish
+the original failure across a restart or re-arming. A superseded live turn or
+archived session settles the old recovery
+terminally instead of waiting for provider proof after suppressing admission.
+Failure reporting does not wait for its durable projection.
+An unresolved projection is retryable while the live turn matches the projected
+in-progress turn. Without that witness, or when the projected turn is already
+completed or cancelled, recovery settles terminally without admitting a continuation.
+Completed projections omit both the failed issue and input origin; they cannot
+distinguish provider task notifications from newer human work. The terminal
+recovery event appears in the session transcript, but cancelled usage-limit
+recovery currently hides its dedicated Retry controls. The default diagnostic
+records the deciding turn ids, status, timestamps and failure fingerprints.
+Once Pending admits a continuation, recovery remains pending until provider
+outcome proof arrives.
 Application correlation only carries that guarded context into an early exact
 recipient acknowledgement; it does not decide admission or deduplication. A late
 superseded in-band report cannot author a continuation before durable recovery
@@ -2001,9 +2274,23 @@ Claude's provider-owned transcript mapper reads reset seconds and allowance iden
 from `apiErrorParams.rate_limit_info`, with `quotaLimits` as a fallback. It converts
 the reset to milliseconds for the existing runtime report, pool exclusion and
 recovery wait. An explicit `usage_limit_reached` remains a usage failure even when
-the accompanying meter is below 100 percent. Standard account-switch continuation
-uses neutral text; a resume after the reset retains the limits-lifted text. Both
-paths use the existing prompt owner and preserve custom resume prompts.
+the accompanying meter is below 100 percent. In current development source,
+standard usage-limit continuation uses the limits-lifted text after either an
+account switch or a reset wait. Transient rate-limit recovery uses neutral text
+unless it actually waited for a usage reset. Both paths use the existing prompt
+owner and preserve custom resume prompts.
+
+For Claude pools, the same transcript router recognizes structured `near_limit`
+and `wrap_up` meta user notes (`isMeta` and `turnCompanion`), even when no 429 or
+rejected rate-limit event follows. A fresh `wrap_up` enters hard usage recovery
+with request-issued identity and transcript organization evidence. A `near_limit`
+keeps the parent turn runnable and is file-logged with its issued account identity
+(or unattributed); it publishes no quota and requests no refresh or switch.
+Wrap-up supplies no numeric quota or reset. Historical
+replay, sidechains, other sessions, `release` notes and non-pool sessions do not
+trigger this path. Local and unified runners use their scanner's raw channel;
+the SDK runner shares its existing goal-status transcript tail.
+Follow-up: native near-limit notes have no session-to-daemon refresh path; switching relies on existing soft quota polling and wrap-up hard recovery.
 
 Claude's existing transcript router also reads `credential_org` attachments. A
 failure uses the latest organization observation at or before its timestamp.
@@ -2051,6 +2338,12 @@ soft threshold. The quota intake precheck uses that same selector; a daemon
 restart cannot make stale or exhausted targets eligible. Failure-driven
 `usage_limit` and `same_provider_account_exhausted` selection retains its existing
 unknown-quota allowance, and pre-turn probes can establish fresh evidence.
+Predictive burn evidence uses the same `probeIfSnapshotOlderThanMs` value as its
+projection horizon. The runtime snapshot store anchors its baseline to the oldest
+observation in the matching generation, effective meter, provider-limit and reset
+context that spans that horizon; readings captured only seconds apart therefore do
+not extrapolate a multi-minute switch. A reset or context change starts a new
+baseline, and non-decreasing, stale or inconsistent observations fail closed.
 Selection also checks learned model exclusions against the requested and applied
 models of the group's live sessions. Generic turn success has no model identity
 and therefore cannot erase a model-specific rejection. This is learned evidence,
@@ -2437,6 +2730,13 @@ separate ownership scopes. Coordinator-owned requests settle through their exist
 waiter lifecycle, while state-only requests use the same durable request store.
 Automatic history can replay only while its request remains absent, including on
 the first write after a version conflict.
+
+In development source, journal and dead-letter reads treat only a missing file
+(`ENOENT`) as absent. Other filesystem failures reject journal startup and admission
+without replacing unread data. Startup failures include the filesystem error code
+in the normal file log. Once filesystem access is restored, reconstructing the
+runtime retries the original journal. Readable malformed queue data still follows
+the existing quarantine path.
 
 This is runtime-owned recovery: reconstructing an ApiSessionClient for the same
 session resumes admitted settlements after a process restart. Closing drains local

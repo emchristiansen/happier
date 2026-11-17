@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { socketApplyFrame } from '@/sync/engine/sessions/socketApplyFrame';
 
 vi.mock('@/sync/runtime/syncTuning', () => ({
     loadSyncTuning: () => ({
@@ -40,7 +41,7 @@ import {
     enableSessionRealtimeTranscriptSuppression,
 } from '@/sync/runtime/sessionRealtimeTranscriptSuppression';
 import { registerSessionRealtimeTranscriptConsumer } from '@/sync/runtime/sessionRealtimeTranscriptConsumers';
-import { handleUpdateContainer } from './socket';
+import { handleUpdateContainer, retireSessionSocketState } from './socket';
 
 const initialStorageState = storage.getState();
 type HandleUpdateContainerParams = Parameters<typeof handleUpdateContainer>[0];
@@ -107,6 +108,7 @@ function buildBaseParams(overrides: Partial<Omit<HandleUpdateContainerParams, 'u
             initializeMachines: vi.fn(async () => {}),
         } as unknown as HandleUpdateContainerParams['encryption'],
         artifactDataKeys: new Map(),
+        retireSession: retireSessionSocketState,
         applySessions: vi.fn((sessions: Parameters<HandleUpdateContainerParams['applySessions']>[0]) => {
             const normalizedSessions: Session[] = sessions.map((session) => ({
                 ...session,
@@ -152,6 +154,7 @@ describe('socket realtime explicit transcript consumers', () => {
     });
 
     afterEach(() => {
+        socketApplyFrame.flushNow();
         unregisterConsumer?.();
         unregisterConsumer = null;
         storage.setState(initialStorageState, true);
@@ -189,6 +192,7 @@ describe('socket realtime explicit transcript consumers', () => {
             updateData: buildPlainNewMessageUpdate(hiddenSessionId),
         });
 
+        socketApplyFrame.flushNow();
         expect(markSessionTranscriptDeferred).not.toHaveBeenCalled();
         expect(applyMessages).toHaveBeenCalledTimes(1);
         const [appliedSessionId, messages] = applyMessages.mock.calls[0] as [string, NormalizedMessage[]];
@@ -215,6 +219,7 @@ describe('socket realtime explicit transcript consumers', () => {
             updateData: buildPlainNewMessageUpdate(hiddenSessionId),
         });
 
+        socketApplyFrame.flushNow();
         expect(markSessionTranscriptDeferred).not.toHaveBeenCalled();
         expect(applyMessages).toHaveBeenCalledTimes(1);
     });
@@ -299,6 +304,7 @@ describe('socket realtime explicit transcript consumers', () => {
             updateData: buildPlainNewMessageUpdate(visibleSessionId),
         });
 
+        socketApplyFrame.flushNow();
         expect(markSessionTranscriptDeferred).not.toHaveBeenCalled();
         expect(applyMessages).toHaveBeenCalledTimes(1);
     });

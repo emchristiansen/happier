@@ -243,6 +243,21 @@ describe('AskUserQuestionView', () => {
         expect(sendMessage).toHaveBeenCalledTimes(0);
     });
 
+    it('shows a settled declined question as dismissed after the transcript reloads', async () => {
+        activeAskUserQuestionRequest = null;
+        const screen = await renderView(makeTool({
+            state: 'completed',
+            completedAt: 2,
+            result: { status: 'declined' },
+        }));
+
+        expect(screen.findAllByProps({ testID: 'ask-user-question.submit' })).toHaveLength(0);
+        expect(screen.findAllByProps({ testID: 'ask-user-question.dismiss' })).toHaveLength(0);
+        expect(JSON.stringify(screen.tree.toJSON())).toContain('tools.askUserQuestion.dismissed');
+        expect(JSON.stringify(screen.tree.toJSON())).toContain('Pick one');
+        expect(JSON.stringify(screen.tree.toJSON())).not.toContain('"-"');
+    });
+
     it('keeps native freeform input touches inside the field instead of bubbling to transcript keyboard dismissal', async () => {
         const screen = await renderView(makeFreeformTool());
         const input = screen.findByProps({ testID: 'ask-user-question.freeform:0' });
@@ -572,6 +587,7 @@ describe('AskUserQuestionView', () => {
         ['STRUCTURED_QUESTION_LEGACY_INVALID', 'tools.askUserQuestion.submissionFailures.retry'],
         ['STRUCTURED_QUESTION_LEGACY_AMBIGUOUS', 'tools.askUserQuestion.submissionFailures.retry'],
         ['STRUCTURED_QUESTION_RECEIVER_NOT_OWNER', 'tools.askUserQuestion.submissionFailures.reconnect'],
+        ['STRUCTURED_QUESTION_SUBMISSION_UNCONFIRMED', 'tools.askUserQuestion.submissionFailures.unconfirmed'],
         ['RPC_METHOD_NOT_AVAILABLE', 'tools.askUserQuestion.submissionFailures.update'],
         ['RPC_METHOD_NOT_FOUND', 'tools.askUserQuestion.submissionFailures.update'],
     ])('keeps the pending answer selected and shows inline guidance for %s', async (rpcErrorCode, guidanceKey) => {

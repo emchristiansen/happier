@@ -8,7 +8,9 @@ import {
   SessionStopCleanupIncompleteReasonSchema,
   SessionStopOutcomeSchema,
   StopSessionResultSchema,
+  resolveSessionStopAbsenceOutcome,
   type SessionStopOutcome,
+  type StopSessionRequestSource,
   type SessionStopResult as SessionStopCommandResult,
 } from '@happier-dev/protocol';
 import type {
@@ -85,25 +87,9 @@ async function stopOutcomeFromAttemptResult(params: Readonly<{
     return SessionStopOutcomeSchema.parse({ status: 'physical_stop_unconfirmed', reason: result.reason });
   }
   if (result.status === 'not_found') {
-    // Nothing was found to stop. That is either PROOF that no runtime exists or
-    // a failure to determine it, and the fact that separates them is the one
-    // this owner already accepts as a confirmed stop after signalling a runtime:
-    // the canonical Session row reporting inactive. A Session the addressed
-    // daemon does not track AND the server reports inactive is stopped — a cold
-    // Session cannot otherwise satisfy any consumer that requires a confirmed
-    // stop, because there is nothing left to signal.
-    const inactive = await readSessionInactive({ token: params.token, sessionId: params.sessionId });
-    if (inactive === true) {
-      return SessionStopOutcomeSchema.parse({
-        status: 'already_stopped',
-        reason: 'no_runtime_session_inactive',
-      });
-    }
-    return SessionStopOutcomeSchema.parse({
-      status: 'physical_stop_unconfirmed',
-      reason: params.targetKind === 'owning_machine'
-        ? 'target_session_not_found'
-        : 'local_session_not_found',
+    return resolveSessionStopAbsenceOutcome({
+      sessionInactive: await readSessionInactive({ token: params.token, sessionId: params.sessionId }),
+      targetKind: params.targetKind,
     });
   }
   return SessionStopOutcomeSchema.parse({
@@ -137,13 +123,14 @@ async function stopSessionOnOwningMachine(params: Readonly<{
   credentials: Credentials;
   sessionId: string;
   machineId: string;
+  source?: StopSessionRequestSource;
 }>): Promise<StopSessionAttemptResult> {
   try {
     const rawResult = await callMachineRpc({
       credentials: params.credentials,
       machineId: params.machineId,
       method: RPC_METHODS.STOP_SESSION,
-      request: { sessionId: params.sessionId },
+      request: { sessionId: params.sessionId, ...(params.source ? { source: params.source } : {}) },
       // Stop's graceful/forced exit and retirement phases can exceed the generic RPC
       // cutoff. The relay retains its finite forwarding deadline and disconnect guard.
       timeoutMs: null,
@@ -223,6 +210,7 @@ async function stopSessionViaMarkersBestEffort(params: Readonly<{
   credentials: Credentials;
   sessionId: string;
   expectedTerminalAttachmentId?: string;
+  source?: StopSessionRequestSource;
 }>): Promise<StopSessionResult> {
   const { sessionId } = params;
   const markers = (await listSessionMarkers()).filter((marker) => marker.happySessionId === sessionId);
@@ -284,7 +272,7 @@ async function stopSessionViaMarkersBestEffort(params: Readonly<{
         terminalMode: attachmentInfo.terminal.mode ?? attachmentInfo.handle.kind,
       });
     },
-  })(sessionId);
+  })(sessionId, { source: params.source, transport: 'marker_fallback' });
 }
 
 async function readExactTerminalAttachmentId(sessionId: string): Promise<string | null> {
@@ -309,6 +297,7 @@ async function cleanupStoppedSessionMarkersBestEffort(sessionId: string): Promis
 export async function requestSessionStop(params: Readonly<{
   credentials: Credentials;
   idOrPrefix: string;
+  source?: StopSessionRequestSource;
 }>): Promise<
   | (Readonly<{ ok: true }> & SessionStopCommandResult)
   | Readonly<{ ok: false; code: 'session_not_found' | 'session_id_ambiguous' | 'session_lookup_timeout' | 'unsupported'; candidates?: string[] }>
@@ -346,6 +335,7 @@ export async function requestSessionStop(params: Readonly<{
         credentials: params.credentials,
         sessionId: resolved.sessionId,
         machineId: owningMachine.machineId,
+        source: params.source,
       });
       if (physicalStopResult.status !== 'stopped') {
         return {
@@ -380,7 +370,7 @@ export async function requestSessionStop(params: Readonly<{
     const exactAttachmentIdBeforeDaemonStop = await readExactTerminalAttachmentId(resolved.sessionId);
     let physicalStopResult: StopSessionAttemptResult;
     try {
-      physicalStopResult = await stopDaemonSession(resolved.sessionId);
+      physicalStopResult = await stopDaemonSession(resolved.sessionId, { source: params.source });
     } catch {
       physicalStopResult = { status: 'incomplete', reason: 'transport_ambiguous' };
     }
@@ -394,6 +384,7 @@ export async function requestSessionStop(params: Readonly<{
       physicalStopResult = await stopSessionViaMarkersBestEffort({
         credentials: params.credentials,
         sessionId: resolved.sessionId,
+        source: params.source,
         ...(mayRunExactAmbiguousFallback && exactAttachmentIdBeforeDaemonStop
           ? { expectedTerminalAttachmentId: exactAttachmentIdBeforeDaemonStop }
           : {}),

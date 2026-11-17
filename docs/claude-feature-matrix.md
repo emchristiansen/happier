@@ -9,6 +9,51 @@ This document captures the current low-level Claude implementation across the CL
 - `legacy`: still wired, but no longer the preferred path
 - `unsupported`: intentionally absent today
 
+## Local retention (development source)
+
+`claudeSessionRetentionV1` in the account settings is the desired user-level
+policy. Missing/null is unmanaged and performs no writes; `providerDefault`
+removes only `cleanupPeriodDays`; `days` sets a positive safe integer. The Claude
+settings plugin owns the UI, including finite 36,500-day copy, shortening/reset
+confirmation and per-machine details. There is no billing gate.
+
+The generic provider-account-settings controller consumes the canonical account
+snapshot and calls the optional catalog hook on startup, snapshot changes,
+reconnect, completed Connected Services projection and successful materialization.
+Claude's hook enumerates
+native and existing canonical profile/group homes. The existing profile
+materializer reapplies the same editor after configuration copying, linking or
+isolation, so new and refreshed homes consume the same policy.
+
+`backends/claude/settings/claudeSessionRetentionSettings.ts` is the persistent
+editor. It rejects malformed settings, preserves unrelated keys and permissions,
+and resolves symlink targets through the settings guard. Intentional writes and
+terminal snapshot/restore share that guard's lock; the writer never restores its
+own write. Known profile-local legacy journals are recovered through the same
+owner. An already-running older guard or an external Claude/editor process does
+not participate in the new shared lock; restarting the older daemon/session is
+required to use the corrected ownership.
+
+Reports travel in encrypted/plain machine daemon state through the existing
+machine-state transport. `providerSettingsV1` reports configured user-level
+values, not effective running-process policy. Its source uses the current PID,
+CLI version and existing running-state timestamp, checked against the daemon
+and machine metadata, so retained state from an older daemon is not accepted as
+current support. Policy
+mismatch is pending; offline matching results are last confirmed. Missing or
+malformed reports never imply success. Local administrative file declarations
+produce a may-override warning; remote/MDM source selection remains vendor-owned.
+
+The existing launch `--settings` merger protects only a proven shared physical
+`projects` store when native Claude has an explicit longer configured period.
+The native configuration marker is produced by the configuration materializer
+and carried in its environment. Isolated stores and explicit shorter policies
+are not replaced by a global maximum. A launch using the same physical settings
+file as native Claude retains its explicit launch-setting precedence. Local,
+unified-terminal, Agent SDK, legacy SDK and catalog probes use this same merger
+and their effective child environment.
+No second settings argument or independent retention engine is introduced.
+
 ## Runtime surfaces
 
 | Feature | Status | Exact source files | Current behavior / special cases | Unified architecture migration notes |
@@ -284,10 +329,30 @@ The native screen parser separates the preview column from option labels and
 records the actual freeform row. The existing answer driver refuses terminal
 notes or an active notes editor before navigation or submission; notes are
 annotations on a choice and are never converted into freeform answers.
+Failed native answers record their specific conflict or verification reason and
+the existing capture's structural state in the CLI file log: page, focus, answered
+tabs, notes state, text lengths and line counts, and last input action. Question,
+choice, answer and terminal text are excluded; no additional capture is taken.
 When the viewport clips a question's tabs and beginning, one shared resolver
 identifies its page from the complete visible question suffix and choice labels
 against the pending hook input. Publication and answer navigation use that same
 identity; missing choices or an ambiguous match remain unrecognized.
+If typing Happier's freeform answer scrolls the entire heading above the viewport,
+the same resolver retains the already identified page only while its complete
+choices and Happier-owned draft still match. A headingless preexisting draft
+does not establish a new question identity.
+The pending hook-correlated question retains Happier's own draft and identified
+page across an interrupted answer attempt. Publication and answer navigation
+consume that same context; a changed terminal draft still belongs to the terminal
+user. The driver waits within the existing terminal verification window for each
+rendered transition instead of treating the first stale capture as a failed write.
+After final Submit, it retains the submitted answers and waits for the exact
+provider result. A retry checks confirmation without typing or submitting again;
+delayed confirmation remains pending and the app offers terminal recovery.
+The session permission router also reports a live receiver's answer-delivery
+failure as unconfirmed, preserving retry. Reconnect guidance is reserved for a
+missing or expired receiver; unconfirmed guidance does not claim final Submit
+was sent.
 Long reviews may clip earlier questions above the viewport. The same parser
 recognizes complete visible entries as a suffix of the hook-owned questions;
 the answer driver submits only after visiting every question page and matching

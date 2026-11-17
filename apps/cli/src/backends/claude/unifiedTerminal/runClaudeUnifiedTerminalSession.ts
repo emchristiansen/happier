@@ -7,6 +7,7 @@ import type {
   TerminalInputInjectionV1,
 } from '@happier-dev/agents';
 import {
+  parseSpecialCommand,
   SessionTerminalComposerClearResultV1Schema,
   type SessionTerminalComposerClearFailureStatusV1,
   type SessionTerminalComposerClearRequestV1,
@@ -830,11 +831,6 @@ function isAcceptedPromptTranscriptCandidate(value: unknown): boolean {
   return type === 'user' || type === 'queue-operation' || type === 'attachment';
 }
 
-function isCompactSlashCommandPrompt(message: string): boolean {
-  const trimmed = message.trim();
-  return trimmed === '/compact' || trimmed.startsWith('/compact ');
-}
-
 function isDeterministicInvalidPromptTextFailure(
   failure: Readonly<{
     failureState: string;
@@ -1188,6 +1184,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
   let spawn: ClaudeUnifiedTerminalSpawn | null = null;
   let spawnArtifactsHandedOff = false;
   let spawnEnvForRuntimeControl: Readonly<Record<string, string>> | null = null;
+  const readProviderInvocation = () => spawn?.providerInvocation;
   const ensureSpawn = async (): Promise<ClaudeUnifiedTerminalSpawn> => {
     if (spawn) return spawn;
     spawn = await (opts.buildSpawn ?? buildDefaultSpawn)({
@@ -1270,6 +1267,14 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
     void opts.runtimeActivityAdapter?.handleRuntimeLoss('claude_process_exit').catch((error) => {
       logger.debug('[unified]: Claude process-exit activity observation failed', error);
     });
+  };
+  const failForTerminalHostLoss = (
+    activeHandle: TerminalHostHandle,
+    error: ClaudeUnifiedTerminalHostDeadError,
+  ): void => {
+    void publishHostDeadHealth(activeHandle, error.liveness);
+    fatalRuntimeError ??= error;
+    if (!runtimeAbortController.signal.aborted) runtimeAbortController.abort(error);
   };
   const expectedProviderResumeSessionId =
     typeof opts.expectedProviderResumeSessionId === 'string'
@@ -2506,7 +2511,7 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
       };
       const confirmCompactBoundaryPromptAcceptedFromTranscript = (message: RawJSONLines): boolean => {
         if (!isClaudeMainChainCompactBoundary(message)) return false;
-        void arbiter.confirmPromptAcceptedByProviderIf((batch) => isCompactSlashCommandPrompt(batch.message)).catch(() => undefined);
+        void arbiter.confirmPromptAcceptedByProviderIf((batch) => parseSpecialCommand(batch.message).type === 'compact').catch(() => undefined);
         return true;
       };
       const pendingQueuePump = createClaudeUnifiedPendingQueuePump<Mode>({
@@ -2794,6 +2799,19 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
             startupGraceMs: configuration.claudeUnifiedTerminalStartupReadinessTimeoutMs,
             startupGraceActive: () => startupHostLivenessGraceActive,
             isExpectedHostExit: (liveness) => expectedPromptInputExit && isCleanTerminalExit(liveness),
+            // Owned processes already deliver qualified exit through IPC. Independently
+            // launched hosts may qualify only the actual provider invocation, never a runner.
+            providerInvocation: currentTerminalProcess ? undefined : readProviderInvocation(),
+            onProviderGone: ({ liveness }) => {
+              observeProviderProcessExit();
+              if (expectedPromptInputExit) {
+                if (!runtimeAbortController.signal.aborted) {
+                  runtimeAbortController.abort('claude-unified-terminal-graceful-exit');
+                }
+                return;
+              }
+              failForTerminalHostLoss(activeHandle, new ClaudeUnifiedTerminalHostDeadError(liveness));
+            },
             onHostExited: () => {
               if (!currentTerminalProcess) {
                 void opts.runtimeActivityAdapter?.handleRuntimeLoss('claude_process_exit').catch((error) => {
@@ -2805,12 +2823,8 @@ export async function runClaudeUnifiedTerminalSession<Mode extends EnhancedMode 
               }
             },
             onHostDead: (error) => {
-              if (!currentTerminalProcess) {
-                observeUnverifiedProviderExit(error);
-              }
-              void publishHostDeadHealth(activeHandle, error.liveness);
-              fatalRuntimeError ??= error;
-              runtimeAbortController.abort(error);
+              if (!currentTerminalProcess) observeUnverifiedProviderExit(error);
+              failForTerminalHostLoss(activeHandle, error);
             },
           }),
         ]),

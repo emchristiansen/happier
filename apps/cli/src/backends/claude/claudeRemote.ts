@@ -38,6 +38,7 @@ import { normalizeCurrentHappierSessionId } from '@/agent/runtime/session/curren
 import type { ClaudeEffectiveModelObservation } from './sessionModels/effectiveModelUpdate';
 import { readClaudeMainChainAssistantModelId } from './sessionModels/readClaudeMainChainAssistantModelId';
 import { isLivePrimaryClaudeProviderMessage, isSidechainSessionHook } from './utils/sessionHookAttribution';
+import { completeClaudeRemoteClear } from './remote/localCommands';
 
 function buildClaudeEffortArgs(params: Readonly<{
     modelId: unknown;
@@ -218,13 +219,7 @@ export async function claudeRemote(opts: {
 
     // Handle /clear command
     if (specialCommand.type === 'clear') {
-        if (opts.onCompletionEvent) {
-            opts.onCompletionEvent('Context was reset');
-        }
-        if (opts.onSessionReset) {
-            opts.onSessionReset();
-        }
-        promptSettlements.accept(initial);
+        await completeClaudeRemoteClear(opts, () => promptSettlements.accept(initial));
         return;
     }
 
@@ -313,6 +308,7 @@ export async function claudeRemote(opts: {
         env: launcherEnv,
         settingsPath: resolveClaudeLaunchSettingsOverlayArg({
             settingsPath: opts.hookSettingsPath,
+            env: launcherEnv,
             // Explicitly off: an ultracode Claude Code saved would otherwise override a pinned effort.
             launchSettings: isClaudeModelEffortPinned(argOverrides.model ?? initial.mode.model) ? { ultracode: false } : {},
         }),

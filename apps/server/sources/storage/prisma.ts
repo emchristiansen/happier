@@ -123,6 +123,7 @@ let _db: PrismaClientType | null = null;
 // SQLite only, and only when HAPPIER_SQLITE_READ_POOL_SIZE is set: serves allow-listed model reads
 // issued outside a transaction. `_db` stays the single write connection. See sqliteReadPool.ts.
 let _readDb: PrismaClientType | null = null;
+let _sqliteReadinessClient: PrismaClientType | null = null;
 let _pglite: PGlite | null = null;
 let _pgliteServer: PGLiteSocketServer | null = null;
 let _provider: DbProvider | null = null;
@@ -268,6 +269,7 @@ export async function initDbSqlite(): Promise<void> {
             renderSqliteReadPoolDatabaseUrl(databaseUrl, readPool.connectionLimit),
         );
     }
+    _sqliteReadinessClient = await createDbSqliteMaintenanceClient();
     const diagnostics = resolveSqliteStartupDiagnosticsFromEnv(process.env);
     log(
         { module: "storage", event: "sqlite-startup-diagnostics", sqlite: diagnostics },
@@ -503,10 +505,30 @@ export async function applySqliteRuntimePragmas(client: PrismaClientType, env: N
     await client.$queryRawUnsafe(`PRAGMA journal_size_limit=${pragmas.journalSizeLimitBytes};`);
 }
 
+// Readiness checks the database on its own SQLite connection. The server-light app pool
+// is deliberately a single connection, so one slow application read would otherwise queue
+// the probe behind it (#832). Reading `sqlite_master` opens a read transaction on the file,
+// so an unreadable or non-database file fails the probe; SQLite answers `SELECT 1` without
+// touching the file. Other providers keep `SELECT 1` on the app pool.
+export async function probeDbReadiness(): Promise<void> {
+    if (_sqliteReadinessClient) {
+        await _sqliteReadinessClient.$queryRawUnsafe("SELECT count(*) FROM sqlite_master;");
+        return;
+    }
+    await db.$queryRaw`SELECT 1`;
+}
+
+export async function disconnectDbReadinessProbe(): Promise<void> {
+    const readinessClient = _sqliteReadinessClient;
+    _sqliteReadinessClient = null;
+    await readinessClient?.$disconnect();
+}
+
 export async function shutdownDbClient(): Promise<void> {
     if (_pglite || _pgliteServer || _provider === "pglite") {
         throw new Error("shutdownDbClient() cannot shut down PGlite; call shutdownDbPglite() instead");
     }
+    await disconnectDbReadinessProbe();
     const client = _db;
     const readClient = _readDb;
     _db = null;

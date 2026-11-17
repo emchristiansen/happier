@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Platform, View, ViewStyle, StyleProp, TextStyle } from 'react-native';
+import { Platform, View, ViewStyle, StyleProp, TextStyle, useWindowDimensions } from 'react-native';
 import { useUnistyles } from 'react-native-unistyles';
 
 import { Popover, type PopoverAnchor, type PopoverPlacement } from '@/components/ui/popover';
@@ -15,6 +15,7 @@ import { normalizeNodeForView } from '@/components/ui/rendering/normalizeNodeFor
 import { TextInput } from '@/components/ui/text/Text';
 import { renderDropdownItemTriggerRightElement } from '@/components/ui/forms/dropdown/renderDropdownItemTriggerRightElement';
 import { KeyHint } from '@/components/ui/keyboard/KeyHint';
+import { useHasHardwareKeyboard } from '@/hooks/ui/useHasHardwareKeyboard';
 import { useScrollRectIntoViewRegistry } from '@/components/ui/scroll/useScrollRectIntoView';
 import { Icon } from '@/components/ui/icons/Icon';
 import { ActivitySpinner, iconMatchedSpinnerSize } from '@/components/ui/feedback/ActivitySpinner';
@@ -247,6 +248,8 @@ function isEditableKeyTarget(target: unknown): boolean {
 
 export function DropdownMenu(props: DropdownMenuProps) {
     const { theme } = useUnistyles();
+    // Keycaps name a key: with no hardware keyboard they only take width from the row.
+    const hasHardwareKeyboard = useHasHardwareKeyboard();
     const anchorRef = React.useRef<View>(null);
     const resolvedAnchorRef = props.popoverAnchorRef ?? anchorRef;
     const submenuAnchorsRef = React.useRef(new Map<string, React.RefObject<unknown>>());
@@ -260,6 +263,10 @@ export function DropdownMenu(props: DropdownMenuProps) {
     const createItemDisplay = props.createItemDisplay ?? null;
     const matchTriggerWidth = props.matchTriggerWidth ?? true;
     const maxWidthCap = props.maxWidthCap ?? (matchTriggerWidth ? 1024 : 320);
+    // Let content grow to the available room without requiring a whole window below the trigger.
+    const { height: windowHeight } = useWindowDimensions();
+    const maxHeightCap = props.maxHeightCap ?? windowHeight;
+    const placementMinSpace = props.maxHeightCap ?? 320;
     const emptyLabel = props.emptyLabel === undefined ? t('commandPalette.noCommandsFound') : props.emptyLabel;
     const contentPadding = rowVariant === 'slim' ? 12 : 16;
     const resultsPaddingBottom = typeof props.resultsPaddingBottom === 'number'
@@ -297,13 +304,13 @@ export function DropdownMenu(props: DropdownMenuProps) {
                     ? item.rightElement
                     : hasSubmenu
                         ? <Icon name="caret-right" size={16} color={theme.colors.text.secondary} />
-                        : item.shortcut
+                        : item.shortcut && hasHardwareKeyboard
                             ? <KeyHint label={item.shortcut} />
                             : null,
                 hasSubmenu,
             };
         });
-    }, [props.items, theme.colors.text.secondary]);
+    }, [hasHardwareKeyboard, props.items, theme.colors.text.secondary]);
 
     const closeOnSelect = props.closeOnSelect !== false;
     const onRequestClose = React.useCallback(() => props.onOpenChange(false), [props]);
@@ -642,7 +649,8 @@ export function DropdownMenu(props: DropdownMenuProps) {
                     anchor={props.popoverAnchor}
                     placement={props.placement ?? 'auto-vertical'}
                     gap={props.gap ?? 0}
-                    maxHeightCap={props.maxHeightCap ?? 320}
+                    maxHeightCap={maxHeightCap}
+                    placementMinSpace={placementMinSpace}
                     maxWidthCap={maxWidthCap}
                     edgePadding={edgePadding}
                     portal={{

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
+import { request } from 'node:http';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
+import { createPostToolUseRendezvous } from './postToolUseRendezvous';
 import { startHookServer } from './startHookServer';
 
 async function postSessionHook(params: {
@@ -27,7 +29,7 @@ async function runSessionForwarder(params: {
   hookEventName: string;
   secretFile?: string;
   body: unknown;
-}): Promise<{ code: number | null; stderr: string }> {
+}): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const scriptPath = resolve(process.cwd(), 'scripts', 'session_hook_forwarder.cjs');
   const args = [scriptPath, String(params.port), params.hookEventName];
   if (params.secretFile) {
@@ -36,13 +38,16 @@ async function runSessionForwarder(params: {
   return await new Promise((resolvePromise, reject) => {
     const child = spawn(process.execPath, args, {
       cwd: process.cwd(),
-      stdio: ['pipe', 'ignore', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
+    let stdout = '';
     let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => { stderr += chunk; });
     child.on('error', reject);
-    child.on('close', (code) => resolvePromise({ code, stderr }));
+    child.on('close', (code) => resolvePromise({ code, stdout, stderr }));
     child.stdin.end(JSON.stringify(params.body));
   });
 }
@@ -128,6 +133,110 @@ describe('startHookServer (/hook/session-start authentication, A5-MED-2)', () =>
     expect(onSessionHook).toHaveBeenCalledWith('legacy', expect.anything());
   });
 
+  it('does not forward incidental observer return values as Claude output', async () => {
+    const observed: unknown[] = [];
+    const server = await startHookServer({ onSessionHook: (_id, data) => ({ count: observed.push(data) }) });
+    servers.push(server);
+    const result = await runSessionForwarder({ port: server.port, hookEventName: 'Stop', body: { session_id: 'test' } });
+    expect(observed).toHaveLength(1);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe('');
+  });
+
+  it('cancels a pending producer when its HTTP client disconnects, but not when its request body ends', async () => {
+    const rendezvous = createPostToolUseRendezvous();
+    let signal: AbortSignal | undefined;
+    const server = await startHookServer({
+      onSessionHook: () => {},
+      produceSessionHookOutput: async (_id: string, _data: unknown, context: { signal: AbortSignal }) => {
+        signal = context?.signal;
+        if (!signal) return;
+        const message = await rendezvous.wait(signal);
+        return message ? { message } : undefined;
+      },
+    });
+    servers.push(server);
+    const client = request({ host: '127.0.0.1', port: server.port, path: '/hook/session-start', method: 'POST' });
+    client.on('error', () => {});
+    client.end(JSON.stringify({ session_id: 'disconnect', hook_event_name: 'PostToolUse' }));
+    try {
+      await waitUntil(() => signal !== undefined);
+      expect(signal?.aborted).toBe(false);
+      expect(rendezvous.current()).toBeDefined();
+      client.destroy();
+      await waitUntil(() => signal?.aborted === true);
+      expect(rendezvous.current()).toBeUndefined();
+    } finally {
+      client.destroy();
+    }
+
+    const response = postSessionHook({ port: server.port, body: { session_id: 'live', hook_event_name: 'PostToolUse' } });
+    await waitUntil(() => rendezvous.current() !== undefined);
+    expect(rendezvous.current()?.offer('next message')).toBe(true);
+    expect(await response).toEqual({ status: 200, text: JSON.stringify({ message: 'next message' }) });
+  });
+
+  it('does not transfer an expired forwarder response to a later PostToolUse forwarder', async () => {
+    const rendezvous = createPostToolUseRendezvous();
+    const server = await startHookServer({
+      onSessionHook: () => {},
+      produceSessionHookOutput: async (_id, data, { signal }) => {
+        if (data.hook_event_name !== 'PostToolUse') return;
+        const message = await rendezvous.wait(signal);
+        return message === undefined ? undefined : {
+          hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: message },
+        };
+      },
+    });
+    servers.push(server);
+    const child = spawn(process.execPath, [resolve(process.cwd(), 'scripts', 'session_hook_forwarder.cjs'), String(server.port), 'PostToolUse'], {
+      cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => resolvePromise({ code, signal }));
+    });
+    child.stdin.end(JSON.stringify({ session_id: 'expired' }));
+    try {
+      await waitUntil(() => rendezvous.current() !== undefined);
+      const expired = rendezvous.current()!;
+      // Model Claude timing out and terminating its hook subprocess.
+      child.kill();
+      expect(await closed).toEqual({ code: null, signal: 'SIGTERM' });
+      await waitUntil(() => rendezvous.current() === undefined);
+      expect(expired.offer('too late')).toBe(false);
+
+      const next = runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body: { session_id: 'next' } });
+      await waitUntil(() => rendezvous.current() !== undefined);
+      expect(expired.offer('stale again')).toBe(false);
+      expect(rendezvous.current()?.offer('fresh message')).toBe(true);
+      const result = await next;
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe('');
+      expect(JSON.parse(result.stdout)).toEqual({
+        hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: 'fresh message' },
+      });
+      expect(rendezvous.current()).toBeUndefined();
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+  });
+
+  it('returns structured hook output from an asynchronous callback through the executable', async () => {
+    const output = { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: 'Context for Claude' } };
+    const observer = vi.fn();
+    const server = await startHookServer({ onSessionHook: observer, produceSessionHookOutput: async () => output, permissionHookSecret: 'secret' });
+    servers.push(server);
+    const dir = mkdtempSync(join(tmpdir(), 'happier-session-hook-output-'));
+    const secretFile = join(dir, 'hook-secret');
+    writeFileSync(secretFile, 'secret', { mode: 0o600 });
+    const result = await runSessionForwarder({ port: server.port, hookEventName: 'UserPromptSubmit', secretFile, body: { session_id: 'test' } });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(observer).toHaveBeenCalledWith('test', expect.objectContaining({ hook_event_name: 'UserPromptSubmit' }));
+    expect(JSON.parse(result.stdout)).toEqual(output);
+  });
+
   it('session forwarder reads --secret-file and authenticates against the server', async () => {
     const onSessionHook = vi.fn();
     const server = await startHookServer({
@@ -147,11 +256,38 @@ describe('startHookServer (/hook/session-start authentication, A5-MED-2)', () =>
       body: { session_id: 'via-forwarder' },
     });
     expect(result.code).toBe(0);
+    expect(result.stdout).toBe('');
     expect(result.stderr).toBe('');
     await waitUntil(() => onSessionHook.mock.calls.length === 1);
     expect(onSessionHook).toHaveBeenCalledWith('via-forwarder', expect.objectContaining({
       hook_event_name: 'SessionStart',
     }));
+  });
+
+  it('does not wait for an observer promise before returning hook output', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const server = await startHookServer({ onSessionHook: () => pending });
+    servers.push(server);
+    try {
+      const result = await Promise.race([
+        runSessionForwarder({ port: server.port, hookEventName: 'Stop', body: { session_id: 'test' } }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('observer blocked hook')), 1000)),
+      ]);
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe('');
+    } finally {
+      release();
+    }
+  });
+
+  it('reports an asynchronous output producer failure without emitting hook output', async () => {
+    const server = await startHookServer({ onSessionHook: () => {}, produceSessionHookOutput: async () => { throw new Error('callback failed'); } });
+    servers.push(server);
+    const result = await runSessionForwarder({ port: server.port, hookEventName: 'Stop', body: { session_id: 'test' } });
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('500');
   });
 
   it('makes non-2xx hook delivery visible through a nonzero command exit', async () => {

@@ -26,6 +26,27 @@ afterEach(async () => {
 });
 
 describe('resolveCodexNativeSessionLogPath', () => {
+  it('keeps searching the same sessions tree after a newer compressed match', async () => {
+    const newerDay = join(codexHome, 'sessions', '2026', '08', '18');
+    await mkdir(newerDay, { recursive: true });
+    await writeFile(join(newerDay, `rollout-2026-08-18T10-00-00-${VENDOR_RESUME_ID}.jsonl.zst`),
+      Buffer.from([0x28, 0xb5, 0x2f, 0xfd]));
+
+    await expect(resolveCodexNativeSessionLogPath({
+      vendorResumeId: VENDOR_RESUME_ID,
+      env: { CODEX_HOME: codexHome },
+    })).resolves.toBe(rolloutPath);
+  });
+
+  it('exposes a raw log only after Codex materializes its compressed rollout', async () => {
+    await rm(rolloutPath);
+    await writeFile(`${rolloutPath}.zst`, Buffer.from([0x28, 0xb5, 0x2f, 0xfd]));
+    const input = { vendorResumeId: VENDOR_RESUME_ID, env: { CODEX_HOME: codexHome } };
+    await expect(resolveCodexNativeSessionLogPath(input)).resolves.toBeNull();
+    await writeFile(rolloutPath, '{}\n');
+    await expect(resolveCodexNativeSessionLogPath(input)).resolves.toBe(rolloutPath);
+  });
+
   it('finds the active rollout with the exact vendor-resume suffix', async () => {
     await expect(resolveCodexNativeSessionLogPath({
       vendorResumeId: VENDOR_RESUME_ID,
@@ -35,6 +56,7 @@ describe('resolveCodexNativeSessionLogPath', () => {
 
   it('finds the archived rollout with the same exact vendor-resume suffix', async () => {
     await rm(rolloutPath);
+    await writeFile(`${rolloutPath}.zst`, Buffer.from([0x28, 0xb5, 0x2f, 0xfd]));
     const archivedDayDir = join(codexHome, 'archived_sessions', '2026', '08', '17');
     const archivedRolloutPath = join(
       archivedDayDir,

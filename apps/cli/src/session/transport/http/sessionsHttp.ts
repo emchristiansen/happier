@@ -33,6 +33,13 @@ import { throwIfCliClientUpgradeRequired } from '@/api/clientCompatibility/cliCl
 export type RawSessionRecord = V2SessionByIdResponse['session'];
 export type RawSessionListRow = V2SessionListResponse['sessions'][number];
 
+export class SessionResponseIdMismatchError extends Error {
+  constructor() {
+    super('Unexpected /v2/sessions response shape');
+    this.name = 'SessionResponseIdMismatchError';
+  }
+}
+
 export async function fetchSessionTurnsProjection(params: Readonly<{
   token: string;
   sessionId: string;
@@ -136,6 +143,12 @@ async function getSessionByIdResponse(params: Readonly<{
   }
 }
 
+function parseSessionByIdResponse(payload: unknown, expectedSessionId: string): RawSessionRecord {
+  const session = parseOrThrow<V2SessionByIdResponse>(V2SessionByIdResponseSchema, payload, 'Unexpected /v2/sessions response shape').session;
+  if (session.id !== expectedSessionId) throw new SessionResponseIdMismatchError();
+  return session;
+}
+
 export async function fetchSessionById(params: Readonly<{ token: string; sessionId: string; reason?: SessionSnapshotRefreshReasonInput; signal?: AbortSignal }>): Promise<RawSessionRecord | null> {
   const response = await getSessionByIdResponse(params);
   enforceSessionCompatibilityResponse(response);
@@ -148,7 +161,7 @@ export async function fetchSessionById(params: Readonly<{ token: string; session
     throwUnexpectedHttpStatusError(response.status, `Unexpected status from /v2/sessions/${params.sessionId}: ${response.status}`, response.headers);
   }
 
-  return parseOrThrow<V2SessionByIdResponse>(V2SessionByIdResponseSchema, response.data, 'Unexpected /v2/sessions response shape').session;
+  return parseSessionByIdResponse(response.data, params.sessionId);
 }
 
 function looksLikeMissingV2SessionRoute404(data: unknown, sessionId: string): boolean {
@@ -195,7 +208,7 @@ export async function fetchSessionByIdCompat(params: Readonly<{ token: string; s
     throwUnexpectedHttpStatusError(response.status, `Unexpected status from /v2/sessions/${params.sessionId}: ${response.status}`, response.headers);
   }
 
-  return parseOrThrow<V2SessionByIdResponse>(V2SessionByIdResponseSchema, response.data, 'Unexpected /v2/sessions response shape').session;
+  return parseSessionByIdResponse(response.data, params.sessionId);
 }
 
 export async function patchSessionMetadata(params: Readonly<{

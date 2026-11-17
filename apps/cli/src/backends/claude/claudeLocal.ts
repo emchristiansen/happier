@@ -420,7 +420,26 @@ export async function claudeLocal(opts: {
                 flagArgs.push('--plugin-dir', opts.hookPluginDir);
                 logger.debug(`[ClaudeLocal] Using hook plugin dir: ${opts.hookPluginDir}`);
             }
+            // Prepare environment variables
+            // Note: Local mode uses global Claude installation with --session-id flag
+            // Launcher only intercepts fetch for thinking state tracking
+            const env = withCurrentHappierSessionId(
+                prepareClaudeSubprocessEnv({
+                    baseEnv: processEnv,
+                    envOverlay: {
+                        // Keep behavior consistent with our wrapper script.
+                        DISABLE_AUTOUPDATER: '1',
+                        ...resolveClaudeConfigDirEnvOverlay(processEnv),
+                        ...(opts.envOverlay ?? {}),
+                    },
+                }),
+                opts.happierSessionId ?? '',
+            );
+
             const settingsOverlay = resolveClaudeLaunchSettingsOverlayArg({
+                args: flagArgs,
+                cwd: opts.path,
+                env: { ...processEnv, ...env },
                 settingsPath: opts.hookSettingsPath,
                 // No ultracode setting for the pin: the pinned `--effort` already overrides any saved
                 // ultracode (native 2.1.280), and Claude Code keeps only the last `--settings`, so an
@@ -452,21 +471,6 @@ export async function claudeLocal(opts: {
                 args.push(...positionalArgs);
             }
 
-            // Prepare environment variables
-            // Note: Local mode uses global Claude installation with --session-id flag
-            // Launcher only intercepts fetch for thinking state tracking
-            const env = withCurrentHappierSessionId(
-                prepareClaudeSubprocessEnv({
-                    baseEnv: processEnv,
-                    envOverlay: {
-                        // Keep behavior consistent with our wrapper script.
-                        DISABLE_AUTOUPDATER: '1',
-                        ...resolveClaudeConfigDirEnvOverlay(processEnv),
-                        ...(opts.envOverlay ?? {}),
-                    },
-                }),
-                opts.happierSessionId ?? '',
-            );
             logClaudeRuntimeAuthEnvDiagnostic({
                 logPrefix: 'ClaudeLocal',
                 sessionId: opts.sessionId,

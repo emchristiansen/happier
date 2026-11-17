@@ -78,3 +78,6 @@ export function scopePlaybackStopperRegistrar(
     };
   };
 }
+
+/** Shared playback owner for live voice and message read-aloud. */
+export const localVoicePlaybackController = createVoicePlaybackController();

@@ -640,6 +640,7 @@ export const pl: TranslationStructure = {
             composerFocus: 'Ustaw fokus na edytorze',
             composerSendImmediate: 'Alternatywne wysyłanie (kolejka / sterowanie)',
             composerSendInterrupt: 'Przerwij i wyślij',
+            composerSendAlternateAfterSend: "Wyślij i rozpocznij kolejną / otwórz",
             composerSendPending: 'Wyślij do kolejki oczekujących',
             commandPaletteOpen: 'Otwórz paletę poleceń',
             modeCycle: 'Przełącz tryb',
@@ -2590,7 +2591,7 @@ export const pl: TranslationStructure = {
           renewal: "Odnowienie",
           renewalOn: "Włączone",
           renewalOff: "Wyłączone",
-          renewalUnknown: "Nieznane",
+          active: "Aktywna",
           renews: ({ date }: { date: string }) => `Odnowienie: ${date}`,
           ends: ({ date }: { date: string }) => `Koniec: ${date}`,
           renewsInDays: ({ days }: { days: number }) => `Odnowienie za ${days} dni`,
@@ -2756,6 +2757,12 @@ export const pl: TranslationStructure = {
       refreshA11y: "Odśwież użycie i limity",
       usageCaption: "Użycie",
       resetsCaption: "Resety limitu",
+      credits: {
+        title: "Kredyty",
+        balance: ({ balance }: { balance: string }) => `${balance} kredytów`,
+        spent: "Brak",
+        includedUsed: "Limity w planie wykorzystane · kredyty dostępne",
+      },
       usedDetail: ({ used, limit }: { used: string; limit: string }) => `${used}/${limit} użyte`,
       capacity: ({ percent }: { percent: number }) => `${percent}% pojemności`,
       memberEnabledLabel: "Włączone w puli",
@@ -3155,6 +3162,8 @@ export const pl: TranslationStructure = {
         membersSubtitle: ({ enabled, total }: { enabled: number; total: number }) => `${enabled}/${total} włączonych`,
         optionsTitle: "Opcje",
         autoSwitchTitle: "Automatyczne przełączenie",
+        claudeCodeAutoContinueAtUsageLimitTitle: "Pozwól Claude czekać po osiągnięciu limitu",
+        claudeCodeAutoContinueAtUsageLimitSubtitle: "W nowych sesjach Claude czeka i automatycznie kontynuuje po odnowieniu limitu. Wyłącz, aby Happier zarządzał wznowieniem.",
         autoQuotaResetTitle: "Automatycznie używaj resetów limitu",
         autoQuotaResetSubtitle: "Zużywa dostępny reset tylko wtedy, gdy żadne konto w puli nie jest gotowe i można zresetować wyczerpany limit. Domyślnie wyłączone.",
         autoDisablePlanInvalidTitle: "Wyłączaj konta, które nie mogą używać wybranego modelu",
@@ -3625,7 +3634,7 @@ export const pl: TranslationStructure = {
     trayOpenInHappier: 'Otwórz w Happier',
     traySettings: 'Ustawienia…',
     trayStartAtLogin: 'Uruchamiaj przy logowaniu',
-    trayStopAndQuit: 'Zatrzymaj usługi w tle i zakończ',
+    trayStopAndQuit: 'Zamknij Happier (zatrzymaj usługi w tle)',
     trayStart: 'Uruchom',
     trayRestart: 'Uruchom ponownie',
     trayStop: 'Zatrzymaj',
@@ -3641,6 +3650,7 @@ export const pl: TranslationStructure = {
     trayStopAllConfirmBody: 'Sesje agentów działające na tym komputerze zostaną zakończone, a telefon i przeglądarka nie dosięgną go, dopóki nie otworzysz Happier ponownie.',
     trayStopConfirmAction: 'Zatrzymaj',
     trayActionFailedTitle: 'Nie udało się',
+    trayQuitWaitForSystemTasks: "Happier nadal konfiguruje lub usuwa komponenty. Poczekaj na zakończenie, a następnie spróbuj ponownie zamknąć aplikację.",
     trayLoginItemFailed: 'Nie udało się zaktualizować elementu logowania Happier',
     traySessions: ({ count }: { count: string }) => `Sesje: ${count}`,
     closeStopTitle: 'Sesje agenta wciąż działają',
@@ -4002,6 +4012,39 @@ export const pl: TranslationStructure = {
     },
 
   settingsProviders: {
+        sessionRetention: {
+            invalidSettings: "Napraw nieprawidłowy JSON ustawień Claude i połącz komputer ponownie.",
+            permissionDenied: "Zezwól na dostęp do pliku ustawień Claude i połącz komputer ponownie.",
+            writeFailed: "Nie udało się zapisać ustawień Claude. Sprawdź dostęp do pliku i połącz komputer ponownie.",
+            managedUnreadable: "Nie udało się odczytać ustawień organizacji. Przed zmianą przechowywania sprawdź uprawnienia w Claude.",
+            group: "Grupa",
+            title: "Przechowywanie sesji",
+            footer: "Ustaw przechowywanie historii Claude na poziomie użytkownika na swoich maszynach. Ustawienia projektu, organizacji lub jawne ustawienia uruchamiania mogą je zastąpić.",
+            policy: "Zachowaj lokalną historię",
+            unmanaged: "Zachowaj obecne ustawienia",
+            unmanagedHint: "Przestań zarządzać przechowywaniem; wcześniejsze zmiany pozostają.",
+            providerDefault: "Domyślne Claude",
+            providerDefaultHint: "Usuń okres użytkownika i użyj wartości domyślnej Claude.",
+            year: "1 rok (365 dni)",
+            century: "100 lat (36 500 dni)",
+            custom: "Własna liczba dni",
+            customDays: "Liczba dni",
+            invalidDays: "Wpisz dodatnią całkowitą liczbę dni.",
+            machines: "Stan komputerów",
+            noMachines: "Tutaj pojawią się sparowane komputery.",
+            native: "Natywny Claude",
+            profile: "Profil",
+            applied: "Skonfigurowano",
+            unmanagedStatus: "Niezarządzane",
+            pending: "Oczekiwanie na komputer",
+            unknown: "Zaktualizuj daemon, aby zobaczyć stan",
+            error: "Nie udało się zastosować przechowywania",
+            managed: "Zasady organizacji mogą zastąpić okres przechowywania",
+            offline: "Offline · ostatni potwierdzony stan",
+            confirmTitle: "Skrócić przechowywanie Claude?",
+            confirmBody: "Krótszy okres może pozwolić Claude usunąć starszą lokalną historię. Usuniętej historii nie można odzyskać. Ustawienia projektu lub organizacji mogą zastąpić to ustawienie.",
+            confirmAction: "Zastosuj przechowywanie",
+        },
         title: "Ustawienia dostawcy AI",
         entrySubtitle: "Skonfiguruj opcje specyficzne dla dostawcy",
         footer:
@@ -4887,6 +4930,8 @@ export const pl: TranslationStructure = {
       hiddenInactiveSessionsEmptyStateSubtitle: "Nieaktywne sesje są ukryte na tej liście",
       hiddenInactiveSessionsSectionTitle: "Nieaktywne sesje",
       hiddenInactiveSessionsSectionSubtitle: "Ukryte na głównej liście, ponieważ są tam pokazywane tylko aktywne czaty",
+    sessionListGroupGitWorktrees: "Grupuj drzewa robocze Git według repozytorium",
+    sessionListGroupGitWorktreesSubtitle: "Zachowaj sesje z tego samego repozytorium razem. Wyłącz, aby grupować według katalogu.",
     sessionListActiveGrouping: "Grupowanie aktywnych sesji",
     sessionListActiveGroupingSubtitle:
       "Wybierz, jak aktywne sesje są grupowane na pasku bocznym",
@@ -5449,6 +5494,7 @@ export const pl: TranslationStructure = {
       resetBody: ({ time }: { time: string }) =>
         `Ten dostawca prosi sesję o czekanie do ${time} przed kontynuacją.`,
       genericBody: "Ten dostawca prosi sesję o czekanie przed kontynuacją.",
+      stoppedBody: "Automatyczne odzyskiwanie zostało zatrzymane i nie ponowi się samo. Spróbuj ponownie poniżej.",
       resetCreditBody: ({ count }: { count: number }) =>
         `${count} ${count === 1 ? "reset użycia jest dostępny" : "resety użycia są dostępne"}.`,
       resetCreditExpiresBody: ({ count, time }: { count: number; time: string }) =>
@@ -6543,7 +6589,7 @@ export const pl: TranslationStructure = {
   },
 
   sessionDrafts: {
-    sectionTitle: 'Wersje robocze', badge: 'Wersja robocza', untitled: 'Wersja bez tytułu', continueEditing: 'Kontynuuj edycję', startAnother: 'Rozpocznij nową',
+    sectionTitle: 'Wersje robocze', badge: 'Wersja robocza', untitled: 'Wersja bez tytułu', continueEditing: 'Kontynuuj edycję', startAnother: 'Rozpocznij nową', startedOpen: "Sesja rozpoczęta · Otwórz",
     status: { offline: 'Poza siecią', syncing: 'Synchronizowanie', conflict: 'Konflikt', machineUnavailable: 'Maszyna niedostępna', attachmentNeedsAttention: 'Załącznik wymaga uwagi', startInterrupted: 'Uruchamianie przerwane' },
     new: { action: 'Nowa wersja robocza' }, delete: { action: 'Usuń wersję roboczą', confirmTitle: 'Usunąć wersję roboczą?', confirmDescription: 'Ta wersja robocza zostanie usunięta z Twoich urządzeń.' },
     conflict: { title: 'Konflikt wersji roboczej', description: 'To pole zmieniono na innym urządzeniu.', mine: 'Na tym urządzeniu', synced: 'Zsynchronizowane', useSynced: 'Użyj zsynchronizowanej', keepDevice: 'Zachowaj z urządzenia', copyMine: 'Kopiuj moją', copied: 'Skopiowano', copyFailed: 'Nie udało się skopiować', field: { text: 'Tekst', mentions: 'Wzmianki', attachments: 'Załączniki', recipient: 'Odbiorca', agentContinuation: 'Kontynuacja agenta', executionRunDelivery: 'Dostarczenie wykonania' } },
@@ -6939,8 +6985,12 @@ export const pl: TranslationStructure = {
   },
 
   agentInput: {
+      keepKeyboard: { label: "Nie zamykaj klawiatury po wysłaniu" },
+      historyPosition: ({ index, total }: { index: number; total: number }) => `${index} z ${total}`,
       sendOptions: {
           title: "Opcje wysyłania",
+          sendAndStartAnother: "Wyślij i rozpocznij kolejną",
+          sendAndOpen: "Wyślij i otwórz sesję",
           queue: "Dodaj do kolejki",
           hint: "Przytrzymaj, aby wybrać sposób wysłania",
       },
@@ -7415,7 +7465,10 @@ export const pl: TranslationStructure = {
     },
     askUserQuestion: {
         submit: "Wyślij odpowiedź",
+        dismiss: 'Odrzuć pytanie',
+        dismissed: 'Pytanie odrzucone',
         submissionFailures: {
+            unconfirmed: "Happier nie mógł potwierdzić Twojej odpowiedzi. Spróbuj ponownie lub otwórz terminal Claude, aby ją sprawdzić.",
             update: "Zaktualizuj Happier CLI i spróbuj ponownie.",
             reconnect: "Połącz ponownie tę sesję i spróbuj jeszcze raz.",
             retry: "Nie udało się przyjąć odpowiedzi. Sprawdź ją i spróbuj ponownie.",
@@ -8305,6 +8358,7 @@ export const pl: TranslationStructure = {
 settingsSession: {
     terminalHostTitle: 'Host terminala dla nowych sesji',
     terminalHostNone: 'Bez hosta terminala',
+    newSessionAfterSend: { title: "Po wysłaniu", footer: "Wybierz, co ma się dziać po wysłaniu z edytora nowej sesji. Przytrzymaj Wyślij, aby dla jednej wiadomości wybrać drugą opcję.", openTitle: "Otwórz sesję", openSubtitle: "Przejdź do sesji, gdy tylko się rozpocznie.", startAnotherTitle: "Zostań i rozpocznij kolejną", startAnotherSubtitle: "Kontynuuj uruchamianie w tle i otwórz nowy szkic." },
     newSessionDraftEntry: {
         title: 'Wersje robocze nowej sesji',
         footer: 'Wybierz, czy Nowa sesja ma kontynuować wersję roboczą z tego urządzenia, czy otworzyć nową.',
@@ -8478,6 +8532,10 @@ settingsSession: {
           resetHiddenSubtitle: 'Wyczyść banery ukryte na tym urządzeniu.',
       },
       inputBehavior: {
+          keepFocusTitle: "Zachowaj fokus w edytorze po wysłaniu",
+          keepFocusSubtitle: "Pozostań w polu wiadomości, aby od razu pisać następną.",
+          typeToFocusTitle: "Pisz z dowolnego miejsca",
+          typeToFocusSubtitle: "Zacznij pisać poza polem tekstowym, aby przejść do pola wiadomości.",
           title: 'Zachowanie wprowadzania',
           footer: 'Skonfiguruj wysyłanie klawiszem Enter i zachowanie historii wiadomości.',
           enterToSendEnabledNativeSubtitle: 'Naciśnij Enter, aby wysłać',
@@ -8590,6 +8648,8 @@ settingsSession: {
         customResumePromptPlaceholder: "Kontynuuj od miejsca, w którym skończyłeś.",
       },
       providerUsageGauge: {
+          numberTitle: "Liczba w środku pierścieni",
+          numberSubtitle: "Wybierz limit dla liczby w pierścieniach. Jeśli jest niedostępny, używany jest najbardziej ograniczający limit.",
         title: "Użycie dostawcy",
         footer:
           "Wybierz wskaźniki edytora dla wszystkich kont. Uwzględniają limity użycia wybrane w każdej puli. Ulubione dodają wskaźniki aktywnego konta.",
@@ -10819,7 +10879,15 @@ settingsSession: {
     },
     cliPath: {
       title: "Terminal",
-      footer: "Happier Desktop dodaje lub usuwa tylko te wpisy PATH, które sam utworzył; wpisy zapisane przez instalator powłoki pozostają nietknięte.",
+      footer: "Happier Desktop zmienia tylko utworzone przez siebie wpisy PATH; wpisy instalatora powłoki pozostają bez zmian.",
+      cleanupTitle: "Usuń składniki Desktop",
+      cleanupSubtitle: "Usuń wiersz poleceń i usługi należące do Desktop, a potem zakończ aplikację.",
+      cleanupConfirmTitle: "Usunąć składniki Desktop i zakończyć?",
+      cleanupConfirmBody: "Ta operacja usuwa pliki wiersza poleceń, wpisy PATH i usługi należące do Desktop, jeśli nie potrzebuje ich inna aplikacja Desktop. Składniki współdzielone lub zainstalowane przez Ciebie, historia sesji i dane konta zostaną zachowane. Usuwane usługi zostaną zatrzymane, co może przerwać trwające sesje i dostęp zdalny.\n\nPo zakończeniu czyszczenia Desktop zostanie zamknięty. Następnie usuń aplikację przy użyciu systemu operacyjnego; w macOS lub przenośnym Linuksie usuń pakiet lub plik aplikacji. Ponowne otwarcie Desktop może ponownie skonfigurować składniki.",
+      cleanupConfirmAction: "Usuń składniki i zakończ",
+      cleanupBusy: "Usuwanie składników Desktop…",
+      cleanupFailed: "Czyszczenie nie zostało ukończone. Spróbuj ponownie.",
+      cleanupQuitFailed: "Czyszczenie zakończone, ale Desktop nie mógł się zamknąć. Zamknij aplikację przed jej usunięciem.",
       addTitle: "Dodaj happier do PATH",
       addSubtitle: "Udostępnij polecenie happier w nowych terminalach.",
       removeTitle: "Usuń happier z PATH",
@@ -10927,11 +10995,16 @@ settingsSession: {
   },
 
   message: {
+    provenanceFrom: ({ source }: { source: string }) => `Od ${source}`,
+    provenanceSession: 'Sesja',
     sessionReferenceUnavailable: "Sesja niedostępna",
     sessionReferenceOpen: ({ name }: { name: string }) => `Otwórz sesję ${name}`,
     switchedToMode: ({ mode }: { mode: string }) =>
       `Przełączono na tryb ${mode}`,
     discarded: "Odrzucono",
+    readAloudA11y: "Odczytaj na głos",
+    stopReadAloudA11y: "Zatrzymaj czytanie na głos",
+    readAloudFailed: "Nie udało się odczytać tej wiadomości na głos. Sprawdź ustawienia głosu.",
     recoveredHistory: "Odzyskana historia",
     unknownEvent: "Nieznane zdarzenie",
     contextCompactionStarted: "Kompaktowanie kontekstu...",
@@ -10980,7 +11053,7 @@ settingsSession: {
     sessionRunningLocally:
       "Ta sesja działa lokalnie na tym komputerze. Możesz przełączyć na zdalny, aby sterować z aplikacji.",
     sessionRunningLocallyAndRemotely:
-      "Ta sesja jest lokalnie podłączona w OpenCode i nadal można nią sterować z aplikacji.",
+      "Ta sesja jest lokalnie podłączona i nadal można nią sterować z aplikacji.",
     switchingToRemote: "Przełączanie na tryb zdalny…",
     switchToRemote: "Przełącz na zdalny",
     detachLocalTerminal: "Odłącz terminal",
@@ -11059,6 +11132,13 @@ settingsSession: {
       codeCopied: "Kod skopiowany",
       copyFailed: "Błąd kopiowania",
       mermaidRenderFailed: "Nie udało się wyświetlić diagramu mermaid",
+      table: {
+          open: "Otwórz tabelę",
+          copyCsv: "Kopiuj jako CSV",
+          copyMarkdown: "Kopiuj jako Markdown",
+          csvLabel: "CSV",
+          viewerTitle: "Tabela",
+      },
       diffLabel: "Różnice",
       codeLabel: "Kod",
 
@@ -11341,6 +11421,7 @@ settingsSession: {
     enterTmuxTempDir: "Wprowadź ścieżkę do katalogu tymczasowego",
     tmuxUpdateEnvironment: "Aktualizuj środowisko automatycznie",
     nameRequired: "Nazwa profilu jest wymagana",
+    invalidProfile: 'Przed zapisaniem sprawdź nazwę profilu, zmienne środowiskowe i ustawienia domyślne.',
     deleteConfirm: ({ name }: { name: string }) =>
       `Czy na pewno chcesz usunąć profil "${name}"?`,
     editProfile: "Edytuj Profil",

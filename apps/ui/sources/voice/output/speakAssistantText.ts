@@ -2,6 +2,8 @@ import type { VoicePlaybackStopperRegistrar } from '@/voice/runtime/VoicePlaybac
 import { VoiceLocalTtsSchema } from '@/sync/domains/settings/voiceLocalTtsSettings';
 import { speakWithLocalTtsProvider } from '@/voice/backends/tts/runtime';
 import { resolveLocalVoiceError, type LocalVoiceState } from '@/voice/local/localVoiceState';
+import { stopReadAloud } from '@/voice/local/readAloudState';
+import { resolveLocalVoiceAdapterSettings } from '@/voice/local/localVoiceSettings';
 import { toSpeechText, type SpeechTextContext } from '@/voice/output/speechText';
 
 /**
@@ -19,21 +21,19 @@ export async function speakAssistantText(params: {
   networkTimeoutMs: number;
   registerPlaybackStopper: VoicePlaybackStopperRegistrar;
   onSpeaking: () => void;
-  onFailed: (failure: Pick<LocalVoiceState, 'error' | 'errorMessage'>) => void;
+  onFailed?: (failure: Pick<LocalVoiceState, 'error' | 'errorMessage'>) => void;
+  /** Live voice replies take over from a message being read aloud; read-aloud itself opts out. */
+  takeOverReadAloud?: boolean;
 }): Promise<boolean> {
   const spoken = toSpeechText(params.text, params.speechTextContext);
   if (!spoken) return true;
+  if (params.takeOverReadAloud !== false) stopReadAloud();
 
-  const voice = params.settings?.voice ?? null;
-  const providerId = voice?.providerId;
-  const adapter =
-    providerId === 'local_direct'
-      ? voice?.adapters?.local_direct
-      : voice?.adapters?.local_conversation ?? voice?.adapters?.local_direct;
+  const { config } = resolveLocalVoiceAdapterSettings(params.settings);
 
   let providerLabel = 'unknown';
   try {
-    const tts = VoiceLocalTtsSchema.parse(adapter?.tts ?? {});
+    const tts = VoiceLocalTtsSchema.parse(config?.tts ?? {});
     providerLabel = tts.provider;
     await speakWithLocalTtsProvider({
       text: spoken,
@@ -46,7 +46,7 @@ export async function speakAssistantText(params: {
     return true;
   } catch (error) {
     console.warn(`[voice/tts] ${providerLabel} speech failed`, error instanceof Error ? error.message : error);
-    params.onFailed(resolveLocalVoiceError(error, 'tts_failed'));
+    params.onFailed?.(resolveLocalVoiceError(error, 'tts_failed'));
     return false;
   }
 }

@@ -139,7 +139,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
     });
     await emitUserMessage({ content: { text: 'Use $removed' }, localId: 'unresolved-steer', meta });
     expect(delivered).toEqual([]);
-    expect(await queue.waitForMessagesAndGetAsString()).toMatchObject({ message: { text: 'Use $removed', meta } });
+    expect(await queue.waitForMessagesAndGetAsString()).toMatchObject({ message: { text: 'Use $removed' }, providerPromptMeta: meta });
   });
 
   it('executes a claimed send action by queueing without steering an active turn', async () => {
@@ -175,6 +175,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
         userMessageLocalIds: ['pending-send'],
         providerAcceptancePending: true,
         pendingProviderAction: 'send',
+        providerPromptMeta: {},
       },
     );
   });
@@ -402,7 +403,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
     expect(spyPush).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'hello', localId: null }),
       { permissionMode: 'default' },
-      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null },
+      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null, providerPromptMeta: {} },
     );
   });
 
@@ -704,7 +705,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
     });
   });
 
-  it('carries the session-reference block on the steered text, not only on send (D-21)', async () => {
+  it('carries session references and sender provenance on steered text, not only on send', async () => {
     // The seam, not the block: this path hands `message.meta` to the prompt-finalization owner.
     // Without that, `@session` would work on send and silently vanish on an in-flight steer —
     // the exact asymmetry D-21's "identically on send and steer" exists to forbid.
@@ -728,6 +729,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
       content: { text: 'compare with @session:peer-abc123' },
       localId: 'local-1',
       meta: {
+        happierProvenanceV1: { v: 1, kind: 'happierSession', sourceSessionId: 'sess-sender', via: 'mcp' },
         happierStructuredInputV1: {
           v: 1,
           mentions: [{
@@ -747,6 +749,8 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
     expect(steered).toContain('compare with @session:peer-abc123');
     expect(steered).toContain('<happier_session_reference>');
     expect(steered).toContain('sess-referenced');
+    expect(steered).toContain('source_session_id="sess-sender"');
+    expect(steered).toContain('source_via="mcp"');
     expect(spyPush).not.toHaveBeenCalled();
   });
 
@@ -777,7 +781,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
     expect(spyPush).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'queue me', localId: null }),
       { permissionMode: 'default' },
-      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null },
+      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null, providerPromptMeta: {} },
     );
   });
 
@@ -810,7 +814,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
     expect(spyPush).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'queue with identity', localId: 'local-43' }),
       { permissionMode: 'default' },
-      { userMessageSeq: 43, userMessageLocalId: 'local-43', userMessageLocalIds: ['local-43'] },
+      { userMessageSeq: 43, userMessageLocalId: 'local-43', userMessageLocalIds: ['local-43'], providerPromptMeta: {} },
     );
   });
 
@@ -996,10 +1000,9 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
       {
         text: 'mode change',
         localId: null,
-        meta: { permissionMode: 'read-only' },
       },
       { permissionMode: 'read-only' },
-      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null },
+      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null, providerPromptMeta: { permissionMode: 'read-only' } },
     );
   });
 
@@ -1029,7 +1032,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
     expect(spyIsolate).toHaveBeenCalledWith(
       expect.objectContaining({ text: '/clear', localId: null }),
       { permissionMode: 'default' },
-      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null },
+      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null, providerPromptMeta: {} },
     );
   });
 
@@ -1059,7 +1062,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight steer)', () => {
     expect(spyPush).toHaveBeenCalledWith(
       expect.objectContaining({ text: '/compact', localId: null }),
       { permissionMode: 'default' },
-      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null },
+      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null, providerPromptMeta: {} },
     );
   });
 
@@ -1183,7 +1186,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight config-delta appl
     expect(spyPush).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'mode change' }),
       { permissionMode: 'read-only' },
-      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null },
+      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null, providerPromptMeta: { permissionMode: 'read-only' } },
     );
     // Not a bounce: the steer was never accepted, so no unsafe_window corrective publish.
     expect(agentState.capabilities?.inFlightSteerUnavailableReason).toBeUndefined();
@@ -1275,7 +1278,7 @@ describe('registerPermissionModeMessageQueueBinding (in-flight config-delta appl
     expect(spyPush).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'mode change' }),
       { permissionMode: 'read-only' },
-      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null },
+      { userMessageSeq: null, userMessageLocalId: null, userMessageLocalIds: null, providerPromptMeta: { permissionMode: 'read-only' } },
     );
   });
 

@@ -627,6 +627,7 @@ export const it: TranslationStructure = {
             composerFocus: 'Metti a fuoco il compositore',
             composerSendImmediate: 'Invio alternativo (coda / indirizza)',
             composerSendInterrupt: 'Interrompi e invia',
+            composerSendAlternateAfterSend: "Invia e iniziane un’altra / apri",
             composerSendPending: 'Invia alla coda in sospeso',
             commandPaletteOpen: 'Apri palette comandi',
             modeCycle: 'Cambia modalità',
@@ -1348,6 +1349,7 @@ export const it: TranslationStructure = {
     enterTmuxTempDir: "Inserisci percorso directory temporanea",
     tmuxUpdateEnvironment: "Aggiorna ambiente automaticamente",
     nameRequired: "Il nome del profilo è obbligatorio",
+    invalidProfile: 'Controlla il nome del profilo, le variabili d’ambiente e i valori predefiniti prima di salvare.',
     deleteConfirm: ({ name }: { name: string }) =>
       `Sei sicuro di voler eliminare il profilo "${name}"?`,
     editProfile: "Modifica profilo",
@@ -2910,7 +2912,7 @@ export const it: TranslationStructure = {
           renewal: "Rinnovo",
           renewalOn: "Attivo",
           renewalOff: "Disattivo",
-          renewalUnknown: "Sconosciuto",
+          active: "Attivo",
           renews: ({ date }: { date: string }) => `Si rinnova il ${date}`,
           ends: ({ date }: { date: string }) => `Termina il ${date}`,
           renewsInDays: ({ days }: { days: number }) => `Si rinnova tra ${days} ${days === 1 ? 'giorno' : 'giorni'}`,
@@ -3174,6 +3176,12 @@ export const it: TranslationStructure = {
       refreshA11y: "Aggiorna utilizzo e limiti",
       usageCaption: "Utilizzo",
       resetsCaption: "Ripristini quota",
+      credits: {
+        title: "Crediti",
+        balance: ({ balance }: { balance: string }) => `${balance} crediti`,
+        spent: "Esauriti",
+        includedUsed: "Limiti inclusi esauriti · crediti disponibili",
+      },
       usedDetail: ({ used, limit }: { used: string; limit: string }) => `${used}/${limit} usati`,
       capacity: ({ percent }: { percent: number }) => `${percent}% di capacità`,
       memberEnabledLabel: "Abilitato nel Pool",
@@ -3476,6 +3484,8 @@ export const it: TranslationStructure = {
         membersSubtitle: ({ enabled, total }: { enabled: number; total: number }) => `${enabled}/${total} abilitati`,
         optionsTitle: "Opzioni",
         autoSwitchTitle: "Fallback automatico",
+        claudeCodeAutoContinueAtUsageLimitTitle: "Lascia che Claude attenda ai limiti di utilizzo",
+        claudeCodeAutoContinueAtUsageLimitSubtitle: "Nelle nuove sessioni, Claude attende e riprende automaticamente quando il limite si reimposta. Disattiva per affidare il recupero a Happier.",
         autoQuotaResetTitle: "Usa automaticamente i reset della quota",
         autoQuotaResetSubtitle: "Consuma un reset disponibile solo quando nessun account del pool è pronto e la quota esaurita può essere ripristinata. Disattivato per impostazione predefinita.",
         autoDisablePlanInvalidTitle: "Disattiva gli account che non possono usare il modello selezionato",
@@ -3946,7 +3956,7 @@ export const it: TranslationStructure = {
     trayOpenInHappier: 'Apri in Happier',
     traySettings: 'Impostazioni…',
     trayStartAtLogin: 'Avvia all’accesso',
-    trayStopAndQuit: 'Arresta i servizi in background ed esci',
+    trayStopAndQuit: 'Esci da Happier (arresta i servizi in background)',
     trayStart: 'Avvia',
     trayRestart: 'Riavvia',
     trayStop: 'Arresta',
@@ -3962,6 +3972,7 @@ export const it: TranslationStructure = {
     trayStopAllConfirmBody: 'Le sessioni degli agenti in esecuzione su questo computer termineranno, e telefono e browser non potranno raggiungerlo finché non riapri Happier.',
     trayStopConfirmAction: 'Arresta',
     trayActionFailedTitle: 'Non è andato a buon fine',
+    trayQuitWaitForSystemTasks: "Happier sta ancora configurando o rimuovendo componenti. Attendi il completamento, poi prova di nuovo a uscire.",
     trayLoginItemFailed: 'Impossibile aggiornare l’elemento di login di Happier',
     traySessions: ({ count }: { count: string }) => `Sessioni: ${count}`,
     closeStopTitle: 'Ci sono ancora sessioni agente in corso',
@@ -4323,6 +4334,39 @@ export const it: TranslationStructure = {
     },
 
   settingsProviders: {
+        sessionRetention: {
+            invalidSettings: "Correggi il JSON delle impostazioni Claude e riconnetti il computer per riprovare.",
+            permissionDenied: "Consenti l’accesso al file delle impostazioni Claude e riconnetti il computer.",
+            writeFailed: "Impossibile salvare le impostazioni Claude. Controlla l’accesso al file e riconnetti il computer.",
+            managedUnreadable: "Impossibile leggere le impostazioni dell’organizzazione. Controlla i permessi in Claude prima di modificare la conservazione.",
+            group: "Gruppo",
+            title: "Conservazione sessioni",
+            footer: "Configura la conservazione di Claude a livello utente su tutte le tue macchine. Le impostazioni del progetto, dell’organizzazione o di avvio esplicito possono sostituirla.",
+            policy: "Conserva cronologia locale",
+            unmanaged: "Mantieni impostazioni esistenti",
+            unmanagedHint: "Interrompi la gestione; le modifiche precedenti restano.",
+            providerDefault: "Predefinito Claude",
+            providerDefaultHint: "Rimuovi il periodo utente e usa quello predefinito di Claude.",
+            year: "1 anno (365 giorni)",
+            century: "100 anni (36.500 giorni)",
+            custom: "Giorni personalizzati",
+            customDays: "Numero di giorni",
+            invalidDays: "Inserisci un numero intero positivo di giorni.",
+            machines: "Stato dei computer",
+            noMachines: "I computer associati appariranno qui.",
+            native: "Claude nativo",
+            profile: "Profilo",
+            applied: "Configurato",
+            unmanagedStatus: "Non gestito",
+            pending: "In attesa del computer",
+            unknown: "Aggiorna il daemon per vedere lo stato",
+            error: "Impossibile applicare la conservazione",
+            managed: "Le regole dell’organizzazione possono prevalere sulla conservazione",
+            offline: "Offline · ultimo stato confermato",
+            confirmTitle: "Ridurre la conservazione Claude?",
+            confirmBody: "Un periodo più breve può consentire a Claude di eliminare la vecchia cronologia locale. La cronologia eliminata non è recuperabile. Le impostazioni del progetto o dell’organizzazione possono prevalere.",
+            confirmAction: "Applica conservazione",
+        },
         title: "Impostazioni del provider IA",
         entrySubtitle: "Configura opzioni specifiche del provider",
         footer:
@@ -5208,6 +5252,8 @@ export const it: TranslationStructure = {
       hiddenInactiveSessionsEmptyStateSubtitle: "Le sessioni inattive sono nascoste in questo elenco",
       hiddenInactiveSessionsSectionTitle: "Sessioni inattive",
       hiddenInactiveSessionsSectionSubtitle: "Nascoste nell'elenco principale perché lì vengono mostrate solo le chat attive",
+    sessionListGroupGitWorktrees: "Raggruppa i worktree Git per repository",
+    sessionListGroupGitWorktreesSubtitle: "Mantieni insieme le sessioni dello stesso repository. Disattiva per raggruppare per directory.",
     sessionListActiveGrouping: "Raggruppamento sessioni attive",
     sessionListActiveGroupingSubtitle:
       "Scegli come raggruppare le sessioni attive nella barra laterale",
@@ -5782,6 +5828,7 @@ export const it: TranslationStructure = {
       resetBody: ({ time }: { time: string }) =>
         `Questo provider chiede alla sessione di attendere fino a ${time} prima di continuare.`,
       genericBody: "Questo provider chiede alla sessione di attendere prima di continuare.",
+      stoppedBody: "Il recupero automatico si è interrotto e non riproverà da solo. Riprova qui sotto.",
       resetCreditBody: ({ count }: { count: number }) =>
         `${count} ${count === 1 ? "reset di utilizzo disponibile" : "reset di utilizzo disponibili"}.`,
       resetCreditExpiresBody: ({ count, time }: { count: number; time: string }) =>
@@ -6876,7 +6923,7 @@ export const it: TranslationStructure = {
   },
 
   sessionDrafts: {
-    sectionTitle: 'Bozze', badge: 'Bozza', untitled: 'Bozza senza titolo', continueEditing: 'Continua a modificare', startAnother: 'Iniziane un’altra',
+    sectionTitle: 'Bozze', badge: 'Bozza', untitled: 'Bozza senza titolo', continueEditing: 'Continua a modificare', startAnother: 'Iniziane un’altra', startedOpen: "Sessione avviata · Apri",
     status: { offline: 'Non in linea', syncing: 'Sincronizzazione', conflict: 'Conflitto', machineUnavailable: 'Computer non disponibile', attachmentNeedsAttention: 'Allegato da controllare', startInterrupted: 'Avvio interrotto' },
     new: { action: 'Nuova bozza' }, delete: { action: 'Elimina bozza', confirmTitle: 'Eliminare la bozza?', confirmDescription: 'Questa bozza verrà rimossa dai tuoi dispositivi.' },
     conflict: { title: 'Conflitto della bozza', description: 'Questo campo è cambiato su un altro dispositivo.', mine: 'Su questo dispositivo', synced: 'Sincronizzato', useSynced: 'Usa sincronizzato', keepDevice: 'Mantieni dispositivo', copyMine: 'Copia il mio', copied: 'Copiato', copyFailed: 'Impossibile copiare', field: { text: 'Testo', mentions: 'Menzioni', attachments: 'Allegati', recipient: 'Destinatario', agentContinuation: 'Continuazione agente', executionRunDelivery: 'Consegna esecuzione' } },
@@ -7270,8 +7317,12 @@ export const it: TranslationStructure = {
   },
 
   agentInput: {
+      keepKeyboard: { label: "Tieni aperta la tastiera dopo l’invio" },
+      historyPosition: ({ index, total }: { index: number; total: number }) => `${index} di ${total}`,
       sendOptions: {
           title: "Opzioni di invio",
+          sendAndStartAnother: "Invia e iniziane un’altra",
+          sendAndOpen: "Invia e apri la sessione",
           queue: "Accoda",
           hint: "Tieni premuto per scegliere come inviare",
       },
@@ -7674,7 +7725,10 @@ export const it: TranslationStructure = {
     },
     askUserQuestion: {
         submit: "Invia risposta",
+        dismiss: 'Ignora la domanda',
+        dismissed: 'Domanda ignorata',
         submissionFailures: {
+            unconfirmed: "Happier non ha potuto confermare la tua risposta. Riprova oppure apri il terminale Claude per verificarla.",
             update: "Aggiorna Happier CLI e riprova.",
             reconnect: "Riconnetti questa sessione e riprova.",
             retry: "La risposta non è stata accettata. Controllala e riprova.",
@@ -8641,6 +8695,7 @@ export const it: TranslationStructure = {
 settingsSession: {
     terminalHostTitle: 'Host terminale per le nuove sessioni',
     terminalHostNone: 'Nessun host terminale',
+    newSessionAfterSend: { title: "Dopo l’invio", footer: "Scegli cosa succede quando invii dall’editor di nuova sessione. Tieni premuto Invia per scegliere l’altra opzione per un solo messaggio.", openTitle: "Apri la sessione", openSubtitle: "Vai alla sessione appena si avvia.", startAnotherTitle: "Resta e iniziane un’altra", startAnotherSubtitle: "Continua l’avvio in background e apri una nuova bozza." },
     newSessionDraftEntry: {
         title: 'Bozze di nuova sessione',
         footer: 'Scegli se Nuova sessione continua la bozza di questo dispositivo o ne apre una nuova.',
@@ -8814,6 +8869,10 @@ settingsSession: {
           resetHiddenSubtitle: 'Cancella i banner nascosti su questo dispositivo.',
       },
       inputBehavior: {
+          keepFocusTitle: "Mantieni l’editor attivo dopo l’invio",
+          keepFocusSubtitle: "Resta nel campo del messaggio per scrivere subito il successivo.",
+          typeToFocusTitle: "Scrivi da qualsiasi punto",
+          typeToFocusSubtitle: "Inizia a digitare fuori da un campo di testo per passare al campo del messaggio.",
           title: 'Comportamento dell\'immissione',
           footer: 'Configura Invio con Enter e il comportamento della cronologia dei messaggi.',
           enterToSendEnabledNativeSubtitle: 'Premi Invio per inviare',
@@ -8926,6 +8985,8 @@ settingsSession: {
         customResumePromptPlaceholder: "Continua da dove eri rimasto.",
       },
       providerUsageGauge: {
+          numberTitle: "Numero al centro degli anelli",
+          numberSubtitle: "Scegli il limite per il numero negli anelli. Se non è disponibile, viene usato quello più restrittivo.",
         title: "Uso del provider",
         footer:
           "Scegli gli indicatori del compositore per tutti gli account. Rispettano i limiti selezionati in ogni pool. I preferiti aggiungono indicatori per l’account attivo.",
@@ -11149,7 +11210,15 @@ settingsSession: {
     },
     cliPath: {
       title: "Terminale",
-      footer: "Happier Desktop aggiunge o rimuove solo le voci PATH che ha creato; quelle scritte dall'installer della shell restano intatte.",
+      footer: "Happier Desktop modifica solo le voci PATH che ha creato; quelle del programma di installazione shell restano invariate.",
+      cleanupTitle: "Rimuovi componenti Desktop",
+      cleanupSubtitle: "Rimuovi la riga di comando e i servizi di Desktop, poi esci.",
+      cleanupConfirmTitle: "Rimuovere i componenti Desktop e uscire?",
+      cleanupConfirmBody: "Questa azione rimuove i file della riga di comando, le voci PATH e i servizi di Desktop quando nessun’altra app Desktop ne ha bisogno. I componenti condivisi o installati da te vengono conservati, così come la cronologia delle sessioni e i dati dell’account. I servizi rimossi vengono arrestati, il che può interrompere le sessioni in corso e l’accesso remoto.\n\nDesktop si chiuderà dopo la pulizia. Rimuovi poi l’app tramite il sistema operativo; su macOS o Linux portatile, rimuovi il pacchetto o il file dell’app. Riaprendo Desktop, i componenti potrebbero essere configurati di nuovo.",
+      cleanupConfirmAction: "Rimuovi componenti ed esci",
+      cleanupBusy: "Rimozione dei componenti Desktop…",
+      cleanupFailed: "La pulizia non è terminata. Riprova.",
+      cleanupQuitFailed: "La pulizia è terminata, ma Desktop non è riuscito a chiudersi. Chiudi l’app prima di rimuoverla.",
       addTitle: "Aggiungi happier al PATH",
       addSubtitle: "Rendi disponibile il comando happier nei nuovi terminali.",
       removeTitle: "Rimuovi happier dal PATH",
@@ -11258,11 +11327,16 @@ settingsSession: {
   },
 
   message: {
+    provenanceFrom: ({ source }: { source: string }) => `Da ${source}`,
+    provenanceSession: 'Sessione',
     sessionReferenceUnavailable: "Sessione non disponibile",
     sessionReferenceOpen: ({ name }: { name: string }) => `Apri la sessione ${name}`,
     switchedToMode: ({ mode }: { mode: string }) =>
       `Passato alla modalità ${mode}`,
     discarded: "Scartato",
+    readAloudA11y: "Leggi ad alta voce",
+    stopReadAloudA11y: "Interrompi la lettura ad alta voce",
+    readAloudFailed: "Impossibile leggere questo messaggio ad alta voce. Controlla le impostazioni vocali.",
     recoveredHistory: "Cronologia recuperata",
     unknownEvent: "Evento sconosciuto",
     contextCompactionStarted: "Compattazione del contesto...",
@@ -11311,7 +11385,7 @@ settingsSession: {
     sessionRunningLocally:
       "Questa sessione è in esecuzione localmente su questo computer. Puoi passare a remoto per controllarla dall’app.",
     sessionRunningLocallyAndRemotely:
-      "Questa sessione è collegata localmente in OpenCode ed è ancora controllabile dall’app.",
+      "Questa sessione è collegata localmente ed è ancora controllabile dall’app.",
     switchingToRemote: "Passaggio alla modalità remota…",
     switchToRemote: "Passa a remoto",
     detachLocalTerminal: "Scollega terminale",
@@ -11391,6 +11465,13 @@ settingsSession: {
       codeCopied: "Codice copiato",
       copyFailed: "Copia non riuscita",
       mermaidRenderFailed: "Impossibile renderizzare il diagramma mermaid",
+      table: {
+          open: "Apri tabella",
+          copyCsv: "Copia come CSV",
+          copyMarkdown: "Copia come Markdown",
+          csvLabel: "CSV",
+          viewerTitle: "Tabella",
+      },
       diffLabel: "Differenze",
       codeLabel: "Codice",
 

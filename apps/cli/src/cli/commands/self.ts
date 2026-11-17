@@ -36,6 +36,7 @@ import { maybeRunDoctorRepair } from './self/maybeRunDoctorRepair';
 import { resolveRunningCliPackageManagerOrigin } from '@/cli/runtime/update/cliUpdateFacts';
 import { reportUpdaterAdmission } from '@/cli/runtime/update/updaterAdmission';
 import {
+  assertWindowsCliUpdateIsOutsideManagedProcessTree,
   quiesceInstalledCliWindowsPayloadOwners,
   resolvePayloadOwnerStopTimeoutMs,
 } from '@/cli/runtime/update/quiesceInstalledCliWindowsPayloadOwners';
@@ -58,7 +59,7 @@ function usage(): string {
     `${chalk.bold('Channels:')}`,
     `  stable  → npm dist-tag ${cmd('latest')}`,
     `  preview → npm dist-tag ${cmd('next')}`,
-    `  dev     → npm dist-tag ${cmd('next')} (${chalk.gray('dev rolling binaries')})`,
+    `  dev     → npm dist-tag ${cmd('dev')} (${chalk.gray('dev rolling binaries')})`,
     '',
     `${chalk.bold('Environment:')}`,
     `  HAPPIER_CLI_UPDATE_CHECK=0                 Disable update notice + background check`,
@@ -110,8 +111,10 @@ function readPackageJsonVersion(path: string): string | null {
   }
 }
 
-function resolveSelfNpmDistTag(channel: SelfChannel): 'latest' | 'next' {
-  return channel === 'stable' ? 'latest' : 'next';
+function resolveSelfNpmDistTag(channel: SelfChannel): 'latest' | 'next' | 'dev' {
+  if (channel === 'stable') return 'latest';
+  if (channel === 'publicdev') return 'dev';
+  return 'next';
 }
 
 function resolveSelfReleaseChannel(params: Readonly<{
@@ -233,7 +236,7 @@ async function cmdCheck(argv: string[], rawArgv: readonly string[] = process.arg
   const invokerVersion = configuration.currentCliVersion;
   const current = runtimeVersion || invokerVersion || null;
 
-  // Rejects cross-channel results itself (preview/dev share the `next` dist-tag).
+  // Rejects cross-channel results itself; preview and dev use separate npm dist-tags.
   recordCliUpdateCheck({
     homeDir: configuration.happyHomeDir,
     publicReleaseRing: channel,
@@ -302,6 +305,8 @@ async function cmdUpdate(argv: string[], rawArgv: readonly string[] = process.ar
     return { channel, targetVersion: v || undefined };
   })();
   const processEnv = { ...process.env, HAPPIER_HOME_DIR: configuration.happyHomeDir };
+
+  await assertWindowsCliUpdateIsOutsideManagedProcessTree();
 
   // Observed before anything changes: on Windows the update stops the payload's processes (every
   // relay's daemon), and only this observation still knows which service daemons must come back.
@@ -442,6 +447,10 @@ async function cmdInternalInstallPayload(argv: string[], rawArgv: readonly strin
     throw new Error('--version is required');
   }
 
+  if (componentId === 'happier-cli') {
+    await assertWindowsCliUpdateIsOutsideManagedProcessTree();
+  }
+
   // On Windows promotion stops every daemon of the payload (every relay's); the service daemons
   // observed running here come back afterwards through the same rule `self update` uses.
   const windowsServiceRestart = componentId === 'happier-cli' && process.platform === 'win32'
@@ -497,7 +506,7 @@ export async function handleSelfCliCommand(context: CommandContext): Promise<voi
   try {
     const argv = context.args.slice(1);
     const sub = argv[0] ?? 'help';
-    if (sub === 'help' || sub === '--help' || sub === '-h') {
+    if (sub === 'help' || argv.includes('--help') || argv.includes('-h')) {
       console.log(usage());
       return;
     }

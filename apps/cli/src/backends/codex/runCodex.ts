@@ -442,9 +442,7 @@ export async function runCodex(opts: {
          */
         localId?: string | null;
         model?: string;
-        promptMetadata?: unknown;
         suppressUserEcho?: boolean;
-        providerPromptAlreadyResolved?: boolean;
         pendingProviderAction?: import('@/agent/runtime/modeMessageQueue').PendingProviderAction;
     }
 
@@ -1275,7 +1273,6 @@ export async function runCodex(opts: {
             ...resolveAppendSystemPromptModeOverride(message.meta),
             localId: message.localId ?? null,
             model: messageModel,
-            promptMetadata: message.meta,
             ...(info?.pendingProviderAction ? { pendingProviderAction: info.pendingProviderAction } : {}),
         };
 
@@ -1300,6 +1297,7 @@ export async function runCodex(opts: {
                         message: text,
                         text,
                         mode: enhancedMode,
+                        providerPromptMeta: message.meta,
                         userMessageSeq,
                         userMessageLocalIds: localIds,
                         providerAcceptancePending: info?.providerAcceptancePending === true,
@@ -1336,7 +1334,6 @@ export async function runCodex(opts: {
                 const resolvedMode: EnhancedMode = {
                     ...enhancedMode,
                     suppressUserEcho: true,
-                    providerPromptAlreadyResolved: true,
                 };
                 const exactSteerLocalId = boundSteer ? message.localId ?? undefined : undefined;
                 const exactSteerBinding = boundSteer?.binding;
@@ -1433,6 +1430,7 @@ export async function runCodex(opts: {
                         });
                         return;
                     }
+                    liveSteerReplaySeedRetirement.register(localIds.length === 1 ? localIds[0] : null, null);
                     if (isConditionalSteer) {
                         await blockProviderPromptDeliveryBeforeAcceptance({
                             localIds, reason: 'steering_unavailable', userMessageSeq, providerEffect: 'none',
@@ -1441,9 +1439,10 @@ export async function runCodex(opts: {
                     }
                     pushMessageToQueueWithSpecialCommands({
                         queue: messageQueue,
-                        message: providerPromptText,
-                        text: providerPromptText,
+                        message: text,
+                        text,
                         mode: resolvedMode,
+                        providerPromptMeta: message.meta,
                         userMessageSeq,
                         userMessageLocalIds: localIds,
                         providerAcceptancePending: info?.providerAcceptancePending === true,
@@ -1469,6 +1468,7 @@ export async function runCodex(opts: {
             message: text,
             text,
             mode: enhancedMode,
+            providerPromptMeta: message.meta,
             userMessageSeq,
             userMessageLocalIds: normalizeProviderPromptLocalIds([message.localId ?? null]),
             providerAcceptancePending: info?.providerAcceptancePending === true,
@@ -2792,9 +2792,7 @@ export async function runCodex(opts: {
                     permissionModeUpdatedAt: message.mode.permissionModeUpdatedAt,
                 });
 
-                const specialCommand: SpecialCommandResult = message.mode.providerPromptAlreadyResolved
-                    ? { type: null }
-                    : parseSpecialCommand(message.message);
+                const specialCommand: SpecialCommandResult = parseSpecialCommand(message.message);
                 if (specialCommand.type === 'clear') {
                     logger.debug('[Codex] Handling /clear command - resetting session');
                 if (client) {
@@ -2860,7 +2858,7 @@ export async function runCodex(opts: {
                 let resolvedProviderDispatch: Readonly<{ text: string; metadata: unknown }> | null = null;
                 // Prompt finalization runs once per queued message and owns BOTH the provider
                 // prompt text and the dispatch metadata: every Codex send/steer below reads
-                // `metadata` from here, never from `message.mode.promptMetadata` directly, so
+                // `metadata` from here, never from `message.providerPromptMeta` directly, so
                 // composer references cannot reach `turnInput.ts` unresolved (R-10).
                 const resolveProviderDispatch = async (): Promise<Readonly<{ text: string; metadata: unknown }>> => {
                     if (resolvedProviderDispatch !== null) return resolvedProviderDispatch;
@@ -2868,9 +2866,9 @@ export async function runCodex(opts: {
                         sessionClient: session,
                         text: message.message,
                         localId,
-                        replaySeedAllowed: specialCommand.type === null && !message.mode.providerPromptAlreadyResolved,
+                        replaySeedAllowed: specialCommand.type === null,
                         didBootstrap: didReplaySeedBootstrap,
-                        metadata: message.mode.promptMetadata,
+                        metadata: message.providerPromptMeta,
                         catalogs: codexDispatchCatalogReaders(),
                     });
                     didReplaySeedBootstrap = dispatchResolution.didBootstrap;

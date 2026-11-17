@@ -32,6 +32,7 @@ import { createManagedChildProcess } from '@/subprocess/supervision/managedChild
 import { resolveJavaScriptRuntimeExecutable } from '@/runtime/js/resolveJavaScriptRuntimeExecutable'
 import { buildMissingJavaScriptRuntimeMessage } from '@/runtime/js/buildMissingJavaScriptRuntimeMessage'
 import { prepareClaudeSubprocessEnv } from '@/backends/claude/spawn/buildClaudeSubprocessEnv'
+import { resolveClaudeLaunchSettingsOverlayArg } from '@/backends/claude/utils/resolveClaudeLaunchSettingsOverlay'
 import { spawnBackgroundSync, resolveWindowsCommandInvocation } from '@happier-dev/cli-common/process'
 import { resolveExistingManagedJavaScriptRuntimeCommand } from '@happier-dev/cli-common/providers'
 import { killProcessTree } from '@/agent/runtime/process/killProcessTree'
@@ -364,6 +365,9 @@ export async function query(config: {
 	    } = config
 
     const envOverlay = env ?? {}
+    const isCommandOnly = pathToClaudeCodeExecutable === 'claude'
+    const baseEnv = isCommandOnly ? getCleanEnv() : process.env
+    const spawnEnv = prepareClaudeSubprocessEnv({ baseEnv, envOverlay })
 
     // Build command arguments
     const args = ['--output-format', 'stream-json', '--verbose']
@@ -388,7 +392,6 @@ export async function query(config: {
 	    if (permissionMode && (forcePermissionMode || permissionMode !== 'default')) {
 	        args.push('--permission-mode', permissionMode)
 	    }
-	    if (settingsPath) args.push('--settings', settingsPath)
 
 	    if (fallbackModel) {
         if (model && fallbackModel === model) {
@@ -402,12 +405,21 @@ export async function query(config: {
 	        args.push(...extraArgs);
 	    }
 
+        const settingsOverlay = resolveClaudeLaunchSettingsOverlayArg({
+            args,
+            settingsPath,
+            launchSettings: {},
+            cwd: cwd,
+            env: { ...baseEnv, ...envOverlay, ...spawnEnv },
+        })
+	    if (settingsOverlay) args.push('--settings', settingsOverlay)
+
+
     // Determine how to spawn Claude Code
     // - If it's a .js/.cjs file → spawn the resolved JS runtime with [path, ...args]
     // - If it's just 'claude' command → resolve + wrap on Windows (PATHEXT .cmd/.bat)
     // - If it's a full path to binary → spawn(path, args)
     const isJsFile = pathToClaudeCodeExecutable.endsWith('.js') || pathToClaudeCodeExecutable.endsWith('.cjs')
-    const isCommandOnly = pathToClaudeCodeExecutable === 'claude'
     const isFirstPartyWrapper = pathToClaudeCodeExecutable === resolveCliRuntimeAssetPath('scripts', 'claude_remote_launcher.cjs')
     const isBunRuntime = typeof process.versions.bun === 'string'
     const resolvedExecutable =
@@ -429,8 +441,6 @@ export async function query(config: {
 
     // Spawn Claude Code process
     // Use clean env for global claude to avoid local node_modules/.bin taking precedence
-    const baseEnv = isCommandOnly ? getCleanEnv() : process.env
-    const spawnEnv = prepareClaudeSubprocessEnv({ baseEnv, envOverlay })
     logClaudeRuntimeAuthEnvDiagnostic({
         logPrefix: 'claudeSdkQuery',
         sessionId: null,

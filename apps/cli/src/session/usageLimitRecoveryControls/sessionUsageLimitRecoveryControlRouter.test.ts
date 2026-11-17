@@ -231,6 +231,39 @@ describe('sessionUsageLimitRecoveryControlRouter', () => {
       .toBeGreaterThan(cancelled.armedAtMs);
   });
 
+  it.each([
+    ['stopped', 'cancelled', 'usage_limit_recovery_stopped'],
+    ['dead-lettered', 'exhausted', 'max_attempts_exhausted'],
+] as const)('re-arms a %s daemon attempt as a fresh wait for the current issue, detached from that attempt', async (_label, status, lastProbeError) => {
+    const issue = createUsageLimitIssue();
+    const terminal = {
+      v: 1, status, issueFingerprint: 'usage-limit:codex:turn-1:1699999999000:no-reset',
+      runtimeAuthRecoveryAttemptId: 'dead-attempt', armedAtMs: 1_700_000_001_000,
+      resetAtMs: null, nextCheckAtMs: null, attemptCount: 3, maxAttempts: 3,
+      lastProbeError, resumePromptMode: 'standard', selectedAuth: { kind: 'native' },
+    };
+
+    await routeSessionUsageLimitRecoveryWaitResumeEnable({
+      token: 'token', credentials: createCredentials(), sessionId: 'sess_1',
+      rawSession: createRawSession({ latestTurnStatus: 'failed', lastRuntimeIssue: issue }),
+      metadata: createMetadata({ sessionUsageLimitRecoveryV1: terminal }),
+      currentMachineId: 'machine-local', ctx, mode: 'plain',
+      request: { sessionId: 'sess_1', issueFingerprint: terminal.issueFingerprint },
+      callLiveSessionRpc: vi.fn(), resolveAdapter: vi.fn(),
+    });
+
+    const persisted = lastMetadataUpdaterResult({ sessionUsageLimitRecoveryV1: terminal })
+      .sessionUsageLimitRecoveryV1 as Record<string, unknown>;
+    expect(persisted).toMatchObject({
+      status: 'waiting', attemptCount: 0, lastProbeError: null,
+      issueFingerprint: buildUsageLimitIssueFingerprint(issue),
+      resetAtMs: issue.usageLimit?.resetAtMs,
+      nextCheckAtMs: issue.usageLimit?.resetAtMs,
+    });
+    expect(persisted).not.toHaveProperty('runtimeAuthRecoveryAttemptId');
+    expect(persisted.armedAtMs).toBeGreaterThan(terminal.armedAtMs);
+  });
+
   it('preserves an existing inactive recovery resumePromptMode when re-arming without explicit input', async () => {
     const recovery = {
       v: 1,
@@ -987,6 +1020,35 @@ describe('sessionUsageLimitRecoveryControlRouter', () => {
       expect(liveRpc).not.toHaveBeenCalled();
       expect(scheduler.readForSession('sess_owner')[0]?.attemptId).toBe(begun.attemptId);
     } finally { scheduler.dispose(); }
+  });
+
+  it('routes historical 45ms enrichment to the owning attempt and excludes a newer failed turn', async () => {
+    const first = { ...createUsageLimitIssue({ resetAtMs: null }), provider: 'claude', providerTurnId: undefined,
+      occurredAt: 1793871333659 };
+    const issue = { ...first, occurredAt: 1793871333704,
+      usageLimit: { ...first.usageLimit, resetAtMs: 1794283200000 } };
+    const metadata = createMetadata({ sessionUsageLimitRecoveryV1: {
+      v: 1, status: 'waiting', issueFingerprint: buildUsageLimitIssueFingerprint(first),
+      runtimeAuthRecoveryAttemptId: 'same-failed-turn', armedAtMs: 1793871335690,
+      resetAtMs: null, nextCheckAtMs: null, attemptCount: 0, maxAttempts: 5,
+      lastProbeError: null, selectedAuth: { kind: 'native' },
+    } });
+    const params = { token: 'token', credentials: createCredentials(), sessionId: 'historical-owner',
+      rawSession: createRawSession({ id: 'historical-owner', latestTurnStatus: 'failed', lastRuntimeIssue: issue }),
+      metadata, currentMachineId: 'machine-local', ctx, mode: 'plain' as const,
+      callLiveSessionRpc: async () => undefined };
+    // This callback is the daemon transport boundary, not a stub of recovery policy.
+    const checkOwner = vi.fn(async () => ({ ok: true, status: 'waiting' }));
+    expect(parseOperationResult(await routeSessionUsageLimitRecoveryCheckNow({ ...params,
+      checkRuntimeAuthUsageLimitRecovery: checkOwner,
+    }))).toMatchObject({ ok: true, status: 'waiting' });
+    expect(checkOwner).toHaveBeenCalledWith({ sessionId: 'historical-owner', attemptId: 'same-failed-turn' });
+    checkOwner.mockClear();
+    await routeSessionUsageLimitRecoveryCheckNow({ ...params,
+      rawSession: { ...params.rawSession, lastRuntimeIssue: { ...issue, occurredAt: 1793871335691, providerTurnId: 'new-turn' } },
+      checkRuntimeAuthUsageLimitRecovery: checkOwner,
+    });
+    expect(checkOwner).not.toHaveBeenCalled();
   });
 
   it('keeps unowned native off mode passive when its backoff adapter becomes ready', async () => {

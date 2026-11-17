@@ -144,13 +144,13 @@ export async function findV2SessionListRowById(params: Readonly<{
             userId,
             sessionId,
             visibilityWhere,
-            select: createV2SessionRowByIdSelect({ userId }),
+            select: createV2SessionRowByIdSelect({ userId, pendingBlockedNoEffectCountSessionId: sessionId }),
         }),
         () => findV2SessionListRowByIdWithSelect({
             userId,
             sessionId,
             visibilityWhere,
-            select: createV2SessionListLegacyRowSelect({ userId }),
+            select: createV2SessionListLegacyRowSelect({ userId, pendingBlockedNoEffectCountSessionId: sessionId }),
         }),
     );
 }

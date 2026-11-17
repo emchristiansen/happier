@@ -14,6 +14,7 @@ import { resolveModelOverrideFromMetadataSnapshot } from '@/agent/runtime/permis
 import { resolveSessionConfigOptionOverridesFromMetadataSnapshot } from '@/agent/runtime/sessionConfigOptionOverrideSync';
 import { summarizeSessionRecord, type SessionSummary } from '@/cli/output/session/sessionSummary';
 import { decryptSessionPayload } from '@/session/transport/encryption/sessionEncryptionContext';
+import { SessionResponseIdMismatchError } from '@/session/transport/http/sessionsHttp';
 import {
   readLatestAgentStateSummaryViaSocket,
   summarizeAgentState,
@@ -161,10 +162,16 @@ export async function getSessionStatus(params: Readonly<{
   idOrPrefix: string;
   live: boolean;
 }>): Promise<GetSessionStatusResult> {
-  const sessionTarget = await resolveSessionTransportContext({
-    credentials: params.credentials,
-    idOrPrefix: params.idOrPrefix,
-  });
+  let sessionTarget: Awaited<ReturnType<typeof resolveSessionTransportContext>>;
+  try {
+    sessionTarget = await resolveSessionTransportContext({
+      credentials: params.credentials,
+      idOrPrefix: params.idOrPrefix,
+    });
+  } catch (error) {
+    if (error instanceof SessionResponseIdMismatchError) return { ok: false, code: 'unsupported' };
+    throw error;
+  }
   if (!sessionTarget.ok) {
     return {
       ok: false,

@@ -4,7 +4,7 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { ToolViewProps } from '../core/_registry';
 import { resolvePermissionRequestId } from '../core/resolvePermissionRequestId';
 import { ToolSectionView } from '../../shell/presentation/ToolSectionView';
-import { sessionAllowWithAnswers } from '@/sync/ops';
+import { sessionAllowWithAnswers, sessionDeny } from '@/sync/ops';
 import { storage, useSession, useSettingMutable } from '@/sync/domains/state/storage';
 import { Modal } from '@/modal';
 import { t } from '@/text';
@@ -62,7 +62,7 @@ interface AskUserQuestionInput {
     happierDialog?: unknown;
 }
 
-type SubmissionFailureGuidance = 'update' | 'reconnect' | 'retry';
+type SubmissionFailureGuidance = 'update' | 'reconnect' | 'retry' | 'unconfirmed';
 
 function resolveSubmissionFailureGuidance(error: unknown): SubmissionFailureGuidance | null {
     switch (readRpcErrorCode(error)) {
@@ -71,6 +71,8 @@ function resolveSubmissionFailureGuidance(error: unknown): SubmissionFailureGuid
             return 'update';
         case PUBLIC_RPC_HANDLER_ERROR_CODES.STRUCTURED_QUESTION_RECEIVER_NOT_OWNER:
             return 'reconnect';
+        case PUBLIC_RPC_HANDLER_ERROR_CODES.STRUCTURED_QUESTION_SUBMISSION_UNCONFIRMED:
+            return 'unconfirmed';
         case PUBLIC_RPC_HANDLER_ERROR_CODES.STRUCTURED_QUESTION_INVALID:
         case PUBLIC_RPC_HANDLER_ERROR_CODES.STRUCTURED_QUESTION_LEGACY_INVALID:
         case PUBLIC_RPC_HANDLER_ERROR_CODES.STRUCTURED_QUESTION_LEGACY_AMBIGUOUS:
@@ -116,6 +118,18 @@ function parseAskUserQuestionAnswersFromToolResult(result: unknown): Record<stri
         }
     }
     return answers;
+}
+
+function isPendingAskUserQuestionRequest(request: unknown): boolean {
+    if (!request || typeof request !== 'object' || !('tool' in request) || request.tool !== 'AskUserQuestion') return false;
+    return resolveAgentRequestKind({ toolName: request.tool, requestKind: 'kind' in request ? request.kind : undefined }) === 'user_action';
+}
+
+function isDeclinedQuestionResult(result: unknown): boolean {
+    if (typeof result === 'string') {
+        try { return isDeclinedQuestionResult(JSON.parse(result) as unknown); } catch { return false; }
+    }
+    return Boolean(result && typeof result === 'object' && 'status' in result && result.status === 'declined');
 }
 
 function keepFreeformTouchInsideInput(event: GestureResponderEvent): void {
@@ -238,9 +252,12 @@ const styles = StyleSheet.create((theme) => ({
     },
     actionsContainer: {
         flexDirection: 'row',
+        flexWrap: 'wrap',
         gap: 12,
         marginTop: 8,
-        justifyContent: 'flex-end',
+    },
+    submitButtonTrailing: {
+        marginLeft: 'auto',
     },
     submitButton: {
         backgroundColor: theme.colors.button.primary.background,
@@ -285,7 +302,7 @@ export const AskUserQuestionView = React.memo<ToolViewProps>(({ tool, sessionId,
     const [selections, setSelections] = React.useState<Map<number, Set<number>>>(new Map());
     const [freeformAnswers, setFreeformAnswers] = React.useState<Map<number, string>>(new Map());
     const [isSubmitting, setIsSubmitting] = React.useState(false);
-    const [isSubmitted, setIsSubmitted] = React.useState(false);
+    const [submissionOutcome, setSubmissionOutcome] = React.useState<'answered' | 'dismissed' | null>(null);
     const [submissionGuidance, setSubmissionGuidance] = React.useState<SubmissionFailureGuidance | null>(null);
     const [, setWorkspaceTrust] = useSettingMutable('claudeUnifiedTerminalWorkspaceTrust');
     const [, setResumeChoice] = useSettingMutable('claudeUnifiedTerminalResumeChoice');
@@ -314,11 +331,9 @@ export const AskUserQuestionView = React.memo<ToolViewProps>(({ tool, sessionId,
     const isRunning = tool.state === 'running';
     const canApprovePermissions = interaction?.canApprovePermissions ?? true;
     const toolCallId = resolvePermissionRequestId(tool);
-    const activeMatchingRequest = toolCallId ? (session as any)?.agentState?.requests?.[toolCallId] : null;
-    const hasActiveAskUserQuestionRequest =
-        activeMatchingRequest?.tool === 'AskUserQuestion' &&
-        resolveAgentRequestKind({ toolName: activeMatchingRequest.tool, requestKind: activeMatchingRequest.kind }) === 'user_action';
-    const canInteract = isRunning && !isSubmitted && !isSubmitting && canApprovePermissions && hasActiveAskUserQuestionRequest;
+    const activeMatchingRequest = toolCallId ? session?.agentState?.requests?.[toolCallId] : null;
+    const hasActiveAskUserQuestionRequest = isPendingAskUserQuestionRequest(activeMatchingRequest);
+    const canInteract = isRunning && !submissionOutcome && !isSubmitting && canApprovePermissions && hasActiveAskUserQuestionRequest;
     const disabledMessage =
         interaction?.permissionDisabledReason === 'public'
             ? t('session.sharing.permissionApprovalsDisabledPublic')
@@ -482,11 +497,8 @@ export const AskUserQuestionView = React.memo<ToolViewProps>(({ tool, sessionId,
             }
 
             const latestSession = storage.getState().sessions[sessionId];
-            const latestRequest = (latestSession as any)?.agentState?.requests?.[toolCallId];
-            const hasLiveMatchingRequest =
-                latestRequest?.tool === 'AskUserQuestion' &&
-                resolveAgentRequestKind({ toolName: latestRequest.tool, requestKind: latestRequest.kind }) === 'user_action';
-            if (!hasLiveMatchingRequest) {
+            const latestRequest = latestSession?.agentState?.requests?.[toolCallId];
+            if (!isPendingAskUserQuestionRequest(latestRequest)) {
                 return;
             }
 
@@ -507,7 +519,7 @@ export const AskUserQuestionView = React.memo<ToolViewProps>(({ tool, sessionId,
             setSubmissionGuidance(null);
 
             await sessionAllowWithAnswers(sessionId, toolCallId, payload.send);
-            setIsSubmitted(true);
+            setSubmissionOutcome('answered');
             const dialog = input?.happierDialog;
             if (dialog && typeof dialog === 'object' && !Array.isArray(dialog)) {
                 const metadata = dialog as Record<string, unknown>;
@@ -541,7 +553,7 @@ export const AskUserQuestionView = React.memo<ToolViewProps>(({ tool, sessionId,
                 }
             }
         } catch (error) {
-            setIsSubmitted(false);
+            setSubmissionOutcome(null);
             const guidance = resolveSubmissionFailureGuidance(error);
             if (guidance) {
                 setSubmissionGuidance(guidance);
@@ -553,8 +565,37 @@ export const AskUserQuestionView = React.memo<ToolViewProps>(({ tool, sessionId,
         }
     }, [sessionId, questions, selections, effectiveFreeformAnswers, allQuestionsAnswered, input?.happierDialog, isSubmitting, setResumeChoice, setWorkspaceTrust, toolCallId]);
 
+    const handleDismiss = React.useCallback(async () => {
+        if (!sessionId || !toolCallId || !canInteract) return;
+        const latestRequest = storage.getState().sessions[sessionId]?.agentState?.requests?.[toolCallId];
+        if (!isPendingAskUserQuestionRequest(latestRequest)) return;
+        setIsSubmitting(true);
+        setSubmissionGuidance(null);
+        try {
+            await sessionDeny(sessionId, toolCallId, undefined, undefined, 'denied');
+            setSubmissionOutcome('dismissed');
+        } catch (error) {
+            const guidance = resolveSubmissionFailureGuidance(error);
+            if (guidance) setSubmissionGuidance(guidance);
+            else Modal.alert(t('common.error'), t('errors.failedToSendMessage'));
+        } finally {
+            setIsSubmitting(false);
+        }
+    }, [sessionId, toolCallId, canInteract]);
+
+    if (submissionOutcome === 'dismissed' || tool.permission?.status === 'denied' || (tool.state === 'completed' && isDeclinedQuestionResult(tool.result))) {
+        return (
+            <ToolSectionView>
+                <View style={styles.submittedContainer}>
+                    <Text style={styles.submittedValue}>{t('tools.askUserQuestion.dismissed')}</Text>
+                    {questions.map((question, index) => <Text key={index} style={styles.submittedHeader}>{question.question}</Text>)}
+                </View>
+            </ToolSectionView>
+        );
+    }
+
     // Show submitted state
-    if (isSubmitted || tool.state === 'completed') {
+    if (submissionOutcome === 'answered' || tool.state === 'completed') {
         const answersFromResult = parseAskUserQuestionAnswersFromToolResult(tool.result);
         return (
             <ToolSectionView>
@@ -728,29 +769,43 @@ export const AskUserQuestionView = React.memo<ToolViewProps>(({ tool, sessionId,
                 ) : null}
 
                 {(canInteract || isSubmitting) && (
-                    <View style={styles.actionsContainer}>
+                    <>
                         {requiresCliUpdate ? (
                             <Text style={styles.optionDescription}>{t('deps.ui.notAvailableUpdateCli')}</Text>
                         ) : null}
-                        <TouchableOpacity
-                            testID="ask-user-question.submit"
-                            accessibilityRole="button"
-                            accessibilityLabel={t('tools.askUserQuestion.submit')}
-                            style={[
-                                styles.submitButton,
-                                (!canSubmit || isSubmitting) && styles.submitButtonDisabled,
-                            ]}
-                            onPress={handleSubmit}
-                            disabled={!canSubmit || isSubmitting}
-                            activeOpacity={0.7}
-                        >
-                            {isSubmitting ? (
-                                <ActivitySpinner size="small" color={theme.colors.button.primary.tint} />
-                            ) : (
-                                <Text style={styles.submitButtonText}>{t('tools.askUserQuestion.submit')}</Text>
-                            )}
-                        </TouchableOpacity>
-                    </View>
+                        <View style={styles.actionsContainer}>
+                            <TouchableOpacity
+                                testID="ask-user-question.dismiss"
+                                accessibilityRole="button"
+                                accessibilityLabel={t('tools.askUserQuestion.dismiss')}
+                                style={[styles.optionButton, isSubmitting && styles.optionButtonDisabled]}
+                                onPress={handleDismiss}
+                                disabled={isSubmitting}
+                                activeOpacity={0.7}
+                            >
+                                <Text style={styles.optionLabel}>{t('tools.askUserQuestion.dismiss')}</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                                testID="ask-user-question.submit"
+                                accessibilityRole="button"
+                                accessibilityLabel={t('tools.askUserQuestion.submit')}
+                                style={[
+                                    styles.submitButton,
+                                    styles.submitButtonTrailing,
+                                    (!canSubmit || isSubmitting) && styles.submitButtonDisabled,
+                                ]}
+                                onPress={handleSubmit}
+                                disabled={!canSubmit || isSubmitting}
+                                activeOpacity={0.7}
+                            >
+                                {isSubmitting ? (
+                                    <ActivitySpinner size="small" color={theme.colors.button.primary.tint} />
+                                ) : (
+                                    <Text style={styles.submitButtonText}>{t('tools.askUserQuestion.submit')}</Text>
+                                )}
+                            </TouchableOpacity>
+                        </View>
+                    </>
                 )}
             </View>
         </ToolSectionView>

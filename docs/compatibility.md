@@ -327,6 +327,22 @@ native code through OTA. Remove the guard only when no supported binary eligible
 for these updates can lack the SDK. Native renderer fixes and app-link entitlement
 changes still require a native app build.
 
+### Android device CA trust (development)
+
+Android native builds from development source opt into both the platform system
+and user-installed CA stores through the Expo network-security configuration
+plugin. HTTP and WebSocket clients retain platform certificate-chain and hostname
+verification. The configuration consumes the same resolved cleartext setting as
+Expo build properties because Android gives network-security configuration
+precedence over the manifest's cleartext flag.
+
+Older installed binaries retain their original trust policy; neither a server
+update nor an OTA JavaScript update changes their native CA trust. A new native
+Android build is required. This introduces no JavaScript/native API requirement
+or relay protocol change, and does not change iOS, web, or desktop trust policy.
+Published release availability and device-level TLS confirmation remain separate
+from source validation.
+
 ### Android file actions native runtime (development)
 
 The development UI's Android Save As, Open With, and Share actions require the
@@ -340,6 +356,21 @@ using the maintenance override.
 This changes the local Android handoff only. Encrypted workspace transfers and
 their daemon-owned limits retain their existing wire contracts. Web and iOS
 downloads keep their existing platform actions.
+
+### Android horizontal overflow native runtime (development)
+
+The development UI's shared horizontal overflow scroller requires the compiled
+`HappierHorizontalOverflowContainer` Expo view on Android. Released binaries on
+the `0.2.11-native` OTA runtime do not include it. Non-publicdev lanes use the new
+`0.2.12-native` runtime train for this native surface; publicdev continues to use
+the existing Expo fingerprint policy. Publish a new native build before updates
+for this train, and do not force this JavaScript bundle onto older native runtimes
+using the maintenance override.
+
+Code blocks, Markdown tables, and unwrapped diffs consume the same Android
+gesture owner. iOS and web retain their existing scrollers and text selection.
+This introduces no relay protocol or persisted-data change. Kotlin compilation
+and device gesture validation remain native release checks.
 
 ### Herdr terminal metadata (development)
 
@@ -516,9 +547,11 @@ omit a cause, replace an automatic cause with `manual`; removing or disabling
 the active member does the same when it selects a replacement.
 
 With priority strategy and `autoRestorePrimaryWhenReset` enabled, the canonical
-candidate selector can restore an eligible primary from fresh healthy quota
-observed after an automatic limit fallback, even without a provider reset time
-or surviving member failure marker. Explicit manual provenance prevents this
+candidate selector can restore the highest-priority eligible member ahead of
+the active member from fresh healthy quota observed after an automatic limit
+fallback, even while the first member remains exhausted and without a provider
+reset time or surviving member failure marker. Restoration requires headroom
+above the soft-switch threshold. Explicit manual provenance prevents this
 override. Older persisted groups without provenance retain the landed-reset
 proof; missing evidence is not treated as an automatic fallback.
 
@@ -573,6 +606,23 @@ policy. Do not roll back a database containing this opt-in to that reader withou
 separately validated, authorized data reconciliation. No database rewrite is performed
 by the response projection.
 
+### Claude pool native waiting preference (development)
+
+The optional `claudeCodeAutoContinueAtUsageLimit` pool policy field defaults to
+Happier-managed recovery when absent. Updated V3 readers send
+`happierClaudeCodeAutoContinueAtUsageLimit=1`; the existing reader-capability
+projection omits the field for older strict clients. Older-client policy patches
+merge with the stored policy and preserve this preference. The predecessor query
+schema at `a2c45c86804b24e60ac0b76146a3ef36dfcaa15b` accepts and strips unknown
+query keys, so updated ordinary reads remain usable against that predecessor.
+This is source-schema evidence, not a live mixed-version deployment check.
+
+As with the other optional pool-policy extensions, this is forward coexistence,
+not old-server database rollback support. A pre-field server rejects the stored
+field and falls back to its whole default policy. A database containing the new
+preference needs separately validated, authorized reconciliation before such a
+rollback. The reader projection does not rewrite storage.
+
 ### Account-pool quota-limit selection (development)
 
 The development daemon's soft-switch target gate and live-session model exclusions
@@ -603,6 +653,16 @@ stored selection.
 it for presentation and expiry-first ranking; absence preserves eligibility semantics and older
 readers safely ignore it. Pool-selected usage projection filters only meters and
 preserves account-, subscription-, freshness-, and recovery-credit fields.
+
+Provider credits (Codex `credits`, Claude `extra_usage` or an in-band Claude
+`overageStatus`) travel as an ordinary quota meter with `unit: 'credits'` and no
+`details.limitCategory`; Codex adds the balance as `remaining` and the provider
+verdict as `isExhausted`. No wire field or enum value is added, so released readers
+parse it unchanged and treat it as one more meter. Updated readers classify it with
+the protocol `isConnectedServiceQuotaCreditMeter` owner: it is never an included
+allowance, every pool `quotaLimitSelection` keeps it, and an account whose included
+usage allowances are spent stays usable (ranked after accounts with included quota)
+while it has credit headroom. A provider usage-limit error remains authoritative.
 
 Provider rejection codes (for example Claude's `rate_limit`) are not allowance
 IDs. When the provider does not identify the exhausted allowance, recovery keeps
@@ -720,6 +780,28 @@ Draft documents preserve unknown extension fields as JSON. This lets a client wi
 composer contribution edit fields it understands without deleting newer semantic data; it does not
 authorize that client to execute the unknown contribution. Raw files, handles, secrets, and other
 device-only state remain outside the compatibility shape.
+
+### Unreadable account-settings entries (development)
+
+The released web readers `ui-web-v0.2.21` and
+`ui-web-v0.2.21-preview.212` at `f6f4032ffe21310f83a652c0c7dc07a205e66ee8`
+omit profiles, saved secrets and execution guidance entries they cannot parse
+from the runtime view. Replacing an array with that view can erase the omitted
+entries and their pruned profile-secret bindings.
+
+Updated 0.2 writeback uses the same entry schemas as the reader and retains
+unreadable baseline entries and their bindings. They remain unavailable to
+runtime consumers. Readable entries can still be edited or deleted; an unreadable
+collection or an identity collision refuses the affected write rather than
+overwriting unknown data. Profile editors validate with the canonical profile
+schema before submitting. The stored format and server API do not change.
+Older clients retain the destructive write behavior; this correction cannot
+restore entries already erased by an earlier write.
+
+0.3 keeps legacy profile/guidance arrays and bindings as read-only import sources;
+current profile entity admission and the saved-secret mutation owner validate
+writes separately. Its raw settings writer must not reintroduce writable legacy
+arrays to reproduce the 0.2 implementation.
 
 ### Request notification previews (development)
 

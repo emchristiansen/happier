@@ -162,11 +162,23 @@ not dismiss the warning. Accepted Pending delivery, explicit cancellation, or
 subsequent Agent activity can end the wait presentation.
 If **Apply reset** fails, its action becomes available again.
 
+If automatic recovery stops without resuming the session, the usage-limit banner stays
+with an action to try again. Depending on the failure, that action switches accounts or
+starts a new wait for the limit to reset. Cancelling a wait yourself still dismisses it.
+
 Pool quota selection determines which meters affect account eligibility before
 a request. A supported limit error that actually fails the Agent's main operation
 still follows the pool's configured switching rules and limits. Create separate
 pools when different sessions should use different quota filters; provider-enforced
 usage and spending limits still apply.
+
+Provider credits count as usable capacity. When an account's included limits are
+used up but the provider can still bill credits (Codex credits, Claude extra usage),
+the account shows its credit balance and "Included limits used · credits available"
+instead of looking used up. Pools keep a session working on that account and prefer
+it only after every account that still has included quota. Happier never buys
+credits or changes whether your provider spends them; if the provider itself reports
+a usage limit, the pool switches as usual.
 
 ## Model-capacity retries
 
@@ -505,6 +517,12 @@ To switch when about a tenth of the allowance is left, set it to 10, not 90.
 Codex and Claude pool sessions apply a switch in the middle of a turn: the
 request already in flight finishes on the previous account and the next request
 uses the new one, so a long turn moves on instead of failing at the limit.
+
+In development builds, Claude pool launches let Happier manage usage-limit
+recovery by default. In the pool's Behavior section, **Let Claude wait for usage
+limits** enables Claude's own waiting instead. This preference applies to new
+launches. Individual connected accounts and native Claude sessions keep their
+existing settings.
 
 ### Bounds that stop it thrashing
 

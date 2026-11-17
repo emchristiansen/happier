@@ -2,10 +2,11 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { dirname, join, win32 } from 'node:path';
+import { dirname, join, posix, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { resolveSelfContainedCliRuntimeRootPath } from '../firstPartyRuntime/resolveSelfContainedCliRuntimeRoot.js';
+import { buildWindowsScheduledTaskLauncherAction, formatWindowsScheduledTaskAction, type WindowsScheduledTaskAction } from './windows.js';
 
 export const WINDOWS_SERVICE_LAUNCHER_BUILD_VERSION = '1';
 export const WINDOWS_SERVICE_LAUNCHER_FILE_NAME = 'happier-service-launcher.exe';
@@ -15,6 +16,39 @@ export type WindowsServiceLauncherInstallSpec = Readonly<{
   sourcePath: string;
   version: string;
 }>;
+
+export type WindowsServiceLauncherPlan = Readonly<{
+  launcherPath: string;
+  diagnosticLogPath: string;
+  action: WindowsScheduledTaskAction;
+  commandLine: string;
+  copy: Readonly<{
+    sourcePath: string;
+    destinationPath: string;
+    validation: 'windows-service-launcher-x64-v1';
+  }>;
+}>;
+
+/** The native task action and its staged asset must always describe the same launcher. */
+export function planWindowsServiceLauncher(params: Readonly<{
+  definitionPath: string;
+  label: string;
+  windowsLauncher?: WindowsServiceLauncherInstallSpec;
+}>): WindowsServiceLauncherPlan {
+  const launcher = params.windowsLauncher ?? resolvePackagedWindowsServiceLauncherInstallSpec();
+  const paths = resolveInstalledWindowsServiceLauncherPaths({ ...params, version: launcher.version });
+  const action = buildWindowsScheduledTaskLauncherAction({ ...paths, definitionPath: params.definitionPath });
+  return {
+    ...paths,
+    action,
+    commandLine: formatWindowsScheduledTaskAction(action),
+    copy: {
+      sourcePath: launcher.sourcePath,
+      destinationPath: paths.launcherPath,
+      validation: 'windows-service-launcher-x64-v1' as const,
+    },
+  };
+}
 
 /**
  * Self-contained binaries (including the `<home>/bin` CLI shortcuts) carry the launcher in their
@@ -97,11 +131,29 @@ export function resolveInstalledWindowsServiceLauncherPaths(params: Readonly<{
   if (!definitionPath) throw new Error('definitionPath is required for Windows service launcher paths');
   const label = sanitizeWindowsServiceLauncherSegment(params.label, 'label');
   const version = sanitizeWindowsServiceLauncherSegment(params.version, 'version');
-  const definition = win32.parse(definitionPath);
+  const pathApi = definitionPathApi(definitionPath);
+  const definition = pathApi.parse(definitionPath);
   return {
-    launcherPath: win32.join(definition.dir, label, `launcher-${version}`, WINDOWS_SERVICE_LAUNCHER_FILE_NAME),
-    diagnosticLogPath: win32.join(definition.dir, `${definition.name}.launcher.log`),
+    launcherPath: pathApi.join(resolveInstalledWindowsServiceLauncherRootPath({ definitionPath, label }), `launcher-${version}`, WINDOWS_SERVICE_LAUNCHER_FILE_NAME),
+    diagnosticLogPath: pathApi.join(definition.dir, `${definition.name}.launcher.log`),
   };
+}
+
+// Installed definitions are Windows paths. A POSIX-rooted one (Windows-shaped
+// tests on POSIX hosts) keeps its own separators instead of becoming `\tmp\...`.
+function definitionPathApi(definitionPath: string): typeof win32 {
+  return definitionPath.startsWith('/') ? posix : win32;
+}
+
+/** All immutable launcher versions belonging to this service, never a neighboring service. */
+export function resolveInstalledWindowsServiceLauncherRootPath(params: Readonly<{
+  definitionPath: string;
+  label: string;
+}>): string {
+  const definitionPath = String(params.definitionPath ?? '').trim();
+  if (!definitionPath) throw new Error('definitionPath is required for Windows service launcher paths');
+  const pathApi = definitionPathApi(definitionPath);
+  return pathApi.join(pathApi.dirname(definitionPath), sanitizeWindowsServiceLauncherSegment(params.label, 'label'));
 }
 
 export async function readValidatedWindowsServiceLauncher(path: string): Promise<Buffer> {

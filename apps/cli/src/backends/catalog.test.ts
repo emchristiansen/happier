@@ -376,6 +376,7 @@ describe('AGENTS', () => {
     });
     await expect(resolveDescriptor('gemini')).resolves.toEqual({
       providerId: 'gemini',
+      credentialStorageCleanup: { deleteCredentialStorageForHomeRoot: expect.any(Function) },
       serviceIds: ['gemini'],
       spawnPreflightOauthRefresh: { mode: 'expiry_window' },
       refreshedCredentialApplication: { mode: 'restart_required' },

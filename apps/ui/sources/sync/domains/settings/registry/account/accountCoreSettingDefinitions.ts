@@ -292,6 +292,13 @@ export const ACCOUNT_CORE_SETTING_DEFINITIONS = defineSettingDefinitions({
         storageScope: 'account',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
     },
+    sessionListGroupGitWorktreesV1: {
+        schema: z.boolean(),
+        default: true,
+        description: 'Group Git worktrees from the same repository together in the session list',
+        storageScope: 'account',
+        analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'boolean', privacy: 'safe', identityScope: 'person' },
+    },
     sessionListActiveGroupingV1: {
         schema: z.enum(['project', 'date']),
         default: 'project',
@@ -415,6 +422,12 @@ export const ACCOUNT_CORE_SETTING_DEFINITIONS = defineSettingDefinitions({
         description: 'Which provider usage quota window the session composer gauge should prefer',
         storageScope: 'account',
         analytics: { trackCurrentState: true, trackChanges: true, valueKind: 'enum', privacy: 'safe', identityScope: 'person' },
+    },
+    sessionProviderUsageGaugeNumberWindowMode: {
+        schema: z.enum(QUOTA_GAUGE_WINDOW_MODES),
+        default: 'most_constrained',
+        description: 'Quota window for the number inside provider usage rings; missing windows use the most constrained available quota',
+        storageScope: 'account',
     },
     sessionProviderUsageGaugeWindowModes: {
         schema: z.array(z.enum(QUOTA_GAUGE_WINDOW_MODES)).min(1).nullable(),

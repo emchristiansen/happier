@@ -51,7 +51,7 @@ const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const rootDir = dirname(scriptsDir);
 const DAEMON_TEST_PROCESS_HELPER_PATH = join(rootDir, 'scripts', 'testkit', 'core', 'spawn_daemon_like_process.mjs');
 
-function buildProfileCaptureDaemonCliScript({ cliHomeDir, capturePath, ignoreServerSet = false }) {
+function buildProfileCaptureDaemonCliScript({ cliHomeDir, capturePath, ignoreServerSet = false, profileDelayMs = 0 }) {
   const activeServerId = 'stack_dev__id_default';
   const statePath = join(cliHomeDir, 'servers', activeServerId, 'daemon.state.json');
   return `
@@ -62,6 +62,10 @@ import { spawnDaemonLikeProcess } from ${JSON.stringify(DAEMON_TEST_PROCESS_HELP
 const args = process.argv.slice(2);
 const home = process.env.HAPPIER_HOME_DIR || process.env.HAPPIER_STACK_CLI_HOME_DIR;
 if (!home) process.exit(2);
+
+if (args[0] === 'server' && args[1] === 'set') {
+  await new Promise((resolve) => setTimeout(resolve, ${profileDelayMs}));
+}
 
 ${buildStubHappierServerSetSource({ ignoreServerSet })}
 
@@ -232,7 +236,8 @@ test('startLocalDaemonWithAuth treats daemon start exit=0 as failure when daemon
       HAPPIER_STACK_AUTO_AUTH_SEED: '0',
       HAPPIER_STACK_MIGRATE_CREDENTIALS: '0',
       HAPPIER_STACK_CLI_BUILD: '0',
-      HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '20',
+      // The startup budget also covers the real CLI subprocess used for server set.
+      HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '2000',
       HAPPIER_STACK_DAEMON_START_VERIFY_POLL_MS: '1',
       HAPPIER_STACK_DAEMON_START_VERIFY_STABLE_MS: '0',
     });
@@ -270,7 +275,7 @@ test('startLocalDaemonWithAuth fails fast when stack-scoped auth is stale and on
       HAPPIER_STACK_AUTO_AUTH_SEED: '0',
       HAPPIER_STACK_MIGRATE_CREDENTIALS: '0',
       HAPPIER_STACK_CLI_BUILD: '0',
-      HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '20',
+      HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '2000',
       HAPPIER_STACK_DAEMON_START_VERIFY_POLL_MS: '1',
       HAPPIER_STACK_DAEMON_START_VERIFY_STABLE_MS: '0',
       HAPPIER_ACTIVE_SERVER_ID: 'stack_dev__id_default',
@@ -325,7 +330,7 @@ test('startLocalDaemonWithAuth does not backfill legacy access.key from main whe
       HAPPIER_STACK_AUTO_AUTH_SEED: '0',
       HAPPIER_STACK_MIGRATE_CREDENTIALS: '1',
       HAPPIER_STACK_CLI_BUILD: '0',
-      HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '20',
+      HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '2000',
       HAPPIER_STACK_DAEMON_START_VERIFY_POLL_MS: '1',
       HAPPIER_STACK_DAEMON_START_VERIFY_STABLE_MS: '0',
       HAPPIER_ACTIVE_SERVER_ID: `stack_${stackName}__id_default`,
@@ -411,7 +416,7 @@ const env = {
   HAPPIER_STACK_AUTO_AUTH_SEED: '0',
   HAPPIER_STACK_MIGRATE_CREDENTIALS: '0',
   HAPPIER_STACK_CLI_BUILD: '0',
-  HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '1',
+  HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '2000',
   HAPPIER_STACK_DAEMON_START_VERIFY_POLL_MS: '1',
   HAPPIER_STACK_DAEMON_START_VERIFY_STABLE_MS: '0',
 };
@@ -491,7 +496,7 @@ await startLocalDaemonWithAuth({
     HAPPIER_STACK_AUTO_AUTH_SEED: '0',
     HAPPIER_STACK_MIGRATE_CREDENTIALS: '0',
     HAPPIER_STACK_CLI_BUILD: '0',
-    HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '1',
+    HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '2000',
     HAPPIER_STACK_DAEMON_START_VERIFY_POLL_MS: '1',
     HAPPIER_STACK_DAEMON_START_VERIFY_STABLE_MS: '0',
   },
@@ -560,7 +565,7 @@ await startLocalDaemonWithAuth({
     HAPPIER_STACK_AUTO_AUTH_SEED: '0',
     HAPPIER_STACK_MIGRATE_CREDENTIALS: '0',
     HAPPIER_STACK_CLI_BUILD: '0',
-    HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '20',
+    HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '2000',
     HAPPIER_STACK_DAEMON_START_VERIFY_POLL_MS: '1',
     HAPPIER_STACK_DAEMON_START_VERIFY_STABLE_MS: '0',
   },
@@ -612,7 +617,7 @@ await startLocalDaemonWithAuth({
     HAPPIER_STACK_AUTO_AUTH_SEED: '0',
     HAPPIER_STACK_MIGRATE_CREDENTIALS: '0',
     HAPPIER_STACK_CLI_BUILD: '0',
-    HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '1',
+    HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '2000',
     HAPPIER_STACK_DAEMON_START_VERIFY_POLL_MS: '1',
     HAPPIER_STACK_DAEMON_START_VERIFY_STABLE_MS: '0',
   },
@@ -733,7 +738,7 @@ try {
   }
 });
 
-test('startLocalDaemonWithAuth reconciles a stale active stack profile before spawning the daemon', async () => {
+test('startLocalDaemonWithAuth reconciles a stale active stack profile before spawning the daemon after a slow profile reconciliation', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'happy-stacks-daemon-profile-reconcile-'));
   let daemonPid = null;
   try {
@@ -752,7 +757,7 @@ test('startLocalDaemonWithAuth reconciles a stale active stack profile before sp
     await chmod(cliBin, 0o755);
     await writeFile(
       cliCommandScript,
-      buildProfileCaptureDaemonCliScript({ cliHomeDir, capturePath }),
+      buildProfileCaptureDaemonCliScript({ cliHomeDir, capturePath, profileDelayMs: 11_000 }),
       'utf-8',
     );
     await writeFile(
@@ -785,7 +790,7 @@ test('startLocalDaemonWithAuth reconciles a stale active stack profile before sp
       HAPPIER_STACK_MIGRATE_CREDENTIALS: '0',
       HAPPIER_STACK_CLI_BUILD: '1',
       HAPPIER_STACK_CREDENTIAL_VALIDATE_TIMEOUT_MS: '10',
-      HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '2000',
+      HAPPIER_STACK_DAEMON_START_VERIFY_TIMEOUT_MS: '20000',
       HAPPIER_STACK_DAEMON_START_VERIFY_POLL_MS: '25',
       HAPPIER_STACK_DAEMON_START_VERIFY_STABLE_MS: '0',
     };

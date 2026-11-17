@@ -9,7 +9,10 @@ import type { NormalizedMessage } from '../../typesRaw';
 import type { SessionListViewItem } from '../../domains/session/listing/sessionListViewData';
 import { readSessionArchivePending, type SessionArchiveOperation, type SessionArchiveOperations } from '../../domains/session/listing/sessionArchiveState';
 import { readStoredSessionMessagesFromStateLike } from '../../domains/messages/readStoredSessionMessages';
-import { isTranscriptRenderableAggregate } from '../../domains/messages/transcriptRenderableAggregate';
+import {
+    canReuseTranscriptRenderableAggregateRequestStates,
+    isTranscriptRenderableAggregate,
+} from '../../domains/messages/transcriptRenderableAggregate';
 import {
     areSessionListRenderablesEqual,
     buildSessionListRenderableFromSession,
@@ -81,6 +84,7 @@ import { resolveSessionListCacheServerId } from '../../domains/session/listing/s
 import { getActiveServerSnapshot } from '../../domains/server/serverRuntime';
 import { areServerProfileIdentifiersEquivalent } from '../../domains/server/serverProfiles';
 import { areScmWorkingSnapshotsEquivalentIgnoringFetchedAt } from '@/scm/sync/snapshotDiff';
+import { scmSnapshotEntriesAreComplete } from '@/scm/core/snapshotMappers';
 import type { ReviewCommentDraft } from '@/sync/domains/input/reviewComments/reviewCommentTypes';
 import type { SessionActionDraft } from '@/sync/domains/sessionActions/sessionActionDraftTypes';
 import type { SessionActionDraftStatus } from '@/sync/domains/sessionActions/sessionActionDraftTypes';
@@ -94,6 +98,7 @@ import { persistSessionPermissionData } from './sessionPermissionPersistence';
 import { resolveMergedSessionPermissionMode } from './resolveMergedSessionPermissionMode';
 import {
     applySessionListRenderableCommitPlan,
+    buildSessionListViewDataForCachedServer,
     refreshSessionListViewDataRowsForRenderables,
     buildNextSessionListRenderableDelta,
     buildSessionListViewDataForRenderableState,
@@ -281,6 +286,7 @@ type SessionsDomainDependencies = {
     // Keep resilient: older settings payloads (or partial boot states) may not yet include this key.
     settings: {
         groupInactiveSessionsByProject?: boolean;
+        sessionListGroupGitWorktreesV1?: boolean;
         sessionListActiveGroupingV1?: 'project' | 'date';
         sessionListInactiveGroupingV1?: 'project' | 'date';
         sessionListSectionModeV1?: 'activity' | 'single';
@@ -882,9 +888,6 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                 }
 
                 const existingSessionMessages = updatedSessionMessages[session.id];
-                let renderableMessages = existingSessionMessages?.isLoaded === true
-                    ? readStoredSessionMessagesFromStateLike(existingSessionMessages)
-                    : undefined;
 
                 if (existingSessionMessages && mergedSessions[session.id]!.agentState) {
                     // Session message cache can outlive a page reload and keep locally synthesized
@@ -905,9 +908,6 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                             ...updated.sessionMessages,
                             isLoaded: existingSessionMessages.isLoaded,
                         };
-                        renderableMessages = updatedSessionMessages[session.id]?.isLoaded === true
-                            ? readStoredSessionMessagesFromStateLike(updatedSessionMessages[session.id])
-                            : undefined;
                     }
                     // Guard with value equality: the reconcile surfaces usage
                     // and todos on every snapshot, and unconditional writes
@@ -938,17 +938,26 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                     }
                 }
 
-                // Reuse the incrementally-maintained transcript aggregate when
-                // it is still valid; the builder self-checks completedRequests
-                // identity and falls back to the messages walk otherwise.
+                // Reuse the incrementally-maintained transcript aggregate when it
+                // is still valid. Only materialize the transcript (O(messages))
+                // when the aggregate cannot serve: a streamed transcript publishes
+                // a session update per message.
                 const sessionMessagesForRenderable = updatedSessionMessages[session.id];
+                const isRenderableTranscriptLoaded = sessionMessagesForRenderable?.isLoaded === true;
+                const renderableAggregate = isRenderableTranscriptLoaded
+                    && isTranscriptRenderableAggregate(sessionMessagesForRenderable.renderableAggregate)
+                    ? sessionMessagesForRenderable.renderableAggregate
+                    : undefined;
+                const renderableCompletedRequests =
+                    (mergedSessions[session.id]!.agentState?.completedRequests as Record<string, unknown> | null | undefined) ?? null;
+                const renderableMessages = isRenderableTranscriptLoaded
+                    && !(renderableAggregate && canReuseTranscriptRenderableAggregateRequestStates(renderableAggregate, renderableCompletedRequests))
+                    ? readStoredSessionMessagesFromStateLike(sessionMessagesForRenderable)
+                    : undefined;
                 const nextRenderableBase = buildSessionListRenderableFromSession(
                     mergedSessions[session.id]!,
                     renderableMessages,
-                    sessionMessagesForRenderable?.isLoaded === true
-                    && isTranscriptRenderableAggregate(sessionMessagesForRenderable.renderableAggregate)
-                        ? sessionMessagesForRenderable.renderableAggregate
-                        : undefined,
+                    renderableAggregate,
                 );
                 const previousRenderable = state.sessionListRenderables?.[session.id];
                 // Unconditional, exactly like the renderable-replacement path: the
@@ -1333,11 +1342,13 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                     state: { ...state, sessionListRenderables: renderables, sessionListViewData: cached }, patches,
                 });
                 if (plan.noop) return state;
-                const projected = refreshSessionListViewDataRowsForRenderables({
-                    sessionListViewData: cached,
-                    renderables: plan.nextRenderables,
-                    sessionIds: plan.changedSessionIds,
-                });
+                const projected = plan.needsSessionListViewDataRebuild
+                    ? buildSessionListViewDataForCachedServer(state, targetServerId, plan.nextRenderables)
+                    : refreshSessionListViewDataRowsForRenderables({
+                        sessionListViewData: cached,
+                        renderables: plan.nextRenderables,
+                        sessionIds: plan.changedSessionIds,
+                    });
                 return {
                     ...state,
                     sessionListViewDataByServerId: setServerSessionListCache(state.sessionListViewDataByServerId, targetServerId, projected),
@@ -1881,10 +1892,14 @@ export function createSessionsDomain<S extends SessionsDomain & SessionsDomainDe
                     projectManager.updateSessionProjectScmSnapshotError(sessionId, null);
                 }
                 projectManager.updateSessionProjectScmStatus(sessionId, status);
-                const activePaths = new Set(snapshot.entries.map((entry) => entry.path));
-                projectManager.pruneSessionProjectScmTouchedPaths(sessionId, activePaths);
-                projectManager.pruneSessionProjectScmCommitSelectionPaths(sessionId, activePaths);
-                projectManager.pruneSessionProjectScmCommitSelectionPatches(sessionId, activePaths);
+                // Prune only against the complete entry set: a path beyond a truncated prefix is
+                // still changed, and its touched/selection state must survive.
+                if (scmSnapshotEntriesAreComplete(snapshot)) {
+                    const activePaths = new Set(snapshot.entries.map((entry) => entry.path));
+                    projectManager.pruneSessionProjectScmTouchedPaths(sessionId, activePaths);
+                    projectManager.pruneSessionProjectScmCommitSelectionPaths(sessionId, activePaths);
+                    projectManager.pruneSessionProjectScmCommitSelectionPatches(sessionId, activePaths);
+                }
                 statusUpdates[sessionId] = status;
             }
             set((state) => ({

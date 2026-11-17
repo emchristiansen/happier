@@ -34,6 +34,16 @@ Before adding or changing a provider/runtime/install/update flow, classify it as
 
 Provider detection, install status, daemon validation, runtime spawning, and UI/installables must reuse the same source of truth. Backend CLIs should prefer user/system installs by default over Happier-managed installs unless an explicit setting says otherwise.
 
+In current development source, the shared provider catalog selects `@opencode/cli`
+for managed OpenCode installs, latest-version lookup, and package-manager attribution.
+The managed installer approves only that package's build through pnpm; OpenCode's
+own postinstall selects and verifies its native binary, including AVX2/baseline
+and libc variants. Happier does not duplicate that selection. Other managed
+packages retain `--ignore-scripts`. Existing `opencode-ai` package-manager installs
+retain their original owner, update command, and latest-version source; managed
+updates select OpenCode 2. CLI version probing accepts the vendor's `opencode v2.x.y`
+output and exposes the normalized version.
+
 In current development source (not yet released), MCP package-runner resolution
 honors configured `npx`, `npm`, `yarn`, `pnpm`, and `bunx` commands, including explicit
 executable paths. `normalizePackageRunnerInvocation` resolves the executable using
@@ -59,6 +69,20 @@ installation). Other command scripts retain shell execution and its existing
 quoting, including npm JavaScript wrappers and wrappers whose target is missing
 or still a text placeholder. Recognition does not choose a different installation
 or modify the subprocess environment.
+
+In current development source (not yet released), managed JavaScript runtime
+selection returns `current/runtime/node.exe` directly on Windows, for both existing
+installations and first bootstrap. The generated `.cmd` wrapper remains an install
+artifact; internal launches bypass it so multiline arguments and trailing protocol
+flags reach the child intact. POSIX selection and explicit runtime overrides keep
+their existing behavior.
+
+In current development source (not yet released), filtered Claude and terminal
+launcher environments share `apps/cli/src/utils/env/windowsSystemEnv.ts` for the
+Windows system-variable baseline. They retain inherited installation and shared
+data paths, including `ProgramFiles` (used by Docker CLI plugin discovery) and
+`ProgramFiles(x86)`, with Windows case-insensitive key matching. This does not
+copy arbitrary ambient secrets or synthesize missing variables such as `HOME`.
 
 In current development source, vendor installers preserve the Windows process
 environment's `Path` spelling; cloning that environment and replacing it with an
@@ -507,9 +531,41 @@ What it guarantees:
 
 Limits, stated so they are not assumed away:
 
-- **There is no uninstall hook.** No desktop uninstall path exists in the Tauri/bootstrap shell,
-  and dragging the app to the Trash cannot run app code, so PATH cleanup happens only when the
-  user asks for it in machine settings.
+- **Desktop cleanup is implemented in development source, not yet released.** Machine settings ›
+  Terminal offers cleanup before app removal; success quits the app. The native owner excludes
+  running setup tasks and blocks new ones through shutdown. Windows NSIS/MSI removal invokes the
+  same `hsetup desktop uninstall` owner before deleting app files; updates preserve components.
+  Real Windows removal refuses a running Desktop app; quit normally and retry. Normal Quit waits
+  for active native setup or component removal, so it cannot abandon an in-flight helper.
+  Older NSIS installers can invoke a newer uninstaller in place during replacement without an
+  update flag. Those ambiguous in-place invocations preserve components; explicit in-place
+  administrative removal therefore needs the settings action or helper cleanup first.
+  Moving the macOS app to the Trash or deleting a Linux AppImage does not invoke Happier's
+  component cleanup in the current implementation: use the settings action first. macOS supports
+  bundle-contained helpers through `SMAppService`, but Happier currently uses external LaunchAgent
+  definitions and separately installed CLI files; app deletion does not run their cleanup owner.
+  Explicit `--uninstall-desktop-components` also requires quitting the app first.
+- `desktopInstallations.ts` records the native bundle identity and the actual state/install homes
+  in the app's platform data directory before acquisition, then records the selected CLI executor.
+  `desktopResourceOwnership.ts` records creation and participating Desktop consumers beside CLI
+  roots and service definitions. Attribution and `managedBy` alone never authorize deletion.
+  Existing unclaimed resources remain user/legacy controlled; a standalone install relinquishes
+  its Desktop claim, while owner-controlled updates preserve it. Service claims bind the exact
+  definition, so an unrecognized replacement fails cleanup visibly.
+- Cleanup first invokes the installed CLI's capability-advertised Desktop service selector for
+  every recorded data home, then refreshes surviving launchers before removing any shared CLI.
+  The app's existing installation record saves that successful service-cleanup result before
+  deleting executables, so a subsequent record-write failure can be retried without reacquisition.
+  Only after those CLI children exit does the shared component uninstaller release CLI claims
+  and remove the last consumer's files.
+  Surviving services protect their CLI dependency. Scoped PATH cleanup uses the existing exposure
+  owner and retains entries for surviving CLI installations. Failed targets stay retryable;
+  successful targets are removed from the app's installation record. Credentials, settings,
+  sessions and other user data remain intact.
+- Older Desktop versions do not register consumers. Their legacy resources are retained without
+  an ownership claim; arbitrary older portable apps cannot be inventoried reliably. Do not infer
+  their absence from the new consumer list. Windows enterprise removal as SYSTEM cannot clean
+  another user's resources; perform cleanup as that user before removing the app.
 - The installer's default POSIX `BIN_DIR` (`~/.local/bin`) differs from the Desktop-managed shim
   directory (`<happier home>/bin`). When a `happier` already resolves the desktop adds nothing
   (INV5). On macOS, where an app opened from the Dock gets launchd's PATH, that check also searches
@@ -599,6 +655,10 @@ on Windows from the existing on-disk dependency payload through the canonical CL
 including installed channel shortcuts. This preserves the dependency's own parser and Windows
 helper lookup: bundling its `import.meta.url` would point at Bun's virtual filesystem instead.
 POSIX keeps the dependency's JavaScript embedded, including in detached installer runners.
+The shared process-tree cleanup owner retains recognized OS/import error codes and numeric
+helper exit codes when discovery fails. The CLI's existing file diagnostic includes that code
+without exposing native error messages, paths, command arguments or stderr; cleanup still fails
+closed when descendant discovery cannot be verified.
 The legacy Claude SDK launcher records unverified process cleanup through the existing
 primary-session turn lifecycle, allocating a failed turn when idle, before preserving the
 resume identity and exiting. Failed issue publication is logged and does not admit a replacement.

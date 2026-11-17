@@ -5,6 +5,7 @@ import { parseProviderResetAt, parseProviderTimestampMs } from '@/daemon/connect
 
 import { readSessionHookSidechainAgentId } from '../utils/sessionHookAttribution';
 import { readClaudeJsonlTimestampMs } from '../utils/claudeJsonlTimestamp';
+import type { ClaudeUsageLimitNote } from '../attachments/claudeAttachmentTypes';
 
 export type NormalizedProviderUsageLimitDetailsV1 = Readonly<{
   v: 1;
@@ -27,6 +28,7 @@ export type NormalizedProviderUsageLimitDetailsV1 = Readonly<{
   sourceProviderOrganizationId?: string | null;
   /** Provider chronology retained for turn identity cross-checks. */
   providerObservedAtMs?: number;
+  usageLimitNoteKind?: ClaudeUsageLimitNote['kind'];
   /**
    * Set when the evidence row was imported from a subagent transcript (`isSidechain: true`).
    * Sidechain limits are real account-level evidence (quota snapshots may consume them) but
@@ -34,6 +36,26 @@ export type NormalizedProviderUsageLimitDetailsV1 = Readonly<{
    */
   sourcedFromSidechain?: true;
 }>;
+
+/** Native notes supply no numerical quota observation. Preserve their kind so
+ * only a grace wrap-up takes the hard-failure path. */
+export function mapClaudeUsageLimitNoteToUsageDetails(note: ClaudeUsageLimitNote): NormalizedProviderUsageLimitDetailsV1 {
+  return {
+    v: 1,
+    resetAtMs: null,
+    retryAfterMs: null,
+    limitCategory: 'usage_limit',
+    quotaScope: 'unknown',
+    recoverability: 'switch_account',
+    planType: null,
+    utilization: null,
+    overage: null,
+    action: null,
+    connectedService: null,
+    providerObservedAtMs: note.timestampMs,
+    usageLimitNoteKind: note.kind,
+  };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -548,6 +570,7 @@ function buildPassiveQuotaEvidence(input: Readonly<{
   providerLimitId: string | null;
   utilization: number;
   resetAtMs: number | null;
+  overage: NormalizedProviderUsageLimitDetailsV1['overage'];
 }>): NormalizedProviderUsageLimitDetailsV1 {
   return {
     v: 1,
@@ -558,9 +581,21 @@ function buildPassiveQuotaEvidence(input: Readonly<{
     ...(input.providerLimitId ? { providerLimitId: input.providerLimitId } : {}),
     planType: null,
     utilization: input.utilization,
-    overage: null,
+    overage: input.overage,
     action: null,
     connectedService: null,
+  };
+}
+
+/** Claude extra usage ("overage") facts the event reports; null when it reports none. */
+function readClaudeRateLimitOverage(info: Record<string, unknown>): NormalizedProviderUsageLimitDetailsV1['overage'] {
+  const overageStatusRaw = info.overageStatus ?? info.overage_status;
+  if (overageStatusRaw === undefined || overageStatusRaw === null) return null;
+  const disabledReason = readString(info.overageDisabledReason ?? info.overage_disabled_reason);
+  return {
+    status: normalizeOverageStatus(overageStatusRaw),
+    resetAtMs: readTimestampMs(info.overageResetsAt ?? info.overage_resets_at),
+    ...(disabledReason ? { disabledReason } : {}),
   };
 }
 
@@ -576,6 +611,7 @@ export function readClaudeRateLimitEventWindows(event: unknown): readonly Normal
   const info = isRecord(record.rate_limit_info) ? record.rate_limit_info : null;
   if (!info) return [];
 
+  const overage = readClaudeRateLimitOverage(info);
   const unifiedWindows = isRecord(info.unifiedWindows) ? info.unifiedWindows : {};
   const windowEvidence = Object.entries(unifiedWindows).flatMap(([windowId, window]) => {
     if (!isRecord(window)) return [];
@@ -585,6 +621,7 @@ export function readClaudeRateLimitEventWindows(event: unknown): readonly Normal
       providerLimitId: windowId,
       utilization,
       resetAtMs: readTimestampMs(window.resetsAt),
+      overage,
     })];
   });
   if (windowEvidence.length > 0) return windowEvidence;
@@ -595,6 +632,7 @@ export function readClaudeRateLimitEventWindows(event: unknown): readonly Normal
     providerLimitId: readString(info.rateLimitType ?? info.rate_limit_type),
     utilization,
     resetAtMs: readTimestampMs(info.resetsAt ?? info.resets_at),
+    overage,
   })];
 }
 

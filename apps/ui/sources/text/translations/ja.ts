@@ -612,6 +612,7 @@ export const ja: TranslationStructure = {
             composerFocus: 'コンポーザーにフォーカス',
             composerSendImmediate: '別の方法で送信（キュー / 方向修正）',
             composerSendInterrupt: '中断して送信',
+            composerSendAlternateAfterSend: "送信して次を開始 / 開く",
             composerSendPending: '保留キューに送信',
             commandPaletteOpen: 'コマンドパレットを開く',
             modeCycle: 'モードを切り替え',
@@ -1330,6 +1331,7 @@ export const ja: TranslationStructure = {
     enterTmuxTempDir: "一時ディレクトリのパスを入力",
     tmuxUpdateEnvironment: "環境を自動更新",
     nameRequired: "プロファイル名は必須です",
+    invalidProfile: '保存する前に、プロフィール名、環境変数、デフォルト設定を確認してください。',
     deleteConfirm: ({ name }: { name: string }) =>
       `プロファイル「${name}」を削除してもよろしいですか？`,
     editProfile: "プロファイルを編集",
@@ -2872,7 +2874,7 @@ localTailscale: {
           renewal: "更新",
           renewalOn: "オン",
           renewalOff: "オフ",
-          renewalUnknown: "不明",
+          active: "有効",
           renews: ({ date }: { date: string }) => `${date}に更新`,
           ends: ({ date }: { date: string }) => `${date}に終了`,
           renewsInDays: ({ days }: { days: number }) => `${days}日後に更新`,
@@ -3132,6 +3134,12 @@ localTailscale: {
       refreshA11y: "使用状況と制限を更新",
       usageCaption: "使用状況",
       resetsCaption: "クォータのリセット",
+      credits: {
+        title: "クレジット",
+        balance: ({ balance }: { balance: string }) => `${balance} クレジット`,
+        spent: "残りなし",
+        includedUsed: "含まれる上限を使い切りました · クレジット利用可能",
+      },
       usedDetail: ({ used, limit }: { used: string; limit: string }) => `${used}/${limit} 使用`,
       capacity: ({ percent }: { percent: number }) => `容量 ${percent}%`,
       memberEnabledLabel: "プールで有効",
@@ -3433,6 +3441,8 @@ localTailscale: {
         membersSubtitle: ({ enabled, total }: { enabled: number; total: number }) => `${enabled}/${total} 有効`,
         optionsTitle: "オプション",
         autoSwitchTitle: "自動フォールバック",
+        claudeCodeAutoContinueAtUsageLimitTitle: "使用上限に達したらClaudeに待機させる",
+        claudeCodeAutoContinueAtUsageLimitSubtitle: "新しいセッションでは、Claudeが上限のリセットを待ち、自動的に続行します。オフにすると、Happierが復旧を管理します。",
         autoQuotaResetTitle: "クォータリセットを自動的に使用",
         autoQuotaResetSubtitle: "プール内に利用可能なアカウントがなく、使い切ったクォータをリセットできる場合にのみ、保存されたリセットを消費します。初期設定はオフです。",
         autoDisablePlanInvalidTitle: "選択したモデルを利用できないアカウントを無効化",
@@ -3895,7 +3905,7 @@ localTailscale: {
     trayOpenInHappier: 'Happier で開く',
     traySettings: '設定…',
     trayStartAtLogin: 'ログイン時に起動',
-    trayStopAndQuit: 'バックグラウンドサービスを停止して終了',
+    trayStopAndQuit: 'Happier を終了（バックグラウンドサービスを停止）',
     trayStart: '開始',
     trayRestart: '再起動',
     trayStop: '停止',
@@ -3911,6 +3921,7 @@ localTailscale: {
     trayStopAllConfirmBody: 'このコンピューターで実行中のエージェントセッションは終了し、Happier を再び開くまでスマートフォンやブラウザーから接続できません。',
     trayStopConfirmAction: '停止',
     trayActionFailedTitle: 'うまくいきませんでした',
+    trayQuitWaitForSystemTasks: "Happier はコンポーネントの設定または削除を実行中です。完了してから、もう一度終了してください。",
     trayLoginItemFailed: 'Happier のログイン項目を更新できませんでした',
     traySessions: ({ count }: { count: string }) => `セッション: ${count}`,
     closeStopTitle: 'エージェントのセッションがまだ実行中です',
@@ -4272,6 +4283,39 @@ localTailscale: {
   },
 
   settingsProviders: {
+        sessionRetention: {
+            invalidSettings: "Claude設定の無効なJSONを修正し、マシンを再接続して再試行してください。",
+            permissionDenied: "Claude設定ファイルへのアクセスを許可し、マシンを再接続してください。",
+            writeFailed: "Claude設定を保存できませんでした。ファイルへのアクセスを確認し、マシンを再接続してください。",
+            managedUnreadable: "組織設定を読み取れませんでした。保持期間を変更する前にClaudeの権限を確認してください。",
+            group: "グループ",
+            title: "セッションの保持",
+            footer: "各マシンのユーザーレベルのClaude保持期間を設定します。プロジェクト、組織、明示的な起動設定によって上書きされる場合があります。",
+            policy: "ローカル履歴の保持",
+            unmanaged: "既存の設定を維持",
+            unmanagedHint: "保持期間の管理を停止します。以前の変更は残ります。",
+            providerDefault: "Claudeの既定値",
+            providerDefaultHint: "ユーザー設定の保持期間を削除し、Claudeの既定値を使います。",
+            year: "1年（365日）",
+            century: "100年（36,500日）",
+            custom: "日数を指定",
+            customDays: "日数",
+            invalidDays: "正の整数で日数を入力してください。",
+            machines: "マシンの状態",
+            noMachines: "ペアリングしたマシンがここに表示されます。",
+            native: "ネイティブClaude",
+            profile: "プロファイル",
+            applied: "設定済み",
+            unmanagedStatus: "管理対象外",
+            pending: "マシンを待機中",
+            unknown: "状態を表示するにはdaemonを更新してください",
+            error: "保持期間を適用できませんでした",
+            managed: "組織ポリシーが保持期間に優先する場合があります",
+            offline: "オフライン・最後に確認した状態",
+            confirmTitle: "Claudeの保持期間を短くしますか？",
+            confirmBody: "保持期間を短くすると、Claudeが古いローカル履歴を削除する可能性があります。削除された履歴は復元できません。プロジェクトや組織の設定が優先される場合があります。",
+            confirmAction: "保持期間を適用",
+        },
       title: "AIプロバイダー設定",
       entrySubtitle: "プロバイダー固有のオプションを設定します",
       footer:
@@ -5143,6 +5187,8 @@ localTailscale: {
       hiddenInactiveSessionsEmptyStateSubtitle: "非アクティブなセッションはこのリストで非表示になっています",
       hiddenInactiveSessionsSectionTitle: "非アクティブなセッション",
       hiddenInactiveSessionsSectionSubtitle: "メインの一覧ではアクティブなチャットだけが表示されるため、ここでは非表示になっています",
+    sessionListGroupGitWorktrees: "Gitワークツリーをリポジトリごとにまとめる",
+    sessionListGroupGitWorktreesSubtitle: "同じリポジトリのセッションをまとめます。オフにするとディレクトリごとにまとめます。",
     sessionListActiveGrouping: "アクティブセッションのグループ化",
     sessionListActiveGroupingSubtitle:
       "サイドバーでアクティブセッションをどのようにグループ化するか選択します",
@@ -5709,6 +5755,7 @@ localTailscale: {
       resetBody: ({ time }: { time: string }) =>
         `このプロバイダーは、続行する前に ${time} まで待機するよう求めています。`,
       genericBody: "このプロバイダーは、続行する前に待機するよう求めています。",
+      stoppedBody: "自動リカバリーは停止し、自動では再試行しません。下から再試行してください。",
       resetCreditBody: ({ count }: { count: number }) =>
         `${count} 件の使用リセットを利用できます。`,
       resetCreditExpiresBody: ({ count, time }: { count: number; time: string }) =>
@@ -6797,7 +6844,7 @@ localTailscale: {
   },
 
   sessionDrafts: {
-    sectionTitle: '下書き', badge: '下書き', untitled: '無題の下書き', continueEditing: '編集を続ける', startAnother: '別の下書きを開始',
+    sectionTitle: '下書き', badge: '下書き', untitled: '無題の下書き', continueEditing: '編集を続ける', startAnother: '別の下書きを開始', startedOpen: "セッションを開始しました · 開く",
     status: { offline: 'オフライン', syncing: '同期中', conflict: '競合', machineUnavailable: 'マシンを利用できません', attachmentNeedsAttention: '添付ファイルの確認が必要です', startInterrupted: '開始が中断されました' },
     new: { action: '新しい下書き' }, delete: { action: '下書きを削除', confirmTitle: '下書きを削除しますか？', confirmDescription: 'この下書きはデバイスから削除されます。' },
     conflict: { title: '下書きの競合', description: 'このフィールドは別のデバイスで変更されました。', mine: 'このデバイス', synced: '同期済み', useSynced: '同期版を使用', keepDevice: 'デバイス版を保持', copyMine: '自分の版をコピー', copied: 'コピーしました', copyFailed: 'コピーできませんでした', field: { text: 'テキスト', mentions: 'メンション', attachments: '添付ファイル', recipient: '受信者', agentContinuation: 'エージェント継続', executionRunDelivery: '実行配信' } },
@@ -7200,8 +7247,12 @@ localTailscale: {
   },
 
   agentInput: {
+      keepKeyboard: { label: "送信後もキーボードを開いたままにする" },
+      historyPosition: ({ index, total }: { index: number; total: number }) => `${index} / ${total}`,
       sendOptions: {
           title: "送信オプション",
+          sendAndStartAnother: "送信して次を開始",
+          sendAndOpen: "送信してセッションを開く",
           queue: "キューに追加",
           hint: "長押しして送信方法を選択",
       },
@@ -7603,7 +7654,10 @@ localTailscale: {
     },
     askUserQuestion: {
         submit: "回答を送信",
+        dismiss: '質問を閉じる',
+        dismissed: '質問を閉じました',
         submissionFailures: {
+            unconfirmed: "Happier は回答を確認できませんでした。再試行するか、Claude ターミナルを開いて回答を確認してください。",
             update: "Happier CLI を更新して、もう一度お試しください。",
             reconnect: "このセッションに再接続して、もう一度お試しください。",
             retry: "回答を受け付けられませんでした。内容を確認して、もう一度お試しください。",
@@ -8562,6 +8616,7 @@ localTailscale: {
 settingsSession: {
     terminalHostTitle: '新しいセッションのターミナルホスト',
     terminalHostNone: 'ターミナルホストなし',
+    newSessionAfterSend: { title: "送信後の動作", footer: "新規セッションのコンポーザーから送信したときの動作を選びます。送信を長押しすると、1 件だけもう一方の動作を選べます。", openTitle: "セッションを開く", openSubtitle: "開始したらすぐセッションに移動します。", startAnotherTitle: "このまま次を開始", startAnotherSubtitle: "バックグラウンドで開始を続け、新しい下書きを開きます。" },
     newSessionDraftEntry: {
         title: '新しいセッションの下書き',
         footer: '「新しいセッション」でこのデバイスの下書きを続けるか、新規作成するかを選びます。',
@@ -8735,6 +8790,10 @@ settingsSession: {
         resetHiddenSubtitle: 'この端末で非表示にしたバナーを解除します。',
     },
     inputBehavior: {
+        keepFocusTitle: "送信後もコンポーザーにフォーカスを保つ",
+        keepFocusSubtitle: "入力欄に留まり、すぐ次のメッセージを書けます。",
+        typeToFocusTitle: "どこからでも入力",
+        typeToFocusSubtitle: "テキスト欄の外で入力を始めると、メッセージ欄に移動します。",
         title: '入力の動作',
         footer: 'Enterで送信とメッセージ履歴の動作を設定します。',
         enterToSendEnabledNativeSubtitle: 'Enterで送信',
@@ -8844,6 +8903,8 @@ settingsSession: {
         customResumePromptPlaceholder: "中断したところから続けてください。",
       },
       providerUsageGauge: {
+          numberTitle: "リング中央の数値",
+          numberSubtitle: "リング内の数値に使う上限を選択します。利用できない場合は、残量が最も少ない上限を使います。",
         title: "プロバイダー使用量",
         footer:
           "すべてのアカウントの入力欄に表示するゲージを選択します。各プールで選択された使用制限が適用されます。お気に入りは現在のアカウントにゲージを追加します。",
@@ -11053,7 +11114,15 @@ settingsSession: {
     },
     cliPath: {
       title: "ターミナル",
-      footer: "Happier Desktop は自身が作成した PATH エントリのみを追加・削除します。シェルインストーラーが書き込んだエントリには触れません。",
+      footer: "Happier Desktop が変更するのは自身が作成した PATH エントリだけで、シェルのインストーラーによる設定は保持されます。",
+      cleanupTitle: "Desktop のコンポーネントを削除",
+      cleanupSubtitle: "Desktop 所有のコマンドラインとバックグラウンドサービスを削除して終了します。",
+      cleanupConfirmTitle: "Desktop のコンポーネントを削除して終了しますか？",
+      cleanupConfirmBody: "他の Desktop アプリが必要としていない場合に、Desktop 所有のコマンドラインファイル、PATH エントリ、バックグラウンドサービスを削除します。共有コンポーネント、ユーザーがインストールしたコンポーネント、セッション履歴、アカウントデータは保持されます。削除するサービスは停止するため、実行中のセッションやリモートアクセスが中断される場合があります。\n\n削除後に Desktop は終了します。その後、OS の機能でアプリを削除してください。macOS またはポータブル版 Linux では、アプリのバンドルまたはファイルを削除します。Desktop を再び開くと、コンポーネントが再設定される場合があります。",
+      cleanupConfirmAction: "コンポーネントを削除して終了",
+      cleanupBusy: "Desktop のコンポーネントを削除中…",
+      cleanupFailed: "削除が完了しませんでした。もう一度お試しください。",
+      cleanupQuitFailed: "削除は完了しましたが、Desktop を終了できませんでした。アプリを削除する前に終了してください。",
       addTitle: "happier を PATH に追加",
       addSubtitle: "新しいターミナルで happier コマンドを使えるようにします。",
       removeTitle: "happier を PATH から削除",
@@ -11162,11 +11231,16 @@ settingsSession: {
   },
 
   message: {
+    provenanceFrom: ({ source }: { source: string }) => `${source} から`,
+    provenanceSession: 'セッション',
     sessionReferenceUnavailable: "利用できないセッション",
     sessionReferenceOpen: ({ name }: { name: string }) => `セッション ${name} を開く`,
     switchedToMode: ({ mode }: { mode: string }) =>
       `${mode}モードに切り替えました`,
     discarded: "破棄済み",
+    readAloudA11y: "読み上げ",
+    stopReadAloudA11y: "読み上げを停止",
+    readAloudFailed: "このメッセージを読み上げられませんでした。音声設定を確認してください。",
     recoveredHistory: "復元された履歴",
     unknownEvent: "不明なイベント",
     contextCompactionStarted: "コンテキストを圧縮中...",
@@ -11214,7 +11288,7 @@ settingsSession: {
     sessionRunningLocally:
       "このセッションはこのコンピュータでローカル実行されています。アプリから制御するにはリモートに切り替えられます。",
     sessionRunningLocallyAndRemotely:
-      "このセッションは OpenCode にローカル接続されたままで、アプリからも引き続き操作できます。",
+      "このセッションはローカル接続されたままで、アプリからも引き続き操作できます。",
     switchingToRemote: "リモートモードに切り替え中…",
     switchToRemote: "リモートに切り替え",
     detachLocalTerminal: "ターミナルを切り離す",
@@ -11293,6 +11367,13 @@ settingsSession: {
     codeCopied: "コードをコピーしました",
     copyFailed: "コピーに失敗しました",
     mermaidRenderFailed: "Mermaidダイアグラムのレンダリングに失敗しました",
+    table: {
+        open: "表を開く",
+        copyCsv: "CSVとしてコピー",
+        copyMarkdown: "Markdownとしてコピー",
+        csvLabel: "CSV",
+        viewerTitle: "表",
+    },
     diffLabel: "差分",
     codeLabel: "コード",
 

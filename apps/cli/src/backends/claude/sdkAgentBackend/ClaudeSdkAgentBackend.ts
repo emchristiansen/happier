@@ -118,6 +118,7 @@ export class ClaudeSdkAgentBackend implements AgentBackend {
     const effortArgs = buildClaudeEffortCliArgs({ modelId: model, effort: undefined });
     const settingsPath = resolveClaudeLaunchSettingsOverlayArg({
         settingsPath: this.opts.settingsPath,
+        env: this.env,
         // Explicitly off: an ultracode Claude Code saved would otherwise override a pinned effort.
         launchSettings: isClaudeModelEffortPinned(model) ? { ultracode: false } : {},
     });

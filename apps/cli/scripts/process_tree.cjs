@@ -1,4 +1,16 @@
+const { constants: { errno } } = require('node:os');
+
 async function psList() { return (await import('ps-list')).default(); }
+
+function readDiscoveryErrorCode(error) {
+  const code = error && typeof error === 'object' ? error.code : undefined;
+  // execFile can report a numeric exit code; system/import codes are fixed identifiers.
+  // Never retain arbitrary native strings, messages, paths, stderr or command arguments.
+  if (typeof code === 'number') return Number.isSafeInteger(code) ? code : undefined;
+  if (typeof code === 'string' && (Object.hasOwn(errno, code)
+    || code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND')) return code;
+  return undefined;
+}
 
 function isPidAliveBySignal(pid, onProbeFailure) {
   try {
@@ -174,14 +186,16 @@ async function terminateProcessTree(proc, opts, enumerate, guard) {
 
   let descendants;
   let discoveryFailed = false;
+  let discoveryErrorCode;
   try {
     descendants = await resolveDescendantPids(pid, enumerate);
-  } catch {
+  } catch (error) {
     // Process enumeration is an external best-effort boundary. The known root must still be
     // resumed and terminated when the OS denies or transiently exhausts that boundary; making
     // every caller fail before that attempt leaves the known root alive. Afterward,
     // missing discovery remains an unverified cleanup, not successful completion.
     discoveryFailed = true;
+    discoveryErrorCode = readDiscoveryErrorCode(error);
     descendants = [];
   }
   // Discovery yields to the OS: an externally killed root may have lost its descendants.
@@ -214,8 +228,9 @@ async function terminateProcessTree(proc, opts, enumerate, guard) {
   if (discoveryFailed || probeFailed || signallingFailed) {
     throw Object.assign(new Error('Process-tree termination could not be verified'), {
       code: 'process_tree_termination_incomplete',
-      // Keep only failure categories: native errors can contain private paths or command lines.
+      // Keep categories and the recognized code only: native error text can contain private data.
       discoveryFailed,
+      discoveryErrorCode,
       probeFailed,
       signallingFailed,
     });

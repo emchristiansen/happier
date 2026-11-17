@@ -475,7 +475,7 @@ export const darkTheme = {
         radio: {
             active: '#9EB9FF',
             inactive: '#766C67',
-            dot: '#131111',
+            dot: '#9EB9FF',
         },
         button: {
             primary: {
@@ -594,7 +594,7 @@ export const darkTheme = {
         // Message View colors
         message: {
             user: {
-                background: '#221C1C',
+                background: '#292423',
                 foreground: '#EFEFEF',
             },
             agent: {

@@ -27,6 +27,8 @@ import { configuration } from '@/configuration';
 import { readPositiveIntEnv } from '@/utils/readPositiveIntEnv';
 import type { RawJSONLines } from '@/backends/claude/types';
 import { persistClaudeToolResultMedia } from '@/backends/claude/attachments/persistClaudeToolResultMedia';
+import { compactClaudeToolResultMetadata } from '@/backends/claude/utils/claudeToolResultMetadata';
+import { readClaudeUserMessageText } from '@/backends/claude/utils/readClaudeUserMessageText';
 import {
     buildClaudeJsonlLocalId,
     buildClaudeJsonlLocalIdFromMessageKey,
@@ -77,7 +79,7 @@ import {
     bootstrapAccountSettingsContext,
     refreshActiveAccountSettingsFromServer,
 } from '@/settings/accountSettings/bootstrapAccountSettingsContext';
-import { AcceptedPendingSettlementResponseV1Schema, AccountSettingsV2GetResponseSchema, readClaudePeerMessage } from '@happier-dev/protocol';
+import { AcceptedPendingSettlementResponseV1Schema, AccountSettingsV2GetResponseSchema } from '@happier-dev/protocol';
 import {
     getActiveAccountSettingsSnapshot,
     subscribeActiveAccountSettingsSnapshot,
@@ -1200,6 +1202,7 @@ export class ApiSessionClient extends EventEmitter {
             encryptionKey: this.encryptionKey,
             encryptionVariant: this.encryptionVariant,
             encryptionMode: this.sessionEncryptionMode,
+            responseMaxBytes: configuration.rpcResponseMaxBytes,
             logger: (msg, data) => logger.debug(msg, data),
             onRegistrationError: (error) => {
                 const probe = classifySessionTransportErrorToProbeResult(error);
@@ -4830,115 +4833,11 @@ export class ApiSessionClient extends EventEmitter {
             return null;
         }
         const retryToken = previousRetryToken ?? this.sessionMessageCommitRetry.beginIntent(localId, payload);
-        if (this.transcriptStorage === 'direct') {
-
-            if (!params.requireCommit) {
-                this.pendingMaterializedLocalIds.add(localId);
-            }
-
-            const ack = await (async () => {
-                try {
-                    const raw = await emitSocketWithAck({
-                        socket: this.socket as any,
-                        event: 'message',
-                        payload: {
-                            sid: this.sessionId,
-                            message: params.message,
-                            localId,
-                            echoToSender: true,
-                            sidechainId: params.sidechainId,
-                            ...(params.messageRole ? { messageRole: params.messageRole } : {}),
-                            ...(params.sessionEventType ? { sessionEventType: params.sessionEventType } : {}),
-                        },
-                    });
-
-                    const parsed = MessageAckResponseSchema.safeParse(raw);
-                    return parsed.success ? parsed.data : null;
-                } catch (error) {
-                    logger.debug('[SOCKET] Direct transcript commit ack failed', {
-                        localId,
-                        sidechainId: params.sidechainId,
-                        requireCommit: params.requireCommit,
-                        error: serializeAxiosErrorForLog(error),
-                    });
-                    return null;
-                }
-            })();
-
-            if (ack && ack.ok === true) {
-                if (params.requireWriteDisposition === true) {
-                    if (ack.localId !== localId) {
-                        this.sessionMessageCommitRetry.complete(retryToken);
-                        throw new Error(`Exact message commit ACK localId mismatch for ${localId}`);
-                    }
-                    if (typeof ack.didWrite !== 'boolean') {
-                        this.sessionMessageCommitRetry.complete(retryToken);
-                        throw new Error(`Exact message commit ACK for ${localId} omitted didWrite`);
-                    }
-                }
-                if (this.sessionMessageCommitRetry.complete(retryToken)) {
-                    if (params.markAsUserMessage === true) {
-                        this.markAgentQueueEchoSuppressedLocalId(ack.localId ?? localId);
-                        this.markAgentQueueDeliveredLocalId(ack.localId ?? localId);
-                    }
-                    this.markCommittedLocalIdAwaitingEcho(localId);
-                    this.lastObservedMessageSeq = Math.max(this.lastObservedMessageSeq, ack.seq);
-                    if (params.markAsUserMessage === true) {
-                        this.lastObservedUserMessageSeq = Math.max(this.lastObservedUserMessageSeq, ack.seq);
-                        this.recordCommittedUserMessageSeq(ack.localId ?? localId, ack.seq);
-                    }
-                }
-                return {
-                    localId: ack.localId ?? localId,
-                    messageId: ack.id,
-                    seq: ack.seq,
-                    didWrite: ack.didWrite ?? null,
-                };
-            }
-            if (ack && ack.ok === false) {
-                if (ack.error === 'transaction-unavailable') {
-                    if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) {
-                        if (params.requireCommit) {
-                            throw new Error('transaction-unavailable: message commit unconfirmed; retry intent no longer current');
-                        }
-                        return null;
-                    }
-                    this.pendingMaterializedLocalIds.add(localId);
-                    const willRetry = this.scheduleCommitRetry(retryToken);
-                    logger.infoFile('[SOCKET] Transcript transaction admission unavailable', {
-                        localId, requireCommit: params.requireCommit, willRetry,
-                    });
-                    if (params.requireCommit) {
-                        throw new Error(`transaction-unavailable: message commit unconfirmed; ${willRetry ? 'same intent queued for retry' : 'retry budget exhausted'}`);
-                    }
-                    return null;
-                }
-                if (this.sessionMessageCommitRetry.complete(retryToken) && !params.requireCommit) {
-                    this.deleteMaterializedLocalId(localId);
-                }
-                logger.debug('[SOCKET] Direct transcript commit rejected', {
-                    localId,
-                    sidechainId: params.sidechainId,
-                    requireCommit: params.requireCommit,
-                    error: ack.error,
-                });
-                throw new Error(ack.error);
-            }
-            if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) return null;
-            if (!params.requireCommit) {
-                this.scheduleCommitRetry(retryToken);
-                return null;
-            }
-            logger.debug('[SOCKET] Direct transcript commit was not confirmed', {
-                localId,
-                sidechainId: params.sidechainId,
-                requireCommit: params.requireCommit,
-            });
-            this.sessionMessageCommitRetry.complete(retryToken);
-            throw new Error('Message send not confirmed');
+        const isDirectTranscript = this.transcriptStorage === 'direct';
+        const storageLabel = isDirectTranscript ? 'Direct' : 'Persisted';
+        if (!isDirectTranscript || !params.requireCommit) {
+            this.pendingMaterializedLocalIds.add(localId);
         }
-
-        this.pendingMaterializedLocalIds.add(localId);
         const ack = await (async () => {
             try {
                 const raw = await emitSocketWithAck({
@@ -4958,7 +4857,7 @@ export class ApiSessionClient extends EventEmitter {
                 const parsed = MessageAckResponseSchema.safeParse(raw);
                 return parsed.success ? parsed.data : null;
             } catch (error) {
-                logger.debug('[SOCKET] Persisted transcript commit ack failed', {
+                logger.debug(`[SOCKET] ${storageLabel} transcript commit ack failed`, {
                     localId,
                     sidechainId: params.sidechainId,
                     requireCommit: params.requireCommit,
@@ -4985,7 +4884,7 @@ export class ApiSessionClient extends EventEmitter {
                     this.markAgentQueueDeliveredLocalId(ack.localId ?? localId);
                 }
                 this.markCommittedLocalIdAwaitingEcho(localId);
-                // ACK confirms persistence. Do not inject a synthetic update here: outbound sends are not prompts.
+                // Outbound acknowledgements are transcript observations, not provider input.
                 this.lastObservedMessageSeq = Math.max(this.lastObservedMessageSeq, ack.seq);
                 if (params.markAsUserMessage === true) {
                     this.lastObservedUserMessageSeq = Math.max(this.lastObservedUserMessageSeq, ack.seq);
@@ -5018,10 +4917,10 @@ export class ApiSessionClient extends EventEmitter {
                 }
                 return null;
             }
-            if (this.sessionMessageCommitRetry.complete(retryToken)) {
+            if (this.sessionMessageCommitRetry.complete(retryToken) && (!isDirectTranscript || !params.requireCommit)) {
                 this.deleteMaterializedLocalId(localId);
             }
-            logger.debug('[SOCKET] Persisted transcript commit rejected', {
+            logger.warnFile(`[SOCKET] ${storageLabel} transcript commit rejected`, {
                 localId,
                 sidechainId: params.sidechainId,
                 requireCommit: params.requireCommit,
@@ -5034,6 +4933,19 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         if (!this.sessionMessageCommitRetry.readCurrent(retryToken)) return null;
+        if (isDirectTranscript) {
+            if (!params.requireCommit) {
+                this.scheduleCommitRetry(retryToken);
+                return null;
+            }
+            logger.debug('[SOCKET] Direct transcript commit was not confirmed', {
+                localId,
+                sidechainId: params.sidechainId,
+                requireCommit: params.requireCommit,
+            });
+            this.sessionMessageCommitRetry.complete(retryToken);
+            throw new Error('Message send not confirmed');
+        }
         if (params.requireCommit) {
             if (params.requireWriteDisposition === true) {
                 this.sessionMessageCommitRetry.complete(retryToken);
@@ -5271,6 +5183,7 @@ export class ApiSessionClient extends EventEmitter {
         ({ body, meta } = await persistClaudeToolResultMedia({
             body, meta, workingDirectory: this.resolveWorkingDirectory(), sessionId: this.sessionId,
         }));
+        body = compactClaudeToolResultMetadata(body);
         this.outboundShapeLogger.log('claude:raw-jsonl', body);
 
         const sidechainId = (() => {
@@ -5280,16 +5193,9 @@ export class ApiSessionClient extends EventEmitter {
 
         let content: MessageContent;
 
-        // Check if body is already a MessageContent (has role property)
-        if (
-            body.type === 'user' &&
-            typeof body.message.content === 'string' &&
-            body.isSidechain !== true &&
-            body.isMeta !== true &&
-            // Peer deliveries keep their sender provenance in the raw output envelope.
-            !readClaudePeerMessage(body)
-        ) {
-            content = this.buildUserTextMessageContent(body.message.content, meta);
+        const userText = readClaudeUserMessageText(body);
+        if (userText !== null) {
+            content = this.buildUserTextMessageContent(userText, meta);
         } else {
             // Wrap Claude messages in the expected format
             content = {

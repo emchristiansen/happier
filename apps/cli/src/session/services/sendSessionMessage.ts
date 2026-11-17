@@ -8,7 +8,13 @@ import {
 } from '@happier-dev/agents';
 import { SESSION_RPC_METHODS } from '@happier-dev/protocol/rpc';
 import { isRpcMethodNotAvailableError, isRpcMethodNotFoundError } from '@happier-dev/protocol/rpcErrors';
-import { readPendingLocalId, type PendingRequestedActionV1 } from '@happier-dev/protocol';
+import {
+  HAPPIER_SESSION_MESSAGE_PROVENANCE_META_KEY,
+  SessionMessageProvenanceV1Schema,
+  readPendingLocalId,
+  type SessionMessageProvenanceV1,
+  type PendingRequestedActionV1,
+} from '@happier-dev/protocol';
 
 import { fetchEncryptedTranscriptPageAfterSeq } from '@/api/session/fetchEncryptedTranscriptWindow';
 import {
@@ -405,6 +411,7 @@ export async function sendSessionMessage(params: Readonly<{
   credentials: Credentials;
   idOrPrefix: string;
   message: string;
+  provenance?: SessionMessageProvenanceV1;
   kind?: 'user' | 'notice';
   from?: string;
   wait: boolean;
@@ -503,6 +510,9 @@ export async function sendSessionMessage(params: Readonly<{
     ctx: sessionTarget.ctx,
     localId,
     text: params.message,
+    ...(params.provenance ? { meta: {
+      [HAPPIER_SESSION_MESSAGE_PROVENANCE_META_KEY]: SessionMessageProvenanceV1Schema.parse(params.provenance),
+    } } : {}),
     permissionIntent,
     modelId,
     ...(params.preserveAdmission ? { preserveAdmission: params.preserveAdmission } : {}),

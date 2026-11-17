@@ -246,7 +246,6 @@ const buildThemeProfileOverridesFromVsCodeTheme = (theme: Record<string, unknown
     setOverride(overrides, 'control.switch.thumb.inactive', textSecondary);
     setOverride(overrides, 'control.radio.active', activeForeground);
     setOverride(overrides, 'control.radio.inactive', textTertiary);
-    setOverride(overrides, 'control.radio.dot', buttonForeground);
     setOverride(overrides, 'control.segmentedControl.trackBackground', surfaceInset);
     setOverride(overrides, 'control.segmentedControl.activeBackground', surfaceSelected);
     setOverride(overrides, 'control.fab.background', buttonBackground);
@@ -264,9 +263,10 @@ const buildThemeProfileOverridesFromVsCodeTheme = (theme: Record<string, unknown
     setOverride(overrides, 'control.permissionButton.selected.background', surfaceSelected);
     setOverride(overrides, 'control.permissionButton.selected.border', borderStrong);
     setOverride(overrides, 'control.permissionButton.selected.foreground', buttonForeground);
-    setOverride(overrides, 'message.user.background', buttonBackground);
-    setOverride(overrides, 'message.user.foreground', buttonForeground);
-    setOverride(overrides, 'message.agent.foreground', buttonForeground);
+    // A prompt is the theme's neutral raised surface in its body ink; the accent button stays a button.
+    setOverride(overrides, 'message.user.background', surfaceElevated);
+    setOverride(overrides, 'message.user.foreground', textPrimary);
+    setOverride(overrides, 'message.agent.foreground', textPrimary);
     setOverride(overrides, 'message.event.foreground', textSecondary);
     setOverride(overrides, 'syntax.default', textPrimary);
     setOverride(overrides, 'versionControl.added.foreground', successForeground);

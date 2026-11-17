@@ -1,4 +1,10 @@
 export const HAPPY_PROTOCOL_PACKAGE = '@happier-dev/protocol';
+export {
+  createSessionRepositoryV1Schema,
+  SessionRepositoryV1Schema,
+  readSessionRepositoryV1FromMetadata,
+  type SessionRepositoryV1,
+} from './sessionMetadata/sessionRepositoryV1.js';
 export { lazySchema } from './lazySchema.js';
 export {
   SessionPermissionResponseSchema,
@@ -610,6 +616,7 @@ export {
   CONNECTED_SERVICE_AUTO_DISABLE_PLAN_INVALID_QUERY_KEY,
   CONNECTED_SERVICE_POOL_QUOTA_LIMIT_SELECTION_QUERY_KEY,
   CONNECTED_SERVICE_POOL_EXPIRY_FIRST_QUERY_KEY,
+  CONNECTED_SERVICE_CLAUDE_AUTO_CONTINUE_QUERY_KEY,
   CONNECTED_SERVICE_AUTH_GROUP_READER_CAPABILITY_QUERY_VALUE,
   ConnectedServiceAuthGroupReaderCapabilitiesQueryV1Schema,
   appendConnectedServiceAuthGroupReaderCapabilities,
@@ -748,8 +755,12 @@ export {
 } from './connect/connectedServiceAuthGroupMemberRuntimeStatePolicy.js';
 
 export {
+  hasConnectedServiceQuotaCreditHeadroom,
+  isConnectedServiceQuotaCreditMeter,
   resolveConnectedServiceQuotaMeterLimitIdentity,
   selectConnectedServiceQuotaMetersForLimitSelection,
+  summarizeConnectedServiceQuotaCredits,
+  type ConnectedServiceQuotaCreditSummary,
 } from './connect/connectedServiceQuotaLimitSelection.js';
 
 export {
@@ -905,7 +916,9 @@ export {
   normalizeClaudeTaskToolUseToWorkStateItem,
   normalizeClaudeSdkInitSkills,
   normalizeClaudeOauthProfileEntitlement,
+  formatClaudeOauthPlanLabel,
   readClaudeOauthCredentialMetadata,
+  readClaudeOauthProfileSubscriptionStatus,
   readClaudeOauthCredentialOrganizationId,
   type ClaudeOauthCredentialMetadata,
   type ClaudeOauthEntitlementMetadata,
@@ -1663,6 +1676,13 @@ export {
 
 export { SENT_FROM_VALUES, SentFromSchema, createSentFromSchema, type SentFrom } from './sentFrom.js';
 export {
+    HAPPIER_SESSION_MESSAGE_PROVENANCE_META_KEY,
+    SessionMessageProvenanceV1Schema,
+    readSessionMessageProvenanceV1,
+    renderSessionMessageProvenanceContextV1,
+    type SessionMessageProvenanceV1,
+} from './sessionMessages/sessionMessageProvenance.js';
+export {
   AuthStatusEnvelopeSchema,
   AuthStatusResultSchema,
   SessionControlEnvelopeBaseSchema,
@@ -1759,6 +1779,7 @@ export {
   SESSION_USAGE_LIMIT_RECOVERY_OPERATION_RESULT_ERROR_STATUSES_V1,
   SESSION_USAGE_LIMIT_RECOVERY_OPERATION_RESULT_OK_STATUSES_V1,
   SESSION_USAGE_LIMIT_RECOVERY_STATE_FIELD_ID,
+  SESSION_USAGE_LIMIT_RECOVERY_STOPPED_PROBE_ERROR,
   TurnTerminalStatusV1Schema,
   V2SessionByIdNotFoundSchema,
   V2SessionByIdResponseSchema,
@@ -1831,6 +1852,7 @@ export {
   type SessionUsageLimitRecoveryV1,
   buildUsageLimitIssueFingerprint,
   isSessionUsageLimitRecoveryForIssue,
+  isSessionUsageLimitRecoveryStoppedByPolicy,
   readSessionUsageLimitRecoveryForIssue,
   type TurnTerminalStatusV1,
   type V2SessionByIdNotFound,
@@ -3755,3 +3777,9 @@ export { assertAccountKeyProvisioningAllowed, AccountKeyProvisioningUnavailableE
 export { PushNotificationTestRequestSchema, PushNotificationTestResultSchema, type PushNotificationTestResult } from './push/pushNotificationTest.js';
 
 export { projectNotificationQuestion, readNotificationQuestionAnswer, isNotificationQuestionAnswerAction, NotificationQuestionAnswerV1Schema, NOTIFICATION_QUESTION_MAX_CHOICES, type NotificationQuestionAnswerV1 } from './push/notificationQuestionActions.js';
+export {
+  ClaudeSessionRetentionPolicyV1Schema,
+  ClaudeSessionRetentionReportV1Schema,
+  type ClaudeSessionRetentionPolicyV1,
+  type ClaudeSessionRetentionReportV1,
+} from './providers/claude/sessionRetention.js';

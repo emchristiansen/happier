@@ -1,6 +1,7 @@
 import { readSessionUserMessageAdmissionBody, type SessionUserMessageAdmissionBody } from '@/session/services/admitSessionUserMessage';
 import type { DaemonServerWorkErrorClassification, DaemonServerWorkErrorKind } from '@/daemon/serverWork/types';
 import { isDeepStrictEqual } from 'node:util';
+import { logger } from '@/ui/logger';
 import { classifyDaemonServerWorkError } from '@/daemon/serverWork/classifyDaemonServerWorkError';
 import {
   DurableBackoffRecoveryScheduler,
@@ -1422,6 +1423,11 @@ export class RuntimeAuthRecoveryScheduler {
             : intent.maxAttempts,
       observeBeforeEffectClaim: (intent) => {
         if (!observeProofWithoutRecovery(intent)) return null;
+        logger.warnFile('[ConnectedServices] Local recovery is waiting for provider outcome producer proof', {
+          reason: 'untargeted_provider_outcome_proof_refresh', sessionId: intent.sessionId,
+          serviceId: intent.serviceId, groupId: intent.groupId, profileId: intent.profileId,
+          attemptId: intent.attemptId, attemptCount: intent.attemptCount,
+        });
         const retryAtMs = this.providerOutcomePendingWaitMs === null
           ? deps.nowMs() + this.baseBackoffMs
           : deps.nowMs() + this.providerOutcomePendingWaitMs;

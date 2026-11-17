@@ -140,8 +140,10 @@ function buildDefaultPermissionHookResponse(data?: PermissionHookData): Permissi
 }
 
 export interface HookServerOptions {
-    /** Called when a session hook is received with a valid session ID */
-    onSessionHook: (sessionId: string, data: SessionHookData) => void;
+    /** Observer invoked when a session hook has a valid session ID; its return value is ignored. */
+    onSessionHook: (sessionId: string, data: SessionHookData) => unknown;
+    /** Explicitly produces JSON for Claude; the observer's return value is ignored. */
+    produceSessionHookOutput?: (sessionId: string, data: SessionHookData, context: Readonly<{ signal: AbortSignal }>) => Record<string, unknown> | void | Promise<Record<string, unknown> | void>;
     /** Called when a permission hook is received */
     onPermissionHook?: (data: PermissionHookData, options?: Readonly<{ signal?: AbortSignal }>) => PermissionHookResponse | Promise<PermissionHookResponse>;
     /**
@@ -246,6 +248,13 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
                         return;
                     }
                 }
+                const controller = new AbortController();
+                const abort = () => controller.abort();
+                const onResponseClose = () => {
+                    if (!res.writableFinished) abort();
+                };
+                req.once('aborted', abort);
+                res.once('close', onResponseClose);
                 // Set timeout to prevent hanging if Claude doesn't close stdin
                 const timeout = setTimeout(() => {
                     if (!res.headersSent) {
@@ -261,6 +270,7 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
                         rejectOversizedBody(req, res);
                         return;
                     }
+                    if (controller.signal.aborted || res.headersSent || res.destroyed) return;
 
                     const body = rawBody.toString('utf-8');
 
@@ -282,20 +292,32 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
 
                     // Support both snake_case (from Claude) and camelCase
                     const sessionId = data.session_id || data.sessionId;
+                    let response: void | Record<string, unknown> = undefined;
                     if (sessionId) {
-                        logger.debug(`[hookServer] Session hook received session ID: ${sessionId}`);
                         onSessionHook(sessionId, data);
+                        response = await options.produceSessionHookOutput?.(sessionId, data, { signal: controller.signal });
                     } else {
                         logger.debug('[hookServer] Session hook received but no session_id found in data');
                     }
 
-                    res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
+                    if (controller.signal.aborted || res.headersSent || res.destroyed) return;
+                    if (response && typeof response === 'object' && !Array.isArray(response)) {
+                        const responseBody = JSON.stringify(response);
+                        res.writeHead(200, { 'Content-Type': 'application/json' }).end(responseBody);
+                    } else {
+                        res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
+                    }
                 } catch (error) {
                     clearTimeout(timeout);
                     logger.debug('[hookServer] Error handling session hook:', error);
-                    if (!res.headersSent) {
+                    if (!res.headersSent && !res.destroyed) {
                         res.writeHead(500).end('error');
                     }
+                } finally {
+                    clearTimeout(timeout);
+                    abort();
+                    req.off('aborted', abort);
+                    res.off('close', onResponseClose);
                 }
                 return;
             }

@@ -39,6 +39,7 @@ async function withCleanupDiagnostic<T>(run: () => Promise<T>): Promise<T> {
       logger.infoFile('[process-tree] Owned process cleanup could not be verified', {
         code: 'process_tree_termination_incomplete',
         discoveryFailed: 'discoveryFailed' in error && error.discoveryFailed === true,
+        discoveryErrorCode: 'discoveryErrorCode' in error ? error.discoveryErrorCode : undefined,
         probeFailed: 'probeFailed' in error && error.probeFailed === true,
         signallingFailed: 'signallingFailed' in error && error.signallingFailed === true,
       });

@@ -293,6 +293,8 @@ export function createOpenAiCodexQuotaFetcher(params?: Readonly<{
           ...normalizeCodexQuotaWindows(rateLimit, now, normalizePct, normalizeWindowResetAtMs),
           ...mapCodexRateLimitPayloadToQuotaMeters({
             additional_rate_limits: data.additional_rate_limits,
+            credits: data.credits,
+            spend_control: data.spend_control,
           }, now, {
             legacyPrimary: { meterId: 'session', label: 'Session' },
             legacySecondary: { meterId: 'weekly', label: 'Weekly' },

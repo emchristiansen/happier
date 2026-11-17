@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { claudeRemoteAgentSdk } from './claudeRemoteAgentSdk';
 import { makeMode } from './claudeRemoteAgentSdk.testkit';
+import { createSessionTurnLifecycle } from '@/agent/runtime/session/turn/lifecycle';
 
 describe('claudeRemoteAgentSdk stream events', () => {
     it('keeps rejected allowance availability and sidechain errors out of parent failure recovery', async () => {
@@ -104,34 +105,44 @@ describe('claudeRemoteAgentSdk stream events', () => {
         const onPromptAcceptedByProvider = vi.fn();
         const onSessionReset = vi.fn();
         const createQuery = vi.fn();
+        const lifecycle = createSessionTurnLifecycle({ sessionId: 'clear-session', enqueueSessionTurn: async () => {} });
+        await lifecycle.beginTurn({ provider: 'claude' });
 
-        await claudeRemoteAgentSdk({
-            sessionId: null,
-            transcriptPath: null,
-            path: '/tmp',
-            claudeExecutablePath: '/tmp/claude',
-            canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
-            isAborted: () => false,
-            nextMessage: async () => ({
-                message: '/clear',
-                mode: makeMode({ claudeRemoteAgentSdkEnabled: true }),
+        try {
+            await claudeRemoteAgentSdk({
+                sessionId: null,
+                transcriptPath: null,
+                path: '/tmp',
+                claudeExecutablePath: '/tmp/claude',
+                canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+                isAborted: () => false,
+                nextMessage: async () => ({
+                    message: '/clear',
+                    mode: makeMode({ claudeRemoteAgentSdkEnabled: true }),
+                    maxUserMessageSeq: 4,
+                    userMessageLocalIds: ['clear-local-4'],
+                }),
+                onReady: async () => {
+                    expect(onPromptAcceptedByProvider).toHaveBeenCalledOnce();
+                    await lifecycle.completeTurn({ provider: 'claude' });
+                },
+                onSessionFound: () => {},
+                onMessage: () => {},
+                onSessionReset,
+                onPromptAcceptedByProvider,
+                createQuery,
+            });
+
+            expect(lifecycle.hasActiveTurn()).toBe(false);
+            expect(onSessionReset).toHaveBeenCalledTimes(1);
+            expect(createQuery).not.toHaveBeenCalled();
+            expect(onPromptAcceptedByProvider).toHaveBeenCalledExactlyOnceWith({
                 maxUserMessageSeq: 4,
                 userMessageLocalIds: ['clear-local-4'],
-            }),
-            onReady: () => {},
-            onSessionFound: () => {},
-            onMessage: () => {},
-            onSessionReset,
-            onPromptAcceptedByProvider,
-            createQuery,
-        } as any);
-
-        expect(onSessionReset).toHaveBeenCalledTimes(1);
-        expect(createQuery).not.toHaveBeenCalled();
-        expect(onPromptAcceptedByProvider).toHaveBeenCalledExactlyOnceWith({
-            maxUserMessageSeq: 4,
-            userMessageLocalIds: ['clear-local-4'],
-        });
+            });
+        } finally {
+            await lifecycle.endSession();
+        }
     });
 
     it('rejects the claimed prompt before effect when Agent SDK preflight fails', async () => {
@@ -2380,9 +2391,18 @@ describe('claudeRemoteAgentSdk stream events', () => {
             releaseStream = resolve;
         });
 
-        const createQuery = vi.fn((_params: any) => {
+        const consumedPrompts: string[] = [];
+        const createQuery = vi.fn((params: any) => {
             return {
                 async *[Symbol.asyncIterator]() {
+                    const prompts = (params.prompt as AsyncIterable<any>)[Symbol.asyncIterator]();
+                    const consumePrompt = async () => {
+                        const next = await Promise.race([prompts.next(), streamClosed.then(() => null)]);
+                        if (!next || next.done) return false;
+                        consumedPrompts.push(next.value.message.content[0].text);
+                        return true;
+                    };
+                    if (!await consumePrompt()) return;
                     // Standalone /compact can finish without a normal result, then the next queued
                     // prompt may emit stream_event output before an assembled assistant message.
                     yield {
@@ -2391,6 +2411,8 @@ describe('claudeRemoteAgentSdk stream events', () => {
                         session_id: 'sess_compacted_2',
                     } as any;
 
+                    // A real provider cannot produce the follow-up's response before receiving it.
+                    if (!await consumePrompt()) return;
                     // Next turn starts emitting assistant output as stream events only (no assembled
                     // assistant message), then ends with a result message.
                     yield {
@@ -2451,7 +2473,8 @@ describe('claudeRemoteAgentSdk stream events', () => {
             await vi.waitFor(() => {
                 expect(nextMessage).toHaveBeenCalledTimes(4);
             });
-            expect(onReady).toHaveBeenCalled();
+            expect(consumedPrompts).toEqual(['/compact', 'follow-up after compaction']);
+            expect(onReady).toHaveBeenCalledTimes(2);
         } finally {
             releaseStream();
             await runnerPromise.catch(() => {});

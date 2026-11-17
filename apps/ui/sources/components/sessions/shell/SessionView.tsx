@@ -194,7 +194,10 @@ import { useReconciledStableRows } from '@/hooks/session/reconcileStableRows';
 import { deriveSessionSubagentRecipients } from '@/sync/domains/session/subagents/deriveSessionSubagentRecipients';
 import type { AgentActivityCounts } from '@/sync/domains/session/agentActivity/deriveAgentActivityCounts';
 import { hasSessionSubagentLaunchCards } from '@/agents/registry/sessionSubagentUiBehavior';
-import { useSurfaceAnchorPathname } from '@/components/sessions/shell/surface/sessionSurfaceAnchorPathname';
+import {
+    isOwnedSessionRootPathname,
+    useSessionRouteEntryPresentation,
+} from '@/components/sessions/shell/surface/sessionRouteEntryPresentation';
 import { isExecutionRunNotRunningSendError, sessionExecutionRunSend } from '@/sync/ops/sessionExecutionRuns';
 import { nowServerMs } from '@/sync/runtime/time';
 import { readSessionUiTelemetryNowMs } from '@/sync/runtime/performance/sessionUiTelemetry';
@@ -306,13 +309,12 @@ import {
 } from '@/components/sessions/attachments/sessionAttachmentDraftStore';
 import { formatAttachmentsBlock, uploadAttachmentDraftsToSession } from '@/components/sessions/attachments/uploadAttachmentDraftsToSession';
 import { buildAttachmentMessageMeta } from '@/components/sessions/attachments/buildAttachmentMessageMeta';
-import { mergeMessageMetaOverrides } from '@/components/sessions/agentInput/structuredInputMentions';
+import { mergeMessageMetaOverrides, readComposerStructuredInputMentionsFromMeta } from '@/components/sessions/agentInput/structuredInputMentions';
 import { Text } from '@/components/ui/text/Text';
 import { AppPaneScopeHost } from '@/components/appShell/panes/AppPaneScopeHost';
 import { useRegisterSessionPaneDriver } from '@/components/sessions/panes/useRegisterSessionPaneDriver';
 import { useAppPaneScope } from '@/components/appShell/panes/hooks/useAppPaneScope';
 import { SessionScreenTestIdsProvider } from './sessionScreenTestIds';
-import { useSessionScreenIsFocused } from './useSessionScreenIsFocused';
 import { resolveMobileWorkspaceExperienceToggleActionId } from '@/components/workspaceCockpit/mobileWorkspaceExperience';
 import { useMobileWorkspaceExperienceState } from '@/components/workspaceCockpit/useMobileWorkspaceExperienceState';
 import { useOpenSessionTarget } from '@/components/sessions/panes/open/useOpenSessionTarget';
@@ -612,42 +614,6 @@ const connectedServiceQuotaGaugeFormatter: ConnectedServiceQuotaGaugeLabelFormat
     subscriptionRenews: ({ date }) => t('connectedServices.subscription.renews', { date }),
     subscriptionRenewsInDays: ({ days }) => t('connectedServices.subscription.renewsInDays', { days }),
 };
-
-function isOwnedSessionRootPathname(pathname: string | null | undefined, sessionId: string): boolean {
-    const normalizedPathname = typeof pathname === 'string' ? pathname.trim() : '';
-    if (!normalizedPathname) {
-        return false;
-    }
-
-    const match = /^\/session\/([^/]+)\/?$/.exec(normalizedPathname);
-    if (!match) {
-        return false;
-    }
-
-    try {
-        return decodeURIComponent(match[1] ?? '') === sessionId;
-    } catch {
-        return false;
-    }
-}
-
-function isOwnedSessionRoutePathname(pathname: string | null | undefined, sessionId: string): boolean {
-    const normalizedPathname = typeof pathname === 'string' ? pathname.trim().split('?')[0] ?? '' : '';
-    if (!normalizedPathname) {
-        return false;
-    }
-
-    const match = /^\/session\/([^/]+)(?:\/.*)?$/.exec(normalizedPathname);
-    if (!match) {
-        return false;
-    }
-
-    try {
-        return decodeURIComponent(match[1] ?? '') === sessionId;
-    } catch {
-        return false;
-    }
-}
 
 function readSessionUsageLimitRecovery(metadata: unknown): SessionUsageLimitRecoveryV1 | null {
     if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
@@ -1597,15 +1563,12 @@ export const SessionView = React.memo((props: SessionViewProps) => {
     const isTablet = useIsTablet();
     const voiceSnap = useVoiceSessionSnapshot();
     const hasAuthCredentials = Boolean(credentials);
-    const routeFocused = useSessionScreenIsFocused();
-    const surfaceFocused = typeof props.surfaceFocusedOverride === 'boolean'
-        ? props.surfaceFocusedOverride
-        : routeFocused;
-    const anchorPathname = useSurfaceAnchorPathname(pathname);
-    const isRouteAnchor = typeof props.routeAnchorOverride === 'boolean'
-        ? props.routeAnchorOverride
-        : isOwnedSessionRoutePathname(anchorPathname, sessionId);
-    const shouldRenderSessionSurface = surfaceFocused || isRouteAnchor;
+    // Web retains every visit for Back/Forward; the route mounts only the presented entry, and the
+    // overrides let embedding hosts (native, cockpit, previews) decide presentation themselves.
+    const { surfaceFocused, presented: shouldRenderSessionSurface } = useSessionRouteEntryPresentation(sessionId, {
+        surfaceFocused: props.surfaceFocusedOverride,
+        routeAnchor: props.routeAnchorOverride,
+    });
     const shouldRetainSessionSurface = Platform.OS === 'web' ? shouldRenderSessionSurface : true;
     const directSessionRuntime = useDirectSessionRuntime({
         sessionId,
@@ -3822,6 +3785,7 @@ function SessionViewLoaded({
     const attachmentsUploadsTransferAvailable = useSessionFileUploadAvailability(sessionId);
     const attachmentsUploadsEnabled = attachmentsUploadsFeatureEnabled && attachmentsUploadsTransferAvailable;
     const sessionProviderUsageGaugeWindowModesSetting = useSetting('sessionProviderUsageGaugeWindowModes');
+    const sessionProviderUsageGaugeNumberWindowMode = useSetting('sessionProviderUsageGaugeNumberWindowMode');
     const pinnedQuotaMeterIdsByKey = useSetting('connectedServicesQuotaPinnedMeterIdsByKey');
     const sessionProviderUsageGaugeMode = useSetting('sessionProviderUsageGaugeMode');
     const sessionProviderUsageGaugeWindowModeSetting = useSetting('sessionProviderUsageGaugeWindowMode');
@@ -4133,6 +4097,7 @@ function SessionViewLoaded({
             activeModelId: modelMode,
             windowMode: sessionProviderUsageGaugeWindowMode,
             windowModes: sessionProviderUsageGaugeWindowModesSetting,
+            numberWindowMode: sessionProviderUsageGaugeNumberWindowMode,
             additionalMeterIds: connectedServiceQuotaProfileRef
                 && gaugeSource.snapshot.serviceId === connectedServiceQuotaProfileRef.serviceId
                 ? pinnedQuotaMeterIdsByKey[connectedServiceProfileKey(gaugeSource.snapshot)] ?? []
@@ -4156,6 +4121,7 @@ function SessionViewLoaded({
         pinnedQuotaMeterIdsByKey,
         connectedServiceQuotaLimitSelection,
         sessionProviderUsageGaugeWindowModesSetting,
+        sessionProviderUsageGaugeNumberWindowMode,
         sessionProviderUsageGaugeWindowMode,
     ]);
     const providerUsageGaugeConnectedServiceProfileRef =
@@ -4538,11 +4504,11 @@ function SessionViewLoaded({
     const restorePendingEditComposerSnapshotIfSafe = React.useCallback((edit: PendingMessageComposerEditState) => {
         setDraftValue(edit.previousDraftText);
         restorePendingEditAttachmentDraftsIfSafe(edit);
-        restorePendingEditSemanticDraftsIfSafe(edit);
+        restoreSemanticDraftValuesFromSnapshot(edit.previousSemanticDraftSnapshot);
         inputComposerRestoreTransientStateRef.current(edit.previousTransientInputState);
     }, [
         restorePendingEditAttachmentDraftsIfSafe,
-        restorePendingEditSemanticDraftsIfSafe,
+        restoreSemanticDraftValuesFromSnapshot,
         setDraftValue,
     ]);
     const restorePendingEditNonTextComposerSnapshotIfSafe = React.useCallback((edit: PendingMessageComposerEditState) => {
@@ -4593,11 +4559,21 @@ function SessionViewLoaded({
         clearMountedArmedContinuationAfterAcceptedComposerClear();
         inputComposerClearTransientStateRef.current();
         setDraftValue(editText);
+        if (draftScope) {
+            const rawRecord = request.message.rawRecord;
+            existingSessionDraftSemanticValues.write(draftScope, sessionId, 'structuredInput.mentions',
+                readComposerStructuredInputMentionsFromMeta({
+                    meta: rawRecord && typeof rawRecord === 'object' && 'meta' in rawRecord ? rawRecord.meta : null,
+                    text: editText,
+                }));
+        }
     }, [
         captureComposerSemanticDraftSnapshot,
         captureDraftForOutboundHandoff,
         clearDraftCurrentness,
         composerTextStore,
+        draftScope,
+        sessionId,
         clearMountedArmedContinuationAfterAcceptedComposerClear,
         replaceSessionAttachmentDrafts,
         setDraftValue,
@@ -5373,7 +5349,7 @@ function SessionViewLoaded({
             setIsComposerSendPending(true);
             fireAndForget((async () => {
                 try {
-                    await sync.updatePendingMessage(sessionId, activePendingEdit.pendingId, nextText);
+                    await sync.updatePendingMessage(sessionId, activePendingEdit.pendingId, nextText, sendOptions?.structuredInputMetaOverrides ?? {});
                     if (pendingMessageEditRef.current?.pendingId === activePendingEdit.pendingId) {
                         setPendingMessageEdit(null);
                         restorePendingEditComposerSnapshotIfSafe(activePendingEdit);

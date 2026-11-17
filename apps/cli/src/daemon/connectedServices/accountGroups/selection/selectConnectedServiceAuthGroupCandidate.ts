@@ -10,8 +10,16 @@ import {
 import {
   reconcileMemberRuntimeStateWithFreshQuotaEvidence,
   reconcileMemberRuntimeStateWithPositiveEvidence,
+  resolveConnectedServiceAuthGroupSnapshotEligibilityBlocker,
   type ConnectedServiceAuthGroupPositiveEvidence,
 } from '../memberRuntimeState';
+import {
+  isConnectedServiceAuthGroupMeterExhausted as meterIsExhausted,
+  isConnectedServiceAuthGroupQuotaSnapshotExhausted as isQuotaExhausted,
+  isConnectedServiceAuthGroupRateLimitMeter as isRateLimitMeter,
+  isConnectedServiceAuthGroupUsageMeter as isQuotaMeter,
+  resolveConnectedServiceAuthGroupQuotaUsability,
+} from '../quotas/quotaUsability';
 
 export {
   reconcileMemberRuntimeStateWithFreshQuotaEvidence,
@@ -54,6 +62,8 @@ export type ConnectedServiceAuthGroupQuotaSnapshot = Readonly<{
   meters?: ReadonlyArray<ConnectedServiceAuthGroupQuotaMeterSnapshot>;
   exhausted?: boolean;
   planUnavailable?: boolean;
+  /** Provider credit headroom (Codex credits, Claude extra usage); absent when the account reports none. */
+  creditsAvailable?: boolean;
 }>;
 
 export type ConnectedServiceAuthGroupMemberRuntimeState = Readonly<{
@@ -81,6 +91,8 @@ export type ConnectedServiceAuthGroupMemberRuntimeState = Readonly<{
 export type ConnectedServiceAuthGroupCandidate = ConnectedServiceAuthGroupMember & Readonly<{
   leastLimitedScore: number | null;
   preferenceDeadlineMs?: number | null;
+  /** Usable only through provider credits; ranked after every candidate with included quota left. */
+  creditsOnly?: boolean;
 }>;
 
 export type ConnectedServiceAuthGroupCandidateSelection = Readonly<{
@@ -102,10 +114,11 @@ export type ConnectedServiceAuthGroupCandidateDecisionTraceEntry = Readonly<{
   exclusionReason?: ConnectedServiceAuthGroupCandidateExclusion['reason'];
   retryAtMs?: number | null;
   quotaEvidence: Readonly<{
-    status: 'fresh' | 'stale_or_missing';
+    status: 'fresh' | 'last_known' | 'stale_or_missing';
     remainingPercent?: number | null;
     capturedAtMs?: number;
     exhausted?: boolean;
+    creditsOnly?: boolean;
   }>;
 }>;
 
@@ -240,37 +253,6 @@ function resolveRecentLimiterRetry(params: Readonly<{
   };
 }
 
-function resolveSnapshotEligibilityBlocker(
-  snapshot: ConnectedServiceAuthGroupQuotaSnapshot | null,
-  nowMs: number,
-): ConnectedServiceAuthGroupCandidateExclusion['reason'] extends infer Reason
-  ? Readonly<{ reason: Extract<Reason, 'capacity_limited' | 'auth_invalid' | 'plan_unavailable' | 'validation_blocked'>; retryAtMs?: number | null }> | null
-  : never {
-  const meters = snapshot?.meters ?? [];
-  if (meters.length === 0) return null;
-  if (meters.some((meter) => meter.limitCategory === 'usage_limit' || meter.limitCategory === 'rate_limit' || meter.limitCategory === 'unknown')) {
-    return null;
-  }
-  const retryAtMs = meters
-    .map((meter) => numberOrNull(meter.resetAtMs))
-    .filter((value): value is number => value !== null && value > nowMs)
-    .sort((left, right) => left - right)[0] ?? null;
-  const categories = new Set(meters.map((meter) => meter.limitCategory));
-  if (categories.has('auth_invalid') || categories.has('disabled')) {
-    return { reason: 'auth_invalid', retryAtMs };
-  }
-  if (categories.has('plan_invalid')) {
-    return { reason: 'plan_unavailable', retryAtMs };
-  }
-  if (categories.has('validation_failed')) {
-    return { reason: 'validation_blocked', retryAtMs };
-  }
-  if (categories.has('capacity')) {
-    return { reason: 'capacity_limited', retryAtMs };
-  }
-  return null;
-}
-
 function isFreshQuotaSnapshot(
   snapshot: ConnectedServiceAuthGroupQuotaSnapshot | null | undefined,
   nowMs: number,
@@ -292,56 +274,40 @@ function isQuotaSnapshotWithinFreshnessWindow(
   });
 }
 
-function meterHasRemainingQuota(meter: ConnectedServiceAuthGroupQuotaMeterSnapshot): boolean {
-  const remaining = numberOrNull(meter.remainingPct);
-  return remaining !== null && remaining > 0;
-}
-
-function meterIsExhausted(meter: ConnectedServiceAuthGroupQuotaMeterSnapshot): boolean {
-  const remaining = numberOrNull(meter.remainingPct);
-  return remaining !== null && remaining <= 0;
-}
-
-function isQuotaMeter(meter: ConnectedServiceAuthGroupQuotaMeterSnapshot): boolean {
-  return meter.limitCategory === 'usage_limit';
-}
-
-function isRateLimitMeter(meter: ConnectedServiceAuthGroupQuotaMeterSnapshot): boolean {
-  return meter.limitCategory === 'rate_limit';
-}
-
-function snapshotProvesQuotaUsable(snapshot: ConnectedServiceAuthGroupQuotaSnapshot): boolean {
-  if (snapshot.exhausted) return false;
-  const quotaMeters = (snapshot.meters ?? []).filter(isQuotaMeter);
-  if (quotaMeters.length > 0) return quotaMeters.every(meterHasRemainingQuota);
-  const remaining = numberOrNull(snapshot.effectiveRemainingPercent);
-  return remaining !== null && remaining > 0;
-}
-
-function snapshotProvesRateLimitUsable(snapshot: ConnectedServiceAuthGroupQuotaSnapshot): boolean {
-  const rateLimitMeters = (snapshot.meters ?? []).filter(isRateLimitMeter);
-  return rateLimitMeters.length > 0 && rateLimitMeters.every(meterHasRemainingQuota);
-}
-
-function isQuotaExhausted(snapshot: ConnectedServiceAuthGroupQuotaSnapshot): boolean {
-  if (snapshot.exhausted) return true;
-  if ((snapshot.meters ?? []).some((meter) => (
-    (isQuotaMeter(meter) || isRateLimitMeter(meter))
-    && meterIsExhausted(meter)
-  ))) {
-    return true;
-  }
-  const remaining = numberOrNull(snapshot.effectiveRemainingPercent);
-  return remaining !== null && remaining <= 0;
+/** An elapsed allowance is unknown, never positive recovery proof. No reset means
+ * the observed exhaustion still applies; age alone cannot invent replenishment. */
+function ageElapsedExhaustedAllowances(
+  snapshot: ConnectedServiceAuthGroupQuotaSnapshot | null,
+  nowMs: number,
+): ConnectedServiceAuthGroupQuotaSnapshot | null {
+  if (!snapshot) return null;
+  const expired = (snapshot.meters ?? []).filter((meter) => (
+    (isQuotaMeter(meter) || isRateLimitMeter(meter)) && meterIsExhausted(meter)
+    && meter.resetAtMs !== null && meter.resetAtMs <= nowMs
+  ));
+  if (expired.length === 0) return snapshot;
+  return { ...snapshot, exhausted: false, effectiveRemainingPercent: null,
+    meters: snapshot.meters?.map((meter) => expired.includes(meter) ? { ...meter, remainingPct: null } : meter),
+  };
 }
 
 /** A reset is a quota remedy, not a fallback for every reason a pool cannot select. */
+/** A selection that can serve work from included quota; a credits-only pick is only the paid fallback. */
+export function hasConnectedServiceAuthGroupIncludedQuotaSelection(selection: ConnectedServiceAuthGroupCandidateSelection): boolean {
+  return selection.selected !== null && selection.selected.creditsOnly !== true;
+}
+
 export function resolveConnectedServiceAuthGroupQuotaResetCandidates(
   params: Parameters<typeof selectConnectedServiceAuthGroupCandidate>[0],
 ): ReadonlyArray<ConnectedServiceAuthGroupMember & Readonly<{ providerLimitIds: ReadonlyArray<string> }>> {
   const selection = selectConnectedServiceAuthGroupCandidate({ ...params, allowCurrentProfileRetry: true });
-  if (selection.selected || selection.reason === 'manual_strategy') return [];
-  const resettable = new Set<string>();
+  if (hasConnectedServiceAuthGroupIncludedQuotaSelection(selection) || selection.reason === 'manual_strategy') return [];
+  // Paid credits are the last tier: a banked free reset on a spent account outranks them, so
+  // credits-only candidates stay resettable alongside the quota-exhausted members.
+  const resettable = new Set<string>(selection.decisionTrace.candidates
+    .filter((entry) => entry.decision !== 'excluded' && entry.quotaEvidence.creditsOnly === true
+      && isFreshQuotaSnapshot(params.memberStatesByProfileId.get(entry.profileId)?.quotaSnapshot, params.nowMs, params.quotaFreshnessMs))
+    .map((entry) => entry.profileId));
   for (const excluded of selection.excluded) {
     if (excluded.reason === 'disabled' || excluded.reason === 'auth_invalid' || excluded.reason === 'plan_unavailable') continue;
     if (excluded.reason !== 'quota_exhausted') return [];
@@ -380,15 +346,17 @@ function resolveLeastLimitedScore(snapshot: ConnectedServiceAuthGroupQuotaSnapsh
   return numberOrNull(snapshot.effectiveRemainingPercent);
 }
 
-function buildCandidateQuotaEvidenceTrace(snapshot: ConnectedServiceAuthGroupQuotaSnapshot | null): ConnectedServiceAuthGroupCandidateDecisionTraceEntry['quotaEvidence'] {
+function buildCandidateQuotaEvidenceTrace(snapshot: ConnectedServiceAuthGroupQuotaSnapshot | null, fresh = true): ConnectedServiceAuthGroupCandidateDecisionTraceEntry['quotaEvidence'] {
   if (!snapshot) {
     return { status: 'stale_or_missing' };
   }
+  const usability = resolveConnectedServiceAuthGroupQuotaUsability(snapshot);
   return {
-    status: 'fresh',
+    status: fresh ? 'fresh' : 'last_known',
     remainingPercent: resolveLeastLimitedScore(snapshot),
     capturedAtMs: snapshot.capturedAtMs,
-    exhausted: isQuotaExhausted(snapshot),
+    exhausted: usability === 'exhausted',
+    ...(usability === 'credits_only' ? { creditsOnly: true } : {}),
   };
 }
 
@@ -421,8 +389,8 @@ export function hasConnectedServiceAuthGroupCandidateEvidenceForSwitchReason(
     ? state?.quotaSnapshot ?? null
     : null;
   if (!quotaSnapshot) return allowsUnknownQuotaEvidenceForSwitchReason(params.reason);
-  if (quotaSnapshot.planUnavailable) return false;
-  if (resolveSnapshotEligibilityBlocker(quotaSnapshot, params.nowMs)) return false;
+  if (quotaSnapshot.planUnavailable && !allowsUnknownQuotaEvidenceForSwitchReason(params.reason)) return false;
+  if (resolveConnectedServiceAuthGroupSnapshotEligibilityBlocker(quotaSnapshot, params.nowMs)) return false;
   return !isQuotaExhausted(quotaSnapshot);
 }
 
@@ -539,9 +507,9 @@ function resolveCurrentCandidate(
  * reset because it hit a limit, and that reset time is now in the past. Paired with an existing
  * limiter-context marker so a never-limited member (whose `providerResetsAtMs` is merely a future
  * scheduled window, or absent) is never treated as "recovered from a limit". This is the
- * "we are off the primary BECAUSE it was limited AND its limit has since reset" precondition.
+ * "we left this member BECAUSE it was limited AND its limit has since reset" precondition.
  */
-function primaryLeftForLimitAndResetLanded(
+function memberLeftForLimitAndResetLanded(
   state: ConnectedServiceAuthGroupMemberRuntimeState | null,
   nowMs: number,
 ): boolean {
@@ -558,12 +526,12 @@ function primaryLeftForLimitAndResetLanded(
 }
 
 /**
- * Restore an eligible priority primary on fresh healthy quota after an automatic limit fallback.
+ * Restore the highest-priority eligible member ahead of the active member after an automatic limit fallback.
  * Group switch provenance survives member failure-state reconciliation and also distinguishes a
  * deliberate manual selection. Older groups without provenance retain their landed-reset proof.
  * Eligibility and fresh headroom remain owned by the normal candidate path.
  */
-function resolvePrimaryRestorePreferredCandidate(params: Readonly<{
+function resolvePriorityRestorePreferredCandidate(params: Readonly<{
   members: ReadonlyArray<ConnectedServiceAuthGroupMember>;
   candidates: ReadonlyArray<ConnectedServiceAuthGroupCandidate>;
   activeProfileId: string | null;
@@ -576,25 +544,21 @@ function resolvePrimaryRestorePreferredCandidate(params: Readonly<{
   if (!params.policy.autoRestorePrimaryWhenReset) return null;
   if (params.policy.strategy !== 'priority') return null;
   if (!params.activeProfileId) return null;
-  const primaryProfileId = resolveConnectedServiceAuthGroupPriorityPrimaryProfileId(params.members);
-  if (!primaryProfileId || primaryProfileId === params.activeProfileId) return null;
-  const primaryCandidate = params.candidates.find((candidate) => candidate.profileId === primaryProfileId) ?? null;
-  if (!primaryCandidate) return null;
-  const primaryState = params.memberStatesByProfileId.get(primaryProfileId) ?? null;
-  if (params.lastSwitchReason) {
-    if (!['usage_limit', 'rate_limit', 'capacity', 'soft_threshold', 'same_provider_account_exhausted'].includes(params.lastSwitchReason)) return null;
-    const capturedAtMs = numberOrNull(primaryState?.quotaSnapshot?.capturedAtMs);
-    const lastSwitchAt = numberOrNull(params.lastSwitchAt);
-    if (lastSwitchAt !== null && (capturedAtMs === null || capturedAtMs <= lastSwitchAt)) return null;
-  } else if (!primaryLeftForLimitAndResetLanded(primaryState, params.nowMs)) {
-    return null;
-  }
-  if (primaryCandidate.leastLimitedScore === null) return null;
+  const activeMember = params.members.find((member) => member.profileId === params.activeProfileId);
+  if (!activeMember) return null;
+  if (params.lastSwitchReason
+    && !['usage_limit', 'rate_limit', 'capacity', 'soft_threshold', 'same_provider_account_exhausted'].includes(params.lastSwitchReason)) return null;
   const threshold = resolveSoftSwitchRemainingPercent(params.policy);
-  if (threshold !== null && primaryCandidate.leastLimitedScore <= threshold) {
-    return null;
-  }
-  return primaryCandidate;
+  return params.candidates
+    .find((candidate) => {
+      if (comparePriority(candidate, activeMember) >= 0) return false;
+      if (candidate.leastLimitedScore === null || (threshold !== null && candidate.leastLimitedScore <= threshold)) return false;
+      const state = params.memberStatesByProfileId.get(candidate.profileId) ?? null;
+      if (!params.lastSwitchReason) return memberLeftForLimitAndResetLanded(state, params.nowMs);
+      const capturedAtMs = numberOrNull(state?.quotaSnapshot?.capturedAtMs);
+      const lastSwitchAt = numberOrNull(params.lastSwitchAt);
+      return lastSwitchAt === null || (capturedAtMs !== null && capturedAtMs > lastSwitchAt);
+    }) ?? null;
 }
 
 function resolveSoftSwitchPreferredCandidate(params: Readonly<{
@@ -666,8 +630,10 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
   requiredModelIds?: ReadonlyArray<string>;
   quotaProbeDeferredUntilMsByProfileId?: ReadonlyMap<string, number>;
   switchReason?: string;
+  /** Adoption of the pool's explicit user selection still enforces all known blockers. */
+  acceptLastKnownQuota?: boolean;
 }>): ConnectedServiceAuthGroupCandidateSelection {
-  if (params.policy.strategy === 'manual') {
+  if (params.policy.strategy === 'manual' && !params.acceptLastKnownQuota) {
     return {
       selected: null,
       reason: 'manual_strategy',
@@ -690,19 +656,24 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
     quotaEvidence: ConnectedServiceAuthGroupCandidateDecisionTraceEntry['quotaEvidence'];
   }> = [];
 
+  const hardLimitRecovery = params.switchReason === 'usage_limit' || params.switchReason === 'same_provider_account_exhausted';
+  const acceptLastKnownQuota = hardLimitRecovery || params.acceptLastKnownQuota === true;
   for (const member of params.members) {
     const state = params.memberStatesByProfileId.get(member.profileId) ?? null;
-    const quotaSnapshot = isFreshQuotaSnapshot(state?.quotaSnapshot, params.nowMs, params.quotaFreshnessMs)
+    const freshQuotaSnapshot = isFreshQuotaSnapshot(state?.quotaSnapshot, params.nowMs, params.quotaFreshnessMs)
       ? state?.quotaSnapshot ?? null
       : null;
+    const observedQuotaSnapshot = freshQuotaSnapshot ?? (acceptLastKnownQuota ? state?.quotaSnapshot ?? null : null);
+    const quotaSnapshot = acceptLastKnownQuota
+      ? ageElapsedExhaustedAllowances(observedQuotaSnapshot, params.nowMs) : observedQuotaSnapshot;
     const effectiveState = reconcileMemberRuntimeStateWithFreshQuotaEvidence({
       state,
-      quotaSnapshot,
+      quotaSnapshot: freshQuotaSnapshot,
       quotaFreshnessMs: params.quotaFreshnessMs,
       policy: params.policy,
       nowMs: params.nowMs,
     });
-    const quotaEvidence = buildCandidateQuotaEvidenceTrace(quotaSnapshot);
+    const quotaEvidence = buildCandidateQuotaEvidenceTrace(quotaSnapshot, freshQuotaSnapshot !== null);
     if (!member.enabled || effectiveState?.autoDisabledReason === 'model_not_entitled') {
       excluded.push({ profileId: member.profileId, reason: 'disabled' });
       decisionTraceCandidates.push({
@@ -714,7 +685,7 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
       continue;
     }
     const probeRetryAtMs = params.quotaProbeDeferredUntilMsByProfileId?.get(member.profileId);
-    if (probeRetryAtMs !== undefined && probeRetryAtMs > params.nowMs) {
+    if (!acceptLastKnownQuota && probeRetryAtMs !== undefined && probeRetryAtMs > params.nowMs) {
       excluded.push({ profileId: member.profileId, reason: 'quota_probe_deferred', retryAtMs: probeRetryAtMs });
       decisionTraceCandidates.push({ profileId: member.profileId, decision: 'excluded',
         exclusionReason: 'quota_probe_deferred', retryAtMs: probeRetryAtMs, quotaEvidence });
@@ -778,7 +749,7 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
       });
       continue;
     }
-    const snapshotBlocker = resolveSnapshotEligibilityBlocker(quotaSnapshot, params.nowMs);
+    const snapshotBlocker = resolveConnectedServiceAuthGroupSnapshotEligibilityBlocker(quotaSnapshot, params.nowMs);
     if (snapshotBlocker) {
       excluded.push({
         profileId: member.profileId,
@@ -863,6 +834,8 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
     const candidate: ConnectedServiceAuthGroupCandidate = {
       ...member,
       leastLimitedScore: resolveLeastLimitedScore(quotaSnapshot),
+      ...(quotaSnapshot && resolveConnectedServiceAuthGroupQuotaUsability(quotaSnapshot) === 'credits_only'
+        ? { creditsOnly: true } : {}),
       ...(params.policy.strategy === 'expiry_first' ? {
         preferenceDeadlineMs: resolvePreferenceDeadline(quotaSnapshot, state?.subscription, params.nowMs),
       } : {}),
@@ -889,7 +862,15 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
     candidates.push(candidate);
   }
 
-  if (params.policy.strategy === 'expiry_first') {
+  if (hardLimitRecovery) {
+    // Prefer fresh usable evidence. If probes cannot supply it, leave the failed member
+    // using the healthiest last-known account rather than waiting indefinitely for proof.
+    candidates.sort((left, right) => {
+      const fresh = (profileId: string) => isFreshQuotaSnapshot(params.memberStatesByProfileId.get(profileId)?.quotaSnapshot,
+        params.nowMs, params.quotaFreshnessMs);
+      return Number(fresh(right.profileId)) - Number(fresh(left.profileId)) || compareLeastLimited(left, right);
+    });
+  } else if (params.policy.strategy === 'expiry_first') {
     candidates.sort((left, right) => {
       const leftAdequate = left.leastLimitedScore !== null && left.leastLimitedScore > params.policy.softSwitchRemainingPercent;
       const rightAdequate = right.leastLimitedScore !== null && right.leastLimitedScore > params.policy.softSwitchRemainingPercent;
@@ -905,8 +886,10 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
   } else {
     candidates.sort(comparePriority);
   }
+  // Credits are the fallback for every strategy: a stable partition keeps each tier's strategy order.
+  candidates.sort((left, right) => Number(left.creditsOnly === true) - Number(right.creditsOnly === true));
 
-  const primaryRestorePreferred = resolvePrimaryRestorePreferredCandidate({
+  const priorityRestorePreferred = resolvePriorityRestorePreferredCandidate({
     members: params.members,
     candidates,
     activeProfileId: params.activeProfileId,
@@ -924,7 +907,7 @@ export function selectConnectedServiceAuthGroupCandidate(params: Readonly<{
     allowCurrentProfileRetry: params.allowCurrentProfileRetry,
   });
 
-  const selected = primaryRestorePreferred ?? softSwitchPreferred ?? candidates[0] ?? null;
+  const selected = priorityRestorePreferred ?? softSwitchPreferred ?? candidates[0] ?? null;
   const reason = selected ? 'selected' : 'no_eligible_members';
   if (selected) {
     const selectedTraceCandidate = decisionTraceCandidates.find((candidate) => candidate.profileId === selected.profileId);

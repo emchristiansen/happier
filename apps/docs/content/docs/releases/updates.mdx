@@ -44,7 +44,7 @@ The table below covers all user-facing released assets and how updates work.
 | **Managed Relay runtime** (`happier relay host …`) | Install the Happier CLI, then run `happier relay host install …` | You rerun `happier relay host install` | No | `happier relay host install` (local or with `--ssh user@host`) |
 | **CLI installer** (`https://happier.dev/install`) | `curl …install \| bash` / `irm …install.ps1` | You rerun it (or use the CLI’s self-update for installer installs) | No | Re-run the installer, or run the lane-specific command (`happier`, `hprev`, or `hdev`) with `self update` |
 | **CLI installer payload** | Installed under `~/.happier/cli{,-preview,-dev}/{versions,current,previous}` with lane-specific shims in `~/.happier/bin` and `~/.local/bin` (or Windows equivalent) | You run `happier self update`, `hprev self update`, `hdev self update`, or rerun the installer | No (but it can show notices) | Installer lanes are `stable` (`happier`), `preview` (`hprev`), and `dev` (`hdev`). You can still target `--channel preview|dev` or `--to versionOrTag` explicitly. |
-| **CLI npm package** (`@happier-dev/cli`) | `npm install -g @happier-dev/cli` | You upgrade the npm package | No (but it can show notices) | `npm install -g @happier-dev/cli@latest` (or `@next` for preview) |
+| **CLI npm package** (`@happier-dev/cli`) | `npm install -g @happier-dev/cli` | You upgrade the npm package | No (but it can show notices) | `npm install -g @happier-dev/cli@latest` (`@next` for preview, `@dev` for nightly dev) |
 | **Stack npm package** (`@happier-dev/stack`) | `npm install -g @happier-dev/stack` | You upgrade the npm package (or use `hstack self update` runtime install) | No (but it can show notices) | `hstack self update` (recommended in-stack) or `npm install -g @happier-dev/stack@latest` |
 
 ## Integrity verification (binaries + bundles)
@@ -139,6 +139,21 @@ previous version does not come back, that it failed). `--to` takes an exact publ
 Windows, `self update` stops the background service and ends running sessions before it switches
 versions, as the installer does.
 
+On Windows, save your work and run the update from an independent terminal, outside any
+Happier session. In current development source (not yet released), the CLI refuses an update
+started below a Happier daemon or daemon-started session before changing the installation.
+
+In current development source (not yet released), Windows self-update also repairs a legacy
+PowerShell task action before restarting its service, using the native hidden launcher. It keeps
+the service's existing startup preference and Desktop ownership. Custom command prefixes that
+cannot be preserved are kept with a repair warning.
+
+In current development source (not yet released), `self update` also opens guided repair when
+a Happier-managed local relay is installed, even when the background service needs no repair.
+Repair shows the installed relay version and offers an update when a newer relay release is
+available for the current channel. Relay updates require confirmation and keep the installed
+channel and user/system mode. The CLI and relay remain separate updates.
+
 Rerunning the installer is also a valid update path:
 
 ```bash
@@ -157,6 +172,12 @@ Preview:
 
 ```bash
 npm install -g @happier-dev/cli@next
+```
+
+Nightly dev:
+
+```bash
+npm install -g @happier-dev/cli@dev
 ```
 
 ## Installers & binaries (what’s automatic vs manual)

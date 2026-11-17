@@ -12,6 +12,7 @@ import {
     createProviderSessionInfoV1Schema,
     createSessionSystemSessionV1Schema,
     createSessionWorkspaceLocationV1Schema,
+    createSessionRepositoryV1Schema,
     SessionMcpSelectionRestartRequiredV1Schema,
     SessionMcpSelectionV1Schema,
     type PendingDeliveryBlockedReason,
@@ -25,6 +26,7 @@ import {
     type ScmDefaultBranchPushPolicy,
     type ScmHostingProvider,
     type ScmPullRequestSummary,
+    type ScmWorkingSnapshot as ProtocolScmWorkingSnapshot,
 } from "@happier-dev/protocol";
 
 //
@@ -45,6 +47,7 @@ const MetadataObjectSchema = z.object({
     }).optional(),
     machineId: z.string().optional(),
     sessionWorkspaceLocationV1: createSessionWorkspaceLocationV1Schema(z).optional(),
+    sessionRepositoryV1: createSessionRepositoryV1Schema(z).optional().catch(undefined),
     handoffV1: z.object({
         v: z.literal(1),
         sourceMachineId: z.string(),
@@ -819,6 +822,8 @@ export interface ScmWorkingSnapshot {
     pullRequest?: ScmPullRequestSummary | null;
     hasConflicts: boolean;
     entries: ScmWorkingEntry[];
+    /** Absent = complete. Read through `scmSnapshotEntriesAreComplete`. */
+    entriesPresentation?: ProtocolScmWorkingSnapshot['entriesPresentation'];
     totals: {
         isComplete?: boolean;
         includedFiles: number;
@@ -828,5 +833,7 @@ export interface ScmWorkingSnapshot {
         includedRemoved: number;
         pendingAdded: number;
         pendingRemoved: number;
+        /** Full-set changed-file count; read through `readScmSnapshotChangedFileCount`. */
+        changedFiles?: number;
     };
 }

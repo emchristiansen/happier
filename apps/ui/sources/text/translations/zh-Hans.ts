@@ -627,6 +627,7 @@ export const zhHans: TranslationStructure = {
             composerFocus: '聚焦输入框',
             composerSendImmediate: '切换发送方式（排队 / 引导）',
             composerSendInterrupt: '中断并发送',
+            composerSendAlternateAfterSend: "发送并开始另一个 / 打开",
             composerSendPending: '发送到待处理队列',
             commandPaletteOpen: '打开命令面板',
             modeCycle: '切换模式',
@@ -2495,7 +2496,7 @@ export const zhHans: TranslationStructure = {
           renewal: "续订",
           renewalOn: "开启",
           renewalOff: "关闭",
-          renewalUnknown: "未知",
+          active: "有效",
           renews: ({ date }: { date: string }) => `${date}续订`,
           ends: ({ date }: { date: string }) => `${date}结束`,
           renewsInDays: ({ days }: { days: number }) => `${days}天后续订`,
@@ -2652,6 +2653,12 @@ export const zhHans: TranslationStructure = {
       refreshA11y: "刷新用量和限额",
       usageCaption: "用量",
       resetsCaption: "配额重置",
+      credits: {
+        title: "额度",
+        balance: ({ balance }: { balance: string }) => `${balance} 额度`,
+        spent: "已用完",
+        includedUsed: "套餐内额度已用完 · 可使用额度",
+      },
       usedDetail: ({ used, limit }: { used: string; limit: string }) => `已用 ${used}/${limit}`,
       capacity: ({ percent }: { percent: number }) => `容量 ${percent}%`,
       memberEnabledLabel: "已在池中启用",
@@ -3048,6 +3055,8 @@ export const zhHans: TranslationStructure = {
         membersSubtitle: ({ enabled, total }: { enabled: number; total: number }) => `${enabled}/${total} 已启用`,
         optionsTitle: "选项",
         autoSwitchTitle: "自动回退",
+        claudeCodeAutoContinueAtUsageLimitTitle: "让Claude在达到用量上限时等待",
+        claudeCodeAutoContinueAtUsageLimitSubtitle: "对于新会话，让Claude等待用量上限重置后自动继续。关闭后由Happier管理恢复。",
         autoQuotaResetTitle: "自动使用配额重置",
         autoQuotaResetSubtitle: "仅当池中没有可用账户且耗尽的配额可以重置时，才消耗已保存的重置次数。默认关闭。",
         autoDisablePlanInvalidTitle: "停用无法使用所选模型的账户",
@@ -3497,7 +3506,7 @@ export const zhHans: TranslationStructure = {
     trayOpenInHappier: '在 Happier 中打开',
     traySettings: '设置…',
     trayStartAtLogin: '登录时启动',
-    trayStopAndQuit: '停止后台服务并退出',
+    trayStopAndQuit: '退出 Happier（停止后台服务）',
     trayStart: '启动',
     trayRestart: '重新启动',
     trayStop: '停止',
@@ -3513,6 +3522,7 @@ export const zhHans: TranslationStructure = {
     trayStopAllConfirmBody: '这台电脑上运行的代理会话将结束，在你再次打开 Happier 之前，你的手机和浏览器都无法连到它。',
     trayStopConfirmAction: '停止',
     trayActionFailedTitle: '没有成功',
+    trayQuitWaitForSystemTasks: "Happier 仍在设置或移除组件。请等待完成后再尝试退出。",
     trayLoginItemFailed: '无法更新 Happier 的登录项',
     traySessions: ({ count }: { count: string }) => `会话：${count}`,
     closeStopTitle: '智能体会话仍在运行',
@@ -3866,6 +3876,39 @@ export const zhHans: TranslationStructure = {
   },
 
   settingsProviders: {
+        sessionRetention: {
+            invalidSettings: "修复 Claude 设置中无效的 JSON，然后重新连接此机器以重试。",
+            permissionDenied: "允许访问 Claude 设置文件，然后重新连接此机器以重试。",
+            writeFailed: "无法保存 Claude 设置。检查文件访问权限，然后重新连接此机器以重试。",
+            managedUnreadable: "无法读取组织设置。更改保留期限前，请检查 Claude 中的权限。",
+            group: "组",
+            title: "会话保留期限",
+            footer: "在各台机器上配置 Claude 用户级保留期限。项目、组织或显式启动设置可能覆盖此设置。",
+            policy: "保留本地历史",
+            unmanaged: "保留现有设置",
+            unmanagedHint: "停止管理保留期限；之前的修改保持不变。",
+            providerDefault: "Claude 默认值",
+            providerDefaultHint: "移除用户级清理期限，使用 Claude 默认值。",
+            year: "1 年（365 天）",
+            century: "100 年（36,500 天）",
+            custom: "自定义天数",
+            customDays: "天数",
+            invalidDays: "请输入正整数天数。",
+            machines: "机器状态",
+            noMachines: "已配对的机器将显示在此处。",
+            native: "原生 Claude",
+            profile: "配置档案",
+            applied: "已配置",
+            unmanagedStatus: "未管理",
+            pending: "等待机器",
+            unknown: "更新 daemon 以报告状态",
+            error: "无法应用保留期限",
+            managed: "组织策略可能覆盖保留期限",
+            offline: "离线 · 上次确认的状态",
+            confirmTitle: "缩短 Claude 会话保留期限？",
+            confirmBody: "较短的期限可能使 Claude 删除较早的本地历史。删除的历史无法恢复。项目或组织设置可能会覆盖此用户设置。",
+            confirmAction: "应用保留期限",
+        },
     title: "AI 提供商设置",
     entrySubtitle: "配置提供商专属选项",
     footer: "配置提供商专属选项。这些设置可能会影响会话行为。",
@@ -4721,6 +4764,8 @@ export const zhHans: TranslationStructure = {
       hiddenInactiveSessionsEmptyStateSubtitle: "非活跃会话在此列表中已隐藏",
       hiddenInactiveSessionsSectionTitle: "非活跃会话",
       hiddenInactiveSessionsSectionSubtitle: "它们在主列表中被隐藏，因为那里只显示活跃聊天",
+    sessionListGroupGitWorktrees: "按仓库分组 Git 工作树",
+    sessionListGroupGitWorktreesSubtitle: "将同一仓库的会话放在一起。关闭后按目录分组。",
     sessionListActiveGrouping: "活跃会话分组",
     sessionListActiveGroupingSubtitle: "选择侧边栏中活跃会话的分组方式",
     sessionListInactiveGrouping: "非活跃会话分组",
@@ -5253,6 +5298,7 @@ export const zhHans: TranslationStructure = {
       resetBody: ({ time }: { time: string }) =>
         `此提供方要求会话等到 ${time} 后再继续。`,
       genericBody: "此提供方要求会话等待后再继续。",
+      stoppedBody: "自动恢复已停止，不会自行重试。请在下方重试。",
       resetCreditBody: ({ count }: { count: number }) =>
         `${count} 次使用重置可用。`,
       resetCreditExpiresBody: ({ count, time }: { count: number; time: string }) =>
@@ -6326,7 +6372,7 @@ export const zhHans: TranslationStructure = {
   },
 
   sessionDrafts: {
-    sectionTitle: '草稿', badge: '草稿', untitled: '未命名草稿', continueEditing: '继续编辑', startAnother: '开始另一份',
+    sectionTitle: '草稿', badge: '草稿', untitled: '未命名草稿', continueEditing: '继续编辑', startAnother: '开始另一份', startedOpen: "会话已启动 · 打开",
     status: { offline: '离线', syncing: '同步中', conflict: '冲突', machineUnavailable: '机器不可用', attachmentNeedsAttention: '附件需要处理', startInterrupted: '启动中断' },
     new: { action: '新建草稿' }, delete: { action: '删除草稿', confirmTitle: '删除草稿？', confirmDescription: '此草稿将从你的设备中移除。' },
     conflict: { title: '草稿冲突', description: '此字段已在另一台设备上更改。', mine: '此设备', synced: '已同步', useSynced: '使用同步版本', keepDevice: '保留设备版本', copyMine: '复制我的版本', copied: '已复制', copyFailed: '无法复制', field: { text: '文本', mentions: '提及', attachments: '附件', recipient: '接收者', agentContinuation: '代理延续', executionRunDelivery: '运行交付' } },
@@ -6716,8 +6762,12 @@ export const zhHans: TranslationStructure = {
   },
 
   agentInput: {
+      keepKeyboard: { label: "发送后保持键盘打开" },
+      historyPosition: ({ index, total }: { index: number; total: number }) => `${index} / ${total}`,
       sendOptions: {
           title: "发送选项",
+          sendAndStartAnother: "发送并开始另一个",
+          sendAndOpen: "发送并打开会话",
           queue: "加入队列",
           hint: "长按选择发送方式",
       },
@@ -7188,7 +7238,10 @@ export const zhHans: TranslationStructure = {
     },
     askUserQuestion: {
         submit: "提交答案",
+        dismiss: '关闭问题',
+        dismissed: '问题已关闭',
         submissionFailures: {
+            unconfirmed: "Happier 无法确认你的回答。请重试，或打开 Claude 终端查看。",
             update: "请更新 Happier CLI，然后重试。",
             reconnect: "请重新连接此会话，然后重试。",
             retry: "无法接受该答案。请检查后重试。",
@@ -8058,6 +8111,7 @@ export const zhHans: TranslationStructure = {
 settingsSession: {
     terminalHostTitle: '新会话的终端宿主',
     terminalHostNone: '不使用终端宿主',
+    newSessionAfterSend: { title: "发送后", footer: "选择从新会话编辑器发送时的行为。长按发送可为单条消息选择另一种方式。", openTitle: "打开会话", openSubtitle: "会话启动后立即前往。", startAnotherTitle: "留下并开始另一个", startAnotherSubtitle: "在后台继续启动，并打开新的草稿。" },
     newSessionDraftEntry: {
         title: '新会话草稿',
         footer: '选择“新会话”是继续此设备上的草稿，还是打开新草稿。',
@@ -8249,6 +8303,10 @@ settingsSession: {
         resetHiddenSubtitle: '清除本设备上已隐藏的横幅。',
     },
     inputBehavior: {
+        keepFocusTitle: "发送后保持编辑器焦点",
+        keepFocusSubtitle: "留在消息框中，以便立即编写下一条消息。",
+        typeToFocusTitle: "随处输入",
+        typeToFocusSubtitle: "在文本框外直接输入即可跳到消息框。",
         title: '输入行为',
         footer: '设置按 Enter 发送以及消息历史行为。',
         enterToSendEnabledNativeSubtitle: '按 Enter 发送',
@@ -8358,6 +8416,8 @@ settingsSession: {
       customResumePromptPlaceholder: "从你上次停下的地方继续。",
     },
     providerUsageGauge: {
+        numberTitle: "圆环中心数值",
+        numberSubtitle: "选择圆环中数值对应的限额。若不可用，则使用剩余额度最少的限额。",
       title: "提供方使用量",
       footer:
         "为所有账户选择输入框上方的用量仪表。仪表遵循每个池所选的用量限制。收藏的限额会为当前账户添加额外仪表。",
@@ -10451,7 +10511,15 @@ settingsSession: {
     },
     cliPath: {
       title: "终端",
-      footer: "Happier Desktop 只会添加或移除它自己创建的 PATH 条目；由 shell 安装脚本写入的条目保持不变。",
+      footer: "Happier Desktop 只修改它创建的 PATH 条目；Shell 安装程序的条目会保留。",
+      cleanupTitle: "移除 Desktop 组件",
+      cleanupSubtitle: "清理 Desktop 拥有的命令行和后台服务，然后退出。",
+      cleanupConfirmTitle: "移除 Desktop 组件并退出？",
+      cleanupConfirmBody: "仅当没有其他 Desktop 应用需要时，才会移除 Desktop 拥有的命令行文件、PATH 条目和后台服务。共享组件、用户自行安装的组件、会话历史和账户数据都会保留。被移除的服务会停止，可能中断正在运行的会话和远程访问。\n\n清理完成后 Desktop 将退出。然后请通过操作系统移除应用；在 macOS 或便携版 Linux 上，请删除应用包或文件。再次打开 Desktop 可能会重新设置这些组件。",
+      cleanupConfirmAction: "移除组件并退出",
+      cleanupBusy: "正在移除 Desktop 组件…",
+      cleanupFailed: "清理未完成，请重试。",
+      cleanupQuitFailed: "清理已完成，但 Desktop 未能退出。请先退出应用，再将其移除。",
       addTitle: "将 happier 添加到 PATH",
       addSubtitle: "让 happier 命令在新终端中可用。",
       removeTitle: "从 PATH 中移除 happier",
@@ -10553,10 +10621,15 @@ settingsSession: {
   },
 
   message: {
+    provenanceFrom: ({ source }: { source: string }) => `来自 ${source}`,
+    provenanceSession: '会话',
     sessionReferenceUnavailable: "会话不可用",
     sessionReferenceOpen: ({ name }: { name: string }) => `打开会话 ${name}`,
     switchedToMode: ({ mode }: { mode: string }) => `已切换到 ${mode} 模式`,
     discarded: "已丢弃",
+    readAloudA11y: "朗读",
+    stopReadAloudA11y: "停止朗读",
+    readAloudFailed: "无法朗读此消息。请检查语音设置。",
     recoveredHistory: "已恢复的历史记录",
     unknownEvent: "未知事件",
     contextCompactionStarted: "正在压缩上下文...",
@@ -10604,7 +10677,7 @@ settingsSession: {
     sessionRunningLocally:
       "此会话正在本机上以本地模式运行。你可以切换到远程以在应用中控制。",
     sessionRunningLocallyAndRemotely:
-      "此会话已在 OpenCode 中本地附加，同时仍可从应用中控制。",
+      "此会话已在本地连接，同时仍可从应用中控制。",
     switchingToRemote: "正在切换到远程模式…",
     switchToRemote: "切换到远程",
     detachLocalTerminal: "断开终端",
@@ -10682,6 +10755,13 @@ settingsSession: {
     codeCopied: "代码已复制",
     copyFailed: "复制失败",
     mermaidRenderFailed: "渲染 mermaid 图表失败",
+    table: {
+        open: "打开表格",
+        copyCsv: "复制为 CSV",
+        copyMarkdown: "复制为 Markdown",
+        csvLabel: "CSV",
+        viewerTitle: "表格",
+    },
     diffLabel: "差异",
     codeLabel: "代码",
 
@@ -10890,6 +10970,7 @@ settingsSession: {
     deleteConfirm: ({ name }: { name: string }) =>
       `确定要删除配置文件“${name}”吗？`,
     nameRequired: "配置文件名称为必填项",
+    invalidProfile: '保存前请检查配置名称、环境变量和默认设置。',
     builtIn: "内置",
     custom: "自定义",
     builtInSaveAsHint: "保存内置配置文件会创建一个新的自定义配置文件。",

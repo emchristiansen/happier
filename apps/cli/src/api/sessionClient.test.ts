@@ -2006,9 +2006,10 @@ describe('ApiSessionClient connection handling', () => {
             output: expect.objectContaining({
                 stdout: 'TRACE_OK\n',
                 _happier: expect.objectContaining({ v: 2, canonicalToolName: 'Bash' }),
-                _raw: expect.anything(),
             }),
         });
+        // Every raw field is represented by the canonical output, so no _raw copy is kept.
+        expect(decrypted.content.data.output).not.toHaveProperty('_raw');
     });
 
     it('backfills empty TodoWrite tool-result outputs with the requested todos', async () => {
@@ -2160,9 +2161,10 @@ describe('ApiSessionClient connection handling', () => {
             output: expect.objectContaining({
                 stdout: 'TRACE_OK\n',
                 _happier: expect.objectContaining({ v: 2, canonicalToolName: 'Bash' }),
-                _raw: expect.anything(),
             }),
         });
+        // Every raw field is represented by the canonical output, so no _raw copy is kept.
+        expect(decrypted.content.data.output).not.toHaveProperty('_raw');
     });
 
     it('should handle socket connection failure gracefully', async () => {
@@ -2724,7 +2726,7 @@ describe('ApiSessionClient connection handling', () => {
         ).resolves.toBe(true);
     });
 
-    it('updateMetadata syncs a snapshot first when metadataVersion is unknown', async () => {
+    it('updateMetadata syncs an unknown snapshot without republishing unchanged metadata', async () => {
                 const serverMetadata = {
                     ...mockSession.metadata,
                     tools: ['tool-1'],
@@ -2771,10 +2773,8 @@ describe('ApiSessionClient connection handling', () => {
                     return metadata;
                 });
 
-                expect(sessionSocket.emitWithAck).toHaveBeenCalledWith(
-                    'update-metadata',
-                    expect.objectContaining({ expectedVersion: 5 }),
-                );
+                expect(client.getMetadataSnapshot()).toEqual(serverMetadata);
+                expect(sessionSocket.emitWithAck.mock.calls.filter(([event]: readonly unknown[]) => event === 'update-metadata')).toEqual([]);
     });
 
 });

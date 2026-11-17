@@ -629,6 +629,7 @@ export const es: TranslationStructure = {
             composerFocus: 'Enfocar el compositor',
             composerSendImmediate: 'Envío alternativo (cola / dirigir)',
             composerSendInterrupt: 'Interrumpir y enviar',
+            composerSendAlternateAfterSend: "Enviar y empezar otra / abrir",
             composerSendPending: 'Enviar a la cola pendiente',
             commandPaletteOpen: 'Abrir paleta de comandos',
             modeCycle: 'Cambiar modo',
@@ -2561,7 +2562,7 @@ export const es: TranslationStructure = {
           renewal: "Renovación",
           renewalOn: "Activada",
           renewalOff: "Desactivada",
-          renewalUnknown: "Desconocida",
+          active: "Activa",
           renews: ({ date }: { date: string }) => `Se renueva el ${date}`,
           ends: ({ date }: { date: string }) => `Finaliza el ${date}`,
           renewsInDays: ({ days }: { days: number }) => `Se renueva en ${days} día${days === 1 ? '' : 's'}`,
@@ -2824,6 +2825,12 @@ export const es: TranslationStructure = {
       refreshA11y: "Actualizar uso y límites",
       usageCaption: "Uso",
       resetsCaption: "Reinicios de cuota",
+      credits: {
+        title: "Créditos",
+        balance: ({ balance }: { balance: string }) => `${balance} créditos`,
+        spent: "No quedan",
+        includedUsed: "Límites incluidos agotados · créditos disponibles",
+      },
       usedDetail: ({ used, limit }: { used: string; limit: string }) => `${used}/${limit} usado`,
       capacity: ({ percent }: { percent: number }) => `${percent}% de capacidad`,
       memberEnabledLabel: "Habilitado en el Pool",
@@ -3125,6 +3132,8 @@ export const es: TranslationStructure = {
         membersSubtitle: ({ enabled, total }: { enabled: number; total: number }) => `${enabled}/${total} habilitados`,
         optionsTitle: "Opciones",
         autoSwitchTitle: "Respaldo automático",
+        claudeCodeAutoContinueAtUsageLimitTitle: "Permitir que Claude espere al alcanzar límites",
+        claudeCodeAutoContinueAtUsageLimitSubtitle: "En las sesiones nuevas, Claude espera y continúa automáticamente cuando se restablece el límite. Desactívalo para que Happier gestione la recuperación.",
         autoQuotaResetTitle: "Usar restablecimientos de cuota automáticamente",
         autoQuotaResetSubtitle: "Consume un restablecimiento disponible solo cuando ninguna cuenta del grupo está lista y se puede restablecer la cuota agotada. Desactivado de forma predeterminada.",
         autoDisablePlanInvalidTitle: "Desactivar cuentas que no pueden usar el modelo seleccionado",
@@ -3594,7 +3603,7 @@ export const es: TranslationStructure = {
     trayOpenInHappier: 'Abrir en Happier',
     traySettings: 'Ajustes…',
     trayStartAtLogin: 'Iniciar al acceder',
-    trayStopAndQuit: 'Detener los servicios en segundo plano y salir',
+    trayStopAndQuit: 'Salir de Happier (detener los servicios en segundo plano)',
     trayStart: 'Iniciar',
     trayRestart: 'Reiniciar',
     trayStop: 'Detener',
@@ -3610,6 +3619,7 @@ export const es: TranslationStructure = {
     trayStopAllConfirmBody: 'Las sesiones de agentes que se ejecutan en este ordenador terminarán, y tu teléfono y tu navegador no podrán alcanzarlo hasta que vuelvas a abrir Happier.',
     trayStopConfirmAction: 'Detener',
     trayActionFailedTitle: 'No se ha podido hacer',
+    trayQuitWaitForSystemTasks: "Happier sigue configurando o eliminando componentes. Espera a que termine y vuelve a intentar salir.",
     trayLoginItemFailed: 'No se pudo actualizar el elemento de inicio de Happier',
     traySessions: ({ count }: { count: string }) => `Sesiones: ${count}`,
     closeStopTitle: 'Todavía hay sesiones de agente en curso',
@@ -3974,6 +3984,39 @@ export const es: TranslationStructure = {
     },
 
   settingsProviders: {
+        sessionRetention: {
+            invalidSettings: "Repara el JSON de los ajustes de Claude y vuelve a conectar este equipo para reintentar.",
+            permissionDenied: "Permite el acceso al archivo de ajustes de Claude y vuelve a conectar este equipo.",
+            writeFailed: "No se pudieron guardar los ajustes de Claude. Comprueba el acceso al archivo y vuelve a conectar el equipo.",
+            managedUnreadable: "No se pudieron leer los ajustes de la organización. Comprueba los permisos en Claude antes de cambiar la conservación.",
+            group: "Grupo",
+            title: "Conservación de sesiones",
+            footer: "Configura la retención de Claude a nivel de usuario en tus máquinas. Los ajustes del proyecto, de la organización o de inicio explícito pueden reemplazarla.",
+            policy: "Conservar historial local",
+            unmanaged: "Mantener ajustes existentes",
+            unmanagedHint: "Dejar de gestionar la conservación; se mantienen los cambios anteriores.",
+            providerDefault: "Predeterminado de Claude",
+            providerDefaultHint: "Eliminar el plazo del usuario y usar el predeterminado de Claude.",
+            year: "1 año (365 días)",
+            century: "100 años (36.500 días)",
+            custom: "Días personalizados",
+            customDays: "Número de días",
+            invalidDays: "Introduce un número entero positivo de días.",
+            machines: "Estado de los equipos",
+            noMachines: "Los equipos vinculados aparecerán aquí.",
+            native: "Claude nativo",
+            profile: "Perfil",
+            applied: "Configurado",
+            unmanagedStatus: "Sin gestionar",
+            pending: "Esperando al equipo",
+            unknown: "Actualiza el daemon para ver el estado",
+            error: "No se pudo aplicar la conservación",
+            managed: "La política de la organización puede sustituir la conservación",
+            offline: "Sin conexión · último estado confirmado",
+            confirmTitle: "¿Reducir la conservación de Claude?",
+            confirmBody: "Un plazo más corto puede permitir que Claude elimine el historial local antiguo. El historial eliminado no se puede recuperar. Los ajustes del proyecto o la organización pueden sustituir este ajuste.",
+            confirmAction: "Aplicar conservación",
+        },
     title: "Configuración del proveedor de IA",
     entrySubtitle: "Configura opciones específicas del proveedor",
     footer:
@@ -4854,6 +4897,8 @@ export const es: TranslationStructure = {
       hiddenInactiveSessionsEmptyStateSubtitle: "Las sesiones inactivas están ocultas en esta lista",
       hiddenInactiveSessionsSectionTitle: "Sesiones inactivas",
       hiddenInactiveSessionsSectionSubtitle: "Ocultas en la lista principal porque allí solo se muestran los chats activos",
+    sessionListGroupGitWorktrees: "Agrupar worktrees de Git por repositorio",
+    sessionListGroupGitWorktreesSubtitle: "Mantén juntas las sesiones del mismo repositorio. Desactiva esta opción para agrupar por directorio.",
     sessionListActiveGrouping: "Agrupación de sesiones activas",
     sessionListActiveGroupingSubtitle:
       "Elige cómo se agrupan las sesiones activas en la barra lateral",
@@ -5428,6 +5473,7 @@ export const es: TranslationStructure = {
       resetBody: ({ time }: { time: string }) =>
         `Este proveedor pide esperar hasta ${time} antes de continuar.`,
       genericBody: "Este proveedor pide esperar antes de continuar.",
+      stoppedBody: "La recuperación automática se detuvo y no se reintentará sola. Vuelve a intentarlo abajo.",
       resetCreditBody: ({ count }: { count: number }) =>
         `${count} ${count === 1 ? "restablecimiento de uso disponible" : "restablecimientos de uso disponibles"}.`,
       resetCreditExpiresBody: ({ count, time }: { count: number; time: string }) =>
@@ -6525,7 +6571,7 @@ export const es: TranslationStructure = {
   },
 
   sessionDrafts: {
-    sectionTitle: 'Borradores', badge: 'Borrador', untitled: 'Borrador sin título', continueEditing: 'Continuar editando', startAnother: 'Empezar otro',
+    sectionTitle: 'Borradores', badge: 'Borrador', untitled: 'Borrador sin título', continueEditing: 'Continuar editando', startAnother: 'Empezar otro', startedOpen: "Sesión iniciada · Abrir",
     status: { offline: 'Sin conexión', syncing: 'Sincronizando', conflict: 'Conflicto', machineUnavailable: 'Máquina no disponible', attachmentNeedsAttention: 'El archivo adjunto requiere atención', startInterrupted: 'Inicio interrumpido' },
     new: { action: 'Nuevo borrador' }, delete: { action: 'Eliminar borrador', confirmTitle: '¿Eliminar borrador?', confirmDescription: 'Este borrador se eliminará de tus dispositivos.' },
     conflict: { title: 'Conflicto de borrador', description: 'Este campo cambió en otro dispositivo.', mine: 'En este dispositivo', synced: 'Sincronizado', useSynced: 'Usar sincronizado', keepDevice: 'Conservar dispositivo', copyMine: 'Copiar el mío', copied: 'Copiado', copyFailed: 'No se pudo copiar', field: { text: 'Texto', mentions: 'Menciones', attachments: 'Adjuntos', recipient: 'Destinatario', agentContinuation: 'Continuación del agente', executionRunDelivery: 'Entrega de ejecución' } },
@@ -6921,8 +6967,12 @@ export const es: TranslationStructure = {
   },
 
   agentInput: {
+      keepKeyboard: { label: "Mantener el teclado abierto al enviar" },
+      historyPosition: ({ index, total }: { index: number; total: number }) => `${index} de ${total}`,
       sendOptions: {
           title: "Opciones de envío",
+          sendAndStartAnother: "Enviar y empezar otra",
+          sendAndOpen: "Enviar y abrir sesión",
           queue: "Poner en cola",
           hint: "Mantén pulsado para elegir cómo enviar",
       },
@@ -7395,7 +7445,10 @@ export const es: TranslationStructure = {
     },
     askUserQuestion: {
         submit: "Enviar respuesta",
+        dismiss: 'Descartar pregunta',
+        dismissed: 'Pregunta descartada',
         submissionFailures: {
+            unconfirmed: "Happier no pudo confirmar tu respuesta. Vuelve a intentarlo o abre el terminal de Claude para revisarla.",
             update: "Actualiza Happier CLI y vuelve a intentarlo.",
             reconnect: "Vuelve a conectar esta sesión e inténtalo de nuevo.",
             retry: "No se pudo aceptar la respuesta. Revísala y vuelve a intentarlo.",
@@ -8293,6 +8346,7 @@ export const es: TranslationStructure = {
 settingsSession: {
     terminalHostTitle: 'Terminal para nuevas sesiones',
     terminalHostNone: 'Sin terminal',
+    newSessionAfterSend: { title: "Después de enviar", footer: "Elige qué ocurre al enviar desde el editor de nueva sesión. Mantén pulsado Enviar para elegir la otra opción en un solo mensaje.", openTitle: "Abrir la sesión", openSubtitle: "Ir a la sesión en cuanto empiece.", startAnotherTitle: "Quedarse y empezar otra", startAnotherSubtitle: "Seguir iniciándola en segundo plano y abrir un borrador nuevo." },
     newSessionDraftEntry: {
         title: 'Borradores de sesión nueva',
         footer: 'Elige si Nueva sesión continúa el borrador de este dispositivo o abre uno nuevo.',
@@ -8484,6 +8538,10 @@ settingsSession: {
           resetHiddenSubtitle: 'Borra los avisos ocultos en este dispositivo.',
       },
       inputBehavior: {
+          keepFocusTitle: "Mantener el editor enfocado al enviar",
+          keepFocusSubtitle: "Permanece en el campo de mensaje para escribir el siguiente enseguida.",
+          typeToFocusTitle: "Escribir desde cualquier lugar",
+          typeToFocusSubtitle: "Empieza a escribir fuera de un campo de texto para ir al campo de mensaje.",
           title: 'Comportamiento de la entrada',
           footer: 'Configura Enviar con Intro y el comportamiento del historial de mensajes.',
           enterToSendEnabledNativeSubtitle: 'Pulsa Intro para enviar',
@@ -8596,6 +8654,8 @@ settingsSession: {
         customResumePromptPlaceholder: "Continúa desde donde lo dejaste.",
       },
       providerUsageGauge: {
+          numberTitle: "Número en el centro de los anillos",
+          numberSubtitle: "Elige el límite para el número dentro de los anillos. Si no está disponible, se usa el más restrictivo.",
         title: "Uso del proveedor",
         footer:
           "Elige los indicadores del editor para todas las cuentas. Respetan los límites de uso seleccionados en cada grupo. Los favoritos añaden indicadores para la cuenta activa.",
@@ -10826,7 +10886,15 @@ settingsSession: {
     },
     cliPath: {
       title: "Terminal",
-      footer: "Happier Desktop solo añade o elimina las entradas del PATH que ha creado; las escritas por el instalador del shell no se tocan.",
+      footer: "Happier Desktop solo modifica las entradas PATH que creó; conserva las del instalador de shell.",
+      cleanupTitle: "Eliminar componentes de Desktop",
+      cleanupSubtitle: "Eliminar la línea de comandos y los servicios propios de Desktop y salir.",
+      cleanupConfirmTitle: "¿Eliminar los componentes de Desktop y salir?",
+      cleanupConfirmBody: "Esto elimina los archivos de línea de comandos, las entradas PATH y los servicios propios de Desktop cuando ninguna otra aplicación Desktop los necesita. Se conservan los componentes compartidos o instalados por ti, el historial de sesiones y los datos de la cuenta. Los servicios eliminados se detienen, lo que puede interrumpir las sesiones en curso y el acceso remoto.\n\nDesktop se cerrará tras la limpieza. Después elimina la aplicación con tu sistema operativo; en macOS o Linux portátil, elimina el paquete o archivo de la aplicación. Al abrir Desktop de nuevo, sus componentes pueden volver a instalarse.",
+      cleanupConfirmAction: "Eliminar componentes y salir",
+      cleanupBusy: "Eliminando componentes de Desktop…",
+      cleanupFailed: "La limpieza no terminó. Inténtalo de nuevo.",
+      cleanupQuitFailed: "La limpieza terminó, pero Desktop no pudo cerrarse. Cierra la aplicación antes de eliminarla.",
       addTitle: "Añadir happier al PATH",
       addSubtitle: "Haz que el comando happier esté disponible en los terminales nuevos.",
       removeTitle: "Quitar happier del PATH",
@@ -10935,10 +11003,15 @@ settingsSession: {
   },
 
   message: {
+    provenanceFrom: ({ source }: { source: string }) => `De ${source}`,
+    provenanceSession: 'Sesión',
     sessionReferenceUnavailable: "Sesión no disponible",
     sessionReferenceOpen: ({ name }: { name: string }) => `Abrir la sesión ${name}`,
     switchedToMode: ({ mode }: { mode: string }) => `Cambiado al modo ${mode}`,
     discarded: "Descartado",
+    readAloudA11y: "Leer en voz alta",
+    stopReadAloudA11y: "Detener la lectura en voz alta",
+    readAloudFailed: "No se pudo leer este mensaje en voz alta. Revisa tu configuración de voz.",
     recoveredHistory: "Historial recuperado",
     unknownEvent: "Evento desconocido",
     contextCompactionStarted: "Compactando contexto...",
@@ -10987,7 +11060,7 @@ settingsSession: {
     sessionRunningLocally:
       "Esta sesión se está ejecutando localmente en este ordenador. Puedes cambiar a remoto para controlarla desde la app.",
     sessionRunningLocallyAndRemotely:
-      "Esta sesión está conectada localmente en OpenCode y sigue siendo controlable desde la app.",
+      "Esta sesión está conectada localmente y sigue siendo controlable desde la app.",
     switchingToRemote: "Cambiando al modo remoto…",
     switchToRemote: "Cambiar a remoto",
     detachLocalTerminal: "Desconectar terminal",
@@ -11066,6 +11139,13 @@ settingsSession: {
       codeCopied: "Código copiado",
       copyFailed: "Error al copiar",
       mermaidRenderFailed: "Error al renderizar el diagrama mermaid",
+      table: {
+          open: "Abrir tabla",
+          copyCsv: "Copiar como CSV",
+          copyMarkdown: "Copiar como Markdown",
+          csvLabel: "CSV",
+          viewerTitle: "Tabla",
+      },
       diffLabel: "Diferencias",
       codeLabel: "Código",
 
@@ -11339,6 +11419,7 @@ settingsSession: {
     enterTmuxTempDir: "Ingrese la ruta del directorio temporal",
     tmuxUpdateEnvironment: "Actualizar entorno automáticamente",
     nameRequired: "El nombre del perfil es requerido",
+    invalidProfile: 'Revisa el nombre del perfil, las variables de entorno y los valores predeterminados antes de guardar.',
     deleteConfirm: ({ name }: { name: string }) =>
       `¿Estás seguro de que quieres eliminar el perfil "${name}"?`,
     editProfile: "Editar Perfil",

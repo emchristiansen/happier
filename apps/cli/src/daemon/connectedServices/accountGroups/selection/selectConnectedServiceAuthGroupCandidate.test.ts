@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
-import { ConnectedServiceAuthGroupPolicyV1Schema } from '@happier-dev/protocol';
+import { ConnectedServiceAuthGroupPolicyV1Schema, type ConnectedServiceQuotaMeterV1 } from '@happier-dev/protocol';
+
+import { buildConnectedServiceAuthGroupRuntimeStateFromMeters } from '../quotas/projection';
 
 import {
   DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1,
@@ -59,6 +61,16 @@ describe('quota reset admission', () => {
     expect(resolve({ ...exhausted, quotaSnapshot: { ...exhausted.quotaSnapshot!, capturedAtMs: -100_000 } })).toEqual([]);
   });
 
+  it('offers banked free resets before falling back to a credits-only account', () => {
+    const creditsOnly: ConnectedServiceAuthGroupMemberRuntimeState = {
+      quotaSnapshot: { ...exhausted.quotaSnapshot!, creditsAvailable: true },
+    };
+    expect(resolve(creditsOnly).map((candidate) => candidate.profileId)).toEqual(['primary', 'backup']);
+    const included: ConnectedServiceAuthGroupMemberRuntimeState = { quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 40,
+      meters: [{ meterId: 'weekly', limitCategory: 'usage_limit', remainingPct: 40, resetAtMs: 100_000, providerLimitId: null }] } };
+    expect(resolve(included)).toEqual([]);
+  });
+
   it('does not spend a usage reset for a rate-limit-only exhausted member', () => {
     expect(resolve({ quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 0, meters: [
       { meterId: 'requests', limitCategory: 'rate_limit', remainingPct: 0, resetAtMs: 2_000, providerLimitId: null },
@@ -87,6 +99,82 @@ describe('DEFAULT_CONNECTED_SERVICE_AUTH_GROUP_POLICY_V1', () => {
 });
 
 describe('selectConnectedServiceAuthGroupCandidate', () => {
+  it.each(['usage_limit', 'manual_adoption'] as const)('ages only elapsed exhausted allowances to unknown for %s', (reason) => {
+    const expired = { meterId: 'short', providerLimitId: 'five_hour', limitCategory: 'usage_limit' as const,
+      remainingPct: 0, resetAtMs: 500_000 };
+    const snapshot = { capturedAtMs: 1, exhausted: true, effectiveRemainingPercent: 0, meters: [expired] };
+    const select = (state: ConnectedServiceAuthGroupMemberRuntimeState) => selectConnectedServiceAuthGroupCandidate({
+      nowMs: 1_000_000, quotaFreshnessMs: 60_000, activeProfileId: 'failed',
+      requiredModelIds: ['model'],
+      switchReason: reason === 'usage_limit' ? reason : undefined,
+      acceptLastKnownQuota: reason === 'manual_adoption',
+      policy: { ...basePolicy, strategy: 'priority' },
+      members: [member('failed', 0, 0), member('backup', 1, 1)],
+      memberStatesByProfileId: new Map([['backup', state]]),
+    });
+    expect(select({ quotaSnapshot: snapshot }).selected).toMatchObject({ profileId: 'backup', leastLimitedScore: null });
+    for (const state of [
+      { quotaSnapshot: { ...snapshot, meters: [expired, { ...expired, meterId: 'weekly', resetAtMs: 2_000_000 }] } },
+      { quotaSnapshot: { ...snapshot, meters: [{ ...expired, resetAtMs: null }] } },
+      { quotaSnapshot: snapshot, credentialHealthStatus: 'needs_reauth' as const },
+      { quotaSnapshot: snapshot, modelUnavailableUntilMsByModelId: { model: 2_000_000 } },
+      { quotaSnapshot: snapshot, quotaExhaustedUntilMs: 2_000_000, lastObservedAtMs: 900_000, lastFailureKind: 'usage_limit' },
+      { quotaSnapshot: { ...snapshot, meters: [expired, { ...expired, limitCategory: 'plan_invalid' as const, remainingPct: null, resetAtMs: null }] } },
+    ]) {
+      expect(select(state).selected, JSON.stringify(state)).toBeNull();
+    }
+  });
+
+  it('recovers a hard limit from healthiest last-known quota without selecting stale weekly exhaustion or blocked members', () => {
+    const result = selectConnectedServiceAuthGroupCandidate({
+      nowMs: 1_000_000, quotaFreshnessMs: 60_000, activeProfileId: 'failed', switchReason: 'usage_limit',
+      policy: { ...basePolicy, strategy: 'priority' },
+      members: ['failed', 'weekly-empty', 'blocked', 'plan-blocked', 'low', 'healthy'].map((id, i) => member(id, i, i)),
+      memberStatesByProfileId: new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>([
+        ['weekly-empty', { quotaSnapshot: { capturedAtMs: 1, effectiveRemainingPercent: 100, meters: [
+          { meterId: 'weekly', providerLimitId: 'seven_day', limitCategory: 'usage_limit', remainingPct: 0, resetAtMs: 2_000_000 },
+        ] } }],
+        ['blocked', { authInvalidUntilMs: 2_000_000 }],
+        ['plan-blocked', { quotaSnapshot: { capturedAtMs: 1, meters: [
+          { meterId: 'plan', providerLimitId: null, limitCategory: 'plan_invalid', remainingPct: null, resetAtMs: null },
+        ] } }],
+        ['low', { quotaSnapshot: { capturedAtMs: 1, effectiveRemainingPercent: 10 } }],
+        ['healthy', { quotaSnapshot: { capturedAtMs: 1, effectiveRemainingPercent: 100 } }],
+      ]),
+      quotaProbeDeferredUntilMsByProfileId: new Map([['healthy', 2_000_000]]),
+    });
+    expect(result.selected?.profileId).toBe('healthy');
+    expect(result.excluded).toEqual(expect.arrayContaining([
+      expect.objectContaining({ profileId: 'weekly-empty', reason: 'quota_exhausted' }),
+      expect.objectContaining({ profileId: 'blocked', reason: 'auth_invalid' }),
+      expect.objectContaining({ profileId: 'plan-blocked', reason: 'plan_unavailable' }),
+    ]));
+    expect(result.decisionTrace.candidates).toContainEqual(expect.objectContaining({
+      profileId: 'healthy', decision: 'selected', quotaEvidence: expect.objectContaining({ status: 'last_known' }),
+    }));
+  });
+
+  it('treats unavailable quota as unknown for hard recovery while preserving the fresh soft-switch gate', () => {
+    const params = { profileId: 'backup', nowMs: 1_000, quotaFreshnessMs: 60_000,
+      memberStatesByProfileId: new Map([['backup', { quotaSnapshot: { capturedAtMs: 999, planUnavailable: true } }]]),
+    };
+    expect(hasConnectedServiceAuthGroupCandidateEvidenceForSwitchReason({ ...params, reason: 'usage_limit' })).toBe(true);
+    expect(hasConnectedServiceAuthGroupCandidateEvidenceForSwitchReason({ ...params, reason: 'soft_threshold' })).toBe(false);
+  });
+
+  it('prefers fresh usable evidence over a healthier last-known fallback for a hard limit', () => {
+    const result = selectConnectedServiceAuthGroupCandidate({
+      nowMs: 1_000_000, quotaFreshnessMs: 60_000, activeProfileId: 'failed', switchReason: 'usage_limit',
+      policy: { ...basePolicy, strategy: 'priority' },
+      members: ['failed', 'stale', 'fresh'].map((id, i) => member(id, i, i)),
+      memberStatesByProfileId: new Map([
+        ['stale', { quotaSnapshot: { capturedAtMs: 1, effectiveRemainingPercent: 100 } }],
+        ['fresh', { quotaSnapshot: { capturedAtMs: 999_999, effectiveRemainingPercent: 50 } }],
+      ]),
+    });
+    expect(result.selected?.profileId).toBe('fresh');
+  });
+
   it('excludes a member only for the model whose entitlement cooldown is active', () => {
     const params = {
       nowMs: 1_000,
@@ -236,6 +324,57 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
     expect(selectConnectedServiceAuthGroupCandidate(input).selected?.profileId).toBe('primary');
     expect(selectConnectedServiceAuthGroupCandidate({ ...input, lastSwitchReason: 'manual' }).selected?.profileId).toBe('backup');
     expect(selectConnectedServiceAuthGroupCandidate({ ...input, lastSwitchAt: 950 }).selected?.profileId).toBe('backup');
+  });
+
+  it('restores a recovered higher-priority member while the first member remains exhausted', () => {
+    const input = {
+      nowMs: 1_000,
+      quotaFreshnessMs: 500,
+      activeProfileId: 'active',
+      allowCurrentProfileRetry: true,
+      lastSwitchReason: 'usage_limit',
+      lastSwitchAt: 400,
+      policy: { ...basePolicy, strategy: 'priority' as const, autoRestorePrimaryWhenReset: true, softSwitchRemainingPercent: 0 },
+      members: [member('active', 300, 3), member('primary', 100, 1), member('recovered', 200, 2)],
+      memberStatesByProfileId: new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>([
+        ['primary', { quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 0, exhausted: true } }],
+        ['recovered', { quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 42 } }],
+        ['active', { quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 5 } }],
+      ]),
+    };
+    const result = selectConnectedServiceAuthGroupCandidate(input);
+    expect(result.selected?.profileId).toBe('recovered');
+    expect(result.decisionTrace.candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ profileId: 'primary', decision: 'excluded', exclusionReason: 'quota_exhausted' }),
+      expect.objectContaining({ profileId: 'recovered', decision: 'selected' }),
+    ]));
+
+    expect(selectConnectedServiceAuthGroupCandidate({ ...input, lastSwitchReason: 'manual' }).selected?.profileId).toBe('active');
+    expect(selectConnectedServiceAuthGroupCandidate({ ...input, lastSwitchAt: 950 }).selected?.profileId).toBe('active');
+    expect(selectConnectedServiceAuthGroupCandidate({ ...input,
+      policy: { ...input.policy, autoRestorePrimaryWhenReset: false },
+    }).selected?.profileId).toBe('active');
+    expect(selectConnectedServiceAuthGroupCandidate({ ...input,
+      members: input.members.map((candidate) => candidate.profileId === 'recovered' ? { ...candidate, priority: 400 } : candidate),
+    }).selected?.profileId).toBe('active');
+
+    for (const recoveredState of [
+      { quotaSnapshot: { capturedAtMs: 100, effectiveRemainingPercent: 42 } },
+      { quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 0 } },
+      { credentialHealthStatus: 'needs_reauth', quotaSnapshot: { capturedAtMs: 900, effectiveRemainingPercent: 42 } },
+    ] satisfies ConnectedServiceAuthGroupMemberRuntimeState[]) {
+      expect(selectConnectedServiceAuthGroupCandidate({ ...input,
+        memberStatesByProfileId: new Map([...input.memberStatesByProfileId, ['recovered', recoveredState]]),
+      }).selected?.profileId).toBe('active');
+    }
+
+    const legacyInput = { ...input, lastSwitchReason: undefined };
+    expect(selectConnectedServiceAuthGroupCandidate(legacyInput).selected?.profileId).toBe('active');
+    expect(selectConnectedServiceAuthGroupCandidate({ ...legacyInput,
+      memberStatesByProfileId: new Map([...input.memberStatesByProfileId, ['recovered', {
+        ...input.memberStatesByProfileId.get('recovered'), lastFailureKind: 'usage_limit', providerResetsAtMs: 500,
+      }]]),
+    }).selected?.profileId).toBe('recovered');
   });
 
   it('does not restore the primary when autoRestorePrimaryWhenReset is disabled (default)', () => {
@@ -1387,5 +1526,79 @@ describe('selectConnectedServiceAuthGroupCandidate', () => {
 
     expect(result.selected).toBeNull();
     expect(result.reason).toBe('manual_strategy');
+  });
+});
+
+describe('provider credits keep spent accounts usable', () => {
+  const nowMs = 1_000;
+  const window = (remainingPct: number): ConnectedServiceQuotaMeterV1 => ({
+    meterId: 'weekly', label: 'Weekly', used: null, limit: null, unit: 'unknown',
+    utilizationPct: 100 - remainingPct, remainingPct, resetsAt: 500_000, resetAtMs: 500_000,
+    status: 'ok', confidence: 'exact', details: {},
+  });
+  const credits = (balance: number): ConnectedServiceQuotaMeterV1 => ({
+    meterId: 'credits', label: 'Credits', used: null, limit: null, unit: 'credits', remaining: balance,
+    utilizationPct: null, resetsAt: null, status: 'ok', isExhausted: balance <= 0, details: {},
+  });
+  const project = (meters: ConnectedServiceQuotaMeterV1[]): ConnectedServiceAuthGroupMemberRuntimeState =>
+    buildConnectedServiceAuthGroupRuntimeStateFromMeters({ capturedAtMs: 900, meters });
+  const states = new Map<string, ConnectedServiceAuthGroupMemberRuntimeState>([
+    ['credits-only', project([window(0), credits(16_845)])],
+    ['spent', project([window(0), credits(0)])],
+    ['included', project([window(30)])],
+  ]);
+  const select = (params: Partial<Parameters<typeof selectConnectedServiceAuthGroupCandidate>[0]> = {}) =>
+    selectConnectedServiceAuthGroupCandidate({
+      nowMs,
+      quotaFreshnessMs: 60_000,
+      activeProfileId: null,
+      policy: ConnectedServiceAuthGroupPolicyV1Schema.parse({ strategy: 'priority' }),
+      members: [member('credits-only', 1, 1), member('spent', 2, 2), member('included', 3, 3)],
+      memberStatesByProfileId: states,
+      ...params,
+    });
+
+  it('ranks included quota before credits-only and excludes accounts with neither', () => {
+    const selection = select();
+    expect(selection.selected?.profileId).toBe('included');
+    expect(selection.excluded).toEqual([expect.objectContaining({ profileId: 'spent', reason: 'quota_exhausted' })]);
+    expect(selection.decisionTrace.candidates).toContainEqual(expect.objectContaining({
+      profileId: 'credits-only', decision: 'eligible', quotaEvidence: expect.objectContaining({ exhausted: false, creditsOnly: true }),
+    }));
+    expect(select({ members: [member('credits-only', 1, 1), member('spent', 2, 2)] }).selected?.profileId).toBe('credits-only');
+  });
+
+  it('keeps a working credits-only account instead of moving it to a spent account', () => {
+    expect(select({
+      activeProfileId: 'credits-only',
+      allowCurrentProfileRetry: true,
+      members: [member('spent', 1, 1), member('credits-only', 2, 2)],
+    }).selected?.profileId).toBe('credits-only');
+    expect(hasConnectedServiceAuthGroupCandidateEvidenceForSwitchReason({
+      reason: 'usage_limit', profileId: 'credits-only', nowMs, quotaFreshnessMs: 60_000, memberStatesByProfileId: states,
+    })).toBe(true);
+    expect(select({
+      activeProfileId: 'included', switchReason: 'soft_threshold',
+      members: [member('included', 1, 1), member('credits-only', 2, 2)],
+    }).excluded).toContainEqual(expect.objectContaining({ profileId: 'credits-only', reason: 'soft_threshold_not_met' }));
+  });
+
+  it('keeps the provider usage-limit error authoritative over credit headroom', () => {
+    const limited = new Map(states);
+    limited.set('credits-only', {
+      ...states.get('credits-only')!,
+      lastFailureKind: 'usage_limit',
+      lastObservedAtMs: 950,
+      quotaExhaustedUntilMs: 400_000,
+    });
+    const selection = select({
+      activeProfileId: 'credits-only',
+      allowCurrentProfileRetry: true,
+      switchReason: 'usage_limit',
+      memberStatesByProfileId: limited,
+      members: [member('credits-only', 1, 1), member('included', 2, 2)],
+    });
+    expect(selection.selected?.profileId).toBe('included');
+    expect(selection.excluded).toContainEqual(expect.objectContaining({ profileId: 'credits-only', reason: 'quota_exhausted' }));
   });
 });

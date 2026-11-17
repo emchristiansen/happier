@@ -1,3 +1,7 @@
+import { open, readdir, utimes } from 'node:fs/promises';
+import { join } from 'node:path';
+
+import { withTempDir } from '@/testkit/fs/tempDir';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -12,7 +16,9 @@ import {
   resolveDaemonLogKeepCount,
   resolveSessionLogKeepCount,
   resolveSessionLogMinAgeMs,
+  LOG_TOTAL_BUDGET_BYTES,
 } from './logRetention';
+import { pruneLogsByCount } from './pruneLogsByCount';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -54,5 +60,22 @@ describe('logRetention', () => {
 
   it('runs the retention pass hourly', () => {
     expect(LOG_RETENTION_INTERVAL_MS).toBe(60 * 60 * 1000);
+  });
+
+  it('keeps up to the owner-set 1 GiB of logs, newest first', async () => {
+    await withTempDir('log-total-budget-', async (root) => {
+      const MiB = 1024 * 1024;
+      // Sparse files: the budget counts each log's size without writing a gigabyte.
+      for (const [name, size, mtime] of [['newest.log', 600 * MiB, 3], ['older.log', 300 * MiB, 2], ['oldest.log', 200 * MiB, 1]] as const) {
+        const handle = await open(join(root, name), 'w');
+        await handle.truncate(size);
+        await handle.close();
+        await utimes(join(root, name), mtime, mtime);
+      }
+
+      await pruneLogsByCount({ dir: root, suffix: '.log', keepCount: Number.MAX_SAFE_INTEGER, maxTotalBytes: LOG_TOTAL_BUDGET_BYTES });
+
+      expect((await readdir(root)).sort()).toEqual(['newest.log', 'older.log']);
+    });
   });
 });

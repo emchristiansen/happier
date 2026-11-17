@@ -13,7 +13,7 @@ import { findVoiceConversationSessionId } from '@/voice/sessionBinding/voiceConv
 import { voiceAgentSessions } from '@/voice/agent/voiceAgentSessions';
 import { speakAssistantText } from '@/voice/output/speakAssistantText';
 import { resolveVoiceNetworkTimeoutMs } from '@/voice/runtime/fetchWithTimeout';
-import { createVoicePlaybackController, scopePlaybackStopperRegistrar } from '@/voice/runtime/VoicePlaybackController';
+import { localVoicePlaybackController as playbackController, scopePlaybackStopperRegistrar } from '@/voice/runtime/VoicePlaybackController';
 import { voiceActivityController } from '@/voice/activity/voiceActivityController';
 import { resetVoiceAgentPersistenceState } from '@/voice/persistence/resetVoiceAgentPersistenceState';
 import { appendVoiceConversationAssistantText } from '@/voice/sessionBinding/voiceConversationTranscript';
@@ -37,13 +37,17 @@ import {
   resolveLocalSttProvider,
   resolveLocalVoiceAdapterSettings,
 } from './localVoiceSettings';
-import { sendVoiceTextTurn as sendVoiceTextTurnImpl } from './sendVoiceTextTurn';
+import { prepareVoiceTextTurn, sendVoiceTextTurn as sendVoiceTextTurnImpl } from './sendVoiceTextTurn';
+import { stopReadAloud } from './readAloudState';
 
 export type { LocalVoiceState, LocalVoiceStatus } from './localVoiceState';
 export { getLocalVoiceState, useLocalVoiceStatus, subscribeLocalVoiceState } from './localVoiceState';
 
 let recorder: InstanceType<typeof AudioModule.AudioRecorder> | null = null;
 let inFlight: Promise<void> | null = null;
+// Input startup can be awaiting native permission/preparation before status becomes recording.
+let inputStartup: Promise<void> | null = null;
+let inputShutdown: Promise<unknown> | null = null;
 let activeTurnAbortController: AbortController | null = null;
 let activeTurnAbortSessionId: string | null = null;
 /**
@@ -67,7 +71,6 @@ function revokeWelcome(): void {
   controller?.abort();
 }
 
-const playbackController = createVoicePlaybackController();
 const deviceSttController = createDeviceSttController({
   setState: patchLocalVoiceState,
   getSettings: () => storage.getState().settings as any,
@@ -173,6 +176,18 @@ async function startRecording(sessionId: string): Promise<void> {
   }
 }
 
+function prepareLocalVoiceTextTurn(sessionId: string) {
+  return prepareVoiceTextTurn({ sessionId, playbackController, voiceAgentSessions });
+}
+
+function trackInputShutdown<T>(stopping: Promise<T>): Promise<T> {
+  const owned = stopping.finally(() => {
+    if (inputShutdown === owned) inputShutdown = null;
+  });
+  inputShutdown = owned;
+  return owned;
+}
+
 async function stopAndSendRecordedTurn(sessionId: string): Promise<void> {
   await runAbortableVoiceTurn(sessionId, async (signal, turnState) => {
     if (!recorder) {
@@ -180,12 +195,13 @@ async function stopAndSendRecordedTurn(sessionId: string): Promise<void> {
       return;
     }
 
+    const dispatch = prepareLocalVoiceTextTurn(sessionId);
     const turnRecorder = recorder;
     recorder = null;
     turnState.patch({ status: 'transcribing', error: null });
     let uri: string | null = null;
     try {
-      await turnRecorder.stop();
+      await trackInputShutdown(turnRecorder.stop());
       if (signal.aborted) return;
       uri = turnRecorder.uri;
     } catch {
@@ -223,27 +239,50 @@ async function stopAndSendRecordedTurn(sessionId: string): Promise<void> {
     }
 
     await handleVoiceTurnSendFailure(sessionId, signal, (signal) =>
-      sendVoiceTextTurnImpl({
-        sessionId,
-        settings,
-        userText: text,
-        playbackController,
-        voiceAgentSessions,
-        signal,
-      }),
+      dispatch({ settings, userText: text, signal }),
     );
   });
 }
 
+async function startLocalVoiceInput(sessionId: string, provider: ReturnType<typeof resolveLocalSttProvider>): Promise<void> {
+  stopReadAloud();
+  const starting = provider === 'device' ? deviceSttController.start(sessionId)
+    : provider === 'local_neural' ? sherpaSttController.start(sessionId) : startRecording(sessionId);
+  inputStartup = starting;
+  try {
+    await starting;
+  } finally {
+    if (inputStartup === starting) inputStartup = null;
+  }
+}
+
+async function stopLocalVoiceInput(sessionId: string): Promise<void> {
+  // Disable endpointing before stopping recognition so discarded input cannot submit or re-arm.
+  deviceSttController.clearHandsFreeSession(sessionId);
+  sherpaSttController.clearHandsFreeSession(sessionId);
+  const activeRecorder = recorder;
+  const stopRecorder = async () => {
+    if (!activeRecorder) return;
+    await activeRecorder.stop();
+    if (recorder === activeRecorder) recorder = null;
+  };
+  await trackInputShutdown(Promise.all([
+    stopRecorder(),
+    deviceSttController.stop(sessionId),
+    sherpaSttController.stop(sessionId),
+  ]));
+}
+
 async function stopDeviceSpeechRecognitionAndSend(sessionId: string): Promise<void> {
   await runAbortableVoiceTurn(sessionId, async (signal, turnState) => {
+    const dispatch = prepareLocalVoiceTextTurn(sessionId);
     turnState.patch({ status: 'transcribing', error: null });
 
-    const text = await deviceSttController.stop(sessionId);
+    const text = await trackInputShutdown(deviceSttController.stop(sessionId));
     if (signal.aborted) return;
     if (!text) {
       if (!signal.aborted && deviceSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
-        await deviceSttController.start(sessionId);
+        await startLocalVoiceInput(sessionId, 'device');
         return;
       }
       turnState.patch({ status: 'idle', sessionId, error: null });
@@ -252,31 +291,25 @@ async function stopDeviceSpeechRecognitionAndSend(sessionId: string): Promise<vo
 
     const settings = storage.getState().settings as any;
     await handleVoiceTurnSendFailure(sessionId, signal, (signal) =>
-      sendVoiceTextTurnImpl({
-        sessionId,
-        settings,
-        userText: text,
-        playbackController,
-        voiceAgentSessions,
-        signal,
-      }),
+      dispatch({ settings, userText: text, signal }),
     );
 
     if (!signal.aborted && deviceSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
-      await deviceSttController.start(sessionId);
+      await startLocalVoiceInput(sessionId, 'device');
     }
   });
 }
 
 async function stopSherpaSpeechRecognitionAndSend(sessionId: string): Promise<void> {
   await runAbortableVoiceTurn(sessionId, async (signal, turnState) => {
+    const dispatch = prepareLocalVoiceTextTurn(sessionId);
     turnState.patch({ status: 'transcribing', error: null });
 
-    const text = await sherpaSttController.stop(sessionId);
+    const text = await trackInputShutdown(sherpaSttController.stop(sessionId));
     if (signal.aborted) return;
     if (!text) {
       if (!signal.aborted && sherpaSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
-        await sherpaSttController.start(sessionId);
+        await startLocalVoiceInput(sessionId, 'local_neural');
         return;
       }
       turnState.patch({ status: 'idle', sessionId, error: null });
@@ -285,18 +318,11 @@ async function stopSherpaSpeechRecognitionAndSend(sessionId: string): Promise<vo
 
     const settings = storage.getState().settings as any;
     await handleVoiceTurnSendFailure(sessionId, signal, (signal) =>
-      sendVoiceTextTurnImpl({
-        sessionId,
-        settings,
-        userText: text,
-        playbackController,
-        voiceAgentSessions,
-        signal,
-      }),
+      dispatch({ settings, userText: text, signal }),
     );
 
     if (!signal.aborted && sherpaSttController.isHandsFreeSession(sessionId) && isHandsFreeSttEnabled(storage.getState().settings)) {
-      await sherpaSttController.start(sessionId);
+      await startLocalVoiceInput(sessionId, 'local_neural');
     }
   });
 }
@@ -395,6 +421,44 @@ async function runAbortableVoiceTurn(
   }
 }
 
+/** Disarms automatic input and discards recording without ending live voice; null means no input to await. */
+export function cancelLocalVoiceRecording(): Promise<void> | null {
+  deviceSttController.clearHandsFreeSession();
+  sherpaSttController.clearHandsFreeSession();
+  if (inputShutdown) return inputShutdown.then(() => {});
+  const starting = inputStartup;
+  if (!starting && getLocalVoiceState().status !== 'recording') return null;
+  return cancelRecording();
+
+  async function cancelRecording(): Promise<void> {
+    if (starting) await starting;
+    if (inputShutdown) await inputShutdown;
+    const current = getLocalVoiceState();
+    const sessionId = current.sessionId;
+    if (!sessionId) return;
+    if (current.status === 'recording') {
+      while (inFlight) await inFlight;
+      const recording = getLocalVoiceState();
+      if (recording.status === 'recording' && recording.sessionId === sessionId) {
+        const stopping = stopLocalVoiceInput(sessionId);
+        inFlight = stopping;
+        try {
+          await stopping;
+        } catch (error) {
+          patchLocalVoiceState(resolveLocalVoiceError(error, 'recording_stop_failed'));
+          throw error;
+        } finally {
+          if (inFlight === stopping) inFlight = null;
+        }
+      }
+    }
+
+    if (getLocalVoiceState().status === 'recording' && getLocalVoiceState().sessionId === sessionId) {
+      patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+    }
+  }
+}
+
 export async function abortLocalVoiceTurn(sessionId: string): Promise<void> {
   const current = getLocalVoiceState();
   if (!current.sessionId) return;
@@ -408,8 +472,10 @@ export async function abortLocalVoiceTurn(sessionId: string): Promise<void> {
       // ignore
     }
   }
-
-  patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+  await cancelLocalVoiceRecording();
+  if (getLocalVoiceState().sessionId === sessionId) {
+    patchLocalVoiceState({ status: 'idle', sessionId, error: null });
+  }
 }
 
 export async function toggleLocalVoiceTurn(sessionId: string): Promise<void> {
@@ -439,6 +505,7 @@ export async function toggleLocalVoiceTurn(sessionId: string): Promise<void> {
   const prewarmLocalVoiceAgentOnConnect = (params: Readonly<{ settings: any; config: any }>): void => {
     const { config } = params;
     if (config?.conversationMode !== 'agent' || config?.agent?.prewarmOnConnect !== true) return;
+    const playbackEpoch = playbackController.captureEpoch();
 
     fireAndForget(
       (async () => {
@@ -456,6 +523,7 @@ export async function toggleLocalVoiceTurn(sessionId: string): Promise<void> {
           // A welcome that arrives after hang-up, a newer connect or a voice turn has no call to speak to.
           if (text && !welcomeSignal.aborted) {
             voiceActivityController.appendAssistantText(sessionId, 'local_conversation', text);
+            if (!playbackController.isEpochCurrent(playbackEpoch)) return;
             // The welcome plays while the mic is already being armed for the first turn. It only
             // owns the status when nothing else does, and hands it back when it finishes.
             let welcomeOwnsSpeakingStatus = false;
@@ -507,23 +575,9 @@ export async function toggleLocalVoiceTurn(sessionId: string): Promise<void> {
     if (inFlight) {
       await inFlight.catch(() => {});
     }
-
-    const settings = storage.getState().settings as any;
-    const { config } = resolveLocalVoiceAdapterSettings(settings);
-    prewarmLocalVoiceAgentOnConnect({ settings, config });
-    const sttProvider = resolveLocalSttProvider(settings);
-    const useDeviceStt = sttProvider === 'device';
-    const useSherpaStt = sttProvider === 'local_neural';
-    deviceSttController.setHandsFreeSession(useDeviceStt && config?.handsFree?.enabled === true ? sessionId : null);
-    sherpaSttController.setHandsFreeSession(useSherpaStt && config?.handsFree?.enabled === true ? sessionId : null);
-    inFlight = (useDeviceStt ? deviceSttController.start(sessionId) : useSherpaStt ? sherpaSttController.start(sessionId) : startRecording(sessionId)).finally(() => {
-      inFlight = null;
-    });
-    await inFlight;
-    return;
   }
 
-  if (current.status === 'idle') {
+  if (current.status === 'idle' || current.status === 'speaking') {
     const settings = storage.getState().settings as any;
     const { config } = resolveLocalVoiceAdapterSettings(settings);
     prewarmLocalVoiceAgentOnConnect({ settings, config });
@@ -532,7 +586,7 @@ export async function toggleLocalVoiceTurn(sessionId: string): Promise<void> {
     const useSherpaStt = sttProvider === 'local_neural';
     deviceSttController.setHandsFreeSession(useDeviceStt && config?.handsFree?.enabled === true ? sessionId : null);
     sherpaSttController.setHandsFreeSession(useSherpaStt && config?.handsFree?.enabled === true ? sessionId : null);
-    inFlight = (useDeviceStt ? deviceSttController.start(sessionId) : useSherpaStt ? sherpaSttController.start(sessionId) : startRecording(sessionId)).finally(() => {
+    inFlight = startLocalVoiceInput(sessionId, sttProvider).finally(() => {
       inFlight = null;
     });
     await inFlight;
@@ -586,29 +640,10 @@ export async function stopLocalVoiceSession(): Promise<void> {
     activeTurnAbortSessionId = null;
   }
 
-  // Best-effort stop any recording (we intentionally do not send).
-  if (recorder) {
-    try {
-      await recorder.stop();
-    } catch {
-      // ignore
-    }
-    recorder = null;
-  }
-
   if (typeof activeSessionId === 'string' && activeSessionId.trim().length > 0) {
-    // Hang-up ends hands-free first so no auto-stop or re-arm can run while recognizers stop.
-    deviceSttController.clearHandsFreeSession(activeSessionId);
-    sherpaSttController.clearHandsFreeSession(activeSessionId);
-
     try {
-      await deviceSttController.stop(activeSessionId);
-    } catch {
-      // ignore
-    }
-
-    try {
-      await sherpaSttController.stop(activeSessionId);
+      if (current.status === 'recording') await cancelLocalVoiceRecording();
+      else await stopLocalVoiceInput(activeSessionId);
     } catch {
       // ignore
     }

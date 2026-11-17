@@ -27,6 +27,8 @@
  * negative value falls back to the default.
  */
 
+import { DEFAULT_BUG_REPORTS_CAPABILITIES } from '@happier-dev/protocol';
+
 export const DAEMON_LOG_SUFFIX = '-daemon.log';
 export const LOG_FILE_SUFFIX = '.log';
 
@@ -38,14 +40,31 @@ export const LOG_RETENTION_INTERVAL_MS = 60 * 60 * 1000;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-export type EnvLike = Readonly<Record<string, string | undefined>>;
-
 function resolveNonNegativeNumber(rawValue: string | undefined, fallback: number): number {
-  // `Number('')` is 0, so a blank variable would silently mean "keep nothing"; treat it as unset.
   if (rawValue === undefined || rawValue.trim() === '') return fallback;
   const value = Number(rawValue);
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
+
+/** Recent log files the diagnostic surfaces name (doctor listing, bug-report machine diagnostics). */
+export const DIAGNOSTIC_RECENT_DAEMON_LOG_COUNT = 5;
+export const DIAGNOSTIC_RECENT_SESSION_LOG_COUNT = 10;
+
+/**
+ * Newest bytes one log file keeps readable. A bug report reads at most this tail of the
+ * daemon and session logs: it is the default per-artifact upload limit, the most a user can share.
+ */
+export const LOG_FILE_TAIL_WINDOW_BYTES = DEFAULT_BUG_REPORTS_CAPABILITIES.maxArtifactBytes;
+
+/**
+ * Total bytes all logs in the logs directory may use (owner ruling 2026-11-15, "Growth decisions
+ * final"). It exceeds the reach of the diagnostic surfaces (recent daemon + session logs and
+ * preserved crashed-session logs, each with its full shareable tail). Oldest logs go first; the
+ * current, live and crashed logs are never removed for it.
+ */
+export const LOG_TOTAL_BUDGET_BYTES = 1024 * 1024 * 1024;
+
+export type EnvLike = Readonly<Record<string, string | undefined>>;
 
 function resolveKeepCount(rawValue: string | undefined, fallback: number): number {
   return Math.floor(resolveNonNegativeNumber(rawValue, fallback));

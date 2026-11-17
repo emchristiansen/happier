@@ -33,6 +33,7 @@ import {
   readClaudeSettingsTranscriptRetention,
   withClaudeTranscriptRetentionDefault,
 } from './claudeTranscriptRetentionSettings';
+import { applyClaudeSessionRetentionSettings, readClaudeSessionRetentionPolicy } from '../settings/claudeSessionRetentionSettings';
 
 type ClaudeStateMode = 'shared' | 'isolated';
 
@@ -425,6 +426,17 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
     const sourceDir = resolveConfiguredClaudeConfigDir({ env: params.sourceEnv });
     await mkdir(params.targetDir, { recursive: true });
 
+    const applyRetention = async (): Promise<void> => {
+      const policy = readClaudeSessionRetentionPolicy(params.accountSettings);
+      if (!policy) return;
+      const result = await applyClaudeSessionRetentionSettings({
+        configDir: params.targetDir,
+        id: 'materialized',
+        policy,
+      });
+      if (result.status === 'error') throw new Error(`Claude session retention could not be configured: ${result.reason}`);
+    };
+
     const existingManifest = await readConnectedServiceStateSharingManifest(params.targetDir);
 
     if (resolve(sourceDir) === resolve(params.targetDir)) {
@@ -454,6 +466,7 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
           }),
         }),
       );
+      await applyRetention();
       return {
         providerId: 'claude',
         requestedStateMode: settings.stateMode,
@@ -540,6 +553,8 @@ export async function syncClaudeConnectedServiceHome(params: Readonly<{
         nextMappings: applyResult.manifest.sessionFileMappings,
       }),
     });
+
+    await applyRetention();
 
     return {
       providerId: 'claude',

@@ -209,6 +209,7 @@ pub struct TrayLabels {
     pub stop_confirm_action: String,
     pub cancel: String,
     pub action_failed_title: String,
+    pub quit_wait_for_system_tasks: String,
     pub login_item_failed: String,
 }
 
@@ -223,7 +224,7 @@ impl Default for TrayLabels {
             quit: "Quit Happier".into(),
             quit_keep_services: "Quit Happier (keep background services running)".into(),
             quit_stop_services: "Quit Happier and stop background services".into(),
-            stop_services_and_quit: "Stop background services and quit".into(),
+            stop_services_and_quit: "Quit Happier (close background services)".into(),
             connected: "Connected".into(),
             offline: "Offline".into(),
             needs_attention: "Needs attention".into(),
@@ -248,6 +249,7 @@ impl Default for TrayLabels {
             stop_confirm_action: "Stop".into(),
             cancel: "Cancel".into(),
             action_failed_title: "That didn’t go through".into(),
+            quit_wait_for_system_tasks: "Happier is still setting up or removing components. Wait for it to finish, then try quitting again.".into(),
             login_item_failed: "Couldn’t update Happier’s login item".into(),
         }
     }
@@ -257,7 +259,7 @@ impl TrayLabels {
     /// Replaces every blank label with its English default.
     pub fn with_fallbacks(mut self) -> Self {
         let english = Self::default();
-        let pairs: [(&mut String, String); 30] = [
+        let pairs = [
             (&mut self.title, english.title),
             (&mut self.open, english.open),
             (&mut self.open_in_happier, english.open_in_happier),
@@ -296,6 +298,7 @@ impl TrayLabels {
             (&mut self.stop_confirm_action, english.stop_confirm_action),
             (&mut self.cancel, english.cancel),
             (&mut self.action_failed_title, english.action_failed_title),
+            (&mut self.quit_wait_for_system_tasks, english.quit_wait_for_system_tasks),
             (&mut self.login_item_failed, english.login_item_failed),
         ];
         for (label, fallback) in pairs {
@@ -635,7 +638,7 @@ fn service_submenu(model: &TrayMenuModel, row: &ServiceRow) -> MenuEntry {
 /// ✓ Start at login
 /// ───
 /// Quit Happier                  ⌘Q
-/// Stop background services and quit
+/// Quit Happier (close background services)
 /// ```
 pub fn build_menu_entries(model: &TrayMenuModel) -> Vec<MenuEntry> {
     let labels = &model.labels;

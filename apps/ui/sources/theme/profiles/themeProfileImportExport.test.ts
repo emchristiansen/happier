@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { THEME_PROFILE_MAX_JSON_BYTES, THEME_PROFILE_MAX_OVERRIDES_PER_MODE, THEME_PROFILE_MAX_PROFILES } from './themeProfileConstants';
 import { exportThemeProfileToJson, getSupportedThemeProfileImportFormats, importThemeProfileFromJson, migrateThemeProfileOverrideTokenIds } from './themeProfileImportExport';
+import { resolveThemeProfile } from './resolveThemeProfile';
 import { THEME_PROFILE_PUBLIC_TOKEN_IDS } from './themeProfileTokenRegistry';
 import type { ThemeProfileV1 } from './themeProfileTypes';
 
@@ -106,6 +107,29 @@ describe('theme profile import/export', () => {
         }
     });
 
+    it('uses the imported selection ink for radio dots rather than the button foreground', () => {
+        const result = importThemeProfileFromJson(JSON.stringify({
+            name: 'Custom selection', type: 'dark',
+            colors: { 'editor.background': '#101010', 'editor.foreground': '#EEEEEE',
+                'button.background': '#ABCDEF', 'button.foreground': '#101010' },
+        }), { now: '2026-05-12T00:00:00.000Z' });
+
+        expect(result.ok).toBe(true);
+        if (!result.ok) return;
+        const effective = resolveThemeProfile({ mode: 'dark', profile: result.profile });
+        expect(effective.colors.radio.dot).toBe(effective.colors.radio.active);
+        expect(effective.colors.radio.dot).not.toBe('#101010');
+    });
+
+    it('preserves an explicitly authored radio dot across export and import', () => {
+        const authored = { ...profile, overrides: { light: {}, dark: { 'control.radio.dot': '#AABBCC' } } };
+        const result = importThemeProfileFromJson(exportThemeProfileToJson(authored), { now: profile.updatedAt });
+        expect(result.ok).toBe(true);
+        if (!result.ok) return;
+        expect(result.profile.overrides.dark['control.radio.dot']).toBe('#AABBCC');
+        expect(resolveThemeProfile({ mode: 'dark', profile: result.profile }).colors.radio.dot).toBe('#AABBCC');
+    });
+
     it('auto-detects and imports a supported VS Code theme JSON payload', () => {
         const json = JSON.stringify({
             name: 'Pitch Dark',
@@ -144,6 +168,31 @@ describe('theme profile import/export', () => {
             expect(result.profile.overrides.dark['effect.surfaceHighlight']).toBe('transparent');
             expect(result.profile.overrides.dark['syntax.keyword']).toBe('#C4A7E7');
             expect(result.profile.overrides.dark['syntax.comment']).toBe('#6E6A86');
+        }
+    });
+
+    it('paints imported messages with the theme neutral surface and text, not its accent button', () => {
+        const json = JSON.stringify({
+            name: 'Harbor Light',
+            type: 'light',
+            colors: {
+                'editor.background': '#FFFFFF',
+                'editor.foreground': '#24292F',
+                'editorWidget.background': '#EEF1F4',
+                'button.background': '#1F6FEB',
+                'button.foreground': '#FFFFFF',
+            },
+        });
+
+        const result = importThemeProfileFromJson(json, { now: '2026-11-05T00:00:00.000Z' });
+
+        expect(result.ok).toBe(true);
+        if (result.ok) {
+            const light = result.profile.overrides.light;
+            expect(light['message.user.background']).toBe(light['surface.elevated']);
+            expect(light['message.user.foreground']).toBe(light['text.primary']);
+            expect(light['message.agent.foreground']).toBe(light['text.primary']);
+            expect(light['control.button.primary.background']).toBe('#1F6FEB');
         }
     });
 

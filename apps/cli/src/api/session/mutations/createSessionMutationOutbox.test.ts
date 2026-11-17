@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,6 +16,11 @@ import {
 } from '@happier-dev/protocol';
 
 vi.mock('axios');
+// Fault injection stays at the filesystem boundary; other operations use real files.
+vi.mock('node:fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('node:fs/promises')>();
+    return { ...actual, readFile: vi.fn(actual.readFile) };
+});
 
 let tempHomeDir: string | null = null;
 let persistenceMockInstalled = false;
@@ -138,6 +144,64 @@ function createObservationSocket(options: Readonly<{
 }
 
 describe('createSessionMutationOutbox', () => {
+    it('preserves an unread journal through failed startup, enqueue and close, then replays it on restart', async () => {
+        const { createSessionMutationOutbox } = await import('./createSessionMutationOutbox');
+        const { createTranscriptMessageAppendMutation } = await import('./sessionMutationTypes');
+        const { saveSessionMutationOutbox } = await import('./sessionMutationPersistence');
+        const sessionId = 's-startup-read-failure';
+        const context = await createRuntimePersistenceContext(sessionId);
+        const mutations = ['one', 'two', 'three'].map((localId, index) => {
+            const payload = createTranscriptMessageAppendMutation({
+                sessionId, localId, content: localId,
+                provenance: { kind: 'non_dependent', source: 'external' },
+            });
+            return {
+                kind: 'transcript_message_append' as const,
+                mutationId: payload.mutationId, payload, intentOrder: index + 1,
+                createdAt: index + 1, attempts: 0, nextAttemptAt: 0,
+            };
+        });
+        await saveSessionMutationOutbox(context, mutations);
+        const originalBytes = await readFile(context.paths.queuePath, 'utf8');
+        const readError = Object.assign(new Error('journal read failed'), { code: 'EBUSY' });
+        // Only the filesystem boundary fails; startup, persistence and delivery stay real.
+        const readSpy = vi.spyOn(fsPromises, 'readFile').mockRejectedValueOnce(readError);
+        const outbox = createSessionMutationOutbox({
+            token: 'tok', sessionId,
+            getSocket: () => createApiSessionSocketStub({ connected: false }),
+            requestReconnect: () => {},
+        });
+        try {
+            await expect(outbox.awaitReady()).rejects.toBe(readError);
+            await expect(outbox.flush('flush')).rejects.toBe(readError);
+            await expect(outbox.enqueueTranscriptMessage(createTranscriptMessageAppendMutation({
+                sessionId, localId: 'new', content: 'new',
+                provenance: { kind: 'non_dependent', source: 'external' },
+            }))).rejects.toThrow();
+        } finally {
+            await outbox.close().catch(() => {});
+            readSpy.mockRestore();
+        }
+        await expect(readFile(context.paths.queuePath, 'utf8')).resolves.toBe(originalBytes);
+        await expect(readFile(context.paths.deadLetterPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+
+        const observed: string[] = [];
+        const socket = createObservationSocket({ onObservation: (payload) => {
+            observed.push(String((payload as { localId: string }).localId));
+        } });
+        const restarted = createSessionMutationOutbox({
+            token: 'tok', sessionId, getSocket: () => socket, requestReconnect: () => {},
+        });
+        try {
+            await restarted.awaitReady();
+            await restarted.flush('flush');
+            expect(observed).toEqual(['one', 'two', 'three']);
+            await expect(readFile(context.paths.queuePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+        } finally {
+            await restarted.close();
+        }
+    });
+
     beforeEach(async () => {
         vi.mocked(axios.post).mockReset();
         vi.mocked(axios.get).mockReset();
@@ -1324,6 +1388,81 @@ describe('createSessionMutationOutbox', () => {
         }
     });
 
+    it('waits for a blocked head mutation backoff instead of re-arming the retry timer at 0 ms', async () => {
+        // Never-attempted mutations queued behind a retryably failing head keep nextAttemptAt 0.
+        // The retry timer must wake for the head's backoff, not for mutations the next flush
+        // cannot attempt; a 0 ms timer re-runs flush continuously while the head backs off.
+        process.env.HAPPIER_SESSION_MUTATION_OUTBOX_BASE_RETRY_MS = '1000';
+        process.env.HAPPIER_SESSION_MUTATION_OUTBOX_JITTER_MS = '0';
+        vi.mocked(axios.post).mockRejectedValue({ response: { status: 503 } });
+        const socket = createApiSessionSocketStub({ connected: false });
+        const { createSessionMutationOutbox } = await import('./createSessionMutationOutbox');
+        const { createSessionTurnMutation } = await import('./sessionMutationTypes');
+        const { saveSessionMutationOutbox } = await import('./sessionMutationPersistence');
+        const sessionId = 's-blocked-head-retry-delay';
+        const head = createSessionTurnMutation({
+            sessionId,
+            action: 'begin',
+            turnId: 'turn-head',
+            provider: 'claude',
+            mutationId: 'mutation-head-begin',
+            observedAt: 1_000,
+        });
+        const behind = createSessionTurnMutation({
+            sessionId,
+            action: 'complete',
+            turnId: 'turn-head',
+            provider: 'claude',
+            mutationId: 'mutation-behind-complete',
+            observedAt: 1_100,
+        });
+        await saveSessionMutationOutbox(await createRuntimePersistenceContext(sessionId), [
+            {
+                kind: 'session_turn',
+                mutationId: head.mutationId,
+                payload: head,
+                createdAt: 1_000,
+                attempts: 0,
+                nextAttemptAt: 0,
+            },
+            {
+                kind: 'session_turn',
+                mutationId: behind.mutationId,
+                payload: behind,
+                createdAt: 1_100,
+                attempts: 0,
+                nextAttemptAt: 0,
+            },
+        ]);
+        const outbox = createSessionMutationOutbox({
+            token: 'tok',
+            sessionId,
+            getSocket: () => socket,
+            requestReconnect: () => {},
+        });
+        // The retry timer is the outbox's only timer; the clock is a system boundary.
+        const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+        try {
+            await outbox.flush('flush');
+
+            const scheduledDelays = setTimeoutSpy.mock.calls.map(([, delay]) => delay ?? 0);
+            expect(scheduledDelays).not.toEqual([]);
+            // The automatic startup flush may also attempt the head, so it has failed at least
+            // once: its backoff is at least 1000 * 2^1 with no jitter, never 0.
+            expect(Math.min(...scheduledDelays)).toBeGreaterThan(1_000);
+            const persisted = await readPersistedOutboxMutations(sessionId);
+            expect(persisted).toEqual([
+                expect.objectContaining({ mutationId: head.mutationId }),
+                expect.objectContaining({ mutationId: behind.mutationId, attempts: 0, nextAttemptAt: 0 }),
+            ]);
+            expect((persisted[0] as { attempts: number }).attempts).toBeGreaterThanOrEqual(1);
+        } finally {
+            setTimeoutSpy.mockRestore();
+            await outbox.close();
+        }
+    });
+
     it('delivers a runtime-activity terminal snapshot even when an earlier session turn is retryably blocked', async () => {
         const sessionId = 's-runtime-activity-not-blocked-by-turn';
         const deliveredSnapshots: unknown[] = [];
@@ -1410,6 +1549,86 @@ describe('createSessionMutationOutbox', () => {
             }),
         ]);
         await outbox.close();
+    });
+
+    it('automatically retries Activity before an earlier blocked ordered head is due', async () => {
+        vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+        vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+        const sessionId = 's-independent-activity-retry';
+        const deliveredSnapshots: unknown[] = [];
+        let activityAttempts = 0;
+        vi.mocked(axios.post).mockRejectedValue({ response: { status: 503 } });
+        const { createSessionMutationJournal } = await import('./createSessionMutationOutbox');
+        const { createRuntimeActivitySnapshotMutation, createSessionTurnMutation } = await import('./sessionMutationTypes');
+        const { parseQueuedSessionMutation } = await import('./sessionMutationPersistence');
+        const outbox = createSessionMutationJournal({
+            custody: 'runtime',
+            token: 'tok',
+            sessionId,
+            paths: (await createRuntimePersistenceContext(sessionId)).paths,
+            admission: parseQueuedSessionMutation,
+            getSocket: () => createApiSessionSocketStub({ connected: false }),
+            requestReconnect: () => {},
+            deliverRuntimeActivitySnapshot: async (mutation) => {
+                activityAttempts += 1;
+                if (activityAttempts === 2) return { status: 'retryable', reason: 'temporarily_unavailable' };
+                deliveredSnapshots.push(mutation.snapshot);
+                return {
+                    status: 'delivered',
+                    path: 'socket',
+                    runtimeActivityEvidence: {
+                        disposition: 'applied',
+                        projection: { ...mutation.snapshot, observedAt: Date.now(), revision: activityAttempts },
+                    },
+                };
+            },
+        });
+        try {
+            await outbox.setSessionSyncPendingInputServerContract(serverContract('session_sync_v2_pending_input_v1'));
+            // Settle the initial snapshot so later Activity is appended behind the ordered queue.
+            await outbox.enqueueRuntimeActivitySnapshot(createRuntimeActivitySnapshotMutation({
+                sessionId, snapshot: { state: 'active', activeCount: 1 },
+            }));
+            const head = createSessionTurnMutation({
+                sessionId, action: 'begin', turnId: 'turn-head', mutationId: 'head', observedAt: Date.now(),
+            });
+            const tail = createSessionTurnMutation({
+                sessionId, action: 'complete', turnId: 'turn-head', mutationId: 'tail', observedAt: Date.now(),
+            });
+            await outbox.enqueueSessionTurn(head);
+            await outbox.enqueueSessionTurn(tail);
+            await outbox.flush('timer');
+            // The head already has the normal 30-second capped backoff. Give Activity
+            // a shorter retry without changing the deadline persisted for that head.
+            process.env.HAPPIER_SESSION_MUTATION_OUTBOX_BASE_RETRY_MS = '1000';
+            const terminal = createRuntimeActivitySnapshotMutation({
+                sessionId, snapshot: { state: 'idle', activeCount: 0 },
+            });
+            await outbox.enqueueRuntimeActivitySnapshot(terminal);
+            expect(await readPersistedOutboxMutations(sessionId)).toEqual([
+                expect.objectContaining({ mutationId: head.mutationId, nextAttemptAt: Date.now() + 30_000 }),
+                expect.objectContaining({ mutationId: tail.mutationId, attempts: 0, nextAttemptAt: 0 }),
+                expect.objectContaining({ mutationId: terminal.mutationId, nextAttemptAt: Date.now() + 2_000 }),
+            ]);
+            const headAttempts = vi.mocked(axios.post).mock.calls.length;
+
+            await vi.advanceTimersByTimeAsync(2_000);
+
+            // Only the scheduled timer may trigger delivery; do not explicitly flush.
+            await vi.waitFor(async () => {
+                expect(deliveredSnapshots).toEqual([
+                    { state: 'active', activeCount: 1 }, { state: 'idle', activeCount: 0 },
+                ]);
+                expect(await readPersistedOutboxMutations(sessionId)).toEqual([
+                    expect.objectContaining({ mutationId: head.mutationId }),
+                    expect.objectContaining({ mutationId: tail.mutationId, attempts: 0, nextAttemptAt: 0 }),
+                ]);
+            });
+            expect(vi.mocked(axios.post).mock.calls.length).toBe(headAttempts);
+        } finally {
+            await outbox.close();
+            vi.useRealTimers();
+        }
     });
 
     it('re-resolves the live server URL and retries a terminal turn mutation after a local endpoint refusal', async () => {

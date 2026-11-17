@@ -15,9 +15,14 @@ import { ConnectedServiceAuthGroupRuntimeStateRevisionConflictError } from '@/ap
 import type {
   ConnectedServiceAuthGroupMemberRuntimeState,
   ConnectedServiceAuthGroupPolicyV1,
-  ConnectedServiceAuthGroupQuotaMeterSnapshot,
   ConnectedServiceAuthGroupQuotaSnapshot,
 } from './selection/selectConnectedServiceAuthGroupCandidate';
+import {
+  connectedServiceAuthGroupMeterHasRemainingQuota as meterHasRemainingQuota,
+  connectedServiceAuthGroupSnapshotProvesQuotaUsable as snapshotProvesQuotaUsable,
+  connectedServiceAuthGroupSnapshotProvesRateLimitUsable as snapshotProvesRateLimitUsable,
+  isConnectedServiceAuthGroupUsageMeter as isQuotaMeter,
+} from './quotas/quotaUsability';
 
 export type ConnectedServiceMemberRuntimeStateApi = Readonly<{
   getConnectedServiceAuthGroup(input: Readonly<{
@@ -40,50 +45,23 @@ function numberOrNull(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function meterHasRemainingQuota(meter: ConnectedServiceAuthGroupQuotaMeterSnapshot): boolean {
-  const remaining = numberOrNull(meter.remainingPct);
-  return remaining !== null && remaining > 0;
-}
-
-function isQuotaMeter(meter: ConnectedServiceAuthGroupQuotaMeterSnapshot): boolean {
-  return meter.limitCategory === 'usage_limit';
-}
-
-function isRateLimitMeter(meter: ConnectedServiceAuthGroupQuotaMeterSnapshot): boolean {
-  return meter.limitCategory === 'rate_limit';
-}
-
-function snapshotProvesQuotaUsable(snapshot: ConnectedServiceAuthGroupQuotaSnapshot): boolean {
-  if (snapshot.exhausted) return false;
-  const quotaMeters = (snapshot.meters ?? []).filter(isQuotaMeter);
-  if (quotaMeters.length > 0) return quotaMeters.every(meterHasRemainingQuota);
-  const remaining = numberOrNull(snapshot.effectiveRemainingPercent);
-  return remaining !== null && remaining > 0;
-}
-
-function snapshotProvesRateLimitUsable(snapshot: ConnectedServiceAuthGroupQuotaSnapshot): boolean {
-  const rateLimitMeters = (snapshot.meters ?? []).filter(isRateLimitMeter);
-  return rateLimitMeters.length > 0 && rateLimitMeters.every(meterHasRemainingQuota);
-}
-
-function resolveSnapshotEligibilityBlocker(
+/** One blocker interpretation for selection and positive-evidence reconciliation. */
+export function resolveConnectedServiceAuthGroupSnapshotEligibilityBlocker(
   snapshot: ConnectedServiceAuthGroupQuotaSnapshot | null,
   nowMs: number,
-): boolean {
-  const meters = snapshot?.meters ?? [];
-  if (meters.length === 0) return false;
-  if (meters.some((meter) => meter.limitCategory === 'usage_limit' || meter.limitCategory === 'rate_limit' || meter.limitCategory === 'unknown')) {
-    return false;
+): Readonly<{ reason: 'capacity_limited' | 'auth_invalid' | 'plan_unavailable' | 'validation_blocked'; retryAtMs: number | null }> | null {
+  const active = (snapshot?.meters ?? []).filter((meter) => meter.resetAtMs === null || meter.resetAtMs > nowMs);
+  for (const [categories, reason] of [
+    [['auth_invalid', 'disabled'], 'auth_invalid'],
+    [['plan_invalid'], 'plan_unavailable'],
+    [['validation_failed'], 'validation_blocked'],
+    [['capacity'], 'capacity_limited'],
+  ] as const) {
+    const blocking = active.filter((meter) => categories.some((category) => category === meter.limitCategory));
+    if (blocking.length > 0) return { reason, retryAtMs: blocking.some((meter) => meter.resetAtMs === null)
+      ? null : Math.max(...blocking.map((meter) => meter.resetAtMs!)) };
   }
-  if (meters.some((meter) => numberOrNull(meter.resetAtMs) !== null && numberOrNull(meter.resetAtMs)! <= nowMs)) {
-    return false;
-  }
-  const categories = new Set(meters.map((meter) => meter.limitCategory));
-  return categories.has('auth_invalid')
-    || categories.has('disabled')
-    || categories.has('plan_invalid')
-    || categories.has('validation_failed')
-    || categories.has('capacity');
+  return null;
 }
 
 export type ConnectedServiceAuthGroupPositiveEvidence = Readonly<
@@ -319,7 +297,7 @@ function reconcileMemberRuntimeStateWithQuotaEvidence(params: Readonly<{
     incomingObservedAtMs: quotaSnapshot.capturedAtMs,
     nowMs: params.nowMs,
   }) !== 'incoming_newer') return state;
-  if (quotaSnapshot.planUnavailable || resolveSnapshotEligibilityBlocker(quotaSnapshot, params.nowMs)) return state;
+  if (quotaSnapshot.planUnavailable || resolveConnectedServiceAuthGroupSnapshotEligibilityBlocker(quotaSnapshot, params.nowMs)) return state;
   // A probe must itself follow the existing limiter cooldown. Waiting until later cannot
   // turn a potentially lagging observation captured just after a failure into new proof.
   if (state.lastFailureKind === 'usage_limit' && lastObservedAtMs !== null
@@ -390,8 +368,20 @@ function readNonNegativeNumber(value: unknown): number | null {
   return Math.trunc(value);
 }
 
-function resolveLimiterRetryAtMs(retryAtMs: number | null): number | null {
-  return retryAtMs;
+function resolveLimiterRetryAtMs(retryAtMs: number | null, existingRetryAtMs: number | null): number | null {
+  if (retryAtMs === null) return existingRetryAtMs;
+  if (existingRetryAtMs === null) return retryAtMs;
+  return Math.max(retryAtMs, existingRetryAtMs);
+}
+
+function resolveProviderResetAtMs(input: Readonly<{
+  resetAtMs?: number | null;
+  existingResetAtMs: number | null;
+}>): number | null {
+  const resetAtMs = numberOrNull(input.resetAtMs);
+  if (resetAtMs === null) return input.existingResetAtMs;
+  if (input.existingResetAtMs === null) return resetAtMs;
+  return Math.max(resetAtMs, input.existingResetAtMs);
 }
 
 function resolveAuthFailureRetryAtMs(input: Readonly<{
@@ -418,6 +408,8 @@ export function buildObservedFailureMemberRuntimeState(input: Readonly<{
   quotaScope?: string | null;
   providerLimitId?: string | null;
   retryAtMs: number | null;
+  /** Provider-declared hard-limit reset, kept separate from transient retry timing. */
+  providerResetsAtMs?: number | null;
   planType: string | null | undefined;
   observedAtMs: number;
 }>): ConnectedServiceAuthGroupMemberRuntimeState {
@@ -426,6 +418,7 @@ export function buildObservedFailureMemberRuntimeState(input: Readonly<{
     ...(existing.cooldownUntilMs === undefined ? {} : { cooldownUntilMs: existing.cooldownUntilMs }),
     ...(existing.exhaustedUntilMs === undefined ? {} : { exhaustedUntilMs: existing.exhaustedUntilMs }),
     ...(existing.quotaExhaustedUntilMs === undefined ? {} : { quotaExhaustedUntilMs: existing.quotaExhaustedUntilMs }),
+    ...(existing.providerResetsAtMs === undefined ? {} : { providerResetsAtMs: existing.providerResetsAtMs }),
     ...(existing.rateLimitedUntilMs === undefined ? {} : { rateLimitedUntilMs: existing.rateLimitedUntilMs }),
     ...(existing.capacityLimitedUntilMs === undefined ? {} : { capacityLimitedUntilMs: existing.capacityLimitedUntilMs }),
     ...(existing.authInvalidUntilMs === undefined ? {} : { authInvalidUntilMs: existing.authInvalidUntilMs }),
@@ -465,12 +458,26 @@ export function buildObservedFailureMemberRuntimeState(input: Readonly<{
     };
   }
   switch (input.reason) {
-    case 'usage_limit':
-      return { ...state, quotaExhaustedUntilMs: resolveLimiterRetryAtMs(input.retryAtMs) };
-    case 'rate_limit':
-      return { ...state, rateLimitedUntilMs: resolveLimiterRetryAtMs(input.retryAtMs) };
+    case 'usage_limit': {
+      const quotaExhaustedUntilMs = resolveLimiterRetryAtMs(input.retryAtMs, numberOrNull(existing.quotaExhaustedUntilMs));
+      const providerResetsAtMs = resolveProviderResetAtMs({ resetAtMs: input.providerResetsAtMs, existingResetAtMs: numberOrNull(existing.providerResetsAtMs) });
+      return {
+        ...state,
+        ...(quotaExhaustedUntilMs === null ? {} : { quotaExhaustedUntilMs }),
+        ...(providerResetsAtMs === null ? {} : { providerResetsAtMs }),
+      };
+    }
+    case 'rate_limit': {
+      const rateLimitedUntilMs = resolveLimiterRetryAtMs(input.retryAtMs, numberOrNull(existing.rateLimitedUntilMs));
+      const providerResetsAtMs = resolveProviderResetAtMs({ resetAtMs: input.providerResetsAtMs, existingResetAtMs: numberOrNull(existing.providerResetsAtMs) });
+      return {
+        ...state,
+        ...(rateLimitedUntilMs === null ? {} : { rateLimitedUntilMs }),
+        ...(providerResetsAtMs === null ? {} : { providerResetsAtMs }),
+      };
+    }
     case 'capacity':
-      return { ...state, capacityLimitedUntilMs: resolveLimiterRetryAtMs(input.retryAtMs) };
+      return { ...state, capacityLimitedUntilMs: resolveLimiterRetryAtMs(input.retryAtMs, numberOrNull(existing.capacityLimitedUntilMs)) };
     case 'auth_expired':
     case 'auth_failed':
     case 'refresh_failed':

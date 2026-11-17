@@ -644,6 +644,7 @@ export const ru: TranslationStructure = {
             composerFocus: 'Перейти к вводу',
             composerSendImmediate: 'Альтернативная отправка (очередь / направление)',
             composerSendInterrupt: 'Прервать и отправить',
+            composerSendAlternateAfterSend: "Отправить и начать ещё одну / открыть",
             composerSendPending: 'Отправить в очередь ожидания',
             commandPaletteOpen: 'Открыть палитру команд',
             modeCycle: 'Переключить режим',
@@ -2513,7 +2514,7 @@ export const ru: TranslationStructure = {
           renewal: "Продление",
           renewalOn: "Включено",
           renewalOff: "Выключено",
-          renewalUnknown: "Неизвестно",
+          active: "Активна",
           renews: ({ date }: { date: string }) => `Продление ${date}`,
           ends: ({ date }: { date: string }) => `Окончание ${date}`,
           renewsInDays: ({ days }: { days: number }) => `Продление через ${days} дн.`,
@@ -2679,6 +2680,12 @@ export const ru: TranslationStructure = {
       refreshA11y: "Обновить использование и лимиты",
       usageCaption: "Использование",
       resetsCaption: "Сбросы квоты",
+      credits: {
+        title: "Кредиты",
+        balance: ({ balance }: { balance: string }) => `${balance} кредитов`,
+        spent: "Не осталось",
+        includedUsed: "Включённые лимиты исчерпаны · доступны кредиты",
+      },
       usedDetail: ({ used, limit }: { used: string; limit: string }) => `${used}/${limit} использовано`,
       capacity: ({ percent }: { percent: number }) => `${percent}% ёмкости`,
       memberEnabledLabel: "Включено в пуле",
@@ -3078,6 +3085,8 @@ export const ru: TranslationStructure = {
         membersSubtitle: ({ enabled, total }: { enabled: number; total: number }) => `${enabled}/${total} включено`,
         optionsTitle: "Параметры",
         autoSwitchTitle: "Автоматический резерв",
+        claudeCodeAutoContinueAtUsageLimitTitle: "Разрешить Claude ждать сброса лимита",
+        claudeCodeAutoContinueAtUsageLimitSubtitle: "В новых сессиях Claude ждёт сброса лимита и автоматически продолжает работу. Выключите, чтобы восстановлением управлял Happier.",
         autoQuotaResetTitle: "Автоматически использовать сбросы квоты",
         autoQuotaResetSubtitle: "Расходует доступный сброс, только когда ни один аккаунт пула не готов и исчерпанную квоту можно сбросить. По умолчанию отключено.",
         autoDisablePlanInvalidTitle: "Отключать аккаунты, которым недоступна выбранная модель",
@@ -3547,7 +3556,7 @@ export const ru: TranslationStructure = {
     trayOpenInHappier: 'Открыть в Happier',
     traySettings: 'Настройки…',
     trayStartAtLogin: 'Запускать при входе',
-    trayStopAndQuit: 'Остановить фоновые службы и выйти',
+    trayStopAndQuit: 'Выйти из Happier (остановить фоновые службы)',
     trayStart: 'Запустить',
     trayRestart: 'Перезапустить',
     trayStop: 'Остановить',
@@ -3563,6 +3572,7 @@ export const ru: TranslationStructure = {
     trayStopAllConfirmBody: 'Сеансы агентов на этом компьютере завершатся, и телефон и браузер не смогут связаться с ним, пока вы снова не откроете Happier.',
     trayStopConfirmAction: 'Остановить',
     trayActionFailedTitle: 'Не получилось',
+    trayQuitWaitForSystemTasks: "Happier ещё настраивает или удаляет компоненты. Дождитесь завершения и попробуйте выйти снова.",
     trayLoginItemFailed: 'Не удалось обновить элемент входа Happier',
     traySessions: ({ count }: { count: string }) => `Сеансы: ${count}`,
     closeStopTitle: 'Сессии агента ещё выполняются',
@@ -3923,6 +3933,39 @@ export const ru: TranslationStructure = {
     },
 
   settingsProviders: {
+        sessionRetention: {
+            invalidSettings: "Исправьте JSON настроек Claude и переподключите компьютер для повторной попытки.",
+            permissionDenied: "Разрешите доступ к файлу настроек Claude и переподключите компьютер.",
+            writeFailed: "Не удалось сохранить настройки Claude. Проверьте доступ к файлу и переподключите компьютер.",
+            managedUnreadable: "Не удалось прочитать настройки организации. Перед изменением срока проверьте разрешения в Claude.",
+            group: "Группа",
+            title: "Хранение сессий",
+            footer: "Настройте срок хранения Claude на уровне пользователя на всех своих машинах. Настройки проекта, организации или явно заданные параметры запуска могут его переопределить.",
+            policy: "Хранить локальную историю",
+            unmanaged: "Сохранить текущие настройки",
+            unmanagedHint: "Прекратить управление; предыдущие изменения сохраняются.",
+            providerDefault: "По умолчанию Claude",
+            providerDefaultHint: "Удалить пользовательский срок и использовать значение Claude по умолчанию.",
+            year: "1 год (365 дней)",
+            century: "100 лет (36 500 дней)",
+            custom: "Другой срок",
+            customDays: "Количество дней",
+            invalidDays: "Введите положительное целое число дней.",
+            machines: "Состояние компьютеров",
+            noMachines: "Здесь появятся сопряжённые компьютеры.",
+            native: "Нативный Claude",
+            profile: "Профиль",
+            applied: "Настроено",
+            unmanagedStatus: "Не управляется",
+            pending: "Ожидание компьютера",
+            unknown: "Обновите daemon для отображения состояния",
+            error: "Не удалось применить срок хранения",
+            managed: "Политика организации может изменить срок хранения",
+            offline: "Не в сети · последнее подтверждённое состояние",
+            confirmTitle: "Сократить срок хранения Claude?",
+            confirmBody: "Более короткий срок может позволить Claude удалить старую локальную историю. Удалённую историю нельзя восстановить. Настройки проекта или организации могут иметь приоритет.",
+            confirmAction: "Применить срок",
+        },
     title: "Настройки провайдера ИИ",
     entrySubtitle: "Настройте параметры для конкретного провайдера",
     footer:
@@ -4803,6 +4846,8 @@ export const ru: TranslationStructure = {
       hiddenInactiveSessionsEmptyStateSubtitle: "Неактивные сессии скрыты в этом списке",
       hiddenInactiveSessionsSectionTitle: "Неактивные сессии",
       hiddenInactiveSessionsSectionSubtitle: "Скрыты в основном списке, потому что там показываются только активные чаты",
+    sessionListGroupGitWorktrees: "Группировать рабочие деревья Git по репозиторию",
+    sessionListGroupGitWorktreesSubtitle: "Объединять сеансы одного репозитория. Отключите для группировки по каталогам.",
     sessionListActiveGrouping: "Группировка активных сессий",
     sessionListActiveGroupingSubtitle:
       "Выберите, как активные сессии группируются в боковой панели",
@@ -5468,7 +5513,7 @@ export const ru: TranslationStructure = {
   },
 
   sessionDrafts: {
-    sectionTitle: 'Черновики', badge: 'Черновик', untitled: 'Черновик без названия', continueEditing: 'Продолжить редактирование', startAnother: 'Начать другой',
+    sectionTitle: 'Черновики', badge: 'Черновик', untitled: 'Черновик без названия', continueEditing: 'Продолжить редактирование', startAnother: 'Начать другой', startedOpen: "Сессия запущена · Открыть",
     status: { offline: 'Не в сети', syncing: 'Синхронизация', conflict: 'Конфликт', machineUnavailable: 'Компьютер недоступен', attachmentNeedsAttention: 'Вложение требует внимания', startInterrupted: 'Запуск прерван' },
     new: { action: 'Новый черновик' }, delete: { action: 'Удалить черновик', confirmTitle: 'Удалить черновик?', confirmDescription: 'Этот черновик будет удалён с ваших устройств.' },
     conflict: { title: 'Конфликт черновика', description: 'Это поле изменено на другом устройстве.', mine: 'На этом устройстве', synced: 'Синхронизировано', useSynced: 'Использовать синхронизированное', keepDevice: 'Оставить с устройства', copyMine: 'Скопировать моё', copied: 'Скопировано', copyFailed: 'Не удалось скопировать', field: { text: 'Текст', mentions: 'Упоминания', attachments: 'Вложения', recipient: 'Получатель', agentContinuation: 'Продолжение агента', executionRunDelivery: 'Доставка запуска' } },
@@ -5984,6 +6029,7 @@ export const ru: TranslationStructure = {
       resetBody: ({ time }: { time: string }) =>
         `Этот провайдер просит сессию подождать до ${time} перед продолжением.`,
       genericBody: "Этот провайдер просит сессию подождать перед продолжением.",
+      stoppedBody: "Автоматическое восстановление остановлено и не будет повторяться само. Повторите попытку ниже.",
       resetCreditBody: ({ count }: { count: number }) =>
         `${count} ${count === 1 ? "сброс использования доступен" : "сброса использования доступны"}.`,
       resetCreditExpiresBody: ({ count, time }: { count: number; time: string }) =>
@@ -6922,8 +6968,12 @@ export const ru: TranslationStructure = {
       },
 
     agentInput: {
+        keepKeyboard: { label: "Не закрывать клавиатуру после отправки" },
+        historyPosition: ({ index, total }: { index: number; total: number }) => `${index} из ${total}`,
         sendOptions: {
             title: "Варианты отправки",
+            sendAndStartAnother: "Отправить и начать ещё одну",
+            sendAndOpen: "Отправить и открыть сессию",
             queue: "В очередь",
             hint: "Удерживайте, чтобы выбрать способ отправки",
         },
@@ -7398,7 +7448,10 @@ export const ru: TranslationStructure = {
     },
     askUserQuestion: {
         submit: "Отправить ответ",
+        dismiss: 'Закрыть вопрос',
+        dismissed: 'Вопрос закрыт',
         submissionFailures: {
+            unconfirmed: "Happier не удалось подтвердить ваш ответ. Повторите попытку или откройте терминал Claude, чтобы проверить его.",
             update: "Обновите Happier CLI и повторите попытку.",
             reconnect: "Переподключите этот сеанс и повторите попытку.",
             retry: "Не удалось принять ответ. Проверьте его и повторите попытку.",
@@ -8289,6 +8342,7 @@ export const ru: TranslationStructure = {
 settingsSession: {
     terminalHostTitle: 'Терминальный хост для новых сеансов',
     terminalHostNone: 'Без терминального хоста',
+    newSessionAfterSend: { title: "После отправки", footer: "Выберите, что происходит при отправке из редактора новой сессии. Удерживайте «Отправить», чтобы выбрать другой вариант для одного сообщения.", openTitle: "Открыть сессию", openSubtitle: "Перейти к сессии сразу после запуска.", startAnotherTitle: "Остаться и начать ещё одну", startAnotherSubtitle: "Продолжить запуск в фоне и открыть новый черновик." },
     newSessionDraftEntry: {
         title: 'Черновики новой сессии',
         footer: 'Выберите, продолжать ли черновик на этом устройстве или открывать новый при выборе «Новая сессия».',
@@ -8462,6 +8516,10 @@ settingsSession: {
         resetHiddenSubtitle: 'Очистить список баннеров, скрытых на этом устройстве.',
     },
     inputBehavior: {
+        keepFocusTitle: "Сохранять фокус в редакторе после отправки",
+        keepFocusSubtitle: "Оставаться в поле сообщения, чтобы сразу написать следующее.",
+        typeToFocusTitle: "Печатать откуда угодно",
+        typeToFocusSubtitle: "Начните печатать вне текстового поля, чтобы перейти в поле сообщения.",
         title: 'Поведение ввода',
         footer: 'Настройте отправку по Enter и поведение истории сообщений.',
         enterToSendEnabledNativeSubtitle: 'Нажмите Enter, чтобы отправить',
@@ -8574,6 +8632,8 @@ settingsSession: {
         customResumePromptPlaceholder: "Продолжай с того места, где остановился.",
       },
       providerUsageGauge: {
+          numberTitle: "Число в центре колец",
+          numberSubtitle: "Выберите лимит для числа внутри колец. Если он недоступен, используется самый ограничивающий лимит.",
         title: "Использование провайдера",
         footer:
           "Выберите индикаторы редактора для всех аккаунтов. Они учитывают лимиты использования, выбранные в каждом пуле. Избранные лимиты добавляют индикаторы активного аккаунта.",
@@ -10713,7 +10773,15 @@ settingsSession: {
     },
     cliPath: {
       title: "Терминал",
-      footer: "Happier Desktop добавляет и удаляет только те записи PATH, которые создал сам; записи установщика оболочки остаются нетронутыми.",
+      footer: "Happier Desktop изменяет только созданные им записи PATH; записи установщика оболочки остаются без изменений.",
+      cleanupTitle: "Удалить компоненты Desktop",
+      cleanupSubtitle: "Удалить командную строку и фоновые службы Desktop, затем выйти.",
+      cleanupConfirmTitle: "Удалить компоненты Desktop и выйти?",
+      cleanupConfirmBody: "Будут удалены файлы командной строки, записи PATH и службы, принадлежащие Desktop, если они не нужны другому приложению Desktop. Общие и установленные вами компоненты, история сеансов и данные учётной записи сохранятся. Удаляемые службы останавливаются, что может прервать текущие сеансы и удалённый доступ.\n\nПосле очистки Desktop закроется. Затем удалите приложение средствами операционной системы; в macOS или портативном Linux удалите пакет или файл приложения. При повторном открытии Desktop компоненты могут быть настроены заново.",
+      cleanupConfirmAction: "Удалить компоненты и выйти",
+      cleanupBusy: "Удаление компонентов Desktop…",
+      cleanupFailed: "Очистка не завершена. Повторите попытку.",
+      cleanupQuitFailed: "Очистка завершена, но Desktop не удалось закрыться. Закройте приложение перед удалением.",
       addTitle: "Добавить happier в PATH",
       addSubtitle: "Сделать команду happier доступной в новых терминалах.",
       removeTitle: "Удалить happier из PATH",
@@ -10821,11 +10889,16 @@ settingsSession: {
   },
 
   message: {
+    provenanceFrom: ({ source }: { source: string }) => `От ${source}`,
+    provenanceSession: 'Сессия',
     sessionReferenceUnavailable: "Сессия недоступна",
     sessionReferenceOpen: ({ name }: { name: string }) => `Открыть сессию ${name}`,
     switchedToMode: ({ mode }: { mode: string }) =>
       `Переключено в режим ${mode}`,
     discarded: "Отброшено",
+    readAloudA11y: "Прочитать вслух",
+    stopReadAloudA11y: "Остановить чтение вслух",
+    readAloudFailed: "Не удалось прочитать это сообщение вслух. Проверьте настройки голоса.",
     recoveredHistory: "Восстановленная история",
     unknownEvent: "Неизвестное событие",
     contextCompactionStarted: "Сжатие контекста...",
@@ -10874,7 +10947,7 @@ settingsSession: {
     sessionRunningLocally:
       "Эта сессия запущена локально на этом компьютере. Вы можете переключиться на удалённый режим, чтобы управлять из приложения.",
     sessionRunningLocallyAndRemotely:
-      "Эта сессия локально подключена в OpenCode и по-прежнему управляется из приложения.",
+      "Эта сессия локально подключена и по-прежнему управляется из приложения.",
     switchingToRemote: "Переключение в удалённый режим…",
     switchToRemote: "Переключиться на удалённый",
     detachLocalTerminal: "Отсоединить терминал",
@@ -10968,6 +11041,13 @@ settingsSession: {
       codeCopied: "Код скопирован",
       copyFailed: "Ошибка копирования",
       mermaidRenderFailed: "Не удалось отобразить диаграмму mermaid",
+      table: {
+          open: "Открыть таблицу",
+          copyCsv: "Копировать как CSV",
+          copyMarkdown: "Копировать как Markdown",
+          csvLabel: "CSV",
+          viewerTitle: "Таблица",
+      },
       diffLabel: "Дифф",
       codeLabel: "Код",
 
@@ -11251,6 +11331,7 @@ settingsSession: {
     enterTmuxTempDir: "Введите путь к временному каталогу",
     tmuxUpdateEnvironment: "Обновлять окружение автоматически",
     nameRequired: "Имя профиля обязательно",
+    invalidProfile: 'Перед сохранением проверьте имя профиля, переменные окружения и настройки по умолчанию.',
     deleteConfirm: ({ name }: { name: string }) =>
       `Вы уверены, что хотите удалить профиль "${name}"?`,
     editProfile: "Редактировать Профиль",

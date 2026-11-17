@@ -23,6 +23,9 @@ mod pet_overlay;
 mod system_tasks;
 
 #[cfg(desktop)]
+mod desktop_notification;
+
+#[cfg(desktop)]
 mod window_chrome;
 
 #[cfg(desktop)]
@@ -30,6 +33,9 @@ mod startup;
 
 #[cfg(desktop)]
 mod shutdown;
+
+#[cfg(any(target_os = "windows", test))]
+mod single_instance;
 
 #[cfg(target_os = "linux")]
 mod linux_webkit_env;
@@ -39,8 +45,35 @@ mod linux_webkit_env;
 // Embed the product Info.plist only in the product entrypoint, not in that test executable.
 #[cfg(not(test))]
 pub fn run() {
+    let context = tauri::generate_context!();
     #[cfg(target_os = "linux")]
     linux_webkit_env::apply_before_gtk_init();
+
+    #[cfg(desktop)]
+    if std::env::args_os().skip(1).any(|arg| arg == "--uninstall-desktop-components") {
+        #[cfg(target_os = "windows")]
+        if let Err(error) = single_instance::ensure_no_running_desktop(&context.config().identifier) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        // No single-instance forwarding, webviews, tray, or setup acquisition.
+        // Windows installers wait for this process before removing its bundled helper.
+        let result = tauri::Builder::default()
+            // Register the existing login-item adapter so cleanup can remove this app's
+            // registration. Registering the adapter never enables a login item.
+            .setup(|app| {
+                autostart::register(app)?;
+                Ok(())
+            })
+            .build(context)
+            .map_err(|error| format!("Unable to initialize desktop cleanup: {error}"))
+            .and_then(|app| system_tasks::uninstall_desktop_components(app.handle()));
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
 
     let mut builder = tauri::Builder::default();
 
@@ -49,6 +82,10 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            #[cfg(target_os = "windows")]
+            for argument in &args {
+                desktop_notification::handle_activation(app, argument);
+            }
             menu_bar::on_second_launch(app, args);
         }));
         builder = builder.plugin(tauri_plugin_deep_link::init());
@@ -83,6 +120,7 @@ pub fn run() {
             .manage(pet_overlay::DesktopPetOverlayState::default())
             .manage(system_tasks::SystemTasksState::default())
             .manage(shutdown::DesktopShutdownState::default())
+            .manage(desktop_notification::PendingNotificationData::default())
             .manage(menu_bar::MenuBarState::default())
             .invoke_handler(tauri::generate_handler![
                 app_updates::desktop_fetch_update,
@@ -107,12 +145,15 @@ pub fn run() {
                 system_tasks::get_system_task_snapshot,
                 system_tasks::system_tasks_open_log_path,
                 system_tasks::respond_system_task_prompt,
+                system_tasks::desktop_uninstall_components,
                 window_chrome::desktop_get_window_chrome_policy,
                 window_chrome::desktop_set_native_title_bar,
                 window_chrome::desktop_get_window_state,
                 window_chrome::desktop_minimize_window,
                 window_chrome::desktop_toggle_window_maximize,
                 window_chrome::desktop_close_window,
+                desktop_notification::desktop_show_clickable_notification,
+                desktop_notification::desktop_take_pending_notification_data,
                 window_chrome::desktop_show_main_window,
                 window_chrome::desktop_start_window_dragging,
                 shutdown::desktop_finish_shutdown
@@ -132,9 +173,14 @@ pub fn run() {
                         window_chrome::request_show_main_window(&handle);
                     });
                 }
-                system_tasks::set_desktop_bundle_id(&app.config().identifier);
+                system_tasks::set_desktop_context(app.handle())?;
                 autostart::register(app)?;
                 menu_bar::prepare_launch(app.handle());
+                // Preserve a retained toast's data before the cold-launch renderer subscribes.
+                #[cfg(target_os = "windows")]
+                for argument in std::env::args().skip(1) {
+                    desktop_notification::handle_activation(app.handle(), &argument);
+                }
                 // The main window first (unless this is a login start in menu-bar mode), so the
                 // tray can follow its theme events on Windows.
                 window_chrome::register(app)?;
@@ -157,7 +203,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             #[cfg(desktop)]
@@ -167,6 +213,8 @@ pub fn run() {
                         api.prevent_exit();
                     }
                 }
+                #[cfg(not(target_os = "macos"))]
+                tauri::RunEvent::Exit => window_chrome::flush_main_window_frame(app_handle),
                 tauri::RunEvent::Ready => {
                     startup::emit_ready(app_handle);
                     window_chrome::present_main_window_for_lifecycle_event(
@@ -273,8 +321,18 @@ mod app_updates {
         app: AppHandle,
         pending_update: State<'_, PendingUpdate>,
     ) -> Result<Option<UpdateMetadata>, String> {
-        let update = app
-            .updater()
+        let updater = app.updater_builder();
+        #[cfg(target_os = "windows")]
+        let updater = {
+            let app = app.clone();
+            updater.on_before_exit(move || {
+                // The Windows installer exits the process without RunEvent::Exit.
+                crate::window_chrome::flush_main_window_frame(&app);
+                app.cleanup_before_exit();
+            })
+        };
+        let update = updater
+            .build()
             .map_err(|e| e.to_string())?
             .check()
             .await

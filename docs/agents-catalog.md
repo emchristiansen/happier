@@ -203,6 +203,20 @@ Every `cli.<agentId>` capability is wrapped by `apps/cli/src/capabilities/cliUpd
 - Update action: `install` with `{ intent: 'update', allowVendorRecipeExecution? }`. A `managed` install is reinstalled through the managed install owner. A `native` install runs the vendor updater (`claude update`, `codex update`, `opencode upgrade`, `agent update`) on the resolved executable, and only with `allowVendorRecipeExecution: true` (the UI's confirmation). Every other owner returns `update-not-available`, and its message includes the owner's command. Happier never spawns a package manager. The action succeeds only when a fresh detect reports a different version. That re-read uses the snapshot's slow-probe budget (`verifyVersion`), so a slow `--version` is not mistaken for "no version". If the version is unchanged because the managed installer's release-age rule still holds the newer version, the error is `update-held-by-release-age` (for example "0.24.6 is less than a day old; Happier installs it once it's a day old."). Otherwise it fails with `update-not-verified`.
 - Old daemons do not report these fields. Clients must offer the update action only when `updateSupported === true` is present, because an old daemon ignores `intent` and runs a plain install.
 
+### CLI inventory version reuse (development source)
+
+`apps/cli/src/capabilities/snapshots/cliSnapshot.ts` owns the daemon's CLI inventory.
+After the ordinary snapshot expires, recognized native installations can reuse a
+successful version while the real executable's filesystem identity is unchanged.
+Eligibility uses the existing install classifier and native executable headers;
+opaque scripts, package-manager shims and unclassified overrides keep probing.
+Concurrent ordinary version probes share the existing bounded execution path.
+Explicit `bypassCache` and `verifyVersion` requests always probe afresh, and
+invalidation retires pending observations so they cannot restore stale facts.
+Banners from failed executions remain best-effort metadata for that observation,
+but are not retained as version facts. This is development-source behavior,
+with no new request fields or persistent storage format.
+
 ### Checklist id conventions
 
 Checklist ids are treated as stable API between daemon and app:
@@ -352,6 +366,19 @@ the in-session `sessionModelsV1` publisher both read it, so the two pickers cann
 which models exist or which effort tiers they report. Its provider-owned cache identity is the
 normalized endpoint, credential kind, and full SHA-256 credential hash. A warm cache entry avoids a
 network request; a cold session start may fetch the catalog before publishing the resolved models.
+In development source, the same target resolver reads user-scoped Claude Code `apiKeyHelper`
+settings and executes the configured shell command when the canonical launch settings-source policy
+includes `user`. Explicit auth tokens/API keys precede the helper; `CLAUDE_CODE_OAUTH_TOKEN` and saved login follow it. The existing
+`ANTHROPIC_OAUTH_TOKEN` bearer alias remains supported. A configured helper failure is terminal
+for credential selection: it cannot substitute another account. Without caller cancellation, this
+unavailable target returns the built-in catalog for the current call and leaves cached observations
+untouched. Malformed JSON, non-object user settings roots and non-string helper settings are
+skipped, matching Claude Code's non-interactive settings loading. Project helpers are not executed without
+Claude Code's workspace-trust decision. The helper receives the effective profile/session
+environment and selected session directory, and its credential kind and value remain part of the existing endpoint-scoped cache identity. Helper, HTTP
+and installed-runtime parser phases share the caller's deadline, cancellation and owned-resource
+cleanup. Helper output uses both API-key and Bearer headers without the subscription OAuth beta
+header. Custom endpoint path prefixes are preserved, while saved subscription credentials remain restricted to Anthropic.
 For Claude, a successful account response is authoritative for membership and API capability/context
 facts; curated rows only enrich matching ids and serve as the fallback before the first success. A
 later failed refresh retains the bounded last successful account snapshot, serves it during the

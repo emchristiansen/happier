@@ -5,6 +5,7 @@ import type {
   ConnectedServiceCredentialRecordV1,
   ConnectedServiceId,
 } from '@happier-dev/protocol';
+import { ConnectedServiceAuthGroupPolicyV1Schema } from '@happier-dev/protocol';
 
 import type { ConnectedServicesMaterializationDiagnostic } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
 import type { ConnectedServicesProviderMaterializerInput } from '@/daemon/connectedServices/materialize/providerMaterializerTypes';
@@ -13,6 +14,7 @@ import type { ConnectedServiceResolvedSelection } from '@/daemon/connectedServic
 import { resolveClaudeConfigDirOverride } from '@/backends/claude/utils/resolveClaudeConfigDirOverride';
 import { resolveConfiguredClaudeConfigDir } from '@/backends/claude/utils/resolveConfiguredClaudeConfigDir';
 import { findClaudeConfigurationSourceScopeViolation, isPathWithinDirectory } from './claudeConfigurationSourceScope';
+import { CLAUDE_AUTO_CONTINUE_AT_USAGE_LIMIT_ENV_KEY, CLAUDE_NATIVE_CONFIG_DIR_ENV_KEY } from '@/backends/claude/utils/resolveClaudeLaunchSettingsOverlay';
 import { materializeClaudeAnthropicApiKeyAuth } from './materializeClaudeAnthropicApiKeyAuth';
 import {
   materializeClaudeSubscriptionNativeAuthHome,
@@ -90,6 +92,10 @@ function resolveClaudeConfigurationSourceEnv(params: Readonly<{
     resolve(claudeConfigDir) !== resolve(params.targetClaudeConfigDir)
     && !isClaudeManagedConnectedServiceConfigDir({ activeServerDir: params.activeServerDir, claudeConfigDir });
 
+  const nativeConfigDir = params.processEnv[CLAUDE_NATIVE_CONFIG_DIR_ENV_KEY]?.trim();
+  if (nativeConfigDir && isPermittedSource(nativeConfigDir)) {
+    return { ...params.processEnv, CLAUDE_CONFIG_DIR: nativeConfigDir };
+  }
   if (isPermittedSource(resolveConfiguredClaudeConfigDir({ env: params.processEnv }))) {
     return params.processEnv;
   }
@@ -175,6 +181,20 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
     selection: params.selection ?? null,
   });
   if (!claudeConfigDir) return null;
+  const nativeSourceEnv = resolveClaudeConfigurationSourceEnv({
+    activeServerDir: params.activeServerDir,
+    processEnv: params.processEnv,
+    targetClaudeConfigDir: claudeConfigDir,
+  });
+  const nativeLaunchEnv = {
+    [CLAUDE_NATIVE_CONFIG_DIR_ENV_KEY]: resolveConfiguredClaudeConfigDir({ env: nativeSourceEnv }),
+  };
+  const poolPolicy = params.selection?.kind === 'group'
+    ? ConnectedServiceAuthGroupPolicyV1Schema.parse(params.selection.policy ?? {})
+    : null;
+  const poolLaunchEnv: Record<string, string> = poolPolicy
+    ? { [CLAUDE_AUTO_CONTINUE_AT_USAGE_LIMIT_ENV_KEY]: poolPolicy.claudeCodeAutoContinueAtUsageLimit === true ? '1' : '0' }
+    : {};
 
   if (params.serviceId === 'claude-subscription') {
     const selectionDescriptor = buildClaudeSubscriptionNativeAuthSelectionDescriptor({
@@ -234,7 +254,7 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
           || hasBlockingDiagnostics(canonicalProfileMaterialized.diagnostics)
         ) {
           return {
-            env: { CLAUDE_CONFIG_DIR: claudeConfigDir },
+            env: { CLAUDE_CONFIG_DIR: claudeConfigDir, ...nativeLaunchEnv },
             targetMaterializedRoot: claudeConfigDir,
             diagnostics: canonicalProfileMaterialized.diagnostics,
             identityDiagnostic: canonicalProfileMaterialized.identityDiagnostic,
@@ -277,7 +297,7 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
       validateGroupMutationCurrentness: params.validateGroupMutationCurrentness,
     });
     return {
-      env: materialized.env,
+      env: { ...materialized.env, ...poolLaunchEnv, ...nativeLaunchEnv },
       targetMaterializedRoot: claudeConfigDir,
       diagnostics: dedupeDiagnostics([...groupSourceDiagnostics, ...materialized.diagnostics]),
       identityDiagnostic: materialized.identityDiagnostic,
@@ -302,7 +322,7 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
     }
   }
   const diagnostics = params.sessionStateMode === 'existing' ? [] : (await syncClaudeConnectedServiceHome({
-    sourceEnv: params.processEnv,
+    sourceEnv: nativeSourceEnv,
     targetDir: claudeConfigDir,
     accountSettings: params.accountSettings ?? null,
     sessionDirectory: params.sessionDirectory ?? null,
@@ -311,6 +331,8 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
   return {
     env: {
       ...materialized.env,
+      ...poolLaunchEnv,
+      ...nativeLaunchEnv,
       CLAUDE_CONFIG_DIR: claudeConfigDir,
     },
     targetMaterializedRoot: claudeConfigDir,

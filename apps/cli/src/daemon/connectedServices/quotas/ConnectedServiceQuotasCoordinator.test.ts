@@ -1,3 +1,5 @@
+import axios, { AxiosError } from 'axios';
+import { createLocalServerStormTracker } from '../../serverWork/localServerStorm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -319,7 +321,8 @@ function createDeferred<T>(): Readonly<{
   return { promise, resolve, reject };
 }
 
-function createObservationProbeFixture(fetch: ConnectedServiceQuotaFetcher['fetch'], consumeRecoveryCredit?: ConnectedServiceQuotaFetcher['consumeRecoveryCredit']) {
+function createObservationProbeFixture(fetch: ConnectedServiceQuotaFetcher['fetch'], consumeRecoveryCredit?: ConnectedServiceQuotaFetcher['consumeRecoveryCredit'],
+  options: Pick<ConstructorParameters<typeof ConnectedServiceQuotasCoordinator>[0], 'quotaWorkGate'> = {}) {
   let now = 1_000_000;
   let credentialRevision = 'csr_bbbbbbbbbbbbbbbbbbbbbb';
   let record = buildConnectedServiceCredentialRecord({ now, serviceId: 'openai-codex', profileId: 'backup',
@@ -344,7 +347,8 @@ function createObservationProbeFixture(fetch: ConnectedServiceQuotaFetcher['fetc
     // The server permits reacquisition by the same daemon owner.
     acquireConnectedServiceRefreshLease: async () => ({ acquired: true, leaseUntil: now + 30_000 }),
   } satisfies QuotaApi;
-  const quotas = new ConnectedServiceQuotasCoordinator({ api,
+  const diagnostics: unknown[] = [];
+  const quotas = new ConnectedServiceQuotasCoordinator({ api, ...options, recordDiagnostic: (event) => diagnostics.push(event),
     credentials: { token: 'synthetic', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) } },
     quotaFetchers: [{ serviceId: 'openai-codex', fetch, consumeRecoveryCredit }], now: () => now, randomBytes,
     discoveryEnabled: false, runtimeQuotaSnapshots, fetchTimeoutMs: 100,
@@ -363,14 +367,51 @@ function createObservationProbeFixture(fetch: ConnectedServiceQuotaFetcher['fetc
     commitSwitch: async () => { throw new Error('Unexpected selection'); },
     applyGeneration: async () => { throw new Error('Unexpected application'); },
   });
-  return { api, quotas, switching, requestRefresh: () => { requestedAt = now; }, observe: () => switching.observeCurrentGenerationForRecovery({
-    serviceId: 'openai-codex', groupId: 'team', observedProfileId: 'primary',
-  }), advance: (elapsedMs: number) => { now += elapsedMs; },
+  return { api, quotas, switching, diagnostics, requestRefresh: () => { requestedAt = now; }, observe: async () => {
+    const result = await switching.observeCurrentGenerationForRecovery({
+      serviceId: 'openai-codex', groupId: 'team', observedProfileId: 'primary',
+    });
+    if (result === null) throw new Error('A replacement observation must not request failure selection');
+    return result;
+  }, advance: (elapsedMs: number) => { now += elapsedMs; },
   replaceRecord: (next: typeof record) => { record = next; }, readRecord: () => record,
   replaceRevision: (next: string) => { credentialRevision = next; } };
 }
 
 describe('ConnectedServiceQuotasCoordinator', () => {
+  it.each([false, true])('reports actual successful quota observations separately from completed admission (snapshot=%s)', async (hasSnapshot) => {
+    const fixture = createObservationProbeFixture(async () => hasSnapshot ? buildQuotaSnapshotFixture({
+      serviceId: 'openai-codex', profileId: 'backup', now: 1_000_000, remainingPct: 100,
+    }) : null);
+    try {
+      await fixture.quotas.probeGroupQuotaSnapshots({ serviceId: 'openai-codex', groupId: 'team', profileIds: ['backup'] });
+      expect(fixture.diagnostics).toContainEqual(expect.objectContaining({
+        phase: 'probe_group', probeOutcome: 'complete', completedTargetCount: 1, successfulTargetCount: hasSnapshot ? 1 : 0,
+      }));
+    } finally { fixture.quotas.dispose(); }
+  });
+
+  it('resumes real quota probes when the shared local-server failure window drains', async () => {
+    let now = 1_000;
+    const client = axios.create({ adapter: async (config) => {
+      throw new AxiosError('unavailable', 'ERR_BAD_RESPONSE', config, undefined,
+        { data: {}, headers: {}, config, status: 503, statusText: '' });
+    } });
+    const tracker = createLocalServerStormTracker({ nowMs: () => now, windowMs: 60_000, serverUrl: 'http://local.test', client });
+    let fetches = 0;
+    const fixture = createObservationProbeFixture(async () => { fetches++; return null; }, undefined, {
+      quotaWorkGate: () => tracker.failureCount() >= 3 ? { status: 'deferred', reason: 'local_server_storm' } : { status: 'open' },
+    });
+    try {
+      for (let i = 0; i < 3; i++) await client.get('http://local.test/fail').catch(() => {});
+      await fixture.quotas.probeGroupQuotaSnapshots({ serviceId: 'openai-codex', groupId: 'team', profileIds: ['backup'] });
+      expect(fetches).toBe(0);
+      now += 60_001;
+      await fixture.quotas.probeGroupQuotaSnapshots({ serviceId: 'openai-codex', groupId: 'team', profileIds: ['backup'] });
+      expect(fetches).toBe(1);
+    } finally { tracker.dispose(); fixture.quotas.dispose(); }
+  });
+
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -456,14 +497,10 @@ describe('ConnectedServiceQuotasCoordinator', () => {
         resetsAtMs: now + 7 * 24 * 60 * 60_000,
       });
       expect(fetches.filter((profileId) => deferred.includes(profileId))).toHaveLength(deferred.length);
-      if (scenario === 'usable_alternative') {
-        expect(result).toMatchObject({ status: 'switched', activeProfileId: 'member-0', generation: 2 });
-      } else {
-        expect(generation).toBe(1);
-        expect(resolveRuntimeAuthRecoveryResultDisposition({ result, nowMs: now,
-          classificationProfileId: 'leeroy_batiplus', classificationResetsAtMs: now + 7 * 24 * 60 * 60_000,
-        })).toMatchObject({ kind: 'durable_wait', nextRetryAtMs: now + (scenario === 'all_deferred' ? 120_000 : 121_000) });
-      }
+      expect(result).toMatchObject({ status: 'switched', generation: 2,
+        activeProfileId: scenario === 'usable_alternative' ? 'member-0' : 'ai3_bat',
+      });
+      expect(generation).toBe(2);
     },
   );
 
@@ -926,6 +963,11 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       expect(accountUsageStore.resolveBySource(groupSource)).toEqual(currentUsage);
       expect(runtimeQuotaSnapshots.getSnapshot({ serviceId: source.serviceId, groupId: 'team', profileId: 'work' })).toEqual(snapshot);
       expect(runtimeQuotaSnapshots.getRecentBurn({ serviceId: source.serviceId, profileId: 'work', groupId: 'team' })).not.toBeNull();
+    } else if (organizationId === 'org-work') {
+      // Current-credential persisted usage is hydrated into the selector's last-known projection
+      // while a deferred provider read waits for the existing backoff budget.
+      expect(runtimeQuotaSnapshots.getSnapshot({ serviceId: source.serviceId, groupId: 'team', profileId: 'work' }))
+        .toMatchObject({ providerOrganizationId: 'org-work' });
     } else {
       expect(runtimeQuotaSnapshots.getSnapshot({ serviceId: source.serviceId, groupId: 'team', profileId: 'work' })).toBeNull();
     }
@@ -969,11 +1011,11 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     await coordinator.tickOnce();
     expect(runtimeQuotaSnapshots.getSnapshotEntry({ serviceId: 'claude-subscription', profileId: 'work' })?.verifiedCredentialFingerprint)
       .toBe(computeConnectedServiceAccessTokenFingerprint('access-a'));
-    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+    expect(providerRequests.filter((url) => new URL(url).pathname === '/api/oauth/usage')).toHaveLength(1);
     expect(accountUsageStore.resolveBySource({ serviceId: 'claude-subscription', profileId: 'work', bindingKind: 'profile' })).toBeNull();
     now += 120_000;
     await coordinator.tickOnce();
-    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+    expect(providerRequests.filter((url) => new URL(url).pathname === '/api/oauth/usage')).toHaveLength(1);
     const acceptedEntry = runtimeQuotaSnapshots.getSnapshotEntry({ serviceId: 'claude-subscription', profileId: 'work' });
     credentialUnavailable = true;
     now += 1;
@@ -986,11 +1028,11 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     credentialUnavailable = false;
     now += 1;
     await coordinator.tickOnce();
-    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+    expect(providerRequests.filter((url) => new URL(url).pathname === '/api/oauth/usage')).toHaveLength(1);
     currentAccessToken = 'access-c';
     now += 1;
     await coordinator.tickOnce();
-    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(2);
+    expect(providerRequests.filter((url) => new URL(url).pathname === '/api/oauth/usage')).toHaveLength(2);
   });
 
   it('uses the qualified local observation budget when the released plaintext relay projection omits organization', async () => {
@@ -1037,26 +1079,26 @@ describe('ConnectedServiceQuotasCoordinator', () => {
     await coordinator.tickOnce();
     const source = { serviceId: 'claude-subscription', profileId: 'work', bindingKind: 'profile' } as const;
     expect(accountUsageStore.resolveBySource(source)?.recordKey).toMatchObject({ quotaScope: 'organization', quotaScopeId: 'org-a' });
-    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+    expect(providerRequests.filter((url) => new URL(url).pathname === '/api/oauth/usage')).toHaveLength(1);
 
     const requestsAfterFirstObservation = providerRequests.length;
     now += 120_000;
     await coordinator.tickOnce();
-    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(1);
+    expect(providerRequests.filter((url) => new URL(url).pathname === '/api/oauth/usage')).toHaveLength(1);
 
     expect(providerRequests).toHaveLength(requestsAfterFirstObservation);
 
     organizationId = 'org-b';
     now += 1;
     await coordinator.tickOnce();
-    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(2);
+    expect(providerRequests.filter((url) => new URL(url).pathname === '/api/oauth/usage')).toHaveLength(2);
     expect(providerRequests.some((url) => url.endsWith('/api/oauth/profile'))).toBe(false);
     expect(accountUsageStore.resolveBySource(source)?.recordKey).toMatchObject({ quotaScope: 'organization', quotaScopeId: 'org-b' });
 
     now += 1;
     releasedQuotaView.metadata.refreshRequestedAt = now;
     await coordinator.tickOnce();
-    expect(providerRequests.filter((url) => url.endsWith('/api/oauth/usage'))).toHaveLength(3);
+    expect(providerRequests.filter((url) => new URL(url).pathname === '/api/oauth/usage')).toHaveLength(3);
   });
 
   it('skips quota bridge fetches for known reconnect-required profiles', async () => {
@@ -4135,14 +4177,14 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       serviceId: 'openai-codex',
       now,
     });
-    // Fast burn on the ACTIVE member: 60% -> 40% remaining across 30s in the in-band runtime store.
+    // Sustained burn on the ACTIVE member: 60% -> 30% across the full 5-minute policy horizon.
     softSwitchEligibility.runtimeQuotaSnapshots.recordSnapshot({
       serviceId: 'openai-codex',
       groupId: 'team',
       profileId: 'active',
       groupGeneration: 1,
       snapshot: buildQuotaSnapshotFixture({
-        serviceId: 'openai-codex', profileId: 'active', now: now - 30_000, remainingPct: 60, resetsAt: now + 600_000,
+        serviceId: 'openai-codex', profileId: 'active', now: now - 300_000, remainingPct: 60, resetsAt: now + 600_000,
       }),
     });
     softSwitchEligibility.runtimeQuotaSnapshots.recordSnapshot({
@@ -4151,15 +4193,15 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       profileId: 'active',
       groupGeneration: 1,
       snapshot: buildQuotaSnapshotFixture({
-        serviceId: 'openai-codex', profileId: 'active', now, remainingPct: 40, resetsAt: now + 600_000,
+        serviceId: 'openai-codex', profileId: 'active', now, remainingPct: 30, resetsAt: now + 600_000,
       }),
     });
 
-    // Canonical source-backed account usage: active is at 40% (ABOVE the 15% threshold — a poll-only
+    // Canonical source-backed account usage: active is at 30% (ABOVE the 15% threshold — a poll-only
     // soft-switch would not fire), backup is healthy at 90%.
     const accountUsageStore = createProviderAccountUsageStore();
     const activeUsageSnapshot = buildProviderAccountUsageSnapshotFixture({
-      serviceId: 'openai-codex', groupId: 'team', profileId: 'active', groupGeneration: 1, now, remainingPct: 40,
+      serviceId: 'openai-codex', groupId: 'team', profileId: 'active', groupGeneration: 1, now, remainingPct: 30,
       resetsAt: now + 600_000,
     });
     recordGroupMemberAccountUsageFixture(accountUsageStore, {
@@ -4208,7 +4250,7 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       observedProfileId: 'active',
     }));
     // PS-1: a burn-projection switch must be distinguishable from a reactive one in diagnostics —
-    // the source was ABOVE threshold (40% vs 15%) and only the projected next-window remaining tripped it.
+    // the source was ABOVE threshold (30% vs 15%) and only the projected next-window remaining tripped it.
     expect(diagnostics).toContainEqual(expect.objectContaining({
       event: 'quota_work_requested',
       phase: 'soft_switch',
@@ -7492,6 +7534,79 @@ describe('ConnectedServiceQuotasCoordinator', () => {
       phase: 'same_account_fanout',
       reason: 'same_account_fanout_no_matching_sessions',
     }));
+  });
+
+  it.each([
+    { spawnGeneration: null, unprovenSessionId: 'source' },
+    { spawnGeneration: 2, unprovenSessionId: 'shared-sibling' },
+  ])('uses applied registry generations after adoption from spawn generation $spawnGeneration and fails closed for $unprovenSessionId', async ({ spawnGeneration, unprovenSessionId }) => {
+    const now = 1_000_000;
+    const runtimeRegistry = new ConnectedServiceRuntimeRegistry({ nowMs: () => now });
+    const diagnostics: unknown[] = [];
+    // These server/process boundaries must remain unused: fanout consumes an existing decision.
+    const unexpectedDecision = async (): Promise<never> => { throw new Error('fanout must not decide another generation'); };
+    const switching = new ConnectedServiceAuthGroupSwitchCoordinator({
+      leases: new InMemoryConnectedServiceAuthGroupSwitchLeaseRegistry(),
+      nowMs: () => now,
+      quotaFreshnessMs: 60_000,
+      loadState: unexpectedDecision,
+      commitSwitch: unexpectedDecision,
+      applyGeneration: unexpectedDecision,
+    });
+    const coordinator = new ConnectedServiceQuotasCoordinator({
+      api: {
+        getConnectedServiceQuotaSnapshotSealed: async () => null,
+        getConnectedServiceCredentialSealed: async () => null,
+      },
+      credentials: { token: 'synthetic', encryption: { type: 'legacy', secret: new Uint8Array(32).fill(9) } },
+      quotaFetchers: [], now: () => now, randomBytes,
+      runtimeRegistry,
+      authGroupSwitchCoordinator: switching,
+      sameAccountFanoutMinIntervalMs: 0,
+      sameAccountFanoutStrategyResolver: () => 'shared_group_auth_surface',
+      recordDiagnostic: (event) => diagnostics.push(event),
+    });
+    for (const [sessionId, pid] of [['source', 561], ['shared-sibling', 562]] as const) {
+      coordinator.registerSpawnTarget({
+        pid, sessionId,
+        connectedServicesBindingsRaw: { v: 1, bindingsByServiceId: {
+          'claude-subscription': { source: 'connected', selection: 'group', groupId: 'team' },
+        } },
+        connectedServiceSelectionsEnv: spawnGeneration === null ? {} : {
+          [HAPPIER_CONNECTED_SERVICE_SELECTIONS_ENV_KEY]: JSON.stringify([{
+            kind: 'group', serviceId: 'claude-subscription', groupId: 'team',
+            activeProfileId: 'old', fallbackProfileId: 'primary', generation: spawnGeneration,
+          }]),
+        },
+      });
+      expect(runtimeRegistry.adoptExactGroupApplicationForSession({
+        sessionId, serviceId: 'claude-subscription', groupId: 'team',
+        profileId: 'primary', generation: 4, credentialRevision: null,
+      })?.activeBindings[0]).toMatchObject({ profileId: 'primary', generation: 4 });
+    }
+    const failure = {
+      sourceSessionId: 'source', serviceId: 'claude-subscription', groupId: 'team',
+      exhaustedProfileId: 'primary', resetAtMs: null,
+      committedGeneration: buildConnectedServiceAuthGroupCommittedGenerationFact({
+        decisionId: 'synthetic-hard-limit', provenance: 'hard_limit',
+        decisionCommittedTarget: { serviceId: 'claude-subscription', groupId: 'team', profileId: 'backup', generation: 5 },
+      }),
+    } as const;
+    try {
+      await expect(coordinator.recordRuntimeUsageLimitExhaustionAndFanout(failure))
+        .resolves.toMatchObject({ fanoutCandidates: 1 });
+      expect(runtimeRegistry.adoptProviderObservedGroupAccountForSession({
+        sessionId: unprovenSessionId, serviceId: 'claude-subscription', groupId: 'team',
+        profileId: 'provider-observed-member', observedAtMs: now + 1,
+      })?.activeBindings[0]).toMatchObject({ generation: null });
+      await expect(coordinator.recordRuntimeUsageLimitExhaustionAndFanout(failure))
+        .resolves.toMatchObject({ fanoutCandidates: 0 });
+      expect(diagnostics).toContainEqual(expect.objectContaining({
+        reason: 'registry_binding_missing_group_generation',
+      }));
+    } finally {
+      coordinator.dispose();
+    }
   });
 
   it('proves shared group auth-surface siblings from registry bindings without runtime probes', async () => {

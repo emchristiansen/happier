@@ -231,7 +231,8 @@ In the app:
 3. **Claude (remote)**
 
 Most settings below affect **Claude remote mode only**.  
-The one exception is **Experimental: local permission bridge**, which affects **local mode**.
+**Experimental: local permission bridge** affects **local mode**.
+The development retention setting also applies to native Claude settings.
 
 ## Settings reference (Claude remote)
 
@@ -247,6 +248,15 @@ The one exception is **Experimental: local permission bridge**, which affects **
 | **Disable TODOs** | Off | Adds a remote-mode system instruction that asks Claude not to create TODO items/lists in its output. |
 | **Strict MCP server config** | Off | Fails the remote start if any MCP server config is invalid (instead of trying to continue). |
 | **Advanced options (JSON)** | Empty | Power-user overrides for a limited allowlist of Agent SDK query options (remote Agent SDK only). Invalid JSON is ignored with a user-visible warning. |
+
+In development source, Happier executes Claude Code's user-scoped `apiKeyHelper` shell command
+during model discovery. It reads the selected Claude configuration directory, passes the session
+environment and selected project directory to the helper, and preserves a gateway's `ANTHROPIC_BASE_URL` path prefix.
+**Setting sources** must include user settings; discovery does not execute project helpers.
+If the configured helper fails without caller cancellation, Happier shows its built-in Claude
+model catalog and does not select a saved account. Malformed JSON, non-object user settings
+roots and non-string helper settings are skipped, as in Claude Code's non-interactive mode. Turning off **Discover available
+models** also prevents helper execution. This behavior is not yet available in a released build.
 
 For the full user-facing MCP guide in Happier, see:
 
@@ -288,6 +298,41 @@ passes it to the sessions it starts, including those in tmux.
 
 An `--effort` flag passed when starting a Claude session sets that session's initial Thinking level.
 Choosing a different level later in the app replaces it from the next message.
+
+## Local session retention (development source)
+
+In the development source, open **Settings → AI & Agents → AI backends → Claude**
+and choose a local session retention period. You can keep existing settings,
+restore Claude's default, choose 365 days or 36,500 days (100 years), or enter a
+positive whole number of days. The app asks for confirmation before a change
+that could shorten retention.
+
+This account preference applies to the user-level Claude settings on connected
+machines, including native Claude and Connected Services profiles. Online
+daemons apply changes when they receive them; newly paired or offline machines
+apply the current preference when they connect. Profile creation and credential
+refresh preserve the selected period. Existing Claude processes may pick up a
+settings change later; the status confirms the configured file value, not a
+completed cleanup or an effective policy inside every running process.
+
+**Keep existing settings** stops Happier managing retention and leaves previous
+edits in place. **Claude default** removes the user-level retention override.
+According to [Claude's settings reference](https://code.claude.com/docs/en/settings-reference#cleanupperioddays),
+the default is 30 days. Changing retention cannot restore deleted history.
+The 100-year option is finite.
+
+Expand a machine's status to see native and profile results. Offline results are
+last confirmed values; a pending preference is not shown as applied. Older
+daemons must be updated to apply and report this setting. File errors are shown
+without replacing malformed settings.
+
+Explicit launch settings, project settings and organization policy can override
+these user-level settings.
+Happier warns when it detects a local managed retention declaration, but it does
+not evaluate Claude's remote or MDM policy precedence. For the effective source,
+check `/status` inside Claude Code. The setting also affects standalone Claude
+that uses the same configuration directory. It does not change retention of
+Happier's stored transcript.
 
 ## Claude Code session history (development source)
 

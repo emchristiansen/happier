@@ -105,7 +105,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       serviceId: 'claude-subscription',
       staleAfterMs: 321_000,
     });
-    expect(fetchMock).toHaveBeenCalledWith(usageUrl, expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledWith(`${usageUrl}?cedar_ember=1&at_wall=1`, expect.objectContaining({
       headers: expect.objectContaining({
         'User-Agent': 'claude-code/descriptor',
         'anthropic-beta': 'oauth-2025-04-20',
@@ -144,7 +144,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
     await expect(fetcher.fetch({ record, now, signal: new AbortController().signal }))
       .resolves
       .toMatchObject({ serviceId: 'claude-subscription', profileId: 'work' });
-    expect(fetchMock).toHaveBeenCalledWith('https://api.anthropic.com/api/oauth/usage', expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledWith('https://api.anthropic.com/api/oauth/usage?cedar_ember=1&at_wall=1', expect.objectContaining({
       method: 'GET',
       headers: expect.objectContaining({
         Authorization: 'Bearer at',
@@ -188,7 +188,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
 
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
     expect(snapshot?.meters.find((meter) => meter.meterId === 'five_hour')?.utilizationPct).toBe(20);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('fetches and parses Claude subscription oauth usage into a quota snapshot', async () => {
@@ -236,7 +236,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
     const parsed = ConnectedServiceQuotaSnapshotV1Schema.safeParse(snapshot);
     expect(parsed.success).toBe(true);
     if (parsed.success) {
-      expect(parsed.data.planLabel).toBe('max_20x');
+      expect(parsed.data.planLabel).toBe('Max 20x');
       expect(parsed.data.meters.map((m) => m.meterId)).toContain('five_hour');
       expect(parsed.data.meters.map((m) => m.meterId)).toContain('seven_day');
       expect(parsed.data.meters.map((m) => m.meterId)).toContain('extra_usage');
@@ -595,18 +595,21 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       signal: new AbortController().signal,
     });
 
-    expect(snapshot?.planLabel).toBe('team_5x');
+    expect(snapshot?.planLabel).toBe('Team');
   });
 
   it.each([
-    { subscriptionType: 'max', rateLimitTier: 'max_5x', expected: 'max_5x' },
-    { subscriptionType: 'max', rateLimitTier: 'default_claude_max_5x', expected: 'default_claude_max_5x' },
-    { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x', expected: 'default_claude_max_20x' },
+    { subscriptionType: 'max', rateLimitTier: 'max_5x', expected: 'Max 5x' },
+    { subscriptionType: 'max', rateLimitTier: 'default_claude_max_5x', expected: 'Max 5x' },
+    { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x', expected: 'Max 20x' },
     { subscriptionType: 'max', rateLimitTier: 'future_provider_tier', expected: 'future_provider_tier' },
-    { subscriptionType: 'max', rateLimitTier: undefined, expected: 'max' },
-    { subscriptionType: 'max', rateLimitTier: '  ', expected: 'max' },
+    { subscriptionType: 'max', rateLimitTier: 'future_provider_50x', expected: 'future_provider_50x' },
+    { subscriptionType: 'team', rateLimitTier: 'future_provider_tier', expected: 'future_provider_tier' },
+    { subscriptionType: undefined, rateLimitTier: 'future_provider_tier', expected: 'future_provider_tier' },
+    { subscriptionType: 'max', rateLimitTier: undefined, expected: 'Max' },
+    { subscriptionType: 'max', rateLimitTier: '  ', expected: 'Max' },
     { subscriptionType: undefined, rateLimitTier: undefined, expected: null },
-  ])('preserves recorded plan metadata without inferring a multiplier: $rateLimitTier / $subscriptionType', async ({
+  ])('formats known plans and preserves an unknown reported tier without inferring a multiplier: $rateLimitTier / $subscriptionType', async ({
     subscriptionType, rateLimitTier, expected,
   }) => {
     const now = 1_000_000;
@@ -664,7 +667,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
     const fetcher = createClaudeSubscriptionQuotaFetcher({ staleAfterMs: 300_000, disablePrivateEndpoint: true });
     const snapshot = await fetcher.fetch({ record, now, signal: new AbortController().signal });
 
-    expect(snapshot?.planLabel).toBe('max_20x');
+    expect(snapshot?.planLabel).toBe('Max 20x');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -784,7 +787,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       if (!url.includes('/anthropic/oauth/usage')) {
         throw new Error(`Unexpected URL in test: ${url}`);
       }
-      if (!url.includes('?')) usageCalls += 1;
+      usageCalls += 1;
       const auth = (() => {
         const headers: unknown =
           init && typeof init === 'object' && 'headers' in init ? (init as { headers?: unknown }).headers : undefined;
@@ -1020,7 +1023,7 @@ describe('createClaudeSubscriptionQuotaFetcher', () => {
       if (!url.includes('/anthropic/oauth/usage')) {
         throw new Error(`Unexpected URL in test: ${url}`);
       }
-      if (!url.includes('?')) usageCalls += 1;
+      usageCalls += 1;
       if (usageCalls === 1) {
         return {
           ok: false,

@@ -16,7 +16,7 @@ import { basename, join } from 'node:path'
 import { inspect } from 'node:util'
 import { redactBugReportSensitiveText } from '@happier-dev/protocol'
 import { writeConsoleErrorBestEffort, writeConsoleLogBestEffort } from '@/utils/writeConsoleBestEffort'
-import { DAEMON_LOG_SUFFIX, LOG_FILE_SUFFIX } from '@/utils/logs/logRetention'
+import { DAEMON_LOG_SUFFIX, LOG_FILE_SUFFIX, LOG_FILE_TAIL_WINDOW_BYTES } from '@/utils/logs/logRetention'
 import { BufferedFileAppender } from './logFileAppender'
 import { isFileLogLevelEnabled, resolveFileLogLevel, type FileLogLevel } from './logFileLevel'
 // Note: readDaemonState is imported lazily inside listDaemonLogFiles() to avoid
@@ -211,6 +211,7 @@ class Logger {
     this.warnFileEnabled = isFileLogLevelEnabled(this.fileLogLevel, 'warn')
     this.fileAppender = new BufferedFileAppender({
       filePath: this.logFilePath,
+      tailWindowBytes: LOG_FILE_TAIL_WINDOW_BYTES,
       onWriteError: (error) => this.handleFileWriteError(error),
     })
 

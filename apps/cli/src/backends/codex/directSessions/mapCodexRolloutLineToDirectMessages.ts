@@ -67,11 +67,12 @@ export function mapCodexProjectedEventsToDirectMessages(params: Readonly<{
       if (shouldFilterHarnessBlob(action.text)) continue;
       out.push({
         id: stableId,
-        localId: stableId,
+        localId: action.clientId ?? stableId,
         createdAtMs,
         raw: {
           role: 'user',
           content: { type: 'text', text: action.text },
+          ...(action.nativeContent ? { meta: { codexNativeContent: action.nativeContent } } : {}),
         },
       });
       continue;

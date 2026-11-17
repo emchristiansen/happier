@@ -431,6 +431,7 @@ export async function runGemini(opts: {
       return;
     }
     const queueDeliveryOptions = {
+      providerPromptMeta: message.meta,
       ...(pendingProviderAction ? { pendingProviderAction: pendingProviderAction === 'steer' ? 'send' as const : pendingProviderAction } : {}),
       ...(deliveryInfo?.pendingRequestedAction ? { pendingRequestedAction: deliveryInfo.pendingRequestedAction } : {}),
       userMessageLocalId: message.localId ?? null,
@@ -1094,17 +1095,10 @@ export async function runGemini(opts: {
         
         let promptToSend = message.message;
         
-        // Inject conversation history context if model was just changed
-        if (injectHistoryContext && conversationHistory.hasHistory()) {
-          const historyContext = conversationHistory.getContextForNewSession();
-          promptToSend = historyContext + promptToSend;
-          logger.debug(`[gemini] Injected conversation history context (${historyContext.length} chars)`);
-          // Don't clear history - keep accumulating for future model changes
-        }
-
         const replaySeedResolution = await resolveGeminiQueuedPromptWithReplaySeed({
           sessionClient: session,
           text: promptToSend,
+          meta: message.providerPromptMeta,
           localId: message.mode?.localId ?? null,
           replaySeedAllowed: message.mode?.replaySeedAllowed !== false,
           didBootstrap: didReplaySeedBootstrap,
@@ -1113,6 +1107,13 @@ export async function runGemini(opts: {
         promptToSend = replaySeedResolution.text;
         if (replaySeedResolution.seedApplied) {
           pendingReplaySeedSettlement = replaySeedResolution.settleReplaySeedOnProviderAcceptance;
+        }
+
+        // Restored history is host context, outside the current sender's message.
+        if (injectHistoryContext && conversationHistory.hasHistory()) {
+          const historyContext = conversationHistory.getContextForNewSession();
+          promptToSend = historyContext + promptToSend;
+          logger.debug(`[gemini] Injected conversation history context (${historyContext.length} chars)`);
         }
 
         if (shouldPrependAppendSystemPromptOnNextFreshSessionPrompt) {

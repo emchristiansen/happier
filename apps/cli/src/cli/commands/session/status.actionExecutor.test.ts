@@ -74,6 +74,12 @@ describe('session status recovery snapshot through authenticated HTTP', () => {
       .toEqual({ ok: false, code: 'unsupported' });
   });
 
+  it('propagates malformed session responses rather than reporting unsupported', async () => {
+    vi.spyOn(axios, 'get').mockResolvedValue({ status: 200, data: { session: { id: 'status_session_expected' } } });
+    await expect(getSessionStatus({ credentials, idOrPrefix: 'status_session_expected', live: false }))
+      .rejects.toThrow('Unexpected /v2/sessions response shape');
+  });
+
   it('binds prefix resolution to that row and accepts an absent optional attempt id', async () => {
     const { runtimeAuthRecoveryAttemptId: _attempt, ...withoutAttempt } = recovery;
     const sessions = [

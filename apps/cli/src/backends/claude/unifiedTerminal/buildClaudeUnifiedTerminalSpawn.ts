@@ -12,6 +12,7 @@ import { getClaudeSystemPrompt } from '../utils/systemPrompt';
 import { isClaudeCliJavaScriptFile, resolveClaudeCliPath } from '../utils/resolveClaudeCliPath';
 import { ensureClaudeJsRuntimeExecutable } from '../utils/ensureClaudeJsRuntimeExecutable';
 import { buildClaudeSubprocessEnv } from '../spawn/buildClaudeSubprocessEnv';
+import { isWindowsSystemEnvKey } from '@/utils/env/windowsSystemEnv';
 import {
   buildClaudeStatuslineOverlaySettings,
   resolveClaudeStatuslineOriginalCommand,
@@ -52,7 +53,10 @@ import {
   withCurrentHappierSessionId,
 } from '@/agent/runtime/session/currentSessionIdEnv';
 
-export type ClaudeUnifiedTerminalSpawn = TerminalSpawn;
+export type ClaudeUnifiedTerminalSpawn = TerminalSpawn & Readonly<{
+  /** The actual provider process, excluding shell shims and the launch-spec runner. */
+  providerInvocation?: Readonly<{ command: string; args: readonly string[] }>;
+}>;
 
 export class ClaudeUnifiedTerminalUnsupportedOptionError extends Error {
   readonly code = 'claude_unified_terminal_unsupported_option';
@@ -285,7 +289,11 @@ function buildClaudeArgs<Mode extends EnhancedMode>(
   }
   const permissionMode = resolveClaudeSdkPermissionModeFromEnhancedMode(input.first.mode);
   const settingsOverlay = resolveClaudeLaunchSettingsOverlayArg({
+    args,
+    // Connected-service markers belong to the runner and are stripped from Claude's env.
+    env: { ...process.env, ...input.envOverlay, ...env },
     settingsPath: input.hookSettingsPath,
+    cwd: input.path,
     launchSettings: {
       ...(terminalOptions.ultracodeSetting === null ? {} : { ultracode: terminalOptions.ultracodeSetting }),
       ...(statuslineSettings ? { statusLine: statuslineSettings } : {}),
@@ -350,17 +358,11 @@ function buildTerminalLauncherProcessEnv(baseEnv: NodeJS.ProcessEnv = process.en
     'COLORTERM',
     '__CF_USER_TEXT_ENCODING',
   ]);
-  if (process.platform === 'win32') {
-    for (const key of ['USERPROFILE', 'USERNAME', 'APPDATA', 'LOCALAPPDATA', 'SystemRoot', 'ComSpec', 'PATHEXT', 'WINDIR']) {
-      allowExact.add(key);
-    }
-  }
-
   const allowPrefixes = ['LC_', 'TERM_', 'XDG_', 'HAPPIER_E2E_', 'HAPPY_E2E_'];
   const out: Record<string, string> = Object.create(null);
   for (const [key, value] of Object.entries(baseEnv)) {
     if (typeof value !== 'string') continue;
-    if (isAllowedExactEnvKey(key, allowExact) || allowPrefixes.some((prefix) => key.startsWith(prefix))) {
+    if (isWindowsSystemEnvKey(key) || isAllowedExactEnvKey(key, allowExact) || allowPrefixes.some((prefix) => key.startsWith(prefix))) {
       out[key] = value;
     }
   }
@@ -506,8 +508,9 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
       throw new Error('Claude unified terminal launch-spec runner not found. Please ensure CLI runtime assets are present next to the running bundle.');
     }
 
+    const isJavaScriptCli = deps.isClaudeCliJavaScriptFile(resolvedClaudeCliPath);
     let childInvocation: CommandInvocation;
-    if (deps.isClaudeCliJavaScriptFile(resolvedClaudeCliPath)) {
+    if (isJavaScriptCli) {
       if (
         !existsSync(deps.claudeLocalLauncherPath)
         && !isEmbeddedBunBundlePath(deps.claudeLocalLauncherPath)
@@ -555,6 +558,11 @@ export async function buildClaudeUnifiedTerminalSpawn<Mode extends EnhancedMode 
 
     return {
       spawnArgv: [nodeExecutable, deps.terminalLaunchSpecRunnerPath, specPath],
+      ...(!childInvocation.windowsVerbatimArguments
+        && (!isJavaScriptCli
+          || (env.HAPPIER_CLAUDE_PATH ?? env.HAPPY_CLAUDE_PATH) === resolvedClaudeCliPath)
+        ? { providerInvocation: { command: childInvocation.command, args: childInvocation.args } }
+        : {}),
       spawnEnv: {
         ...buildTerminalLauncherProcessEnv(),
         ...splitEnv.passthroughEnv,

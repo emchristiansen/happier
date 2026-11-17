@@ -84,11 +84,19 @@ process.stdin.on('end', () => {
             ...(secret.length > 0 ? { 'x-happier-hook-secret': secret } : {})
         }
     }, (res) => {
-        res.resume(); // Drain response
+        const responseChunks = [];
+        res.on('data', (chunk) => responseChunks.push(chunk));
+        res.on('aborted', () => {
+            reportFailure('Hook server response aborted');
+            process.exitCode = 1;
+        });
         res.on('end', () => {
             if (res.statusCode < 200 || res.statusCode >= 300) {
                 reportFailure(`Hook server returned HTTP ${res.statusCode}`);
                 process.exitCode = 1;
+            } else if ((res.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase() === 'application/json') {
+                // Old servers respond with plain-text "ok"; never pass that acknowledgement to Claude.
+                process.stdout.write(Buffer.concat(responseChunks));
             }
         });
     });

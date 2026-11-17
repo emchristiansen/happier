@@ -1651,7 +1651,7 @@ export function createCliActionDeps(params: Readonly<{
     },
     ...(approvalsStore ?? {}),
     ...inventoryDeps,
-    sessionSendMessage: async ({ sessionId, message, kind, from, localId, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride, callerSurface, callerPermissionMode }) => {
+    sessionSendMessage: async ({ sessionId, message, provenance, kind, from, localId, requestedAction, wait, timeoutSeconds, permissionModeOverride, modelOverride, callerSurface, callerPermissionMode }) => {
       if (!params.credentials) {
         return { ok: false, errorCode: 'not_authenticated', error: 'not_authenticated' };
       }
@@ -1673,6 +1673,7 @@ export function createCliActionDeps(params: Readonly<{
         credentials: params.credentials,
         idOrPrefix: sessionId,
         message: String(message ?? ''),
+        ...(provenance ? { provenance } : {}),
         ...(kind ? { kind } : {}),
         ...(from !== undefined ? { from } : {}),
         ...(localId ? { localId } : {}),
@@ -1706,11 +1707,24 @@ export function createCliActionDeps(params: Readonly<{
       return res;
     },
 
-    sessionStop: async ({ sessionId }) => {
+    sessionStop: async ({ sessionId, context }) => {
       if (!params.credentials) {
         return { ok: false, errorCode: 'not_authenticated', error: 'not_authenticated' };
       }
-      return await requestSessionStop({ credentials: params.credentials, idOrPrefix: sessionId });
+      // defaultSessionId can name the target. Only explicit tool origin or this
+      // process's session identifies the requester; an approver is not the caller.
+      const requestingSessionId = context?.approvalOrigin?.sessionId
+        ?? context?.messageSource?.sourceSessionId
+        ?? (!context?.bypassApprovals && params.sessionId !== 'cli-global' ? params.sessionId : undefined);
+      return await requestSessionStop({
+        credentials: params.credentials,
+        idOrPrefix: sessionId,
+        source: {
+          ...(context?.surface ? { surface: context.surface } : {}),
+          ...(requestingSessionId ? { requestingSessionId } : {}),
+          ...(context?.approvalOrigin?.toolCallId ? { toolCallId: context.approvalOrigin.toolCallId } : {}),
+        },
+      });
     },
 
     sessionTitleSet: async ({ sessionId, title }) => {

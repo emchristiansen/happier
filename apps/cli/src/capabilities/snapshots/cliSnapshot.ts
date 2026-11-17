@@ -12,8 +12,11 @@ import { resolveProviderCliCommand } from '@/runtime/managedTools/providerCliRes
 import { resolveJavaScriptRuntimeExecutable } from '@/runtime/js/resolveJavaScriptRuntimeExecutable';
 import { AsyncTtlCache } from '@happier-dev/protocol';
 import { getProviderCliRuntimeSpec } from '@happier-dev/agents';
-import { isProviderCliPathRunnable, providerCliPathRequiresJavaScriptRuntime } from '@happier-dev/cli-common/providers';
+import { classifyProviderCliInstall, resolvePlatformFromNodePlatform, isProviderCliPathRunnable, providerCliPathRequiresJavaScriptRuntime } from '@happier-dev/cli-common/providers';
 import { resolveWindowsCommandInvocation, resolveWindowsCommandOnPath } from '@happier-dev/cli-common/process';
+
+import { CliVersionCache, type CliVersionProbeResult } from './cliVersionCache';
+import { logger } from '@/ui/logger';
 
 const execFileAsync = promisify(execFile);
 type ExecFileBestEffortOptions = ExecOptions & Readonly<{ windowsVerbatimArguments?: boolean }>;
@@ -284,8 +287,8 @@ function getFirstLine(value: string): string | null {
 
 function extractSemver(value: string | null): string | null {
     if (!value) return null;
-    const match = value.match(/\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/);
-    return match?.[0] ?? null;
+    const match = value.match(/\b[vV]?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b/);
+    return match?.[1] ?? null;
 }
 
 function extractTmuxVersion(value: string | null): string | null {
@@ -392,7 +395,35 @@ async function resolveCliBinaryNames(name: DetectCliName): Promise<readonly stri
     return [name];
 }
 
-async function detectCliVersion(params: { name: DetectCliName; resolvedPath: string; verifyVersion: boolean; probeTimeoutMs: number }): Promise<string | null> {
+const cliVersionCache = new CliVersionCache();
+
+async function detectCliVersion(params: {
+    name: DetectCliName; resolvedPath: string; resolutionSource: 'override' | 'system' | 'managed';
+    verifyVersion: boolean; bypassCache: boolean; probeTimeoutMs: number; probeKey: string;
+}): Promise<string | null> {
+    const platform = resolvePlatformFromNodePlatform(process.platform);
+    const install = platform ? classifyProviderCliInstall({
+        providerId: params.name, command: params.resolvedPath, source: params.resolutionSource, platform,
+    }) : null;
+    const nativeInstall = install?.installSource === 'native'
+        || (install?.installSource === 'managed' && getProviderCliRuntimeSpec(params.name).managedInstall?.kind === 'github_release_binary');
+    return await cliVersionCache.read({
+        name: params.name, resolvedPath: params.resolvedPath, nativeInstall,
+        fresh: params.bypassCache || params.verifyVersion,
+        probeKey: JSON.stringify([params.probeTimeoutMs, params.probeKey]),
+        probe: async () => {
+            // The shared operation must settle within the existing inventory budget even
+            // when execFile's child ignores its termination signal. The outer deadline
+            // also covers filesystem identity lookup and is not shared between callers.
+            const version = await withCliSnapshotProbeTimeout(probeCliVersion(params), params.probeTimeoutMs);
+            if (version !== CLI_SNAPSHOT_PROBE_TIMEOUT) return version;
+            logger.warn('[capabilities] CLI version probe exceeded its inventory budget', { name: params.name });
+            return { version: null, successful: false };
+        },
+    });
+}
+
+async function probeCliVersion(params: { name: DetectCliName; resolvedPath: string; verifyVersion: boolean; probeTimeoutMs: number }): Promise<CliVersionProbeResult> {
     // Best-effort, must never throw.
     try {
         // Ambient listing keeps each attempt short (runs in parallel for many CLIs) so one retry
@@ -458,32 +489,32 @@ async function detectCliVersion(params: { name: DetectCliName; resolvedPath: str
             file: string,
             args: string[],
             options: ExecFileBestEffortOptions,
-	        ): Promise<string | null> => {
+	        ): Promise<CliVersionProbeResult> => {
 	            const first = await probeSemverOnce(file, args, options);
-	            if (first.semver) return first.semver;
+	            if (first.semver) return { version: first.semver, successful: first.error === null };
 
 	            const shouldRetry =
 	                (first.error && isTransientExecFileError(first.error))
 	                || (!first.error && first.combinedTrimmed.length === 0);
-	            if (!shouldRetry) return null;
+	            if (!shouldRetry) return { version: null, successful: false };
 
 	            // Best-effort retry for transient spawn/timeout failures (can happen under load).
 	            await new Promise((resolve) => setTimeout(resolve, 0));
 	            const second = await probeSemverOnce(file, args, options);
-	            return second.semver;
+	            return { version: second.semver, successful: second.error === null };
 	        };
 
         if (needsJavaScriptRuntime) {
             const runtimeExecutable = await resolveJavaScriptRuntimeExecutableForCliSnapshot();
-            if (!runtimeExecutable) return null;
+            if (!runtimeExecutable) return { version: null, successful: false };
             for (const args of argsToTry) {
-                const semver = await probeSemverWithRetry(runtimeExecutable, [params.resolvedPath, ...args], {
+                const observation = await probeSemverWithRetry(runtimeExecutable, [params.resolvedPath, ...args], {
                     timeout: timeoutMs,
                     windowsHide: true,
                 });
-                if (semver) return semver;
+                if (observation.version) return observation;
             }
-            return null;
+            return { version: null, successful: false };
         }
 
         if (isCmdScript) {
@@ -502,16 +533,16 @@ async function detectCliVersion(params: { name: DetectCliName; resolvedPath: str
         }
 
         for (const args of argsToTry) {
-            const semver = await probeSemverWithRetry(params.resolvedPath, args, {
+            const observation = await probeSemverWithRetry(params.resolvedPath, args, {
                 timeout: timeoutMs,
                 windowsHide: true,
             });
-            if (semver) return semver;
+            if (observation.version) return observation;
         }
 
-        return null;
+        return { version: null, successful: false };
     } catch {
-        return null;
+        return { version: null, successful: false };
     }
 }
 
@@ -627,6 +658,7 @@ async function resolveCliPathForName(
 export function invalidateCliSnapshots(): void {
     // Retire the cache with its pending probes; their late results belong only to that cache.
     cliSnapshotCache = createCliSnapshotCache();
+    cliVersionCache.clear();
 }
 
 /**
@@ -637,7 +669,6 @@ export function invalidateCliSnapshots(): void {
  * - matches how the daemon itself will resolve binaries when spawning
  */
 export async function detectCliSnapshotOnDaemonPath(data: DetectCliRequest): Promise<DetectCliSnapshot> {
-    const cache = cliSnapshotCache;
     const pathEnv = typeof process.env.PATH === 'string' ? process.env.PATH : null;
     const includeLoginStatus = Boolean(data?.includeLoginStatus);
     const verifyVersion = data?.verifyVersion === true;
@@ -646,12 +677,17 @@ export async function detectCliSnapshotOnDaemonPath(data: DetectCliRequest): Pro
         : [];
     const probeTimeoutMs = resolveCliSnapshotProbeTimeoutMs(includeLoginStatus || verifyVersion);
     const cacheKey = buildCliSnapshotCacheKey({ includeLoginStatus, requestedCliNames, verifyVersion }, pathEnv);
-    const cached = data?.bypassCache ? null : cache.get(cacheKey);
-    if (!data?.bypassCache && cached?.kind === 'success' && cache.isFresh(cached)) return cached.value;
+    const versionProbeKey = buildCliSnapshotCacheKey({ requestedCliNames: [], verifyVersion }, pathEnv);
+    // Recovery starts a new observation; older work can only publish into its retired cache.
+    if (data?.bypassCache || verifyVersion) cliSnapshotCache = createCliSnapshotCache();
+    const cache = cliSnapshotCache;
+    const cached = (data?.bypassCache || verifyVersion) ? null : cache.get(cacheKey);
+    if (!data?.bypassCache && !verifyVersion && cached?.kind === 'success' && cache.isFresh(cached)) return cached.value;
 
     return await cache.runDedupe(cacheKey, async () => {
         const cached2 = cache.get(cacheKey);
-        if (!data?.bypassCache && cached2?.kind === 'success' && cache.isFresh(cached2)) return cached2.value;
+        if (!data?.bypassCache && !verifyVersion && cached2?.kind === 'success' && cache.isFresh(cached2)) return cached2.value;
+
 
     const names = requestedCliNames.length > 0
         ? requestedCliNames
@@ -668,7 +704,7 @@ export async function detectCliSnapshotOnDaemonPath(data: DetectCliRequest): Pro
 
             const [versionResult, authStatusResult, resolvedCommandResult] = await Promise.all([
                 withCliSnapshotProbeTimeout(
-                    detectCliVersion({ name, resolvedPath, verifyVersion, probeTimeoutMs }),
+                    detectCliVersion({ name, resolvedPath, resolutionSource, verifyVersion, bypassCache: data.bypassCache === true, probeTimeoutMs, probeKey: versionProbeKey }),
                     probeTimeoutMs,
                 ),
                 includeLoginStatus

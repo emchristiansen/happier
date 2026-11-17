@@ -20,7 +20,7 @@ export type ComposerKeyEvent = Readonly<{
 }>;
 
 export type ComposerEnterAction = 'send';
-export type ComposerSendShortcutAction = 'sendAlternate' | 'sendPending' | 'sendInterrupt';
+export type ComposerSendShortcutAction = 'sendAlternate' | 'sendPending' | 'sendInterrupt' | 'sendAlternateAfterSend';
 export type ComposerEscapeAction = 'armAbort' | 'confirmAbort';
 
 export type ComposerShortcutSettings = Readonly<{
@@ -61,6 +61,24 @@ function resolveComposerKeyboardPlatform(input: Readonly<{
 
 export function shouldIgnoreComposerKeyboardEvent(event: ComposerKeyEvent): boolean {
     return event.isComposing === true || event.repeat === true;
+}
+
+/**
+ * A key that types visible text: one character, no command modifier, and not Space, which keeps
+ * scrolling the focused transcript. AltGr (Ctrl+Alt on Windows) and macOS Option still type
+ * characters such as "@" or "{".
+ */
+export function isComposerTypeToFocusKey(
+    event: ComposerKeyEvent & Readonly<{ altGraph?: boolean }>,
+    input: Readonly<{ platformOS?: string; webPlatform?: string }> = {},
+): boolean {
+    if (event.isComposing === true) return false;
+    const altTypesText = event.altGraph === true
+        || (event.altKey === true && event.ctrlKey !== true && isAppleKeyboardPlatform(input));
+    const commandModifier = event.metaKey === true
+        || (!altTypesText && (event.ctrlKey === true || event.altKey === true));
+    if (commandModifier) return false;
+    return Array.from(event.key).length === 1 && event.key.trim() !== '';
 }
 
 export function shouldRunComposerModeCycleShortcut(
@@ -110,6 +128,8 @@ export function resolveComposerSendShortcutAction(
         hasSendableInput: boolean;
         canSendNextQueued?: boolean;
         sendActionDisabled: boolean;
+        /** A new-session composer: it has no delivery modes, and its second send key chooses what follows. */
+        newSessionComposer?: boolean;
         platformOS?: string;
         webPlatform?: string;
     }>,
@@ -120,7 +140,7 @@ export function resolveComposerSendShortcutAction(
     let action: ComposerSendShortcutAction | null = null;
     const dispatcher = createKeyboardShortcutDispatcher({
         enabled: input.keyboardShortcutsV2Enabled,
-        enabledWhenDisabledCommandIds: ['composer.sendImmediate', 'composer.sendInterrupt'],
+        enabledWhenDisabledCommandIds: ['composer.sendImmediate', 'composer.sendInterrupt', 'composer.sendAlternateAfterSend'],
         platform: resolveComposerKeyboardPlatform({
             platformOS: event.platformOS ?? input.platformOS,
             webPlatform: event.webPlatform ?? input.webPlatform,
@@ -133,12 +153,18 @@ export function resolveComposerSendShortcutAction(
             'composer.sendImmediate': () => {
                 action = 'sendAlternate';
             },
-            'composer.sendPending': () => {
-                if (input.hasSendableInput) action = 'sendPending';
-            },
-            'composer.sendInterrupt': () => {
-                action = 'sendInterrupt';
-            },
+            ...(input.newSessionComposer ? {
+                'composer.sendAlternateAfterSend': () => {
+                    if (input.hasSendableInput) action = 'sendAlternateAfterSend';
+                },
+            } : {
+                'composer.sendPending': () => {
+                    if (input.hasSendableInput) action = 'sendPending';
+                },
+                'composer.sendInterrupt': () => {
+                    action = 'sendInterrupt';
+                },
+            }),
         },
         getContext: () => ({
             isEditableTarget: true,
@@ -173,6 +199,17 @@ export function buildComposerSendShortcutLabels(input: ComposerShortcutSettings 
         ...(labels['composer.sendImmediate'] ? { [input.alternateMode]: labels['composer.sendImmediate'] } : {}),
         ...(labels['composer.sendInterrupt'] ? { interrupt: labels['composer.sendInterrupt'] } : {}),
     };
+}
+
+export function buildComposerAfterSendShortcutLabel(input: ComposerShortcutSettings & Readonly<{
+    platformOS?: string;
+    webPlatform?: string;
+}>): string | undefined {
+    return buildKeyboardShortcutLabels(resolveComposerKeyboardPlatform(input), Platform.OS === 'web' ? 'web' : 'native', {
+        overrides: input.keyboardShortcutOverridesV1,
+        disabledCommandIds: input.keyboardShortcutDisabledCommandIdsV1,
+        singleKeyShortcutsEnabled: input.keyboardSingleKeyShortcutsEnabled,
+    })['composer.sendAlternateAfterSend'];
 }
 
 export function resolveComposerEnterAction(

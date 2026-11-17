@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger';
+import type { StopSessionRequestSource } from '@happier-dev/protocol';
 import { spawnBackgroundSync } from '@happier-dev/cli-common/process';
 import type { TerminalHostAdapter } from '@/integrations/terminalHost/_types';
 import type { TerminalHostRegistry } from '@/integrations/terminalHost/registry';
@@ -41,6 +42,12 @@ import {
 import {
   type ExactTerminalControlServiceabilityRetirement,
 } from './retireTerminalControlServiceability';
+
+export type StopSessionOptions = Readonly<{
+  source?: StopSessionRequestSource;
+  transport?: 'machine_rpc' | 'local_http' | 'internal' | 'marker_fallback';
+  exactRunner?: ExactStopRunner;
+}>;
 
 function mapDispositionFailureReason(
   reason: 'legacy_attachment' | 'attachment_mismatch' | 'missing_topology_proof' | 'disposition_in_progress' | 'destroy_failed' | 'retirement_failed' | 'descriptor_retirement_failed',
@@ -99,6 +106,7 @@ async function taskkillWindowsDaemonChild(params: Readonly<{
   normalizedSessionId: string;
   logPidReuseRefusal: (message: string) => void;
   readExactRunnerIdentity?: ExactRunnerIdentityReader;
+  recordKillAudit: typeof recordTerminalHostKillAudit;
 }>): Promise<boolean> {
   if (!isTrackedChildStillLiveForPid(params.session, params.pid)) {
     params.logPidReuseRefusal(`[DAEMON RUN] Refusing to taskkill PID ${params.pid} for session ${params.normalizedSessionId} (tracked child is no longer live)`);
@@ -120,7 +128,7 @@ async function taskkillWindowsDaemonChild(params: Readonly<{
     return false;
   }
 
-  recordTerminalHostKillAudit({
+  params.recordKillAudit({
     actor: 'daemon.stop-session',
     reason: 'stop-session',
     sessionId: params.normalizedSessionId,
@@ -149,6 +157,7 @@ async function forceKillTrackedRunner(params: Readonly<{
   logWarning: (message: string, ...args: unknown[]) => void;
   exactRunner?: ExactStopRunner;
   readExactRunnerIdentity?: ExactRunnerIdentityReader;
+  recordKillAudit: typeof recordTerminalHostKillAudit;
 }>): Promise<ForcedRunnerKillResult> {
   const currentSession = params.pidToTrackedSession.get(params.pid);
   if (currentSession !== params.expectedSession) {
@@ -172,7 +181,7 @@ async function forceKillTrackedRunner(params: Readonly<{
     return 'not_signaled';
   }
 
-  recordTerminalHostKillAudit({
+  params.recordKillAudit({
     actor: 'daemon.stop-session',
     reason: 'stop-session-timeout',
     sessionId: params.normalizedSessionId,
@@ -251,7 +260,7 @@ type ForcedRunnerKillResult = 'signaled' | 'not_signaled' | 'exact_runner_incomp
  * this pid is the session's only tracked runner, and re-verifies the process instance before every signal.
  */
 export type ExactStopRunner = Readonly<{ pid: number; processInstanceFingerprint: string }>;
-export type StopSessionOptions = Readonly<{ exactRunner?: ExactStopRunner }>;
+
 
 function selectTrackedRunnersForStop(
   pidToTrackedSession: ReadonlyMap<number, TrackedSession>,
@@ -333,6 +342,7 @@ export function createStopSession(params: Readonly<{
   /** Liveness check for exact-runner Stop; `process.kill(pid, 0)` by default. */
   isProcessAlive?: (pid: number) => boolean;
 }>): (sessionId: string, options?: StopSessionOptions) => Promise<StopSessionResult> {
+
   const { pidToTrackedSession } = params;
   const readProcessInstanceFingerprint = params.readProcessInstanceFingerprint ?? readProcessInstanceFingerprintSync;
   const isProcessAlive = params.isProcessAlive ?? isProcessAliveDefault;
@@ -340,8 +350,16 @@ export function createStopSession(params: Readonly<{
   const logWarning = params.logWarning ?? ((message: string, ...args: unknown[]): void => logger.warn(message, ...args));
 
   // Stop a session by sessionId or PID fallback
-  return async (sessionId: string, options?: StopSessionOptions): Promise<StopSessionResult> => {
+  return async (sessionId: string, options: StopSessionOptions = {}): Promise<StopSessionResult> => {
     const stopStartedAtMs = Date.now();
+    const requestContext = {
+      requestSource: options.source ?? null,
+      requestTransport: options.transport ?? 'internal',
+    };
+    logger.infoFile('[DAEMON STOP] Attempting Stop', { event: 'session_stop_attempt', sessionId, ...requestContext });
+    const recordKillAudit: typeof recordTerminalHostKillAudit = (record) => {
+      recordTerminalHostKillAudit({ ...record, ...requestContext });
+    };
     logger.debug(`[DAEMON RUN] Attempting to stop session ${sessionId}`);
 
     const normalizedSessionId = String(sessionId ?? '').trim();
@@ -562,8 +580,10 @@ export function createStopSession(params: Readonly<{
             session,
             normalizedSessionId,
             logPidReuseRefusal,
+            recordKillAudit,
             ...(readExactRunnerIdentity ? { readExactRunnerIdentity } : {}),
           })) {
+
             stoppedAny = true;
             signaledPids.push(pid);
           }
@@ -573,7 +593,7 @@ export function createStopSession(params: Readonly<{
         try {
           try {
             // Prefer killing the full process group when the daemon spawned a detached session runner.
-            recordTerminalHostKillAudit({
+            recordKillAudit({
               actor: 'daemon.stop-session',
               reason: 'stop-session',
               sessionId: normalizedSessionId,
@@ -594,7 +614,7 @@ export function createStopSession(params: Readonly<{
             // fall through
           }
 
-          recordTerminalHostKillAudit({
+          recordKillAudit({
             actor: 'daemon.stop-session',
             reason: 'stop-session',
             sessionId: normalizedSessionId,
@@ -627,7 +647,7 @@ export function createStopSession(params: Readonly<{
       }
 
       try {
-        recordTerminalHostKillAudit({
+        recordKillAudit({
           actor: 'daemon.stop-session',
           reason: 'stop-session',
           sessionId: normalizedSessionId,
@@ -701,12 +721,14 @@ export function createStopSession(params: Readonly<{
           normalizedSessionId,
           logPidReuseRefusal,
           logWarning,
+          recordKillAudit,
           ...(exactRunner && readExactRunnerIdentity ? { exactRunner, readExactRunnerIdentity } : {}),
         });
         // An exact runner that could not be signalled to completion is never counted as stopped,
         // whatever a later exit wait or presence probe would conclude.
         if (forced === 'exact_runner_incomplete') return incompleteStopSession('runner_signal_incomplete');
         forceSignaledAny = forced === 'signaled' || forceSignaledAny;
+
       }
 
       if (exitedBeforeForcePids.size === pidsToStop.length) {

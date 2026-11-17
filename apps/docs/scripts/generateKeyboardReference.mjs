@@ -61,6 +61,7 @@ const GROUPS = [
       'composer.focus': 'Jump to the composer',
       'composer.sendImmediate': 'Send now',
       'composer.sendInterrupt': 'Interrupt the turn and send',
+      'composer.sendAlternateAfterSend': 'New session: send and start another, or open it, whichever is not your default',
       'composer.sendPending': 'Queue without opening the composer',
       'composer.abortConfirm': 'Stop the current turn',
       'mode.cycle': 'Cycle session mode',
@@ -194,6 +195,10 @@ ${extras}
 Shortcuts respect focus. Most do nothing while you are typing in the composer,
 which is why sending has its own explicitly editable-safe binding rather than
 relying on you leaving the field first.
+
+On web and desktop you don't need a shortcut to start writing: typing a
+character outside a text field moves into the composer. See
+[Type anywhere to write](/sessions/session-settings#type-anywhere-to-write).
 
 ## Changing them
 
