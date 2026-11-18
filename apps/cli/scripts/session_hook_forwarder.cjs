@@ -81,6 +81,8 @@ process.stdin.on('end', () => {
         headers: {
             'Content-Type': 'application/json',
             'Content-Length': body.length,
+            // Declares that this forwarder passes JSON responses to Claude; old forwarders discard them.
+            'x-happier-hook-output': 'json-v1',
             ...(secret.length > 0 ? { 'x-happier-hook-secret': secret } : {})
         }
     }, (res) => {

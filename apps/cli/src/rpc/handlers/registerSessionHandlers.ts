@@ -35,6 +35,7 @@ import {
     type SessionUserMessageEnqueueResult,
 } from './sessionUserMessageSend';
 import { registerSessionPendingQueueWakeHandlers } from './sessionPendingQueueWake';
+import { registerSessionToolBoundarySteerHandler } from './sessionToolBoundarySteer';
 import { registerSessionControlHandlers, type SessionRuntimeControls } from './sessionControls';
 import {
     type FilesystemAccessPolicy,
@@ -324,6 +325,9 @@ export function registerSessionHandlers(
         sessionRuntimeControls: opts?.sessionRuntimeControls ?? null,
     });
     registerSessionPendingQueueWakeHandlers(rpcHandlerManager, {
+        sessionRuntimeControls: opts?.sessionRuntimeControls ?? null,
+    });
+    registerSessionToolBoundarySteerHandler(rpcHandlerManager, {
         sessionRuntimeControls: opts?.sessionRuntimeControls ?? null,
     });
     registerSessionControlHandlers(rpcHandlerManager, {

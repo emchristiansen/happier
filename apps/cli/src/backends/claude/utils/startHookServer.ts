@@ -139,11 +139,27 @@ function buildDefaultPermissionHookResponse(data?: PermissionHookData): Permissi
     };
 }
 
+/** Header by which a session forwarder declares that it passes JSON hook output to Claude. */
+export const SESSION_HOOK_OUTPUT_HEADER = 'x-happier-hook-output';
+export const SESSION_HOOK_OUTPUT_JSON_V1 = 'json-v1';
+
+export type SessionHookOutputContext = Readonly<{
+    /** Aborted when the forwarder disconnects before its response is written. */
+    signal: AbortSignal;
+    /** Whether this forwarder passes JSON output to Claude. Old forwarders discard it. */
+    outputCapable: boolean;
+    /**
+     * Settles once this one response ends: true when it finished writing to the forwarder,
+     * false when it closed first. Writing is not proof that Claude read the output.
+     */
+    responseWritten: Promise<boolean>;
+}>;
+
 export interface HookServerOptions {
     /** Observer invoked when a session hook has a valid session ID; its return value is ignored. */
     onSessionHook: (sessionId: string, data: SessionHookData) => unknown;
     /** Explicitly produces JSON for Claude; the observer's return value is ignored. */
-    produceSessionHookOutput?: (sessionId: string, data: SessionHookData, context: Readonly<{ signal: AbortSignal }>) => Record<string, unknown> | void | Promise<Record<string, unknown> | void>;
+    produceSessionHookOutput?: (sessionId: string, data: SessionHookData, context: SessionHookOutputContext) => Record<string, unknown> | void | undefined | Promise<Record<string, unknown> | void | undefined>;
     /** Called when a permission hook is received */
     onPermissionHook?: (data: PermissionHookData, options?: Readonly<{ signal?: AbortSignal }>) => PermissionHookResponse | Promise<PermissionHookResponse>;
     /**
@@ -255,6 +271,12 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
                 };
                 req.once('aborted', abort);
                 res.once('close', onResponseClose);
+                const responseWritten = new Promise<boolean>((resolveWritten) => {
+                    res.once('finish', () => resolveWritten(true));
+                    res.once('close', () => resolveWritten(res.writableFinished));
+                });
+                const outputHeader = req.headers[SESSION_HOOK_OUTPUT_HEADER];
+                const outputCapable = (Array.isArray(outputHeader) ? outputHeader[0] : outputHeader) === SESSION_HOOK_OUTPUT_JSON_V1;
                 // Set timeout to prevent hanging if Claude doesn't close stdin
                 const timeout = setTimeout(() => {
                     if (!res.headersSent) {
@@ -295,7 +317,11 @@ export async function startHookServer(options: HookServerOptions): Promise<HookS
                     let response: void | Record<string, unknown> = undefined;
                     if (sessionId) {
                         onSessionHook(sessionId, data);
-                        response = await options.produceSessionHookOutput?.(sessionId, data, { signal: controller.signal });
+                        response = await options.produceSessionHookOutput?.(sessionId, data, {
+                            signal: controller.signal,
+                            outputCapable,
+                            responseWritten,
+                        });
                     } else {
                         logger.debug('[hookServer] Session hook received but no session_id found in data');
                     }

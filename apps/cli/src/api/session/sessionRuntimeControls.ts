@@ -21,6 +21,7 @@ const SESSION_RUNTIME_CONTROL_KEYS = [
     'handleUserMessage',
     'wakePendingMaterialization',
     'readPendingMaterializationServiceability',
+    'steerAtToolBoundary',
 ] as const satisfies readonly SessionRuntimeControlKey[];
 
 export function copyCallableSessionRuntimeControls(

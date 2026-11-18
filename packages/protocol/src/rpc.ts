@@ -298,6 +298,7 @@ export const SESSION_RPC_METHODS = {
   SESSION_PENDING_QUEUE_MATERIALIZE_NEXT: 'session.pendingQueue.materializeNext',
   SESSION_PENDING_QUEUE_WAKE_CAPABILITY_GET_V1: 'session.pendingQueue.wakeCapability.v1.get',
   SESSION_PENDING_QUEUE_WAKE_V1: 'session.pendingQueue.wake.v1',
+  SESSION_TOOL_BOUNDARY_STEER_V1: 'session.toolBoundary.steer.v1',
   SESSION_WORK_STATE_GET: 'session.workState.get',
   SESSION_GOAL_GET: 'session.goal.get',
   SESSION_GOAL_SET: 'session.goal.set',

@@ -81,6 +81,7 @@ import { createClaudeStartupSpec, type ClaudeStartupArtifacts } from '@/backends
 import type { DeferredApiSessionTarget } from '@/agent/runtime/startup/DeferredApiSessionClient';
 import { resolveRunnerMcpServers } from '@/mcp/runtime/resolveRunnerMcpServers';
 import { registerSessionHandlers } from '@/rpc/handlers/registerSessionHandlers';
+import { createClaudeToolBoundarySteering } from './utils/postToolUseSteeringBroker';
 import {
     createBackendRunRuntimeActivityLifecycle,
     initializeBackendRunSession,
@@ -745,7 +746,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // Start Hook server for receiving Claude session notifications
     const statuslineApplier = createClaudeStatuslineApplier({ logPrefix: '[claude]' });
+    const toolBoundarySteering = createClaudeToolBoundarySteering({ readExpectedSessionId: () => currentSession?.sessionId ?? null });
+    session.registerSessionRuntimeControls?.({ steerAtToolBoundary: toolBoundarySteering.steerAtToolBoundary });
     const hookServerOptions: Parameters<typeof startHookServer>[0] = {
+        produceSessionHookOutput: toolBoundarySteering.produceSessionHookOutput,
         onStatuslineUpdate: (payload) => {
             if (currentSession) {
                 statuslineApplier.apply(currentSession, payload);
@@ -1635,7 +1639,9 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
     };
 
     const statuslineApplier = createClaudeStatuslineApplier({ logPrefix: '[claude]' });
+    const toolBoundarySteering = createClaudeToolBoundarySteering({ readExpectedSessionId: () => currentSession?.sessionId ?? null });
     const hookServerOptions: Parameters<typeof startHookServer>[0] = {
+        produceSessionHookOutput: toolBoundarySteering.produceSessionHookOutput,
         onStatuslineUpdate: (payload) => {
             if (currentSession) {
                 statuslineApplier.apply(currentSession, payload);
@@ -1685,8 +1691,10 @@ async function runClaudeLocalFastStart(credentials: Credentials, options: StartO
                                 artifacts.deferredSession.enqueueSessionUserMessage(request),
                         }),
                         wakePendingMaterialization: () => artifacts.deferredSession.wakePendingMaterialization(),
+                        steerAtToolBoundary: toolBoundarySteering.steerAtToolBoundary,
                     },
                 });
+                artifacts.deferredSession.registerSessionRuntimeControls({ steerAtToolBoundary: toolBoundarySteering.steerAtToolBoundary });
                 userMessageHandlerReady = true;
             },
                 startHookServer: async () => {

@@ -82,6 +82,14 @@ export type SessionRuntimeControls = {
     request: Readonly<SessionConnectedServiceAuthReadRuntimeIdentityRequestV1>,
   ) => Promise<unknown> | unknown;
   wakePendingMaterialization?: () => void;
+  /**
+   * Holds one steering message for at most `waitMs` until the provider's next tool boundary takes it;
+   * an abort before that withdraws it. Never creates durable Pending custody.
+   * `written_to_hook_response` is not provider consumption.
+   */
+  steerAtToolBoundary?: (request: Readonly<{ message: string; waitMs: number; signal?: AbortSignal }>) => Promise<
+    'written_to_hook_response' | 'hook_response_lost' | 'no_tool_boundary'
+  >;
   readPendingMaterializationServiceability?: () => PendingMaterializationServiceability;
   enableUsageLimitWaitResume?: (request: Readonly<{
     sessionId: string;

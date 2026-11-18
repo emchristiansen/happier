@@ -92,6 +92,12 @@ export {
   type SessionPendingQueueWakeResponseV1,
 } from './sessionControl/sessionPendingQueueWakeV1.js';
 export {
+  SessionToolBoundarySteerRequestV1Schema,
+  SessionToolBoundarySteerResponseV1Schema,
+  type SessionToolBoundarySteerRequestV1,
+  type SessionToolBoundarySteerResponseV1,
+} from './sessionControl/sessionToolBoundarySteerV1.js';
+export {
   PendingActivationAuthorizationV1Schema,
   PendingActivationFailureCodeV1Schema,
   PendingActivationFailureRequestV1Schema,

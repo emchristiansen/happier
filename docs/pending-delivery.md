@@ -113,6 +113,37 @@ foreground turn through the shared transcript lifecycle classifier. This release
 a waiting **Send now** prompt through the existing arbiter; the interruption
 itself does not establish provider acceptance of that follow-up.
 
+## Tool-boundary steering without Pending (development)
+
+`steerSessionAtToolBoundary` (session RPC `session.toolBoundary.steer.v1`)
+steers an active Claude runner at its next main-session `PostToolUse` hook. It
+creates no Pending row and never resumes a runtime. An inactive session is
+refused before any RPC. A runner that does not register the method, whether it
+is older or already gone, is refused by the relay as unavailable. A runner without a
+tool-boundary broker answers `steering_unavailable`.
+
+The runner holds the message only for the caller's `waitMs`, and the hook never waits.
+Caller cancellation or loss of the runner's RPC transport withdraws a message no
+hook has taken yet. While the runner's native Claude session identity is unknown
+(before the first `SessionStart`, or after a fork clears it), no hook takes a
+message; it waits for the established primary within its `waitMs`.
+`createClaudeToolBoundarySteering` owns one broker per runner. Each primary
+`PostToolUse` response takes every offer that is live at that moment and answers
+immediately, so tool calls are never delayed. Steering is withheld from subagent
+hooks, from hooks for other Claude sessions, from responses whose forwarder has
+already disconnected, and from forwarders that do not send
+`x-happier-hook-output: json-v1`. Older forwarders discard hook output, so the
+message stays with its caller and expires as `no_tool_boundary`.
+
+A taken message is bound to that one response and is never moved to another.
+`written_to_hook_response` means the response finished writing to the
+forwarder. It does not prove that Claude read the message. `hook_response_lost`
+(the response closed first) and `no_tool_boundary` delivered nothing and are
+retryable. If the RPC reply itself is lost, the caller sees `delivery_uncertain`.
+Retrying may then deliver the message twice, and that duplicate is accepted.
+Because one boundary carries all live offers, an uncertain earlier message
+never holds back later ones.
+
 ## Composer busy-steer policy (development)
 
 `decideSessionMessageDelivery` owns the requested action for ordinary composer

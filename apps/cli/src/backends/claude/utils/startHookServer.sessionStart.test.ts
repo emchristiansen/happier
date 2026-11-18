@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { createPostToolUseRendezvous } from './postToolUseRendezvous';
+import { createClaudeToolBoundarySteering, createPostToolUseSteeringBroker, producePostToolUseSteeringOutput } from './postToolUseSteeringBroker';
 import { startHookServer } from './startHookServer';
 
 async function postSessionHook(params: {
@@ -143,83 +143,158 @@ describe('startHookServer (/hook/session-start authentication, A5-MED-2)', () =>
     expect(result.stdout).toBe('');
   });
 
-  it('cancels a pending producer when its HTTP client disconnects, but not when its request body ends', async () => {
-    const rendezvous = createPostToolUseRendezvous();
+  it('answers a PostToolUse forwarder immediately with no output when no steering is waiting', async () => {
+    const broker = createPostToolUseSteeringBroker();
+    const server = await startHookServer({
+      onSessionHook: () => {},
+      produceSessionHookOutput: (_id, data, context) => producePostToolUseSteeringOutput({ broker, data, context, expectedSessionId: 'main' }),
+    });
+    servers.push(server);
+    const result = await Promise.race([
+      runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body: { session_id: 'main' } }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('PostToolUse hook stalled')), 2_000)),
+    ]);
+    expect(result).toEqual({ code: 0, stdout: '', stderr: '' });
+  });
+
+  it('writes a waiting steering offer through the next capable PostToolUse forwarder exactly once', async () => {
+    const broker = createPostToolUseSteeringBroker();
+    const server = await startHookServer({
+      onSessionHook: () => {},
+      produceSessionHookOutput: (_id, data, context) => producePostToolUseSteeringOutput({ broker, data, context, expectedSessionId: 'main' }),
+    });
+    servers.push(server);
+    const outcome = broker.offer({ message: 'steer now', waitMs: 10_000 });
+
+    // Subagent and foreign-session tool boundaries never take the main session's message.
+    expect(await runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body: { session_id: 'main', agent_id: 'sub-1' } }))
+      .toEqual({ code: 0, stdout: '', stderr: '' });
+    expect(await runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body: { session_id: 'other' } }))
+      .toEqual({ code: 0, stdout: '', stderr: '' });
+
+    const result = await runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body: { session_id: 'main' } });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: 'steer now' },
+    });
+    await expect(outcome).resolves.toBe('written_to_hook_response');
+
+    const later = await runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body: { session_id: 'main' } });
+    expect(later).toEqual({ code: 0, stdout: '', stderr: '' });
+  });
+
+  it('never hands steering to an old forwarder that cannot pass hook output to Claude', async () => {
+    const broker = createPostToolUseSteeringBroker();
+    const server = await startHookServer({
+      onSessionHook: () => {},
+      produceSessionHookOutput: (_id, data, context) => producePostToolUseSteeringOutput({ broker, data, context, expectedSessionId: 'main' }),
+    });
+    servers.push(server);
+    const outcome = broker.offer({ message: 'not for old forwarders', waitMs: 500 });
+    // An old forwarder posts without advertising JSON output and discards any reply.
+    const old = await postSessionHook({ port: server.port, body: { session_id: 'main', hook_event_name: 'PostToolUse' } });
+    expect(old).toEqual({ status: 200, text: 'ok' });
+    await expect(outcome).resolves.toBe('no_tool_boundary');
+  });
+
+  it('reports a taken message as lost when its hook response disconnects before writing, then delivers retries and later messages', async () => {
+    const broker = createPostToolUseSteeringBroker();
+    let disconnect: (() => void) | undefined;
+    const server = await startHookServer({
+      onSessionHook: () => {},
+      produceSessionHookOutput: async (_id, data, context) => {
+        const output = producePostToolUseSteeringOutput({ broker, data, context, expectedSessionId: 'main' });
+        if (disconnect) {
+          // Model Claude killing the hook command after the message was bound to this response.
+          disconnect();
+          await waitUntil(() => context.signal.aborted);
+        }
+        return output;
+      },
+    });
+    servers.push(server);
+
+    const first = broker.offer({ message: 'first', waitMs: 10_000 });
+    const client = request({
+      host: '127.0.0.1', port: server.port, path: '/hook/session-start', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-happier-hook-output': 'json-v1' },
+    });
+    client.on('error', () => {});
+    disconnect = () => client.destroy();
+    client.end(JSON.stringify({ session_id: 'main', hook_event_name: 'PostToolUse' }));
+    await expect(first).resolves.toBe('hook_response_lost');
+    disconnect = undefined;
+
+    // The bound response never transfers its message; the caller's retry and a later message both arrive.
+    const retry = broker.offer({ message: 'first', waitMs: 10_000 });
+    const second = broker.offer({ message: 'second', waitMs: 10_000 });
+    const result = await runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body: { session_id: 'main' } });
+    expect(JSON.parse(result.stdout)).toEqual({
+      hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: 'first\n\nsecond' },
+    });
+    await expect(retry).resolves.toBe('written_to_hook_response');
+    await expect(second).resolves.toBe('written_to_hook_response');
+  });
+
+  it('does not bind steering to a hook response whose forwarder already disconnected', async () => {
+    const broker = createPostToolUseSteeringBroker();
+    let release!: () => void;
+    const released = new Promise<void>((resolvePromise) => { release = resolvePromise; });
     let signal: AbortSignal | undefined;
     const server = await startHookServer({
       onSessionHook: () => {},
-      produceSessionHookOutput: async (_id: string, _data: unknown, context: { signal: AbortSignal }) => {
-        signal = context?.signal;
-        if (!signal) return;
-        const message = await rendezvous.wait(signal);
-        return message ? { message } : undefined;
+      produceSessionHookOutput: async (_id, data, context) => {
+        signal = context.signal;
+        await released;
+        return producePostToolUseSteeringOutput({ broker, data, context, expectedSessionId: 'main' });
       },
     });
     servers.push(server);
-    const client = request({ host: '127.0.0.1', port: server.port, path: '/hook/session-start', method: 'POST' });
+    const outcome = broker.offer({ message: 'survives', waitMs: 10_000 });
+    const client = request({
+      host: '127.0.0.1', port: server.port, path: '/hook/session-start', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-happier-hook-output': 'json-v1' },
+    });
     client.on('error', () => {});
-    client.end(JSON.stringify({ session_id: 'disconnect', hook_event_name: 'PostToolUse' }));
-    try {
-      await waitUntil(() => signal !== undefined);
-      expect(signal?.aborted).toBe(false);
-      expect(rendezvous.current()).toBeDefined();
-      client.destroy();
-      await waitUntil(() => signal?.aborted === true);
-      expect(rendezvous.current()).toBeUndefined();
-    } finally {
-      client.destroy();
-    }
+    client.end(JSON.stringify({ session_id: 'main', hook_event_name: 'PostToolUse' }));
+    await waitUntil(() => signal !== undefined);
+    client.destroy();
+    await waitUntil(() => signal?.aborted === true);
+    release();
 
-    const response = postSessionHook({ port: server.port, body: { session_id: 'live', hook_event_name: 'PostToolUse' } });
-    await waitUntil(() => rendezvous.current() !== undefined);
-    expect(rendezvous.current()?.offer('next message')).toBe(true);
-    expect(await response).toEqual({ status: 200, text: JSON.stringify({ message: 'next message' }) });
+    const result = await runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body: { session_id: 'main' } });
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toBe('survives');
+    await expect(outcome).resolves.toBe('written_to_hook_response');
   });
 
-  it('does not transfer an expired forwarder response to a later PostToolUse forwarder', async () => {
-    const rendezvous = createPostToolUseRendezvous();
-    const server = await startHookServer({
-      onSessionHook: () => {},
-      produceSessionHookOutput: async (_id, data, { signal }) => {
-        if (data.hook_event_name !== 'PostToolUse') return;
-        const message = await rendezvous.wait(signal);
-        return message === undefined ? undefined : {
-          hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: message },
-        };
-      },
-    });
+  it('withholds steering while the native primary identity is unknown, then delivers to the established primary', async () => {
+    let expectedSessionId: string | null = null;
+    const steering = createClaudeToolBoundarySteering({ readExpectedSessionId: () => expectedSessionId });
+    const server = await startHookServer({ onSessionHook: () => {}, produceSessionHookOutput: steering.produceSessionHookOutput });
     servers.push(server);
-    const child = spawn(process.execPath, [resolve(process.cwd(), 'scripts', 'session_hook_forwarder.cjs'), String(server.port), 'PostToolUse'], {
-      cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, reject) => {
-      child.once('error', reject);
-      child.once('close', (code, signal) => resolvePromise({ code, signal }));
-    });
-    child.stdin.end(JSON.stringify({ session_id: 'expired' }));
-    try {
-      await waitUntil(() => rendezvous.current() !== undefined);
-      const expired = rendezvous.current()!;
-      // Model Claude timing out and terminating its hook subprocess.
-      child.kill();
-      expect(await closed).toEqual({ code: null, signal: 'SIGTERM' });
-      await waitUntil(() => rendezvous.current() === undefined);
-      expect(expired.offer('too late')).toBe(false);
+    const fire = (body: Record<string, unknown>) => runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body });
+    const none = { code: 0, stdout: '', stderr: '' };
 
-      const next = runSessionForwarder({ port: server.port, hookEventName: 'PostToolUse', body: { session_id: 'next' } });
-      await waitUntil(() => rendezvous.current() !== undefined);
-      expect(expired.offer('stale again')).toBe(false);
-      expect(rendezvous.current()?.offer('fresh message')).toBe(true);
-      const result = await next;
-      expect(result.code).toBe(0);
-      expect(result.stderr).toBe('');
-      expect(JSON.parse(result.stdout)).toEqual({
-        hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: 'fresh message' },
-      });
-      expect(rendezvous.current()).toBeUndefined();
-    } finally {
-      if (child.exitCode === null && child.signalCode === null) child.kill();
-    }
+    // First start: identity not yet established; a primary-looking hook from any session takes nothing.
+    const first = steering.steerAtToolBoundary({ message: 'for main', waitMs: 10_000 });
+    expect(await fire({ session_id: 'foreign' })).toEqual(none);
+    expect(await fire({ session_id: 'main' })).toEqual(none);
+
+    expectedSessionId = 'main';
+    expect(await fire({ session_id: 'foreign' })).toEqual(none);
+    expect(await fire({ session_id: 'main', agent_id: 'sub-1' })).toEqual(none);
+    expect(JSON.parse((await fire({ session_id: 'main' })).stdout).hookSpecificOutput.additionalContext).toBe('for main');
+    await expect(first).resolves.toBe('written_to_hook_response');
+
+    // Fork preparation clears identity; the old and new sessions both wait for the new identity.
+    expectedSessionId = null;
+    const second = steering.steerAtToolBoundary({ message: 'for fork', waitMs: 10_000 });
+    expect(await fire({ session_id: 'main' })).toEqual(none);
+    expect(await fire({ session_id: 'forked' })).toEqual(none);
+    expectedSessionId = 'forked';
+    expect(await fire({ session_id: 'main' })).toEqual(none);
+    expect(JSON.parse((await fire({ session_id: 'forked' })).stdout).hookSpecificOutput.additionalContext).toBe('for fork');
+    await expect(second).resolves.toBe('written_to_hook_response');
   });
 
   it('returns structured hook output from an asynchronous callback through the executable', async () => {
