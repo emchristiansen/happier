@@ -84,6 +84,9 @@ export type RuntimeAuthRecoveryIntent = Readonly<{
   groupId: string | null;
   resumePromptMode?: 'standard' | 'off' | 'custom';
   status: RuntimeAuthRecoveryIntentStatus;
+  // Admitted provider continuation is scheduled work, distinct from an atomic
+  // observation of a completed local repair. Gate diagnostics cannot erase it.
+  proofWaitPhase?: 'usage_limit_continuation';
   armedAtMs: number;
   nextRetryAtMs: number | null;
   attemptCount: number;
@@ -340,6 +343,17 @@ function normalizeIntent(value: unknown): RuntimeAuthRecoveryIntent | null {
   const limitResetTrial = readLimitResetTrial(value.limitResetTrial);
   if (value.limitResetTrial !== undefined && (!limitResetTrial
     || limitResetTrial.retryCount !== readNonNegativeNumber(value.limitResetRetryCount))) return null;
+  const status = value.status === 'resumed_awaiting_proof'
+    && (value.lastError === 'no_eligible_member'
+      || value.lastError === 'switch_limit_reached'
+      || value.lastError === 'awaiting_limit_reset')
+    ? 'waiting'
+    : value.status;
+  const proofWaitPhase = (status === 'resumed_awaiting_proof' || status === 'checking')
+    && (value.proofWaitPhase === 'usage_limit_continuation'
+      || value.lastError === USAGE_LIMIT_CONTINUATION_PROOF_WAIT_ERROR)
+    ? 'usage_limit_continuation' as const
+    : undefined;
   return {
     v: value.v,
     ...(readString(value.attemptId) ? { attemptId: readString(value.attemptId) as string } : {}),
@@ -353,12 +367,8 @@ function normalizeIntent(value: unknown): RuntimeAuthRecoveryIntent | null {
     // An accepted durable deadline remains recovery work, even in a record
     // written by an older stale proof settlement. Normalize before gate errors
     // can replace the diagnostic that identifies that work.
-    status: value.status === 'resumed_awaiting_proof'
-      && (value.lastError === 'no_eligible_member'
-        || value.lastError === 'switch_limit_reached'
-        || value.lastError === 'awaiting_limit_reset')
-      ? 'waiting'
-      : value.status,
+    status,
+    ...(proofWaitPhase ? { proofWaitPhase } : {}),
     armedAtMs,
     nextRetryAtMs,
     attemptCount,
@@ -409,6 +419,7 @@ function buildTerminalRuntimeAuthIntent(input: Readonly<{
     ...input.intent,
     v: 2,
     status: 'cancelled',
+    proofWaitPhase: undefined,
     lastSettledTransition: 'terminal',
     nextRetryAtMs: null,
     terminalAtMs: input.nowMs,
@@ -468,6 +479,7 @@ function buildRecoveredRuntimeAuthIntent(
     ...intent,
     v: 2,
     status: 'recovered',
+    proofWaitPhase: undefined,
     nextRetryAtMs: null,
     lastSettledTransition: 'recovered',
     terminalAtMs: nowMs,
@@ -1056,6 +1068,26 @@ function mergeRuntimeAuthRecoveryIntent(
     ? { ...next.classification, runtimeIssueFingerprint: previous.classification.runtimeIssueFingerprint }
     : next.classification;
   const sameEvidence = hasSameRuntimeAuthRecoveryEvidence(previous, { ...next, classification });
+  if (sameEvidence && !freshProviderOutcome && next.lastSettledTransition === 'working') {
+    // This report joins the existing pending attempt; it does not replace its
+    // policy. Preserve every attempt fact so a duplicate cannot manufacture a
+    // policy change under an outstanding claim or consume a manual-check refund.
+    return {
+      ...previous,
+      // Legacy pending records may predate attempt identities. Initialize that
+      // missing identity in this same intake transaction so its in-band result
+      // can settle by identity, without replacing an existing ID or policy.
+      attemptId: previous.attemptId ?? next.attemptId,
+      lastSettledTransition: mergeRuntimeAuthRecoveryTransition(
+        previous.lastSettledTransition,
+        next.lastSettledTransition,
+      ),
+      pendingVisibleEvents: mergeRuntimeAuthRecoveryPendingVisibleEvents(
+        previous.pendingVisibleEvents,
+        next.pendingVisibleEvents,
+      ),
+    };
+  }
   if (!sameEvidence && hasExplicitRuntimeAuthRecoveryEpochChange(previous, next)) return next;
   if (!sameEvidence && previous.status !== 'checking' && previous.status !== 'resumed_awaiting_proof') return next;
   return {
@@ -1083,6 +1115,7 @@ function mergeRuntimeAuthRecoveryIntent(
     status: !sameEvidence && isUntargetedProviderOutcomeProofWait(previous)
       ? 'waiting'
       : previous.status,
+    proofWaitPhase: sameEvidence ? previous.proofWaitPhase : undefined,
     lastError: sameEvidence && isUntargetedProviderOutcomeProofWait(previous)
       ? previous.lastError
       : next.lastError,
@@ -1320,6 +1353,14 @@ function isUntargetedProviderOutcomeProofWait(intent: RuntimeAuthRecoveryIntent)
     && intent.pendingTargetGeneration == null;
 }
 
+function isDueProfileUsageLimit(intent: RuntimeAuthRecoveryIntent, nowMs: number): boolean {
+  const resetAtMs = intent.classification.resetsAtMs;
+  return intent.groupId === null
+    && intent.classification.kind === 'usage_limit'
+    && typeof resetAtMs === 'number' && Number.isFinite(resetAtMs)
+    && resetAtMs <= nowMs;
+}
+
 // Handler verdict: the replayed recovery no longer applies (e.g. the group already moved
 // off the failing profile). The scheduler removes the durable record so the same key can
 // re-arm on a genuine future failure — see `DurableRecoveryOutcome['superseded']`.
@@ -1373,18 +1414,15 @@ export class RuntimeAuthRecoveryScheduler {
       && deps.providerOutcomePendingWaitMs > 0
       ? Math.trunc(deps.providerOutcomePendingWaitMs)
       : null;
-    const canContinueProfileLimit = (intent: RuntimeAuthRecoveryIntent): boolean => {
-      const resetAtMs = intent.classification.resetsAtMs;
-      return !deps.retryAfterLimitReset && Boolean(deps.continueAfterUsageLimitReset)
-        && intent.groupId === null && intent.classification.kind === 'usage_limit'
-        && typeof resetAtMs === 'number' && Number.isFinite(resetAtMs)
-        && resetAtMs <= deps.nowMs();
-    };
+    const canContinueProfileLimit = (intent: RuntimeAuthRecoveryIntent): boolean =>
+      !deps.retryAfterLimitReset && Boolean(deps.continueAfterUsageLimitReset)
+        && isDueProfileUsageLimit(intent, deps.nowMs());
     // A due profile continuation keeps its own bounded admission/proof lifecycle.
     // Observing a generic repair's proof must not suppress that first admission or
     // replace an admitted continuation's existing retry deadline.
     const observeProofWithoutRecovery = (intent: RuntimeAuthRecoveryIntent): boolean =>
-      isUntargetedProviderOutcomeProofWait(intent) && !canContinueProfileLimit(intent);
+      isUntargetedProviderOutcomeProofWait(intent)
+      && intent.proofWaitPhase !== 'usage_limit_continuation' && !canContinueProfileLimit(intent);
     // Only initial attempts present before this process took custody lost their
     // in-band owner. Live intake below must keep its null deadline unarmed.
     const restoredInitialAttemptIds = new Set((deps.durableStore?.readAll?.() ?? []).flatMap(([, value]) => {
@@ -1482,6 +1520,7 @@ export class RuntimeAuthRecoveryScheduler {
         ...intent,
         v: 2,
         status: 'cancelled',
+        proofWaitPhase: undefined,
         lastSettledTransition: mergeRuntimeAuthRecoveryTransition(intent.lastSettledTransition, 'terminal'),
         nextRetryAtMs: null,
         lastError: null,
@@ -1514,6 +1553,7 @@ export class RuntimeAuthRecoveryScheduler {
           ...intent,
           v: 2,
           status: 'exhausted',
+          proofWaitPhase: undefined,
           lastSettledTransition: mergeRuntimeAuthRecoveryTransition(intent.lastSettledTransition, 'terminal'),
           nextRetryAtMs: null,
           lastError: input.lastError,
@@ -1610,7 +1650,7 @@ export class RuntimeAuthRecoveryScheduler {
           }
           const dueProfileLimit = canContinueProfileLimit(intent);
           const awaitingContinuation = dueProfileLimit && Boolean(deps.continueAfterUsageLimitReset)
-            && intent.lastError === USAGE_LIMIT_CONTINUATION_PROOF_WAIT_ERROR;
+            && intent.proofWaitPhase === 'usage_limit_continuation';
           // An elapsed profile limit needs a provider retry, not another evaluation
           // of the historic failure as an action-required credential problem.
           const result = dueProfileLimit && deps.continueAfterUsageLimitReset
@@ -1706,6 +1746,8 @@ export class RuntimeAuthRecoveryScheduler {
               intent: {
                 ...intent,
                 status: 'resumed_awaiting_proof',
+                proofWaitPhase: switchResultForHandoff?.status === 'continuation_enqueued'
+                  ? 'usage_limit_continuation' : undefined,
                 attemptCount: rollbackAttempt ? Math.max(0, intent.attemptCount - 1) : intent.attemptCount,
                 ...(coalescedReplay ? { coalescedReplayCount: coalescedReplayCount + 1 } : {}),
                 pendingTargetProfileId: pendingTarget?.activeProfileId ?? intent.pendingTargetProfileId ?? null,
@@ -2252,6 +2294,7 @@ export class RuntimeAuthRecoveryScheduler {
     const waiting = withRuntimeAuthWaitPresentation({
       ...intent,
       status: 'waiting',
+      proofWaitPhase: undefined,
       attemptCount,
       nextRetryAtMs,
       lastError: disposition.reason,
@@ -2292,14 +2335,17 @@ export class RuntimeAuthRecoveryScheduler {
     if (input.expectedAttemptId && intent.attemptId !== input.expectedAttemptId) return intent;
     if (isTerminalRuntimeAuthRecoveryStatus(intent.status)) return intent;
     const pendingTarget = readPendingProofTarget(input.result);
+    const awaitingContinuation = readSwitchAttemptResult(input.result)?.status === 'continuation_enqueued';
     const nextRetryAtMs = this.providerOutcomePendingWaitMs === null
       ? intent.nextRetryAtMs
       : this.deps.nowMs() + this.providerOutcomePendingWaitMs;
     const waiting: RuntimeAuthRecoveryIntent = {
       ...intent,
       status: 'resumed_awaiting_proof',
+      proofWaitPhase: awaitingContinuation ? 'usage_limit_continuation' : undefined,
       nextRetryAtMs,
-      lastError: RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
+      lastError: awaitingContinuation
+        ? USAGE_LIMIT_CONTINUATION_PROOF_WAIT_ERROR : RUNTIME_AUTH_RECOVERY_UNPROVEN_PROVIDER_OUTCOME_ERROR,
       pendingTargetProfileId: pendingTarget?.activeProfileId ?? intent.pendingTargetProfileId ?? null,
       pendingTargetGeneration: pendingTarget?.generation ?? intent.pendingTargetGeneration ?? null,
     };
