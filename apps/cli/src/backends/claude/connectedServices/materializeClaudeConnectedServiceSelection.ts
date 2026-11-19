@@ -307,13 +307,12 @@ export async function materializeClaudeConnectedServiceSelection(params: Readonl
   if (params.sessionStateMode !== 'existing') {
     const managedHomesRoot = resolveConnectedServiceManagedHomesRoot(params.activeServerDir);
     const sourceViolation = await findClaudeConfigurationSourceScopeViolation({
-      sourceEnv: params.processEnv,
+      sourceEnv: nativeSourceEnv,
       targetDir: claudeConfigDir,
       managedHomesRoot,
-      // This path has always imported from the configured dir as given, including a managed home it
-      // names directly; only entries that resolve elsewhere than they appear are refused here.
-      permittedManagedHome: isWithinDir(resolveConfiguredClaudeConfigDir({ env: params.processEnv }), managedHomesRoot)
-        ? resolveConfiguredClaudeConfigDir({ env: params.processEnv })
+      // Permit the managed home directly named by the actual source, not an unrelated ambient dir.
+      permittedManagedHome: isWithinDir(resolveConfiguredClaudeConfigDir({ env: nativeSourceEnv }), managedHomesRoot)
+        ? resolveConfiguredClaudeConfigDir({ env: nativeSourceEnv })
         : null,
       serviceId: params.serviceId,
     });

@@ -9,6 +9,7 @@ import { startHookServer, type HookServer } from '@/backends/claude/utils/startH
 import { registerSessionHandlers } from '@/rpc/handlers/registerSessionHandlers';
 import type { SessionRuntimeControls } from '@/rpc/handlers/sessionControls';
 import { createRpcAcknowledgementError, markRpcRequestDisposition } from '@/session/transport/rpc/rpcRequestDisposition';
+import { captureConsoleJsonOutput } from '@/testkit/logger/captureOutput';
 
 /**
  * Composition of the public client, the session RPC relay boundary, the real runner handler,
@@ -96,6 +97,18 @@ describe('steerSessionAtToolBoundary', () => {
     expect(callSessionRpc).not.toHaveBeenCalled();
   });
 
+  it('refuses inactive CLI steering before any RPC without resuming or queueing', async () => {
+    const relay = vi.fn<Relay>();
+    const { callSessionRpc } = await load({ active: false, relay });
+    const { cmdSessionSteer } = await import('@/cli/commands/session/steer');
+    const output = captureConsoleJsonOutput();
+    try {
+      await cmdSessionSteer(['steer', 'sess-1', 'hello', '--from', 'worker/123', '--wait-ms', '100', '--json'], { readCredentialsFn: async () => credentials });
+      expect(output.json()).toMatchObject({ ok: false, error: { code: 'session_inactive' } });
+      expect(callSessionRpc).not.toHaveBeenCalled();
+    } finally { output.restore(); process.exitCode = 0; }
+  });
+
   it('refuses when the runner does not serve tool-boundary steering', async () => {
     const oldRunner: Relay = async (method) => {
       // Older runners never register the method; the relay reports it unavailable.
@@ -126,6 +139,23 @@ describe('steerSessionAtToolBoundary', () => {
     expect(hook?.code).toBe(0);
     expect(additionalContextOf(hook!.stdout)).toBe('please also run lint');
     await expect(result).resolves.toEqual({ ok: true, sessionId: 'sess-1', result: 'written_to_hook_response' });
+  });
+
+  it('carries caller attribution from the CLI command through the real broker and forwarder', async () => {
+    const runner = await startClaudeRunner();
+    await load({ active: true, relay: runner.relay });
+    const { cmdSessionSteer } = await import('@/cli/commands/session/steer');
+    const output = captureConsoleJsonOutput();
+    try {
+      const result = cmdSessionSteer(['steer', 'sess-1', 'hello', '--from', 'worker/123', '--wait-ms', '10000', '--json'], { readCredentialsFn: async () => credentials });
+      let hook: Awaited<ReturnType<typeof runForwarder>> | undefined;
+      for (let attempt = 0; attempt < 50 && !additionalContextOf(hook?.stdout ?? ''); attempt += 1) {
+        hook = await runForwarder(runner.port, { session_id: 'claude-main' });
+      }
+      expect(additionalContextOf(hook?.stdout ?? '')).toBe('[Steering from worker/123 (caller-asserted)]\nhello');
+      await result;
+      expect(output.json()).toMatchObject({ ok: true, data: { result: 'written_to_hook_response' } });
+    } finally { output.restore(); }
   });
 
   it('reports no tool boundary and keeps nothing once the wait ends', async () => {

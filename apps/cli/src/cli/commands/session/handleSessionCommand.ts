@@ -8,6 +8,7 @@ import { cmdSessionStatus } from './status';
 import { cmdSessionCreate } from './create';
 import { SESSION_CREATE_USAGE } from './create/parseSessionCreateSpawnOptions';
 import { cmdSessionSend, SESSION_SEND_USAGE } from './send';
+import { cmdSessionSteer, SESSION_STEER_USAGE } from './steer';
 import { cmdSessionWait } from './wait';
 import { cmdSessionStop } from './stop';
 import { cmdSessionArchive } from './archive';
@@ -50,6 +51,7 @@ function inferSessionKind(argv: readonly string[]): string {
   if (sub === 'set-permission-mode') return 'session_set_permission_mode';
   if (sub === 'set-model') return 'session_set_model';
   if (sub === 'send') return 'session_send';
+  if (sub === 'steer') return 'session_steer';
   if (sub === 'wait') return 'session_wait';
   if (sub === 'stop') return 'session_stop';
   if (sub === 'archive') return 'session_archive';
@@ -88,6 +90,7 @@ const SESSION_HELP_BY_COMMAND = {
   status: 'happier session status <session-id-or-prefix-or-tag> [--live] [--json]',
   create: SESSION_CREATE_USAGE,
   send: SESSION_SEND_USAGE,
+  steer: SESSION_STEER_USAGE,
   wait: 'happier session wait <session-id-or-prefix-or-tag> [--timeout <seconds>] [--json]',
   stop: 'happier session stop <session-id-or-prefix-or-tag> [--json]',
   history: 'happier session history <session-id-or-prefix-or-tag> [--limit N] [--format compact|raw] [--include-meta] [--include-structured-payload] [--json]',
@@ -230,6 +233,9 @@ export async function handleSessionCommand(
         return;
       case 'send':
         await cmdSessionSend(argv, { readCredentialsFn });
+        return;
+      case 'steer':
+        await cmdSessionSteer(argv, { readCredentialsFn });
         return;
       case 'wait':
         await cmdSessionWait(argv, { readCredentialsFn });
